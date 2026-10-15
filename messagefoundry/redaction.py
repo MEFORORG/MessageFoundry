@@ -938,10 +938,12 @@ def _drop_truncated_userinfo(text: str, cut: int) -> int:
     **That is still bounded, because both factors are.** The span is a constant, and a pass consumes
     at least one opener, so the passes cannot exceed the openers a window holds. Measured over a sweep
     of the gap between opener and terminator, in steps of 5 from 0 to 125, on 64 KiB of nothing but
-    credential spans: the worst is a 75-character gap at **348 passes and 1.6 ms**, against the 50 ms
-    the #1437 arms budget. A gap of 120 or more takes ONE pass -- past that the span cannot reach an
-    ``@`` beyond the cut at all -- so the cost is not monotone in the gap and a single sample of it
-    measures nothing. Pinned in ``tests/test_redaction.py`` under *bounding the input*."""
+    credential spans: the worst is a 75-character gap at **348 passes**. A gap of 120 or more takes
+    ONE pass -- past that the span cannot reach an ``@`` beyond the cut at all -- so the cost is not
+    monotone in the gap and a single sample of it measures nothing. Pinned in
+    ``tests/test_redaction.py`` by ``test_the_credential_walk_is_bounded_by_the_window_not_by_the_peer``,
+    which holds the measured cost; an earlier 1.6 ms figure here did not survive re-measurement
+    (BACKLOG #2958)."""
     while cut:
         start = _first_truncated_userinfo(text, cut)
         if start < 0:

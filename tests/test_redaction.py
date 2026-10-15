@@ -12,7 +12,7 @@ import logging
 import random
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any, SupportsIndex
 
 import pytest
@@ -177,6 +177,10 @@ _HOSTILE_RUN_CHARS = 16_000
 #: prove that this exact budget discriminates. If some future CPython makes the pre-guard scan fast
 #: enough to slip under it, the control reds, which is the correct thing to be told: at that point the
 #: instrument has stopped discriminating and the number needs re-deriving.
+#:
+#: **Only the arms with a wide margin still read it (BACKLOG #2958).** The credential walk and the
+#: frame-cap prose case ran 5 to 10 ms against it, the margin the token walk lost on a loaded runner
+#: (#2896). They moved to a CPU-time ratio, ``_CPU_GROWTH_LINE``, and their controls moved with them.
 _SCAN_BUDGET_SECONDS = 0.05
 
 
@@ -210,6 +214,53 @@ def _best_of(work: Callable[[], object], reps: int = 3) -> float:
         start = time.perf_counter()
         work()
         best = min(best, time.perf_counter() - start)
+    return best
+
+
+#: The least CPU time one ``_cpu_seconds`` sample spends. **A floor, because the clock is coarse:**
+#: ``time.process_time`` reports a resolution of 100 ns on Windows but moves in 15.625 ms ticks,
+#: measured 2026-10-13. One call of a 5 ms arm reads 0 or 15.6 ms, so a sample repeats the call
+#: until this much CPU time has passed and divides by the count. That caps the tick's error at
+#: about 8% of the sample.
+_CPU_SAMPLE_FLOOR_SECONDS = 0.2
+
+#: The line the CPU-time cost arms share. Each arm divides a large input's CPU time by a small one's,
+#: and the sizes are chosen so the shipped code and the regression it guards land on opposite sides
+#: of 24, each with room. **The number is borrowed, the clock is not:**
+#: ``test_the_mrn_pass_stays_linear_and_affordable`` reads the same 24 off a WALL-clock ratio, and
+#: keeps its own literal.
+_CPU_GROWTH_LINE = 24.0
+
+#: The absolute ceiling those arms also read, in CPU seconds for the large input. **Ten times the
+#: wall-clock budget, on purpose.** The ratio is what the arm is about; this bound keeps a linear
+#: path with a ruinous constant from passing. It is the same 0.5 s the MRN arm uses.
+_CPU_CEILING_SECONDS = 0.5
+
+
+def _cpu_seconds(work: Callable[[], object], reps: int = 3) -> float:
+    """Best-of-``reps`` CPU seconds per call of ``work``, each sample at least
+    ``_CPU_SAMPLE_FLOOR_SECONDS`` long.
+
+    **CPU time rather than wall time, for the arms whose margin a loaded runner can eat (BACKLOG
+    #2958).** A busy host delays a process without charging it the delay, so the clock this reads
+    stops while the runner is away. **It counts every thread in the process, not only this one**, so
+    a thread an earlier test left running is charged here too. It does not stop everything: a shared
+    core still slows each instruction through the cache, which is why the arms read a RATIO between
+    two sizes timed back to back, under one load, rather than a fixed number of seconds. A wall-clock ratio was built and
+    withdrawn in PR 2000, red 12 times in 25 on a shared Linux core; this is not that instrument.
+
+    The minimum over samples, for the reason ``_best_of`` gives."""
+    best = float("inf")
+    for _ in range(reps):
+        calls = 0
+        start = time.process_time()
+        while True:
+            work()
+            calls += 1
+            spent = time.process_time() - start
+            if spent >= _CPU_SAMPLE_FLOOR_SECONDS:
+                break
+        best = min(best, spent / calls)
     return best
 
 
@@ -257,7 +308,11 @@ def test_a_delimiter_free_run_stays_inside_the_scan_budget() -> None:
     took a single sample of an input whose longest token was one character and compared it to a bare
     ``< 1.0`` literal. It could not fail for the reason it named, and it did not: measured 2026-09-03,
     the shipped scan cost **1.05 s** on a 20,000-character run while that arm passed in under a
-    millisecond."""
+    millisecond.
+
+    **Kept on the budget because the margin is wide (BACKLOG #2958).** Re-measured best-of-5 on
+    2026-10-13, three runs on an unloaded Windows box: 0.77 to 1.19 ms, at least 42 times under the
+    line. The token walk that failed #2896 had about 7 times."""
     seconds = _redact_seconds(5)
     assert seconds < _SCAN_BUDGET_SECONDS, (
         f"redacting one {_HOSTILE_RUN_CHARS}-character delimiter-free run cost {seconds:.4f}s of the "
@@ -498,7 +553,11 @@ def test_the_separator_sniff_stays_inside_the_scan_budget() -> None:
     """Cost, on the two inputs that matter: a block of ordinary operational text carrying no MSH (the
     sniff runs and finds nothing) and a long fully-custom message (the sniff runs and the extra pass
     fires). Both share the ``_SCAN_BUDGET_SECONDS`` line the #1437 arms use, and best-of-5 for the same
-    reason: a scheduling hiccup can only inflate a sample."""
+    reason: a scheduling hiccup can only inflate a sample.
+
+    **Kept on the budget because the margins are wide (BACKLOG #2958).** Measured 2026-10-13, three
+    runs on an unloaded Windows box: 1.6 to 1.8 ms for the ops text and 0.66 to 0.79 ms for the custom
+    message, at least 27 and 63 times under the line."""
     ops_block = "\n".join(_OPERATIONAL_LINES * 40)  # about 10 KB, no MSH anywhere
     assert len(ops_block) > 9_000
     custom = _custom_delimiter_message(300)
@@ -1019,9 +1078,9 @@ def test_one_credential_span_can_cover_a_second_opener_and_both_go() -> None:
 def test_the_credential_walk_is_bounded_by_the_window_not_by_the_peer() -> None:
     """THE COST HALF, on the argument ``test_the_token_walk_is_bounded_by_the_window_not_by_the_peer``
     makes: the PEER chooses how many passes the walk takes, so each pass has to stay inside the
-    region it drops. That arm reads a count now (BACKLOG #2896); this one still reads a budget.
+    region it drops. That arm reads a count now (BACKLOG #2896); this one reads CPU time.
 
-    It does, on two bounds that are both properties rather than counts. A pass searches one
+    The walk is bounded by two properties rather than counts. A pass searches one
     ``_USERINFO_SPAN``-wide region behind the cut -- further back than that, a span ends inside the
     head, where the head's bytes are the text's bytes and the match still stands. And a pass consumes
     at least one opener, so the passes cannot outnumber the openers a window holds. The searched
@@ -1032,23 +1091,93 @@ def test_the_credential_walk_is_bounded_by_the_window_not_by_the_peer() -> None:
     The fixture is the worst of a sweep of the gap between opener and terminator, in steps of 5 from
     0 to 125: openers close enough together that a span reaches past the cut, far enough apart that a
     pass steps back over only a few. A gap of 120 or more takes ONE pass and 0.05 ms, because past
-    that no span can reach an ``@`` beyond the cut. Measured on the author's box: 348 passes and
-    1.6 ms at the worst gap, against the same ``_SCAN_BUDGET_SECONDS`` the #1437 arms use."""
-    window = redaction._REDACT_WINDOW - redaction._CLAMP_MARKER_BUDGET
-    block = redaction._USERINFO_OPENER + "x" * 75 + "@"
-    hostile = (block * (window // len(block) + 2))[: window + 200] + "Q" * 200_000
+    that no span can reach an ``@`` beyond the cut.
 
-    best = _best_of(lambda: clamp_untrusted(hostile))
-    assert best < _SCAN_BUDGET_SECONDS, (
-        f"clamping a {window}-character wall of credential spans cost {best:.4f}s of the event loop "
-        f"against a {_SCAN_BUDGET_SECONDS}s budget -- the walk is no longer linear in the window"
+    **A CPU-time ratio now, not the 0.05 s budget (BACKLOG #2958).** The arm clamps one wall at an
+    eighth of the shipped window and one at the shipped window, and divides. A walk linear in the
+    window reads about 8 and a quadratic one about 64, so ``_CPU_GROWTH_LINE`` sits between them. The
+    budget had to go because its margin was the one that failed #2896: measured 2026-10-13 on an
+    unloaded Windows box, this clamp cost 5.3 to 9.7 ms of wall time against 50 ms, and the token walk
+    went red on a loaded runner from 6 to 8 ms. Measured the same day in CPU time, over four runs: a
+    ratio of 7.3 to 9.1, and 5.8 to 7.0 ms at the shipped window, under ``_CPU_CEILING_SECONDS`` by
+    about 70 times. The control below reads 62 to 76 for a search that restarts at index 0.
+
+    **An absolute bound is kept, but it is ten times looser than the old one.** BACKLOG #2952 limit 3
+    asks that an absolute bound on one clamp's cost survive. A pure ratio would give it up, so the
+    shipped window is also held under ``_CPU_CEILING_SECONDS``. That ceiling passes a walk that stays
+    linear but costs up to about 70 times today's, where the old budget caught about 8 times. The
+    batch 255 Manager ruling on #2952 and #2958 (2026-10-13) chose that trade for headroom on a loaded
+    runner. The ratio's own margin is smaller, about 2.6 times, so load can still turn it red."""
+    growth, large = _credential_walk_growth()
+    assert growth < _CPU_GROWTH_LINE, (
+        f"an eight times wider window cost the credential walk {growth:.1f} times the CPU time, over "
+        f"the {_CPU_GROWTH_LINE} line -- the walk is no longer linear in the window"
     )
-    # Non-vacuity: a walk that stopped after a pass or two would be fast for the wrong reason.
-    head, _ = redaction._clamp(hostile, window)
-    assert len(head) < redaction._USERINFO_SPAN, (
-        f"the walk stopped with {len(head)} characters still in hand, so this fixture is not "
-        f"measuring a full-window walk and the budget above proves nothing about one"
+    assert large < _CPU_CEILING_SECONDS, (
+        f"clamping a shipped-window wall of credential spans cost {large:.4f} CPU seconds against a "
+        f"{_CPU_CEILING_SECONDS}s ceiling"
     )
+
+
+def test_a_credential_search_from_index_0_is_quadratic_on_the_same_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live positive control for the arm above: the SAME walls, the SAME clock and the SAME line, with
+    the search behind the cut started at index 0 instead of one ``_USERINFO_SPAN`` back.
+
+    That is the obvious spelling, and it is the one the bound exists against: every pass then reads
+    every opener in the head, so the cost is passes times openers. Without this control a ratio that
+    read 8 for every walk would pass the arm while measuring nothing. It patches the module global
+    ``_drop_truncated_userinfo`` reads, so the whole shipping path runs the quadratic search.
+
+    One rep for the large input, because a slow sample there only helps this assertion."""
+
+    def search_from_zero(text: str, cut: int) -> int:
+        pos = 0
+        while (start := text.find(redaction._USERINFO_OPENER, pos, cut)) >= 0:
+            match = redaction._INVALID_URL_USERINFO.match(text, start)
+            if match is not None and match.end() > cut:
+                return start
+            pos = start + 1
+        return -1
+
+    monkeypatch.setattr(redaction, "_first_truncated_userinfo", search_from_zero)
+    growth, _ = _credential_walk_growth(large_reps=1)
+    assert growth > _CPU_GROWTH_LINE, (
+        f"a search from index 0 grew only {growth:.1f} times for an eight times wider window, under "
+        f"the {_CPU_GROWTH_LINE} line. The ratio no longer separates a bounded search from an "
+        f"unbounded one, so the arm above is not measuring anything"
+    )
+
+
+def _credential_wall(window: int) -> str:
+    """The worst wall of credential spans for a ``clamp_untrusted`` of ``window``: the 75-character gap
+    the sweep found, run past the cut, then a peer-sized tail."""
+    cut = window - redaction._CLAMP_MARKER_BUDGET
+    block = redaction._USERINFO_OPENER + "x" * 75 + "@"
+    return (block * (cut // len(block) + 2))[: cut + 200] + "Q" * 200_000
+
+
+def _credential_walk_growth(large_reps: int = 3) -> tuple[float, float]:
+    """``(ratio, large)``: CPU seconds for one clamp of a ``_credential_wall`` at the shipped window,
+    over the same at an eighth of it, and the large reading alone.
+
+    Both walls are checked before anything is divided, because a ratio hides a broken reading: a walk
+    that stopped after a pass or two would be fast at both sizes for the wrong reason."""
+    readings = []
+    for window, reps in (
+        (redaction._REDACT_WINDOW // 8, 3),
+        (redaction._REDACT_WINDOW, large_reps),
+    ):
+        hostile = _credential_wall(window)
+        head, _ = redaction._clamp(hostile, window - redaction._CLAMP_MARKER_BUDGET)
+        assert len(head) < redaction._USERINFO_SPAN, (
+            f"the walk stopped with {len(head)} characters still in hand at a {window}-character "
+            f"window, so this fixture is not measuring a full-window walk"
+        )
+        readings.append(_cpu_seconds(lambda: clamp_untrusted(hostile, window=window), reps))  # noqa: B023
+    small, large = readings
+    return large / small, large
 
 
 def test_the_credential_walk_costs_an_ordinary_message_nothing() -> None:
@@ -1149,18 +1278,29 @@ _FRAME_CAP_SHAPES = {
 }
 
 
-@pytest.mark.parametrize("label", sorted(_FRAME_CAP_SHAPES))
+#: The two frame-cap shapes still read against ``_SCAN_BUDGET_SECONDS``. Prose left it for a CPU-time
+#: ratio (BACKLOG #2958), because its margin was the thin one.
+_FRAME_CAP_BUDGET_SHAPES = ("one solid run", "segment-shaped")
+
+
+@pytest.mark.parametrize("label", _FRAME_CAP_BUDGET_SHAPES)
 def test_a_frame_cap_sized_input_no_longer_buys_the_event_loop(label: str) -> None:
     """THE ROW'S ACCEPTANCE ARM: event-loop responsiveness against an input a remote peer sizes.
 
     A negative acknowledgment's MSA-3 runs to the 16 MiB frame cap, and ``safe_text`` scanned all of it
     before truncating to 200 characters. Measured unbounded on the author's box: 0.29 s for the
     segment shape and 0.78 s for prose, which matches the 0.53-0.94 s band measured independently on
-    another. Bounded, the same inputs cost 1.2 ms and 3.1 ms.
+    another. Those are the first readings; the controls below hold the current ones.
 
     The budget is ``_SCAN_BUDGET_SECONDS`` -- the same line the #1437 cost arms use, so a regression
     that reopened the scan would fail here at the same threshold it fails there -- and best-of-3
-    because a scheduling hiccup can only inflate a sample."""
+    because a scheduling hiccup can only inflate a sample.
+
+    **Kept on the budget because the margins are wide (BACKLOG #2958).** Measured best-of-3 on
+    2026-10-13, three runs on an unloaded Windows box: 2.0 to 3.0 ms for the segment shape and 0.06
+    to 0.09 ms for the solid run. A runner would have to inflate them at least 16 and 550 times to
+    fake a red. The token walk that failed #2896 had about 7 times. Prose is the third shape, and it moved to
+    ``test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs``."""
     text = _FRAME_CAP_SHAPES[label]()
     assert len(text) >= 16_000_000
     best = _best_of(lambda: safe_text(text))
@@ -1170,18 +1310,73 @@ def test_a_frame_cap_sized_input_no_longer_buys_the_event_loop(label: str) -> No
     )
 
 
-def test_control_the_same_inputs_are_expensive_unbounded() -> None:
-    """Non-vacuity for the arm above, in the shape ``test_the_hostile_fixture_is_actually_hostile``
-    established: without it, a fast ``safe_text`` would be equally consistent with a fixture too cheap
-    to measure anything. ``redact`` is called directly, which is what ``safe_text`` did before the
-    bound."""
-    # The shape from the table above, not a re-typed copy of it: a control has to measure the same
-    # fixture as the arm it controls, and a duplicated literal is free to drift out from under it.
-    text = _FRAME_CAP_SHAPES["delimiter-free prose"]()
-    best = _best_of(lambda: redact(text))
+@pytest.mark.parametrize("label", _FRAME_CAP_BUDGET_SHAPES)
+def test_control_the_budget_shapes_are_expensive_unbounded(label: str) -> None:
+    """Non-vacuity for the budget arm above, on the SAME fixture and the SAME line. Without it, a fast
+    ``safe_text`` would be equally consistent with a fixture too cheap to measure anything.
+    ``redact`` is called directly, which is what ``safe_text`` did before the bound. Measured
+    2026-10-13, five single samples each: 1.24 to 1.56 s for the solid run and 0.59 to 1.03 s for
+    the segment shape. One sample, because noise can only make it slower."""
+    text = _FRAME_CAP_SHAPES[label]()
+    best = _best_of(lambda: redact(text), 1)
     assert best > _SCAN_BUDGET_SECONDS, (
-        f"the unbounded scan cost only {best:.4f}s, under the {_SCAN_BUDGET_SECONDS}s budget the "
-        f"bounded arm clears -- this fixture no longer discriminates and the budget needs re-deriving"
+        f"the unbounded scan of {label} cost only {best:.4f}s, under the {_SCAN_BUDGET_SECONDS}s "
+        f"budget the bounded arm clears -- this fixture no longer discriminates"
+    )
+
+
+def _frame_cap_prose_growth(
+    scan: Callable[[str], object], large_reps: int = 3
+) -> tuple[float, float]:
+    """``(ratio, large)``: CPU seconds for ``scan`` over the 16 MiB prose shape, over the same for one
+    window of it, and the large reading alone.
+
+    **A window as the small size, so the two sides of the line are far apart.** The prose is about
+    267 windows long. Bounded, both inputs cost one window's scan and the ratio is near 1; unbounded,
+    it is near 267. An 8x pair, the shape the MRN arm uses, would read 8 unbounded and sit under the line."""
+    large_text = _FRAME_CAP_SHAPES["delimiter-free prose"]()
+    small_text = large_text[: redaction._REDACT_WINDOW]
+    small = _cpu_seconds(lambda: scan(small_text))
+    large = _cpu_seconds(lambda: scan(large_text), large_reps)
+    return large / small, large
+
+
+def test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs() -> None:
+    """The frame-cap arm's prose shape, on a CPU-time ratio rather than the 0.05 s budget (BACKLOG
+    #2958).
+
+    Its margin was the thin one: measured 2026-10-13 on an unloaded Windows box, 4.2 to 6.9 ms of wall
+    time against 50 ms, the class of margin the token walk lost on a loaded runner (#2896). Measured
+    the same day in CPU time, over four runs: a ratio of 0.9 to 1.3, and 4.8 to 5.6 ms for the frame
+    cap, under ``_CPU_CEILING_SECONDS`` by about 90 times. The control below reads 282 to 320 for the
+    unbounded scan.
+
+    **The ceiling is an absolute bound of the kind BACKLOG #2952 limit 3 asks to keep**, ten times looser than
+    the old line: it passes a scan up to about 90 times today's. ``safe_text`` runs the whole clamp on
+    this input, the name walk included."""
+    growth, large = _frame_cap_prose_growth(safe_text)
+    assert growth < _CPU_GROWTH_LINE, (
+        f"safe_text on the frame-cap prose cost {growth:.1f} times one window of it, over the "
+        f"{_CPU_GROWTH_LINE} line -- the scan is no longer bounded by the window"
+    )
+    assert large < _CPU_CEILING_SECONDS, (
+        f"safe_text on the frame-cap prose cost {large:.4f} CPU seconds against a "
+        f"{_CPU_CEILING_SECONDS}s ceiling"
+    )
+
+
+def test_control_the_same_inputs_are_expensive_unbounded() -> None:
+    """Non-vacuity for the prose arm above, in the shape ``test_the_hostile_fixture_is_actually_hostile``
+    established: without it, a cheap ``safe_text`` would be equally consistent with a fixture too
+    cheap to measure anything. ``redact`` is called directly, which is what ``safe_text`` did before
+    the bound. **The same pair, the same clock and the same line as the arm**, so the line provably
+    separates a bounded scan from an unbounded one. One rep for the large input, because a slow
+    sample there only helps this assertion."""
+    growth, _ = _frame_cap_prose_growth(redact, large_reps=1)
+    assert growth > _CPU_GROWTH_LINE, (
+        f"the unbounded scan cost only {growth:.1f} times one window of it, under the "
+        f"{_CPU_GROWTH_LINE} line the bounded arm clears -- this fixture no longer discriminates "
+        f"and the line needs re-deriving"
     )
 
 
@@ -1298,21 +1493,49 @@ class _MeteredText(str):
     taken out.
 
     An index is one character, a slice is the characters it copies, and a search is the characters
-    between where it starts and where it stops. Each read hands back a plain ``str``, so the count is
-    of work done on the WHOLE text, which is where a quadratic walk spends it.
+    between where it starts and where it stops. An index hands back a plain one-character ``str``.
+
+    **A slice hands back a ``_MeteredText`` that charges the SAME counter (BACKLOG #2952 limit 1).**
+    The first version handed back a plain ``str``, so a walk run on one ``text[:cut]`` copy was
+    charged the copy and nothing else. A quadratic walk spelled that way read a growth of 2.0005,
+    under the line, measured 2026-10-13. Charging the copy's own reads to the parent closes it, and
+    the shipped walk's ``text[start:end]`` token reads are now charged as well. That is why the
+    meter charges ``endswith`` and ``rstrip``, the two methods ``_ends_with_name_token`` calls on a
+    token.
 
     **Why characters and not calls.** The two spellings of the name walk take the same number of
     steps. What separates them is how far each step reaches, so a step count reads them as equal.
 
-    **WHAT IT CANNOT SEE, which is more than the floor in ``_walk_cost`` covers.** Work done on a
-    plain copy is charged nothing past the copy, and neither is a read made by the regex engine, by an
-    operator (``in``, ``+``) or by an unbound ``str.rfind(text, ...)``. The floor refuses a walk the
-    meter saw NOTHING of. It passes at least these two, both measured: a quadratic walk run on one
-    ``text[:cut]`` copy, and an unseen scan added beside the shipped index reads. So the two walk arms
-    show that the shipped spelling is linear and that the ``_last_cut`` spelling is caught. They do
-    not show that every quadratic spelling is."""
+    **What it refuses.** Every public ``str`` method it does not charge (``_UNMETERED_READS``), and
+    four operators that would hand the text to unmetered code: ``str()``, ``in``, iteration and
+    ``+`` (BACKLOG #2952 limit 2). ``str(text)`` was the second way past the meter, a plain copy any
+    search could then read for free.
 
-    touched = 0
+    **WHAT IT STILL CANNOT SEE, which is more than the floor in ``_walk_cost`` covers.** At least
+    these: a read made by the regex engine; an unbound call such as ``str.rfind(text, ...)`` or
+    ``str.__str__(text)``; an operator this class does not override, or one with a plain ``str`` on
+    its left, such as ``"" + text``, ``text * 2`` or ``text == other``; and a method of ANOTHER
+    string that reads this one, such as ``"".join([text])``. Each reaches the C code without passing
+    through this class. The floor
+    refuses a walk charged less than one touch per character it dropped. It passes a walk that
+    charges that much and then does unbounded work through one of those routes. So the walk arms show
+    that the shipped spelling is linear and that the spellings they name are caught. They do not show
+    that every quadratic spelling is."""
+
+    _meter: list[int]
+
+    def __new__(cls, value: str, meter: list[int] | None = None) -> _MeteredText:
+        made = super().__new__(cls, value)
+        made._meter = [0] if meter is None else meter
+        return made
+
+    @property
+    def touched(self) -> int:
+        """Characters charged so far, to this text and to every slice taken from it."""
+        return self._meter[0]
+
+    def _charge(self, chars: int) -> None:
+        self._meter[0] += chars
 
     def __getattribute__(self, name: str) -> Any:
         if name in _UNMETERED_READS:
@@ -1322,17 +1545,52 @@ class _MeteredText(str):
             )
         return super().__getattribute__(name)
 
+    def _refuse(self, operator: str) -> AssertionError:
+        return AssertionError(
+            f"{operator} handed a _MeteredText to code the meter does not charge. Charge it in "
+            f"_MeteredText before trusting a count taken through it"
+        )
+
+    def __str__(self) -> str:
+        raise self._refuse("str()")
+
+    def __contains__(self, key: object, /) -> bool:
+        raise self._refuse("`in`")
+
+    def __iter__(self) -> Iterator[str]:
+        raise self._refuse("iteration")
+
+    def __add__(self, value: str, /) -> str:
+        raise self._refuse("`+`")
+
     def __getitem__(self, key: SupportsIndex | slice, /) -> str:
         got = super().__getitem__(key)
-        self.touched += len(got)
-        return got
+        self._charge(len(got))
+        return _MeteredText(got, self._meter) if isinstance(key, slice) else got
+
+    def endswith(
+        self,
+        suffix: str | tuple[str, ...],
+        start: SupportsIndex | None = None,
+        end: SupportsIndex | None = None,
+        /,
+    ) -> bool:
+        longest = max(map(len, (suffix,) if isinstance(suffix, str) else suffix), default=0)
+        self._charge(min(longest, len(self)))
+        return super().endswith(suffix, start, end)
+
+    def rstrip(self, chars: str | None = None, /) -> str:
+        kept = super().rstrip(chars)
+        # Every character stripped, plus the one that stopped the scan.
+        self._charge(len(self) - len(kept) + (1 if kept else 0))
+        return _MeteredText(kept, self._meter)
 
     def find(
         self, sub: str, start: SupportsIndex | None = None, end: SupportsIndex | None = None, /
     ) -> int:
         at = super().find(sub, start, end)
         low, high, _ = slice(start, end).indices(len(self))
-        self.touched += max((at + len(sub) if at >= 0 else high) - low, 0)
+        self._charge(max((at + len(sub) if at >= 0 else high) - low, 0))
         return at
 
     def rfind(
@@ -1340,7 +1598,7 @@ class _MeteredText(str):
     ) -> int:
         at = super().rfind(sub, start, end)
         low, high, _ = slice(start, end).indices(len(self))
-        self.touched += max(high - (at if at >= 0 else low), 0)
+        self._charge(max(high - (at if at >= 0 else low), 0))
         return at
 
 
@@ -1364,18 +1622,21 @@ _WALK_WINDOW = 8_192
 _WALK_GROWTH_LINE = 3.0
 
 
-def _name_token_wall(window: int) -> str:
+def _name_token_wall(window: int, tail: int | None = None) -> str:
     """The most steps a ``window`` can buy the name walk: the shortest legal ALLCAPS token plus one
     space, 21,820 of them at the shipped window, with a non-whitespace run behind so the cut lands at
     the end of the run and the walk has to travel the whole way back.
 
-    **The run behind grows with the window.** It is the part of the text the PEER sizes, so a step
-    that searched it would cost more as it grew, and a tail of one fixed length would hide that from
-    a growth reading. Behind this one, one unbounded ``rfind`` per step reads a growth of 4.00."""
-    return ("AA " * (window // 3 + 1))[:window] + "Q" * (3 * window)
+    **The run behind grows with the window by default.** It is the part of the text the PEER sizes,
+    so a step that searched it would cost more as it grew, and a tail of one fixed length would hide
+    that from a growth reading. Behind this one, one unbounded ``rfind`` per step reads a growth of
+    4.00. **That catches a search per STEP, not one per clamp:** a single scan of the whole text
+    still doubles with the window. ``tail`` sets the run behind on its own, for
+    ``test_the_walk_charges_nothing_for_the_text_behind_the_window``, which reads that case."""
+    return ("AA " * (window // 3 + 1))[:window] + "Q" * (3 * window if tail is None else tail)
 
 
-def _walk_cost(window: int) -> int:
+def _walk_cost(window: int, tail: int | None = None) -> int:
     """Characters the name walk touches inside ``redaction._clamp``, on a ``_name_token_wall``.
 
     **The walk's own share, not the clamp's total.** ``_clamp`` opens with one ``_last_cut`` over the
@@ -1383,9 +1644,14 @@ def _walk_cost(window: int) -> int:
     a walk the meter cannot see: such a walk reads as free, and the total still doubles with the
     window. So the opening call is read on its own and taken off.
 
-    Both checks run before anything is divided, because a ratio hides a broken reading: two walks that
-    each stopped early, or two counts that each missed the walk, divide to a clean 2."""
-    wall = _name_token_wall(window)
+    **The subtraction is checked, not assumed (BACKLOG #2952 limit 4).** The clamp is run once more
+    with both walks patched out. What it charges then must be the opening ``_last_cut`` plus the final
+    slice, or ``_clamp`` no longer opens the way this subtracts. That failure names the opening, so a
+    reader does not mistake it for the blind-meter failure below it.
+
+    Every check runs before anything is divided, because a ratio hides a broken reading: two walks
+    that each stopped early, or two counts that each missed the walk, divide to a clean 2."""
+    wall = _name_token_wall(window, tail)
     text = _MeteredText(wall)
     head, _ = redaction._clamp(text, window)
     assert not head, (
@@ -1394,6 +1660,17 @@ def _walk_cost(window: int) -> int:
     )
     opening = _MeteredText(wall)
     cut = redaction._last_cut(opening, window)
+    bare = _MeteredText(wall)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(redaction, "_drop_trailing_name_tokens", lambda _text, at: at)
+        patch.setattr(redaction, "_drop_truncated_userinfo", lambda _text, at: at)
+        redaction._clamp(bare, window)
+    assert bare.touched == opening.touched + cut, (
+        f"with both walks patched out, _clamp charged {bare.touched} characters, not the "
+        f"{opening.touched} of one opening _last_cut plus the {cut} of the final slice. _clamp no "
+        f"longer opens the way _walk_cost subtracts, so re-derive the opening read before trusting "
+        f"the walk's share"
+    )
     walked = text.touched - opening.touched
     assert walked >= cut, (
         f"the meter charged the walk {walked} characters for dropping {cut}. A walk has to read "
@@ -1427,14 +1704,27 @@ def test_the_token_walk_is_bounded_by_the_window_not_by_the_peer() -> None:
     touches at 2N over the characters it touches at N (``_walk_growth``). No clock is involved, so
     load cannot move the answer.
 
-    Measured on the shipped walk: 19,108 characters at 8,192 and 38,225 at 16,384, a growth of 2.00.
-    The control below reads 4.00 for the ``_last_cut`` spelling on the same meter and the same line.
+    Measured on the shipped walk, 2026-10-13, with slices metered: 30,028 characters at 8,192 and
+    60,069 at 16,384, a growth of 2.00. Before slices were metered it read 19,108 and 38,225; the
+    difference is the token reads ``_ends_with_name_token`` makes on each slice. The control below
+    reads 4.00 for the ``_last_cut`` spelling on the same meter and the same line.
 
     **What this gave up, so nobody reads it as more than it is.** The budget bounded the seconds one
     shipped-window clamp may cost, whatever the spelling. This arm bounds neither: a linear walk with
     a large constant passes, and so does a quadratic one the meter cannot see (``_MeteredText`` names
     the cases). A count was chosen over a timed ratio because a count cannot go red on a busy
-    runner, and going red there is the defect being fixed."""
+    runner, and going red there is the defect being fixed.
+
+    **No absolute bound is added here, and that is BACKLOG #2952 limit 3 answered by a reason rather
+    than by code.** Any absolute bound is a number of seconds, and seconds on this walk are what
+    #2896 removed. Absolute bounds on one clamp live in at least these arms instead: the two CPU-time
+    arms under ``_CPU_CEILING_SECONDS``
+    (``test_the_credential_walk_is_bounded_by_the_window_not_by_the_peer`` and
+    ``test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs``), and the two frame-cap shapes
+    still under ``_SCAN_BUDGET_SECONDS``. None of their walls is name-shaped where the cut lands, so
+    none drives the name walk past a token or two. So a name walk that stays linear but carries a
+    large constant still passes everything here. That gap is accepted, and it is recorded rather
+    than closed."""
     growth = _walk_growth()
     assert growth < _WALK_GROWTH_LINE, (
         f"doubling the window multiplied the characters the walk touches by {growth:.2f}, over the "
@@ -1475,13 +1765,94 @@ def test_the_last_cut_spelling_of_the_walk_is_quadratic_on_the_same_meter(
     )
 
 
+def test_a_quadratic_walk_on_one_copy_of_the_text_is_charged_to_the_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #2952 limit 1. The ``_last_cut`` spelling, run on ONE ``text[:cut]`` copy, so every
+    read after the first lands on the copy.
+
+    Measured 2026-10-13: this read a growth of 2.0005 while a slice handed back a plain ``str``, under
+    the line and green. A slice now charges the parent's counter, and it reads 4.00."""
+    monkeypatch.setattr(
+        redaction,
+        "_drop_trailing_name_tokens",
+        lambda text, cut: _last_cut_walk(text[:cut], cut, steps=cut),
+    )
+    growth = _walk_growth()
+    assert growth > _WALK_GROWTH_LINE, (
+        f"a quadratic walk on a copy of the text grew only {growth:.2f}, under the "
+        f"{_WALK_GROWTH_LINE} line, so a slice is no longer charged to the text it came from"
+    )
+
+
+def test_a_plain_copy_of_the_text_is_refused_not_read_as_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #2952 limit 2, the spelling the row measured: the shipped walk plus one
+    ``str.rfind(str(text), ...)`` per clamp, a search the meter never saw.
+
+    Measured 2026-10-13: a growth of 2.0005 before ``str()`` was refused, the same as the shipped walk,
+    because the search ran on a plain copy. Now the copy is refused."""
+    shipped = redaction._drop_trailing_name_tokens
+
+    def walk_and_search_a_copy(text: str, cut: int) -> int:
+        str.rfind(str(text), "ZZZ")
+        return shipped(text, cut)
+
+    monkeypatch.setattr(redaction, "_drop_trailing_name_tokens", walk_and_search_a_copy)
+    with pytest.raises(AssertionError, match=r"str\(\) handed a _MeteredText"):
+        _walk_growth()
+
+
+#: The run behind the window, in two lengths, for the arm below. The first is what
+#: ``_name_token_wall`` uses at ``_WALK_WINDOW``; the second doubles it with the window held still.
+_WALK_TAILS = (3 * _WALK_WINDOW, 6 * _WALK_WINDOW)
+
+
+def test_the_walk_charges_nothing_for_the_text_behind_the_window() -> None:
+    """BACKLOG #2952 limit 2, the half a growth reading cannot see: ONE scan of the whole text per
+    clamp, rather than one per step.
+
+    The growth arm doubles the window and the tail together, so a single peer-sized scan doubles too
+    and reads as linear. This holds the window still and doubles only the tail. Nothing the walk does
+    should reach past the window, so the charge must not move at all. A count has no noise, so the
+    test asks for equality. Measured 2026-10-13: 30,028 characters at both tails."""
+    short, long = (_walk_cost(_WALK_WINDOW, tail) for tail in _WALK_TAILS)
+    assert short == long, (
+        f"doubling only the text behind the window moved the walk's charge from {short} to {long} "
+        f"characters, so the walk reads text the window does not hold"
+    )
+
+
+def test_a_scan_of_the_whole_text_per_clamp_is_charged_to_the_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live positive control for the arm above: the shipped walk plus one metered ``text.rfind``
+    over the whole text per clamp. The growth arm reads it at 2.0002, under its line, measured
+    2026-10-13. Here the charge moves with the tail."""
+    shipped = redaction._drop_trailing_name_tokens
+
+    def walk_and_scan(text: str, cut: int) -> int:
+        text.rfind("ZZZ")
+        return shipped(text, cut)
+
+    monkeypatch.setattr(redaction, "_drop_trailing_name_tokens", walk_and_scan)
+    assert _walk_growth() < _WALK_GROWTH_LINE  # the case the growth arm misses
+    short, long = (_walk_cost(_WALK_WINDOW, tail) for tail in _WALK_TAILS)
+    assert long > short, (
+        f"a scan of the whole text charged {short} and {long} characters at two tails, so the arm "
+        f"above cannot see a read past the window"
+    )
+
+
 def test_the_meter_charges_each_read_for_the_characters_it_touches() -> None:
     """The instrument's own control. Both walk arms divide two readings of ``_MeteredText``, and a
     ratio hides a meter that charges every read the same wrong amount.
 
     One reading per kind of read ``_clamp`` makes, on a text small enough to count by hand: an index,
     a slice from 0, a backward search that hits, one that runs out, and a forward search. The forward
-    search is the credential walk's; neither name-walk arm reaches it."""
+    search is the credential walk's; neither name-walk arm reaches it. Then the reads a SLICE makes,
+    which charge the same counter: a slice of a slice, an ``rstrip`` and an ``endswith``."""
     text = _MeteredText("ab cd ef")
     charged = []
     for read in (
@@ -1490,29 +1861,57 @@ def test_the_meter_charges_each_read_for_the_characters_it_touches() -> None:
         lambda: text.rfind(" ", 0, 8),  # hits at 5, having read 7, 6 and 5
         lambda: text.rfind("\t", 0, 8),  # no hit, so all eight
         lambda: text.find(" ", 3),  # hits at 5, having read 3, 4 and 5
+        lambda: text[:5][1:3],  # five copied, then two of those
+        lambda: text[:5].rstrip("d "),  # five copied, then "d" stripped and "c" read
+        lambda: text.endswith("ef"),  # the two characters compared
     ):
         before = text.touched
         read()
         charged.append(text.touched - before)
-    assert charged == [1, 5, 3, 8, 3]
+    assert charged == [1, 5, 3, 8, 3, 7, 7, 2]
     with pytest.raises(AssertionError, match="rsplit"):
         text.rsplit(None, 1)
+    for escape in (lambda: str(text), lambda: "a" in text, lambda: list(text), lambda: text + "a"):
+        with pytest.raises(AssertionError, match="the meter does not charge"):
+            escape()
 
 
+@pytest.mark.parametrize("charged", [0, 1], ids=["nothing", "one character"])
 def test_a_walk_the_meter_cannot_see_is_refused_not_read_as_free(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, charged: int
 ) -> None:
     """The floor's own control. ``_walk_cost`` refuses a walk charged under one touch per character
     it dropped, and nothing else here shows that refusal can fire.
 
-    The walk is the QUADRATIC spelling run on a plain ``str`` copy, so the meter is charged nothing
-    for it. Without the floor that reads as a walk costing zero at both windows."""
-    monkeypatch.setattr(
-        redaction,
-        "_drop_trailing_name_tokens",
-        lambda text, cut: _last_cut_walk(str(text), cut, steps=cut),
-    )
-    with pytest.raises(AssertionError, match="cannot see"):
+    The walk is the QUADRATIC spelling run on a plain copy made by ``str.__str__(text)``, an unbound
+    call the meter cannot see. Without the floor that reads as a walk costing nothing at both
+    windows. **Twice, because a floor of "more than zero" would pass the second (BACKLOG #2952 limit
+    5):** once charged nothing, and once charged one indexed character first."""
+
+    def unseen_walk(text: str, cut: int) -> int:
+        if charged:
+            text[cut - 1]  # noqa: B018 -- the one metered read
+        return _last_cut_walk(str.__str__(text), cut, steps=cut)
+
+    monkeypatch.setattr(redaction, "_drop_trailing_name_tokens", unseen_walk)
+    with pytest.raises(AssertionError, match=rf"charged the walk {charged} characters.*cannot see"):
+        _walk_cost(_WALK_WINDOW)
+
+
+def test_a_clamp_that_no_longer_opens_with_one_last_cut_is_named_as_that(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The opening check's own control (BACKLOG #2952 limit 4). ``_walk_cost`` takes one opening
+    ``_last_cut`` off the clamp's charge. A clamp that opened with an extra read would make that
+    subtraction wrong, and the failure has to say so, not blame the meter."""
+    shipped = redaction._clamp
+
+    def clamp_with_an_extra_read(text: str, window: int) -> tuple[str, int]:
+        text[:window]  # noqa: B018 -- a read the subtraction does not know about
+        return shipped(text, window)
+
+    monkeypatch.setattr(redaction, "_clamp", clamp_with_an_extra_read)
+    with pytest.raises(AssertionError, match="no longer opens the way _walk_cost subtracts"):
         _walk_cost(_WALK_WINDOW)
 
 
