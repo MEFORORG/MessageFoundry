@@ -43,7 +43,7 @@
 
     A PIN IS REPLACED ATOMICALLY. It is written to a unique temp file beside it and moved over it
     with [System.IO.File]::Move(..., $true), which replaces in one rename on the same volume. On
-    that path a reader sees the old pin or the new one and never none (the race test measures it).
+    that path a reader sees the old pin or the new one and never none (the engine's race test measures it).
     Readers open it sharing delete, so they hold it as briefly and loosely as .NET allows; whether
     an open reader still blocks the rename on Windows is not measured, which is why the move is
     retried. A move that keeps failing deletes the old pin and tries once more: then, and only
@@ -53,9 +53,9 @@
 
     NO CWD IS NOT A FAULT. A payload with no `cwd` (an older harness, a hand-run test) answers for
     the session's pin, or with none leaves the hook where it started. Stdin still open at the
-    read's bound IS one, because nothing says it would have named no `cwd`. A refused `cwd` is a fault too, and both entry points return the
-    Reason so the caller can say it aloud. Falling back in silence is the defect this file exists
-    to fix.
+    read's bound IS one, because nothing says it would have named no `cwd`. A refused `cwd` is a
+    fault too, and both entry points return the Reason so the caller can say it aloud. Falling back
+    in silence is the defect this file exists to fix.
 
     A hook reads its input with Read-CcxHookInput and then does ONE of two things:
 
@@ -446,7 +446,10 @@ function Resolve-CcxHookSession {
 
     if (-not $p.Named) {
         # No cwd: a pinned session still answers for its pin (rule 3); an unpinned one stays put.
-        if ($pinned) { $out.Dir = $pinned; $out.Root = $pinned; $out.Source = 'pin' }
+        if ($pinned) {
+            $out.Dir = $pinned; $out.Root = $pinned; $out.Source = 'pin'
+            $out.Note = "the hook input names no cwd; this hook answers for $pinned, the worktree the session started in"
+        }
         return $out
     }
     $own = if ($pinned) { $pinned } else { $startRoot }
