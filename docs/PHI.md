@@ -94,7 +94,8 @@ least these changes made outside the store:
 - an account inserted or edited: its `users` row, its role rows, or its passkey set apart from
   the sign count;
 - a custom role inserted or edited;
-- the Active Directory group-to-role or group-to-channel map changed.
+- the Active Directory group-to-role or group-to-channel map changed;
+- a dual-control approval request inserted or edited, such as its captured params or its requester.
 
 **Cell tags** need a store key, `[store].aad_bind` on and `[store].allow_unmarked_ciphertext` off,
 which are the defaults. They refuse at least these:
@@ -102,14 +103,16 @@ which are the defaults. They refuse at least these:
 - a message moved to another channel, or a saved search moved to another owner;
 - a queue row's routing fields changed under its encrypted payload.
 
-A refused authority row grants nothing. A refused cell does not open, so its message or delivery
-is refused on read or dead-lettered. A moved message still shows in the other channel's message
-list by its plaintext columns, with its encrypted cells withheld. The engine keeps running. A
-refusal usually writes an `integrity.*` audit row and raises an `integrity_drift` alert, with at
-least two exceptions. Under `vault_transit`, a cell that fails its tag keeps the cipher's own
-error, with no integrity audit row or alert. A message cell that keeps failing is reported once an
-hour in each process. What each refusal does is in the changelog entries for vault BACKLOG #2592 and #2593 (in
-`changelog.d/` until the next release, then [CHANGELOG.md](../CHANGELOG.md)). The seal format is
+A refused authority row grants nothing, and a refused approval request cannot be released. A
+refused cell does not open, so its message or delivery is refused on read or dead-lettered. A
+moved message still shows in the other channel's message list by its plaintext columns, with its
+encrypted cells withheld. The engine keeps running. A refusal usually writes an `integrity.*`
+audit row and raises an `integrity_drift` alert, with at least these exceptions. Under
+`vault_transit`, a cell that fails its tag keeps the cipher's own error, with no integrity audit
+row or alert. Each process reports a row that keeps failing again only after an interval: five
+minutes for a sealed row, and an hour for a message or saved-search cell. What each refusal does
+is in the changelog entries for vault BACKLOG #2592, #2593 and #3510 (in `changelog.d/` until the
+next release, then [CHANGELOG.md](../CHANGELOG.md)). The seal format is
 in [`store/row_seal.py`](../messagefoundry/store/row_seal.py).
 
 On a first deployment, a writer could still do at least these:
@@ -118,17 +121,17 @@ On a first deployment, a writer could still do at least these:
   forged row, not a rollback. Nothing inside the database stops a whole-database rollback. With
   `[logging].forward_*` set, the audit tee ([§7](#7-logging--phi-redaction), streams 3 and 4)
   sends the chain anchors off the host, where a collector could compare them.
-- **Copy sealed authority rows in from another store** under the same key. The row seal key carries
-  no store id yet. That pin is vault BACKLOG #3411.
-- **Change authority rows freely on a keyless store or under `vault_transit`**, since no row seal
-  is written there.
+- **Copy sealed rows in from another store** under the same key. The row seal key carries no
+  store id yet. That pin is vault BACKLOG #3411.
+- **Change authority rows and approval requests freely on a keyless store or under**
+  **`vault_transit`**, since no row seal is written there.
 - **Move messages and re-route queue rows on a keyless store, or with `[store].aad_bind` off**,
   since no cell tag is bound there.
 - **Blank an encrypted cell.** An empty value opens on any keyed store, so a writer can erase a
   message body without a refusal.
 - **Change rows no seal covers.** At least these: a message's status, which could hide a failure;
-  the delivered-key rows, which could make a delivery look like a duplicate and skip it; pending
-  approvals; queue state and lane order; cluster rows; and `sessions.last_used_at`.
+  the delivered-key rows, which could make a delivery look like a duplicate and skip it; queue
+  state and lane order; cluster rows; and `sessions.last_used_at`.
 - **Delete rows.** A delete needs no key, so a writer can always destroy data and stop service.
 
 ---
