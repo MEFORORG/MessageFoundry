@@ -2949,6 +2949,7 @@ def _serve(args: argparse.Namespace) -> int:
         approvals=settings.approvals,
         cert_monitor=settings.cert_monitor,
         backup=settings.backup,
+        secrets=settings.secrets,
         store_privilege=None,
         audit_chain_unkeyed=None,
         remote_debug=remote_debug_posture(),
@@ -7057,7 +7058,9 @@ def _check_privileges(args: argparse.Namespace) -> int:
     posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
     report = run_guarded(probe_store_privileges(settings.store, posture=posture))
     others = settings_hops(
-        settings, vault_probe=probe_vault, ldap_probe=lambda: read_ldap_bind(settings, posture)
+        settings,
+        vault_probe=functools.partial(probe_vault, settings=settings, posture=posture),
+        ldap_probe=lambda: read_ldap_bind(settings, posture),
     )
     hops = [store_hop(report, settings.store), *others]
     code = exit_code_for(hops)
@@ -7283,8 +7286,13 @@ def _keyless_store_gate(settings: ServiceSettings) -> str | None:
     return keyless_opt_out_refusal(settings.store, settings.security)
 
 
-def _offline_security_notifier(settings: ServiceSettings) -> SecurityEventNotifier | None:
+def _offline_security_notifier(
+    settings: ServiceSettings, posture: HopPosture | None = None
+) -> SecurityEventNotifier | None:
     """The per-user security notifier ``serve`` would wire, built for an offline command (#2019).
+
+    ``posture`` is the caller's instance posture, for the Vault hop a ``[secrets]`` read can dial
+    (vault BACKLOG #2983). ``None`` counts as enforcing there.
 
     Same conditions as the API lifespan: ``[auth].notify_security_events`` on, and an ``[alerts]``
     SMTP host and sender. ``None`` otherwise, and the caller's notice is then dropped with the
@@ -7327,7 +7335,7 @@ def _offline_security_notifier(settings: ServiceSettings) -> SecurityEventNotifi
     try:
         return security_notifier_from_settings(
             alerts,
-            secret_provider=resolve_secret_provider(settings.secrets),
+            secret_provider=resolve_secret_provider(settings.secrets, posture=posture),
             trust_anchor_policy=settings.tls.policy(),
         )
     except Exception as exc:  # noqa: BLE001 - best-effort channel; the recovery must not die here
@@ -7453,7 +7461,7 @@ def _build_provision_auth_service(
 
     refusal: str | None = None
     try:
-        secret_provider = resolve_secret_provider(settings.secrets)
+        secret_provider = resolve_secret_provider(settings.secrets, posture=posture)
     except SecretProviderError:
         refusal = _PROVISION_AUTH_REFUSALS["provider"]
     if refusal is not None:
@@ -7661,7 +7669,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # first fail at the write, after the prompt. Resolved now and discarded; the write
             # resolves it again, which costs a second Vault round trip. Nothing is created. A
             # server backend resolved it inside the open, before it found no store.
-            build_store_cipher(settings.store)
+            build_store_cipher(settings.store, posture=posture)
     except (StoreKeylessError, CipherError) as exc:
         # CipherError: a keyed open met a row it cannot read, or one that decrypted to something
         # that is not JSON (BACKLOG #2308). Its text names the table or key id, never the value.
@@ -7777,7 +7785,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # nothing about a notice it does not owe. Attached, not passed to the build (#2081).
             existing = await store.get_user_by_username(username)
             security_notifier = (
-                _offline_security_notifier(settings) if existing is not None else None
+                _offline_security_notifier(settings, posture) if existing is not None else None
             )
             service.attach_security_notifier(security_notifier)
             if security_notifier is not None:
@@ -10218,6 +10226,7 @@ def _security(args: argparse.Namespace) -> int:
         BackupSettings,
         CertMonitorSettings,
         SecretRotationSettings,
+        SecretsSettings,
         SecuritySettings,
         StoreSettings,
         security_loosenings,
@@ -10226,7 +10235,7 @@ def _security(args: argparse.Namespace) -> int:
     path = args.service_config
 
     # This subcommand edits [security], but security_loosenings() also reports [store]/[auth]/[alerts]/
-    # [secret_rotation]/[api]/[approvals]/[cert_monitor]/[backup] deviations (ADR 0148: one posture). Resolve those from the whole file so the
+    # [secret_rotation]/[api]/[approvals]/[cert_monitor]/[backup]/[secrets] deviations (ADR 0148: one posture). Resolve those from the whole file so the
     # list is complete. If the file will
     # not load — it may be invalid OUTSIDE [security], which must not break `security show` — fall back to
     # the shipped defaults and SAY SO via the emitted `loosenings_partial` marker, rather than silently
@@ -10249,6 +10258,8 @@ def _security(args: argparse.Namespace) -> int:
     _cert_monitor = CertMonitorSettings()
     # Vault BACKLOG #2302: [backup].allow_unencrypted is a loosening too. Same read and marker.
     _backup = BackupSettings()
+    # Vault BACKLOG #2983: [secrets].vault_revocation_attested is a loosening too. Same read and marker.
+    _secrets = SecretsSettings()
     if Path(path).exists():
         # An ABSENT file is not a degraded read — the shipped defaults ARE the effective posture there,
         # and `security show` is expected to work offline before any config exists. Only a file that
@@ -10263,6 +10274,7 @@ def _security(args: argparse.Namespace) -> int:
             _approvals = _full.approvals
             _cert_monitor = _full.cert_monitor
             _backup = _full.backup
+            _secrets = _full.secrets
 
     def _loosenings(sec: SecuritySettings) -> list[dict[str, str]]:
         # This CLI reads a SETTINGS file and never loads the connection graph — nor does it open the
@@ -10295,6 +10307,7 @@ def _security(args: argparse.Namespace) -> int:
                 approvals=_approvals,
                 cert_monitor=_cert_monitor,
                 backup=_backup,
+                secrets=_secrets,
                 store_privilege=None,
                 audit_chain_unkeyed=None,
                 remote_debug=None,

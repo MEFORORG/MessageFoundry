@@ -208,13 +208,22 @@ def _config_rows(settings: ServiceSettings) -> list[CheckResult]:
 
 
 def _client_credential_row(settings: ServiceSettings) -> CheckResult:
-    """Resolve the configured client credential exactly as the engine does. This CAN fail (a Vault
-    reference that does not resolve, a provider that is unset, and under ``private_key_jwt`` an
-    unreadable file, a bad passphrase, a weak RSA key or a wrong curve), so it earns a PASS.
+    """Resolve the configured client credential as the engine does, except for the posture (see
+    below). This CAN fail (a Vault reference that does not resolve, a provider that is unset, and
+    under ``private_key_jwt`` an unreadable file, a bad passphrase, a weak RSA key or a wrong
+    curve), so it earns a PASS.
 
     The same construction :class:`~messagefoundry.auth.service.AuthService` runs (BACKLOG #296).
     Nothing is signed or sent to the identity provider, but a ``*_ref`` credential is read from the
-    ``[secrets]`` provider, which for Vault is a network read."""
+    ``[secrets]`` provider, which for Vault is a network read.
+
+    **That read is judged strictly, whatever** ``[security].enforcement`` **says.** The provider is
+    built with no posture, and the Vault revocation guard reads ``None`` as enforcing (vault
+    BACKLOG #2983). ``verify``'s store opens pass no posture either (vault BACKLOG #2354). So one
+    command judges both Vault hops by one rule. An off-box Vault crosses here only on its own
+    ``[secrets].vault_revocation_attested`` pair. On a ``warn`` instance ``serve`` would cross it
+    with a WARNING, so this row can FAIL where ``serve`` starts. :func:`_revocation_row` does take
+    the posture, because it reports the decision ``serve`` would make and dials nothing."""
     from messagefoundry.auth.oidc.client_auth import ClientSecretPost
     from messagefoundry.auth.service import oidc_client_auth_from_settings
     from messagefoundry.config.secretprovider import SecretProviderError, resolve_secret_provider
@@ -232,6 +241,7 @@ def _client_credential_row(settings: ServiceSettings) -> CheckResult:
         rid, title = "fed.client_secret", "OIDC client secret resolves"
         source = "[secrets] provider reference" if auth.oidc_client_secret_ref else "environment"
     try:
+        # No posture, on purpose: see the docstring.
         credential = oidc_client_auth_from_settings(auth, resolve_secret_provider(settings.secrets))
     # SigningError is a ValueError; catching the base keeps this module off the signing seam.
     except (SecretProviderError, ValueError) as exc:

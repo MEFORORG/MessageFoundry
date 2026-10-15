@@ -57,6 +57,7 @@ from pathlib import Path
 
 from messagefoundry.config import atomic_edit
 from messagefoundry.config.settings import BackupSettings, StoreBackend, StoreSettings
+from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.last_resort import run_guarded
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
@@ -336,12 +337,17 @@ class BackupRunner:
         alert_sink: AlertSink | None = None,
         clock: Callable[[], float] = time.time,
         coordinator: ClusterCoordinator | None = None,
+        hop_posture: HopPosture | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
         # The store settings carry the KeyProvider seam (ADR 0019) — the archive's KEY SOURCE. Typed
         # loosely to avoid importing StoreSettings here; resolve_active_key takes it.
         self._store_settings = store_settings
+        # The instance posture, for the Vault hop a key resolve or a full verify can dial on every
+        # pass (vault BACKLOG #2983). The engine passes its own. `None`, which the `backup`
+        # command passes, counts as enforcing on that hop.
+        self._hop_posture = hop_posture
         self._config_dir_source = config_dir
         self._engine_version = engine_version
         self._instance = instance
@@ -725,6 +731,7 @@ class BackupRunner:
                     # The same staging root as the build, so the next backup's sweep covers both.
                     staging_root=staging_root,
                     secure=secure,
+                    posture=self._hop_posture,
                 )
             except StagingNotPrivateError as exc:
                 # Not a verdict on the archive: it stays at its staging name, unpublished and not
@@ -1183,7 +1190,7 @@ class BackupRunner:
         """The 32-byte store DEK via the ADR 0019 KeyProvider seam, or ``None`` (identity cipher)."""
         import base64
 
-        key_b64 = resolve_active_key(self._store_settings)  # type: ignore[arg-type]
+        key_b64 = resolve_active_key(self._store_settings, posture=self._hop_posture)  # type: ignore[arg-type]
         if not key_b64:
             return None
         return base64.b64decode(key_b64)
@@ -1387,6 +1394,7 @@ def _verify_archive_blocking(
     secure: bool = False,
     allow_unencrypted: bool = False,
     store_settings: object | None = None,
+    posture: HopPosture | None = None,
 ) -> VerifyResult:
     """Lightweight (or full) restore-verify of a ``.mfbak`` archive — runs OFF the event loop.
 
@@ -1507,6 +1515,7 @@ def _verify_archive_blocking(
                     full=full,
                     store_settings=store_settings,
                     secure=secure,
+                    posture=posture,
                 )
         except (BackupCodecError, OSError, tarfile.TarError) as exc:
             result = _verify_failure(exc)
@@ -2186,6 +2195,7 @@ def _verify_in_staging(
     full: bool,
     store_settings: object | None,
     secure: bool = False,
+    posture: HopPosture | None = None,
 ) -> VerifyResult:
     """Steps 2 to 4 of :func:`_verify_archive_blocking`, writing into ``staging``, which the caller
     creates and always discards. With ``secure``, each plaintext file is locked to its owner before its
@@ -2274,6 +2284,7 @@ def _verify_in_staging(
             snap,
             _as_store_settings(store_settings),
             engine_version=str(manifest.get("engine_version") or ""),
+            posture=posture,
         )
         if full_status != "PASS":
             return VerifyResult(
@@ -2300,6 +2311,7 @@ async def run_restore_verify(
     store_settings: object,
     full: bool = False,
     allow_unencrypted: bool = False,
+    posture: HopPosture | None = None,
 ) -> VerifyResult:
     """Verify an existing ``.mfbak`` archive WITHOUT activating it (ADR 0049 — 0049's owned primitive,
     which ADR 0048's cold-seed activation *calls*). Resolves the store's decrypt-capable keyring (active
@@ -2315,9 +2327,15 @@ async def run_restore_verify(
     # The decrypt-capable keyring, NOT just the active key: a backup taken under a key that has since
     # been retired (a routine WP-5 rotation) must still verify, or ADR 0048's cold-seed activation would
     # falsely refuse a perfectly recoverable archive (AC-5: compare to the resolved key, incl. retired).
+    # `posture` is the caller's, for the Vault hop the key resolve and a full verify can dial
+    # (vault BACKLOG #2983). The engine's DR activation passes its own; the `restore-verify`
+    # command holds none, and `None` counts as enforcing on that hop.
     keys = [
         base64.b64decode(k)
-        for k in resolve_decrypt_keys(store_settings)  # type: ignore[arg-type]
+        for k in resolve_decrypt_keys(
+            store_settings,  # type: ignore[arg-type]
+            posture=posture,
+        )
     ]
     # `staging_root=None` is a standalone verify: a private directory under the OS temp dir, never
     # where the backup runner stages. See the staging-location block above `_Staging` (BACKLOG #1174).
@@ -2332,6 +2350,7 @@ async def run_restore_verify(
         # Threaded through so a full verify opens the snapshot under the SAME cipher/keyring/provider
         # the keyring above was resolved from, instead of a bare default (see _full_open_check).
         store_settings=store_settings,
+        posture=posture,
     )
 
 
@@ -2423,7 +2442,11 @@ def _integrity_check(db_path: Path) -> tuple[bool, str]:
 
 
 def _full_open_check(
-    snap: Path, settings: StoreSettings | None, *, engine_version: str = ""
+    snap: Path,
+    settings: StoreSettings | None,
+    *,
+    engine_version: str = "",
+    posture: HopPosture | None = None,
 ) -> tuple[str, str, int]:
     """Open the snapshot through the real ``open_store`` path, then decrypt + authenticate its PHI.
     Returns ``(status, message, decrypted_cells)`` — the ``VerifyResult`` status this leg earned, so the
@@ -2483,7 +2506,9 @@ def _full_open_check(
         # the check (BACKLOG #1916). A keyed open of a snapshot whose audit_log is EMPTY writes that
         # copy's genesis row, like any keyed open of an empty log, and tees it; a snapshot of a
         # store that holds a key already has one.
-        store = await open_store(snap_settings, keyless_chain_refusal=None)
+        # `posture` is the caller's, for the Vault hop the cipher build can dial; `None` counts
+        # as enforcing there (vault BACKLOG #2983). The snapshot itself is always SQLite.
+        store = await open_store(snap_settings, keyless_chain_refusal=None, posture=posture)
         try:
             return await store.integrity_check()
         finally:
@@ -2502,7 +2527,7 @@ def _full_open_check(
         return "FAIL", safe_exc(exc), 0
     if not ok:
         return "FAIL", msg, 0
-    return _decrypt_check(snap, snap_settings)
+    return _decrypt_check(snap, snap_settings, posture=posture)
 
 
 #: Longer than safe_exc's default, so the remedy and at least the first differences survive.
@@ -2534,7 +2559,9 @@ def _incompatible_snapshot(exc: SchemaMismatchError, engine_version: str) -> str
     )
 
 
-def _decrypt_check(snap: Path, settings: StoreSettings) -> tuple[str, str, int]:
+def _decrypt_check(
+    snap: Path, settings: StoreSettings, *, posture: HopPosture | None = None
+) -> tuple[str, str, int]:
     """Decrypt AND authenticate every cipher-covered cell retained in the snapshot, under the store's own
     cipher. Returns ``(status, message, cells)`` — a COUNT and a PHI-free reason, never a plaintext.
 
@@ -2552,7 +2579,7 @@ def _decrypt_check(snap: Path, settings: StoreSettings) -> tuple[str, str, int]:
     """
     import sqlite3
 
-    cipher = build_store_cipher(settings)
+    cipher = build_store_cipher(settings, posture=posture)
     # Keylessness is a fact about the CIPHER, never about a plaintext: a decrypted value may itself
     # begin with the marker (a partner reply, a transformed body), and reading that as "no key" would
     # send the operator to fix a key configuration that is fine.

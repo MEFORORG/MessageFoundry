@@ -159,6 +159,7 @@ leaves the engine.
 | | `[api].plaintext_upstream_hop_acknowledged` | `false` (*conditional* — a loosening only while `[api].tls_terminated_upstream` is set with no `[api].tls_cert_file`, the one topology where the engine serves the proxy-to-engine hop in plaintext) |
 | | `[api].expose_docs` | `false` (`true` serves at least `/docs`, `/redoc` and `/openapi.json` with no sign-in) |
 | | `[backup].allow_unencrypted` | `false` (`true` lets a keyless instance write a cleartext backup archive; named as `backup.allow_unencrypted`) |
+| | `[store].vault_revocation_attested`, `[secrets].vault_revocation_attested` | `false` / `false` (`true`, with its mandatory reason, lifts the revocation refusal on that section's Vault hops; named as `store.vault_revocation_attested` and `secrets.vault_revocation_attested`) |
 | Process environment | `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` | unset (*conditional* — an environment variable, not a setting. Honoured only with `MEFOR_SECURITY_ENFORCEMENT=warn` in the same environment, and refused under `enforce`. See its entry below) |
 | Per-connection | `cleartext_accepted` | `false` on every outbound / `FhirLookup` (*connection-scoped* — see below) |
 | | `tls_allow_expired` | `false` on all six outbound connectors that take it, and on an `Ftp` (FTPS) poller (*connection-scoped*) |
@@ -182,11 +183,12 @@ keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admi
 `[approvals].min_dwell_seconds`, `[approvals].expiry_hours`, `[approvals].operations`,
 `[secret_rotation].enforce_store_key_expiry`, `[secret_rotation].warn_days`,
 `[cert_monitor].warn_days`, `[[alerts.rules]]`, `[api].trusted_proxies`,
-`[api].plaintext_upstream_hop_acknowledged`, `[api].expose_docs` and `[backup].allow_unencrypted` sit in their own sections for cohesion, and the per-connection rows are per-**connection** facts, not service
+`[api].plaintext_upstream_hop_acknowledged`, `[api].expose_docs`, `[backup].allow_unencrypted`,
+`[store].vault_revocation_attested` and `[secrets].vault_revocation_attested` sit in their own sections for cohesion, and the per-connection rows are per-**connection** facts, not service
 settings at all. They are listed here anyway, because the rule is *one shipped
 posture, loosen only* — a deviation the registry cannot see is a second posture by the back door. The
 section settings are named by `security_loosenings()` from the loaded
-`[store]`/`[auth]`/`[approvals]`/`[secret_rotation]`/`[cert_monitor]`/`[alerts]`/`[api]`/`[backup]` sections; the per-connection
+`[store]`/`[auth]`/`[approvals]`/`[secret_rotation]`/`[cert_monitor]`/`[alerts]`/`[api]`/`[backup]`/`[secrets]` sections; the per-connection
 rows are resolved from the loaded connection graph and passed in by name (see their entries below for
 exactly which surfaces see them, and which cannot).
 
@@ -1172,6 +1174,72 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `encrypted: false`. Nothing refuses the flag, and `messagefoundry check` has no line for it.
 - **Reversible:** yes. Configure a store key, set the flag back to `false` (or delete the line) and
   restart. Archives already written in cleartext stay cleartext; delete them once a sealed one exists.
+
+### `[store].vault_revocation_attested = true` or `[secrets].vault_revocation_attested = true` — revocation of a Vault certificate is taken on trust
+> **Settings-scoped, one pair per Vault** (vault BACKLOG #2983, owner ruling 2026-10-13). The
+> `[store]` pair covers both store hops, the `vault` key provider and the `vault_transit` cipher,
+> which read one address. The `[secrets]` pair covers the connector secret provider. Each flag
+> needs its own `vault_revocation_attested_reason`.
+- **What the engine refuses without it:** each of the three Vault hops verifies the Vault server's
+  certificate, and its handshake checks no CRL and no OCSP. So the client build refuses a Vault
+  that is off the box. On the box means a loopback host reached with no proxy, decided on the
+  address the client will really dial, hvac's `VAULT_ADDR` fallback included. A loopback Vault
+  behind a proxy is not on the box. The refusal applies under `[security].enforcement = enforce`,
+  and wherever a client is built without a known posture, which counts as enforcing.
+- **Which callers know the posture:** at least `serve`, `check-privileges` and
+  `provision-admin` hand it to the guard. On an instance at `enforcement = warn` they cross an
+  unattested off-box Vault with a WARNING. **A command that holds no posture refuses that
+  Vault even on a `warn` instance.** That includes at least `rotate-key`, `backup` and
+  `audit-verify`, at least today. **`verify` passes no posture to either of its Vault hops, on
+  purpose:** its store opens and its OIDC client-credential read are judged by one rule. So on a
+  `warn` instance `verify` can fail a Vault hop that `serve` crosses with a WARNING. `warn`
+  alone therefore does not make an off-box Vault usable by every command: set the pair. This
+  bullet is the one place the docs name callers. `tests/test_vault_posture_census.py` is the list itself: what
+  each call passes.
+- **`check-privileges` follows the same rule.** It builds each Vault client with that hop's own
+  pair and its own posture. So it probes an off-box Vault only where `serve` would reach it, and
+  otherwise reports the token as not observed, with the refusal.
+- **What you lose:** that refusal. A revoked but unexpired Vault certificate is then accepted
+  unless something outside the engine stops it. These hops carry the key that unwraps the store
+  DEK, every at-rest cell under `vault_transit`, and connector credentials.
+  **Setting the flag adds no check on the wire.**
+- **What the attestation can truthfully rest on:** not on the engine. No CRL lever is built for
+  these hops, so the flag is the only way across. The main honest basis is a **short-lived Vault
+  server certificate**: a lifetime short enough that expiry does the work revocation would. Put
+  that lifetime in the reason.
+- **Know which CA the hop trusts before you attest.** With `MEFOR_STORE_VAULT_CA_FILE` or
+  `MEFOR_SECRETS_VAULT_CA_FILE` set, the hop trusts only that file. With it unset, hvac and
+  requests choose the anchor. It may come from at least `VAULT_CACERT` or `VAULT_CAPATH`,
+  `REQUESTS_CA_BUNDLE` or `CURL_CA_BUNDLE`, or the public certifi bundle. Then there is no single
+  PKI to review, and a reason that names "our PKI" may not describe the certificate the hop
+  accepts. Set the CA file first.
+- **What it cannot do:** it never lifts the hop's other refusals: an `http://` Vault off the
+  box, proxy credentials sent in cleartext, or a hop that verifies no peer. It is also not the
+  process-wide `MEFOR_TLS_REVOCATION_ATTESTED`. That variable does **not** cross a Vault hop
+  under an enforcing or unknown posture, because it cannot say which hop's certificate was
+  reviewed (BACKLOG #299). **On an instance at `enforcement = warn` it does change something:**
+  where the posture reaches the guard, it turns the warning into a silent crossing, and no line
+  is logged. The shared rule every revocation guard decides by ranks it so.
+- **Named gap, the proxy leg:** through an `https://` proxy the hop has a second TLS leg, to the
+  proxy. Nothing checks revocation of the proxy's certificate, and this attestation does not
+  claim it. The Vault leg's own TLS, inside the tunnel, is what protects the token.
+- **How it is reported:** at least five ways. `security_loosenings()` names it as
+  `store.vault_revocation_attested` or `secrets.vault_revocation_attested`, with the reason, so
+  `messagefoundry security show` and `GET /security/posture` list it. The serve-time loosening
+  WARNING prints that entry, reason included, at each start. The start's `config_loaded` audit
+  row lists the switch name. `messagefoundry check` lists each set pair, with its reason, on its
+  `vault-revocation-attested` line. And a hop that crosses an enforcing or unknown posture on
+  its attestation logs a WARNING that carries the reason. That line is written **once per
+  process for each hop**, not at each crossing: the secret provider builds a client on every
+  read. The key provider and the Transit cipher share one line.
+  **None of these is an `audit` table row that carries the reason**: all three clients can be
+  built before the store opens.
+  The entry is named whenever the flag is set, whether or not a Vault provider is selected.
+- **At load:** the flag without a reason, a blank reason, a reason without the flag, or a reason
+  holding a control character or a lone surrogate is refused when the settings load.
+  `messagefoundry security show` does not stop on a file that will not load: it marks its report
+  partial and lists no attestation from that file.
+- **Reversible:** yes. Delete both lines and restart. An off-box Vault hop then refuses again.
 
 ### `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1` **with `MEFOR_SECURITY_ENFORCEMENT=warn`** — config Python loads from a place others can write
 > **An environment variable, not a setting, and refused under `[security].enforcement = enforce`**

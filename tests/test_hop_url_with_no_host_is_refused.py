@@ -523,9 +523,9 @@ def test_a_vault_client_does_not_build_for_an_address_with_no_host(addr: str) ->
 
     token = "s.synthetic-token"  # nosec B105 - a made-up test value, not a credential
     with pytest.raises(SecretProviderError):
-        secretprovider_vault._build_client(addr, token)
+        secretprovider_vault._build_client(addr, token, revocation_attested=True)
     with pytest.raises(KeyProviderError):
-        keyprovider_vault._build_client(addr, token)
+        keyprovider_vault._build_client(addr, token, revocation_attested=True)
 
 
 # --- the OIDC revocation guards -----------------------------------------------------------------

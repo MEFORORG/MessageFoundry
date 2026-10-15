@@ -349,6 +349,16 @@ def run_checks(
         # ADR 0173: the per-connection revocation attestation, same shape and same reason. Its only
         # report was the WARNING logged where it suppresses a refusal. Advisory — see the check.
         _check_revocation_attested(config_dir),
+        # Vault BACKLOG #2983: the two Vault hops' revocation attestations, which are settings
+        # and so are not in the graph the line above reads. Advisory, for the same reason.
+        _with_source(
+            _check_vault_revocation_attested(
+                config_dir,
+                service_config=service_config,
+                suppress_search=suppress_service_toml_search,
+            ),
+            env_only,
+        ),
         # vault BACKLOG #2550: every FHIR connection that puts the update id back in the URL, a
         # listed loosening of owner ruling R3. Advisory, as tls_allow_expired is -- see the check.
         _check_fhir_update_path_form(config_dir),
@@ -2796,6 +2806,76 @@ def _check_revocation_attested(config_dir: str | Path) -> CheckResult:
         detail=(
             f"{len(attested)} connection(s) attest revocation is checked outside the engine, so "
             f"the revocation refusal is lifted wherever it would apply to them — {listed}"
+        ),
+    )
+
+
+def _check_vault_revocation_attested(
+    config_dir: str | Path,
+    *,
+    service_config: str | Path | None = None,
+    suppress_search: bool = False,
+) -> CheckResult:
+    """Surface each Vault hop whose revocation is attested, with its reason (vault BACKLOG #2983).
+
+    The settings sibling of :func:`_check_revocation_attested`. ``[store].vault_revocation_attested``
+    and ``[secrets].vault_revocation_attested`` each say that revocation of a Vault server
+    certificate is covered outside the engine, so an enforcing instance does not refuse that
+    section's Vault hops. They are service settings, not declarations in the graph, so the
+    connection line cannot list them.
+
+    The entries come from :func:`~messagefoundry.config.settings.vault_revocation_attestations`,
+    the walk :func:`~messagefoundry.config.settings.security_loosenings` reads too, so this line
+    and the posture read-out name a switch the same way.
+
+    Advisory (``required=False``): a reasoned attestation is the one lever these hops have. It
+    reports the settings and builds no Vault client, so it does not say whether a hop would be
+    refused. Service-toml resolution is :func:`_check_posture`'s, with the SKIP and FAIL arms of
+    :func:`_check_alert_smtp_tls`."""
+    from pydantic import ValidationError
+
+    name = "vault-revocation-attested"
+    toml, env_only = _settings_source(
+        config_dir, service_config=service_config, suppress_search=suppress_search
+    )
+    if toml is None and not env_only:
+        return CheckResult(
+            name,
+            ok=True,
+            required=False,
+            skipped=True,
+            detail=_no_settings_detail(service_config, suppress_search),
+        )
+    try:
+        settings = _load_check_settings(toml)
+    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
+        # Present but refused is a failure, not a skip (BACKLOG #1318). A flag with no reason
+        # lands here, since the settings load refuses it.
+        return CheckResult(
+            name,
+            ok=False,
+            required=False,
+            detail=f"settings did not load: {_settings_error(exc)}",
+        )
+    from messagefoundry.config.settings import vault_revocation_attestations
+
+    attested = [
+        (switch, reason)
+        for switch, _hops, reason in vault_revocation_attestations(settings.store, settings.secrets)
+    ]
+    if not attested:
+        return CheckResult(
+            name, ok=True, required=False, detail="no Vault hop's revocation is attested"
+        )
+    listed = "; ".join(_declared_entry(switch, reason) for switch, reason in attested)
+    return CheckResult(
+        name,
+        ok=True,
+        required=False,
+        detail=(
+            f"{len(attested)} Vault attestation(s) say revocation of the Vault server "
+            "certificate is covered outside the engine, so the revocation refusal is lifted on "
+            f"that section's Vault hops: {listed}"
         ),
     )
 
