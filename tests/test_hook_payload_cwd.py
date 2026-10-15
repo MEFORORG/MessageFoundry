@@ -26,7 +26,7 @@ from typing import Any
 
 import pytest
 
-from tests._session_pin import pin_path, seed_pin
+from tests._session_pin import pin_dir, pin_path, seed_pin
 from tests._spawn_lock import run_single
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -279,7 +279,7 @@ def test_a_clear_after_a_cd_never_pins_the_sibling(tmp_path: Path, source: str) 
     assert "no pin records" in first["Reason"], first
     got = _resolve(repo, tmp_path, _stop("fresh", sibling))
     assert got["Dir"] is None, "a /clear after a cd pinned the sibling"
-    assert not any((repo / ".git" / "ccx-session-root").glob("*")), "a pin was written"
+    assert not any(pin_dir(repo).glob("*")), "a pin was written"
     # The control: the same `cwd` at a startup is the session's launch, and it pins.
     _resolve(repo, tmp_path, _launch("fresh", sibling))
     got = _resolve(repo, tmp_path, _stop("fresh", sibling))
@@ -290,7 +290,7 @@ def test_a_launch_answers_for_its_cwd_and_pins_only_where_opted_in(tmp_path: Pat
     """The opt-in gate. A user-scope copy of the helper writes no file in a clone that did not opt
     in, yet still answers the launch itself, whose `cwd` is where the session started."""
     repo, wt = _primary_with(tmp_path, "linked")
-    pins = repo / ".git" / "ccx-session-root"
+    pins = pin_dir(repo)
     got = _resolve(repo, tmp_path, _launch("s1", wt))
     assert got["Dir"] and _same_dir(got["Dir"], wt), got
     assert not pins.exists(), "a pin was written in a clone that did not opt in"
@@ -311,7 +311,7 @@ def test_a_launch_that_cannot_replace_the_pin_keeps_no_stale_one(tmp_path: Path)
     or none, never the old one naming the sibling."""
     repo, wt, sibling = _opted_in(tmp_path)
     _resolve(repo, tmp_path, _launch("s1", sibling))
-    pin = next((repo / ".git" / "ccx-session-root").glob("*"))
+    pin = next(pin_dir(repo).glob("*"))
     os.chmod(pin, 0o444)
     try:
         _resolve(repo, tmp_path, _launch("s1", wt, "resume"))
@@ -386,7 +386,7 @@ def test_the_pin_is_never_missing_while_it_is_replaced(tmp_path: Path) -> None:
 
 def test_a_pin_write_prunes_stale_temp_files_and_keeps_fresh_ones(tmp_path: Path) -> None:
     repo, wt, _ = _opted_in(tmp_path)
-    pins = repo / ".git" / "ccx-session-root"
+    pins = pin_dir(repo)
     pins.mkdir(parents=True)
     stale = pins / "abc.1.dead.tmp"
     fresh = pins / "abc.2.live.tmp"

@@ -263,9 +263,9 @@ function Write-CcxSessionPin {
         Replace the pin at $Path with $Root in one rename. Returns $true when the pin names $Root.
 
       .DESCRIPTION
-        The header says why. A move that keeps failing removes the old pin, and a removal clears a
-        read-only bit, which is the one way a test can make the move fail on demand. The move is
-        tried once more after a removal, so a pin that only blocked the rename is still replaced.
+        The header says why. A move that keeps failing removes the old pin and tries once more, so
+        a pin whose own state blocked the rename (read-only, say) is still replaced. Any other
+        failure leaves no pin, never the old one.
     #>
     param([string] $Path, [string] $Root)
     $dir = Split-Path -Parent $Path
@@ -280,7 +280,7 @@ function Write-CcxSessionPin {
         }
         if (-not $written) {
             Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-            try { [System.IO.File]::Move($tmp, $Path, $true); $written = $true } catch { $written = $false }
+            try { [System.IO.File]::Move($tmp, $Path, $true); $written = $true } catch { }
         }
         # Pruned here because a pin is written about once per session. A temp file ten minutes old
         # belongs to no live writer; a pin thirty days old to no live session.
@@ -292,10 +292,9 @@ function Write-CcxSessionPin {
     }
     catch { $written = $false }
     finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
-    if (-not $written -and (Test-Path -LiteralPath $Path)) {
-        # Never keep the previous run's pin: with none, the session falls to rule 4 of the header.
-        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-    }
+    # Never keep the previous run's pin, including after a throw above: with none, the session
+    # falls to rule 4 of the header.
+    if (-not $written) { Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue }
     return $written
 }
 
@@ -323,7 +322,8 @@ function Resolve-CcxHookSession {
           Reason     set when the input NAMED a cwd and this refused it: the fault to say aloud.
           Note       set when Dir is the pinned worktree and not the `cwd`: why the `cwd` was not used.
           Pinned     the worktree the pin records after this call, or $null.
-          StartRoot  the start checkout's worktree root, or $null when it is in no checkout.
+          Own        the session's own worktree as far as the rules know it: Pinned, else the start
+                     checkout's root; $null when the hook started in no checkout.
           Named, SessionId, Event, Payload  what the input said.
 
         A hook started outside every checkout has no repository to check a `cwd` against and nowhere
@@ -342,7 +342,7 @@ function Resolve-CcxHookSession {
     )
     $out = [pscustomobject]@{
         Named = $false; Dir = $null; Root = $null; Source = 'start'; Reason = ''; Note = ''
-        SessionId = ''; Event = ''; Payload = $null; Pinned = $null; StartRoot = $null
+        SessionId = ''; Event = ''; Payload = $null; Pinned = $null; Own = $null
     }
     $timedOut = [bool](Get-Variable -Name CcxHookInputTimedOut -Scope Script -ValueOnly -ErrorAction Ignore)
     if ([string]::IsNullOrWhiteSpace($Text) -and $timedOut) {
@@ -375,7 +375,6 @@ function Resolve-CcxHookSession {
         elseif ($p.Cwd -and $AllowOutside -and -not (Get-CcxWorktreeRoot $p.Cwd)) { $out.Dir = $p.Cwd; $out.Source = 'cwd' }
         return $out
     }
-    $out.StartRoot = $startRoot
 
     $launch = ($out.Event -eq 'SessionStart') -and ($source -notin @('clear', 'compact'))
     $pinFile = ''
@@ -403,7 +402,9 @@ function Resolve-CcxHookSession {
             $why = "the hook input names cwd $($p.Cwd), which is inside no checkout"
         }
         else {
-            $common = Get-CcxGitCommonDir $root
+            # A root already checked (the pin's, or the start checkout's) needs no second read.
+            $common = if ((Test-CcxSamePath $root $pinned) -or (Test-CcxSamePath $root $startRoot)) { $startCommon }
+                      else { Get-CcxGitCommonDir $root }
             if (-not $common) { $why = "the hook input names cwd $($p.Cwd), whose .git names no git directory" }
             elseif (-not (Test-CcxSamePath $common $startCommon)) { $why = "the hook input names cwd $($p.Cwd), which is in another repository" }
         }
@@ -417,10 +418,10 @@ function Resolve-CcxHookSession {
         else { Remove-Item -LiteralPath $pinFile -Force -ErrorAction SilentlyContinue }
     }
     $out.Pinned = $pinned
+    $out.Own = if ($pinned) { $pinned } else { $startRoot }
 
     if (-not $p.Named) { return $out }
-    $own = if ($pinned) { $pinned } else { $startRoot }
-    if ($root -and ($launch -or (Test-CcxSamePath $root $own))) {
+    if ($root -and ($launch -or (Test-CcxSamePath $root $out.Own))) {
         $out.Dir = $p.Cwd; $out.Root = $root; $out.Source = 'cwd'
         return $out
     }
@@ -448,8 +449,8 @@ function Enter-CcxHookSession {
         PowerShell starts native children in the current location, so a git call or a child pwsh
         launched after this answers for the session too. A Dir it cannot enter becomes the Reason.
     #>
-    param([string] $Text, [string] $StartDir = (Get-Location).ProviderPath, [switch] $ReadOnly)
-    $s = Resolve-CcxHookSession -Text $Text -StartDir $StartDir -ReadOnly:$ReadOnly
+    param([string] $Text, [switch] $ReadOnly)
+    $s = Resolve-CcxHookSession -Text $Text -ReadOnly:$ReadOnly
     if ($s.Dir) {
         try { Set-Location -LiteralPath $s.Dir -ErrorAction Stop }
         catch {

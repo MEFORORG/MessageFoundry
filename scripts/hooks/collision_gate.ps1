@@ -282,8 +282,8 @@ if ($hasHelper) {
         # With no pin the session's own worktree is unknown, so the gate runs from the checkout it
         # started in, never from the file's. A file in a sibling then meets the sibling's row; one in
         # the session's own unpinned worktree may meet its own row, which is noise, not a miss.
-        $session = Resolve-CcxHookSession -Text $raw -ReadOnly
-        $self = if ($session.Pinned) { $session.Pinned } elseif ($session.StartRoot) { $session.StartRoot } else { $root }
+        $self = (Resolve-CcxHookSession -Text $raw -ReadOnly).Own
+        if (-not $self) { $self = $root }
         $relative = $null
         try { $relative = [System.IO.Path]::GetRelativePath($root, (ConvertTo-CcxNormPath $abs)) } catch { $relative = $null }
         if (-not $relative) { $self = $root }   # an absolute path is only meaningful from its own root

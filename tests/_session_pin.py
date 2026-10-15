@@ -18,15 +18,19 @@ import subprocess
 from pathlib import Path
 
 
-def pin_path(start: Path, session_id: str) -> Path:
+def pin_dir(start: Path) -> Path:
+    """The directory holding every session's pin in the clone ``start`` belongs to."""
     common = subprocess.run(
         ["git", "-C", str(start), "rev-parse", "--path-format=absolute", "--git-common-dir"],
         check=True,
         capture_output=True,
         text=True,
     ).stdout.strip()
-    key = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:16]
-    return Path(common) / "ccx-session-root" / key
+    return Path(common) / "ccx-session-root"
+
+
+def pin_path(start: Path, session_id: str) -> Path:
+    return pin_dir(start) / hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:16]
 
 
 def seed_pin(start: Path, worktree: Path, session_id: str) -> Path:
