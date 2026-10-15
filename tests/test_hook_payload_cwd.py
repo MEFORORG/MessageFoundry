@@ -305,6 +305,18 @@ def test_a_launch_answers_for_its_cwd_and_pins_only_where_opted_in(tmp_path: Pat
     assert len(list(pins.glob("*"))) == 1, "a -ReadOnly launch wrote a pin"
 
 
+def test_a_launch_in_a_clone_no_longer_opted_in_removes_the_old_pin(tmp_path: Path) -> None:
+    """The opt-in gate guarded the removal too, so a resume after the opt-in went away kept the
+    previous run's pin, and later events answered for that worktree. Removing writes no new file."""
+    repo, wt, sibling = _opted_in(tmp_path)
+    _resolve(repo, tmp_path, _launch("s1", sibling))
+    (repo / "ccx.config.json").unlink()
+    _resolve(repo, tmp_path, _launch("s1", wt, "resume"))
+    assert not pin_path(repo, "s1").exists(), "the previous run's pin survived the launch"
+    got = _resolve(repo, tmp_path, _stop("s1", sibling))
+    assert got["Dir"] is None, "the stale pin answered for the sibling"
+
+
 def test_a_launch_that_cannot_replace_the_pin_keeps_no_stale_one(tmp_path: Path) -> None:
     """A swap that failed used to leave the previous run's pin, which then answered for every later
     event. A read-only pin makes the move fail on demand. The helper must still end with the new pin
@@ -345,8 +357,19 @@ def test_the_pin_is_never_missing_while_it_is_replaced(tmp_path: Path) -> None:
     probe = tmp_path / "race.ps1"
     probe.write_text(
         "param($h, $a, $b, $pin)\n"
-        "$writer = Start-ThreadJob -ArgumentList $h, $a, $b -ScriptBlock {\n"
-        "    param($h, $a, $b)\n"
+        # The reader runs in a thread until the writer, here, says it is done, so it samples the
+        # whole run however the scheduler starts the two.
+        "$sync = [hashtable]::Synchronized(@{ done = $false; reads = 0; misses = 0 })\n"
+        "$reader = Start-ThreadJob -ArgumentList $sync, $pin -ScriptBlock {\n"
+        "    param($sync, $pin)\n"
+        "    while (-not $sync.done) {\n"
+        "        $sync.reads++\n"
+        "        if (-not [System.IO.File]::Exists($pin)) { $sync.misses++ }\n"
+        "    }\n"
+        "}\n"
+        "while ($sync.reads -eq 0) { Start-Sleep -Milliseconds 5 }\n"
+        "$errs = @()\n"
+        "try {\n"
         "    . $h\n"
         "    foreach ($i in 1..300) {\n"
         "        $cwd = if ($i % 2) { $b } else { $a }\n"
@@ -354,13 +377,10 @@ def test_the_pin_is_never_missing_while_it_is_replaced(tmp_path: Path) -> None:
         " source = 'resume' } | ConvertTo-Json\n"
         "        $null = Resolve-CcxHookSession -Text $j\n"
         "    }\n"
-        "}\n"
-        "$misses = 0; $reads = 0\n"
-        "while ($writer.State -eq 'Running' -or $writer.State -eq 'NotStarted') {\n"
-        "    $reads++\n"
-        "    if (-not [System.IO.File]::Exists($pin)) { $misses++ }\n"
-        "}\n"
-        "$errs = @(Receive-Job $writer -Wait -AutoRemoveJob 2>&1 | ForEach-Object { [string]$_ })\n"
+        "} catch { $errs += [string]$_ }\n"
+        "$sync.done = $true\n"
+        "Receive-Job $reader -Wait -AutoRemoveJob | Out-Null\n"
+        "$reads = $sync.reads; $misses = $sync.misses\n"
         "$named = Get-Content -LiteralPath $pin -TotalCount 1\n"
         "@{ reads = $reads; misses = $misses; errors = $errs; named = $named }"
         " | ConvertTo-Json -Compress\n",

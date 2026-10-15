@@ -186,9 +186,10 @@
     WHICH BOX IS THE SESSION'S follows the rules in scripts/hooks/_hookinput.ps1: after a `cd`, the
     box of the worktree the session started in, never the sibling's or another repository's.
 
-    A `cwd` THOSE RULES REFUSE READS NO BOX, and neither does a missing helper. Either says "NO BOX ... NOTHING WAS READ", once per
-    $NO_BOX_COOLDOWN_MINUTES and only past the OFF switch, because silence there reads as an empty box,
-    and any other box would be another session's mail for this session's Stop to file.
+    A `cwd` THOSE RULES REFUSE READS NO BOX, and neither does a missing helper. Either says "NO BOX
+    ... NOTHING WAS READ", once per $NO_BOX_COOLDOWN_MINUTES and only past the OFF switch, because
+    silence there reads as an empty box, and any other box would be another session's mail for this
+    session's Stop to file.
 
     ASCII-only on purpose; run under pwsh 7 by the hook.
 #>

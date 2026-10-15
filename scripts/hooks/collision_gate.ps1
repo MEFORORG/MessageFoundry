@@ -254,8 +254,8 @@ if (-not $target) { exit 0 }
 # runs in ("not a collision with yourself"), and matches -File against every other row by its path
 # within the repository. So the gate hands it the edit's path relative to the worktree the file sits
 # in, which holds whatever directory the session has `cd`-ed into, and runs it from the SESSION's own
-# worktree: the one its pin records (scripts/hooks/_hookinput.ps1), else the checkout the gate started
-# in. Run from the file's worktree instead, an edit into a sibling's tree would skip the sibling's row,
+# worktree: the one its pin records (scripts/hooks/_hookinput.ps1), else the file's. Run from the
+# file's worktree instead, a pinned session's edit into a sibling's tree would skip the sibling's row,
 # the one row that can collide.
 #
 # A file in another repository, or in no checkout, is left where the gate started: no worktree of the
@@ -279,10 +279,10 @@ if ($hasHelper) {
     $rootCommon = if ($root) { Get-CcxGitCommonDir $root } else { $null }
     $target = $abs
     if ($rootCommon -and (-not $script:StartCommon -or (Test-CcxSamePath $rootCommon $script:StartCommon))) {
-        # With no pin the session's own worktree is unknown, so the gate runs from the checkout it
-        # started in, never from the file's. A file in a sibling then meets the sibling's row; one in
-        # the session's own unpinned worktree may meet its own row, which is noise, not a miss.
-        $self = (Resolve-CcxHookSession -Text $raw -ReadOnly).Own
+        # With no pin the gate runs from the file's worktree. Run from the start checkout instead (the
+        # primary, under the desktop app), it would skip the primary's row, and an unpinned session
+        # usually edits its own worktree, whose row is the one to skip.
+        $self = (Resolve-CcxHookSession -Text $raw -ReadOnly).Pinned
         if (-not $self) { $self = $root }
         $relative = $null
         try { $relative = [System.IO.Path]::GetRelativePath($root, (ConvertTo-CcxNormPath $abs)) } catch { $relative = $null }

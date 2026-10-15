@@ -31,6 +31,8 @@ from typing import Any
 
 import pytest
 
+from tests._session_pin import seed_pin
+
 ROOT = Path(__file__).resolve().parents[1]
 GATE = ROOT / "scripts" / "hooks" / "collision_gate.ps1"
 INSTALLER = ROOT / "scripts" / "coord" / "install-coordination.ps1"
@@ -1147,20 +1149,8 @@ def test_an_edit_into_a_siblings_tree_collides_with_the_sibling(
         check=True,
         capture_output=True,
     )
-    pin = tmp_path / "pin.ps1"
-    pin.write_text(
-        f". '{ROOT / 'scripts' / 'hooks' / '_hookinput.ps1'}'\n"
-        "$null = Resolve-CcxHookSession -Text (Read-CcxHookInput)\n",
-        encoding="utf-8",
-    )
-    subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(pin)],
-        cwd=str(repo),
-        input=json.dumps({"hook_event_name": "SessionStart", "session_id": "s1", "cwd": str(wt)}),
-        text=True,
-        check=True,
-        capture_output=True,
-    )
+    # A launch pinned the session to ``wt``; tests/_session_pin.py stands in for it.
+    seed_pin(repo, wt, "s1")
     own = {**EDITING_ROW, "Worktree": "linked", "Branch": "linked", "Root": _top(wt)}
     owner = {
         **EDITING_ROW,

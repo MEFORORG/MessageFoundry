@@ -251,8 +251,9 @@ function Read-CcxSessionPin {
     try {
         $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
         $fs = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
-        try { return ([string][System.IO.StreamReader]::new($fs, [System.Text.UTF8Encoding]::new($false)).ReadLine()).Trim() }
-        finally { $fs.Dispose() }
+        $reader = [System.IO.StreamReader]::new($fs, [System.Text.UTF8Encoding]::new($false))
+        try { return ([string]$reader.ReadLine()).Trim() }
+        finally { $reader.Dispose() }
     }
     catch { return $null }
 }
@@ -264,8 +265,10 @@ function Write-CcxSessionPin {
 
       .DESCRIPTION
         The header says why. A move that keeps failing removes the old pin and tries once more, so
-        a pin whose own state blocked the rename (read-only, say) is still replaced. Any other
-        failure leaves no pin, never the old one.
+        a pin whose own state blocked the rename (read-only, say) is still replaced. A pin that
+        already names $Root counts as written: a concurrent SessionStart hook put it there, and
+        deleting it would leave the session with none. Any other failure leaves no pin, never the
+        old one. Pruning runs apart from the write, so a prune that throws cannot undo a pin.
     #>
     param([string] $Path, [string] $Root)
     $dir = Split-Path -Parent $Path
@@ -278,10 +281,19 @@ function Write-CcxSessionPin {
             try { [System.IO.File]::Move($tmp, $Path, $true); $written = $true; break }
             catch { Start-Sleep -Milliseconds 25 }
         }
-        if (-not $written) {
+        if (-not $written -and -not (Test-CcxSamePath (Read-CcxSessionPin $Path) $Root)) {
             Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
             try { [System.IO.File]::Move($tmp, $Path, $true); $written = $true } catch { }
         }
+    }
+    catch { }
+    finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    if (-not $written) {
+        if (Test-CcxSamePath (Read-CcxSessionPin $Path) $Root) { $written = $true }
+        # Never keep the previous run's pin: with none, the session falls to rule 4 of the header.
+        else { Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue }
+    }
+    try {
         # Pruned here because a pin is written about once per session. A temp file ten minutes old
         # belongs to no live writer; a pin thirty days old to no live session.
         $now = Get-Date
@@ -290,11 +302,7 @@ function Write-CcxSessionPin {
                            ($_.Name -notlike '*.tmp' -and $_.LastWriteTime -lt $now.AddDays(-30)) } |
             Remove-Item -Force -ErrorAction SilentlyContinue
     }
-    catch { $written = $false }
-    finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
-    # Never keep the previous run's pin, including after a throw above: with none, the session
-    # falls to rule 4 of the header.
-    if (-not $written) { Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue }
+    catch { }
     return $written
 }
 
@@ -322,8 +330,6 @@ function Resolve-CcxHookSession {
           Reason     set when the input NAMED a cwd and this refused it: the fault to say aloud.
           Note       set when Dir is the pinned worktree and not the `cwd`: why the `cwd` was not used.
           Pinned     the worktree the pin records after this call, or $null.
-          Own        the session's own worktree as far as the rules know it: Pinned, else the start
-                     checkout's root; $null when the hook started in no checkout.
           Named, SessionId, Event, Payload  what the input said.
 
         A hook started outside every checkout has no repository to check a `cwd` against and nowhere
@@ -342,7 +348,7 @@ function Resolve-CcxHookSession {
     )
     $out = [pscustomobject]@{
         Named = $false; Dir = $null; Root = $null; Source = 'start'; Reason = ''; Note = ''
-        SessionId = ''; Event = ''; Payload = $null; Pinned = $null; Own = $null
+        SessionId = ''; Event = ''; Payload = $null; Pinned = $null
     }
     $timedOut = [bool](Get-Variable -Name CcxHookInputTimedOut -Scope Script -ValueOnly -ErrorAction Ignore)
     if ([string]::IsNullOrWhiteSpace($Text) -and $timedOut) {
@@ -411,17 +417,20 @@ function Resolve-CcxHookSession {
         if ($why) { $root = $null }
     }
 
-    # Rule 2. A launch whose `cwd` was refused, or not named, leaves no pin: the previous run's would
-    # otherwise answer, in silence, for every later event.
-    if ($launch -and $pinFile -and -not $ReadOnly -and (Test-CcxPinOptIn $startRoot $startCommon)) {
-        if ($root) { if (Write-CcxSessionPin -Path $pinFile -Root $root) { $pinned = $root } }
+    # Rule 2. A launch that does not write a pin removes any it finds: a refused or unnamed `cwd`,
+    # or a clone no longer opted in. The previous run's would otherwise answer, in silence, for
+    # every later event. Removing writes no new file, so it needs no opt-in.
+    if ($launch -and $pinFile -and -not $ReadOnly) {
+        if ($root -and (Test-CcxPinOptIn $startRoot $startCommon)) {
+            if (Write-CcxSessionPin -Path $pinFile -Root $root) { $pinned = $root }
+        }
         else { Remove-Item -LiteralPath $pinFile -Force -ErrorAction SilentlyContinue }
     }
     $out.Pinned = $pinned
-    $out.Own = if ($pinned) { $pinned } else { $startRoot }
 
     if (-not $p.Named) { return $out }
-    if ($root -and ($launch -or (Test-CcxSamePath $root $out.Own))) {
+    $own = if ($pinned) { $pinned } else { $startRoot }
+    if ($root -and ($launch -or (Test-CcxSamePath $root $own))) {
         $out.Dir = $p.Cwd; $out.Root = $root; $out.Source = 'cwd'
         return $out
     }
