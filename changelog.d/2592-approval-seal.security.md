@@ -8,7 +8,8 @@
   so a row changed outside the store is never re-sealed. The approval gate reads requests only
   through its own seal check. A request that fails is left out of the pending and interrupted
   lists, and approving, rejecting or resolving it answers 409, so it runs nothing and expires where
-  it stands. A repeat request never joins an open one that fails; it is filed on its own. A row
+  it stands. A repeat request never joins an open one that fails; it is filed on its own, and the store logs
+  the skipped row at WARNING, with the audit row and alert following when the gate next reads it. A row
   changed while its operation runs is left `executing`, and the restart reconcile leaves it so. Each
   failure writes an `integrity.authority_seal_failed` audit row and raises `integrity_drift`, once
   per request per five minutes, and the engine keeps running. A keyed open names how many open

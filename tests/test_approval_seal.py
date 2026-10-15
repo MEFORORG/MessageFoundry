@@ -157,7 +157,7 @@ async def test_a_key_rotation_reseals_approvals_under_the_active_key(tmp_path: P
     only_new = await MessageStore.open(path, cipher=make_cipher(new, write_v2=True))
     try:
         with pytest.raises(ApprovalError):  # control
-            await _gate(only_new)._load(approval_id)
+            await _gate(only_new)._load(approval_id, status="pending", wrong=str)
     finally:
         await only_new.close()
 
@@ -165,7 +165,9 @@ async def test_a_key_rotation_reseals_approvals_under_the_active_key(tmp_path: P
     try:
         sealer = rotated.row_sealer()
         assert sealer is not None
-        assert (await _gate(rotated)._load(approval_id)).id == approval_id
+        assert (
+            await _gate(rotated)._load(approval_id, status="pending", wrong=str)
+        ).id == approval_id
         await rotated.reencrypt_to_active()  # rotate-key's store pass, which runs the re-seal
         found = await rotated.get_pending_approval(approval_id)
         assert found is not None and sealer.is_active(ApprovalRow.from_mapping(found).seal)
@@ -174,7 +176,9 @@ async def test_a_key_rotation_reseals_approvals_under_the_active_key(tmp_path: P
 
     dropped = await MessageStore.open(path, cipher=make_cipher(new, write_v2=True))
     try:
-        assert (await _gate(dropped)._load(approval_id)).id == approval_id
+        assert (
+            await _gate(dropped)._load(approval_id, status="pending", wrong=str)
+        ).id == approval_id
     finally:
         await dropped.close()
 

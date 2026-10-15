@@ -14122,8 +14122,8 @@ class MessageStore:
                 found = await cur.fetchone()
                 if found is None:
                     continue
-                current = ApprovalRow.from_mapping(found)
                 try:
+                    current = ApprovalRow.from_mapping(found)
                     wrote = await self._write_approval(current, current=current)
                 except RowSealError:
                     refused += 1

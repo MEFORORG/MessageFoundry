@@ -8195,7 +8195,8 @@ class PostgresStore:
                 )
             if joined is None:
                 await self._write_approval(conn, row)
-            elif on_repeat is not None:  # always, since `joined` is read only with on_repeat
+            else:
+                assert on_repeat is not None  # `joined` is read only with on_repeat
                 held = joined.id
                 append = on_repeat(held)
             audits: tuple[AuditAppend, ...] = () if append is None else (append,)

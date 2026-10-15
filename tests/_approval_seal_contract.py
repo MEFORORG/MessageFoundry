@@ -120,20 +120,17 @@ class _Harness:
         return approval_id in {e["id"] for e in await self.gate.list_pending()}
 
     async def refused(self, approval_id: str) -> None:
-        """Approve, reject and resolve all refuse ``approval_id`` with the seal refusal."""
+        """Approve and reject both refuse the pending ``approval_id`` with the seal refusal."""
         for attempt in (
             self.approve(approval_id),
             self.gate.reject(approval_id, approver=_APPROVER),
-            self.gate.resolve_interrupted(
-                approval_id,
-                outcome="effects_applied",
-                resolver=_APPROVER,
-                resolver_user_id=_APPROVER_ID,
-            ),
         ):
             with pytest.raises(ApprovalError) as refusal:
                 await attempt
             assert refusal.value.status == 409 and "integrity" in refusal.value.detail
+
+    async def load(self, approval_id: str) -> ApprovalRow:
+        return await self.gate._load(approval_id, status="pending", wrong=str)
 
 
 async def assert_approval_seal_contract(store: Any, raw: RawSql) -> None:
@@ -183,10 +180,10 @@ async def assert_approval_seal_contract(store: Any, raw: RawSql) -> None:
     # --- every sealed column changed outside the store makes the request act on nothing --------
     for column, value in _SEALED_CHANGES:
         changed = await h.request()
-        assert (await h.gate._load(changed)).id == changed, column  # control
+        assert (await h.load(changed)).id == changed, column  # control
         await raw(f"UPDATE pending_approvals SET {column}=? WHERE id=?", (value, changed))
         with pytest.raises(ApprovalError) as refusal:
-            await h.gate._load(changed)
+            await h.load(changed)
         assert refusal.value.status == 409, column
 
     # --- a request inserted outside the store, or given another's seal, is refused -------------
@@ -311,11 +308,22 @@ async def assert_approval_seal_contract(store: Any, raw: RawSql) -> None:
         await h.gate.resolve_interrupted(
             cut, outcome="effects_applied", resolver=_APPROVER, resolver_user_id=_APPROVER_ID
         )
-    assert resolve_refusal.value.status == 409
+    assert resolve_refusal.value.status == 409 and "integrity" in resolve_refusal.value.detail
     resolved = await h.gate.resolve_interrupted(  # control
         resolvable, outcome="effects_applied", resolver=_APPROVER, resolver_user_id=_APPROVER_ID
     )
     assert resolved["status"] == "resolved_applied"
+
+    # --- a decided request answers 'already decided', and raises no alarm -------------------
+    decided = await h.request()
+    assert await store.decide_pending_approval(
+        decided, status="rejected", approver=_APPROVER, decided_at=time.time()
+    )
+    await raw("UPDATE pending_approvals SET seal='' WHERE id=?", (decided,))
+    with pytest.raises(ApprovalError) as stale:
+        await h.approve(decided)
+    assert stale.value.status == 409 and "already rejected" in stale.value.detail
+    assert h.alerted(decided) == 0 and await h.seal_failures(decided) == 0
 
     # --- a request with no seal is counted at open ---------------------------------------------
     blank = await h.request()

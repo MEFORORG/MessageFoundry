@@ -12471,7 +12471,8 @@ class SqlServerStore:
                             )
                         if joined is None:
                             await self._write_approval(cur, row)
-                        elif on_repeat is not None:  # always: `joined` is read only with it
+                        else:
+                            assert on_repeat is not None  # `joined` is read only with it
                             held = joined.id
                             append = on_repeat(held)
                         audits: tuple[AuditAppend, ...] = () if append is None else (append,)

@@ -376,6 +376,11 @@ class ApprovalGate:
                     from_status="executing",
                     audit=AuditAppend("approval.interrupted", actor="system", detail=detail),
                 )
+            except RowSealError:
+                # Changed outside the store between the read and the move. Nothing re-seals it,
+                # so no later start can move it either (BACKLOG #2592).
+                await self._approval_seal_failed(approval_id)
+                continue
             except Exception:  # noqa: BLE001 - every store backend raises its own type
                 log.exception(
                     "approval %s: could not mark this process's leftover 'executing' release "
@@ -392,19 +397,20 @@ class ApprovalGate:
                     approval_id,
                 )
         foreign: list[str] = []
-        # Only logged, never acted on, so this read needs no seal check.
+        # Only logged, never acted on, so this read needs no seal check. Its values are scrubbed,
+        # since an unchecked row may carry anything.
         for other in await self._store.list_executing_approvals():
             owner = other["claim_owner"]
             if owner is None or str(owner) == me:
-                continue  # a row of ours whose move failed, already logged above
+                continue  # a row of ours, already moved, logged or reported above
             foreign.append(str(other["id"]))
             log.warning(
                 "approval %s: still 'executing' under claim owner %s since %s. This process is "
                 "%s, so it leaves the row alone; it moves to 'interrupted' only when an engine "
                 "with that owner starts, which an unpinned cluster node never does",
-                other["id"],
-                owner,
-                other["decided_at"],
+                scrub_log_argument(str(other["id"])),
+                scrub_log_argument(str(owner)),
+                scrub_log_argument(str(other["decided_at"])),
                 me,
             )
         if interrupted:
@@ -1139,6 +1145,9 @@ class ApprovalGate:
                 decided_at=self._clock(),
                 from_status="executing",
             )
+        except RowSealError:
+            await self._approval_seal_failed(approval_id)
+            return None
         except Exception:  # noqa: BLE001 - the caller's outcome stands either way
             log.exception(
                 "approval %s: writing the '%s' status alone failed too; the row may still read "
@@ -1570,12 +1579,13 @@ class ApprovalGate:
         status = RESOLVE_OUTCOMES.get(outcome)
         if status is None:
             raise ApprovalError(422, f"unknown outcome '{outcome}'")
-        row = await self._load(approval_id)
-        current = row.status
-        if current != "interrupted":
-            raise ApprovalError(
-                409, f"request is {current}; only an interrupted request can be resolved"
-            )
+        row = await self._load(
+            approval_id,
+            status="interrupted",
+            wrong=lambda current: (
+                f"request is {current}; only an interrupted request can be resolved"
+            ),
+        )
         requester_user_id = row.requester_user_id
         if not requester_user_id:
             # Fail closed, for the reason approve() gives: with no id there is no way to tell the
@@ -1727,23 +1737,33 @@ class ApprovalGate:
         return ApprovalError(503, f"the store could not record this {what}. {retry}")
 
     async def _require_pending(self, approval_id: str) -> ApprovalRow:
-        row = await self._load(approval_id)
-        if row.status != "pending":
-            raise ApprovalError(409, f"request is already {row.status}")
+        row = await self._load(
+            approval_id, status="pending", wrong=lambda current: f"request is already {current}"
+        )
         if row.expires_at is not None and row.expires_at <= self._clock():
             raise ApprovalError(409, "request has expired")
         return row
 
     # --- the request loaders (BACKLOG #2592) -------------------------------------------------------
 
-    async def _load(self, approval_id: str) -> ApprovalRow:
-        """The request ``approval_id`` names, its integrity seal checked. With
+    async def _load(
+        self, approval_id: str, *, status: str, wrong: Callable[[str], str]
+    ) -> ApprovalRow:
+        """The request ``approval_id`` names, in ``status``, its integrity seal checked. With
         :meth:`_verified_rows`, the ONLY reader of the store's request readers in this gate;
-        ``tests/test_approval_seal.py`` holds that. Raises 404 for no such request and 409 for one
-        that fails its seal, which is reported."""
+        ``tests/test_approval_seal.py`` holds that. Raises 404 for no such request, 409 with
+        ``wrong(<its status>)`` for one in another status, and 409 for one that fails its seal,
+        which is reported.
+
+        The status is compared before the seal is checked. A decided row is acted on by nothing, so
+        a stale click on one, or on one written before the seal, answers "already decided" rather
+        than raising a tamper alarm. A status changed outside the store can only refuse here: a row
+        that reads as wanted is still checked whole."""
         found = await self._store.get_pending_approval(approval_id)
         if found is None:
             raise ApprovalError(404, "no such approval request")
+        if str(found["status"]) != status:
+            raise ApprovalError(409, wrong(scrub_log_argument(str(found["status"]))))
         row = await self._verified(found)
         if row is None:
             raise ApprovalError(409, _SEAL_REFUSAL)
@@ -1783,13 +1803,14 @@ class ApprovalGate:
             return
         # The id comes from the row that failed, so it is scrubbed before it reaches a log line or
         # an alert (CodeQL py/log-injection).
+        ref = scrub_log_argument(approval_id)
         reason = (
             f"an {APPROVAL_KIND} request failed its integrity check and acts on nothing"
-            f" (approval {scrub_log_argument(approval_id)})"
+            f" (approval {ref})"
         )
         log.warning("%s", reason)
         await self._record_audit_soft(
-            approval_id,
+            ref,
             AUTHORITY_SEAL_FAILED_ACTION,
             actor="system",
             detail=json.dumps({"kind": APPROVAL_KIND, "approval_id": approval_id}),
