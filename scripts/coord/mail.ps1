@@ -99,7 +99,7 @@ param(
     # NOT Mandatory, ON PURPOSE. -To and -Body exist only in this set, so a call that passes them but
     # forgets -Send still binds here. With -Send Mandatory, PowerShell then PROMPTS on stdin for it, and
     # a caller whose stdin stays open and silent (the Bash tool) waits forever. Measured 2026-10-13/14:
-    # four sends hung so; the one box checked got nothing. The refusal is right after this param block.
+    # four sends hung. The one box checked got nothing. The refusal is right after this param block.
     [Parameter(ParameterSetName = 'Send')][switch]$Send,
     # Recipient worktree. A path (matched case-insensitively and exactly), or "all" to broadcast to
     # every live peer in this repo. Defaults to nothing: refusing to guess is the point.

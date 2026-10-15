@@ -473,12 +473,14 @@ def test_a_send_without_the_send_switch_fails_fast_instead_of_prompting(repo: Pa
     ) as proc:  # fmt: skip
         try:
             # stderr is one short error, far under a pipe buffer, so wait() cannot deadlock on it.
-            # A short bound: a healthy refusal takes about a second, and a regression should fail
-            # here by name, well inside the pytest-timeout budget, not die there by thread dump.
-            rc = proc.wait(timeout=20)
+            rc = proc.wait(timeout=TIMEOUT)
         except subprocess.TimeoutExpired:
             proc.kill()
-            pytest.fail("mail.ps1 without -Send waited on stdin instead of refusing")
+            # Either cause is possible here, so name both: a slow pwsh start under load looks the same.
+            pytest.fail(
+                f"mail.ps1 without -Send did not exit in {TIMEOUT}s: the stdin prompt is back, "
+                "or pwsh started very slowly"
+            )
         assert proc.stderr is not None
         err = proc.stderr.read()
 
