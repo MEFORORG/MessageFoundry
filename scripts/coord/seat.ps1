@@ -40,7 +40,7 @@
 
     THREE HARD RULES, each paying for a measured failure on this box.
 
-    1. NEVER MINT A BOX KEY FROM A PATH THAT IS NOT A ROOTED, EXISTING DIRECTORY. mail.ps1:392-401
+    1. NEVER MINT A BOX KEY FROM A PATH THAT IS NOT A ROOTED, EXISTING DIRECTORY. mail.ps1:429-450
        records that the unguarded version "silently mints a NEW box that no reader will ever drain",
        and 11 of 29 mailboxes on disk are that residue. A git-resolution failure here is a NO-WRITE
        path, never an empty-string path -- writing to seats/-<hash>/ would be the same defect with a

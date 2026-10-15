@@ -96,7 +96,11 @@
 #>
 [CmdletBinding(DefaultParameterSetName = 'Status')]
 param(
-    [Parameter(ParameterSetName = 'Send', Mandatory)][switch]$Send,
+    # NOT Mandatory, ON PURPOSE. -To and -Body exist only in this set, so a call that passes them but
+    # forgets -Send still binds here. With -Send Mandatory, PowerShell then PROMPTS on stdin for it, and
+    # a caller whose stdin stays open and silent (the Bash tool) waits forever. Measured 2026-10-13/14:
+    # four sends hung. The one box checked got nothing. The refusal is right after this param block.
+    [Parameter(ParameterSetName = 'Send')][switch]$Send,
     # Recipient worktree. A path (matched case-insensitively and exactly), or "all" to broadcast to
     # every live peer in this repo. Defaults to nothing: refusing to guess is the point.
     [Parameter(ParameterSetName = 'Send')][string]$To,
@@ -129,6 +133,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Send-set arguments without -Send: refuse by name, before anything is read or written. See $Send.
+if ($PSCmdlet.ParameterSetName -eq 'Send' -and -not $Send) {
+    throw "Send arguments were given without -Send. Nothing was sent. Add -Send and re-run."
+}
 
 # --- Location ------------------------------------------------------------------------------------
 
