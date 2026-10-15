@@ -4027,15 +4027,16 @@ class AuthService:
                 tie_break_object_id=await self._stored_directory_object_id(username),
             )
         except KerberosTokenRefused as exc:
-            # BACKLOG #3196: audited as a failed sign-in, not a directory outage. Where pyspnego's
-            # wrapper is the acceptor, a bad keytab also lands here; kerberos_principal logs its text.
+            # BACKLOG #3196: audited as a failed sign-in, not a directory outage. An acceptor key
+            # fault in the step (a keytab miss, a rotated service password) also lands here;
+            # kerberos_principal logs the error's class and status codes, never its text.
             await self._directory_reject_audit(
                 "<kerberos>", "kerberos", "token_refused", client=client, error=exc.error_type
             )
             return LoginOutcome(ok=False, error="SSO authentication failed")
         except LdapError as exc:
-            # Reached from settings or from the directory, never from the token: kerberos_principal
-            # turns every failure of the acceptor's step into the arm above.
+            # Reached from settings, from the directory, or from a principal read after the step
+            # accepted the token. kerberos_principal turns every failure of the step into the arm above.
             await self._audit(
                 "auth.login_error",
                 actor="<kerberos>",

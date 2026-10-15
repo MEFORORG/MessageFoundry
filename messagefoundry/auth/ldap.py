@@ -1553,10 +1553,9 @@ def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:
     defence in depth: no such provider is known.
 
     Raises :class:`KerberosTokenRefused` when the acceptor refuses the token, and
-    :class:`LdapError` when the acceptor cannot be built from settings.
+    :class:`LdapError` when the acceptor cannot be built from settings or cannot read the principal
+    of a token its step accepted.
     """
-    import spnego
-
     server = _kerberos_acceptor(settings)
     refused: str | None = None
     try:
@@ -1577,8 +1576,10 @@ def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:
         raise KerberosTokenRefused(refused)
     try:
         principal = server.client_principal if _kerberos_context_complete(server) else None
-    except spnego.exceptions.SpnegoError as exc:
-        # The step took the token, so this is the provider failing, not the caller's token.
+    except Exception as exc:
+        # The step took the token, so this is the provider failing, not the caller's token. Broad,
+        # because pyspnego does not wrap this read: SSPI raises an OSError and GSSAPI a GSSError, and
+        # either one outside this arm was an unaudited 500.
         raise LdapError(f"Kerberos principal read failed: {_refusal_diagnostic(exc)}") from exc
     if not principal:
         return None

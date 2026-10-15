@@ -151,9 +151,9 @@ class _KeytabMissServer:
 def test_a_gssapi_error_logs_its_status_codes_and_not_its_text(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """On a host without SSPI a missing keytab entry fails in the step, as a crafted token does,
-    and the audit row names only the type. The status codes are what tell an operator it is
-    configuration. Round 1 logged the provider's text, which quoted the token."""
+    """A missing keytab entry fails in the step, as a crafted token does. The status codes are what
+    tell an operator it is configuration. Round 1 logged the provider's text, which quoted the
+    token. The audit row for the same error is pinned at the service, below."""
     monkeypatch.setattr(
         "messagefoundry.auth.ldap._kerberos_acceptor", lambda _s: _KeytabMissServer()
     )
@@ -291,3 +291,50 @@ async def test_both_routes_write_the_same_row_for_a_token_that_is_not_base64(
     assert len(negotiate_rows) == 1 and len(rows) == 2, rows
     assert [json.loads(row["detail"]) for row in rows] == [_MALFORMED, _MALFORMED]
     assert [(row["actor"], row["client"]) for row in rows] == [("<kerberos>", "127.0.0.1")] * 2
+
+
+async def test_the_service_audits_a_keytab_miss_by_type_and_none_of_its_text(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "messagefoundry.auth.ldap._kerberos_acceptor", lambda _s: _KeytabMissServer()
+    )
+    service = await _service(engine, monkeypatch)
+    outcome = await service.authenticate_kerberos(b"token", client="192.0.2.7")
+    assert not outcome.ok
+    await _assert_refused_rows(engine, "NoCredentialError", "192.0.2.7", count=1)
+
+
+class _UnreadablePrincipalServer:
+    """A step that accepts the token, then a principal read that fails as SSPI's does."""
+
+    complete = True
+
+    def step(self, _token: bytes) -> None:
+        return None
+
+    @property
+    def client_principal(self) -> str:
+        raise OSError(f"QueryContextAttributes failed for {_LEAK}")
+
+
+async def test_a_failed_principal_read_is_audited_as_an_outage_not_a_500(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """pyspnego does not wrap this read, so an arm that caught only its SpnegoError let an OSError
+    out of the service as an unaudited 500."""
+    monkeypatch.setattr(
+        "messagefoundry.auth.ldap._kerberos_acceptor", lambda _s: _UnreadablePrincipalServer()
+    )
+    service = await _service(engine, monkeypatch)
+    outcome = await service.authenticate_kerberos(b"token", client="192.0.2.7")
+    assert not outcome.ok and outcome.error == "directory unavailable"
+    rows = await _rows(engine, "auth.login_error")
+    assert len(rows) == 1, rows
+    assert json.loads(rows[0]["detail"]) == {
+        "provider": "ad",
+        "mech": "kerberos",
+        "error": "Kerberos principal read failed: OSError",
+    }
+    assert _LEAK not in json.dumps(rows[0])
+    assert await _rows(engine, "auth.login_failed") == []
