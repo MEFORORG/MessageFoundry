@@ -143,6 +143,10 @@ _EXPECTED: dict[str, tuple[int, int]] = {
     # Both DEAD branches guarded; the success path deliberately is not (it ADMITS a message, and
     # fencing it would convert a permitted duplicate into a LOST re-ingress).
     "ingress_handoff": (2, 2),
+    # BACKLOG #2593: ingress_handoff's dead-and-consume helper, nested in it and shared by the
+    # corrupt-ref and origin-tag branches. It is counted inside ingress_handoff too; its guard is that
+    # method's.
+    "_consume_dead": (1, 1),
     # ONE statement with a conditional suffix: the epoch guard on the DEAD branch, and on the retry
     # branch, which re-pends, a status term (ADR 0157 Amendment A), never the epoch guard.
     "mark_failed": (1, 1),

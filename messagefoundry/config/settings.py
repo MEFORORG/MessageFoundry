@@ -4746,6 +4746,9 @@ _ALERT_EVENT_TYPES = frozenset(
         # sign-in's role sync (granted_by `<directory>`).
         "approval_approver_provenance",
         "administrator_granted",
+        # vault BACKLOG #3229: a directory-driven role change left no enabled Administrator. Keyed
+        # `user:<username>`, which no connection can be named.
+        "no_enabled_administrator",
         # vault BACKLOG #2255: the approval gate could not write one of its audit rows. Keyed
         # `approval:<id>`, which no connection can be named. Since vault BACKLOG #2254 also an
         # inline config reload's lost config_reload_attempted row, keyed `config_reload:inline`.
@@ -4779,6 +4782,11 @@ _ALERT_EVENT_TYPES = frozenset(
         "bulk_export",
         "log_level_debug",
         "posture_loosened",
+        # vault BACKLOG #2742: the remote-debugging guard refused scripts another process
+        # injected into the engine. Keyed `remote_debug:refused`, with a process suffix where
+        # several engine processes share the store, which no connection can be named. It has no
+        # inverse: a refusal is an event, not a state that clears.
+        "remote_debug_refused",
         # NOTE: the INVERSE events (leadership_lost / dr_released / intake_resumed /
         # ad_reconcile_breaker_cleared / ad_reconcile_hold_released) are auto-resolve-only
         # (alert_sinks _AUTO_RESOLVE), NOT rule-targetable alert types -- a step-down, a fail-back,

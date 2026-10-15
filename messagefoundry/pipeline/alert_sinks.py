@@ -60,6 +60,7 @@ from messagefoundry.pipeline.alerts import (
     crl_expiry_detail,
     crl_reload_refused_detail,
     intake_pause_detail,
+    remote_debug_refused_detail,
 )
 
 # Not lazy, unlike the two transports imports below: the shared webhook opener is built at import.
@@ -1153,6 +1154,15 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # stands in for "connection" (the key's grammar is on AlertSink). `granted_by` is the granting
         # administrator's operator account name, or the fixed marker `<directory>` when a directory
         # sign-in's role sync made the grant (vault BACKLOG #2610). Never message content.
+        # Vault BACKLOG #3229: every administrator_granted call pops the _last_sent key built from
+        # the no_enabled_administrator alert type and the granted target, so a loss after an
+        # administrator_granted re-grant is not held back by the earlier loss's cooldown. A
+        # reconciler re-grant calls no administrator_granted, so it pops nothing. The pop builds that key with its own
+        # f-string in `_emit`'s key format; tests/test_directory_last_admin_alert.py pins the match.
+        # Only a `user:` target can match a loss key, so an `ad-group:` grant pops nothing. _last_sent is
+        # per process, so this clears the cooldown in this process only. _occurrences and _suspended
+        # are kept. Unlike crl_reload_applied, this resolves no open instance.
+        self._last_sent.pop(f"no_enabled_administrator:{name}", None)
         self._emit(
             {
                 "type": "administrator_granted",
@@ -1201,6 +1211,19 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     def ad_reconcile_hold_released(self, name: str) -> None:
         # #2136: the INVERSE -- no page; auto-resolves the open ad_reconcile_held via _AUTO_RESOLVE.
         self._record_state({"type": "ad_reconcile_hold_released", "connection": name}, "info")
+
+    def no_enabled_administrator(self, name: str, *, via: str) -> None:
+        # Vault BACKLOG #3229: a directory role change left no enabled Administrator. `user:<username>`
+        # stands in for "connection", as on administrator_granted. `via` is the closed pair ad-sync /
+        # ad-reconcile. Never message content.
+        self._emit(
+            {
+                "type": "no_enabled_administrator",
+                "connection": name,
+                "via": via,
+                "reason": f"no enabled Administrator remains after {via}",
+            }
+        )
 
     def ad_session_revoked(self, name: str, *, reason: str) -> None:
         # ADR 0079 mechanism 2: a directory principal's sessions were revoked. Keyed on the username so
@@ -1349,6 +1372,24 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # event type, so each detector routes and throttles on its own; the subject stands in for
         # "connection". A count and a fixed sentence only: never a body, an id or a row's detail.
         self._emit({"type": signal, "connection": name, "count": count, "detail": detail})
+
+    def remote_debug_refused(self, name: str, *, count: int, total: int) -> None:
+        # vault BACKLOG #2742: the remote-debugging guard refused injected scripts.
+        # `remote_debug:refused[@<process>]` stands in for "connection", so each engine process is
+        # its own instance and throttle key. Two counts and fixed words: the injecting process
+        # chooses the script's file name, so it is never passed in. `detail` is what the
+        # instance's reason column shows, built by the helper the logging sink uses. The watch
+        # raises this at most once per pass. A second raise inside the cooldown updates the
+        # instance and does not page again.
+        self._emit(
+            {
+                "type": "remote_debug_refused",
+                "connection": name,
+                "count": count,
+                "total": total,
+                "detail": remote_debug_refused_detail(count=count, total=total),
+            }
+        )
 
     def set_store(self, store: _AlertStateStore | None) -> None:
         """Wire (or clear) the alert-state store (ADR 0044, #56). The lifespan calls this once the store

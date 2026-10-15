@@ -37,9 +37,9 @@ async def assert_search_select_is_capped(store: Any, monkeypatch: pytest.MonkeyP
     fetched: list[list[str]] = []
     real = store._scan_rows
 
-    def _spy(spec: SearchSpec, candidates: Sequence[Any], limit: int) -> Any:
+    def _spy(spec: SearchSpec, candidates: Sequence[Any], limit: int, failures: list[Any]) -> Any:
         fetched.append([c["id"] for c in candidates])
-        return real(spec, candidates, limit)
+        return real(spec, candidates, limit, failures)
 
     monkeypatch.setattr(store, "_scan_rows", _spy)
     spec = make_spec(

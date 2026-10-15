@@ -406,6 +406,36 @@ gets you back in. `admin-unlock` clears a local lockout only (vault BACKLOG #271
   old loopback mode could not repair an account anyway: with no auth service, creating
   an account, unbinding one and reading the audit log all answered 503.
 
+#### A directory role change can remove the last Administrator, and it alerts
+
+The engine refuses a console change that would leave no enabled Administrator. Disabling,
+deleting or changing the roles of the last one answers 400. A change the directory drives is not
+refused. When a directory sign-in's role sync, or the session reconciler, takes Administrator from
+its last enabled holder, the change applies at once (owner ruling 2026-10-13, vault BACKLOG #3229).
+So an Administrator taken out of the mapped group, or a compromised one, loses the role straight
+away.
+
+The engine then tells the operators in two ways:
+
+- the `no_enabled_administrator` alert, keyed `user:<username>`, with `via` set to `ad-sync` or
+  `ad-reconcile`;
+- an `auth.no_enabled_administrator` audit row, with the demoted account as its actor.
+
+Only a role change raises them. When the directory disables or deletes the account instead, the
+reconciler ends its sessions but leaves its stored role, so the account still counts as an enabled
+Administrator. No `no_enabled_administrator` alert fires, and `provision-admin` still refuses. On
+PostgreSQL and SQL Server, a console removal that races a directory role change can leave no enabled
+Administrator with no `no_enabled_administrator` alert and no `auth.no_enabled_administrator` audit
+row. The directory's role write does not take the console guard's lock. At least one more path
+raises no `no_enabled_administrator` alert: if the engine cannot read whether an enabled
+Administrator remains, it logs the fault at ERROR and writes no `auth.no_enabled_administrator` audit
+row. That fault does not stop the caller's role write or session revocation.
+
+The cost is that a site whose Administrators all come from the directory can end up with none
+(vault BACKLOG #2711). With no enabled Administrator left, `provision-admin` runs again at the host,
+or the directory can grant the role back at the next sign-in. A local Administrator, as above,
+keeps a site out of this state.
+
 ### Admin password reset (WP-L3-12, ASVS 6.4.6)
 
 An administrator (`users:manage`) recovers a locked-out or compromised **local** account with
@@ -5692,11 +5722,12 @@ Three controls answer it, and they differ in strength:
   console script, such as a developer's `messagefoundry serve`, leaves it on. So the command line
   installs an audit hook as it starts, for every command (`messagefoundry/remotedebug.py`). The
   interpreter raises an event before it runs an injected script, the hook raises on it, and the
-  interpreter drops the script.
+  interpreter drops the script. A refusal is logged. Under `serve` the engine also writes a
+  `remote_debug_refused` audit row and raises an alert of that name (vault BACKLOG #2742).
 
 The hook is the weakest of the three, so an engine that starts with the interface on reports it
-as the loosening `remote_debug_enabled`. What the hook leaves open, where the entry is reported,
-which starts report it and how to clear it are stated once, in
+as the loosening `remote_debug_enabled`. What the hook leaves open, what a refusal records, where
+the entry is reported, which starts report it and how to clear it are stated once, in
 [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#remote_debug_enabled-and-remote_debug_unguarded-the-interpreter-accepts-a-script-from-another-process).
 
 ### Isolated mode and start-up code of the engine's interpreter

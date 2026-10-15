@@ -247,7 +247,7 @@ async def test_rotation_reseals_the_tag_and_steps_over_a_cell_that_fails_it(
     try:
         with caplog.at_level("WARNING"):
             assert await rotated.reencrypt_to_active() >= 1
-        assert "rotation left 2 queue row(s)" in caplog.text
+        assert "rotation left 2 queue.payload value(s)" in caplog.text
         item = await rotated.claim_next_fifo("OB_KEEP")
         assert item is not None and item.payload == "B1"  # re-sealed under the new key and tag
         assert await rotated.claim_next_fifo("OB_X") is None  # still refused after the rotation
