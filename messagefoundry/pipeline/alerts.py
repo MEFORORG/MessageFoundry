@@ -36,6 +36,7 @@ __all__ = [
     "crl_expiry_detail",
     "crl_reload_refused_detail",
     "intake_pause_detail",
+    "remote_debug_refused_detail",
 ]
 
 log = logging.getLogger(__name__)
@@ -134,6 +135,18 @@ def crl_reload_refused_detail(
         parts.append(f"{remedy}.")
     parts.append("The crl_reload ERROR line in the engine log gives the reason.")
     return " ".join(parts)
+
+
+def remote_debug_refused_detail(*, count: int, total: int) -> str:
+    """The one-line description of a ``remote_debug_refused`` alert both sinks show (vault BACKLOG
+    #2742). Counts and fixed words: never a script's file name, which the injecting process
+    chooses. The alert instance's reason column keeps only about the first 200 characters, so the
+    count leads."""
+    return (
+        f"refused {count} script(s) another process injected through the interpreter's remote "
+        f"debugging ({total} since this process started). None ran. WARNING lines in the engine "
+        "log may name the files."
+    )
 
 
 class AlertSink(Protocol):
@@ -500,6 +513,21 @@ class AlertSink(Protocol):
         ``auth/``."""
         ...
 
+    def no_enabled_administrator(self, name: str, *, via: str) -> None:
+        """A directory-driven role change took the built-in Administrator role from its last
+        enabled holder, so no enabled Administrator remains (vault BACKLOG #3229). The same event
+        as the ``auth.no_enabled_administrator`` audit row. ``name`` is ``user:<username>``, the
+        demoted account; ``via`` is ``ad-sync`` (a directory sign-in's role sync) or
+        ``ad-reconcile`` (the session reconciler).
+
+        The change was applied, not refused: by owner ruling 2026-10-13 (#3229) the directory
+        stays authoritative. This alert is how the operators learn the instance has no enabled
+        Administrator; ``provision-admin`` at the host runs again once none exists (vault BACKLOG
+        #2711 is the open recovery row). Nothing resolves it automatically. No PHI. Raised through
+        the callable :func:`no_enabled_administrator_alert` builds, which the API lifespan hands to
+        the auth service, so ``auth/`` never imports a sink."""
+        ...
+
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
         """A directory reconciliation pass revoked nothing for some or all signed-in accounts and
         needs an operator (ADR 0079 mechanism 2). Either the mass-revoke circuit breaker tripped
@@ -723,6 +751,35 @@ class AlertSink(Protocol):
         Never a message body, a message id, a typed username or an audit row's detail. None is
         connection-scoped, so no rule's ``control_action`` fires on one, and nothing resolves
         one."""
+        ...
+
+    # --- vault BACKLOG #2742: a script the remote-debugging guard refused ----------------------
+
+    def remote_debug_refused(self, name: str, *, count: int, total: int) -> None:
+        """The engine's remote-debugging guard refused one or more scripts that another process
+        injected into this process (vault BACKLOG #2742, :mod:`messagefoundry.remotedebug`).
+        Nothing in them ran. It still means a process on this host was allowed to attach to the
+        engine and tried to run code inside it.
+
+        ``name`` is ``remote_debug:refused``, with ``@node:<id>`` or ``@shard:<id>`` appended
+        where several engine processes share the store, because the count is each process's own.
+        ``count`` is how many scripts were refused since the sink last took this alert, and
+        ``total`` how many since the process started.
+
+        **Never a script's file name.** The injecting process chooses it, so it stays in the
+        engine's log output, usually the guard's WARNING line (docs/SECURITY-LOOSENING.md names
+        the exceptions). Counts and this process's own label only: no message content, no PHI.
+
+        Raised at most once per pass of
+        :class:`~messagefoundry.pipeline.remote_debug_watch.RemoteDebugRefusalWatch`, on the event
+        loop, however many scripts were refused, so the injecting process does not set the rate.
+        The engine runs that watch. Of the commands, only ``serve`` builds an engine, so only
+        ``serve`` raises this. An application that builds its own engine may have no guard at
+        all; docs/SECURITY-LOOSENING.md says what that means. It is not a connection-scoped event,
+        so no rule's ``control_action`` fires on it. The colon keeps ``name`` outside the
+        connection-name grammar. Nothing resolves it: a refusal is an event, not a state that can
+        clear, so an operator resolves the instance. The ``remote_debug_refused`` audit row is the
+        durable record."""
         ...
 
 
@@ -1016,6 +1073,15 @@ class LoggingAlertSink:
             scrub_log_argument(repr(granted_by)),
         )
 
+    def no_enabled_administrator(self, name: str, *, via: str) -> None:
+        # Scrubbed as administrator_granted's line above is, and for the same reason.
+        log.warning(
+            "ALERT no_enabled_administrator: a directory role change (%s) took Administrator from "
+            "%s, and no enabled Administrator remains",
+            scrub_log_argument(via),
+            scrub_log_argument(repr(name)),
+        )
+
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
         log.warning(
             "ALERT ad_reconcile_aborted: %r left accounts unrevoked in a pass of %d principal(s) "
@@ -1163,6 +1229,16 @@ class LoggingAlertSink:
     def security_signal(self, name: str, *, signal: str, count: int, detail: str) -> None:
         log.warning("ALERT %s: %r %s (count %d)", signal, name, detail, count)
 
+    def remote_debug_refused(self, name: str, *, count: int, total: int) -> None:
+        # The guard usually logs one WARNING for each refusal, with the script's file name, but
+        # not always (docs/SECURITY-LOOSENING.md). This line is the alert's own record on this
+        # stream, and it carries no name.
+        log.warning(
+            "ALERT remote_debug_refused: %r %s",
+            name,
+            remote_debug_refused_detail(count=count, total=total),
+        )
+
 
 #: The ``integrity_drift`` subject for a store-cipher refusal (BACKLOG #1169). Its own subject so it
 #: throttles and routes apart from engine attestation and the audit-chain check.
@@ -1197,6 +1273,22 @@ def authority_seal_alert(sink: AlertSink) -> Callable[[str], None]:
             sink.integrity_drift(AUTHORITY_SEAL_SUBJECT, reason=reason, drift_count=1)
         except Exception:  # noqa: BLE001 — an alert-sink failure must never break a request
             log.warning("authority-seal integrity alert could not be delivered")
+
+    return _raise
+
+
+def no_enabled_administrator_alert(sink: AlertSink) -> Callable[[str, str], None]:
+    """An alert callable for :class:`~messagefoundry.auth.service.AuthService`: each call, with a
+    username and a ``via``, raises :meth:`AlertSink.no_enabled_administrator` keyed
+    ``user:<username>`` (vault BACKLOG #3229).
+
+    Never raises: an alert failure must not change what a sign-in or a reconcile pass does."""
+
+    def _raise(username: str, via: str) -> None:
+        try:
+            sink.no_enabled_administrator(f"user:{username}", via=via)
+        except Exception:  # noqa: BLE001 — an alert-sink failure must never break a request
+            log.warning("the no_enabled_administrator alert could not be delivered", exc_info=True)
 
     return _raise
 

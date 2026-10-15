@@ -36,6 +36,7 @@ from messagefoundry.parsing.peek import Peek
 from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
 from messagefoundry.store import FailOutcome, MessageStatus, OutboxStatus, Stage
+from messagefoundry.store.cell_tag import message_cell_aad
 from messagefoundry.store.content_search import make_spec
 from messagefoundry.store.crypto import MARKER_PREFIX, cell_aad, generate_key, make_cipher
 from messagefoundry.store.queue_tag import queue_row_aad
@@ -92,6 +93,7 @@ _TABLES = (
     "known_login_addresses",  # vault BACKLOG #2145: FK to users(id), cleared before users
     "user_roles",
     "ad_group_role_map",
+    "authority_set_seal",  # BACKLOG #2592: the map's seal, under the key of the test that wrote it
     "ad_group_scope_map",
     "users",
     "roles",
@@ -3977,10 +3979,11 @@ async def _pg_force_error(store, mid: str, error: str) -> None:
     """Force a seeded origin to a terminal ERROR (ciphered at rest) — proves the direct edit-resend
     never reopens/overwrites it (mirrors test_edit_resend.py::_seed_error)."""
     async with store._pool.acquire() as conn:
+        channel = await conn.fetchval("SELECT channel_id FROM messages WHERE id=$1", mid)
         await conn.execute(
             "UPDATE messages SET status=$1, error=$2 WHERE id=$3",
             MessageStatus.ERROR.value,
-            store._enc(error, aad=cell_aad("messages", "error", mid)),
+            store._enc(error, aad=message_cell_aad("error", message_id=mid, channel_id=channel)),
             mid,
         )
 
@@ -3991,9 +3994,11 @@ async def _pg_force_error(store, mid: str, error: str) -> None:
 async def _pg_set_meta(store, message_id: str, bag: dict) -> None:
     """Attach a metadata bag the way transform_handoff does (encrypted, cell-AAD bound)."""
     async with store._pool.acquire() as conn:
+        channel = await conn.fetchval("SELECT channel_id FROM messages WHERE id=$1", message_id)
+        tag = message_cell_aad("metadata", message_id=message_id, channel_id=channel)
         await conn.execute(
             "UPDATE messages SET metadata=$1 WHERE id=$2",
-            store._enc(json.dumps(bag), aad=cell_aad("messages", "metadata", message_id)),
+            store._enc(json.dumps(bag), aad=tag),
             message_id,
         )
 
@@ -5263,6 +5268,39 @@ async def test_user_seal_contract(store) -> None:
         await keyed.close()
 
 
+async def test_role_seal_contract(store) -> None:
+    """BACKLOG #2592: sealed custom role definitions and the sealed AD group-to-role map, the same
+    contract the SQLite suite runs, on a keyed handle, with the role table's columns pinned to the
+    record the seal covers. ``raw`` runs each statement on a pooled connection, outside the store's
+    helpers. The fixture truncates the role and map tables on the next entry."""
+    from dataclasses import fields
+
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from messagefoundry.store.store import RoleRow
+    from tests._role_seal_contract import assert_role_seal_contract
+    from tests._session_seal_contract import dollar_placeholders
+
+    keyed = await PostgresStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[object, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                await conn.execute(dollar_placeholders(sql), *params)
+
+        async with keyed._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT column_name FROM information_schema.columns"
+                " WHERE table_schema = current_schema() AND table_name = 'roles'"
+            )
+        assert {str(r["column_name"]) for r in rows} == {f.name for f in fields(RoleRow)}
+        await assert_role_seal_contract(keyed, raw)
+    finally:
+        await keyed.close()
+
+
 async def test_a_role_delete_racing_a_grant_leaves_no_dangling_role_row(store) -> None:
     """BACKLOG #2592: a grant that commits while its custom role is deleted fails the delete on the
     ``user_roles`` role foreign key, rather than leaving a sealed role row with no role behind it.
@@ -5306,6 +5344,34 @@ async def test_queue_tag_contract(store) -> None:
                 return [dict(r) for r in await conn.fetch(dollar_placeholders(sql), *params)]
 
         await assert_queue_tag_contract(keyed, raw, fetch, store_once=False)
+    finally:
+        await keyed.close()
+
+
+async def test_cell_tag_contract(store) -> None:
+    """BACKLOG #2593: message cells bound to their channel and preset criteria to their owner, the
+    same contract the SQLite suite runs, on a keyed handle under the cell-bound writer. ``raw`` and
+    ``fetch`` run on pooled connections, outside the store's helpers."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests._cell_tag_contract import assert_cell_tag_contract
+    from tests._session_seal_contract import dollar_placeholders
+
+    keyed = await PostgresStore.open(
+        load_settings(environ=os.environ).store,
+        cipher=make_cipher(generate_key(), write_v2=True),
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[object, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                await conn.execute(dollar_placeholders(sql), *params)
+
+        async def fetch(sql: str, params: tuple[object, ...]) -> list[dict[str, object]]:
+            async with keyed._pool.acquire() as conn:
+                return [dict(r) for r in await conn.fetch(dollar_placeholders(sql), *params)]
+
+        await assert_cell_tag_contract(keyed, raw, fetch)
     finally:
         await keyed.close()
 

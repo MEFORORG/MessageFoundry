@@ -88,7 +88,11 @@ _EXPECTED: dict[str, tuple[int, int]] = {
     "mark_done": (1, 1),
     "mark_batch_done": (1, 1),
     "complete_with_response": (1, 1),
-    "ingress_handoff": (2, 2),  # both DEAD branches; the success path ADMITS and is not guarded
+    # both DEAD branches; the success path ADMITS and is not guarded. ingress_handoff wraps this
+    # transaction so a tag failure is audited after it closes (BACKLOG #2593).
+    "_ingress_handoff_txn": (2, 2),
+    # Its dead-and-consume helper, nested in it and shared by the corrupt-ref and origin-tag branches.
+    "_consume_dead": (1, 1),
     # One statement each. The suffix is the epoch guard on the DEAD branch and, since ADR 0157
     # Amendment A, a status term (never an epoch guard) on the retry branch.
     "mark_failed": (1, 1),
@@ -109,7 +113,7 @@ _RESOLVE_FENCED = frozenset(
         "mark_done",
         "mark_batch_done",
         "complete_with_response",
-        "ingress_handoff",
+        "_ingress_handoff_txn",
         "mark_failed",
         "mark_batch_failed",
         "dead_letter_batch",

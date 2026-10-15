@@ -23,6 +23,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from messagefoundry.store.cell_tag import is_row_tagged, row_tag_aad, row_tag_columns
 from messagefoundry.store.crypto import cell_aad
 from messagefoundry.store.queue_tag import QUEUE_TAG_COLUMNS, queue_row_aad
 from messagefoundry.store.store import MessageStore
@@ -69,6 +70,19 @@ def _queue_payload_aad(*values: object) -> bytes:
     return queue_row_aad(dict(zip(QUEUE_TAG_COLUMNS, values, strict=True)))
 
 
+def _id_keyed_cell(table: str, column: str) -> CipherCell:
+    """An id-keyed cell. A message cell binds its channel and a preset's criteria its owner as well
+    (BACKLOG #2593), so those take their tag's columns and builder."""
+    if not is_row_tagged(table, column):
+        return CipherCell(table, column, ("id",), locator=("id",))
+    columns = row_tag_columns(table, column)
+
+    def build(*values: object) -> bytes:
+        return row_tag_aad(table, column, dict(zip(columns, values, strict=True)))
+
+    return CipherCell(table, column, columns, locator=("id",), builder=build)
+
+
 #: Every literal ``cell_aad`` cell in ``store.py`` that ``_CIPHER_COLUMNS`` does not carry. The AAD columns
 #: are copied from each cell's writer, and the round-trip test proves they match it.
 COMPOSITE_CIPHER_CELLS: tuple[CipherCell, ...] = (
@@ -93,6 +107,6 @@ COMPOSITE_CIPHER_CELLS: tuple[CipherCell, ...] = (
 #: Every cipher-covered cell of the SQLite store: the id-keyed ones from the store's own tuple, then
 #: the composite ones above.
 SQLITE_CIPHER_CELLS: tuple[CipherCell, ...] = (
-    *(CipherCell(t, c, ("id",), locator=("id",)) for t, c in MessageStore._CIPHER_COLUMNS),
+    *(_id_keyed_cell(t, c) for t, c in MessageStore._CIPHER_COLUMNS),
     *COMPOSITE_CIPHER_CELLS,
 )

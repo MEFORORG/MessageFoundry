@@ -297,9 +297,9 @@ async def test_fingerprint_is_taken_before_the_swap(
             order.append("fingerprint")
             return {"fingerprint": "deadbeef", "files": 1}
 
-        async def _recording_swap(new_registry: Any) -> None:
+        async def _recording_swap(new_registry: Any, env_values: Any = None) -> None:
             order.append("swap")
-            await original_reload(new_registry)
+            await original_reload(new_registry, env_values)
 
         monkeypatch.setattr(
             "messagefoundry.config.fingerprint.config_fingerprint_detail", _recording_fingerprint

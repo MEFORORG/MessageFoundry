@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.store.cell_tag import CellTagError
 from messagefoundry.store.crypto import Cipher, generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 
@@ -137,8 +138,8 @@ CREATE UNIQUE INDEX ux_search_presets_owner_name ON search_presets(owner, name);
 async def _seed_v032_store(db: Path, cipher: Cipher) -> None:
     """Write presets with this version, then move them into the 0.3.2 table under usernames.
 
-    Sealing them first shows the criteria still open after the migration: they are bound to the
-    preset id, which it leaves alone. ``ghost`` matches no account. ``pc`` was last saved before
+    Sealing them first shows the criteria no longer open after the migration: they are bound to
+    the owner, which it rewrites (BACKLOG #2593).``ghost`` matches no account. ``pc`` was last saved before
     the ``carol`` account existed (created at 1.0), so an earlier holder of that username wrote it;
     ``pr`` was created then too, but the current ``carol`` saved it again at 2.0. ``system`` is the
     no-auth identity: its rows cannot be told from a deleted account's named ``system``."""
@@ -197,8 +198,11 @@ async def test_a_v032_preset_table_is_migrated_on_open(tmp_path: Path) -> None:
         try:
             listed = await s.list_search_presets("u-alice")
             assert [p["id"] for p in listed] == ["pa"]
-            got = await s.get_search_preset(preset_id="pa", owner_user_id="u-alice")
-            assert got is not None and json.loads(got["criteria"]) == json.loads(CRIT)
+            # BACKLOG #2593: criteria bind the owner. The migration rewrites the owner from a
+            # username to an account id, so a cell sealed before it no longer opens: the recall is
+            # refused (and alerted), and the row still lists. Zero deployments, so no re-seal path.
+            with pytest.raises(CellTagError):
+                await s.get_search_preset(preset_id="pa", owner_user_id="u-alice")
             assert [p["id"] for p in await s.list_search_presets("u-bob")] == ["pb"]
             assert [p["id"] for p in await s.list_search_presets("u-carol")] == ["pr"]
             assert await s.list_search_presets("system") == []

@@ -24,7 +24,7 @@ from typing import Any, cast
 import pytest
 from uvicorn.protocols.utils import get_path_with_query_string
 
-from messagefoundry import __main__, secretscrub
+from messagefoundry import __main__, logging_setup, secretscrub
 from messagefoundry.controlchars import has_lone_surrogate
 from messagefoundry.logging_setup import (
     _CREDENTIAL_QUERY_KEYS,
@@ -1831,7 +1831,37 @@ _LOG_ESCAPED_CLASSES = {
     "c0_and_del": (0x01, 0x08, 0x1B, 0x7F),
     "soft_hyphen": (0xAD,),
     "astral": (0xE0001, 0xF0000),
+    # Categories Co and Cn in the Basic Multilingual Plane. U+FFFF is a noncharacter, unassigned in
+    # every Unicode version, so no table update can move it out of Cn (BACKLOG #2976).
+    "private_use_and_unassigned": (0xE000, 0xFFFF),
 }
+
+#: Every class above, named a second time. The tests below are parametrised over the keys of
+#: ``_LOG_ESCAPED_CLASSES``, so a class removed there would silently lose its cases. Adding a class
+#: means adding it here too.
+_LOG_ESCAPED_CLASS_NAMES = frozenset(
+    {
+        "c1",
+        "bidi",
+        "separator",
+        "surrogate",
+        "c0_and_del",
+        "soft_hyphen",
+        "astral",
+        "private_use_and_unassigned",
+    }
+)
+
+
+def test_the_log_alphabet_classes_are_all_present() -> None:
+    """Not parametrised, on purpose (engine PR 2012, review comment 5987939300). The tests below
+    take one case per key of ``_LOG_ESCAPED_CLASSES``. If the dict lost a key, or every key, pytest
+    would run fewer cases or report the tests as skipped, and the run would stay green. Each
+    class's own ``len(codes) >= 1`` check cannot see that, because it never runs."""
+    missing = _LOG_ESCAPED_CLASS_NAMES - _LOG_ESCAPED_CLASSES.keys()
+    assert not missing, f"_LOG_ESCAPED_CLASSES lost the classes {sorted(missing)}"
+    unlisted = _LOG_ESCAPED_CLASSES.keys() - _LOG_ESCAPED_CLASS_NAMES
+    assert not unlisted, f"add {sorted(unlisted)} to _LOG_ESCAPED_CLASS_NAMES"
 
 
 def _expected_log_escape(code: int) -> str:
@@ -1923,6 +1953,52 @@ def test_ordinary_non_ascii_text_reaches_every_sink_unchanged(
     """The control for the test above: the wider alphabet is control characters, not non-ASCII."""
     for out in _write_one_record_through_every_sink(fmt, _PLAIN_NON_ASCII, tmp_path, capsys):
         _assert_logged(fmt, out, _PLAIN_NON_ASCII)
+
+
+def test_a_filter_less_json_formatter_limit_is_real_and_stated() -> None:
+    """BACKLOG #2976 item 3, kept as a documented limit by a Manager ruling: ``JsonFormatter`` does
+    not escape or redact on its own, and its docstring says so. Two halves, tied together.
+
+    The behaviour: on a handler with no filters, ``json.dumps`` escapes the C0 controls, and every
+    other character of the log alphabet comes out raw. A credential and the message's PHI pass too.
+    The wording: the docstring states that limit, names each kind of character that passes, and
+    names the missing redaction. If someone adds escaping inside the formatter, the first half goes
+    red and the docstring must change with it. If someone softens the docstring, the second half
+    goes red. ``test_every_configured_sink_escapes_the_wider_log_alphabet`` is the other side: every
+    configured sink escapes the same characters."""
+    class_codes = sorted({code for codes in _LOG_ESCAPED_CLASSES.values() for code in codes})
+    # Split before CR and LF join, so the C0 half is never kept non-empty by those two alone.
+    c0 = [code for code in class_codes if code < 0x20]
+    others = [code for code in class_codes if code >= 0x20]
+    # Either half with no code points would pass its absence check below without testing anything.
+    assert len(c0) >= 1, "the classes name no C0 control"
+    assert len(others) >= 1, "the classes name no character outside C0"
+    # DEL alone would keep the second half non-empty; the docstring's limit is about non-ASCII too.
+    assert len([code for code in others if code >= 0x80]) >= 1, "the classes name no non-ASCII"
+    # CR and LF are not in the classes; they are added so the framing assertion has input to fail on.
+    codes = sorted({0x0A, 0x0D, *class_codes})
+    message = "a" + "".join(chr(code) for code in codes) + f"z password=pw-Jf_A-91 {SYNTHETIC_PHI}"
+    record = logging.LogRecord("t", logging.INFO, __file__, 1, "%s", (message,), None)
+    line = JsonFormatter().format(record)
+    assert "\n" not in line and "\r" not in line, "a C0 control broke the one-line framing"
+    c0_left_raw = [hex(code) for code in c0 if chr(code) in line]
+    others_escaped = [hex(code) for code in others if chr(code) not in line]
+    assert not c0_left_raw, f"json.dumps no longer escapes the C0 controls {c0_left_raw}"
+    assert not others_escaped, (
+        f"JsonFormatter now escapes {others_escaped} on its own. Update its docstring's limit "
+        "paragraph, and keep the JSON-valid spelling the audit tee relies on (vault BACKLOG #3012)."
+    )
+    assert "pw-Jf_A-91" in line and SYNTHETIC_PHI in line, "the formatter now redacts by itself"
+
+    doc = " ".join((JsonFormatter.__doc__ or "").split())
+    for phrase in (
+        "A handler with this formatter and no filters is not safe",
+        "DEL, the C1 controls, the format characters",
+        "U+2028 and U+2029, a lone surrogate, and the private-use and unassigned code points",
+        "leaves the message, its arguments and ``stack_info`` unredacted",
+        "scrubs no credential",
+    ):
+        assert phrase in doc, f"JsonFormatter's docstring no longer says: {phrase!r}"
 
 
 def test_the_c0_escape_is_spelled_as_json() -> None:
@@ -2369,6 +2445,171 @@ def test_the_access_format_this_file_copies_is_uvicorns(module: str) -> None:
     assert "access_logger.info(" in source and f"'{_UVICORN_ACCESS_FORMAT}'" in source, (
         f"uvicorn's {module} no longer calls access_logger.info with {_UVICORN_ACCESS_FORMAT!r}. "
         "Update the copy and the argument tuple _emit_access passes."
+    )
+
+
+# --- BACKLOG #3002: the query filter must not swallow a later credential label -------------------
+#
+# CredentialQueryScrubFilter runs before CredentialScrubFilter. Its value ran on through a separator
+# and a later label, and stopped at the quote that opened that label's value. So the label was gone
+# before the credential pass could read it, and the quoted value printed on every configured sink.
+
+#: The separators the row and the secretscrub family name, less "&", which always ended the value,
+#: and less ".", "-" and "_", which are label characters and the residual pinned below.
+_QUERY_STOP_SEPARATORS = (";", ",", ":", "=", "|", "/", "+")
+
+#: Synthetic values, one per piece that must not print. Shorter than any base64 sweep reads.
+_QUERY_TOKEN_VALUE = "qtk-Qs_A-81"
+_QUERY_SECOND_VALUES = ("pw-Qs_B-82", "pw-Qs_C-83")
+
+
+def _query_swallow_lines() -> list[tuple[str, str]]:
+    """``(the label that must stay visible, line)``: a token query value, a separator, then a
+    credential label of each family whose value is quoted and holds a space, written each way a
+    label's value can start past the end of the query value."""
+    head, tail = _QUERY_SECOND_VALUES
+    shapes = (
+        ("password", '="{} {}"'),
+        ("secret", "='{} {}'"),
+        ("ad_bind_password", '= "{} {}"'),
+        ("api_key", ' = "{} {}"'),
+        ("private_key", "'='{} {}'"),
+        ("MEFOR_DB_PW", '="{} {}"'),
+    )
+    return [
+        (label, f"retry token={_QUERY_TOKEN_VALUE}{sep}{label}{rest.format(head, tail)} for svc")
+        for sep in _QUERY_STOP_SEPARATORS
+        for label, rest in shapes
+    ]
+
+
+@pytest.mark.parametrize("fmt", ["text", "json"])
+def test_a_query_value_stops_before_a_later_credential_label(
+    fmt: str, tmp_path: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #3002 closing step 2, through ``configure_logging`` as ``serve`` installs it: the
+    stdout sink and the log file, the message and the exception, in both formats. No value piece
+    prints, and the later label stays visible so a reader sees which credential was there."""
+    cases = _query_swallow_lines()
+    failures: list[str] = []
+    for index, (label, line) in enumerate(cases):
+        # A fresh directory per case, so the log file holds this case's record and no other.
+        case_dir = tmp_path / str(index)
+        case_dir.mkdir()
+        for sink, out in zip(
+            ("stdout", "file"),
+            _write_one_record_through_every_sink(fmt, line, case_dir, capsys),
+            strict=True,
+        ):
+            printed = [v for v in (_QUERY_TOKEN_VALUE, *_QUERY_SECOND_VALUES) if v in out]
+            if printed:
+                failures.append(f"{fmt} {sink}: {printed} printed from {line!r}")
+            # The message and the exception each carry the label. A MEFOR_ label is the exception:
+            # CredentialScrubFilter's token pass takes it after its own value is redacted, so it
+            # leaves a stray quote and no label. Both values are still hidden.
+            elif out.count(label) < 2 and not label.startswith("MEFOR_"):
+                failures.append(f"{fmt} {sink}: the label {label} was lost: {out!r}")
+    assert not failures, f"{len(failures)} failures, first: {failures[:2]}"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        f"token={_QUERY_TOKEN_VALUE};b;c end",
+        f"token={_QUERY_TOKEN_VALUE},b,c end",
+        f"token={_QUERY_TOKEN_VALUE};pass;c end",
+        f"token={_QUERY_TOKEN_VALUE};password=b end",
+        f"token={_QUERY_TOKEN_VALUE};password=b;c end",
+        # A label with an empty or unquoted value: a base64 code's tail can read like one.
+        f"token={_QUERY_TOKEN_VALUE};password= end",
+        f"token={_QUERY_TOKEN_VALUE}/ab.secret= end",
+        f"token={_QUERY_TOKEN_VALUE}+Pwd= end",
+        f"token={_QUERY_TOKEN_VALUE}/Pwd=",
+    ],
+)
+def test_a_query_value_with_no_label_value_outside_it_is_hidden_whole(line: str) -> None:
+    """Closing step 4, and the narrowing control. A bare ";" or "," inside one value does not stop
+    it. Nor does a label whose value is not quoted: inside the query value, empty, or after a
+    space. The query filter hides the value whole, as before, so nothing a reader saw hidden now
+    prints. A review found the empty case printing a base64 code's tail before the quote was
+    required."""
+    out = logging_setup._scrub_credential_query(line)
+    expected = f"token={CREDENTIAL_PLACEHOLDER}" + (" end" if line.endswith(" end") else "")
+    assert out == expected, out
+
+
+@pytest.mark.parametrize("sep", [".", "-", "_"])
+def test_a_label_glued_on_by_a_label_character_still_goes_with_the_value(
+    sep: str, tmp_path: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """THE RESIDUAL, TWO-SIDED. ".", "-" and "_" are label characters, so the query value does not
+    stop there and the quoted value still prints through the chain. That shape is owned by #2966's
+    owner ruling and #3122, not by #3002. If this goes red because the value no longer prints, the
+    residual is closed: say so on #2966 and #3122, and delete this test."""
+    head, tail = _QUERY_SECOND_VALUES
+    line = f'retry token={_QUERY_TOKEN_VALUE}{sep}password="{head} {tail}" for svc'
+    out, _file = _write_one_record_through_every_sink("text", line, tmp_path, capsys)
+    assert _QUERY_TOKEN_VALUE not in out
+    assert f'"{head} {tail}"' in out, f"the glued residual is closed on {sep!r}: {out!r}"
+
+
+def test_the_query_stop_words_are_secretscrubs_label_words() -> None:
+    """The DRIFT GATE. ``_QUERY_STOP_WORDS`` copies ``secretscrub``'s private tuples. A word added
+    there and not here would let the query value swallow that label again."""
+    assert set(logging_setup._QUERY_STOP_WORDS) == {
+        *secretscrub._CREDENTIAL_WORDS,
+        *secretscrub._TOKEN_WORDS,
+        *secretscrub._KEY_MATERIAL_WORDS,
+    }
+    assert secretscrub._ENV_PREFIX in logging_setup._LABEL_WITH_ITS_VALUE_OUTSIDE
+    # The bounded label prefix too: widened there and not here, longer labels would be swallowed.
+    assert secretscrub._LABEL_PREFIX in logging_setup._LABEL_WITH_ITS_VALUE_OUTSIDE
+
+
+#: A separator then a near-miss label: six prefix segments and a word one letter short, so the
+#: stop's lookahead walks its whole bounded reach at every separator and then fails.
+_QUERY_COST_UNIT = ";a.b.c.d.e.f.passwor"
+
+
+def _query_scrub_seconds(length: int, rounds: int) -> float:
+    """The minimum time of one ``_scrub_credential_query`` call on a ``length``-character value."""
+    line = "token=" + (_QUERY_COST_UNIT * (length // len(_QUERY_COST_UNIT) + 1))[:length]
+    return _best_of(lambda: logging_setup._scrub_credential_query(line), rounds)
+
+
+#: 8x apart, as ``_ACCESS_GROWTH_LENGTHS`` are, but half as long, so the quadratic control stays
+#: affordable on a slow runner.
+_QUERY_GROWTH_LENGTHS = (1024, 8192)
+
+
+def _query_scrub_growth(rounds: int) -> float:
+    short, long_ = _QUERY_GROWTH_LENGTHS
+    return _query_scrub_seconds(long_, rounds) / _query_scrub_seconds(short, rounds)
+
+
+def test_the_query_stop_keeps_the_scan_linear(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BACKLOG #3002: the stop runs a lookahead at every separator in a value, on attacker-
+    influenceable text, on every record. Bounded the way the access-chain arm above is: the growth
+    across 8x the length, against the same ``_ACCESS_MAX_GROWTH``.
+
+    THE POSITIVE CONTROL is the tempting wrong stop: "stop before a separator if a label follows
+    anywhere later in the value". Its lookahead scans to the end of the value from every separator,
+    which is quadratic, and the same harness must catch it."""
+    shipped = logging_setup._CREDENTIAL_QUERY_RE
+    unbounded = shipped.pattern.replace("(?!", "(?![^&\\s\"']*?", 1)
+    assert unbounded != shipped.pattern, "the control pattern did not change"
+    quadratic = re.compile(unbounded, shipped.flags)
+    with monkeypatch.context() as m:
+        m.setattr(logging_setup, "_CREDENTIAL_QUERY_RE", quadratic)
+        before = _query_scrub_growth(rounds=3)
+    assert before > _ACCESS_MAX_GROWTH, (
+        f"the quadratic control grew only {before:.1f}x, so this harness cannot fail. Fix the "
+        "harness, not the bound."
+    )
+    growth = _query_scrub_growth(rounds=5)
+    assert growth <= _ACCESS_MAX_GROWTH, (
+        f"one query scrub grew {growth:.1f}x for 8x the value length, over the "
+        f"{_ACCESS_MAX_GROWTH}x bound"
     )
 
 

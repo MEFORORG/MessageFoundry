@@ -1389,8 +1389,9 @@ transport's list is set, an outbound of that transport not on it is **refused at
 > **This is a rule of the engine's own `urllib` openers**: at least the HTTP family and its token
 > endpoints, the alert webhook, the OIDC legs and the AI broker. A client built on another HTTP
 > library is outside it. Of those, the Vault clients refuse a loopback `http://` Vault behind a proxy
-> rather than bypass it (see `[secrets]`). The `tee` tool uses none of the engine's openers and
-> follows the environment proxy even for a loopback engine address that `NO_PROXY` does not name.
+> rather than bypass it (see `[secrets]`). The `tee` tool uses none of the engine's openers. It
+> carries its own copy of the host rule, so it too dials a loopback engine address direct (ADR 0126,
+> Amendment D).
 >
 > **`tls_hop_attested` is a per-connection declaration, set with `tls_hop_attested_reason`** (owner
 > ruling 2026-09-24). It is a keyword on `inbound()` / `outbound()` / `FhirLookup()` /
@@ -1686,7 +1687,7 @@ silences an event you didn't name. Matching is pure config (no code/`eval`).
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `audit_write_failed`, `backup_failed`, `cert_expiry`, `config_changed`, `connection_error`, `connection_stopped`, `crl_reload_refused`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `intake_paused`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_forward_failed`, `log_write_failed`, `message_stall`, `queue_buildup`, `saturation`, `secret_rotation`, `storage_threshold`, `store_privilege_warning`, `update_available`, and the six security signals `signin_failure_burst`, `access_denied_burst`, `body_view_burst`, `bulk_export`, `log_level_debug` and `posture_loosened`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
+| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `audit_write_failed`, `backup_failed`, `cert_expiry`, `config_changed`, `connection_error`, `connection_stopped`, `crl_reload_refused`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `intake_paused`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_forward_failed`, `log_write_failed`, `message_stall`, `no_enabled_administrator`, `queue_buildup`, `remote_debug_refused`, `saturation`, `secret_rotation`, `storage_threshold`, `store_privilege_warning`, `update_available`, and the six security signals `signin_failure_burst`, `access_denied_burst`, `body_view_burst`, `bulk_export`, `log_level_debug` and `posture_loosened`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
 | `connection` | str (glob) | `*` | glob over the connection name (e.g. `OB_*`, `IB_ACME_*`) |
 | `min_depth` | int | _unset_ | `queue_buildup` only — match only when pending depth is at/over this |
 | `min_oldest_seconds` | num | _unset_ | `queue_buildup` only — …or the oldest pending message has waited at least this long |

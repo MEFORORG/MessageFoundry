@@ -28,6 +28,7 @@ from messagefoundry.parsing.peek import Peek
 from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
 from messagefoundry.store import FailOutcome, MessageStatus, OutboxStatus, Stage
+from messagefoundry.store.cell_tag import message_cell_aad
 from messagefoundry.store.content_search import make_spec
 from messagefoundry.store.crypto import MARKER_PREFIX, cell_aad, generate_key, make_cipher
 from messagefoundry.store.store import load_audit_chain
@@ -117,6 +118,7 @@ async def store() -> AsyncIterator[object]:
                 "user_roles",
                 "ad_group_role_map",
                 "ad_group_scope_map",  # BACKLOG #3187: the width contract writes it
+                "authority_set_seal",  # BACKLOG #2592: the map's seal, under an earlier test's key
                 "users",
                 "roles",
             ):
@@ -1812,12 +1814,12 @@ async def test_purge_message_bodies_blanks_delivered(store) -> None:
 async def _set_meta_ss(store, message_id: str, bag: dict) -> None:
     """Attach a metadata bag the way transform_handoff does (encrypted, cell-AAD bound)."""
     async with store._acquire() as conn, store._cursor(conn) as cur:
+        await cur.execute("SELECT channel_id FROM messages WHERE id=?", (message_id,))
+        channel = (await cur.fetchone())[0]
+        tag = message_cell_aad("metadata", message_id=message_id, channel_id=channel)
         await cur.execute(
             "UPDATE messages SET metadata=? WHERE id=?",
-            (
-                store._enc(json.dumps(bag), aad=cell_aad("messages", "metadata", message_id)),
-                message_id,
-            ),
+            (store._enc(json.dumps(bag), aad=tag), message_id),
         )
         await store._commit(conn)
 
@@ -4397,11 +4399,15 @@ async def _ss_force_error(store, mid: str, error: str) -> None:
     never reopens/overwrites it (mirrors test_edit_resend.py::_seed_error)."""
     async with store._acquire() as conn, store._cursor(conn) as cur:
         try:
+            await cur.execute("SELECT channel_id FROM messages WHERE id=?", (mid,))
+            channel = (await cur.fetchone())[0]
             await cur.execute(
                 "UPDATE messages SET status=?, error=? WHERE id=?",
                 (
                     MessageStatus.ERROR.value,
-                    store._enc(error, aad=cell_aad("messages", "error", mid)),
+                    store._enc(
+                        error, aad=message_cell_aad("error", message_id=mid, channel_id=channel)
+                    ),
                     mid,
                 ),
             )
@@ -5604,6 +5610,39 @@ async def test_user_seal_contract(store) -> None:
         await keyed.close()
 
 
+async def test_role_seal_contract(store) -> None:
+    """BACKLOG #2592: sealed custom role definitions and the sealed AD group-to-role map, the same
+    contract the SQLite suite runs, on a keyed handle, with the role table's columns pinned to the
+    record the seal covers. ``raw`` runs each statement on a pooled connection, outside the store's
+    helpers. The fixture clears the role and map tables on the next entry."""
+    from dataclasses import fields
+
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+    from messagefoundry.store.store import RoleRow
+    from tests._role_seal_contract import assert_role_seal_contract
+
+    keyed = await SqlServerStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[Any, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                cur = await conn.cursor()
+                await cur.execute(sql, params)
+                await conn.commit()
+
+        async with keyed._pool.acquire() as conn:
+            cur = await conn.cursor()
+            await cur.execute("SELECT name FROM sys.columns WHERE object_id = OBJECT_ID('roles')")
+            columns = {str(r[0]) for r in await cur.fetchall()}
+        assert columns == {f.name for f in fields(RoleRow)}
+        await assert_role_seal_contract(keyed, raw)
+    finally:
+        await keyed.close()
+
+
 async def test_a_role_delete_racing_a_grant_leaves_no_dangling_role_row(store) -> None:
     """BACKLOG #2592: this backend has the ``user_roles`` role foreign key too, so a grant that
     commits while its custom role is deleted fails the delete rather than leaving a sealed role row
@@ -5656,6 +5695,40 @@ async def test_queue_tag_contract(store) -> None:
         await assert_queue_tag_contract(
             keyed, raw, fetch, store_once=False, claim_reads_body_ref=False
         )
+    finally:
+        await keyed.close()
+
+
+async def test_cell_tag_contract(store) -> None:
+    """BACKLOG #2593: message cells bound to their channel and preset criteria to their owner, the
+    same contract the SQLite suite runs, on a keyed handle under the cell-bound writer. ``raw`` and
+    ``fetch`` run on pooled connections, outside the store's helpers."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+    from tests._cell_tag_contract import assert_cell_tag_contract
+
+    keyed = await SqlServerStore.open(
+        load_settings(environ=os.environ).store,
+        cipher=make_cipher(generate_key(), write_v2=True),
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[Any, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                cur = await conn.cursor()
+                await cur.execute(sql, params)
+                await conn.commit()
+
+        async def fetch(sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
+            async with keyed._pool.acquire() as conn:
+                cur = await conn.cursor()
+                await cur.execute(sql, params)
+                names = [c[0] for c in cur.description]
+                rows = [dict(zip(names, r, strict=True)) for r in await cur.fetchall()]
+                await conn.commit()
+                return rows
+
+        await assert_cell_tag_contract(keyed, raw, fetch)
     finally:
         await keyed.close()
 
