@@ -84,9 +84,9 @@ change, and the service would run their next edit.
 **The installer refuses an engine install anyone but administrators can write** (vault BACKLOG
 #2626). That holds for the default root and for one you pass with `-AppExe` or `-PythonExe`. It
 reads the interpreter, the launcher, the package's `__init__.py` and a venv's `pyvenv.cfg`, each
-file and every folder above it. Only SYSTEM, Administrators, TrustedInstaller, `CREATOR OWNER` and
-`OWNER RIGHTS` may write them. So `Everyone`, `Authenticated Users`, `BUILTIN\Users` and the user
-who owns a checkout are all refused. It also refuses an install with no `messagefoundry` folder in
+file and every folder above it. Only administrator principals, such as SYSTEM, Administrators
+and TrustedInstaller, may write them. So at least `Everyone`, `Authenticated Users`,
+`BUILTIN\Users` and the user who owns a checkout are refused. It also refuses an install with no `messagefoundry` folder in
 its `Lib\site-packages`, or with an `__editable__` file for it. That is an editable install, which
 imports the engine from a checkout. **A service can no longer run from a checkout.** To try the
 engine from one, run `messagefoundry serve` from a prompt.

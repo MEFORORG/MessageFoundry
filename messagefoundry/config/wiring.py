@@ -8737,10 +8737,9 @@ def untrusted_install_paths() -> list[str]:
     """Why the interpreter or the package folder fails the config-source policy, one line each, or
     nothing when both pass. **Reported, never refused** (vault BACKLOG #2626 step 3).
 
-    Refusing these at start would end every service that runs from a checkout a broad principal can
-    write. Whether the project may end those services is an open owner question, the same one that
-    holds the installer's refusal of such an ``-AppExe`` (#2626 step 1), so the start names them and
-    goes on."""
+    The installer refuses such an install before it registers a service (#2626 step 1), so a
+    service it set up never reaches this report. A start it did not set up, such as ``serve`` from
+    a prompt in a checkout, is named here and goes on. Refusing at start is #2626 step 3."""
     reasons: list[str] = []
     _check_trusted_paths(
         install_trust_paths(), lead="the engine runs code from", refuse=reasons.append

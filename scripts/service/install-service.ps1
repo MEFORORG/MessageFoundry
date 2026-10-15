@@ -446,17 +446,31 @@ function Get-NssmHomeProblem {
       Who, other than administrators, could replace $File: through the file itself, its folder, or
       any folder above that up to, not including, the drive root. "" when nobody.
 
+      $File may name several files, as the engine install check does (vault BACKLOG #2626). Each
+      folder is then read once, however many of the files sit below it, and a holder of a file
+      itself is named with that file's path.
+
       THE PARENTS COUNT. Whoever can delete or rename a folder's child can move the checked folder
       aside and put their own in its place. The drive root is left out because Windows lets
       Authenticated Users create folders there by default, which moves nothing that already exists.
     #>
-    param([Parameter(Mandatory)][string]$File)
+    param([Parameter(Mandatory)][string[]]$File)
     $found = @()
-    if (Test-Path -LiteralPath $File) { $found += @(Get-BroadWriteHolders -Path $File) }
-    $dir = Split-Path -Parent $File
-    while ($dir -and (Split-Path -Parent $dir)) {
-        $found += @(Get-BroadWriteHolders -Path $dir | ForEach-Object { "$_ on '$dir'" })
-        $dir = Split-Path -Parent $dir
+    # Case-insensitive keys, as Windows paths are.
+    $read = @{}
+    foreach ($one in $File) {
+        if (Test-Path -LiteralPath $one) {
+            $found += @(Get-BroadWriteHolders -Path $one | ForEach-Object {
+                if ($File.Count -gt 1) { "$_ on '$one'" } else { $_ } })
+        }
+        $dir = Split-Path -Parent $one
+        while ($dir -and (Split-Path -Parent $dir)) {
+            if (-not $read.ContainsKey($dir)) {
+                $read[$dir] = $true
+                $found += @(Get-BroadWriteHolders -Path $dir | ForEach-Object { "$_ on '$dir'" })
+            }
+            $dir = Split-Path -Parent $dir
+        }
     }
     return ($found -join "; ")
 }
@@ -1349,7 +1363,11 @@ function Get-EngineInstallProblem {
     # __editable__ hook, direct_url.json declaring dir_info.editable, or a RECORD row naming an
     # editable finder or a .pth. Read here as files, because this prompt runs none of the install's
     # code.
-    $editable = @(Get-ChildItem -LiteralPath $sitePackages -Filter '__editable__*messagefoundry*' -Force -ErrorAction SilentlyContinue |
+    # The engine's own hooks only: __editable__.messagefoundry-<ver>.pth and
+    # __editable___messagefoundry_<ver>_finder.py. A sibling such as messagefoundry_webconsole is
+    # another distribution, and naming it as the engine would send the operator to the wrong wheel.
+    $editable = @(Get-ChildItem -LiteralPath $sitePackages -Filter '__editable__*' -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^__editable__(\.messagefoundry-|_+messagefoundry_[0-9])' } |
         ForEach-Object { $_.Name })
     foreach ($distInfo in @(Get-ChildItem -LiteralPath $sitePackages -Filter 'messagefoundry-*.dist-info' -Directory -Force -ErrorAction SilentlyContinue)) {
         $directUrl = Join-Path $distInfo.FullName "direct_url.json"
@@ -1370,15 +1388,10 @@ function Get-EngineInstallProblem {
         }
     }
     if ($editable) { return "it holds an editable install of the engine: $($editable -join '; ')" }
-    $files = @($PythonExe, $package, $AppExe, (Join-Path $InstallRoot "pyvenv.cfg"))
-    # Each file's walk reads the same folders above the root, so a broad folder there would be named
-    # once per file. -Unique names it once. A holder of the file itself carries no path, so the
-    # file's is added, and two files with the same holder stay apart.
-    return (@($files | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | ForEach-Object {
-            $file = $_
-            (Get-NssmHomeProblem -File $file) -split '; ' | Where-Object { $_ } | ForEach-Object {
-                if ($_.Contains(" on '")) { $_ } else { "$_ on '$file'" } }
-        } | Select-Object -Unique) -join "; ")
+    # The interpreter and the package are known to exist by now, so the list is never empty.
+    $files = @(@($PythonExe, $package, $AppExe, (Join-Path $InstallRoot "pyvenv.cfg")) |
+        Where-Object { $_ -and (Test-Path -LiteralPath $_) })
+    return (Get-NssmHomeProblem -File $files)
 }
 
 function Assert-NoNssmExpansion {

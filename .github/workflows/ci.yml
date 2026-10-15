@@ -3986,9 +3986,12 @@ jobs:
       # the installer's default root the way docs/SERVICE.md "Install the engine where only
       # administrators can write" does: a venv under Program Files, the engine wheel installed into
       # it, never editable, then an administrator-only access list on it and the folder above it.
-      # The extras are the ones the editable install above takes, for the same reason. The commands
-      # repeat the docs' recipe on purpose, rather than calling the installer's Set-AdminOnlyAcl, so
-      # this leg runs what an operator runs. Change the two together.
+      # The extras are the ones the editable install above takes, for the same reason. The access
+      # list and owner commands repeat the docs' recipe on purpose, rather than calling the
+      # installer's Set-AdminOnlyAcl, so this leg locks the folders the way an operator does. Change
+      # the two together. The package install does NOT follow the docs: it takes uv and
+      # constraints.lock with the extras, where the docs take pip, requirements.lock with hashes, and
+      # a --no-deps wheel. So this leg does not prove the docs' hash-locked install.
       - name: Build the administrator-only engine install from the wheel
         run: |
           $root = "$env:ProgramFiles\MessageFoundry\engine"
@@ -4041,6 +4044,8 @@ jobs:
           NSSM_PIN: ${{ steps.nssm-pin.outputs.pin }}
           MEFOR_RIG_ADMIN_PASSWORD: ${{ steps.rig.outputs.password }}
         run: |
+          # The checkout's editable launcher, for `gen-key` below. The service does not run it.
+          $exe = (Get-Command messagefoundry).Source
           $cached = @{}
           if ($env:NSSM_CACHE_HIT -eq 'true') {
             $hit = $env:SMOKE_NSSM_CACHED_EXE
@@ -4072,10 +4077,12 @@ jobs:
           # locks that folder with the config directory.
           # Vault BACKLOG #2626 step 1: no -AppExe. The service runs the default install root the
           # step above built, so this leg is the one that proves the installer accepts it.
+          # -ProjectRoot is the checkout, so the value file stays environments\prod.toml. Without
+          # it the project root would be the folder above -Config, samples\.
           $serviceConfig = "C:\ProgramData\MessageFoundry-settings\messagefoundry.toml"
           New-Item -ItemType Directory -Force -Path (Split-Path -Parent $serviceConfig) | Out-Null
           [System.IO.File]::WriteAllText($serviceConfig, "# windows-service-smoke: set through the service's environment.`n")
-          .\scripts\service\install-service.ps1 -NssmDir $env:SMOKE_NSSM_DIR -Config samples\config -ServiceConfig $serviceConfig -LogLevel INFO -Environment prod -LockConfigDir @cached
+          .\scripts\service\install-service.ps1 -NssmDir $env:SMOKE_NSSM_DIR -Config samples\config -ProjectRoot $PWD -ServiceConfig $serviceConfig -LogLevel INFO -Environment prod -LockConfigDir @cached
           # The installer only warns when it cannot lock a folder, and `serve` would then refuse the
           # settings file at start. So run the check `serve` runs on the file and its folder, and
           # fail here, by name, rather than as a service that never comes up.
