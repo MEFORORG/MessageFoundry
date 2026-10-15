@@ -13,6 +13,7 @@ request written before the seal.
 from __future__ import annotations
 
 import ast
+import asyncio
 import logging
 import pathlib
 import sqlite3
@@ -28,13 +29,19 @@ from messagefoundry.api.approvals import ApprovalError, ApprovalGate
 from messagefoundry.auth.permissions import Permission
 from messagefoundry.config.settings import ApprovalsSettings
 from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.row_seal import RowSealError
 from messagefoundry.store.store import (
     APPROVAL_SEAL_EXCLUDED,
     ApprovalRow,
     MessageStore,
     approval_seal_ok,
 )
-from tests._approval_seal_contract import assert_approval_columns, assert_approval_seal_contract
+from tests._approval_seal_contract import (
+    _Hooked,
+    _Sink,
+    assert_approval_columns,
+    assert_approval_seal_contract,
+)
 from tests._pending_approval_store_contract import _resolve, _StandingStore
 from tests.test_role_seal import _literal_text, _raw_for
 
@@ -219,6 +226,83 @@ async def test_a_request_written_before_the_seal_is_named_at_open_and_refused(
         assert refusal.value.status == 409
     finally:
         await reopened.close()
+
+
+async def test_a_value_no_honest_write_leaves_is_a_failed_seal_not_a_crash(
+    keyed: tuple[MessageStore, Path],
+) -> None:
+    """SQLite keeps text in a REAL column, so a writer can leave a row no reader can type. Each
+    reader treats it as a request that fails its seal: the queue still lists the sound request, a
+    repeat files its own, and the store's move refuses it. The control is the sound request beside
+    it, which is listed and released."""
+    store, path = keyed
+    gate = _gate(store)
+    sound = await _request(gate, "sound")
+    broken = await _request(gate, "broken")
+    await _raw_for(path)(
+        "UPDATE pending_approvals SET requested_at=? WHERE id=?", ("not-a-time", broken)
+    )
+    assert [e["id"] for e in await gate.list_pending()] == [sound]
+    with pytest.raises(ApprovalError) as refusal:
+        await gate.approve(broken, approver="a", approver_user_id="a-id")
+    assert refusal.value.status == 409
+    assert await _request(gate, "broken") != broken  # a repeat does not join it
+    with pytest.raises(RowSealError):
+        await store.decide_pending_approval(
+            broken, status="rejected", approver="a", decided_at=time.time()
+        )
+    released = await gate.approve(sound, approver="a", approver_user_id="a-id")  # control
+    assert released["operation"] == "dead_letter_replay"
+
+
+class _PagingSink(_Sink):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lost: list[str] = []
+
+    def audit_write_failed(self, name: str, *, action: str) -> None:
+        self.lost.append(action)
+
+
+@pytest.mark.parametrize("refusal", [RowSealError("approval"), OSError("store down")])
+async def test_a_cancelled_claim_the_store_refuses_on_its_seal_is_reported_not_paged_lost(
+    keyed: tuple[MessageStore, Path], refusal: Exception
+) -> None:
+    """An approve cancelled while its claim runs settles the claim itself. A claim the store
+    refuses on the row's seal wrote nothing, so it raises the integrity alert and pages no lost
+    audit row. The control is a claim that fails for any other reason, which pages the loss."""
+    store, _ = keyed
+    sink = _PagingSink()
+    started = asyncio.Event()
+
+    async def refuse(approval_id: str, **kw: Any) -> bool:
+        if kw.get("status") != "executing":
+            return bool(await store.decide_pending_approval(approval_id, **kw))
+        started.set()
+        await asyncio.sleep(0.05)
+        raise refusal
+
+    gate = ApprovalGate(
+        _StandingStore(_Hooked(store, refuse)),
+        ApprovalsSettings(enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=0.0),
+        resolve_identity=_resolve,
+        alert_sink=sink,
+    )
+
+    async def run(_params: Any) -> dict[str, Any]:
+        return {}
+
+    gate.register("dead_letter_replay", "op", run, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await _request(gate, "cancel")
+    task = asyncio.ensure_future(gate.approve(approval_id, approver="a", approver_user_id="a-id"))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    if isinstance(refusal, RowSealError):
+        assert sink.lost == [] and len(sink.reasons) == 1
+    else:
+        assert sink.lost == ["approval.release_attempted"] and sink.reasons == []
 
 
 # --- static guards --------------------------------------------------------------------------

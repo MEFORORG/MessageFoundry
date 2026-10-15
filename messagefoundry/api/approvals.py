@@ -1165,6 +1165,11 @@ class ApprovalGate:
         it did not commit, the row is still ``pending`` and there is nothing to settle."""
         try:
             claimed = await claim
+        except RowSealError:
+            # The store refused the claim and wrote nothing (BACKLOG #2592), so no audit row was
+            # lost: report the failed seal, as the uncancelled path does.
+            await self._approval_seal_failed(approval_id)
+            return
         except Exception:  # noqa: BLE001 - the caller's cancellation is re-raised either way
             log.exception(
                 "approval %s: the approve was cancelled and its claim failed, so its "
@@ -1758,7 +1763,11 @@ class ApprovalGate:
         """``found`` as a checked :class:`ApprovalRow`, or ``None`` when its seal fails, which is
         reported. Its params and requester id are what a release acts on and what the
         self-approval refusal compares, so a row changed outside the store acts on nothing."""
-        row = ApprovalRow.from_mapping(found)
+        try:
+            row = ApprovalRow.from_mapping(found)
+        except RowSealError:
+            await self._approval_seal_failed(str(found["id"]))
+            return None
         if approval_seal_ok(self._store.row_sealer(), row):
             return row
         await self._approval_seal_failed(row.id)
@@ -1772,9 +1781,11 @@ class ApprovalGate:
         audit write is logged and paged, not raised, so it does not turn a refusal into an error."""
         if not self._seal_failures_reported.due(approval_id):
             return
+        # The id comes from the row that failed, so it is scrubbed before it reaches a log line or
+        # an alert (CodeQL py/log-injection).
         reason = (
             f"an {APPROVAL_KIND} request failed its integrity check and acts on nothing"
-            f" (approval {approval_id})"
+            f" (approval {scrub_log_argument(approval_id)})"
         )
         log.warning("%s", reason)
         await self._record_audit_soft(

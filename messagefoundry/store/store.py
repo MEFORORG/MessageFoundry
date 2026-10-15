@@ -3215,7 +3215,16 @@ class ApprovalRow:
 
     @classmethod
     def from_mapping(cls, d: ByName) -> ApprovalRow:
-        """Hard subscripts, as :meth:`UserRow.from_mapping` has, for the same reason."""
+        """Hard subscripts, as :meth:`UserRow.from_mapping` has, for the same reason. A value no
+        honest write leaves, such as text in ``requested_at``, raises :class:`RowSealError`: the row
+        was changed outside the store, so it is a failed seal, not a crash in every reader."""
+        try:
+            return cls._of(d)
+        except (TypeError, ValueError) as exc:
+            raise RowSealError(APPROVAL_KIND) from exc
+
+    @classmethod
+    def _of(cls, d: ByName) -> ApprovalRow:
         return cls(
             id=str(d["id"]),
             operation=str(d["operation"]),
@@ -3334,7 +3343,11 @@ def first_sealed_approval(sealer: RowSealer | None, rows: Iterable[ByName]) -> A
     absorb a real request; it is logged, and the caller files the request on its own."""
     failed = 0
     for found in rows:
-        row = ApprovalRow.from_mapping(found)
+        try:
+            row = ApprovalRow.from_mapping(found)
+        except RowSealError:
+            failed += 1
+            continue
         if approval_seal_ok(sealer, row):
             return row
         failed += 1
