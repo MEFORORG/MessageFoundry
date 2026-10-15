@@ -3631,8 +3631,10 @@ Both kinds of user share one identity model (`users.auth_provider` is `local` or
   way on any host, for example a missing keytab entry or a rotated service password. So the
   engine log names the error's class and its numeric GSSAPI or SSPI status at WARNING, never its
   text. The status helps tell a key fault from a bad token but does not prove either, because the
-  caller names the ticket's principal. Only a DEBUG traceback carries the text. If the step
-  accepts the token but the principal cannot be read, the row is `auth.login_error`, reading
+  caller names the ticket's principal. Only a DEBUG traceback carries the text. Each such row
+  counts toward `signin_failure_burst`, which counts refused sign-ins per client address. So a
+  key fault can raise that alert, sooner where many users reach the engine from one address.
+  If the step accepts the token but the principal cannot be read, the row is `auth.login_error`, reading
   `Kerberos principal read failed` and the error's class, and the sign-in fails as a directory
   outage. While browser SSO is available, a 400
   for a token that is not base64 writes the `malformed_token` row `GET /ui/sso` writes. A 400 for
