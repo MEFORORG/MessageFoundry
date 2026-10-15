@@ -54,6 +54,7 @@ from messagefoundry.auth.identity import ALL_CHANNELS, AuthProvider, Identity, S
 from messagefoundry.auth.ldap import (
     AdPrincipal,
     DirectoryAnswer,
+    KerberosTokenRefused,
     LdapAuthenticator,
     LdapError,
     LdapReferralError,
@@ -4022,7 +4023,18 @@ class AuthService:
                 username,
                 tie_break_object_id=await self._stored_directory_object_id(username),
             )
+        except KerberosTokenRefused as exc:
+            # BACKLOG #3196: audited as a failed sign-in, not a directory outage. An acceptor key
+            # fault in the step (a keytab miss, a rotated service password) also lands here;
+            # kerberos_principal logs the error's class and status codes at WARNING, and its text
+            # only in a DEBUG traceback.
+            await self._directory_reject_audit(
+                "<kerberos>", "kerberos", "token_refused", client=client, error=exc.error_type
+            )
+            return LoginOutcome(ok=False, error="SSO authentication failed")
         except LdapError as exc:
+            # Reached from settings, from the directory, or from a principal read after the step
+            # accepted the token. kerberos_principal turns every failure of the step into the arm above.
             await self._audit(
                 "auth.login_error",
                 actor="<kerberos>",
@@ -5132,20 +5144,19 @@ class AuthService:
         return LoginOutcome(ok=False, error="invalid credentials", reason=reason)
 
     async def _directory_reject_audit(
-        self, actor: str, mech: str, reason: str, *, client: str | None
+        self, actor: str, mech: str, reason: str, *, client: str | None, error: str | None = None
     ) -> None:
         """Audit a rejected directory-SSO attempt. ``mech`` is the mechanism slug ("kerberos" /
         "oidc"); ``reason`` must come from a closed set so no IdP-influenced text is ever stored.
+        ``error``, when given, is an exception's TYPE name, never its message (BACKLOG #3196).
 
         ``client`` is keyword-only with no default, so every caller must name it (BACKLOG #2132).
         The type still accepts ``None``, so this forces a decision and does not enforce an address.
         A run of refusals is how a spray shows, and the operator needs to see its source."""
-        await self._audit(
-            "auth.login_failed",
-            actor=actor,
-            detail=_json({"provider": "ad", "mech": mech, "reason": reason}),
-            client=client,
-        )
+        detail: dict[str, object] = {"provider": "ad", "mech": mech, "reason": reason}
+        if error is not None:
+            detail["error"] = error
+        await self._audit("auth.login_failed", actor=actor, detail=_json(detail), client=client)
 
     async def _complete_ad_login(
         self,

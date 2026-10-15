@@ -573,6 +573,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         try:
             token_bytes = base64.b64decode(header[len("Negotiate ") :], validate=True)
         except (binascii.Error, ValueError):
+            # The row GET /ui/sso writes, under the gate it uses (BACKLOG #3196).
+            if service.kerberos_available:
+                await service.audit_kerberos_reject("malformed_token", client=client)
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid SPNEGO token") from None
         # BACKLOG #1144 step 5: the session is born with NO step-up window, exactly as GET /ui/sso's
         # is. This route used to take the seeding default while the console passed False, so a
