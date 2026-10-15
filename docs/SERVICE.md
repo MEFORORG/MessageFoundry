@@ -91,6 +91,17 @@ principal can write is an open owner question. `serve` reports such an install a
 `-Config` is required: the config directory the service loads. It used to default to the checkout's
 `samples\config`, a demo graph.
 
+**The service needs a settings file, registered by absolute path** (vault BACKLOG #2626). When the
+engine finds it runs as an NSSM service, `serve` and `supervise` refuse to start with no
+`--service-config`, or with a relative one and no `--project-root`. Either way they would read a
+`messagefoundry.toml` from the working directory. Pass `-ServiceConfig <path>`, or put
+`messagefoundry.toml` where the installer looks for it, which the Defaults table below names. With
+neither, the installer refuses. A service that sets everything through its environment still needs
+the file; an empty one will do. `messagefoundry serve` from a prompt needs no flag. The engine knows it is
+the service when `nssm.exe` is the first process above it other than Python and the
+`messagefoundry` launcher. A start it cannot place, such as one under a wrapper between NSSM and the
+interpreter, is not refused. `messagefoundry/serviceenv.py` says what the reading covers.
+
 `-Environment` is **required** (ADR 0017): it selects which `environments/<name>.toml` value file the
 engine resolves and the instance's production tier. `serve` refuses to start without it (no silent
 default), so the install script refuses too — pass `dev`, `staging`, `prod`, or a custom name.
@@ -117,7 +128,7 @@ Defaults:
 | Config dir (`-Config`) | *(required)* |
 | Working directory | the install root; the repository for a passed `-AppExe` |
 | Project root (`-ProjectRoot`, registered as `--project-root`) | the folder above `-Config` for the default install; none for a passed `-AppExe` |
-| Service settings (`-ServiceConfig`, registered as an absolute `--service-config`) | `messagefoundry.toml` under the project root, or else the working directory, when it exists; otherwise none |
+| Service settings (`-ServiceConfig`, registered as an absolute `--service-config`) | `messagefoundry.toml` under the project root, or else the working directory, when it exists. When it does not, the installer refuses |
 | Active environment | *(required — `-Environment`)* |
 | Data dir | `C:\ProgramData\MessageFoundry` |
 | Message store | `<DataDir>\messagefoundry.db` |

@@ -43,6 +43,7 @@ from messagefoundry.serviceenv import (
     LOOSENING_CLASS_NAMES,
     ServiceEnvPosture,
     ServiceEnvStatus,
+    missing_service_config_refusal,
     read_service_env_posture,
     service_env_loosenings,
     service_env_refusal,
@@ -431,10 +432,41 @@ _KEY_LISTED = ServiceEnvPosture(
 _PASSWORD_LISTED = ServiceEnvPosture(
     ServiceEnvStatus.OBSERVED, service_name="MessageFoundry", listed=("MEFOR_STORE_PASSWORD",)
 )
+_A_SERVICE = ServiceEnvPosture(ServiceEnvStatus.OBSERVED, service_name="MessageFoundry")
+_A_SHELL = ServiceEnvPosture(ServiceEnvStatus.NOT_A_SERVICE)
+_KEY_REFUSAL = (
+    "refusing to start: MEFOR_STORE_ENCRYPTION_KEY is set in the environment of the Windows service"
+)
+#: Vault BACKLOG #2626 step 2.
+_FLAG_REFUSAL = (
+    "refusing to start: this engine runs as the Windows service 'MessageFoundry' and was started "
+    "with no --service-config"
+)
+#: Each refusal case says whether it passes --service-config. The store-key case passes one, so
+#: the flag refusal, which comes first, does not hide the key refusal it tests.
+_REFUSALS = pytest.mark.parametrize(
+    ("posture", "with_flag", "reason"),
+    [(_KEY_LISTED, True, _KEY_REFUSAL), (_A_SERVICE, False, _FLAG_REFUSAL)],
+    ids=["store-key-listed", "no-service-config"],
+)
+
+
+@pytest.fixture
+def settings_file(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """An empty settings file outside the working directory, so the flag is what names it, and a
+    test can still check that the working directory stays empty."""
+    path = tmp_path_factory.mktemp("settings") / "messagefoundry.toml"
+    path.write_text("", encoding="utf-8")
+    return str(path)
 
 
 def _serve(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, posture: ServiceEnvPosture, *, warn: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    posture: ServiceEnvPosture,
+    *,
+    warn: bool,
+    service_config: str | None,
 ) -> int:
     from messagefoundry.__main__ import main
 
@@ -447,39 +479,73 @@ def _serve(
     monkeypatch.setattr(serviceenv, "service_env_posture", lambda: posture)
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
-    return main(["serve", "--config", str(_SAMPLES_CONFIG), "--env", "dev"])
+    flag = [] if service_config is None else ["--service-config", service_config]
+    return main(["serve", "--config", str(_SAMPLES_CONFIG), "--env", "dev", *flag])
 
 
 @pytest.mark.parametrize("warn", [False, True], ids=["enforce", "warn"])
-def test_serve_refuses_a_store_key_in_its_nssm_list(
+@_REFUSALS
+def test_serve_as_a_service_refuses(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    settings_file: str,
     warn: bool,
+    posture: ServiceEnvPosture,
+    with_flag: bool,
+    reason: str,
 ) -> None:
-    assert _serve(tmp_path, monkeypatch, _KEY_LISTED, warn=warn) == 2
-    err = capsys.readouterr().err
-    assert (
-        "refusing to start: MEFOR_STORE_ENCRYPTION_KEY is set in the environment of the Windows service"
-        in err
-    )
+    service_config = settings_file if with_flag else None
+    assert _serve(tmp_path, monkeypatch, posture, warn=warn, service_config=service_config) == 2
+    assert reason in capsys.readouterr().err
     # Before any side effect: nothing was minted or opened in the working directory.
     assert not any(tmp_path.iterdir()), sorted(p.name for p in tmp_path.iterdir())
 
 
 def test_serve_names_another_secret_in_its_nssm_list_and_does_not_refuse_on_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    settings_file: str,
 ) -> None:
-    """The control for the refusal above: it may stop at a later gate, not at this one."""
-    _serve(tmp_path, monkeypatch, _PASSWORD_LISTED, warn=True)
+    """The control for the key refusal: it may stop at a later gate, not at this one."""
+    _serve(tmp_path, monkeypatch, _PASSWORD_LISTED, warn=True, service_config=settings_file)
     captured = capsys.readouterr()
     assert "is set in the environment of the Windows service" not in captured.err
     # serve installs its own stdout handler, so the loosening line is read from stdout.
     assert "service_environment_secret (MEFOR_STORE_PASSWORD is set in" in captured.out
 
 
-def test_supervise_refuses_a_store_key_in_its_nssm_list_before_it_starts_an_engine_shard(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    ("posture", "with_flag"),
+    [(_A_SERVICE, True), (_A_SHELL, False)],
+    ids=["service-with-flag", "shell-without-flag"],
+)
+def test_serve_runs_as_a_service_with_the_flag_and_from_a_shell_without_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    settings_file: str,
+    posture: ServiceEnvPosture,
+    with_flag: bool,
+) -> None:
+    """The control for the flag refusal: a service with the flag, and the developer loop."""
+    service_config = settings_file if with_flag else None
+    rc = _serve(tmp_path, monkeypatch, posture, warn=True, service_config=service_config)
+    err = capsys.readouterr().err
+    assert "--service-config" not in err
+    assert rc == 0, err
+
+
+@_REFUSALS
+def test_supervise_as_a_service_refuses_before_it_starts_an_engine_shard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    settings_file: str,
+    posture: ServiceEnvPosture,
+    with_flag: bool,
+    reason: str,
 ) -> None:
     from messagefoundry import __main__ as cli
 
@@ -491,7 +557,7 @@ def test_supervise_refuses_a_store_key_in_its_nssm_list_before_it_starts_an_engi
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")
-    monkeypatch.setattr(serviceenv, "service_env_posture", lambda: _KEY_LISTED)
+    monkeypatch.setattr(serviceenv, "service_env_posture", lambda: posture)
     monkeypatch.setattr("messagefoundry.pipeline.supervisor.supervise", fake_supervise)
     monkeypatch.setattr(cli, "configure_logging", lambda *args, **kwargs: None)
     args = argparse.Namespace(
@@ -499,14 +565,42 @@ def test_supervise_refuses_a_store_key_in_its_nssm_list_before_it_starts_an_engi
         db=str(tmp_path / "mefor.db"),
         base_port=8765,
         env="dev",
-        service_config=None,
+        service_config=settings_file if with_flag else None,
         project_root=str(tmp_path),
     )
     rc = cli._supervise(args)
     err = capsys.readouterr().err
     assert rc == 2 and not spawned
-    assert "MEFOR_STORE_ENCRYPTION_KEY is set in the environment of the Windows service" in err
+    # The key refusal's own line drops the "refusing to start: " prefix serve prints.
+    assert reason.removeprefix("refusing to start: ") in err
     assert "refusing to start the fleet" in err
+
+
+def test_only_a_known_service_with_no_settings_flag_is_refused() -> None:
+    cases = [
+        (_A_SERVICE, True),
+        # The service is known and only its lists could not be read: still a service.
+        (ServiceEnvPosture(ServiceEnvStatus.UNOBSERVABLE, service_name="MessageFoundry"), True),
+        (_A_SHELL, False),
+        # No service found, so the start may be a shell's, and the reading settles nothing.
+        (ServiceEnvPosture(ServiceEnvStatus.UNOBSERVABLE, detail="walk failed"), False),
+    ]
+    for posture, refused in cases:
+        reason = missing_service_config_refusal(posture, None)
+        assert (reason is not None) is refused, posture
+        if reason is not None:
+            assert "'MessageFoundry'" in reason and "-ServiceConfig <path>" in reason
+        assert missing_service_config_refusal(posture, str(_SAMPLES_CONFIG / "x.toml")) is None
+
+
+def test_a_service_refuses_a_relative_settings_flag() -> None:
+    """A relative --service-config with no --project-root is read from the working directory, the
+    file the flag refusal exists to keep out. The caller passes the flag anchored under the root,
+    so a relative flag with a root arrives absolute."""
+    for relative in ("messagefoundry.toml", str(Path("settings", "messagefoundry.toml"))):
+        reason = missing_service_config_refusal(_A_SERVICE, relative)
+        assert reason is not None and "which is not an absolute path" in reason, relative
+        assert missing_service_config_refusal(_A_SHELL, relative) is None
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the Windows probe reads this host")

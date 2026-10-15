@@ -4036,7 +4036,19 @@ jobs:
           # -LockConfigDir path that now runs AFTER ObjectName so the per-service SID resolves) + data-dir
           # read/write, gets SeServiceLogonRight, and actually starts and serves /health + MLLP. Pass
           # -AllowLocalSystem here if a run-as-LocalSystem smoke is ever needed instead.
-          .\scripts\service\install-service.ps1 -NssmDir $env:SMOKE_NSSM_DIR -AppExe $exe -Config samples\config -LogLevel INFO -Environment prod -LockConfigDir @cached
+          # Vault BACKLOG #2626 step 2: `serve` as the service refuses to start with no
+          # --service-config. This rig sets everything through the service's environment, so the
+          # file is empty. It sits in a folder of its own outside the checkout, so -LockConfigDir
+          # locks that folder with the config directory.
+          $serviceConfig = "C:\ProgramData\MessageFoundry-settings\messagefoundry.toml"
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $serviceConfig) | Out-Null
+          [System.IO.File]::WriteAllText($serviceConfig, "# windows-service-smoke: set through the service's environment.`n")
+          .\scripts\service\install-service.ps1 -NssmDir $env:SMOKE_NSSM_DIR -AppExe $exe -Config samples\config -ServiceConfig $serviceConfig -LogLevel INFO -Environment prod -LockConfigDir @cached
+          # The installer only warns when it cannot lock a folder, and `serve` would then refuse the
+          # settings file at start. So run the check `serve` runs on the file and its folder, and
+          # fail here, by name, rather than as a service that never comes up.
+          python -c "import sys; from pathlib import Path; from messagefoundry.config.wiring import assert_trusted_start_paths as check; check([Path(sys.argv[1])])" $serviceConfig
+          if ($LASTEXITCODE -ne 0) { throw "serve would refuse the settings file '$serviceConfig' (exit $LASTEXITCODE)" }
           # vault BACKLOG #2702: that install gives the service a restricted token. The samples
           # graph has File connections under the working directory (in\, dev-inbox\, out\), and a
           # grant to Users there no longer counts. So they get the grant docs/SERVICE.md tells an operator
