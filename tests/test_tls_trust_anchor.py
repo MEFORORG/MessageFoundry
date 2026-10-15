@@ -782,13 +782,13 @@ def test_hvac_clients_take_a_ca_only_when_one_is_configured(
     mod = importlib.import_module(module)
 
     monkeypatch.delenv(env_var, raising=False)
-    mod._build_client("https://vault.internal:8200", "s.token")
+    mod._build_client("https://vault.internal:8200", "s.token", revocation_attested=True)
     assert "verify" not in calls[-1], "an unconfigured hop must be constructed exactly as before"
     assert set(calls[-1]) == {"url", "token", "allow_redirects"}
 
     ca = _ca_pem(tmp_path, "mefor-vault-ca")
     monkeypatch.setenv(env_var, ca)
-    mod._build_client("https://vault.internal:8200", "s.token")
+    mod._build_client("https://vault.internal:8200", "s.token", revocation_attested=True)
     assert calls[-1]["verify"] == ca
 
 

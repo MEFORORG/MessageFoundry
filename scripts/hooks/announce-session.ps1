@@ -201,7 +201,7 @@ function Get-ClaimNotes {
 
 function Get-Wrapped {
     # THE LINE CAP IS A REFUSAL, NOT A FOLD, so an unwrapped body does not arrive ugly -- it does not
-    # arrive. mail.ps1:337-342 throws on any line over 240 chars, and the receiving drain
+    # arrive. mail.ps1:346-351 throws on any line over 240 chars, and the receiving drain
     # (mail-drain.ps1:236) cuts at the same number. Measured by a peer 2026-09-14: an ordinary one-line
     # intent of ~370 chars refused all 7 of its sends. The announce shape this hook dictates says
     # "intent: <one line>", so the hook cannot pass its own prescribed text through the lane unmodified.
@@ -266,7 +266,7 @@ function Get-AnnounceBody {
 
 function Send-AnnounceMail {
     # SHELLS OUT ON PURPOSE. Writing the inbox file directly would be faster and is the wrong trade:
-    # mail.ps1:324 says its caps are advisory because "anyone who can write a file into the inbox never
+    # mail.ps1:333 says its caps are advisory because "anyone who can write a file into the inbox never
     # runs this code", and the ENFORCING copy (mail-drain.ps1:216-236) truncates instead of refusing. So
     # bypassing mail.ps1 swaps a loud refusal here for a silent mid-sentence cut at the far end.
     param([string]$Script, [string]$To, [string]$Body, [int]$TtlMinutes)

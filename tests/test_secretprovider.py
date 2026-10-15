@@ -74,7 +74,7 @@ class _FakeClient:
 
 def _patch_vault(monkeypatch: pytest.MonkeyPatch, kv_v2: _FakeKvV2) -> None:
     monkeypatch.setattr(
-        secretprovider_vault, "_build_client", lambda addr, token: _FakeClient(kv_v2)
+        secretprovider_vault, "_build_client", lambda addr, token, **_: _FakeClient(kv_v2)
     )
 
 
@@ -177,7 +177,7 @@ def test_vault_kv_failure_fails_closed_without_leaking(monkeypatch: pytest.Monke
     monkeypatch.setattr(
         secretprovider_vault,
         "_build_client",
-        lambda addr, token: _FakeClient(_BoomKv()),  # type: ignore[arg-type]
+        lambda addr, token, **_: _FakeClient(_BoomKv()),  # type: ignore[arg-type]
     )
     provider = secretprovider_vault.build_provider(SecretsSettings())
     with pytest.raises(SecretProviderError) as excinfo:

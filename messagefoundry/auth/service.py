@@ -54,6 +54,7 @@ from messagefoundry.auth.identity import ALL_CHANNELS, AuthProvider, Identity, S
 from messagefoundry.auth.ldap import (
     AdPrincipal,
     DirectoryAnswer,
+    KerberosTokenRefused,
     LdapAuthenticator,
     LdapError,
     LdapReferralError,
@@ -135,6 +136,7 @@ from messagefoundry.store.row_seal import (
     USER_KIND,
     RowSealer,
     RowSealError,
+    SealFailureThrottle,
 )
 from messagefoundry.store.store import (
     AD_ROLE_MAP,
@@ -2268,10 +2270,6 @@ def oidc_client_auth_from_settings(
 
 #: The audit action written when an authority row fails its integrity seal (BACKLOG #2592).
 AUTHORITY_SEAL_FAILED_ACTION: Final = "integrity.authority_seal_failed"
-#: How often one failing row is reported again while it keeps being presented, in seconds.
-_SEAL_FAILURE_REPORT_INTERVAL_SECONDS: Final = 300.0
-#: How many failing rows the report throttle remembers; the oldest is forgotten first.
-_SEAL_FAILURE_TRACK_MAX: Final = 1024
 #: How much of a session's token hash a log line, audit row or alert names. Twelve hex characters, as
 #: the ``auth.session_revoked`` rows already record.
 _SESSION_REF_LEN: Final = 12
@@ -2353,7 +2351,7 @@ class AuthService:
         self._admin_loss_alert = admin_loss_alert
         # Session token-hash prefix -> monotonic time its seal failure was last reported, so one
         # bad row presented on every request writes one audit row and one alert per interval.
-        self._seal_failures_reported: dict[str, float] = {}
+        self._seal_failures_reported = SealFailureThrottle()
         # #285 (ASVS 6.7.1): the ADR 0148 [security].enforcement dial, threaded in by the caller
         # (the lifespan passes trust_anchors_enforcing). It gates the OIDC anchor's construction-site
         # ACL preflight in build_idp_opener below so a group/world-writable anchor WARNS (not refuses)
@@ -3538,7 +3536,7 @@ class AuthService:
             # window, not as its branch finishes (BACKLOG #1131, Manager decision 2026-09-28).
             # Written as the branch finished, a row's ``ts``, and the moment it appeared to a reader
             # polling ``GET /audit``, showed how much work the branch did: a refusal by a live lock
-            # does one dummy verify, a verified refusal also reads the TOTP secret and counts the
+            # does one dummy verify, a verified refusal also checks the TOTP code and counts the
             # failure, and only a right candidate arms the second-step lock. The point is the
             # equalizer's own floor, half a budget past the attempt's turn in the queue, so the rows
             # land there on every branch whose work fits in half a budget (the same condition the
@@ -3549,21 +3547,71 @@ class AuthService:
             # write different numbers of rows. The COUNT still runs before this, so counting is
             # unchanged.
             after_pad: list[Callable[[], Awaitable[None]]] = []
-            outcome = await self._dispatch_login(
-                username,
-                password,
-                provider=provider,
-                client=client,
-                supersedes=supersedes,
-                totp_code=totp_code,
-                arrived=arrived,
-                after_pad=after_pad,
-            )
+            try:
+                outcome = await self._dispatch_login(
+                    username,
+                    password,
+                    provider=provider,
+                    client=client,
+                    supersedes=supersedes,
+                    totp_code=totp_code,
+                    arrived=arrived,
+                    after_pad=after_pad,
+                )
+            except RowSealError as refused:
+                if refused.kind != USER_KIND:
+                    raise  # another record's seal: its own handler, as before BACKLOG #3510
+                outcome = self._sign_in_seal_refused(
+                    username,
+                    after_pad,
+                    client=client,
+                    combined=bool(totp_code and totp_code.strip()),
+                )
             # The room is set on every branch, whether it deferred rows or not, so every refusal
             # answers on the same slot.
             return await self._equalize_failure(
                 outcome, started, seam="login", queued=queued, writes=after_pad, write_room=True
             )
+
+    def _sign_in_seal_refused(
+        self,
+        username: str,
+        after_pad: list[Callable[[], Awaitable[None]]],
+        *,
+        client: str | None,
+        combined: bool,
+    ) -> LoginOutcome:
+        """The sign-in's answer when a store write refused the account's record because it no
+        longer passes its seal (BACKLOG #3510): it was checked at load, then changed outside the
+        store, before a write. The same refusal as a wrong password, padded the same way by
+        :meth:`login`.
+
+        Not named ``_login*``: see :meth:`login`. The rows are deferred to ``after_pad`` with the
+        other refused rows, so their timing shows nothing: the ``auth.login_failed`` row a wrong
+        credential writes, then a reload through the checked loader, which reports a record that
+        still fails. One put back in between passes, leaving the warning logged here and the
+        failed-sign-in row. The failure count did not run, since its write was the one refused. A
+        store error in the reload is logged, never raised, so the answer stays the fixed one."""
+        _log.warning(
+            "sign-in refused for %r: the account's record failed its integrity seal during the "
+            "sign-in",
+            scrub_log_argument(username),
+        )
+
+        async def report() -> None:
+            await self._audit(
+                "auth.login_failed",
+                actor=username,
+                detail=_local_refusal_detail(_LOCAL_REFUSAL_REASON, combined=combined),
+                client=client,
+            )
+            try:
+                await self._load_user_by_username(username)
+            except _audit_write_errors():
+                _log.exception("sign-in refusal: the account could not be read again to report it")
+
+        after_pad.append(report)
+        return LoginOutcome(ok=False, error="invalid credentials")
 
     async def _dispatch_login(
         self,
@@ -3905,12 +3953,13 @@ class AuthService:
         verified = await self._argon2(verify_password, stored or _DUMMY_PASSWORD_HASH, password)
         password_ok = stored is not None and verified
         # A stored secret that will not decrypt or decode is a wrong code, logged, and never an
-        # exception: this read is reachable WITHOUT the password here, so an unpadded 500 would name
-        # the account as enrolled to anyone who knows the username. The catch is broad on purpose,
-        # as in ``_classify_login_address``: each backend's cipher and driver raise their own
-        # classes, which ``auth/`` does not import, and every arm fails CLOSED (the code is wrong).
+        # exception: this decrypt is reachable WITHOUT the password here, so an unpadded 500 would
+        # name the account as enrolled to anyone who knows the username. The secret comes from the
+        # checked record, so no driver runs here since BACKLOG #3510; the catch stays broad because
+        # each backend's cipher raises its own classes, which ``auth/`` does not import, and every
+        # arm fails CLOSED (the code is wrong). ``consume_totp_step`` below is outside it.
         try:
-            secret = await self._store.get_totp_secret(user.id)
+            secret = self._totp_secret(user)
             step = (
                 totp.verify_totp_step(
                     secret,
@@ -4025,7 +4074,18 @@ class AuthService:
                 username,
                 tie_break_object_id=await self._stored_directory_object_id(username),
             )
+        except KerberosTokenRefused as exc:
+            # BACKLOG #3196: audited as a failed sign-in, not a directory outage. An acceptor key
+            # fault in the step (a keytab miss, a rotated service password) also lands here;
+            # kerberos_principal logs the error's class and status codes at WARNING, and its text
+            # only in a DEBUG traceback.
+            await self._directory_reject_audit(
+                "<kerberos>", "kerberos", "token_refused", client=client, error=exc.error_type
+            )
+            return LoginOutcome(ok=False, error="SSO authentication failed")
         except LdapError as exc:
+            # Reached from settings, from the directory, or from a principal read after the step
+            # accepted the token. kerberos_principal turns every failure of the step into the arm above.
             await self._audit(
                 "auth.login_error",
                 actor="<kerberos>",
@@ -5135,20 +5195,19 @@ class AuthService:
         return LoginOutcome(ok=False, error="invalid credentials", reason=reason)
 
     async def _directory_reject_audit(
-        self, actor: str, mech: str, reason: str, *, client: str | None
+        self, actor: str, mech: str, reason: str, *, client: str | None, error: str | None = None
     ) -> None:
         """Audit a rejected directory-SSO attempt. ``mech`` is the mechanism slug ("kerberos" /
         "oidc"); ``reason`` must come from a closed set so no IdP-influenced text is ever stored.
+        ``error``, when given, is an exception's TYPE name, never its message (BACKLOG #3196).
 
         ``client`` is keyword-only with no default, so every caller must name it (BACKLOG #2132).
         The type still accepts ``None``, so this forces a decision and does not enforce an address.
         A run of refusals is how a spray shows, and the operator needs to see its source."""
-        await self._audit(
-            "auth.login_failed",
-            actor=actor,
-            detail=_json({"provider": "ad", "mech": mech, "reason": reason}),
-            client=client,
-        )
+        detail: dict[str, object] = {"provider": "ad", "mech": mech, "reason": reason}
+        if error is not None:
+            detail["error"] = error
+        await self._audit("auth.login_failed", actor=actor, detail=_json(detail), client=client)
 
     async def _complete_ad_login(
         self,
@@ -7838,7 +7897,7 @@ class AuthService:
         an :data:`AUTHORITY_SEAL_FAILED_ACTION` audit row and an ``integrity_drift`` alert. The
         caller denies; the engine keeps running.
 
-        Reports are rate-limited per row, once per :data:`_SEAL_FAILURE_REPORT_INTERVAL_SECONDS`,
+        Reports are rate-limited per row, once per :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`,
         for a row the revoke could not end. Each names the row by a short prefix of its token hash,
         never a row value. A store refusal of the revoke or the audit write is logged, not raised,
         so it does not turn a denial into an error."""
@@ -7863,18 +7922,12 @@ class AuthService:
     async def _report_seal_failure(self, key: str, reason: str, detail: dict[str, str]) -> None:
         """Report one authority row that failed its integrity seal (BACKLOG #2592): a WARNING, an
         :data:`AUTHORITY_SEAL_FAILED_ACTION` audit row carrying ``detail``, and an
-        ``integrity_drift`` alert, at most once per :data:`_SEAL_FAILURE_REPORT_INTERVAL_SECONDS`
+        ``integrity_drift`` alert, at most once per :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`
         per ``key``. ``reason`` and ``detail`` name the row by an id, never a row value. A store
         refusal of the audit write is logged, not raised, so it does not turn a denial into an
         error."""
-        now = time.monotonic()
-        last = self._seal_failures_reported.get(key)
-        if last is not None and now - last < _SEAL_FAILURE_REPORT_INTERVAL_SECONDS:
+        if not self._seal_failures_reported.due(key):
             return
-        self._seal_failures_reported.pop(key, None)
-        if len(self._seal_failures_reported) >= _SEAL_FAILURE_TRACK_MAX:
-            self._seal_failures_reported.pop(next(iter(self._seal_failures_reported)))
-        self._seal_failures_reported[key] = now
         _log.warning("%s", reason)
         await write_audit_soft(
             lambda: self._audit(AUTHORITY_SEAL_FAILED_ACTION, detail=_json(detail)),
@@ -7986,6 +8039,12 @@ class AuthService:
                 user = reread
         await self._user_seal_failed(user.id)
         return None
+
+    def _totp_secret(self, user: VerifiedUser) -> str | None:
+        """``user``'s TOTP secret, decrypted from the record its seal covered (BACKLOG #3510), or
+        ``None``. Never a second read of the store: a secret swapped in after the checked load would
+        be checked against no seal, and its codes would sign in."""
+        return self._store.open_totp_secret(user.id, user.totp_secret_cell)
 
     async def _verified_passkeys(self, user: VerifiedUser) -> list[WebAuthnCredential] | None:
         """The account's passkeys, or ``None`` when they do not match the digest its seal covers
@@ -10009,7 +10068,7 @@ class AuthService:
         user = await self._load_user(identity.user_id)
         if user is None:
             raise ValueError("no such user")
-        secret = await self._store.get_totp_secret(identity.user_id)
+        secret = self._totp_secret(user)
         if not secret:
             raise ValueError("no enrollment in progress")
         if await self._enrolment_too_early(
@@ -10515,7 +10574,7 @@ class AuthService:
         if not code:
             return False
         totp_refused = False
-        secret = await self._store.get_totp_secret(user.id)
+        secret = self._totp_secret(user)
         if secret:
             # Clock-skew window is operator-configurable (BACKLOG #187; ASVS 6.5.5). Default
             # totp_skew_steps=0 accepts only the current 30 s step (strict, tightest replay window);

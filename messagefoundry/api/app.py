@@ -1169,8 +1169,9 @@ def _build_approval_gate(
         actor = str(p["requester"])
         # Vault BACKLOG #2596, step 3: the release loads only the bytes the approval named. A hold
         # whose params carry no digest (none is filed that way now) binds to None, which matches
-        # nothing, so it is refused as a mismatch once its directory resolves. The digest is not sealed: a writer to
-        # pending_approvals can replace it with the params (vault BACKLOG #2592).
+        # nothing, so it is refused as a mismatch once its directory resolves. On a store that holds
+        # a key the params are sealed with the rest of the request, so a writer to pending_approvals
+        # who changes the digest leaves a request the gate refuses (vault BACKLOG #2592).
         approved = p.get("fingerprint")
         approval = ApprovedConfig(approved if isinstance(approved, str) else None)
         # reload_detail for parity with the inline route (BACKLOG #1111): a released reload that
@@ -1369,6 +1370,9 @@ def _posture_loosenings(
             # managed lifespan stashed. The same stash-or-default rule: an app built without it
             # is read at the shipped default, which names nothing.
             backup=getattr(state, "backup_settings", None) or BackupSettings(),
+            # Vault BACKLOG #2983: the secret provider's Vault revocation attestation, off the
+            # [secrets] section the managed lifespan stashed. The same stash-or-default rule.
+            secrets=getattr(state, "secrets_settings", None) or SecretsSettings(),
             store_privilege=store_privilege,
             # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
             audit_chain_unkeyed=engine.store.audit_chain_unkeyed(),
@@ -3000,8 +3004,19 @@ def create_app(
     # there is no bound to share and nothing durable to charge.
     app.state.upload_store = None
     if store_settings is not None and store_settings.uploads_dir:
+        # Vault BACKLOG #2983: `serve` reaches this build before its lifespan opens the store, so
+        # it is handed the instance posture the lifespan derives. None (no [ai]) is enforcing.
+        posture = (
+            hop_posture_from_ai(
+                ai_settings, enforcement=(security_settings or SecuritySettings()).enforcement
+            )
+            if ai_settings is not None
+            else None
+        )
         upload_cipher = (
-            engine.store.cipher() if engine is not None else build_store_cipher(store_settings)
+            engine.store.cipher()
+            if engine is not None
+            else build_store_cipher(store_settings, posture=posture)
         )
         app.state.upload_store = UploadStore(
             store_settings.uploads_dir,
@@ -9848,7 +9863,9 @@ def create_managed_app(
         # An unknown provider / missing extra fails closed HERE (resolve_secret_provider raises), refusing
         # startup rather than degrading to a blank credential.
         secret_provider = (
-            resolve_secret_provider(secrets_settings) if secrets_settings is not None else None
+            resolve_secret_provider(secrets_settings, posture=_hop_posture)
+            if secrets_settings is not None
+            else None
         )
         notifier = (
             notifier_from_settings(
@@ -10324,6 +10341,10 @@ def create_managed_app(
             # None (direct create_app / embedding) leaves the route on the shipped [backup]
             # defaults, which report nothing.
             app.state.backup_settings = backup_settings
+            # Vault BACKLOG #2983: back GET /security/posture's secrets.vault_revocation_attested
+            # entry. None (direct create_app / embedding) leaves the route on the shipped
+            # [secrets] defaults, which report nothing.
+            app.state.secrets_settings = secrets_settings
             # BACKLOG #1004: back GET /security/posture's enforce_store_key_expiry loosening entry.
             # None (direct create_app / embedding) leaves the route on shipped defaults, which report
             # nothing — correct, because an app built without [secret_rotation] has not opted out.

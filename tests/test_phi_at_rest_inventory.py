@@ -1845,13 +1845,13 @@ _CODE_PROBE_DELETIONS: tuple[tuple[str, str, str, Callable[[str], bool]], ...] =
     ),
     (
         "pipeline/dr_backup.py",
-        "resolve_active_key(self._store_settings)",
+        "resolve_active_key(self._store_settings, posture=self._hop_posture)",
         "None",
         lambda src: source_calls(src, "resolve_active_key"),
     ),
     (
         "pipeline/dr_backup.py",
-        "build_store_cipher(settings)",
+        "build_store_cipher(settings, posture=posture)",
         "None",
         lambda src: source_calls(src, "build_store_cipher"),
     ),

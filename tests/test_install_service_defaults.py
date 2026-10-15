@@ -135,6 +135,18 @@ def test_the_settings_file_and_project_root_are_registered_by_absolute_path() ->
     assert "$ProjectRoot = Resolve-AbsolutePath $ProjectRoot" in text
 
 
+def test_the_install_refuses_when_there_is_no_settings_file_to_register() -> None:
+    """Vault BACKLOG #2626 step 2: `serve` as the service refuses to start with no
+    --service-config, so the installer refuses at install time instead of registering a service
+    that cannot start. The refusal sits after the default is looked up and before the command line
+    is built, so nothing has acted yet."""
+    text = _text()
+    default = text.index("else { $ServiceConfig = Get-DefaultServiceConfig -Anchor $ValuesAnchor }")
+    refusal = text.index('if (-not $ServiceConfig) {\n    throw ("no settings file to register: ')
+    params = text.index("$AppParams = ")
+    assert default < refusal < params
+
+
 def test_lock_config_dir_locks_each_start_folder_it_may() -> None:
     """``-LockConfigDir`` locks the value folder and the settings file's folder with the config
     directory, each only when Get-LockPathProblem clears it. The settings folder must also not sit

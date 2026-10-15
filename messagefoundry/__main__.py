@@ -2463,6 +2463,22 @@ def _start_files_refused(service_config: str | None, env_file: Path, *, fleet: s
     return False
 
 
+def _missing_service_config_refused(service_config: str | None, *, fleet: str = "") -> bool:
+    """Vault BACKLOG #2626 step 2: True, with the reason printed, when this start is the Windows
+    service and has no absolute ``--service-config``. ``service_config`` is the flag anchored under
+    ``--project-root``. Called before the settings load, so the service never reads a
+    ``messagefoundry.toml`` from its working directory. A start from a shell is unchanged.
+    ``serve`` and ``supervise`` both call it; ``fleet`` says the supervisor refuses for its
+    engine shards."""
+    from messagefoundry.serviceenv import missing_service_config_refusal, service_env_posture
+
+    refused = missing_service_config_refusal(service_env_posture(), service_config)
+    if refused is None:
+        return False
+    print(f"error: refusing to start: {refused}.{f' {fleet}' if fleet else ''}", file=sys.stderr)
+    return True
+
+
 def _serve(args: argparse.Namespace) -> int:
     # Vault BACKLOG #2700: first in this function, ahead of the imports below and of config,
     # because a script injected before the hook is in place runs. It is NOT first in the process:
@@ -2532,6 +2548,8 @@ def _serve(args: argparse.Namespace) -> int:
     config_dir = anchor_under_root(args.config, root, cwd=cwd)
     assert config_dir is not None  # args.config always has a string default
     service_config = anchor_under_root(args.service_config, root, cwd=cwd)
+    if _missing_service_config_refused(service_config):
+        return 2
 
     # Only pass flags the user actually supplied so they override env/file but an unset flag doesn't.
     cli: dict[str, dict[str, object]] = {}
@@ -2949,6 +2967,7 @@ def _serve(args: argparse.Namespace) -> int:
         approvals=settings.approvals,
         cert_monitor=settings.cert_monitor,
         backup=settings.backup,
+        secrets=settings.secrets,
         store_privilege=None,
         audit_chain_unkeyed=None,
         remote_debug=remote_debug_posture(),
@@ -4844,6 +4863,12 @@ def _supervise(args: argparse.Namespace) -> int:
     # anchor_under_root(None, ...) returns None (config/anchor.py), so this is safe when unset; each child
     # re-anchors the raw --service-config to the same path under the forwarded --project-root.
     service_config = anchor_under_root(args.service_config, root, cwd=cwd)
+    # Each engine shard is started with the same --service-config, so each would refuse.
+    if _missing_service_config_refused(
+        service_config,
+        fleet="Every engine shard would refuse to start; refusing to start the fleet.",
+    ):
+        return 2
     # `--env` goes into the settings as `serve` puts it (BACKLOG #2356), so one validated value
     # names the environment for every gate below, and a name `serve` refuses at load is refused
     # here. Each engine shard is still started with the flag itself.
@@ -6351,6 +6376,23 @@ def _host_gated_store_settings(
     return settings
 
 
+def _seal_refusal(username: str, act: str) -> str:
+    """The fixed refusal of a host command whose write the store refused because the account's
+    record fails its integrity seal (BACKLOG #3510). Logs it and returns the text, which the caller
+    ends by saying what was written. The error carries the record's kind only, so neither names a
+    stored value. A missing key fails the check the same way as a change, so the text names both."""
+    logging.getLogger(__name__).warning(
+        "%s refused for %r: the account's record failed its integrity seal", act, username
+    )
+    return (
+        f"the store refused the {act} for {username!r}: its record fails its integrity seal under "
+        "the store keys this shell holds. Either a retired store key it was sealed under is not "
+        "configured here, or the record was changed outside the engine. Check the key "
+        "configuration first; if it is right, read the audit log and restore the account from a "
+        "backup"
+    )
+
+
 def _admin_unlock(args: argparse.Namespace) -> int:
     """Clear a local account's lockout from the host (BACKLOG #1236, ADR 0171).
 
@@ -6379,6 +6421,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         StoreNotFoundError,
         open_store,
     )
+    from messagefoundry.store.row_seal import RowSealError
 
     settings = _host_gated_store_settings(args)
     if isinstance(settings, int):
@@ -6430,6 +6473,11 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     ) as exc:
         _emit_error(str(exc), as_json=args.json)
         return 2
+    except RowSealError:
+        # BACKLOG #3510: the store's write helper refused the clear, writing nothing.
+        return _emit_error(
+            _seal_refusal(args.username, "unlock") + ". Nothing was written", as_json=args.json
+        )
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
     if outcome == "no-such-user":
@@ -7057,7 +7105,9 @@ def _check_privileges(args: argparse.Namespace) -> int:
     posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
     report = run_guarded(probe_store_privileges(settings.store, posture=posture))
     others = settings_hops(
-        settings, vault_probe=probe_vault, ldap_probe=lambda: read_ldap_bind(settings, posture)
+        settings,
+        vault_probe=functools.partial(probe_vault, settings=settings, posture=posture),
+        ldap_probe=lambda: read_ldap_bind(settings, posture),
     )
     hops = [store_hop(report, settings.store), *others]
     code = exit_code_for(hops)
@@ -7283,8 +7333,13 @@ def _keyless_store_gate(settings: ServiceSettings) -> str | None:
     return keyless_opt_out_refusal(settings.store, settings.security)
 
 
-def _offline_security_notifier(settings: ServiceSettings) -> SecurityEventNotifier | None:
+def _offline_security_notifier(
+    settings: ServiceSettings, posture: HopPosture | None = None
+) -> SecurityEventNotifier | None:
     """The per-user security notifier ``serve`` would wire, built for an offline command (#2019).
+
+    ``posture`` is the caller's instance posture, for the Vault hop a ``[secrets]`` read can dial
+    (vault BACKLOG #2983). ``None`` counts as enforcing there.
 
     Same conditions as the API lifespan: ``[auth].notify_security_events`` on, and an ``[alerts]``
     SMTP host and sender. ``None`` otherwise, and the caller's notice is then dropped with the
@@ -7327,7 +7382,7 @@ def _offline_security_notifier(settings: ServiceSettings) -> SecurityEventNotifi
     try:
         return security_notifier_from_settings(
             alerts,
-            secret_provider=resolve_secret_provider(settings.secrets),
+            secret_provider=resolve_secret_provider(settings.secrets, posture=posture),
             trust_anchor_policy=settings.tls.policy(),
         )
     except Exception as exc:  # noqa: BLE001 - best-effort channel; the recovery must not die here
@@ -7453,7 +7508,7 @@ def _build_provision_auth_service(
 
     refusal: str | None = None
     try:
-        secret_provider = resolve_secret_provider(settings.secrets)
+        secret_provider = resolve_secret_provider(settings.secrets, posture=posture)
     except SecretProviderError:
         refusal = _PROVISION_AUTH_REFUSALS["provider"]
     if refusal is not None:
@@ -7661,7 +7716,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # first fail at the write, after the prompt. Resolved now and discarded; the write
             # resolves it again, which costs a second Vault round trip. Nothing is created. A
             # server backend resolved it inside the open, before it found no store.
-            build_store_cipher(settings.store)
+            build_store_cipher(settings.store, posture=posture)
     except (StoreKeylessError, CipherError) as exc:
         # CipherError: a keyed open met a row it cannot read, or one that decrypted to something
         # that is not JSON (BACKLOG #2308). Its text names the table or key id, never the value.
@@ -7777,7 +7832,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # nothing about a notice it does not owe. Attached, not passed to the build (#2081).
             existing = await store.get_user_by_username(username)
             security_notifier = (
-                _offline_security_notifier(settings) if existing is not None else None
+                _offline_security_notifier(settings, posture) if existing is not None else None
             )
             service.attach_security_notifier(security_notifier)
             if security_notifier is not None:
@@ -7965,6 +8020,7 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         store_driver_errors,
     )
     from messagefoundry.store.crypto import CipherError, StoreKeylessError
+    from messagefoundry.store.row_seal import RowSealError
 
     settings = _host_gated_store_settings(args)
     if isinstance(settings, int):
@@ -7990,7 +8046,13 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
     # shell, or the current range's key not held) is asked before the append, so that refusal does
     # not arrive here (BACKLOG #2124); a failure the check cannot predict still can. `OSError` covers
     # a server backend's lost connection; the rest are the drivers' own bases, which subclass neither.
-    store_errors: tuple[type[Exception], ...] = (RuntimeError, OSError, *store_driver_errors())
+    # RowSealError (BACKLOG #3510): the account's record fails its seal, so the write helper refused.
+    store_errors: tuple[type[Exception], ...] = (
+        RuntimeError,
+        OSError,
+        RowSealError,
+        *store_driver_errors(),
+    )
 
     async def run() -> tuple[str, str, str]:
         """``(outcome, username, extra)``: ``extra`` is the store for ``set``, else an error text."""
@@ -8056,6 +8118,8 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
                     logged = f"appending the matching _failed audit row also failed ({follow})"
                 if not isinstance(exc, store_errors):
                     raise  # not a store refusal but a defect: the dispatch floor reports it
+                if isinstance(exc, RowSealError):  # BACKLOG #3510: re-running cannot help
+                    return ("seal-refused", user.username, logged)
                 return ("write-failed", user.username, f"{exc}; {logged}")
             return ("set", user.username, store.path)
         finally:
@@ -8084,6 +8148,13 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         # `StoreKeylessError`. Exit 1 stays a refusal about the account.
         _emit_error(f"{_sentence(extra)} Nothing was written", as_json=args.json)
         return 2
+    if outcome == "seal-refused":  # BACKLOG #3510; its own branch, since the text logs a warning
+        refused = _seal_refusal(username, "address write")
+        return _emit_error(
+            f"{refused}. The audit row for the change was written first; the address is NOT set, "
+            f"and {extra}",
+            as_json=args.json,
+        )
     refusals = {
         "no-such-user": f"no account named {username!r}",
         "not-admin": f"the account {username!r} is not an Administrator; the start gate asks only "
@@ -8198,6 +8269,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         store_driver_errors,
     )
     from messagefoundry.store.crypto import CipherError, StoreKeylessError
+    from messagefoundry.store.row_seal import RowSealError
     from messagefoundry.store.store import AuditAppend
 
     settings = _host_gated_store_settings(args)
@@ -8218,8 +8290,14 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         sqlite3.DatabaseError,
         *could_not_start,
     )
-    # A refused write on every backend (BACKLOG #1983), as admin-set-notify-email names them.
-    store_errors: tuple[type[Exception], ...] = (RuntimeError, OSError, *store_driver_errors())
+    # A refused write on every backend (BACKLOG #1983), as admin-set-notify-email names them, and a
+    # record that fails its seal, which the write helper refuses (BACKLOG #3510).
+    store_errors: tuple[type[Exception], ...] = (
+        RuntimeError,
+        OSError,
+        RowSealError,
+        *store_driver_errors(),
+    )
 
     def open_refused(exc: Exception, *, hint: str = "") -> int:
         """The exit for a refusal raised while a store was opened or checked: nothing written.
@@ -8405,9 +8483,15 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
                 # Only a store refusal that the re-read confirms becomes a refusal; anything else
                 # is re-raised, after the re-read has said whether the swap landed.
                 landed = await swap_landed(store, user.id)
-                if landed is False and not isinstance(exc, store_errors):
-                    raise
                 if landed is False:
+                    if not isinstance(exc, store_errors):
+                        raise
+                    if isinstance(exc, RowSealError):
+                        return (
+                            _seal_refusal(user.username, "seed replacement")
+                            + ". Nothing was written."
+                            + unused_entry
+                        )
                     # One transaction: the seed, the session sweep and the audit row rolled back
                     # as one, and the re-read confirms the old seed is still there. The class
                     # only: a driver's message can quote a stored value (ASVS 16.5.4).
@@ -10218,6 +10302,7 @@ def _security(args: argparse.Namespace) -> int:
         BackupSettings,
         CertMonitorSettings,
         SecretRotationSettings,
+        SecretsSettings,
         SecuritySettings,
         StoreSettings,
         security_loosenings,
@@ -10226,7 +10311,7 @@ def _security(args: argparse.Namespace) -> int:
     path = args.service_config
 
     # This subcommand edits [security], but security_loosenings() also reports [store]/[auth]/[alerts]/
-    # [secret_rotation]/[api]/[approvals]/[cert_monitor]/[backup] deviations (ADR 0148: one posture). Resolve those from the whole file so the
+    # [secret_rotation]/[api]/[approvals]/[cert_monitor]/[backup]/[secrets] deviations (ADR 0148: one posture). Resolve those from the whole file so the
     # list is complete. If the file will
     # not load — it may be invalid OUTSIDE [security], which must not break `security show` — fall back to
     # the shipped defaults and SAY SO via the emitted `loosenings_partial` marker, rather than silently
@@ -10249,6 +10334,8 @@ def _security(args: argparse.Namespace) -> int:
     _cert_monitor = CertMonitorSettings()
     # Vault BACKLOG #2302: [backup].allow_unencrypted is a loosening too. Same read and marker.
     _backup = BackupSettings()
+    # Vault BACKLOG #2983: [secrets].vault_revocation_attested is a loosening too. Same read and marker.
+    _secrets = SecretsSettings()
     if Path(path).exists():
         # An ABSENT file is not a degraded read — the shipped defaults ARE the effective posture there,
         # and `security show` is expected to work offline before any config exists. Only a file that
@@ -10263,6 +10350,7 @@ def _security(args: argparse.Namespace) -> int:
             _approvals = _full.approvals
             _cert_monitor = _full.cert_monitor
             _backup = _full.backup
+            _secrets = _full.secrets
 
     def _loosenings(sec: SecuritySettings) -> list[dict[str, str]]:
         # This CLI reads a SETTINGS file and never loads the connection graph — nor does it open the
@@ -10295,6 +10383,7 @@ def _security(args: argparse.Namespace) -> int:
                 approvals=_approvals,
                 cert_monitor=_cert_monitor,
                 backup=_backup,
+                secrets=_secrets,
                 store_privilege=None,
                 audit_chain_unkeyed=None,
                 remote_debug=None,

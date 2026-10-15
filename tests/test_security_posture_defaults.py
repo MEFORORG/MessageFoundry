@@ -41,6 +41,7 @@ from messagefoundry.config.settings import (
     CertMonitorSettings,
     EgressSettings,
     SecretRotationSettings,
+    SecretsSettings,
     SecuritySettings,
     ServiceSettings,
     StoreBackend,
@@ -84,6 +85,7 @@ def _pairs(
     approvals: ApprovalsSettings | None = None,
     cert_monitor: CertMonitorSettings | None = None,
     backup: BackupSettings | None = None,
+    secrets: SecretsSettings | None = None,
 ) -> list[tuple[str, str]]:
     """The loosening ``(switch, risk)`` pairs for a settings combination (defaults where not
     overridden)."""
@@ -105,6 +107,7 @@ def _pairs(
         approvals=approvals or ApprovalsSettings(),
         cert_monitor=cert_monitor or CertMonitorSettings(),
         backup=backup or BackupSettings(),
+        secrets=secrets or SecretsSettings(),
         store_privilege=None,
         audit_chain_unkeyed=None,
         remote_debug=None,
@@ -162,6 +165,7 @@ def test_aad_bind_off_is_a_named_loosening() -> None:
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
             backup=BackupSettings(),
+            secrets=SecretsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -199,6 +203,7 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
             backup=BackupSettings(),
+            secrets=SecretsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -233,6 +238,7 @@ def test_recheck_zero_with_ad_enabled_is_a_named_loosening() -> None:
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
             backup=BackupSettings(),
+            secrets=SecretsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -328,6 +334,7 @@ def test_new_ip_step_up_off_is_a_named_loosening() -> None:
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
             backup=BackupSettings(),
+            secrets=SecretsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -489,6 +496,7 @@ def _risk(auth: AuthSettings, switch: str) -> str | None:
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
             backup=BackupSettings(),
+            secrets=SecretsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -1636,6 +1644,7 @@ def test_the_plaintext_hop_acknowledgement_is_a_named_loosening() -> None:
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
             backup=BackupSettings(),
+            secrets=SecretsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -2389,6 +2398,7 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
             backup=BackupSettings(),
+            secrets=SecretsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -2438,6 +2448,7 @@ def test_expiry_relaxation_is_a_named_loosening() -> None:
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
             backup=BackupSettings(),
+            secrets=SecretsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -2478,6 +2489,7 @@ def test_generic_odbc_unenforced_tls_is_a_named_loosening() -> None:
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
             backup=BackupSettings(),
+            secrets=SecretsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -2515,6 +2527,7 @@ def test_revocation_attestation_is_a_named_loosening() -> None:
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
             backup=BackupSettings(),
+            secrets=SecretsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -2894,6 +2907,12 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
         "allow_unencrypted_phi",  # reported via [security].allow_unencrypted_phi (ADR 0118 move)
         # secure_delete left this set when vault BACKLOG #2619 began naming it; the loop below now
         # pins that it is reported, and its own tests pin the file-backed condition.
+        #
+        # REPORTED, so not an owed gap (vault BACKLOG #2983): named as
+        # `store.vault_revocation_attested`, with its section, because [secrets] has a field of
+        # the same name. This loop's lone flip cannot build it: the flag refuses to load without
+        # its reason. tests/test_vault_revocation_attestation.py pins the entry.
+        "vault_revocation_attested",
     }
     exempt_auth = {
         # Vault BACKLOG #2600 re-read this set. require_action_step_up and the three

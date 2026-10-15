@@ -945,6 +945,30 @@ bind-guard ladder above:
   `ssl=True`, so the CRL needed a pinned CA and the refusal named both settings. Setting
   `[store].ssl_crl_file` on a store hop that verifies nothing is refused at load rather than ignored.
 
+  **The three Vault hops are gated too, by a guard of their own** (vault BACKLOG #2983, owner
+  ruling 2026-10-13). They are the store key provider (`key_provider = "vault"`), the Transit
+  cipher (`cipher_provider = "vault_transit"`) and the connector secret provider
+  (`[secrets].provider = "vault"`). An `https://` Vault that is off the box is refused unless that
+  hop is attested. Plan for at least these four differences from the hops above:
+
+  - **The lever is a settings pair, and it is the only one.** Set
+    `[store].vault_revocation_attested = true` with a `[store].vault_revocation_attested_reason`
+    for the two store hops, or the same pair under `[secrets]` for the secret provider. No CRL
+    lever is built for these hops, so `[tls].crl_file` and `[store].ssl_crl_file` do not reach
+    them. The attestation adds no check on the wire.
+    [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) is the one place that says what it can
+    truthfully rest on.
+  - **It refuses later than `check`.** The refusal comes when a Vault client is built, and again
+    before each send. That is a store open or a secret read. `messagefoundry check` builds no
+    Vault client, so it does not report this refusal. It lists a set pair on its
+    `vault-revocation-attested` line.
+  - **A Vault behind any proxy is off the box**, a loopback Vault included. A proxy can reach
+    these clients from the environment alone; [CONFIGURATION.md](CONFIGURATION.md) says how.
+  - **A command that holds no instance posture is judged as enforcing.** So it refuses an
+    unattested off-box Vault even on an instance at `[security].enforcement = warn`.
+    [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) names which callers hand their posture to
+    the guard. Attest the hop rather than lowering the dial.
+
 **Every other verifying TLS hop the engine dials is ungated.** It validates the chain — and nothing
 asks it for an attestation, warns, or refuses. **Do not book revocation as an estate-wide engine
 control**: confirming the refusal on MLLP and REST tells you nothing about these, which cross silently
@@ -994,7 +1018,8 @@ attestation:
    bind, so the variable unambiguously names that hop — ADR 0078's documented opt-out, deliberately
    left intact), and it still crosses an outbound hop on a **non-enforcing** instance, where the
    alternative is a warning rather than a refusal. An attestation that suppresses a would-be refusal
-   is **logged at WARNING at every construction**, so it stays visible.
+   is **logged at WARNING at every construction**, so it stays visible. (A Vault hop logs it once
+   per process for each hop, because its client is rebuilt on every secret read.)
    **The attestation that does cross an enforcing outbound hop is per-connection:**
    `tls_revocation_attested = true` plus a mandatory `tls_revocation_attested_reason`, set on that one
    connection (an `outbound()` or `FhirLookup()` keyword, or a top-level `connections.toml` key, not a `[settings]` key —
@@ -1004,14 +1029,18 @@ attestation:
    same pair on an `inbound()` mTLS listener clears the listener-side revocation gate
    (`check_inbound_revocation`) in the same way; `tls_crl_file` is still the better fix there,
    because it checks revocation in the engine.
+   **A Vault hop is not a connection, so it takes neither key.** It crosses on its own settings
+   pair, named in the Vault paragraph above.
 3. **Stay on loopback**, which neither gate reaches.
 4. **(Retired.)** `[security].handles_real_patient_data = false` used to sit here and **silenced the
    outbound gate entirely** — ALLOW before the refuse arm, on every hop, with no per-hop record. It was
    the widest crossing on this list, the easiest to reach for by accident, and this page claimed it was
    audited in `security_loosenings()`, which it never was. [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md) removed it; the key is refused at
    load. Nothing on this list silences the gate without a per-hop record any more.
-5. **`[security].enforcement = warn`** — downgrades every outbound revocation refusal to a **warning**
-   and lets the hop proceed. Also a named loosening in the posture read-out.
+5. **`[security].enforcement = warn`** — downgrades an outbound revocation refusal to a **warning**
+   and lets the hop proceed, wherever the instance posture reaches the guard. It does not reach at
+   least one family: a command that opens a store with no posture still refuses an unattested
+   off-box Vault (the Vault paragraph above). Also a named loosening in the posture read-out.
 
 Items 4 and 5 are **not supported production settings** and neither is a per-hop decision: both are
 instance-wide, and both leave the refusal-shaped evidence a reviewer looks for **absent rather than
@@ -1024,7 +1053,9 @@ recorded**. If you are auditing revocation, check those two switches *before* co
 guards), and the bind-guards in `__main__.py` / `pipeline/wiring_runner.py`. Four standing traps:
 a connector that does **not** route through `InsecureHopGuard` must be named as an exception rather than
 covered by the "one authority" paragraph; **the same discipline applies to `RevocationHopGuard`** — the
-gated set is enumerable (grep the constructions) and every *other* verifying TLS hop must be named as
+gated set is enumerable (grep the constructions, and also the calls to `revocation_hop_disposition`:
+the Vault guard in `transports/strict_requests.py` calls that function itself and builds no
+`RevocationHopGuard`) and every *other* verifying TLS hop must be named as
 ungated, never covered by an "every verifying hop" sentence; a weakening with no posture gate
 (`tls_allow_expired`, the `dialect='generic'` DATABASE hop) must be listed even though no refusal keys
 on it — **reported is not gated**, and the two must never be written as if either implied the other;

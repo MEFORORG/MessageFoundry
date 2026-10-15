@@ -65,6 +65,7 @@ from messagefoundry import proctree
 from messagefoundry.auth.trust_anchors import TrustAnchorError
 from messagefoundry.childenv import hook_environment
 from messagefoundry.config.settings import DrSettings, StoreBackend
+from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.dr_backup import VerifyResult, run_restore_verify
 from messagefoundry.pipeline.path_confine import confine, lexical_roots
@@ -222,9 +223,13 @@ class DrCoordinator:
         owned_lanes: Callable[[], OwnedLanes | None] | None = None,
         profile_provenance: Callable[[], Awaitable[Mapping[str, object]]] | None = None,
         after_release: Callable[[], Awaitable[None]] | None = None,
+        hop_posture: HopPosture | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
+        # The instance posture, for the Vault hop the cold-seed verify can dial (vault BACKLOG
+        # #2983). The engine passes its own. `None` counts as enforcing on that hop.
+        self._hop_posture = hop_posture
         # The store settings carry the KeyProvider seam (ADR 0019) — the DEK the cold-seed archive is
         # encrypted under. Typed loosely to avoid importing StoreSettings here; run_restore_verify takes it.
         self._store_settings = store_settings
@@ -901,7 +906,9 @@ class DrCoordinator:
         raising :class:`DrActivationError`. Only a ``PASS`` proceeds."""
         try:
             verify = await asyncio.wait_for(
-                run_restore_verify(archive, store_settings=self._store_settings),
+                run_restore_verify(
+                    archive, store_settings=self._store_settings, posture=self._hop_posture
+                ),
                 timeout=self._settings.takeover_timeout_seconds,
             )
         except TimeoutError:

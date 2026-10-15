@@ -1289,7 +1289,7 @@ def test_a_mailed_peer_is_not_mailed_again(repo: Path, tmp_path: Path) -> None:
 
 
 def test_the_mail_body_never_breaches_the_receiver_line_cap(repo: Path, tmp_path: Path) -> None:
-    """mail.ps1:337 THROWS on any line over 240 chars and the drain cuts at the same number, so an
+    """mail.ps1:346 THROWS on any line over 240 chars and the drain cuts at the same number, so an
     unwrapped body does not arrive ugly -- it does not arrive. Measured by a peer 2026-09-14: an
     ordinary 370-char intent line refused all 7 of its sends. The note here is one unbroken 400-char
     token, which word wrapping ALONE cannot fix, so this also covers the hard-cut path."""

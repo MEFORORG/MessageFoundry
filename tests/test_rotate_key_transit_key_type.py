@@ -71,7 +71,9 @@ def test_rotate_key_on_a_refused_transit_key_type_exits_2_without_a_traceback(
     asyncio.run(_seed(db, key))
 
     transit = _FakeTransit("aes128-gcm96")  # withdrawn by owner ruling R4 (BACKLOG #2043)
-    monkeypatch.setattr(crypto_transit, "_build_client", lambda addr, token: _FakeClient(transit))
+    monkeypatch.setattr(
+        crypto_transit, "_build_client", lambda addr, token, **_: _FakeClient(transit)
+    )
     monkeypatch.setenv("MEFOR_STORE_CIPHER_PROVIDER", "vault_transit")
     monkeypatch.setenv("MEFOR_STORE_TRANSIT_KEY", "mefor-store")
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)  # gets the command past its first check

@@ -152,6 +152,9 @@ def _reading(vault: _FakeVault, token: str = _TOKEN) -> VaultTokenReading:
 
 
 _STORE = VaultConsumer("vault.store", "kek", "store key provider", "read and decrypt the KEK")
+#: Settings with neither Vault hop attested (vault BACKLOG #2983). Every Vault address in this
+#: file is loopback or faked, so no test here turns on the attestation.
+_NO_ATTESTATION = ServiceSettings()
 
 
 def _out(hop: Any) -> str:
@@ -302,7 +305,7 @@ def test_an_unset_token_and_address_are_both_named_in_one_run(
     monkeypatch.delenv("MEFOR_STORE_VAULT_TOKEN", raising=False)
     monkeypatch.delenv("MEFOR_STORE_VAULT_ADDR", raising=False)
     monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", _KEK)
-    reading = probe_vault(_STORE)
+    reading = probe_vault(_STORE, _NO_ATTESTATION)
     joined = " ".join(reading.problems)
     assert "MEFOR_STORE_VAULT_TOKEN is not set" in joined
     assert "MEFOR_STORE_VAULT_ADDR is not set" in joined
@@ -348,7 +351,7 @@ def test_one_token_serving_both_hops_is_judged_on_the_union_of_its_grants() -> N
 def test_an_unknown_consumer_kind_is_refused_not_probed_as_the_kek() -> None:
     bogus = VaultConsumer("vault.x", cast("Any", "kv2"), "x", "x")
     with pytest.raises(ValueError, match="no Vault probe for consumer kind 'kv2'"):
-        probe_vault(bogus)
+        probe_vault(bogus, _NO_ATTESTATION)
 
 
 def test_a_probe_problem_is_logged_without_the_token(caplog: pytest.LogCaptureFixture) -> None:
@@ -477,7 +480,9 @@ def test_the_kek_paths_are_the_ones_the_key_provider_calls(monkeypatch: pytest.M
     monkeypatch.setenv(
         "MEFOR_STORE_VAULT_WRAPPED_DEK", "vault:v1:" + base64.b64encode(b"k" * 32).decode()
     )
-    monkeypatch.setattr(keyprovider_vault, "_build_client", lambda a, t: _TransitClient(transit))
+    monkeypatch.setattr(
+        keyprovider_vault, "_build_client", lambda a, t, **_: _TransitClient(transit)
+    )
     keyprovider_vault.VaultKeyProvider(StoreSettings()).active_key()
     assert transit.paths == set(keyprovider_vault.kek_required_capabilities())
 
@@ -492,7 +497,7 @@ def test_the_transit_paths_are_the_ones_the_cipher_calls(
         monkeypatch.delenv("MEFOR_STORE_TRANSIT_AUDIT_KEY", raising=False)
     else:
         monkeypatch.setenv("MEFOR_STORE_TRANSIT_AUDIT_KEY", audit_key)
-    monkeypatch.setattr(crypto_transit, "_build_client", lambda a, t: _TransitClient(transit))
+    monkeypatch.setattr(crypto_transit, "_build_client", lambda a, t, **_: _TransitClient(transit))
     cipher = crypto_transit.build_transit_cipher(StoreSettings())
     aad = cell_aad("messages", "raw", 1)
     cipher.decrypt(cipher.encrypt("synthetic", aad=aad), aad=aad)
@@ -512,7 +517,7 @@ def test_the_kv_paths_are_the_ones_the_secret_provider_reads(
 
     client = type("C", (), {"secrets": type("S", (), {"kv": type("K", (), {"v2": _V2()})()})()})()
     monkeypatch.setenv("MEFOR_SECRETS_VAULT_KV_MOUNT", "kv-mefor")
-    monkeypatch.setattr(secretprovider_vault, "_build_client", lambda a, t: client)
+    monkeypatch.setattr(secretprovider_vault, "_build_client", lambda a, t, **_: client)
     refs = ["mefor/ad", "mefor/smtp#pw"]
     provider = secretprovider_vault.build_provider(SecretsSettings(provider="vault"))
     for ref in refs:
@@ -567,10 +572,10 @@ def test_the_transit_cipher_probe_asks_about_the_cipher_paths(
     monkeypatch.setenv("MEFOR_STORE_VAULT_ADDR", _VAULT_ADDR)
     monkeypatch.setenv("MEFOR_STORE_TRANSIT_KEY", "mefor-data")
     monkeypatch.delenv("MEFOR_STORE_TRANSIT_AUDIT_KEY", raising=False)
-    monkeypatch.setattr(keyprovider_vault, "_build_client", lambda a, t: vault)
+    monkeypatch.setattr(keyprovider_vault, "_build_client", lambda a, t, **_: vault)
     settings = ServiceSettings.model_validate({"store": {"cipher_provider": "vault_transit"}})
     (consumer,) = vault_consumers(settings)
-    reading = probe_vault(consumer)
+    reading = probe_vault(consumer, _NO_ATTESTATION)
     assert set(reading.required) == set(crypto_transit.transit_cipher_required_capabilities())
     assert "transit/hmac/mefor-data" in vault.asked
 
@@ -890,7 +895,9 @@ def test_a_vault_held_bind_password_is_never_read_with_a_fallback_token(
     with VAULT_TOKEN. The probe refuses before the provider is built."""
     monkeypatch.delenv("MEFOR_SECRETS_VAULT_TOKEN", raising=False)
     monkeypatch.setenv("VAULT_TOKEN", "hvs.synthetic-operator-305")
-    monkeypatch.setattr(secretprovider_vault, "_build_client", lambda a, t: pytest.fail("built"))
+    monkeypatch.setattr(
+        secretprovider_vault, "_build_client", lambda a, t, **_: pytest.fail("built")
+    )
     auth = _ad_settings().model_dump() | {
         "ad_bind_password": None,
         "ad_bind_password_secret": "mefor/ad",
@@ -941,7 +948,7 @@ def _cli(
     monkeypatch.setenv("MEFOR_STORE_VAULT_TOKEN", _TOKEN)
     monkeypatch.setenv("MEFOR_STORE_VAULT_ADDR", _VAULT_ADDR)
     monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", _KEK)
-    monkeypatch.setattr(keyprovider_vault, "_build_client", build)
+    monkeypatch.setattr(keyprovider_vault, "_build_client", lambda a, t, **_: build(a, t))
     return ["check-privileges", "--service-config", str(_vault_toml(tmp_path)), "--json"]
 
 
@@ -1003,10 +1010,12 @@ def test_the_store_probe_never_sends_the_token_to_vault_addr(
     monkeypatch.delenv("MEFOR_STORE_VAULT_ADDR", raising=False)
     monkeypatch.setenv("VAULT_ADDR", _OPERATOR_ADDR)
     monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", _KEK)
-    monkeypatch.setattr(keyprovider_vault, "_build_client", lambda a, t: pytest.fail(f"built {a}"))
+    monkeypatch.setattr(
+        keyprovider_vault, "_build_client", lambda a, t, **_: pytest.fail(f"built {a}")
+    )
     with pytest.raises(KeyProviderError, match="MEFOR_STORE_VAULT_ADDR is not set"):
         keyprovider_vault.store_vault_address()
-    reading = probe_vault(_STORE)
+    reading = probe_vault(_STORE, _NO_ATTESTATION)
     assert any("MEFOR_STORE_VAULT_ADDR is not set" in p for p in reading.problems)
     assert not reading.looked_up
 
@@ -1020,12 +1029,12 @@ def test_the_secrets_probe_never_sends_the_token_to_vault_addr(
     monkeypatch.delenv("MEFOR_SECRETS_VAULT_ADDR", raising=False)
     monkeypatch.setenv("VAULT_ADDR", _OPERATOR_ADDR)
     monkeypatch.setattr(
-        secretprovider_vault, "_build_client", lambda a, t: pytest.fail(f"built {a}")
+        secretprovider_vault, "_build_client", lambda a, t, **_: pytest.fail(f"built {a}")
     )
     with pytest.raises(SecretProviderError, match="MEFOR_SECRETS_VAULT_ADDR is not set"):
         secretprovider_vault.secrets_vault_address()
     kv = VaultConsumer("vault.secrets", "kv", "kv", "kv", ("mefor/ad",))
-    reading = probe_vault(kv)
+    reading = probe_vault(kv, _NO_ATTESTATION)
     assert any("MEFOR_SECRETS_VAULT_ADDR is not set" in p for p in reading.problems)
 
 
@@ -1036,7 +1045,7 @@ def test_the_ldap_probe_never_reads_the_bind_password_from_vault_addr(
     monkeypatch.delenv("MEFOR_SECRETS_VAULT_ADDR", raising=False)
     monkeypatch.setenv("VAULT_ADDR", _OPERATOR_ADDR)
     monkeypatch.setattr(
-        secretprovider_vault, "_build_client", lambda a, t: pytest.fail(f"built {a}")
+        secretprovider_vault, "_build_client", lambda a, t, **_: pytest.fail(f"built {a}")
     )
     auth = _ad_settings().model_dump() | {
         "ad_bind_password": None,
@@ -1053,7 +1062,9 @@ def test_the_ldap_probe_names_both_an_unset_vault_token_and_address(
 ) -> None:
     monkeypatch.delenv("MEFOR_SECRETS_VAULT_TOKEN", raising=False)
     monkeypatch.delenv("MEFOR_SECRETS_VAULT_ADDR", raising=False)
-    monkeypatch.setattr(secretprovider_vault, "_build_client", lambda a, t: pytest.fail("built"))
+    monkeypatch.setattr(
+        secretprovider_vault, "_build_client", lambda a, t, **_: pytest.fail("built")
+    )
     auth = _ad_settings().model_dump() | {
         "ad_bind_password": None,
         "ad_bind_password_secret": "mefor/ad",
@@ -1071,7 +1082,7 @@ def test_a_missing_key_name_is_named_in_the_same_run_as_an_unset_token(
     monkeypatch.delenv("MEFOR_STORE_VAULT_TOKEN", raising=False)
     monkeypatch.delenv("MEFOR_STORE_VAULT_ADDR", raising=False)
     monkeypatch.delenv("MEFOR_STORE_VAULT_TRANSIT_KEY", raising=False)
-    joined = " ".join(probe_vault(_STORE).problems)
+    joined = " ".join(probe_vault(_STORE, _NO_ATTESTATION).problems)
     assert "MEFOR_STORE_VAULT_TOKEN is not set" in joined
     assert "MEFOR_STORE_VAULT_TRANSIT_KEY is not set" in joined
 
@@ -1079,9 +1090,11 @@ def test_a_missing_key_name_is_named_in_the_same_run_as_an_unset_token(
 def test_the_secrets_probe_refuses_an_unset_token_too(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MEFOR_SECRETS_VAULT_TOKEN", raising=False)
     monkeypatch.setenv("VAULT_TOKEN", "hvs.synthetic-operator-305")
-    monkeypatch.setattr(secretprovider_vault, "_build_client", lambda a, t: pytest.fail("built"))
+    monkeypatch.setattr(
+        secretprovider_vault, "_build_client", lambda a, t, **_: pytest.fail("built")
+    )
     kv = VaultConsumer("vault.secrets", "kv", "kv", "kv", ("mefor/ad",))
-    reading = probe_vault(kv)
+    reading = probe_vault(kv, _NO_ATTESTATION)
     assert any("MEFOR_SECRETS_VAULT_TOKEN is not set" in p for p in reading.problems)
     assert not reading.looked_up
 
