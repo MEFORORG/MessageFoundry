@@ -8150,7 +8150,11 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         return 2
     if outcome == "seal-refused":  # BACKLOG #3510; its own branch, since the text logs a warning
         refused = _seal_refusal(username, "address write")
-        return _emit_error(f"{refused}. The address is NOT set, and {extra}", as_json=args.json)
+        return _emit_error(
+            f"{refused}. The audit row for the change was written first; the address is NOT set, "
+            f"and {extra}",
+            as_json=args.json,
+        )
     refusals = {
         "no-such-user": f"no account named {username!r}",
         "not-admin": f"the account {username!r} is not an Administrator; the start gate asks only "

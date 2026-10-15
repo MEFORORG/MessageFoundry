@@ -27,7 +27,7 @@ from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION, AuthService
 from messagefoundry.config.settings import AuthSettings
-from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.crypto import cell_aad, generate_key, make_cipher
 from messagefoundry.store.row_seal import USER_KIND, RowSealError
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_USERNAME, login_admin
@@ -101,6 +101,22 @@ async def test_the_second_step_checks_the_secret_the_seal_covered(
     assert await store.get_totp_secret(identity.user_id) == _ATTACKER  # the swap is live
     assert not await service._verify_second_factor(user, clock.code(_ATTACKER))
     assert await service._verify_second_factor(user, clock.code(secret))  # control
+
+
+async def test_a_secret_written_into_the_cell_after_the_load_is_not_used(
+    keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The attack arm with a real cell: the attacker's secret, encrypted under the store key for
+    that cell, is written into the row after the checked load. A store read now returns it, and
+    the code it gives is still refused, because the check uses the record the seal covered."""
+    store, path = keyed
+    service, identity, _, _, clock = await _enrolled(store, monkeypatch)
+    user = await service._load_user(identity.user_id)
+    assert user is not None
+    cell = store.cipher().encrypt(_ATTACKER, aad=cell_aad("users", "totp_secret", identity.user_id))
+    await _raw_for(path)("UPDATE users SET totp_secret=? WHERE id=?", (cell, identity.user_id))
+    assert await store.get_totp_secret(identity.user_id) == _ATTACKER  # the cell is the attacker's
+    assert not await service._verify_second_factor(user, clock.code(_ATTACKER))
 
 
 async def test_the_combined_sign_in_checks_the_secret_the_seal_covered(
@@ -181,6 +197,8 @@ async def test_a_tamper_between_the_load_and_a_write_gives_the_sign_in_refusal(
     assert not out.ok and out.error == "invalid credentials" and out.token is None
     assert len(alerts) == 1 and "u" in alerts[0]
     assert len(await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)) == 1
+    # The row a wrong credential writes, so a reader cannot tell this refusal from one.
+    assert len(await store.list_audit(action="auth.login_failed")) == 1
 
 
 async def test_the_control_without_a_tamper_signs_in(keyed: tuple[MessageStore, Path]) -> None:

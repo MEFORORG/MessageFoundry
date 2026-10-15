@@ -3563,7 +3563,12 @@ class AuthService:
             except RowSealError as refused:
                 if refused.kind != USER_KIND:
                     raise  # another record's seal: its own handler, as before BACKLOG #3510
-                outcome = self._sign_in_seal_refused(username, after_pad)
+                outcome = self._sign_in_seal_refused(
+                    username,
+                    after_pad,
+                    client=client,
+                    combined=bool(totp_code and totp_code.strip()),
+                )
             # The room is set on every branch, whether it deferred rows or not, so every refusal
             # answers on the same slot.
             return await self._equalize_failure(
@@ -3571,17 +3576,24 @@ class AuthService:
             )
 
     def _sign_in_seal_refused(
-        self, username: str, after_pad: list[Callable[[], Awaitable[None]]]
+        self,
+        username: str,
+        after_pad: list[Callable[[], Awaitable[None]]],
+        *,
+        client: str | None,
+        combined: bool,
     ) -> LoginOutcome:
         """The sign-in's answer when a store write refused the account's record because it no
         longer passes its seal (BACKLOG #3510): it was checked at load, then changed outside the
         store, before a write. The same refusal as a wrong password, padded the same way by
         :meth:`login`.
 
-        Not named ``_login*``: see :meth:`login`. The report is deferred to ``after_pad`` with the
-        other refused rows, so its timing shows nothing. It loads the account once more through the
-        checked loader, which reports a record that still fails; one put back in between passes,
-        and only the warning logged here is left."""
+        Not named ``_login*``: see :meth:`login`. The rows are deferred to ``after_pad`` with the
+        other refused rows, so their timing shows nothing: the ``auth.login_failed`` row a wrong
+        credential writes, then a reload through the checked loader, which reports a record that
+        still fails. One put back in between passes, leaving the warning logged here and the
+        failed-sign-in row. The failure count did not run, since its write was the one refused. A
+        store error in the reload is logged, never raised, so the answer stays the fixed one."""
         _log.warning(
             "sign-in refused for %r: the account's record failed its integrity seal during the "
             "sign-in",
@@ -3589,7 +3601,16 @@ class AuthService:
         )
 
         async def report() -> None:
-            await self._load_user_by_username(username)
+            await self._audit(
+                "auth.login_failed",
+                actor=username,
+                detail=_local_refusal_detail(_LOCAL_REFUSAL_REASON, combined=combined),
+                client=client,
+            )
+            try:
+                await self._load_user_by_username(username)
+            except _audit_write_errors():
+                _log.exception("sign-in refusal: the account could not be read again to report it")
 
         after_pad.append(report)
         return LoginOutcome(ok=False, error="invalid credentials")
