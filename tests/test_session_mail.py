@@ -45,7 +45,7 @@ from typing import Any
 
 import pytest
 
-from tests._spawn_lock import spawn_burst
+from tests._spawn_lock import single_spawn, spawn_burst
 
 ROOT = Path(__file__).resolve().parents[1]
 COORD = ROOT / "scripts" / "coord"
@@ -450,6 +450,44 @@ def _send_addressed(repo: Path, session_id: str | None) -> subprocess.CompletedP
     return subprocess.run(
         args, cwd=str(repo), capture_output=True, text=True, timeout=TIMEOUT, check=False
     )
+
+
+def test_a_send_without_the_send_switch_fails_fast_instead_of_prompting(repo: Path) -> None:
+    """``-To``/``-Body`` with no ``-Send`` must refuse in seconds, naming the missing switch.
+
+    The incident and the mechanism are in the comment on ``$Send`` in mail.ps1.
+
+    THE CALLER'S CONDITIONS, NOT THE OTHER TESTS'. Every other send here passes ``-NonInteractive``,
+    which turns the prompt into an instant error and hides the hang. So this one omits it and holds
+    stdin OPEN: ``subprocess.run`` would close stdin, the prompt would read EOF, and the test would
+    pass against the broken script. Verified red against the pre-fix script before the fix.
+    """
+    # The context manager closes both pipes and reaps the process on every path, including the fail.
+    with single_spawn(), subprocess.Popen(
+        [
+            "pwsh", "-NoProfile", "-File", str(MAIL),
+            "-MailRoot", str(mail_root(repo)), "-To", str(repo), "-Body", "no send switch",
+        ],
+        cwd=str(repo), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE, text=True,
+    ) as proc:  # fmt: skip
+        try:
+            # stderr is one short error, far under a pipe buffer, so wait() cannot deadlock on it.
+            rc = proc.wait(timeout=TIMEOUT)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            # Either cause is possible here, so name both: a slow pwsh start under load looks the same.
+            pytest.fail(
+                f"mail.ps1 without -Send did not exit in {TIMEOUT}s: the stdin prompt is back, "
+                "or pwsh started very slowly"
+            )
+        assert proc.stderr is not None
+        err = proc.stderr.read()
+
+    assert rc != 0, "a send without -Send must be refused, not queued"
+    assert "-Send" in err, err
+    # Refused means NOTHING written. A box appearing would mean the guard ran after a write.
+    assert not (mail_root(repo) / "box").exists()
 
 
 def test_a_wrong_namespace_session_id_is_refused_at_SEND(repo: Path) -> None:

@@ -350,6 +350,10 @@ _USER_READERS = frozenset(
         "get_user_role_grants",
         "get_recovery_code_hashes",
         "list_webauthn_credentials",
+        # BACKLOG #3510: no `self._store` read of it in the service; the secret comes from the
+        # checked record. The walk sees only `self._store.<reader>`, so the module-level census
+        # (`_totp_secret_usable`, which takes the store as a parameter) is not covered here.
+        "get_totp_secret",
     }
 )
 #: The service functions allowed to call a raw user reader, and why each needs it.

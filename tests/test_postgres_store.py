@@ -4807,6 +4807,11 @@ async def test_the_rekey_audit_command_is_gone_server(store, capsys) -> None:
     assert "invalid choice" in capsys.readouterr().err
 
 
+#: A synthetic TOTP secret for the rotate-key leg (BACKLOG #3510), derived so a secret scanner
+#: reading the source sees no key-shaped literal.
+_ROTATED_TOTP_SECRET = base64.b32encode(b"rotate-key-user-row!").decode("ascii")
+
+
 async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch, tmp_path) -> None:
     """CLI-24 (Postgres mirror): the ``rotate-key`` CLI wrapper (resolve_active_key + keyring from env +
     open_store dispatch + reencrypt_to_active) has only ever run against SQLite ``--db``; the underlying
@@ -4817,7 +4822,8 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
     every ciphertext carries the new active key's fingerprint and the message decrypts under key_b ALONE
     (retired key dropped) — end-to-end proof."""
     from messagefoundry.__main__ import main
-    from messagefoundry.config.settings import load_settings
+    from messagefoundry.auth.service import AuthService
+    from messagefoundry.config.settings import AuthSettings, load_settings
     from messagefoundry.store.crypto import AesGcmCipher
     from messagefoundry.store.postgres import PostgresStore
 
@@ -4835,6 +4841,12 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
     seed = await PostgresStore.open(settings, cipher=make_cipher(key_a))
     try:
         mid = await seed.enqueue_message(channel_id="ch", raw=RAW, deliveries=[("d", RAW)])
+        # BACKLOG #3510: a user row, so the leg proves the sealed record and its TOTP secret come
+        # through the rotation too, not only the message cells.
+        await seed.create_user(
+            user_id="u-rot", username="rot", auth_provider="local", password_generated=False
+        )
+        await seed.set_totp_secret("u-rot", secret=_ROTATED_TOTP_SECRET)
     finally:
         await seed.close()
 
@@ -4857,6 +4869,12 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
         for r in blobs:
             assert r["v"].startswith(MARKER_PREFIX)
             assert r["v"].startswith(cipher_b.active_marker_prefix)  # active key, active format
+        # The account resolves under key_b alone, re-sealed under it, its secret re-encrypted.
+        sealer = verify.row_sealer()
+        user = await AuthService(verify, AuthSettings())._load_user("u-rot")
+        assert sealer is not None and user is not None and user.row is not None
+        assert sealer.is_active(user.row.authz_seal)
+        assert await verify.get_totp_secret("u-rot") == _ROTATED_TOTP_SECRET
     finally:
         await verify.close()
 
@@ -5297,6 +5315,39 @@ async def test_role_seal_contract(store) -> None:
             )
         assert {str(r["column_name"]) for r in rows} == {f.name for f in fields(RoleRow)}
         await assert_role_seal_contract(keyed, raw)
+    finally:
+        await keyed.close()
+
+
+async def test_approval_seal_contract(store) -> None:
+    """BACKLOG #2592: sealed dual-control approval requests, the same contract the SQLite suite
+    runs, on a keyed handle, with the table's columns pinned to the record the seal covers. ``raw``
+    runs each statement on a pooled connection, outside the store's helpers. The contract keys every
+    assertion on the requests it files, because this table is shared across tests."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests._approval_seal_contract import (
+        assert_approval_columns,
+        assert_approval_seal_contract,
+    )
+    from tests._session_seal_contract import dollar_placeholders
+
+    keyed = await PostgresStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[object, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                await conn.execute(dollar_placeholders(sql), *params)
+
+        async with keyed._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT column_name FROM information_schema.columns"
+                " WHERE table_schema = current_schema() AND table_name = 'pending_approvals'"
+            )
+        assert_approval_columns({str(r["column_name"]) for r in rows})
+        await assert_approval_seal_contract(keyed, raw)
     finally:
         await keyed.close()
 

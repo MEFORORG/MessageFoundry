@@ -1064,8 +1064,10 @@ class AesGcmCipher(_UnmarkedPolicy):
         # BACKLOG #2592: the authorization root, from the same live active DEK at the same point. Only
         # the ACTIVE key's root: a session seal verifies under the newest root generation alone.
         self._authz_root = _derive_authz_root(active_key)
-        # The retired keys' roots, derived at the same point. A seal never verifies under one: they
-        # only let a row sealed before a key change be recognised as such (BACKLOG #2592).
+        # The retired keys' roots, derived at the same point (BACKLOG #2592). A session seal never
+        # verifies under one; it only lets a session sealed before a key change be recognised as
+        # such. Every other sealed record, a user's among them, does verify under one while that key
+        # stays configured, until rotate-key re-seals it (RowSealer.verify_held, BACKLOG #3510).
         self._retired_authz_roots = tuple(_derive_authz_root(key) for key in retired_keys)
         # BACKLOG #1904: one audit key per keyring entry, RETIRED keys included, derived the same way and
         # at the same point (before _install_key zeroizes the DEK). A chain keyed under a key that has
@@ -1261,8 +1263,9 @@ class AesGcmCipher(_UnmarkedPolicy):
         return self._authz_root
 
     def retired_authz_roots(self) -> Sequence[bytes]:
-        """The authorization roots of the retired keys (BACKLOG #2592). No seal is verified under
-        one; they only name the keys a row sealed before a key change was sealed under."""
+        """The authorization roots of the retired keys (BACKLOG #2592). A session seal is never
+        verified under one. Every other sealed record, a user's among them, is, while the key stays
+        configured, so it keeps resolving until ``rotate-key`` re-seals it (BACKLOG #3510)."""
         return self._retired_authz_roots
 
     # --- persisted per-key invocation bound (ASVS 11.3.4) --------------------

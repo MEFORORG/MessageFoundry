@@ -1872,16 +1872,24 @@ class AuditStore(Protocol):
           pre-existing table. It is **not** backfilled: after a rename the stored name may belong to
           somebody else, so resolving it to an id would key the refusal on the wrong person -- the
           exact error the column exists to remove.
-        * A NULL is therefore refused **fail closed** at approve time, never fallen back from."""
+        * A NULL is therefore refused **fail closed** at approve time, never fallen back from.
+
+        **The row is sealed (BACKLOG #2592).** It is written through one helper per backend, with an
+        integrity seal over every column. A repeat joins only an open request whose seal holds; a
+        match that fails is logged and the request is filed on its own."""
         ...
 
-    async def get_pending_approval(self, approval_id: str) -> Row | None: ...
+    async def get_pending_approval(self, approval_id: str) -> Row | None:
+        """One request with every column, its seal included, or ``None``. Unchecked:
+        ``ApprovalGate`` checks the seal where it reads a request (BACKLOG #2592)."""
+        ...
 
     async def list_pending_approvals(self, *, now: float, limit: int = 100) -> Sequence[Row]:
         """Open (``pending``, unexpired) requests, newest first. Each row projects at least ``id``,
         ``operation``, ``params``, ``requester``, ``requester_user_id`` (BACKLOG #2460: the queue
         marks the caller's own requests by it), ``requested_at``, ``status``, ``approver``,
-        ``decided_at`` and ``expires_at``."""
+        ``decided_at`` and ``expires_at``. Every read here projects every column, ``claim_owner``
+        and ``seal`` included, so the gate can check each row's seal (BACKLOG #2592)."""
         ...
 
     async def list_interrupted_approvals(self, *, limit: int = 100) -> Sequence[Row]:
@@ -1923,7 +1931,12 @@ class AuditStore(Protocol):
         the claim (``pending`` to ``executing``): it names the engine process that will run the
         operation, so that process can recognise its own claims after a restart
         (``ApprovalGate.reconcile_after_restart``). Engine shards and cluster nodes share one store,
-        and the owner is what keeps one process from settling a sibling's live release."""
+        and the owner is what keeps one process from settling a sibling's live release.
+
+        **The move checks the row's seal first (BACKLOG #2592).** It reads the row, and raises
+        :class:`~messagefoundry.store.row_seal.RowSealError`, writing nothing, when the seal does
+        not verify, so a row changed outside the store is never re-sealed. Otherwise it writes the
+        moved row and a new seal, guarded on the status and the seal it read."""
         ...
 
     async def list_executing_approvals(
@@ -1934,11 +1947,21 @@ class AuditStore(Protocol):
         ``claim_owner``, when given, keeps only the rows that owner claimed and the rows with no
         owner, filtered in SQL so other owners' rows cannot push them past ``limit``.
 
-        Projects ``id``, ``operation``, ``requester``, ``approver``, ``decided_at`` (when it was
-        claimed) and ``claim_owner``. Read at startup by ``ApprovalGate.reconcile_after_restart``,
+        Projects every column, as :meth:`list_pending_approvals` does; ``decided_at`` is when it
+        was claimed. Read at startup by ``ApprovalGate.reconcile_after_restart``,
         which settles the rows this process owns and reports the rest. An ``executing`` row is
         normally short-lived, so the cap is generous; oldest first so a row stuck longest is never
         the one past it."""
+        ...
+
+    async def count_unsealed_approvals(self) -> int:
+        """How many ``pending``, ``executing`` or ``interrupted`` requests carry no integrity seal
+        (BACKLOG #2592). A keyed open names the count."""
+        ...
+
+    async def reseal_approval_records(self) -> tuple[int, int]:
+        """Re-seal every approval request under the active key, for ``rotate-key`` (BACKLOG
+        #2592). Returns ``(re-sealed, refused)``; one that fails its seal is left as it is."""
         ...
 
     async def audit_anchor(self) -> tuple[int, str]: ...
@@ -2245,6 +2268,11 @@ class AuthStore(Protocol):
     ) -> None: ...
 
     async def get_totp_secret(self, user_id: str) -> str | None: ...
+
+    # BACKLOG #3510: decrypt a ``users.totp_secret`` cell the caller already holds, from a record
+    # whose seal it checked, so the sign-in code is checked against that record's secret and not a
+    # second, unchecked read. ``None`` for no cell. No I/O.
+    def open_totp_secret(self, user_id: str, cell: str | None) -> str | None: ...
 
     # CONDITIONAL (BACKLOG #2224): writes only where a secret is staged (``totp_secret IS NOT NULL``)
     # and TOTP is still off, in the same UPDATE, and returns whether a row was written. An
