@@ -36,6 +36,25 @@
 
     Wired on Edit|Write|MultiEdit|NotebookEdit. The overlap map is cached, so the common case is a
     cache read, not a git walk across every worktree.
+
+    IT CHECKS FROM THE WORKTREE THE EDITED FILE SITS IN, NOT THE ONE IT RUNS IN. The desktop app starts a
+    worktree session's CLI with `--project-config-root <primary checkout>`. Measured 2026-10-12, a
+    hook then runs with its directory, CLAUDE_PROJECT_DIR and `git rev-parse` all naming the PRIMARY.
+    overlap.ps1 reads an absolute -File against ITS OWN worktree root. From the primary, a path into a
+    sibling worktree is under no root it knows, matches no row's Files, and the walk prints "[]": the
+    gate allowed every edit a worktree session made, and said nothing. A blind gate, read as all-clear.
+
+    The edited file names its own worktree, so the gate walks up from it to the nearest `.git` and
+    moves there (scripts/hooks/_hookinput.ps1) before it starts overlap.ps1. That holds after the
+    session runs `cd`, which moves the payload `cwd` and not the file: the Lander's verdict on
+    korus#223 measured a gate that followed the `cwd` into a sibling allow, in silence, an edit `main`
+    denied. A file in another repository or in no checkout is checked from where the gate started,
+    and writes nothing into another repository's .git. The `cwd` is read only to resolve a relative
+    path.
+
+    A DEGRADED RUN STILL CHECKS. A missing helper, or a relative path with a `cwd` the gate cannot
+    use, leaves it checking from where it started. A collision found there still denies; an allow
+    lands on the unresolved notice below, with its throttle stamp keyed on the session id.
 #>
 [CmdletBinding()]
 param(
@@ -133,6 +152,10 @@ function Write-Unresolved([string]$Slug, [string]$Detail) {
     $emit = $true
     try {
         $dir = $StateDir
+        # The repository the gate STARTED in, captured before it moved. Asked from where the gate is
+        # now, git answers nothing in a directory outside every checkout, so the notice was never
+        # throttled, and in another repository it would stamp that repository's .git.
+        if (-not $dir -and $script:StartCommon) { $dir = Join-Path $script:StartCommon "mefor-coord" }
         if (-not $dir) {
             $common = (& git rev-parse --path-format=absolute --git-common-dir 2>$null)
             if ($LASTEXITCODE -eq 0 -and $common) { $dir = Join-Path ([string]$common).Trim() "mefor-coord" }
@@ -143,12 +166,16 @@ function Write-Unresolved([string]$Slug, [string]$Detail) {
             # other session for the whole cooldown -- and those sessions would read that silence as
             # "checked, nobody is here", which is precisely the defect this notice exists to remove.
             # One session's diagnostic must never become another session's false all-clear.
-            $who = "shared"
-            $top = (& git rev-parse --path-format=absolute --show-toplevel 2>$null)
-            if ($LASTEXITCODE -eq 0 -and $top) {
-                $who = (Split-Path ([string]$top).Trim() -Leaf) -replace '[^A-Za-z0-9._-]+', '-'
-                if (-not $who) { $who = "shared" }
+            #
+            # $script:StampWho names the session when the gate never reached its directory. git would
+            # then answer for where the gate started, the primary under the desktop app, and every
+            # worktree session would share one stamp, so one session's notice would silence the rest.
+            $who = $script:StampWho
+            if (-not $who) {
+                $top = (& git rev-parse --path-format=absolute --show-toplevel 2>$null)
+                if ($top) { $who = (Split-Path ([string]$top).Trim() -Leaf) -replace '[^A-Za-z0-9._-]+', '-' }
             }
+            if (-not $who) { $who = "shared" }
             $stamp = Join-Path $dir "gate-unresolved/$who.$Slug.stamp"
             $prev = Get-Item -LiteralPath $stamp -ErrorAction SilentlyContinue
             if ($prev) {
@@ -180,9 +207,33 @@ function Write-Unresolved([string]$Slug, [string]$Detail) {
 }
 
 $target = $PathOverride
+# DEGRADED: the check still runs, and a collision it finds still denies, but an allow from it is not
+# an all-clear, so it lands on the unresolved notice. Same rule as a partial map, below.
+$degraded = ''
+$slug = ''
+$hook = $null
+$raw = ''
+# Read as UTF-8 through the shared helper. Under SilentlyContinue a dot-source of a missing file does
+# not throw, so the helper is tested for first. Without it the input is still read, so the gate can
+# name the file, and the check runs from where the gate started.
+$hasHelper = $false
+$hookInput = Join-Path $PSScriptRoot '_hookinput.ps1'
+try {
+    if (-not (Test-Path -LiteralPath $hookInput -PathType Leaf)) { throw 'scripts/hooks/_hookinput.ps1 is missing beside this hook' }
+    . $hookInput
+    $hasHelper = $true
+} catch {
+    $degraded = "the gate could not load its input reader ($($_.Exception.Message))"
+    $slug = 'input-reader-missing'
+}
+# The repository the gate STARTED in, the one it guards, before anything moves it. Write-Unresolved
+# stamps here.
+$script:StartCommon = if ($hasHelper) { Get-CcxGitCommonDir (Get-CcxWorktreeRoot (Get-Location).ProviderPath) }
+                      else { "$(& git rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim() }
 if (-not $target) {
     if (-not [Console]::IsInputRedirected) { exit 0 }
-    try { $hook = [Console]::In.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop } catch {
+    $raw = if ($hasHelper) { Read-CcxHookInput } else { try { [Console]::In.ReadToEnd() } catch { '' } }
+    try { $hook = $raw | ConvertFrom-Json -ErrorAction Stop } catch {
         Write-Unresolved "payload-unreadable" `
             "the PreToolUse payload on stdin was not readable JSON, so the gate never learned which file this edit targets"
     }
@@ -198,6 +249,69 @@ if (-not $target) {
     if (-not $target) { $target = [string]$hook.tool_input.notebook_path }
 }
 if (-not $target) { exit 0 }
+
+# THE FILE NAMES THE PATH; THE SESSION NAMES WHO IS ASKING. overlap.ps1 skips the row of the root it
+# runs in ("not a collision with yourself"), and matches -File against every other row by its path
+# within the repository. So the gate hands it the edit's path relative to the worktree the file sits
+# in, which holds whatever directory the session has `cd`-ed into, and runs it from the SESSION's own
+# worktree: the one its pin records (scripts/hooks/_hookinput.ps1), else the file's. Run from the
+# file's worktree instead, a pinned session's edit into a sibling's tree would skip the sibling's row,
+# the one row that can collide.
+#
+# A file in another repository, or in no checkout, is left where the gate started: no worktree of the
+# repository this gate guards can hold it, so the walk's "nobody" is true there, and the gate writes
+# nothing into another repository's .git.
+if ($hasHelper) {
+    $abs = $target
+    if (-not [System.IO.Path]::IsPathRooted($abs)) {
+        # A relative path is read against the session's cwd. One the gate cannot use leaves it reading
+        # against where it started, so an allow from there is not an all-clear.
+        $base = (Get-Location).ProviderPath
+        $p = Get-CcxHookPayloadCwd -Payload $hook
+        if ($p.Cwd) { $base = $p.Cwd }
+        elseif ($p.Named) {
+            $degraded = "$($p.Reason), and the edit names the relative path $target"
+            $slug = 'cwd-unusable'
+        }
+        $abs = Join-Path $base $abs
+    }
+    $root = Get-CcxWorktreeRoot (Split-Path -Parent $abs)
+    $rootCommon = if ($root) { Get-CcxGitCommonDir $root } else { $null }
+    $target = $abs
+    if ($rootCommon -and (-not $script:StartCommon -or (Test-CcxSamePath $rootCommon $script:StartCommon))) {
+        # With no pin the gate runs from the file's worktree, and that is a trade-off, not a fix:
+        # overlap skips the row of the root it runs from, so an unpinned session that `cd`s into a
+        # sibling and edits there is not checked against the sibling's row. Run from the start
+        # checkout instead (the primary, under the desktop app), it skips the primary's row, which
+        # an unpinned session editing its own worktree needs checked. Closing both needs overlap
+        # to take the session's root apart from where it runs.
+        $self = (Resolve-CcxHookSession -Text $raw -ReadOnly).Pinned
+        if (-not $self) { $self = $root }
+        $relative = $null
+        try { $relative = [System.IO.Path]::GetRelativePath($root, (ConvertTo-CcxNormPath $abs)) } catch { $relative = $null }
+        if (-not $relative) { $self = $root }   # an absolute path is only meaningful from its own root
+        try {
+            Set-Location -LiteralPath $self -ErrorAction Stop
+            if ($relative) { $target = $relative }
+        }
+        catch {
+            $degraded = "the gate could not enter $self, this session's worktree ($($_.Exception.Message))"
+            $slug = 'worktree-unenterable'
+        }
+    }
+}
+
+# A degraded run's throttle stamp names the SESSION. Keyed on where the gate stands, which is where it
+# started or the worktree a relative path fell back to (the primary, under the desktop app), every
+# worktree session would share one stamp, and one session's notice would silence the rest. See
+# Write-Unresolved.
+if ($degraded -and $hook) {
+    $who = [string]$hook.session_id
+    $kind = 'sid'
+    if (-not $who) { $who = [string]$hook.cwd; $kind = 'cwd' }
+    if ($who -and $hasHelper) { $script:StampWho = "$kind-$(Get-CcxShortHash $who)" }
+}
+$degradedDetail = "$degraded, so the check ran from $((Get-Location).ProviderPath) and its allow is not an all-clear"
 
 if (-not (Test-Path -LiteralPath $OverlapScript)) {
     Write-Unresolved "overlap-missing" "no overlap script at $OverlapScript"
@@ -262,6 +376,13 @@ if ($partial -and $rows.Count -gt 0 -and $null -ne $rows[0].PSObject.Properties[
         "Those were checked; the rest were never looked at"
 }
 
+# A ROW CARRYING THIS SESSION'S OWN ID IS NOT A PEER, whichever worktree it is in. overlap.ps1 skips
+# only the root it runs from, and a session can hold a second worktree under the same id (a subagent
+# with worktree isolation). Short is the first eight characters of the registry session id.
+$selfShort = ''
+if ($hook) { $sid = [string]$hook.session_id; if ($sid.Length -ge 8) { $selfShort = $sid.Substring(0, 8) } }
+if ($selfShort) { $rows = @($rows | Where-Object { [string]$_.Short -ne $selfShort }) }
+
 $live = @($rows | Where-Object { $_.Live })
 
 # DENY ONLY ON AN UNCOMMITTED EDIT IN A LIVE WORKTREE. `Files` is the union of what a branch COMMITTED
@@ -282,6 +403,7 @@ if ($editing.Count -eq 0) {
     # found is a collision, however little else was checked -- but "nobody is in this file" is a claim
     # about the WHOLE map, and a short walk has not earned it. So say so instead of exiting silently.
     if ($partial) { Write-Unresolved "overlap-slow" $slowDetail }
+    if ($degraded) { Write-Unresolved $slug $degradedDetail }
     # Nobody live at all, or the only rows are dormant worktrees: worth knowing, not worth blocking.
     if ($live.Count -eq 0) { exit 0 }
 

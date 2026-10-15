@@ -388,7 +388,15 @@ def test_the_coordination_exemption_is_keyed_on_the_target_not_the_cwd(
 # the exemption has been widened into the hole it was shaped to avoid.
 @pytest.mark.parametrize(
     "rest",
-    [".git/hooks/pre-commit", ".git/config", ".git/HEAD", ".git/worktrees/wt-1/HEAD"],
+    [
+        ".git/hooks/pre-commit",
+        ".git/config",
+        ".git/HEAD",
+        ".git/worktrees/wt-1/HEAD",
+        # scripts/hooks/_hookinput.ps1 reads a session's pin here; a forged one moves its mail box
+        # and steering note.
+        ".git/ccx-session-root/0a1b2c3d4e5f6a7b",
+    ],
 )
 def test_the_rest_of_the_shared_git_dir_is_still_denied(
     primary: Path, repos_file: Path, rest: str
@@ -414,6 +422,7 @@ def test_the_rest_of_the_shared_git_dir_is_still_denied(
         "test-slots/0.lock",  # the pytest port-slot mutex
         "gate-unresolved/wt.slug.stamp",  # suppresses the collision gate's own warning
         "overlap-cache.json",  # makes the collision gate report a silent all-clear
+        "overlap-cache/0a1b2c3d.json",  # the per-root cache that replaced it
         "announce/OFF",  # a documented REPO-WIDE kill switch, one Write
         # Found by listing the directory AFTER three adversarial readers had enumerated it, which is
         # why rule 1b cannot rest on its named list alone: announce-session.ps1 exits outright when

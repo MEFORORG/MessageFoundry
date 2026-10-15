@@ -234,6 +234,7 @@ _KNOWN_UNWIRED: dict[str, str] = {
     "lane-level.ps1": "Not a PreToolUse guard; invoked directly by coordination scripts.",
     "steer-inject.ps1": "Opt-in steering channel, armed per-session rather than by a matcher.",
     "steer-send.ps1": "The sending half of the same opt-in channel; never a hook handler.",
+    "_hookinput.ps1": "A library the hooks dot-source to read their input; never a hook handler.",
 }
 
 

@@ -41,6 +41,7 @@ from typing import Any
 
 import pytest
 
+from tests._session_pin import seed_pin
 from tests._spawn_lock import run_single, single_spawn
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -184,6 +185,7 @@ def run(
     env: dict[str, str] | None = None,
     extra: tuple[str, ...] = (),
     stdin: bool = True,
+    payload_cwd: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if presence is None:
         presence = presence_stub(tmp_path, rows, body=body)
@@ -199,6 +201,8 @@ def run(
     payload: dict[str, Any] = {"hook_event_name": "UserPromptSubmit", "prompt": "do a thing"}
     if session_id is not None:
         payload["session_id"] = session_id
+    if payload_cwd is not None:
+        payload["cwd"] = payload_cwd
     # ISOLATE THE SESSION REGISTRY. The hook resolves its own login from the records under
     # $env:USERPROFILE\.claude*, so without this every test reads the DEVELOPER'S real registry and its
     # result depends on which sessions happen to be running on the machine. Default to a fixture home
@@ -1408,3 +1412,176 @@ def test_the_self_test_reports_the_mail_split_under_a_stated_login(
     assert "2 of 2 unreachable peer(s) are mailable" in p.stdout, p.stdout
     assert "STATED via -AsLogin" in p.stdout, p.stdout
     assert sends(_) == [], "a read-only diagnostic sent mail"
+
+
+# --------------------------------------------------------------------------------------------------
+# Which worktree the announcement names.
+#
+# Measured 2026-10-12: the desktop app starts a worktree session's CLI with `--project-config-root
+# <primary checkout>`, and a hook then runs in the PRIMARY. This hook announced every such session as
+# "[SESSION-ANNOUNCE] <primary> (main)". Only the hook input's `cwd` names the worktree. These tests run
+# the hook IN the primary, as the app does, and vary only that field.
+# --------------------------------------------------------------------------------------------------
+
+
+def _top(path: Path) -> str:
+    """The toplevel exactly as the hook asks git for it."""
+    return subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--path-format=absolute", "--show-toplevel"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+@pytest.fixture
+def linked(repo: Path, tmp_path: Path) -> Path:
+    """A worktree linked to ``repo``, so ``repo`` plays the primary checkout."""
+    wt = Path(os.path.realpath(tmp_path)) / "linked"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", "-b", "linked", str(wt)],
+        check=True,
+        capture_output=True,
+    )
+    return wt
+
+
+def test_the_announcement_names_the_worktree_the_hook_input_names(
+    repo: Path, linked: Path, tmp_path: Path
+) -> None:
+    """A launch pinned the session to ``linked``; tests/_session_pin.py stands in for it."""
+    sd = tmp_path / "state"
+    seed_pin(repo, linked, SELF_ID)
+    p = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, PEER], payload_cwd=str(linked))
+    assert f"[SESSION-ANNOUNCE] {_top(linked)} (linked)" in p.stdout, p.stdout
+    assert _top(repo) not in p.stdout, p.stdout
+
+
+def test_an_unpinned_worktree_cwd_announces_nothing(
+    repo: Path, linked: Path, tmp_path: Path
+) -> None:
+    """With no pin the hook cannot tell the session's own worktree from a sibling it moved into, so
+    it announces neither, and never the primary it runs in. The arm above is its control."""
+    sd = tmp_path / "state"
+    p = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, PEER], payload_cwd=str(linked))
+    assert "[SESSION-ANNOUNCE]" not in p.stdout, p.stdout
+    assert "no pin records that this session started in" in p.stdout, p.stdout
+    assert outcomes(sd) == ["ERROR"], receipts(sd)
+
+
+def test_without_a_cwd_the_announcement_names_where_the_hook_runs(
+    repo: Path, linked: Path, tmp_path: Path
+) -> None:
+    """The control. With no `cwd` the same call names the primary, so the arm above can fail."""
+    sd = tmp_path / "state"
+    p = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, PEER])
+    assert f"[SESSION-ANNOUNCE] {_top(repo)} (" in p.stdout, p.stdout
+    assert _top(linked) not in p.stdout, p.stdout
+    assert "could not read this session's worktree" not in p.stdout
+
+
+def test_a_cwd_that_does_not_exist_announces_nothing(
+    repo: Path, linked: Path, tmp_path: Path
+) -> None:
+    """The only checkout left to name is where the hook started, the primary under the desktop app.
+    Announcing it would tell every peer this session sits in the primary."""
+    sd = tmp_path / "state"
+    gone = str(Path(os.path.realpath(tmp_path)) / "deleted-worktree")
+    p = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, PEER], payload_cwd=gone)
+    assert "deleted-worktree, which does not exist" in p.stdout, p.stdout
+    assert "announced nothing" in p.stdout, p.stdout
+    assert "[SESSION-ANNOUNCE]" not in p.stdout, p.stdout
+    assert outcomes(sd) == ["ERROR"], receipts(sd)
+
+
+def test_a_cwd_in_another_repository_announces_nothing_and_writes_nothing_there(
+    repo: Path, tmp_path: Path
+) -> None:
+    """A session that started here and moved its `cwd` into a foreign repository, with no pin to
+    fall back to. The hook must not enter that repository: it neither announces the foreign checkout
+    nor writes into its .git. It says, once, that it announced nothing (the Lander's point 4 on
+    korus#223 was that it printed nothing at all)."""
+    foreign = Path(os.path.realpath(tmp_path)) / "foreign"
+    foreign.mkdir()
+    _git_init(foreign)
+    common = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    sd = tmp_path / "state"
+    p = run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=sd,
+        rows=[SELF_ROW, PEER],
+        payload_cwd=str(foreign),
+        extra=("-CommonDir", common),
+    )
+    assert "[SESSION-ANNOUNCE]" not in p.stdout, p.stdout
+    assert "which is in another repository" in p.stdout, p.stdout
+    assert "announced nothing" in p.stdout, p.stdout
+    assert not (foreign / ".git" / "mefor-coord").exists(), (
+        "state was written into the foreign repo"
+    )
+
+
+def _second_worktree(repo: Path, tmp_path: Path, leaf: str) -> Path:
+    wt = Path(os.path.realpath(tmp_path)) / leaf
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", "-b", leaf, str(wt)],
+        check=True,
+        capture_output=True,
+    )
+    return wt
+
+
+def test_after_a_cd_to_a_sibling_the_session_announces_its_own_worktree(
+    repo: Path, linked: Path, tmp_path: Path
+) -> None:
+    """SessionStart pins the worktree the session is in. A later `cwd` in a sibling is a `cd`, and
+    the hook announces the pinned worktree, never the sibling."""
+    sibling = _second_worktree(repo, tmp_path, "sibling")
+    seed_pin(repo, linked, SELF_ID)
+    p = run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=tmp_path / "s2",
+        rows=[SELF_ROW, PEER],
+        payload_cwd=str(sibling),
+    )
+    assert f"[SESSION-ANNOUNCE] {_top(linked)} (linked)" in p.stdout, p.stdout
+    assert _top(sibling) not in p.stdout, p.stdout
+
+
+def test_a_session_that_starts_in_the_sibling_announces_the_sibling(
+    repo: Path, linked: Path, tmp_path: Path
+) -> None:
+    """The control: a session whose launch pinned the sibling announces the sibling."""
+    sibling = _second_worktree(repo, tmp_path, "sibling")
+    seed_pin(repo, sibling, SELF_ID)
+    p = run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=tmp_path / "s2",
+        rows=[SELF_ROW, PEER],
+        payload_cwd=str(sibling),
+    )
+    assert f"[SESSION-ANNOUNCE] {_top(sibling)} (sibling)" in p.stdout, p.stdout
+
+
+def test_the_no_checkout_notice_is_throttled_and_obeys_the_kill_switch(
+    repo: Path, tmp_path: Path
+) -> None:
+    gone = str(Path(os.path.realpath(tmp_path)) / "deleted-worktree")
+    sd = tmp_path / "state"
+    first = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, PEER], payload_cwd=gone)
+    assert "announced nothing" in first.stdout, first.stdout
+    again = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, PEER], payload_cwd=gone)
+    assert again.stdout.strip() == "", "the notice repeated inside its cooldown"
+    off = tmp_path / "off-state"
+    off.mkdir()
+    (off / "OFF").write_text("", encoding="utf-8")
+    silenced = run(repo, tmp_path=tmp_path, state_dir=off, rows=[SELF_ROW, PEER], payload_cwd=gone)
+    assert "announced nothing" not in silenced.stdout, "the kill switch did not silence the notice"

@@ -2569,6 +2569,11 @@ POWERSHELL_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "scripts/hooks/announce-session.ps1": frozenset({"hash:SHA256"}),
     # A fallback name for a branch whose name has no safe characters left.
     "scripts/hooks/worktree_gate.ps1": frozenset({"hash:SHA256"}),
+    # A fixed-length cache file name for each querying worktree, from its root path.
+    "scripts/coord/overlap.ps1": frozenset({"hash:SHA256"}),
+    # Fixed-length file names for a session's worktree pin and a notice's throttle stamp, from a
+    # session id or a notice key.
+    "scripts/hooks/_hookinput.ps1": frozenset({"hash:SHA256"}),
 }
 
 

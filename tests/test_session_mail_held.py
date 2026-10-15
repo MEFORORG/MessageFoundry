@@ -1059,6 +1059,22 @@ def plant(repo: Path, tmp_path: Path) -> None:
     )
 
 
+def _drain_loading_the_real_libraries() -> str:
+    """The shipped drain's text, with every library it loads from beside itself pointed at the tree.
+
+    ``$PSScriptRoot`` is ``tmp_path`` in a copy. The input reader matters as much as the two coord
+    libraries: a copy that cannot load it reads no session, shows no box, and never reaches the
+    sweep, so every control below would pass for the wrong reason.
+    """
+    text = DRAIN.read_text(encoding="ascii")
+    prefix = '"$PSScriptRoot\\..\\coord\\'
+    assert text.count(prefix) == 2, "the drain no longer dot-sources its libraries the same way"
+    reader = "Join-Path $PSScriptRoot '_hookinput.ps1'"
+    assert text.count(reader) == 1, "the drain no longer loads its input reader the same way"
+    out = text.replace(prefix, '"' + str(COORD) + "\\")
+    return out.replace(reader, "'" + str(DRAIN.parent / "_hookinput.ps1") + "'")
+
+
 def rewrite_drain(tmp_path: Path, filename: str, func: str, replacement: str) -> Path:
     """A copy of the shipped drain with ONE function replaced, dot-sourcing the REAL libraries.
 
@@ -1071,10 +1087,7 @@ def rewrite_drain(tmp_path: Path, filename: str, func: str, replacement: str) ->
     neither library. The function substitution must match exactly once. Without them a strip that
     silently matched nothing would leave a control agreeing with its subject for the wrong reason.
     """
-    text = DRAIN.read_text(encoding="ascii")
-    prefix = '"$PSScriptRoot\\..\\coord\\'
-    assert text.count(prefix) == 2, "the drain no longer dot-sources its libraries the same way"
-    dotted = text.replace(prefix, '"' + str(COORD) + "\\")
+    dotted = _drain_loading_the_real_libraries()
     pattern = re.compile(rf"(?ms)^function {re.escape(func)} \{{.*?^\}}")
     out, n = pattern.subn(lambda _m: replacement, dotted)
     assert n == 1, f"the {func} rewrite matched {n} times, so this control proves nothing"
@@ -1417,10 +1430,7 @@ def rewrite_budgets(tmp_path: Path, filename: str, value: int) -> Path:
     ``$PSScriptRoot`` points at ``tmp_path`` in the copy. A rewrite that silently matched nothing
     would leave a control agreeing with its subject for the wrong reason.
     """
-    text = DRAIN.read_text(encoding="ascii")
-    prefix = '"$PSScriptRoot\\..\\coord\\'
-    assert text.count(prefix) == 2, "the drain no longer dot-sources its libraries the same way"
-    out = text.replace(prefix, '"' + str(COORD) + "\\")
+    out = _drain_loading_the_real_libraries()
     for name in ("MESSAGE_DELETE_BUDGET", "MARKER_DELETE_BUDGET", "RECEIPT_DELETE_BUDGET"):
         out, n = re.subn(rf"(?m)^\${name} = \d+$", f"${name} = {value}", out)
         assert n == 1, f"the ${name} rewrite matched {n} times, so this control proves nothing"

@@ -19,10 +19,25 @@
 # Get-Fold and the '    | ' prefix are what keep the note inside the one line the frame gave it.
 # BACKLOG #1424; the same class BACKLOG #1040 closed on the deny surface.
 #
+# THE NOTE IS READ FROM THE WORKTREE THE HOOK INPUT NAMES. The desktop app starts a worktree
+# session's CLI with `--project-config-root <primary checkout>`. Measured 2026-10-12, a hook then runs
+# with its directory, CLAUDE_PROJECT_DIR and `git rev-parse` all naming the PRIMARY, so this hook read
+# the primary's note and never the worktree's. Only the `cwd` field of the JSON on stdin names the
+# worktree. Which worktree's note the hook reads follows the rules in scripts/hooks/_hookinput.ps1,
+# never the one a `cd` reached: this hook deletes what it reads and injects it as text the user
+# typed. Input with no `cwd` reads the session's pinned worktree, or with no pin CLAUDE_PROJECT_DIR,
+# as before.
+#
+# A `cwd` THOSE RULES REFUSE READS NO NOTE. Falling back to CLAUDE_PROJECT_DIR there would read,
+# delete and inject the PRIMARY session's note into this one, so its recipient never sees it. The
+# hook says so on a `[steer]` line instead, at most once per $FAULT_COOLDOWN_MINUTES for each
+# session, because it runs before every tool call. A missing helper is the same fault.
+#
 # Fail-open: any error here must never block a tool call.
 # ASCII-only on purpose (PS 5.1 ANSI-read lesson); run under pwsh 7 by the hook.
 
 $ErrorActionPreference = 'SilentlyContinue'
+$FAULT_COOLDOWN_MINUTES = 30
 
 # THE ONE SANITISER. Every byte that came out of the note file passes through here, and nothing else
 # in this script builds a line from note content.
@@ -45,11 +60,56 @@ function Get-Fold([string]$Text) {
     return ($t -replace '\s+', ' ').Trim()
 }
 
-try {
-    if (-not $env:CLAUDE_PROJECT_DIR) { exit 0 }
+function Write-Context([string]$Text) {
+    $payload = [pscustomobject]@{
+        hookSpecificOutput = [pscustomobject]@{
+            hookEventName     = 'PreToolUse'
+            additionalContext = $Text
+        }
+    }
+    [Console]::Out.Write(($payload | ConvertTo-Json -Compress -Depth 6))
+}
 
-    $noteFile = Join-Path $env:CLAUDE_PROJECT_DIR ".claude\steer.txt"
-    if (-not (Test-Path -LiteralPath $noteFile)) { exit 0 }
+# Say a fault once per cooldown per key, never on every tool call. Without the helper there is no
+# throttle (Test-CcxSayOnce lives there), so the notice is said every time: noise, never quiet.
+function Write-FaultOnce([string]$Key, [string]$Text) {
+    $emit = $true
+    if (Get-Command Test-CcxSayOnce -ErrorAction SilentlyContinue) {
+        $emit = Test-CcxSayOnce -Key $Key -Minutes $FAULT_COOLDOWN_MINUTES `
+            -Dir (Join-Path ([System.IO.Path]::GetTempPath()) 'mefor-steer-fault')
+    }
+    if ($emit) { Write-Context $Text }
+}
+
+try {
+    # The session's worktree from the hook input, and CLAUDE_PROJECT_DIR only where the input names
+    # none. Tested for first: under SilentlyContinue a dot-source of a missing file does not throw.
+    $project = $env:CLAUDE_PROJECT_DIR
+    $fault = ''
+    $faultKey = ''
+    try {
+        $hookInput = Join-Path $PSScriptRoot '_hookinput.ps1'
+        if (-not (Test-Path -LiteralPath $hookInput -PathType Leaf)) { throw 'scripts/hooks/_hookinput.ps1 is missing beside this hook' }
+        . $hookInput
+        $s = Resolve-CcxHookSession -Text (Read-CcxHookInput) -ReadOnly
+        if ($s.Root) { $project = $s.Root }
+        elseif ($s.Reason) {
+            $fault = $s.Reason
+            $faultKey = if ($s.SessionId) { 'sid:' + $s.SessionId } else { 'cwd:' + [string]$s.Payload.cwd }
+        }
+    } catch {
+        $fault = "the hook could not read its input ($($_.Exception.Message))"
+        $faultKey = 'reader:' + $PSScriptRoot
+    }
+
+    # NO NOTE IS READ WITHOUT THE SESSION'S WORKTREE. See the header.
+    if ($fault) {
+        Write-FaultOnce $faultKey "[steer] Could not read this session's worktree: $(Get-Fold $fault). No steering note was read or removed, so a note queued for this session waits until the hook can find its worktree."
+        exit 0
+    }
+
+    $noteFile = if ($project) { Join-Path $project ".claude\steer.txt" } else { '' }
+    if (-not $noteFile -or -not (Test-Path -LiteralPath $noteFile)) { exit 0 }
 
     $note = Get-Content -LiteralPath $noteFile -Raw
     Remove-Item -LiteralPath $noteFile -Force
@@ -77,13 +137,7 @@ try {
         "    | $note"
     ) -join "`n"
 
-    $payload = [pscustomobject]@{
-        hookSpecificOutput = [pscustomobject]@{
-            hookEventName     = 'PreToolUse'
-            additionalContext = $context
-        }
-    }
-    [Console]::Out.Write(($payload | ConvertTo-Json -Compress -Depth 6))
+    Write-Context $context
 } catch {
     exit 0
 }

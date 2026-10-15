@@ -62,6 +62,23 @@
     the presence scoping below therefore serve a caller the OPERATOR wires. Do not read their existence
     as the container gap being closed.
 
+    IT ANNOUNCES THE WORKTREE THE HOOK INPUT NAMES, NOT THE ONE IT RUNS IN. The desktop app starts a
+    worktree session's CLI with `--project-config-root <primary checkout>`. Measured 2026-10-12, a
+    hook then runs with its directory, CLAUDE_PROJECT_DIR and `git rev-parse` all naming the PRIMARY,
+    so this hook announced every worktree session as "[SESSION-ANNOUNCE] <primary> (main)". It also
+    keyed the /clear cooldown and the claim lookup on the primary, and mail.ps1 stamped the primary as
+    the sender. Only the `cwd` field of the JSON on stdin names the worktree.
+
+    So stdin is read FIRST, before any git call, and the hook moves into that `cwd`
+    (scripts/hooks/_hookinput.ps1). Every git call, and the mail.ps1 child, then answers for the
+    session. Input with no `cwd` answers for the session's pin, or with none leaves the hook where
+    it started, as before. Which worktree it announces follows the rules in that helper, never
+    the one a `cd` reached. A `cwd` those rules refuse, or a missing helper, announces NOTHING:
+    one `[announce]` line and an ERROR receipt, once per 30 minutes and only past the kill switch
+    and the settled check, because the only checkout left to name is where the hook started.
+    Inside the session's directory the hook asks git for the common dir again rather than trusting
+    -CommonDir, which the shim resolved where the hook started.
+
     OUTCOME CODES: ANNOUNCED, ANNOUNCED_MAIL, NO_PEERS, NO_SESSION_ID, NO_LOGIN, LOOKUP_FAILED, LOOKUP_KILLED,
     UNATTENDED, DISABLED, BUDGET_EXHAUSTED, SETTLED, RECENT_CWD, ERROR. There is deliberately NO code for the
     suppressed path: that is the hot path and it must stay free. The log records DECISIONS, not
@@ -311,11 +328,45 @@ function Write-Receipt {
 # $script:MarkerKey and $script:SelfId are read defensively in Write-Receipt, so $null is fine.
 
 try {
+    # --- 0. HOOK INPUT, THEN THE SESSION'S OWN DIRECTORY ---------------------------------------------
+    # BEFORE ANY GIT CALL. Under the desktop app this process starts in the PRIMARY checkout, and only
+    # the input's `cwd` names the worktree; see the header. Under SilentlyContinue a dot-source of a
+    # missing file does not throw, so the helper is tested for first. Without it the hook cannot tell
+    # which checkout the session is in, and section 9b says so and announces nothing.
+    #
+    # '-not $SelfTest' is UNCONDITIONAL, not conditional on redirection: measured on this host,
+    # [Console]::IsInputRedirected is True from an agent shell with NO pipe at all, so a read guarded
+    # only on redirection turns the diagnostic switch into a hang.
+    $cwdFault = ''
+    $hasHelper = $false
+    $hookInput = Join-Path $PSScriptRoot '_hookinput.ps1'
+    try {
+        if (-not (Test-Path -LiteralPath $hookInput -PathType Leaf)) { throw 'scripts/hooks/_hookinput.ps1 is missing beside this hook' }
+        . $hookInput
+        $hasHelper = $true
+    } catch { $cwdFault = "the hook could not load its input reader ($($_.Exception.Message))" }
+    $raw = $PayloadOverride
+    if (-not $raw -and -not $SelfTest) {
+        if ($hasHelper) { $raw = Read-CcxHookInput }
+        elseif ([Console]::IsInputRedirected) { try { $raw = [Console]::In.ReadToEnd() } catch { $raw = '' } }
+    }
+    $moved = $false
+    if ($hasHelper -and $raw) {
+        # -SelfTest is a diagnostic, so it reads the session pin and never writes one.
+        $session = Enter-CcxHookSession -Text $raw -ReadOnly:$SelfTest
+        $cwdFault = $session.Reason
+        $moved = [bool]$session.Dir
+    }
+
     # --- 1. COMMON DIR -------------------------------------------------------------------------------
     # MANDATORY inert-outside-a-repo guarantee: this entry is user-global and runs in every unrelated
     # project on the machine.
+    #
+    # The shim's -CommonDir was resolved where the hook STARTED. Once section 0 has moved into the
+    # session's directory, that answer may be another repository's, and the guard below would pass on
+    # it while $top named this one. So a moved hook asks git again, and stands down outside a repo.
     $cd = $CommonDir
-    if (-not $cd) {
+    if ($moved -or -not $cd) {
         $cd = (& git rev-parse --path-format=absolute --git-common-dir 2>$null)
         if ($LASTEXITCODE -ne 0 -or -not $cd) { exit 0 }
     }
@@ -365,11 +416,7 @@ try {
     $script:StateDir = $StateDir
 
     # --- 4. PAYLOAD ---------------------------------------------------------------------------------
-    # '-not $SelfTest' is UNCONDITIONAL, not conditional on redirection: measured on this host,
-    # [Console]::IsInputRedirected is True from an agent shell with NO pipe at all, so a read guarded
-    # only on redirection turns the diagnostic switch into a hang.
-    $raw = $PayloadOverride
-    if (-not $raw -and -not $SelfTest -and [Console]::IsInputRedirected) { $raw = [Console]::In.ReadToEnd() }
+    # $raw was read in section 0, because the `cwd` in it has to move the hook before any git call.
     $selfId = ''
     if ($raw) {
         try {
@@ -396,6 +443,12 @@ try {
         }
         $markerKey = $clean
         $script:MarkerKey = $markerKey
+    }
+
+    # The real run says this in section 9b, after the kill switch and the settled check.
+    $cwdWhy = if ($cwdFault) { (Get-Clean $cwdFault 240) -replace '[^\x20-\x7E]', '?' } else { '' }
+    if ($cwdFault -and $SelfTest) {
+        Write-Output "[announce -SelfTest] $cwdWhy; a real run would announce nothing."
     }
 
     if (-not $SelfTest) {
@@ -451,6 +504,26 @@ try {
 
         # --- 9. TERMINAL STATES: THE COLD HOT PATH --------------------------------------------------
         if ($m -and ($m.state -eq 'settled' -or $m.state -eq 'exhausted')) { exit 0 }
+
+        # --- 9b. NO KNOWN CHECKOUT, NO ANNOUNCEMENT -------------------------------------------------
+        # Section 0 could not put this hook in the session's directory, and had no starting worktree to
+        # fall back to, so $top is where the hook started: under the desktop app, the primary.
+        # Announcing that would tell every peer the session is in the primary, which is the defect
+        # section 0 fixes. So the hook says why, leaves a receipt, and stops.
+        #
+        # AFTER the kill switch and the settled check, so OFF still silences it and a settled session
+        # is not told. ONCE PER 30 MINUTES PER SESSION, because this runs on every prompt. A stamp that
+        # cannot be read or written means the line is said: noise is the safe failure of a silencer.
+        if ($cwdFault) {
+            # Without the helper there is no throttle, and the line is said every time.
+            $say = $true
+            if ($hasHelper) { $say = Test-CcxSayOnce -Key "fault:$markerKey" -Dir (Join-Path $StateDir 'fault') -Minutes 30 }
+            if ($say) {
+                Write-Output "[announce] $cwdWhy, so this hook cannot tell which checkout this session is in and announced nothing. Said once per 30 minutes while it lasts."
+                Write-Receipt 'ERROR' @{ note = $cwdFault }
+            }
+            exit 0
+        }
 
         # --- 10. KILL LADDER ------------------------------------------------------------------------
         # state 'checking' means the previous run did not reach the post-lookup write, which on this

@@ -94,7 +94,11 @@
 
     The WHOLE-MAP cache is a plain last-write-wins file: a stale-by-seconds view of who is editing what
     is fine, and two sessions refreshing at once cost a duplicate walk, not corruption. It is keyed on
-    the querying worktree's root AND HEAD, because Files depends on both. The term memo beside it is
+    the querying worktree's root AND HEAD, because Files depends on both. There is ONE FILE PER ROOT,
+    mefor-coord/overlap-cache/<first 8 hex of sha256(root)>.json. It was one shared file until
+    2026-10-13, when collision_gate.ps1 began running this script from each session's own worktree
+    rather than from the primary checkout. A shared file then held one root at a time, so every
+    session's edit evicted the last one's map and each gated edit paid a full walk. The term memo beside it is
     keyed on content rather than time, so it has no freshness window and needs none.
 
 .EXAMPLE
@@ -281,7 +285,12 @@ if ($myHead) {
     }
 }
 
-$cacheFile = Join-Path $common "mefor-coord/overlap-cache.json"
+# One file per querying root; see the header. A hash, not the path, so the name is fixed-length and
+# carries no separator.
+$cacheSha = [System.Security.Cryptography.SHA256]::Create()
+$cacheKey = -join ($cacheSha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($myRootNorm))[0..3] | ForEach-Object { $_.ToString('x2') })
+$cacheSha.Dispose()
+$cacheFile = Join-Path $common "mefor-coord/overlap-cache/$cacheKey.json"
 $termCacheFile = Join-Path $common "mefor-coord/overlap-terms.json"
 
 # THE ANCHOR EVERY COMMITTED-HALF TERM IS MEASURED AGAINST, resolved once so it can go in the memo key.
@@ -960,6 +969,20 @@ if ($null -eq $map) {
             @{ at = (Get-Date).ToString("o"); root = $myRootNorm; head = $myHead; rows = $map
                census = $script:Census } |
                 ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cacheFile -Encoding UTF8
+            # One file per root, and roots come and go with worktrees. A file a day old is far past
+            # -CacheSeconds, so nothing reads it again; sweep those rather than keep one per worktree
+            # ever made. At most once an hour, by a stamp the *.json filter never matches, because this
+            # write sits on the gate's path.
+            $sweepStamp = Join-Path (Split-Path $cacheFile) '.swept'
+            $lastSweep = Get-Item -LiteralPath $sweepStamp -ErrorAction SilentlyContinue
+            if (-not $lastSweep -or ((Get-Date) - $lastSweep.LastWriteTime).TotalMinutes -ge 60 -or
+                $lastSweep.LastWriteTime -gt (Get-Date)) {
+                $staleBefore = (Get-Date).AddDays(-1)
+                Get-ChildItem -LiteralPath (Split-Path $cacheFile) -Filter *.json -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.LastWriteTime -lt $staleBefore } |
+                    Remove-Item -Force -ErrorAction SilentlyContinue
+                Set-Content -LiteralPath $sweepStamp -Value ((Get-Date).ToString("o")) -Encoding ascii
+            }
         } catch { }   # a cache we cannot write is a slow hook, not a broken one
     }
 }

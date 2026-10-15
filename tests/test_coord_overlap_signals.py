@@ -23,6 +23,7 @@ using stub rows would only assert that the plumbing carries a value someone else
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -565,8 +566,12 @@ def test_a_generous_budget_still_returns_the_whole_map(three_peers: Path, tmp_pa
 
 
 def _cache_path(primary: Path) -> Path:
+    """One cache file per querying root, named as overlap.ps1 names it."""
     common = git(primary, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
-    return Path(common) / "mefor-coord" / "overlap-cache.json"
+    top = git(primary, "rev-parse", "--path-format=absolute", "--show-toplevel").strip()
+    norm = top.replace("\\", "/").rstrip("/").lower()
+    key = hashlib.sha256(norm.encode("utf-8")).hexdigest()[:8]
+    return Path(common) / "mefor-coord" / "overlap-cache" / f"{key}.json"
 
 
 def test_a_walk_that_reaches_nothing_prints_nothing_rather_than_an_empty_array(

@@ -88,10 +88,17 @@ owner's approval.
 - **The sender resolves the worktree root, never the current directory.** An earlier version wrote to
   `(Get-Location)/.claude/steer.txt` and created the directory if missing, so running it from a
   subdirectory dropped the note somewhere the hook never looks — silently — and left a stray
-  `.claude/` behind. It now uses `-ProjectDir`, else `$env:CLAUDE_PROJECT_DIR`, else `git rev-parse
-  --show-toplevel`, and **refuses** rather than guessing.
-- **The hook is fail-open.** Any error exits 0 and emits nothing; a broken hook must never be able to
-  block a tool call.
+  `.claude/` behind. It now uses `-ProjectDir`, else `git rev-parse --show-toplevel`, else
+  `$env:CLAUDE_PROJECT_DIR`, and **refuses** rather than guessing.
+- **The sender and the hook agree on the worktree.** The desktop app starts a worktree session with
+  `CLAUDE_PROJECT_DIR` naming the primary checkout (measured 2026-10-12). So the hook reads the note
+  of the session's own worktree, by the rules in `scripts/hooks/_hookinput.ps1`, and the sender tries
+  the worktree you stand in
+  before `CLAUDE_PROJECT_DIR`. Until 2026-10-13 the sender tried `CLAUDE_PROJECT_DIR` first, so a note
+  sent from inside a worktree session went to the primary.
+- **The hook is fail-open.** Any error exits 0; a broken hook must never be able to block a tool
+  call. Where it cannot find the session's worktree it reads no note and says so on one `[steer]`
+  line, at most once every 30 minutes.
 - **One note at a time.** A queued-but-unconsumed note is replaced, with a warning. The note is
   consumed (deleted) the first time the hook sees it, so it is delivered exactly once.
 - **A note is data, not authority.** It arrives labelled as coming from the user via a side channel,
