@@ -71,10 +71,9 @@
 
     So stdin is read FIRST, before any git call, and the hook moves into that `cwd`
     (scripts/hooks/_hookinput.ps1). Every git call, and the mail.ps1 child, then answers for the
-    session. Input with no `cwd` leaves the hook where it started, as before. After a `cd` into a
-    sibling worktree or another repository it announces the worktree the session started in, never
-    the one the `cd` reached. A `cwd` it cannot use with nothing to fall back to, or a missing helper,
-    announces NOTHING: one `[announce]` line and an ERROR receipt, once per 30 minutes and only past
+    session. Input with no `cwd` leaves the hook where it started, as before. Which worktree it
+    announces follows the rules in that helper, never the one a `cd` reached. A `cwd` those rules
+    refuse, or a missing helper, announces NOTHING: one `[announce]` line and an ERROR receipt, once per 30 minutes and only past
     the kill switch and the settled check, because the only checkout left to name is where the hook
     started. Inside the session's directory the hook
     asks git for the common dir again rather than trusting -CommonDir, which the shim resolved where

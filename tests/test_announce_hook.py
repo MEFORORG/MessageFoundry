@@ -41,6 +41,7 @@ from typing import Any
 
 import pytest
 
+from tests._session_pin import seed_pin
 from tests._spawn_lock import run_single, single_spawn
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1448,10 +1449,24 @@ def linked(repo: Path, tmp_path: Path) -> Path:
 def test_the_announcement_names_the_worktree_the_hook_input_names(
     repo: Path, linked: Path, tmp_path: Path
 ) -> None:
+    """A launch pinned the session to ``linked``; tests/_session_pin.py stands in for it."""
     sd = tmp_path / "state"
+    seed_pin(repo, linked, SELF_ID)
     p = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, PEER], payload_cwd=str(linked))
     assert f"[SESSION-ANNOUNCE] {_top(linked)} (linked)" in p.stdout, p.stdout
     assert _top(repo) not in p.stdout, p.stdout
+
+
+def test_an_unpinned_worktree_cwd_announces_nothing(
+    repo: Path, linked: Path, tmp_path: Path
+) -> None:
+    """With no pin the hook cannot tell the session's own worktree from a sibling it moved into, so
+    it announces neither, and never the primary it runs in. The arm above is its control."""
+    sd = tmp_path / "state"
+    p = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, PEER], payload_cwd=str(linked))
+    assert "[SESSION-ANNOUNCE]" not in p.stdout, p.stdout
+    assert "no pin records that this session started in" in p.stdout, p.stdout
+    assert outcomes(sd) == ["ERROR"], receipts(sd)
 
 
 def test_without_a_cwd_the_announcement_names_where_the_hook_runs(
@@ -1528,21 +1543,7 @@ def test_after_a_cd_to_a_sibling_the_session_announces_its_own_worktree(
     """SessionStart pins the worktree the session is in. A later `cwd` in a sibling is a `cd`, and
     the hook announces the pinned worktree, never the sibling."""
     sibling = _second_worktree(repo, tmp_path, "sibling")
-    pin = tmp_path / "pin.ps1"
-    pin.write_text(
-        f". '{HOOK.parent / '_hookinput.ps1'}'\n"
-        "$null = Resolve-CcxHookSession -Text (Read-CcxHookInput)\n",
-        encoding="utf-8",
-    )
-    start = {"hook_event_name": "SessionStart", "session_id": SELF_ID, "cwd": str(linked)}
-    subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(pin)],
-        cwd=str(repo),
-        input=json.dumps(start),
-        text=True,
-        check=True,
-        capture_output=True,
-    )
+    seed_pin(repo, linked, SELF_ID)
     p = run(
         repo,
         tmp_path=tmp_path,
@@ -1557,8 +1558,9 @@ def test_after_a_cd_to_a_sibling_the_session_announces_its_own_worktree(
 def test_a_session_that_starts_in_the_sibling_announces_the_sibling(
     repo: Path, linked: Path, tmp_path: Path
 ) -> None:
-    """The control: with no earlier run for this session, the sibling is where it is."""
+    """The control: a session whose launch pinned the sibling announces the sibling."""
     sibling = _second_worktree(repo, tmp_path, "sibling")
+    seed_pin(repo, sibling, SELF_ID)
     p = run(
         repo,
         tmp_path=tmp_path,

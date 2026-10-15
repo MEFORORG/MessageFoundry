@@ -4395,8 +4395,6 @@ turned off and I need you to do it." Do not disable it yourself.
 #                                 read "RESOLVED, and nobody else is touching it" and ALLOW with no
 #                                 additionalContext -- indistinguishable from a real all-clear, which is
 #                                 the silent-green failure that gate was built to remove.
-#   session-root/<hash>           _hookinput.ps1 reads it as the worktree a session started in, so a
-#                                 forged one points that session's mail drain and steering note elsewhere.
 #   gate-unresolved/*.stamp       suppresses that gate's "could NOT check this edit" notice for 30 minutes.
 #                                 Freshness is LastWriteTime, which a Write sets to now, so the existing
 #                                 future-stamp bound does not see it.
@@ -4529,9 +4527,6 @@ foreach ($r in $roots) {
         @{ Name = "overlap-cache"
            What = "the collision gate's peer-overlap input (one cache file per querying worktree)"
            Fix  = 'pwsh -NoProfile -File scripts\coord\overlap.ps1 -Refresh' }
-        @{ Name = "session-root"
-           What = "the hooks' record of which worktree each session started in"
-           Fix  = 'let scripts\hooks\_hookinput.ps1 write it at SessionStart; a forged one moves the mail box and steering note of a session' }
         @{ Name = "announce/off"
            What = "the REPO-WIDE announce kill switch"
            Fix  = 'ask the user -- silencing announcements for every session is their decision, not yours' }

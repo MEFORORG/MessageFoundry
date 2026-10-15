@@ -183,11 +183,10 @@
     that path and the drain exits silent, so that worktree's mail is never shown. The read now goes
     through scripts/hooks/_hookinput.ps1.
 
-    AFTER A `cd` THE DRAIN READS THE BOX OF THE WORKTREE THE SESSION STARTED IN, not the sibling's or
-    another repository's that the `cwd` now names (scripts/hooks/_hookinput.ps1 keeps that worktree).
+    WHICH BOX IS THE SESSION'S follows the rules in scripts/hooks/_hookinput.ps1: after a `cd`, the
+    box of the worktree the session started in, never the sibling's or another repository's.
 
-    A `cwd` THE INPUT NAMES BUT THE DRAIN CANNOT USE, WITH NO STARTING WORKTREE TO FALL BACK TO, READS
-    NO BOX, and neither does a missing helper. Either says "NO BOX ... NOTHING WAS READ", once per
+    A `cwd` THOSE RULES REFUSE READS NO BOX, and neither does a missing helper. Either says "NO BOX ... NOTHING WAS READ", once per
     $NO_BOX_COOLDOWN_MINUTES and only past the OFF switch, because silence there reads as an empty box,
     and any other box would be another session's mail for this session's Stop to file.
 

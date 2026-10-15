@@ -254,9 +254,9 @@ if (-not $target) { exit 0 }
 # runs in ("not a collision with yourself"), and matches -File against every other row by its path
 # within the repository. So the gate hands it the edit's path relative to the worktree the file sits
 # in, which holds whatever directory the session has `cd`-ed into, and runs it from the SESSION's own
-# worktree: the one its pin records (scripts/hooks/_hookinput.ps1), else the file's. Run from the
-# file's worktree instead, an edit into a sibling's tree would skip the sibling's row, the one row
-# that can collide.
+# worktree: the one its pin records (scripts/hooks/_hookinput.ps1), else the checkout the gate started
+# in. Run from the file's worktree instead, an edit into a sibling's tree would skip the sibling's row,
+# the one row that can collide.
 #
 # A file in another repository, or in no checkout, is left where the gate started: no worktree of the
 # repository this gate guards can hold it, so the walk's "nobody" is true there, and the gate writes
@@ -279,8 +279,11 @@ if ($hasHelper) {
     $rootCommon = if ($root) { Get-CcxGitCommonDir $root } else { $null }
     $target = $abs
     if ($rootCommon -and (-not $script:StartCommon -or (Test-CcxSamePath $rootCommon $script:StartCommon))) {
-        $self = (Resolve-CcxHookSession -Text $raw -ReadOnly).Pinned
-        if (-not $self) { $self = $root }
+        # With no pin the session's own worktree is unknown, so the gate runs from the checkout it
+        # started in, never from the file's. A file in a sibling then meets the sibling's row; one in
+        # the session's own unpinned worktree may meet its own row, which is noise, not a miss.
+        $session = Resolve-CcxHookSession -Text $raw -ReadOnly
+        $self = if ($session.Pinned) { $session.Pinned } elseif ($session.StartRoot) { $session.StartRoot } else { $root }
         $relative = $null
         try { $relative = [System.IO.Path]::GetRelativePath($root, (ConvertTo-CcxNormPath $abs)) } catch { $relative = $null }
         if (-not $relative) { $self = $root }   # an absolute path is only meaningful from its own root

@@ -33,6 +33,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._session_pin import seed_pin
+
 ROOT = Path(__file__).resolve().parents[1]
 SEAT = ROOT / "scripts" / "coord" / "seat.ps1"
 MAILKEY = ROOT / "scripts" / "coord" / "mail-key.ps1"
@@ -275,10 +277,23 @@ class TestThePromptLandsOnTheSessionsWorktree:
     def test_the_record_names_the_worktree_the_hook_input_names(
         self, repo: Path, linked: Path
     ) -> None:
+        """A launch pinned the session to ``linked``; tests/_session_pin.py stands in for it."""
+        seed_pin(repo, linked, "s1")
         _prompt_in_primary(repo, {"session_id": "s1", "cwd": str(linked)})
         rec = record(repo)
         assert _same_dir(rec["worktree"], linked), rec["worktree"]
         assert rec["goalPromptedAt"]
+
+    def test_an_unpinned_worktree_cwd_stamps_nothing_and_says_so(
+        self, repo: Path, linked: Path
+    ) -> None:
+        """With no pin the hook cannot tell the session's worktree from a sibling it moved into, so
+        it stamps neither, and never the primary. The arm above is its control."""
+        proc = _prompt_in_primary(repo, {"session_id": "s1", "cwd": str(linked)})
+        assert "no pin records that this session started in" in proc.stdout, proc.stdout
+        assert "No record was stamped" in proc.stdout, proc.stdout
+        common = git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+        assert not list((Path(common) / "mefor-coord" / "seats").rglob("s1.json"))
 
     def test_without_a_cwd_the_record_names_where_the_hook_runs(
         self, repo: Path, linked: Path

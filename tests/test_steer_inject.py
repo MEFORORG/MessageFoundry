@@ -34,10 +34,13 @@ import json
 import os
 import shutil
 import subprocess
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+
+from tests._session_pin import seed_pin
 
 ROOT = Path(__file__).resolve().parents[1]
 HOOK = ROOT / "scripts" / "hooks" / "steer-inject.ps1"
@@ -358,11 +361,15 @@ def primary_and_worktree(tmp_path: Path) -> tuple[Path, Path]:
     return repo, wt
 
 
-def run_hook_with_cwd(project_dir: Path, cwd_field: str | None) -> str | None:
+def run_hook_with_cwd(
+    project_dir: Path, cwd_field: str | None, session_id: str | None = None
+) -> str | None:
     """The hook as the app runs it: CLAUDE_PROJECT_DIR on the primary, `cwd` in the input."""
     env = os.environ.copy()
     env["CLAUDE_PROJECT_DIR"] = str(project_dir)
     payload: dict[str, object] = {"hook_event_name": "PreToolUse", "tool_name": "Read"}
+    if session_id is not None:
+        payload["session_id"] = session_id
     if cwd_field is not None:
         payload["cwd"] = cwd_field
     proc = subprocess.run(
@@ -383,12 +390,28 @@ def run_hook_with_cwd(project_dir: Path, cwd_field: str | None) -> str | None:
 def test_the_note_comes_from_the_worktree_the_hook_input_names(
     primary_and_worktree: tuple[Path, Path],
 ) -> None:
+    """A launch pinned the session to the worktree; tests/_session_pin.py stands in for it."""
     repo, wt = primary_and_worktree
-    ctx = run_hook_with_cwd(repo, str(wt))
+    seed_pin(repo, wt, "s1")
+    ctx = run_hook_with_cwd(repo, str(wt), "s1")
     assert ctx is not None and f"{PREFIX}WORKTREE-NOTE" in ctx, ctx
     assert "PRIMARY-NOTE" not in ctx
     assert (repo / ".claude" / "steer.txt").exists(), "the primary's note was consumed"
     assert not (wt / ".claude" / "steer.txt").exists(), "the worktree's note was not consumed"
+
+
+def test_an_unpinned_worktree_cwd_reads_no_note(
+    primary_and_worktree: tuple[Path, Path],
+) -> None:
+    """With no pin the hook cannot tell the session's worktree from a sibling it moved into, so it
+    reads and removes neither note, not even the primary's, and says why. The arm above is its
+    control."""
+    repo, wt = primary_and_worktree
+    # A fresh id: the fault notice is throttled per session id in a machine-wide directory.
+    ctx = run_hook_with_cwd(repo, str(wt), f"unpinned-{uuid.uuid4()}")
+    assert ctx is not None and "no pin records that this session started in" in ctx, ctx
+    assert (wt / ".claude" / "steer.txt").exists(), "a note was read with no pin"
+    assert (repo / ".claude" / "steer.txt").exists(), "the primary's note was read instead"
 
 
 def test_without_a_cwd_the_note_comes_from_the_project_dir(

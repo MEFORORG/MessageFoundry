@@ -46,6 +46,7 @@ from typing import Any
 
 import pytest
 
+from tests._session_pin import seed_pin
 from tests._spawn_lock import spawn_burst
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -2007,6 +2008,8 @@ def accented_worktree(repo: Path, tmp_path: Path) -> Path:
 
 
 def _drain_in_primary(repo: Path, wt: Path, *, ascii_escaped: bool) -> str:
+    # A launch pinned the session to ``wt``; tests/_session_pin.py stands in for it.
+    seed_pin(repo, wt, SELF_ID)
     payload = {"hook_event_name": "Stop", "session_id": SELF_ID, "cwd": str(wt)}
     proc = subprocess.run(
         ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(DRAIN)],
@@ -2044,27 +2047,6 @@ def test_the_same_address_escaped_to_ascii_gets_its_mail(
 # --------------------------------------------------------------------------------------------------
 
 
-def _pin(repo: Path, wt: Path, tmp_path: Path, session_id: str) -> None:
-    """Pin ``wt`` for the session as a SessionStart hook does, through the real helper."""
-    probe = tmp_path / "pin.ps1"
-    probe.write_text(
-        f". '{HOOKS / '_hookinput.ps1'}'\n"
-        "$null = Resolve-CcxHookSession -Text (Read-CcxHookInput)\n",
-        encoding="utf-8",
-    )
-    payload = {"hook_event_name": "SessionStart", "session_id": session_id, "cwd": str(wt)}
-    proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(probe)],
-        cwd=str(repo),
-        input=json.dumps(payload),
-        capture_output=True,
-        text=True,
-        timeout=TIMEOUT,
-        check=False,
-    )
-    assert proc.returncode == 0, proc.stderr
-
-
 @pytest.fixture
 def two_worktrees(repo: Path, tmp_path: Path) -> tuple[Path, Path]:
     base = Path(os.path.realpath(tmp_path))
@@ -2084,8 +2066,9 @@ def test_after_a_cd_the_drain_shows_the_starting_worktrees_box(
     repo: Path, tmp_path: Path, two_worktrees: tuple[Path, Path]
 ) -> None:
     mine, sibling = two_worktrees
-    _pin(repo, mine, tmp_path, SELF_ID)
-    text = injection(run_drain(repo, cwd=sibling, run_from=repo, event="SessionStart"))
+    seed_pin(repo, mine, SELF_ID)
+    # Not SessionStart: one with no source is a launch, whose `cwd` is where the session starts.
+    text = injection(run_drain(repo, cwd=sibling, run_from=repo, event="Stop"))
     assert "mail for mine" in text, text
     assert "mail for the sibling" not in text, "the session was shown its sibling's mail"
 
@@ -2095,9 +2078,22 @@ def test_a_session_that_started_in_the_sibling_gets_the_siblings_box(
 ) -> None:
     """The control: the same drain, for a session pinned in the sibling."""
     _, sibling = two_worktrees
-    _pin(repo, sibling, tmp_path, SELF_ID)
-    text = injection(run_drain(repo, cwd=sibling, run_from=repo, event="SessionStart"))
+    seed_pin(repo, sibling, SELF_ID)
+    text = injection(run_drain(repo, cwd=sibling, run_from=repo, event="Stop"))
     assert "mail for the sibling" in text, text
+
+
+def test_with_no_pin_a_sibling_cwd_shows_no_box_and_consumes_nothing(
+    repo: Path, tmp_path: Path, two_worktrees: tuple[Path, Path]
+) -> None:
+    """THE LANDER'S POINT ON PR 2328 AND korus#223: with no pin, a sibling's `cwd` was answered for
+    as it stood, and Stop filed the sibling's mail as read. The arm above is its control."""
+    _, sibling = two_worktrees
+    text = injection(run_drain(repo, cwd=sibling, run_from=repo, event="Stop"))
+    assert "mail for the sibling" not in text, "an unpinned session was shown its sibling's mail"
+    assert "NO BOX" in text and "no pin records" in text, text
+    inboxes = list((mail_root(repo) / "box").glob("*/inbox/*.json"))
+    assert len(inboxes) == 2, f"a box was consumed: {inboxes}"
 
 
 def test_the_no_box_notice_is_throttled_and_obeys_the_off_switch(

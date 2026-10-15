@@ -25,10 +25,10 @@
     Only the `cwd` field of the JSON on stdin names the session's worktree. So the hook moves there
     (scripts/hooks/_hookinput.ps1) before its first git call, and presence.ps1, overlap.ps1 and every
     git call below answer for the session. Input with no `cwd` leaves it where it started, as before.
-    A `cwd` in another repository or another worktree falls back to the worktree the session started
-    in, and the banner says so. A `cwd` with nothing to fall back to, or a helper that is missing,
-    becomes the banner's first line, and the banner then describes the checkout the hook runs in.
-    _hookinput.ps1 says what the `cwd` means.
+    _hookinput.ps1 holds the rules for which worktree that is. Where they answer with the pinned
+    worktree rather than the `cwd`, the banner says so. A `cwd` they refuse, or a helper that is
+    missing, becomes the banner's first line, and the banner then describes the checkout the hook
+    runs in.
 #>
 $ErrorActionPreference = "SilentlyContinue"
 

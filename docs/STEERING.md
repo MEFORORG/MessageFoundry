@@ -92,7 +92,8 @@ owner's approval.
   `$env:CLAUDE_PROJECT_DIR`, and **refuses** rather than guessing.
 - **The sender and the hook agree on the worktree.** The desktop app starts a worktree session with
   `CLAUDE_PROJECT_DIR` naming the primary checkout (measured 2026-10-12). So the hook reads the note
-  from the worktree its hook input's `cwd` sits in, and the sender tries the worktree you stand in
+  of the session's own worktree, by the rules in `scripts/hooks/_hookinput.ps1`, and the sender tries
+  the worktree you stand in
   before `CLAUDE_PROJECT_DIR`. Until 2026-10-13 the sender tried `CLAUDE_PROJECT_DIR` first, so a note
   sent from inside a worktree session went to the primary.
 - **The hook is fail-open.** Any error exits 0; a broken hook must never be able to block a tool
