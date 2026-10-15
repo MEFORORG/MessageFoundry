@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import time
 from collections.abc import Iterable
 from typing import Final
 
@@ -83,6 +84,36 @@ class RowSealError(Exception):
     def __init__(self, kind: str) -> None:
         super().__init__(f"the {kind} row's integrity seal does not verify; the write was refused")
         self.kind = kind
+
+
+#: How often one failing row is reported again while it keeps being presented, in seconds.
+SEAL_FAILURE_REPORT_INTERVAL_SECONDS: Final = 300.0
+#: How many failing rows a :class:`SealFailureThrottle` remembers; the oldest is forgotten first.
+SEAL_FAILURE_TRACK_MAX: Final = 1024
+
+
+class SealFailureThrottle:
+    """Decides when a row that failed its seal is reported again (BACKLOG #2592): at most once per
+    :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS` per key, remembering at most
+    :data:`SEAL_FAILURE_TRACK_MAX` keys. One per reporter: the auth service and the approval gate
+    each hold one, so both follow one policy."""
+
+    __slots__ = ("_last",)
+
+    def __init__(self) -> None:
+        self._last: dict[str, float] = {}
+
+    def due(self, key: str) -> bool:
+        """Whether ``key`` should be reported now; if so, records that it was."""
+        now = time.monotonic()
+        last = self._last.get(key)
+        if last is not None and now - last < SEAL_FAILURE_REPORT_INTERVAL_SECONDS:
+            return False
+        self._last.pop(key, None)
+        if len(self._last) >= SEAL_FAILURE_TRACK_MAX:
+            self._last.pop(next(iter(self._last)))
+        self._last[key] = now
+        return True
 
 
 def _part(value: bytes) -> bytes:

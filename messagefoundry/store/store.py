@@ -3192,11 +3192,6 @@ def report_role_reseal(resealed: int, refused: int) -> None:
 #: ``tests/test_approval_seal.py`` pins this list.
 APPROVAL_SEAL_EXCLUDED: Final[Mapping[str, str]] = MappingProxyType({"seal": "the seal itself"})
 
-#: The statuses a request can still move out of: a release, a settle, or a resolution reads one.
-#: The others are terminal and grant nothing, so a keyed open counts only these when it names the
-#: requests that carry no seal.
-APPROVAL_OPEN_STATUSES: Final = ("pending", "executing", "interrupted")
-
 
 @dataclass(frozen=True)
 class ApprovalRow:
