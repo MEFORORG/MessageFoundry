@@ -64,6 +64,7 @@ table covers it. Which accounts that factor covers is stated in
 | Operator using the console/API | Yes | Auth + RBAC + audit (built — [SECURITY.md](SECURITY.md)); step-up re-verification on sensitive ops (ASVS 7.5.3) |
 | Local user reading the DB file directly | Yes | Owner-only file ACL (built, **SQLite store only** — on a server-DB store the `.mdf`/`.ldf`/tempdb permissions are the DBA's) + at-rest body encryption when a key is set (built — §3); volume encryption for the rest |
 | Stolen DB file / backup | Yes | At-rest body + `summary`/`metadata` encryption (built — §3) + required volume encryption for WAL/temp |
+| Database writer who holds no store key | Yes | Partly built: row seals on a store whose key is held in the engine, and cell tags on a keyed store under the default `[store]` settings. What each refuses, and what stays open, is [below](#a-database-writer-is-refused-only-where-a-seal-or-a-tag-covers-the-row) |
 | PHI in logs / CI output / shell redirects | **Yes** | "Never log bodies" rule + global log redaction (`RedactionFilter`) + `safe_exc()` chokepoint + prod-DEBUG startup guard (built — §7) |
 | Eavesdropper on the **internal LAN** (MLLP / API) | Yes | **API/WSS TLS is always on, except behind a declared proxy with no operator certificate; MLLP-over-TLS is built** (Gate #4, §4) — *enable MLLP TLS per connection*; the bind-guards refuse a non-loopback plaintext listener, and an off-loopback API bind needs an operator certificate or a declared TLS-terminating proxy; + your network segmentation |
 | Compromised internal host / lateral movement | Partly | Network segmentation + TLS + required auth + at-rest encryption; off-box log forwarding to your SIEM (set `[logging].forward_*` — [§7](#7-logging--phi-redaction)) for evidence beyond the host |
@@ -73,6 +74,65 @@ table covers it. Which accounts that factor covers is stated in
 **Note:** the management API is **loopback-default *and* always authenticated** (auth/RBAC/audit built
 — [SECURITY.md](SECURITY.md)); the data plane is network-bound with TLS (above). Only *public-internet*
 exposure is excluded by design.
+
+### A database writer is refused only where a seal or a tag covers the row
+
+The file ACL and encryption at rest above stop someone who reads the store. They do not stop a
+**database writer**: someone who can change rows in the store but does not hold the store key.
+A database administrator or a holder of a stolen database login can be one. So can a process on
+the host that can write the SQLite file. SQL injection through an engine query is a route to the
+same position. The owner named this actor in scope on 2026-10-01 (vault BACKLOG #2592).
+
+A writer never needs the key to change a plaintext column. Without a seal, on a first deployment,
+one inserted row would give it an administrator session, a role or a channel scope.
+
+**Row seals** need a store key held in the engine's own memory. So the `vault_transit` key provider
+and a keyless store write and check none yet. On any other keyed store, the engine refuses at
+least these changes made outside the store:
+
+- a session row inserted or edited, in any column but `last_used_at`;
+- an account inserted or edited: its `users` row, its role rows, or its passkey set apart from
+  the sign count;
+- a custom role inserted or edited;
+- the Active Directory group-to-role or group-to-channel map changed;
+- a dual-control approval request inserted or edited, such as its captured params or its requester.
+
+**Cell tags** need a store key, `[store].aad_bind` on and `[store].allow_unmarked_ciphertext` off,
+which are the defaults. They refuse at least these:
+
+- a message moved to another channel, or a saved search moved to another owner;
+- a queue row's routing fields changed under its encrypted payload.
+
+A refused authority row grants nothing, and a refused approval request cannot be released. A
+refused cell does not open, so its message or delivery is refused on read or dead-lettered. A
+moved message still shows in the other channel's message list by its plaintext columns, with its
+encrypted cells withheld. The engine keeps running. A refusal usually writes an `integrity.*`
+audit row and raises an `integrity_drift` alert, with at least these exceptions. Under
+`vault_transit`, a cell that fails its tag keeps the cipher's own error, with no integrity audit
+row or alert. Each process reports a row that keeps failing again only after an interval: five
+minutes for a sealed row, and an hour for a message or saved-search cell. What each refusal does
+is in the changelog entries for vault BACKLOG #2592, #2593 and #3510 (in `changelog.d/` until the
+next release, then [CHANGELOG.md](../CHANGELOG.md)). The seal format is
+in [`store/row_seal.py`](../messagefoundry/store/row_seal.py).
+
+On a first deployment, a writer could still do at least these:
+
+- **Put back an older sealed copy** of a row it kept, or of the whole database. A seal stops a
+  forged row, not a rollback. Nothing inside the database stops a whole-database rollback. With
+  `[logging].forward_*` set, the audit tee ([§7](#7-logging--phi-redaction), streams 3 and 4)
+  sends the chain anchors off the host, where a collector could compare them.
+- **Copy sealed rows in from another store** under the same key. The row seal key carries no
+  store id yet. That pin is vault BACKLOG #3411.
+- **Change authority rows and approval requests freely on a keyless store or under**
+  **`vault_transit`**, since no row seal is written there.
+- **Move messages and re-route queue rows on a keyless store, or with `[store].aad_bind` off**,
+  since no cell tag is bound there.
+- **Blank an encrypted cell.** An empty value opens on any keyed store, so a writer can erase a
+  message body without a refusal.
+- **Change rows no seal covers.** At least these: a message's status, which could hide a failure;
+  the delivered-key rows, which could make a delivery look like a duplicate and skip it; queue
+  state and lane order; cluster rows; and `sessions.last_used_at`.
+- **Delete rows.** A delete needs no key, so a writer can always destroy data and stop service.
 
 ---
 
