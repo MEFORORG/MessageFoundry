@@ -1767,8 +1767,9 @@ class UserRecord:
     # in auth.service._allowed_channels; this column carries the grant, never the decision.
     channel_scope: str | None = None
     # MFA (WP-14): whether a native TOTP second factor is enrolled+active, and when. The secret and
-    # the recovery-code hashes are deliberately NOT carried here (least exposure) — they are read only
-    # via the store's get_totp_secret / get_recovery_code_hashes accessors.
+    # the recovery-code hashes are deliberately NOT carried as fields here (least exposure). The
+    # service reads them from the sealed ``row`` below (BACKLOG #3510); other callers use the store's
+    # get_totp_secret / get_recovery_code_hashes accessors.
     totp_enabled: bool = False
     totp_enrolled_at: float | None = None
     # Federated-account identity (BACKLOG #1015, ADR 0142): the verified OIDC ``(issuer, sub)`` this
@@ -2360,6 +2361,12 @@ class VerifiedUser(UserRecord):
     def recovery_code_hashes(self) -> list[str]:
         """The recovery-code hashes the seal covered, or ``[]``."""
         return [] if self.row is None else self.row.recovery_code_hashes()
+
+    @property
+    def totp_secret_cell(self) -> str | None:
+        """The TOTP secret the seal covered, still encrypted, or ``None`` (BACKLOG #3510). The
+        store's ``open_totp_secret`` decrypts it."""
+        return None if self.row is None else self.row.totp_secret
 
 
 # The statements that write a sealed user record (BACKLOG #2592), with `?` placeholders: SQLite and
@@ -14531,11 +14538,12 @@ class MessageStore:
         async with self._read() as db:
             cur = await db.execute("SELECT totp_secret FROM users WHERE id=?", (user_id,))
             row = await cur.fetchone()
-        return (
-            self._dec(row["totp_secret"], aad=cell_aad("users", "totp_secret", user_id))
-            if row
-            else None
-        )
+        return self.open_totp_secret(user_id, row["totp_secret"] if row else None)
+
+    def open_totp_secret(self, user_id: str, cell: str | None) -> str | None:
+        """``cell``, a ``users.totp_secret`` value the caller already read, decrypted (BACKLOG
+        #3510). ``None`` for no cell."""
+        return self._dec(cell, aad=cell_aad("users", "totp_secret", user_id))
 
     async def enable_totp(
         self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None

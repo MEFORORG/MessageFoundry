@@ -6376,6 +6376,23 @@ def _host_gated_store_settings(
     return settings
 
 
+def _seal_refusal(username: str, act: str) -> str:
+    """The fixed refusal of a host command whose write the store refused because the account's
+    record fails its integrity seal (BACKLOG #3510). Logs it and returns the text, which the caller
+    ends by saying what was written. The error carries the record's kind only, so neither names a
+    stored value. A missing key fails the check the same way as a change, so the text names both."""
+    logging.getLogger(__name__).warning(
+        "%s refused for %r: the account's record failed its integrity seal", act, username
+    )
+    return (
+        f"the store refused the {act} for {username!r}: its record fails its integrity seal under "
+        "the store keys this shell holds. Either a retired store key it was sealed under is not "
+        "configured here, or the record was changed outside the engine. Check the key "
+        "configuration first; if it is right, read the audit log and restore the account from a "
+        "backup"
+    )
+
+
 def _admin_unlock(args: argparse.Namespace) -> int:
     """Clear a local account's lockout from the host (BACKLOG #1236, ADR 0171).
 
@@ -6404,6 +6421,7 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         StoreNotFoundError,
         open_store,
     )
+    from messagefoundry.store.row_seal import RowSealError
 
     settings = _host_gated_store_settings(args)
     if isinstance(settings, int):
@@ -6455,6 +6473,11 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     ) as exc:
         _emit_error(str(exc), as_json=args.json)
         return 2
+    except RowSealError:
+        # BACKLOG #3510: the store's write helper refused the clear, writing nothing.
+        return _emit_error(
+            _seal_refusal(args.username, "unlock") + ". Nothing was written", as_json=args.json
+        )
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
     if outcome == "no-such-user":
@@ -7997,6 +8020,7 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         store_driver_errors,
     )
     from messagefoundry.store.crypto import CipherError, StoreKeylessError
+    from messagefoundry.store.row_seal import RowSealError
 
     settings = _host_gated_store_settings(args)
     if isinstance(settings, int):
@@ -8022,7 +8046,13 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
     # shell, or the current range's key not held) is asked before the append, so that refusal does
     # not arrive here (BACKLOG #2124); a failure the check cannot predict still can. `OSError` covers
     # a server backend's lost connection; the rest are the drivers' own bases, which subclass neither.
-    store_errors: tuple[type[Exception], ...] = (RuntimeError, OSError, *store_driver_errors())
+    # RowSealError (BACKLOG #3510): the account's record fails its seal, so the write helper refused.
+    store_errors: tuple[type[Exception], ...] = (
+        RuntimeError,
+        OSError,
+        RowSealError,
+        *store_driver_errors(),
+    )
 
     async def run() -> tuple[str, str, str]:
         """``(outcome, username, extra)``: ``extra`` is the store for ``set``, else an error text."""
@@ -8088,6 +8118,8 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
                     logged = f"appending the matching _failed audit row also failed ({follow})"
                 if not isinstance(exc, store_errors):
                     raise  # not a store refusal but a defect: the dispatch floor reports it
+                if isinstance(exc, RowSealError):  # BACKLOG #3510: re-running cannot help
+                    return ("seal-refused", user.username, logged)
                 return ("write-failed", user.username, f"{exc}; {logged}")
             return ("set", user.username, store.path)
         finally:
@@ -8116,6 +8148,9 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         # `StoreKeylessError`. Exit 1 stays a refusal about the account.
         _emit_error(f"{_sentence(extra)} Nothing was written", as_json=args.json)
         return 2
+    if outcome == "seal-refused":  # BACKLOG #3510; its own branch, since the text logs a warning
+        refused = _seal_refusal(username, "address write")
+        return _emit_error(f"{refused}. The address is NOT set, and {extra}", as_json=args.json)
     refusals = {
         "no-such-user": f"no account named {username!r}",
         "not-admin": f"the account {username!r} is not an Administrator; the start gate asks only "
@@ -8230,6 +8265,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         store_driver_errors,
     )
     from messagefoundry.store.crypto import CipherError, StoreKeylessError
+    from messagefoundry.store.row_seal import RowSealError
     from messagefoundry.store.store import AuditAppend
 
     settings = _host_gated_store_settings(args)
@@ -8250,8 +8286,14 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         sqlite3.DatabaseError,
         *could_not_start,
     )
-    # A refused write on every backend (BACKLOG #1983), as admin-set-notify-email names them.
-    store_errors: tuple[type[Exception], ...] = (RuntimeError, OSError, *store_driver_errors())
+    # A refused write on every backend (BACKLOG #1983), as admin-set-notify-email names them, and a
+    # record that fails its seal, which the write helper refuses (BACKLOG #3510).
+    store_errors: tuple[type[Exception], ...] = (
+        RuntimeError,
+        OSError,
+        RowSealError,
+        *store_driver_errors(),
+    )
 
     def open_refused(exc: Exception, *, hint: str = "") -> int:
         """The exit for a refusal raised while a store was opened or checked: nothing written.
@@ -8437,9 +8479,15 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
                 # Only a store refusal that the re-read confirms becomes a refusal; anything else
                 # is re-raised, after the re-read has said whether the swap landed.
                 landed = await swap_landed(store, user.id)
-                if landed is False and not isinstance(exc, store_errors):
-                    raise
                 if landed is False:
+                    if not isinstance(exc, store_errors):
+                        raise
+                    if isinstance(exc, RowSealError):
+                        return (
+                            _seal_refusal(user.username, "seed replacement")
+                            + ". Nothing was written."
+                            + unused_entry
+                        )
                     # One transaction: the seed, the session sweep and the audit row rolled back
                     # as one, and the re-read confirms the old seed is still there. The class
                     # only: a driver's message can quote a stored value (ASVS 16.5.4).

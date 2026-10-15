@@ -3538,7 +3538,7 @@ class AuthService:
             # window, not as its branch finishes (BACKLOG #1131, Manager decision 2026-09-28).
             # Written as the branch finished, a row's ``ts``, and the moment it appeared to a reader
             # polling ``GET /audit``, showed how much work the branch did: a refusal by a live lock
-            # does one dummy verify, a verified refusal also reads the TOTP secret and counts the
+            # does one dummy verify, a verified refusal also checks the TOTP code and counts the
             # failure, and only a right candidate arms the second-step lock. The point is the
             # equalizer's own floor, half a budget past the attempt's turn in the queue, so the rows
             # land there on every branch whose work fits in half a budget (the same condition the
@@ -3549,21 +3549,50 @@ class AuthService:
             # write different numbers of rows. The COUNT still runs before this, so counting is
             # unchanged.
             after_pad: list[Callable[[], Awaitable[None]]] = []
-            outcome = await self._dispatch_login(
-                username,
-                password,
-                provider=provider,
-                client=client,
-                supersedes=supersedes,
-                totp_code=totp_code,
-                arrived=arrived,
-                after_pad=after_pad,
-            )
+            try:
+                outcome = await self._dispatch_login(
+                    username,
+                    password,
+                    provider=provider,
+                    client=client,
+                    supersedes=supersedes,
+                    totp_code=totp_code,
+                    arrived=arrived,
+                    after_pad=after_pad,
+                )
+            except RowSealError as refused:
+                if refused.kind != USER_KIND:
+                    raise  # another record's seal: its own handler, as before BACKLOG #3510
+                outcome = self._sign_in_seal_refused(username, after_pad)
             # The room is set on every branch, whether it deferred rows or not, so every refusal
             # answers on the same slot.
             return await self._equalize_failure(
                 outcome, started, seam="login", queued=queued, writes=after_pad, write_room=True
             )
+
+    def _sign_in_seal_refused(
+        self, username: str, after_pad: list[Callable[[], Awaitable[None]]]
+    ) -> LoginOutcome:
+        """The sign-in's answer when a store write refused the account's record because it no
+        longer passes its seal (BACKLOG #3510): it was checked at load, then changed outside the
+        store, before a write. The same refusal as a wrong password, padded the same way by
+        :meth:`login`.
+
+        Not named ``_login*``: see :meth:`login`. The report is deferred to ``after_pad`` with the
+        other refused rows, so its timing shows nothing. It loads the account once more through the
+        checked loader, which reports a record that still fails; one put back in between passes,
+        and only the warning logged here is left."""
+        _log.warning(
+            "sign-in refused for %r: the account's record failed its integrity seal during the "
+            "sign-in",
+            scrub_log_argument(username),
+        )
+
+        async def report() -> None:
+            await self._load_user_by_username(username)
+
+        after_pad.append(report)
+        return LoginOutcome(ok=False, error="invalid credentials")
 
     async def _dispatch_login(
         self,
@@ -3905,12 +3934,13 @@ class AuthService:
         verified = await self._argon2(verify_password, stored or _DUMMY_PASSWORD_HASH, password)
         password_ok = stored is not None and verified
         # A stored secret that will not decrypt or decode is a wrong code, logged, and never an
-        # exception: this read is reachable WITHOUT the password here, so an unpadded 500 would name
-        # the account as enrolled to anyone who knows the username. The catch is broad on purpose,
-        # as in ``_classify_login_address``: each backend's cipher and driver raise their own
-        # classes, which ``auth/`` does not import, and every arm fails CLOSED (the code is wrong).
+        # exception: this decrypt is reachable WITHOUT the password here, so an unpadded 500 would
+        # name the account as enrolled to anyone who knows the username. The secret comes from the
+        # checked record, so no driver runs here since BACKLOG #3510; the catch stays broad because
+        # each backend's cipher raises its own classes, which ``auth/`` does not import, and every
+        # arm fails CLOSED (the code is wrong). ``consume_totp_step`` below is outside it.
         try:
-            secret = await self._store.get_totp_secret(user.id)
+            secret = self._totp_secret(user)
             step = (
                 totp.verify_totp_step(
                     secret,
@@ -7987,6 +8017,12 @@ class AuthService:
         await self._user_seal_failed(user.id)
         return None
 
+    def _totp_secret(self, user: VerifiedUser) -> str | None:
+        """``user``'s TOTP secret, decrypted from the record its seal covered (BACKLOG #3510), or
+        ``None``. Never a second read of the store: a secret swapped in after the checked load would
+        be checked against no seal, and its codes would sign in."""
+        return self._store.open_totp_secret(user.id, user.totp_secret_cell)
+
     async def _verified_passkeys(self, user: VerifiedUser) -> list[WebAuthnCredential] | None:
         """The account's passkeys, or ``None`` when they do not match the digest its seal covers
         (BACKLOG #2592), which is reported like a failing record and denies every passkey
@@ -10009,7 +10045,7 @@ class AuthService:
         user = await self._load_user(identity.user_id)
         if user is None:
             raise ValueError("no such user")
-        secret = await self._store.get_totp_secret(identity.user_id)
+        secret = self._totp_secret(user)
         if not secret:
             raise ValueError("no enrollment in progress")
         if await self._enrolment_too_early(
@@ -10515,7 +10551,7 @@ class AuthService:
         if not code:
             return False
         totp_refused = False
-        secret = await self._store.get_totp_secret(user.id)
+        secret = self._totp_secret(user)
         if secret:
             # Clock-skew window is operator-configurable (BACKLOG #187; ASVS 6.5.5). Default
             # totp_skew_steps=0 accepts only the current 30 s step (strict, tightest replay window);
