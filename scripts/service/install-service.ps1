@@ -1345,12 +1345,40 @@ function Get-EngineInstallProblem {
         return ("the engine package is not installed in it: '$package' is missing. An editable " +
             "install leaves it out and imports the engine from a checkout")
     }
-    $editable = @(Get-ChildItem -LiteralPath $sitePackages -Force -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -like '__editable__*messagefoundry*' } | ForEach-Object { $_.Name })
-    if ($editable) { return "it holds an editable install of the engine: $($editable -join ', ')" }
+    # The markers messagefoundry/integrity.py's _declares_editable reads, which `serve` reports: an
+    # __editable__ hook, direct_url.json declaring dir_info.editable, or a RECORD row naming an
+    # editable finder or a .pth. Read here as files, because this prompt runs none of the install's
+    # code.
+    $editable = @(Get-ChildItem -LiteralPath $sitePackages -Filter '__editable__*messagefoundry*' -Force -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.Name })
+    foreach ($distInfo in @(Get-ChildItem -LiteralPath $sitePackages -Filter 'messagefoundry-*.dist-info' -Directory -Force -ErrorAction SilentlyContinue)) {
+        $directUrl = Join-Path $distInfo.FullName "direct_url.json"
+        if (Test-Path -LiteralPath $directUrl -PathType Leaf) {
+            try {
+                $info = Get-Content -LiteralPath $directUrl -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                if ($info.dir_info -and $info.dir_info.editable) { $editable += "$($distInfo.Name)\direct_url.json" }
+            } catch {
+                return "its '$directUrl' could not be read ($($_.Exception.Message))"
+            }
+        }
+        $record = Join-Path $distInfo.FullName "RECORD"
+        if (Test-Path -LiteralPath $record -PathType Leaf) {
+            $rows = @(Get-Content -LiteralPath $record -ErrorAction SilentlyContinue | ForEach-Object {
+                (($_ -split ',')[0] -split '[\\/]')[-1] } |
+                Where-Object { $_ -like '__editable__*' -or $_ -like '*.pth' -or $_ -like '*_editable_impl*' })
+            if ($rows) { $editable += "$($distInfo.Name)\RECORD names $($rows -join ', ')" }
+        }
+    }
+    if ($editable) { return "it holds an editable install of the engine: $($editable -join '; ')" }
     $files = @($PythonExe, $package, $AppExe, (Join-Path $InstallRoot "pyvenv.cfg"))
-    return (@($files | Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
-        ForEach-Object { Get-NssmHomeProblem -File $_ } | Where-Object { $_ }) -join "; ")
+    # Each file's walk reads the same folders above the root, so a broad folder there would be named
+    # once per file. -Unique names it once. A holder of the file itself carries no path, so the
+    # file's is added, and two files with the same holder stay apart.
+    return (@($files | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | ForEach-Object {
+            $file = $_
+            (Get-NssmHomeProblem -File $file) -split '; ' | Where-Object { $_ } | ForEach-Object {
+                if ($_.Contains(" on '")) { $_ } else { "$_ on '$file'" } }
+        } | Select-Object -Unique) -join "; ")
 }
 
 function Assert-NoNssmExpansion {
@@ -1497,7 +1525,7 @@ function Get-LockPathProblem {
 # Resolve-Nssm had already joined a possibly-relative -DataDir, and after Test-Path had validated a
 # relative -DbPath against a DIFFERENT directory from the one the service would resolve it against.
 # That is the whole defect: one path, validated here against the operator's shell location, resolved
-# there against AppDirectory ($RepoRoot).
+# there against AppDirectory, then the checkout and now the install root.
 #
 # NOT Resolve-Path: it THROWS on a path that does not exist, and a first install legitimately has no
 # database file yet. GetUnresolvedProviderPathFromPSPath normalizes without requiring existence.

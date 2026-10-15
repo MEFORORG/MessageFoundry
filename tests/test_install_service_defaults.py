@@ -150,8 +150,25 @@ def test_a_user_writable_install_is_refused_and_an_admin_only_one_passes(tmp_pat
     names = ["root", "above", "python", "app", "init", "cfg"]
     venvs = {name: _venv(tmp_path / "chain" / name / "venv") for name in names + ["clean"]}
     no_package = _venv(tmp_path / "chain" / "nopkg" / "venv", package=False)
-    editable = _venv(tmp_path / "chain" / "editable" / "venv", package=True)
+    editable = _venv(tmp_path / "chain" / "editable" / "venv")
     (editable["site"] / "__editable__.messagefoundry-0.5.1.pth").write_text("", encoding="utf-8")
+    # The two markers integrity.py's _declares_editable also reads, each in a venv of its own.
+    direct_url = _venv(tmp_path / "chain" / "directurl" / "venv")
+    dist = direct_url["site"] / "messagefoundry-0.5.1.dist-info"
+    dist.mkdir()
+    (dist / "direct_url.json").write_text(
+        '{"url": "file:///C:/src", "dir_info": {"editable": true}}', encoding="utf-8"
+    )
+    record = _venv(tmp_path / "chain" / "record" / "venv")
+    dist = record["site"] / "messagefoundry-0.5.1.dist-info"
+    dist.mkdir()
+    (dist / "RECORD").write_text(
+        "messagefoundry/__init__.py,sha256=x,1\n_messagefoundry.pth,sha256=y,2\n", encoding="utf-8"
+    )
+    # A wheel install's own dist-info: a RECORD of package rows and no direct_url.json.
+    wheel = venvs["clean"]["site"] / "messagefoundry-0.5.1.dist-info"
+    wheel.mkdir()
+    (wheel / "RECORD").write_text("messagefoundry/__init__.py,sha256=x,1\n", encoding="utf-8")
     lines = []
     for name in names:
         v = venvs[name]
@@ -170,6 +187,8 @@ def test_a_user_writable_install_is_refused_and_an_admin_only_one_passes(tmp_pat
     cases["clean_no_app"] = call(venvs["clean"], app=False)
     cases["nopkg"] = call(no_package)
     cases["editable"] = call(editable)
+    cases["directurl"] = call(direct_url)
+    cases["record"] = call(record)
     cases["root_of_venv"] = (
         f"Get-EngineInstallRoot -PythonExe {_psq(str(venvs['clean']['python']))}"
     )
@@ -194,6 +213,10 @@ def test_a_user_writable_install_is_refused_and_an_admin_only_one_passes(tmp_pat
     assert got["clean_no_app"] == ""
     assert "is missing" in got["nopkg"] and "editable" in got["nopkg"]
     assert "__editable__.messagefoundry-0.5.1.pth" in got["editable"]
+    assert "direct_url.json" in got["directurl"]
+    assert "RECORD names _messagefoundry.pth" in got["record"]
+    # A holder of the file itself is named with the file's path.
+    assert "BUILTIN\\Users on '" + str(venvs["python"]["python"]) + "'" in got["python"]
     assert got["root_of_venv"] == str(venvs["clean"]["root"])
     assert got["root_of_system"] == "C:\\Python314"
 

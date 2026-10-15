@@ -3986,7 +3986,9 @@ jobs:
       # the installer's default root the way docs/SERVICE.md "Install the engine where only
       # administrators can write" does: a venv under Program Files, the engine wheel installed into
       # it, never editable, then an administrator-only access list on it and the folder above it.
-      # The extras are the ones the editable install above takes, for the same reason.
+      # The extras are the ones the editable install above takes, for the same reason. The commands
+      # repeat the docs' recipe on purpose, rather than calling the installer's Set-AdminOnlyAcl, so
+      # this leg runs what an operator runs. Change the two together.
       - name: Build the administrator-only engine install from the wheel
         run: |
           $root = "$env:ProgramFiles\MessageFoundry\engine"
