@@ -21,7 +21,7 @@ from urllib.parse import parse_qsl, unquote, urlencode, urlsplit
 
 import httpx
 import pytest
-from _ui_clients import create_local_user_chosen
+from _ui_clients import create_local_user_chosen, issue_continuation
 
 from messagefoundry.api import create_app
 from messagefoundry.api.models import EventInfo, MessageDetail, OutboxInfo
@@ -197,6 +197,9 @@ def test_the_outcome_page_words_a_duplicate_apart_from_a_send() -> None:
     assert "Resend queued" in sent and "nothing new was queued" not in sent
     assert "Already resent" in dup and "nothing new was queued" in dup
     assert "Resend queued" not in dup
+    # No source names none, rather than an empty pair of quotes.
+    bare = str(message_resend_done("m1", "OB2", "", duplicate=False))
+    assert "copied from" not in bare and "“OB2”." in bare
 
 
 def test_the_outcome_page_carries_the_tail_warning_too() -> None:
@@ -313,6 +316,9 @@ async def _mint(c: httpx.AsyncClient, mid: str) -> None:
     continues to the confirm page. The grant names the action, not the target, so one selection
     serves every target a test posts."""
     nxt = f"/ui/messages/{mid}/resend-confirm?" + urlencode({"to": "OB2", "source": "archive"})
+    # Issued first, as the gate's refusal issues it: /ui/reauth mints only for an issued
+    # continuation (owner ruling 2026-10-13, #3241 R3).
+    issue_continuation(c, nxt)
     r = await c.post(
         "/ui/reauth",
         data={"next": nxt, "password": PW},
@@ -750,19 +756,68 @@ async def test_a_key_used_for_another_target_is_not_a_repeat(
         assert other.status_code == 303 and other.headers["location"].startswith("/ui/reauth?")
 
 
-async def test_the_outcome_page_echoes_only_connection_names(engine: Engine) -> None:
-    """The resend-done page names a target from its query, so the query must pass the
-    connection-name rule: markup or a space is refused there, not rendered."""
+async def test_the_outcome_page_refuses_a_target_that_is_not_a_connection_name(
+    engine: Engine,
+) -> None:
+    """The resend-done query must pass the connection-name rule: markup is refused there."""
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR.value)
     mid = await _seed(engine)
     async with _client(engine, service) as c:
         await _login(c, "op")
-        for bad in ({"to": "<b>x</b>"}, {"to": "OB2", "source": "has space"}):
-            r = await c.get(f"/ui/messages/{mid}/resend-done", params=bad)
-            assert r.status_code == 422, (bad, r.status_code)
-        ok = await c.get(f"/ui/messages/{mid}/resend-done", params={"to": "OB2"})
-        assert ok.status_code == 200  # control: a name and no source renders
+        r = await c.get(f"/ui/messages/{mid}/resend-done", params={"to": "<b>x</b>", "key": "k1"})
+        assert r.status_code == 422, r.status_code
+        # Control: a name the rule takes gets past the rule (and finds no resend, below).
+        ok = await c.get(f"/ui/messages/{mid}/resend-done", params={"to": "OB2", "key": "k1"})
+        assert ok.status_code == 404, ok.status_code
+
+
+async def test_a_crafted_outcome_link_reports_no_resend(engine: Engine, tmp_path: Path) -> None:
+    """Vault BACKLOG #3241 (PR 2142, 13:57Z comment): the outcome page rendered "Resend queued"
+    from its query alone, so a crafted link reported a resend that never ran. It now renders from
+    the store's record of the key. A link with no record says so; a real one still renders, with
+    the source the store recorded rather than one the link names."""
+    engine.add_registry(_registry(tmp_path))
+    await engine.start()
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR.value)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _login(c, "op")
+        crafted = await c.get(
+            f"/ui/messages/{mid}/resend-done",
+            params={"to": "OB2", "key": "never-used", "duplicate": "false"},
+        )
+        assert crafted.status_code == 404, crafted.status_code
+        assert "No such resend" in crafted.text and "Resend queued" not in crafted.text
+        # CONTROL: a resend that really ran renders from its record.
+        done = await _post_resend(c, mid, key="k-real")
+        assert done.status_code == 200 and "Resend queued" in done.text
+        # Its key under another target, or on another message, is not its record.
+        for path, params in (
+            (f"/ui/messages/{mid}/resend-done", {"to": "OB3", "key": "k-real"}),
+            ("/ui/messages/" + "0" * 32 + "/resend-done", {"to": "OB2", "key": "k-real"}),
+        ):
+            other = await c.get(path, params=params)
+            assert other.status_code == 404, (path, params, other.status_code)
+    # A caller without scope on the target is told no more than about an unknown key.
+    await _add(service, "narrow", Role.OPERATOR.value, channels=["IB_ELSEWHERE"])
+    async with _client(engine, service) as c:
+        await _login(c, "narrow")
+        hidden = await c.get(
+            f"/ui/messages/{mid}/resend-done", params={"to": "OB2", "key": "k-real"}
+        )
+        assert hidden.status_code == 404 and "No such resend" in hidden.text
+    # CONTROL: scope on the target alone renders it, and shows no source, since the origin
+    # channel is not checked here.
+    await _add(service, "target_only", Role.OPERATOR.value, channels=["OB2"])
+    async with _client(engine, service) as c:
+        await _login(c, "target_only")
+        shown = await c.get(
+            f"/ui/messages/{mid}/resend-done", params={"to": "OB2", "key": "k-real"}
+        )
+        assert shown.status_code == 200 and "Resend queued" in shown.text
+        assert "copied from" not in shown.text
 
 
 async def test_a_malformed_name_costs_no_proof(engine: Engine) -> None:

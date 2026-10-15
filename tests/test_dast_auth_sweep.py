@@ -23,12 +23,16 @@ no message is ever seeded, so no payload — synthetic or otherwise — exists t
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
+from messagefoundry.api.app import create_app
 from scripts.security import dast_target as dast_target_module
 from scripts.security import route_gates
 from scripts.security.dast_auth_sweep import (
@@ -139,7 +143,7 @@ def test_receipt_names_what_it_examined(clean_run: tuple[int, dict[str, Any]]) -
         "reaching neither pass, and the receipt's coverage line would overstate what was examined."
     )
     assert receipt["write_bfla_probes"] >= 35, receipt["write_bfla_probes"]
-    assert receipt["write_reached"] >= 40, (
+    assert receipt["write_reached"] >= 55, (
         f"only {receipt['write_reached']} gated non-GET operation(s) admitted the administrator "
         "identity; the write reach pass is measuring a wall, not authorization."
     )
@@ -467,7 +471,7 @@ def test_a_policy_without_floors_fails_closed(tmp_path: Path) -> None:
             "negative_probes": 198,
             "reached": 46,
             "bfla_probes": 19,
-            "write_reached": 47,
+            "write_reached": 61,
             "write_bfla_probes": 43,
             "ungated_routes": _declared_public(policy),
         },
@@ -507,7 +511,7 @@ async def test_a_session_destroying_write_probe_does_not_poison_the_rows_after_i
         original = target.admin_token
         rebuilt: list[str] = []
         async with httpx.AsyncClient(base_url=target.base_url, timeout=30.0) as client:
-            results = await _write_pass(
+            results, _token = await _write_pass(
                 client,
                 [logout, *followers],
                 target=target,
@@ -622,7 +626,7 @@ def test_the_bfla_canary_floors_the_write_pass_separately() -> None:
         "negative_probes": 204,
         "reached": 46,
         "bfla_probes": 19,
-        "write_reached": 47,
+        "write_reached": 61,
         "write_bfla_probes": 43,
         "unreached_unexplained": 0,
         "ungated_routes": _declared_public(policy),
@@ -646,7 +650,7 @@ def test_too_many_destroyed_sessions_is_a_could_not_measure() -> None:
         "negative_probes": 204,
         "reached": 46,
         "bfla_probes": 19,
-        "write_reached": 47,
+        "write_reached": 61,
         "write_bfla_probes": 43,
         "unreached_unexplained": 0,
         "ungated_routes": _declared_public(policy),
@@ -664,10 +668,10 @@ def test_every_unreachable_allowlist_entry_names_a_real_row_and_a_reason(
 ) -> None:
     """An exemption may only shrink the scan for a stated reason, and only for a row that EXISTS.
 
-    Eight write rows sit behind an action-scoped step-up wall a password login cannot satisfy, so they
-    are exempted rather than reached. That is how a scan quietly shrinks, so both halves are pinned: no
-    entry may be reason-free, and no entry may name a row the live route table no longer has — a stale
-    exemption is an exemption nobody is checking.
+    An exemption is how a scan quietly shrinks, so both halves are pinned: no entry may be
+    reason-free, and no entry may name a row the live route table no longer has — a stale exemption
+    is an exemption nobody is checking. The action-bound step-up rows used to be exempted here; the
+    sweep now re-proves them instead (vault BACKLOG #3241), and the tests below pin that.
     """
     _code, receipt = clean_run
     policy = _policy()
@@ -680,6 +684,92 @@ def test_every_unreachable_allowlist_entry_names_a_real_row_and_a_reason(
         )
     # The exemptions must not be able to swallow the pass: reach still clears its floor beside them.
     assert receipt["write_reached"] > receipt["write_unreached_allowlisted"], receipt
+
+
+# =====================================================================================================
+# Action-bound step-up rows are re-proved, not exempted (vault BACKLOG #3241)
+# =====================================================================================================
+
+
+def _action_bound_rows() -> dict[tuple[str, str], str]:
+    """``(method, path) -> action`` for every row of the default app whose gate binds an action."""
+    return {
+        (row.method, row.path): row.action
+        for row in route_gates.gated_http_rows()
+        if row.action is not None
+    }
+
+
+def test_action_bound_rows_are_reached_by_re_proving(clean_run: tuple[int, dict[str, Any]]) -> None:
+    """PR 2142 item 4: the sweep exempted every action-bound row and so measured none of them.
+
+    Now each one is reached: none is exempted, and the clean run has no unexplained unreached row.
+    The re-proofs it records are all on action-bound rows, and the receipt names no action, because
+    the action is a header value."""
+    code, receipt = clean_run
+    bound = _action_bound_rows()
+    assert len(bound) >= 10, f"the walk found only {len(bound)} action-bound rows: {bound}"
+    exempted = {(e["method"], e["path"]) for e in _policy()["unreachable_allowlist"]}
+    assert not exempted & set(bound), (
+        f"action-bound rows are still exempted instead of re-proved: {sorted(exempted & set(bound))}"
+    )
+    assert code == 0 and receipt["unreached_unexplained"] == 0, receipt["findings"]
+    reproved = set(receipt["step_up_reproof_rows"])
+    assert receipt["step_up_reproofs"] == len(receipt["step_up_reproof_rows"]) > 0, receipt
+    assert reproved <= {f"{m} {p}" for m, p in bound}, (
+        f"re-proved rows that bind no action: {sorted(reproved - {f'{m} {p}' for m, p in bound})}"
+    )
+    blob = json.dumps(receipt)
+    leaked = sorted(action for action in set(bound.values()) if action in blob)
+    assert not leaked, (
+        f"the receipt carries step-up action names, which are header values: {leaked}"
+    )
+
+
+def test_without_a_re_proof_the_action_bound_rows_are_findings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The negative control: the action-bound rows really are walls, so a re-proof that does nothing
+    leaves them refused, unexempted and reported. Without this, the test above would pass on rows
+    a password login already reached."""
+    import scripts.security.dast_auth_sweep as sweep
+
+    real = dast_target
+
+    async def _no_reproof(token: str, _action: str) -> str:
+        return token
+
+    @asynccontextmanager
+    async def _target(**kwargs: Any) -> AsyncIterator[Any]:
+        async with real(**kwargs) as target:
+            yield replace(target, reprove=_no_reproof)
+
+    monkeypatch.setattr(sweep, "dast_target", _target)
+    receipt_path = tmp_path / "receipt.json"
+    code = main(["--policy", str(_POLICY), "--receipt", str(receipt_path)])
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    refused = {
+        f"{f['method']} {f['path']}"
+        for f in receipt["findings"]
+        if f["observed_status"] == 403 and f["pass_name"].startswith("authorized-reach")
+    }
+    # Exit 2 today, because the lost rows also breach the write-reach floor; either code reds.
+    assert code != 0, f"a sweep that could not pass the step-up wall exited {code}"
+    assert refused and refused <= {f"{m} {p}" for m, p in _action_bound_rows()}, refused
+    # A body-less GET export now fails its own criteria check before its spend (owner ruling
+    # 2026-10-13, #3241 R2), so it is reached without a proof and is not here.
+    assert {"POST /messages/{message_id}/resend", "POST /connections/{name}/purge"} <= refused, (
+        refused
+    )
+
+
+async def test_a_refused_re_proof_is_a_could_not_measure() -> None:
+    """A re-proof the engine refuses raises ``DastTargetUnusable``, which ``main()`` turns into
+    exit 2. Driven on the real endpoint with a token that authenticates nothing."""
+    async with dast_target() as target:
+        with pytest.raises(DastTargetUnusable) as caught:
+            await target.reprove("dast-not-a-real-token", "config_reload")
+    assert "measured nothing" in str(caught.value), caught.value
 
 
 # =====================================================================================================
@@ -700,7 +790,6 @@ def test_no_route_falls_off_the_end_of_the_walk() -> None:
     Driven with ``expose_docs=True`` and ``serve_ui=True`` on purpose: those are the flags that
     MATERIALISE the route classes the walk used to drop.
     """
-    from messagefoundry.api.app import create_app
     from scripts.security import route_gates
 
     app = create_app(expose_docs=True)
@@ -777,7 +866,7 @@ def test_bfla_oracle_treats_404_as_a_violation() -> None:
         "negative_probes": 198,
         "reached": 46,
         "bfla_probes": 19,
-        "write_reached": 47,
+        "write_reached": 61,
         "write_bfla_probes": 43,
         "bfla_violations": 1,
         "unreached_unexplained": 0,
@@ -808,7 +897,7 @@ def test_an_unexplained_unreached_operation_is_a_finding() -> None:
         "negative_probes": 198,
         "reached": 46,
         "bfla_probes": 19,
-        "write_reached": 47,
+        "write_reached": 61,
         "write_bfla_probes": 43,
         "unreached_unexplained": 3,
         "ungated_routes": _declared_public(policy),
@@ -832,7 +921,7 @@ def test_a_newly_ungated_route_reds_the_run() -> None:
         "negative_probes": 198,
         "reached": 46,
         "bfla_probes": 19,
-        "write_reached": 47,
+        "write_reached": 61,
         "write_bfla_probes": 43,
         "unreached_unexplained": 0,
         # Declared public with a reason, so only the set check can catch it: the route is public
@@ -872,7 +961,7 @@ def test_an_allow_listed_route_that_is_not_declared_public_reds_the_run(
         "negative_probes": 198,
         "reached": 46,
         "bfla_probes": 19,
-        "write_reached": 47,
+        "write_reached": 61,
         "write_bfla_probes": 43,
         "unreached_unexplained": 0,
         "ungated_routes": rows,

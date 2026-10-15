@@ -703,11 +703,16 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         to: str = Query(..., min_length=1, max_length=256),
         engine: Any = Depends(deps.get_engine),
         # `messages:edit` as well as the POST, so a role that cannot resend is told so here rather
-        # than after it confirms (vault BACKLOG #2625). The window, not the bound proof: the re-auth
-        # for this page mints that proof, and the POST spends it.
+        # than after it confirms (vault BACKLOG #2625). The bound proof HELD, not spent (owner ruling
+        # 2026-10-13, #3241 R2): a page opened inside the window but with no proof would cost the
+        # operator a confirm and then a re-auth at the POST. The POST spends it.
         identity: Identity = Depends(
-            require_ui_step_up(
-                Permission.FILES_BROWSE, Permission.MESSAGES_EDIT, reauth_next=_resend_confirm_next
+            require_ui_step_up_action(
+                STEP_UP_ACTION_UPLOAD_RESEND,
+                Permission.FILES_BROWSE,
+                Permission.MESSAGES_EDIT,
+                reauth_next=_resend_confirm_next,
+                spend=False,
             )
         ),
     ) -> Response:

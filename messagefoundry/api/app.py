@@ -5357,11 +5357,15 @@ def create_app(
     async def approve_action(
         approval_id: ResourceId,
         request: Request,
-        identity: Identity = Depends(require_paced(Permission.APPROVALS_APPROVE)),
+        # Owner ruling 2026-10-13 (#3241 R4): a FRESH step-up, as the resolve below asks. The
+        # release runs the held operation, so it asks at least what the request side asked; reject
+        # runs nothing and stays paced.
+        identity: Identity = Depends(require_step_up(Permission.APPROVALS_APPROVE)),
         gate: ApprovalGate | None = Depends(_get_gate),
     ) -> ApprovalDecisionResult:
         """Release a pending action: re-executes the captured operation and audits both identities. A
-        requester can never approve their own request (dual-control, 2.3.5)."""
+        requester can never approve their own request (dual-control, 2.3.5). Needs a fresh step-up
+        window (``require_step_up``)."""
         if gate is None:
             raise HTTPException(503, "approval workflow is not available")
         try:
@@ -5840,16 +5844,12 @@ def create_app(
         engine: Engine,
         identity: Identity,
         ids: list[str],
-        content: str | None = None,
-        field_path: str | None = None,
-        field_value: str | None = None,
-        target: str = "both",
         channel_id: str | None = None,
         status: str | None = None,
         message_type: str | None = None,
         control_id: str | None = None,
         limit: int = 1000,
-        scan_limit: int = DEFAULT_CONTENT_SCAN_LIMIT,
+        spec: SearchSpec | None = None,
     ) -> StreamingResponse:
         """Stream a batch of message bodies to a downloadable NDJSON file (#124, ADR 0131) — the
         Corepoint-parity bulk export a one-at-a-time ``/messages/{id}/raw`` fetch can't provide.
@@ -5869,13 +5869,15 @@ def create_app(
 
         This is the shared implementation behind both request shapes (BACKLOG #1184): the GET below,
         which takes ids and the URL-safe criteria, and the POST, which is the only way to select by
-        ``content`` or ``field_value``."""
-        # #200 (ADR 0092): a bulk-PHI read behind step-up (NOT require_phi_read), so apply the data-path
-        # hop guard explicitly before any body is decrypted — exactly as the step-up search route does.
-        enforce_phi_read_hop(request)
-        # Charged BEFORE selection: step-up pacing is NON-GET only, so without this a single actor can
-        # stream far more bodies per minute through the export GET than the per-actor budget allows
-        # through /messages/{id}/raw. Admission-time so a refused call does no store work. The POST shape
+        ``content`` or ``field_value``. Each route checks its criteria with :func:`_export_spec` and
+        spends the export proof before it calls this (owner ruling 2026-10-13, #3241 R2), so a
+        search selection arrives as ``spec`` and a malformed one cost no proof."""
+        # #200 (ADR 0092): the data-path hop guard runs in each export route, before its spend
+        # (owner ruling 2026-10-13, #3241 R2), so it has run before any body is decrypted here.
+        # Charged BEFORE selection, and after the spend, so a refused proof is charged nothing.
+        # Step-up pacing is NON-GET only, so without this a single actor can stream far more bodies
+        # per minute through the export GET than the per-actor budget allows through
+        # /messages/{id}/raw. Admission-time so a refused call does no store work. The POST shape
         # draws on this same PHI-read bucket (its admin-write charge is a different, stricter one).
         enforce_phi_read_pacing(request, identity)
         allowed = _scope(identity)  # per-channel RBAC (None = all)
@@ -5883,16 +5885,8 @@ def create_app(
             selected = ids[:limit]
             selection: dict[str, object] = {"mode": "ids", "requested": len(ids)}
         else:
-            try:
-                spec = make_spec(
-                    content=content,
-                    field_path=field_path,
-                    field_value=field_value,
-                    target=SearchTarget(target),
-                    scan_limit=scan_limit,
-                )
-            except ContentSearchError as exc:
-                raise HTTPException(400, str(exc)) from exc
+            if spec is None:
+                raise HTTPException(400, "an export by search needs its checked criteria")
             result = await engine.store.search_messages(
                 spec,
                 channel_id=channel_id,
@@ -6013,6 +6007,32 @@ def create_app(
             headers={"Content-Disposition": 'attachment; filename="messages-export.ndjson"'},
         )
 
+    def _export_spec(
+        ids: list[str],
+        *,
+        content: str | None = None,
+        field_path: str | None = None,
+        field_value: str | None = None,
+        target: str = "both",
+        scan_limit: int = DEFAULT_CONTENT_SCAN_LIMIT,
+    ) -> SearchSpec | None:
+        """The export's own input check, run BEFORE its proof is spent (owner ruling 2026-10-13,
+        #3241 R2): ``None`` for an export by ``ids``, else the checked search spec. A malformed
+        criterion answers 400 and costs the caller no proof. Pure: it reads nothing and writes
+        nothing."""
+        if ids:
+            return None
+        try:
+            return make_spec(
+                content=content,
+                field_path=field_path,
+                field_value=field_value,
+                target=SearchTarget(target),
+                scan_limit=scan_limit,
+            )
+        except ContentSearchError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
     # LARGEST PHI surface in the cluster (bulk raw bodies → a file), on both shapes: the strongest
     # interactive gate — a fresh step-up + second factor over BOTH messages:view_raw AND a dedicated
     # messages:export capability (ADR 0131 §2). Bulk egress is a distinct privilege from opening one
@@ -6026,6 +6046,7 @@ def create_app(
                 STEP_UP_ACTION_MESSAGE_EXPORT,
                 Permission.MESSAGES_EXPORT,
                 Permission.MESSAGES_VIEW_RAW,
+                proof_in_route=True,
             )
         ),
         ids: list[ResourceId] = Query(default=[], max_length=MAX_EXPORT_IDS),  # noqa: B006 — FastAPI repeated ?ids=
@@ -6044,19 +6065,20 @@ def create_app(
         operator-typed needle is PHI-shaped and a query string is logged in three places the redactor
         cannot reach. Send a needle-bearing save-all to ``POST /messages/export``. Message ids stay —
         they are engine-minted opaque identifiers, not patient data."""
+        enforce_phi_read_hop(request)
+        spec = _export_spec(ids, field_path=field_path, target=target, scan_limit=scan_limit)
+        await spend_step_up_action(request, STEP_UP_ACTION_MESSAGE_EXPORT)
         return await export_messages(
             request,
             engine=engine,
             identity=identity,
             ids=ids,
-            field_path=field_path,
-            target=target,
             channel_id=channel_id,
             status=status,
             message_type=message_type,
             control_id=control_id,
             limit=limit,
-            scan_limit=scan_limit,
+            spec=spec,
         )
 
     @app.post("/messages/export")
@@ -6069,26 +6091,33 @@ def create_app(
                 STEP_UP_ACTION_MESSAGE_EXPORT,
                 Permission.MESSAGES_EXPORT,
                 Permission.MESSAGES_VIEW_RAW,
+                proof_in_route=True,
             )
         ),
     ) -> StreamingResponse:
         """The needle-bearing shape of the export above (BACKLOG #1184): same gate, same per-row channel
         re-check, same pre-stream audit — the selection criteria arrive in the request BODY."""
+        enforce_phi_read_hop(request)
+        spec = _export_spec(
+            criteria.ids,
+            content=criteria.content,
+            field_path=criteria.field_path,
+            field_value=criteria.field_value,
+            target=criteria.target,
+            scan_limit=_scan_limit_or_default(criteria.scan_limit),
+        )
+        await spend_step_up_action(request, STEP_UP_ACTION_MESSAGE_EXPORT)
         return await export_messages(
             request,
             engine=engine,
             identity=identity,
             ids=criteria.ids,
-            content=criteria.content,
-            field_path=criteria.field_path,
-            field_value=criteria.field_value,
-            target=criteria.target,
             channel_id=criteria.channel_id,
             status=criteria.status,
             message_type=criteria.message_type,
             control_id=criteria.control_id,
             limit=criteria.limit,
-            scan_limit=_scan_limit_or_default(criteria.scan_limit),
+            spec=spec,
         )
 
     @app.get("/messages/{message_id}", response_model=MessageDetail)
@@ -6673,7 +6702,9 @@ def create_app(
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(
-            require_step_up_action(STEP_UP_ACTION_MESSAGE_EDIT_RESEND, Permission.MESSAGES_EDIT)
+            require_step_up_action(
+                STEP_UP_ACTION_MESSAGE_EDIT_RESEND, Permission.MESSAGES_EDIT, proof_in_route=True
+            )
         ),
     ) -> EditResendResult:
         """Edit a stored message and resubmit the EDITED body (ADR 0090 §9, BACKLOG #153). The edit is
@@ -6689,56 +6720,158 @@ def create_app(
         The audit row also carries keyed digests of the original and the edited body, and the new
         message records its origin as ``operator_edit`` with the acting user, so the edited body can
         be proved after retention has blanked both bodies (vault BACKLOG #2615,
-        :func:`_edit_resend_provenance`)."""
-        # 404 (not 403) outside the caller's channel scope (mirrors resend/replay/get_message).
-        row = await get_scoped_message(engine, identity, message_id, request)
+        :func:`_edit_resend_provenance`).
 
-        if body.to is not None:
-            # DIRECT power-path: deliver the edited body straight to an alternate outbound. Same cross-
-            # channel authorization + target validation as #123's resend (registered/owned/running).
-            if not identity.can_access_channel(body.to):
-                await _audit_channel_denied(engine, identity, body.to, client_ip(request))
-                raise HTTPException(403, f"not authorized to resend to outbound {body.to!r}")
+        The step-up proof is spent in this route, after FastAPI has validated the body, so a 422
+        costs no proof (owner ruling 2026-10-13, #3241 R1 and R2); a refusal raised before the
+        store write gives the proof back."""
+        await spend_step_up_action(request, STEP_UP_ACTION_MESSAGE_EDIT_RESEND)
+        return await _edit_resend_core(
+            message_id, body=body, engine=engine, identity=identity, request=request
+        )
+
+    async def _edit_resend_core(
+        message_id: str,
+        *,
+        body: EditResendRequest,
+        request: Request,
+        engine: Engine,
+        identity: Identity,
+    ) -> EditResendResult:
+        """The body of :func:`edit_resend_message` after its spend, whose docstring is the contract.
+        The console calls this in-process after its own spend."""
+        # Owner ruling 2026-10-13 (#3241 R1): a refusal raised BEFORE the store write gives back the
+        # proof the gate spent (ADR 0197 Amendment C), so an edit the engine refused costs the
+        # operator no password and the console can re-open the editor without a re-auth. `written`
+        # turns true just before the store call: a refusal from there on keeps the spend, because the
+        # store may have committed. The console calls this handler in-process after its own spend,
+        # so the refund reaches both planes.
+        written = False
+        try:
+            # 404 (not 403) outside the caller's channel scope (mirrors resend/replay/get_message).
+            row = await get_scoped_message(engine, identity, message_id, request)
+
+            if body.to is not None:
+                # DIRECT power-path: deliver the edited body straight to an alternate outbound. Same cross-
+                # channel authorization + target validation as #123's resend (registered/owned/running).
+                if not identity.can_access_channel(body.to):
+                    await _audit_channel_denied(engine, identity, body.to, client_ip(request))
+                    raise HTTPException(403, f"not authorized to resend to outbound {body.to!r}")
+                rr = engine.registry_runner
+                if rr is None or body.to not in rr.registry.outbound:
+                    raise HTTPException(404, f"no such outbound connection: {body.to}")
+                # THE BACK DOOR (#233, ADR 0111): the direct path reuses #123's resend seam, which inserts an
+                # outbound-stage row DIRECTLY (store.resend_to) without transform_one — so, exactly like
+                # /resend above, the transform-time not-deployed decline does not cover it. Refuse a
+                # not-deployed target so an operator can't hand-queue a row into a lane with no connector.
+                if not rr.registry.outbound[body.to].deployed:
+                    raise HTTPException(409, str(NotDeployedError(body.to)))
+                owner = rr.destination_owner(body.to)
+                if owner is not None and owner != rr.registry.shard_id:
+                    raise HTTPException(
+                        409,
+                        f"outbound {body.to!r} is owned by engine shard {owner!r} —"
+                        " resend on that shard's API",
+                    )
+                try:
+                    if not rr.outbound_running(body.to):
+                        raise HTTPException(409, _outbound_down_detail(rr, body.to))
+                except KeyError:
+                    raise HTTPException(404, f"no such outbound connection: {body.to}") from None
+                # BACKLOG #1911: an outbound row has no inbound whose declared type to sniff against, so
+                # only the engine-wide guards apply here (the NUL rule and the 16 MiB ceiling).
+                admitted = await _guard_resubmission(
+                    engine,
+                    identity,
+                    request,
+                    raw=body.raw,
+                    inbound=None,
+                    action="message_edit_resend_reject",
+                    channel_id=row["channel_id"],
+                    detail={"message_id": message_id, "mode": "direct", "to": body.to},
+                )
+                client = client_ip(request)
+
+                direct_provenance = await _edit_resend_provenance(engine, row, admitted)
+
+                def _direct_audit(direct: ResendOutcome) -> AuditAppend | None:
+                    # Committed with the delivery row (BACKLOG #2624); a duplicate records nothing.
+                    if direct.status != "resent":
+                        return None
+                    return AuditAppend(
+                        "message_edit_resend",
+                        actor=identity.username,
+                        channel_id=row["channel_id"],
+                        detail=json.dumps(
+                            {
+                                "message_id": message_id,
+                                "mode": "direct",
+                                "to": direct.to_destination,
+                                "outbox_id": direct.outbox_id,
+                                "new_message_id": direct.new_message_id,
+                                **direct_provenance,
+                            }
+                        ),
+                        client=client,
+                    )
+
+                written = True  # from here a refusal may follow the store write
+                try:
+                    direct = await engine.edit_resend_direct(
+                        message_id,
+                        to=body.to,
+                        raw=admitted,
+                        idempotency_key=body.idempotency_key,
+                        audit=_direct_audit,
+                        actor=identity.username,
+                    )
+                except ResendError as exc:
+                    # Empty edited body / idempotency-key reused for a different target gives 409. str(exc)
+                    # carries ids only (never the body — the messages don't interpolate ``raw``).
+                    raise HTTPException(409, str(exc)) from None
+                return EditResendResult(
+                    message_id=message_id,
+                    status=direct.status,
+                    reroute=False,
+                    to=direct.to_destination,
+                    outbox_id=direct.outbox_id,
+                )
+
+            # RE-ROUTE (default): re-ingress the edited body on the origin channel. `reroute` must be set
+            # (guards against a request that supplied neither a target nor an explicit reroute intent).
+            if not body.reroute:
+                raise HTTPException(
+                    400,
+                    "set reroute=true to re-ingress on the origin channel, or provide a target 'to'",
+                )
+            # BACKLOG #1911: the re-route writes an INGRESS row on the origin channel, so the origin
+            # inbound's own ceiling and declared type apply. With no such inbound in THIS runner's registry
+            # (no config loaded, the inbound removed, or owned by another engine shard, whose registry is
+            # filtered to its own inbounds) there is nothing to guard with, so refuse rather than fail open.
             rr = engine.registry_runner
-            if rr is None or body.to not in rr.registry.outbound:
-                raise HTTPException(404, f"no such outbound connection: {body.to}")
-            # THE BACK DOOR (#233, ADR 0111): the direct path reuses #123's resend seam, which inserts an
-            # outbound-stage row DIRECTLY (store.resend_to) without transform_one — so, exactly like
-            # /resend above, the transform-time not-deployed decline does not cover it. Refuse a
-            # not-deployed target so an operator can't hand-queue a row into a lane with no connector.
-            if not rr.registry.outbound[body.to].deployed:
-                raise HTTPException(409, str(NotDeployedError(body.to)))
-            owner = rr.destination_owner(body.to)
-            if owner is not None and owner != rr.registry.shard_id:
+            origin = rr.registry.inbound.get(row["channel_id"]) if rr is not None else None
+            if origin is None:
                 raise HTTPException(
                     409,
-                    f"outbound {body.to!r} is owned by engine shard {owner!r} —"
-                    " resend on that shard's API",
+                    f"origin inbound {row['channel_id']!r} is not registered on this engine; "
+                    "re-route on the engine shard that owns it",
                 )
-            try:
-                if not rr.outbound_running(body.to):
-                    raise HTTPException(409, _outbound_down_detail(rr, body.to))
-            except KeyError:
-                raise HTTPException(404, f"no such outbound connection: {body.to}") from None
-            # BACKLOG #1911: an outbound row has no inbound whose declared type to sniff against, so
-            # only the engine-wide guards apply here (the NUL rule and the 16 MiB ceiling).
             admitted = await _guard_resubmission(
                 engine,
                 identity,
                 request,
                 raw=body.raw,
-                inbound=None,
+                inbound=origin,
                 action="message_edit_resend_reject",
                 channel_id=row["channel_id"],
-                detail={"message_id": message_id, "mode": "direct", "to": body.to},
+                detail={"message_id": message_id, "mode": "reroute"},
             )
             client = client_ip(request)
+            reroute_provenance = await _edit_resend_provenance(engine, row, admitted)
 
-            direct_provenance = await _edit_resend_provenance(engine, row, admitted)
-
-            def _direct_audit(direct: ResendOutcome) -> AuditAppend | None:
-                # Committed with the delivery row (BACKLOG #2624); a duplicate records nothing.
-                if direct.status != "resent":
+            def _reroute_audit(outcome: ReingressOutcome) -> AuditAppend | None:
+                # Committed with the re-ingress (BACKLOG #2624); a duplicate records nothing.
+                if outcome.status != "resubmitted":
                     return None
                 return AuditAppend(
                     "message_edit_resend",
@@ -6747,105 +6880,37 @@ def create_app(
                     detail=json.dumps(
                         {
                             "message_id": message_id,
-                            "mode": "direct",
-                            "to": direct.to_destination,
-                            "outbox_id": direct.outbox_id,
-                            "new_message_id": direct.new_message_id,
-                            **direct_provenance,
+                            "mode": "reroute",
+                            "new_message_id": outcome.new_message_id,
+                            "channel_id": outcome.channel_id,
+                            **reroute_provenance,
                         }
                     ),
                     client=client,
                 )
 
+            written = True  # from here a refusal may follow the store write
             try:
-                direct = await engine.edit_resend_direct(
+                outcome = await engine.edit_resend_reroute(
                     message_id,
-                    to=body.to,
                     raw=admitted,
                     idempotency_key=body.idempotency_key,
-                    audit=_direct_audit,
+                    audit=_reroute_audit,
                     actor=identity.username,
                 )
             except ResendError as exc:
-                # Empty edited body / idempotency-key reused for a different target gives 409. str(exc)
-                # carries ids only (never the body — the messages don't interpolate ``raw``).
                 raise HTTPException(409, str(exc)) from None
             return EditResendResult(
                 message_id=message_id,
-                status=direct.status,
-                reroute=False,
-                to=direct.to_destination,
-                outbox_id=direct.outbox_id,
+                status=outcome.status,
+                reroute=True,
+                new_message_id=outcome.new_message_id,
             )
-
-        # RE-ROUTE (default): re-ingress the edited body on the origin channel. `reroute` must be set
-        # (guards against a request that supplied neither a target nor an explicit reroute intent).
-        if not body.reroute:
-            raise HTTPException(
-                400,
-                "set reroute=true to re-ingress on the origin channel, or provide a target 'to'",
-            )
-        # BACKLOG #1911: the re-route writes an INGRESS row on the origin channel, so the origin
-        # inbound's own ceiling and declared type apply. With no such inbound in THIS runner's registry
-        # (no config loaded, the inbound removed, or owned by another engine shard, whose registry is
-        # filtered to its own inbounds) there is nothing to guard with, so refuse rather than fail open.
-        rr = engine.registry_runner
-        origin = rr.registry.inbound.get(row["channel_id"]) if rr is not None else None
-        if origin is None:
-            raise HTTPException(
-                409,
-                f"origin inbound {row['channel_id']!r} is not registered on this engine; "
-                "re-route on the engine shard that owns it",
-            )
-        admitted = await _guard_resubmission(
-            engine,
-            identity,
-            request,
-            raw=body.raw,
-            inbound=origin,
-            action="message_edit_resend_reject",
-            channel_id=row["channel_id"],
-            detail={"message_id": message_id, "mode": "reroute"},
-        )
-        client = client_ip(request)
-        reroute_provenance = await _edit_resend_provenance(engine, row, admitted)
-
-        def _reroute_audit(outcome: ReingressOutcome) -> AuditAppend | None:
-            # Committed with the re-ingress (BACKLOG #2624); a duplicate records nothing.
-            if outcome.status != "resubmitted":
-                return None
-            return AuditAppend(
-                "message_edit_resend",
-                actor=identity.username,
-                channel_id=row["channel_id"],
-                detail=json.dumps(
-                    {
-                        "message_id": message_id,
-                        "mode": "reroute",
-                        "new_message_id": outcome.new_message_id,
-                        "channel_id": outcome.channel_id,
-                        **reroute_provenance,
-                    }
-                ),
-                client=client,
-            )
-
-        try:
-            outcome = await engine.edit_resend_reroute(
-                message_id,
-                raw=admitted,
-                idempotency_key=body.idempotency_key,
-                audit=_reroute_audit,
-                actor=identity.username,
-            )
-        except ResendError as exc:
-            raise HTTPException(409, str(exc)) from None
-        return EditResendResult(
-            message_id=message_id,
-            status=outcome.status,
-            reroute=True,
-            new_message_id=outcome.new_message_id,
-        )
+        except HTTPException:
+            auth = get_auth(request)
+            if not written and auth is not None:
+                auth.refund_action_step_up(STEP_UP_ACTION_MESSAGE_EDIT_RESEND)
+            raise
 
     # --- offline uploaded logs (BACKLOG #125/#126, ADR 0134) -----------------
 
@@ -9023,7 +9088,7 @@ def create_app(
                 restart_connection=restart_connection,
                 replay_message=replay_message,
                 resend_message=resend_message,
-                edit_resend_message=edit_resend_message,
+                edit_resend_message=_edit_resend_core,
                 prior_resend=prior_resend,
                 replay_dead_letters=replay_dead_letters,
                 list_active_alerts=list_active_alerts,

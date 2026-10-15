@@ -281,6 +281,8 @@ async def test_purge_confirm_never_arms_a_name_no_outbound_has(admin: httpx.Asyn
     audit test below is why the annotation came off again.
     """
     for dest in (BAD_NAME, "OB_NOT_REGISTERED"):
+        # The page holds the purge proof (owner ruling 2026-10-13, #3241 R2).
+        await mint_bound_proof(admin, "/ui/connections/purge-confirm")
         r = await admin.get("/ui/connections/purge-confirm", params={"dest": dest})
         assert r.status_code == 200
         assert dest not in r.text, f"{dest!r} must not be pre-armed for purge"
@@ -449,6 +451,7 @@ async def test_purge_confirm_still_audits_a_channel_scoped_attempt_with_a_bad_de
     await service.set_channel_scope(user_id, ["ch1"], actor="test")
     async with ui_client(engine, service) as c:
         await cookie_login(c, "scoped")
+        await mint_bound_proof(c, "/ui/connections/purge-confirm")  # #3241 R2: the page holds it
         r = await c.get("/ui/connections/purge-confirm", params={"dest": BAD_NAME})
         assert r.status_code == 403
     # The exact action and actor, not a count over a "denied" suffix: a step-up or permission

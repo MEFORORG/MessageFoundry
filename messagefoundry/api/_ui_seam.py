@@ -504,10 +504,11 @@ class CoreHandlers:
     # object-flag toggle (config:deploy). TOML-managed connections only — a code-first one is refused 409.
     set_connection_flag: Callable[..., Awaitable[Any]]
     # Dual-control approvals (ASVS 2.3.5, BACKLOG #1982): the console's Approvals page. The JSON
-    # gates are require(APPROVALS_APPROVE) on the list and require_paced(APPROVALS_APPROVE) on approve
-    # and reject, so each /ui route asserts approvals:approve through require_ui, which paces a /ui
-    # write the same way. The resolve of an interrupted release (BACKLOG #2460) has the JSON gate
-    # require_step_up, so its /ui route takes require_ui_step_up for the same fresh re-proof.
+    # gates are require(APPROVALS_APPROVE) on the list and require_paced(APPROVALS_APPROVE) on
+    # reject, so those /ui routes assert approvals:approve through require_ui, which paces a /ui
+    # write the same way. The resolve of an interrupted release (BACKLOG #2460) and, since owner
+    # ruling 2026-10-13 (#3241 R4), the approve have the JSON gate require_step_up, so their /ui
+    # routes take require_ui_step_up for the same fresh re-proof.
     list_approvals: Callable[..., Awaitable[Any]]
     approve_action: Callable[..., Awaitable[Any]]
     reject_action: Callable[..., Awaitable[Any]]

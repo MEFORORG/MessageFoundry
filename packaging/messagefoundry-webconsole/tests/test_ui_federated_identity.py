@@ -27,7 +27,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
-from _ui_clients import PW, SAME_ORIGIN, cookie_login, provision, ui_client
+from _ui_clients import PW, SAME_ORIGIN, cookie_login, issue_continuation, provision, ui_client
 
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
@@ -88,7 +88,9 @@ async def _mint(c: httpx.AsyncClient, next_path: str) -> None:
     """Re-authenticate through /ui/reauth for ``next_path``, which mints the grant its tag names.
 
     Asserts the re-auth LANDED back on that page. A continuation /ui/reauth does not recognise
-    bounces to /ui instead, and a test that minted nothing would then read as a refusal."""
+    bounces to /ui instead, and a test that minted nothing would then read as a refusal. Issued
+    first, as the gate's refusal issues it (owner ruling 2026-10-13, #3241 R3)."""
+    issue_continuation(c, next_path)
     r = await c.post("/ui/reauth", data={"next": next_path, "password": PW}, headers=SAME_ORIGIN)
     assert r.status_code == 303 and r.headers["location"] == next_path, (r.status_code, r.headers)
 

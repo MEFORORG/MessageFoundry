@@ -4,9 +4,9 @@
     "min_route_rows_examined": "measured 105 on 2026-07-31 against 2fd1ad8a; re-measured 108 on 2026-09-05 against c57903c2",
     "min_gated_http_rows": "measured 99 on 2026-07-31 against 2fd1ad8a; re-measured 102 on 2026-09-05 against c57903c2",
     "min_negative_probes": "measured 198 on 2026-07-31 against 2fd1ad8a; re-measured 204 on 2026-09-05 against c57903c2",
-    "min_get_rows_reached": "measured 46 on 2026-07-31 against 2fd1ad8a; re-measured 47 on 2026-09-05 against c57903c2",
+    "min_get_rows_reached": "measured 46 on 2026-07-31 against 2fd1ad8a; re-measured 47 on 2026-09-05 against c57903c2; re-measured 48 of 49 on 2026-10-12 against 26477d59e3 plus vault BACKLOG #3241 (GET /messages/export reached after a re-proof; the holdout is the mTLS-only GET /service/identity)",
     "min_bfla_probes": "measured 19 on 2026-07-31 against 2fd1ad8a; re-measured 19 on 2026-09-05 against c57903c2",
-    "min_write_rows_reached": "measured 47 of 55 gated non-GET rows on 2026-09-05 against c57903c2; the 8 that refused the administrator are the action-scoped step-up rows in unreachable_allowlist below; re-measured 45 of 61 on 2026-10-07 against branch b198/2625-resend-perm-stepup (6e1de21d plus the #2625 change, not 6e1de21d alone), after vault BACKLOG #2625 bound six more write rows (and one GET, export) to an action",
+    "min_write_rows_reached": "measured 47 of 55 gated non-GET rows on 2026-09-05 against c57903c2; the 8 that refused the administrator were the action-scoped step-up rows, then exempted in unreachable_allowlist; re-measured 45 of 61 on 2026-10-07 against branch b198/2625-resend-perm-stepup (6e1de21d plus the #2625 change, not 6e1de21d alone), after vault BACKLOG #2625 bound six more write rows (and one GET, export) to an action; re-measured 61 of 61 on 2026-10-12 against 26477d59e3 plus vault BACKLOG #3241, which re-proves each action-bound row for its action and removed all 17 of their exemptions (15 write rows reached after a re-proof, and POST /config/reload, which answers a body-less probe 422 before its in-route proof); floor raised from 40 to 55",
     "min_write_bfla_probes": "measured 43 write BFLA candidate rows, all 43 refused, on 2026-09-05 against c57903c2",
     "_canary_floor_units": "The canary floors below are compared against negative_non_401, bfla_violations and write_bfla_violations, which count PROBES, not rows. The open-auth canary sends 2 probes per gated row, so its finding count is roughly twice the row count -- do not re-derive a floor from a row number.",
     "open-auth_min_negative_findings": "measured 196 failing PROBES (98 of 99 gated rows x 2 probes; the holdout is the mTLS-only GET /service/identity) on 2026-07-31 against 2fd1ad8a",
@@ -20,7 +20,7 @@
     "min_negative_probes": 180,
     "min_get_rows_reached": 40,
     "min_bfla_probes": 15,
-    "min_write_rows_reached": 40,
+    "min_write_rows_reached": 55,
     "min_write_bfla_probes": 35
   },
   "max_unexplained_unreached": 0,
@@ -35,91 +35,6 @@
       "method": "GET",
       "path": "/service/identity",
       "reason": "mTLS client-certificate identity only; it accepts no bearer token by design (ADR 0083)"
-    },
-    {
-      "method": "POST",
-      "path": "/me/mfa/enroll",
-      "reason": "action-scoped step-up (X-Step-Up-Action: mfa_enroll); a password login does not satisfy it and the scan performs no per-action re-auth"
-    },
-    {
-      "method": "POST",
-      "path": "/me/mfa/confirm",
-      "reason": "action-scoped step-up (X-Step-Up-Action: mfa_confirm); a password login does not satisfy it and the scan performs no per-action re-auth"
-    },
-    {
-      "method": "DELETE",
-      "path": "/me/mfa",
-      "reason": "action-scoped step-up (X-Step-Up-Action: mfa_disable); a password login does not satisfy it and the scan performs no per-action re-auth"
-    },
-    {
-      "method": "DELETE",
-      "path": "/me/sessions",
-      "reason": "action-scoped step-up (X-Step-Up-Action: session_terminate); a password login does not satisfy it and the scan performs no per-action re-auth"
-    },
-    {
-      "method": "DELETE",
-      "path": "/me/sessions/{session_id}",
-      "reason": "action-scoped step-up (X-Step-Up-Action: session_terminate); a password login does not satisfy it and the scan performs no per-action re-auth"
-    },
-    {
-      "method": "PATCH",
-      "path": "/users/{user_id}",
-      "reason": "action-scoped step-up (X-Step-Up-Action: admin_user_update); a password login does not satisfy it and the scan performs no per-action re-auth"
-    },
-    {
-      "method": "POST",
-      "path": "/users/{user_id}/reset-password",
-      "reason": "action-scoped step-up (X-Step-Up-Action: admin_reset_password); a password login does not satisfy it and the scan performs no per-action re-auth"
-    },
-    {
-      "method": "POST",
-      "path": "/users/{user_id}/reset-mfa",
-      "reason": "action-scoped step-up (X-Step-Up-Action: admin_reset_mfa); a password login does not satisfy it and the scan performs no per-action re-auth"
-    },
-    {
-      "method": "PUT",
-      "path": "/users/{user_id}/federated-identity",
-      "reason": "action-scoped step-up (X-Step-Up-Action: admin_federated_identity); a password login does not satisfy it and the scan performs no per-action re-auth"
-    },
-    {
-      "method": "DELETE",
-      "path": "/users/{user_id}/federated-identity",
-      "reason": "action-scoped step-up (X-Step-Up-Action: admin_federated_identity); a password login does not satisfy it and the scan performs no per-action re-auth"
-    },
-    {
-      "method": "GET",
-      "path": "/messages/export",
-      "reason": "action-scoped step-up (X-Step-Up-Action: message_export, vault BACKLOG #2625); a password login does not satisfy it and the scan performs no per-action re-auth"
-    },
-    {
-      "method": "POST",
-      "path": "/messages/export",
-      "reason": "action-scoped step-up (X-Step-Up-Action: message_export, vault BACKLOG #2625); a password login does not satisfy it and the scan performs no per-action re-auth"
-    },
-    {
-      "method": "POST",
-      "path": "/messages/{message_id}/resend",
-      "reason": "action-scoped step-up (X-Step-Up-Action: message_resend, vault BACKLOG #2625); a password login does not satisfy it and the scan performs no per-action re-auth"
-    },
-    {
-      "method": "POST",
-      "path": "/messages/{message_id}/edit-resend",
-      "reason": "action-scoped step-up (X-Step-Up-Action: message_edit_resend, vault BACKLOG #2625); a password login does not satisfy it and the scan performs no per-action re-auth"
-    },
-    {
-      "method": "POST",
-      "path": "/uploads/{file_id}/resend",
-      "reason": "action-scoped step-up (X-Step-Up-Action: upload_resend, vault BACKLOG #2625); a password login does not satisfy it and the scan performs no per-action re-auth"
-    },
-    {
-      "method": "POST",
-      "path": "/connections/{name}/purge",
-      "reason": "action-scoped step-up (X-Step-Up-Action: connection_purge, vault BACKLOG #2625); a password login does not satisfy it and the scan performs no per-action re-auth"
-    },
-    {
-      "method": "POST",
-      "path": "/config/reload",
-      "reason": "action-scoped step-up (X-Step-Up-Action: config_reload, vault BACKLOG #2625); a password login does not satisfy it and the scan performs no per-action re-auth"
     }
   ],
   "anonymous_allowlist": [

@@ -1225,10 +1225,20 @@ async def _time_reload(poller: EnginePoller) -> tuple[float | None, bool]:
     if client is None:
         return None, True
     # Before the timer starts: the reload route wants a proof bound to it (vault BACKLOG #2625),
-    # and proving it inside the timed call would charge a re-authentication to the reload.
-    await poller.prove_sign_in()
+    # and proving it inside the timed call would charge a re-authentication to the reload. The
+    # proof is made on a client of its own, so the sampler's client is never re-keyed under it.
+    proved = await poller.reload_client()
+    if proved is None and poller.holds_rig_session:
+        # The proof failed. Reloading through the sampler's client would re-key it under a sample
+        # in flight, so report no reading; no request was made, so nothing was closed.
+        log.warning("reload probe: could not prove the rig session for the reload")
+        return None, True
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, time_reload_outcome, client, None)
+    try:
+        return await loop.run_in_executor(None, time_reload_outcome, proved or client, None)
+    finally:
+        if proved is not None:
+            await poller.end_reload_client(proved)
 
 
 @dataclass(frozen=True)

@@ -32,6 +32,7 @@ __all__ = [
     "message_edit",
     "message_resend_confirm",
     "message_resend_done",
+    "message_resend_unknown",
     "message_search",
     "messages",
     "parse_tree_page",
@@ -616,6 +617,29 @@ def message_detail(
     )
 
 
+def message_resend_unknown(message_id: str) -> Markup:
+    """The outcome page for a link that names no resend this engine ran (vault BACKLOG #3241).
+
+    The outcome page renders from the store's record of the resend's key, so a link someone
+    crafted, or one whose record is gone, says that and claims nothing was queued by it."""
+    return page(
+        "Resend message",
+        el("h1", "No such resend"),
+        el(
+            "p",
+            text("This link names no resend of this message, so it reports none."),
+            class_="muted",
+        ),
+        el(
+            "p",
+            el("a", "← Message detail", href=f"/ui/messages/{_seg(message_id)}", class_="btn-link"),
+            " ",
+            el("a", "All messages", href="/ui/messages", class_="btn-link"),
+        ),
+        active="messages",
+    )
+
+
 def message_resend_done(message_id: str, to: str, source: str, *, duplicate: bool) -> Markup:
     """The resend OUTCOME page — the GET a completed POST redirects to (post-redirect-get, vault
     BACKLOG #2625), instead of the detail page.
@@ -628,10 +652,12 @@ def message_resend_done(message_id: str, to: str, source: str, *, duplicate: boo
     "queued" for it would be the same lie as answering a refusal with the success response, so the
     two outcomes are worded apart. The ways out are LINKS, not redirects — a role that cannot open
     the detail page simply does not follow that one."""
+    # An empty `source` names none: the outcome route shows the target alone (vault BACKLOG #3241).
+    copied = f", copied from “{source}”" if source else ""
     said = (
         "That key was already used, so nothing new was queued. The earlier resend stands."
         if duplicate
-        else f"A new delivery of this message is queued to “{to}”, copied from “{source}”."
+        else f"A new delivery of this message is queued to “{to}”{copied}."
     )
     return page(
         "Resend message",

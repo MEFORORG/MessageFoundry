@@ -550,3 +550,27 @@ def test_a_bulk_purge_with_a_held_destination_links_to_approvals() -> None:
     assert 'href="/ui/approvals"' in held.split("<main>", 1)[1]
     purged = str(pages.purge_result("all", [("out1", "purged 0")]))
     assert 'href="/ui/approvals"' not in purged.split("<main>", 1)[1]
+
+
+async def test_a_stale_window_lands_the_approver_back_on_the_page(engine: Engine) -> None:
+    """Owner ruling 2026-10-13 (#3241 R4): the console approve asks for the fresh step-up the JSON
+    approve does. A stale window goes to /ui/reauth, which lands back on the page to approve again,
+    never re-posting the release for the approver. Nothing is released until then."""
+    from messagefoundry.auth.tokens import hash_token
+
+    service, _maker, _checker = await _two_approvers(engine)
+    async with _client(engine, service, _ON) as maker, _client(engine, service, _ON) as checker:
+        await cookie_login(maker, "maker")
+        await cookie_login(checker, "checker")
+        approval_id = await _hold(maker)
+        token = checker.cookies.get("mf_session")
+        assert token
+        await service.store.mark_session_reauthed(hash_token(token), now=0.0)  # window elapsed
+        r = await checker.post(f"/ui/approvals/{approval_id}/approve", headers=SAME_ORIGIN)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/reauth?next=" + quote(
+            "/ui/approvals?m=approve_again", safe="/"
+        )
+        assert await _status(engine, approval_id) == "pending"
+        landed = await checker.get("/ui/approvals?m=approve_again")
+        assert "Nothing was released" in landed.text
