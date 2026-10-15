@@ -363,6 +363,7 @@ def test_the_gate_reads_requests_through_its_seal_check() -> None:
     """A raw request read outside the loaders would act on a row nobody checked."""
     calls = _gate_reader_calls(_GATE.read_text("utf-8"))
     # Liveness first: the walk finds every listed read, so an empty walk cannot pass.
+    assert len(calls) >= len(_GATE_READS), calls
     assert {f for f, _, _ in calls} == set(_GATE_READS), calls
     stray = [(f, r) for f, r, _ in calls if r not in _GATE_READS[f]]
     assert not stray, stray
