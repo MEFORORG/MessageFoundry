@@ -5301,6 +5301,39 @@ async def test_role_seal_contract(store) -> None:
         await keyed.close()
 
 
+async def test_approval_seal_contract(store) -> None:
+    """BACKLOG #2592: sealed dual-control approval requests, the same contract the SQLite suite
+    runs, on a keyed handle, with the table's columns pinned to the record the seal covers. ``raw``
+    runs each statement on a pooled connection, outside the store's helpers. The contract keys every
+    assertion on the requests it files, because this table is shared across tests."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests._approval_seal_contract import (
+        assert_approval_columns,
+        assert_approval_seal_contract,
+    )
+    from tests._session_seal_contract import dollar_placeholders
+
+    keyed = await PostgresStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[object, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                await conn.execute(dollar_placeholders(sql), *params)
+
+        async with keyed._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT column_name FROM information_schema.columns"
+                " WHERE table_schema = current_schema() AND table_name = 'pending_approvals'"
+            )
+        assert_approval_columns({str(r["column_name"]) for r in rows})
+        await assert_approval_seal_contract(keyed, raw)
+    finally:
+        await keyed.close()
+
+
 async def test_a_role_delete_racing_a_grant_leaves_no_dangling_role_row(store) -> None:
     """BACKLOG #2592: a grant that commits while its custom role is deleted fails the delete on the
     ``user_roles`` role foreign key, rather than leaving a sealed role row with no role behind it.

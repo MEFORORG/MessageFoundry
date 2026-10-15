@@ -1169,8 +1169,9 @@ def _build_approval_gate(
         actor = str(p["requester"])
         # Vault BACKLOG #2596, step 3: the release loads only the bytes the approval named. A hold
         # whose params carry no digest (none is filed that way now) binds to None, which matches
-        # nothing, so it is refused as a mismatch once its directory resolves. The digest is not sealed: a writer to
-        # pending_approvals can replace it with the params (vault BACKLOG #2592).
+        # nothing, so it is refused as a mismatch once its directory resolves. On a store that holds
+        # a key the params are sealed with the rest of the request, so a writer to pending_approvals
+        # who changes the digest leaves a request the gate refuses (vault BACKLOG #2592).
         approved = p.get("fingerprint")
         approval = ApprovedConfig(approved if isinstance(approved, str) else None)
         # reload_detail for parity with the inline route (BACKLOG #1111): a released reload that

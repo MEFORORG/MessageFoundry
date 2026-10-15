@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import time
 from collections.abc import Iterable
 from typing import Final
 
@@ -50,6 +51,10 @@ ROLE_KIND: Final = "role"
 #: ``authority_set_seal``. The map's name is inside the sealed bytes, so one map's seal never
 #: verifies for another.
 ADSET_KIND: Final = "adset"
+
+#: The kind a ``pending_approvals`` row is sealed under: one seal per dual-control request, over
+#: the whole row, so its captured params and its requester id are bound to the request.
+APPROVAL_KIND: Final = "approval"
 
 #: The label a passkey digest is computed under. Not a seal kind: the digest is a plain SHA-256 that
 #: the user seal covers, so it needs no key of its own.
@@ -79,6 +84,36 @@ class RowSealError(Exception):
     def __init__(self, kind: str) -> None:
         super().__init__(f"the {kind} row's integrity seal does not verify; the write was refused")
         self.kind = kind
+
+
+#: How often one failing row is reported again while it keeps being presented, in seconds.
+SEAL_FAILURE_REPORT_INTERVAL_SECONDS: Final = 300.0
+#: How many failing rows a :class:`SealFailureThrottle` remembers; the oldest is forgotten first.
+SEAL_FAILURE_TRACK_MAX: Final = 1024
+
+
+class SealFailureThrottle:
+    """Decides when a row that failed its seal is reported again (BACKLOG #2592): at most once per
+    :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS` per key, remembering at most
+    :data:`SEAL_FAILURE_TRACK_MAX` keys. One per reporter: the auth service and the approval gate
+    each hold one, so both follow one policy."""
+
+    __slots__ = ("_last",)
+
+    def __init__(self) -> None:
+        self._last: dict[str, float] = {}
+
+    def due(self, key: str) -> bool:
+        """Whether ``key`` should be reported now; if so, records that it was."""
+        now = time.monotonic()
+        last = self._last.get(key)
+        if last is not None and now - last < SEAL_FAILURE_REPORT_INTERVAL_SECONDS:
+            return False
+        self._last.pop(key, None)
+        if len(self._last) >= SEAL_FAILURE_TRACK_MAX:
+            self._last.pop(next(iter(self._last)))
+        self._last[key] = now
+        return True
 
 
 def _part(value: bytes) -> bytes:

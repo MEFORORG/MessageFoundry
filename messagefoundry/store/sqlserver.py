@@ -189,6 +189,7 @@ from messagefoundry.store.store import (
     AlertInstance,
     AlertSummary,
     AppendedAuditRow,
+    ApprovalRow,
     AuditAppend,
     AuditedWrite,
     AuditVerdict,
@@ -248,6 +249,7 @@ from messagefoundry.store.store import (
     _transit_attestation_row,
     ad_map_write,
     admin_guard_counts,
+    approval_update,
     audit_append_refusal,
     audit_append_secret,
     audit_seal_next,
@@ -259,11 +261,13 @@ from messagefoundry.store.store import (
     existing_roles_only,
     federated_bind,
     federated_unbind,
+    first_sealed_approval,
     full_authentication_clear,
     load_audit_chain,
     lockout_clear,
     lockout_increment,
     mfa_stamp,
+    new_approval_row,
     new_session_record,
     new_user_record,
     not_deployed_detail,
@@ -274,9 +278,11 @@ from messagefoundry.store.store import (
     read_transit_bound_attestation_rows,
     reauth_stamp,
     recovery_code_spend,
+    report_approval_reseal,
     report_refused_ad_role_map,
     report_refused_role_holder,
     report_role_reseal,
+    report_unsealed_approvals,
     report_unsealed_role_records,
     report_unsealed_users,
     report_user_reseal,
@@ -286,6 +292,7 @@ from messagefoundry.store.store import (
     rotation_reseal,
     scope_if_source,
     scope_withdrawal,
+    seal_approval,
     seal_role,
     seal_session,
     seal_user,
@@ -746,6 +753,21 @@ _MSSQL_USER_RESEAL: Final = (
     " second_step_failed_attempts=?, second_step_locked_until=?, second_step_lock_cycles=?,"
     " password_generated=?, session_epoch=?, cred_digest=?, authz_seal=?"
     " OUTPUT inserted.id WHERE id=? AND authz_seal=?"
+)
+# The approval statements (BACKLOG #2592); store.py's twins state the contract. The writes are used
+# only by `_write_approval`.
+_MSSQL_APPROVAL_COLUMNS: Final = (
+    "id, operation, params, requester, requester_user_id, requested_at, status,"
+    " approver, decided_at, expires_at, claim_owner, seal"
+)
+_MSSQL_APPROVAL_INSERT: Final = (
+    "INSERT INTO pending_approvals (id, operation, params, requester, requester_user_id,"
+    " requested_at, status, approver, decided_at, expires_at, claim_owner, seal)"
+    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+)
+_MSSQL_APPROVAL_UPDATE: Final = (
+    "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?, claim_owner = ?,"
+    " seal = ? WHERE id = ? AND status = ? AND seal COLLATE Latin1_General_100_BIN2 = ?"
 )
 # The role write and the map seal write (BACKLOG #2592), each a MERGE under HOLDLOCK; store.py
 # states the contract. Used only by `_write_role` and `_write_ad_map`.
@@ -2125,7 +2147,7 @@ _SCHEMA: list[str] = [
         requester_user_id NVARCHAR(64) NULL,
         requested_at FLOAT NOT NULL, status NVARCHAR(20) NOT NULL DEFAULT 'pending',
         approver NVARCHAR(256) NULL, decided_at FLOAT NULL, expires_at FLOAT NULL,
-        claim_owner NVARCHAR(512) NULL)""",
+        claim_owner NVARCHAR(512) NULL, seal NVARCHAR(256) NOT NULL DEFAULT '')""",
     # COL_LENGTH-gated ADD for a pre-existing pending_approvals table; a no-op on a fresh DB (the
     # CREATE above has it). This MUST live in _SCHEMA: `_schema_hash()` stores a content marker of
     # this batch, so an on-open migration placed anywhere else is skipped whenever the marker already
@@ -2137,6 +2159,11 @@ _SCHEMA: list[str] = [
     # "node:" plus a cluster node id (nodes.node_id is NVARCHAR(256)) always fits.
     """IF COL_LENGTH('pending_approvals','claim_owner') IS NULL
         ALTER TABLE pending_approvals ADD claim_owner NVARCHAR(512) NULL""",
+    # BACKLOG #2592: the request's integrity seal, guarded and in _SCHEMA for the reason above. An
+    # existing row gets an empty seal, which a keyed store refuses; store.py's
+    # report_unsealed_approvals says why.
+    """IF COL_LENGTH('pending_approvals','seal') IS NULL
+        ALTER TABLE pending_approvals ADD seal NVARCHAR(256) NOT NULL DEFAULT ''""",
     """IF INDEXPROPERTY(OBJECT_ID('pending_approvals'),'ix_pending_approvals_status','IndexID') IS NULL
         CREATE INDEX ix_pending_approvals_status ON pending_approvals(status, requested_at)""",
     # BACKLOG #1268: `username` carries the same binary collation as every other identifier column in
@@ -3518,6 +3545,7 @@ class SqlServerStore:
             if store._row_sealer is not None:
                 report_unsealed_users(await store.count_unsealed_users())
                 report_unsealed_role_records(await store.count_unsealed_role_records())
+                report_unsealed_approvals(await store.count_unsealed_approvals())
             # The audit chain's state, and on a fresh keyed store its genesis row (#2594). The
             # genesis append takes the audit applock and needs INSERT and SELECT only.
             await load_audit_chain(store, read_only=read_only)
@@ -8049,6 +8077,7 @@ class SqlServerStore:
         # BACKLOG #2592: the user re-seal pass first; store.py's reencrypt_to_active says why.
         report_user_reseal(*await self.reseal_user_records())
         report_role_reseal(*await self.reseal_role_records())
+        report_approval_reseal(*await self.reseal_approval_records())
         total = 0
         # summary/metadata (EF-3): MRN/name PHI on messages — rotated like raw. error/last_error (H4):
         # exception text that may embed raw HL7 fragments — rotated too, or a later retired-key drop
@@ -12390,31 +12419,25 @@ class SqlServerStore:
         on_repeat: Callable[[str], AuditAppend] | None = None,
     ) -> str:
         """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5).
-        The Store protocol states the ``audit`` and ``on_repeat`` contract and what is returned."""
-        sql = (
-            "INSERT INTO pending_approvals "
-            "(id, operation, params, requester, requester_user_id, requested_at, status, expires_at)"
-            " VALUES (?,?,?,?,?,?,'pending',?)"
+        The Store protocol states the ``audit`` and ``on_repeat`` contract and what is returned.
+        The row is sealed, and a repeat joins only an open request whose seal holds (BACKLOG
+        #2592); store.py's twin says why."""
+        row = new_approval_row(
+            approval_id=approval_id,
+            operation=operation,
+            params=params,
+            requester=requester,
+            requester_user_id=requester_user_id,
+            requested_at=requested_at,
+            expires_at=expires_at,
         )
-        args = (
-            approval_id,
-            operation,
-            params,
-            requester,
-            requester_user_id,
-            requested_at,
-            expires_at,
-        )
-        if audit is None and on_repeat is None:
-            await self._execute(sql, args)
-            return approval_id
-        # vault BACKLOG #2445: the open request a repeat joins. Oldest first: that is the request
-        # every earlier caller got. The three text columns carry no COLLATE, so without one here
-        # they would compare under the database default, which is case-INSENSITIVE on a stock
+        # vault BACKLOG #2445: the open requests a repeat may join. Oldest first: that is the
+        # request every earlier caller got. The three text columns carry no COLLATE, so without one
+        # here they would compare under the database default, which is case-INSENSITIVE on a stock
         # install: 'OB_ACME' would join a hold for 'OB_Acme'. SQLite and Postgres compare bytes,
         # and so does this, as BACKLOG #1268 does for the other identifier columns.
         match = (
-            "SELECT TOP (1) id FROM pending_approvals"
+            "SELECT " + _MSSQL_APPROVAL_COLUMNS + " FROM pending_approvals"
             " WHERE operation COLLATE Latin1_General_100_BIN2 = ?"
             " AND params COLLATE Latin1_General_100_BIN2 = CAST(? AS NVARCHAR(MAX))"
             " COLLATE Latin1_General_100_BIN2"
@@ -12437,17 +12460,21 @@ class SqlServerStore:
                         # pending_approvals key, so every approval write takes the applock and
                         # then the row, never the reverse (no AB/BA deadlock across processes).
                         await self._open_under_audit_applock(cur)
+                        joined = None
                         if on_repeat is not None:
                             # Under the applock, which every request takes anyway for its own row
                             # and which is re-entrant per transaction, this read sees every request
                             # committed before it, so two repeats cannot both find none and insert.
                             await cur.execute(match, match_args)
-                            found = await cur.fetchone()
-                            if found is not None:
-                                held = str(found[0])
-                                append = on_repeat(held)
-                        if held == approval_id:
-                            await cur.execute(sql, args)
+                            joined = first_sealed_approval(
+                                self._row_sealer, await self._fetch_dicts(cur)
+                            )
+                        if joined is None:
+                            await self._write_approval(cur, row)
+                        else:
+                            assert on_repeat is not None  # `joined` is read only with it
+                            held = joined.id
+                            append = on_repeat(held)
                         audits: tuple[AuditAppend, ...] = () if append is None else (append,)
                         appended = await self._append_audits(cur, audits, now=now)
                         await self._commit(conn)
@@ -12457,6 +12484,21 @@ class SqlServerStore:
                     raise
         tee_audits(audits, appended, ts=now)
         return held
+
+    async def _write_approval(
+        self, cur: Any, new: ApprovalRow, *, current: ApprovalRow | None = None
+    ) -> bool:
+        """The one writer of a ``pending_approvals`` row (BACKLOG #2592); store.py's
+        ``MessageStore._write_approval`` states the contract. Call it on ``cur`` inside an open
+        transaction. Returns whether a row was written."""
+        sealer = self._row_sealer
+        if current is None:
+            await cur.execute(_MSSQL_APPROVAL_INSERT, seal_approval(sealer, new).write_params())
+            return True
+        await cur.execute(
+            _MSSQL_APPROVAL_UPDATE, approval_update(sealer, current, new).update_params(current)
+        )
+        return int(cur.rowcount) > 0
 
     async def _open_under_audit_applock(self, cur: Any) -> None:
         """Open a transaction on ``cur`` and take ``_AUDIT_APPEND_LOCK`` in it, before it locks
@@ -12468,17 +12510,15 @@ class SqlServerStore:
 
     async def get_pending_approval(self, approval_id: str) -> dict[str, Any] | None:
         return await self._fetchone(
-            "SELECT id, operation, params, requester, requester_user_id, requested_at, status,"
-            " approver, decided_at, expires_at FROM pending_approvals WHERE id = ?",
+            "SELECT " + _MSSQL_APPROVAL_COLUMNS + " FROM pending_approvals WHERE id = ?",
             (approval_id,),
         )
 
     async def list_pending_approvals(self, *, now: float, limit: int = 100) -> list[dict[str, Any]]:
-        """Open (still-``pending``, unexpired) approval requests, newest-first."""
+        """Open (still-``pending``, unexpired) approval requests, newest-first. Every column, so
+        the gate can check each row's seal (BACKLOG #2592)."""
         return await self._fetchall(
-            # requester_user_id: see the SQLite twin (BACKLOG #2460).
-            "SELECT TOP (?) id, operation, params, requester, requester_user_id, requested_at,"
-            " status, approver, decided_at, expires_at FROM pending_approvals"
+            "SELECT TOP (?) " + _MSSQL_APPROVAL_COLUMNS + " FROM pending_approvals"
             " WHERE status = 'pending' AND (expires_at IS NULL OR expires_at > ?)"
             " ORDER BY requested_at DESC",
             (limit, now),
@@ -12488,8 +12528,7 @@ class SqlServerStore:
         """Released requests cut off mid-run, oldest-first (BACKLOG #1562). No expiry filter, and the
         order: the Store protocol says why."""
         return await self._fetchall(
-            "SELECT TOP (?) id, operation, params, requester, requester_user_id, requested_at,"
-            " status, approver, decided_at, expires_at FROM pending_approvals"
+            "SELECT TOP (?) " + _MSSQL_APPROVAL_COLUMNS + " FROM pending_approvals"
             " WHERE status = 'interrupted'"
             " ORDER BY requested_at ASC",
             (limit,),
@@ -12508,36 +12547,45 @@ class SqlServerStore:
     ) -> bool:
         """Atomically move a request in ``from_status`` to ``status``.
         Returns ``True`` iff this call made the transition — guards against a double decision.
-        The SQLite twin documents why the guard is a parameter (ASVS 2.3.3); the Store protocol
-        states the ``audit`` and ``claim_owner`` contracts (vault BACKLOG #2255, BACKLOG #1562)."""
-        sql = (
-            "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?,"
-            " claim_owner = COALESCE(?, claim_owner) WHERE id = ? AND status = ?"
-        )
-        args = (status, approver, decided_at, claim_owner, approval_id, from_status)
-        if audit is None:
-            async with self._acquire() as conn, self._cursor(conn) as cur:
-                try:
-                    await cur.execute(sql, args)
-                    count = cur.rowcount
-                    await self._commit(conn)
-                except Exception:
-                    await conn.rollback()
-                    raise
-            return int(count) > 0
+        The SQLite twin documents why the guard is a parameter (ASVS 2.3.3) and how the move goes
+        through the write helper (BACKLOG #2592); the Store protocol states the ``audit`` and
+        ``claim_owner`` contracts (vault BACKLOG #2255, BACKLOG #1562). The row is read under
+        ``UPDLOCK``, so a concurrent decision waits for this one and then finds the row moved."""
         now = time.time()
         # Same lock order as `record_audit`: the in-process gate, then the connection. Then the
-        # audit applock BEFORE the UPDATE locks the row, the order create_pending_approval uses.
+        # audit applock BEFORE the read locks the row, the order create_pending_approval uses.
         async with self._audit_lock:  # noqa: SIM117
             async with self._acquire() as conn:
                 try:
                     async with self._cursor(conn) as cur:
                         await self._open_under_audit_applock(cur)
-                        await cur.execute(sql, args)
-                        moved = int(cur.rowcount) > 0
+                        await cur.execute(
+                            "SELECT "
+                            + _MSSQL_APPROVAL_COLUMNS
+                            + " FROM pending_approvals WITH (UPDLOCK, ROWLOCK) WHERE id = ?",
+                            (approval_id,),
+                        )
+                        found = await self._fetch_dicts(cur)
+                        current = ApprovalRow.from_mapping(found[0]) if found else None
+                        moved = (
+                            current is not None
+                            and current.status == from_status
+                            and await self._write_approval(
+                                cur,
+                                current.decided(
+                                    status=status,
+                                    approver=approver,
+                                    decided_at=decided_at,
+                                    claim_owner=claim_owner,
+                                ),
+                                current=current,
+                            )
+                        )
                         # Before the one commit, so a failed append rolls the transition back. A
                         # transition that matched no row writes no audit row.
-                        audits: tuple[AuditAppend, ...] = (audit,) if moved else ()
+                        audits: tuple[AuditAppend, ...] = (
+                            (audit,) if moved and audit is not None else ()
+                        )
                         appended = await self._append_audits(cur, audits, now=now)
                         await self._commit(conn)
                 except Exception:
@@ -12552,21 +12600,64 @@ class SqlServerStore:
     ) -> list[dict[str, Any]]:
         """Released requests still claimed as ``executing``, oldest claim first (BACKLOG #1562).
         The Store protocol says who reads it, why, and what ``claim_owner`` filters. The owner
-        compares under BIN2, so two owners differing only in case stay two owners."""
+        compares under BIN2, so two owners differing only in case stay two owners. Every column,
+        so the gate can check each row's seal (BACKLOG #2592)."""
         if claim_owner is None:
             return await self._fetchall(
-                "SELECT TOP (?) id, operation, requester, approver, decided_at, claim_owner"
-                " FROM pending_approvals WHERE status = 'executing'"
+                "SELECT TOP (?) " + _MSSQL_APPROVAL_COLUMNS + " FROM pending_approvals"
+                " WHERE status = 'executing'"
                 " ORDER BY decided_at ASC",
                 (limit,),
             )
         return await self._fetchall(
-            "SELECT TOP (?) id, operation, requester, approver, decided_at, claim_owner"
-            " FROM pending_approvals WHERE status = 'executing'"
+            "SELECT TOP (?) " + _MSSQL_APPROVAL_COLUMNS + " FROM pending_approvals"
+            " WHERE status = 'executing'"
             " AND (claim_owner COLLATE Latin1_General_100_BIN2 = ? OR claim_owner IS NULL)"
             " ORDER BY decided_at ASC",
             (limit, claim_owner),
         )
+
+    async def count_unsealed_approvals(self) -> int:
+        """store.py's ``MessageStore.count_unsealed_approvals`` states the contract."""
+        row = await self._fetchone(
+            "SELECT COUNT(*) AS n FROM pending_approvals WHERE seal = ''"
+            " AND status IN ('pending', 'executing', 'interrupted')"
+        )
+        return int(row["n"]) if row else 0
+
+    async def reseal_approval_records(self) -> tuple[int, int]:
+        """Re-seal every approval request under the active key, for ``rotate-key`` (BACKLOG
+        #2592); store.py's ``MessageStore.reseal_approval_records`` states the contract."""
+        sealer = self._row_sealer
+        if sealer is None:
+            return 0, 0
+        rows = await self._fetchall(
+            "SELECT id FROM pending_approvals WHERE seal <> ''"
+            " AND seal COLLATE Latin1_General_100_BIN2 NOT LIKE ? ORDER BY id",
+            (f"{SEAL_PREFIX}{sealer.key_id}:%",),
+        )
+        resealed = refused = 0
+        for found in rows:
+            async with self._acquire() as conn, self._cursor(conn) as cur:
+                try:
+                    await cur.execute(
+                        "SELECT "
+                        + _MSSQL_APPROVAL_COLUMNS
+                        + " FROM pending_approvals WITH (UPDLOCK, ROWLOCK) WHERE id = ?",
+                        (str(found["id"]),),
+                    )
+                    locked = await self._fetch_dicts(cur)
+                    if locked:
+                        current = ApprovalRow.from_mapping(locked[0])
+                        resealed += await self._write_approval(cur, current, current=current)
+                    await self._commit(conn)
+                except RowSealError:
+                    await conn.rollback()
+                    refused += 1
+                except Exception:
+                    await conn.rollback()
+                    raise
+        return resealed, refused
 
     async def _execute_with_audits(
         self, sql: str, params: tuple[Any, ...], audits: Sequence[AuditAppend], *, now: float

@@ -135,6 +135,7 @@ from messagefoundry.store.row_seal import (
     USER_KIND,
     RowSealer,
     RowSealError,
+    SealFailureThrottle,
 )
 from messagefoundry.store.store import (
     AD_ROLE_MAP,
@@ -2268,10 +2269,6 @@ def oidc_client_auth_from_settings(
 
 #: The audit action written when an authority row fails its integrity seal (BACKLOG #2592).
 AUTHORITY_SEAL_FAILED_ACTION: Final = "integrity.authority_seal_failed"
-#: How often one failing row is reported again while it keeps being presented, in seconds.
-_SEAL_FAILURE_REPORT_INTERVAL_SECONDS: Final = 300.0
-#: How many failing rows the report throttle remembers; the oldest is forgotten first.
-_SEAL_FAILURE_TRACK_MAX: Final = 1024
 #: How much of a session's token hash a log line, audit row or alert names. Twelve hex characters, as
 #: the ``auth.session_revoked`` rows already record.
 _SESSION_REF_LEN: Final = 12
@@ -2353,7 +2350,7 @@ class AuthService:
         self._admin_loss_alert = admin_loss_alert
         # Session token-hash prefix -> monotonic time its seal failure was last reported, so one
         # bad row presented on every request writes one audit row and one alert per interval.
-        self._seal_failures_reported: dict[str, float] = {}
+        self._seal_failures_reported = SealFailureThrottle()
         # #285 (ASVS 6.7.1): the ADR 0148 [security].enforcement dial, threaded in by the caller
         # (the lifespan passes trust_anchors_enforcing). It gates the OIDC anchor's construction-site
         # ACL preflight in build_idp_opener below so a group/world-writable anchor WARNS (not refuses)
@@ -7838,7 +7835,7 @@ class AuthService:
         an :data:`AUTHORITY_SEAL_FAILED_ACTION` audit row and an ``integrity_drift`` alert. The
         caller denies; the engine keeps running.
 
-        Reports are rate-limited per row, once per :data:`_SEAL_FAILURE_REPORT_INTERVAL_SECONDS`,
+        Reports are rate-limited per row, once per :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`,
         for a row the revoke could not end. Each names the row by a short prefix of its token hash,
         never a row value. A store refusal of the revoke or the audit write is logged, not raised,
         so it does not turn a denial into an error."""
@@ -7863,18 +7860,12 @@ class AuthService:
     async def _report_seal_failure(self, key: str, reason: str, detail: dict[str, str]) -> None:
         """Report one authority row that failed its integrity seal (BACKLOG #2592): a WARNING, an
         :data:`AUTHORITY_SEAL_FAILED_ACTION` audit row carrying ``detail``, and an
-        ``integrity_drift`` alert, at most once per :data:`_SEAL_FAILURE_REPORT_INTERVAL_SECONDS`
+        ``integrity_drift`` alert, at most once per :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`
         per ``key``. ``reason`` and ``detail`` name the row by an id, never a row value. A store
         refusal of the audit write is logged, not raised, so it does not turn a denial into an
         error."""
-        now = time.monotonic()
-        last = self._seal_failures_reported.get(key)
-        if last is not None and now - last < _SEAL_FAILURE_REPORT_INTERVAL_SECONDS:
+        if not self._seal_failures_reported.due(key):
             return
-        self._seal_failures_reported.pop(key, None)
-        if len(self._seal_failures_reported) >= _SEAL_FAILURE_TRACK_MAX:
-            self._seal_failures_reported.pop(next(iter(self._seal_failures_reported)))
-        self._seal_failures_reported[key] = now
         _log.warning("%s", reason)
         await write_audit_soft(
             lambda: self._audit(AUTHORITY_SEAL_FAILED_ACTION, detail=_json(detail)),

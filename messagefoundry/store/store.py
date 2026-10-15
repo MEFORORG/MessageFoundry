@@ -161,6 +161,7 @@ from messagefoundry.store.queue_tag import (
 )
 from messagefoundry.store.row_seal import (
     ADSET_KIND,
+    APPROVAL_KIND,
     PASSKEYS_LABEL,
     ROLE_KIND,
     SEAL_PREFIX,
@@ -3177,6 +3178,212 @@ def report_role_reseal(resealed: int, refused: int) -> None:
         )
 
 
+# --- sealed dual-control approval requests (BACKLOG #2592) -------------------------------------
+#
+# One seal per ``pending_approvals`` row, over every other column. It binds what a release acts on:
+# the captured ``params`` (a held reload's config digest among them) and ``requester_user_id``,
+# which the self-approval refusal compares. Each backend writes the table through one helper,
+# ``_write_approval``. A new request is sealed as it is inserted. A status change reads the row,
+# checks its seal, and writes the changed row and its new seal only if the row still carries the
+# seal it read, so a row that fails is never re-sealed. ``ApprovalGate`` checks the seal where it
+# reads a request.
+
+#: The ``pending_approvals`` columns an approval seal leaves out, each with its reason.
+#: ``tests/test_approval_seal.py`` pins this list.
+APPROVAL_SEAL_EXCLUDED: Final[Mapping[str, str]] = MappingProxyType({"seal": "the seal itself"})
+
+
+@dataclass(frozen=True)
+class ApprovalRow:
+    """Every column of one ``pending_approvals`` row, each in the one type every backend reads it
+    back as (BACKLOG #2592). ``tests/test_approval_seal.py`` holds the fields equal to the table's
+    columns on each backend, so a column cannot sit outside the seal unnoticed."""
+
+    id: str
+    operation: str
+    params: str
+    requester: str
+    requester_user_id: str | None
+    requested_at: float
+    status: str
+    approver: str | None
+    decided_at: float | None
+    expires_at: float | None
+    claim_owner: str | None
+    #: The seal (``mfseal:v1:...``) over everything else. ``""`` on a keyless store.
+    seal: str
+
+    @classmethod
+    def from_mapping(cls, d: ByName) -> ApprovalRow:
+        """Hard subscripts, as :meth:`UserRow.from_mapping` has, for the same reason. A value no
+        honest write leaves, such as text in ``requested_at``, raises :class:`RowSealError`: the row
+        was changed outside the store, so it is a failed seal, not a crash in every reader."""
+        try:
+            return cls._of(d)
+        except (TypeError, ValueError) as exc:
+            raise RowSealError(APPROVAL_KIND) from exc
+
+    @classmethod
+    def _of(cls, d: ByName) -> ApprovalRow:
+        return cls(
+            id=str(d["id"]),
+            operation=str(d["operation"]),
+            params=str(d["params"]),
+            requester=str(d["requester"]),
+            requester_user_id=_opt_str(d["requester_user_id"]),
+            requested_at=float(d["requested_at"]),
+            status=str(d["status"]),
+            approver=_opt_str(d["approver"]),
+            decided_at=_opt_float(d["decided_at"]),
+            expires_at=_opt_float(d["expires_at"]),
+            claim_owner=_opt_str(d["claim_owner"]),
+            seal=str(d["seal"] or ""),
+        )
+
+    def seal_fields(self) -> tuple[tuple[str, object], ...]:
+        """Every field not in :data:`APPROVAL_SEAL_EXCLUDED`, in field order."""
+        return tuple(
+            (f.name, getattr(self, f.name))
+            for f in _dc_fields(self)
+            if f.name not in APPROVAL_SEAL_EXCLUDED
+        )
+
+    def write_params(self) -> tuple[object, ...]:
+        """Every column, in field order, as the approval insert binds them."""
+        return tuple(getattr(self, f.name) for f in _dc_fields(self))
+
+    def update_params(self, current: ApprovalRow) -> tuple[object, ...]:
+        """What each backend's compare-and-set UPDATE binds, in order: the four columns a status
+        change writes and this row's seal, then ``current``'s id, status and seal."""
+        return (
+            self.status,
+            self.approver,
+            self.decided_at,
+            self.claim_owner,
+            self.seal,
+            current.id,
+            current.status,
+            current.seal,
+        )
+
+    def decided(
+        self, *, status: str, approver: str | None, decided_at: float, claim_owner: str | None
+    ) -> ApprovalRow:
+        """This row moved to ``status``, as ``decide_pending_approval`` moves it. A ``None``
+        ``claim_owner`` keeps the stored one. The seal is left for the write helper to set."""
+        return replace(
+            self,
+            status=status,
+            approver=approver,
+            decided_at=float(decided_at),
+            claim_owner=self.claim_owner if claim_owner is None else claim_owner,
+        )
+
+
+def new_approval_row(
+    *,
+    approval_id: str,
+    operation: str,
+    params: str,
+    requester: str,
+    requester_user_id: str,
+    requested_at: float,
+    expires_at: float | None,
+) -> ApprovalRow:
+    """The row ``create_pending_approval`` inserts on every backend: ``pending``, undecided and
+    unclaimed. Unsealed; the write helper seals it."""
+    return ApprovalRow(
+        id=approval_id,
+        operation=operation,
+        params=params,
+        requester=requester,
+        requester_user_id=requester_user_id,
+        requested_at=float(requested_at),
+        status="pending",
+        approver=None,
+        decided_at=None,
+        expires_at=_opt_float(expires_at),
+        claim_owner=None,
+        seal="",
+    )
+
+
+def seal_approval(sealer: RowSealer | None, row: ApprovalRow) -> ApprovalRow:
+    """``row`` with its seal set under the active key, or empty with no sealer (BACKLOG #2592)."""
+    return replace(
+        row, seal="" if sealer is None else sealer.seal(APPROVAL_KIND, row.seal_fields())
+    )
+
+
+def approval_seal_ok(sealer: RowSealer | None, row: ApprovalRow) -> bool:
+    """Whether ``row`` carries a valid seal under a key this process holds. Always True with no
+    sealer. With one, a missing or empty seal fails like a wrong one."""
+    if sealer is None:
+        return True
+    try:
+        return sealer.verify_held(APPROVAL_KIND, row.seal_fields(), row.seal)
+    except TypeError:
+        return False
+
+
+def approval_update(
+    sealer: RowSealer | None, current: ApprovalRow, new: ApprovalRow
+) -> ApprovalRow:
+    """What a backend's ``_write_approval`` writes over ``current``, the row it read: ``new``,
+    sealed. Raises :class:`RowSealError` when ``current`` fails its seal, because the write keeps
+    its stored values, so a change made outside the store must never be sealed in."""
+    if not approval_seal_ok(sealer, current):
+        raise RowSealError(APPROVAL_KIND)
+    return seal_approval(sealer, new)
+
+
+def first_sealed_approval(sealer: RowSealer | None, rows: Iterable[ByName]) -> ApprovalRow | None:
+    """The first of ``rows`` whose seal holds, for a repeat request to join (vault BACKLOG #2445),
+    or ``None``. A request that fails is never joined, so a row planted outside the store cannot
+    absorb a real request; it is logged, and the caller files the request on its own."""
+    failed = 0
+    for found in rows:
+        try:
+            row = ApprovalRow.from_mapping(found)
+        except RowSealError:
+            failed += 1
+            continue
+        if approval_seal_ok(sealer, row):
+            return row
+        failed += 1
+    if failed:
+        log.warning(
+            "%d open dual-control request(s) matching a repeat failed their integrity seal and were"
+            " not joined; the request was filed on its own (BACKLOG #2592)",
+            failed,
+        )
+    return None
+
+
+def report_unsealed_approvals(count: int) -> None:
+    """Name, at a keyed open, the open dual-control requests that carry no integrity seal (BACKLOG
+    #2592). Each can no longer be released, rejected or settled, since nothing re-seals a row that
+    fails; it expires, and the operation is requested again."""
+    if count:
+        log.warning(
+            "%d open dual-control approval request(s) carry no integrity seal and can no longer be"
+            " released or rejected (BACKLOG #2592); request each operation again",
+            count,
+        )
+
+
+def report_approval_reseal(resealed: int, refused: int) -> None:
+    """Log what ``rotate-key``'s approval re-seal pass did (BACKLOG #2592)."""
+    if resealed:
+        log.info("re-sealed %d approval request(s) under the active key (rotation)", resealed)
+    if refused:
+        log.warning(
+            "%d approval request(s) failed their integrity seal and were left as they are; none"
+            " can be released (BACKLOG #2592)",
+            refused,
+        )
+
+
 # PHI-at-rest encryption is the store's `_cipher` (messagefoundry.store.crypto): identity when no
 # key is configured, AES-256-GCM when MEFOR_STORE_ENCRYPTION_KEY is set. See STORE-1.
 
@@ -5514,10 +5721,38 @@ _SQLITE_OPEN_REPEAT = (
     " AND (expires_at IS NULL OR expires_at > ?)"
 )
 
-#: The head both of ``create_pending_approval``'s INSERTs share; each appends its own row source.
+# The approval statements (BACKLOG #2592), every column in `ApprovalRow` field order. Each is named
+# at its call, because `tests/test_writer_txn_is_the_only_begin.py` reads every `execute` argument
+# in this module as text. The writes are used only by `_write_approval`; tests/test_approval_seal.py
+# keeps them so.
+#: Every column, as each approval read projects them.
+_SQLITE_APPROVAL_SELECT = (
+    "SELECT id, operation, params, requester, requester_user_id, requested_at, status,"
+    " approver, decided_at, expires_at, claim_owner, seal FROM pending_approvals"
+)
+#: A new request: every column bound.
 _SQLITE_APPROVAL_INSERT = (
-    "INSERT INTO pending_approvals "
-    "(id, operation, params, requester, requester_user_id, requested_at, status, expires_at)"
+    "INSERT INTO pending_approvals (id, operation, params, requester, requester_user_id,"
+    " requested_at, status, approver, decided_at, expires_at, claim_owner, seal)"
+    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+)
+#: A new request unless an open one matches (vault BACKLOG #2445). ONE statement, so its read and
+#: its write cannot be split: it takes SQLite's file-level write lock before it reads, which holds
+#: against another connection to the file too. Binds every column, then the four
+#: :data:`_SQLITE_OPEN_REPEAT` values.
+_SQLITE_APPROVAL_INSERT_UNLESS_OPEN = (
+    "INSERT INTO pending_approvals (id, operation, params, requester, requester_user_id,"
+    " requested_at, status, approver, decided_at, expires_at, claim_owner, seal)"
+    " SELECT ?,?,?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM pending_approvals WHERE"
+    " operation = ? AND params = ? AND requester_user_id = ? AND status = 'pending'"
+    " AND (expires_at IS NULL OR expires_at > ?))"
+)
+#: A status change, as a compare-and-set: it lands only on the row still in the status and still
+#: carrying the seal the helper read. The status guard holds on a keyless store too, where every
+#: seal is empty.
+_SQLITE_APPROVAL_UPDATE = (
+    "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?, claim_owner = ?,"
+    " seal = ? WHERE id = ? AND status = ? AND seal = ?"
 )
 
 
@@ -6607,7 +6842,8 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
     -- BACKLOG #1562: the engine process that claimed the release ('executing'). The Store
     -- protocol's decide_pending_approval says what it holds and who reads it. NULL on a row never
     -- claimed, and on one claimed before the column existed.
-    claim_owner  TEXT
+    claim_owner  TEXT,
+    seal         TEXT NOT NULL DEFAULT ''      -- BACKLOG #2592: integrity seal over the whole row. NO COMMA in this comment
 );
 CREATE INDEX IF NOT EXISTS ix_pending_approvals_status ON pending_approvals(status, requested_at);
 
@@ -7210,6 +7446,7 @@ class MessageStore:
             if store._row_sealer is not None:
                 report_unsealed_users(await store.count_unsealed_users())
                 report_unsealed_role_records(await store.count_unsealed_role_records())
+                report_unsealed_approvals(await store.count_unsealed_approvals())
             if read_only:
                 await store._load_read_only()
             else:
@@ -7958,6 +8195,7 @@ class MessageStore:
         # whose record has no seal or fails it and is refused anyway.
         report_user_reseal(*await self.reseal_user_records())
         report_role_reseal(*await self.reseal_role_records())
+        report_approval_reseal(*await self.reseal_approval_records())
         total = 0
         async with _writer_guard(self._db, self._lock):
             for table, column in self._CIPHER_COLUMNS:
@@ -8635,6 +8873,12 @@ class MessageStore:
         # recorded owner; ApprovalGate.reconcile_after_restart says how it treats one.
         if "claim_owner" not in approval_cols:
             await db.execute("ALTER TABLE pending_approvals ADD COLUMN claim_owner TEXT")
+        # BACKLOG #2592: the request's integrity seal. An existing row gets an empty seal, which a
+        # keyed store refuses; `report_unsealed_approvals` names the open ones at open.
+        if "seal" not in approval_cols:
+            await db.execute(
+                "ALTER TABLE pending_approvals ADD COLUMN seal TEXT NOT NULL DEFAULT ''"
+            )
         await MessageStore._migrate_outbox_to_queue(db)
 
     @staticmethod
@@ -13675,52 +13919,41 @@ class MessageStore:
         on_repeat: Callable[[str], AuditAppend] | None = None,
     ) -> str:
         """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5).
-        The Store protocol states the ``audit`` and ``on_repeat`` contract and what is returned."""
-        args: tuple[Any, ...] = (
-            approval_id,
-            operation,
-            params,
-            requester,
-            requester_user_id,
-            requested_at,
-            expires_at,
+        The Store protocol states the ``audit`` and ``on_repeat`` contract and what is returned.
+
+        The row is sealed as it is inserted (BACKLOG #2592). A repeat joins only an open request
+        whose seal holds: :func:`first_sealed_approval` says why."""
+        row = new_approval_row(
+            approval_id=approval_id,
+            operation=operation,
+            params=params,
+            requester=requester,
+            requester_user_id=requester_user_id,
+            requested_at=requested_at,
+            expires_at=expires_at,
         )
         match = (operation, params, requester_user_id, requested_at)
         now = time.time()
         held = approval_id
         append = audit
-        # Each statement is concatenated at its `execute` from module constants, so
-        # `tests/test_writer_txn_is_the_only_begin.py` can read it whole. That guard counts SQL held
-        # in a local as unreadable against a pinned count, and it reads an f-string's interpolated
-        # name only as a placeholder, so it would miss a verb that name carries.
         async with _writer_guard(self._db, self._lock):
             if on_repeat is None:
-                await self._db.execute(
-                    _SQLITE_APPROVAL_INSERT + " VALUES (?,?,?,?,?,?,'pending',?)", args
+                await self._write_approval(row)
+            elif not await self._write_approval(row, unless_open=match):
+                # The INSERT opened this connection's write transaction, so this read is the
+                # authoritative one. Oldest first: that is the request every earlier caller got.
+                found = await self._db.execute(
+                    _SQLITE_APPROVAL_SELECT
+                    + " WHERE "
+                    + _SQLITE_OPEN_REPEAT
+                    + " ORDER BY requested_at ASC",
+                    match,
                 )
-            else:
-                # vault BACKLOG #2445. ONE statement, so its read and its write cannot be split: it
-                # takes SQLite's file-level write lock before it reads, which holds against another
-                # connection to the file too, where the in-process lock does not reach.
-                cur = await self._db.execute(
-                    _SQLITE_APPROVAL_INSERT + " SELECT ?,?,?,?,?,?,'pending',? WHERE NOT EXISTS ("
-                    "SELECT 1 FROM pending_approvals WHERE " + _SQLITE_OPEN_REPEAT + ")",
-                    args + match,
-                )
-                if cur.rowcount == 0:
-                    # The INSERT opened this connection's write transaction, so this read is the
-                    # authoritative one. Oldest first: that is the request every earlier caller got.
-                    found = await self._db.execute(
-                        "SELECT id FROM pending_approvals WHERE "
-                        + _SQLITE_OPEN_REPEAT
-                        + " ORDER BY requested_at ASC LIMIT 1",
-                        match,
-                    )
-                    row = await found.fetchone()
-                    # The INSERT's own NOT EXISTS matched one, under the write lock.
-                    if row is None:
-                        raise RuntimeError("pending_approvals: a repeat matched no open request")
-                    held = str(row["id"])
+                joined = first_sealed_approval(self._row_sealer, await found.fetchall())
+                if joined is None:
+                    await self._write_approval(row)
+                else:
+                    held = joined.id
                     append = on_repeat(held)
             # vault BACKLOG #2255. Before the one commit, so a failed append rolls the request back
             # and no releasable row is left without its approval.requested row.
@@ -13730,24 +13963,47 @@ class MessageStore:
         tee_audits(audits, appended, ts=now)
         return held
 
+    async def _write_approval(
+        self,
+        new: ApprovalRow,
+        *,
+        current: ApprovalRow | None = None,
+        unless_open: tuple[Any, ...] | None = None,
+    ) -> bool:
+        """The one writer of a ``pending_approvals`` row (BACKLOG #2592). Call it inside an open
+        write. Returns whether a row was written.
+
+        With no ``current`` it inserts ``new``, sealed; with ``unless_open`` (the four
+        :data:`_SQLITE_OPEN_REPEAT` values) only when no open request matches. With ``current``,
+        the row it read, it is a compare-and-set: :func:`approval_update` refuses a ``current``
+        that fails its seal, raising :class:`RowSealError` and writing nothing, and the UPDATE
+        lands only while the row is still in ``current``'s status and carries its seal."""
+        sealer = self._row_sealer
+        if current is not None:
+            cur = await self._db.execute(
+                _SQLITE_APPROVAL_UPDATE,
+                approval_update(sealer, current, new).update_params(current),
+            )
+            return cur.rowcount > 0
+        params = seal_approval(sealer, new).write_params()
+        if unless_open is None:
+            await self._db.execute(_SQLITE_APPROVAL_INSERT, params)
+            return True
+        cur = await self._db.execute(_SQLITE_APPROVAL_INSERT_UNLESS_OPEN, params + unless_open)
+        return cur.rowcount > 0
+
     async def get_pending_approval(self, approval_id: str) -> aiosqlite.Row | None:
         async with self._read() as db:
-            cur = await db.execute(
-                "SELECT id, operation, params, requester, requester_user_id, requested_at, status,"
-                " approver, decided_at, expires_at FROM pending_approvals WHERE id = ?",
-                (approval_id,),
-            )
+            cur = await db.execute(_SQLITE_APPROVAL_SELECT + " WHERE id = ?", (approval_id,))
             return await cur.fetchone()
 
     async def list_pending_approvals(self, *, now: float, limit: int = 100) -> list[aiosqlite.Row]:
-        """Open (still-``pending``, unexpired) approval requests, newest-first."""
+        """Open (still-``pending``, unexpired) approval requests, newest-first. Every column, so
+        the gate can check each row's seal (BACKLOG #2592)."""
         async with self._read() as db:
             cur = await db.execute(
-                # requester_user_id is projected only so the queue can tell a caller a request is
-                # their own (BACKLOG #2460). The refusals still read it through get_pending_approval.
-                "SELECT id, operation, params, requester, requester_user_id, requested_at, status,"
-                " approver, decided_at, expires_at FROM pending_approvals"
-                " WHERE status = 'pending' AND (expires_at IS NULL OR expires_at > ?)"
+                _SQLITE_APPROVAL_SELECT
+                + " WHERE status = 'pending' AND (expires_at IS NULL OR expires_at > ?)"
                 " ORDER BY requested_at DESC LIMIT ?",
                 (now, limit),
             )
@@ -13758,9 +14014,7 @@ class MessageStore:
         order: the Store protocol says why. Same projection as :meth:`list_pending_approvals`."""
         async with self._read() as db:
             cur = await db.execute(
-                "SELECT id, operation, params, requester, requester_user_id, requested_at, status,"
-                " approver, decided_at, expires_at FROM pending_approvals"
-                " WHERE status = 'interrupted'"
+                _SQLITE_APPROVAL_SELECT + " WHERE status = 'interrupted'"
                 " ORDER BY requested_at ASC LIMIT ?",
                 (limit,),
             )
@@ -13787,16 +14041,29 @@ class MessageStore:
         the guard is a parameter rather than a hardcoded literal. The resolve path moves a row out of
         ``interrupted`` the same way, so two resolvers cannot both record an outcome.
 
+        The move goes through :meth:`_write_approval` (BACKLOG #2592): a row whose seal fails
+        raises :class:`RowSealError` and nothing is written.
+
         ``audit`` and ``claim_owner``: the Store protocol states the contract (vault BACKLOG #2255,
         BACKLOG #1562)."""
         now = time.time()
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute(
-                "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?,"
-                " claim_owner = COALESCE(?, claim_owner) WHERE id = ? AND status = ?",
-                (status, approver, decided_at, claim_owner, approval_id, from_status),
+            cur = await self._db.execute(_SQLITE_APPROVAL_SELECT + " WHERE id = ?", (approval_id,))
+            found = await cur.fetchone()
+            current = None if found is None else ApprovalRow.from_mapping(found)
+            moved = (
+                current is not None
+                and current.status == from_status
+                and await self._write_approval(
+                    current.decided(
+                        status=status,
+                        approver=approver,
+                        decided_at=decided_at,
+                        claim_owner=claim_owner,
+                    ),
+                    current=current,
+                )
             )
-            moved = cur.rowcount > 0
             # Before the one commit, so a failed append rolls the transition back. A transition
             # that matched no row writes no audit row.
             audits: tuple[AuditAppend, ...] = (audit,) if moved and audit is not None else ()
@@ -13809,17 +14076,61 @@ class MessageStore:
         self, *, claim_owner: str | None = None, limit: int = 1000
     ) -> list[aiosqlite.Row]:
         """Released requests still claimed as ``executing``, oldest claim first (BACKLOG #1562).
-        The Store protocol says who reads it, why, and what ``claim_owner`` filters."""
+        The Store protocol says who reads it, why, and what ``claim_owner`` filters. Every column,
+        so the gate can check each row's seal (BACKLOG #2592)."""
         owned = "" if claim_owner is None else " AND (claim_owner = ? OR claim_owner IS NULL)"
         args = (limit,) if claim_owner is None else (claim_owner, limit)
         async with self._read() as db:
             cur = await db.execute(
-                "SELECT id, operation, requester, approver, decided_at, claim_owner"
-                f" FROM pending_approvals WHERE status = 'executing'{owned}"
+                _SQLITE_APPROVAL_SELECT + f" WHERE status = 'executing'{owned}"
                 " ORDER BY decided_at ASC LIMIT ?",
                 args,
             )
             return list(await cur.fetchall())
+
+    async def count_unsealed_approvals(self) -> int:
+        """How many open approval requests carry no integrity seal (BACKLOG #2592). See
+        :func:`report_unsealed_approvals`."""
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM pending_approvals WHERE seal = ''"
+                " AND status IN ('pending', 'executing', 'interrupted')"
+            )
+            row = await cur.fetchone()
+        return int(row[0]) if row else 0
+
+    async def reseal_approval_records(self) -> tuple[int, int]:
+        """Re-seal every approval request under the active key, for ``rotate-key`` (BACKLOG
+        #2592), as :meth:`reseal_role_records` does for roles. Each is checked under the key its
+        seal names first; one that fails is left as it is and counted. Returns
+        ``(re-sealed, refused)``."""
+        sealer = self._row_sealer
+        if sealer is None:
+            return 0, 0
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT id FROM pending_approvals WHERE seal <> '' AND seal NOT LIKE ? ORDER BY id",
+                (f"{SEAL_PREFIX}{sealer.key_id}:%",),
+            )
+            ids = [str(r["id"]) for r in await cur.fetchall()]
+        resealed = refused = 0
+        for approval_id in ids:
+            async with _writer_guard(self._db, self._lock):
+                cur = await self._db.execute(
+                    _SQLITE_APPROVAL_SELECT + " WHERE id = ?", (approval_id,)
+                )
+                found = await cur.fetchone()
+                if found is None:
+                    continue
+                try:
+                    current = ApprovalRow.from_mapping(found)
+                    wrote = await self._write_approval(current, current=current)
+                except RowSealError:
+                    refused += 1
+                    continue
+                await self._commit()
+                resealed += wrote
+        return resealed, refused
 
     # --- per-key AES-GCM invocation bound (ASVS 11.3.4) ----------------------
 

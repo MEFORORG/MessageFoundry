@@ -2131,8 +2131,10 @@ The engine logs the cause of the last two at WARNING. None writes a `config_relo
 because nothing was attempted. A repeat request joins an open hold only while the digest is
 unchanged. An ungated reload takes no request-time digest. At least these limits remain:
 
-- the digest is not sealed. A writer to the `pending_approvals` table can replace it along with the
-  rest of the params. Sealing that row is vault BACKLOG #2592;
+- the digest is sealed only on a store that holds a key. There the whole request row carries an
+  integrity seal, so a writer to the `pending_approvals` table who replaces the digest leaves a
+  request the gate refuses. The seal does not stop an older sealed copy of the row being put back,
+  and a keyless store checks nothing (vault BACKLOG #2592);
 - the digest covers what `config/fingerprint.py` hashes and no more. A planted `__pycache__` file
   runs under an unchanged digest. So does an edit to an environment value file outside the config
   directory, or to a `MEFOR_VALUE_*` variable. These gaps are closing step 1 of vault BACKLOG #2596;
