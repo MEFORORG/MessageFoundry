@@ -315,6 +315,51 @@ def test_a_launch_in_a_clone_no_longer_opted_in_removes_the_old_pin(tmp_path: Pa
     assert not pin_path(repo, "s1").exists(), "the previous run's pin survived the launch"
     got = _resolve(repo, tmp_path, _stop("s1", sibling))
     assert got["Dir"] is None, "the stale pin answered for the sibling"
+    # The control: a pin naming this launch's own worktree is kept, because an opted-in copy run by
+    # another hook on the same event may just have written it.
+    seed_pin(repo, wt, "s1")
+    _resolve(repo, tmp_path, _launch("s1", wt, "resume"))
+    assert pin_path(repo, "s1").exists(), "a launch removed the pin that names its own worktree"
+
+
+def test_a_pinned_session_with_no_cwd_answers_for_its_pin(tmp_path: Path) -> None:
+    """Rule 3 covers an event whose input names no cwd. Staying put there answered for the primary,
+    where steer-inject then read the primary's note."""
+    repo, wt, _ = _opted_in(tmp_path)
+    seed_pin(repo, wt, "s1")
+    got = _resolve(repo, tmp_path, {"session_id": "s1", "hook_event_name": "PreToolUse"})
+    assert got["Dir"] and _same_dir(got["Dir"], wt) and got["Source"] == "pin", got
+    # The control: an unpinned session with no cwd stays put, in silence.
+    other = _resolve(repo, tmp_path, {"session_id": "s2", "hook_event_name": "PreToolUse"})
+    assert other["Dir"] is None and other["Reason"] == "", other
+
+
+def test_an_open_stdin_outside_every_checkout_stays_silent(tmp_path: Path) -> None:
+    """Outside every checkout a hook stays put in silence; an open stdin used to make it a fault."""
+    outside = tmp_path / "no-repo"
+    outside.mkdir()
+    probe = tmp_path / "timeout.ps1"
+    probe.write_text(
+        f". '{HELPER}'\n$script:CcxHookInputTimedOut = $true\n"
+        f"$o = Resolve-CcxHookSession -Text '' -StartDir '{outside}'\n"
+        "$r = Resolve-CcxHookSession -Text '' -StartDir $args[0]\n"
+        "@{ outside = $o.Reason; inside = $r.Reason } | ConvertTo-Json -Compress\n",
+        encoding="utf-8",
+    )
+    repo, _ = _primary_with(tmp_path, "linked")
+    proc = run_single(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(probe), str(repo)],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    got = json.loads(proc.stdout)
+    assert got["outside"] == "", got
+    # The control: inside a checkout the same open stdin is a fault.
+    assert "still open" in got["inside"], got
 
 
 def test_a_launch_that_cannot_replace_the_pin_keeps_no_stale_one(tmp_path: Path) -> None:

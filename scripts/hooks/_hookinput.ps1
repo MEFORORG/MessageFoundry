@@ -42,14 +42,17 @@
     leaves no file in an unrelated repository. Reading a pin needs no opt-in.
 
     A PIN IS REPLACED ATOMICALLY. It is written to a unique temp file beside it and moved over it
-    with [System.IO.File]::Move(..., $true), which replaces in one rename on the same volume, so a
-    reader sees the old pin or the new one and never none. Readers open it sharing delete, so a
-    reader never blocks the rename. A move that keeps failing deletes the old pin rather than keep
-    it, so the session falls to rule 4, never to the previous run's worktree. Temp files older than
-    ten minutes and pins older than thirty days are pruned at each pin write.
+    with [System.IO.File]::Move(..., $true), which replaces in one rename on the same volume. On
+    that path a reader sees the old pin or the new one and never none (the race test measures it).
+    Readers open it sharing delete, so they hold it as briefly and loosely as .NET allows; whether
+    an open reader still blocks the rename on Windows is not measured, which is why the move is
+    retried. A move that keeps failing deletes the old pin and tries once more: then, and only
+    then, a reader can briefly find none and falls to rule 4, never to the previous run's
+    worktree. Temp files older than ten minutes and pins older than thirty days are pruned at each
+    pin write.
 
-    NO CWD IS NOT A FAULT. A payload with no `cwd` (an older harness, a hand-run test) leaves the
-    hook where it started. Stdin still open at the read's bound IS one, because nothing says it
+    NO CWD IS NOT A FAULT. A payload with no `cwd` (an older harness, a hand-run test) answers for
+    the session's pin, or with none leaves the hook where it started. Stdin still open at the read's bound IS one, because nothing says it
     would have named no `cwd`. A refused `cwd` is a fault too, and both entry points return the
     Reason so the caller can say it aloud. Falling back in silence is the defect this file exists
     to fix.
@@ -350,8 +353,11 @@ function Resolve-CcxHookSession {
         Named = $false; Dir = $null; Root = $null; Source = 'start'; Reason = ''; Note = ''
         SessionId = ''; Event = ''; Payload = $null; Pinned = $null
     }
+    $startRoot = Get-CcxWorktreeRoot $StartDir
+    $startCommon = Get-CcxGitCommonDir $startRoot
     $timedOut = [bool](Get-Variable -Name CcxHookInputTimedOut -Scope Script -ValueOnly -ErrorAction Ignore)
-    if ([string]::IsNullOrWhiteSpace($Text) -and $timedOut) {
+    # Outside every checkout a hook stays silent (below), and an open stdin does not change that.
+    if ([string]::IsNullOrWhiteSpace($Text) -and $timedOut -and $startCommon) {
         $out.Named = $true
         $out.Reason = 'the hook input was still open when the hook stopped waiting for it, so it names no cwd'
         return $out
@@ -370,8 +376,6 @@ function Resolve-CcxHookSession {
     $p = Get-CcxHookPayloadCwd -Payload $out.Payload
     $out.Named = $p.Named
 
-    $startRoot = Get-CcxWorktreeRoot $StartDir
-    $startCommon = Get-CcxGitCommonDir $startRoot
     if (-not $startCommon) {
         # No repository to check against and nowhere to pin. A `cwd` in some checkout is not this
         # session's own (it launched in none), so the hook stays put, in silence, as it did before
@@ -417,18 +421,26 @@ function Resolve-CcxHookSession {
         if ($why) { $root = $null }
     }
 
-    # Rule 2. A launch that does not write a pin removes any it finds: a refused or unnamed `cwd`,
-    # or a clone no longer opted in. The previous run's would otherwise answer, in silence, for
-    # every later event. Removing writes no new file, so it needs no opt-in.
+    # Rule 2. A launch that does not write a pin removes any it finds that names another worktree:
+    # a refused or unnamed `cwd`, or a clone no longer opted in. The previous run's would otherwise
+    # answer, in silence, for every later event. Removing writes no new file, so it needs no
+    # opt-in. A pin naming this launch's own worktree is kept: an opted-in copy of this file, run
+    # by another hook on the same event, may just have written it.
     if ($launch -and $pinFile -and -not $ReadOnly) {
         if ($root -and (Test-CcxPinOptIn $startRoot $startCommon)) {
             if (Write-CcxSessionPin -Path $pinFile -Root $root) { $pinned = $root }
         }
-        else { Remove-Item -LiteralPath $pinFile -Force -ErrorAction SilentlyContinue }
+        elseif (-not ($root -and (Test-CcxSamePath (Read-CcxSessionPin $pinFile) $root))) {
+            Remove-Item -LiteralPath $pinFile -Force -ErrorAction SilentlyContinue
+        }
     }
     $out.Pinned = $pinned
 
-    if (-not $p.Named) { return $out }
+    if (-not $p.Named) {
+        # No cwd: a pinned session still answers for its pin (rule 3); an unpinned one stays put.
+        if ($pinned) { $out.Dir = $pinned; $out.Root = $pinned; $out.Source = 'pin' }
+        return $out
+    }
     $own = if ($pinned) { $pinned } else { $startRoot }
     if ($root -and ($launch -or (Test-CcxSamePath $root $own))) {
         $out.Dir = $p.Cwd; $out.Root = $root; $out.Source = 'cwd'
