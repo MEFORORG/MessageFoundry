@@ -279,9 +279,12 @@ if ($hasHelper) {
     $rootCommon = if ($root) { Get-CcxGitCommonDir $root } else { $null }
     $target = $abs
     if ($rootCommon -and (-not $script:StartCommon -or (Test-CcxSamePath $rootCommon $script:StartCommon))) {
-        # With no pin the gate runs from the file's worktree. Run from the start checkout instead (the
-        # primary, under the desktop app), it would skip the primary's row, and an unpinned session
-        # usually edits its own worktree, whose row is the one to skip.
+        # With no pin the gate runs from the file's worktree, and that is a trade-off, not a fix:
+        # overlap skips the row of the root it runs from, so an unpinned session that `cd`s into a
+        # sibling and edits there is not checked against the sibling's row. Run from the start
+        # checkout instead (the primary, under the desktop app), it skips the primary's row, which
+        # an unpinned session editing its own worktree needs checked. Closing both needs overlap
+        # to take the session's root apart from where it runs.
         $self = (Resolve-CcxHookSession -Text $raw -ReadOnly).Pinned
         if (-not $self) { $self = $root }
         $relative = $null

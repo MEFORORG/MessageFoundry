@@ -52,8 +52,8 @@
     pin write.
 
     NO CWD IS NOT A FAULT. A payload with no `cwd` (an older harness, a hand-run test) answers for
-    the session's pin, or with none leaves the hook where it started. Stdin still open at the read's bound IS one, because nothing says it
-    would have named no `cwd`. A refused `cwd` is a fault too, and both entry points return the
+    the session's pin, or with none leaves the hook where it started. Stdin still open at the
+    read's bound IS one, because nothing says it would have named no `cwd`. A refused `cwd` is a fault too, and both entry points return the
     Reason so the caller can say it aloud. Falling back in silence is the defect this file exists
     to fix.
 
@@ -248,8 +248,9 @@ function Get-CcxGitCommonDir {
 }
 
 function Read-CcxSessionPin {
-    # The first line of a pin, or $null. Opened sharing delete, so a writer's rename over it never
-    # waits on this reader.
+    # The first line of a pin, or $null. Opened sharing delete, so it holds the pin as loosely as
+    # .NET allows; whether that lets a writer rename over an open pin on Windows is unmeasured, so
+    # the writer retries.
     param([string] $Path)
     try {
         $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
@@ -284,17 +285,23 @@ function Write-CcxSessionPin {
             try { [System.IO.File]::Move($tmp, $Path, $true); $written = $true; break }
             catch { Start-Sleep -Milliseconds 25 }
         }
-        if (-not $written -and -not (Test-CcxSamePath (Read-CcxSessionPin $Path) $Root)) {
-            Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-            try { [System.IO.File]::Move($tmp, $Path, $true); $written = $true } catch { }
-        }
     }
     catch { }
     finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    # One decision for every way the move did not land, including a throw above.
     if (-not $written) {
         if (Test-CcxSamePath (Read-CcxSessionPin $Path) $Root) { $written = $true }
-        # Never keep the previous run's pin: with none, the session falls to rule 4 of the header.
-        else { Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue }
+        else {
+            # Never keep the previous run's pin: with none, the session falls to rule 4 of the header.
+            # A pin whose own state blocked the rename (read-only, say) is then written afresh.
+            Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+            try {
+                [System.IO.File]::WriteAllText($tmp, $Root, [System.Text.UTF8Encoding]::new($false))
+                [System.IO.File]::Move($tmp, $Path, $true)
+                $written = $true
+            }
+            catch { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        }
     }
     try {
         # Pruned here because a pin is written about once per session. A temp file ten minutes old
@@ -356,8 +363,9 @@ function Resolve-CcxHookSession {
     $startRoot = Get-CcxWorktreeRoot $StartDir
     $startCommon = Get-CcxGitCommonDir $startRoot
     $timedOut = [bool](Get-Variable -Name CcxHookInputTimedOut -Scope Script -ValueOnly -ErrorAction Ignore)
-    # Outside every checkout a hook stays silent (below), and an open stdin does not change that.
-    if ([string]::IsNullOrWhiteSpace($Text) -and $timedOut -and $startCommon) {
+    # Outside every checkout a hook stays silent (below), and an open stdin does not change that,
+    # except for an -AllowOutside caller, which does act outside a checkout and must say why not.
+    if ([string]::IsNullOrWhiteSpace($Text) -and $timedOut -and ($startCommon -or $AllowOutside)) {
         $out.Named = $true
         $out.Reason = 'the hook input was still open when the hook stopped waiting for it, so it names no cwd'
         return $out

@@ -343,7 +343,8 @@ def test_an_open_stdin_outside_every_checkout_stays_silent(tmp_path: Path) -> No
         f". '{HELPER}'\n$script:CcxHookInputTimedOut = $true\n"
         f"$o = Resolve-CcxHookSession -Text '' -StartDir '{outside}'\n"
         "$r = Resolve-CcxHookSession -Text '' -StartDir $args[0]\n"
-        "@{ outside = $o.Reason; inside = $r.Reason } | ConvertTo-Json -Compress\n",
+        f"$x = Resolve-CcxHookSession -Text '' -StartDir '{outside}' -AllowOutside\n"
+        "@{ outside = $o.Reason; inside = $r.Reason; anchored = $x.Reason } | ConvertTo-Json -Compress\n",
         encoding="utf-8",
     )
     repo, _ = _primary_with(tmp_path, "linked")
@@ -358,8 +359,10 @@ def test_an_open_stdin_outside_every_checkout_stays_silent(tmp_path: Path) -> No
     assert proc.returncode == 0, proc.stderr
     got = json.loads(proc.stdout)
     assert got["outside"] == "", got
-    # The control: inside a checkout the same open stdin is a fault.
+    # The controls: inside a checkout, or for an -AllowOutside caller (mail-drain's anchor case),
+    # the same open stdin is a fault.
     assert "still open" in got["inside"], got
+    assert "still open" in got["anchored"], got
 
 
 def test_a_launch_that_cannot_replace_the_pin_keeps_no_stale_one(tmp_path: Path) -> None:
@@ -412,7 +415,13 @@ def test_the_pin_is_never_missing_while_it_is_replaced(tmp_path: Path) -> None:
         "        if (-not [System.IO.File]::Exists($pin)) { $sync.misses++ }\n"
         "    }\n"
         "}\n"
-        "while ($sync.reads -eq 0) { Start-Sleep -Milliseconds 5 }\n"
+        "$t0 = Get-Date\n"
+        "while ($sync.reads -eq 0) {\n"
+        "    if (((Get-Date) - $t0).TotalSeconds -gt 20) {\n"
+        "        throw ('the reader never started: ' + (Receive-Job $reader 2>&1 | Out-String))\n"
+        "    }\n"
+        "    Start-Sleep -Milliseconds 5\n"
+        "}\n"
         "$errs = @()\n"
         "try {\n"
         "    . $h\n"

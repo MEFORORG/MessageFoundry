@@ -25,12 +25,13 @@
 # the primary's note and never the worktree's. Only the `cwd` field of the JSON on stdin names the
 # worktree. Which worktree's note the hook reads follows the rules in scripts/hooks/_hookinput.ps1,
 # never the one a `cd` reached: this hook deletes what it reads and injects it as text the user
-# typed. Input with no `cwd` falls back to CLAUDE_PROJECT_DIR, as before.
+# typed. Input with no `cwd` reads the session's pinned worktree, or with no pin CLAUDE_PROJECT_DIR,
+# as before.
 #
 # A `cwd` THOSE RULES REFUSE READS NO NOTE. Falling back to CLAUDE_PROJECT_DIR there would read,
-# delete and inject the PRIMARY session's note into this one, so its recipient never sees it. The hook says so on a `[steer]` line instead, at most once per
-# $FAULT_COOLDOWN_MINUTES for each session, because it runs before every tool call. A missing helper
-# is the same fault.
+# delete and inject the PRIMARY session's note into this one, so its recipient never sees it. The
+# hook says so on a `[steer]` line instead, at most once per $FAULT_COOLDOWN_MINUTES for each
+# session, because it runs before every tool call. A missing helper is the same fault.
 #
 # Fail-open: any error here must never block a tool call.
 # ASCII-only on purpose (PS 5.1 ANSI-read lesson); run under pwsh 7 by the hook.
