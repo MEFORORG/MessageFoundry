@@ -202,6 +202,7 @@ from messagefoundry.store.store import (
     AlertInstance,
     AlertSummary,
     AppendedAuditRow,
+    ApprovalRow,
     AuditAppend,
     AuditedWrite,
     AuditVerdict,
@@ -255,6 +256,7 @@ from messagefoundry.store.store import (
     _transit_attestation_row,
     ad_map_write,
     admin_guard_counts,
+    approval_update,
     audit_append_refusal,
     audit_append_secret,
     audit_seal_next,
@@ -266,11 +268,13 @@ from messagefoundry.store.store import (
     existing_roles_only,
     federated_bind,
     federated_unbind,
+    first_sealed_approval,
     full_authentication_clear,
     load_audit_chain,
     lockout_clear,
     lockout_increment,
     mfa_stamp,
+    new_approval_row,
     new_session_record,
     new_user_record,
     not_deployed_detail,
@@ -281,9 +285,11 @@ from messagefoundry.store.store import (
     read_transit_bound_attestation_rows,
     reauth_stamp,
     recovery_code_spend,
+    report_approval_reseal,
     report_refused_ad_role_map,
     report_refused_role_holder,
     report_role_reseal,
+    report_unsealed_approvals,
     report_unsealed_role_records,
     report_unsealed_users,
     report_user_reseal,
@@ -293,6 +299,7 @@ from messagefoundry.store.store import (
     rotation_reseal,
     scope_if_source,
     scope_withdrawal,
+    seal_approval,
     seal_role,
     seal_session,
     seal_user,
@@ -778,7 +785,9 @@ _SCHEMA: list[str] = [
         expires_at   DOUBLE PRECISION,
         -- BACKLOG #1562: the engine process that claimed the release. See the Store protocol's
         -- decide_pending_approval.
-        claim_owner  TEXT
+        claim_owner  TEXT,
+        -- BACKLOG #2592: the integrity seal over the whole row.
+        seal         TEXT NOT NULL DEFAULT ''
     )""",
     # BACKLOG #1540: the immutable requester id for a pre-existing pending_approvals table; a no-op on
     # a fresh DB (the CREATE above has it). Lives in _SCHEMA (hash-gated, ADR 0064) so it runs once
@@ -1078,6 +1087,9 @@ _SCHEMA.append(_gated_add_column("users", "authz_seal", "TEXT NOT NULL DEFAULT '
 # BACKLOG #2592: a role's integrity seal. An existing custom role gets an empty seal and grants nothing
 # until an administrator saves it again; store.py's report_unsealed_role_records says why.
 _SCHEMA.append(_gated_add_column("roles", "seal", "TEXT NOT NULL DEFAULT ''"))
+# BACKLOG #2592: an approval request's integrity seal. An existing row gets an empty seal, which a
+# keyed store refuses; store.py's report_unsealed_approvals says why.
+_SCHEMA.append(_gated_add_column("pending_approvals", "seal", "TEXT NOT NULL DEFAULT ''"))
 # Vault BACKLOG #2615: the plain origin pair for a pre-existing messages table. Gated, because a bare
 # ADD COLUMN IF NOT EXISTS would hold ACCESS EXCLUSIVE on the hottest table through the batch even when
 # the column is there. In _SCHEMA, so adding it moves _schema_hash() and needs no _MIGRATION_REV bump.
@@ -1192,6 +1204,21 @@ _PG_WEBAUTHN_INSERT: Final = (
     " rp_id, public_key, sign_count, transports, device_type, backed_up, label,"
     " aaguid, created_at, last_used_at)"
     " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)"
+)
+# The `$n` twins of store.py's approval statements (BACKLOG #2592); store.py states the contract.
+# The writes are used only by `_write_approval`.
+_PG_APPROVAL_SELECT: Final = (
+    "SELECT id, operation, params, requester, requester_user_id, requested_at, status,"
+    " approver, decided_at, expires_at, claim_owner, seal FROM pending_approvals"
+)
+_PG_APPROVAL_INSERT: Final = (
+    "INSERT INTO pending_approvals (id, operation, params, requester, requester_user_id,"
+    " requested_at, status, approver, decided_at, expires_at, claim_owner, seal)"
+    " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)"
+)
+_PG_APPROVAL_UPDATE: Final = (
+    "UPDATE pending_approvals SET status = $1, approver = $2, decided_at = $3, claim_owner = $4,"
+    " seal = $5 WHERE id = $6 AND status = $7 AND seal = $8"
 )
 # The `$n` twins of store.py's role write and AD map statements (BACKLOG #2592); store.py states
 # the contract. The role write is used only by `_write_role`.
@@ -1659,6 +1686,7 @@ class PostgresStore:
             if store._row_sealer is not None:
                 report_unsealed_users(await store.count_unsealed_users())
                 report_unsealed_role_records(await store.count_unsealed_role_records())
+                report_unsealed_approvals(await store.count_unsealed_approvals())
             # The audit chain's state, and on a fresh keyed store its genesis row (#2594). The
             # genesis append takes the audit advisory lock and needs INSERT and SELECT only.
             await load_audit_chain(store, read_only=read_only)
@@ -3064,6 +3092,7 @@ class PostgresStore:
         # BACKLOG #2592: the user re-seal pass first; store.py's reencrypt_to_active says why.
         report_user_reseal(*await self.reseal_user_records())
         report_role_reseal(*await self.reseal_role_records())
+        report_approval_reseal(*await self.reseal_approval_records())
         total = 0
         for table, column in self._CIPHER_COLUMNS:
             if is_row_tagged(table, column):
@@ -8130,69 +8159,75 @@ class PostgresStore:
         BACKLOG #2445), because READ COMMITTED lets two transactions both find none and both insert.
         Every request takes that lock anyway, for its audit row, and it is re-entrant within a
         transaction, so this adds no lock and no lock order. Each later statement sees every request
-        committed before it."""
-        insert = (
-            "INSERT INTO pending_approvals "
-            "(id, operation, params, requester, requester_user_id, requested_at, status, expires_at)"
-            " VALUES ($1,$2,$3,$4,$5,$6,'pending',$7)"
+        committed before it. The row is sealed, and a repeat joins only an open request whose seal
+        holds (BACKLOG #2592); store.py's twin says why."""
+        row = new_approval_row(
+            approval_id=approval_id,
+            operation=operation,
+            params=params,
+            requester=requester,
+            requester_user_id=requester_user_id,
+            requested_at=requested_at,
+            expires_at=expires_at,
         )
-        args = (
-            approval_id,
-            operation,
-            params,
-            requester,
-            requester_user_id,
-            requested_at,
-            expires_at,
-        )
-        if audit is None and on_repeat is None:
-            await self._execute(insert, *args)
-            return approval_id
         now = time.time()
         held, append = approval_id, audit
         # vault BACKLOG #2255. The audit row joins the INSERT's transaction, so a failed append
         # rolls the request back. `record=False` as `_execute` passes: not a pipeline borrow.
         async with self._timed_acquire(record=False) as conn, conn.transaction():
-            existing = None
+            joined = None
             if on_repeat is not None:
                 await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
                 # The open-request rule is the Store protocol's; the SQLite and SQL Server
                 # twins state it in their own SQL, and the shared repeat contract checks all three.
-                existing = await conn.fetchval(
-                    "SELECT id FROM pending_approvals WHERE operation = $1 AND params = $2"
-                    " AND requester_user_id = $3 AND status = 'pending'"
-                    " AND (expires_at IS NULL OR expires_at > $4)"
-                    " ORDER BY requested_at ASC LIMIT 1",
-                    operation,
-                    params,
-                    requester_user_id,
-                    requested_at,
+                joined = first_sealed_approval(
+                    self._row_sealer,
+                    await conn.fetch(
+                        _PG_APPROVAL_SELECT + " WHERE operation = $1 AND params = $2"
+                        " AND requester_user_id = $3 AND status = 'pending'"
+                        " AND (expires_at IS NULL OR expires_at > $4)"
+                        " ORDER BY requested_at ASC",
+                        operation,
+                        params,
+                        requester_user_id,
+                        requested_at,
+                    ),
                 )
-            if existing is None:
-                await conn.execute(insert, *args)
-            elif on_repeat is not None:  # always, since `existing` is read only with on_repeat
-                held = str(existing)
+            if joined is None:
+                await self._write_approval(conn, row)
+            elif on_repeat is not None:  # always, since `joined` is read only with on_repeat
+                held = joined.id
                 append = on_repeat(held)
             audits: tuple[AuditAppend, ...] = () if append is None else (append,)
             appended = await self._append_audits(conn, audits, now=now)
         tee_audits(audits, appended, ts=now)
         return held
 
-    async def get_pending_approval(self, approval_id: str) -> Row | None:
-        row: Row | None = await self._fetchone(
-            "SELECT id, operation, params, requester, requester_user_id, requested_at, status,"
-            " approver, decided_at, expires_at FROM pending_approvals WHERE id = $1",
-            approval_id,
+    async def _write_approval(
+        self, conn: Any, new: ApprovalRow, *, current: ApprovalRow | None = None
+    ) -> bool:
+        """The one writer of a ``pending_approvals`` row (BACKLOG #2592); store.py's
+        ``MessageStore._write_approval`` states the contract. Call it inside ``conn``'s
+        transaction. Returns whether a row was written."""
+        sealer = self._row_sealer
+        if current is None:
+            await conn.execute(_PG_APPROVAL_INSERT, *seal_approval(sealer, new).write_params())
+            return True
+        result = await conn.execute(
+            _PG_APPROVAL_UPDATE, *approval_update(sealer, current, new).update_params(current)
         )
+        return _rowcount(result) > 0
+
+    async def get_pending_approval(self, approval_id: str) -> Row | None:
+        row: Row | None = await self._fetchone(_PG_APPROVAL_SELECT + " WHERE id = $1", approval_id)
         return row
 
     async def list_pending_approvals(self, *, now: float, limit: int = 100) -> Sequence[Row]:
-        """Open (still-``pending``, unexpired) approval requests, newest-first."""
+        """Open (still-``pending``, unexpired) approval requests, newest-first. Every column, so
+        the gate can check each row's seal (BACKLOG #2592)."""
         return await self._fetchall(
-            # requester_user_id: see the SQLite twin (BACKLOG #2460).
-            "SELECT id, operation, params, requester, requester_user_id, requested_at, status,"
-            " approver, decided_at, expires_at FROM pending_approvals"
-            " WHERE status = 'pending' AND (expires_at IS NULL OR expires_at > $1)"
+            _PG_APPROVAL_SELECT
+            + " WHERE status = 'pending' AND (expires_at IS NULL OR expires_at > $1)"
             " ORDER BY requested_at DESC LIMIT $2",
             now,
             limit,
@@ -8202,10 +8237,8 @@ class PostgresStore:
         """Released requests cut off mid-run, oldest-first (BACKLOG #1562). No expiry filter, and the
         order: the Store protocol says why."""
         return await self._fetchall(
-            "SELECT id, operation, params, requester, requester_user_id, requested_at, status,"
-            " approver, decided_at, expires_at FROM pending_approvals"
-            " WHERE status = 'interrupted'"
-            " ORDER BY requested_at ASC LIMIT $1",
+            _PG_APPROVAL_SELECT
+            + " WHERE status = 'interrupted' ORDER BY requested_at ASC LIMIT $1",
             limit,
         )
 
@@ -8222,22 +8255,33 @@ class PostgresStore:
     ) -> bool:
         """Atomically move a request in ``from_status`` to ``status``.
         Returns ``True`` iff this call made the transition — guards against a double decision.
-        The SQLite twin documents why the guard is a parameter (ASVS 2.3.3); the Store protocol
-        states the ``audit`` and ``claim_owner`` contracts (vault BACKLOG #2255, BACKLOG #1562)."""
-        sql = (
-            "UPDATE pending_approvals SET status = $1, approver = $2, decided_at = $3,"
-            " claim_owner = COALESCE($6, claim_owner) WHERE id = $4 AND status = $5"
-        )
-        args = (status, approver, decided_at, approval_id, from_status, claim_owner)
-        if audit is None:
-            result = await self._pool.execute(sql, *args)
-            return _rowcount(result) > 0
+        The SQLite twin documents why the guard is a parameter (ASVS 2.3.3) and how the move goes
+        through the write helper (BACKLOG #2592); the Store protocol states the ``audit`` and
+        ``claim_owner`` contracts (vault BACKLOG #2255, BACKLOG #1562). The row is read ``FOR
+        UPDATE``, so a concurrent decision waits for this one and then finds the row moved."""
         now = time.time()
         async with self._timed_acquire(record=False) as conn, conn.transaction():
-            moved = _rowcount(await conn.execute(sql, *args)) > 0
+            found = await conn.fetchrow(
+                _PG_APPROVAL_SELECT + " WHERE id = $1 FOR UPDATE", approval_id
+            )
+            current = None if found is None else ApprovalRow.from_mapping(found)
+            moved = (
+                current is not None
+                and current.status == from_status
+                and await self._write_approval(
+                    conn,
+                    current.decided(
+                        status=status,
+                        approver=approver,
+                        decided_at=decided_at,
+                        claim_owner=claim_owner,
+                    ),
+                    current=current,
+                )
+            )
             # Inside the transaction, so a failed append rolls the transition back. A transition
             # that matched no row writes no audit row.
-            audits: tuple[AuditAppend, ...] = (audit,) if moved else ()
+            audits: tuple[AuditAppend, ...] = (audit,) if moved and audit is not None else ()
             appended = await self._append_audits(conn, audits, now=now)
         tee_audits(audits, appended, ts=now)
         return moved
@@ -8246,22 +8290,53 @@ class PostgresStore:
         self, *, claim_owner: str | None = None, limit: int = 1000
     ) -> Sequence[Row]:
         """Released requests still claimed as ``executing``, oldest claim first (BACKLOG #1562).
-        The Store protocol says who reads it, why, and what ``claim_owner`` filters."""
+        The Store protocol says who reads it, why, and what ``claim_owner`` filters. Every column,
+        so the gate can check each row's seal (BACKLOG #2592)."""
         if claim_owner is None:
             return await self._fetchall(
-                "SELECT id, operation, requester, approver, decided_at, claim_owner"
-                " FROM pending_approvals WHERE status = 'executing'"
-                " ORDER BY decided_at ASC LIMIT $1",
+                _PG_APPROVAL_SELECT
+                + " WHERE status = 'executing' ORDER BY decided_at ASC LIMIT $1",
                 limit,
             )
         return await self._fetchall(
-            "SELECT id, operation, requester, approver, decided_at, claim_owner"
-            " FROM pending_approvals WHERE status = 'executing'"
+            _PG_APPROVAL_SELECT + " WHERE status = 'executing'"
             " AND (claim_owner = $1 OR claim_owner IS NULL)"
             " ORDER BY decided_at ASC LIMIT $2",
             claim_owner,
             limit,
         )
+
+    async def count_unsealed_approvals(self) -> int:
+        """store.py's ``MessageStore.count_unsealed_approvals`` states the contract."""
+        row = await self._fetchone(
+            "SELECT COUNT(*) AS n FROM pending_approvals WHERE seal = ''"
+            " AND status IN ('pending', 'executing', 'interrupted')"
+        )
+        return int(row["n"]) if row else 0
+
+    async def reseal_approval_records(self) -> tuple[int, int]:
+        """Re-seal every approval request under the active key, for ``rotate-key`` (BACKLOG
+        #2592); store.py's ``MessageStore.reseal_approval_records`` states the contract."""
+        sealer = self._row_sealer
+        if sealer is None:
+            return 0, 0
+        rows = await self._fetchall(
+            "SELECT id FROM pending_approvals WHERE seal <> '' AND seal NOT LIKE $1 ORDER BY id",
+            f"{SEAL_PREFIX}{sealer.key_id}:%",
+        )
+        resealed = refused = 0
+        for found in rows:
+            try:
+                async with self._timed_acquire(record=False) as conn, conn.transaction():
+                    locked = await conn.fetchrow(
+                        _PG_APPROVAL_SELECT + " WHERE id = $1 FOR UPDATE", str(found["id"])
+                    )
+                    if locked is not None:
+                        current = ApprovalRow.from_mapping(locked)
+                        resealed += await self._write_approval(conn, current, current=current)
+            except RowSealError:
+                refused += 1
+        return resealed, refused
 
     # --- per-key AES-GCM invocation bound (ASVS 11.3.4) ----------------------
 

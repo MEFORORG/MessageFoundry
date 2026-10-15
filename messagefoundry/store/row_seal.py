@@ -51,6 +51,10 @@ ROLE_KIND: Final = "role"
 #: verifies for another.
 ADSET_KIND: Final = "adset"
 
+#: The kind a ``pending_approvals`` row is sealed under: one seal per dual-control request, over
+#: the whole row, so its captured params and its requester id are bound to the request.
+APPROVAL_KIND: Final = "approval"
+
 #: The label a passkey digest is computed under. Not a seal kind: the digest is a plain SHA-256 that
 #: the user seal covers, so it needs no key of its own.
 PASSKEYS_LABEL: Final = "passkeys"
