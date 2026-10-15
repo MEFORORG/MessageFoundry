@@ -988,7 +988,10 @@ _REAUTH_CONTINUATION_SESSIONS_MAX = 4096
 
 
 class _IssuedContinuations:
-    """The ``auto_retry`` continuations this process issued, each bound to ONE session (#2764).
+    """The continuations this process issued, each bound to ONE session (#2764): ``auto_retry``
+    actions, and since owner ruling 2026-10-13 (#3241 R3) ``unlock`` pages that bind an action too,
+    because the re-auth toward such a page mints its grant only when the page was issued. A
+    window-only unlock page is never recorded: it always continues.
 
     ``/ui/reauth`` used to auto-submit whichever registered action its ``next`` named, and nothing
     recorded that the server had asked for it, so a typed, bookmarked or clicked link to
@@ -1071,15 +1074,24 @@ def continuation_issued(token: str | None, next_path: str) -> bool:
 
 
 def consume_continuation(token: str | None, next_path: str) -> bool:
-    """Spend the continuation issued to this session for ``next_path``; True only once."""
+    """Spend the continuation issued to this session for ``next_path``; True only once.
+
+    The password re-auth spends an unlock page's issue as it mints the grant, so one issue mints
+    one grant. The federated start leg does not call this for an unlock page; see the comment
+    there (owner ruling 2026-10-13, #3241 R3)."""
     return _ISSUED_CONTINUATIONS.consume(token, next_path)
 
 
 def continues_after_reauth(action: UiWriteAction, token: str | None, next_path: str) -> bool:
-    """Whether a re-auth for ``next_path`` will hand control back to it: always for an ``unlock``
-    page (a GET the operator still submits from), and for an ``auto_retry`` action only when it was
-    issued to this session (vault BACKLOG #2764). Ask it of the CURRENT token; a ceremony rotates."""
-    return action.unlock or continuation_issued(token, next_path)
+    """Whether a re-auth for ``next_path`` continues to it, and so mints the grant its action names:
+    when a gate issued it to this session, for an ``auto_retry`` action (vault BACKLOG #2764) and for
+    an ``unlock`` page that binds an action alike (owner ruling 2026-10-13, #3241 R3). A crafted
+    ``/ui/reauth?next=<that page>`` therefore mints nothing bound. An unlock page that binds no
+    action (a window-only form) still always continues: there is no grant to pre-arm, and the
+    re-auth only sends the browser back to it. Ask it of the CURRENT token; a ceremony rotates."""
+    if action.unlock and action.action is None:
+        return True
+    return continuation_issued(token, next_path)
 
 
 def rekey_continuations(old_token: str | None, new_token: str | None) -> None:
@@ -1097,20 +1109,44 @@ def _request_is_same_origin(request: Request) -> bool:
 
 
 def _issue_continuation(request: Request, next_path: str) -> None:
-    """Record ``next_path`` as a continuation this session may auto-submit after its re-auth.
+    """Record ``next_path`` as a continuation this session may continue to after its re-auth.
 
-    Only for an ``auto_retry`` target, only when the refused request was itself a same-origin POST,
-    and only for a request with a session. The POST condition is what ties the record to an action
-    the operator actually submitted from this console: a GET is what a link produces, and a
-    same-site POST from a sibling host carries the SameSite=Strict cookie but fails the origin check
-    (the MFA-pending refusal fires before ``require_ui`` asserts provenance, so it is checked here)."""
+    Only for a request with a session that passes the origin check, and then:
+
+    * an ``auto_retry`` target only when the refused request was itself a POST. That ties the record
+      to an action the operator actually submitted from this console: a GET is what a link produces,
+      and a same-site POST from a sibling host carries the SameSite=Strict cookie but fails the
+      origin check (the MFA-pending refusal fires before ``require_ui`` asserts provenance, so it is
+      checked here).
+    * an ``unlock`` page on either method (owner ruling 2026-10-13, #3241 R3). Opening the page is a
+      GET, and a gate refusing it is what issues it; the re-auth toward it then mints its grant. A
+      cross-site link carries no SameSite=Strict cookie, and the origin check refuses a cross-site or
+      same-site GET. A GET with ``Sec-Fetch-Site: none`` issues nothing either: that is a typed URL,
+      a bookmark, or a link opened from outside the browser, such as one in an email, and a crafted
+      link of that kind must not pre-arm a grant. The page asks again, and the re-auth from the
+      console's own navigation then issues it. A client that sends no ``Sec-Fetch-Site`` at all is
+      judged only by the origin check, and a top-level GET carries no ``Origin`` either, which that
+      check accepts. So on a browser without Fetch Metadata, a link opened from outside the browser
+      still issues the page; this rule does not close that case. A window-only unlock page (one that
+      binds no action) is never issued: it always continues, so an entry would only fill the
+      per-session cap and evict a pending ``auto_retry`` issue."""
     token = session_token(request)
+    action = lookup_ui_action(next_path)
     if (
         token
-        and request.method == "POST"
         # GET /ui/reauth answers 422 past its cap, so a longer entry could never be consumed.
         and len(next_path) <= _REAUTH_NEXT_MAX
-        and is_safe_ui_action(next_path)
+        and (
+            (request.method == "POST" and is_safe_ui_action(next_path))
+            or (
+                action is not None
+                and action.unlock
+                and action.action is not None
+                and not (
+                    request.method == "GET" and request.headers.get("sec-fetch-site") == "none"
+                )
+            )
+        )
         and _request_is_same_origin(request)
     ):
         _ISSUED_CONTINUATIONS.issue(token, next_path)
@@ -1124,9 +1160,10 @@ def _reauth_redirect(request: Request, next_path: str | None = None) -> HTTPExce
     deliberately not a registered continuation). Either way the value is only ever *acted on* after
     ``/ui/reauth`` re-validates it against the write-action registry, so a bad override fails closed.
 
-    An ``auto_retry`` continuation is also RECORDED against this session (vault BACKLOG #2764, see
-    :class:`_IssuedContinuations`); ``/ui/reauth`` auto-submits only a recorded one. The ``next`` in
-    the URL stays what it was, so the record, not the URL, is what authorises the auto-submit.
+    The continuation is also RECORDED against this session (vault BACKLOG #2764, and for an unlock
+    page owner ruling 2026-10-13, #3241 R3; see :func:`_issue_continuation`). ``/ui/reauth``
+    auto-submits, or mints an unlock page's grant, only for a recorded one. The ``next`` in the URL
+    stays what it was, so the record, not the URL, is what authorises it.
     """
     target = next_path if next_path is not None else request.url.path
     _issue_continuation(request, target)

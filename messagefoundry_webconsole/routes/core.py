@@ -1222,23 +1222,39 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     # Before #2625 the outcome rendered in place on the POST, and a refresh re-POSTed, which was
     # safe only as ADR 0090 §4's no-op. Answering with a GET keeps a refresh from sending anything.
     #
-    # Same permission as the POST and nothing more, and it reads no message: the page echoes the
-    # outcome the POST put in the query, through the escaping builders and the connection-name
-    # rule. A crafted link can therefore show a "queued" page for a resend that never ran. It queues
-    # nothing, the audit row is the record, and the detail page is where the delivery shows.
+    # Same permission as the POST, plus the caller's channel scope on the target. It reads the
+    # store's record of the resend's key (vault BACKLOG #3241), so a link that names no resend this
+    # engine ran answers 404 "No such resend", and the target shown is the record's. It does not read
+    # the message, so it does not check scope on the origin channel. That is why it shows no source:
+    # a caller scoped to the target alone learns only that a resend to it ran under this key.
+    # The `duplicate` flag still rides the query and only picks the wording: "queued" and "already
+    # resent" are both true of a key whose resend ran. Before #3241 the page echoed the query alone,
+    # so a crafted link showed "queued" for a resend that never ran.
     @app.get("/ui/messages/{message_id}/resend-done", response_class=HTMLResponse)
     async def ui_message_resend_done(
         message_id: str,
-        # Echoed from the engine's answer and checked against the connection-name rule, so the
-        # page names only what could name a connection. `source` may be absent: a duplicate of a
-        # key first used over the JSON API without one reports the prior row's empty source.
+        request: Request,
+        # Checked against the connection-name rule, so the page names only what could name a
+        # connection.
         to: Annotated[ConnectionName, Query()],
-        source: ConnectionName | None = Query(None),
+        # The idempotency key the resend ran under. The page renders from the store's record of
+        # it, never from the query, so a crafted link cannot report a resend that never ran
+        # (vault BACKLOG #3241). The key is the unguessable value the confirm page minted.
+        key: Annotated[IdempotencyKey, Query(min_length=1, max_length=128)],
         duplicate: bool = Query(False),
-        _identity: Identity = Depends(require_ui(Permission.MESSAGES_RESEND)),
+        identity: Identity = Depends(require_ui(Permission.MESSAGES_RESEND)),
     ) -> HTMLResponse:
+        prior = await core.prior_resend(
+            engine=await deps.get_engine(request),
+            idempotency_key=key,
+            message_id=message_id,
+            to=to,
+        )
+        # A target out of the caller's scope reads as no record at all.
+        if prior is None or not identity.can_access_channel(prior.to_destination):
+            return HTMLResponse(pages.message_resend_unknown(message_id), status_code=404)
         return HTMLResponse(
-            pages.message_resend_done(message_id, to, source or "", duplicate=duplicate)
+            pages.message_resend_done(message_id, prior.to_destination, "", duplicate=duplicate)
         )
 
     # NEITHER OUTCOME GOES TO THE MESSAGE DETAIL PAGE. That page is `require_ui(MESSAGES_VIEW_RAW)`,
@@ -1347,9 +1363,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             settle_ui_action_step_up(spend, refused=False)
         # `duplicate` means the key was already used and NOTHING was queued (ADR 0090 §4). Reporting
         # it as a send would be the same lie as answering a refusal with the success response.
-        echo = {"to": result.to, "source": result.source} if result.source else {"to": result.to}
         outcome = urlencode(
-            {**echo, "duplicate": "true" if result.status == "duplicate" else "false"}
+            {
+                "to": result.to,
+                "key": body.idempotency_key,
+                "duplicate": "true" if result.status == "duplicate" else "false",
+            }
         )
         return RedirectResponse(
             f"/ui/messages/{_seg(message_id)}/resend-done?{outcome}", status_code=303
@@ -1433,7 +1452,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         engine: Any = Depends(deps.get_engine),
         # Held, not spent, in the gate (vault BACKLOG #2625): the grant is spent below, after this
         # route's own input checks, so a refusal of those (direct mode with no outbound, an invalid
-        # body) costs the operator no proof. A refusal from the engine handler comes after the
+        # body) costs the operator no proof. A refusal the engine handler raises before its store
+        # write gives the proof back (owner ruling 2026-10-13, #3241 R1); any later one keeps the
         # spend, so the next submit asks again and re-opens the editor from the stored body.
         identity: Identity = Depends(
             require_ui_step_up_action(
@@ -1515,8 +1535,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             )
         except HTTPException as exc:
             # A refused resubmit drops its spend record BEFORE the two audited reads in _reject,
-            # so a repeat waiting on it is answered at once, and the editor _reject re-renders
-            # with the same key asks for a proof again on the next submit.
+            # so a repeat waiting on it is answered at once. A refusal the engine raised before
+            # its store write has given the proof back (owner ruling 2026-10-13, #3241 R1), so the
+            # re-rendered editor's next submit asks for none; any other refusal kept the spend,
+            # and that submit asks for a proof again.
             settle_ui_action_step_up(spend, refused=True, refusal=exc)
             # str(exc.detail) carries ids only (the endpoint never interpolates the body).
             return await _reject(str(exc.detail))
@@ -1883,13 +1905,18 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # Vault BACKLOG #2764: only for a continuation that will run. A `next` the console did not
         # issue to this session takes no grant, because ADR 0077 derives the grant's purpose from
         # `next` itself, and a forged one would otherwise bind the proof to the forged action.
+        # Read once, before the await: what follows keys on what was minted. An unlock entry that
+        # lapses or is evicted during the re-auth still redirects to the page its grant names. An
+        # auto-retry entry that lapses the same way ends on "nothing ran", and that exit discards the
+        # grant it minted, so no armed grant sits behind a page saying nothing ran.
+        continues = continues_after_reauth(action, token, next_)
         pre_rotation = token
         pw_elevation = await auth.reauth(
             identity,
             form.get("password", ""),
             token=token,
             client=client,
-            purpose=action.action if continues_after_reauth(action, token, next_) else None,
+            purpose=action.action if continues else None,
         )
         if pw_elevation.session_lost:
             return login_redirect_response()
@@ -1937,12 +1964,24 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # The issue is spent under the pre-rotation token, the key it still sits under, and then
         # the session's OTHER issued entries follow the rotation -- before any branch returns, so
         # an unlock re-auth in one tab does not strand an action another tab is confirming.
-        issued = not action.unlock and consume_continuation(pre_rotation, next_)
+        # An unlock page that binds an action continues only when it was issued (owner ruling
+        # 2026-10-13, #3241 R3), and spends the issue here, so one issue mints one grant. An
+        # unissued one ends on the page that says nothing ran, which is what the re-auth form told
+        # the operator. A window-only unlock page always continues; it has no grant to pre-arm.
+        # A re-auth that minted nothing (`continues` false) spends no issue: another tab may have
+        # been issued the same `next` during the await, and its own re-auth needs it. The unlock
+        # branch follows `continues`; the auto-retry branch also needs the spend, so two tabs racing
+        # one issue auto-submit it once.
+        issued = continues and consume_continuation(pre_rotation, next_)
         rekey_continuations(pre_rotation, token)
-        if is_unlock_action(next_):
+        if is_unlock_action(next_) and continues:
             return _keep_session(RedirectResponse(next_, status_code=303), token)
         if issued:
             return _keep_session(HTMLResponse(pages.reauth_continue(next_, action.label)), token)
+        if continues and action.action is not None:
+            # The entry lapsed or a racing tab spent it during the await, so this page says nothing
+            # ran: spend the grant this re-auth minted, so none stays armed behind that page.
+            await auth.has_action_step_up(token, action.action)
         return _keep_session(
             HTMLResponse(pages.reauth_nothing_ran(action.label, reauth_landing(identity))), token
         )

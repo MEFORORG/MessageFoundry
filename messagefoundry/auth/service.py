@@ -592,10 +592,15 @@ STEP_UP_ACTION_CONFIG_RELOAD = "config_reload"
 
 #: The actions whose spent grant :meth:`AuthService.refund_action_step_up` may give back: the two
 #: routes that issue a generated credential and can refuse BEFORE any side effect (ADR 0197
-#: Amendment A, Manager decision 2026-09-29). No other action's grant is recorded, so no other
-#: route can restore one, whatever it calls.
+#: Amendment A, Manager decision 2026-09-29), and edit-and-resubmit, for a refusal raised before its
+#: store write (ADR 0197 Amendment C, owner ruling 2026-10-13, #3241 R1). No other action's grant is
+#: recorded, so no other route can restore one, whatever it calls.
 _REFUNDABLE_ACTIONS = frozenset(
-    {STEP_UP_ACTION_ADMIN_RESET_PASSWORD, STEP_UP_ACTION_ADMIN_RESET_MFA}
+    {
+        STEP_UP_ACTION_ADMIN_RESET_PASSWORD,
+        STEP_UP_ACTION_ADMIN_RESET_MFA,
+        STEP_UP_ACTION_MESSAGE_EDIT_RESEND,
+    }
 )
 
 #: The grant THIS REQUEST spent on a refundable action, as ``(service id, key, deadline)``, or

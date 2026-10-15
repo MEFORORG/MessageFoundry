@@ -31,6 +31,10 @@
   process, and does not reach a combined sign-in with both factors wrong (BACKLOG #2284). Amendment
   B, at the end of this file, records both. It builds nothing. It ticks the pre-count item under *To
   resolve on acceptance*, and changes neither the Decision nor Amendment A.
+- **Amended 2026-10-13: Amendment C, by owner ruling.** The owner chose "Refund (Recommended)"
+  for vault BACKLOG #3241 R1, in an AskUserQuestion dialog with the batch 256 Manager. It widens
+  Amendment A's refund set by one action, edit-and-resubmit. Amendment C, at the end of this file,
+  records it. The Decision, Amendment A's other text and Amendment B are unchanged.
 - **Date:** 2026-09-27
 - **Related:** BACKLOG #1131 (the row this answers; ASVS 6.1.1) · BACKLOG #1236 (closed 2026-09-26;
   its cycle-cap remainder moved to #1131 by owner ruling) · BACKLOG #1138 (re-proof failures count
@@ -1475,3 +1479,28 @@ pre-count.** The Manager put two reasons to the owner:
 - a need for the per-account bound to hold across engine shards that serve the sign-in API;
 - a proposal to refuse case 2 under a live sign-in lock, which would have to keep the owner's way
   past that lock.
+
+---
+
+## Amendment C (2026-10-13) -- edit-and-resubmit joins the refund set
+
+**Ruling.** Owner ruling 2026-10-13 (#3241 R1), *"Refund (Recommended)"*. Engine PR 2142 (vault
+BACKLOG #2625) bound `POST /messages/{id}/edit-resend` to a single-use proof. Its gate spends the
+proof before the handler runs, so a refusal the engine raises (an unknown message, an unknown or
+stopped target, an origin inbound another engine shard owns) cost the operator a password. The
+re-authentication cannot carry the typed body, so the console lost the edit too.
+
+**What changes.** `message_edit_resend` joins `_REFUNDABLE_ACTIONS` beside the two credential
+resets. The route gives the proof back for an `HTTPException` it raises BEFORE the store write
+(`refund_action_step_up`, which restores only the grant this request spent, with its original
+deadline). From the store call on, a refusal keeps the spend, because the store may have committed.
+The console calls the handler in-process after its own spend, so the refund reaches both planes.
+
+**What it does not change.** Amendment A's rule that a refund can never mint, extend or restore an
+expired grant. Only a request refused before its message-store write is refunded. Such a request
+may still have written an audit row, such as `message_edit_resend_reject` or
+`auth.channel_denied`, so one proof can drive repeated audited refusals, each limited by the
+admin-write pacing. Single use still holds: the route spends the proof at its top, and once it
+reaches the store call it keeps the spend, even when that call refuses without writing.
+`tests/test_bound_step_up_injection.py` pins a pre-write refusal refunding and a store-call
+refusal keeping the spend.

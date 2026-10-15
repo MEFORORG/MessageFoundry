@@ -174,10 +174,10 @@ _UI_WEAKER_THAN_JSON_EQUIVALENT = frozenset(
         ("GET", "/ui/uploaded-logs"),
         ("POST", "/ui/connections/{name}/flag"),
         ("POST", "/ui/messages/search/presets/{preset_id}/delete"),
-        # BACKLOG #1982: the console's approve and reject mirror the JSON approve and reject, both
-        # require_paced, which require_ui charges too. They are flagged only because the JSON
-        # resolve, same method and permission, is require_step_up; the console offers no resolve.
-        ("POST", "/ui/approvals/{approval_id}/approve"),
+        # BACKLOG #1982: the console's reject mirrors the JSON reject, require_paced, which
+        # require_ui charges too. It is flagged only because the JSON approve and resolve, same
+        # method and permission, are require_step_up. The console's approve (owner ruling
+        # 2026-10-13, #3241 R4) and resolve (BACKLOG #2460) carry require_ui_step_up.
         ("POST", "/ui/approvals/{approval_id}/reject"),
         # BACKLOG #1739 removed ("POST", "/ui/uploaded-logs/upload") and BACKLOG #1822 removed
         # ("GET", "/ui/uploaded-logs/file/{file_id}/resend-confirm"): both now carry
@@ -1141,7 +1141,8 @@ def test_ungated_ui_routes_are_exactly_the_reviewed_allowlist() -> None:
     ungated = {(m, p) for m, p, _perms, gate in _ui_route_rows() if gate is None}
     assert ungated == _UI_NO_GATE_ROUTES, (
         f"the un-gated /ui route set changed: {sorted(ungated ^ _UI_NO_GATE_ROUTES)}. These are the "
-        "sign-in and re-auth entry points; anything else here is a console route that lost its gate."
+        "sign-in, sign-out, re-auth and second-factor entry points and the CSP report sink; anything "
+        "else here is a console route that lost its gate."
     )
     block = _section(_doc_text(), _H_UI_ROUTE_MAP)
     assert f"**Unauthenticated `/ui` routes ({len(ungated)}).**" in block, (
@@ -1211,6 +1212,273 @@ def test_ui_gate_divergences_are_exactly_the_reviewed_set() -> None:
             f"{path} is weaker than a permission-equivalent JSON route and is not disclosed in the "
             "behavioural-differences block"
         )
+
+
+# --- console gate parity: each /ui route against the JSON route it performs (vault BACKLOG #3241) ---
+#
+# The console calls the engine's handlers by reference, so the JSON route's gate never runs on a /ui
+# request: each /ui route has to re-assert it. PR 2142 (vault BACKLOG #2625) moved six JSON routes to
+# a proof bound to their action and re-asserted five of them on the console by hand. Nothing checked
+# the pairs: a /ui route left on the shared window, or bound to the wrong action, kept every test
+# green. ``test_ui_gate_divergences_are_exactly_the_reviewed_set`` above cannot see it, because it
+# flags only a /ui route on plain ``require_ui``.
+
+#: ``(method, /ui path) -> (method, JSON path)``: the JSON route whose operation each /ui route
+#: performs, for every JSON route on a step-up gate that the console offers. Reviewed by hand. The
+#: completeness tests below red when a step-up route on either plane is in neither this map nor a
+#: reviewed set beside it.
+_UI_JSON_COUNTERPARTS: dict[tuple[str, str], tuple[str, str]] = {
+    ("POST", "/ui/ad-groups/map"): ("PUT", "/ad-group-map"),
+    ("POST", "/ui/ad-groups/scope-map"): ("PUT", "/ad-group-scope-map"),
+    ("POST", "/ui/approvals/{approval_id}/resolve/{outcome}"): (
+        "POST",
+        "/approvals/{approval_id}/resolve",
+    ),
+    # Owner ruling 2026-10-13 (#3241 R4).
+    ("POST", "/ui/approvals/{approval_id}/approve"): ("POST", "/approvals/{approval_id}/approve"),
+    ("POST", "/ui/cluster/stepdown"): ("POST", "/cluster/stepdown"),
+    ("POST", "/ui/cluster/force-stepdown"): ("POST", "/cluster/stepdown"),
+    ("POST", "/ui/config/reload"): ("POST", "/config/reload"),
+    ("POST", "/ui/connections/{name}/purge/{scope}"): ("POST", "/connections/{name}/purge"),
+    ("POST", "/ui/connections/purge-bulk"): ("POST", "/connections/{name}/purge"),
+    ("POST", "/ui/dead-letters/replay-all"): ("POST", "/dead-letters/replay"),
+    ("POST", "/ui/dead-letters/{channel_id}/replay"): ("POST", "/dead-letters/replay"),
+    ("POST", "/ui/dead-letters/{channel_id}/{destination_name}/replay"): (
+        "POST",
+        "/dead-letters/replay",
+    ),
+    ("POST", "/ui/dr/activate"): ("POST", "/dr/activate"),
+    ("POST", "/ui/dr/release"): ("POST", "/dr/release"),
+    ("POST", "/ui/account/mfa/disable"): ("DELETE", "/me/mfa"),
+    ("POST", "/ui/account/mfa/enroll"): ("POST", "/me/mfa/enroll"),
+    ("POST", "/ui/account/mfa/verify"): ("POST", "/me/mfa/confirm"),
+    ("POST", "/ui/account/sessions/revoke-others"): ("DELETE", "/me/sessions"),
+    ("POST", "/ui/account/sessions/{session_id}/revoke"): ("DELETE", "/me/sessions/{session_id}"),
+    ("GET", "/ui/messages/search"): ("GET", "/messages/search"),
+    ("POST", "/ui/messages/search/run"): ("POST", "/messages/search"),
+    ("GET", "/ui/messages/search/layered"): ("GET", "/search/layered"),
+    ("POST", "/ui/messages/search/presets"): ("POST", "/search/presets"),
+    ("POST", "/ui/messages/{message_id}/edit-resend"): (
+        "POST",
+        "/messages/{message_id}/edit-resend",
+    ),
+    ("POST", "/ui/messages/{message_id}/replay"): ("POST", "/messages/{message_id}/replay"),
+    ("POST", "/ui/messages/{message_id}/resend"): ("POST", "/messages/{message_id}/resend"),
+    ("POST", "/ui/roles/custom"): ("POST", "/roles/custom"),
+    ("POST", "/ui/roles/custom/{role_id}/delete"): ("DELETE", "/roles/custom/{role_id}"),
+    ("POST", "/ui/roles/custom/{role_id}/update"): ("PUT", "/roles/custom/{role_id}"),
+    ("POST", "/ui/uploaded-logs/upload"): ("POST", "/uploads"),
+    ("POST", "/ui/uploaded-logs/file/{file_id}/delete"): ("DELETE", "/uploads/{file_id}"),
+    ("GET", "/ui/uploaded-logs/file/{file_id}"): ("GET", "/uploads/{file_id}/messages"),
+    ("POST", "/ui/uploaded-logs/file/{file_id}/filter"): (
+        "POST",
+        "/uploads/{file_id}/messages/search",
+    ),
+    ("POST", "/ui/uploaded-logs/file/{file_id}/resend"): ("POST", "/uploads/{file_id}/resend"),
+    ("POST", "/ui/users"): ("POST", "/users"),
+    ("POST", "/ui/users/{user_id}/delete"): ("DELETE", "/users/{user_id}"),
+    ("POST", "/ui/users/{user_id}/update"): ("PATCH", "/users/{user_id}"),
+    ("POST", "/ui/users/{user_id}/channel-scope"): ("PUT", "/users/{user_id}/channel-scope"),
+    ("POST", "/ui/users/{user_id}/federated-identity/link"): (
+        "PUT",
+        "/users/{user_id}/federated-identity",
+    ),
+    ("POST", "/ui/users/{user_id}/federated-identity/unlink"): (
+        "DELETE",
+        "/users/{user_id}/federated-identity",
+    ),
+    ("POST", "/ui/users/{user_id}/reset-mfa"): ("POST", "/users/{user_id}/reset-mfa"),
+    ("POST", "/ui/users/{user_id}/reset-password"): ("POST", "/users/{user_id}/reset-password"),
+    ("POST", "/ui/users/{user_id}/roles"): ("PUT", "/users/{user_id}/roles"),
+    ("POST", "/ui/users/{user_id}/revoke-sessions"): ("DELETE", "/users/{user_id}/sessions"),
+}
+
+#: JSON routes on a step-up gate that the console does not offer, one reason each.
+_JSON_STEP_UP_WITHOUT_CONSOLE = frozenset(
+    {
+        # Bulk export has no console route (vault BACKLOG #2625 names it).
+        ("GET", "/messages/export"),
+        ("POST", "/messages/export"),
+        # The console creates a directory account through POST /ui/users, not this route.
+        ("POST", "/users/directory"),
+    }
+)
+
+#: /ui routes on an ACTION-BOUND gate that perform no JSON route's operation. The webauthn routes
+#: have no JSON plane at all (passkeys are browser-only). The editor page only checks that the
+#: edit-resend proof is held and spends nothing; its POST is paired above.
+_UI_BOUND_WITHOUT_JSON = frozenset(
+    {
+        ("POST", "/ui/account/webauthn/enroll"),
+        ("POST", "/ui/account/webauthn/{credential_id_hash}/delete"),
+        ("GET", "/ui/messages/{message_id}/edit"),
+        # The confirm pages hold the proof their POST spends (owner ruling 2026-10-13, #3241 R2).
+        ("GET", "/ui/connections/purge-confirm"),
+        ("GET", "/ui/uploaded-logs/file/{file_id}/resend-confirm"),
+    }
+)
+
+_GateInfo = tuple[str, frozenset[str], str | None]
+
+
+def _gates_by_operation() -> dict[tuple[str, str], _GateInfo]:
+    """``(method, path) -> (gate name, permissions, bound action)`` over both planes of a
+    ``create_app(serve_ui=True)``, from the shared route walk. Only gated routes appear."""
+    return {
+        (row.method, row.path): (row.gate, frozenset(row.permissions), row.action)
+        for row in route_rows(create_app(serve_ui=True))
+        if row.gate is not None
+    }
+
+
+#: The gate factories that ask for a step-up, on both planes, and those that do not. A closed set,
+#: never a name pattern (route_gates.py recognises a gate by its mark, BACKLOG #2604):
+#: ``test_every_gate_is_classed_as_step_up_or_not`` reds when a new factory appears in neither.
+_STEP_UP_GATES = frozenset(
+    {
+        "require_step_up",
+        "require_step_up_action",
+        "require_reauth_only",
+        "require_reauth_only_action",
+        "require_ui_step_up",
+        "require_ui_step_up_action",
+        "require_ui_reauth_only",
+        "require_ui_reauth_only_action",
+    }
+)
+_NOT_STEP_UP_GATES = frozenset(
+    {
+        "require",
+        "require_paced",
+        "require_phi_read",
+        "require_ui",
+        "require_service_cert",
+        # The /ws/stats socket's gates, read off the endpoint body by the shared walk.
+        "authorize_ui_ws",
+        "authorize_ws",
+    }
+)
+
+
+#: The step-up gates that skip the MFA gate (the factor-enrolment and session-terminate lanes).
+_MFA_DROPPING_GATES = frozenset(
+    {
+        "require_reauth_only",
+        "require_reauth_only_action",
+        "require_ui_reauth_only",
+        "require_ui_reauth_only_action",
+    }
+)
+
+
+def _is_step_up(gate: str) -> bool:
+    return gate in _STEP_UP_GATES
+
+
+def test_every_gate_is_classed_as_step_up_or_not() -> None:
+    """The parity tests below sort gates by these two sets, so a gate in neither is unreviewed."""
+    pytest.importorskip("messagefoundry_webconsole")
+    seen = {gate for gate, _perms, _action in _gates_by_operation().values()}
+    assert _MFA_DROPPING_GATES <= _STEP_UP_GATES
+    assert seen <= _STEP_UP_GATES | _NOT_STEP_UP_GATES, (
+        f"gate factories classed as neither step-up nor not: {sorted(seen - _STEP_UP_GATES - _NOT_STEP_UP_GATES)}"
+    )
+    assert not _STEP_UP_GATES & _NOT_STEP_UP_GATES
+
+
+def _parity_breaks(
+    pairs: Mapping[tuple[str, str], tuple[str, str]], gates: Mapping[tuple[str, str], _GateInfo]
+) -> list[str]:
+    """Each way a /ui route's gate is weaker than its JSON counterpart's, one line per break.
+
+    A /ui route must: take a step-up when the JSON route does; take a proof bound to the SAME action
+    when the JSON route binds one; keep the MFA gate when the JSON route keeps it (a ``reauth_only``
+    gate drops it); and require every permission the JSON route requires.
+
+    It reads the gate, not the route body, so it cannot see ``spend=False``: a /ui gate that only
+    holds the proof leaves the spend to the route, and this does not check that the route spends it.
+    That is each lane's own tests' job."""
+    breaks: list[str] = []
+    for ui, json_op in sorted(pairs.items()):
+        if ui not in gates or json_op not in gates:
+            breaks.append(f"{ui} -> {json_op}: a route of the pair is not served, or has no gate")
+            continue
+        ui_gate, ui_perms, ui_action = gates[ui]
+        json_gate, json_perms, json_action = gates[json_op]
+        if _is_step_up(json_gate) and not _is_step_up(ui_gate):
+            breaks.append(f"{ui}: {ui_gate} takes no step-up; {json_op} takes {json_gate}")
+        if json_action is not None and ui_action != json_action:
+            breaks.append(f"{ui}: bound to {ui_action!r}; {json_op} is bound to {json_action!r}")
+        if (
+            _is_step_up(json_gate)
+            and json_gate not in _MFA_DROPPING_GATES
+            and (ui_gate in _MFA_DROPPING_GATES)
+        ):
+            breaks.append(f"{ui}: {ui_gate} drops the MFA gate {json_op}'s {json_gate} keeps")
+        if not json_perms <= ui_perms:
+            breaks.append(f"{ui}: lacks {sorted(json_perms - ui_perms)}, which {json_op} requires")
+    return breaks
+
+
+def test_each_console_gate_is_at_least_its_json_gate() -> None:
+    """Vault BACKLOG #3241 (PR 2142 item 6): no /ui route is weaker than the JSON route it performs.
+
+    RULE: a /ui route that performs a JSON route's operation re-asserts that route's step-up, its
+    bound action, its MFA gate and its permissions. ``_parity_breaks`` says what each means."""
+    pytest.importorskip("messagefoundry_webconsole")
+    breaks = _parity_breaks(_UI_JSON_COUNTERPARTS, _gates_by_operation())
+    assert not breaks, "a /ui route is weaker than its JSON counterpart:\n" + "\n".join(breaks)
+
+
+def test_every_json_step_up_route_has_a_reviewed_console_counterpart() -> None:
+    """A JSON route that gains a step-up, or a new one, must be paired or reviewed as console-less."""
+    pytest.importorskip("messagefoundry_webconsole")
+    stepped = {
+        op
+        for op, (gate, _perms, _action) in _gates_by_operation().items()
+        if not op[1].startswith("/ui") and _is_step_up(gate)
+    }
+    reviewed = set(_UI_JSON_COUNTERPARTS.values()) | _JSON_STEP_UP_WITHOUT_CONSOLE
+    assert stepped == reviewed, (
+        f"the JSON step-up routes changed: {sorted(stepped ^ reviewed)}. Pair each new one with the "
+        "/ui route that performs it in _UI_JSON_COUNTERPARTS, or list it in "
+        "_JSON_STEP_UP_WITHOUT_CONSOLE with the reason the console has none."
+    )
+    assert not set(_UI_JSON_COUNTERPARTS.values()) & _JSON_STEP_UP_WITHOUT_CONSOLE
+
+
+def test_every_action_bound_console_route_is_paired_or_reviewed() -> None:
+    """A /ui route bound to an action must name the JSON route it performs, or say it has none."""
+    pytest.importorskip("messagefoundry_webconsole")
+    bound = {
+        op
+        for op, (_gate, _perms, action) in _gates_by_operation().items()
+        if op[1].startswith("/ui") and action is not None
+    }
+    reviewed = (bound & set(_UI_JSON_COUNTERPARTS)) | _UI_BOUND_WITHOUT_JSON
+    assert bound == reviewed, (
+        f"action-bound /ui routes with no reviewed counterpart: {sorted(bound - reviewed)}; "
+        f"reviewed but no longer action-bound: {sorted(reviewed - bound)}"
+    )
+
+
+def test_console_gate_parity_detects_each_planted_weakening() -> None:
+    """The parity check is not vacuous: each way a console gate can be weaker reds it."""
+    ui, json_op = ("POST", "/ui/config/reload"), ("POST", "/config/reload")
+    perms = frozenset({"config:deploy"})
+    json_gate: _GateInfo = ("require_step_up_action", perms, "config_reload")
+    pair = {ui: json_op}
+    sound: _GateInfo = ("require_ui_step_up_action", perms, "config_reload")
+    assert _parity_breaks(pair, {ui: sound, json_op: json_gate}) == []
+    planted: dict[str, _GateInfo] = {
+        "the shared window": ("require_ui_step_up", perms, None),
+        "another action": ("require_ui_step_up_action", perms, "message_resend"),
+        "no step-up": ("require_ui", perms, None),
+        "no MFA gate": ("require_ui_reauth_only_action", perms, "config_reload"),
+        "a lost permission": ("require_ui_step_up_action", frozenset(), "config_reload"),
+    }
+    for name, weak in planted.items():
+        assert _parity_breaks(pair, {ui: weak, json_op: json_gate}), f"{name} was not detected"
 
 
 # --- source probes: AST walks, never substring scans (BACKLOG #1818) ----------------------------------

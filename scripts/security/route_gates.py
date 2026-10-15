@@ -187,6 +187,8 @@ class RouteRow:
     gates: tuple[str, ...]
     kind: RouteKind
     declaration: str | None = None
+    #: The action a ``require*_action`` gate binds its step-up proof to (ADR 0077), or ``None``.
+    action: str | None = None
 
     @property
     def gate(self) -> str | None:
@@ -597,6 +599,7 @@ def _walk(owner: Starlette | APIRouter | Mount, prefix: str, app: Starlette) -> 
                     gates=(gate[0],) if gate else (),
                     kind=kind,
                     declaration=declaration,
+                    action=gate[2] if gate else None,
                 )
         elif isinstance(effective, APIWebSocketRoute):
             # A WebSocket reached through an include is served by a rebuilt route that carries the

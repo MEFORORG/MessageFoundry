@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -53,6 +54,8 @@ import httpx
 from harness.load import rigadmin
 from harness.load.metrics import Counters
 from messagefoundry.apiclient import ApiError, EngineClient
+
+_log = logging.getLogger(__name__)
 
 #: Hosts whose engine this harness could have spawned itself. Mirrors apiclient's own loopback set;
 #: kept local rather than importing a private name from that package.
@@ -730,27 +733,68 @@ class EnginePoller:
         for client in clients:
             await loop.run_in_executor(None, client.close)
 
-    async def prove_sign_in(self) -> None:
-        """Prove the PRIMARY client's credential for a reload, for a caller about to TIME one.
+    @property
+    def holds_rig_session(self) -> bool:
+        """Whether this poller signs in as the run's rig Administrator, so it can re-prove."""
+        return isinstance(self._token, rigadmin.RigSession)
+
+    async def reload_client(self) -> EngineClient | None:
+        """A client of its own on the PRIMARY engine, proved for one reload, for a caller about to
+        TIME one; ``None`` when this poller holds no rig session.
 
         ``POST /config/reload`` wants a proof bound to it (vault BACKLOG #2625). A client without
         one is refused, re-proves and asks again, and all of that would land inside the caller's
-        timer. So the caller proves it first, outside the timer. Only a rig poller does anything
-        here, and a failure is left for the timed request to report in its own terms."""
-        if isinstance(self._token, rigadmin.RigSession) and self._clients:
-            await asyncio.get_running_loop().run_in_executor(None, self._prove_sign_in_sync)
+        timer. So the proof is made here, outside the timer.
 
-    def _prove_sign_in_sync(self) -> None:
+        A separate client, not :attr:`client` (vault BACKLOG #3241). Proving re-keys the session,
+        and the sampler reads through :attr:`client` on another thread, so proving on it swapped
+        the token under a sample in flight. The caller closes the client with
+        :meth:`end_reload_client`, which signs its session out, so a run of reloads holds one
+        session at a time against ``[auth].max_sessions_per_user``.
+
+        A ``--token`` poller gets ``None``: the rig holds no password for an engine it did not
+        start, so it cannot re-prove there. A failed sign-in or proof is also ``None``; a rig
+        caller then reports the reload unmeasured rather than reloading through :attr:`client`,
+        whose step-up handler would re-key the sampler's session after all."""
+        if not self.holds_rig_session or not self._clients:
+            return None
+        return await asyncio.get_running_loop().run_in_executor(None, self._reload_client_sync)
+
+    def _reload_client_sync(self) -> EngineClient | None:
         url = self._urls[0]
         cacert = self._cacert or self._cacert_for(url)
-        client = self._clients[0]
-        with contextlib.suppress(*SIGN_IN_ERRORS):
-            # Since vault BACKLOG #2625 the reload takes a proof bound to its action, which a
-            # sign-in does not mint, so prove for that action here, on a session of this client's
-            # own (the rotation then touches no other client), and the timed reload spends it at
-            # once. The action id is spelled out: the harness does not import engine internals.
+        client = EngineClient(url, allow_insecure=self._allow_insecure, cacert=cacert)
+        try:
+            # The action id is spelled out: the harness does not import engine internals.
             client.set_token(rigadmin.sign_in(url, cacert=cacert))
             client.reauth(rigadmin.rig_admin().password, purpose="config_reload")
+        except SIGN_IN_ERRORS as exc:
+            # The class and status only: an ApiError's text can carry the engine's reply.
+            _log.warning(
+                "reload probe: the rig could not prove for the reload: %s (HTTP %s)",
+                type(exc).__name__,
+                getattr(exc, "status", None),
+            )
+            self._end_reload_client_sync(client)
+            return None
+        except BaseException:
+            self._end_reload_client_sync(client)
+            raise
+        return client
+
+    async def end_reload_client(self, client: EngineClient) -> None:
+        """Sign out and close a client :meth:`reload_client` returned."""
+        await asyncio.get_running_loop().run_in_executor(None, self._end_reload_client_sync, client)
+
+    @staticmethod
+    def _end_reload_client_sync(client: EngineClient) -> None:
+        try:
+            if client.token is not None:
+                # A failed sign-out leaves the session to its idle timeout; nothing else holds it.
+                with contextlib.suppress(ApiError):
+                    client.logout()
+        finally:
+            client.close()
 
     async def calibrate(self) -> PollerCalibration:
         """Measure what one sample costs the engine, at idle and before load (vault BACKLOG #2794).

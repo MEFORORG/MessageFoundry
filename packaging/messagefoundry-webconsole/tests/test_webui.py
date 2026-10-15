@@ -7907,6 +7907,8 @@ async def test_purge_confirm_channel_scoped_forbidden(engine: Engine) -> None:
     await service.set_channel_scope(await _uid(service, "op"), ["in1"], actor="admin")
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
+        # The page holds the purge proof (owner ruling 2026-10-13, #3241 R2).
+        await _mint_action(c, "/ui/connections/purge-confirm")
         r = await c.get("/ui/connections/purge-confirm", params={"scope": "all", "dest": "out1"})
         assert (
             r.status_code == 403
@@ -7925,6 +7927,8 @@ async def test_purge_confirm_lists_only_quiesced_and_validates_scope(
     await _wait_quiesced(engine, "out1")
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
+        # The page holds the purge proof (owner ruling 2026-10-13, #3241 R2).
+        await _mint_action(c, "/ui/connections/purge-confirm")
         r = await c.get(
             "/ui/connections/purge-confirm",
             params=[("scope", "all"), ("dest", "out1"), ("dest", "out2")],

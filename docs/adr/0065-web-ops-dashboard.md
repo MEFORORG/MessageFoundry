@@ -368,3 +368,20 @@ action-bound lane a second re-authentication, because no grant is minted for an 
 does not hold. It never runs anything the session did not submit. The federated callback cannot
 yet name a dropped action: when the start leg finds nothing issued it stages the console landing,
 and the callback's landing page does not say that nothing ran.
+
+## Amendment (2026-10-13) -- an unlock page's grant is minted only for an issued continuation (vault BACKLOG #3241 R3)
+
+- **Status:** **Accepted (2026-10-13).** Owner ruling 2026-10-13 (#3241 R3), *"Mint only if issued
+  (Recommended)"*, given in an AskUserQuestion dialog with the batch 256 Manager.
+
+The 2026-10-06 amendment above left `unlock` continuations out of the issue record: `/ui/reauth`
+minted the action-bound grant for any registered unlock page its `next` named. So a crafted
+`/ui/reauth?next=<unlock page>` pre-armed the grant, though the operator still had to click Confirm.
+Now a gate that refuses a request records an unlock page as issued to that session, on a GET or a
+POST that passes the origin check, and `/ui/reauth` mints the grant only for an issued page, once.
+An issued page's re-auth redirects back to it, as before. A re-auth toward a page that was not
+issued mints nothing. A password re-auth then ends on the page that says nothing ran, which is
+what the re-auth form told the operator; a federated one lands on the console's landing page.
+A GET with `Sec-Fetch-Site: none` issues nothing. A browser that sends no Fetch Metadata is
+judged only by the origin check, which accepts a top-level GET, so on such a browser a crafted
+link to the page itself still issues it. The operator must still confirm on the page.

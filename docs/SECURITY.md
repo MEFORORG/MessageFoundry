@@ -1062,9 +1062,9 @@ apply. What each **adds** over plain `require()`:
 | Gate wrapper | Routes | What it adds over `require()` |
 |---|---|---|
 | `require` | 42 | nothing — the ladder itself |
-| `require_paced` | 17 | the **new-client-IP** refusal (403 + `X-Step-Up-Required: 1`, vault BACKLOG #2620), then per-actor anti-automation pacing on **non-GET** requests (`allow_admin_write`), 429 + a `Retry-After` naming the actor's wait |
+| `require_paced` | 16 | the **new-client-IP** refusal (403 + `X-Step-Up-Required: 1`, vault BACKLOG #2620), then per-actor anti-automation pacing on **non-GET** requests (`allow_admin_write`), 429 + a `Retry-After` naming the actor's wait |
 | `require_phi_read` | 8 | the ADR 0092 PHI-read hop refusal (`enforce_phi_read_hop`) **before** any identity work, then the **new-client-IP** refusal (403 + `X-Step-Up-Required: 1`, vault BACKLOG #2620), then the per-actor PHI-read budget, 429 + `Retry-After: 10` |
-| `require_step_up` | 25 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
+| `require_step_up` | 26 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
 | `require_step_up_action` | 13 | the same non-GET pacing (BACKLOG #1148), the **MFA gate**, then a **single-use, action-bound** step-up grant, minted on this plane only by `POST /me/reauth` (403 + `X-Step-Up-Action: <action>`; the password leg of `POST /ui/reauth` and the IdP leg mint it for a cookie session). Promoting a route here no longer drops the pacing floor. Since vault BACKLOG #2625 it also gates the injection and bulk-export set (see [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)) |
 | `require_reauth_only_action` | 4 | password step-up **without** the MFA gate — deadlock avoidance on the MFA-enrollment lanes, and on session terminate (ASVS 7.5.2), where the grant is action-bound so a login-seeded window does not unlock it. `require_reauth_only` still exists and still backs the `/ui` twin, but BACKLOG #1149 moved the last JSON route off it, so it no longer appears in this walk |
 | `require_service_cert` | 1 | cert-only authentication (a bearer token gets 401), and a **PHI fence** that raises at *app construction* if asked to gate `messages:view_summary` / `messages:view_raw` |
@@ -1349,7 +1349,7 @@ tuple: they act only on the caller's own account.
 | `POST` | `/connections/{name}/purge` | `messages:purge` | `require_step_up_action` (action `connection_purge`, vault BACKLOG #2625) — may return **202 + `approval_id`** under dual control; data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `POST` | `/config/reload` | `config:deploy` | `require_step_up_action` (action `config_reload`, vault BACKLOG #2625; a `dry_run` takes it too, because the loader executes the config's Python either way) — the target dir must resolve within an allowed root (see below) |
 | `GET` | `/approvals` | `approvals:approve` | `require` |
-| `POST` | `/approvals/{approval_id}/approve` | `approvals:approve` | `require_paced` — the requester can never approve their own request; data rule: *Single-route data rules* below (BACKLOG #1151) |
+| `POST` | `/approvals/{approval_id}/approve` | `approvals:approve` | `require_step_up` — a fresh step-up, as the resolve asks (owner ruling 2026-10-13, #3241 R4); the requester can never approve their own request; data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `POST` | `/approvals/{approval_id}/reject` | `approvals:approve` | `require_paced` |
 | `POST` | `/approvals/{approval_id}/resolve` | `approvals:approve` | `require_step_up` — records an `interrupted` release as `effects_applied` or `effects_not_applied`; never re-runs it, and the requester can never resolve their own request (BACKLOG #1562) |
 | `POST` | `/cluster/stepdown` | `cluster:control` | `require_step_up` |
@@ -1498,8 +1498,8 @@ functions too, and they gate on the **same 29-permission catalogue** through par
 `require_ui`, `require_ui_step_up`, `require_ui_reauth_only`, `require_ui_step_up_action`,
 `require_ui_reauth_only_action` — but authenticate by the `SameSite=Strict` **session cookie**
 rather than a bearer token, and refuse cross-site state changes on `Sec-Fetch-Site`/`Origin`.
-**Route → permission map (`/ui` plane).** 116 of the 126 carry a gate; the 10 that do not are the
-sign-in and re-auth entry points, listed after the table. Where the console is served it is the
+**Route → permission map (`/ui` plane).** 116 of the 126 carry a gate. The 10 that do not are the
+sign-in, sign-out, re-auth and second-factor entry points and the CSP report sink, listed after the table. Where the console is served it is the
 *sole* operator UI, so ~20 of these have no JSON counterpart from which their authorization could be
 inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bulk`, the
 `/ui/statistics/reset-*` pair, the three `/ui/dead-letters/*/replay` variants,
@@ -1541,7 +1541,7 @@ the console routes with a rule of their own.
 | `POST` | `/ui/alerts/{alert_id}/resume` | `monitoring:diagnose` | `require_ui` |
 | `POST` | `/ui/alerts/{alert_id}/suspend` | `monitoring:diagnose` | `require_ui` |
 | `GET` | `/ui/approvals` | `approvals:approve` | `require_ui` |
-| `POST` | `/ui/approvals/{approval_id}/approve` | `approvals:approve` | `require_ui` — paces the write like `require_paced`; the requester can never approve their own request |
+| `POST` | `/ui/approvals/{approval_id}/approve` | `approvals:approve` | `require_ui_step_up` — the fresh step-up the JSON approve asks for (#3241 R4); a stale window lands back on the page to approve again; the requester can never approve their own request |
 | `POST` | `/ui/approvals/{approval_id}/reject` | `approvals:approve` | `require_ui` |
 | `POST` | `/ui/approvals/{approval_id}/resolve/{outcome}` | `approvals:approve` | `require_ui_step_up` — the fresh step-up the JSON resolve asks for; the requester can never resolve their own request (BACKLOG #2460) |
 | `GET` | `/ui/audit` | `audit:read` | `require_ui` |
@@ -1559,7 +1559,7 @@ the console routes with a rule of their own.
 | `GET` | `/ui/connections` | `monitoring:read` | `require_ui` |
 | `POST` | `/ui/connections/bulk-control` | `connections:control` | `require_ui` |
 | `POST` | `/ui/connections/purge-bulk` | `messages:purge` | `require_ui_step_up_action` |
-| `GET` | `/ui/connections/purge-confirm` | `messages:purge` | `require_ui_step_up` |
+| `GET` | `/ui/connections/purge-confirm` | `messages:purge` | `require_ui_step_up_action` |
 | `POST` | `/ui/connections/{name}/flag` | `config:deploy` | `require_ui` |
 | `POST` | `/ui/connections/{name}/purge/{scope}` | `messages:purge` | `require_ui_step_up_action` |
 | `POST` | `/ui/connections/{name}/restart` | `connections:control` | `require_ui` |
@@ -1613,7 +1613,7 @@ the console routes with a rule of their own.
 | `POST` | `/ui/uploaded-logs/file/{file_id}/delete` | `files:delete` | `require_ui_step_up` |
 | `GET` | `/ui/uploaded-logs/file/{file_id}/delete-confirm` | `files:delete` | `require_ui` |
 | `POST` | `/ui/uploaded-logs/file/{file_id}/resend` | `files:browse`**+**`messages:edit` | `require_ui_step_up_action` |
-| `GET` | `/ui/uploaded-logs/file/{file_id}/resend-confirm` | `files:browse`**+**`messages:edit` | `require_ui_step_up` |
+| `GET` | `/ui/uploaded-logs/file/{file_id}/resend-confirm` | `files:browse`**+**`messages:edit` | `require_ui_step_up_action` |
 | `POST` | `/ui/uploaded-logs/upload` | `files:upload` | `require_ui_step_up` |
 | `GET` | `/ui/uploaded-logs/upload-form` | `files:upload` | `require_ui_step_up` |
 | `GET` | `/ui/users` | `users:read` | `require_ui` |
@@ -1675,8 +1675,14 @@ first passes, so it can re-prove its password to reach the enrolment (ADR 0197 A
 page (a session whose passkey is already proven gets there through `/ui`). Its POST charges one
 per-actor ceremony attempt and refuses any code with a 400, because the account holds no TOTP to
 check it against.
-None of them is reachable without a live session cookie — "unauthenticated" here means
-"carries no `Depends` gate", not "open".
+"Unauthenticated" here means "carries no `Depends` gate", not "open". Five of them act with no
+session cookie at all, by design: the two `/ui/login` routes and `GET /ui/sso` start a session,
+`POST /ui/csp-report` is the browser's report sink, and `POST /ui/logout` answers a caller with no
+session by sending it to the sign-in page. With federation on, the two `/ui/oidc/start` routes and
+`GET /ui/oidc/callback` join them. Each of the others reads the session cookie by hand, and with no
+live session it acts on nothing and sends the browser to sign in (`POST /ui/reauth/webauthn`
+answers 401). `GET /ui/reauth` checks its `next` before the cookie, so an unregistered `next` goes
+to `/ui` first.
 
 The `/ui/static` **mount** is the eleventh unauthenticated served path, and it is not a route at all:
 `StaticFiles` serves it with **no gate whatsoever** — no session, no permission, not even the 503
@@ -1691,14 +1697,23 @@ else would need its own authorization rule stated here.
    browser cannot act on. The page names the action, and after the re-authentication it
    auto-submits a body-less action **only when a step-up gate issued that continuation to this
    session**, once; any other `next` ends on a page saying nothing ran (vault BACKLOG #2764,
-   [ADR 0065](adr/0065-web-ops-dashboard.md) amendment of 2026-10-06).
+   [ADR 0065](adr/0065-web-ops-dashboard.md) amendment of 2026-10-06). An unlock page (a confirm
+   page or the editor) follows the same rule for its action-bound grant: the re-auth mints it only
+   when a gate issued that page to this session, once. A crafted `/ui/reauth?next=<unlock page>`
+   mints nothing. A password re-auth then ends on the page saying nothing ran; a federated one
+   lands on the console's landing page (owner ruling 2026-10-13, #3241 R3). A link opened from
+   outside the browser issues nothing when the browser sends `Sec-Fetch-Site: none`. **A browser
+   that sends no Fetch Metadata is judged only by the origin check, which accepts a top-level GET,
+   so there a crafted link to the page itself still issues it and the re-auth mints the grant.**
+   The operator must still confirm on the page.
 2. **The `/ui` write path charges the per-actor admin-write floor in `require_ui` itself**, because
    the console calls the JSON handlers in-process and their pacing `Depends` never runs (see *The
    `/ui` write path is paced* under [Anti-automation](#admin-password-reset-wp-l3-12-asvs-646)).
    It draws the same bucket, and its 429 carries the same `Retry-After` the JSON floor sends.
 3. **The uploaded-logs resend-confirm GET is no longer weaker than its JSON equivalent (BACKLOG
-   #1822).** `GET /ui/uploaded-logs/file/{file_id}/resend-confirm` is `require_ui_step_up`, like the
-   permission-equivalent JSON browse route. The one weaker uploaded-logs GET left is
+   #1822).** `GET /ui/uploaded-logs/file/{file_id}/resend-confirm` was made `require_ui_step_up`, like
+   the permission-equivalent JSON browse route, and since owner ruling 2026-10-13 (#3241 R2) it
+   holds the `upload_resend` proof without spending it. The one weaker uploaded-logs GET left is
    `GET /ui/uploaded-logs`, under item 5, and the set of record is `_UI_WEAKER_THAN_JSON_EQUIVALENT`,
    not this prose.
 
@@ -1770,13 +1785,13 @@ else would need its own authorization rule stated here.
    `POST /ui/messages/search/presets/{preset_id}/delete` mirrors
    `DELETE /search/presets/{preset_id}` (`require_paced`, a floor `require_ui` charges too), deleting
    a saved query, not PHI. It is flagged because `POST /search/presets`, same method and
-   permission, carries `require_step_up`. The other two are
-   `POST /ui/approvals/{approval_id}/approve` and `POST /ui/approvals/{approval_id}/reject`
-   (BACKLOG #1982), which mirror `POST /approvals/{approval_id}/approve` and `/reject`
-   (`require_paced`, a floor `require_ui` charges too). They are flagged because
-   `POST /approvals/{approval_id}/resolve`, same method and permission, carries `require_step_up`.
-   The console's own resolve route, `POST /ui/approvals/{approval_id}/resolve/{outcome}` (BACKLOG
-   #2460), takes `require_ui_step_up`, so that step-up is not missing from it.
+   permission, carries `require_step_up`. The other is
+   `POST /ui/approvals/{approval_id}/reject` (BACKLOG #1982), which mirrors
+   `POST /approvals/{approval_id}/reject` (`require_paced`, a floor `require_ui` charges too). It is
+   flagged because the JSON approve and resolve, same method and permission, carry
+   `require_step_up`; a reject runs nothing. The console's approve (owner ruling 2026-10-13, #3241
+   R4) and resolve (BACKLOG #2460) take `require_ui_step_up`, so that step-up is not missing from
+   them.
 
 Differences 4 and 5 are derived and pinned: a `/ui` route that is weaker than **any** JSON route holding
 the same permission set on the same method reds CI until it is listed here.
@@ -2247,8 +2262,9 @@ and when it was cut off. Once the operator has checked, `POST /approvals/{id}/re
 `{"outcome": "effects_applied"}` or `{"outcome": "effects_not_applied"}` records the finding and moves
 the row to the matching `resolved_*` status (owner ruling 2026-09-26). The resolve:
 
-- needs `approvals:approve` **and a fresh step-up** (`require_step_up`), which approve and reject do
-  not ask for. The console's resolve asks for the same (see the /ui route map). A stale window
+- needs `approvals:approve` **and a fresh step-up** (`require_step_up`), as approve does since owner
+  ruling 2026-10-13 (#3241 R4); reject does not ask for one. The console's resolve and approve ask
+  for the same (see the /ui route map). A stale window
   lands the operator back on the page to choose again; the outcome is never re-posted for them;
 - refuses the original requester with **403**, keyed on the user id like the self-approval refusal. The
   approver who released the request may resolve it;
@@ -2517,11 +2533,19 @@ grant that a step-up mints for that action instead:
 
 A JSON client answers the 403 with `POST /me/reauth`, setting `purpose` to the action the 403 named
 in `X-Step-Up-Action`; the engine client does this itself. The console's re-auth page mints the grant
-when it continues to the action's confirm page, editor or auto-retry. The message editor asks for the
+when it continues to the action's confirm page, editor or auto-retry, and only for a continuation a
+gate issued to this session (owner ruling 2026-10-13, #3241 R3). The message editor asks for the
 grant before it opens and the resubmit spends it after its own input checks, so a re-auth no longer
 drops an edit the operator is about to type, and a refusal of the console's own input costs no proof.
-A refusal from the engine handler comes after the spend: the next submit asks again and re-opens the
-editor from the stored body, as an expired grant (300 s by default) does. The console resend checks
+The purge and upload-resend confirm pages hold their proof the same way, so the window alone no
+longer opens a page whose POST then asks for a re-auth. The JSON export spends its proof after its
+own criteria check, so a malformed export costs no proof (owner ruling 2026-10-13, #3241 R2). The
+bulk purge confirm page still drops its selection across a re-auth, as before.
+A refusal the engine handler raises before its store write gives the proof back (owner ruling
+2026-10-13, #3241 R1; ADR 0197 Amendment C), so the operator resubmits without a new password. A
+refusal from the store call on keeps the spend, because the store may have committed: the next
+submit asks again and re-opens the editor from the stored body, as an expired grant (300 s by
+default) does. The console resend checks
 its own input before it spends the proof too. On both, a double-click asks for no second proof.
 The console marks each request it spends a proof on. Only an identical request rides on that mark.
 For a resend that means the same key, target and source. For an edit-resend it means the same key,
