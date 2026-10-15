@@ -3980,6 +3980,35 @@ jobs:
           # in sync with the connectors used in samples/config.
           uv pip install --system --constraint constraints.lock -e ".[fhir,dicom]"
 
+      # Vault BACKLOG #2626 step 1: the installer refuses an engine install that anyone but
+      # administrators can write, and an editable one, so the service cannot run from this checkout
+      # or from the editable install above, which the rig's own python steps still use. This builds
+      # the installer's default root the way docs/SERVICE.md "Install the engine where only
+      # administrators can write" does: a venv under Program Files, the engine wheel installed into
+      # it, never editable, then an administrator-only access list on it and the folder above it.
+      # The extras are the ones the editable install above takes, for the same reason.
+      - name: Build the administrator-only engine install from the wheel
+        run: |
+          $root = "$env:ProgramFiles\MessageFoundry\engine"
+          $parent = Split-Path -Parent $root
+          $wheels = Join-Path $env:RUNNER_TEMP "engine-wheel"
+          uv build --wheel --out-dir $wheels .
+          if ($LASTEXITCODE -ne 0) { throw "building the engine wheel failed" }
+          $wheel = @(Get-ChildItem -LiteralPath $wheels -Filter "messagefoundry-*.whl")
+          if ($wheel.Count -ne 1) { throw "expected one engine wheel in $wheels, found $($wheel.Count)" }
+          python -m venv $root
+          if ($LASTEXITCODE -ne 0) { throw "creating the venv at $root failed" }
+          uv pip install --python "$root\Scripts\python.exe" --constraint constraints.lock "$($wheel[0].FullName)[fhir,dicom]"
+          if ($LASTEXITCODE -ne 0) { throw "installing the engine wheel into $root failed" }
+          foreach ($folder in $parent, $root) {
+            & icacls $folder /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX" "*S-1-5-11:(OI)(CI)RX" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "icacls on $folder failed" }
+          }
+          & icacls $parent /setowner "*S-1-5-32-544" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "icacls /setowner on $parent failed" }
+          & icacls $root /setowner "*S-1-5-32-544" /T /C | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "icacls /setowner on $root failed" }
+
       # RIGS SIGN IN (vault BACKLOG #2719). The service runs with sign-in on, as shipped, so this
       # smoke provisions one Administrator before the first start and reads /messages and the
       # security posture as that account (harness/load/rigadmin.py). The password is drawn here,
@@ -4010,7 +4039,6 @@ jobs:
           NSSM_PIN: ${{ steps.nssm-pin.outputs.pin }}
           MEFOR_RIG_ADMIN_PASSWORD: ${{ steps.rig.outputs.password }}
         run: |
-          $exe = (Get-Command messagefoundry).Source
           $cached = @{}
           if ($env:NSSM_CACHE_HIT -eq 'true') {
             $hit = $env:SMOKE_NSSM_CACHED_EXE
@@ -4040,10 +4068,12 @@ jobs:
           # --service-config. This rig sets everything through the service's environment, so the
           # file is empty. It sits in a folder of its own outside the checkout, so -LockConfigDir
           # locks that folder with the config directory.
+          # Vault BACKLOG #2626 step 1: no -AppExe. The service runs the default install root the
+          # step above built, so this leg is the one that proves the installer accepts it.
           $serviceConfig = "C:\ProgramData\MessageFoundry-settings\messagefoundry.toml"
           New-Item -ItemType Directory -Force -Path (Split-Path -Parent $serviceConfig) | Out-Null
           [System.IO.File]::WriteAllText($serviceConfig, "# windows-service-smoke: set through the service's environment.`n")
-          .\scripts\service\install-service.ps1 -NssmDir $env:SMOKE_NSSM_DIR -AppExe $exe -Config samples\config -ServiceConfig $serviceConfig -LogLevel INFO -Environment prod -LockConfigDir @cached
+          .\scripts\service\install-service.ps1 -NssmDir $env:SMOKE_NSSM_DIR -Config samples\config -ServiceConfig $serviceConfig -LogLevel INFO -Environment prod -LockConfigDir @cached
           # The installer only warns when it cannot lock a folder, and `serve` would then refuse the
           # settings file at start. So run the check `serve` runs on the file and its folder, and
           # fail here, by name, rather than as a service that never comes up.
@@ -4337,8 +4367,9 @@ jobs:
       # provision, serve, read. That order belongs to the install and start steps above.
       #
       # NOT PROVEN HERE: that the service account cannot write site-packages. The engine's reading
-      # is printed and not judged. This runner's Python is the hosted tool cache, whose permissions
-      # are the runner image's and say nothing about an install.
+      # is printed and not judged. The service runs the Program Files venv the build step made,
+      # whose base interpreter is the hosted tool cache, and that folder's permissions are the
+      # runner image's and say nothing about an install.
       - name: "Verify the service runs isolated, remote debugging off (vault BACKLOG #2701)"
         env:
           MEFOR_RIG_ADMIN_PASSWORD: ${{ steps.rig.outputs.password }}
