@@ -165,6 +165,7 @@ _V4_PREFIX = "mfenc:v4:"
 _ALG_AES_256_GCM = "a256gcm"
 
 _NONCE_BYTES = 12  # 96-bit random nonce, the standard size for AES-GCM
+_GCM_TAG_BYTES = 16  # the AES-GCM authentication tag every sealed value ends with
 _KEY_ID_LEN = 16  # hex chars of the SHA-256 key fingerprint embedded as key_id
 
 # HKDF info label for the audit-chain HMAC key (#190). Versioned so a future re-derivation is an
@@ -319,8 +320,9 @@ class _UnmarkedPolicy:
     ASVS 11.3.3).
 
     **It refuses, by default.** A keyed store writes only marked ciphertext into a cipher-covered
-    column, and the at-open sweep seals legacy plaintext only on a surface that holds no ciphertext
-    yet. So once a key is configured, a non-blank unmarked value in a covered column is a stripped
+    column, and the at-open sweep seals legacy plaintext only on a surface that is still unsealed:
+    not yet recorded in the store's ``keyed_surface`` table and holding no ciphertext (BACKLOG
+    #3383). So once a key is configured, a non-blank unmarked value in a covered column is a stripped
     marker or a planted row. Returning it as plaintext -- what this seam did before -- is exactly where
     the AEAD tag's protection against modification was lost: substitution has a tag to fail, and a
     downgrade to plaintext has none, so only a refusal can stop it.
@@ -422,6 +424,25 @@ def report_unmarked(cipher: Cipher, table: str, column: str) -> None:
     report = getattr(cipher, "report_unmarked", None)
     if callable(report):
         report(table, column)
+
+
+def report_sealed_surface(
+    logger: logging.Logger, cipher: Cipher, table: str, column: str, pending: int
+) -> None:
+    """Log and alert that the at-open sweep left ``pending`` unmarked values on a SEALED surface.
+
+    One text for all three backends' sweeps, logged under the calling backend's ``logger``. The
+    alert names the cell only, never a row or a value (BACKLOG #1169). It fires now, not only on a
+    read, so a planted row nobody reads still reaches an alert."""
+    logger.warning(
+        "cipher column %s.%s is sealed and holds %d unmarked value(s); they were NOT sealed and "
+        "every read of them is refused (a stripped marker or a planted row). Set "
+        "[store].allow_unmarked_ciphertext only if they are known to be legitimate",
+        table,
+        column,
+        pending,
+    )
+    report_unmarked(cipher, table, column)
 
 
 # --- in-use memory hygiene (ASVS 13.3.3 / 11.7.2) — all best-effort, see the module docstring -------
@@ -536,6 +557,21 @@ class CipherError(Exception):
     It also covers a **corrupt row** that no key fixes (BACKLOG #2308): a value whose tag verified
     but whose plaintext is not UTF-8, or, at an eager read seam (:func:`decrypt_json_cell`), is not
     JSON. The message says which, so an operator is not sent looking for a missing key."""
+
+
+class UnauthenticatedCipherError(CipherError):
+    """No configured key's AEAD tag verified the value (BACKLOG #2593).
+
+    The name ends in ``CipherError`` on purpose: ``safe_exc`` renders the type name into stored
+    reasons, and this is the error a plain decrypt miss raises, which read ``CipherError: ...``
+    before it existed (``tests/test_restore_verify.py`` matches that token). Not every subclass
+    keeps the token: :class:`~messagefoundry.store.cell_tag.CellTagError` does not.
+
+    :class:`AesGcmCipher` raises it, and only it can mean the cell was sealed for another place:
+    wrong associated data, or a key that is not supplied. Bad base64 and a verified plaintext that is
+    not UTF-8 stay plain :class:`CipherError`, since they are a corrupt row, so
+    :func:`~messagefoundry.store.cell_tag.open_tagged_cell` never reads them as tag drift. The Vault
+    Transit cipher does not raise it; ``open_tagged_cell`` never reads a Transit failure as drift."""
 
 
 class AuditKeyVersionRefusedError(CipherError):
@@ -1510,6 +1546,10 @@ class AesGcmCipher(_UnmarkedPolicy):
             raw = base64.b64decode(blob)
         except (ValueError, base64.binascii.Error) as exc:  # type: ignore[attr-defined]
             raise CipherError(f"malformed ciphertext (bad base64, key_id={key_id!r})") from exc
+        if len(raw) < _NONCE_BYTES + _GCM_TAG_BYTES:
+            # Too short to hold a nonce and a tag. AESGCM.decrypt would raise a bare ValueError for a
+            # short nonce, which no caller contains as a CipherError (BACKLOG #2593).
+            raise CipherError(f"malformed ciphertext (too short, key_id={key_id!r})")
         nonce, ct = raw[:_NONCE_BYTES], raw[_NONCE_BYTES:]
         # Try the named key first (the fast path for current-format rows), then every other key — this
         # transparently decrypts legacy key_id='0' rows and rows written under a retired key mid-rotation.
@@ -1570,7 +1610,7 @@ class AesGcmCipher(_UnmarkedPolicy):
             raise CipherError(
                 f"decrypted value is not valid UTF-8 (key_id={key_id!r}); the row is corrupt"
             )
-        raise CipherError(
+        raise UnauthenticatedCipherError(
             f"no configured key decrypts this value (key_id={key_id!r}); if rotating, supply the "
             "prior key via MEFOR_STORE_ENCRYPTION_KEYS_RETIRED"
         )

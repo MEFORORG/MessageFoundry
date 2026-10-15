@@ -406,6 +406,36 @@ gets you back in. `admin-unlock` clears a local lockout only (vault BACKLOG #271
   old loopback mode could not repair an account anyway: with no auth service, creating
   an account, unbinding one and reading the audit log all answered 503.
 
+#### A directory role change can remove the last Administrator, and it alerts
+
+The engine refuses a console change that would leave no enabled Administrator. Disabling,
+deleting or changing the roles of the last one answers 400. A change the directory drives is not
+refused. When a directory sign-in's role sync, or the session reconciler, takes Administrator from
+its last enabled holder, the change applies at once (owner ruling 2026-10-13, vault BACKLOG #3229).
+So an Administrator taken out of the mapped group, or a compromised one, loses the role straight
+away.
+
+The engine then tells the operators in two ways:
+
+- the `no_enabled_administrator` alert, keyed `user:<username>`, with `via` set to `ad-sync` or
+  `ad-reconcile`;
+- an `auth.no_enabled_administrator` audit row, with the demoted account as its actor.
+
+Only a role change raises them. When the directory disables or deletes the account instead, the
+reconciler ends its sessions but leaves its stored role, so the account still counts as an enabled
+Administrator. No `no_enabled_administrator` alert fires, and `provision-admin` still refuses. On
+PostgreSQL and SQL Server, a console removal that races a directory role change can leave no enabled
+Administrator with no `no_enabled_administrator` alert and no `auth.no_enabled_administrator` audit
+row. The directory's role write does not take the console guard's lock. At least one more path
+raises no `no_enabled_administrator` alert: if the engine cannot read whether an enabled
+Administrator remains, it logs the fault at ERROR and writes no `auth.no_enabled_administrator` audit
+row. That fault does not stop the caller's role write or session revocation.
+
+The cost is that a site whose Administrators all come from the directory can end up with none
+(vault BACKLOG #2711). With no enabled Administrator left, `provision-admin` runs again at the host,
+or the directory can grant the role back at the next sign-in. A local Administrator, as above,
+keeps a site out of this state.
+
 ### Admin password reset (WP-L3-12, ASVS 6.4.6)
 
 An administrator (`users:manage`) recovers a locked-out or compromised **local** account with
@@ -931,7 +961,7 @@ crossing that needs an operator relaxation is a recorded delta, not the default 
 | Vault KV secrets | `config/secretprovider_vault.py` `_build_client` | hvac over the scheme the address names | a scheme gate, `transports/strict_requests.py` `_refuse_a_cleartext_vault_hop`, through the shared `insecure_hop_disposition`; run by `mount_strict_reply_adapter` at build and again before each send | refuses an `http://` address unless it is loopback and reached with no proxy. The hop holds no posture and has no escape, so it refuses the same way under `warn`. CORRECTED: at `bca583f2a7` this row read *"none on the scheme"* and *"an `http://` address is used as given"*; engine PR 1880 (vault BACKLOG #2317) added the gate | Off by default; once on, only a loopback `http://` address with no proxy crosses unencrypted |
 | Vault store key provider | `store/keyprovider_vault.py` `_build_client` | as above | as above | as above | as above |
 | Vault Transit cipher | `store/crypto_transit.py`, which builds its client through `store/keyprovider_vault.py` `_build_client` | as above | as above | as above | as above |
-| AD (LDAP) binds | `auth/ldap.py` `LdapAuthenticator` | LDAPS through `NarrowedTls`; plain LDAP for an `ldap://` address | verify-off refusal through `weakened_tls_escape_permitted`; an `ldap://` address is refused at settings load unless `[auth].ad_allow_insecure_ldap = true` and `[security].enforcement = warn` (`ServiceSettings`), and again at authenticator build | verify-off refuses. A plain `ldap://` bind refuses under `enforce`, where the opt-in is inert. Under `warn` it is honoured with a WARNING line and a `security_loosenings()` entry, and writes no audit row, like the other settings-scoped loosenings. CORRECTED: at `c31f0c37f9` this cell read *"`ad_allow_insecure_ldap = true` is honoured with no posture check, no audit line and no `security_loosenings()` entry"*; that was true then (vault BACKLOG #2354) | Off by default; `ldap://` needs the opt-in and `warn` |
+| AD (LDAP) binds | `auth/ldap.py` `LdapAuthenticator` | LDAPS through `NarrowedTls`; plain LDAP for an `ldap://` address | verify-off refusal with no escape (vault BACKLOG #3230; until then through `weakened_tls_escape_permitted`); an `ldap://` address is refused at settings load unless `[auth].ad_allow_insecure_ldap = true` and `[security].enforcement = warn` (`ServiceSettings`), and again at authenticator build | verify-off refuses. A plain `ldap://` bind refuses under `enforce`, where the opt-in is inert. Under `warn` it is honoured with a WARNING line and a `security_loosenings()` entry, and writes no audit row, like the other settings-scoped loosenings. CORRECTED: at `c31f0c37f9` this cell read *"`ad_allow_insecure_ldap = true` is honoured with no posture check, no audit line and no `security_loosenings()` entry"*; that was true then (vault BACKLOG #2354) | Off by default; `ldap://` needs the opt-in and `warn` |
 | Off-box log and audit forwarder (the audit tee in `store/audit_tee.py` writes through it) | `logging_setup.py` `_build_syslog_handler`; decided by `config/settings.py` `forward_hop_disposition` in `serve` | UDP, TCP or TLS syslog | the shared `insecure_hop_disposition` gradient | refuses a non-loopback UDP, TCP or verify-off collector unless `forward_hop_attested` | Off by default; the `udp` default is refused off loopback |
 
 **How the negatives were checked.** Each "no gate" or "not clamped" cell came from a search paired
@@ -1154,6 +1184,20 @@ replacement:
   at once (`/raw`, attachments, `/ui/messages/{id}/body`, a one-id `/messages/export`), and the
   route gates on `/outbound` and the `/responses` body stay as a second line. No deployment exists,
   so no stored role is broken by the change.
+  *Decided 2026-10-12, vault BACKLOG #2727, by the maintainers and not by an owner ruling:* the
+  rule is judged **per role**, and it stays that way. A `view_raw` role meant to pair with another
+  role's `view_summary` is refused, even for a user who would hold both roles. That cost is
+  accepted. A role is the unit an administrator grants, so such a role could later be assigned
+  alone. The premise is that every identity is built from whole roles: the built-in ones, plus
+  each custom role's decoded set. `Identity.build` has at least three callers, two in
+  `AuthService` and the embedder's system identity in `api/security.py`, and each passes whole
+  roles. While that holds and no role has the shape, no merged identity has it either.
+  `Identity.build` itself does not check this and no test pins its callers, so a caller that
+  hands it a narrowed permission set would break the premise. A rule on the merged identity
+  would need a check wherever a role reaches a user, at least each role assignment and each
+  directory group mapping. `raw_body_without_summary` in
+  [`auth/permissions.py`](../messagefoundry/auth/permissions.py) is the one predicate, and
+  `tests/test_custom_roles.py` pins the per-role answer.
 - An empty set or an unknown permission string is rejected on write (`CustomRoleError`); a
   malformed/hand-edited persisted `roles.permissions` row decodes **defensively to the empty set**, and
   a forbidden value that somehow reached storage is dropped.
@@ -1237,7 +1281,7 @@ tuple: they act only on the caller's own account.
 | `PUT` | `/users/{user_id}/roles` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) |
 | `POST` | `/users/{user_id}/reset-password` | `users:manage` | `require_step_up_action` (action `admin_reset_password`) |
 | `GET` | `/users/{user_id}/federated-identity` | `users:manage` | `require` (a read on the `users:manage` tier, like `GET /users/{user_id}/channel-scope`). The account's stored `issuer`/`subject`, the issuer a bind would use, and whether the account carries its directory id: the pair the console's federated-identity screen shows, for a JSON caller to send back as `expected_issuer`/`expected_subject` (BACKLOG #2331). No step-up, so it spends no grant. Audited as every satisfied route is, by its `auth.permission_granted` row, as the channel-scope read is. The console page of the same pair asks for the step-up window, because it also offers the link and unlink forms. 404 for an unknown user |
-| `PUT` | `/users/{user_id}/federated-identity` | `users:manage` | `require_step_up_action` (action `admin_federated_identity`). Binds the account to an IdP `sub` under the configured `[auth].oidc_issuer`, or rebinds it; either one revokes every live session of the account, in the same transaction as the write (vault BACKLOG #2609). **The only path that creates a federated binding** (ADR 0184, BACKLOG #1143): a federated login never binds, and an unbound one is refused. Directory (AD) accounts only, and only one that carries its immutable directory id (`users.directory_object_id`, the `objectGUID`): 400 `directory_object_id_missing` otherwise, audited as `auth.federated_bind_refused` (BACKLOG #1143 slice C); 409 when another account holds the identity, and 409 `federated_binding_changed` when the account no longer holds the body's required `expected_issuer`/`expected_subject`, the pair the caller saw (BACKLOG #2026), also audited as `auth.federated_bind_refused`, with reason `federated_binding_changed` and the expected pair (BACKLOG #2331). 404 for an unknown user, including one deleted while the bind ran (BACKLOG #2331). A rebind is still a clear then a separate set: if another bind lands between them the rebind is refused 409 without that code, and its clear has already removed the old binding, audited as `auth.federated_subject_unbound`. **A bound account is refused Windows SSO from then on**, whether or not `oidc_enabled` is on (vault BACKLOG #2609; [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) has the limits) |
+| `PUT` | `/users/{user_id}/federated-identity` | `users:manage` | `require_step_up_action` (action `admin_federated_identity`). Binds the account to an IdP `sub` under the configured `[auth].oidc_issuer`, or rebinds it; either one revokes every live session of the account, in the same transaction as the write (vault BACKLOG #2609). **The only path that creates a federated binding** (ADR 0184, BACKLOG #1143): a federated login never binds, and an unbound one is refused. Directory (AD) accounts only, and only one that carries its immutable directory id (`users.directory_object_id`, the `objectGUID`): 400 `directory_object_id_missing` otherwise, audited as `auth.federated_bind_refused` (BACKLOG #1143 slice C). A local account is refused 400 too, audited with reason `not_a_directory_account` (BACKLOG #3174). 409 when another account holds the identity, audited with reason `federated_subject_held` (BACKLOG #3174), and 409 `federated_binding_changed` when the account no longer holds the body's required `expected_issuer`/`expected_subject`, the pair the caller saw (BACKLOG #2026), also audited as `auth.federated_bind_refused`, with reason `federated_binding_changed`, the expected pair (BACKLOG #2331), and the pair the row held as `held_issuer`/`held_subject` wherever the refusal read it (BACKLOG #3174). 404 for an unknown user, including one deleted while the bind ran (BACKLOG #2331). A rebind is still a clear then a separate set: if another bind lands between them the rebind is refused 409 without that code, and its clear has already removed the old binding, audited as `auth.federated_subject_unbound`. The refusal itself is audited as `auth.federated_bind_refused` with reason `account_bound_concurrently`; that row and the `federated_subject_held` one carry `previous_binding_removed`, which says whether this request's clear had removed a binding first (BACKLOG #3174). **A bound account is refused Windows SSO from then on**, whether or not `oidc_enabled` is on (vault BACKLOG #2609; [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) has the limits) |
 | `DELETE` | `/users/{user_id}/federated-identity` | `users:manage` | `require_step_up_action` (action `admin_federated_identity`). Removes the binding and revokes the account's sessions (BACKLOG #1474's service method); its next federated login is refused until it is bound again. The body's required `expected_issuer`/`expected_subject` is the pair the caller saw: a stored pair that differs is refused 409 `federated_binding_changed` with nothing changed, compared under the clear's row lock (BACKLOG #2026). That refusal writes an `auth.federated_unbind_refused` audit row naming the actor, with reason `federated_binding_changed` and the expected pair (BACKLOG #2331) |
 | `POST` | `/users/{user_id}/reset-mfa` | `users:manage` | `require_step_up_action` (action `admin_reset_mfa`); **refuses (400) when `user_id` is the caller's own** — use the self-service MFA settings instead. Targeting yourself here was a third route to zero factors that skipped the last-factor refusal both self-service paths make (BACKLOG #1022). Cross-user reset is untouched: it is the always-available recovery for a locked-out passkey user (ADR 0068 §2) |
 | `GET` | `/users/{user_id}/channel-scope` | `users:manage` | `require` (a read on the `users:manage` tier, not `users:read`) |
@@ -1829,8 +1873,10 @@ the same permission set on the same method reds CI until it is listed here.
 >   nothing resets. A destination target is one inbound's edge into an outbound, so it passes when
 >   that inbound is in scope, and it resets only that edge. Both refusals are audited
 >   `auth.channel_denied`.
-> - `GET /status` narrows one field by scope. `channels_failed_names` lists only the failed inbounds
->   in the caller's scope. At least `channels_failed`, `channels_total`, `outbox_by_status`, the
+> - `GET /status` narrows two fields by scope. `channels_failed_names` lists only the failed inbounds
+>   in the caller's scope. `fhir_lookups_failed` names an isolated `FhirLookup` to an estate-wide
+>   caller only, because a lookup belongs to no channel (vault BACKLOG #3008). A scoped caller gets
+>   an empty list, which does not mean every lookup started. At least `channels_failed`, `channels_total`, `outbox_by_status`, the
 >   `kpis` block and the `db` message and event counts are not narrowed. So a scoped caller can see
 >   a failure count higher than the names it is shown. Two other fields, `db.audit` and
 >   `logs.size_bytes`, follow a permission rule rather than a scope rule. The `## Audit` section
@@ -2041,6 +2087,70 @@ compare against it. Only a committed reload or a flag toggle that moves the engi
 fingerprint counts. A later reload that fails and rolls back does not mark the row. The check
 runs just before the write, so a change after it is not caught. A cluster convergence reload's
 row is still read from the engine's live state when it is written.
+
+**A released reload loads only the config its approval named (vault BACKLOG #2596, step 3).** When
+dual control holds a reload, the hold's `params` carry `fingerprint`: the ADR 0041 D1 content
+digest of the target directory, taken at request time. An approver sees it in the queue. The
+release checks the directory against it before any config module runs. After a load that
+succeeds, it checks again, before the checks that refuse an invalid graph. It first takes the
+fail-closed digest. Then it compares the digest the `config_reload` row records, if the engine
+took one. After a load that fails as an invalid config, it checks the fail-closed digest once
+more. So an edit that also breaks the graph is recorded as an edit. If any check differs from the
+approved digest, nothing loads past that point and nothing swaps. The running graph keeps the
+environment values it had. A reload applies the values it re-read only with the swap, and a
+rolled-back swap puts the old ones back. A dry run checks the values and never applies them. The
+approve answers **422**, the request moves to `failed`, and a `config_reload_failed` row records
+reason `digest_mismatch` with `approved_fingerprint` and `current_fingerprint`. A hold whose
+params carry no digest is refused the same way, with reason `no_approved_digest`. A release that
+cannot take the digest now is refused with reason `digest_unavailable`, and the engine logs the
+cause at WARNING. The requester asks again, and a second approver reviews the new bytes.
+
+This digest fails closed, unlike the provenance fingerprint, which skips what it cannot read. A
+file or folder it covers that cannot be read gives no digest at all, never the digest of the rest.
+A directory that is gone when the digest first lists it is refused as missing. So is a name or
+path too long for the filesystem, or a name Windows refuses. A directory removed after that first
+listing is not refused as missing. The digest covers the files it still finds, down to an empty
+bundle. That digest does not match an approved bundle that held files, so the release is refused
+as `digest_mismatch`. A file that goes between its stat and its read gives `digest_unavailable`
+instead. After the load the release checks this digest first, and then the one the row records.
+
+At least these requests file no hold, because their release could only be refused. Each is
+answered and audited at once, as an inline reload's refusal is:
+
+- a directory outside the reload roots, or a missing one;
+- a directory the engine cannot resolve or list, such as one under a parent the service account
+  cannot traverse. Its reason is `unreadable`;
+- a directory holding a covered file or sub-folder that cannot be read. Its reason is
+  `digest_unavailable`, with `approved_fingerprint` and `current_fingerprint` both null.
+
+The engine logs the cause of the last two at WARNING. None writes a `config_reload_attempted` row,
+because nothing was attempted. A repeat request joins an open hold only while the digest is
+unchanged. An ungated reload takes no request-time digest. At least these limits remain:
+
+- the digest is not sealed. A writer to the `pending_approvals` table can replace it along with the
+  rest of the params. Sealing that row is vault BACKLOG #2592;
+- the digest covers what `config/fingerprint.py` hashes and no more. A planted `__pycache__` file
+  runs under an unchanged digest. So does an edit to an environment value file outside the config
+  directory, or to a `MEFOR_VALUE_*` variable. These gaps are closing step 1 of vault BACKLOG #2596;
+- each check samples the files. An edit that lands after the first check runs its module code
+  before the second check refuses it. An edit reverted while the release loads is not seen at all.
+  Hashing, compiling and running the same bytes is that same step 1;
+- the request-time digest is taken before the route checks its step-up proof;
+- the digest checks that each folder it reads can be listed, and then lists it again. A folder
+  that becomes unlistable between the two is left out of the digest;
+- a directory moved away during a release is recorded as `not_found`, not as an edit, unless the
+  move lands while a digest is reading it;
+- a swap that fails while reconciling outbound connections does not roll those connections back.
+  Any it already rebuilt keep the new graph's settings and values;
+- a connection flag toggle rewrites `connections.toml`, so it changes the digest. A reload held
+  before a toggle is refused at release and must be asked for again;
+- a repeat after an edit files a second hold and leaves the first pending. The first is refused
+  at release unless the edit is reverted, and then it can be released;
+- in a cluster, the release compares the digest with the disk of the node that handles the approve,
+  which may not be the node that took it;
+- a restart, a cluster convergence reload, a DR activation and a sandbox worker respawn check no
+  approved digest. Whether a restart under dual control refuses an unapproved digest is an open
+  owner question.
 
 Unlike a reload, a released dead-letter replay fails closed (vault BACKLOG #2624). Its `dead_letter_replay` row
 commits in the same transaction as the re-queue. So when that row fails, nothing is re-queued, the
@@ -2325,7 +2435,9 @@ route, and it would also refuse an honest directory approver whose engine row is
 sign-in.
 
 The gated set is configurable (`[approvals].operations`); the first cut covers the two highest-PHI-impact
-flows — **bulk dead-letter replay** and **connection purge**. (The web console's "are you
+flows — **bulk dead-letter replay** and **connection purge**. With dual control on, a list that leaves
+either out is named as a security loosening (vault BACKLOG #3123);
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) says what that gives up. (The web console's "are you
 sure?" confirm prompts are **client-side only** and bypassable via the raw API — they are *not* a second approver
 and do not satisfy this control.)
 
@@ -2801,8 +2913,9 @@ identity provider's `amr` or `acr` claim, while `[auth].oidc_require_mfa_claim` 
 `require_mfa` defaults **on** (BACKLOG #187 — secure-by-default, including the loopback bind; the
 documented org opt-out is `[security].require_mfa = false` — the `[auth]` spelling of this key is
 **rejected at load** and `serve` exits 2 naming the replacement). The exposure gate now guards the **explicit
-opt-out**: when the instance is **exposed** (an off-loopback bind, or a declared TLS-terminating
-proxy, `[api].tls_terminated_upstream`) with `require_mfa` *turned off*, `serve` makes the
+opt-out**: when the instance is **exposed** (an off-loopback bind, a declared TLS-terminating
+proxy (`[api].tls_terminated_upstream`), or a set `[api].trusted_proxies`; vault BACKLOG #2251)
+with `require_mfa` *turned off*, `serve` makes the
 posture explicit at startup — it **refuses to start** under `[security].enforcement = enforce`, the
 default in every environment, and **warns** otherwise or where
 `[security].allow_single_factor_admin_when_exposed` is set, mirroring the keyless-store and
@@ -3128,16 +3241,22 @@ this gate can be forgotten (the previous claim here was overstated: the old pinn
 - **The policy is applied** — `tests/test_field_authz_enforcement_sites.py` hits the redaction
   surfaces over HTTP as a caller lacking `messages:view_summary` (a Viewer, plus a `custom:` role
   holding `view_raw` **without** `view_summary` for the detail route, and one holding
-  `monitoring:diagnose` without it for the alert list). That `view_raw` role is one minting now
-  refuses (see [Custom roles](#custom-roles-adr-0045)), so this test lifts the pairing rule alone
-  to reach the route tier, as `tests/_role_pairing.py` describes. The test asserts every gated
-  property comes back `null`. A companion assertion checks that an administrator sees all
-  fifteen, matched **per model, not per property name**, so the negative cannot pass vacuously.
-  That distinction is load-bearing: keyed on names, `last_error` looked covered by
-  `DeadLetterRow.last_error` on
-  `/dead-letters` while `OutboxInfo.last_error` had **zero** coverage, because the only message whose
-  outbox row carries a non-null `last_error` is the dead-lettered one and its detail route was not in
-  the surface list. It is now, and the coverage assertion is keyed on `(model, property)` pairs.
+  `monitoring:diagnose` without it for the alert list). Minting now refuses that `view_raw` role
+  (see [Custom roles](#custom-roles-adr-0045)). So this test lifts the pairing rule alone to reach
+  the route tier, as `tests/_role_pairing.py` describes. The test asserts every gated property
+  comes back `null`. It also reads each surface as an administrator, and checks two things there
+  (vault BACKLOG #2727). The administrator sees a gated value on that surface. And for each
+  model, the restricted response holds at least as many objects as the administrator saw carrying
+  one. So a surface that returns the restricted caller fewer objects of a model than that now
+  fails, where before it passed with nothing checked. That is a count per model. It does not
+  match object to object, so a surface that swaps the carrying rows for as many others of the
+  same model still passes. A companion assertion checks that an administrator sees all fifteen
+  across the surfaces, matched **per model, not per property name**. That distinction is
+  load-bearing: keyed on names, `last_error` looked covered by `DeadLetterRow.last_error` on
+  `/dead-letters` while `OutboxInfo.last_error` had **zero** coverage, because the only message
+  whose outbox row carries a non-null `last_error` is the dead-lettered one and its detail route
+  was not in the surface list. It is now, and the coverage assertion is keyed on
+  `(model, property)` pairs.
 - **The default is fail-closed** — `tests/test_field_authz_fail_closed.py` mounts a PHI-returning
   route that *omits* the `redact_unauthorized` call and asserts the response carries `null` for every
   gated property, each assertion paired with a released positive control. It also pins `PHI_FIELDS`
@@ -3542,7 +3661,7 @@ only. A user in multiple mapped groups gets the union of those roles.
 unescapes each value and escapes it again one way, and sorts the parts of a multi-valued RDN. The
 result is printable ASCII: ASCII letters are lower-cased, and every non-ASCII or control
 character is written as hex escapes of its UTF-8 bytes. The maps store that form, and a key
-whose canonical form passes 256 characters is refused. So a key matches however either side
+whose canonical form passes 512 characters is refused. So a key matches however either side
 escapes a value: Active Directory writes `CN=C# Developers,OU=Groups,...` with the `#` unescaped,
 and `CN=C\# Developers` and `CN=C\23 Developers` name the same group.
 
@@ -3675,7 +3794,9 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
     steps back, or IdP nodes whose clocks disagree, would refuse a real re-authentication until
     the IdP clock passes the stored value;
   - the directory still returns the account by its immutable id. A row with no id is refused, as
-    at sign-in. The password re-bind this leg replaces would have failed for a deleted account;
+    at sign-in. The password re-bind this leg replaces would have failed for a deleted account.
+    The answer must carry that same id before its groups are trusted, or the leg refuses with
+    `directory_object_id_missing` or `directory_identity_conflict` (BACKLOG #3174);
   - every role stored on the account is among the roles its current directory groups map to
     (BACKLOG #2154). Otherwise the leg refuses with `reason=directory_roles_demoted`.
 
@@ -3693,7 +3814,8 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   step-up page with a plain message, except one that finds the session gone, which sends the operator to sign in. A refusal after the `state`
   check is filed under the staged session's account. A cancel at the IdP returns to the same page.
   A callback without the flow's own `state` consumes nothing, and the flow waits for the real
-  return. A password is
+  return. The sign-in callback follows the same rule, an `error=` or malformed one included
+  (BACKLOG #3198). A password is
   **never** checked for an `oidc` session. `POST /me/reauth` (through `AuthService.reauth`)
   refuses it before any verify, audited with `reason=idp_step_up_required`, and charges nothing to
   the lockout or the session's re-proof budget. `POST /ui/reauth` sends it to the IdP page without
@@ -4371,7 +4493,7 @@ list, which admits any certificate its CA ever signed.
 | Pathway | Factor | Brute-force defense | Notes |
 |---|---|---|---|
 | **Local** (argon2id) | **password** (argon2id) **plus an engine second factor** — RFC 6238 TOTP, single-use recovery codes, or a WebAuthn/FIDO2 passkey. That factor is an **access gate, not merely a step-up boundary**: an MFA-pending session is refused on *every* authorized route with `X-MFA-Required: 1`, and a browser session is **redirected** to `/ui/mfa` — *not* confined to it, as an earlier revision of this cell said, because the account and factor-enrolment routes are declared MFA-pending-exempt, so a user with no factor yet enrols at `/ui/account`. It binds any local account that has enrolled a factor, plus every account `[security].require_mfa_scope` covers — **`every_local_account` by default** (`[security].require_mfa` defaults **on**; both keys are rejected under `[auth]` and fail the start). Set the scope to `administrators` for the earlier, narrower posture, in which a non-admin, un-enrolled local session is **password-only end to end**. Caveat: a passkey is asserted at `user_verification=preferred`, so for a passkey-only account the second factor may be **device possession alone** | **per-account lockout** (5/15 min) on **two counters** (ADR 0197). The **sign-in** counter is fed by wrong passwords **and** by the step-up re-auth and password-change re-proofs, which it does not refuse; those are capped per session instead (BACKLOG #1138). The **second-step** counter is fed by wrong TOTP/recovery codes and by a **combined sign-in** (password and TOTP code in one request) that gets exactly one factor right. The sign-in lock refuses a password-only sign-in but **not** a combined one on an account with TOTP enrolled; the second-step lock refuses both, and the second step. The second-step lock doubles per cycle up to `lockout_max_minutes` on every local account, and the sign-in lock does so only on a local account with TOTP enrolled; every other lock keeps `lockout_minutes`. While the credential in force is engine-generated, sign-in failures arm no lock, and under `require_mfa` the holder enrols TOTP before replacing it (ADR 0197 Amendment A) + breach/context policy + the per-IP **and** global sign-in window | the only sign-in whose **first** factor feeds the engine lockout; the TOTP/recovery leg feeds it on **any** account that enrolled a code, directory accounts included. Its passkey is phishing-resistant, but not Local's alone: a directory account can enrol one too (BACKLOG #1144) |
-| **AD** (LDAP simple-bind, LDAPS by default) — **step-up re-authentication only; the sign-in was retired** | password, verified by a bind **as the user** against the DC. It no longer mints a session: `POST /auth/login` with `provider=ad` is refused and audited, and the bind survives only at `POST /me/reauth` and the console's `POST /ui/reauth`, where it re-proves a session **Kerberos** minted. An `oidc` session never reaches the bind: `reauth()` refuses it before any verify and it steps up at the IdP (the OIDC row). The one other session it can reach is a row written before `sessions.auth_mechanism` existed, which reads NULL and takes this leg for an AD account. So this row carries no MFA grant of its own — the session's MFA state was decided at its own sign-in. The delegated-directory relaxation it used to carry is **retired** (BACKLOG #1144): no pathway grants MFA satisfaction on a directory assertion the engine cannot read | the **directory's** lockout/complexity policy; engine-side, a **per-actor** step-up budget, **not** the sign-in limiter — the bind is post-session, so an unauthenticated flood cannot reach it — plus the **engine** per-account lockout, which a rejected re-bind feeds (BACKLOG #1138), and a per-session cap: the session whose re-binds reach `lockout_threshold` rejections is revoked, so it sends the DC at most that many. `[auth].login_rate_limit_enabled=false` removes the per-actor budget too, because that flag builds neither limiter. The lockout feed and the per-session cap survive it, so the flag does not strip this pathway bare. The engine lock sets the engine's own row and is enforced at the Kerberos and OIDC sign-ins, not at the re-bind. It never writes a lock to the directory account, but each rejected re-bind still reaches the DC, so the domain's own lockout policy can lock the domain account too | password strength + lockout are the AD domain's responsibility. LDAPS is the default, not a structural guarantee: `[auth].ad_allow_insecure_ldap` opts into a plain bind under `[security].enforcement = warn` only (it is inert under `enforce`), and `ad_tls_verify=false` is refused at startup unless the `MEFOR_ALLOW_INSECURE_TLS` dev escape is set |
+| **AD** (LDAP simple-bind, LDAPS by default) — **step-up re-authentication only; the sign-in was retired** | password, verified by a bind **as the user** against the DC. It no longer mints a session: `POST /auth/login` with `provider=ad` is refused and audited, and the bind survives only at `POST /me/reauth` and the console's `POST /ui/reauth`, where it re-proves a session **Kerberos** minted. An `oidc` session never reaches the bind: `reauth()` refuses it before any verify and it steps up at the IdP (the OIDC row). The one other session it can reach is a row written before `sessions.auth_mechanism` existed, which reads NULL and takes this leg for an AD account. So this row carries no MFA grant of its own — the session's MFA state was decided at its own sign-in. The delegated-directory relaxation it used to carry is **retired** (BACKLOG #1144): no pathway grants MFA satisfaction on a directory assertion the engine cannot read | the **directory's** lockout/complexity policy; engine-side, a **per-actor** step-up budget, **not** the sign-in limiter — the bind is post-session, so an unauthenticated flood cannot reach it — plus the **engine** per-account lockout, which a rejected re-bind feeds (BACKLOG #1138), and a per-session cap: the session whose re-binds reach `lockout_threshold` rejections is revoked, so it sends the DC at most that many. `[auth].login_rate_limit_enabled=false` removes the per-actor budget too, because that flag builds neither limiter. The lockout feed and the per-session cap survive it, so the flag does not strip this pathway bare. The engine lock sets the engine's own row and is enforced at the Kerberos and OIDC sign-ins, not at the re-bind. It never writes a lock to the directory account, but each rejected re-bind still reaches the DC, so the domain's own lockout policy can lock the domain account too | password strength + lockout are the AD domain's responsibility. LDAPS is the default, not a structural guarantee: `[auth].ad_allow_insecure_ldap` opts into a plain bind under `[security].enforcement = warn` only (it is inert under `enforce`), and `ad_tls_verify=false` is refused at startup, with no escape (vault BACKLOG #3230; until then the `MEFOR_ALLOW_INSECURE_TLS` dev escape released it) |
 | **Kerberos / SPNEGO** | domain ticket **plus an engine second factor**. No `amr`-equivalent evidence reaches the engine, so the ticket proves nothing about directory-side factor strength and the session is issued **MFA-pending** (BACKLOG #1144). It used to be issued **MFA-satisfied** under a delegated-directory relaxation, which cleared every engine MFA gate on zero engine-readable evidence; that grant is retired. While `[security].require_mfa` is on, an un-satisfied directory session reaches only the MFA-pending-exempt routes, and its holder enrols a TOTP or a passkey on the same routes a local account uses. Set `require_mfa = false` for the earlier single-factor posture | the **domain's** controls; engine-side, the sign-in window on the token-bearing leg (`[auth].login_rate_limit_enabled`, default on — **off leaves the ticket leg with no engine-side control at all**; the RFC 4559 challenge leg is deliberately unthrottled either way). An enrolled engine TOTP or recovery code still feeds the per-account lockout, and a locked account row refuses this sign-in (BACKLOG #1638) | experimental, off by default, **single-leg — no mutual authentication**, channel binding deliberately un-enforced. Both legs (`GET /ui/sso` and the JSON `POST /auth/negotiate`) mint with no step-up window, so a sensitive action forces a step-up unless a TOTP or recovery code proved at the MFA gate has already stamped one. That step-up is the **AD** row's directory re-bind, at `POST /me/reauth` or `POST /ui/reauth`. **Refuses an account that holds a federated binding** (vault BACKLOG #2609): that account signs in through the OIDC row, and [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) has the limits |
 | **OIDC federation** (browser only, hybrid AD-backed) | IdP-asserted, gated on a **signature-verified** `amr`/`acr` claim (`[auth].oidc_require_mfa_claim` defaults **on**) — an assertion, not a proof | no engine credential to guess on the federated leg, so that leg feeds no per-account lockout, though a lock another leg set on the account row refuses this sign-in (BACKLOG #1638); both legs (`POST /ui/oidc/start`, `GET /ui/oidc/callback`) charge the sign-in window, and so does `GET /ui/oidc/start` when its interstitial is skipped (see the [Route → limiter map](#route--limiter-map)) (`[auth].login_rate_limit_enabled`, default on — **off leaves the federated leg with no engine-side control at all**, though the bounded pending-flow cache still caps concurrent start legs), plus the IdP's own lockout. The **step-up leg** checks no engine credential either, so a refused IdP step-up feeds no lockout and no per-session re-proof cap, and neither account lock refuses it. Its start, `POST /ui/reauth/oidc`, draws the per-actor ceremony budget, and the IdP's return to `GET /ui/oidc/callback` draws the sign-in window | hybrid-only: a federated principal with no on-prem AD object is refused. Roles come from LDAP, never from a token claim. When `[auth].oidc_username_strip_domain` is on (default), the claim's UPN suffix must match `oidc_allowed_username_domains` (or `[auth].ad_domain`); with stripping **off** the claim is used verbatim and no suffix check applies. Either way the claim selects no account: the bound (issuer, sub) pair does (ADR 0184). The session's absolute lifetime is capped at the verified `id_token.exp` and at `auth_time + [auth].oidc_max_age_seconds`; minted with no step-up window. **Its step-up goes back to the IdP and never to a password** (BACKLOG #296, ADR 0142 Amendment B). `POST /ui/reauth/oidc` sends the browser to the IdP with `max_age=0` and `prompt=login`, and `complete_oidc_step_up` checks the answer before it elevates the session. Among its checks, the verified (issuer, sub) pair must still be the account's, and the new `auth_time` must be no earlier than the moment the flow was staged, less `oidc_clock_skew_seconds`, and later than the IdP `auth_time` the session holds (BACKLOG #2143). The full list, in order, is under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142). It then stamps `reauth_at`, rotates the session, and mints the action-bound grant when the action the operator started from takes one and the session is not refused it (a pending session on an account with a factor, for a factor-binding or session-terminate action). Console only: `POST /me/reauth` refuses an `oidc` session, and the JSON plane has no federated step-up |
 | **mTLS service identity** (non-interactive, ADR 0083) | a **verified** client certificate mapped through a deny-by-default, name-space-qualified allow-list (`CN:` / `SAN:<type>:`) | **not applicable** — no guessable secret and no lockout; admission requires a chain verifying to the pinned client CA plus a listed qualified name | no session, no MFA, no step-up — which is why it is **PHI-fenced**: `require_service_cert` raises at **app construction** if asked to gate a PHI-view permission. One route only (`GET /service/identity`); every success is audited `service_cert_auth` |
@@ -4928,7 +5050,7 @@ additionally front the API with a proxy/WAF limiter and TLS.
 | Request body | `[store].max_upload_bytes` (the `/uploads` routes only) | 1 MiB elsewhere | per request | no | no | no | **stateless** — every route, in ASGI middleware | **413** over the cap, **400** on ambiguous CL+TE framing or an invalid `Content-Length`, **411** on a chunked body |
 | Uploaded files retained, per uploader | `[store].max_upload_files_per_user`, `max_upload_total_bytes_per_user`, `uploads_retention_days` | 100 files / 250 MiB / 30 days | cumulative (no window; the retention age is what releases budget) | **yes** — a **cumulative** count *and* byte total, so the single-file cap above is not the only upload bound | no | no | **store-backed** — scoped to the `uploads_dir` via an uncached sidecar scan, with the check-then-write held as an atomic `reserve_upload_quota` on the unified store, so shards sharing a dir share one budget (separate dirs get separate budgets by construction) | **409** before any write, audited `upload.reject_quota`; over-age blob+meta pairs are pruned and audited `upload.prune`. Defaults-**on** with a `ge=1` floor once `uploads_dir` is set — the control cannot ship disabled |
 | Remote-file retrieve | `max_file_bytes` (the `File(...)` and `Sftp`/`Ftp` inbound connections) | 16 MiB | per file | no | no | no | **stateless** — a per-file test carrying no budget, applied in the connector | the file is quarantined to `error_subdir` and WARNING-logged; it never becomes a received message, so there is no store disposition. **Charged twice on a remote source, and the second charge is the one that binds** (BACKLOG #1191): once against the size the partner server reported in its own directory listing, then again against the **bytes actually read**, streaming in 1 MiB chunks so a share that lists a small file and delivers an arbitrarily large body is cut off mid-transfer. That second charge is the only bound that can see this surface at all — the connector consumes the body *before* an ingress row exists |
-| Egress response body | *(module constants in `transports/bounded_read.py`: `DEFAULT_MAX_RESPONSE_BYTES`, `MAX_TOKEN_RESPONSE_BYTES` — no knobs)* | 16 MiB; 256 KiB on a token endpoint | per response | no | no | no | **stateless** — a per-response test carrying no budget, applied at every outbound HTTP read: REST, SOAP, FHIR write, the `fhir_lookup` live read, DICOMweb STOW-RS, the OAuth2 and SMART token endpoints, the AI broker and the alert webhook, plus each of their reachability probes | the read stops at the bound plus one byte and raises `ResponseTooLargeError`, a `DeliveryError`. Where that surfaces inside a delivery, as it does when a delivery mints its token, the message retries and then dead-letters like any other reply the engine could not read. At least a probe and the AI broker report it to their own caller instead, and nothing retries those. The alert webhook counts an over-cap body after a 2xx as delivered and logs a WARNING that carries no reply byte, because nothing reads that body (owner ruling 2026-10-12, vault BACKLOG #3040 item 1). **A REST, SOAP, FHIR or DICOMweb delivery that already holds a 2xx is the exception** (vault BACKLOG #2180, owner ruling 2026-10-05): a retry would send again a request the partner answered 2xx, so an over-cap body there is either dropped with a WARNING or refused for good with the code `reply-too-large`. The table under REST in [`CONNECTIONS.md`](CONNECTIONS.md) says which destination and mode does which. The ruling names the principle, which is to judge the body by who reads it, and not the FHIR cases that refuse; refusing those is a reading of it made when this was built, which the owner may reverse, and the note under that table says which rows it covers. A `fhir_lookup` refusal is a `FhirLookupError` the Handler sees directly, and the two HTTP-error-body reads instead WARNING-log and classify on the status alone. 16 MiB is not a new number — it is `parsing/peek.DEFAULT_MAX_MESSAGE_BYTES`, the engine's existing one-message ceiling, so no honest clinical reply is refused. **Egress only:** this bounds a reply to a request the engine made, never a received message, so it cannot drop one (BACKLOG #1191) |
+| Egress response body | *(module constants in `transports/bounded_read.py`: `DEFAULT_MAX_RESPONSE_BYTES`, `MAX_TOKEN_RESPONSE_BYTES` — no knobs)* | 16 MiB; 256 KiB on a token endpoint | per response | no | no | no | **stateless** — a per-response test carrying no budget, applied at every outbound HTTP read: REST, SOAP, FHIR write, the `fhir_lookup` live read, DICOMweb STOW-RS, the OAuth2 and SMART token endpoints, the AI broker and the alert webhook, plus each of their reachability probes | the read stops at the bound plus one byte and raises `ResponseTooLargeError`, a `DeliveryError`. Where that surfaces inside a delivery, as it does when a delivery mints its token, the message retries and then dead-letters like any other reply the engine could not read. At least a probe and the AI broker report it to their own caller instead, and nothing retries those. The alert webhook counts an over-cap body after a 2xx as delivered and logs a WARNING that carries no reply byte, because nothing reads that body (owner ruling 2026-10-12, vault BACKLOG #3040 item 1). **A REST, SOAP, FHIR or DICOMweb delivery that already holds a 2xx does not retry either** (vault BACKLOG #2180, owner ruling 2026-10-05): a retry would send again a request the partner answered 2xx, so an over-cap body there is either dropped or refused for good with the code `reply-too-large`. The table under REST in [`CONNECTIONS.md`](CONNECTIONS.md) says which destination and mode does which. The ruling names the principle, which is to judge the body by who reads it, and not the FHIR cases that refuse; refusing those is a reading of it made when this was built, which the owner may reverse, and the note under that table says which rows it covers. A 2xx body cut short of its declared length, or misframed, follows the same rule with the code `reply-truncated` or `reply-misframed` (BACKLOG #2989; ADR 0095 Amendment B.1 records who decided it). A `fhir_lookup` refusal is a `FhirLookupError` the Handler sees directly, and the two HTTP-error-body reads instead WARNING-log and classify on the status alone. 16 MiB is not a new number — it is `parsing/peek.DEFAULT_MAX_MESSAGE_BYTES`, the engine's existing one-message ceiling, so no honest clinical reply is refused. **Egress only:** this bounds a reply to a request the engine made, never a received message, so it cannot drop one (BACKLOG #1191) |
 | OIDC pending flows | `[auth].oidc_flow_cache_max` (global), `DEFAULT_PER_IP_CAP` (per-IP, no knob), `oidc_flow_ttl_seconds` | 512 / 16 / 300 s | 300 s TTL | no | **yes** (512) | **yes** (16) | **in-process** — `POST /ui/oidc/start`, and `GET /ui/oidc/start` when its interstitial is skipped, and the step-up start `POST /ui/reauth/oidc` (`begin_oidc_step_up`) — reject-when-full, never evict | 303 → `/ui/login?e=rate_limited` on the sign-in start; 429 re-rendering the step-up page, no `Retry-After`, on `POST /ui/reauth/oidc`; WARNING-logged, **never** audited |
 | WebAuthn pending ceremonies | `GLOBAL_PENDING_CAP`, `PER_USER_PENDING_CAP`, `CHALLENGE_TTL_SECONDS` (module constants, no knobs) | 4096 / 16 / 120 s | 120 s TTL | **yes** (16) | **yes** (4096) | no | **in-process** — every passkey registration + assertion ceremony | per-user: evicts that user's **own** oldest pending ceremony (silent); global: `ChallengeCacheFullError` naming the cause + the `admin_reset_mfa` recovery path |
 | **Ingest plane** | `max_messages_per_second`, `message_burst` (MLLP, raw-TCP, X12 and HTTP inbounds) | **off** (unset = no rate bound) | per message | no | no | no | **in-process** — one bucket per MLLP / raw-TCP / X12 **connection** and one per HTTP **listener**, so it neither coordinates across engine shards nor aggregates per peer | **Ships OFF, and the off default is ruled rather than accidental** — a rate on a clinical interface is only safe at a number taken from a real feed profile. **So a default install has NO message-RATE bound on the ingest plane**, and that is a deliberate posture, not a gap in the control. Both keys are parameters of the `MLLP()`, `Tcp()`, `X12()` and `Http()` factories, so **the code-first surface expresses them on all four**. `connections.toml` desugars through those same factories, so **the TOML surface expresses them on three of the four**: `X12` is absent from that loader's `_TRANSPORTS` map entirely, so **no** X12 setting is expressible in `connections.toml` and the pacing keys are not a special case of that. Closing it means adding the transport, which is a separate decision from this control; the gap is pinned with its own positive control at `tests/test_ingress_message_pacing.py::test_x12_has_no_toml_surface_at_all_which_is_a_separate_gap` (BACKLOG #1249 for MLLP, BACKLOG #1114 for the other three — until #1249 landed the pacer was built and no documented configuration could turn it on, and until #1114 landed the other three intakes had no rate control in **any** configuration, which is a different and worse thing than being off). *What it does when set:* the listener **pauses reading before its next read** so TCP back-pressures the sender; no message is dropped, refused, NAK'd, 429'd or reordered — the count-and-log invariant forbids accept-and-drop, so a discarding limiter was never available. **The HTTP bucket is listener-wide, not per-connection**, because that connector answers one request per connection; a `GET`/`HEAD` probe waits behind an outstanding debt but charges nothing. **Two SIBLING intake bounds on different units, added by BACKLOG #1114 — read them as separate controls, not as this row's keys reaching further.** (1) `max_associations_per_second` / `association_burst` bound the **DICOM C-STORE SCP**, and the unit is an **association**, not a message: `pynetdicom` owns the read loop, so by the time a C-STORE reaches the engine the object has already been read and decoded, and a pace after decode would delay a message the count-and-log invariant has already obliged us to account for. The pacer waits before reading the association request and never refuses one. The engine-wide intake pause is a separate control that does refuse a new association as busy while it holds (BACKLOG #290; the `[inbound].max_staged_depth` row of [CONFIGURATION.md](CONFIGURATION.md) says how). An established association is still **unbounded in the objects it may push** (`max_object_bytes` and `timeout_seconds` bound those instead). It **ships OFF**, for the reason in bold above, so it does not soften the sentence about a default install. (2) `poll_max_files` (the `File`, `Sftp` and `Ftp` sources) and `poll_max_rows` (the `DatabasePoll` source) cap how many items one **poll tick** takes, not how many it lists, and both **ship ON at 500**. That is the opposite default, deliberately, because a poll source has no sender to back-pressure. The excess is **deferred, not refused**: it stays in the drop directory or the table for a later tick. That holds on the Database source only under conditions, and a file source can still spend the cap on a file it leaves in place; [CONNECTIONS.md §*Per-tick poll ceilings*](CONNECTIONS.md#per-tick-poll-ceilings) states both, with what spends the cap on each source, why 500 and when to raise it. A negative or non-numeric value is **refused when the connection is built**, before it starts. **Still not covered even when set:** any **per-message** bound on the DICOM SCP, and any **per-peer MESSAGE-RATE** bound (MLLP, TCP and X12 peers are unauthenticated, so the only key would be source IP, which NAT collapses). **A per-peer CONNECTION bound does now ship on the MLLP, raw-TCP and X12 listeners** — `max_connections_per_host` (32). BACKLOG #1725 added it to MLLP, and vault BACKLOG #2606 to the other two. It is a different unit: it caps concurrent sockets from one address, refusing pre-ingress, and never bounds how fast an admitted peer may send. It keys on source IP, so the NAT objection still applies to it and is recorded at its constant; behind a source-NAT proxy set it to `None`/`0`. The HTTP listener takes the same key but **ships it off**. Behind a reverse proxy every partner arrives from one address, so a cap there would be the listener's whole capacity. The DICOM intake carries no per-host term. **Resource bounds that DO ship on** — at least `max_connections` (256), the MLLP, raw-TCP and X12 listeners' `max_connections_per_host` (32) and `max_frame_seconds` (60.0 s), `receive_timeout` (60.0 s), `max_frame_bytes` (16 MiB), per-connection `max_message_bytes`, `poll_max_files` and `poll_max_rows` (500, on the poll sources), `source_ip_allowlist`. On the MLLP, raw-TCP and X12 listeners `receive_timeout` resets on every byte received, so it bounds only silence; `max_frame_seconds` bounds the frame. Bytes outside a frame count toward that deadline too (vault BACKLOG #2847 brought MLLP into line). [CONNECTIONS.md](CONNECTIONS.md#resource-management--limits-asvs-1312--1313--1326) states when its clock starts and stops. |
@@ -5581,11 +5703,12 @@ Three controls answer it, and they differ in strength:
   console script, such as a developer's `messagefoundry serve`, leaves it on. So the command line
   installs an audit hook as it starts, for every command (`messagefoundry/remotedebug.py`). The
   interpreter raises an event before it runs an injected script, the hook raises on it, and the
-  interpreter drops the script.
+  interpreter drops the script. A refusal is logged. Under `serve` the engine also writes a
+  `remote_debug_refused` audit row and raises an alert of that name (vault BACKLOG #2742).
 
 The hook is the weakest of the three, so an engine that starts with the interface on reports it
-as the loosening `remote_debug_enabled`. What the hook leaves open, where the entry is reported,
-which starts report it and how to clear it are stated once, in
+as the loosening `remote_debug_enabled`. What the hook leaves open, what a refusal records, where
+the entry is reported, which starts report it and how to clear it are stated once, in
 [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#remote_debug_enabled-and-remote_debug_unguarded-the-interpreter-accepts-a-script-from-another-process).
 
 ### Isolated mode and start-up code of the engine's interpreter

@@ -39,7 +39,10 @@ def fetchone_for(sql: str) -> Any:
     if sql == ss._SQL_DELETE_GUARD:
         return ("consumed-row-id",)  # non-None -> guard proceeds (not the idempotent no-op)
     if sql == ss._SQL_SELECT_METADATA:
-        return (None,)  # no parent metadata -> depth 0
+        return (
+            "IB_FAKE",
+            None,
+        )  # (channel_id, metadata), BACKLOG #2593  # no parent metadata -> depth 0
     if sql == ss._SQL_SELECT_MESSAGE_EXISTS:
         return None
     return None

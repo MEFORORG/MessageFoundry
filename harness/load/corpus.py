@@ -157,8 +157,12 @@ def corpus_from_file(path: str | Path, ids: ControlIds) -> Corpus:
     """Build a replay :class:`Corpus` from a **committed, de-identified dataset** (ADR 0030 §6) —
     the JSONL the anonymizer / capture sink writes (``{"control_id", "raw", ...}`` per line, ``raw``
     being a whole HL7 message). Each message is parsed and indexed by ``(code, trigger)`` from its
-    MSH-9, so the harness can replay a PHI-free corpus of **real-shaped** traffic instead of synthetic
-    generation — the point of the anonymizer. ``next()``'s MSH-10 restamp applies unchanged.
+    MSH-9, so the harness can replay a de-identified corpus of **real-shaped** traffic instead of
+    synthetic generation — the point of the anonymizer. ``next()``'s MSH-10 restamp applies
+    unchanged.
+
+    De-identified does not mean guaranteed free of PHI: ``docs/PHI.md`` section 9 says what the
+    anonymizer's leak-check refuses and what it lets through.
 
     Raises :class:`~harness.load.profile.LoadProfileError` if the file is empty or a line is not a
     JSON record carrying a parseable ``raw`` message.

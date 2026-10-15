@@ -100,6 +100,20 @@ from messagefoundry.redaction import safe_text
 from messagefoundry.service_status import _system_exe
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
+from messagefoundry.store.cell_tag import (
+    CellTagError,
+    audits_cell_tag,
+    dead_letters_on_cell_tag,
+    is_row_tagged,
+    message_cell_aad,
+    open_message_cell,
+    open_preset_criteria,
+    preset_criteria_aad,
+    report_cell_tag_failures,
+    row_tag_aad,
+    row_tag_columns,
+    withhold_message_cells,
+)
 from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
@@ -115,7 +129,7 @@ from messagefoundry.store.crypto import (
     cell_aad,
     cipher_info,
     decrypt_json_cell,
-    report_unmarked,
+    report_sealed_surface,
     rotation_fingerprint_key,
 )
 from messagefoundry.store.document_strip import StripResult, cutoff_for
@@ -145,7 +159,17 @@ from messagefoundry.store.queue_tag import (
     queue_row_aad,
     report_queue_tag_failure,
 )
-from messagefoundry.store.row_seal import SESSION_KIND, RowSealer, RowSealError
+from messagefoundry.store.row_seal import (
+    ADSET_KIND,
+    PASSKEYS_LABEL,
+    ROLE_KIND,
+    SEAL_PREFIX,
+    SESSION_KIND,
+    USER_KIND,
+    RowSealer,
+    RowSealError,
+    seal_bytes,
+)
 from messagefoundry.store.schema_verify import (
     SchemaMismatchError,
     is_schema_step_error,
@@ -1252,10 +1276,6 @@ _SESSION_RESEAL: Final = (
     " seal=? WHERE token_hash=? AND seal=?"
 )
 
-#: Raises an account's session epoch, which ends every session minted under the old one (BACKLOG
-#: #2592). Run beside every whole-account revoke.
-_BUMP_SESSION_EPOCH_SQL: Final = "UPDATE users SET session_epoch=session_epoch+1 WHERE id=?"
-
 
 def session_reseal_params(new: SessionRecord, old: SessionRecord) -> tuple[object, ...]:
     """The parameters :data:`_SESSION_RESEAL` binds, in order: ``new``'s sealed columns and seal,
@@ -1678,38 +1698,41 @@ class AdminRemoval(StrEnum):
         return self is not AdminRemoval.SET_ROLES or admin_role_id not in role_ids
 
 
-#: The last-administrator guard's read (vault BACKLOG #2779): among enabled accounts holding the
-#: role, how many are the target and how many are not. Binds: user id, user id, role id. The ids
-#: are compared in SQL rather than in Python so the guard matches ids exactly as the write's
+#: The last-administrator guard's read (vault BACKLOG #2779): every enabled account holding the
+#: role, each with a flag for whether it is the target. Binds: user id, role id. The ids are
+#: compared in SQL rather than in Python so the guard matches ids exactly as the write's
 #: ``WHERE id=?`` does, under the database's own collation. SQL Server runs it as is; Postgres
 #: carries a ``$n``/boolean twin. One more copy of "enabled administrator" beside the service's
 #: enumerations (``AuthService.has_notifiable_admin`` lists them); a condition added to one belongs
-#: in all.
-_SQL_ADMIN_GUARD_COUNTS = (
-    "SELECT COALESCE(SUM(CASE WHEN u.id = ? THEN 1 ELSE 0 END), 0),"
-    " COALESCE(SUM(CASE WHEN u.id <> ? THEN 1 ELSE 0 END), 0)"
+#: in all. Since BACKLOG #2592 the other holders are counted only when their record passes its
+#: integrity seal (:func:`admin_guard_counts`), as the service's enumerations count them.
+_SQL_ADMIN_GUARD_HOLDERS = (
+    "SELECT u.id, CASE WHEN u.id = ? THEN 1 ELSE 0 END"
     " FROM users u JOIN user_roles r ON r.user_id = u.id"
     " WHERE r.role_id = ? AND u.disabled = 0"
 )
 
-#: The compare-and-set behind ``withdraw_ad_channel_scope`` on SQLite. Postgres carries a ``$n``
-#: twin and SQL Server a collation-pinned one. Binds: new source, now, user id, the expected scope,
-#: the manual marker.
-WITHDRAW_AD_SCOPE_SQL: Final = (
-    "UPDATE users SET channel_scope=NULL, channel_scope_source=?, updated_at=?"
-    " WHERE id=? AND channel_scope = ?"
-    " AND (channel_scope_source IS NULL OR channel_scope_source <> ?)"
-)
 
-#: ``set_user_federated_subject``'s two statements on SQLite: unconditional, and conditional on the
-#: row holding no pair (``expect_unbound``, BACKLOG #1143). Both literal, so no SQL is assembled.
-_SET_FEDERATED_SQL: Final = (
-    "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?"
-)
-_SET_FEDERATED_IF_UNBOUND_SQL: Final = (
-    "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?"
-    " AND oidc_issuer IS NULL AND oidc_subject IS NULL"
-)
+async def admin_guard_counts(
+    holders: Iterable[tuple[str, bool]],
+    sealer: RowSealer | None,
+    read_record: Callable[[str], Awaitable[UserAuthzRecord | None]],
+) -> tuple[int, int]:
+    """``(target, others)`` for the last-administrator guard from :data:`_SQL_ADMIN_GUARD_HOLDERS`'
+    rows (BACKLOG #2592). Another holder counts only when its record passes its seal, read with
+    ``read_record`` inside the guard's transaction: a refused administrator can sign nobody in, so
+    counting it would let the last usable administrator be removed."""
+    target = others = 0
+    for holder_id, is_target in holders:
+        if is_target:
+            target += 1
+            continue
+        record = await read_record(holder_id)
+        if record is not None and user_seal_ok(sealer, record):
+            others += 1
+    return target, others
+
+
 #: The session sweep a bind and an unbind each run inside their own transaction. A revoke blanks
 #: the seal (BACKLOG #2592): that needs no key, and a revoked row then fails its seal even with
 #: ``revoked_at`` put back to NULL. Each caller also raises the account's session epoch.
@@ -1835,11 +1858,13 @@ class UserRecord:
     # mutable credential state. The login-time rehash (``set_password_hash``) never writes it.
     password_generated: bool = False
     # THE ACCOUNT'S SESSION EPOCH (BACKLOG #2592). Every whole-account session revoke raises it by
-    # one, and a session resolves only while its own ``user_epoch`` equals it. The session's copy is
-    # sealed; this column is not yet, because the account row has no seal of its own. Until it does,
-    # the epoch orders the store's own writes (a sign-in racing an "end every session") and is not
-    # an integrity control on its own.
+    # one, and a session resolves only while its own ``user_epoch`` equals it. Both copies are
+    # sealed: the session's in the session seal, this one in the account's own seal.
     session_epoch: int = 0
+    #: Every column of the row as it was read, for the integrity seal (BACKLOG #2592). Carries the
+    #: TOTP ciphertext and the recovery-code hashes, so it is never printed or compared, and nothing
+    #: but the seal check and the store's write helper reads it. ``None`` on a record built by hand.
+    row: UserRow | None = field(default=None, compare=False, repr=False)
 
     def sign_in_locked(self, now: float) -> bool:
         """Whether the SIGN-IN lock is live at ``now``."""
@@ -1903,6 +1928,7 @@ class UserRecord:
             # Hard subscript (BACKLOG #2592): a missing key would decode as epoch 0, which every
             # session minted before a revoke also carries, so it is the OPEN direction.
             session_epoch=int(d["session_epoch"]),
+            row=UserRow.from_mapping(d),
         )
 
 
@@ -2070,6 +2096,1084 @@ class WebAuthnCredential:
             aaguid=d.get("aaguid"),
             created_at=float(d["created_at"]),
             last_used_at=_opt_float(d.get("last_used_at")),
+        )
+
+
+# --- the sealed user record (BACKLOG #2592) ----------------------------------------------------
+#
+# One seal per account covers its whole authorization record: every column of its ``users`` row,
+# its ``user_roles`` rows, and a digest of its passkeys (``users.cred_digest``). The store writes it,
+# through one helper per backend; ``AuthService._load_user`` checks it. The canonical form is built
+# from :class:`UserRow`'s own fields, so a column added later is sealed by default and only an entry
+# in :data:`USER_SEAL_EXCLUDED` leaves one out.
+
+#: The ``users`` columns a user seal leaves out, each with its reason (BACKLOG #2592).
+#: ``tests/test_user_seal.py`` pins this list.
+USER_SEAL_EXCLUDED: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "authz_seal": "the seal itself",
+    }
+)
+
+#: The ``webauthn_credentials`` columns the passkey digest leaves out, each with its reason.
+PASSKEY_DIGEST_EXCLUDED: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "sign_count": "written on every assertion, by a compare-and-set",
+        "last_used_at": "written on every assertion, with the sign count",
+    }
+)
+
+
+def _opt_str(value: Any) -> str | None:
+    return None if value is None else str(value)
+
+
+@dataclass(frozen=True)
+class UserRow:
+    """Every column of one ``users`` row, each in the one type every backend reads it back as
+    (BACKLOG #2592). ``tests/test_user_seal.py`` holds the fields equal to the table's columns on
+    each backend, so a column cannot sit outside the seal unnoticed."""
+
+    id: str
+    username: str
+    auth_provider: str
+    display_name: str | None
+    email: str | None
+    notify_email: str | None
+    disabled: bool
+    created_at: float
+    updated_at: float
+    last_login_at: float | None
+    password_hash: str | None
+    password_changed_at: float | None
+    must_change_password: bool
+    failed_attempts: int
+    locked_until: float | None
+    channel_scope: str | None
+    totp_secret: str | None
+    totp_enabled: bool
+    totp_enrolled_at: float | None
+    totp_recovery_codes: str | None
+    last_totp_step: int | None
+    oidc_issuer: str | None
+    oidc_subject: str | None
+    directory_object_id: str | None
+    password_claimed_at: float | None
+    channel_scope_source: str | None
+    lock_cycles: int
+    second_step_failed_attempts: int
+    second_step_locked_until: float | None
+    second_step_lock_cycles: int
+    password_generated: bool
+    session_epoch: int
+    #: A digest of the account's passkeys (:func:`passkey_digest`), ``""`` with none.
+    cred_digest: str
+    #: The seal (``mfseal:v1:...``) over everything else. ``""`` on a keyless store.
+    authz_seal: str
+
+    @classmethod
+    def from_mapping(cls, d: Mapping[str, Any]) -> UserRow:
+        """Hard subscripts throughout: every reader is a ``SELECT *``, and a row missing a column
+        must fail loudly rather than decode a default the seal was never made over."""
+        last_step = d["last_totp_step"]
+        return cls(
+            id=str(d["id"]),
+            username=str(d["username"]),
+            auth_provider=str(d["auth_provider"]),
+            display_name=_opt_str(d["display_name"]),
+            email=_opt_str(d["email"]),
+            notify_email=_opt_str(d["notify_email"]),
+            disabled=bool(d["disabled"]),
+            created_at=float(d["created_at"]),
+            updated_at=float(d["updated_at"]),
+            last_login_at=_opt_float(d["last_login_at"]),
+            password_hash=_opt_str(d["password_hash"]),
+            password_changed_at=_opt_float(d["password_changed_at"]),
+            must_change_password=bool(d["must_change_password"]),
+            failed_attempts=int(d["failed_attempts"]),
+            locked_until=_opt_float(d["locked_until"]),
+            channel_scope=_opt_str(d["channel_scope"]),
+            totp_secret=_opt_str(d["totp_secret"]),
+            totp_enabled=bool(d["totp_enabled"]),
+            totp_enrolled_at=_opt_float(d["totp_enrolled_at"]),
+            totp_recovery_codes=_opt_str(d["totp_recovery_codes"]),
+            last_totp_step=None if last_step is None else int(last_step),
+            oidc_issuer=_opt_str(d["oidc_issuer"]),
+            oidc_subject=_opt_str(d["oidc_subject"]),
+            directory_object_id=_opt_str(d["directory_object_id"]),
+            password_claimed_at=_opt_float(d["password_claimed_at"]),
+            channel_scope_source=_opt_str(d["channel_scope_source"]),
+            lock_cycles=int(d["lock_cycles"]),
+            second_step_failed_attempts=int(d["second_step_failed_attempts"]),
+            second_step_locked_until=_opt_float(d["second_step_locked_until"]),
+            second_step_lock_cycles=int(d["second_step_lock_cycles"]),
+            password_generated=bool(d["password_generated"]),
+            session_epoch=int(d["session_epoch"]),
+            cred_digest=str(d["cred_digest"] or ""),
+            authz_seal=str(d["authz_seal"] or ""),
+        )
+
+    def recovery_code_hashes(self) -> list[str]:
+        """The remaining single-use recovery-code hashes this row holds, or ``[]``."""
+        if self.totp_recovery_codes is None:
+            return []
+        return [str(h) for h in json.loads(self.totp_recovery_codes)]
+
+    def write_params(self) -> tuple[object, ...]:
+        """Every column but ``id``, in :class:`UserRow` field order, as the write statements bind
+        them. Booleans go in as ``bool``; each backend's driver stores them in its own type."""
+        return tuple(getattr(self, f.name) for f in _dc_fields(self) if f.name != "id")
+
+
+@dataclass(frozen=True)
+class RoleGrant:
+    """One ``user_roles`` row of an account, as the user seal covers it (BACKLOG #2592)."""
+
+    role_id: str
+    assigned_at: float
+    assigned_by: str | None
+
+    @classmethod
+    def from_mapping(cls, d: Mapping[str, Any]) -> RoleGrant:
+        return cls(
+            role_id=str(d["role_id"]),
+            assigned_at=float(d["assigned_at"]),
+            assigned_by=_opt_str(d["assigned_by"]),
+        )
+
+
+@dataclass(frozen=True)
+class UserAuthzRecord:
+    """One account's whole authorization record: its ``users`` row and its role rows, sorted by
+    role id (BACKLOG #2592). The one value a user seal is computed over."""
+
+    row: UserRow
+    roles: tuple[RoleGrant, ...] = ()
+
+    @classmethod
+    def of(cls, row: UserRow, roles: Iterable[RoleGrant]) -> UserAuthzRecord:
+        return cls(row=row, roles=tuple(sorted(roles, key=lambda g: g.role_id)))
+
+    @property
+    def role_ids(self) -> tuple[str, ...]:
+        return tuple(g.role_id for g in self.roles)
+
+    def changed(self, **columns: Any) -> UserAuthzRecord:
+        """This record with the named ``users`` columns replaced."""
+        return replace(self, row=replace(self.row, **columns))
+
+    def with_roles(
+        self, role_ids: Iterable[str], *, assigned_by: str | None, now: float
+    ) -> UserAuthzRecord:
+        """This record holding exactly ``role_ids``, each assigned at ``now`` by ``assigned_by``,
+        as :meth:`MessageStore.set_user_roles` has always written them."""
+        grants = {r: RoleGrant(r, float(now), assigned_by) for r in role_ids}
+        return UserAuthzRecord.of(self.row, grants.values())
+
+    def bump_epoch(self) -> UserAuthzRecord:
+        """This record with its session epoch raised by one, which ends every session minted under
+        the old one."""
+        return self.changed(session_epoch=self.row.session_epoch + 1)
+
+    def seal_fields(self) -> tuple[tuple[str, object], ...]:
+        """The ``(name, value)`` pairs a user seal covers: every :class:`UserRow` field not in
+        :data:`USER_SEAL_EXCLUDED`, then the role rows, counted."""
+        out: list[tuple[str, object]] = [
+            (f.name, getattr(self.row, f.name))
+            for f in _dc_fields(self.row)
+            if f.name not in USER_SEAL_EXCLUDED
+        ]
+        out.append(("roles", len(self.roles)))
+        for grant in self.roles:
+            out.extend(
+                (
+                    ("role_id", grant.role_id),
+                    ("assigned_at", grant.assigned_at),
+                    ("assigned_by", grant.assigned_by),
+                )
+            )
+        return tuple(out)
+
+
+def passkey_digest(creds: Iterable[WebAuthnCredential]) -> str:
+    """The digest of an account's passkeys that its user seal covers (``users.cred_digest``):
+    SHA-256 over every credential's fields but those :data:`PASSKEY_DIGEST_EXCLUDED` names, sorted by
+    the credential's id hash. ``""`` for no passkeys, which is what a new account carries."""
+    ordered = sorted(creds, key=lambda c: c.credential_id_hash)
+    if not ordered:
+        return ""
+    parts: list[tuple[str, object]] = [("count", len(ordered))]
+    for cred in ordered:
+        for f in _dc_fields(cred):
+            if f.name in PASSKEY_DIGEST_EXCLUDED:
+                continue
+            value = getattr(cred, f.name)
+            parts.append((f.name, json.dumps(value) if f.name == "transports" else value))
+    return hashlib.sha256(seal_bytes(PASSKEYS_LABEL, parts)).hexdigest()
+
+
+def seal_user(sealer: RowSealer | None, record: UserAuthzRecord) -> UserAuthzRecord:
+    """``record`` with its seal set: the sealer's seal over it under the active key, or empty on a
+    store with no sealer (BACKLOG #2592)."""
+    seal = "" if sealer is None else sealer.seal(USER_KIND, record.seal_fields())
+    return record.changed(authz_seal=seal)
+
+
+def user_seal_ok(sealer: RowSealer | None, record: UserAuthzRecord) -> bool:
+    """Whether ``record`` carries a valid seal under a key this process holds. Always True with no
+    sealer: a store that holds no key writes and checks no seals. With one, a missing or empty seal
+    fails like a wrong one, and so does a value the encoder cannot read."""
+    if sealer is None:
+        return True
+    try:
+        return sealer.verify_held(USER_KIND, record.seal_fields(), record.row.authz_seal)
+    except TypeError:
+        return False
+
+
+@dataclass(frozen=True)
+class VerifiedUser(UserRecord):
+    """A :class:`UserRecord` whose whole authorization record passed its integrity seal (BACKLOG
+    #2592). Built by ``AuthService._load_user`` and nothing else, which
+    ``tests/test_user_seal.py`` holds. The identity build and the credential checks take this type,
+    so a record nobody checked does not type-check there.
+
+    ``role_ids`` are the role rows the seal covered: the identity build reads them from here, not
+    from a second store read that nobody checked."""
+
+    role_ids: tuple[str, ...] = ()
+
+    @classmethod
+    def of(cls, user: UserRecord, role_ids: Iterable[str]) -> VerifiedUser:
+        values = {f.name: getattr(user, f.name) for f in _dc_fields(UserRecord)}
+        return cls(**values, role_ids=tuple(role_ids))
+
+    @property
+    def cred_digest(self) -> str:
+        return "" if self.row is None else self.row.cred_digest
+
+    @property
+    def has_passkeys(self) -> bool:
+        """Whether the sealed record names at least one passkey."""
+        return self.cred_digest != ""
+
+    def recovery_code_hashes(self) -> list[str]:
+        """The recovery-code hashes the seal covered, or ``[]``."""
+        return [] if self.row is None else self.row.recovery_code_hashes()
+
+
+# The statements that write a sealed user record (BACKLOG #2592), with `?` placeholders: SQLite and
+# SQL Server run them as written, Postgres carries `$n` twins. Each names every column, in
+# `UserRow` field order, so the write and the seal cover the same row. They are used only by each
+# backend's `create_user` and `_write_user`; `tests/test_user_seal.py` keeps it so.
+_USER_INSERT: Final = (
+    "INSERT INTO users (id, username, auth_provider, display_name, email, notify_email, disabled,"
+    " created_at, updated_at, last_login_at, password_hash, password_changed_at,"
+    " must_change_password, failed_attempts, locked_until, channel_scope, totp_secret,"
+    " totp_enabled, totp_enrolled_at, totp_recovery_codes, last_totp_step, oidc_issuer,"
+    " oidc_subject, directory_object_id, password_claimed_at, channel_scope_source, lock_cycles,"
+    " second_step_failed_attempts, second_step_locked_until, second_step_lock_cycles,"
+    " password_generated, session_epoch, cred_digest, authz_seal)"
+    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+)
+_USER_RESEAL: Final = (
+    "UPDATE users SET username=?, auth_provider=?, display_name=?, email=?, notify_email=?,"
+    " disabled=?, created_at=?, updated_at=?, last_login_at=?, password_hash=?,"
+    " password_changed_at=?, must_change_password=?, failed_attempts=?, locked_until=?,"
+    " channel_scope=?, totp_secret=?, totp_enabled=?, totp_enrolled_at=?, totp_recovery_codes=?,"
+    " last_totp_step=?, oidc_issuer=?, oidc_subject=?, directory_object_id=?,"
+    " password_claimed_at=?, channel_scope_source=?, lock_cycles=?,"
+    " second_step_failed_attempts=?, second_step_locked_until=?, second_step_lock_cycles=?,"
+    " password_generated=?, session_epoch=?, cred_digest=?, authz_seal=?"
+    " WHERE id=? AND authz_seal=?"
+)
+_USER_ROLES_CLEAR: Final = "DELETE FROM user_roles WHERE user_id=?"
+_USER_ROLE_INSERT: Final = (
+    "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by) VALUES (?,?,?,?)"
+)
+_WEBAUTHN_INSERT: Final = (
+    "INSERT INTO webauthn_credentials (credential_id_hash, credential_id, user_id,"
+    " rp_id, public_key, sign_count, transports, device_type, backed_up, label,"
+    " aaguid, created_at, last_used_at)"
+    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+_WEBAUTHN_DELETE_ONE: Final = (
+    "DELETE FROM webauthn_credentials WHERE user_id=? AND credential_id_hash=?"
+)
+_WEBAUTHN_DELETE_ALL: Final = "DELETE FROM webauthn_credentials WHERE user_id=?"
+
+# The role write (BACKLOG #2592), every column in `RoleRow` field order. SQLite only: Postgres
+# carries a `$n` twin and SQL Server a MERGE. Used only by `_write_role`; tests/test_role_seal.py
+# keeps it so.
+_ROLE_UPSERT: Final = (
+    "INSERT INTO roles (id, display_name, description, builtin, permissions, seal)"
+    " VALUES (?,?,?,?,?,?)"
+    " ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name,"
+    " description=excluded.description, builtin=excluded.builtin,"
+    " permissions=excluded.permissions, seal=excluded.seal"
+)
+
+
+def user_insert_params(record: UserAuthzRecord) -> tuple[object, ...]:
+    """The parameters :data:`_USER_INSERT` binds, in order."""
+    return (record.row.id, *record.row.write_params())
+
+
+def user_reseal_params(new: UserAuthzRecord, old: UserAuthzRecord) -> tuple[object, ...]:
+    """The parameters :data:`_USER_RESEAL` binds: ``new``'s columns and seal, then the id and the
+    seal of the row as it was read."""
+    return (*new.row.write_params(), old.row.id, old.row.authz_seal)
+
+
+def webauthn_insert_params(cred: WebAuthnCredential) -> tuple[object, ...]:
+    """The parameters :data:`_WEBAUTHN_INSERT` binds, in order."""
+    return (
+        cred.credential_id_hash,
+        cred.credential_id,
+        cred.user_id,
+        cred.rp_id,
+        cred.public_key,
+        cred.sign_count,
+        json.dumps(cred.transports) if cred.transports is not None else None,
+        cred.device_type,
+        bool(cred.backed_up),
+        cred.label,
+        cred.aaguid,
+        cred.created_at,
+        cred.last_used_at,
+    )
+
+
+def new_user_record(
+    *,
+    user_id: str,
+    username: str,
+    auth_provider: str,
+    display_name: str | None,
+    email: str | None,
+    notify_email: str | None,
+    password_hash: str | None,
+    must_change_password: bool,
+    password_generated: bool,
+    directory_object_id: str | None,
+    now: float,
+) -> UserAuthzRecord:
+    """The whole row ``create_user`` writes, every float as the backend reads it back, so the seal
+    made over it verifies after the round trip (BACKLOG #2592). No roles, no passkeys."""
+    now = float(now)
+    row = UserRow(
+        id=user_id,
+        username=username,
+        auth_provider=auth_provider,
+        display_name=display_name,
+        email=email,
+        notify_email=notify_email,
+        disabled=False,
+        created_at=now,
+        updated_at=now,
+        last_login_at=None,
+        password_hash=password_hash,
+        password_changed_at=now if password_hash is not None else None,
+        must_change_password=bool(must_change_password),
+        failed_attempts=0,
+        locked_until=None,
+        channel_scope=None,
+        totp_secret=None,
+        totp_enabled=False,
+        totp_enrolled_at=None,
+        totp_recovery_codes=None,
+        last_totp_step=None,
+        oidc_issuer=None,
+        oidc_subject=None,
+        directory_object_id=directory_object_id,
+        password_claimed_at=None,
+        channel_scope_source=None,
+        lock_cycles=0,
+        second_step_failed_attempts=0,
+        second_step_locked_until=None,
+        second_step_lock_cycles=0,
+        password_generated=bool(password_generated),
+        session_epoch=0,
+        cred_digest="",
+        authz_seal="",
+    )
+    return UserAuthzRecord(row=row)
+
+
+#: A change to one user record, for a backend's ``_write_user``: the new record, or ``None`` to
+#: write nothing (a condition the old statement carried in its WHERE did not hold).
+UserChange = Callable[[UserAuthzRecord], UserAuthzRecord | None]
+
+
+def full_authentication_clear(r: UserAuthzRecord, now: float) -> UserAuthzRecord:
+    """What a FULL AUTHENTICATION writes (ADR 0197 AC-8): the sign-in stamp and all six lockout
+    columns back to "no history". Zeroing the sign-in cycle count is the ADR's recommendation,
+    matching "consecutive failures": an owner who signs in restarts the escalation."""
+    return r.changed(
+        last_login_at=float(now),
+        failed_attempts=0,
+        locked_until=None,
+        lock_cycles=0,
+        second_step_failed_attempts=0,
+        second_step_locked_until=None,
+        second_step_lock_cycles=0,
+        updated_at=float(now),
+    )
+
+
+def lockout_clear(r: UserAuthzRecord, *, reset_cycles: bool, now: float) -> UserAuthzRecord:
+    """What ``clear_lockout`` writes (ADR 0197 AC-9, the ``admin-unlock`` write): both locks and
+    both failure counts. Both cycle counts are KEPT unless ``reset_cycles``, so an attacker who
+    re-locks after an unlock resumes at the escalated length (the ADR's recommendation); the operator
+    passes ``--reset-cycles`` when they know the campaign is over."""
+    out = r.changed(
+        failed_attempts=0,
+        locked_until=None,
+        second_step_failed_attempts=0,
+        second_step_locked_until=None,
+        updated_at=float(now),
+    )
+    return out.changed(lock_cycles=0, second_step_lock_cycles=0) if reset_cycles else out
+
+
+def password_change(
+    *,
+    password_hash: str,
+    password_generated: bool,
+    must_change_password: bool,
+    require_totp: bool,
+    now: float,
+) -> UserChange:
+    """What ``set_password`` writes (ADR 0197 Decision item 8, BACKLOG #1245).
+
+    Both locks, both failure counts and the SECOND-STEP cycle count are cleared, because the
+    password those failures proved is gone; the sign-in cycle count stays: a caller who knows only
+    the username is not answered by a new password.
+
+    ``password_claimed_at`` is single-writer and WRITE-ONCE (BACKLOG #1245). A caller passing
+    ``must_change_password`` False is issuing a credential the holder chose, so the claim is
+    recorded, and a stamp already there is kept; that monotonicity is the point, since the flag it
+    replaces as a claimed-ness test is not monotonic. A caller passing True (an admin-created
+    account, an admin reset) can neither stamp nor clear it. Self-service rotation is the intended
+    caller passing False and need not be the only one; the invariant to preserve is that every
+    caller passing False has just authenticated the holder. Do not add a second writer of the
+    column, and never set it back to NULL after creation.
+
+    With ``require_totp`` (ADR 0197 Amendment A) the write happens only while TOTP is on with a
+    secret, so an ``admin_reset_mfa`` landing first makes it write nothing. TOTP with no secret is
+    no way past the lock, hence the second test."""
+    when = float(now)
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if require_totp and not (r.row.totp_enabled and r.row.totp_secret is not None):
+            return None
+        claimed = r.row.password_claimed_at
+        if not must_change_password and claimed is None:
+            claimed = when
+        return r.changed(
+            password_hash=password_hash,
+            password_changed_at=when,
+            must_change_password=bool(must_change_password),
+            password_claimed_at=claimed,
+            failed_attempts=0,
+            locked_until=None,
+            second_step_failed_attempts=0,
+            second_step_locked_until=None,
+            second_step_lock_cycles=0,
+            password_generated=bool(password_generated),
+            updated_at=when,
+        )
+
+    return apply
+
+
+def lockout_increment(
+    counter: LockoutCounter,
+    *,
+    threshold: int,
+    lockout_seconds: float,
+    max_lockout_seconds: float,
+    now: float,
+    out: list[LockoutIncrement],
+) -> UserChange:
+    """One failed credential attempt on ``counter``, with the lockout policy applied
+    (:func:`next_lockout_state`). The answer is appended to ``out``."""
+    attempts_col, until_col, cycles_col = LOCKOUT_COLUMNS[counter]
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord:
+        state = next_lockout_state(
+            failed_attempts=int(getattr(r.row, attempts_col)),
+            locked_until=getattr(r.row, until_col),
+            lock_cycles=int(getattr(r.row, cycles_col)),
+            now=now,
+            threshold=threshold,
+            lockout_seconds=lockout_seconds,
+            max_lockout_seconds=max_lockout_seconds,
+            escalate=lockout_escalates(
+                counter, auth_provider=r.row.auth_provider, totp_enabled=r.row.totp_enabled
+            ),
+            lockable=lockout_arms(counter, password_generated=r.row.password_generated),
+        )
+        out.append(LockoutIncrement(state.attempts, state.just_locked, state.cycles))
+        return r.changed(
+            **{
+                attempts_col: state.attempts,
+                until_col: _opt_float(state.locked_until),
+                cycles_col: state.cycles,
+            },
+            updated_at=float(now),
+        )
+
+    return apply
+
+
+def totp_enable(recovery_code_hashes: Sequence[str], now: float) -> UserChange:
+    """What ``enable_totp`` writes, only where a secret is staged and TOTP is still off (BACKLOG
+    #2224). The enrolment confirm rotates the session BEFORE it enables TOTP (BACKLOG #1902), so an
+    ``admin_reset_mfa`` can clear the staged secret inside that window, and a second confirm can
+    enable first; either way this writes nothing and the caller refuses."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if r.row.totp_secret is None or r.row.totp_enabled:
+            return None
+        return r.changed(
+            totp_enabled=True,
+            totp_enrolled_at=float(now),
+            totp_recovery_codes=json.dumps(list(recovery_code_hashes)),
+            updated_at=float(now),
+        )
+
+    return apply
+
+
+def totp_disable(r: UserAuthzRecord, now: float) -> UserAuthzRecord:
+    """What ``disable_totp`` writes. ``last_totp_step`` goes too (ADR 0197 Amendment A): the
+    high-water mark belonged to the secret being removed, and a new secret has no history."""
+    return r.changed(
+        totp_secret=None,
+        totp_enabled=False,
+        totp_enrolled_at=None,
+        totp_recovery_codes=None,
+        last_totp_step=None,
+        updated_at=float(now),
+    )
+
+
+def totp_replace(
+    *,
+    sealed_secret: str | None,
+    recovery_code_hashes: Sequence[str],
+    step: int,
+    expected_enrolled_at: float | None,
+    now: float,
+) -> UserChange:
+    """``replace_totp_enrolment``'s swap (ADR 0171 Amendment B): only where TOTP is on, with a
+    seed, still enrolled at ``expected_enrolled_at``. The session epoch is raised in the same
+    write, since the caller ends every session with it."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if not r.row.totp_enabled or r.row.totp_secret is None:
+            return None
+        if r.row.totp_enrolled_at != _opt_float(expected_enrolled_at):
+            return None
+        return r.bump_epoch().changed(
+            totp_secret=sealed_secret,
+            totp_enrolled_at=float(now),
+            totp_recovery_codes=json.dumps(list(recovery_code_hashes)),
+            last_totp_step=int(step),
+            updated_at=float(now),
+        )
+
+    return apply
+
+
+def recovery_code_spend(code_hash: str, now: float) -> UserChange:
+    """Remove one recovery-code hash; nothing is written when it is already gone, which is how two
+    concurrent verifications cannot both spend it (WP-14)."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        hashes = r.row.recovery_code_hashes()
+        if code_hash not in hashes:
+            return None
+        hashes.remove(code_hash)
+        return r.changed(totp_recovery_codes=json.dumps(hashes), updated_at=float(now))
+
+    return apply
+
+
+def totp_step_spend(step: int) -> UserChange:
+    """Record ``step`` as the highest consumed TOTP time-step, only when it is strictly greater than
+    the one stored, which makes each code single-use (ASVS 6.5.1)."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        last = r.row.last_totp_step
+        if last is not None and last >= step:
+            return None
+        return r.changed(last_totp_step=int(step))
+
+    return apply
+
+
+def scope_if_source(
+    scope_json: str | None,
+    source: ChannelScopeSource,
+    expected_source: ChannelScopeSource | None,
+    now: float,
+) -> UserChange:
+    """``set_user_channel_scope_if_source``'s compare-and-set (BACKLOG #2098): the scope and its
+    source, only while the row's source is still ``expected_source`` (``None`` matching NULL)."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if r.row.channel_scope_source != expected_source:
+            return None
+        return r.changed(
+            channel_scope=scope_json, channel_scope_source=source, updated_at=float(now)
+        )
+
+    return apply
+
+
+def scope_withdrawal(expected_scope: str, now: float) -> UserChange:
+    """``withdraw_ad_channel_scope``'s compare-and-set (BACKLOG #1927): withdraw to NULL, marked
+    ``ad``, only while the row holds ``expected_scope`` exactly and no administrator set it. The
+    compare is Python's, so it is byte-exact on every backend, as SQL Server's pinned collation
+    made it there."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if r.row.channel_scope != expected_scope:
+            return None
+        if r.row.channel_scope_source == SCOPE_SOURCE_MANUAL:
+            return None
+        return r.changed(
+            channel_scope=None, channel_scope_source=SCOPE_SOURCE_AD, updated_at=float(now)
+        )
+
+    return apply
+
+
+def federated_bind(issuer: str, subject: str, *, expect_unbound: bool, now: float) -> UserChange:
+    """``set_user_federated_subject``'s write, with the session epoch raised in the same write
+    because the caller ends the account's sessions with it. With ``expect_unbound`` (BACKLOG
+    #1143) only a row holding no pair is written."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if expect_unbound and (r.row.oidc_issuer is not None or r.row.oidc_subject is not None):
+            return None
+        return r.bump_epoch().changed(
+            oidc_issuer=issuer, oidc_subject=subject, updated_at=float(now)
+        )
+
+    return apply
+
+
+def federated_unbind(r: UserAuthzRecord, now: float) -> UserAuthzRecord:
+    """``clear_user_federated_subject``'s write, epoch raised for the same reason as the bind."""
+    return r.bump_epoch().changed(oidc_issuer=None, oidc_subject=None, updated_at=float(now))
+
+
+def report_unsealed_users(count: int) -> None:
+    """Name, at a keyed open, the accounts that carry no integrity seal (BACKLOG #2592).
+
+    A keyed store refuses such an account on every read, the same as one whose seal is wrong: a
+    blank seal is exactly what a row inserted outside the store carries, so nothing seals one
+    automatically. They are accounts written before this store held a key, or before the seal
+    existed. The remedy is an account the store itself writes, such as ``provision-admin`` under a
+    new username, and not a sweep that would seal whatever the table holds."""
+    if count:
+        log.warning(
+            "%d user account(s) carry no integrity seal and are refused on every sign-in and"
+            " request (BACKLOG #2592); provision a new administrator with 'messagefoundry"
+            " provision-admin' under a new username, then recreate or remove these accounts",
+            count,
+        )
+
+
+def rotation_reseal(
+    sealer: RowSealer, active_prefix: str, reencrypt: Callable[[str, bytes], str]
+) -> UserChange:
+    """``rotate-key``'s change to one user record (BACKLOG #2592): the TOTP secret re-encrypted under
+    the active key when it is not already, and the record re-sealed under the active key. The seal
+    covers the secret's bytes, so the generic re-encrypt loops leave ``users.totp_secret`` to this
+    pass, which re-encrypts it and re-seals in one write after the old seal has been checked.
+    ``None`` (nothing written) for a record already sealed under the active key over an active-key
+    secret."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        secret = r.row.totp_secret
+        stale = bool(secret) and not str(secret).startswith(active_prefix)
+        if not stale and sealer.is_active(r.row.authz_seal):
+            return None
+        if not stale:
+            return r
+        aad = cell_aad("users", "totp_secret", r.row.id)
+        return r.changed(totp_secret=reencrypt(str(secret), aad))
+
+    return apply
+
+
+def report_refused_role_holder() -> None:
+    """Log a holder of a custom role being deleted whose record fails its integrity seal (BACKLOG
+    #2592). Its role row is deleted with the role, which needs no key, and nothing is re-sealed; the
+    account was already refused on every read, and reported there."""
+    log.warning(
+        "a holder of a deleted custom role failed its integrity seal; its role row was removed"
+        " and nothing was re-sealed (BACKLOG #2592)"
+    )
+
+
+def report_user_reseal(resealed: int, refused: int) -> None:
+    """Log what ``rotate-key``'s user re-seal pass did (BACKLOG #2592)."""
+    if resealed:
+        log.info("re-sealed %d user record(s) under the active key (rotation)", resealed)
+    if refused:
+        log.warning(
+            "%d user record(s) failed their integrity seal and were left as they are; each is"
+            " refused on every read (BACKLOG #2592)",
+            refused,
+        )
+
+
+def without_role(role_id: str) -> UserChange:
+    """The account's record with ``role_id`` removed; nothing written when it does not hold it."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if role_id not in r.role_ids:
+            return None
+        return replace(r, roles=tuple(g for g in r.roles if g.role_id != role_id))
+
+    return apply
+
+
+class UnknownRoleError(LookupError):
+    """A role write named a role id with no ``roles`` row; nothing was written (BACKLOG #2592).
+
+    Raised by each backend's ``_write_user`` for an id the write ADDS whose role was gone when the
+    write read the ``roles`` table, so a role deleted after a caller's own check is not granted. A
+    delete that commits after that read is refused instead by the ``user_roles`` foreign key, which
+    every backend has, as the driver's integrity error. Either way no record seals the id."""
+
+    def __init__(self, role_ids: Sequence[str]) -> None:
+        self.role_ids = tuple(role_ids)
+        super().__init__(f"no such role: {', '.join(self.role_ids)}")
+
+
+def existing_roles_only(
+    current: UserAuthzRecord, changed: UserAuthzRecord, present: Iterable[str]
+) -> UserAuthzRecord:
+    """``changed`` with every role id that has no ``roles`` row handled, given the ids that have
+    one (BACKLOG #2592). Each backend's ``_write_user`` calls it, inside its transaction, before it
+    seals a record whose roles changed.
+
+    An id the write adds raises :class:`UnknownRoleError`. An id the account already held is
+    dropped instead: it is a row its deleted role left behind, which grants nothing, and keeping it
+    would write it back, sealed, on every later role change."""
+    held = set(present)
+    added = [r for r in changed.role_ids if r not in held and r not in current.role_ids]
+    if added:
+        raise UnknownRoleError(added)
+    kept = tuple(g for g in changed.roles if g.role_id in held)
+    if len(kept) == len(changed.roles):
+        return changed
+    log.warning(
+        "a role write dropped %d role row(s) whose role no longer exists (BACKLOG #2592)",
+        len(changed.roles) - len(kept),
+    )
+    return replace(changed, roles=kept)
+
+
+# --- sealed role definitions and the directory maps (BACKLOG #2592) ----------------------------
+#
+# One seal per ``roles`` row, over the whole row, and one seal over each whole AD directory map (the
+# group-to-role map and the group-to-channel map), stored in ``authority_set_seal`` under the map's
+# name. The store writes them through one helper each per backend (``_write_role``,
+# ``_write_ad_map``); ``AuthService`` checks them where it reads them.
+#
+# A role write and a map write each replace the whole thing from the caller's values:
+# ``upsert_role`` writes every column of one row, and ``set_ad_group_role_map`` and
+# ``set_ad_group_scope_map`` write a whole map. Neither carries a stored value forward, so neither
+# needs the old seal to verify, and each seals exactly what its caller gave. That is the repair route
+# for a role or a map that fails its seal, or carries none: an administrator saves it again. The
+# reads an administrator edits from never show a failing role's permissions or a failing map's
+# pairs, so a re-save cannot copy a change made outside the store into a sealed row. A write that
+# DOES carry stored values forward checks them first and never re-seals a failing one: removing a
+# deleted role's pairs from the role map, and ``rotate-key``'s re-seal.
+
+#: The ``roles`` columns a role seal leaves out, each with its reason (BACKLOG #2592).
+#: ``tests/test_role_seal.py`` pins this list.
+ROLE_SEAL_EXCLUDED: Final[Mapping[str, str]] = MappingProxyType({"seal": "the seal itself"})
+
+#: The AD group-to-role map: its table, and the name its seal is stored under in
+#: ``authority_set_seal``. The name is inside the sealed bytes too, so a seal made for one map
+#: never verifies for the other.
+AD_ROLE_MAP: Final = "ad_group_role_map"
+#: The AD group-to-channel map, named the same way.
+AD_SCOPE_MAP: Final = "ad_group_scope_map"
+#: Each sealed directory map, by name, with the label its second column is sealed under.
+AD_MAPS: Final[Mapping[str, str]] = MappingProxyType(
+    {AD_ROLE_MAP: "role_id", AD_SCOPE_MAP: "channel"}
+)
+
+
+class ByName(Protocol):
+    """A read row any backend returns: subscript by column name (a `dict`, an `aiosqlite.Row`,
+    an `asyncpg.Record`)."""
+
+    def __getitem__(self, key: str, /) -> Any: ...
+
+
+@dataclass(frozen=True)
+class RoleRow:
+    """Every column of one ``roles`` row, each in the one type every backend reads it back as
+    (BACKLOG #2592). ``tests/test_role_seal.py`` holds the fields equal to the table's columns."""
+
+    id: str
+    display_name: str
+    description: str | None
+    builtin: bool
+    #: A custom role's JSON permission list; ``None`` on a built-in row, which resolves from code.
+    permissions: str | None
+    #: The seal (``mfseal:v1:...``) over everything else. ``""`` on a keyless store.
+    seal: str
+
+    @classmethod
+    def from_mapping(cls, d: ByName) -> RoleRow:
+        """Hard subscripts, as :meth:`UserRow.from_mapping` has, for the same reason."""
+        return cls(
+            id=str(d["id"]),
+            display_name=str(d["display_name"]),
+            description=_opt_str(d["description"]),
+            builtin=bool(d["builtin"]),
+            permissions=_opt_str(d["permissions"]),
+            seal=str(d["seal"] or ""),
+        )
+
+    def seal_fields(self) -> tuple[tuple[str, object], ...]:
+        """Every field not in :data:`ROLE_SEAL_EXCLUDED`, in field order."""
+        return tuple(
+            (f.name, getattr(self, f.name))
+            for f in _dc_fields(self)
+            if f.name not in ROLE_SEAL_EXCLUDED
+        )
+
+    def write_params(self) -> tuple[object, ...]:
+        """Every column, in field order, as the role write binds them."""
+        return tuple(getattr(self, f.name) for f in _dc_fields(self))
+
+
+def seal_role(sealer: RowSealer | None, row: RoleRow) -> RoleRow:
+    """``row`` with its seal set under the active key, or empty with no sealer (BACKLOG #2592)."""
+    return replace(row, seal="" if sealer is None else sealer.seal(ROLE_KIND, row.seal_fields()))
+
+
+def role_seal_ok(sealer: RowSealer | None, row: RoleRow) -> bool:
+    """Whether ``row`` carries a valid seal under a key this process holds. Always True with no
+    sealer. With one, a missing or empty seal fails like a wrong one."""
+    if sealer is None:
+        return True
+    try:
+        return sealer.verify_held(ROLE_KIND, row.seal_fields(), row.seal)
+    except TypeError:
+        return False
+
+
+def ad_group_keys(groups: Iterable[str]) -> frozenset[str]:
+    """AD group names as the maps store them: stripped, lower-cased, blanks dropped."""
+    return frozenset(g.strip().lower() for g in groups if g.strip())
+
+
+@dataclass(frozen=True)
+class AdMap:
+    """One whole AD directory map and its seal (BACKLOG #2592).
+
+    ``name`` is the map (:data:`AD_MAPS`). ``pairs`` are sorted ``(ad_group, value)``, the value
+    being a role id or a channel; the seal covers them and the name. ``missing`` names mapped role
+    ids with no ``roles`` row when the role map was read. It is not sealed: it is read beside the
+    map so a deleted role is never handed out, on SQL Server especially, where the role map has no
+    role foreign key. The channel map's ``missing`` is always empty."""
+
+    name: str
+    pairs: tuple[tuple[str, str], ...] = ()
+    seal: str = ""
+    missing: frozenset[str] = frozenset()
+
+    @classmethod
+    def of(
+        cls,
+        name: str,
+        pairs: Iterable[tuple[str, str]],
+        seal: str = "",
+        missing: Iterable[str] = (),
+    ) -> AdMap:
+        return cls(name, tuple(sorted(set(pairs))), seal, frozenset(missing))
+
+    @classmethod
+    def from_entries(cls, name: str, entries: Iterable[tuple[str, str]]) -> AdMap:
+        """The map an administrator's entries describe, as the map stores them: group names as
+        :func:`ad_group_keys` keeps them. A channel is stripped and a blank one dropped; a role id
+        is kept as given, and an unknown one is refused by the roles foreign key."""
+        if name == AD_SCOPE_MAP:
+            entries = [(g, v.strip()) for g, v in entries if v.strip()]
+        return cls.of(name, ((g.strip().lower(), v) for g, v in entries if g.strip()))
+
+    @classmethod
+    def from_rows(cls, name: str, rows: Iterable[ByName]) -> AdMap:
+        """The map from each backend's one-statement read: a ``seal`` row, if the map has one, and
+        a ``pair`` row per pair, each with ``live`` saying whether its value is a role with a
+        ``roles`` row (always true for a channel)."""
+        seal = ""
+        pairs: list[tuple[str, str]] = []
+        missing: set[str] = set()
+        for r in rows:
+            if str(r["k"]) == "seal":
+                seal = str(r["a"] or "")
+                continue
+            pair = (str(r["a"]), str(r["b"]))
+            pairs.append(pair)
+            if not r["live"]:
+                missing.add(pair[1])
+        return cls.of(name, pairs, seal, missing)
+
+    def seal_fields(self) -> tuple[tuple[str, object], ...]:
+        label = AD_MAPS[self.name]
+        out: list[tuple[str, object]] = [("map", self.name), ("pairs", len(self.pairs))]
+        for ad_group, value in self.pairs:
+            out.extend((("ad_group", ad_group), (label, value)))
+        return tuple(out)
+
+    def values_for(self, groups: Iterable[str]) -> set[str]:
+        """The role ids or channels this map gives ``groups``, leaving out a role with no
+        ``roles`` row."""
+        keys = ad_group_keys(groups)
+        return {v for g, v in self.pairs if g in keys and v not in self.missing}
+
+    def without_value(self, value: str) -> AdMap:
+        return replace(self, pairs=tuple(p for p in self.pairs if p[1] != value))
+
+
+def ad_map_seal_ok(sealer: RowSealer | None, current: AdMap) -> bool:
+    """Whether the map carries a valid seal under a key this process holds. Always True with no
+    sealer, and for an empty map, which grants nothing whatever its seal says. With pairs, a missing
+    or empty seal fails like a wrong one."""
+    if sealer is None or not current.pairs:
+        return True
+    try:
+        return sealer.verify_held(ADSET_KIND, current.seal_fields(), current.seal)
+    except TypeError:
+        return False
+
+
+#: A write to one AD map, for a backend's ``_write_ad_map``: a whole replacement map, which keeps
+#: nothing stored and so is never refused, or an edit of the stored map, which is checked first.
+AdMapChange = AdMap | Callable[[AdMap], AdMap]
+
+
+def ad_map_write(sealer: RowSealer | None, current: AdMap, change: AdMapChange) -> AdMap | None:
+    """What a backend's ``_write_ad_map`` writes over ``current``, the map it read inside its
+    transaction: the changed map, sealed, or ``None`` when nothing differs (BACKLOG #2592).
+
+    An edit (a callable) keeps stored pairs, so it raises :class:`RowSealError` when ``current``
+    fails its seal, and pairs written outside the store are never sealed in. A whole replacement
+    (an :class:`AdMap`) keeps nothing and is not refused; it is how an administrator repairs a map.
+    """
+    if isinstance(change, AdMap):
+        changed = replace(change, name=current.name)
+    elif not ad_map_seal_ok(sealer, current):
+        raise RowSealError(ADSET_KIND)
+    else:
+        changed = change(current)
+    seal = "" if sealer is None else sealer.seal(ADSET_KIND, changed.seal_fields())
+    new = replace(changed, seal=seal)
+    if new.pairs == current.pairs and new.seal == current.seal:
+        return None
+    return new
+
+
+class AdMapSql(NamedTuple):
+    """Postgres's or SQL Server's statements for one AD directory map (BACKLOG #2592), each used
+    only by that backend's ``get_ad_map`` (``read``) or ``_write_ad_map`` (the rest). SQLite names
+    the same statements as module constants (``_AD_ROLE_MAP_READ`` and its siblings), which say why;
+    a statement added here needs its SQLite twin there."""
+
+    #: The map and its seal in ONE statement, so a read never pairs one write's pairs with
+    #: another's seal: a ``seal`` row, then a ``pair`` row per pair with ``live`` saying whether a
+    #: mapped role has a ``roles`` row (always true for a channel). Binds the map's name.
+    read: str
+    #: Every pair, inside the writer's transaction.
+    pairs: str
+    #: The rewrite: clear the map, then insert each pair.
+    clear: str
+    insert: str
+
+
+# SQLite's statements for each AD directory map, the twins of the ``AdMapSql`` tables Postgres and
+# SQL Server carry. Each is a plain named string, and each call site names one directly, because
+# ``tests/test_writer_txn_is_the_only_begin.py`` reads every ``execute`` argument in this module as
+# text and pins how many it cannot read; a statement looked up in a table at run time is one it
+# cannot. ``_AD_*_READ`` is used only by ``get_ad_map``, the rest only by ``_write_ad_map``.
+_AD_ROLE_MAP_READ: Final = (
+    "SELECT 'seal' AS k, seal AS a, NULL AS b, 1 AS live FROM authority_set_seal WHERE name=?"
+    " UNION ALL"
+    " SELECT 'pair' AS k, m.ad_group AS a, m.role_id AS b, r.id IS NOT NULL AS live"
+    " FROM ad_group_role_map m LEFT JOIN roles r ON r.id = m.role_id"
+)
+_AD_ROLE_MAP_PAIRS: Final = "SELECT ad_group, role_id FROM ad_group_role_map"
+_AD_ROLE_MAP_CLEAR: Final = "DELETE FROM ad_group_role_map"
+_AD_ROLE_MAP_INSERT: Final = "INSERT INTO ad_group_role_map (ad_group, role_id) VALUES (?,?)"
+_AD_SCOPE_MAP_READ: Final = (
+    "SELECT 'seal' AS k, seal AS a, NULL AS b, 1 AS live FROM authority_set_seal WHERE name=?"
+    " UNION ALL"
+    " SELECT 'pair' AS k, ad_group AS a, channel AS b, 1 AS live FROM ad_group_scope_map"
+)
+_AD_SCOPE_MAP_PAIRS: Final = "SELECT ad_group, channel FROM ad_group_scope_map"
+_AD_SCOPE_MAP_CLEAR: Final = "DELETE FROM ad_group_scope_map"
+_AD_SCOPE_MAP_INSERT: Final = "INSERT INTO ad_group_scope_map (ad_group, channel) VALUES (?,?)"
+
+
+def _is_role_map(name: str) -> bool:
+    """Whether ``name`` is the role map rather than the channel map. Any other name raises, a map
+    added to :data:`AD_MAPS` later included, so a caller can branch on the answer without a name
+    falling through to the channel map's statements."""
+    if name == AD_ROLE_MAP:
+        return True
+    if name == AD_SCOPE_MAP:
+        return False
+    raise KeyError(name)
+
+
+def report_unsealed_role_records(count: int) -> None:
+    """Name, at a keyed open, the custom roles and directory maps that carry no integrity seal
+    (BACKLOG #2592). Each grants nothing until an administrator saves it again, which seals it;
+    nothing seals one automatically, for the reason :func:`report_unsealed_users` gives."""
+    if count:
+        log.warning(
+            "%d custom role(s) or directory map(s) carry no integrity seal and grant nothing"
+            " (BACKLOG #2592); an administrator saves each again through the console or the API"
+            " to seal it",
+            count,
+        )
+
+
+def report_refused_ad_role_map() -> None:
+    """Log a custom-role delete that met an AD group-to-role map failing its seal (BACKLOG #2592).
+    The role's pairs are deleted, which needs no key, and the map is not re-sealed, so it still
+    grants nothing until an administrator saves it again."""
+    log.warning(
+        "the AD group-to-role map failed its integrity seal during a role delete; the role's pairs"
+        " were removed and nothing was re-sealed (BACKLOG #2592)"
+    )
+
+
+def report_role_reseal(resealed: int, refused: int) -> None:
+    """Log what ``rotate-key``'s role and map re-seal pass did (BACKLOG #2592)."""
+    if resealed:
+        log.info(
+            "re-sealed %d role definition(s) and map(s) under the active key (rotation)", resealed
+        )
+    if refused:
+        log.warning(
+            "%d role definition(s) or map(s) failed their integrity seal and were left as they"
+            " are; each grants nothing (BACKLOG #2592)",
+            refused,
         )
 
 
@@ -3500,8 +4604,10 @@ def not_deployed_detail(destination: str) -> str:
 #: "off" would lose exactly the record needed to answer that, on exactly the deployments most likely
 #: to be asked. ``reply_returned`` is the routine happy-path counterpart and is deliberately NOT in
 #: the floor: it is thinnable like ``delivered``.
+#: ``reply_dropped`` joins it for the same reason (vault BACKLOG #3040 item 5): it is the one row
+#: that answers "you ignored our reply", and the delivery worker's WARNING says it was written.
 _AUDIT_FLOOR_EVENTS = frozenset(
-    {VIEWED_EVENT, "dead", "error", "failed", NOT_DEPLOYED_EVENT, "reply_timeout"}
+    {VIEWED_EVENT, "dead", "error", "failed", NOT_DEPLOYED_EVENT, "reply_timeout", "reply_dropped"}
 )
 
 #: The COMPLETE ``message_events.event`` vocabulary, shared by all three backends.
@@ -3542,11 +4648,17 @@ MESSAGE_EVENT_KINDS: Final[frozenset[str]] = frozenset(
         # out of every log, event and exception).
         "reply_returned",
         "reply_timeout",
+        # vault BACKLOG #3040 item 5: a delivered row whose 2xx reply body was over the byte bound
+        # and dropped. Written by mark_done with the "delivered" row. Status and bound only, never
+        # a byte of the reply.
+        "reply_dropped",
     }
 )
 
 #: Kinds only the store itself writes, refused from the public ``record_message_event``.
-_STORE_ONLY_EVENT_KINDS: Final[frozenset[str]] = frozenset({VIEWED_EVENT})
+#: ``reply_dropped`` too: it is a floor row, and only ``mark_done`` may write it, with the
+#: delivery it describes (vault BACKLOG #3040 item 5).
+_STORE_ONLY_EVENT_KINDS: Final[frozenset[str]] = frozenset({VIEWED_EVENT, "reply_dropped"})
 
 
 def check_caller_event_kind(event: str) -> None:
@@ -3555,7 +4667,8 @@ def check_caller_event_kind(event: str) -> None:
     Shared by all three backends so the rule cannot drift between them. Undeclared: see
     :data:`MESSAGE_EVENT_KINDS`. Store-only: :data:`VIEWED_EVENT`, because a caller-written
     ``viewed`` row would carry a detail the error reveal unmasks while the audit leaves it out
-    (BACKLOG #2440)."""
+    (BACKLOG #2440). And ``reply_dropped``, a floor row only ``mark_done`` may write, with the
+    delivery it describes (vault BACKLOG #3040 item 5)."""
     if event not in MESSAGE_EVENT_KINDS:
         raise ValueError(
             f"unknown message_events kind {event!r} — add it to MESSAGE_EVENT_KINDS and to the "
@@ -4798,38 +5911,6 @@ def require_notify_email(email: str) -> str:
     return cleaned
 
 
-def password_claim_set(must_change_password: bool, placeholder: str) -> str:
-    """The ``users.password_claimed_at`` term of a ``set_password`` UPDATE — shared by all three
-    backends so the single-writer rule is stated once (BACKLOG #1245).
-
-    A caller passing ``must_change_password`` False is issuing a credential the holder chose, so that
-    call records the claim. A caller passing True is issuing a provisional credential (an
-    admin-created account, an admin reset): it gets an EMPTY term, so the column is absent
-    from the SET list and the statement can neither stamp nor clear it.
-
-    **AT LEAST TWO callers pass False, not one** -- stated as a floor rather than an enumeration
-    because a closed list here is a liability (SDS-3.6), and an earlier draft of this docstring said
-    "and only that call" and was wrong. Self-service rotation is the intended one. The argon2
-    rehash-on-login path passes the record's EXISTING flag straight through, which is False for any
-    already-rotated account, so it reaches this branch too. That is safe for a reason worth writing
-    down rather than rediscovering: reaching it requires a verified password, and on any row where
-    the flag is False with a password set the stamp is already present (a fresh database because
-    only rotation clears the flag, and it stamps; a migrated one because the upgrade backfill covers
-    exactly ``must_change_password = 0 AND password_hash IS NOT NULL``), so the COALESCE no-ops.
-    **The invariant to preserve is therefore not "one caller" but "every caller passing False has
-    just authenticated the holder".**
-
-    ``COALESCE`` makes the claim WRITE-ONCE: a later rotation re-runs this term against a non-NULL
-    column and changes nothing, so the stamp is monotonic once set. That monotonicity is the whole
-    point — the flag it replaces as a claimed-ness test is non-monotonic (rotation clears it, an
-    admin reset re-sets it), which is why no reader could tell "never claimed" from "claimed, then
-    reset". Do not add a second writer of this column, and never assign it NULL after creation.
-    """
-    if must_change_password:
-        return ""
-    return f" password_claimed_at=COALESCE(password_claimed_at, {placeholder}),"
-
-
 def check_password_generated(*, password_generated: bool, password_hash: str | None) -> None:
     """Refuse a row that claims an engine-generated credential and carries none (ADR 0197
     Amendment A). Shared by the three backends' ``create_user`` so the rule is stated once: a
@@ -4837,29 +5918,6 @@ def check_password_generated(*, password_generated: bool, password_hash: str | N
     not exist, and the census would then never name it."""
     if password_generated and password_hash is None:
         raise ValueError("password_generated needs a password_hash: there is no credential to flag")
-
-
-#: The WHERE term a conditional rotation adds (ADR 0197 Amendment A, N-B2 part 4). The rotation's
-#: own UPDATE carries the factor check, so an ``admin_reset_mfa`` that clears TOTP between the
-#: service's read and this write makes the write match no row, and the caller refuses. Backend
-#: truth literals differ, so each backend passes its own.
-def rotation_factor_term(true_literal: str) -> str:
-    # ``totp_secret IS NOT NULL`` too, because TOTP with no secret is no way past the lock. Since
-    # BACKLOG #2224 ``enable_totp`` no longer writes that state (see ``totp_enable_term``), but at
-    # least ``set_totp_secret(secret=None)`` still can, so the second guard stays.
-    return f" AND totp_enabled={true_literal} AND totp_secret IS NOT NULL"
-
-
-#: The WHERE term that makes ``enable_totp`` conditional (BACKLOG #2224). The enrolment confirm
-#: rotates the session BEFORE it enables TOTP (BACKLOG #1902), so an ``admin_reset_mfa`` can clear
-#: the staged secret inside that window, and a second confirm can enable first. Unconditional, the
-#: enable would then set ``totp_enabled`` over a NULL secret, or replace the first confirm's
-#: recovery codes. With this term the write matches no row in either case, and the caller refuses.
-#: It checks that SOME secret is staged, not that it is the one the caller verified: a second
-#: ``set_totp_secret`` landing in the window is not caught here. Backend false literals differ, so
-#: each backend passes its own.
-def totp_enable_term(false_literal: str) -> str:
-    return f" AND totp_secret IS NOT NULL AND totp_enabled={false_literal}"
 
 
 #: Which lockout counter one failed attempt feeds (ADR 0197, BACKLOG #1131). ``"sign_in"`` is the
@@ -4880,37 +5938,6 @@ LOCKOUT_COLUMNS: Mapping[LockoutCounter, tuple[str, str, str]] = MappingProxyTyp
         ),
     }
 )
-
-#: The SET terms a FULL AUTHENTICATION writes (ADR 0197 AC-8): all six lockout columns back to "no
-#: history", in the one ``record_login_success`` UPDATE on every backend. Zeroing the sign-in cycle
-#: count here is the ADR's recommendation, matching "consecutive failures": an owner who signs in
-#: restarts the escalation.
-FULL_AUTHENTICATION_LOCKOUT_CLEAR: Final = (
-    "failed_attempts=0, locked_until=NULL, lock_cycles=0, second_step_failed_attempts=0,"
-    " second_step_locked_until=NULL, second_step_lock_cycles=0"
-)
-
-#: The SET terms a PASSWORD CHANGE writes (``set_password``, ADR 0197 Decision item 8): both locks and
-#: both failure counts, and the SECOND-STEP cycle count, because the password those failures proved
-#: is gone. The sign-in cycle count stays: a caller who knows only the username is not answered by a
-#: new password.
-PASSWORD_CHANGE_LOCKOUT_CLEAR: Final = (
-    "failed_attempts=0, locked_until=NULL, second_step_failed_attempts=0,"
-    " second_step_locked_until=NULL, second_step_lock_cycles=0"
-)
-
-
-def lockout_clear_set(*, reset_cycles: bool) -> str:
-    """The SET terms ``clear_lockout`` writes (ADR 0197 AC-9, the ``admin-unlock`` write): both locks
-    and both failure counts. Both cycle counts are KEPT unless ``reset_cycles``, so an attacker who
-    re-locks after an unlock resumes at the escalated length (the ADR's recommendation); the operator
-    passes ``--reset-cycles`` when they know the campaign is over."""
-    terms = (
-        "failed_attempts=0, locked_until=NULL, second_step_failed_attempts=0,"
-        " second_step_locked_until=NULL"
-    )
-    return terms + (", lock_cycles=0, second_step_lock_cycles=0" if reset_cycles else "")
-
 
 #: The largest exponent the escalation ever computes. 2**64 lock lengths are far past any ceiling an
 #: operator can configure, so capping here changes no answer and keeps a huge stored count finite.
@@ -5505,6 +6532,20 @@ CREATE TABLE IF NOT EXISTS store_salt (
     created_at  REAL NOT NULL
 );
 
+-- The cipher-covered (table, column) surfaces a keyed open has KEYED (BACKLOG #3383, owner ruling
+-- 2026-10-10; ASVS 11.3.3). One row per surface. A keyed open writes it when it finds the surface
+-- with nothing to seal or already sealed, and when it seals a surface's legacy plaintext, in that
+-- seal's own transaction. The engine never deletes a row. A surface named here is sealed whatever its
+-- rows hold, so a plaintext value written into it later is refused instead of being sealed as legacy
+-- data, even after every row was purged or when no value was ever written. See
+-- `MessageStore._encrypt_existing_rows`. Non-secret: two code-constant names and a timestamp.
+CREATE TABLE IF NOT EXISTS keyed_surface (
+    surface_table  TEXT NOT NULL,
+    surface_column TEXT NOT NULL,
+    keyed_at       REAL NOT NULL,
+    PRIMARY KEY (surface_table, surface_column)
+);
+
 -- The vault_transit AES-GCM bound attestation (BACKLOG #2337, owner rulings 2026-10-07). One row at
 -- most: the Transit data-key NAME an operator attested, their reason, who (a `cli:<osuser>` actor) and
 -- when. Only `messagefoundry store attest-transit-bound` writes it, and its audit row commits in the
@@ -5602,7 +6643,9 @@ CREATE TABLE IF NOT EXISTS users (
     second_step_locked_until REAL,             -- ADR 0197: the second-step lock expiry; NULL = not locked
     second_step_lock_cycles INTEGER NOT NULL DEFAULT 0,  -- ADR 0197: how many times the second-step lock was set
     password_generated   INTEGER NOT NULL DEFAULT 0,  -- ADR 0197 Amendment A: 1 while the credential in force is engine-generated; wrong passwords arm no sign-in lock then. NO COMMA in this comment
-    session_epoch        INTEGER NOT NULL DEFAULT 0  -- BACKLOG #2592: raised by every whole-account session revoke; a session minted under an older epoch resolves to nothing. NO COMMA in this comment
+    session_epoch        INTEGER NOT NULL DEFAULT 0,  -- BACKLOG #2592: raised by every whole-account session revoke; a session minted under an older epoch resolves to nothing. NO COMMA in this comment
+    cred_digest          TEXT NOT NULL DEFAULT '',  -- BACKLOG #2592: digest of the account's passkeys; the user seal covers it. NO COMMA in this comment
+    authz_seal           TEXT NOT NULL DEFAULT ''  -- BACKLOG #2592: integrity seal over the account's row and role rows. NO COMMA in this comment
 );
 
 CREATE TABLE IF NOT EXISTS roles (
@@ -5610,7 +6653,15 @@ CREATE TABLE IF NOT EXISTS roles (
     display_name TEXT NOT NULL,
     description  TEXT,
     builtin      INTEGER NOT NULL DEFAULT 1,
-    permissions  TEXT                          -- custom roles (ADR 0045): JSON array of Permission wire values; NULL = built-in (resolves from code)
+    permissions  TEXT,                         -- custom roles (ADR 0045): JSON array of Permission wire values; NULL = built-in (resolves from code)
+    seal         TEXT NOT NULL DEFAULT ''      -- BACKLOG #2592: integrity seal over the whole row. NO COMMA in this comment
+);
+
+-- BACKLOG #2592: one integrity seal per directory map over its sorted pairs. A map with pairs and no
+-- seal grants nothing on a keyed store.
+CREATE TABLE IF NOT EXISTS authority_set_seal (
+    name TEXT PRIMARY KEY,                     -- the map the seal covers: 'ad_group_role_map' or 'ad_group_scope_map'
+    seal TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS user_roles (
@@ -6156,6 +7207,9 @@ class MessageStore:
                 await store.checkpoint_cipher_invocations()
                 # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
                 await store._encrypt_existing_rows()
+            if store._row_sealer is not None:
+                report_unsealed_users(await store.count_unsealed_users())
+                report_unsealed_role_records(await store.count_unsealed_role_records())
             if read_only:
                 await store._load_read_only()
             else:
@@ -6547,7 +7601,9 @@ class MessageStore:
     #: columns (error/last_error/detail) added in WP-5, and summary/metadata (MRN + patient name +
     #: operator-attached values) added in EF-3. Used by the on-open migration and rotate-key.
     # Cipher-covered columns whose PRIMARY KEY is a single `id` — they ride the generic id-keyed
-    # migration/rotation loops, binding cell_aad(table, column, id). (ASVS 11.3.3, ADR 0019.)
+    # migration/rotation loops, binding cell_aad(table, column, id). (ASVS 11.3.3, ADR 0019.) The
+    # `messages` cells also bind the row's channel and `search_presets.criteria` its owner (BACKLOG
+    # #2593); the loops build those tags through `row_tag_aad`.
     _CIPHER_COLUMNS = (
         ("messages", "raw"),
         # NB: `queue.payload` is cipher-covered but NOT id-keyed: its tag binds the row's routing
@@ -6562,7 +7618,7 @@ class MessageStore:
             "totp_secret",
         ),  # MFA secret (WP-14) — id-keyed, so it rides the migration + rotation
         # Saved-search preset criteria (ADR 0136): content/field_value are PHI-shaped. id-keyed
-        # (`id` PK), so it rides the migration + rotation loops (cell_aad("search_presets","criteria", id)).
+        # (`id` PK), so it rides the migration + rotation loops, bound to its id and owner (#2593).
         ("search_presets", "criteria"),
         # NB: `message_events` (detail), `connection_event` (reason), and `alert_instance` (reason) are
         # cipher-covered too, but their `id` is AUTOINCREMENT — unknown at the encrypting INSERT, and (for
@@ -6587,13 +7643,49 @@ class MessageStore:
         WP-5), one (table, column) SURFACE at a time.
 
         Runs at EVERY keyed open, not once. That is why a surface is sealed only while it is still
-        UNSEALED -- while it holds no marked value at all (BACKLOG #1169, ASVS 11.3.3). Once one
-        ciphertext exists there, the keyed writer is the only thing that writes that column, so a
-        non-blank unmarked value beside it is a stripped marker or a planted row. Sealing it would
-        launder the plant into genuine ciphertext, so it is left in place and every read of it is
-        refused (:class:`~messagefoundry.store.crypto._UnmarkedPolicy`). The state comes from the data,
-        never from a persisted flag, so it cannot go stale. ``[store].allow_unmarked_ciphertext``
-        restores the old sweep, which seals every unmarked value.
+        UNSEALED (BACKLOG #1169, ASVS 11.3.3). Once a surface is sealed, the keyed writer is the only
+        thing that writes that column, so a non-blank unmarked value there is a stripped marker or a
+        planted row. Sealing it would launder the plant into genuine ciphertext, so it is left in place
+        and every read of it is refused (:class:`~messagefoundry.store.crypto._UnmarkedPolicy`).
+
+        **SUPERSEDED (BACKLOG #3383, owner ruling 2026-10-10):** this docstring used to say *"The
+        state comes from the data, never from a persisted flag, so it cannot go stale."* That left a
+        gap. A surface with no ciphertext at the moment of a keyed open read as unsealed, so a row
+        planted into an emptied table, or into a column never yet written, was sealed as legacy data
+        and then carried genuine ciphertext. The owner chose a persisted flag instead.
+
+        **What decides "sealed" now.** A surface is SEALED when it has a ``keyed_surface`` row (the
+        persisted marker) OR it holds at least one marked value. The data check stays as a second
+        signal, so a lost marker row cannot reopen the gap on a surface that still holds ciphertext.
+
+        **When the marker is written.** Every writable keyed open that completes this sweep visits
+        every surface, and leaves each one marked:
+
+        1. Nothing to seal (empty, all blank or NULL, or all marked): the marker is written in its
+           own transaction. This is what keys an empty surface at the first keyed open.
+        2. Sealed, with unmarked values: they are left, logged and alerted, and the marker is written
+           if it was missing.
+        3. Unsealed, with legacy plaintext: the marker is written FIRST, inside the seal's one
+           transaction, then every value is sealed and the whole thing commits once. A crash rolls back
+           the seal and the marker together, so the next open still sees legacy rows and seals them.
+           If the marker turns out to exist already, another process keyed the surface after this
+           open read it, so this open seals nothing. On every backend it counts again and reports
+           whatever is still unmarked. On the server backends the insert also serializes
+           concurrent first opens: the second waits on the first's uncommitted key.
+
+        **Edge cases.** An existing store holding only legacy plaintext gets it sealed exactly once,
+        at the first keyed open that records the surface. A value planted before that open, on a
+        surface that holds no ciphertext, looks exactly like legacy plaintext, so that open seals
+        it. On a surface that already holds ciphertext the data check refuses it instead. A value
+        written into a marked surface by a later KEYLESS run of the same store, or by hand, is
+        refused even if the table had emptied out; the opt-out below seals it for one open. A read-only open writes no marker. A store restored from a file copy keeps
+        the copy's markers. ``rotate-key`` changes no marker, because a surface stays keyed under any
+        key. The uploaded-file store (``uploads.py``) is a directory, not a table, and has no marker.
+
+        ``[store].allow_unmarked_ciphertext`` restores the old sweep, which seals every unmarked value,
+        marked surface or not. The open still writes the marker under it, and the sweep ignores the
+        marker while the setting is on. Turning it off again restores the refusal on every marked
+        surface.
 
         NULL and blank ``''`` are never sealed: ``''`` is what every purge path writes.
 
@@ -6610,7 +7702,15 @@ class MessageStore:
         total = 0
         async with _writer_guard(self._db, self._lock):
             for table, column in self._CIPHER_COLUMNS:
-                total += await self._seal_surface(table, column, like, aad_cols=("id",))
+                # A message cell binds its channel and a preset's criteria its owner (#2593).
+                total += await self._seal_surface(
+                    table,
+                    column,
+                    like,
+                    aad_cols=row_tag_columns(table, column),
+                    key_cols=("id",),
+                    aad_of=functools.partial(row_tag_aad, table, column),
+                )
             # The `queue.payload` cell binds the row's routing fields (BACKLOG #2593).
             total += await self._seal_surface(
                 "queue",
@@ -6693,46 +7793,56 @@ class MessageStore:
 
         Three steps, in this order:
 
-        1. **Derive the surface's state from the data.** No unmarked non-blank value: nothing to do.
-           A marked value already present: the surface is SEALED, so its unmarked values are left in
-           place and refused at read (unless the opt-out is on).
+        1. **Decide whether the surface is sealed.** It is when its ``keyed_surface`` marker exists or
+           it holds a marked value (BACKLOG #3383). No unmarked non-blank value: write the marker if it
+           is missing, and stop. Sealed with unmarked values: leave them in place, refused at read,
+           and write the marker if it is missing (unless the opt-out is on).
         2. **Reserve the whole burst on the AES-GCM bound first** (ASVS 11.3.4). On SQLite the
            reservation commits the one writer connection, so it cannot happen once the seal's
            transaction is open. Reserving everything up front is what lets the seal skip the per-batch
            charge without the persisted total ever trailing an encrypt.
-        3. **Seal every batch, then commit once.** Any failure rolls the whole surface back.
+        3. **Write the marker, seal every batch, then commit once.** Any failure rolls the whole
+           surface back, marker included. If the marker was already there, another process keyed the
+           surface since step 1, so this one seals nothing (unless the opt-out is on). It counts
+           again instead, and reports whatever that process left unmarked.
+
+        Step 1 probes for ciphertext only when there is something to seal and no marker, and then
+        counts again. A peer that seals between the count and the probe then shows up as nothing
+        pending, never as a false plant beside its own new ciphertext.
         """
         keys = key_cols if key_cols is not None else aad_cols
         pending_where = f"{column} NOT LIKE ? AND {column} <> ''"
-        cur = await self._db.execute(
-            f"SELECT COUNT(*) AS n FROM {table} WHERE {pending_where}", (like,)
-        )
-        row = await cur.fetchone()
-        pending = int(row["n"]) if row is not None else 0
-        if not pending:
+        strict = not allows_unmarked(self._cipher)
+        keyed = await self._surface_keyed(table, column)
+        pending = await self._count_unmarked(table, pending_where, like)
+        is_sealed = keyed
+        if pending and strict and not keyed:
+            is_sealed = await self._surface_holds_ciphertext(table, column, like)
+            if is_sealed:
+                # A peer may have sealed the rows between the count and the probe; count again so
+                # its legitimate seal is not reported as a plant.
+                pending = await self._count_unmarked(table, pending_where, like)
+        if not pending or (strict and is_sealed):
+            if pending:
+                report_sealed_surface(log, self._cipher, table, column, pending)
+            if not keyed:
+                await self._insert_keyed_marker(table, column)
+                await self._commit()
             return 0
-        if not allows_unmarked(self._cipher):
-            cur = await self._db.execute(
-                f"SELECT 1 FROM {table} WHERE {column} LIKE ? LIMIT 1", (like,)
-            )
-            if await cur.fetchone() is not None:
-                log.warning(
-                    "cipher column %s.%s holds %d unmarked value(s) beside sealed ones; they were NOT "
-                    "sealed and every read of them is refused (a stripped marker or a planted row). "
-                    "Set [store].allow_unmarked_ciphertext only if they are known to be legitimate",
-                    table,
-                    column,
-                    pending,
-                )
-                # Alert now, not only on a read: a planted row nobody reads would otherwise stay
-                # invisible except in the log. Names the cell only (BACKLOG #1169).
-                report_unmarked(self._cipher, table, column)
-                return 0
         await reserve_invocations_ahead(self._cipher, self._add_cipher_invocations_locked, pending)
         select_cols = ", ".join(dict.fromkeys((*keys, *aad_cols)))
         where_keys = " AND ".join(f"{c}=?" for c in keys)
         sealed = 0
         try:
+            # The marker goes in FIRST, in the seal's own transaction, so a crash undoes both.
+            if not await self._insert_keyed_marker(table, column) and strict:
+                # Another process keyed this surface after step 1, so it sealed the legacy rows.
+                left = await self._count_unmarked(table, pending_where, like)
+                await self._db.rollback()  # the insert changed nothing; this closes the transaction
+                log.debug("cipher column %s.%s was keyed by another process", table, column)
+                if left:
+                    report_sealed_surface(log, self._cipher, table, column, left)
+                return 0
             while True:
                 # The same connection sees its own uncommitted UPDATEs, so a sealed row stops
                 # matching NOT LIKE and the loop terminates inside the one transaction.
@@ -6770,6 +7880,39 @@ class MessageStore:
         # Top the reserve back up for whatever follows; the burst itself was reserved in step 2.
         await self._charge_bound_batch()
         return sealed
+
+    async def _surface_keyed(self, table: str, column: str) -> bool:
+        """Whether ``table.column`` has its persisted ``keyed_surface`` marker (BACKLOG #3383)."""
+        cur = await self._db.execute(
+            "SELECT 1 FROM keyed_surface WHERE surface_table = ? AND surface_column = ?",
+            (table, column),
+        )
+        return await cur.fetchone() is not None
+
+    async def _surface_holds_ciphertext(self, table: str, column: str, like: str) -> bool:
+        """Whether ``table.column`` holds at least one marked value: the data's own "sealed" signal."""
+        cur = await self._db.execute(
+            f"SELECT 1 FROM {table} WHERE {column} LIKE ? LIMIT 1", (like,)
+        )
+        return await cur.fetchone() is not None
+
+    async def _count_unmarked(self, table: str, pending_where: str, like: str) -> int:
+        """How many values ``pending_where`` matches in ``table``: the non-blank unmarked ones."""
+        cur = await self._db.execute(
+            f"SELECT COUNT(*) AS n FROM {table} WHERE {pending_where}", (like,)
+        )
+        row = await cur.fetchone()
+        return int(row["n"]) if row is not None else 0
+
+    async def _insert_keyed_marker(self, table: str, column: str) -> bool:
+        """Write ``table.column``'s marker in the caller's transaction, unless it exists. Returns
+        whether THIS call wrote it. The caller commits."""
+        cur = await self._db.execute(
+            "INSERT OR IGNORE INTO keyed_surface (surface_table, surface_column, keyed_at)"
+            " VALUES (?, ?, ?)",
+            (table, column, time.time()),
+        )
+        return cur.rowcount == 1
 
     async def reencrypt_to_active(self, *, batch: int = 500) -> int:
         """Re-encrypt every cipher-covered value under the **active** key — the key-rotation re-encrypt
@@ -6809,9 +7952,27 @@ class MessageStore:
         # prefix, so a value re-encrypted to the active key/format matches next round and the loop ends.
         # Built off the cipher (not a baked-in v1 prefix+keyid) so a v4-active rotation matches its own rows.
         active_like = f"{cipher.active_marker_prefix}%"
+        # BACKLOG #2592: first, each sealed account's TOTP secret re-encrypted and the account
+        # re-sealed under the active key in one write (rotation_reseal), so the loop below finds those
+        # secrets already under the active key. The loop then rotates the rest, which are accounts
+        # whose record has no seal or fails it and is refused anyway.
+        report_user_reseal(*await self.reseal_user_records())
+        report_role_reseal(*await self.reseal_role_records())
         total = 0
         async with _writer_guard(self._db, self._lock):
             for table, column in self._CIPHER_COLUMNS:
+                if is_row_tagged(table, column):
+                    # A message cell or a preset's criteria rebinds its row tag (BACKLOG #2593).
+                    total += await self._reencrypt_tagged_to_active(
+                        cipher,
+                        active_like,
+                        batch,
+                        table=table,
+                        column=column,
+                        select=", ".join(row_tag_columns(table, column)),
+                        aad_of=functools.partial(row_tag_aad, table, column),
+                    )
+                    continue
                 while True:
                     # Anything not already under the active key (plaintext or a retired-key blob),
                     # excluding NULL/blank. Rewritten rows match active_like next round, so this ends.
@@ -6840,7 +8001,15 @@ class MessageStore:
                     await self._charge_bound_batch()
                     total += len(rows)
             # `queue.payload` rebinds the row's routing tag, old and new ciphertext alike (#2593).
-            total += await self._reencrypt_queue_payload_to_active(cipher, active_like, batch)
+            total += await self._reencrypt_tagged_to_active(
+                cipher,
+                active_like,
+                batch,
+                table="queue",
+                column="payload",
+                select=QUEUE_TAG_SELECT,
+                aad_of=queue_row_aad,
+            )
             # The `state` table has a composite PK (namespace,key), not an `id`, so it can't ride the
             # generic id-keyed loop above — rotate it with its own pass (ADR 0005).
             total += await self._reencrypt_state_to_active(cipher, active_like, batch)
@@ -6883,23 +8052,32 @@ class MessageStore:
         loop funnels through, so no loop can accidentally pair mismatched decrypt/encrypt AADs."""
         return cipher.encrypt(cipher.decrypt(stored, aad=aad), aad=aad)
 
-    async def _reencrypt_queue_payload_to_active(
-        self, cipher: AesGcmCipher, active_like: str, batch: int
+    async def _reencrypt_tagged_to_active(
+        self,
+        cipher: AesGcmCipher,
+        active_like: str,
+        batch: int,
+        *,
+        table: str,
+        column: str,
+        select: str,
+        aad_of: Callable[[aiosqlite.Row], bytes],
     ) -> int:
-        """Re-seal ``queue.payload`` under the active key, rebinding each row's routing tag
-        (:func:`queue_row_aad`, BACKLOG #2593); caller holds ``self._lock``. The id-keyed loop's
-        shape, with the tag columns selected so the decrypt and the encrypt share one tag.
-        A cell that does not open under its own tag with a key this process holds
-        (:func:`is_tag_failure`) is left as it is and counted in a WARNING: no
-        claim or read can ever open it, and re-sealing it would make it look genuine. Any other
-        failure, a retired key that was not supplied above all, still stops the rotation. Pages by
-        ``id``, since a skipped row still matches the marker filter."""
+        """Re-seal an id-keyed cell whose tag binds more than the row id under the active key,
+        rebinding each row's tag (``queue.payload``'s routing tag, a message cell's channel, a
+        preset's owner; BACKLOG #2593); caller holds ``self._lock``. ``select`` names the tag's
+        columns, ``id`` among them, so the decrypt and the encrypt share one tag. All identifiers
+        are code constants. A cell that does not open under its own tag with a key this process holds
+        (:func:`is_tag_failure`) is left as it is and counted in a WARNING: no read can ever open it,
+        and re-sealing it would make it look genuine. Any other failure, a retired key that was not
+        supplied above all, still stops the rotation. Pages by ``id``, since a skipped row still
+        matches the marker filter."""
         total = skipped = 0
         after = ""
         while True:
             cur = await self._db.execute(
-                f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue"
-                " WHERE payload NOT LIKE ? AND payload <> '' AND id > ? ORDER BY id LIMIT ?",
+                f"SELECT {select}, {column} AS v FROM {table}"
+                f" WHERE {column} NOT LIKE ? AND {column} <> '' AND id > ? ORDER BY id LIMIT ?",
                 (active_like, after, batch),
             )
             rows = list(await cur.fetchall())
@@ -6909,23 +8087,23 @@ class MessageStore:
             updates: list[tuple[str, str]] = []
             for r in rows:
                 try:
-                    updates.append(
-                        (self._reencrypt_value(cipher, r["payload"], queue_row_aad(r)), r["id"])
-                    )
+                    updates.append((self._reencrypt_value(cipher, r["v"], aad_of(r)), r["id"]))
                 except CipherError:
-                    if not is_tag_failure(cipher, r["payload"]):
+                    if not is_tag_failure(cipher, r["v"]):
                         raise
                     skipped += 1
             if updates:
-                await self._db.executemany("UPDATE queue SET payload=? WHERE id=?", updates)
+                await self._db.executemany(f"UPDATE {table} SET {column}=? WHERE id=?", updates)
                 await self._commit()
                 await self._charge_bound_batch()
                 total += len(updates)
         if skipped:
             log.warning(
-                "rotation left %d queue row(s) whose payload does not open under its own tag"
-                " under a held key; no claim or read opens them (BACKLOG #2593)",
+                "rotation left %d %s.%s value(s) that do not open under their own row's tag"
+                " under a held key; no read opens them (BACKLOG #2593)",
                 skipped,
+                table,
+                column,
             )
         return total
 
@@ -7241,8 +8419,15 @@ class MessageStore:
         # the column — ALTER it in (NULL on every existing built-in row is byte-identical to today:
         # built-ins resolve from BUILTIN_ROLE_PERMISSIONS, never this column). Idempotent.
         cur = await db.execute("PRAGMA table_info(roles)")
-        if "permissions" not in {row["name"] for row in await cur.fetchall()}:
+        role_cols = {row["name"] for row in await cur.fetchall()}
+        if "permissions" not in role_cols:
             await db.execute("ALTER TABLE roles ADD COLUMN permissions TEXT")
+        # BACKLOG #2592: the role's integrity seal. An existing row gets an empty seal: a keyed
+        # store grants nothing from a custom role carrying one until an administrator saves it
+        # again, and the built-in rows are re-sealed by the service's role seed at every start.
+        # `report_unsealed_role_records` names the count at open.
+        if "seal" not in role_cols:
+            await db.execute("ALTER TABLE roles ADD COLUMN seal TEXT NOT NULL DEFAULT ''")
         # --- end custom RBAC roles (ADR 0045) --------------------------------
         # MFA (WP-14): a pre-existing DB's users predate the TOTP columns — ALTER them in (NULL/0 on
         # existing rows = "not enrolled", correct). Idempotent: skipped once present.
@@ -7281,6 +8466,12 @@ class MessageStore:
             # BACKLOG #2592: the account's session epoch. 0 on an existing row, which every
             # existing session (user_epoch 0 below) matches, so nothing is signed out by the add.
             ("session_epoch", "INTEGER NOT NULL DEFAULT 0"),
+            # BACKLOG #2592: the passkey digest and the account's integrity seal. An existing row
+            # gets an empty seal, which a keyed store refuses like a wrong one: a blank seal is
+            # exactly what a row inserted outside the store has, so nothing here seals it.
+            # `report_unsealed_users` names the count at open.
+            ("cred_digest", "TEXT NOT NULL DEFAULT ''"),
+            ("authz_seal", "TEXT NOT NULL DEFAULT ''"),
         ):
             if column not in user_cols:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
@@ -7460,8 +8651,9 @@ class MessageStore:
         ``updated_at``. Every other row is dropped, because nobody could list, recall or delete it.
         That includes rows of ``system``, the no-auth identity: its id equals its username, but so
         would a deleted account's that was named ``system``, and the two cannot be told apart.
-        ``criteria`` is sealed against the preset ``id``, which does not change, so no cell is
-        re-encrypted. The rename carries the unique index along with the column. Runs in the open's
+        ``criteria`` is sealed against the preset ``id`` AND its owner (BACKLOG #2593), and this
+        rewrites the owner, so a cell sealed before it no longer opens: its recall is refused and the
+        row still lists. No store has deployed, so nothing re-seals it. The rename carries the unique index along with the column. Runs in the open's
         migration transaction, so a refused open rolls all of it back."""
         await db.execute(
             "DELETE FROM search_presets"
@@ -8439,6 +9631,7 @@ class MessageStore:
             ),
         )
 
+    @dead_letters_on_cell_tag
     async def transform_handoff(
         self,
         *,
@@ -8507,16 +9700,23 @@ class MessageStore:
             # lineage) or SetMeta (merges the user bag) will use it — a handler returning both PT Sends
             # and SetMeta ops shares this single SELECT.
             pmeta_json: str | None = None
+            # The cell is bound to the message row's own channel (BACKLOG #2593); a row whose cell
+            # fails that tag raises CellTagError, which aborts this handoff.
+            msg_channel = channel_id
             if pt_deliveries or meta_ops:
                 pcur = await self._db.execute(
-                    "SELECT metadata FROM messages WHERE id=?", (message_id,)
+                    "SELECT channel_id, metadata FROM messages WHERE id=?", (message_id,)
                 )
                 prow = await pcur.fetchone()
-                pmeta_json = (
-                    self._dec(prow["metadata"], aad=cell_aad("messages", "metadata", message_id))
-                    if prow
-                    else None
-                )
+                if prow is not None:
+                    msg_channel = str(prow["channel_id"])
+                    pmeta_json = open_message_cell(
+                        self._cipher,
+                        "metadata",
+                        prow["metadata"],
+                        message_id=message_id,
+                        channel_id=msg_channel,
+                    )
             # Pass-through re-ingress (ADR 0013, generalized): produce each PT child + the parent's
             # done marker in THIS same transaction as the routed-row DELETE, so the handoff is atomic
             # and re-run-idempotent (absent lineage → depth 0).
@@ -8559,7 +9759,12 @@ class MessageStore:
                 await self._db.execute(
                     "UPDATE messages SET metadata=? WHERE id=?",
                     (
-                        self._enc(merged, aad=cell_aad("messages", "metadata", message_id)),
+                        self._enc(
+                            merged,
+                            aad=message_cell_aad(
+                                "metadata", message_id=message_id, channel_id=msg_channel
+                            ),
+                        ),
                         message_id,
                     ),
                 )
@@ -8619,6 +9824,7 @@ class MessageStore:
         origin: MessageOrigin,
         origin_actor: str | None = None,
     ) -> None:
+        # BACKLOG #2593: every message cell is bound to the row's id AND its channel.
         await self._db.execute(
             "INSERT INTO messages"
             " (id, channel_id, received_at, source_type, control_id,"
@@ -8631,12 +9837,21 @@ class MessageStore:
                 source_type,
                 control_id,
                 message_type,
-                self._cipher.encrypt(raw, aad=cell_aad("messages", "raw", mid)),
+                self._cipher.encrypt(
+                    raw, aad=message_cell_aad("raw", message_id=mid, channel_id=channel_id)
+                ),
                 status,
-                self._enc(error, aad=cell_aad("messages", "error", mid)),
+                self._enc(
+                    error, aad=message_cell_aad("error", message_id=mid, channel_id=channel_id)
+                ),
                 # EF-3: MRN/name is PHI — ciphered at rest like the body
-                self._enc(summary, aad=cell_aad("messages", "summary", mid)),
-                self._enc(metadata, aad=cell_aad("messages", "metadata", mid)),
+                self._enc(
+                    summary, aad=message_cell_aad("summary", message_id=mid, channel_id=channel_id)
+                ),
+                self._enc(
+                    metadata,
+                    aad=message_cell_aad("metadata", message_id=mid, channel_id=channel_id),
+                ),
                 # vault BACKLOG #2615: plain by design, like control_id. A label and a username.
                 origin.value,
                 origin_actor,
@@ -9285,15 +10500,17 @@ class MessageStore:
             return
         await self._run_grouped(_body)
 
-    async def mark_done(self, outbox_id: str, now: float | None = None) -> None:
+    async def mark_done(
+        self, outbox_id: str, now: float | None = None, *, reply_dropped: str | None = None
+    ) -> bool:
         now = time.time() if now is None else now
 
-        async def _body() -> None:
+        async def _body() -> bool:
             # _row is a read; under group-commit it runs inside the batch's BEGIN. A vanished row is an
             # idempotent no-op (zero mutation) — abort without failing the batch.
             row = await self._row(outbox_id)
             if row is None:
-                raise _AbortMember(None)
+                raise _AbortMember(False)
             await self._db.execute(
                 "UPDATE queue SET status=?, last_error=NULL, updated_at=? WHERE id=?",
                 (OutboxStatus.DONE.value, now, outbox_id),
@@ -9315,9 +10532,14 @@ class MessageStore:
                 f"attempt {row['attempts']}",
                 now,
             )
+            if reply_dropped is not None:
+                await self._event(
+                    row["message_id"], "reply_dropped", row["destination_name"], reply_dropped, now
+                )
             await self._maybe_finalize_message(row["message_id"], now)
+            return True
 
-        await self._run_grouped(_body)
+        return bool(await self._run_grouped(_body))
 
     async def mark_batch_done(self, outbox_ids: Sequence[str], now: float | None = None) -> None:
         """Complete N delivered outbound rows in ONE transaction — the batch counterpart of
@@ -9729,8 +10951,43 @@ class MessageStore:
         child). On ``peek_failed`` the child is produced ``RECEIVED→ERROR`` with **no** ingress row (it
         owes no work) — count-and-log holds, the token is still consumed. The peek-derived
         ``control_id``/``message_type``/``summary`` are passed **in** so the store stays parsing-free.
-        Returns ``True`` if this call performed the handoff, ``False`` if it was an already-consumed no-op."""
-        now = time.time() if now is None else now
+        Returns ``True`` if this call performed the handoff, ``False`` if it was an already-consumed no-op.
+
+        An origin whose metadata cell fails its row tag (BACKLOG #2593) makes the token unrecoverable:
+        it is dead-lettered and consumed like a corrupt reference, and the failure is audited."""
+        tag_failures: list[CellTagError] = []
+        try:
+            return await self._ingress_handoff_txn(
+                response_row_id=response_row_id,
+                loopback_channel_id=loopback_channel_id,
+                correlation_depth_cap=correlation_depth_cap,
+                control_id=control_id,
+                message_type=message_type,
+                summary=summary,
+                peek_failed=peek_failed,
+                peek_error=peek_error,
+                now=time.time() if now is None else now,
+                tag_failures=tag_failures,
+            )
+        finally:
+            await report_cell_tag_failures(self, tag_failures)
+
+    async def _ingress_handoff_txn(
+        self,
+        *,
+        response_row_id: str,
+        loopback_channel_id: str,
+        correlation_depth_cap: int,
+        control_id: str | None,
+        message_type: str | None,
+        summary: str | None,
+        peek_failed: bool,
+        peek_error: str | None,
+        now: float,
+        tag_failures: list[CellTagError],
+    ) -> bool:
+        """:meth:`ingress_handoff`'s one transaction. An origin tag failure is appended to
+        ``tag_failures`` for the caller to audit after the writer lock is released."""
         async with _writer_txn(self._db, self._lock):
             # 1. The work-row must still be INFLIGHT (the claim set it so); it carries the artifact ref.
             cur = await self._db.execute(
@@ -9742,33 +10999,37 @@ class MessageStore:
                 await self._db.rollback()  # already consumed by a committed prior run — no-op
                 return False
             origin_id = wr["message_id"]
+
+            async def _consume_dead(error: str, event_detail: str) -> bool:
+                # An unrecoverable token: dead-letter it + ERROR the origin in THIS transaction and
+                # CONSUME it (return True) — never re-loop forever on a row that can't be used.
+                await self._db.execute(
+                    "UPDATE queue SET status=?, last_error=?, next_attempt_at=?, updated_at=?"
+                    " WHERE id=?",
+                    (
+                        OutboxStatus.DEAD.value,
+                        self._enc(error, aad=cell_aad("queue", "last_error", response_row_id)),
+                        now,
+                        now,
+                        response_row_id,
+                    ),
+                )
+                await self._event(origin_id, "dead", None, event_detail, now)
+                await self._maybe_finalize_message(origin_id, now)
+                await self._commit()
+                return True
+
             try:
                 ref = self._dec(wr["payload"], aad=queue_row_aad(wr)) or ""
                 origin_msg_id, dest, seq_s = ref.split("\x1f")
                 seq = int(seq_s)
             except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
                 # A corrupt/undecryptable work-row reference (DB corruption, a cipher/key failure)
-                # can NEVER be re-ingressed. Dead-letter the token + ERROR the origin in THIS
-                # transaction and CONSUME it (return True) — never re-loop forever on a row that can't
-                # be parsed. Mirrors the depth-cap branch (a different unrecoverable-token case).
-                await self._db.execute(
-                    "UPDATE queue SET status=?, last_error=?, next_attempt_at=?, updated_at=?"
-                    " WHERE id=?",
-                    (
-                        OutboxStatus.DEAD.value,
-                        self._enc(
-                            "re-ingress work-row reference is corrupt/unparseable",
-                            aad=cell_aad("queue", "last_error", response_row_id),
-                        ),
-                        now,
-                        now,
-                        response_row_id,
-                    ),
+                # can NEVER be re-ingressed. Mirrors the depth-cap branch (a different
+                # unrecoverable-token case).
+                return await _consume_dead(
+                    "re-ingress work-row reference is corrupt/unparseable", "re-ingress ref corrupt"
                 )
-                await self._event(origin_id, "dead", None, "re-ingress ref corrupt", now)
-                await self._maybe_finalize_message(origin_id, now)
-                await self._commit()
-                return True
             # 2. The IMMUTABLE artifact body (same committed bytes every re-run → re-run-stable). NULL
             #    only if retention purged it — but an outstanding work-row makes the message
             #    purge-ineligible (Q8), so this is defensive: treat as empty, still consume.
@@ -9788,15 +11049,28 @@ class MessageStore:
             )
             body = body or ""
             # 3. The origin's correlation lineage (absent keys → depth 0, origin is its own root).
-            cur = await self._db.execute("SELECT metadata FROM messages WHERE id=?", (origin_id,))
+            cur = await self._db.execute(
+                "SELECT channel_id, metadata FROM messages WHERE id=?", (origin_id,)
+            )
             mrow = await cur.fetchone()
             origin_meta: dict[str, Any] = {}
-            # EF-3: ciphered at rest, bound to the origin message's metadata cell
-            meta_json = (
-                self._dec(mrow["metadata"], aad=cell_aad("messages", "metadata", origin_id))
-                if mrow
-                else None
-            )
+            # EF-3: ciphered at rest, bound to the origin message's metadata cell and its channel
+            # (BACKLOG #2593). A cell that fails that tag makes the token unrecoverable.
+            try:
+                meta_json = (
+                    open_message_cell(
+                        self._cipher,
+                        "metadata",
+                        mrow["metadata"],
+                        message_id=origin_id,
+                        channel_id=mrow["channel_id"],
+                    )
+                    if mrow
+                    else None
+                )
+            except CellTagError as err:
+                tag_failures.append(err)  # audited by ingress_handoff once the lock is released
+                return await _consume_dead(str(err), "re-ingress origin failed its integrity check")
             if meta_json:
                 loaded = json.loads(meta_json)
                 if isinstance(loaded, dict):
@@ -10701,6 +11975,7 @@ class MessageStore:
             outbox_id=row["outbox_id"],
         )
 
+    @audits_cell_tag
     async def resend_to(
         self,
         *,
@@ -10816,8 +12091,12 @@ class MessageStore:
                     )
                 # Correlate the child to the origin (mirrors `reingress`): correlation_id/_root_id/
                 # _depth link the logs, plus an explicit `edited_from` for the edit provenance.
-                raw_meta = self._dec(
-                    mrow["metadata"], aad=cell_aad("messages", "metadata", message_id)
+                raw_meta = open_message_cell(
+                    self._cipher,
+                    "metadata",
+                    mrow["metadata"],
+                    message_id=message_id,
+                    channel_id=src_channel,
                 )
                 try:
                     parent_meta = json.loads(raw_meta) if raw_meta else {}
@@ -10941,6 +12220,7 @@ class MessageStore:
             await self._commit()
             return outcome
 
+    @audits_cell_tag
     async def reingress(
         self,
         *,
@@ -11017,8 +12297,12 @@ class MessageStore:
                 return outcome
             # Correlate the child to the origin (mirrors _insert_passthrough_child): correlation_id /
             # _root_id / _depth link the logs, plus an explicit `edited_from` for the edit provenance.
-            raw_meta = self._dec(
-                orow["metadata"], aad=cell_aad("messages", "metadata", origin_message_id)
+            raw_meta = open_message_cell(
+                self._cipher,
+                "metadata",
+                orow["metadata"],
+                message_id=origin_message_id,
+                channel_id=channel_id,
             )
             try:
                 parent_meta = json.loads(raw_meta) if raw_meta else {}
@@ -11249,6 +12533,7 @@ class MessageStore:
 
     # --- read helpers (for API / console / tests) ----------------------------
 
+    @audits_cell_tag
     async def get_message(self, message_id: str) -> dict[str, Any] | None:
         async with self._read() as db:
             cur = await db.execute("SELECT * FROM messages WHERE id=?", (message_id,))
@@ -11256,27 +12541,37 @@ class MessageStore:
         if row is None:
             return None
         record = dict(row)
-        mid = record["id"]
-        # decrypt the body for display, bound to the messages cell (ASVS 11.3.3)
-        record["raw"] = self._cipher.decrypt(record["raw"], aad=cell_aad("messages", "raw", mid))
-        # error may embed raw HL7 fragments (WP-5)
-        record["error"] = self._dec(record["error"], aad=cell_aad("messages", "error", mid))
-        # EF-3: MRN/name PHI, ciphered at rest
-        record["summary"] = self._dec(record["summary"], aad=cell_aad("messages", "summary", mid))
-        record["metadata"] = self._dec(  # EF-3
-            record["metadata"], aad=cell_aad("messages", "metadata", mid)
-        )
+        # Decrypt for display: raw (the body), error (may embed raw HL7 fragments, WP-5), summary and
+        # metadata (EF-3 PHI). Each cell is bound to the row's id and channel (ASVS 11.3.3, BACKLOG
+        # #2593), so a cell that fails that tag refuses the whole read.
+        for column in ("raw", "error", "summary", "metadata"):
+            record[column] = open_message_cell(
+                self._cipher,
+                column,
+                record[column],
+                message_id=record["id"],
+                channel_id=record["channel_id"],
+            )
         return record
 
+    @audits_cell_tag
     async def message_metadata_json(self, message_id: str) -> str | None:
         # #68: decrypt ONLY the metadata column (never the raw PHI body) for the delivery worker's
         # per-message dynamic headers. Off the perf-critical claim path; read only for opted-in outbounds.
         async with self._read() as db:
-            cur = await db.execute("SELECT metadata FROM messages WHERE id=?", (message_id,))
+            cur = await db.execute(
+                "SELECT channel_id, metadata FROM messages WHERE id=?", (message_id,)
+            )
             row = await cur.fetchone()
         if row is None:
             return None
-        return self._dec(row["metadata"], aad=cell_aad("messages", "metadata", message_id))
+        return open_message_cell(
+            self._cipher,
+            "metadata",
+            row["metadata"],
+            message_id=message_id,
+            channel_id=row["channel_id"],
+        )
 
     async def list_messages(
         self,
@@ -11314,10 +12609,29 @@ class MessageStore:
                 " ORDER BY received_at DESC, id DESC LIMIT ? OFFSET ?",
                 (*params, limit, offset),
             )
-            return [
-                self._decode_row(r, "messages", (r["id"],), "error", "summary", "metadata")
-                for r in await cur.fetchall()
-            ]
+            rows = await cur.fetchall()
+        return await self._list_message_records(rows)
+
+    async def _list_message_records(self, rows: Iterable[aiosqlite.Row]) -> list[dict[str, Any]]:
+        """Each row as a dict with its ``error``/``summary``/``metadata`` opened under the row's tag
+        (BACKLOG #2593). A row whose cells fail the tag still lists, by its plaintext columns, with
+        those cells withheld; it raised the alert, and it is audited here. Call it outside any read
+        or writer block: the audit write takes the writer lock."""
+        failures: list[CellTagError] = []
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            withhold_message_cells(
+                self._cipher,
+                d,
+                ("error", "summary", "metadata"),
+                message_id=d["id"],
+                channel_id=d["channel_id"],
+                failures=failures,
+            )
+            out.append(d)
+        await report_cell_tag_failures(self, failures)
+        return out
 
     async def count_messages(
         self,
@@ -11386,15 +12700,26 @@ class MessageStore:
                 (*params, spec.fetch_limit),
             )
             candidates = newest_first(await cur.fetchall())
-        return await asyncio.to_thread(self._scan_rows, spec, candidates, limit)
+        failures: list[CellTagError] = []
+        result = await asyncio.to_thread(self._scan_rows, spec, candidates, limit, failures)
+        await report_cell_tag_failures(self, failures)
+        return result
 
     def _scan_rows(
-        self, spec: SearchSpec, candidates: Sequence[aiosqlite.Row], limit: int
+        self,
+        spec: SearchSpec,
+        candidates: Sequence[aiosqlite.Row],
+        limit: int,
+        failures: list[CellTagError],
     ) -> MessageSearchResult:
         """The off-loop decrypt+match loop (run via ``asyncio.to_thread``). Decrypts each candidate's
         ``raw``/``summary`` and tests the content predicate; bounded by ``spec.scan_limit`` decrypts and
         ``limit`` matches. The returned rows are metadata-only (the decrypted ``raw`` is dropped — the
-        result has the same PHI surface as ``list_messages``)."""
+        result has the same PHI surface as ``list_messages``).
+
+        A candidate whose cells fail the row's tag (BACKLOG #2593) cannot be matched, so it is left
+        out of the result; it raised the alert, and its error goes to ``failures`` for the caller to
+        audit on the loop."""
         rows: list[dict[str, Any]] = []
         scanned = 0
         truncated = False
@@ -11403,15 +12728,25 @@ class MessageStore:
                 truncated = True
                 break
             scanned += 1
-            cid = cand["id"]
-            raw = self._dec(cand["raw"], aad=cell_aad("messages", "raw", cid))
-            summary = self._dec(cand["summary"], aad=cell_aad("messages", "summary", cid))
-            if row_matches(spec, raw=raw, summary=summary):
-                d = self._decode_row(cand, "messages", (cid,), "error", "summary", "metadata")
-                d.pop("raw", None)  # never return the decrypted body in a list-shaped result
-                rows.append(d)
-                if len(rows) >= limit:
-                    break
+            d = dict(cand)
+            stored_raw = d.pop(
+                "raw", None
+            )  # never return the decrypted body in a list-shaped result
+
+            tag = {"message_id": d["id"], "channel_id": d["channel_id"]}
+            try:
+                d["summary"] = open_message_cell(self._cipher, "summary", d.get("summary"), **tag)
+                raw = open_message_cell(self._cipher, "raw", stored_raw, **tag)
+                if not row_matches(spec, raw=raw, summary=d["summary"]):
+                    continue
+                for column in ("error", "metadata"):
+                    d[column] = open_message_cell(self._cipher, column, d.get(column), **tag)
+            except CellTagError as err:
+                failures.append(err)
+                continue
+            rows.append(d)
+            if len(rows) >= limit:
+                break
         return MessageSearchResult(
             rows=rows, scanned=scanned, matched=len(rows), truncated=truncated
         )
@@ -11434,21 +12769,30 @@ class MessageStore:
             cur = await db.execute(
                 "SELECT o.id AS outbox_id, o.message_id, o.channel_id, o.destination_name,"
                 " o.attempts, o.last_error, o.updated_at,"
-                " m.control_id, m.message_type, m.received_at, m.summary"
+                " m.control_id, m.message_type, m.received_at, m.summary,"
+                " m.channel_id AS message_channel_id"
                 f" FROM queue o JOIN messages m ON m.id = o.message_id{where}"
                 " ORDER BY o.updated_at DESC, o.id DESC LIMIT ? OFFSET ?",
                 (*params, limit, offset),
             )
             # Mixed-table join: `last_error` is queue's (keyed by o.id, aliased outbox_id), `summary` is
-            # the joined messages row's (keyed by message_id) — each binds to its own cell (ASVS 11.3.3).
+            # the joined messages row's (keyed by message_id and bound to the message's own channel,
+            # BACKLOG #2593) — each binds to its own cell (ASVS 11.3.3).
+            failures: list[CellTagError] = []
             out: list[dict[str, Any]] = []
             for r in await cur.fetchall():
                 d = self._decode_row(r, "queue", (r["outbox_id"],), "last_error")
-                d["summary"] = self._dec(
-                    r["summary"], aad=cell_aad("messages", "summary", r["message_id"])
+                withhold_message_cells(
+                    self._cipher,
+                    d,
+                    ("summary",),
+                    message_id=r["message_id"],
+                    channel_id=d.pop("message_channel_id"),
+                    failures=failures,
                 )
                 out.append(d)
-            return out
+        await report_cell_tag_failures(self, failures)
+        return out
 
     async def count_dead(
         self,
@@ -12810,28 +14154,23 @@ class MessageStore:
     ) -> None:
         check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
+        record = new_user_record(
+            user_id=user_id,
+            username=username,
+            auth_provider=auth_provider,
+            display_name=display_name,
+            email=email,
+            notify_email=birth_notify_email(email, adopt=adopt_notify_email, typed=notify_email),
+            password_hash=password_hash,
+            must_change_password=must_change_password,
+            password_generated=password_generated,
+            directory_object_id=directory_object_id,
+            now=now,
+        )
         async with _writer_guard(self._db, self._lock):
+            # BACKLOG #2592: the whole row, sealed, in one INSERT.
             await self._db.execute(
-                "INSERT INTO users (id, username, auth_provider, display_name, email, notify_email,"
-                " disabled, created_at, updated_at, last_login_at, password_hash, password_changed_at,"
-                " must_change_password, failed_attempts, locked_until, directory_object_id,"
-                " password_generated)"
-                " VALUES (?,?,?,?,?,?,0,?,?,NULL,?,?,?,0,NULL,?,?)",
-                (
-                    user_id,
-                    username,
-                    auth_provider,
-                    display_name,
-                    email,
-                    birth_notify_email(email, adopt=adopt_notify_email, typed=notify_email),
-                    now,
-                    now,
-                    password_hash,
-                    now if password_hash is not None else None,
-                    1 if must_change_password else 0,
-                    directory_object_id,
-                    1 if password_generated else 0,
-                ),
+                _USER_INSERT, user_insert_params(seal_user(self._row_sealer, record))
             )
             # BACKLOG #2100. Before the one commit, so a failed append rolls the account back.
             appended = await self._append_audits(audits, now=now)
@@ -12843,6 +14182,159 @@ class MessageStore:
             cur = await db.execute("SELECT * FROM users WHERE id=?", (user_id,))
             row = await cur.fetchone()
         return UserRecord.from_mapping(dict(row)) if row else None
+
+    async def get_user_role_grants(self, user_id: str) -> list[RoleGrant]:
+        """The account's role rows, whole, as its user seal covers them (BACKLOG #2592)."""
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT role_id, assigned_at, assigned_by FROM user_roles WHERE user_id=?",
+                (user_id,),
+            )
+            return [RoleGrant.from_mapping(dict(r)) for r in await cur.fetchall()]
+
+    async def _read_user_record(self, user_id: str) -> UserAuthzRecord | None:
+        """The account's whole authorization record, read on the writer connection inside the
+        caller's transaction (BACKLOG #2592)."""
+        cur = await self._db.execute("SELECT * FROM users WHERE id=?", (user_id,))
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        cur = await self._db.execute(
+            "SELECT role_id, assigned_at, assigned_by FROM user_roles WHERE user_id=?", (user_id,)
+        )
+        grants = [RoleGrant.from_mapping(dict(r)) for r in await cur.fetchall()]
+        return UserAuthzRecord.of(UserRow.from_mapping(dict(row)), grants)
+
+    async def _write_user(self, user_id: str, change: UserChange) -> UserAuthzRecord | None:
+        """The one writer of a user's sealed record (BACKLOG #2592). Call it inside a writer
+        transaction on ``self._db``.
+
+        Reads the row and its role rows, verifies the seal, applies ``change``, seals the result and
+        writes every column with a compare on the seal it read, then rewrites the role rows when they
+        changed. Returns the new record, or ``None`` when there is no row, ``change`` declined, or
+        the compare lost to a concurrent write; nothing is written then. Raises
+        :class:`RowSealError`, and writes nothing, when the record it read does not verify:
+        re-sealing it would turn a change made outside this helper into a sealed record. A change to
+        the roles passes :func:`existing_roles_only` first, so it raises :class:`UnknownRoleError`,
+        writing nothing, for an added role id with no ``roles`` row."""
+        current = await self._read_user_record(user_id)
+        if current is None:
+            return None
+        if not user_seal_ok(self._row_sealer, current):
+            raise RowSealError(USER_KIND)
+        changed = change(current)
+        if changed is None:
+            return None
+        if changed.roles != current.roles:
+            cur = await self._db.execute("SELECT id FROM roles")
+            changed = existing_roles_only(
+                current, changed, [str(r["id"]) for r in await cur.fetchall()]
+            )
+        updated = seal_user(self._row_sealer, changed)
+        cur = await self._db.execute(_USER_RESEAL, user_reseal_params(updated, current))
+        if cur.rowcount != 1:
+            return None
+        if updated.roles != current.roles:
+            await self._db.execute(_USER_ROLES_CLEAR, (current.row.id,))
+            for grant in updated.roles:
+                await self._db.execute(
+                    _USER_ROLE_INSERT,
+                    (current.row.id, grant.role_id, grant.assigned_at, grant.assigned_by),
+                )
+        return updated
+
+    async def _account_passkeys(self, user_id: str) -> list[WebAuthnCredential]:
+        rows = await self._db.execute(
+            "SELECT * FROM webauthn_credentials WHERE user_id=?", (user_id,)
+        )
+        return [WebAuthnCredential.from_mapping(dict(r)) for r in await rows.fetchall()]
+
+    async def _write_passkeys(
+        self,
+        user_id: str,
+        statement: str,
+        params: tuple[object, ...],
+        *,
+        removes_all: bool = False,
+    ) -> int:
+        """Run one passkey write and re-seal the account over its new passkey digest, in the
+        caller's writer transaction (BACKLOG #2592). Returns the statement's row count.
+
+        The account's record and its passkeys are checked first: a passkey is never added to or
+        removed from an account whose record fails its seal, or whose passkeys no longer match the
+        digest it covers, since the new digest would then seal a row the store never wrote.
+        ``removes_all`` skips the passkey check: once every passkey is gone nothing unchecked is
+        left to seal, so ``admin_reset_mfa`` can still clear a set that fails."""
+        current = await self._read_user_record(user_id)
+        if current is not None:
+            if not user_seal_ok(self._row_sealer, current):
+                raise RowSealError(USER_KIND)
+            if (
+                self._row_sealer is not None
+                and not removes_all
+                and passkey_digest(await self._account_passkeys(user_id)) != current.row.cred_digest
+            ):
+                raise RowSealError(USER_KIND)
+        # With no account the statement runs as it always did: an INSERT meets the foreign key and
+        # a DELETE matches nothing, and there is no record to seal. ``statement`` is one of the
+        # module's ``_WEBAUTHN_*`` constants, never caller text.
+        cur = await self._db.execute(statement, params)
+        count = int(cur.rowcount or 0)
+        if current is not None:
+            digest = passkey_digest(await self._account_passkeys(user_id))
+            await self._write_user(user_id, lambda r: r.changed(cred_digest=digest))
+        return count
+
+    async def reseal_user_records(self) -> tuple[int, int]:
+        """Re-seal every user record under the active key (BACKLOG #2592), for ``rotate-key``.
+
+        A record sealed under a retired key verifies until that key is dropped; this moves it to the
+        active key first, so dropping the retired key locks nobody out. The account's TOTP secret is
+        re-encrypted here too, in the same write (:func:`rotation_reseal` says why). A record that
+        fails its seal is left exactly as it is and counted. Returns ``(re-sealed, refused)``."""
+        sealer = self._row_sealer
+        if sealer is None:
+            return 0, 0
+        # A sealer exists only for a cipher that holds its keys in-process, which is AesGcmCipher.
+        cipher = cast("AesGcmCipher", self._cipher)
+        change = rotation_reseal(
+            sealer,
+            cipher.active_marker_prefix,
+            lambda stored, aad: self._reencrypt_value(cipher, stored, aad),
+        )
+        async with self._read() as db:
+            # Only records the pass has work on: sealed under another key, or over a TOTP secret not
+            # yet under the active key. The change re-checks both, so this filter only saves work.
+            cur = await db.execute(
+                "SELECT id FROM users WHERE authz_seal <> '' AND (authz_seal NOT LIKE ?"
+                " OR (totp_secret IS NOT NULL AND totp_secret <> '' AND totp_secret NOT LIKE ?))"
+                " ORDER BY id",
+                (f"{SEAL_PREFIX}{sealer.key_id}:%", f"{cipher.active_marker_prefix}%"),
+            )
+            ids = [str(r["id"]) for r in await cur.fetchall()]
+        resealed = refused = 0
+        for user_id in ids:
+            try:
+                async with _writer_guard(self._db, self._lock):
+                    written = await self._write_user(user_id, change)
+                    await self._commit()
+            except RowSealError:
+                refused += 1
+                continue
+            resealed += written is not None
+        if resealed:
+            # Each re-encrypted TOTP secret is an AES-GCM invocation under the active key (ASVS
+            # 11.3.4); charged here, as each generic rotation batch charges its own.
+            await self._charge_bound_batch()
+        return resealed, refused
+
+    async def count_unsealed_users(self) -> int:
+        """How many accounts carry no integrity seal (BACKLOG #2592). See
+        :func:`report_unsealed_users`."""
+        async with self._read() as db:
+            cur = await db.execute("SELECT COUNT(*) FROM users WHERE authz_seal = ''")
+            row = await cur.fetchone()
+        return int(row[0]) if row else 0
 
     async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
         # BACKLOG #1256. Both columns are compared, never `subject` alone: a subject is unique only
@@ -12900,15 +14392,28 @@ class MessageStore:
         #
         # The residual is still absorbed at the call site (`_refresh_cached_username`) for every
         # backend alike -- this store must not be the reason that handler looks unnecessary.
+        #
+        # BACKLOG #2592: the compare and the NOT EXISTS are now a read inside the same writer
+        # transaction, then the sealed write; the lock and SQLite's file-level writer lock still
+        # order it against every other writer as the comment above describes.
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
-                "UPDATE users SET username=?, updated_at=? WHERE id=? AND username=? AND NOT EXISTS "
-                "(SELECT 1 FROM users other WHERE other.username=? AND other.id<>?)",
-                (username, now, user_id, expected_username, username, user_id),
+                "SELECT 1 FROM users WHERE username=? AND id<>?", (username, user_id)
             )
+            taken = await cur.fetchone() is not None
+            written = None
+            if not taken:
+                written = await self._write_user(
+                    user_id,
+                    lambda r: (
+                        r.changed(username=username, updated_at=float(now))
+                        if r.row.username == expected_username
+                        else None
+                    ),
+                )
             await self._commit()
-            return int(cur.rowcount) > 0
+            return written is not None
 
     async def list_users(self) -> list[UserRecord]:
         async with self._read() as db:
@@ -12930,28 +14435,17 @@ class MessageStore:
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
-        claim_set = password_claim_set(must_change_password, "?")
-        claim_args: tuple[float, ...] = () if must_change_password else (now,)
-        condition = rotation_factor_term("1") if require_totp else ""
+        change = password_change(
+            password_hash=password_hash,
+            password_generated=password_generated,
+            must_change_password=must_change_password,
+            require_totp=require_totp,
+            now=now,
+        )
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute(
-                "UPDATE users SET password_hash=?, password_changed_at=?, must_change_password=?,"
-                f"{claim_set}"
-                f" {PASSWORD_CHANGE_LOCKOUT_CLEAR}, password_generated=?, updated_at=?"
-                f" WHERE id=?{condition}",
-                (
-                    password_hash,
-                    now,
-                    1 if must_change_password else 0,
-                    *claim_args,
-                    1 if password_generated else 0,
-                    now,
-                    user_id,
-                ),
-            )
-            written = cur.rowcount > 0
+            written = await self._write_user(user_id, change)
             await self._commit()
-        return written
+        return written is not None
 
     async def set_password_hash(
         self, user_id: str, *, password_hash: str, now: float | None = None
@@ -12960,9 +14454,8 @@ class MessageStore:
         See the protocol's note on why it must not reuse ``set_password``."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                "UPDATE users SET password_hash=?, updated_at=? WHERE id=?",
-                (password_hash, now, user_id),
+            await self._write_user(
+                user_id, lambda r: r.changed(password_hash=password_hash, updated_at=float(now))
             )
             await self._commit()
 
@@ -12971,9 +14464,8 @@ class MessageStore:
     ) -> None:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                "UPDATE users SET disabled=?, updated_at=? WHERE id=?",
-                (1 if disabled else 0, now, user_id),
+            await self._write_user(
+                user_id, lambda r: r.changed(disabled=bool(disabled), updated_at=float(now))
             )
             await self._commit()
 
@@ -12993,9 +14485,9 @@ class MessageStore:
         ``AuthStore.update_user_profile``."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                "UPDATE users SET display_name=?, email=?, updated_at=? WHERE id=?",
-                (display_name, email, now, user_id),
+            await self._write_user(
+                user_id,
+                lambda r: r.changed(display_name=display_name, email=email, updated_at=float(now)),
             )
             appended = await self._append_audits(audits, now=now)
             await self._commit()
@@ -13013,9 +14505,8 @@ class MessageStore:
         cleaned = require_notify_email(email)
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                "UPDATE users SET notify_email=?, updated_at=? WHERE id=?",
-                (cleaned, now, user_id),
+            await self._write_user(
+                user_id, lambda r: r.changed(notify_email=cleaned, updated_at=float(now))
             )
             await self._commit()
 
@@ -13028,10 +14519,10 @@ class MessageStore:
         enable MFA — enrollment is confirmed by :meth:`enable_totp` after the user proves a live code.
         ``secret=None`` clears the staged secret."""
         now = time.time() if now is None else now
+        sealed = self._enc(secret, aad=cell_aad("users", "totp_secret", user_id))
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                "UPDATE users SET totp_secret=?, updated_at=? WHERE id=?",
-                (self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)), now, user_id),
+            await self._write_user(
+                user_id, lambda r: r.changed(totp_secret=sealed, updated_at=float(now))
             )
             await self._commit()
 
@@ -13051,17 +14542,12 @@ class MessageStore:
     ) -> bool:
         """Activate TOTP for a user (post-confirm), storing the argon2id hashes of their one-time
         recovery codes. Writes only where a secret is staged and TOTP is still off, and returns
-        whether it wrote (BACKLOG #2224, see :func:`totp_enable_term`)."""
+        whether it wrote (BACKLOG #2224, see :func:`totp_enable`)."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute(
-                "UPDATE users SET totp_enabled=1, totp_enrolled_at=?, totp_recovery_codes=?,"
-                f" updated_at=? WHERE id=?{totp_enable_term('0')}",
-                (now, json.dumps(recovery_code_hashes), now, user_id),
-            )
-            written = cur.rowcount > 0
+            written = await self._write_user(user_id, totp_enable(recovery_code_hashes, now))
             await self._commit()
-        return written
+        return written is not None
 
     async def replace_totp_enrolment(
         self,
@@ -13086,28 +14572,19 @@ class MessageStore:
         never be turned on for an account that did not have it. The audit row and the session sweep
         commit or roll back with the swap, so a refused audit append leaves the old seed in place."""
         now = time.time() if now is None else now
+        change = totp_replace(
+            sealed_secret=self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)),
+            recovery_code_hashes=recovery_code_hashes,
+            step=step,
+            expected_enrolled_at=expected_enrolled_at,
+            now=now,
+        )
         async with _writer_txn(self._db, self._lock):
-            cur = await self._db.execute(
-                "UPDATE users SET totp_secret=?, totp_enrolled_at=?, totp_recovery_codes=?,"
-                " last_totp_step=?, updated_at=?"
-                " WHERE id=? AND totp_enabled=1 AND totp_secret IS NOT NULL"
-                " AND totp_enrolled_at IS ?",
-                (
-                    self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)),
-                    now,
-                    json.dumps(recovery_code_hashes),
-                    step,
-                    now,
-                    user_id,
-                    expected_enrolled_at,
-                ),
-            )
-            if int(cur.rowcount) <= 0:
+            if await self._write_user(user_id, change) is None:
                 # Nothing written, so nothing is revoked or audited. The commit ends the empty
                 # transaction, as set_user_federated_subject does.
                 await self._commit()
                 return None
-            await self._db.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
             revoked = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
             appended = await self._append_audits((audit,), now=now)
             await self._commit()
@@ -13118,15 +14595,10 @@ class MessageStore:
         """Clear a user's TOTP enrollment entirely (secret, enabled flag, recovery codes)."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            # ``last_totp_step`` too (ADR 0197 Amendment A): the high-water mark belonged to the secret
-            # being removed, and a new secret has no history. Kept, it would refuse the first code of
+            # ``last_totp_step`` too (:func:`totp_disable`): kept, it would refuse the first code of
             # the next secret inside the same 30 seconds -- which the earlier holder of a row being
             # repaired by ``provision-admin`` could use to block the repair.
-            await self._db.execute(
-                "UPDATE users SET totp_secret=NULL, totp_enabled=0, totp_enrolled_at=NULL,"
-                " totp_recovery_codes=NULL, last_totp_step=NULL, updated_at=? WHERE id=?",
-                (now, user_id),
-            )
+            await self._write_user(user_id, lambda r: totp_disable(r, now))
             await self._commit()
 
     async def get_recovery_code_hashes(self, user_id: str) -> list[str]:
@@ -13146,22 +14618,10 @@ class MessageStore:
         concurrent verifications can't double-spend a single-use recovery code (WP-14)."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute(
-                "SELECT totp_recovery_codes FROM users WHERE id=?", (user_id,)
-            )
-            row = await cur.fetchone()
-            if not row or row["totp_recovery_codes"] is None:
-                return False
-            hashes = [str(h) for h in json.loads(row["totp_recovery_codes"])]
-            if code_hash not in hashes:
-                return False  # already consumed by a concurrent caller
-            hashes.remove(code_hash)
-            await self._db.execute(
-                "UPDATE users SET totp_recovery_codes=?, updated_at=? WHERE id=?",
-                (json.dumps(hashes), now, user_id),
-            )
+            # Nothing written when the hash is gone: a concurrent caller already spent it.
+            written = await self._write_user(user_id, recovery_code_spend(code_hash, now))
             await self._commit()
-            return True
+        return written is not None
 
     async def consume_totp_step(self, user_id: str, step: int) -> bool:
         """Atomically record ``step`` as the user's highest consumed TOTP time-step; return ``True``
@@ -13171,16 +14631,10 @@ class MessageStore:
         (ASVS 6.5.1). The re-read + compare + write run under one ``self._lock``, so two concurrent
         verifications of the same code can't both win."""
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute("SELECT last_totp_step FROM users WHERE id=?", (user_id,))
-            row = await cur.fetchone()
-            if row is None:
-                return False
-            last = row["last_totp_step"]
-            if last is not None and last >= step:
-                return False  # already consumed (or an older step) — replay within the window
-            await self._db.execute("UPDATE users SET last_totp_step=? WHERE id=?", (step, user_id))
+            # Nothing written for an older or equal step: a replay within the window.
+            written = await self._write_user(user_id, totp_step_spend(step))
             await self._commit()
-            return True
+        return written is not None
 
     # --- WebAuthn credentials (WP-14b, ADR 0068) ------------------------------
 
@@ -13188,29 +14642,10 @@ class MessageStore:
         """Persist one enrolled passkey. Public keys are plaintext by design (see the
         ``_CIPHER_COLUMNS`` note). A duplicate ``(user_id, label)`` raises the backend's
         IntegrityError — the caller renders it as the same "label already in use" error as its
-        pre-check (the concurrent-enroll race, ADR 0068 §4)."""
+        pre-check (the concurrent-enroll race, ADR 0068 §4). The account is re-sealed over its new
+        passkey digest in the same transaction (BACKLOG #2592)."""
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                "INSERT INTO webauthn_credentials (credential_id_hash, credential_id, user_id,"
-                " rp_id, public_key, sign_count, transports, device_type, backed_up, label,"
-                " aaguid, created_at, last_used_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    cred.credential_id_hash,
-                    cred.credential_id,
-                    cred.user_id,
-                    cred.rp_id,
-                    cred.public_key,
-                    cred.sign_count,
-                    json.dumps(cred.transports) if cred.transports is not None else None,
-                    cred.device_type,
-                    int(cred.backed_up),
-                    cred.label,
-                    cred.aaguid,
-                    cred.created_at,
-                    cred.last_used_at,
-                ),
-            )
+            await self._write_passkeys(cred.user_id, _WEBAUTHN_INSERT, webauthn_insert_params(cred))
             await self._commit()
 
     async def list_webauthn_credentials(self, user_id: str) -> list[WebAuthnCredential]:
@@ -13251,23 +14686,24 @@ class MessageStore:
 
     async def delete_webauthn_credential(self, user_id: str, credential_id_hash: str) -> bool:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
-        predicate keeps the action self-scoped even if a foreign id-hash is submitted)."""
+        predicate keeps the action self-scoped even if a foreign id-hash is submitted). The
+        account is re-sealed over its new passkey digest in the same transaction (BACKLOG #2592)."""
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute(
-                "DELETE FROM webauthn_credentials WHERE user_id=? AND credential_id_hash=?",
-                (user_id, credential_id_hash),
+            count = await self._write_passkeys(
+                user_id, _WEBAUTHN_DELETE_ONE, (user_id, credential_id_hash)
             )
             await self._commit()
-            return cur.rowcount > 0
+        return count > 0
 
     async def delete_all_webauthn_credentials(self, user_id: str) -> int:
-        """Remove every credential for a user (``admin_reset_mfa``); returns the count removed."""
+        """Remove every credential for a user (``admin_reset_mfa``); returns the count removed.
+        The account is re-sealed over its empty passkey digest in the same transaction."""
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute(
-                "DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,)
+            count = await self._write_passkeys(
+                user_id, _WEBAUTHN_DELETE_ALL, (user_id,), removes_all=True
             )
             await self._commit()
-            return int(cur.rowcount or 0)
+        return count
 
     async def update_webauthn_sign_count(
         self, credential_id_hash: str, *, expected: int, new: int, used_at: float
@@ -13337,21 +14773,24 @@ class MessageStore:
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
             if change.takes_role(admin_role_id, role_ids):
-                cur = await self._db.execute(
-                    _SQL_ADMIN_GUARD_COUNTS, (user_id, user_id, admin_role_id)
+                cur = await self._db.execute(_SQL_ADMIN_GUARD_HOLDERS, (user_id, admin_role_id))
+                holders = [(str(r[0]), bool(r[1])) for r in await cur.fetchall()]
+                target, others = await admin_guard_counts(
+                    holders, self._row_sealer, self._read_user_record
                 )
-                target, others = await cur.fetchone() or (0, 0)
                 if target and not others:
                     await self._db.rollback()
                     return False
             if change is AdminRemoval.DISABLE:
-                await self._db.execute(
-                    "UPDATE users SET disabled=1, updated_at=? WHERE id=?", (now, user_id)
+                await self._write_user(
+                    user_id, lambda r: r.changed(disabled=True, updated_at=float(now))
                 )
             elif change is AdminRemoval.DELETE:
                 await self._delete_user_rows(user_id)
             elif change is AdminRemoval.SET_ROLES:
-                await self._replace_user_roles(user_id, role_ids, assigned_by=assigned_by, now=now)
+                await self._write_user(
+                    user_id, lambda r: r.with_roles(role_ids, assigned_by=assigned_by, now=now)
+                )
             else:
                 assert_never(change)
             await self._commit()
@@ -13359,10 +14798,11 @@ class MessageStore:
 
     async def _delete_user_rows(self, user_id: str) -> None:
         """Delete the account and every row keyed to it. Commits nothing: the caller holds the
-        writer transaction."""
-        await self._db.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
+        writer transaction. Destroying a sealed record needs no key, so nothing here re-seals
+        (BACKLOG #2592)."""
+        await self._db.execute(_USER_ROLES_CLEAR, (user_id,))
         await self._db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
-        await self._db.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))
+        await self._db.execute(_WEBAUTHN_DELETE_ALL, (user_id,))
         # vault BACKLOG #2145: the account's known sign-in addresses go with it.
         await self._db.execute("DELETE FROM known_login_addresses WHERE user_id=?", (user_id,))
         # BACKLOG #1233: presets are owner-scoped by Identity.user_id (#1225) and there is no
@@ -13376,11 +14816,7 @@ class MessageStore:
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                f"UPDATE users SET last_login_at=?, {FULL_AUTHENTICATION_LOCKOUT_CLEAR},"
-                " updated_at=? WHERE id=?",
-                (now, now, user_id),
-            )
+            await self._write_user(user_id, lambda r: full_authentication_clear(r, now))
             await self._commit()
 
     async def clear_lockout(
@@ -13388,10 +14824,8 @@ class MessageStore:
     ) -> None:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                f"UPDATE users SET {lockout_clear_set(reset_cycles=reset_cycles)}, updated_at=?"
-                " WHERE id=?",
-                (now, user_id),
+            await self._write_user(
+                user_id, lambda r: lockout_clear(r, reset_cycles=reset_cycles, now=now)
             )
             await self._commit()
 
@@ -13405,9 +14839,13 @@ class MessageStore:
     ) -> None:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                "UPDATE users SET failed_attempts=?, locked_until=?, updated_at=? WHERE id=?",
-                (failed_attempts, locked_until, now, user_id),
+            await self._write_user(
+                user_id,
+                lambda r: r.changed(
+                    failed_attempts=int(failed_attempts),
+                    locked_until=_opt_float(locked_until),
+                    updated_at=float(now),
+                ),
             )
             await self._commit()
 
@@ -13433,36 +14871,19 @@ class MessageStore:
         Returns ``(0, False, 0)`` for an unknown user -- there is no row to count against, and a
         caller that reached here on a missing account has already refused it."""
         now = time.time() if now is None else now
-        attempts_col, until_col, cycles_col = LOCKOUT_COLUMNS[counter]
+        out: list[LockoutIncrement] = []
+        change = lockout_increment(
+            counter,
+            threshold=threshold,
+            lockout_seconds=lockout_seconds,
+            max_lockout_seconds=max_lockout_seconds,
+            now=now,
+            out=out,
+        )
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute(
-                f"SELECT {attempts_col}, {until_col}, {cycles_col}, auth_provider, totp_enabled,"
-                " password_generated FROM users WHERE id=?",
-                (user_id,),
-            )
-            row = await cur.fetchone()
-            if row is None:
-                return LockoutIncrement(0, False, 0)
-            state = next_lockout_state(
-                failed_attempts=int(row[0]),
-                locked_until=_opt_float(row[1]),
-                lock_cycles=int(row[2]),
-                now=now,
-                threshold=threshold,
-                lockout_seconds=lockout_seconds,
-                max_lockout_seconds=max_lockout_seconds,
-                escalate=lockout_escalates(
-                    counter, auth_provider=str(row[3]), totp_enabled=bool(row[4])
-                ),
-                lockable=lockout_arms(counter, password_generated=bool(row[5])),
-            )
-            await self._db.execute(
-                f"UPDATE users SET {attempts_col}=?, {until_col}=?, {cycles_col}=?, updated_at=?"
-                " WHERE id=?",
-                (state.attempts, state.locked_until, state.cycles, now, user_id),
-            )
+            written = await self._write_user(user_id, change)
             await self._commit()
-            return LockoutIncrement(state.attempts, state.just_locked, state.cycles)
+        return out[0] if written is not None else LockoutIncrement(0, False, 0)
 
     async def upsert_role(
         self,
@@ -13473,16 +14894,21 @@ class MessageStore:
         builtin: bool = True,
         permissions: str | None = None,
     ) -> None:
+        row = RoleRow(role_id, display_name, description, bool(builtin), permissions, "")
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                "INSERT INTO roles (id, display_name, description, builtin, permissions)"
-                " VALUES (?,?,?,?,?)"
-                " ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name,"
-                " description=excluded.description, builtin=excluded.builtin,"
-                " permissions=excluded.permissions",
-                (role_id, display_name, description, 1 if builtin else 0, permissions),
-            )
+            await self._write_role(row)
             await self._commit()
+
+    async def _write_role(self, row: RoleRow) -> None:
+        """The one writer of a ``roles`` row (BACKLOG #2592): every column of ``row``, sealed under
+        the active key. Call it inside an open write.
+
+        It replaces the whole row from ``row`` and keeps nothing from the row it replaces, so it
+        does not check that row's seal: an administrator's re-save is how a role that fails is
+        repaired (the comment above :data:`ROLE_SEAL_EXCLUDED` says why that copies nothing in). A
+        caller that builds ``row`` from a stored one checks it first, as
+        :meth:`reseal_role_records` does."""
+        await self._db.execute(_ROLE_UPSERT, seal_role(self._row_sealer, row).write_params())
 
     async def list_roles(self) -> list[aiosqlite.Row]:
         async with self._read() as db:
@@ -13504,8 +14930,30 @@ class MessageStore:
             if row is None or int(row["builtin"]) != 0:
                 await self._db.rollback()
                 return False
-            await self._db.execute("DELETE FROM user_roles WHERE role_id=?", (role_id,))
-            await self._db.execute("DELETE FROM ad_group_role_map WHERE role_id=?", (role_id,))
+            # BACKLOG #2592: each holder's record is re-sealed without the role. A holder whose
+            # record fails its seal is refused on every read already; only its own row of this role
+            # is deleted, which needs no key and re-seals nothing. No bulk delete: it would leave a
+            # sealed record naming a row it no longer has. A holder that appears after the read,
+            # from another process, keeps its row; the `user_roles` foreign key, which every backend
+            # has (foreign_keys=ON here), then makes the role delete below fail.
+            cur = await self._db.execute(
+                "SELECT user_id FROM user_roles WHERE role_id=?", (role_id,)
+            )
+            for holder in [str(r["user_id"]) for r in await cur.fetchall()]:
+                try:
+                    await self._write_user(holder, without_role(role_id))
+                except RowSealError:
+                    report_refused_role_holder()
+                    await self._db.execute(
+                        "DELETE FROM user_roles WHERE role_id=? AND user_id=?", (role_id, holder)
+                    )
+            # The map keeps its other pairs, so it is re-sealed only when it verifies; a map that
+            # fails loses this role's pairs, which needs no key, and stays failing.
+            try:
+                await self._write_ad_map(AD_ROLE_MAP, lambda m: m.without_value(role_id))
+            except RowSealError:
+                report_refused_ad_role_map()
+                await self._db.execute("DELETE FROM ad_group_role_map WHERE role_id=?", (role_id,))
             await self._db.execute("DELETE FROM roles WHERE id=?", (role_id,))
             await self._commit()
             return True
@@ -13540,7 +14988,11 @@ class MessageStore:
             )
             row = await cur.fetchone()
             effective_id = str(row["id"]) if row is not None else preset_id
-            enc = self._enc(criteria, aad=cell_aad("search_presets", "criteria", effective_id))
+            # Bound to the row id and its owner (BACKLOG #2593).
+            enc = self._enc(
+                criteria,
+                aad=preset_criteria_aad(preset_id=effective_id, owner_user_id=owner_user_id),
+            )
             if row is not None:
                 await self._db.execute(
                     "UPDATE search_presets SET criteria=?, updated_at=? WHERE id=?",
@@ -13567,6 +15019,7 @@ class MessageStore:
             )
             return [dict(r) for r in await cur.fetchall()]
 
+    @audits_cell_tag
     async def get_search_preset(
         self, *, preset_id: str, owner_user_id: str, now: float | None = None
     ) -> dict[str, Any] | None:
@@ -13588,8 +15041,10 @@ class MessageStore:
             if row is None:
                 return None
             out = dict(row)
-            out["criteria"] = self._dec(
-                row["criteria"], aad=cell_aad("search_presets", "criteria", preset_id)
+            # Bound to the row id and its owner (BACKLOG #2593): a preset moved to another owner
+            # outside the store refuses here.
+            out["criteria"] = open_preset_criteria(
+                self._cipher, row["criteria"], preset_id=preset_id, owner_user_id=owner_user_id
             )
         # Outside the _read() block: on the :memory: fallback path _read() holds self._lock, and the
         # pooled read connections are PRAGMA query_only=ON — the stamp must go to the writer.
@@ -13628,21 +15083,10 @@ class MessageStore:
     ) -> None:
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
-            await self._replace_user_roles(user_id, role_ids, assigned_by=assigned_by, now=now)
-            await self._commit()
-
-    async def _replace_user_roles(
-        self, user_id: str, role_ids: Sequence[str], *, assigned_by: str | None, now: float
-    ) -> None:
-        """Replace the account's role rows. Commits nothing: the caller holds the writer
-        transaction."""
-        await self._db.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
-        for role_id in role_ids:
-            await self._db.execute(
-                "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by)"
-                " VALUES (?,?,?,?)",
-                (user_id, role_id, now, assigned_by),
+            await self._write_user(
+                user_id, lambda r: r.with_roles(role_ids, assigned_by=assigned_by, now=now)
             )
+            await self._commit()
 
     async def set_user_channel_scope(
         self,
@@ -13657,9 +15101,11 @@ class MessageStore:
         ``source`` records who wrote it, in the same statement (BACKLOG #1927)."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                "UPDATE users SET channel_scope=?, channel_scope_source=?, updated_at=? WHERE id=?",
-                (scope_json, source, now, user_id),
+            await self._write_user(
+                user_id,
+                lambda r: r.changed(
+                    channel_scope=scope_json, channel_scope_source=source, updated_at=float(now)
+                ),
             )
             await self._commit()
 
@@ -13676,13 +15122,11 @@ class MessageStore:
         ``=`` so a ``None`` expectation matches a NULL source."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute(
-                "UPDATE users SET channel_scope=?, channel_scope_source=?, updated_at=?"
-                " WHERE id=? AND channel_scope_source IS ?",
-                (scope_json, source, now, user_id, expected_source),
+            written = await self._write_user(
+                user_id, scope_if_source(scope_json, source, expected_source, now)
             )
             await self._commit()
-            return int(cur.rowcount) > 0
+        return written is not None
 
     async def withdraw_ad_channel_scope(
         self, user_id: str, expected_scope: str, *, now: float | None = None
@@ -13690,12 +15134,9 @@ class MessageStore:
         """Withdraw a directory-derived scope to NULL (BACKLOG #1927); see ``AuthStore``."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            cur = await self._db.execute(
-                WITHDRAW_AD_SCOPE_SQL,
-                (SCOPE_SOURCE_AD, now, user_id, expected_scope, SCOPE_SOURCE_MANUAL),
-            )
+            written = await self._write_user(user_id, scope_withdrawal(expected_scope, now))
             await self._commit()
-            return int(cur.rowcount) > 0
+        return written is not None
 
     async def set_user_federated_subject(
         self,
@@ -13714,17 +15155,11 @@ class MessageStore:
         # ux_users_federated_subject refusing this UPDATE is EXPECTED (the #1256 race loser), and the
         # unwind rolls it back (BACKLOG #1801).
         async with _writer_txn(self._db, self._lock):
-            if expect_unbound:
-                cur = await self._db.execute(
-                    _SET_FEDERATED_IF_UNBOUND_SQL, (issuer, subject, now, user_id)
-                )
-            else:
-                cur = await self._db.execute(_SET_FEDERATED_SQL, (issuer, subject, now, user_id))
-            if int(cur.rowcount) <= 0:
+            change = federated_bind(issuer, subject, expect_unbound=expect_unbound, now=now)
+            if await self._write_user(user_id, change) is None:
                 # Nothing written, so nothing is revoked. The commit ends the empty transaction.
                 await self._commit()
                 return None
-            await self._db.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
             revoked = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
             await self._commit()
             return int(revoked.rowcount)
@@ -13770,11 +15205,7 @@ class MessageStore:
                 return FederatedUnbind(
                     username=row["username"], issuer=None, subject=None, sessions_revoked=0
                 )
-            await self._db.execute(
-                "UPDATE users SET oidc_issuer=NULL, oidc_subject=NULL, updated_at=? WHERE id=?",
-                (now, user_id),
-            )
-            await self._db.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
+            await self._write_user(user_id, lambda r: federated_unbind(r, now))
             revoked = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
             await self._commit()
             return FederatedUnbind(
@@ -13785,16 +15216,17 @@ class MessageStore:
             )
 
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
-        normalized = sorted({g.strip().lower() for g in groups if g.strip()})
-        if not normalized:
-            return set()
-        placeholders = ",".join("?" * len(normalized))  # count-bound, not user text
+        """The role ids the role map gives ``groups``, its seal UNCHECKED. The service reads each
+        map through its own loader, which checks the seal (BACKLOG #2592)."""
+        return (await self.get_ad_map(AD_ROLE_MAP)).values_for(groups)
+
+    async def get_ad_map(self, name: str) -> AdMap:
         async with self._read() as db:
-            cur = await db.execute(
-                f"SELECT DISTINCT role_id FROM ad_group_role_map WHERE ad_group IN ({placeholders})",
-                tuple(normalized),
-            )
-            return {str(r["role_id"]) for r in await cur.fetchall()}
+            if _is_role_map(name):
+                cur = await db.execute(_AD_ROLE_MAP_READ, (name,))
+            else:
+                cur = await db.execute(_AD_SCOPE_MAP_READ, (name,))
+            return AdMap.from_rows(name, await cur.fetchall())
 
     async def list_ad_group_role_map(self) -> list[aiosqlite.Row]:
         async with self._read() as db:
@@ -13804,30 +15236,108 @@ class MessageStore:
             return list(await cur.fetchall())
 
     async def set_ad_group_role_map(self, entries: Iterable[tuple[str, str]]) -> None:
-        pairs = sorted({(g.strip().lower(), r) for g, r in entries if g.strip()})
+        await self._replace_ad_map(AdMap.from_entries(AD_ROLE_MAP, entries))
+
+    async def _replace_ad_map(self, replacement: AdMap) -> None:
         async with _writer_txn(self._db, self._lock):
-            await self._db.execute("DELETE FROM ad_group_role_map")
-            for ad_group, role_id in pairs:
-                await self._db.execute(
-                    "INSERT INTO ad_group_role_map (ad_group, role_id) VALUES (?,?)",
-                    (ad_group, role_id),
-                )
+            await self._write_ad_map(replacement.name, replacement)
             await self._commit()
 
-    async def channels_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
-        """Channels mapped to a user's AD groups (per-channel RBAC C3). May include the sentinel
-        ``'*'`` (all). Empty = no group mapping matched; the AD login sync then keeps a manual scope
-        and withdraws any other (BACKLOG #1927)."""
-        normalized = sorted({g.strip().lower() for g in groups if g.strip()})
-        if not normalized:
-            return set()
-        placeholders = ",".join("?" * len(normalized))  # count-bound, not user text
+    async def _write_ad_map(self, name: str, change: AdMapChange) -> bool:
+        """The one writer of an AD directory map and its seal (BACKLOG #2592). Call it inside an
+        open write transaction. Reads the map, applies ``change`` and writes the result, sealed;
+        :func:`ad_map_write` says when it refuses, raising :class:`RowSealError` and writing
+        nothing. Returns whether anything was written."""
+        # Each statement is named at its call, not looked up; the module constants say why.
+        role = _is_role_map(name)
+        cur = await self._db.execute("SELECT seal FROM authority_set_seal WHERE name=?", (name,))
+        seal_row = await cur.fetchone()
+        if role:
+            cur = await self._db.execute(_AD_ROLE_MAP_PAIRS)
+        else:
+            cur = await self._db.execute(_AD_SCOPE_MAP_PAIRS)
+        current = AdMap.of(
+            name,
+            [(str(r[0]), str(r[1])) for r in await cur.fetchall()],
+            "" if seal_row is None else str(seal_row["seal"] or ""),
+        )
+        new = ad_map_write(self._row_sealer, current, change)
+        if new is None:
+            return False
+        if new.pairs != current.pairs:
+            if role:
+                await self._db.execute(_AD_ROLE_MAP_CLEAR)
+                for pair in new.pairs:
+                    await self._db.execute(_AD_ROLE_MAP_INSERT, pair)
+            else:
+                await self._db.execute(_AD_SCOPE_MAP_CLEAR)
+                for pair in new.pairs:
+                    await self._db.execute(_AD_SCOPE_MAP_INSERT, pair)
+        await self._db.execute(
+            "INSERT INTO authority_set_seal (name, seal) VALUES (?,?)"
+            " ON CONFLICT(name) DO UPDATE SET seal=excluded.seal",
+            (name, new.seal),
+        )
+        return True
+
+    async def count_unsealed_role_records(self) -> int:
+        """How many custom roles carry no integrity seal, plus one for each AD directory map that
+        has pairs and no seal (BACKLOG #2592). See :func:`report_unsealed_role_records`."""
+        async with self._read() as db:
+            cur = await db.execute("SELECT COUNT(*) FROM roles WHERE builtin = 0 AND seal = ''")
+            row = await cur.fetchone()
+        unsealed = int(row[0]) if row else 0
+        for name in AD_MAPS:
+            current = await self.get_ad_map(name)
+            unsealed += 1 if current.pairs and not current.seal else 0
+        return unsealed
+
+    async def reseal_role_records(self) -> tuple[int, int]:
+        """Re-seal every role definition and both AD directory maps under the active key, for
+        ``rotate-key`` (BACKLOG #2592), as :meth:`reseal_user_records` does for accounts. Each is
+        checked under the key its seal names first; one that fails is left as it is and counted.
+        Returns ``(re-sealed, refused)``."""
+        sealer = self._row_sealer
+        if sealer is None:
+            return 0, 0
         async with self._read() as db:
             cur = await db.execute(
-                f"SELECT DISTINCT channel FROM ad_group_scope_map WHERE ad_group IN ({placeholders})",
-                tuple(normalized),
+                "SELECT id FROM roles WHERE seal <> '' AND seal NOT LIKE ? ORDER BY id",
+                (f"{SEAL_PREFIX}{sealer.key_id}:%",),
             )
-            return {str(r["channel"]) for r in await cur.fetchall()}
+            ids = [str(r["id"]) for r in await cur.fetchall()]
+        resealed = refused = 0
+        for role_id in ids:
+            async with _writer_guard(self._db, self._lock):
+                cur = await self._db.execute("SELECT * FROM roles WHERE id=?", (role_id,))
+                found = await cur.fetchone()
+                if found is None:
+                    continue
+                row = RoleRow.from_mapping(found)
+                if not role_seal_ok(sealer, row):
+                    refused += 1
+                    continue
+                await self._write_role(row)
+                await self._commit()
+                resealed += 1
+        for name in AD_MAPS:
+            current = await self.get_ad_map(name)
+            if not current.seal or sealer.is_active(current.seal):
+                continue
+            try:
+                async with _writer_txn(self._db, self._lock):
+                    resealed += await self._write_ad_map(name, lambda m: m)
+                    await self._commit()
+            except RowSealError:
+                refused += 1
+        return resealed, refused
+
+    async def channels_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
+        """Channels mapped to a user's AD groups (per-channel RBAC C3), the map's seal UNCHECKED;
+        the service reads it through its own loader (BACKLOG #2592). May include the sentinel
+        ``'*'`` (all). Empty = no group mapping matched; the AD login sync then keeps a manual scope
+        and withdraws any other (BACKLOG #1927)."""
+        return (await self.get_ad_map(AD_SCOPE_MAP)).values_for(groups)
 
     async def list_ad_group_scope_map(self) -> list[aiosqlite.Row]:
         async with self._read() as db:
@@ -13837,17 +15347,7 @@ class MessageStore:
             return list(await cur.fetchall())
 
     async def set_ad_group_scope_map(self, entries: Iterable[tuple[str, str]]) -> None:
-        pairs = sorted(
-            {(g.strip().lower(), c.strip()) for g, c in entries if g.strip() and c.strip()}
-        )
-        async with _writer_txn(self._db, self._lock):
-            await self._db.execute("DELETE FROM ad_group_scope_map")
-            for ad_group, channel in pairs:
-                await self._db.execute(
-                    "INSERT INTO ad_group_scope_map (ad_group, channel) VALUES (?,?)",
-                    (ad_group, channel),
-                )
-            await self._commit()
+        await self._replace_ad_map(AdMap.from_entries(AD_SCOPE_MAP, entries))
 
     async def create_session(
         self,
@@ -14035,7 +15535,7 @@ class MessageStore:
         :class:`RowSealError` and the whole transaction, revokes included, rolls back."""
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
-            await self._db.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
+            await self._bump_session_epoch(user_id)
             if except_token_hash is None:
                 cur = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
             else:
@@ -14059,6 +15559,16 @@ class MessageStore:
         cur = await self._db.execute("SELECT session_epoch FROM users WHERE id=?", (user_id,))
         row = await cur.fetchone()
         return 0 if row is None else int(row["session_epoch"])
+
+    async def _bump_session_epoch(self, user_id: str) -> None:
+        """Raise the account's session epoch through the write helper, inside the caller's writer
+        transaction (BACKLOG #2592). An account whose record fails its seal is refused on every
+        read already, so the revoke that called this goes ahead without the raise: ending sessions
+        needs no key, and refusing it would keep them live."""
+        try:
+            await self._write_user(user_id, UserAuthzRecord.bump_epoch)
+        except RowSealError:
+            log.warning("an account's record failed its integrity seal; its sessions end anyway")
 
     async def enforce_session_cap(
         self,
@@ -14375,22 +15885,35 @@ class MessageStore:
         docs = 0
         reclaimed = 0
         updates: list[tuple[str, float, str]] = []
+        failures: list[CellTagError] = []
         for row in rows:
             cutoff = cutoff_for(row["channel_id"], older_than, connection_cutoffs)
             if row["received_at"] >= cutoff:
                 continue  # not past its own (per-connection) window — skip
             try:
-                raw = self._cipher.decrypt(row["raw"], aad=cell_aad("messages", "raw", row["id"]))
+                raw = open_message_cell(
+                    self._cipher,
+                    "raw",
+                    row["raw"],
+                    message_id=row["id"],
+                    channel_id=row["channel_id"],
+                )
             except CipherError as exc:
                 # Contain ONE row, as the claim sites do: a refused (unmarked) or undecryptable body
                 # must not abort the whole retention pass. The row is left exactly as found; the
                 # message names only the cell and the message id, never the body (BACKLOG #1169).
+                if isinstance(exc, CellTagError):
+                    # BACKLOG #2593: the read already logged and alerted it, once per hour; it is
+                    # audited below. No second WARNING on every pass.
+                    failures.append(exc)
+                    continue
                 log.warning(
                     "document strip skipped message %s: its body could not be read: %s",
                     row["id"],
                     exc,
                 )
                 continue
+            assert raw is not None  # raw is NOT NULL
             new_raw, n_docs, n_bytes = _strip_documents(
                 raw,
                 pruned_at=now,
@@ -14401,7 +15924,12 @@ class MessageStore:
                 continue  # no embedded document in this body — leave it (and its NULL flag) untouched
             updates.append(
                 (
-                    self._cipher.encrypt(new_raw, aad=cell_aad("messages", "raw", row["id"])),
+                    self._cipher.encrypt(
+                        new_raw,
+                        aad=message_cell_aad(
+                            "raw", message_id=row["id"], channel_id=row["channel_id"]
+                        ),
+                    ),
                     now,
                     row["id"],
                 )
@@ -14415,6 +15943,7 @@ class MessageStore:
                     "UPDATE messages SET raw=?, documents_pruned=? WHERE id=?", updates
                 )
                 await self._commit()
+        await report_cell_tag_failures(self, failures)
         return StripResult(
             messages_stripped=msgs, documents_stripped=docs, bytes_reclaimed=reclaimed
         )

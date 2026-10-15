@@ -80,6 +80,7 @@ from messagefoundry.config.models import (
     _check_cleartext_acceptance,
     _check_hop_attestation,
     _check_revocation_attestation,
+    bool_setting,
     check_db_connect_timeout,
     flag_from_settings,
     require_hop_reason,
@@ -96,7 +97,12 @@ from messagefoundry.credential import CERT_NAME_PREFIXES
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
 from messagefoundry.redaction import safe_name
 from messagefoundry.secretscrub import (
+    _QUERY_NAME_SEPARATORS,
+    _QUERY_NOT_CREDENTIAL_TAILS,
+    _SEGMENT_SEPARATORS,
     CREDENTIAL_PLACEHOLDER,
+    _base_name,
+    _is_credential_param,
     credential_query_params,
     has_credential_like_segment,
     scrub_credentials,
@@ -752,10 +758,11 @@ def refuse_resolved_verify_off(
     connector refuses a client cert with verification off when it is built."""
     if type_ is not ConnectorType.DICOMWEB or "verify_tls" not in settings:
         return
-    if not settings["verify_tls"] and settings.get("tls_ca_file"):
+    # Read as the connector reads it: an explicit None is the default, on (vault BACKLOG #3230).
+    if not bool_setting(settings, "verify_tls", default=True) and settings.get("tls_ca_file"):
         raise WiringError(
-            f"{where}: DICOMweb tls_ca_file would never be read: verify_tls resolved to a false, empty "
-            "or unset value, which verifies nothing, and DICOMweb has no token hop."
+            f"{where}: DICOMweb tls_ca_file would never be read: verify_tls resolved to a false or "
+            "empty value, which verifies nothing, and DICOMweb has no token hop."
         )
 
 
@@ -1009,8 +1016,9 @@ def DatabaseLookup(
     ``ERROR``; the result is never truncated. The ceiling is charged at the fetch, so an over-broad
     statement does not buffer its whole result in the transform worker first. ``0`` removes it.
 
-    Put secrets (``password``) in :func:`env`. TLS is on by default; weakening it needs
-    ``MEFOR_ALLOW_INSECURE_TLS``. The dial-out is gated by the **fail-closed** ``[egress].allowed_db``
+    Put secrets (``password``) in :func:`env`. TLS is on by default. Weakening it is refused unless
+    ``tls_hop_attested`` below is set; ``MEFOR_ALLOW_INSECURE_TLS`` works only at
+    ``[security].enforcement = warn``. The dial-out is gated by the **fail-closed** ``[egress].allowed_db``
     allowlist, like a DATABASE source — point the engine only at allowed hosts. Example::
 
         DatabaseLookup("clarity", server=env("clarity_host"), database="Clarity",
@@ -1109,7 +1117,7 @@ def FhirLookup(
     | None = None,  # HTTP Basic (with basic_password); use env() for secrets
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
@@ -1153,7 +1161,10 @@ def FhirLookup(
     FHIR writes stay on the :func:`FHIR` outbound). The dial-out is gated by the **fail-closed**
     ``[egress].allowed_http`` allowlist (the same arm the FHIR outbound + SMART token endpoint use) — point
     the engine only at allowed hosts. Put secrets (``bearer_token`` / ``basic_*`` / SMART keys) in
-    :func:`env`. TLS is on by default; weakening it needs ``MEFOR_ALLOW_INSECURE_TLS``. The pure
+    :func:`env`. TLS is on by default. ``verify_tls=False`` to an off-box host is refused unless
+    ``tls_hop_attested`` below is set; ``MEFOR_ALLOW_INSECURE_TLS`` works only at
+    ``[security].enforcement = warn``, and never crosses a cleartext ``http`` url (that takes
+    ``tls_hop_attested`` or ``cleartext_accepted``, below). The pure
     ``parsing/fhir/`` codec parses the reply, so a ``FhirLookup``-declaring graph needs the optional
     ``messagefoundry[fhir]`` extra.
 
@@ -1496,6 +1507,10 @@ def _is_secret_header(name: str, value: object = None) -> bool:
     ``MONITORING_READ``. The asymmetry is not close, so this errs toward redacting -- but the VALUE arm
     is kept narrow (auth-scheme prefixes and JWTs only) rather than "long and high-entropy", because
     masking every long header value would quietly destroy the view rather than protect it.
+
+    **It is also a security control, not only a mask.** ``transports.rest.http_credentials_sent``
+    reads it to decide whether a ``verify_tls=false`` hop carries a credential (vault BACKLOG
+    #3230), so narrowing it narrows that no-escape refusal too.
     """
     if _looks_like_a_credential_value(value):
         return True
@@ -1605,11 +1620,20 @@ def connector_secret_env_values(
 #: existed, so a `proxy` key was not a URL setting at all.
 #: Review of 0c6b32e5c4: a bare ``uri`` and ``http_proxy``-style names were missed, so the suffix
 #: rule now covers ``uri`` and ``proxy`` too (which also covers a bare ``proxy``).
-_URL_SETTING_SUFFIXES = ("url", "uri", "endpoint", "proxy")
+#: BACKLOG #2721: the plurals too, so a list-valued ``fallback_urls`` is read as URLs.
+_URL_SETTING_SUFFIXES = ("url", "uri", "endpoint", "proxy", "urls", "uris", "endpoints", "proxies")
+
+#: Names that end in a URL word and hold no URL: a proxy EXCLUSION host list and an on/off flag
+#: (BACKLOG #2721 shape 6). Matched as the whole name or after a ``_``, so ``proxy_no_proxy`` is one
+#: of them and ``proxy_url`` is not. The cost of a miss here is only over-masking.
+_NOT_URL_SETTING_TAILS = ("no_proxy", "use_proxy")
 
 
 def _is_url_setting(name: str) -> bool:
-    return name.lower().endswith(_URL_SETTING_SUFFIXES)
+    low = name.lower()
+    if any(low == tail or low.endswith(f"_{tail}") for tail in _NOT_URL_SETTING_TAILS):
+        return False
+    return low.endswith(_URL_SETTING_SUFFIXES)
 
 
 #: A URL scheme at the very start of a value, ``https://`` and the like. Shown in a withheld URL so
@@ -1620,37 +1644,151 @@ _URL_SCHEME_PREFIX = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
 #: spelling of "a credential was here", imported rather than restated.
 _WITHHELD_URL = CREDENTIAL_PLACEHOLDER
 
+#: Percent-escapes that withhold a URL setting whatever surrounds them: ``@`` and ``:`` (userinfo),
+#: and ``&``, ``;``, ``?`` and ``#`` (BACKLOG #2721 shape 5), which a reader that decodes twice takes
+#: as a separator, so ``a=1%26api_key=SECRET`` hides a credential name from a single decode. And
+#: ``%25``, an escaped ``%``, for the same reader: ``api%255Fkey`` is ``api_key`` after two decodes.
+_WITHHELD_URL_ESCAPES = ("%40", "%3a", "%26", "%3b", "%3f", "%23", "%25")
+
+#: Credential words a DISPLAY name may hold ANYWHERE, compared casefolded with ``_``, ``-``, ``.``
+#: and spaces removed (BACKLOG #2721 shape 3: ``sslpassword``, ``user[password]``,
+#: ``x_api_key_v2``). Only words too specific to turn up inside an ordinary name: ``key``,
+#: ``auth``, ``pass``, ``sig`` and ``session`` are left out, as ``keyword``, ``author``,
+#: ``compass``, ``design`` and ``sessionCount`` show. Display only: the warning detector in
+#: ``secretscrub`` keeps its narrower tail rule, so ``check`` and the egress warning are unchanged.
+_DISPLAY_CREDENTIAL_WORDS = (
+    "password",
+    "passwd",
+    "passphrase",
+    "pwd",
+    "secret",
+    "credential",
+    "token",
+    "apikey",
+    "accesskey",
+    "bearer",
+    "authorization",
+    "signature",
+    "jwt",
+)
+
+#: Short credential words a PATH segment may BE, whole, after a trailing ``s`` is dropped. Too
+#: short for the anywhere rule above, but a whole segment that is ``key`` or ``session`` names what
+#: the next segment holds. ``auth`` is left out on purpose: an older Keycloak puts every endpoint
+#: under ``/auth/realms/``, and withholding all of them would hide the OAuth endpoints the shape-4
+#: ruling keeps readable. The ruling still withholds an endpoint BELOW a credential word, such as
+#: ``/token/introspect`` or ``/sessions/123/messages``: over-masking is its safe direction.
+_DISPLAY_CREDENTIAL_SEGMENTS = frozenset({"key", "pass", "session", "sig"})
+
+#: What splits a decoded path into segments for the shape-4 rule: ``/``, and ``\``, which a WHATWG
+#: reader of an ``http`` URL takes for ``/``.
+_PATH_SEPARATORS = re.compile(r"[/\\]")
+
+
+def _squash_name(name: str) -> str:
+    """``name`` casefolded, without the separators the warning detector splits a name on."""
+    return "".join(ch for ch in name.casefold() if ch not in _QUERY_NAME_SEPARATORS)
+
+
+def _names_a_credential(name: str) -> bool:
+    """Whether a decoded query or path NAME holds a credential word anywhere in it.
+
+    A name that ends in a known non-secret (:data:`~messagefoundry.secretscrub._QUERY_NOT_CREDENTIAL_TAILS`,
+    such as ``pageToken``) is not one, unless a credential word also sits outside that ending. The
+    ending is judged without a trailing index or digits, as the warning detector judges it, so
+    ``pageToken[0]`` is a cursor, while ``user[password]`` and ``pageToken[password]`` are not."""
+    squashed = _squash_name(name)
+    if not any(word in squashed for word in _DISPLAY_CREDENTIAL_WORDS):
+        return False
+    base = _squash_name(_base_name(name))
+    for tail in _QUERY_NOT_CREDENTIAL_TAILS:
+        if base.endswith(tail):
+            before, _tail, after = squashed.rpartition(tail)
+            return any(word in before + after for word in _DISPLAY_CREDENTIAL_WORDS)
+    return True
+
+
+def _has_credential_named_segment(value: str) -> bool:
+    """Whether any ``name=value`` segment, split at every ``?``, ``&``, ``#`` and ``;``, has a name
+    :func:`_names_a_credential` matches. The same walk as
+    :func:`~messagefoundry.secretscrub.has_credential_like_segment`, with the wider name rule: a name
+    drops tab, CR and LF before it is percent-decoded, as ``urlsplit`` drops them first."""
+    for segment in _SEGMENT_SEPARATORS.split(value):
+        name, equals, _value = segment.partition("=")
+        if equals:
+            name = name.replace("\t", "").replace("\r", "").replace("\n", "")
+            if _names_a_credential(urllib.parse.unquote_plus(name)):
+                return True
+    return False
+
+
+def _has_credential_path_segment(path: str) -> bool:
+    """Whether a path has a credential word as a whole segment with another segment after it, as
+    ``/token/SECRET`` and ``/api_key/SECRET/x`` do (BACKLOG #2721 shape 4).
+
+    MANAGER RULING (batch 255): the LAST segment is not read, so ``/oauth2/token`` stays readable;
+    a credential word with nothing after it names an endpoint rather than introducing a value. The
+    path is percent-decoded before it is split, so an escaped ``/`` splits too. A ``\\`` splits as
+    well, as a WHATWG reader of an ``http`` URL takes it for ``/``. Empty segments are skipped, so
+    ``/token/`` ends in ``token``, and a segment is judged without its ``;`` parameters. A segment
+    is a credential word by the short whole-word set, by the anywhere rule, or by the warning
+    detector's own name test (``private_key``, ``sessionid``)."""
+    segments = [s for s in _PATH_SEPARATORS.split(urllib.parse.unquote(path)) if s]
+    for segment in segments[:-1]:
+        bare = segment.partition(";")[0]
+        word = _squash_name(bare)
+        if {word, word.removesuffix("s")} & _DISPLAY_CREDENTIAL_SEGMENTS:
+            return True
+        if _names_a_credential(bare):
+            return True
+        # The detector reads a bare ``auth`` as a credential name; as a path segment it is the
+        # Keycloak prefix the comment on _DISPLAY_CREDENTIAL_SEGMENTS keeps readable.
+        if word != "auth" and _is_credential_param(bare):
+            return True
+    return False
+
 
 def _url_may_carry_a_credential(value: str) -> bool:
     """Whether a URL setting must be withheld from a settings view, by a COARSE rule. This is the
     one statement of the rule; the docs point here.
 
-    Any of these withholds it: an ``@``, ``%40`` or ``%3A`` anywhere in it (any case); a value
+    Any of these withholds it: an ``@`` anywhere in it; a ``%40``, ``%3A``, ``%26``, ``%3B``,
+    ``%3F``, ``%23`` or ``%25`` anywhere in it, any case (:data:`_WITHHELD_URL_ESCAPES`); a value
     ``urlsplit`` refuses; a credential-looking query name by the warning detector
-    (:func:`~messagefoundry.secretscrub.credential_query_params`); or a credential-looking name in
-    any ``name=value`` segment after a ``?``, ``&``, ``#`` or ``;``
-    (:func:`~messagefoundry.secretscrub.has_credential_like_segment`). It does not try to find WHERE
-    a secret is: three review rounds on PR 1912 each found a URL reader that disagreed with a mask
-    that did. The cost is the view: a URL with an ``@`` in its path or query, such as an email
-    address, is withheld too.
+    (:func:`~messagefoundry.secretscrub.credential_query_params`); a credential-looking name in any
+    ``name=value`` segment after a ``?``, ``&``, ``#`` or ``;``
+    (:func:`~messagefoundry.secretscrub.has_credential_like_segment`), or a credential word anywhere
+    in such a name (:func:`_has_credential_named_segment`); or a path segment that is a credential
+    word with another segment after it, in the path or a hash-route fragment
+    (:func:`_has_credential_path_segment`). It does not try to
+    find WHERE a secret is: three review rounds on PR 1912 each found a URL reader that disagreed
+    with a mask that did. The cost is the view: a URL with an ``@`` in its path or query, such as an
+    email address, is withheld too, and so is ``/v1/secret/data/app``, which names a secret's path.
 
-    The ``@``, ``%40`` and ``%3A`` tests read the value with tab, CR and LF removed, as ``urlsplit``
-    removes them before any reader decodes the host: ``%<TAB>40`` is ``%40`` to that reader.
+    The ``@`` and escape tests read the value with tab, CR and LF removed, as ``urlsplit`` removes
+    them before any reader decodes the host: ``%<TAB>40`` is ``%40`` to that reader.
 
     It covers at least the shapes above, not every place a URL can hold a secret: a secret that is a
-    bare path segment (``/services/T000/B000/SECRET``) has no name to find, and is shown. Each step
-    is one scan of the value, so the rule is linear in its length."""
+    bare path segment with no credential word before it (``/services/T000/B000/SECRET``) has no name
+    to find, and is shown. Each step is one scan of the value, so the rule is linear in its length."""
     cleaned = value.replace("\t", "").replace("\r", "").replace("\n", "")
     if "@" in cleaned:
         return True
     folded = cleaned.casefold()
-    if "%40" in folded or "%3a" in folded:
+    if any(escape in folded for escape in _WITHHELD_URL_ESCAPES):
         return True
     try:
-        urllib.parse.urlsplit(value)
+        parts = urllib.parse.urlsplit(value)
     except ValueError:
         return True
-    return has_credential_like_segment(value) or bool(credential_query_params(value))
+    return (
+        has_credential_like_segment(value)
+        or bool(credential_query_params(value))
+        or _has_credential_named_segment(value)
+        or _has_credential_path_segment(parts.path)
+        # A hash route, ``#/token/SECRET/x``, is a path to the page that reads it.
+        or _has_credential_path_segment(parts.fragment)
+    )
 
 
 def _mask_url(value: str) -> str:
@@ -1685,7 +1823,52 @@ def _redact_header_name(name: object) -> str:
     return str(name)
 
 
-def _redact_header_value(name: str, value: object) -> object:
+#: How deep a settings view walks a nested value (BACKLOG #2721). Settings nest a level or two; the
+#: cap exists so a structure that holds itself, built in Python, cannot recurse without end. A value
+#: past it renders as ``"***"``, failing closed.
+_MAX_VIEW_DEPTH = 8
+
+
+def _marker_key(marker: Mapping[str, Any]) -> str:
+    """A raw marker's env KEY for a view. A key that is not text is no key anyone set on purpose,
+    and rendering it could carry a nested default, so it renders as ``"***"``. So does a key that
+    looks like a credential: a code-first ``headers`` table whose one header is named ``env`` has
+    the marker's shape, and its value is the header's (review of the #2721 build)."""
+    key = marker["env"]
+    if not isinstance(key, str) or _looks_like_a_credential_value(key):
+        return "***"
+    return key
+
+
+def _view_stop(value: object, depth: int) -> object | None:
+    """Where a nested walk stops, shared by :func:`_view_value` and :func:`_redact_header_value`:
+    ``"***"`` past :data:`_MAX_VIEW_DEPTH`, ``{"env": key}`` for a nested reference in either shape
+    (its default dropped), and ``None`` to go on."""
+    if depth > _MAX_VIEW_DEPTH:
+        return "***"
+    if isinstance(value, EnvRef):
+        return {"env": value.key}
+    if _is_env_marker(value):
+        return {"env": _marker_key(value)}
+    return None
+
+
+def _view_items(value: object, render: Callable[[object], object]) -> object:
+    """``value`` with ``render`` applied to each item when it is a container, else ``value``.
+
+    A key is named by :func:`_redact_header_name`, so an :class:`EnvRef` key is not a raw object.
+    A set comes back as a list and any other sequence keeps its kind, so ``json.dumps`` takes all
+    of them (BACKLOG #2721 shape 7: a list was never walked)."""
+    if isinstance(value, Mapping):
+        return {_redact_header_name(k): render(v) for k, v in value.items()}
+    if isinstance(value, tuple):
+        return tuple(render(v) for v in value)
+    if isinstance(value, list | set | frozenset):
+        return [render(v) for v in value]
+    return value
+
+
+def _redact_header_value(name: str, value: object, depth: int = 0) -> object:
     """One header's value, scrubbed. Handles the ``EnvRef`` case the headers branch used to miss.
 
     BACKLOG #1207. The headers branch had no ``EnvRef`` arm, so an ``env()`` ref inside a headers
@@ -1704,12 +1887,145 @@ def _redact_header_value(name: str, value: object) -> object:
     before that refusal existed -- so it must drop the default wherever the value came from. The raw
     ``connections.toml`` marker was served verbatim here, fallback secret included, because
     ``parse_env_setting`` never descends into a nested table and so the ``EnvRef`` arm never saw it.
-    """
+
+    A CONTAINER value is walked item by item with these same rules (BACKLOG #2721), so
+    ``["Bearer ..."]`` under an opaque name is caught by the value arm."""
+    if (stop := _view_stop(value, depth)) is not None:
+        return stop
+    if _is_secret_header(name, value):
+        return "***"
+    return _view_items(value, lambda item: _redact_header_value(name, item, depth + 1))
+
+
+def _view_value(name: str, value: object, depth: int = 0) -> object:
+    """A value under setting ``name``, below the setting's own reference layer: a default, an item
+    of a container, or a plain top-level value. BACKLOG #2721 shapes 1, 2 and 7.
+
+    A nested reference renders as ``{"env": key}`` with ITS default dropped. A default inside a
+    default has no reading anyone needs in a view, and showing it is how
+    ``env("a", default=env("b", default=SECRET))`` printed the secret and how the raw
+    :class:`EnvRef` it left behind made ``json.dumps`` refuse the whole view. A string under a URL
+    setting is withheld by :func:`_mask_url`, in a list as at the top, and a credential-shaped
+    string under ``headers`` is masked. A ``headers`` table and an ``odbc_params`` bag get their own
+    key rules, so a whole-table ``env()`` default is scrubbed like a literal table. Inside any other
+    mapping, a key with a rule of its own takes that rule (:func:`_view_entry`)."""
+    if (stop := _view_stop(value, depth)) is not None:
+        return stop
+    if isinstance(value, str):
+        if name == "headers" and _looks_like_a_credential_value(value):
+            # A header value reached outside a table: an env() default or a list item.
+            return "***"
+        # BACKLOG #1207 and ASVS 14.2.1: withheld whole when it may carry a credential; the
+        # rule is stated once, on _url_may_carry_a_credential.
+        return _mask_url(value) if _is_url_setting(name) else value
+    if name == "headers" and isinstance(value, Mapping):
+        # Both axes: a header NAME is rendered through _redact_header_name before it is used as
+        # the output key AND before it is handed to the value rule, so a reference in the name
+        # slot neither survives nor reaches _is_secret_header as a repr carrying its default.
+        return {
+            (safe := _redact_header_name(k)): _redact_header_value(safe, v, depth + 1)
+            for k, v in value.items()
+        }
+    if name == "odbc_params" and isinstance(value, Mapping):
+        # BACKLOG #1206. This bag is documented as carrying "only static driver keywords", and the
+        # redactor honoured that by not descending -- so a credential inside it was served verbatim
+        # by /metadata behind MONITORING_READ and printed by graph --json, on the SAME object whose
+        # top-level `password` masked correctly.
+        #
+        # It is not merely operator misuse, which is why this masks rather than warns. The typed
+        # fields carry exactly ONE credential (`username`/`password`, key names configurable via
+        # `odbc_user_key`/`odbc_password_key`), and `_reject_envref_odbc_params` refuses `env()`
+        # here. So a connection needing a SECOND driver credential -- libpq `sslpassword` beside
+        # `PWD` -- has no typed home and no env() form, and the inline literal is the only
+        # expressible shape. A refusal that removes the SAFE expression while leaving the UNSAFE
+        # one is not a mitigation.
+        #
+        # Keys only, by a predicate of their own: real static driver keywords (`Encrypt`,
+        # `TrustServerCertificate`, `ApplicationIntent`) are not credential-shaped, and the ones
+        # that are -- `PWD`, `Password`, `sslpassword` -- are credentials. Values are NOT
+        # shape-tested here: a driver keyword's value is opaque and masking on its content would
+        # hide ordinary configuration with nothing to say so. A nested reference still renders
+        # by its key only (BACKLOG #2721).
+        #
+        # THIS IS A DISPLAY FIX, NOT A STORAGE FIX. The credential remains an inline literal in
+        # the config file. Keeping it out of the file needs `env()` to work here, which needs
+        # nested settings to be env-resolved -- filed as #1206's route-onward, deliberately not
+        # folded in, because it changes the resolution path and what the refusal above means.
+        return {
+            _redact_header_name(k): (
+                "***" if _is_secret_odbc_key(k) else _view_value(_rule_name(name, k), v, depth + 1)
+            )
+            for k, v in value.items()
+        }
+    if (
+        name == "headers"
+        and isinstance(value, list | tuple)
+        and len(value) == 2
+        and isinstance(value[0], str)
+    ):
+        # A (name, value) pair, the list form httpx takes: the header rule, judged by its name.
+        # The name is value-tested too, so two bare values are not read as name and value.
+        header = "***" if _looks_like_a_credential_value(value[0]) else value[0]
+        pair = [header, _redact_header_value(value[0], value[1], depth + 1)]
+        return tuple(pair) if isinstance(value, tuple) else pair
+    if isinstance(value, Mapping):
+        return {
+            _redact_header_name(k): _view_entry(name, k, v, depth + 1) for k, v in value.items()
+        }
+    return _view_items(value, lambda item: _view_value(name, item, depth + 1))
+
+
+def _view_entry(parent: str, key: object, value: object, depth: int) -> object:
+    """One entry of a nested mapping under setting ``parent``. A key that is a URL setting,
+    ``headers`` or ``odbc_params`` takes that rule. Otherwise a key that is a credential setting
+    name, or holds a credential word (:func:`_names_a_credential`, so ``client_secret``), masks
+    its value, as does a credential-shaped value (``Bearer ...``). Any other key keeps the
+    parent's rule, so a URL under ``fallback_url`` is still a URL."""
+    if _has_own_rule(key):
+        return _view_value(str(key), value, depth)
+    if isinstance(key, str) and (
+        _is_secret_setting(key) or _names_a_credential(key) or _looks_like_a_credential_value(value)
+    ):
+        return "***"
+    return _view_value(parent, value, depth)
+
+
+def _has_own_rule(key: object) -> bool:
+    """Whether a nested key is a setting name with a rule of its own: a URL setting, ``headers`` or
+    ``odbc_params``."""
+    return isinstance(key, str) and (key in ("headers", "odbc_params") or _is_url_setting(key))
+
+
+def _rule_name(parent: str, key: object) -> str:
+    """The setting name whose rule a nested entry under ``parent`` takes."""
+    return str(key) if _has_own_rule(key) else parent
+
+
+def _view_setting(name: str, value: object) -> object:
+    """One top-level setting as :func:`redacted_settings` shows it.
+
+    An ``env()`` reference shows its key, and its default by :func:`_view_value` unless the setting
+    is a credential, when the default is dropped so a fallback secret can't leak. The RAW
+    ``connections.toml`` marker, ``{"env": ..., "default": ...}``, gets the same treatment when it
+    reaches this view undecoded (a hand-built spec, a stored graph): review of 0c6b32e5c4 found its
+    default served verbatim, and BACKLOG #2721 found the same for a non-URL setting such as
+    ``headers``."""
+    is_secret = _is_secret_setting(name)
     if isinstance(value, EnvRef):
-        return {"env": value.key}
-    if _is_env_marker(value):
-        return {"env": value["env"]}
-    return "***" if _is_secret_header(name, value) else value
+        key, default = value.key, value.default
+    elif is_secret:
+        return "***"
+    elif _is_env_marker(value):
+        key, default = _marker_key(value), value.get("default", _UNSET)
+    else:
+        return _view_value(name, value)
+    ref: dict[str, Any] = {"env": key}
+    if default is not _UNSET and not is_secret:
+        ref["default"] = _view_value(name, default, 1)
+    cast = value.get("cast") if _is_env_marker(value) else None
+    if isinstance(cast, str) and cast in _NAMED_CASTS:
+        ref["cast"] = cast  # a named cast is public, and the IDE graph view shows it
+    return ref
 
 
 def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
@@ -1718,72 +2034,9 @@ def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
     credential field rendered inline is replaced with ``"***"`` (an ``env()`` *default* is dropped for
     a credential field so a fallback secret can't leak), a credential header inside a ``headers``
     table is redacted too, and a URL setting that may carry a credential is withheld whole as
-    ``<scheme>://<redacted>`` (:func:`_mask_url`)."""
-    out: dict[str, Any] = {}
-    for name, value in settings.items():
-        is_secret = _is_secret_setting(name)
-        if isinstance(value, EnvRef):
-            ref: dict[str, Any] = {"env": value.key}
-            if value.default is not _UNSET and not is_secret:
-                default = value.default
-                if isinstance(default, str) and _is_url_setting(name):
-                    # A URL default gets the same rule as a literal URL below (ASVS 14.2.1).
-                    default = _mask_url(default)
-                ref["default"] = default
-            out[name] = ref
-        elif is_secret:
-            out[name] = "***"
-        elif _is_env_marker(value) and _is_url_setting(name):
-            # The RAW connections.toml marker, {"env": ..., "default": ...}, when it reaches this view
-            # undecoded (a hand-built spec, a stored graph). Review of 0c6b32e5c4: it fell to the
-            # last arm and its default was served verbatim. Same treatment as an EnvRef above.
-            marker: dict[str, Any] = {"env": value.get("env")}
-            if "default" in value:
-                raw_default = value["default"]
-                marker["default"] = (
-                    _mask_url(raw_default) if isinstance(raw_default, str) else raw_default
-                )
-            out[name] = marker
-        elif isinstance(value, str) and _is_url_setting(name):
-            # BACKLOG #1207 and ASVS 14.2.1: withheld whole when it may carry a credential; the
-            # rule is stated once, on _url_may_carry_a_credential.
-            out[name] = _mask_url(value)
-        elif name == "headers" and isinstance(value, dict):
-            # Both axes: a header NAME is rendered through _redact_header_name before it is used as
-            # the output key AND before it is handed to the value rule, so a reference in the name
-            # slot neither survives nor reaches _is_secret_header as a repr carrying its default.
-            out[name] = {
-                (safe := _redact_header_name(k)): _redact_header_value(safe, v)
-                for k, v in value.items()
-            }
-        elif name == "odbc_params" and isinstance(value, dict):
-            # BACKLOG #1206. This bag is documented as carrying "only static driver keywords", and the
-            # redactor honoured that by not descending -- so a credential inside it was served verbatim
-            # by /metadata behind MONITORING_READ and printed by graph --json, on the SAME object whose
-            # top-level `password` masked correctly.
-            #
-            # It is not merely operator misuse, which is why this masks rather than warns. The typed
-            # fields carry exactly ONE credential (`username`/`password`, key names configurable via
-            # `odbc_user_key`/`odbc_password_key`), and `_reject_envref_odbc_params` refuses `env()`
-            # here. So a connection needing a SECOND driver credential -- libpq `sslpassword` beside
-            # `PWD` -- has no typed home and no env() form, and the inline literal is the only
-            # expressible shape. A refusal that removes the SAFE expression while leaving the UNSAFE
-            # one is not a mitigation.
-            #
-            # Keys only, by the same predicate the rest of this function uses: real static driver
-            # keywords (`Encrypt`, `TrustServerCertificate`, `ApplicationIntent`) are not
-            # credential-shaped, and the ones that are -- `PWD`, `Password`, `sslpassword` -- are
-            # credentials. Values are NOT shape-tested here: a driver keyword's value is opaque and
-            # masking on its content would hide ordinary configuration with nothing to say so.
-            #
-            # THIS IS A DISPLAY FIX, NOT A STORAGE FIX. The credential remains an inline literal in
-            # the config file. Keeping it out of the file needs `env()` to work here, which needs
-            # nested settings to be env-resolved -- filed as #1206's route-onward, deliberately not
-            # folded in, because it changes the resolution path and what the refusal above means.
-            out[name] = {k: ("***" if _is_secret_odbc_key(k) else v) for k, v in value.items()}
-        else:
-            out[name] = value
-    return out
+    ``<scheme>://<redacted>`` (:func:`_mask_url`). Every default and every container is walked by
+    the same rules (:func:`_view_value`), and ``json.dumps`` takes what comes back."""
+    return {name: _view_setting(name, value) for name, value in settings.items()}
 
 
 def display_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
@@ -1852,7 +2105,7 @@ def MLLP(
     | None = None,  # BOTH: SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142, #2371)
     tls_crl_file: str
     | None = None,  # INBOUND: opt-in CRL for mTLS client certs (#1005): a bare PEM CRL (#1890)
-    tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able → needs MEFOR_ALLOW_INSECURE_TLS)
+    tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able, and is refused unless MEFOR_ALLOW_INSECURE_TLS is set at [security].enforcement = warn)
     tls_check_hostname: bool = True,  # OUTBOUND: require the server cert to match `host`
     # OUTBOUND: honour an EXPIRED server cert (#129). The chain is still verified, and the hostname
     # too unless tls_check_hostname=False.
@@ -1979,7 +2232,8 @@ def MLLP(
     A negative value is rejected at wiring. ``tls_key_password`` decrypts a passphrase-encrypted
     ``tls_key_file`` (supply it via ``env()`` so the secret stays out of config — mirrors the API
     listener's ``MEFOR_API_TLS_KEY_PASSWORD``); omit it for an unencrypted key. ``tls_verify=False``
-    (outbound) is MITM-able and refused unless ``MEFOR_ALLOW_INSECURE_TLS`` is set (loud warning) —
+    (outbound) is MITM-able and refused unless ``MEFOR_ALLOW_INSECURE_TLS`` is set on an instance at
+    ``[security].enforcement = warn`` (loud warning) —
     exactly like LDAPS / SQL Server. TLS is TLS 1.2+ and composes with the ``[egress].allowed_mllp``
     allowlist (both enforced). ``tls_allow_expired=True`` (outbound, #129 / ADR 0094) is the **granular**
     alternative to ``tls_verify=False`` for the narrow real-world case of a partner whose server
@@ -2873,7 +3127,7 @@ def Rest(
     | None = None,  # HTTP Basic (with basic_password); use env() for secrets
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
@@ -2976,7 +3230,7 @@ def FHIR(
     | None = None,  # HTTP Basic (with basic_password); use env() for secrets
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
@@ -3103,8 +3357,8 @@ def Email(
     subject: str | EnvRef = "",  # static Subject (a per-message subject is a Phase-2 follow-up)
     username: str | EnvRef | None = None,  # optional SMTP AUTH user (use env() for the secret)
     password: str | EnvRef | None = None,  # optional SMTP AUTH password (use env() for the secret)
-    use_tls: bool = True,  # STARTTLS by default; False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
-    tls_verify: bool = True,  # verify the server cert (#323); False (dev only) needs the escape
+    use_tls: bool = True,  # STARTTLS by default; False (dev only) is refused unless tls_hop_attested or cleartext_accepted is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
+    tls_verify: bool = True,  # verify the server cert (#323); False (dev only) is refused unless MEFOR_ALLOW_INSECURE_TLS is set at [security].enforcement = warn
     tls_ca_file: str | EnvRef | None = None,  # PEM to verify the SMTP server against (not a secret)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     tls_check_hostname: bool = True,  # match the cert against `host` (leave on)
@@ -3117,16 +3371,19 @@ def Email(
     ``recipients`` with a static ``subject``. STARTTLS by default (``use_tls=True``) on the ``587``
     submission port; port ``465`` is implicit TLS (``SMTP_SSL``). Optional ``username``/``password`` do
     SMTP ``AUTH`` (over a **verified** TLS session only — a cleartext- or unverified-credential config
-    is refused). Disabling TLS (``use_tls=False``) is MITM-able and refused unless
-    ``MEFOR_ALLOW_INSECURE_TLS`` is set (loud warning), like LDAPS / SQL Server / MLLP.
+    is refused). Disabling TLS (``use_tls=False``) sends the message in cleartext. It is refused
+    unless the connection declares ``tls_hop_attested`` or ``cleartext_accepted``, each with its
+    reason, or ``MEFOR_ALLOW_INSECURE_TLS`` is set on an instance at
+    ``[security].enforcement = warn`` (loud warning).
 
     **The server certificate is verified** (``tls_verify=True``, #323) — chain, hostname and strict RFC
     5280 flags, anchored to the OS roots, a per-connection ``tls_ca_file``, or the instance-wide
     ``[tls].internal_ca_file`` (ADR 0093). ``smtplib``'s own default context verifies **nothing**
     (``CERT_NONE``/``check_hostname=False``), so before #323 ``use_tls=True`` bought encryption without
     authentication. Point ``tls_ca_file`` at your relay's CA PEM for a private-CA server;
-    ``tls_verify=False`` is a trusted-network dev/test escape, refused on an enforcing production-PHI
-    instance even with ``MEFOR_ALLOW_INSECURE_TLS``, and it also refuses SMTP ``AUTH``.
+    ``tls_verify=False`` is a trusted-network dev/test setting, refused unless
+    ``MEFOR_ALLOW_INSECURE_TLS`` is set on an instance at ``[security].enforcement = warn``, and it
+    also refuses SMTP ``AUTH``.
     The egress host is gated by ``[egress].allowed_smtp``, and every recipient's domain and the
     sender's domain by the deny-by-default ``[egress].allowed_recipient_domains`` (an empty list
     refuses the destination; the sender is listed because bounces go to it). Put
@@ -3177,8 +3434,8 @@ def Direct(
     subject: str | EnvRef = "",  # static Subject
     username: str | EnvRef | None = None,  # optional SMTP AUTH user (use env() for the secret)
     password: str | EnvRef | None = None,  # optional SMTP AUTH password (use env() for the secret)
-    use_tls: bool = True,  # STARTTLS by default; False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
-    tls_verify: bool = True,  # verify the relay's cert (#323); False (dev only) needs the escape
+    use_tls: bool = True,  # STARTTLS by default; False (dev only) is refused unless MEFOR_ALLOW_INSECURE_TLS is set at [security].enforcement = warn
+    tls_verify: bool = True,  # verify the relay's cert (#323); False (dev only) is refused unless MEFOR_ALLOW_INSECURE_TLS is set at [security].enforcement = warn
     tls_ca_file: str | EnvRef | None = None,  # PEM to verify the SMTP/HISP relay against
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     tls_check_hostname: bool = True,  # match the cert against `host` (leave on)
@@ -3387,7 +3644,7 @@ def DICOMweb(
     | None = None,  # HTTP Basic (with basic_password); use env() for secrets
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
@@ -3427,8 +3684,9 @@ def DICOMweb(
         "DICOMweb",
         tls_ca_file,
         # Unlike REST/FHIR/SOAP there is no token hop here that would still read it.
+        # A Python None is the default, on, as the connector reads it (vault BACKLOG #3230).
         unread=None
-        if verify_tls
+        if verify_tls is None or verify_tls
         else "verify_tls=False verifies nothing, and DICOMweb has no token hop",
     )
     _check_tls_ca_pin("DICOMweb", tls_ca_pin, tls_ca_file)
@@ -3553,7 +3811,7 @@ def Database(
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
     port: int | EnvRef = 1433,
-    encrypt: bool = True,  # SQL Server preset: False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    encrypt: bool = True,  # SQL Server preset: False (dev only) is refused unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     trust_server_certificate: bool = False,  # SQL Server preset only
     connect_timeout: int = DEFAULT_DB_CONNECT_TIMEOUT,
     app_name: str = "messagefoundry",
@@ -3644,7 +3902,7 @@ def DatabasePoll(
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
     port: int | EnvRef = 1433,
-    encrypt: bool = True,  # SQL Server preset: False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    encrypt: bool = True,  # SQL Server preset: False (dev only) is refused unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     trust_server_certificate: bool = False,  # SQL Server preset only
     connect_timeout: int = DEFAULT_DB_CONNECT_TIMEOUT,
     app_name: str = "messagefoundry",
@@ -3668,8 +3926,9 @@ def DatabasePoll(
     high-water-mark ``UPDATE`` work through the same ``mark_statement``). ``body_column`` unset → the
     whole row as a JSON object (pair with ``content_type=json``); set → that one column's value verbatim
     (e.g. a column holding an HL7 message → ``content_type=hl7v2``). Put secrets (``password``) in
-    ``env()``; TLS is on by default (weakening needs ``MEFOR_ALLOW_INSECURE_TLS``); the polled ``server``
-    is gated by ``[egress].allowed_db``.
+    ``env()``; TLS is on by default (on the SQL Server preset, weakening it is refused unless the
+    ``inbound()`` declares ``tls_hop_attested``; ``MEFOR_ALLOW_INSECURE_TLS`` works only at
+    ``[security].enforcement = warn``); the polled ``server`` is gated by ``[egress].allowed_db``.
 
     ``poll_max_rows`` mirrors transports.base.DEFAULT_MAX_ITEMS_PER_POLL and **ships on**: one poll
     fetches at most this many rows and leaves the rest of the result set in the table for the next poll.
@@ -3790,7 +4049,7 @@ def Soap(
     basic_user: str | EnvRef | None = None,
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
@@ -3935,7 +4194,8 @@ def Sftp(
     uploads to ``remote_dir``/``filename`` (write to a temp name then rename, so a poller never sees a
     partial). Needs the ``[sftp]`` extra (``pip install 'messagefoundry[sftp]'``; paramiko is lazily
     imported). **Host-key verification is ON by default** (system + ``known_hosts``; an unknown key is
-    refused) — accepting an unknown key needs ``MEFOR_ALLOW_INSECURE_TLS``. Put secrets (``password``/
+    refused) — ``MEFOR_ALLOW_INSECURE_TLS`` accepts an unknown key only at
+    ``[security].enforcement = warn``. Put secrets (``password``/
     ``private_key``) in ``env()``; ``private_key`` must be unencrypted, and ``key_password`` is
     refused (BACKLOG #1352). The host is gated by ``[egress].allowed_remote``
     (both directions). At-least-once: an upload may re-send and a poll may re-emit, so downstreams
@@ -3983,8 +4243,7 @@ def Ftp(
     port: int | EnvRef = 21,
     tls: bool = False,  # True → FTPS (explicit TLS, PROT P); False → plain ftp
     # FTPS: honour an EXPIRED server cert (#129). The chain is still verified, and the hostname too
-    # unless a hand-built spec sets tls_check_hostname=False. That key, and tls_verify=False, are
-    # refused outright when a username or password is set (vault BACKLOG #2636).
+    # unless a hand-built spec sets tls_check_hostname=False, which a credentialed hop may not.
     tls_allow_expired: bool = False,
     tls_ca_file: str | EnvRef | None = None,  # FTPS: PEM, trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
@@ -4010,12 +4269,9 @@ def Ftp(
     """An **FTP** (``tls=False``) or **FTPS** (``tls=True`` — explicit TLS) endpoint, source **and**
     destination (stdlib ``ftplib`` — no extra). Same poll/upload shape as :func:`Sftp`.
 
-    Plain ``ftp`` transmits credentials in **cleartext**: supplying a ``username``/``password`` over
-    plain ``ftp`` is **refused** outright, with no escape (use ``tls=True`` for FTPS, or
-    :func:`Sftp`). FTPS encrypts the control + data channels, so credentials are fine there while
-    the server certificate is verified, name included: a hand-built spec that sets
-    ``tls_verify=False`` or ``tls_check_hostname=False`` with a ``username`` or ``password`` is
-    refused outright, with no escape (vault BACKLOG #2636). Put secrets (``password``) in ``env()``. The host is gated by ``[egress].allowed_remote`` (both
+    A ``username`` or ``password`` is **refused** over plain ``ftp`` (use ``tls=True`` for FTPS, or
+    :func:`Sftp`), and over FTPS with a check off; docs/SECURITY-LOOSENING.md, *No escape sends a
+    credential to an unverified peer*, states the rule. Put secrets (``password``) in ``env()``. The host is gated by ``[egress].allowed_remote`` (both
     directions). At-least-once → downstreams **must be idempotent**. ``validate_directory`` and
     ``poll_max_files`` behave exactly as they do on :func:`Sftp`.
 
@@ -5611,8 +5867,10 @@ def _declares_hostname_check_off(settings: Mapping[str, Any]) -> bool:
     An ``env()`` reference counts, because it is unresolved here and could resolve to false: a
     reader that skipped it would miss exactly the hop whose value nobody can read in the config. The
     construction WARNING names the resolved value either way."""
-    value = settings.get("tls_check_hostname", True)
-    return isinstance(value, EnvRef) or not value
+    # An explicit None is the default, on, as the connectors read it (vault BACKLOG #3230).
+    if isinstance(settings.get("tls_check_hostname"), EnvRef):
+        return True
+    return not bool_setting(settings, "tls_check_hostname", default=True)
 
 
 def hostname_unchecked_hops(registry: Registry) -> list[tuple[str, str]]:

@@ -56,7 +56,7 @@ operational notes.
 | TOTP MFA (WP-14) | ADR 0002 §3; `[security].require_mfa`; console flow in [`apiclient/client.py`](../messagefoundry/apiclient/client.py) | Native RFC 6238 TOTP; access gate on every authorized route; admin reset; recovery codes. Built 2026-06-17. |
 | Cert-expiry monitor | [`pipeline/cert_expiry.py`](../messagefoundry/pipeline/cert_expiry.py); `[cert_monitor]` in [`config/settings.py`](../messagefoundry/config/settings.py) | Engine-owned asyncio task (started in `Engine.start`). `certs_from_registry` watches the `[api]` cert + every connection `tls_cert_file`; reads `notAfter` only (never the key); `warn_days` default 30, 12 h cadence; raises a `cert_expiry` AlertSink event. |
 | Console transport guard | [`apiclient/client.py`](../messagefoundry/apiclient/client.py) `_assert_safe_transport` | `https` always allowed; loopback host allowed; non-loopback `http` **refused** unless `--insecure` (then warned). `httpx.Client(cert=...)` carries a client cert for mTLS via `--client-cert`/`--client-key`. |
-| At-rest PHI cipher | `[store].encryption_key` (`MEFOR_STORE_ENCRYPTION_KEY`), `require_encryption` | AES-256-GCM on PHI columns; `require_encryption=true` refuses start without a key; rotation via `messagefoundry rotate-key` + `encryption_keys_retired`. |
+| At-rest PHI cipher | `[store].encryption_key` (`MEFOR_STORE_ENCRYPTION_KEY`), `require_encryption` | AES-256-GCM on PHI columns; a start with no key is refused by default, and `require_encryption=true` keeps that refusal when the audited opt-out (`[security].allow_unencrypted_phi`) is set ([PHI.md](PHI.md) §3); rotation via `messagefoundry rotate-key` + `encryption_keys_retired`. |
 
 **No Dockerfile / compose exists in the repo** (confirmed via glob). ADR 0017 decision 7 lists the
 container image as a **fast-follow**, "byte-identical multi-instance rollout… after the env-name
@@ -289,7 +289,7 @@ So: **server TLS required** (the gate enforces it), **mTLS opt-in per partner**,
 |---|---|---|---|
 | `tls_cert_file`, `tls_key_file` (API + MLLP) | PEM **files** (the *key* is sensitive) | **mount** as read-only files (bind mount, Docker config/secret-as-file, or k8s Secret mounted as a volume) | The settings treat these as *paths, not secrets*, but the **key file is sensitive** — mount read-only, restrict perms, never bake into an image layer. |
 | `tls_key_password` (API + MLLP) | secret | API: env `MEFOR_API_TLS_KEY_PASSWORD`. MLLP: per-connection `tls_key_password=env(...)` | Decrypts an encrypted private key. The API key uses the env var; an encrypted **MLLP** key uses the per-connection `tls_key_password` (env-sourced) — see §7. |
-| Store cipher key | secret | container env / secret → `MEFOR_STORE_ENCRYPTION_KEY` (base64 32-byte) | Set `[store].require_encryption = true` so the engine **fails closed** if the key is absent. Mint with `messagefoundry gen-key`. |
+| Store cipher key | secret | container env / secret → `MEFOR_STORE_ENCRYPTION_KEY` (base64 32-byte) | The engine **fails closed** by default if the key is absent. Set `[store].require_encryption = true` so the audited opt-out (`[security].allow_unencrypted_phi`) cannot start it keyless either ([PHI.md](PHI.md) §3). Mint with `messagefoundry gen-key`. |
 | DB password / `tls_client_ca_file` etc. | secret / file | env (`MEFOR_STORE_PASSWORD`) / mounted file | Prefer the orchestrator's secret store over plain `-e` where possible. |
 
 **Prefer secret stores over plain env** for the passwords/keys (Docker/K8s secrets surface as files
@@ -342,15 +342,17 @@ The console stays a **host-side process**; only its target URL changes.
 ## 6. PHI / volume considerations
 
 - **SQLite store volume holds PHI.** Mount a named volume (or bind mount) for `messagefoundry.db` +
-  WAL/SHM files. Enable the at-rest cipher: `MEFOR_STORE_ENCRYPTION_KEY` set, and
-  `[store].require_encryption = true` so a PHI instance **refuses to start** without it (fail-closed,
-  matching the keyless-store posture). Back up and restrict the volume like any PHI-at-rest store.
+  WAL/SHM files. Enable the at-rest cipher: set `MEFOR_STORE_ENCRYPTION_KEY`. An instance already
+  **refuses to start** without a key by default (fail-closed). Also set
+  `[store].require_encryption = true`, so the audited opt-out (`[security].allow_unencrypted_phi`)
+  cannot start it keyless either ([PHI.md](PHI.md) §3). Back up and restrict the volume like any
+  PHI-at-rest store.
 - **External SQL Server / Postgres store.** The store connection is TLS by default
   (`[store].encrypt = true`, `[store].trust_server_certificate = false`). **`MEFOR_ALLOW_INSECURE_TLS`
   must NOT be set in a real deployment** — it is the single switch that downgrades store TLS (and
-  MLLP-outbound verify, REST/SOAP verify, SFTP host-key) to best-effort. It no longer releases a
-  credential over plain FTP or over an unverified FTPS session: those are refused outright (vault
-  BACKLOG #2636). Note CI sets
+  MLLP-outbound verify, REST/SOAP verify, SFTP host-key) to best-effort. On most hops it no longer
+  releases a credential; [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)
+  says which, and the store login is not among them. Note CI sets
   it deliberately for the self-signed SQL Server container; that is a **CI-only** posture and must
   never leak into a production image/compose. Give the production DB a CA-trusted cert instead.
 - **Logs.** Keep the service at INFO (never raise to DEBUG in a PHI container — full-body logging risk

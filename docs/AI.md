@@ -79,9 +79,10 @@ The policy is two independent axes, then **clamped** by the instance's **product
    `code_only`.
 3. **`deidentified` hard rule** — `deidentified` always falls back to `code_only` today, because **no
    de-identification is wired into the AI-assist path**. (A de-id framework,
-   [`messagefoundry/anon/`](../messagefoundry/anon/) / ADR 0030, exists to build PHI-free **test
-   datasets**; it does not de-identify message bodies flowing to the assistant — see
-   [PHI.md §9](PHI.md#9-de-identification).)
+   [`messagefoundry/anon/`](../messagefoundry/anon/) / ADR 0030, exists to build de-identified
+   **test datasets**; it does not de-identify message bodies flowing to the assistant. Its output
+   is de-identified, not guaranteed free of PHI: [PHI.md §9](PHI.md#9-de-identification) says what
+   its leak-check refuses and what it lets through.)
 4. **`off` normalization** — when `mode == off`, `data_scope` is irrelevant and resolves to `code_only`.
 
 **`mode` is never clamped by posture** — only `data_scope` is. Every clamp is recorded in a
@@ -283,8 +284,9 @@ editor.
   **only** path by which `phi` scope ever becomes reachable.
 - **Runtime de-identification** (the `deidentified` scope) is **roadmap only** — the AI-assist path has
   no message de-identification wired in today, so the scope falls back to `code_only`. (A de-id
-  framework, [`messagefoundry/anon/`](../messagefoundry/anon/) / ADR 0030, exists to build PHI-free
-  **test datasets**; it does not de-identify message bodies for the live assistant.) See
-  [PHI.md §9](PHI.md#9-de-identification).
+  framework, [`messagefoundry/anon/`](../messagefoundry/anon/) / ADR 0030, exists to build
+  de-identified **test datasets**; it does not de-identify message bodies for the live assistant.)
+  See [PHI.md §9](PHI.md#9-de-identification), which also says what that framework's leak-check
+  lets through.
 - The `provider` / `model` / `baa_attested` / `endpoint` config keys are **accepted but unused**
   today; they exist so the broker can consume them without a config migration.

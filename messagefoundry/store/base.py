@@ -66,6 +66,7 @@ from messagefoundry.store.privilege import (
 from messagefoundry.store.row_seal import RowSealer
 from messagefoundry.store.store import (
     UPLOAD_RESERVATION_STALE_AFTER,
+    AdMap,
     AdminRemoval,
     AlertInstance,
     AlertSummary,
@@ -101,6 +102,7 @@ from messagefoundry.store.store import (
     ResendSourceAmbiguous,
     ResendSourceEmpty,
     ResendSourceNotFound,
+    RoleGrant,
     SessionRecord,
     Stage,
     StreamingAttachmentsUnsupported,
@@ -722,7 +724,18 @@ class QueueStore(StoreLifecycle, Protocol):
         needed, and a raise always fails that start closed."""
         return None
 
-    async def mark_done(self, outbox_id: str, now: float | None = None) -> None: ...
+    async def mark_done(
+        self, outbox_id: str, now: float | None = None, *, reply_dropped: str | None = None
+    ) -> bool:
+        """Mark one delivered outbound row ``DONE``, with its ``delivered`` event, in one
+        transaction. ``reply_dropped``, when given, is the detail of a ``reply_dropped`` event
+        written in the same transaction: the partner answered 2xx and its reply body was over the
+        byte bound and dropped (vault BACKLOG #3040 item 5). It carries the status and the bound,
+        never a byte of the reply. Returns ``True`` when this call wrote the ``DONE`` flip and its
+        events, and ``False`` when it wrote nothing: a vanished row, or a write the H1 fence rolled
+        back (vault BACKLOG #3040 item 2). It does not check the row's status first, so a row some
+        other writer already made ``DONE`` is written again and returns ``True``."""
+        ...
 
     async def mark_batch_done(self, outbox_ids: Sequence[str], now: float | None = None) -> None:
         """Complete N delivered outbound rows in **one transaction** — the batch counterpart of
@@ -2136,7 +2149,7 @@ class AuthStore(Protocol):
     #
     # ADR 0197: a password change also clears BOTH locks and both failure counts, and zeroes the
     # second-step cycle count, because the password those failures proved is gone. The sign-in cycle
-    # count stays (``store.PASSWORD_CHANGE_LOCKOUT_CLEAR``).
+    # count stays (``store.password_change``).
     #
     # ADR 0197 Amendment A: ``password_generated`` is REQUIRED, with no default, for the reason
     # ``create_user`` gives: the generated paths pass True and every holder-chosen path passes False.
@@ -2350,7 +2363,11 @@ class AuthStore(Protocol):
         permissions: str | None = None,
     ) -> None:
         """Create-or-update a role. ``permissions`` is a JSON array of ``Permission`` wire values for a
-        custom role (ADR 0045), or ``None`` for a built-in row (which resolves from code)."""
+        custom role (ADR 0045), or ``None`` for a built-in row (which resolves from code).
+
+        The row is written whole and sealed (BACKLOG #2592), through one helper per backend. The
+        service checks the seal where it reads a custom role; the readers here return rows
+        unchecked. Saving a role again seals it, which is how one that fails is repaired."""
         ...
 
     async def list_roles(self) -> Sequence[Row]: ...
@@ -2363,6 +2380,36 @@ class AuthStore(Protocol):
         ...
 
     async def get_user_role_ids(self, user_id: str) -> list[str]: ...
+
+    async def get_user_role_grants(self, user_id: str) -> list[RoleGrant]:
+        """The account's role rows, whole, as its integrity seal covers them (BACKLOG #2592).
+
+        The store writes the user seal: every write to ``users``, ``user_roles`` or the account's
+        passkeys goes through one helper per backend, which verifies the record it read before it
+        re-seals it and raises :class:`~messagefoundry.store.row_seal.RowSealError` rather than
+        re-seal a record that fails. Deleting needs no key. :class:`AuthService` checks the seal,
+        in its one user loader; the store's readers return rows unchecked."""
+        ...
+
+    async def reseal_user_records(self) -> tuple[int, int]:
+        """Re-seal every user record under the active key, for ``rotate-key`` (BACKLOG #2592).
+        Returns ``(re-sealed, refused)``; a record that fails its seal is left as it is."""
+        ...
+
+    async def count_unsealed_users(self) -> int:
+        """How many accounts carry no integrity seal (BACKLOG #2592)."""
+        ...
+
+    async def reseal_role_records(self) -> tuple[int, int]:
+        """Re-seal every role definition and the AD group-to-role map under the active key, for
+        ``rotate-key`` (BACKLOG #2592). Returns ``(re-sealed, refused)``; one that fails its seal
+        is left as it is."""
+        ...
+
+    async def count_unsealed_role_records(self) -> int:
+        """How many custom roles carry no integrity seal, plus one for each AD directory map that
+        has pairs and no seal (BACKLOG #2592)."""
+        ...
 
     # --- saved-search presets (ADR 0136, BACKLOG #151) — per-user, criteria encrypted at rest -----
 
@@ -2405,7 +2452,14 @@ class AuthStore(Protocol):
         *,
         assigned_by: str | None = None,
         now: float | None = None,
-    ) -> None: ...
+    ) -> None:
+        """Replace the account's roles with ``role_ids``. Raises ``UnknownRoleError``, writing
+        nothing, when an id the account does not already hold has no ``roles`` row as the write
+        reads it; a role deleted after that read fails the ``user_roles`` foreign key instead, with
+        the driver's integrity error. A held id with no row is dropped (BACKLOG #2592,
+        ``store.existing_roles_only``). :meth:`remove_unless_last_admin` with ``SET_ROLES`` does
+        the same."""
+        ...
 
     async def remove_unless_last_admin(
         self,
@@ -2584,13 +2638,23 @@ class AuthStore(Protocol):
         """
         ...
 
-    async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]: ...
+    async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
+        """The role ids the AD group-to-role map gives ``groups``, its seal UNCHECKED."""
+        ...
+
+    async def get_ad_map(self, name: str) -> AdMap:
+        """One whole AD directory map (``AD_ROLE_MAP`` or ``AD_SCOPE_MAP``) and its seal, read in
+        one statement (BACKLOG #2592). Unchecked: :class:`AuthService` checks the seal in its one
+        map loader. Each map is written whole and sealed, through one helper per backend."""
+        ...
 
     async def list_ad_group_role_map(self) -> Sequence[Row]: ...
 
     async def set_ad_group_role_map(self, entries: Iterable[tuple[str, str]]) -> None: ...
 
-    async def channels_for_ad_groups(self, groups: Iterable[str]) -> set[str]: ...
+    async def channels_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
+        """The channels the AD group-to-channel map gives ``groups``, its seal UNCHECKED."""
+        ...
 
     async def list_ad_group_scope_map(self) -> Sequence[Row]: ...
 

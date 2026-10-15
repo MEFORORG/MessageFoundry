@@ -229,13 +229,22 @@ _ENCODED_SEPARATOR = re.compile(r"%(?:7[CcEe]|5[Ee]|26)")
 #: lines, so no encoded run in one is scrubbed. Moving the credential filters ahead of this module
 #: in the log chain would lift it.
 #:
-#: **Each arm is a copy of its source, or wider.** The label arm is ``secretscrub``'s own: the same
-#: ``\b``, the same bounded dotted prefix as ``_LABEL_PREFIX``, the same words, and the separator.
-#: The URL arm is ``_DSN_PASSWORD`` without its scheme. The query arm is
-#: ``logging_setup._CREDENTIAL_QUERY_KEYS``. This module is stdlib-only and cannot import them, so
-#: ``tests/test_redaction.py`` holds each arm to its source, and checks by behaviour that this
-#: pattern matches every text either filter changes. A plain literal, so the static regex gate reads
-#: it. The prefix bound keeps the scan linear, as it does there.
+#: **Each arm is a copy of its source, or wider, with ONE stated exception.** The label arm is
+#: ``secretscrub``'s own: the same bounded dotted prefix as ``_LABEL_PREFIX``, the same words, and
+#: the separator. Its start is ``\b`` alone. Since BACKLOG #2999 ``secretscrub`` also starts a label
+#: right after a ``%XX`` escape (``_LABEL_START``), and this arm deliberately does not. Taking that
+#: start here switched the encoded run off on every text holding such a label, so the run's PHI
+#: printed. Measured by a before-and-after differential under BACKLOG #2999, whose commit carries the
+#: numbers: with that start, PHI values the run hid printed on the installed chain; without it,
+#: no value printed on any of nine log paths that the code before it hid. The price: where such a
+#: label sits in the run's own token and its value in the next one, as in
+#: ``a%7Cb%7Cc%2Cpassword: <value>``, the run takes the label and the value prints, as it did before
+#: #2999. ``tests/test_redaction.py`` pins both. The URL arm is ``_DSN_PASSWORD`` without its scheme.
+#: The query arm is ``logging_setup._CREDENTIAL_QUERY_KEYS``. This module is stdlib-only and cannot
+#: import them, so ``tests/test_redaction.py`` holds each arm to its source, and checks by behaviour
+#: that this pattern matches every text either filter changes when the filters start a label at
+#: ``\b`` alone. A plain literal, so the static regex gate reads it. The prefix bound keeps the scan
+#: linear, as it does there.
 _CREDENTIAL_AHEAD = re.compile(
     r"""\b(?:MEFOR_[A-Z0-9_]+|(?i:(?:[A-Za-z0-9]+[._-]){0,6}(?:"""
     r"""encryption_keys_retired|intake_api_key_next|encryption_key|authorization|private_key"""
@@ -712,6 +721,7 @@ _REDACT_WINDOW = 64 * 1024
 #: real one behind decoys. Keeping the first segment whatever the cut would special-case a register
 #: that has none. Strict xfails in ``tests/test_redaction.py`` assert the fragment IS scrubbed, so they
 #: fail loudly the day someone closes the gap; the corpus arm there cannot reach the shape at all.
+#: The operator's statement of this residual is in ``docs/PHI.md`` section 7, *A third residual*.
 #:
 #: **The structured passes (BACKLOG #1711) mostly answer "yes", and need no walk.** Each is
 #: label-anchored and treats a region that never closes as running to the end of the text, so a cut
@@ -1922,8 +1932,21 @@ def _clear_of_own_notes(text: str, kept: int) -> int:
     end in this module's notes. The whole-token cut sees the space inside a note as a boundary, so it
     kept ``…(+150`` and then wrote its own note after it: ``…(+150…(+7 chars)``, two counts glued
     together. So a bound note the cut would split goes whole. Then a count note the cut would split,
-    or that the head would end on, goes whole too, so the result ends in one count. That count still
-    covers every character held back. No opener holds whitespace, so a cut never splits an opener.
+    or that the head would end on, goes whole too, so no count is glued to the new one. The new count
+    covers every character of ``text`` held back, dropped notes included. No opener holds whitespace,
+    so a cut never splits an opener.
+
+    **The result does not always hold one count (vault BACKLOG #3034).** This sentence read "so the
+    result ends in one count", and that was false. A note that closes before the cut, with other text
+    after it, stays in the kept head unless that text itself ends on the closer at the cut. The result
+    then holds that count and the new one. ``tests/test_redaction.py`` pins it under *what a second
+    cut does to an earlier note*, and ``docs/PHI.md``, *The store's 200-character bound*, is the
+    operator's statement.
+
+    **The two checks run once each, in that order.** So the count check can move the cut back into a
+    bound note the first check already passed, and part of that note is then kept. Measured on text a
+    peer can write: a count opener inside a bound note. Found while building vault BACKLOG #3034, not
+    fixed, and unfiled when this was written.
 
     Residuals, at least these. Only the last opener of each kind before the cut is read. One a peer
     wrote, with no closer after it, moves the cut back as far as itself, possibly to nothing. That
@@ -1964,6 +1987,15 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     held back, every character of it, and the bound note is raw characters no pattern ever looked at. One total would add a
     redacted length to an unredacted one and report a number that is neither. Nothing is dropped in the
     ordinary case, so the ordinary result is byte-identical to its pre-#1576 self.
+
+    **Both counts are about THIS call's input (vault BACKLOG #3034).** The store calls this again on a
+    value an emit site already bounded, and an earlier note this call drops counts as plain
+    characters. So ``N`` is NOT how much of the original text the result lacks, and a dropped bound
+    note takes its unscanned figure with it. Neither earlier number is carried forward, because that
+    would mean parsing a number out of text a peer can write. ``docs/PHI.md``, *The store's
+    200-character bound*, states the rule; ``tests/test_redaction.py`` pins a first result ending
+    ``(+65334 chars) [redaction bound: dropped 6_001 more chars unscanned]`` that ends ``(+81
+    chars)`` after a second cut at 200.
 
     **It is not strictly idempotent, and the known exceptions all only add redaction or shorten the
     text.** At least these: a truncated result re-truncates with a new ``(+N chars)`` count; the
@@ -2085,25 +2117,72 @@ def safe_exc(
     return f"{name}: {message}" if message else name
 
 
-#: A codec name as the codecs module spells one: the shape test runs before the set lookup.
-_CODEC_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}")
+#: ``encodings`` modules that are no text codec: the alias table, the bytes-to-bytes and str-to-str
+#: transforms, and ``undefined``, which only ever raises. ``tests/test_safe_exc_unicode_errors.py``
+#: checks the transforms against the codec registry, so a new one cannot join the names unseen.
+_NOT_TEXT_CODECS = frozenset(
+    {
+        "aliases",
+        "base64_codec",
+        "bz2_codec",
+        "hex_codec",
+        "quopri_codec",
+        "rot_13",
+        "undefined",
+        "uu_codec",
+        "zlib_codec",
+    }
+)
 
 
-def _codec_key(name: str) -> str:
-    return name.replace("-", "").replace("_", "").lower()
-
-
-#: Every stdlib codec name and alias, normalized. Built from the ``encodings`` package rather than by
-#: ``codecs.lookup``, which runs third-party search functions and caches each name it misses: the very
-#: value this check declines to echo would stay in process memory. A third-party codec is not named.
-_KNOWN_CODECS = frozenset(
-    _codec_key(n)
-    for n in (
-        *encodings.aliases.aliases,
+def _text_codec_names() -> set[str]:
+    """Each stdlib text codec's module name and its aliases, as the ``encodings`` package spells
+    them."""
+    modules = {
         *encodings.aliases.aliases.values(),
         *(m.name for m in pkgutil.iter_modules(encodings.__path__)),
-    )
+    }
+    modules = {m for m in modules if not m.startswith("_")} - _NOT_TEXT_CODECS
+    aliases = {
+        alias
+        for alias, module in encodings.aliases.aliases.items()
+        if module in modules and not alias.isdigit()
+    }
+    return modules | aliases
+
+
+#: Names a real Windows error reports that no ``encodings`` module or alias carries, written out one
+#: by one. ``cp1``: what ``str.encode("oem")`` reports, the OEM code page's constant (measured on
+#: Windows 11, Python 3.14). Python 3.14 on Windows also reports ``cp<number>`` for a code page with
+#: no module, such as ``cp20127``. That family is open, so it is not named.
+_WINDOWS_ERROR_NAMES = frozenset({"cp1"})
+
+
+def _spellings(name: str) -> tuple[str, str, str]:
+    """``name`` as ``encodings`` spells it, with hyphens, and with no separator: the three forms a
+    stdlib codec is measured to report itself in (``euc_jp``, ``utf-8``, ``unicodeescape``)."""
+    return name, name.replace("_", "-"), name.replace("_", "")
+
+
+#: The rule: a name is rendered only if it is EXACTLY one of these strings. They are each stdlib
+#: TEXT codec's module name and non-numeric aliases, in the three :func:`_spellings`, plus
+#: :data:`_WINDOWS_ERROR_NAMES`. The match is exact because the name is printed as given: a match
+#: on a normalized key would print any spelling of a known name, and case and separators are text a
+#: caller chooses. Built from the ``encodings`` package rather than by ``codecs.lookup``, which runs
+#: third-party search functions and caches each name it misses: the very value this check declines
+#: to echo would stay in process memory. A third-party codec is not named. The build costs about
+#: 1 ms at import, so it is not deferred.
+_KNOWN_CODECS = frozenset(
+    {s for n in _text_codec_names() for s in _spellings(n)} | _WINDOWS_ERROR_NAMES
 )
+
+
+def _names_a_codec(encoding: object) -> bool:
+    """Whether ``encoding`` is a name :func:`_unicode_error_detail` may print (see
+    :data:`_KNOWN_CODECS` for the rule). ``type(...) is str``, as for the reason below: a str
+    subclass can hash and compare equal to a listed name."""
+    return type(encoding) is str and encoding in _KNOWN_CODECS
+
 
 #: ``.reason`` phrases known to be fixed text. At least the stdlib idna and punycode codecs put the
 #: offending label INTO ``.reason``, so a reason is rendered only from this list, never on trust.
@@ -2147,9 +2226,11 @@ def _unicode_error_text(exc: UnicodeError) -> str:
 
     The class name alone is the fallback: a bare ``UnicodeError``, or one whose attributes are missing,
     not the standard types, or raise when read. A bare one's message is free text this function cannot
-    vouch for. ``.encoding`` is rendered only when it names a stdlib codec, so a value someone else set
-    there is not echoed. ``.reason`` is rendered only from a fixed list. Windows ``mbcs`` raises with
-    ``start == end``, so an empty span still names its position."""
+    vouch for. ``.encoding`` is rendered only when it is exactly one of a fixed set of strings
+    (:func:`_names_a_codec`), so a value someone else set there prints only if it is one of them. ``.reason`` is rendered only from a fixed list.
+
+    An empty span (``start == end``) prints no position (vault BACKLOG #3206). Windows ``mbcs`` and
+    ``oem`` raise with ``start == end == 0`` wherever the character sat, so the index is not one."""
     name = type(exc).__name__
     detail = _unicode_error_detail(exc)
     return f"{name}: {detail}" if detail else name
@@ -2178,15 +2259,13 @@ def _unicode_error_detail(exc: UnicodeError) -> str:
         return ""
     if type(start) is not int or type(end) is not int or not 0 <= start <= end:
         return ""
-    where = f"position {start}" if end <= start + 1 else f"positions {start}-{end - 1}"
-    codec = (
-        f"{encoding!r} codec "
-        if type(encoding) is str
-        and _CODEC_NAME.fullmatch(encoding)
-        and _codec_key(encoding) in _KNOWN_CODECS
-        else ""
-    )
-    text = f"{codec}cannot {verb} at {where}"
+    codec = f"{encoding!r} codec " if _names_a_codec(encoding) else ""
+    text = f"{codec}cannot {verb}"
+    # An empty span names no character, so its start is not a position (:func:`_unicode_error_text`).
+    if end == start + 1:
+        text = f"{text} at position {start}"
+    elif end > start:
+        text = f"{text} at positions {start}-{end - 1}"
     # `type(...) is str`, not isinstance: a str subclass can compare equal to a listed phrase.
     if type(reason) is str and reason in _FIXED_UNICODE_REASONS:
         text = f"{text}: {reason}"

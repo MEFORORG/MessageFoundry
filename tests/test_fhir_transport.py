@@ -33,7 +33,7 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import FHIR, WiringError
 from messagefoundry.transports import build_destination
-from messagefoundry.transports.base import DeliveryError, NegativeAckError
+from messagefoundry.transports.base import DeliveryError, DeliveryResponse, NegativeAckError
 from messagefoundry.transports.egress import check_egress_allowed
 from messagefoundry.transports.fhir import (
     FhirDestination,
@@ -488,7 +488,7 @@ async def test_send_capture_accepted() -> None:
     dest = _dest(capture_response=True)
     dest._opener = _FakeOpener(body=as_json(PATIENT_R4B).encode(), status=201)  # type: ignore[assignment]
     resp = await dest.send(PATIENT)
-    assert resp is not None
+    assert isinstance(resp, DeliveryResponse)
     assert resp.outcome == "accepted"
 
 
@@ -496,7 +496,7 @@ async def test_send_capture_no_reply_on_empty_2xx() -> None:
     dest = _dest(capture_response=True)
     dest._opener = _FakeOpener(body=b"", status=200)  # type: ignore[assignment]
     resp = await dest.send(PATIENT)
-    assert resp is not None and resp.outcome == "no_reply"
+    assert isinstance(resp, DeliveryResponse) and resp.outcome == "no_reply"
 
 
 async def test_send_5xx_raises_transient() -> None:
@@ -650,7 +650,7 @@ async def test_entry_etag_and_location_are_captured_as_headers() -> None:
         headers=reply_headers,
     )
     resp = await dest.send(UPDATE_1965)
-    assert resp is not None
+    assert isinstance(resp, DeliveryResponse)
     assert resp.headers == {"ETag": 'W/"8"', "Location": "from-the-real-header"}
 
 
@@ -664,7 +664,7 @@ async def test_overlong_entry_etag_is_not_captured_and_hides_the_bundle_etag() -
         body=_transaction_response("200 OK", etag="x" * 9000), headers=reply_headers
     )
     resp = await dest.send(UPDATE_1965)
-    assert resp is not None and resp.headers == {}
+    assert isinstance(resp, DeliveryResponse) and resp.headers == {}
 
 
 @pytest.mark.parametrize(
@@ -684,7 +684,7 @@ async def test_capture_outcome_comes_from_the_entry(
     dest = _dest(interaction="update", capture_response=True)
     dest._opener = _FakeOpener(body=_transaction_response("200 OK", **extra))  # type: ignore[assignment]
     resp = await dest.send(UPDATE_1965)
-    assert resp is not None and resp.outcome == expected
+    assert isinstance(resp, DeliveryResponse) and resp.outcome == expected
 
 
 @pytest.mark.parametrize(
@@ -722,7 +722,7 @@ async def test_too_deep_2xx_reply_captures_as_unparseable() -> None:
         dest = _dest(capture_response=True, **over)
         dest._opener = _FakeOpener(body=b"[" * 200_000)  # type: ignore[assignment]
         resp = await dest.send(UPDATE_1965)
-        assert resp is not None and resp.outcome == "unparseable"
+        assert isinstance(resp, DeliveryResponse) and resp.outcome == "unparseable"
 
 
 async def test_reply_that_is_not_a_transaction_response_is_delivered() -> None:
@@ -1079,7 +1079,7 @@ async def test_path_form_captures_the_plain_resource_reply() -> None:
     )
     dest._opener = _FakeOpener(body=UPDATE_1965.encode(), headers=reply_headers)  # type: ignore[assignment]
     resp = await dest.send(UPDATE_1965)
-    assert resp is not None
+    assert isinstance(resp, DeliveryResponse)
     assert (resp.outcome, resp.body, resp.headers) == ("accepted", UPDATE_1965, {"ETag": 'W/"8"'})
 
 

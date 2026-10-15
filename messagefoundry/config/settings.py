@@ -445,9 +445,8 @@ INSECURE_TLS_ESCAPE_ENV = "MEFOR_ALLOW_INSECURE_TLS"
 def insecure_tls_allowed() -> bool:
     """Whether the explicit dev escape to permit insecure TLS overrides is set (ASVS 12.3.2).
 
-    Certificate-validation overrides (``ad_tls_verify=false`` for LDAPS, ``trust_server_certificate
-    =true`` for SQL Server) are MITM-able, so they now **refuse** at startup unless
-    ``MEFOR_ALLOW_INSECURE_TLS`` is truthy. This means a production deployment can't silently disable
+    Certificate-validation overrides (``trust_server_certificate=true`` for SQL Server, for one) are
+    MITM-able, so they now **refuse** at startup unless ``MEFOR_ALLOW_INSECURE_TLS`` is truthy. This means a production deployment can't silently disable
     server-cert validation; an operator must opt in loudly for a trusted-network dev/test bind."""
     return os.environ.get(INSECURE_TLS_ESCAPE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -480,11 +479,11 @@ def weakened_tls_escape_permitted(posture: HopPosture | None) -> bool:
     here so the blunt escape can no longer silence an **enforcing** refusal (matching the
     ``--allow-insecure-bind`` API-bind clamp). That is **at least** the engine<->store TLS gate
     (:func:`~messagefoundry.store.sqlserver.connection_string` / ``store.postgres._build_ssl``), the MLLP
-    and the anonymous FTPS ``tls_verify=false`` context (a credential on FTPS verify-off or on plain
-    ``ftp`` is refused outright, vault BACKLOG #2636), **and — since #329 —**
-    the LDAPS ``ad_tls_verify=false`` bind (:mod:`messagefoundry.auth.ldap`), the SFTP unknown-host-key
-    acceptance (:mod:`messagefoundry.transports.remotefile`), and the webhook-alert-sink and AI-broker
-    cleartext-``http`` hops. Pass the construction-time
+    and the anonymous FTPS ``tls_verify=false`` context, **and — since #329 —** the SFTP
+    unknown-host-key acceptance for a login with no ``password``
+    (:mod:`messagefoundry.transports.remotefile`), and the webhook-alert-sink and AI-broker
+    cleartext-``http`` hops. The credential hops it no longer reaches are named once, in
+    docs/SECURITY-LOOSENING.md, *No escape sends a credential to an unverified peer*. Pass the construction-time
     :func:`~messagefoundry.config.tls_policy.current_hop_posture` (in-gate transport cells, via
     :func:`weakened_tls_escape_permitted_here`) or an explicitly-threaded posture (the store hop and the
     out-of-gate #329 cells, whose construction never stamps the contextvar). Semantics: the escape must
@@ -746,8 +745,9 @@ class StoreSettings(_Section):
     aad_bind: bool = True
     # Accept an UNMARKED value in a cipher-covered column of a KEYED store (BACKLOG #1169, ASVS 11.3.3).
     # **Off by default**: a keyed store writes only `mfenc:` ciphertext there, and the at-open sweep
-    # seals legacy plaintext only on a (table, column) surface that holds no ciphertext yet, so a
-    # non-blank unmarked value beside sealed ones is a stripped marker or a planted row -- the cipher
+    # seals legacy plaintext only on a (table, column) surface that is still unsealed: not yet
+    # recorded in `keyed_surface` and holding no ciphertext (BACKLOG #3383). So a non-blank unmarked
+    # value on a sealed surface is a stripped marker or a planted row -- the cipher
     # REFUSES it (`CipherError`, an `integrity_drift` alert with subject `store-cipher`) instead of
     # returning it as plaintext. A purged '' is never refused. Setting it true restores the old
     # behaviour: unmarked values read back as plaintext and the sweep seals every unmarked value. It is
@@ -1423,9 +1423,10 @@ class ApiSettings(_Section):
     def host_is_browser_origin(self) -> bool:
         """:func:`request_host_is_browser_origin` for this config. False means the browser reaches the
         engine off-box or through a proxy. ``serve`` reads it for the console exposure checks
-        (BACKLOG #2218) and as ``instance_exposed``, the single exposure test its refusing arms read:
-        MFA-at-exposure, dual-control and the ADR 0152 declaration (vault BACKLOG #2251). A change to
-        :func:`request_host_is_browser_origin` therefore moves those security refusals too."""
+        (BACKLOG #2218) and as ``instance_exposed``, the single exposure test at least three of its
+        arms read: MFA-at-exposure, dual-control and the ADR 0152 declaration (vault BACKLOG #2251).
+        They do not all refuse, and each arm in ``serve`` says what it does. A change to
+        :func:`request_host_is_browser_origin` therefore moves those refusals and warnings too."""
         return request_host_is_browser_origin(
             loopback=self.is_loopback,
             trusted_proxies=self.trusted_proxies,
@@ -1647,8 +1648,10 @@ class ApiSettings(_Section):
                 "[api].trusted_proxies requires [api].tls_terminated_upstream = true, or an "
                 "operator [api].tls_cert_file if the proxy re-encrypts to the engine. Without "
                 "either, a proxy forwarding X-Forwarded-Proto 'http' makes the web console issue "
-                "its session cookie without Secure (BACKLOG #2055). A declared terminator is an "
-                "exposed posture: see docs/CONFIGURATION.md for what serve then requires."
+                "its session cookie without Secure (BACKLOG #2055). Either route is an exposed "
+                "posture, on a loopback bind too: a set [api].trusted_proxies counts as exposed "
+                "with or without a declared terminator. See docs/CONFIGURATION.md for what serve "
+                "then requires."
             )
         # Refuse rather than ignore a stray acknowledgement, as ad_session_recheck_seconds without
         # ad_enabled is refused: an operator who set it believes a proxy-to-engine hop exists and
@@ -1692,9 +1695,9 @@ class ApiSettings(_Section):
 class TlsSettings(_Section):
     """``[tls]`` — the instance-wide client **trust-anchor and revocation** policy (#190, ADR 0093).
 
-    A small, shared fallback for outbound connectors that verify a downstream *server* certificate
-    (MLLP/DICOM/FTPS today), and the inbound FTPS poller, which dials out too (vault BACKLOG
-    #2370). By default the OS trust store roots verify the peer; a hospital estate
+    A small, shared fallback read by at least these: the outbound connectors that verify a downstream
+    *server* certificate, such as MLLP, DICOM and FTPS, and the inbound FTPS poller, which dials out
+    too (vault BACKLOG #2370). By default the OS trust store roots verify the peer; a hospital estate
     whose internal endpoints present a PRIVATE / internal-CA cert can pin that CA here once instead of
     installing it box-globally or repeating a per-connection ``tls_ca_file``. This is a CLIENT trust
     anchor — it selects WHICH roots verify the peer, it NEVER disables verification — so it composes
@@ -1713,9 +1716,10 @@ class TlsSettings(_Section):
     #               the forward_tls_ca_file template).
     trust_anchor_mode: TrustAnchorMode = "system"
     # PEM path to a file of CRLs for OUTBOUND hops and the FTPS poller (BACKLOG #299, #2370). NOT a
-    # secret -- a path, the same status as internal_ca_file. Empty (default) = no outbound revocation checking, which is
-    # exactly the gap the #201 RevocationHopGuard refuses on an enforcing hop. Set it and every hop that
-    # resolves a trust anchor loads the CRL onto its OWN context and sets VERIFY_CRL_CHECK_LEAF.
+    # secret -- a path, the same status as internal_ca_file. Empty (default) = no outbound
+    # revocation checking, which is exactly the gap the #201 RevocationHopGuard refuses on an
+    # enforcing hop. Set it and every hop that resolves a trust anchor loads the CRL onto its OWN
+    # context and sets VERIFY_CRL_CHECK_LEAF.
     #
     # WARNING, and it is the operational half of this setting: VERIFY_CRL_CHECK_LEAF refuses a peer whose
     # issuer has NO CRL in the store, not only a revoked one. So the file must cover every issuer the
@@ -2194,8 +2198,10 @@ class DiagnosticsSettings(_Section):
     #   "all"    — record every event (the default; unchanged behavior).
     #   "errors" — drop routine success events (received/delivered/replayed); keep the compliance floor.
     #   "off"    — keep ONLY the compliance floor.
-    # COMPLIANCE FLOOR (retained at EVERY level, even "off"): `viewed` (a PHI-access record — the HIPAA
-    # message-view trail must never be dropped) and the terminal failure events `dead`/`error`/`failed`.
+    # COMPLIANCE FLOOR (retained at EVERY level, even "off"): at least `viewed` (a PHI-access record —
+    # the HIPAA message-view trail must never be dropped) and the terminal failure events
+    # `dead`/`error`/`failed`. The full set is `_AUDIT_FLOOR_EVENTS` in store/store.py, and
+    # docs/PHI.md section 7 row 6 lists it.
     message_events: Literal["all", "errors", "off"] = "all"
     # ASVS 16.3.2 (BACKLOG #244; default flipped ON by BACKLOG #1277). Audit EVERY authorization GRANT,
     # not just the sensitive/state-changing set. Setting it false narrows the trail back to that set
@@ -4740,6 +4746,9 @@ _ALERT_EVENT_TYPES = frozenset(
         # sign-in's role sync (granted_by `<directory>`).
         "approval_approver_provenance",
         "administrator_granted",
+        # vault BACKLOG #3229: a directory-driven role change left no enabled Administrator. Keyed
+        # `user:<username>`, which no connection can be named.
+        "no_enabled_administrator",
         # vault BACKLOG #2255: the approval gate could not write one of its audit rows. Keyed
         # `approval:<id>`, which no connection can be named. Since vault BACKLOG #2254 also an
         # inline config reload's lost config_reload_attempted row, keyed `config_reload:inline`.
@@ -4760,6 +4769,10 @@ _ALERT_EVENT_TYPES = frozenset(
         # recorded one. Keyed `config:<12 hex>`, which no connection can be named, so it is not in
         # _ALERT_CONTROL_EVENT_TYPES below.
         "config_changed",
+        # vault BACKLOG #2904: the CRL reload refused a replaced CRL file, so running TLS contexts
+        # keep the copy they hold. Keyed `crl_reload:<path>`, with a process suffix where several
+        # engine processes share the store, which no connection can be named.
+        "crl_reload_refused",
         # vault BACKLOG #2613: the security-signal rule layer over the audit stream. Each detector
         # has its own type; pipeline/security_signals.py SECURITY_SIGNAL_TYPES mirrors this block, and
         # a test pins that each is here. None is connection-scoped.
@@ -4769,6 +4782,11 @@ _ALERT_EVENT_TYPES = frozenset(
         "bulk_export",
         "log_level_debug",
         "posture_loosened",
+        # vault BACKLOG #2742: the remote-debugging guard refused scripts another process
+        # injected into the engine. Keyed `remote_debug:refused`, with a process suffix where
+        # several engine processes share the store, which no connection can be named. It has no
+        # inverse: a refusal is an event, not a state that clears.
+        "remote_debug_refused",
         # NOTE: the INVERSE events (leadership_lost / dr_released / intake_resumed /
         # ad_reconcile_breaker_cleared / ad_reconcile_hold_released) are auto-resolve-only
         # (alert_sinks _AUTO_RESOLVE), NOT rule-targetable alert types -- a step-down, a fail-back,
@@ -8304,13 +8322,14 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
 
 
 def _approvals_loosenings(approvals: ApprovalsSettings) -> list[tuple[str, str]]:
-    """The ``[approvals]`` dual-control limits set LOOSER THAN THEIR SHIPPED DEFAULT, as
-    ``(switch, risk)`` entries for :func:`security_loosenings` (BACKLOG #2489; ASVS 2.3.5, 2.4.2).
+    """The ``[approvals]`` dual-control limits and held list set LOOSER THAN THEIR SHIPPED DEFAULT,
+    as ``(switch, risk)`` entries for :func:`security_loosenings` (BACKLOG #2489; ASVS 2.3.5, 2.4.2).
 
     It reads them as :func:`_auth_limit_loosenings` reads the ``[auth]`` limits: the shipped default
     is the cutoff, a stricter value is never named, and a part of a control is named only while the
-    control is built. Dual control ships OFF, so nothing here is named until ``enabled`` is on with
-    at least one operation held. Switching it off again is the shipped posture, not a loosening.
+    control is built. Dual control ships OFF, so nothing here is named until ``enabled`` is on, and
+    its two limits only with at least one operation held. Switching it off again is the shipped
+    posture, not a loosening.
 
     The direction is read from ``ApprovalGate``. Its dwell check skips a ``min_dwell_seconds`` of 0
     and refuses an approve younger than the floor, so a floor below the default is looser. Its
@@ -8320,13 +8339,46 @@ def _approvals_loosenings(approvals: ApprovalsSettings) -> list[tuple[str, str]]
     Values are quoted at 15 significant digits, so a value just past the default never prints as
     the default itself.
 
-    **Not covered:** ``approve`` checks neither ``enabled`` nor ``operations``, and each request
-    keeps the deadline stamped when it was made. A request left pending when dual control is turned
-    off can still be released under the current dwell, and nothing here names that."""
+    **The held list is read the same way (vault BACKLOG #3123).** While ``enabled`` is on, an
+    ``operations`` list that leaves out an operation the field's own default holds is named as
+    ``approvals.operations``, with the operations left out. ``ApprovalGate`` holds an action only
+    while its operation is in the list, so each one left out completes on one caller's authority.
+    An EMPTY list loads and holds nothing, which is that narrowing at its largest: it gets its own
+    wording, and the dwell and expiry are then not named, because they bind no request. Adding an
+    operation the default leaves out (``config_reload``) holds more and is not named, and it does
+    not make up for a default one left out.
+
+    **A request already held.** ``ApprovalGate.approve`` refuses a request whose operation is no
+    longer held (409, ``approval.no_longer_gated``), whether dual control was turned off or the
+    operation left the list. So narrowing the list releases nothing already held; it changes what
+    the NEXT call does. Each request keeps the deadline stamped when it was made."""
     out: list[tuple[str, str]] = []
-    if not (approvals.enabled and approvals.operations):
+    if not approvals.enabled:
         return out
     fields = ApprovalsSettings.model_fields
+    held = set(approvals.operations)
+    if not held:
+        return [
+            (
+                "approvals.operations",
+                "dual control is on and holds no operation. One caller's authority completes "
+                "every action with no second approver, as it does with dual control off",
+            )
+        ]
+    # The default is read off the field, so a default that moves is followed and never restated.
+    left_out = sorted(set(fields["operations"].get_default(call_default_factory=True)) - held)
+    if left_out:
+        # The names end the sentence, so nothing after them reads as one more operation.
+        one = len(left_out) == 1
+        out.append(
+            (
+                "approvals.operations",
+                "dual control is on and its list leaves out the default "
+                f"{'operation' if one else 'operations'} {', '.join(left_out)}. "
+                f"One caller's authority completes {'it' if one else 'each'} with "
+                "no second approver",
+            )
+        )
     dwell, dwell_default = approvals.min_dwell_seconds, fields["min_dwell_seconds"].default
     if dwell <= 0:
         out.append(
@@ -8544,7 +8596,8 @@ def security_loosenings(
     AD timeout, step-up window, TOTP skew and temporary-password life
     settings :func:`_auth_limit_loosenings` lists, each set looser than its shipped default (#1131),
     the ``[approvals]`` dwell and expiry :func:`_approvals_loosenings` lists, read the same way
-    (#2489), any ``[api].trusted_proxies`` entry covering more than one address, with its own
+    (#2489), an ``[approvals].operations`` list that leaves out a default operation (vault BACKLOG
+    #3123), any ``[api].trusted_proxies`` entry covering more than one address, with its own
     wording where the entries together cover every peer of a family (#1131),
     ``[api].plaintext_upstream_hop_acknowledged`` (#1179), ``[api].expose_docs`` (vault BACKLOG
     #2385, which also put the ``[api]`` bools under a floor of their own in the same test file),
@@ -8592,7 +8645,8 @@ def security_loosenings(
 
     ``api`` is a settings section like the five before it, but it sits in the keyword-only group, so
     every call site names it. It carries the BACKLOG #1179 acknowledgement. ``approvals`` sits beside
-    it for the same reason and carries the dual-control dwell and expiry (BACKLOG #2489).
+    it for the same reason and carries the dual-control dwell and expiry (BACKLOG #2489) and the
+    held list (vault BACKLOG #3123).
     ``cert_monitor`` joins them for its ``warn_days`` (BACKLOG #2227). ``backup`` joins them for
     ``[backup].allow_unencrypted`` (vault BACKLOG #2302).
 
@@ -9001,7 +9055,8 @@ def security_loosenings(
     # keeps its ASVS cell at partial. Every such limit LOOSER THAN ITS SHIPPED DEFAULT is named, not
     # only an off value; _auth_limit_loosenings says why and how each direction was read.
     out.extend(_auth_limit_loosenings(auth))
-    # BACKLOG #2489: the dual-control dwell floor and expiry ceiling, read the same way.
+    # BACKLOG #2489: the dual-control dwell floor and expiry ceiling, read the same way. Vault
+    # BACKLOG #3123: and a held list that leaves out a default operation.
     out.extend(_approvals_loosenings(approvals))
     # BACKLOG #1131: trusted_proxies ranges covering every peer of a family (0.0.0.0/0, ::/0, or
     # ranges whose union is that) make uvicorn trust X-Forwarded-For from all of them, which is what

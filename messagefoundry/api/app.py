@@ -386,12 +386,21 @@ from messagefoundry.logging_setup import (
     set_runtime_level,
 )
 from messagefoundry.parsing.sniff import attachment_mime_agrees, nontext_upload_reason
-from messagefoundry.pipeline import ConfigReloadDenied, Engine, ReloadOutcome
+from messagefoundry.pipeline import (
+    ApprovedConfig,
+    ConfigDigestMismatch,
+    ConfigDigestUnavailable,
+    ConfigDirUnreadable,
+    ConfigReloadDenied,
+    Engine,
+    ReloadOutcome,
+)
 from messagefoundry.pipeline.alert_sinks import EmailTransport, notifier_from_settings
 from messagefoundry.pipeline.alerts import (
     AlertSink,
     LoggingAlertSink,
     authority_seal_alert,
+    no_enabled_administrator_alert,
     store_cipher_refusal_forwarder,
 )
 from messagefoundry.pipeline.cert_expiry import MonitoredCert
@@ -424,6 +433,7 @@ from messagefoundry.serviceenv import ServiceEnvPosture, service_env_posture
 from messagefoundry.startupcode import StartupPosture, startup_posture
 from messagefoundry.store import Row, open_store, sqlite_settings
 from messagefoundry.store.base import ResendError, Store, build_store_cipher
+from messagefoundry.store.cell_tag import CellTagError
 from messagefoundry.store.content_search import (
     DEFAULT_SCAN_LIMIT as DEFAULT_CONTENT_SCAN_LIMIT,
 )
@@ -956,9 +966,19 @@ def _purge_hold_params(name: str, scope: str) -> dict[str, Any]:
     return {"name": name, "scope": scope}
 
 
-def _reload_hold_params(config_dir: str | None, requester: str) -> dict[str, Any]:
-    """What a held reload captures; shared by the guard and the rejoin as for a purge."""
-    return {"config_dir": config_dir, "requester": requester}
+async def _reload_hold_params(
+    engine: Engine, gate: ApprovalGate | None, config_dir: str | None, requester: str
+) -> dict[str, Any]:
+    """What a held reload captures; shared by the guard and the rejoin as for a purge.
+
+    ``fingerprint`` is the content digest of the directory as it is now, so the approval names the
+    bytes it releases and the release refuses any others (vault BACKLOG #2596, step 3). It is taken
+    only when dual control gates the reload, and is ``None`` otherwise, because an inline reload
+    holds nothing and takes its own digest. A target the reload would refuse, or one whose digest
+    cannot be taken, raises one of :data:`_RELOAD_REFUSALS` here, so no hold is filed for it."""
+    gated = gate is not None and gate.gates("config_reload")
+    digest = await engine.reload_target_digest(config_dir) if gated else None
+    return {"config_dir": config_dir, "requester": requester, "fingerprint": digest}
 
 
 def _purge_target_refusal(rr: RegistryRunner | None, name: str) -> HTTPException | None:
@@ -1147,6 +1167,12 @@ def _build_approval_gate(
         # Read BEFORE the reload (BACKLOG #1940): a KeyError raised after the swap would reach the
         # gate's compensation and record a reload that ran as 'failed'.
         actor = str(p["requester"])
+        # Vault BACKLOG #2596, step 3: the release loads only the bytes the approval named. A hold
+        # whose params carry no digest (none is filed that way now) binds to None, which matches
+        # nothing, so it is refused as a mismatch once its directory resolves. The digest is not sealed: a writer to
+        # pending_approvals can replace it with the params (vault BACKLOG #2592).
+        approved = p.get("fingerprint")
+        approval = ApprovedConfig(approved if isinstance(approved, str) else None)
         # reload_detail for parity with the inline route (BACKLOG #1111): a released reload that
         # swapped the graph and then failed a follow-on step must report the same degraded outcome
         # the inline path reports, or dual control would be the quieter of the two.
@@ -1156,7 +1182,11 @@ def _build_approval_gate(
                 # BACKLOG #1940: the row's write never raises after the swap; see
                 # _record_reload_audit.
                 outcome, failures = await _reload_and_record(
-                    engine, config_dir, actor=actor, client=None
+                    engine,
+                    config_dir,
+                    actor=actor,
+                    client=None,
+                    approval=approval,
                 )
             except _RELOAD_REFUSALS as exc:
                 # BACKLOG #2034 / vault BACKLOG #2459: a release the engine refuses records the row
@@ -1445,7 +1475,12 @@ _UNKNOWN_LOADED = _LoadedConfig(
 
 
 async def _reload_or_record_interruption(
-    engine: Engine, config_dir: str | None, *, actor: str, client: str | None
+    engine: Engine,
+    config_dir: str | None,
+    *,
+    actor: str,
+    client: str | None,
+    approval: ApprovedConfig | None = None,
 ) -> ReloadOutcome:
     """A real (non-dry-run) reload with ``propagate=True``, which records its own cancellation.
 
@@ -1456,7 +1491,9 @@ async def _reload_or_record_interruption(
     Its detail does not claim either graph is live: a cancellation after the swap committed, in a
     follow-on step, leaves the new graph serving. ``GET /config/provenance`` says which one is."""
     try:
-        return await engine.reload_detail(config_dir, dry_run=False, propagate=True)
+        return await engine.reload_detail(
+            config_dir, dry_run=False, propagate=True, approval=approval
+        )
     except asyncio.CancelledError:
         try:
             await engine.store.record_audit(
@@ -1475,14 +1512,22 @@ async def _reload_or_record_interruption(
 
 
 async def _reload_and_record(
-    engine: Engine, config_dir: str | None, *, actor: str, client: str | None
+    engine: Engine,
+    config_dir: str | None,
+    *,
+    actor: str,
+    client: str | None,
+    approval: ApprovedConfig | None = None,
 ) -> tuple[ReloadOutcome, list[str]]:
     """Apply a real reload and write its ``config_reload`` row from that reload's own outcome
-    (vault BACKLOG #2257). The inline route and the released executor share this.
+    (vault BACKLOG #2257). The inline route and the released executor share this; only the executor
+    passes ``approval`` (see :meth:`Engine.reload_detail`).
 
     A refusal the reload raises propagates, with nothing swapped and no row written here. Returns
     the outcome and the failed steps to report, ``audit`` among them when the row was lost."""
-    outcome = await _reload_or_record_interruption(engine, config_dir, actor=actor, client=client)
+    outcome = await _reload_or_record_interruption(
+        engine, config_dir, actor=actor, client=client, approval=approval
+    )
     failures = await _record_reload_audit(
         engine,
         actor=actor,
@@ -1613,6 +1658,9 @@ async def _record_reload_audit(
 #: this one tuple, so a held reload is refused exactly as an ungated one is (vault BACKLOG #2459).
 _RELOAD_REFUSALS: tuple[type[Exception], ...] = (
     ConfigReloadDenied,
+    ConfigDigestMismatch,
+    ConfigDigestUnavailable,
+    ConfigDirUnreadable,
     FileNotFoundError,
     WiringError,
 )
@@ -1627,6 +1675,21 @@ _RELOAD_REFUSALS: tuple[type[Exception], ...] = (
 #: ``scrub_log_argument`` escapes it, so a run of control characters can still grow the line several
 #: times over. The cut keeps the head, so an error longer than this still loses its tail.
 _REFUSAL_LOG_LIMIT: Final = 8192
+
+
+async def _answer_refused_reload(
+    engine: Engine, exc: Exception, req: ReloadRequest, request: Request, user: Identity
+) -> NoReturn:
+    """Audit a reload request the engine refused and answer it, for the route and the console."""
+    status, answer = await _audit_refused_reload(
+        engine,
+        exc,
+        actor=user.username,
+        requested=req.config_dir,
+        dry_run=req.dry_run,
+        client=client_ip(request),
+    )
+    raise HTTPException(status, answer) from exc
 
 
 async def _audit_refused_reload(
@@ -1645,7 +1708,14 @@ async def _audit_refused_reload(
     with reason ``not_found`` and answers 404. A bad graph writes ``config_reload_failed`` and
     answers 422; its reason is ``trust_anchor`` when a trust anchor refused it inside the engine,
     an inbound connection's CA (BACKLOG #1142) or a settings anchor (BACKLOG #2034), so one audit
-    filter sees both, and ``invalid_config`` otherwise.
+    filter sees both, and ``invalid_config`` otherwise. A released reload whose config is not the
+    one its approval named writes ``config_reload_failed`` with reason ``digest_mismatch``, or
+    ``no_approved_digest`` when the hold took none, with both digests, and answers 422 (vault
+    BACKLOG #2596); only the executor meets it. One whose digest could not be taken now writes
+    reason ``digest_unavailable`` and answers 422; the engine logged why at WARNING. A gated
+    request whose digest cannot be taken is refused the same way, with no hold filed. A directory
+    that cannot be resolved for another reason writes reason ``unreadable`` and answers 422; the
+    engine logged why at WARNING.
 
     The inline route and the dual-control executor share this, so a held reload whose directory
     vanished or left the reload roots before its release is refused and recorded the way an inline
@@ -1671,6 +1741,46 @@ async def _audit_refused_reload(
         )
         action, detail["reason"] = "config_reload_failed", "not_found"
         status, answer = 404, "config directory not found"
+    elif isinstance(exc, ConfigDigestMismatch):
+        # A hold that took no digest is told apart, so nobody goes looking for an edit that
+        # never happened.
+        unbound = exc.approved is None
+        _log.warning(
+            "config reload refused: %s",
+            "its approval named no config digest"
+            if unbound
+            else "the config changed after its approval was requested",
+        )
+        action = "config_reload_failed"
+        detail["reason"] = "no_approved_digest" if unbound else "digest_mismatch"
+        detail["approved_fingerprint"] = exc.approved
+        detail["current_fingerprint"] = exc.current
+        status = 422
+        answer = (
+            "this request named no config digest, so it cannot be released; request the reload "
+            "again"
+            if unbound
+            else "the config changed after this reload was requested; request the reload again"
+        )
+    elif isinstance(exc, ConfigDirUnreadable):
+        # The engine logged the cause, scrubbed, where it raised this.
+        _log.warning("config reload refused: its config directory could not be resolved or listed")
+        action, detail["reason"] = "config_reload_failed", "unreadable"
+        status, answer = 422, "the engine could not read the config directory; see the engine log"
+    elif isinstance(exc, ConfigDigestUnavailable):
+        # Not "the config changed": nothing shows it did. The digest's own WARNING names the cause.
+        _log.warning("config reload refused: its config digest could not be taken")
+        action, detail["reason"] = "config_reload_failed", "digest_unavailable"
+        detail["approved_fingerprint"] = exc.approved
+        detail["current_fingerprint"] = None
+        status = 422
+        answer = (
+            "the engine could not read the config to take its digest for this request; "
+            "see the engine log"
+            if exc.approved is None
+            else "the engine could not read the config to check it against this request's "
+            "approval; see the engine log"
+        )
     else:
         anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
         _log.warning(
@@ -5336,21 +5446,33 @@ def create_app(
 
         Error responses are intentionally generic (the detail is logged server-side, not returned)
         so a config:deploy holder can't probe the filesystem via reload error text."""
-        # The core refuses nothing before its guard. A refusal added there must be read here too,
-        # as the purge route reads _purge_target_refusal, or a doomed repeat is told "held".
+        # The core refuses a target the reload would refuse before its guard (vault BACKLOG #2596).
+        # Such a request skips the rejoin, as the purge route's _purge_target_refusal does, so a
+        # doomed repeat is never told "held"; the core answers it after the spend, as the inline
+        # path does, so the refusal is no cheaper to reach than an inline one.
+        hold_params: dict[str, Any] | None = None
+        hold_refusal: Exception | None = None
         if not req.dry_run:
-            held = await _rejoin_without_proof(
-                request,
-                gate,
-                "config_reload",
-                _reload_hold_params(req.config_dir, user.username),
-                user,
-            )
-            if held is not None:
-                return _held_reply(response, held, "config_reload")
+            try:
+                hold_params = await _reload_hold_params(engine, gate, req.config_dir, user.username)
+            except _RELOAD_REFUSALS as exc:
+                hold_refusal = exc  # audited and answered by the core, after the spend
+            else:
+                held = await _rejoin_without_proof(
+                    request, gate, "config_reload", hold_params, user
+                )
+                if held is not None:
+                    return _held_reply(response, held, "config_reload")
         await spend_step_up_action(request, STEP_UP_ACTION_CONFIG_RELOAD)
         return await _reload_config_core(
-            req, response, engine=engine, user=user, gate=gate, request=request
+            req,
+            response,
+            engine=engine,
+            user=user,
+            gate=gate,
+            request=request,
+            hold_params=hold_params,
+            hold_refusal=hold_refusal,
         )
 
     async def _reload_config_core(
@@ -5361,18 +5483,41 @@ def create_app(
         user: Identity,
         gate: ApprovalGate | None,
         request: Request,
+        hold_params: dict[str, Any] | None = None,
+        hold_refusal: Exception | None = None,
     ) -> ReloadResult | PendingApprovalResponse:
         """:func:`reload_config` past its step-up. The console calls this through the seam, behind
-        its own action-bound gate, which has already spent the proof."""
+        its own action-bound gate, which has already spent the proof. ``hold_params`` are the ones
+        the route's rejoin captured, so a first request takes the directory's digest once, and
+        ``hold_refusal`` is the refusal taking them met instead. The console passes neither, and
+        the params are captured here."""
         # Hold a real (non-dry-run) reload for a second approver when dual-control gates it. A dry_run
         # is a read-only pre-flight (no swap), so it is never held. The guard runs AFTER the caller's
         # own step-up + config:deploy check (in reload_config, or the console's own gate) — the second
         # approver is an additional control, not a replacement. On hold, 202 + the pending id; the
         # captured config_dir is replayed on release.
         if gate is not None and not req.dry_run:
+            # A hold its release could only refuse is not filed (vault BACKLOG #2596). Its row is
+            # written inside an outliving operation, as every refusal past this point is, so a
+            # request deadline cannot cut it short.
+            if hold_refusal is not None:
+                return await outliving.run(
+                    _answer_refused_reload(engine, hold_refusal, req, request, user),
+                    "refused config reload",
+                )
+            if hold_params is None:
+                try:
+                    hold_params = await _reload_hold_params(
+                        engine, gate, req.config_dir, user.username
+                    )
+                except _RELOAD_REFUSALS as exc:
+                    return await outliving.run(
+                        _answer_refused_reload(engine, exc, req, request, user),
+                        "refused config reload",
+                    )
             pending = await gate.guard(
                 "config_reload",
-                _reload_hold_params(req.config_dir, user.username),
+                hold_params,
                 requester=user.username,
                 requester_user_id=user.user_id,
                 client=client_ip(request),
@@ -5421,15 +5566,7 @@ def create_app(
                 )
             registry = outcome.registry
         except _RELOAD_REFUSALS as exc:
-            status, answer = await _audit_refused_reload(
-                engine,
-                exc,
-                actor=user.username,
-                requested=req.config_dir,
-                dry_run=req.dry_run,
-                client=client_ip(request),
-            )
-            raise HTTPException(status, answer) from exc
+            await _answer_refused_reload(engine, exc, req, request, user)
         # Bind "what loaded" to a reviewable content digest (ADR 0041 D1): the prior detail recorded
         # only counts, so two reloads of the same dir with different on-disk code were
         # indistinguishable. Computed off the event loop (it reads files) and best-effort — a
@@ -7445,9 +7582,22 @@ def create_app(
             raise HTTPException(400, f"at most {_MAX_PRESET_LAYERS} presets may be layered")
         criterias: list[dict[str, Any]] = []
         for preset_id in ids:
-            row = await engine.store.get_search_preset(
-                preset_id=preset_id, owner_user_id=identity.user_id
-            )
+            integrity_refused = False
+            try:
+                row = await engine.store.get_search_preset(
+                    preset_id=preset_id, owner_user_id=identity.user_id
+                )
+            except CellTagError:
+                # BACKLOG #2593: the criteria fail their owner tag (alerted and audited) or are
+                # corrupt (logged); the store refused. The caller's own preset exists, so a refusal,
+                # never a 500.
+                integrity_refused = True
+            if integrity_refused:
+                # Raised after the handler, so the 423 chains nothing (BACKLOG #1796): `from None`
+                # would still leave the CellTagError and the cipher's error on __context__.
+                raise HTTPException(
+                    423, f"preset {preset_id} failed its integrity check and cannot be used"
+                )
             if row is None:
                 raise HTTPException(404, f"no such preset: {preset_id}")
             # No chain (BACKLOG #2085): the decode error holds the criteria, which can quote a
@@ -7962,6 +8112,13 @@ def create_app(
                 # BACKLOG #1609: a pooled stage whose claimer died reads healthy everywhere
                 # else, so it is named here for the console's nav heart.
                 stages_degraded=rr.degraded_stages() if rr is not None else {},
+                # Vault BACKLOG #3008. A lookup belongs to no channel, so only an estate-wide
+                # caller is shown the names; a channel-scoped one gets an empty list.
+                fhir_lookups_failed=(
+                    sorted(rr.degraded_fhir_lookups())
+                    if rr is not None and _user.allowed_channels is None
+                    else []
+                ),
             ),
             kpis=kpis,
             db=DbInfo(
@@ -9663,11 +9820,12 @@ def create_managed_app(
         # engine is byte-identical when the gate is unset. Stashed for /stats + shut down in finally.
         app.state.connscale_executor = maybe_install_executor_shim(asyncio.get_running_loop())
         # #329: the derived instance hop posture, computed ONCE here for the OUT-OF-GATE cells this
-        # lifespan builds — the alerts webhook sink (notifier_from_settings) and the LDAPS bind
+        # lifespan builds — the alerts webhook sink (notifier_from_settings) and the AD bind
         # (AuthService → LdapAuthenticator). Neither is built inside an active_hop_posture scope, so
-        # current_hop_posture() is None there and their weakened-TLS escape would ship UNCLAMPED (green
-        # and inert) without an explicit posture; threading this makes the ADR-0092 clamp apply on first
-        # deployment. None only for an embedding that passes no [ai] (serve always passes it); since
+        # current_hop_posture() is None there. The webhook sink's weakened-TLS escape would ship
+        # UNCLAMPED without an explicit posture, and the plain ldap:// bind refusal reads it too
+        # (vault BACKLOG #2354); threading this makes both apply on first deployment. The LDAPS
+        # ad_tls_verify=false escape it once clamped is gone (vault BACKLOG #3230). None only for an embedding that passes no [ai] (serve always passes it); since
         # vault BACKLOG #2354 a None posture fails closed, so there the escape is NOT honoured. Reuses
         # the same hop_posture_from_ai derivation the store hop and the runner use.
         _hop_posture = (
@@ -10108,13 +10266,16 @@ def create_managed_app(
                     # central run_anchor_preflight above) rather than refusing at enforce-only. Central
                     # preflight already ran before any listener bound; this keeps the seam consistent.
                     enforcing=trust_anchors_enforcing,
-                    # #329: thread the derived instance posture to the LDAPS bind so its ad_tls_verify=false
-                    # escape is clamped on an enforcing-PHI instance (LdapAuthenticator is built out of the
-                    # connector-construction gate, so the clamp is inert unless the posture arrives here).
+                    # Thread the derived instance posture to the AD bind, which is built out of the
+                    # connector-construction gate: its plain ldap:// refusal reads it (vault BACKLOG
+                    # #2354). Its ad_tls_verify=false escape, which #329 clamped here, is gone (#3230).
                     hop_posture=_hop_posture,
                     # BACKLOG #2592: an authority row that fails its integrity seal is denied and
                     # raises integrity_drift on the same sink the cipher refusal uses.
                     integrity_alert=authority_seal_alert(notifier or LoggingAlertSink()),
+                    # Vault BACKLOG #3229: a directory role change that leaves no enabled
+                    # Administrator is applied, and raises no_enabled_administrator here.
+                    admin_loss_alert=no_enabled_administrator_alert(notifier or LoggingAlertSink()),
                 )
                 # Started only once the service is built, so a constructor refusal starts no task.
                 if security_notifier is not None:

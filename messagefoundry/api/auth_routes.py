@@ -28,6 +28,7 @@ from fastapi.responses import StreamingResponse
 # api._ui_seam — never the console package), so it imports and the engine boots with the console ABSENT.
 from messagefoundry.api._ui_seam import AdminHandlers
 from messagefoundry.api.auth_models import (
+    _GROUP_MAX,
     AdGroupMap,
     AdGroupMapEntry,
     AdGroupScopeEntry,
@@ -151,6 +152,7 @@ from messagefoundry.auth.service import (
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.credential import constant_time_equal
 from messagefoundry.spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
+from messagefoundry.store.row_seal import RowSealError
 from messagefoundry.store.store import SessionRecord, UserRecord
 
 _VALID_ROLE_IDS = {role.value for role in Role}
@@ -396,10 +398,10 @@ async def _validate_roles(service: AuthService, roles: list[str]) -> None:
 #: How many refused group keys the 400 names before it only counts the rest.
 _GROUPS_NAMED = 3
 
-#: The longest canonical group key any store can hold: SQL Server's ``ad_group NVARCHAR(256)``.
-#: The request model allows 512 characters, and canonical form can be longer than what was typed,
-#: so a key past this would fail inside the store's write with a 500 rather than a 400.
-_STORED_GROUP_MAX = 256
+#: The longest canonical group key any store can hold: SQL Server's ``ad_group NVARCHAR(512)``,
+#: the request model's cap (BACKLOG #3187). Canonical form can outgrow what was typed, so the
+#: route checks it again; past this, the store's write would fail with a 500, not a 400.
+_STORED_GROUP_MAX = _GROUP_MAX
 
 
 def _canonical_group_dns(groups: list[str]) -> list[str]:
@@ -465,6 +467,26 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         return await http_exception_handler(request, exc)
 
     app.add_exception_handler(RepeatedCredentialError, _repeated_credential)
+
+    async def _row_seal_refused(request: Request, exc: Exception) -> Response:
+        # BACKLOG #2592: the store refused a write because the row it read fails its integrity
+        # seal, and wrote nothing. Any route that edits an account or a session can meet it; it is
+        # a refused change, so a 409 with a fixed text, never the row and never a 500. Logged with
+        # the row's kind, since this path does not pass the service loader that audits and alerts.
+        assert isinstance(exc, RowSealError)
+        _log.warning(
+            "a write to a %s row was refused: its integrity seal does not verify (BACKLOG #2592)",
+            exc.kind,
+        )
+        return await http_exception_handler(
+            request,
+            HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"the {exc.kind} record fails its integrity check, so the change was refused",
+            ),
+        )
+
+    app.add_exception_handler(RowSealError, _row_seal_refused)
     # --- authentication ------------------------------------------------------
 
     @app.get("/auth/providers", response_model=ProvidersInfo)
@@ -1706,10 +1728,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         _: Identity = Depends(require(Permission.USERS_MANAGE)),
     ) -> AdGroupMap:
-        rows = await service.store.list_ad_group_role_map()
-        return AdGroupMap(
-            entries=[AdGroupMapEntry(ad_group=r["ad_group"], role=r["role_id"]) for r in rows]
-        )
+        # BACKLOG #2592: through the service, which leaves out a map that fails its integrity seal.
+        pairs = await service.list_ad_group_role_map()
+        return AdGroupMap(entries=[AdGroupMapEntry(ad_group=g, role=r) for g, r in pairs])
 
     @app.put("/ad-group-map", response_model=SimpleMessage)
     async def set_ad_group_map(
@@ -1724,9 +1745,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # so each group that newly maps to it pages, as a promotion does. Read back from the store on
         # both sides, because the store normalises group names and a re-save must not page.
         async def admin_groups() -> set[str]:
-            rows = await service.store.list_ad_group_role_map()
             return {
-                str(r["ad_group"]) for r in rows if str(r["role_id"]) == Role.ADMINISTRATOR.value
+                g
+                for g, r in await service.list_ad_group_role_map()
+                if r == Role.ADMINISTRATOR.value
             }
 
         grants = any(e.role == Role.ADMINISTRATOR.value for e in body.entries)
@@ -1746,10 +1768,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         _: Identity = Depends(require(Permission.USERS_MANAGE)),
     ) -> AdGroupScopeMap:
-        rows = await service.store.list_ad_group_scope_map()
-        return AdGroupScopeMap(
-            entries=[AdGroupScopeEntry(ad_group=r["ad_group"], channel=r["channel"]) for r in rows]
-        )
+        # BACKLOG #2592: through the service, which leaves out a map that fails its integrity seal.
+        pairs = await service.list_ad_group_scope_map()
+        return AdGroupScopeMap(entries=[AdGroupScopeEntry(ad_group=g, channel=c) for g, c in pairs])
 
     @app.put("/ad-group-scope-map", response_model=SimpleMessage)
     async def set_ad_group_scope_map(

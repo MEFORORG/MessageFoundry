@@ -1,0 +1,304 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""A Vault handler keeps the text of the Vault hop's own refusal only (vault BACKLOG #3247).
+
+``vault_failure_text`` decides what a Vault provider's catch-all handler may print about a failure.
+It used to keep the text of every ``InsecureHopRefused``. That type is raised across the engine, and
+elsewhere its text can echo a host (``transports/rest.py``), so a handler that met one of those
+would have printed the host. The hop's own refusals are now a marked subclass,
+``VaultHopRefused``, and only that subclass keeps its text.
+
+Three source scans hold the marker to its meaning. No module but ``strict_requests`` calls the
+name. ``strict_requests`` calls neither ``InsecureHopRefused`` nor ``enforce_insecure_hop``. And
+each marked refusal is built from a shape that cannot interpolate a caller's value. The scans match
+a call by name, so an alias or a subclass is outside what they see.
+
+Synthetic data only: the host, key names and wrapped key are made up.
+"""
+
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from messagefoundry.config.settings import StoreSettings
+from messagefoundry.config.tls_policy import InsecureHopRefused
+from messagefoundry.store import keyprovider_vault
+from messagefoundry.store.keyprovider import KeyProviderError
+from tests._ast_sites import call_sites, callee_name, parse_source
+from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
+
+#: ``strict_requests`` imports ``requests`` and ``urllib3`` at module scope.
+_needs_the_vault_extra = pytest.mark.skipif(
+    not extra_is_installed(OPTIONAL_EXTRAS["vault"]),
+    reason="the [vault] extra (hvac + requests + urllib3) is not installed in this interpreter",
+)
+
+_PACKAGE = Path(__file__).resolve().parent.parent / "messagefoundry"
+_HOME = _PACKAGE / "transports" / "strict_requests.py"
+_MARKER = "VaultHopRefused"
+
+_HOST = "vault.synthetic.test"
+#: The shape a refusal takes elsewhere in the engine: it names the host it refused.
+_HOST_ECHOING = f"REST cleartext egress: http://{_HOST}:8200 is not loopback; refusing"
+
+
+def _lines_building(path: Path, name: str) -> list[int]:
+    """The lines of ``path`` that call ``name``. A file whose text never spells the name is not
+    parsed: code that builds the type has to spell it."""
+    text = path.read_text(encoding="utf-8")
+    if name not in text:
+        return []
+    return [call.lineno for call in call_sites(parse_source(text), name)]
+
+
+def test_only_the_strict_reader_module_builds_the_marked_refusal() -> None:
+    modules = sorted(_PACKAGE.rglob("*.py"))
+    # 337 modules when this floor was set. A moved package or a changed glob leaves few or none
+    # to scan. Lower the floor only if the package really shrank.
+    assert len(modules) >= 300, f"the walk found only {len(modules)} module(s) under {_PACKAGE}"
+    # The same scan sees the name where it is built, so finding none elsewhere means something.
+    assert _lines_building(_HOME, _MARKER), f"the scan sees no {_MARKER} call in {_HOME.name}"
+    elsewhere = {
+        str(path.relative_to(_PACKAGE)): lines
+        for path in modules
+        if path != _HOME and (lines := _lines_building(path, _MARKER))
+    }
+    assert elsewhere == {}, f"{_MARKER} is built outside strict_requests.py: {elsewhere}"
+
+
+@pytest.mark.parametrize("unmarked", ["InsecureHopRefused", "enforce_insecure_hop"])
+def test_the_strict_reader_module_builds_no_unmarked_hop_refusal(unmarked: str) -> None:
+    """A check added here that raised the base type would lose its text at every handler. The
+    shared ``enforce_insecure_hop`` raises the base type, so a call to it counts too."""
+    lines = _lines_building(_HOME, unmarked)
+    assert lines == [], f"strict_requests.py calls {unmarked} at lines {lines}"
+    # The control for these scans: the same scan sees the marked sites in this module, so an
+    # empty answer is not the scan seeing nothing at all.
+    assert _lines_building(_HOME, _MARKER)
+
+
+#: Helpers in ``strict_requests`` whose return value is a refusal's whole text. Each takes the
+#: connector label and returns it with a fixed reason. Read a helper before adding it here.
+_TEXT_HELPERS = frozenset({"_unverifiable_proxy_leg"})
+
+
+def _string_constants(tree: ast.Module) -> frozenset[str]:
+    """The names a module binds at its top level to a string literal, and nothing else."""
+    return frozenset(
+        target.id
+        for stmt in tree.body
+        if isinstance(stmt, ast.Assign)
+        and isinstance(stmt.value, ast.Constant)
+        and isinstance(stmt.value.value, str)
+        for target in stmt.targets
+        if isinstance(target, ast.Name)
+    )
+
+
+def _is_label_or_constant(node: ast.expr, constants: frozenset[str]) -> bool:
+    """``connector``, ``self._connector``, or one of the module's own string constants."""
+    if isinstance(node, ast.Name):
+        return node.id == "connector" or node.id in constants
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "_connector"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+    )
+
+
+def _is_fixed_text(call: ast.Call, constants: frozenset[str]) -> bool:
+    """Whether a refusal is built from one argument that can carry only fixed text.
+
+    That is a literal, a listed helper called on the connector label alone, or an f-string whose
+    holes are the connector label or a module string constant. A hole with a conversion or a
+    format spec is refused, because a format spec can hold a second value."""
+    if len(call.args) != 1 or call.keywords:
+        return False
+    text = call.args[0]
+    if isinstance(text, ast.Constant):
+        return isinstance(text.value, str)
+    if isinstance(text, ast.Call):
+        return (
+            callee_name(text, bare_only=True) in _TEXT_HELPERS
+            and not text.keywords
+            and all(_is_label_or_constant(arg, frozenset()) for arg in text.args)
+        )
+    if isinstance(text, ast.JoinedStr):
+        return all(
+            part.conversion == -1
+            and part.format_spec is None
+            and _is_label_or_constant(part.value, constants)
+            for part in text.values
+            if isinstance(part, ast.FormattedValue)
+        )
+    return False
+
+
+def test_every_marked_refusal_is_built_from_fixed_text() -> None:
+    """The marker means the text names no address, proxy URL, token or reply. This holds each
+    site to a shape that cannot interpolate one. It does not read a listed helper's own text."""
+    tree = parse_source(_HOME.read_text(encoding="utf-8"))
+    constants = _string_constants(tree)
+    sites = call_sites(tree, _MARKER)
+    # 8 marked refusals when this floor was set. A scan that sees few of them, or none, leaves the
+    # rest unchecked. Lower the floor only if refusals were really merged or removed.
+    assert len(sites) >= 6, f"the scan saw only {len(sites)} marked refusal(s) in {_HOME.name}"
+    loose = [site.lineno for site in sites if not _is_fixed_text(site, constants)]
+    assert loose == [], f"a marked refusal interpolates something at lines {loose}"
+    # The constants the sites use today are found, so the lookup is not passing on an empty set.
+    assert {"_CLEARTEXT_VAULT_HOP", "_CLEARTEXT_PROXY_CREDENTIALS"} <= constants
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'VaultHopRefused(f"{connector}: proxy {proxy} refused")',
+        'VaultHopRefused(f"{connector}: {request.url} refused")',
+        "VaultHopRefused(str(exc))",
+        'VaultHopRefused("refused: " + url)',
+        "VaultHopRefused(_other_helper(connector))",
+        # Round 2 of the review: three shapes the first scan passed.
+        "VaultHopRefused(_unverifiable_proxy_leg(request.url))",
+        'VaultHopRefused(f"{connector:{url}}")',
+        'VaultHopRefused(f"{connector!r}: {PROXY}")',
+        'PROXY = os.environ["HTTPS_PROXY"]\nVaultHopRefused(f"{connector}: {PROXY}")',
+    ],
+)
+def test_the_fixed_text_scan_can_fail(source: str) -> None:
+    """The control for the scan above: each of these would put a caller's value in the text."""
+    tree = parse_source(source)
+    (site,) = call_sites(tree, _MARKER)
+    assert not _is_fixed_text(site, _string_constants(tree))
+
+
+def test_the_fixed_text_scan_passes_the_shapes_the_module_uses() -> None:
+    """The other control: the scan is not refusing everything."""
+    tree = parse_source(
+        'FIXED = "a fixed reason"\n'
+        'VaultHopRefused(f"{connector}: {FIXED}")\n'
+        'VaultHopRefused(f"{self._connector} would do a fixed thing")\n'
+        "VaultHopRefused(_unverifiable_proxy_leg(self._connector))\n"
+    )
+    constants = _string_constants(tree)
+    assert [_is_fixed_text(site, constants) for site in call_sites(tree, _MARKER)] == [True] * 3
+
+
+@_needs_the_vault_extra
+def test_an_unmarked_hop_refusal_gives_only_its_type_name() -> None:
+    from messagefoundry.transports.strict_requests import VaultHopRefused, vault_failure_text
+
+    assert vault_failure_text(InsecureHopRefused(_HOST_ECHOING)) == "InsecureHopRefused"
+    # The control: the marked type keeps its text, and it is still the base type to a handler.
+    marked = VaultHopRefused("Vault test hop: fixed text")
+    assert vault_failure_text(marked) == "Vault test hop: fixed text"
+    assert isinstance(marked, InsecureHopRefused)
+
+    # Exactly the marked type. The source scans do not see a subclass, so one keeps no text.
+    class _Elsewhere(VaultHopRefused):
+        pass
+
+    assert vault_failure_text(_Elsewhere(_HOST_ECHOING)) == "_Elsewhere"
+
+
+@_needs_the_vault_extra
+def test_the_cleartext_refusal_is_marked_and_keeps_its_wording() -> None:
+    """The cleartext refusal used to come from the shared ``enforce_insecure_hop``, which raises
+    the base type. The module now builds it, with the text that function gave it."""
+    from messagefoundry.transports.strict_requests import (
+        _CLEARTEXT_VAULT_HOP,
+        VaultHopRefused,
+        _refuse_a_cleartext_vault_hop,
+    )
+
+    with pytest.raises(VaultHopRefused) as caught:
+        _refuse_a_cleartext_vault_hop(f"http://{_HOST}:8200", None, connector="Vault test hop")
+    assert str(caught.value) == f"Vault test hop: {_CLEARTEXT_VAULT_HOP}"
+    assert _HOST not in str(caught.value)
+
+
+@_needs_the_vault_extra
+def test_a_proxy_url_the_stdlib_parser_rejects_is_refused_with_fixed_text() -> None:
+    """The client build read the proxy's scheme with ``urllib.parse.urlsplit``. That parser rejects
+    some URLs ``urllib3`` accepts, and its error quotes the user and password. The error left the
+    build as a bare ``ValueError``, which a command such as ``rotate-key`` prints.
+
+    The proxy below reads as ``https://`` to ``urllib3``, so the credential check passes it. Its
+    user name holds U+2100, which NFKC normalization turns into text with a ``/``."""
+    import urllib.parse
+
+    import requests
+
+    from messagefoundry.transports.strict_requests import (
+        VaultHopRefused,
+        _refuse_an_insecure_vault_hop,
+        _unverifiable_proxy_leg,
+    )
+
+    proxy = "https://us℀er:synthetic-pw@proxy.synthetic.test:3128"
+    # The premise: the standard parser does reject this URL, and its error does quote the password.
+    with pytest.raises(ValueError, match="synthetic-pw"):
+        urllib.parse.urlsplit(proxy)
+
+    session = requests.Session()
+    session.trust_env = False  # only the proxy passed below applies
+    with pytest.raises(VaultHopRefused) as caught:
+        _refuse_an_insecure_vault_hop(
+            session,
+            "http://127.0.0.1:8200",
+            connector="Vault test hop",
+            request_proxies={"http": proxy},
+        )
+    assert type(caught.value) is VaultHopRefused
+    # The whole text is the helper's fixed one, so no part of the proxy URL can be in it.
+    assert str(caught.value) == _unverifiable_proxy_leg("Vault test hop")
+    for fragment in ("synthetic-pw", "proxy.synthetic.test", "3128"):
+        assert fragment not in str(caught.value)
+
+
+class _Transit:
+    """A Transit backend whose first call fails with ``exc``."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def read_key(self, *, name: str) -> dict[str, Any]:
+        raise self._exc
+
+
+class _Client:
+    def __init__(self, exc: Exception) -> None:
+        self.secrets = type("_Secrets", (), {"transit": _Transit(exc)})()
+
+
+def _active_key_failure(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> str:
+    monkeypatch.setenv("MEFOR_STORE_VAULT_TRANSIT_KEY", "synthetic-kek")
+    monkeypatch.setenv("MEFOR_STORE_VAULT_WRAPPED_DEK", "vault:v1:c3ludGhldGlj")
+    monkeypatch.setattr(keyprovider_vault, "_build_client", lambda addr, token: _Client(exc))
+    with pytest.raises(KeyProviderError) as caught:
+        keyprovider_vault.VaultKeyProvider(StoreSettings()).active_key()
+    return str(caught.value)
+
+
+@_needs_the_vault_extra
+def test_the_key_provider_does_not_print_a_host_from_an_unmarked_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = _active_key_failure(monkeypatch, InsecureHopRefused(_HOST_ECHOING))
+    assert _HOST not in text, text
+    assert text.endswith("InsecureHopRefused."), text
+
+
+@_needs_the_vault_extra
+def test_the_key_provider_keeps_the_text_of_a_marked_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control for the test above: the handler under test does keep a refusal's text."""
+    from messagefoundry.transports.strict_requests import VaultHopRefused
+
+    text = _active_key_failure(monkeypatch, VaultHopRefused("Vault test hop: fixed text"))
+    assert text.endswith("Vault test hop: fixed text."), text

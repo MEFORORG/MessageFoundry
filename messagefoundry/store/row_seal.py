@@ -39,6 +39,22 @@ SEAL_PREFIX: Final = "mfseal:v1:"
 #: The kind a session row is sealed under. Each sealed table has its own kind.
 SESSION_KIND: Final = "session"
 
+#: The kind a user's authorization record is sealed under: the ``users`` row, the account's
+#: ``user_roles`` rows and a digest of its passkeys, under one seal.
+USER_KIND: Final = "user"
+
+#: The kind a ``roles`` row is sealed under: one seal per role definition, over the whole row.
+ROLE_KIND: Final = "role"
+
+#: The kind a directory map is sealed under: one seal per map, over its sorted pairs, stored in
+#: ``authority_set_seal``. The map's name is inside the sealed bytes, so one map's seal never
+#: verifies for another.
+ADSET_KIND: Final = "adset"
+
+#: The label a passkey digest is computed under. Not a seal kind: the digest is a plain SHA-256 that
+#: the user seal covers, so it needs no key of its own.
+PASSKEYS_LABEL: Final = "passkeys"
+
 # Leads every encoding, so a seal can never be mistaken for a MAC over some other construction.
 _SCHEME: Final = b"mfseal/v1"
 
@@ -107,8 +123,9 @@ class RowSealer:
         self._key = bytes(key)
         #: The non-secret id every seal this sealer writes names.
         self.key_id: str = row_seal_key_id(self._key)
-        # The seal keys the retired store keys derive, by id. Nothing is ACCEPTED under them; they
-        # only tell a row a retired key genuinely sealed from one nobody sealed.
+        # The seal keys the retired store keys derive, by id. A session is never accepted under one;
+        # they tell a session a retired key genuinely sealed from one nobody sealed. A user record
+        # is, through verify_held, until rotate-key re-seals it under the active key.
         self._retired: dict[str, bytes] = {
             row_seal_key_id(k): bytes(k) for k in retired_keys if bytes(k) != self._key
         }
@@ -165,3 +182,23 @@ class RowSealer:
             and parsed[0] == self.key_id
             and self._matches(self._key, kind, fields, parsed[1])
         )
+
+    def verify_held(
+        self, kind: str, fields: Iterable[tuple[str, object]], stored: str | None
+    ) -> bool:
+        """Whether ``stored`` is a seal over ``fields`` under the key it names, when that key is the
+        active one or a retired one this process holds.
+
+        For the records that outlive a key change: a user, which ``rotate-key`` re-seals under the
+        active key and which must keep resolving until it has. A session never uses this; its seal
+        verifies under the active key alone (:meth:`verify`)."""
+        parsed = self._parse(stored)
+        if parsed is None:
+            return False
+        key = self._key if parsed[0] == self.key_id else self._retired.get(parsed[0])
+        return key is not None and self._matches(key, kind, fields, parsed[1])
+
+    def is_active(self, stored: str | None) -> bool:
+        """Whether ``stored`` names the active key. Says nothing about whether it verifies."""
+        parsed = self._parse(stored)
+        return parsed is not None and parsed[0] == self.key_id

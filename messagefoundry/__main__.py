@@ -756,8 +756,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     cert_import = cert_sub.add_parser(
         "import",
         help="import a PKCS#12/.pfx bundle into cert.pem / key.pem / ca-chain.pem. The passphrase is "
-        "read ONLY from MEFOR_PFX_PASSWORD (never a CLI arg); key.pem is written 0600 and refuses to "
-        "overwrite an existing key",
+        "read ONLY from MEFOR_PFX_PASSWORD (never a CLI arg); key.pem is written owner-only (mode 0600 "
+        "on POSIX, a restrictive access list on Windows) and refuses to overwrite an existing key",
     )
     cert_import.add_argument(
         "--pfx", required=True, help="path to the PKCS#12/.pfx bundle to import"
@@ -802,13 +802,21 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "self-signed",
         help="mint a self-signed EC P-256 cert+key (cert.pem / key.pem) as a TLS PLACEHOLDER (no "
         "chain of trust: better than cleartext, worse than an operator-supplied chain, so replace "
-        "it); key.pem is written 0600 and refuses to overwrite an existing key",
+        "it); key.pem is written owner-only (mode 0600 on POSIX, a restrictive access list on "
+        "Windows). It refuses to overwrite an existing cert.pem or key.pem, and removes the key it "
+        "wrote if cert.pem cannot be written",
     )
     cert_self_signed.add_argument(
-        "--cn", required=True, help="certificate common name (also added as a DNS SAN)"
+        "--cn",
+        required=True,
+        help="certificate common name (also added as a SAN: an IP SAN for an IP address, else DNS)",
     )
     cert_self_signed.add_argument(
-        "--san", action="append", default=None, metavar="DNS", help="an extra DNS SAN (repeatable)"
+        "--san",
+        action="append",
+        default=None,
+        metavar="NAME",
+        help="an extra SAN, a hostname or an IP address (repeatable)",
     )
     cert_self_signed.add_argument(
         "--days", type=int, default=365, help="validity in days (default 365)"
@@ -1432,7 +1440,10 @@ def _check_env_file_present(config_dir: str, root: Path, env_name: str, env_dir:
     from messagefoundry.config.wiring import WiringError, load_config
 
     try:
-        reg = load_config(config_dir)
+        # This load imports the author's config modules ahead of the subcommand's own load, so a
+        # print() in one would reach stdout before any command redirects it (vault BACKLOG #2727).
+        with _author_prints_to_stderr():
+            reg = load_config(config_dir)
     except (WiringError, FileNotFoundError, OSError):
         # A config that doesn't load is reported by the subcommand's own validate/load path with a
         # precise message; don't pre-empt it here (and don't claim a missing env file for it). OSError
@@ -2342,6 +2353,34 @@ def _start_logging(
             log_forward.fmt,
         )
     return None
+
+
+def _exposure_description(settings: ServiceSettings, *, exposed: bool) -> str:
+    """What made this instance exposed, as the start of a ``serve`` exposure message. Empty when it
+    is not exposed.
+
+    ``exposed`` is ``_serve``'s own ``instance_exposed``, passed in. Whether the instance is exposed
+    is not worked out again here, so this text cannot call an instance exposed that the arms do
+    not, or the reverse (vault BACKLOG #3102). The branches below only choose which field to name.
+    They name the one the operator set, so a loopback bind that only trusts a proxy (re-encrypting
+    to an operator certificate) is told ``[api].trusted_proxies``, not a terminator it never
+    declared (vault BACKLOG #2251).
+
+    The last line covers a term added to the exposure rule and not named here yet. Its text is true
+    of any exposed instance, so a new term gets a vague message rather than a wrong one."""
+    if not exposed:
+        return ""
+    api = settings.api
+    if not api.is_loopback:
+        return f"API bound to non-loopback host {api.host!r}"
+    if api.tls_terminated_upstream:
+        return (
+            "admin interface reached through a declared reverse proxy "
+            "([api].tls_terminated_upstream)"
+        )
+    if api.trusted_proxies:
+        return "admin interface reached through a declared reverse proxy ([api].trusted_proxies)"
+    return "admin interface reachable from beyond this host"
 
 
 def _read_environment_values(*, base_dir: Path, dir_name: str, environment: str) -> dict[str, Any]:
@@ -3478,9 +3517,9 @@ def _serve(args: argparse.Namespace) -> int:
             "until it is set. See docs/SECURITY.md (WebAuthn passkeys).",
             file=sys.stderr,
         )
-    # Only the two advisories below read this: instance_exposed plus the serve_ui term. The refusing
-    # arms read instance_exposed alone, since serve_ui is rewritten in place above (BACKLOG #326,
-    # #2218, vault BACKLOG #2251).
+    # Only the two advisories below read this: instance_exposed plus the serve_ui term. At least the
+    # MFA-at-exposure, dual-control and ADR 0152 arms read instance_exposed alone, since serve_ui is
+    # rewritten in place above (BACKLOG #326, #2218, vault BACKLOG #2251).
     ui_exposed = settings.api.serve_ui and console_offbox
     if ui_exposed:
         # The ASVS 8.4.2 managed-admin-host / reverse-proxy-mTLS posture is deployment-delegated
@@ -3580,7 +3619,7 @@ def _serve(args: argparse.Namespace) -> int:
     # commonest shape of this posture it does not print at all. Citing it as the compensating control
     # would have rested that control on a premise measurement contradicts.
 
-    # MFA-at-exposure posture (sec-mfa-on; WP-14, ASVS 6.3.3): an off-loopback bind serving local
+    # MFA-at-exposure posture (sec-mfa-on; WP-14, ASVS 6.3.3): an exposed instance serving local
     # accounts puts admin authentication on the network, where a single password factor is far weaker.
     # [security].require_mfa adds an engine second factor (TOTP or a passkey) for every account
     # that [security].require_mfa_scope covers: every account under the default, not the
@@ -3613,20 +3652,8 @@ def _serve(args: argparse.Namespace) -> int:
     # it points back at the sentence that names it rather than printing it twice.
     oidc_exception = oidc_second_factor_claim_exception(settings.auth)
     directory_exception = ", with the OIDC exception above" if oidc_exception else ""
-    # What made this instance exposed, named once for the MFA and dual-control arms below. It names
-    # the field the operator set, so a loopback bind that only trusts a proxy (re-encrypting to an
-    # operator certificate) is told [api].trusted_proxies, not a terminator it never declared
-    # (vault BACKLOG #2251). Empty when not exposed, and read only when admin_exposed.
-    exposure_desc = (
-        f"API bound to non-loopback host {settings.api.host!r}"
-        if not settings.api.is_loopback
-        else "admin interface reached through a declared reverse proxy "
-        "([api].tls_terminated_upstream)"
-        if settings.api.tls_terminated_upstream
-        else "admin interface reached through a declared reverse proxy ([api].trusted_proxies)"
-        if settings.api.trusted_proxies
-        else ""
-    )
+    # Named once for the MFA and dual-control arms below, and read only when admin_exposed.
+    exposure_desc = _exposure_description(settings, exposed=instance_exposed)
     if admin_exposed and not settings.auth.require_mfa:
         if enforcing and not settings.security.allow_single_factor_admin_when_exposed:
             print(
@@ -3679,13 +3706,17 @@ def _serve(args: argparse.Namespace) -> int:
     if not instance_exposed and settings.api.public_origin and not settings.auth.require_mfa:
         print(
             "warning: [security].web_console_public_address is set with no declared TLS terminator "
-            "on a PHI instance "
+            "and no [api].trusted_proxies on a PHI instance "
             f"({env_name!r}) with [security].require_mfa off — if that origin is served by an "
             "UNDECLARED reverse proxy, every account with no second factor enrolled is single-factor "
             f"over the network{oidc_exception}, and "
             "the MFA-at-exposure refusal cannot see it (an undeclared proxy is not, and cannot be, an "
-            "exposure signal the engine can verify). Declare it with [api].tls_terminated_upstream + "
-            "trusted_proxies, or set [security].require_mfa=true.",
+            "exposure signal the engine can verify). Set [security].require_mfa=true. If a proxy "
+            "does serve that origin, also declare it by naming the proxy in [api].trusted_proxies, "
+            "with [api].tls_terminated_upstream=true if it terminates TLS or an operator "
+            "[api].tls_cert_file if it re-encrypts to the engine. A declared proxy counts as "
+            "exposed, so with require_mfa still off the MFA-at-exposure gate then applies, and a "
+            "declared terminator has start requirements of its own (docs/CONFIGURATION.md).",
             file=sys.stderr,
         )
 
@@ -3792,6 +3823,22 @@ def _serve(args: argparse.Namespace) -> int:
     # call needs. Before #1026 this comment named three conditions while the gate had four, and the
     # undocumented fourth was the whole defect -- a reader concluded the probe runs whenever a PHI
     # instance sits behind a declared terminator under `enforce`, and it did not.
+    #
+    # NOT EVERY EXPOSED POSTURE IS PROBED (vault BACKLOG #3102). `instance_exposed` also counts a
+    # set `trusted_proxies` with no declared terminator (vault BACKLOG #2251): a proxy that
+    # re-encrypts to an operator certificate. This gate and the refusal above it read
+    # `tls_terminated_upstream`, not `instance_exposed`, so that shape is never probed and may leave
+    # `public_origin` unset. Two facts, and neither says the gap is safe:
+    #  1. On the hop the engine serves there, its own listener enforces the floor: api/tls.py sets
+    #     `minimum_version` from `[api].tls_min_version`, which the loader holds to 1.2 or 1.3.
+    #  2. The browser's hop still ends at the proxy, as it does behind a terminator. Nothing at
+    #     start measures that proxy's floor, and that shape owes no attestation of it either:
+    #     the only gate that asks for `proxy_tls_min_version` is the terminator gate.
+    # Widening this gate is a new control: it would add a start refusal for an unset origin on this
+    # shape, and make that start depend on the proxy being reachable. The terminator case took an
+    # owner ruling (BACKLOG #1026). No ruling covers this shape, so the gate is not widened in
+    # passing here; vault BACKLOG #3102 is where the question was raised. The cost to a running site
+    # is not the reason: there are none (CLAUDE.md section 0).
     if settings.api.tls_terminated_upstream and enforcing and settings.api.public_origin:
         from messagefoundry.config.tls_probe import TlsProbeUnavailable, probe_tls_floor
 
@@ -5043,7 +5090,8 @@ def _validate(args: argparse.Namespace) -> int:
     if isinstance(resolved, int):
         return resolved
     config_dir, _ = resolved
-    diags = validate_config(config_dir)
+    with _author_prints_to_stderr():
+        diags = validate_config(config_dir)
     if args.json:
         print(
             json.dumps(
@@ -5070,7 +5118,8 @@ def _graph(args: argparse.Namespace) -> int:
         # allow_empty: `graph` REPORTS a graph, it does not gate one (BACKLOG #1648), and its edges
         # come from Routers and Handlers, which a connection-less config still has. Refusing here
         # would make the reporting surface go dark on the config an operator most wants to look at.
-        reg = load_config(config_dir, allow_empty=True)
+        with _author_prints_to_stderr():
+            reg = load_config(config_dir, allow_empty=True)
     except WiringError as exc:
         return _emit_error(str(exc), as_json=args.json)
     # Edges come from the one authoritative static extractor (ADR 0091 D1): AST-first with the
@@ -5196,7 +5245,11 @@ def _author_prints_to_stderr() -> contextlib.AbstractContextManager[object]:
     ``dryrun`` runs config modules, Routers and Handlers in this process, so a debugging print in
     one used to land on stdout ahead of the JSON, which then would not parse. Stdout carries only
     the command's result. Scoped to the calls that run author code, so ``_emit_error`` and
-    ``_print_json`` still write to the real stdout (vault BACKLOG #1187)."""
+    ``_print_json`` still write to the real stdout (vault BACKLOG #1187).
+
+    ``validate``, ``graph`` and the anchor helper's own load wrap their config load the same way
+    (vault BACKLOG #2727). Nothing enforces the wrap: a command that loads a config without it
+    still lets a print reach stdout."""
     return contextlib.redirect_stdout(sys.stderr)
 
 
@@ -5791,7 +5844,7 @@ def _cert_import(args: argparse.Namespace) -> int:
     else:
         _safe_print(f"Imported .pfx into {out_dir}:")
         _safe_print(f"  cert:     {cert_path}")
-        _safe_print(f"  key:      {key_path} (private; 0600)")
+        _safe_print(f"  key:      {key_path} (private; {_key_protection()})")
         if wrote_ca:
             _safe_print(f"  ca-chain: {ca_path} ({len(cas)} CA cert(s))")
         else:
@@ -5991,44 +6044,120 @@ _SELF_SIGNED_PLACEHOLDER_NOTE = (
 )
 
 
+def _key_protection() -> str:
+    """How :func:`_write_private_key` restricts key.pem on THIS platform, for the console line."""
+    if sys.platform == "win32":
+        return "restricted to SYSTEM, Administrators and this account"
+    return "mode 0600"
+
+
+def _san_labels(names: list[str]) -> str:
+    """Label each SAN as the certificate holds it, ``IP:`` or ``DNS:``. It asks the minting
+    classifier, ``pki._general_names``, so the console cannot disagree with the minted file."""
+    import ipaddress
+
+    from messagefoundry import pki
+
+    # An iPAddress entry's value is an ipaddress object and a DNSName's a str. Testing the value
+    # keeps `cryptography` out of this module, which the crypto inventory gate holds it to.
+    ip_types = (ipaddress.IPv4Address, ipaddress.IPv6Address)
+    return ", ".join(
+        f"IP:{gn.value}" if isinstance(gn.value, ip_types) else f"DNS:{gn.value}"
+        for gn in pki._general_names(names)
+    )
+
+
 def _cert_self_signed(args: argparse.Namespace) -> int:
     """`cert self-signed` — mint a self-signed EC P-256 cert+key, a TLS PLACEHOLDER.
 
-    Writes cert.pem + key.pem to ``--out-dir``; key.pem is written by :func:`_write_private_key`,
-    which refuses to overwrite it (cert.pem has no such guard). Prints
-    :data:`_SELF_SIGNED_PLACEHOLDER_NOTE` (ADR 0172)."""
+    Writes cert.pem + key.pem to ``--out-dir``. It refuses an existing cert.pem or key.pem before
+    it mints, and both writes are exclusive, so a file that appears meanwhile is still never
+    replaced. If cert.pem is not written, the files this run wrote are removed, and the failure
+    line names any it could not remove. Prints :data:`_SELF_SIGNED_PLACEHOLDER_NOTE` (ADR 0172)."""
     from messagefoundry import pki
+
+    # Imported up front, not in the cleanup arm: an import that failed there would skip the cleanup.
+    # It rides out a brief Windows hold on a file, such as a scanner opening the new key.
+    from messagefoundry.api.tls import _unlink_generated
 
     if args.days <= 0:
         return _cert_fail("--days must be a positive integer", as_json=args.json)
     out_dir = Path(args.out_dir)
+    cert_path = out_dir / "cert.pem"
+    key_path = out_dir / "key.pem"
+    refuse_cert = (
+        f"refusing to overwrite an existing certificate file: {cert_path} (remove it first)"
+    )
+    refuse_key = f"refusing to overwrite an existing key file: {key_path} (remove it first)"
+    if cert_path.exists():
+        return _cert_fail(refuse_cert, as_json=args.json)
+    if key_path.exists():
+        return _cert_fail(refuse_key, as_json=args.json)
+
     sans = args.san or []
-    cert_pem, key_pem = pki.make_self_signed(args.cn, sans, args.days)
+    try:
+        cert_pem, key_pem = pki.make_self_signed(args.cn, sans, args.days)
+    except OverflowError:
+        # The validity end falls past the last date a datetime can hold.
+        return _cert_fail(
+            f"cannot mint the certificate: --days {args.days} is too large, it ends after the "
+            "year 9999",
+            as_json=args.json,
+        )
+    except ValueError as exc:
+        # A common name over 64 characters, or a common name or --san not in ASCII. The text
+        # names the rejected value and never carries key material.
+        return _cert_fail(f"cannot mint the certificate: {exc}", as_json=args.json)
 
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         return _cert_fail(f"cannot create --out-dir {args.out_dir!r}: {exc}", as_json=args.json)
 
-    cert_path = out_dir / "cert.pem"
-    key_path = out_dir / "key.pem"
     try:
         _write_private_key(key_path, key_pem)
     except FileExistsError:
-        return _cert_fail(
-            f"refusing to overwrite an existing key file: {key_path} (remove it first)",
-            as_json=args.json,
-        )
+        return _cert_fail(refuse_key, as_json=args.json)
     except OSError as exc:
         return _cert_fail(f"cannot write {key_path}: {exc}", as_json=args.json)
-    cert_path.write_bytes(cert_pem)
 
-    dns = list(dict.fromkeys([args.cn, *sans]))
+    # Exclusive create: a cert.pem that appeared after the check above is still never replaced.
+    cert_created = False
+    try:
+        with cert_path.open("xb") as fh:
+            cert_created = True
+            fh.write(cert_pem)
+    except BaseException as exc:
+        # BaseException, so an interrupt between the two writes still cleans up; it is re-raised.
+        # Remove only what THIS run wrote, never a file that was already there.
+        removed: list[str] = []
+        left: list[str] = []
+        for path in (key_path, cert_path) if cert_created else (key_path,):
+            try:
+                _unlink_generated(path)
+            except FileNotFoundError:
+                continue  # already gone, so nothing is left to remove
+            except OSError:
+                left.append(str(path))
+            else:
+                removed.append(str(path))
+        if not isinstance(exc, OSError):
+            raise
+        reason = (
+            refuse_cert if isinstance(exc, FileExistsError) else f"cannot write {cert_path}: {exc}"
+        )
+        if removed:
+            reason += f"; removed {', '.join(removed)}, which this run wrote"
+        if left:
+            reason += f"; could not remove {', '.join(left)}, so remove it before running again"
+        return _cert_fail(reason, as_json=args.json)
+
+    names = list(dict.fromkeys([args.cn, *sans]))
     result: dict[str, object] = {
         "cert": str(cert_path),
         "key": str(key_path),
         "cn": args.cn,
-        "sans": dns,
+        "sans": names,
         "days": args.days,
         "note": _SELF_SIGNED_PLACEHOLDER_NOTE,
     }
@@ -6037,8 +6166,8 @@ def _cert_self_signed(args: argparse.Namespace) -> int:
     else:
         _safe_print(f"Wrote a self-signed PLACEHOLDER certificate to {out_dir}:")
         _safe_print(f"  cert: {cert_path}")
-        _safe_print(f"  key:  {key_path} (private; 0600)")
-        _safe_print(f"  CN={args.cn}  SAN(DNS)={', '.join(dns)}  valid {args.days} day(s)")
+        _safe_print(f"  key:  {key_path} (private; {_key_protection()})")
+        _safe_print(f"  CN={args.cn}  SAN={_san_labels(names)}  valid {args.days} day(s)")
         _safe_print(f"  NOTE: {_SELF_SIGNED_PLACEHOLDER_NOTE}.")
     return 0
 
@@ -8936,10 +9065,25 @@ def _rotate_key(args: argparse.Namespace) -> int:
 
     try:
         active_key = resolve_active_key(settings.store)
-    except _key_unresolved() as exc:
+    except _key_unresolved() + (ValueError,) as exc:
         # KeyProviderError: a non-default [store].key_provider that is unknown or not-yet-built (an
         # external HSM/KMS/Vault provider) — fail closed with a clean exit-2, not a traceback (ADR 0019).
-        print(f"error: cannot load the active key for rotation: {exc}", file=sys.stderr)
+        #
+        # ValueError (vault BACKLOG #3247): under key_provider=vault the Vault client build can
+        # refuse with a bare one, which reached the dispatch floor and exited 1, an aborted
+        # rotation's code. Taken whole, subclasses too, as `build_store_cipher` takes the same
+        # refusal when the open below meets it: it comes from the settings or the key provider, and
+        # only the key is resolved here, so nothing a store holds can reach this arm.
+        #
+        # Printed through `codec_safe_str`, not as `{exc}`. One ValueError here is a
+        # UnicodeDecodeError from a DPAPI key file that unprotects to bytes that are not ASCII, and
+        # its own text quotes a byte of the key. Every other text is printed whole.
+        from messagefoundry.redaction import codec_safe_str
+
+        print(
+            f"error: cannot load the active key for rotation: {codec_safe_str(exc)}",
+            file=sys.stderr,
+        )
         return 2
     if not active_key:
         print(

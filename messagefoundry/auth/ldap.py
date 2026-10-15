@@ -36,11 +36,9 @@ from urllib.parse import urlsplit
 from messagefoundry.auth.trust_anchors import ad_anchor_spec, verified_anchor_cadata
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import (
-    INSECURE_TLS_ESCAPE_ENV,
     AuthSettings,
     is_ldaps_address,
     split_kerberos_spn,
-    weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.redaction import safe_name
@@ -846,6 +844,19 @@ class LdapAuthenticator:
                 "[security].enforcement = warn) -- the service-account and user passwords cross the "
                 "network in cleartext; do not use in production."
             )
+        # Every LDAPS bind carries a password: the service account's (required below) and then the
+        # user's. With ad_tls_verify=false the engine would hand both to whichever peer answered, so it
+        # is refused, with no escape and in every posture (vault BACKLOG #3230; the rule is stated in
+        # docs/SECURITY-LOOSENING.md). Until then MEFOR_ALLOW_INSECURE_TLS released it at
+        # [security].enforcement = warn (#329). Like the plain-bind refusal above, it runs before the
+        # bind secret is resolved, so a refused build never fetches the password.
+        if self._ldaps and not settings.ad_tls_verify:
+            raise LdapError(
+                "ad_tls_verify=false would send the AD service-account and user passwords to an "
+                "LDAPS peer whose certificate is not verified; refused, with no escape. Leave "
+                "ad_tls_verify on (the default). For a directory whose certificate comes from a "
+                "private or self-signed CA, pin that CA with ad_tls_ca_cert_file."
+            )
         # Resolve the effective service-account bind password ONCE at construction (ADR 0019 §5): from a
         # [secrets].provider when ad_bind_password_secret is set, else the env-sourced ad_bind_password
         # (byte-identical when no reference/provider). A configured-but-unresolvable reference fails closed
@@ -872,39 +883,9 @@ class LdapAuthenticator:
         spec = ad_anchor_spec(settings)
         if self._ldaps and spec is not None:
             self._ca_certs_data = verified_anchor_cadata(spec, enforcing=enforcing)
-        # #329: the instance hop posture (threaded by AuthService from create_app's derived posture).
-        # LDAPS is built OUT of the connector-construction gate (AuthService, not build_check_registry),
-        # so current_hop_posture() would be None here; the posture must be passed explicitly or the
-        # escape below is refused. None (a direct/test/embedding construction) FAILS CLOSED: the escape
-        # is not permitted (vault BACKLOG #2354). CORRECTED: this read that None *"falls back to the
-        # unclamped escape -- byte-identical to the pre-#329 bare read"*; weakened_tls_escape_permitted
-        # stopped doing that in engine PR 1886.
-        self._posture = posture
-        # A disabled-cert-verification posture (ad_tls_verify=false over LDAPS) would make the service-
-        # account and user binds MITM-able on first deployment, so it REFUSES at startup unless the
-        # operator sets the explicit MEFOR_ALLOW_INSECURE_TLS dev escape (ASVS 12.3.2). #329 routes that
-        # escape through the ADR-0092 clamp (weakened_tls_escape_permitted): under an enforcing-PHI
-        # posture the escape is INERT, so it can never silence this refusal on such an instance — the
-        # blunt env var no longer buys verify-off there. With the escape permitted (a known, non-enforcing
-        # posture; an unstamped one now refuses), we still warn loudly once at startup.
-        if self._ldaps and not settings.ad_tls_verify:
-            if not weakened_tls_escape_permitted(self._posture):
-                raise LdapError(
-                    "ad_tls_verify=false disables LDAPS certificate verification (MITM risk). Use a "
-                    f"trusted CA via ad_tls_ca_cert_file, or set {INSECURE_TLS_ESCAPE_ENV}=1 on an "
-                    "instance at [security].enforcement = warn to explicitly allow it for a "
-                    "trusted-network dev/test bind (the override has no effect while enforcing, the "
-                    "default, or with no posture)."
-                )
-            logger.warning(
-                "LDAPS certificate verification for AD is DISABLED (ad_tls_verify=false, permitted by "
-                "%s at [security].enforcement = warn) — the service-account and user binds are "
-                "exposed to MITM; do not use in production.",
-                INSECURE_TLS_ESCAPE_ENV,
-            )
         # BACKLOG #1317, #2494. The engine builds this hop's TLS context (ASVS 12.1.2): narrowed to the
         # approved suites at TLS 1.2 and, where the interpreter allows it, TLS 1.3, then asserted.
-        # Verification-off is refused/warned above; this is the separate question of whether the
+        # Verification-off is refused above; this is the separate question of whether the
         # traffic is ENCRYPTED and the peer AUTHENTICATED at all. NarrowedTls builds and asserts that
         # context once here, so a bad one fails app startup (AuthService builds this eagerly), and
         # again for every connection. One Tls serves every Server: ldap3.Tls holds only settings.
@@ -916,7 +897,7 @@ class LdapAuthenticator:
             from messagefoundry.auth.ldap_tls import NarrowedTls  # lazy: it imports ldap3
 
             self._tls = NarrowedTls(
-                validate=ssl.CERT_REQUIRED if settings.ad_tls_verify else ssl.CERT_NONE,
+                validate=ssl.CERT_REQUIRED,  # ad_tls_verify=false is refused above
                 ca_certs_data=self._ca_certs_data,
                 connector=_LDAPS_CONNECTOR,
             )
@@ -1016,10 +997,17 @@ class LdapAuthenticator:
         *,
         fallback_username: str,
         expected_object_id: str | None = None,
+        tie_break_object_id: str | None = None,
     ) -> _Lookup:
         """Run one user search and extract the entry. ``info`` is ``None`` for no match, more than
         one match (``AMBIGUOUS``, vault BACKLOG #2778), a disabled account or an undetermined one,
         and ``answer`` says which (ADR 0195 rule item 2).
+
+        ``tie_break_object_id``, a canonical id, picks among several matches of a name-keyed search
+        (vault BACKLOG #3228). It is used only when exactly one match holds ``fallback_username`` as
+        its own ``sAMAccountName`` and that entry is the only match reading the id back. Anything
+        else is still ``AMBIGUOUS``. It never changes a search that matched one entry. See
+        :meth:`_lookup_by_name`.
 
         ``expected_object_id``, the canonical id an id-keyed search asked for, makes an entry that
         does not read it back a no-match, before its account state is read (BACKLOG #2027). See
@@ -1055,24 +1043,58 @@ class LdapAuthenticator:
         )
         if not conn.entries:
             return _Lookup(DirectoryAnswer.NOT_FOUND)
+        e = conn.entries[0]
+        own: str | None = None
         if len(conn.entries) > 1:
             # Vault BACKLOG #2778. The name filter matches sAMAccountName OR userPrincipalName, and
             # a directory may legally give one account a UPN prefix equal to another's
             # sAMAccountName. Taking entries[0] would let the server's result order pick which
-            # account signs in. No entry is provably the one asked about, so none is. Logged with
-            # a label for the name and the count only, once per name: the attempts repeat at
-            # sign-in rate, and the set of names stays bounded by the collisions the directory holds.
+            # account signs in. Logged with a label for the name and the count only, once per name:
+            # the attempts repeat at sign-in rate, and the set of names stays bounded by the
+            # collisions the directory holds.
+            #
+            # Vault BACKLOG #3228. When the caller holds the account's stored objectGUID, the one
+            # entry that reads it back is the account the engine row is bound to, so it is used.
+            # Refusing it too let anyone able to write a colliding entry lock the account out. No
+            # match, or more than one, still proves nothing, so it is refused as before.
+            #
+            # THE CHOSEN ENTRY MUST BE THE ONLY MATCH HOLDING THE NAME AS ITS sAMAccountName. The
+            # Kerberos caller passes the ticket's name with its realm already dropped, so the ticket
+            # proves only that its holder has this sAMAccountName in SOME realm the acceptor trusts.
+            # - An entry that matched only through its UPN is not that holder. Choosing it would let
+            #   a renamed account that kept its old UPN be signed in by whoever was later given the
+            #   old name.
+            # - Two entries holding the name, as same-named accounts in two domains under one
+            #   search base would, cannot be told apart by the ticket, so the id does not choose.
+            # The id must also be on that entry alone: an id on two entries names neither.
+            # Compared with lower(), not casefold(), so "straße" does not equal "strasse".
+            # The `is not None` test is load-bearing: an entry with no readable id reads back
+            # None, which must never match a caller that holds no id.
             label = safe_name(fallback_username)
+            name = fallback_username.lower()
+            holders = [
+                x for x in conn.entries if (_attr(x, "sAMAccountName") or "").lower() == name
+            ]
+            chosen = (
+                tie_break_object_id is not None
+                and len(holders) == 1
+                # Identity, not ==: the one entry carrying the id must be the holder itself.
+                and [id(x) for x in conn.entries if _object_guid(x) == tie_break_object_id]
+                == [id(holders[0])]
+            )
+            # Reported either way: the collision is in the directory, and an operator should clear it.
             _warn_once(
-                f"ambiguous:{label}",
-                "AD user search for %s matched %d directory entries; refusing it as ambiguous "
-                "(logged once per name)",
+                f"ambiguous-chosen:{label}" if chosen else f"ambiguous:{label}",
+                "AD user search for %s matched %d directory entries; %s (logged once per name)",
                 label,
                 len(conn.entries),
+                f"using the one carrying the account's stored {_OBJECT_GUID_ATTR}"
+                if chosen
+                else "refusing it as ambiguous",
             )
-            return _Lookup(DirectoryAnswer.AMBIGUOUS)
-        e = conn.entries[0]
-        own: str | None = None
+            if not chosen:
+                return _Lookup(DirectoryAnswer.AMBIGUOUS)
+            e, own = holders[0], tie_break_object_id
         if expected_object_id is not None:
             own = _object_guid(e)
             if own != expected_object_id:
@@ -1098,8 +1120,9 @@ class LdapAuthenticator:
                 # BACKLOG #1471. Read through _object_guid, never _attr: that helper str()s whatever it
                 # is given, which would render the raw 16 bytes as a Python bytes repr and store a
                 # second, non-canonical spelling of the same identity.
-                # An id-keyed lookup has already read it, and proved it equal to the id asked for.
-                "object_id": own if expected_object_id is not None else _object_guid(e),
+                # An id-keyed lookup or a tie-break has already read it, and proved it equal to
+                # the id the caller holds.
+                "object_id": own if own is not None else _object_guid(e),
                 "display_name": _attr(e, "displayName"),
                 "email": _attr(e, "mail"),
                 "memberOf": _multi(e, "memberOf"),
@@ -1109,7 +1132,17 @@ class LdapAuthenticator:
     def _find_user(self, conn: Any, username: str) -> dict[str, Any] | None:
         return self._lookup_by_name(conn, username).info
 
-    def _lookup_by_name(self, conn: Any, username: str) -> _Lookup:
+    def _lookup_by_name(
+        self, conn: Any, username: str, *, tie_break_object_id: str | None = None
+    ) -> _Lookup:
+        """Find a user by name. ``tie_break_object_id`` only chooses among several matches.
+
+        Vault BACKLOG #3228. The name stays the key: a Kerberos ticket proves a name, so searching
+        by the stored id instead would sign the ticket holder in as whoever holds that id now, even
+        after the name passed to someone else. For the same reason the tie-break only accepts the
+        one entry whose own ``sAMAccountName`` is the name (:meth:`_search_user`). The id is
+        normalised here, the one place it enters this lookup; one that cannot be read breaks no tie.
+        """
         upn = f"{username}@{self._s.ad_domain}" if self._s.ad_domain else username
         return self._search_user(
             conn,
@@ -1118,6 +1151,7 @@ class LdapAuthenticator:
                 f"(userPrincipalName={_escape_filter(upn)}))"
             ),
             fallback_username=username,
+            tie_break_object_id=normalise_object_guid(tie_break_object_id),
         )
 
     def _lookup_by_object_id(self, conn: Any, object_id: str, *, fallback_username: str) -> _Lookup:
@@ -1275,7 +1309,11 @@ class LdapAuthenticator:
         return DirectoryBind(DirectoryAnswer.FOUND, _principal_from(info, user_dn, groups))
 
     def resolve_principal(
-        self, username: str, *, object_id: str | None = None
+        self,
+        username: str,
+        *,
+        object_id: str | None = None,
+        tie_break_object_id: str | None = None,
     ) -> AdPrincipal | None:
         """Look a user up + resolve groups *without* a password. Uses the service-account bind only.
 
@@ -1296,10 +1334,23 @@ class LdapAuthenticator:
         ``username`` is still required, and is what the principal reports when the matched entry
         carries no ``sAMAccountName`` of its own -- an absent attribute is not the directory announcing
         a rename to nothing.
-        """
-        return self.probe_principal(username, object_id=object_id).principal
 
-    def probe_principal(self, username: str, *, object_id: str | None = None) -> DirectoryProbe:
+        ``tie_break_object_id`` serves a name-keyed caller that already holds the account's stored
+        ``objectGUID``: when the name matches several entries, the one carrying that id is used
+        (vault BACKLOG #3228, :meth:`_lookup_by_name`). Passing it with ``object_id`` is a
+        programming error and raises :class:`ValueError`: an id-keyed search has no tie to break.
+        """
+        return self.probe_principal(
+            username, object_id=object_id, tie_break_object_id=tie_break_object_id
+        ).principal
+
+    def probe_principal(
+        self,
+        username: str,
+        *,
+        object_id: str | None = None,
+        tie_break_object_id: str | None = None,
+    ) -> DirectoryProbe:
         """:meth:`resolve_principal`, also saying WHY an account did not resolve (ADR 0195).
 
         The session reconciler's lookup, and ``verify_mfa``'s before it renews a directory
@@ -1313,12 +1364,16 @@ class LdapAuthenticator:
         """
         import ldap3
 
+        if object_id is not None and tie_break_object_id is not None:
+            raise ValueError("pass object_id or tie_break_object_id, not both")
         try:
             with self._service_conn() as svc:
                 found = (
                     self._lookup_by_object_id(svc, object_id, fallback_username=username)
                     if object_id is not None
-                    else self._lookup_by_name(svc, username)
+                    else self._lookup_by_name(
+                        svc, username, tie_break_object_id=tie_break_object_id
+                    )
                 )
                 info = found.info
                 if info is None:

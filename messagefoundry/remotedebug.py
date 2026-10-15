@@ -48,10 +48,34 @@ drop that one report and pass every other one on. Code that replaces ``sys.unrai
 afterwards brings the interpreter's lines back.
 
 **Cost.** An audit hook runs on every audited operation in the process, not only this event.
-Measured on one Windows development machine, CPython 3.14.6: about 60 to 90 ns for each audited
-operation. How many audited operations the engine performs for each message is not measured. Where
-the interface is already disabled the event cannot fire, so no hook is installed and nothing is
-paid.
+Where the interface is already disabled the event cannot fire, so no hook is installed and nothing
+is paid.
+
+The cost for each message was measured once, on one machine (vault BACKLOG #2742). It is a
+reading, not a contract and not a bound. It was taken on 2026-10-12, on Windows 11 (10.0.26300)
+with CPython 3.14.6, at engine ``main`` ``cb2dca6be6``. The processor was an Intel64 Family 6
+Model 198 with 20 logical CPUs, and other work was running on the machine. An audit hook cannot
+be removed, so each reading came from a child process of its own.
+
+- *Count.* One child ran a ``RegistryRunner`` on a SQLite store with one feed: MLLP inbound,
+  router, handler, MLLP outbound, cleartext, with logging at INFO. It added an audit hook that
+  only counts events by name. Another process sent synthetic ADT messages, on one connection
+  for each batch, and ACKed each delivery. After 200 warm-up messages, 5 idle seconds raised no event. Then 500
+  messages raised 502 events: 501 ``socket.__new__`` and one thread start. 2,000 more raised
+  2,001, all ``socket.__new__``. That is about one audited operation for each message. It fits
+  the MLLP outbound's default of a new connection for each message, though no event was traced
+  to that code. Each batch arrived on a new sender connection, which may be its one extra socket.
+- *Time.* Four more children, two for each arm, timed ``sys.audit`` for an event this hook does
+  not match. Each ran 9 rounds of 2,000,000 calls, so each arm has 18. With no audit hook the median was 36 ns a call (30 to 52).
+  With this hook, installed as the command line installs it, it was 110 ns (91 to 133). The
+  medians differ by 74 ns. An earlier reading, taken when the hook was written, was 60 to 90 ns.
+
+So on that feed, on Windows, the hook cost about 74 ns for each message. That figure is the two
+readings multiplied, not a timed message. The count belongs to that operating system as well as
+that feed: asyncio connects another way on Linux, and may raise more events there for the same
+message. Not measured: at least Linux, a File connection, a TLS hop, a peer given by name, a
+persistent MLLP outbound and a DEBUG log level. Start-up and API requests were not measured
+either.
 
 No engine state. It imports the standard library and ``messagefoundry.controlchars``, which
 imports only the standard library, so any package may import it.

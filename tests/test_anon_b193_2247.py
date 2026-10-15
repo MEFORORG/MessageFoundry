@@ -161,7 +161,10 @@ def test_the_cli_prints_the_coverage_line_when_the_level_hides_info(
 
 # --- defect 4: the advice names only the causes that fired ------------------------------------------
 
-_REPAIR = "Repair the line with a malformed segment id."
+_REPAIR = (
+    "Repair the line no rule can reach: give it a well-formed segment id, or give a header line "
+    "the separator after its encoding characters."
+)
 _EXTEND = "Extend the rule map so the field that carries it is scrubbed."
 _KEEP = "Add a rule for each field named, or a keep for one you reviewed."
 _LOAD = "Load the denylist token source."

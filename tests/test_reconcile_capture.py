@@ -20,7 +20,7 @@ import pytest
 
 from harness.reconcile import __main__ as reconcile_cli
 from harness.reconcile.capture import CaptureSink
-from messagefoundry.anon import Keyer, anonymize_checked
+from messagefoundry.anon import Keyer, anonymize_checked, load_rules
 from messagefoundry.anon.leak import CoverageTally
 from messagefoundry.transports.mllp import DEFAULT_MAX_FRAME_BYTES, MLLPDecoder, frame
 from tests._mllp_over_cap import send_over_cap, send_valid_then_over_cap
@@ -99,16 +99,22 @@ def test_the_documented_on_report_wiring_hands_the_caller_a_coverage_report(tmp_
     # The docstring is what a caller copies, so pin its wiring as well as running it here.
     doc = CaptureSink.__doc__ or ""
     assert "on_report=tally.add" in doc and "Keyer(salt)" in doc
+    # The rules are loaded before the run too, so a bad overlay raises once instead of dropping
+    # every message (BACKLOG #2994 part 4, as the tee does for BACKLOG #2267).
+    assert "rules = load_rules(overlay)" in doc and "rules=rules" in doc
 
     out = tmp_path / "cap.jsonl"
     Keyer(_ANON_SALT)  # the example's own first step: a weak salt raises before any drop
+    rules = load_rules(None)  # its second: no overlay here, so the default rules
     tally = CoverageTally()
 
     async def scenario() -> CaptureSink:
         sink = CaptureSink(
             out,
             ports=(0,),
-            anonymizer=lambda raw: anonymize_checked(raw, salt=_ANON_SALT, on_report=tally.add),
+            anonymizer=lambda raw: anonymize_checked(
+                raw, salt=_ANON_SALT, rules=rules, on_report=tally.add
+            ),
         )
         await sink.start()
         try:

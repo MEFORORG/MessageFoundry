@@ -58,7 +58,9 @@ from messagefoundry.keyed_lock import KeyedLock, hold_keyed_lock
 from messagefoundry.pipeline.alerts import (
     config_changed_detail,
     crl_expiry_detail,
+    crl_reload_refused_detail,
     intake_pause_detail,
+    remote_debug_refused_detail,
 )
 
 # Not lazy, unlike the two transports imports below: the shared webhook opener is built at import.
@@ -144,6 +146,9 @@ _AUTO_RESOLVE: dict[str, str] = {
     # raised under the "directory-reconciler-referral" label once no referral stands.
     "ad_reconcile_breaker_cleared": "ad_reconcile_aborted",
     "ad_reconcile_hold_released": "ad_reconcile_held",
+    # #2904: a CRL file the reload no longer refuses resolves the open refusal for the same file
+    # on the same process.
+    "crl_reload_applied": "crl_reload_refused",
 }
 
 _T = TypeVar("_T")
@@ -977,8 +982,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
         Vault BACKLOG #2319: a date that is a running hop's held copy says so. The event gains
         ``held_copy``, ``shared_with`` and a ``detail`` only when there is something to say, so a
-        plain CRL alert's payload is what it was. ``detail`` also becomes the alert instance's
-        reason, which the store cuts to about 200 characters, so it leads with the remedy."""
+        plain CRL alert's payload is what it was. The event's ``detail`` is
+        :func:`~messagefoundry.pipeline.alerts.crl_expiry_detail`: the held-copy marker, then the
+        scan's ``detail``, then the other rows. It also becomes the alert instance's reason, which
+        the store cuts to about 200 characters, so the marker and the scan's remedy lead."""
         event: dict[str, Any] = {
             "type": "cert_expiry",
             "connection": f"{name} (CRL)",
@@ -993,6 +1000,50 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         if note := crl_expiry_detail(held_copy=held_copy, detail=detail, shared_with=shared_with):
             event["detail"] = note
         self._emit(event)
+
+    def crl_reload_refused(
+        self,
+        name: str,
+        *,
+        path: str,
+        remedy_class: str,
+        stale_contexts: int,
+        remedy: str,
+        start_refuses: bool = False,
+    ) -> None:
+        # Vault BACKLOG #2904: the reload refused a replaced CRL file. `crl_reload:<path>[@<process>]`
+        # stands in for "connection", so each file on each engine process is its own instance and
+        # throttle key. The payload is the path, a class token, a count and fixed words: the
+        # refusal's reason quotes CRL issuer names and dates, so it is never passed in. `detail` is
+        # what the instance's reason column shows, built by the helper the logging sink uses. The
+        # runner raises this once per file version, so a second version refused inside the
+        # cooldown while the alert is still open updates the instance and does not page again.
+        # crl_reload_applied ends that cooldown, so it never throttles a refusal after a clear.
+        event: dict[str, Any] = {
+            "type": "crl_reload_refused",
+            "connection": name,
+            "path": path,
+            "remedy_class": remedy_class,
+            "stale_contexts": stale_contexts,
+            "detail": crl_reload_refused_detail(
+                remedy_class=remedy_class,
+                stale_contexts=stale_contexts,
+                remedy=remedy,
+                start_refuses=start_refuses,
+            ),
+        }
+        if start_refuses:
+            # Only when there is something to say, as crl_expiry adds its held-copy keys.
+            event["start_refuses"] = True
+        self._emit(event)
+
+    def crl_reload_applied(self, name: str, *, path: str) -> None:
+        # #2904: the INVERSE -- no page; auto-resolves the open crl_reload_refused via _AUTO_RESOLVE.
+        # It also ends the cooldown for that file. The runner raises a refusal once per file
+        # version and sends no reminders, so a refusal that follows this clear inside the cooldown
+        # would otherwise be throttled and never paged at all.
+        self._last_sent.pop(f"crl_reload_refused:{name}", None)
+        self._record_state({"type": "crl_reload_applied", "connection": name}, "info")
 
     def secret_rotation_due(
         self,
@@ -1103,6 +1154,15 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # stands in for "connection" (the key's grammar is on AlertSink). `granted_by` is the granting
         # administrator's operator account name, or the fixed marker `<directory>` when a directory
         # sign-in's role sync made the grant (vault BACKLOG #2610). Never message content.
+        # Vault BACKLOG #3229: every administrator_granted call pops the _last_sent key built from
+        # the no_enabled_administrator alert type and the granted target, so a loss after an
+        # administrator_granted re-grant is not held back by the earlier loss's cooldown. A
+        # reconciler re-grant calls no administrator_granted, so it pops nothing. The pop builds that key with its own
+        # f-string in `_emit`'s key format; tests/test_directory_last_admin_alert.py pins the match.
+        # Only a `user:` target can match a loss key, so an `ad-group:` grant pops nothing. _last_sent is
+        # per process, so this clears the cooldown in this process only. _occurrences and _suspended
+        # are kept. Unlike crl_reload_applied, this resolves no open instance.
+        self._last_sent.pop(f"no_enabled_administrator:{name}", None)
         self._emit(
             {
                 "type": "administrator_granted",
@@ -1151,6 +1211,19 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     def ad_reconcile_hold_released(self, name: str) -> None:
         # #2136: the INVERSE -- no page; auto-resolves the open ad_reconcile_held via _AUTO_RESOLVE.
         self._record_state({"type": "ad_reconcile_hold_released", "connection": name}, "info")
+
+    def no_enabled_administrator(self, name: str, *, via: str) -> None:
+        # Vault BACKLOG #3229: a directory role change left no enabled Administrator. `user:<username>`
+        # stands in for "connection", as on administrator_granted. `via` is the closed pair ad-sync /
+        # ad-reconcile. Never message content.
+        self._emit(
+            {
+                "type": "no_enabled_administrator",
+                "connection": name,
+                "via": via,
+                "reason": f"no enabled Administrator remains after {via}",
+            }
+        )
 
     def ad_session_revoked(self, name: str, *, reason: str) -> None:
         # ADR 0079 mechanism 2: a directory principal's sessions were revoked. Keyed on the username so
@@ -1299,6 +1372,24 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # event type, so each detector routes and throttles on its own; the subject stands in for
         # "connection". A count and a fixed sentence only: never a body, an id or a row's detail.
         self._emit({"type": signal, "connection": name, "count": count, "detail": detail})
+
+    def remote_debug_refused(self, name: str, *, count: int, total: int) -> None:
+        # vault BACKLOG #2742: the remote-debugging guard refused injected scripts.
+        # `remote_debug:refused[@<process>]` stands in for "connection", so each engine process is
+        # its own instance and throttle key. Two counts and fixed words: the injecting process
+        # chooses the script's file name, so it is never passed in. `detail` is what the
+        # instance's reason column shows, built by the helper the logging sink uses. The watch
+        # raises this at most once per pass. A second raise inside the cooldown updates the
+        # instance and does not page again.
+        self._emit(
+            {
+                "type": "remote_debug_refused",
+                "connection": name,
+                "count": count,
+                "total": total,
+                "detail": remote_debug_refused_detail(count=count, total=total),
+            }
+        )
 
     def set_store(self, store: _AlertStateStore | None) -> None:
         """Wire (or clear) the alert-state store (ADR 0044, #56). The lifespan calls this once the store

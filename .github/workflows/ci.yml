@@ -622,10 +622,45 @@ jobs:
       #
       #   leg              max passing step   n     old cap   old margin   new cap   new margin
       #   ubuntu-latest    20:28              35    25:00     1.221x       31:00     1.515x   <- RE-DERIVED 2026-08-12
-      #                    (SUPERSEDED 2026-10-07: 34:00 over a 24:36 row, in the note directly below)
+      #                    (SUPERSEDED 2026-10-07: 34:00 over a 24:36 row, and again 2026-10-13: 38:00
+      #                    over a 28:07 row, in the two notes directly below)
+      #
+      # THE UBUNTU ROW WAS RE-DERIVED A THIRD TIME 2026-10-13, AND IT IS NOW 38:00 / JOB 50:00.
+      # Merge-group run 38372578370 (PR 2301) reddened this leg at 26:13 of 34:00 (1.297x) with
+      # `37755 passed, 1197 skipped`, and the queue ejected it. The pool, its n and its
+      # uncensored-on-evidence reading live ONCE, in this leg's row of
+      # scripts/ci/step_margin_baseline.toml; this note carries the sizing.
+      #
+      # THE EJECTION WAS NOT THE WORST RUN IN ITS POOL, SO THE CAP IS 38 AND NOT 36. The gate's
+      # RE-SIZE annotation on that run computed 36:00 from its own 26:13. The pool's worst passing
+      # step is 28:07, merge-group run 37591955946, created 50 minutes after the 34:00 cap landed on
+      # 2026-10-07. The gate reddened that run too, and nothing re-measured the row then.
+      # ceil_minute(1.35 x 28:07) is 38:00, and the rule sizes from the pool's worst row. At 36:00
+      # that row would still be LOW (1.280x).
+      #
+      # THE JOB CAP keeps the 12 minutes the overhead row below derives, 38 + 12 = 50. The 12 was not
+      # re-derived here. This pool's worst same-row overhead on this leg, job wall clock minus the
+      # step, is 5:22 (n=694), and 1.5 x 5:22 is 8:03, so the 12 still covers it. The rule applied
+      # to that 5:22 alone would give 9 and a job cap of 47; whether to shrink the 12 is left open.
+      # The worst pre-pytest setup in this pool over every conclusion is 6:18 (cancelled run
+      # 37639352866), over the 5:22 the 2026-08 rows below still use. On it the nesting gap is
+      # 50:00 - 6:18 - 38:00 = 5:42.
+      #
+      # THIS BUYS LITTLE TIME. At 38:00 the gate reds a run over 1753.8s, 29:14 or longer, 4 percent
+      # over the worst pooled run. By the day a step started, this leg's median rose from 21:24 on
+      # 2026-10-07 to 24:14 on 2026-10-12. The suite grew as well: the red run on 2026-10-07 printed
+      # `32060 passed` and this one `37755 passed`. The rule sizes from the worst row measured, not
+      # from that trend. The gate's RE-DERIVE annotation is still the trigger to re-measure.
+      #
+      # THE TWO WINDOWS ROWS WERE LEFT ALONE, AS A SEPARATE RE-MEASURE. In this pool their worst
+      # passing steps are 36:28 and 39:31, under the 55:00 caps' 42:19 red line, and both are over
+      # their 2026-08-08 rows. One windows-2025 job was cancelled at 68:35 with its step at 48:16
+      # (push run 37585340441, 2026-10-07, 18:31 of setup before pytest). That meets the
+      # "RE-DERIVE IF" trigger further down, and 18:31 is over the 2:32 setup maximum the
+      # windows-2025 nesting row uses. Neither is re-derived in this change.
       #
       # THE UBUNTU ROW WAS RE-DERIVED AGAIN 2026-10-07, AS PART OF THE WEB CONSOLE STEP-MARGIN GATE
-      # RE-MEASURE OF THAT DATE, AND IT IS NOW 34:00 / JOB 46:00. Merge-group run 37568821379, a
+      # RE-MEASURE OF THAT DATE, TO 34:00 / JOB 46:00 (SUPERSEDED 2026-10-13, ABOVE). Merge-group run 37568821379, a
       # five-PR stack headed by PR 2087, reddened this leg at 24:36 of 31:00 (1.260x) with `32060
       # passed, 1143 skipped`, and the queue ejected it. The step-margin record it was compared with,
       # 16:08, dated from 2026-08-08 and had never followed the 2026-08-12 re-derivation below. The
@@ -769,6 +804,7 @@ jobs:
       # #131 used when it set 36:00 (1.364x over 26:23, the largest execution then observed).
       #   ubuntu  22:50 x 1.35 = 30:50 -> 31:00   (1.358x over the anchor, 1.515x over max passing)
       #           SUPERSEDED 2026-10-07: 24:36 x 1.35 -> 34:00, under "RE-DERIVED AGAIN 2026-10-07" above
+      #           SUPERSEDED 2026-10-13: 28:07 x 1.35 -> 38:00, under "RE-DERIVED A THIRD TIME 2026-10-13" above
       #   W22     29:23 x 1.35 = 39:40 -> 40:00   (takes the shared Windows value below)
       #   W25     40:07 x 1.35 = 54:09 -> 55:00   (1.371x over the anchor, 1.537x over max passing)
       #
@@ -853,6 +889,7 @@ jobs:
       #   leg      worst same-row   setup(max)+wc(max)   overhead used   x1.5    room   job
       #   ubuntu   7:12 (n=451)     5:22 + 2:22 = 7:44   7:44            11:36   12:00  31+12 = 43
       #            (34+12 = 46 since 2026-10-07; the 12 is unchanged)
+      #            (38+12 = 50 since 2026-10-13; the 12 is unchanged)
       #   W22      6:16 (n=413)     4:05 + 2:51 = 6:56   6:56            10:24   11:00  55+11 = 66
       #   W25      6:29 (n=372)     2:32 + 3:59 = 6:31   6:31             9:47   10:00  (takes W22's 66)
       #
@@ -861,6 +898,7 @@ jobs:
       #
       #   ubuntu  5:22 + 30:59 + 2:22 = 38:43 vs 43:00  +4:17   |  old: 32:43 vs 37:00  +4:17  (band held)
       #           (since 2026-10-07: 5:22 + 33:59 + 2:22 = 41:43 vs 46:00, +4:17)
+      #           (since 2026-10-13, same 2026-08 addends: 5:22 + 37:59 + 2:22 = 45:43 vs 50:00, +4:17)
       #   W22     4:05 + 54:59 + 2:51 = 61:55 vs 66:00  +4:05   |  old: 42:55 vs 46:00  +3:04
       #   W25     2:32 + 54:59 + 3:59 = 61:30 vs 66:00  +4:30   |  old: 42:30 vs 46:00  +3:30
       #
@@ -880,6 +918,7 @@ jobs:
       # `Tests` kill is a NAMED STEP failure rather than an unattributed job cancellation:
       #   ubuntu  5:22 + 25:00 = 30:22 < 37:00  (gap 6:38)
       #           (since 2026-10-07: 5:22 + 34:00 = 39:22 < 46:00, gap 6:38)
+      #           (since 2026-10-13, same 2026-08 setup: 5:22 + 38:00 = 43:22 < 50:00, gap 6:38)
       #   W22     4:05 + 55:00 = 59:05 < 66:00  (gap 6:55)
       #   W25     2:32 + 55:00 = 57:32 < 66:00  (gap 8:28)
       #
@@ -1108,7 +1147,7 @@ jobs:
       #
       # 5 MINUTES, AND NO MORE. On `!cancelled()` this step also runs after a pytest step that used its
       # whole `step_timeout`, so it must fit in what the ubuntu job cap leaves after setup plus that
-      # step (46 - 34 - about 5.5 minutes of setup). The script's own time budget sits inside it, so a
+      # step (50 - 38 - about 5.5 minutes of setup). The script's own time budget sits inside it, so a
       # slow fetch fails the script by name first.
       #
       # PULL REQUESTS ONLY. Why `merge_group` is skipped, and what the scan does not cover, is in the
@@ -2426,7 +2465,7 @@ jobs:
           # `webconsole_margin_cap`, so sizing this close to the observed run would buy no detection and
           # cost false reds on green suites. That knob is the gate's ruler and `webconsole_step_timeout`
           # is only the wall -- this sentence named the wall until they were split.
-          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":46,"step_timeout":34,"webconsole_margin_cap":7,"webconsole_step_timeout":10,"webconsole_job_timeout":21,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
+          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":50,"step_timeout":38,"webconsole_margin_cap":7,"webconsole_step_timeout":10,"webconsole_job_timeout":21,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
           W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":8,"webconsole_step_timeout":11,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
           W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":12,"webconsole_step_timeout":16,"webconsole_job_timeout":24,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
           if [ "${GITHUB_REPOSITORY:-}" = "MEFORORG/MessageFoundry" ]; then
@@ -2655,7 +2694,7 @@ jobs:
           # and the body both server legs run (BACKLOG #1562).
           # tests/test_transit_bound_attestation_server_backends.py holds the attestation round trip
           # both server legs run (BACKLOG #2337).
-          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__main__|messagefoundry/api/(__init__|app|approvals)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|sharding|stage_dispatcher|wiring_runner)|messagefoundry/content_type|messagefoundry/uploads|messagefoundry/config/(models|response|settings|wiring)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege|uploads_shard_quota)|tests/_live_scratch\.py|tests/audit_chain_cases\.py|tests/_replay_settle_contract\.py|tests/_pending_approval_store_contract\.py|tests/test_transit_bound_attestation_server_backends\.py|\.github/workflows/ci\.yml)'; then
+          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__main__|messagefoundry/api/(__init__|app|approvals)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|sharding|stage_dispatcher|wiring_runner)|messagefoundry/content_type|messagefoundry/uploads|messagefoundry/config/(models|response|settings|wiring)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege|uploads_shard_quota)|tests/_live_scratch\.py|tests/audit_chain_cases\.py|tests/_replay_settle_contract\.py|tests/_pending_approval_store_contract\.py|tests/_ad_group_map_store_contract\.py|tests/test_transit_bound_attestation_server_backends\.py|\.github/workflows/ci\.yml)'; then
             echo "serverdb=true" >> "$GITHUB_OUTPUT"
           else
             echo "serverdb=false" >> "$GITHUB_OUTPUT"
@@ -4770,9 +4809,25 @@ jobs:
           # BACKLOG #1966 (R4 (a), ADR 0200): an enforcing PHI start needs verified-TLS forwarding to a
           # non-loopback collector. Config-only gate, so `siem.invalid` never resolving is fine. The host
           # python has no `cryptography`, so the CA+CRL is minted by the image's own interpreter.
+          # This step leaves the directory root-owned (see below). So clear one left by an earlier
+          # run on the same machine, which the runner's own account could not reuse.
+          sudo rm -rf "${RUNNER_TEMP:?}/syslog-ca"
           mkdir -p "$RUNNER_TEMP/syslog-ca" && chmod 755 "$RUNNER_TEMP/syslog-ca"
           docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo:ro" -v "$RUNNER_TEMP/syslog-ca:/out" \
             --entrypoint python messagefoundry:smoke /repo/scripts/ci/make_syslog_ca_crl.py /out
+          # THE CA GOES TO ROOT BEFORE THE ENGINE READS IT. An enforcing start checks who owns
+          # `[logging].forward_tls_ca_file` and each directory above it. The owner must be root or
+          # the engine's own account, because any other owner could swap the CA. The rule is
+          # `posix_path_verdict` in messagefoundry/auth/anchor_path.py. The mint above runs as the
+          # runner, which lets it write into RUNNER_TEMP. That left the runner owning the directory
+          # and the bundle, and the engine refused to start. The refusal is right and the rig was
+          # wrong. docker/README.md gives these two commands for a read-only config mount, and the
+          # same owner rule applies here: everyone may read, and only root may write. The mode
+          # change runs first, while the runner still owns the files. The last line prints the
+          # owner and mode the engine will see.
+          chmod -R a+rX,go-w "$RUNNER_TEMP/syslog-ca"
+          sudo chown -R root:root "$RUNNER_TEMP/syslog-ca"
+          stat -c '%u:%g %a %n' "$RUNNER_TEMP/syslog-ca" "$RUNNER_TEMP/syslog-ca"/*
           # THE RIG SIGNS IN (vault BACKLOG #2719). The engine serves with sign-in on, as shipped, so
           # one Administrator is provisioned before it starts and the /messages reads below carry that
           # account's session. Both run INSIDE the image, on the image's interpreter and as the
@@ -4983,6 +5038,9 @@ jobs:
         run: |
           docker rm -f mefor || true
           docker volume rm mefor-data || true
+          # The serve step leaves the syslog CA directory root-owned, so the runner's own account
+          # cannot delete it. If RUNNER_TEMP is unset, `:?` ends this step with an error.
+          sudo rm -rf "${RUNNER_TEMP:?}/syslog-ca" || true
 
   packaging-build:
     # BUILD every distribution this repo publishes, then run the release gates over the REAL

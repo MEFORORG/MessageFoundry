@@ -36,6 +36,7 @@ from messagefoundry.parsing.peek import Peek
 from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
 from messagefoundry.store import FailOutcome, MessageStatus, OutboxStatus, Stage
+from messagefoundry.store.cell_tag import message_cell_aad
 from messagefoundry.store.content_search import make_spec
 from messagefoundry.store.crypto import MARKER_PREFIX, cell_aad, generate_key, make_cipher
 from messagefoundry.store.queue_tag import queue_row_aad
@@ -66,6 +67,8 @@ _TABLES = (
     "message_events",
     "audit_log",
     "cipher_meta",  # ASVS 11.3.4 per-key GCM invocation counters (no FK)
+    "keyed_surface",  # BACKLOG #3383 markers (no FK): a keyed test leaves every surface marked, and
+    #                   a later test's keyless-then-keyed migration would then refuse, not seal
     "connection_event",  # #46 lifecycle log (no FK) — ciphered `reason` rows else leak across runs
     #                      and break the key-rotation reencrypt scan (persistent contamination)
     "cluster_config",
@@ -90,6 +93,7 @@ _TABLES = (
     "known_login_addresses",  # vault BACKLOG #2145: FK to users(id), cleared before users
     "user_roles",
     "ad_group_role_map",
+    "authority_set_seal",  # BACKLOG #2592: the map's seal, under the key of the test that wrote it
     "ad_group_scope_map",
     "users",
     "roles",
@@ -996,6 +1000,13 @@ async def test_auth_users_roles_sessions(store) -> None:
     assert await store.get_user_role_ids("u1") == []
 
 
+async def test_group_map_keys_at_the_api_widths_store(store) -> None:
+    """BACKLOG #3187: the contract is in ``tests/_ad_group_map_store_contract.py``."""
+    from tests._ad_group_map_store_contract import assert_group_map_keys_at_width_store
+
+    await assert_group_map_keys_at_width_store(store)
+
+
 async def test_last_admin_guard_contract(store) -> None:
     """Vault BACKLOG #2779 on Postgres: the guarded removal refuses only the last administrator."""
     from tests._last_admin_store_contract import assert_last_admin_contract
@@ -1386,6 +1397,59 @@ async def test_directory_object_id_column_upgrade_is_idempotent(store) -> None:
     assert again is not None and again.id == "dir-upgrade"
 
 
+async def test_session_idp_auth_time_column_upgrade_is_idempotent(store) -> None:
+    """The gated ADD for ``sessions.idp_auth_time`` (BACKLOG #2143) on a database from before it.
+
+    BACKLOG #3174: only the SQLite migration was tested against an existing table. Driven against a
+    table that really lacks the column, with the ``schema_meta`` marker cleared, for the reasons
+    ``test_directory_object_id_column_upgrade_is_idempotent`` gives. The type is asserted, and a
+    fractional value round-trips, so a column added as an integer cannot pass."""
+
+    async def _column_type() -> str | None:
+        async with store._pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT data_type FROM information_schema.columns"
+                " WHERE table_name='sessions' AND column_name='idp_auth_time'"
+            )
+
+    async with store._pool.acquire() as conn:
+        await conn.execute("ALTER TABLE sessions DROP COLUMN idp_auth_time")
+        await conn.execute("DELETE FROM schema_meta")
+    assert await _column_type() is None  # positive control: the column really is gone
+
+    assert await store._ensure_schema() is True  # pre-marker DB: the full batch really ran
+    assert await _column_type() == "double precision"
+
+    await store.create_user(
+        user_id="idp-upgrade",
+        username="idp-upgrade",
+        auth_provider="ad",
+        directory_object_id="guid-idp-upgrade",
+        now=1.0,
+        password_generated=False,
+    )
+    await store.create_session(
+        token_hash="i" * 64,
+        user_id="idp-upgrade",
+        expires_at=9e9,
+        now=2.0,
+        auth_mechanism="oidc",
+        idp_auth_time=1.25,
+    )
+    created = await store.get_session("i" * 64)
+    assert created is not None and created.idp_auth_time == 1.25
+    await store.mark_session_reauthed("i" * 64, now=3.0, idp_auth_time=2.75)
+    moved = await store.get_session("i" * 64)
+    assert moved is not None and moved.idp_auth_time == 2.75
+
+    # A second full run against the migrated table skips the ADD and leaves the value alone.
+    async with store._pool.acquire() as conn:
+        await conn.execute("DELETE FROM schema_meta")
+    assert await store._ensure_schema() is True
+    again = await store.get_session("i" * 64)
+    assert again is not None and again.idp_auth_time == 2.75
+
+
 async def test_mark_session_reauthed_reanchors_client(store) -> None:
     """WP-L3-13: mark_session_reauthed(client=) re-anchors the session's client address via COALESCE;
     a None client leaves it unchanged while still refreshing reauth_at. Exercises the new COALESCE
@@ -1416,11 +1480,11 @@ async def test_mark_session_reauthed_reanchors_client(store) -> None:
 async def test_set_password_claim_stamp_round_trip(store) -> None:
     """BACKLOG #1245 ``users.password_claimed_at`` on the real Postgres backend.
 
-    ``password_claim_set`` is shared by all three backends, so the SQL TEXT of the claim term is
-    single-sourced — but the ARGUMENT BINDING around it is hand-written per backend and nothing
-    else on this leg executes ``set_password`` at all. Here the term reuses ``$2`` (already
-    ``now``) so the argument list is unchanged; a regression that renumbered it would bind the
-    wrong value into the column while the shared helper still produced correct-looking SQL.
+    The claim rule is ``store.password_change``, shared by all three backends since BACKLOG #2592,
+    and the write is the sealed user record's one whole-row statement -- but its ARGUMENT BINDING
+    is spelled per backend and nothing else on this leg executes ``set_password`` at all. A
+    regression that renumbered a ``$n`` would bind the wrong value into a column while the shared
+    rule still computed the right record.
 
     Every assertion below compares against the EXACT timestamp passed, never merely ``is not
     None``: a mis-bound placeholder that landed the ``must_change_password`` flag in the column
@@ -2067,6 +2131,55 @@ async def test_unmarked_value_on_a_sealed_surface_is_refused_not_sealed(store) -
             with pytest.raises(CipherError, match=r"messages\.raw"):
                 await reopened.get_message(planted)
             assert refused == [("messages", "raw")] * 2  # the open's finding, then this refusal
+        finally:
+            await reopened.close()
+    finally:
+        cleanup = await PostgresStore.open(settings, cipher=make_cipher(k))
+        try:
+            async with cleanup._pool.acquire() as conn:
+                for table in ("message_events", "queue", "messages"):
+                    await conn.execute(f"DELETE FROM {table}")
+        finally:
+            await cleanup.close()
+
+
+async def test_a_plant_on_a_never_written_keyed_surface_is_refused_pg(store) -> None:
+    """BACKLOG #3383 (owner ruling 2026-10-10), the ``postgres-store`` twin of the same-named test in
+    ``tests/test_store_strict_ciphertext.py``. ``messages.error`` is never written here, so it holds
+    no ciphertext. The keyed open still writes its ``keyed_surface`` marker, the marker survives a
+    restart, and a plant written there afterwards is refused rather than sealed as legacy data."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.crypto import CipherError
+    from messagefoundry.store.postgres import PostgresStore
+
+    settings = load_settings(environ=os.environ).store
+    k = generate_key()
+    plant = "MSH|^~\\&|EVIL|F|R|RF|20260101||ADT^A01|PLANTED|P|2.5.1\r"
+    try:
+        keyed = await PostgresStore.open(settings, cipher=make_cipher(k))
+        try:
+            mid = await keyed.enqueue_message(
+                channel_id="IB", raw=RAW, deliveries=[("OB", "p")], now=100.0
+            )
+            row = await keyed._fetchone("SELECT error AS v FROM messages WHERE id=$1", mid)
+            assert row["v"] in (None, "")  # the surface holds no ciphertext
+            await keyed._execute("UPDATE messages SET error=$1 WHERE id=$2", plant, mid)
+        finally:
+            await keyed.close()
+        rows = await store._fetchall("SELECT surface_table, surface_column FROM keyed_surface")
+        marks = {(r["surface_table"], r["surface_column"]) for r in rows}
+        assert {("messages", "error"), ("messages", "raw")} <= marks  # survived the close
+
+        cipher = make_cipher(k)
+        refused: list[tuple[str, str]] = []
+        cipher.set_refusal_hook(lambda t, c: refused.append((t, c)))  # type: ignore[attr-defined]
+        reopened = await PostgresStore.open(settings, cipher=cipher)
+        try:
+            assert refused == [("messages", "error")], "the open must find the plant once"
+            row = await reopened._fetchone("SELECT error AS v FROM messages WHERE id=$1", mid)
+            assert row["v"] == plant, "the keyed reopen sealed a plant on a keyed surface"
+            with pytest.raises(CipherError, match=r"messages\.error"):
+                await reopened.get_message(mid)
         finally:
             await reopened.close()
     finally:
@@ -3866,10 +3979,11 @@ async def _pg_force_error(store, mid: str, error: str) -> None:
     """Force a seeded origin to a terminal ERROR (ciphered at rest) — proves the direct edit-resend
     never reopens/overwrites it (mirrors test_edit_resend.py::_seed_error)."""
     async with store._pool.acquire() as conn:
+        channel = await conn.fetchval("SELECT channel_id FROM messages WHERE id=$1", mid)
         await conn.execute(
             "UPDATE messages SET status=$1, error=$2 WHERE id=$3",
             MessageStatus.ERROR.value,
-            store._enc(error, aad=cell_aad("messages", "error", mid)),
+            store._enc(error, aad=message_cell_aad("error", message_id=mid, channel_id=channel)),
             mid,
         )
 
@@ -3880,9 +3994,11 @@ async def _pg_force_error(store, mid: str, error: str) -> None:
 async def _pg_set_meta(store, message_id: str, bag: dict) -> None:
     """Attach a metadata bag the way transform_handoff does (encrypted, cell-AAD bound)."""
     async with store._pool.acquire() as conn:
+        channel = await conn.fetchval("SELECT channel_id FROM messages WHERE id=$1", message_id)
+        tag = message_cell_aad("metadata", message_id=message_id, channel_id=channel)
         await conn.execute(
             "UPDATE messages SET metadata=$1 WHERE id=$2",
-            store._enc(json.dumps(bag), aad=cell_aad("messages", "metadata", message_id)),
+            store._enc(json.dumps(bag), aad=tag),
             message_id,
         )
 
@@ -5117,6 +5233,93 @@ async def test_session_seal_contract(store) -> None:
         await keyed.close()
 
 
+async def test_user_seal_contract(store) -> None:
+    """BACKLOG #2592: the sealed user record, the same contract the SQLite suite runs, on a keyed
+    handle, with the round trip that pins the canonical bytes (AC-19). ``raw`` runs each statement
+    on a pooled connection, outside the store's helpers. The fixture truncates the user and role
+    tables on the next entry."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests._session_seal_contract import dollar_placeholders
+    from tests._user_seal_contract import (
+        assert_user_columns,
+        assert_user_record_round_trips,
+        assert_user_seal_contract,
+    )
+
+    keyed = await PostgresStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[object, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                await conn.execute(dollar_placeholders(sql), *params)
+
+        async with keyed._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT column_name FROM information_schema.columns"
+                " WHERE table_schema = current_schema() AND table_name = 'users'"
+            )
+        assert_user_columns({str(r["column_name"]) for r in rows})
+        await assert_user_record_round_trips(keyed)
+        await assert_user_seal_contract(keyed, raw)
+    finally:
+        await keyed.close()
+
+
+async def test_role_seal_contract(store) -> None:
+    """BACKLOG #2592: sealed custom role definitions and the sealed AD group-to-role map, the same
+    contract the SQLite suite runs, on a keyed handle, with the role table's columns pinned to the
+    record the seal covers. ``raw`` runs each statement on a pooled connection, outside the store's
+    helpers. The fixture truncates the role and map tables on the next entry."""
+    from dataclasses import fields
+
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from messagefoundry.store.store import RoleRow
+    from tests._role_seal_contract import assert_role_seal_contract
+    from tests._session_seal_contract import dollar_placeholders
+
+    keyed = await PostgresStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[object, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                await conn.execute(dollar_placeholders(sql), *params)
+
+        async with keyed._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT column_name FROM information_schema.columns"
+                " WHERE table_schema = current_schema() AND table_name = 'roles'"
+            )
+        assert {str(r["column_name"]) for r in rows} == {f.name for f in fields(RoleRow)}
+        await assert_role_seal_contract(keyed, raw)
+    finally:
+        await keyed.close()
+
+
+async def test_a_role_delete_racing_a_grant_leaves_no_dangling_role_row(store) -> None:
+    """BACKLOG #2592: a grant that commits while its custom role is deleted fails the delete on the
+    ``user_roles`` role foreign key, rather than leaving a sealed role row with no role behind it.
+    The SQL Server suite runs the same race; ``tests/_user_seal_contract.py`` makes it."""
+    import asyncpg
+
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests._user_seal_contract import assert_role_delete_race_refused
+
+    keyed = await PostgresStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+        await assert_role_delete_race_refused(keyed, asyncpg.exceptions.ForeignKeyViolationError)
+    finally:
+        await keyed.close()
+
+
 async def test_queue_tag_contract(store) -> None:
     """BACKLOG #2593: the queue payload's routing tag, the same contract the SQLite suite runs, on a
     keyed handle under the cell-bound writer. ``raw`` and ``fetch`` run on pooled connections,
@@ -5141,6 +5344,34 @@ async def test_queue_tag_contract(store) -> None:
                 return [dict(r) for r in await conn.fetch(dollar_placeholders(sql), *params)]
 
         await assert_queue_tag_contract(keyed, raw, fetch, store_once=False)
+    finally:
+        await keyed.close()
+
+
+async def test_cell_tag_contract(store) -> None:
+    """BACKLOG #2593: message cells bound to their channel and preset criteria to their owner, the
+    same contract the SQLite suite runs, on a keyed handle under the cell-bound writer. ``raw`` and
+    ``fetch`` run on pooled connections, outside the store's helpers."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests._cell_tag_contract import assert_cell_tag_contract
+    from tests._session_seal_contract import dollar_placeholders
+
+    keyed = await PostgresStore.open(
+        load_settings(environ=os.environ).store,
+        cipher=make_cipher(generate_key(), write_v2=True),
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[object, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                await conn.execute(dollar_placeholders(sql), *params)
+
+        async def fetch(sql: str, params: tuple[object, ...]) -> list[dict[str, object]]:
+            async with keyed._pool.acquire() as conn:
+                return [dict(r) for r in await conn.fetch(dollar_placeholders(sql), *params)]
+
+        await assert_cell_tag_contract(keyed, raw, fetch)
     finally:
         await keyed.close()
 

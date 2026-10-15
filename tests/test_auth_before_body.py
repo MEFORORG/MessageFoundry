@@ -513,13 +513,14 @@ _ONCE = (
 
 
 #: What the early check costs a signed-in caller on a route with a body: one more identity
-#: lookup, which reads the session, its user and the user's roles, and writes nothing for a session
-#: it accepts. A session it refuses it can revoke; ``docs/SECURITY.md`` says when.
+#: lookup, which reads the session, its user and the user's role rows, and writes nothing for a
+#: session it accepts. A session it refuses it can revoke; ``docs/SECURITY.md`` says when. The
+#: role rows are read whole, for the account's integrity seal (BACKLOG #2592).
 _SECOND_LOOKUP = {
     "identity_for_token": 1,
     "store.get_session": 1,
     "store.get_user": 1,
-    "store.get_user_role_ids": 1,
+    "store.get_user_role_grants": 1,
 }
 
 
