@@ -226,6 +226,21 @@ def test_compose_registry_hints() -> None:
     assert cfg.log_path is not None and cfg.log_path.endswith("service.out.log")
 
 
+def test_compose_repo_path_prefers_the_registered_project_root() -> None:
+    """The service's working directory is the engine install root (vault BACKLOG #2626), so the
+    registered --project-root, the config repo, is the repo_path hint when there is one."""
+    reg = ServiceRegistryInfo(
+        app_directory="C:\\Program Files\\MessageFoundry\\engine",
+        app_parameters='serve --config "D:\\hl7\\config" --project-root "D:\\hl7" --port 9100',
+    )
+    assert compose_config(None, reg).repo_path == "D:\\hl7"
+    # Without one, the working directory is still the hint.
+    reg = ServiceRegistryInfo(
+        app_directory="C:\\Program Files\\MessageFoundry\\engine", app_parameters="serve"
+    )
+    assert compose_config(None, reg).repo_path == "C:\\Program Files\\MessageFoundry\\engine"
+
+
 def test_compose_toml_overrides_registry() -> None:
     reg = ServiceRegistryInfo(app_parameters="serve --host 127.0.0.1 --port 9100")
     toml_data: dict[str, object] = {

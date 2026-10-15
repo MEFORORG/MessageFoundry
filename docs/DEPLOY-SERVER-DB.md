@@ -67,6 +67,7 @@ trailing `$` and **no password**:
 
 ```powershell
 .\scripts\service\install-service.ps1 -Environment prod -Config D:\hl7\config `
+  -ServiceConfig D:\hl7\messagefoundry.toml `
   -ServiceAccount "CORP\mefor-svc$"          # gMSA — passwordless; preflight + SeServiceLogonRight auto
 ```
 

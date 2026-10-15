@@ -30,8 +30,8 @@ param(
     # that install directly, so the interpreter options below reach it (vault BACKLOG #2701).
     # Defaults to the admin-only install root, "$env:ProgramFiles\MessageFoundry\engine", which the
     # installer checks and does not build (vault BACKLOG #2626). docs/SERVICE.md "Install the engine
-    # where only administrators can write" builds it from the wheel. A checkout's venv still works
-    # when passed here.
+    # where only administrators can write" builds it from the wheel. A passed one is checked the
+    # same way, so a checkout's venv, which its developers can write, is refused.
     [string]$AppExe,
     # The interpreter the service runs. Defaults to the python.exe of the install -AppExe is in:
     # beside it for a virtual environment, one folder up for a system-wide install. Pass it when
@@ -42,14 +42,13 @@ param(
     # samples\config, a demo graph in a folder its developers can write (vault BACKLOG #2626).
     [string]$Config,
     # The service settings file (messagefoundry.toml), registered as an absolute --service-config.
-    # Without it, the installer registers <ProjectRoot or working directory>\messagefoundry.toml
-    # when that file exists, and refuses when it does not: `serve` as the service refuses to start
+    # Without it, the installer registers <ProjectRoot>\messagefoundry.toml, or the working
+    # directory's when -Config is a drive root, when that file exists, and refuses when it does not: `serve` as the service refuses to start
     # with no --service-config (vault BACKLOG #2626).
     [string]$ServiceConfig,
     # The config-repo root the value file environments\<env>.toml resolves under, registered as
-    # --project-root. Without it, a service on the default install root uses the folder above
-    # -Config, the layout docs/INSTALL-GUIDE.md shows, and a service on a passed -AppExe uses its
-    # working directory, as before.
+    # --project-root. Without it, the installer uses the folder above -Config, the layout
+    # docs/INSTALL-GUIDE.md shows, for every install (vault BACKLOG #2626).
     [string]$ProjectRoot,
     [string]$DbPath,
     [string]$DataDir = "C:\ProgramData\MessageFoundry",
@@ -446,17 +445,31 @@ function Get-NssmHomeProblem {
       Who, other than administrators, could replace $File: through the file itself, its folder, or
       any folder above that up to, not including, the drive root. "" when nobody.
 
+      $File may name several files, as the engine install check does (vault BACKLOG #2626). Each
+      folder is then read once, however many of the files sit below it, and a holder of a file
+      itself is named with that file's path.
+
       THE PARENTS COUNT. Whoever can delete or rename a folder's child can move the checked folder
       aside and put their own in its place. The drive root is left out because Windows lets
       Authenticated Users create folders there by default, which moves nothing that already exists.
     #>
-    param([Parameter(Mandatory)][string]$File)
+    param([Parameter(Mandatory)][string[]]$File)
     $found = @()
-    if (Test-Path -LiteralPath $File) { $found += @(Get-BroadWriteHolders -Path $File) }
-    $dir = Split-Path -Parent $File
-    while ($dir -and (Split-Path -Parent $dir)) {
-        $found += @(Get-BroadWriteHolders -Path $dir | ForEach-Object { "$_ on '$dir'" })
-        $dir = Split-Path -Parent $dir
+    # Case-insensitive keys, as Windows paths are.
+    $read = @{}
+    foreach ($one in $File) {
+        if (Test-Path -LiteralPath $one) {
+            $found += @(Get-BroadWriteHolders -Path $one | ForEach-Object {
+                if ($File.Count -gt 1) { "$_ on '$one'" } else { $_ } })
+        }
+        $dir = Split-Path -Parent $one
+        while ($dir -and (Split-Path -Parent $dir)) {
+            if (-not $read.ContainsKey($dir)) {
+                $read[$dir] = $true
+                $found += @(Get-BroadWriteHolders -Path $dir | ForEach-Object { "$_ on '$dir'" })
+            }
+            $dir = Split-Path -Parent $dir
+        }
     }
     return ($found -join "; ")
 }
@@ -856,7 +869,7 @@ function Get-CrashDumpImageName {
 # launcher, because a launcher cannot pass an option to the interpreter it starts. What each option
 # does is in docs/SERVICE.md, "The service launch". Two things are particular to this script:
 #
-#   - `-m` would search the working directory first, and that is AppDirectory, the repository. -I
+#   - `-m` would search the working directory first, and that is AppDirectory, the install root. -I
 #     keeps it off the import path.
 #   - A MEFOR_* variable set through AppEnvironmentExtra still reaches the engine. -I ignores only
 #     the interpreter's own PYTHON* variables.
@@ -1277,17 +1290,16 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     throw "Installing a Windows service requires an elevated (Administrator) PowerShell."
 }
 
-# Repo root is two levels up from this script (scripts\service\). Computed FIRST: it is the working
-# directory of a service run from a checkout (a passed -AppExe), and the normalization below has to
-# run before anything CONSUMES a path.
+# Repo root is two levels up from this script (scripts\service\). -LockConfigDir must never lock it.
+# The service does not run from it: its working directory is the install root (vault BACKLOG #2626).
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 
 # The default install root (vault BACKLOG #2626). Under Program Files, so a new folder there inherits
 # an access list only administrators can write; the installer checks that below rather than assume
 # it. The installer does not build the root: docs/SERVICE.md "Install the engine where only
 # administrators can write" installs the hash-locked dependencies and the engine wheel into it, never
-# editable. A checkout's own venv stays usable by passing -AppExe, and whether the installer may stop
-# accepting one is an open owner question, so nothing here refuses it.
+# editable. A passed -AppExe or -PythonExe gets the same check (Get-EngineInstallProblem), so a
+# service can no longer run from a checkout its developers can write.
 $DefaultInstallRoot = Join-Path $env:ProgramFiles "MessageFoundry\engine"
 $UsesDefaultInstall = -not ($AppExe -or $PythonExe)
 
@@ -1295,15 +1307,102 @@ function Get-DefaultServiceConfig {
     <#
       The settings file a service registered without -ServiceConfig is given: messagefoundry.toml
       under $Anchor when it exists, else "". $Anchor is -ProjectRoot, or the working directory when
-      there is none. For a passed -AppExe with no -ProjectRoot, that is the file `serve` would have
-      read from its working directory. For the default install it sits beside the value folder,
-      above -Config, the layout docs/INSTALL-GUIDE.md shows. `serve` would not find that file on
-      its own, so the installer names it by absolute path (vault BACKLOG #2626).
+      there is none, which happens only when -Config is a drive root. It sits beside the value
+      folder, above -Config, the layout docs/INSTALL-GUIDE.md shows. `serve` would not find that
+      file on its own, so the installer names it by absolute path (vault BACKLOG #2626).
     #>
     param([Parameter(Mandatory)][string]$Anchor)
     $candidate = Join-Path $Anchor "messagefoundry.toml"
     if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
     return ""
+}
+
+function Get-EngineInstallRoot {
+    <#
+      The root of the install $PythonExe belongs to: the folder above Scripts for a virtual
+      environment, else the interpreter's own folder, as for a system-wide install. It is the
+      service's working directory, and Get-EngineInstallProblem checks it (vault BACKLOG #2626).
+    #>
+    param([Parameter(Mandatory)][string]$PythonExe)
+    $folder = Split-Path -Parent $PythonExe
+    if ((Split-Path -Leaf $folder) -eq 'Scripts') { return (Split-Path -Parent $folder) }
+    return $folder
+}
+
+function Get-EngineInstallProblem {
+    <#
+      Why the service must not run the engine installed at $InstallRoot, or "" when it may (vault
+      BACKLOG #2626). Two refusals:
+
+        - The engine package is not a folder in the install's site-packages, or an editable-install
+          hook for it is there. An editable install imports the engine from a checkout, which its
+          developers can write, so the service would run their next edit.
+        - Someone other than administrators could replace the interpreter the service runs, the
+          launcher, the package's __init__.py or __pycache__ folder or a venv's pyvenv.cfg,
+          through the file or any folder above it. Get-NssmHomeProblem reads that, the same reading that guards nssm.exe.
+          It refuses every principal outside SYSTEM, Administrators and three others, so it refuses
+          Everyone, Authenticated Users and BUILTIN\Users, and the user who owns a checkout.
+
+      NOT READ: the base interpreter a venv's python.exe starts, the standard library beside it,
+      and the package's other files one by one. `serve` reports the interpreter and package it
+      finds at every start.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$PythonExe,
+        [string]$AppExe
+    )
+    $sitePackages = Join-Path $InstallRoot "Lib\site-packages"
+    $package = Join-Path $sitePackages "messagefoundry\__init__.py"
+    if (-not (Test-Path -LiteralPath $package -PathType Leaf)) {
+        return ("the engine package is not in its site-packages: '$package' is missing. An " +
+            "editable install, a `pip install --user` copy and a package installed elsewhere all " +
+            "leave it out")
+    }
+    # The markers messagefoundry/integrity.py's _declares_editable reads, which `serve` reports: an
+    # __editable__ hook, direct_url.json declaring dir_info.editable, or a RECORD row naming an
+    # editable finder or a .pth. Read here as files, because this prompt runs none of the install's
+    # code.
+    # The engine's own hooks only: __editable__.messagefoundry-<ver>.pth and
+    # __editable___messagefoundry_<ver>_finder.py. A sibling such as messagefoundry_webconsole is
+    # another distribution, and naming it as the engine would send the operator to the wrong wheel.
+    # Each read refuses when it fails: an unread marker cannot be shown absent.
+    try {
+        $editable = @(Get-ChildItem -LiteralPath $sitePackages -Filter '__editable__*' -Force -ErrorAction Stop |
+            Where-Object { $_.Name -match '^__editable__(\.messagefoundry-|_+messagefoundry_[0-9])' } |
+            ForEach-Object { $_.Name })
+        $distInfos = @(Get-ChildItem -LiteralPath $sitePackages -Filter 'messagefoundry-*.dist-info' -Directory -Force -ErrorAction Stop)
+    } catch {
+        return "its '$sitePackages' could not be listed ($($_.Exception.Message))"
+    }
+    foreach ($distInfo in $distInfos) {
+        $directUrl = Join-Path $distInfo.FullName "direct_url.json"
+        if (Test-Path -LiteralPath $directUrl -PathType Leaf) {
+            try {
+                $info = Get-Content -LiteralPath $directUrl -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                if ($info.dir_info -and $info.dir_info.editable) { $editable += "$($distInfo.Name)\direct_url.json" }
+            } catch {
+                return "its '$directUrl' could not be read ($($_.Exception.Message))"
+            }
+        }
+        $record = Join-Path $distInfo.FullName "RECORD"
+        if (Test-Path -LiteralPath $record -PathType Leaf) {
+            try { $lines = @(Get-Content -LiteralPath $record -ErrorAction Stop) } catch {
+                return "its '$record' could not be read ($($_.Exception.Message))"
+            }
+            $rows = @($lines | ForEach-Object { (($_ -split ',')[0] -split '[\\/]')[-1] } |
+                Where-Object { $_ -like '__editable__*' -or $_ -like '*.pth' -or $_ -like '*_editable_impl*' })
+            if ($rows) { $editable += "$($distInfo.Name)\RECORD names $($rows -join ', ')" }
+        }
+    }
+    if ($editable) { return "it holds an editable install of the engine: $($editable -join '; ')" }
+    # The interpreter and the package are known to exist by now, so the list is never empty. The
+    # package's __pycache__ is read too, as `serve`'s install_trust_paths reads it: a cache file
+    # there runs in place of the source beside it.
+    $cache = Join-Path (Split-Path -Parent $package) "__pycache__"
+    $files = @(@($PythonExe, $package, $cache, $AppExe, (Join-Path $InstallRoot "pyvenv.cfg")) |
+        Where-Object { $_ -and (Test-Path -LiteralPath $_) })
+    return (Get-NssmHomeProblem -File $files)
 }
 
 function Assert-NoNssmExpansion {
@@ -1450,7 +1549,7 @@ function Get-LockPathProblem {
 # Resolve-Nssm had already joined a possibly-relative -DataDir, and after Test-Path had validated a
 # relative -DbPath against a DIFFERENT directory from the one the service would resolve it against.
 # That is the whole defect: one path, validated here against the operator's shell location, resolved
-# there against AppDirectory ($RepoRoot).
+# there against AppDirectory, then the checkout and now the install root.
 #
 # NOT Resolve-Path: it THROWS on a path that does not exist, and a first install legitimately has no
 # database file yet. GetUnresolvedProviderPathFromPSPath normalizes without requiring existence.
@@ -1471,6 +1570,23 @@ elseif ($AppExe) { $AppExe = Resolve-AbsolutePath $AppExe }
 # is absolute before anything consumes it. Empty when none is found; refused below.
 if ($PythonExe) { $PythonExe = Resolve-AbsolutePath $PythonExe }
 else { $PythonExe = Get-EngineInterpreter -AppExe $AppExe }
+# The launcher only names the install, so it is required only while it is what finds the
+# interpreter. With -PythonExe the service's program is already named.
+if (-not $PSBoundParameters.ContainsKey('PythonExe') -and -not (Test-Path -LiteralPath $AppExe)) {
+    throw ("Engine executable not found at: $AppExe`nBuild the install root from the engine wheel " +
+        "(docs/SERVICE.md 'Install the engine where only administrators can write'), or pass " +
+        "-AppExe, or name the interpreter with -PythonExe.")
+}
+# NOT CHECKED: that this interpreter can import the engine. Finding out would mean running the
+# install's code from this elevated prompt. A wrong -PythonExe shows as ModuleNotFoundError in the
+# service's error log at its first start.
+if (-not $PythonExe -or -not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) {
+    throw ("The Python interpreter the service runs was not found" +
+        $(if ($PythonExe) { " at: $PythonExe" } else { " beside '$AppExe' or one folder up" }) +
+        ".`nThe service runs the interpreter directly, in isolated mode, and not the " +
+        "messagefoundry.exe launcher. Pass -PythonExe with the python.exe of the install the " +
+        "engine is in (docs/SERVICE.md 'The service launch').")
+}
 # No default (vault BACKLOG #2626). It used to be the checkout's samples\config: a demo graph, in a
 # folder its developers can write, run as the service account.
 if (-not $Config) {
@@ -1478,11 +1594,11 @@ if (-not $Config) {
         "one was this checkout's samples\config, a demo graph (docs/SERVICE.md 'Install').")
 }
 $Config = Resolve-AbsolutePath $Config
-# The working directory: the install root for the default install, and the checkout for a passed
-# -AppExe, as before. -m resolves nothing against it either way: the service runs isolated (-I).
-$AppDirectory = if ($UsesDefaultInstall) { $DefaultInstallRoot } else { $RepoRoot }
+# The working directory is the install root, never the checkout (vault BACKLOG #2626). -m resolves
+# nothing against it: the service runs isolated (-I).
+$AppDirectory = Get-EngineInstallRoot -PythonExe $PythonExe
 if ($ProjectRoot) { $ProjectRoot = Resolve-AbsolutePath $ProjectRoot }
-elseif ($UsesDefaultInstall) { $ProjectRoot = Split-Path -Parent $Config }
+else { $ProjectRoot = Split-Path -Parent $Config }
 # What `serve` resolves the value file and its default settings file under: -ProjectRoot, else
 # its working directory.
 $ValuesAnchor = if ($ProjectRoot) { $ProjectRoot } else { $AppDirectory }
@@ -1541,47 +1657,19 @@ if ($LockConfigDir) {
     }
 }
 
+# Every install is checked, the default root and a passed -AppExe or -PythonExe alike, before
+# anything acts (vault BACKLOG #2626). A checkout's venv, which its developers can write, is refused.
+$installProblem = Get-EngineInstallProblem -InstallRoot $AppDirectory -PythonExe $PythonExe -AppExe $AppExe
+if ($installProblem) {
+    throw ("The engine install '$AppDirectory' is not administrator-only: $installProblem. Build " +
+        "it from the engine wheel and set its access list and owner as docs/SERVICE.md 'Install " +
+        "the engine where only administrators can write' shows.")
+}
+
 # AFTER the normalization: Resolve-Nssm copies nssm.exe into -NssmDir, and the service is registered
 # with that path, so a relative one would be resolved against a different directory later.
 $NssmPath = Resolve-Nssm -Provided $NssmPath -NssmDir $NssmDir
 
-# The launcher only names the install, so it is required only while it is what finds the
-# interpreter. With -PythonExe the service's program is already named.
-if (-not $PSBoundParameters.ContainsKey('PythonExe') -and -not (Test-Path $AppExe)) {
-    throw ("Engine executable not found at: $AppExe`nBuild the install root from the engine wheel " +
-        "(docs/SERVICE.md 'Install the engine where only administrators can write'), or pass " +
-        "-AppExe, or name the interpreter with -PythonExe.")
-}
-# The default root must be what its name says. A passed -AppExe is not checked here: refusing one a
-# broad principal can write would end most services run from a checkout, and that waits on an owner
-# ruling. `serve` reports such an install at every start.
-#
-# Get-NssmHomeProblem answers that question for any file, not only nssm.exe: who other than
-# administrators could replace it, through the file or any folder above it.
-#
-# The launcher only names the install. The interpreter is what the service runs and the engine
-# package is what it imports, so each is checked as well when it is there.
-if ($UsesDefaultInstall) {
-    $installFiles = @($AppExe, $PythonExe,
-        (Join-Path $DefaultInstallRoot "Lib\site-packages\messagefoundry\__init__.py"))
-    $installProblem = @($installFiles | Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
-        ForEach-Object { Get-NssmHomeProblem -File $_ } | Where-Object { $_ }) -join "; "
-    if ($installProblem) {
-        throw ("The default install root '$DefaultInstallRoot' is not administrator-only: " +
-            "$installProblem. Set its access list and owner as docs/SERVICE.md 'Install the " +
-            "engine where only administrators can write' shows, or pass -AppExe.")
-    }
-}
-# NOT CHECKED: that this interpreter can import the engine. Finding out would mean running the
-# install's code from this elevated prompt. A wrong -PythonExe shows as ModuleNotFoundError in the
-# service's error log at its first start.
-if (-not $PythonExe -or -not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) {
-    throw ("The Python interpreter the service runs was not found" +
-        $(if ($PythonExe) { " at: $PythonExe" } else { " beside '$AppExe' or one folder up" }) +
-        ".`nThe service runs the interpreter directly, in isolated mode, and not the " +
-        "messagefoundry.exe launcher. Pass -PythonExe with the python.exe of the install the " +
-        "engine is in (docs/SERVICE.md 'The service launch').")
-}
 if ($ServiceConfig -and -not (Test-Path -LiteralPath $ServiceConfig -PathType Leaf)) {
     throw "Service settings file not found at: $ServiceConfig"
 }

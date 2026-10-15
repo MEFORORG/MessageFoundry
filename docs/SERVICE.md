@@ -23,7 +23,8 @@ venv interpreter) and the per-connection firewall openings the service needs.
 1. **The engine, installed where only administrators can write.** The installer's default is
    `C:\Program Files\MessageFoundry\engine`, built from the engine wheel and never editable.
    [Install the engine where only administrators can write](#install-the-engine-where-only-administrators-can-write)
-   builds it. The installer checks that folder and does not build it.
+   builds it. The installer checks that folder and does not build it. It refuses any other
+   install, such as a checkout's venv, that anyone but administrators can write.
 2. **NSSM** — provisioned automatically. `install-service.ps1` keeps the `nssm.exe` the service
    runs in `-NssmDir`, `C:\Program Files\MessageFoundry\nssm` by default. It refuses a folder that
    anyone but administrators can write to or owns, because it runs that file as administrator. It
@@ -66,26 +67,35 @@ change, and the service would run their next edit.
    ```
    `requirements.lock` is the SHA-256-pinned export checked in sync and audited in CI (DEP-1).
    Install the web console wheel the same way if the service serves `/ui`.
-3. Make the folder administrator-only, owner included:
+3. Make the folder and the folder above it administrator-only, owner included:
    ```powershell
-   icacls $Root /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" `
-       "*S-1-5-32-545:(OI)(CI)RX" "*S-1-5-11:(OI)(CI)RX"
+   $Parent = Split-Path -Parent $Root
+   foreach ($Folder in $Parent, $Root) {
+       icacls $Folder /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" `
+           "*S-1-5-32-545:(OI)(CI)RX" "*S-1-5-11:(OI)(CI)RX"
+   }
+   icacls $Parent /setowner "*S-1-5-32-544"
    icacls $Root /setowner "*S-1-5-32-544" /T /C
    ```
    A new folder under Program Files can be owned by the administrator who made it, with full
-   control through `CREATOR OWNER`. The installer refuses the default folder unless only
-   administrators can write the launcher and every folder above it.
+   control through `CREATOR OWNER`. That administrator's own account then counts as another
+   account that can write it.
 
-**A service on a checkout still installs**: pass `-AppExe` with the checkout venv's
-`messagefoundry.exe`. The installer does not check that folder. Whether it should refuse one a broad
-principal can write is an open owner question. `serve` reports such an install at every start
-(see *Lock down the config directory* below).
+**The installer refuses an engine install anyone but administrators can write** (vault BACKLOG
+#2626). That holds for the default root and for one you pass with `-AppExe` or `-PythonExe`. It
+reads the interpreter, the launcher, the package's `__init__.py` and a venv's `pyvenv.cfg`, each
+file and every folder above it. Only administrator principals, such as SYSTEM, Administrators
+and TrustedInstaller, may write them. So at least `Everyone`, `Authenticated Users`,
+`BUILTIN\Users` and the user who owns a checkout are refused. It also refuses an install with no `messagefoundry` folder in
+its `Lib\site-packages`, or with an `__editable__` file for it. That is an editable install, which
+imports the engine from a checkout. **A service can no longer run from a checkout.** To try the
+engine from one, run `messagefoundry serve` from a prompt.
 
 ## Install
 
 ```powershell
 # from repo root, elevated PowerShell
-.\scripts\service\install-service.ps1 -Environment prod -Config D:\hl7\config
+.\scripts\service\install-service.ps1 -Environment prod -Config D:\hl7\config -ServiceConfig D:\hl7\messagefoundry.toml
 ```
 
 `-Config` is required: the config directory the service loads. It used to default to the checkout's
@@ -123,11 +133,11 @@ Defaults:
 | Setting | Default |
 |---|---|
 | Service name | `MessageFoundry` |
-| Engine launcher (`-AppExe`) | `C:\Program Files\MessageFoundry\engine\Scripts\messagefoundry.exe`. It names the install; the service does not run it. The installer refuses the default root when another account can write the launcher, the venv's `python.exe` or the package's `__init__.py`, or a folder above them. It reads no other file, such as the base interpreter a venv's `python.exe` starts; `serve` reports the interpreter and package at start |
+| Engine launcher (`-AppExe`) | `C:\Program Files\MessageFoundry\engine\Scripts\messagefoundry.exe`. It names the install; the service does not run it. The installer refuses any install, the default or a passed one, when another account can write the launcher, the `python.exe` the service runs, the package's `__init__.py` or a venv's `pyvenv.cfg`, or a folder above them. It reads no other file, such as the base interpreter a venv's `python.exe` starts; `serve` reports the interpreter and package at start |
 | Interpreter the service runs (`-PythonExe`) | the `python.exe` beside the launcher, or one folder up |
 | Config dir (`-Config`) | *(required)* |
-| Working directory | the install root; the repository for a passed `-AppExe` |
-| Project root (`-ProjectRoot`, registered as `--project-root`) | the folder above `-Config` for the default install; none for a passed `-AppExe` |
+| Working directory | the install root: the folder above `Scripts` for a venv, else the folder of the `python.exe`. Never the checkout |
+| Project root (`-ProjectRoot`, registered as `--project-root`) | the folder above `-Config` |
 | Service settings (`-ServiceConfig`, registered as an absolute `--service-config`) | `messagefoundry.toml` under the project root, or else the working directory, when it exists. When it does not, the installer refuses |
 | Active environment | *(required — `-Environment`)* |
 | Data dir | `C:\ProgramData\MessageFoundry` |
@@ -153,7 +163,7 @@ Override any of them, e.g.:
 
 ```powershell
 .\scripts\service\install-service.ps1 -Environment prod -Port 9000 -LogLevel WARNING `
-    -Config D:\hl7\config -DataDir D:\MessageFoundry
+    -Config D:\hl7\config -ServiceConfig D:\hl7\messagefoundry.toml -DataDir D:\MessageFoundry
 ```
 
 The install script is idempotent — re-running it reconfigures the existing service.
@@ -237,15 +247,14 @@ Restart-Service MessageFoundry
 curl.exe --cacert C:\ProgramData\MessageFoundry\api-generated-cert.pem https://127.0.0.1:8765/health
 ```
 
-Install the release's `requirements.lock` first when its dependencies changed. A service on a
-checkout's **editable** venv (a passed `-AppExe`) is different: a restart there runs whatever branch
-is checked out. That is a development setup, and `serve` reports it at start.
+Install the release's `requirements.lock` first when its dependencies changed. The installer
+refuses an editable install, so a restart never runs whatever branch a checkout has.
 
 **Reinstall** instead when paths or flags change (port, config dir, data dir) or the service
 definition drifted — the install script is idempotent (it stops and reconfigures in place):
 
 ```powershell
-.\scripts\service\install-service.ps1 -Environment prod -Config D:\hl7\config   # elevated; re-points the exe + AppParameters
+.\scripts\service\install-service.ps1 -Environment prod -Config D:\hl7\config -ServiceConfig D:\hl7\messagefoundry.toml   # elevated; re-points the exe + AppParameters
 Start-Service MessageFoundry
 ```
 
@@ -305,7 +314,7 @@ By default the service now installs under a **least-privilege per-service virtua
 bare install therefore lands on the least-privilege posture with nothing extra to configure:
 
 ```powershell
-.\scripts\service\install-service.ps1 -Environment prod -Config D:\hl7\config   # runs as NT SERVICE\MessageFoundry
+.\scripts\service\install-service.ps1 -Environment prod -Config D:\hl7\config -ServiceConfig D:\hl7\messagefoundry.toml   # runs as NT SERVICE\MessageFoundry
 ```
 
 The engine needs only **read** on the config directory and **read/write** on the data directory, so
@@ -318,14 +327,14 @@ most privileged local account — widens the blast radius of any compromise (a c
 in-process — see *Lock down the config directory* below), so it is now an explicit opt-out:
 
 ```powershell
-.\scripts\service\install-service.ps1 -Environment prod -Config D:\hl7\config -AllowLocalSystem   # opt out to LocalSystem
+.\scripts\service\install-service.ps1 -Environment prod -Config D:\hl7\config -ServiceConfig D:\hl7\messagefoundry.toml -AllowLocalSystem   # opt out to LocalSystem
 ```
 
 To run under a **different** account (a domain gMSA, a dedicated local user, or another virtual
 account), pass `-ServiceAccount` — it always wins over the default:
 
 ```powershell
-.\scripts\service\install-service.ps1 -Environment prod -Config D:\hl7\config -ServiceAccount "NT SERVICE\MessageFoundry"
+.\scripts\service\install-service.ps1 -Environment prod -Config D:\hl7\config -ServiceConfig D:\hl7\messagefoundry.toml -ServiceAccount "NT SERVICE\MessageFoundry"
 ```
 
 ```powershell
@@ -454,8 +463,7 @@ A launcher cannot pass an option to the interpreter it starts, and both options 
   `PYTHONPATH` or `PYTHONHOME` in the service's environment cannot decide what the engine imports.
   Another product's installer can leave one behind, machine-wide. It also keeps the working
   directory and the user's own site directory off the import path. The service's working
-  directory is the install root, or the repository for a passed `-AppExe`, and `python -m` would
-  otherwise search it first.
+  directory is the install root, and `python -m` would otherwise search it first.
 - **`-X disable-remote-debug` turns off the interpreter's remote debugging** (PEP 768), which
   would let another process running as the service account run Python inside the engine. The
   environment variable for it is one of those `-I` ignores, so the option is the only form that
@@ -677,8 +685,9 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     or a `subst` drive gets past them.
   - **It also reads the interpreter and the engine package, and only reports them.** A start whose
     interpreter or `messagefoundry` package folder another account can write logs a WARNING,
-    *"the engine runs code from writable-by-others path ..."*, and goes on. Refusing would end every
-    service run from such a checkout, and that is an open owner question.
+    *"the engine runs code from writable-by-others path ..."*, and goes on. The installer refuses
+    such an install before it registers the service (vault BACKLOG #2626), so the warning is for
+    a start the installer did not set up, such as `serve` from a prompt.
   - **Dev/test escape (never set in production).** Because a default Windows checkout grants
     `BUILTIN\Users` write, set `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1` **and**
     `MEFOR_SECURITY_ENFORCEMENT=warn` in the same environment to downgrade the refusal to a
@@ -711,7 +720,7 @@ can set, so a LocalDumps-configured host still dumps a process that suppressed e
 it. Close it at install time:
 
 ```powershell
-.\install-service.ps1 -Environment prod -Config D:\hl7\config -SuppressCrashDumps
+.\install-service.ps1 -Environment prod -Config D:\hl7\config -ServiceConfig D:\hl7\messagefoundry.toml -SuppressCrashDumps
 ```
 
 It is **opt-in** because it writes `HKLM` keys **by image name**, which affects every process of that

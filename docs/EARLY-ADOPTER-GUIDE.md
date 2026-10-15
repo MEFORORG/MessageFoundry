@@ -335,8 +335,14 @@ required:
 
 ```powershell
 # from an elevated shell
-scripts\service\install-service.ps1 -Environment prod -Config D:\hl7\config -ServiceAccount "NT SERVICE\MessageFoundry"
+scripts\service\install-service.ps1 -Environment prod -Config D:\hl7\config -ServiceConfig D:\hl7\messagefoundry.toml -ServiceAccount "NT SERVICE\MessageFoundry"
 ```
+
+The service runs the engine from `C:\Program Files\MessageFoundry\engine`, built from the engine
+wheel as [SERVICE.md](SERVICE.md#install-the-engine-where-only-administrators-can-write) shows. The
+installer refuses an install anyone but administrators can write, and an editable one, so a service
+cannot run from a checkout. It also needs a settings file: pass `-ServiceConfig`, or put
+`messagefoundry.toml` in the folder above `-Config`, or it refuses.
 
 The installer is idempotent, auto-downloads a SHA-256-pinned NSSM, bakes absolute `serve` paths into
 the service, and (with `-ServiceAccount`) auto-grants config-read + data-dir-read/write to the
@@ -350,8 +356,8 @@ engine writes, such as a File connection's, to `NT SERVICE\MessageFoundry` by na
 > **WARNING: Pinned-wheel operational model.** With a pinned-version install (§4.1), the running service
 > loads the **installed wheel** — a known, pinned version, not a moving checkout. Picking up a new
 > engine version is a deliberate run of the §13 upgrade runbook, which pins the new version, so every
-> upgrade is an explicit, reviewable act. *(A contributor running the **editable** install instead
-> serves whatever branch is checked out — treat that checkout as the release artifact; see §13.)*
+> upgrade is an explicit, reviewable act. The installer refuses an **editable** install, so a service
+> never serves whatever branch a checkout has (vault BACKLOG #2626).
 
 ### 4.5 Provision the first administrator
 
@@ -816,9 +822,9 @@ for a clean drain. Always **drain → stop → back up → change → restart
 2. **Stop** the service (graceful).
 3. **Back up** the store **and** the encryption key (§10).
 4. **Bump the pinned engine version:** update the pin in your config repo's `requirements.txt`
-   (`messagefoundry==<new>`) and `pip install "messagefoundry==<new>"` into the deployment venv. *(A
-   contributor on the **editable** install instead pulls the target commit/tag and `pip install -e .` —
-   treat that checkout as the release artifact; §4.4.)*
+   (`messagefoundry==<new>`) and `pip install "messagefoundry==<new>"` into the deployment venv, the
+   service's install root. *(A contributor who builds from a checkout builds a wheel at the target
+   commit/tag and installs it there; the installer refuses an editable install, §4.4.)*
 5. **Re-validate:** run `messagefoundry check` against your config (and `ruff`/`mypy`/`pytest` too if
    you develop the engine).
 6. **Restart** and **verify** (`/health`, "wiring started" banner, `/status`).
@@ -828,8 +834,8 @@ for a clean drain. Always **drain → stop → back up → change → restart
   to a known-good `--config` directory (confined to the allow-listed reload roots). Keep your last
   known-good config dir available.
 - **Engine rollback:** re-pin the prior version (`pip install "messagefoundry==<prev>"`) → restart
-  (same runbook above). *(Contributors on the editable install: `git checkout` the prior commit/tag →
-  reinstall → restart.)*
+  (same runbook above). *(Contributors building from a checkout: build a wheel at the prior
+  commit/tag → install it into the install root → restart.)*
 - **WARNING: Schema/store-level changes are not trivially reversible** against a populated store given the
   greenfield-only posture (no in-place migration). Plan code/config rollback as your primary path;
   use **dead-letter replay** to recover messages that a bad transform stranded before the rollback.
