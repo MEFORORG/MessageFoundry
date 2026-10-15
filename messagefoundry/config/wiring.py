@@ -8737,9 +8737,11 @@ def untrusted_install_paths() -> list[str]:
     """Why the interpreter or the package folder fails the config-source policy, one line each, or
     nothing when both pass. **Reported, never refused** (vault BACKLOG #2626 step 3).
 
-    The installer refuses such an install before it registers a service (#2626 step 1), so a
-    service it set up never reaches this report. A start it did not set up, such as ``serve`` from
-    a prompt in a checkout, is named here and goes on. Refusing at start is #2626 step 3."""
+    The installer refuses an install whose interpreter, package ``__init__.py`` or
+    ``__pycache__``, or a folder above one, another account can write (#2626 step 1). It reads them
+    at install time, so this report is what catches a change after it, and a start the installer
+    did not set up, such as ``serve`` from a prompt in a checkout. Refusing at start is #2626 step
+    3."""
     reasons: list[str] = []
     _check_trusted_paths(
         install_trust_paths(), lead="the engine runs code from", refuse=reasons.append

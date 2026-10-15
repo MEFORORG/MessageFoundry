@@ -244,7 +244,8 @@ def test_the_real_acl_reading_refuses_a_folder_in_the_users_profile(tmp_path: Pa
         ),
         tmp_path,
     )
-    assert out.strip(), "the real reading passed a venv in the user's temp folder"
+    # A holder on a folder of the chain, not a missing package or an unread listing.
+    assert " on '" in out, f"the real reading did not name a broad holder: {out!r}"
 
 
 def test_python_exe_alone_needs_no_launcher() -> None:

@@ -103,7 +103,7 @@ poll_seconds = 5
 ```
 
 When a key is absent the tray fills it in from sensible defaults and from the service's own NSSM
-registry entry (`AppDirectory` → repo path, `AppParameters` → host/port, `AppStdout` → log path), which a standard
+registry entry (`AppParameters` → host/port and the `--project-root` repo path, else `AppDirectory` → repo path, `AppStdout` → log path), which a standard
 interactively-logged-on user can read without elevation. Registry values are treated as untrusted
 hints (validated, never executed).
 
@@ -128,9 +128,11 @@ To read a log that lives on a share, copy it to a local drive first. One gap is 
 or resolving a local symbolic link that points at a share contacts that share before the tray
 refuses it. Planting one needs write access to the log's own folder.
 
-**"Open Repo in VS Code" opens the wrong folder?** By default `repo_path` falls back to the *engine
-service's* install directory (its NSSM `AppDirectory`). To open your own config/conversion estate
-instead, set `repo_path` in `tray.toml` (edit it via the menu) and restart the tray.
+**"Open Repo in VS Code" opens the wrong folder?** By default `repo_path` is the service's
+registered `--project-root`, which the installer sets to the folder above `-Config`. With none, it
+falls back to the *engine service's* install directory (its NSSM `AppDirectory`). To open your own
+config/conversion estate instead, set `repo_path` in `tray.toml` (edit it via the menu) and restart
+the tray.
 
 **How "Open Repo in VS Code" starts the editor.** The tray finds the `code` command, then starts
 the editor program itself: `Code.exe`, one folder above the `bin` folder that holds `code.cmd`. It

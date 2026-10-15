@@ -42,14 +42,13 @@ param(
     # samples\config, a demo graph in a folder its developers can write (vault BACKLOG #2626).
     [string]$Config,
     # The service settings file (messagefoundry.toml), registered as an absolute --service-config.
-    # Without it, the installer registers <ProjectRoot or working directory>\messagefoundry.toml
-    # when that file exists, and refuses when it does not: `serve` as the service refuses to start
+    # Without it, the installer registers <ProjectRoot>\messagefoundry.toml, or the working
+    # directory's when -Config is a drive root, when that file exists, and refuses when it does not: `serve` as the service refuses to start
     # with no --service-config (vault BACKLOG #2626).
     [string]$ServiceConfig,
     # The config-repo root the value file environments\<env>.toml resolves under, registered as
-    # --project-root. Without it, a service on the default install root uses the folder above
-    # -Config, the layout docs/INSTALL-GUIDE.md shows, and a service on a passed -AppExe uses its
-    # working directory, as before.
+    # --project-root. Without it, the installer uses the folder above -Config, the layout
+    # docs/INSTALL-GUIDE.md shows, for every install (vault BACKLOG #2626).
     [string]$ProjectRoot,
     [string]$DbPath,
     [string]$DataDir = "C:\ProgramData\MessageFoundry",
@@ -1339,8 +1338,8 @@ function Get-EngineInstallProblem {
           hook for it is there. An editable install imports the engine from a checkout, which its
           developers can write, so the service would run their next edit.
         - Someone other than administrators could replace the interpreter the service runs, the
-          launcher, the package's __init__.py or a venv's pyvenv.cfg, through the file or any
-          folder above it. Get-NssmHomeProblem reads that, the same reading that guards nssm.exe.
+          launcher, the package's __init__.py or __pycache__ folder or a venv's pyvenv.cfg,
+          through the file or any folder above it. Get-NssmHomeProblem reads that, the same reading that guards nssm.exe.
           It refuses every principal outside SYSTEM, Administrators and three others, so it refuses
           Everyone, Authenticated Users and BUILTIN\Users, and the user who owns a checkout.
 
@@ -1356,8 +1355,9 @@ function Get-EngineInstallProblem {
     $sitePackages = Join-Path $InstallRoot "Lib\site-packages"
     $package = Join-Path $sitePackages "messagefoundry\__init__.py"
     if (-not (Test-Path -LiteralPath $package -PathType Leaf)) {
-        return ("the engine package is not installed in it: '$package' is missing. An editable " +
-            "install leaves it out and imports the engine from a checkout")
+        return ("the engine package is not in its site-packages: '$package' is missing. An " +
+            "editable install, a `pip install --user` copy and a package installed elsewhere all " +
+            "leave it out")
     }
     # The markers messagefoundry/integrity.py's _declares_editable reads, which `serve` reports: an
     # __editable__ hook, direct_url.json declaring dir_info.editable, or a RECORD row naming an
@@ -1366,10 +1366,16 @@ function Get-EngineInstallProblem {
     # The engine's own hooks only: __editable__.messagefoundry-<ver>.pth and
     # __editable___messagefoundry_<ver>_finder.py. A sibling such as messagefoundry_webconsole is
     # another distribution, and naming it as the engine would send the operator to the wrong wheel.
-    $editable = @(Get-ChildItem -LiteralPath $sitePackages -Filter '__editable__*' -Force -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '^__editable__(\.messagefoundry-|_+messagefoundry_[0-9])' } |
-        ForEach-Object { $_.Name })
-    foreach ($distInfo in @(Get-ChildItem -LiteralPath $sitePackages -Filter 'messagefoundry-*.dist-info' -Directory -Force -ErrorAction SilentlyContinue)) {
+    # Each read refuses when it fails: an unread marker cannot be shown absent.
+    try {
+        $editable = @(Get-ChildItem -LiteralPath $sitePackages -Filter '__editable__*' -Force -ErrorAction Stop |
+            Where-Object { $_.Name -match '^__editable__(\.messagefoundry-|_+messagefoundry_[0-9])' } |
+            ForEach-Object { $_.Name })
+        $distInfos = @(Get-ChildItem -LiteralPath $sitePackages -Filter 'messagefoundry-*.dist-info' -Directory -Force -ErrorAction Stop)
+    } catch {
+        return "its '$sitePackages' could not be listed ($($_.Exception.Message))"
+    }
+    foreach ($distInfo in $distInfos) {
         $directUrl = Join-Path $distInfo.FullName "direct_url.json"
         if (Test-Path -LiteralPath $directUrl -PathType Leaf) {
             try {
@@ -1381,15 +1387,20 @@ function Get-EngineInstallProblem {
         }
         $record = Join-Path $distInfo.FullName "RECORD"
         if (Test-Path -LiteralPath $record -PathType Leaf) {
-            $rows = @(Get-Content -LiteralPath $record -ErrorAction SilentlyContinue | ForEach-Object {
-                (($_ -split ',')[0] -split '[\\/]')[-1] } |
+            try { $lines = @(Get-Content -LiteralPath $record -ErrorAction Stop) } catch {
+                return "its '$record' could not be read ($($_.Exception.Message))"
+            }
+            $rows = @($lines | ForEach-Object { (($_ -split ',')[0] -split '[\\/]')[-1] } |
                 Where-Object { $_ -like '__editable__*' -or $_ -like '*.pth' -or $_ -like '*_editable_impl*' })
             if ($rows) { $editable += "$($distInfo.Name)\RECORD names $($rows -join ', ')" }
         }
     }
     if ($editable) { return "it holds an editable install of the engine: $($editable -join '; ')" }
-    # The interpreter and the package are known to exist by now, so the list is never empty.
-    $files = @(@($PythonExe, $package, $AppExe, (Join-Path $InstallRoot "pyvenv.cfg")) |
+    # The interpreter and the package are known to exist by now, so the list is never empty. The
+    # package's __pycache__ is read too, as `serve`'s install_trust_paths reads it: a cache file
+    # there runs in place of the source beside it.
+    $cache = Join-Path (Split-Path -Parent $package) "__pycache__"
+    $files = @(@($PythonExe, $package, $cache, $AppExe, (Join-Path $InstallRoot "pyvenv.cfg")) |
         Where-Object { $_ -and (Test-Path -LiteralPath $_) })
     return (Get-NssmHomeProblem -File $files)
 }
@@ -1561,7 +1572,7 @@ if ($PythonExe) { $PythonExe = Resolve-AbsolutePath $PythonExe }
 else { $PythonExe = Get-EngineInterpreter -AppExe $AppExe }
 # The launcher only names the install, so it is required only while it is what finds the
 # interpreter. With -PythonExe the service's program is already named.
-if (-not $PSBoundParameters.ContainsKey('PythonExe') -and -not (Test-Path $AppExe)) {
+if (-not $PSBoundParameters.ContainsKey('PythonExe') -and -not (Test-Path -LiteralPath $AppExe)) {
     throw ("Engine executable not found at: $AppExe`nBuild the install root from the engine wheel " +
         "(docs/SERVICE.md 'Install the engine where only administrators can write'), or pass " +
         "-AppExe, or name the interpreter with -PythonExe.")

@@ -93,7 +93,9 @@ class TrayConfig:
 class ServiceRegistryInfo:
     """The NSSM ``Parameters`` values relevant to discovery (all optional, all untrusted)."""
 
-    app_directory: str | None = None  # repo root (nssm AppDirectory) → repo_path hint
+    # The service's working directory (nssm AppDirectory): the engine install root since vault
+    # BACKLOG #2626, so it is the repo_path hint only when no --project-root is registered.
+    app_directory: str | None = None
     app_parameters: str | None = None  # `serve ... --host H --port P ...` → engine_url hint
     app_stdout: str | None = None  # service.out.log path (nssm AppStdout) → log_path hint
 
@@ -255,6 +257,7 @@ def _iter_options(app_parameters: str, wanted: frozenset[str]) -> Iterator[tuple
 
 _SERVE_BIND_FLAGS = frozenset({"--host", "--port"})
 _SERVE_CONFIG_FLAGS = frozenset({"--service-config"})
+_SERVE_PROJECT_ROOT_FLAGS = frozenset({"--project-root"})
 _SERVE_DB_FLAGS = frozenset({"--db"})
 _SERVE_ROOT_FLAGS = frozenset({"--project-root"})
 
@@ -287,6 +290,15 @@ def parse_service_config_arg(app_parameters: str) -> str | None:
     that the engine's bind speaks https (there is no ``serve`` TLS *flag* to sniff).
     """
     return _last_path_option(app_parameters, _SERVE_CONFIG_FLAGS)
+
+
+def parse_project_root_arg(app_parameters: str) -> str | None:
+    """The ``serve --project-root <path>`` value, or ``None`` when the flag is absent/hostile.
+
+    The installer registers it, and it is the config repo, where the service's working directory is
+    the engine install root (vault BACKLOG #2626).
+    """
+    return _last_path_option(app_parameters, _SERVE_PROJECT_ROOT_FLAGS)
 
 
 def _last_path_option(app_parameters: str, flags: frozenset[str]) -> str | None:
@@ -446,7 +458,11 @@ def compose_config(
         url_hint = build_engine_url(host_hint, port_hint, tls=engine_tls)
         if url_hint is not None:
             engine_url = url_hint
-        repo_path = _clean_path_hint(reg.app_directory) or repo_path
+        repo_path = (
+            parse_project_root_arg(reg.app_parameters or "")
+            or _clean_path_hint(reg.app_directory)
+            or repo_path
+        )
         log_path = _clean_path_hint(reg.app_stdout) or log_path
 
     # TOML overrides.
