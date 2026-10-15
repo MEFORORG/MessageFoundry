@@ -2269,6 +2269,11 @@ class AuthStore(Protocol):
 
     async def get_totp_secret(self, user_id: str) -> str | None: ...
 
+    # BACKLOG #3510: decrypt a ``users.totp_secret`` cell the caller already holds, from a record
+    # whose seal it checked, so the sign-in code is checked against that record's secret and not a
+    # second, unchecked read. ``None`` for no cell. No I/O.
+    def open_totp_secret(self, user_id: str, cell: str | None) -> str | None: ...
+
     # CONDITIONAL (BACKLOG #2224): writes only where a secret is staged (``totp_secret IS NOT NULL``)
     # and TOTP is still off, in the same UPDATE, and returns whether a row was written. An
     # ``admin_reset_mfa`` that clears the secret, or a second confirm that enables first, between

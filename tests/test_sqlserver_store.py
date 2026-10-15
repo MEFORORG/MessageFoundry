@@ -5138,6 +5138,11 @@ async def test_the_rekey_audit_command_is_gone_server(store, capsys) -> None:
     assert "invalid choice" in capsys.readouterr().err
 
 
+#: A synthetic TOTP secret for the rotate-key leg (BACKLOG #3510), derived so a secret scanner
+#: reading the source sees no key-shaped literal.
+_ROTATED_TOTP_SECRET = base64.b32encode(b"rotate-key-user-row!").decode("ascii")
+
+
 async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch, tmp_path) -> None:
     """CLI-24: the ``rotate-key`` CLI wrapper (resolve_active_key + keyring from env + open_store dispatch
     + reencrypt_to_active) has only ever run against SQLite ``--db``; the underlying store method is
@@ -5147,7 +5152,8 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
     leftover → no CipherError). After rotation every ciphertext carries the new active key's fingerprint
     and the message decrypts under key_b ALONE (retired key dropped) — end-to-end proof."""
     from messagefoundry.__main__ import main
-    from messagefoundry.config.settings import load_settings
+    from messagefoundry.auth.service import AuthService
+    from messagefoundry.config.settings import AuthSettings, load_settings
     from messagefoundry.store.crypto import AesGcmCipher
     from messagefoundry.store.sqlserver import SqlServerStore
 
@@ -5165,6 +5171,12 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
     seed = await SqlServerStore.open(settings, cipher=make_cipher(key_a))
     try:
         mid = await seed.enqueue_message(channel_id="ch", raw=RAW, deliveries=[("d", RAW)])
+        # BACKLOG #3510: a user row, so the leg proves the sealed record and its TOTP secret come
+        # through the rotation too, not only the message cells.
+        await seed.create_user(
+            user_id="u-rot", username="rot", auth_provider="local", password_generated=False
+        )
+        await seed.set_totp_secret("u-rot", secret=_ROTATED_TOTP_SECRET)
     finally:
         await seed.close()
 
@@ -5187,6 +5199,12 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
         for r in blobs:
             assert r["v"].startswith(MARKER_PREFIX)
             assert r["v"].startswith(cipher_b.active_marker_prefix)  # active key, active format
+        # The account resolves under key_b alone, re-sealed under it, its secret re-encrypted.
+        sealer = verify.row_sealer()
+        user = await AuthService(verify, AuthSettings())._load_user("u-rot")
+        assert sealer is not None and user is not None and user.row is not None
+        assert sealer.is_active(user.row.authz_seal)
+        assert await verify.get_totp_secret("u-rot") == _ROTATED_TOTP_SECRET
     finally:
         await verify.close()
 

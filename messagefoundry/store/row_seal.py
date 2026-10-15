@@ -10,6 +10,12 @@ It is a MAC, not a ciphertext. An ``mfenc:`` value is a sealed CELL (encrypted);
 is a sealed ROW (authenticated). The row stays readable plaintext; the seal makes a change to it that
 was not made through the store's own write helper detectable by any process that holds the key.
 
+**Except a rollback** (BACKLOG #3510). A seal covers one record and nothing outside it counts the
+record's versions, so an earlier copy that the helper sealed, put back whole with its seal (and, for
+a user, its role rows), verifies. That restores whatever the copy held: a removed role, an old
+password, a cleared lockout. The seal proves a record was written by the helper, not that it is the
+latest one.
+
 **Whose key.** The seal key is derived from the store key's authorization root and the store id
 (:func:`~messagefoundry.store.crypto.derive_row_seal_key`). The key id in a stored seal is a one-way
 digest of that derived key, so it changes when either input changes. A process with no in-process

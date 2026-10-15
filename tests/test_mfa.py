@@ -2353,11 +2353,12 @@ async def test_a_corrupt_stored_secret_is_a_padded_wrong_code(
         async def record(deadline: float) -> None:
             padded.append(deadline)
 
-        async def broken(_user_id: str) -> str:
+        # BACKLOG #3510: the secret is decrypted from the checked record, not read again.
+        def broken(_user_id: str, _cell: str | None) -> str:
             raise CipherError("synthetic: the stored secret will not decrypt")
 
         monkeypatch.setattr(service_module, "_sleep_until", record)
-        monkeypatch.setattr(store, "get_totp_secret", broken)
+        monkeypatch.setattr(store, "open_totp_secret", broken)
         assert not (await service.login(ADMIN_USERNAME, password, totp_code=steps.next_code())).ok
         assert len(padded) == 1
         user = await store.get_user(identity.user_id)

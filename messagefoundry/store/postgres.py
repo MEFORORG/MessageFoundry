@@ -8898,9 +8898,11 @@ class PostgresStore:
 
     async def get_totp_secret(self, user_id: str) -> str | None:
         d = await self._fetchone("SELECT totp_secret FROM users WHERE id=$1", user_id)
-        if not d or d["totp_secret"] is None:
-            return None
-        return self._dec(d["totp_secret"], aad=cell_aad("users", "totp_secret", user_id))
+        return self.open_totp_secret(user_id, d["totp_secret"] if d else None)
+
+    def open_totp_secret(self, user_id: str, cell: str | None) -> str | None:
+        """See :meth:`MessageStore.open_totp_secret` (BACKLOG #3510)."""
+        return self._dec(cell, aad=cell_aad("users", "totp_secret", user_id))
 
     async def enable_totp(
         self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
