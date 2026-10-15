@@ -43,6 +43,14 @@ SESSION_KIND: Final = "session"
 #: ``user_roles`` rows and a digest of its passkeys, under one seal.
 USER_KIND: Final = "user"
 
+#: The kind a ``roles`` row is sealed under: one seal per role definition, over the whole row.
+ROLE_KIND: Final = "role"
+
+#: The kind a directory map is sealed under: one seal per map, over its sorted pairs, stored in
+#: ``authority_set_seal``. The map's name is inside the sealed bytes, so one map's seal never
+#: verifies for another.
+ADSET_KIND: Final = "adset"
+
 #: The label a passkey digest is computed under. Not a seal kind: the digest is a plain SHA-256 that
 #: the user seal covers, so it needs no key of its own.
 PASSKEYS_LABEL: Final = "passkeys"

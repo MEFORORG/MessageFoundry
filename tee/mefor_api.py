@@ -8,19 +8,23 @@ message's per-destination transformed payloads. Uses :mod:`urllib.request` delib
 standalone (stdlib + ``aiosqlite``), the same dependency-minimal principle as the vendored MLLP/HL7
 codecs: a few authenticated GETs to a default-localhost engine need only a timeout, a bearer-token
 header and an optional TLS context. (mTLS / rich retry against a remote TLS engine would be the trigger
-to revisit a richer HTTP client — deferred, not built.)
+to revisit a richer HTTP client — deferred, not built.) The opener also dials a loopback engine past
+any proxy and follows no redirect (BACKLOG #2708); a replacement client must keep both, or the token
+can reach a proxy again.
 
 The ``/messages/{id}/outbound`` body is PHI; callers handle it under the test-data-only guardrail.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import urllib.error
 import urllib.request
 from collections.abc import Callable
 from ssl import SSLContext
 from typing import Any
+from urllib.parse import urlsplit
 
 from tee.correlate import MeforOutput
 
@@ -30,6 +34,53 @@ JsonGetter = Callable[[str], dict[str, Any]]
 
 class MeforApiError(RuntimeError):
     """A MEFOR API request failed (transport, auth, throttle, or a non-2xx status)."""
+
+
+def _is_loopback_host(host: str | None) -> bool:
+    """Whether ``host`` names this box, read from the URL alone with no DNS lookup (BACKLOG #2708).
+
+    A copy of ``is_never_proxied_host`` in ``messagefoundry/transports/bounded_read.py``, which says
+    which hosts that is. The tee imports no ``messagefoundry``, so it carries its own;
+    ``tests/test_tee_mefor_api.py`` compares the two on a sample of hosts."""
+    if not host:
+        return False
+    host = host.lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+class _LoopbackDirect(urllib.request.ProxyHandler):
+    """urllib's proxy handler, except that a loopback engine is dialled direct (BACKLOG #2708).
+
+    The stock handler sends ``http://127.0.0.1`` to ``HTTP_PROXY``, or to the system proxy, unless
+    ``NO_PROXY`` names the host. That proxy would read the bearer token in clear. The engine's own
+    openers dial a loopback host direct (``LoopbackDirectProxyHandler``); this copy keeps the tee on
+    the standard library. An off-box engine still goes through a set proxy."""
+
+    def proxy_open(self, req: urllib.request.Request, proxy: str, type: str) -> Any:  # noqa: A002
+        try:
+            host = urlsplit(req.full_url).hostname
+        except ValueError:
+            host = None  # a URL nobody can read a host from; urllib's own handling decides
+        if _is_loopback_host(host):
+            return None  # not rewritten, so the scheme's own handler dials the host itself
+        return super().proxy_open(req, proxy, type)
+
+
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow no redirect (BACKLOG #2708). urllib copies the ``Authorization`` header onto the new
+    request, so a 3xx to an off-box host would carry the token there, through any set proxy.
+    Returning ``None`` makes urllib raise the 3xx as an ``HTTPError``. The engine's openers do the
+    same (``NoRedirectHandler``)."""
+
+    def redirect_request(
+        self, req: urllib.request.Request, fp: Any, code: int, msg: str, headers: Any, newurl: str
+    ) -> None:
+        return None
 
 
 def make_getter(
@@ -43,6 +94,10 @@ def make_getter(
     TLS context. Raises :class:`MeforApiError` on any transport/HTTP error — a 429 anti-automation
     throttle is surfaced verbatim (narrow ``--since``/``--limit`` and re-run)."""
     base = base_url.rstrip("/")
+    # A hand-built opener must be handed the context, or it uses the default trust store instead.
+    opener = urllib.request.build_opener(
+        _LoopbackDirect(), _RefuseRedirect(), urllib.request.HTTPSHandler(context=ssl_context)
+    )
 
     def get(path: str) -> dict[str, Any]:
         url = base + path
@@ -53,12 +108,15 @@ def make_getter(
             # `base_url` is operator config (default localhost), so the URL scheme is fixed by the
             # operator and never derived from message/HL7 content — B310's non-http(s)-scheme concern
             # does not apply (a few authenticated GETs to the local engine API).
-            with urllib.request.urlopen(  # nosec B310
-                req, timeout=timeout, context=ssl_context
-            ) as resp:
+            with opener.open(req, timeout=timeout) as resp:  # nosec B310
                 payload = resp.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
-            raise MeforApiError(f"GET {path} -> HTTP {exc.code} {exc.reason}") from exc
+            # The Location is left out: it names a host, and an operator may paste this error.
+            redirected = 300 <= exc.code < 400
+            hint = (
+                " (redirects are not followed; give the engine's own address)" if redirected else ""
+            )
+            raise MeforApiError(f"GET {path} -> HTTP {exc.code} {exc.reason}{hint}") from exc
         except urllib.error.URLError as exc:
             raise MeforApiError(f"GET {path} failed: {exc.reason}") from exc
         try:

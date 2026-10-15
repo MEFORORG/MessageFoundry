@@ -60,6 +60,7 @@ from messagefoundry.pipeline.alerts import (
     crl_expiry_detail,
     crl_reload_refused_detail,
     intake_pause_detail,
+    remote_debug_refused_detail,
 )
 
 # Not lazy, unlike the two transports imports below: the shared webhook opener is built at import.
@@ -1371,6 +1372,24 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # event type, so each detector routes and throttles on its own; the subject stands in for
         # "connection". A count and a fixed sentence only: never a body, an id or a row's detail.
         self._emit({"type": signal, "connection": name, "count": count, "detail": detail})
+
+    def remote_debug_refused(self, name: str, *, count: int, total: int) -> None:
+        # vault BACKLOG #2742: the remote-debugging guard refused injected scripts.
+        # `remote_debug:refused[@<process>]` stands in for "connection", so each engine process is
+        # its own instance and throttle key. Two counts and fixed words: the injecting process
+        # chooses the script's file name, so it is never passed in. `detail` is what the
+        # instance's reason column shows, built by the helper the logging sink uses. The watch
+        # raises this at most once per pass. A second raise inside the cooldown updates the
+        # instance and does not page again.
+        self._emit(
+            {
+                "type": "remote_debug_refused",
+                "connection": name,
+                "count": count,
+                "total": total,
+                "detail": remote_debug_refused_detail(count=count, total=total),
+            }
+        )
 
     def set_store(self, store: _AlertStateStore | None) -> None:
         """Wire (or clear) the alert-state store (ADR 0044, #56). The lifespan calls this once the store

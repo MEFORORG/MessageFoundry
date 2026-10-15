@@ -128,23 +128,36 @@ from messagefoundry.keyed_lock import KeyedLock as _KeyedLock
 from messagefoundry.keyed_lock import hold_keyed_lock as _hold_keyed_lock
 from messagefoundry.store.base import AdminStore, store_driver_errors
 from messagefoundry.store.crypto import MARKER_PREFIX, CipherError
-from messagefoundry.store.row_seal import SESSION_KIND, USER_KIND, RowSealer, RowSealError
+from messagefoundry.store.row_seal import (
+    ADSET_KIND,
+    ROLE_KIND,
+    SESSION_KIND,
+    USER_KIND,
+    RowSealer,
+    RowSealError,
+)
 from messagefoundry.store.store import (
+    AD_ROLE_MAP,
+    AD_SCOPE_MAP,
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
+    AdMap,
     AdminRemoval,
     AuditAppend,
     ChannelScopeSource,
     FederatedUnbind,
     LockoutCounter,
     LockoutIncrement,
+    RoleRow,
     SessionRecord,
     UserAuthzRecord,
     UserRecord,
     VerifiedUser,
     WebAuthnCredential,
+    ad_map_seal_ok,
     passkey_digest,
     require_notify_email,
+    role_seal_ok,
     seed_notify_email,
     session_seal_ok,
     session_sealed_by_retired_key,
@@ -1812,12 +1825,6 @@ class CustomRoleInfo:
     display_name: str
     description: str | None
     permissions: frozenset[Permission]
-
-
-def _row_builtin(row: Any) -> bool:
-    """Whether a ``roles`` row is a built-in. Tolerant of each backend's truthy representation of the
-    ``builtin`` column (SQLite ``int`` 0/1, Postgres ``bool``, SQL Server ``bit``)."""
-    return bool(row["builtin"])
 
 
 def _roles_from_ids(ids: Iterable[str]) -> frozenset[Role]:
@@ -4541,7 +4548,7 @@ class AuthService:
         # ADR 0184 part 2 and AC-2: RE-RESOLVE THE DIRECTORY PRINCIPAL FROM THE BOUND ROW, never from
         # the claim. Carrying on with a principal resolved from the claimed username is the half-done
         # re-ordering the ADR warns about: `_upsert_ad_user` would touch the claimed name's row and
-        # `roles_for_ad_groups` would write that name's groups onto the bound account. The row's own
+        # `_ad_roles_for_groups` would write that name's groups onto the bound account. The row's own
         # object id is handed over as the reconciler hands it, so a directory-side rename still
         # resolves (BACKLOG #1532). The branch above guarantees the row carries one, so this
         # re-resolve is never keyed on the name alone (BACKLOG #2027).
@@ -5007,7 +5014,7 @@ class AuthService:
             return await self._step_up_refused(
                 "session_gone", actor=actor, client=client, return_to=return_to, lost=True
             )
-        if not set(fresh.role_ids) <= await self._store.roles_for_ad_groups(principal.groups):
+        if not set(fresh.role_ids) <= await self._ad_roles_for_groups(principal.groups):
             return await self._step_up_refused(
                 DIRECTORY_ROLES_DEMOTED, actor=actor, client=client, return_to=return_to
             )
@@ -5349,7 +5356,7 @@ class AuthService:
             )
             await self._directory_reject_audit(principal.username, "oidc", reason, client=client)
             return LoginOutcome(ok=False, error="federated sign-in failed", reason=reason)
-        role_ids = sorted(await self._store.roles_for_ad_groups(principal.groups))
+        role_ids = sorted(await self._ad_roles_for_groups(principal.groups))
         previous = set(user.role_ids)
         await self._store.set_user_roles(user.id, role_ids, assigned_by="ad-sync")
         # Owner ruling 2026-10-13 (#3229): the directory stays authoritative, so a sync that takes
@@ -5542,9 +5549,7 @@ class AuthService:
                 stored_scope=user.channel_scope,
                 stored_source=user.channel_scope_source,
                 # An administrator's groups are not read: the decision ignores them.
-                mapped=frozenset()
-                if administrator
-                else frozenset(await self._store.channels_for_ad_groups(groups)),
+                mapped=frozenset() if administrator else await self._ad_channels_for_groups(groups),
                 administrator=administrator,
             )
         )
@@ -6289,6 +6294,10 @@ class AuthService:
         current_roles: dict[str, frozenset[str]] = {}
         target_roles: dict[str, frozenset[str]] = {}
         scopes: dict[str, channel_scope.ScopeInput] = {}
+        # Both directory maps read once for the pass, each through its seal check (BACKLOG #2592),
+        # so every account in the pass is judged against one version of each map.
+        role_map = await self._ad_map(AD_ROLE_MAP)
+        scope_map = await self._ad_map(AD_SCOPE_MAP)
         for probe in probes:
             if probe.outcome is not reconcile.ProbeOutcome.PRESENT:
                 continue
@@ -6300,7 +6309,7 @@ class AuthService:
             # the loader, so the roles judged are the ones the account's seal covers (#2592).
             row = await self._load_user(probe.user_id)
             current_roles[probe.user_id] = frozenset(() if row is None else row.role_ids)
-            target = frozenset(await self._store.roles_for_ad_groups(probe.groups))
+            target = frozenset(role_map.values_for(probe.groups))
             target_roles[probe.user_id] = target
             if row is None:
                 continue  # deleted mid-pass: nothing to decide, and the role re-diff still runs
@@ -6311,9 +6320,7 @@ class AuthService:
                 stored_scope=row.channel_scope,
                 stored_source=row.channel_scope_source,
                 mapped=(
-                    frozenset()
-                    if administrator
-                    else frozenset(await self._store.channels_for_ad_groups(probe.groups))
+                    frozenset() if administrator else frozenset(scope_map.values_for(probe.groups))
                 ),
                 administrator=administrator,
             )
@@ -8007,6 +8014,99 @@ class AuthService:
             {"kind": part, "user_id": user_id},
         )
 
+    # --- the role and directory-map loaders (BACKLOG #2592) ----------------------------------------
+
+    async def _load_role(self, role_id: str) -> RoleRow | None:
+        """The ``roles`` row ``role_id`` names, its integrity seal checked, or ``None``. With
+        :meth:`_load_custom_roles`, :meth:`_custom_role_held` and :meth:`_ad_map`, the ONLY
+        readers of the store's role and AD role-map readers in this service;
+        ``tests/test_role_seal.py`` holds that. A row that fails is reported and read as absent, so
+        it grants nothing."""
+        found = await self._store.get_role(role_id)
+        if found is None:
+            return None
+        row = RoleRow.from_mapping(found)
+        if role_seal_ok(self._store.row_sealer(), row):
+            return row
+        await self._role_seal_failed(row.id)
+        return None
+
+    async def _load_custom_roles(self) -> list[tuple[RoleRow, bool]]:
+        """Every custom role row, each with whether its seal holds. One that fails is reported, and
+        listed with no permissions by the caller, so an administrator can still see it to save it
+        again or delete it, and never sees, or re-saves, a value written outside the store."""
+        sealer = self._store.row_sealer()
+        out: list[tuple[RoleRow, bool]] = []
+        for found in await self._store.list_roles():
+            row = RoleRow.from_mapping(found)
+            if not is_custom_role_id(row.id):
+                continue  # a built-in resolves from code; its row grants nothing
+            holds = role_seal_ok(sealer, row)
+            if not holds:
+                await self._role_seal_failed(row.id)
+            out.append((row, holds))
+        return out
+
+    async def _custom_role_held(self, role_id: str) -> bool:
+        """Whether a custom role row holds ``role_id``, sealed or not (BACKLOG #2592). An existence
+        question, as :meth:`_username_held` is: a role that fails its seal can still be saved again,
+        which re-seals it, or deleted. Only a ``bool`` leaves here, never the unchecked row. A row
+        whose ``builtin`` column is set is not a custom role, whatever its id says: the store's own
+        delete and its unsealed count read that column, so this answer must match theirs."""
+        if not is_custom_role_id(role_id):
+            return False
+        found = await self._store.get_role(role_id)
+        return found is not None and not bool(found["builtin"])
+
+    async def _role_seal_failed(self, role_id: str) -> None:
+        """Report a custom role whose row failed its integrity seal (BACKLOG #2592), through
+        :meth:`_report_seal_failure`, keyed per role. The role grants nothing; its holders keep
+        their other roles."""
+        await self._report_seal_failure(
+            f"{ROLE_KIND}:{role_id}",
+            f"a {ROLE_KIND} definition failed its integrity check and grants nothing"
+            f" (role {role_id})",
+            {"kind": ROLE_KIND, "role_id": role_id},
+        )
+
+    async def _ad_map(self, name: str) -> AdMap:
+        """The AD directory map ``name`` (the group-to-role or group-to-channel map), its seal
+        checked (BACKLOG #2592). When it fails, an EMPTY map stands in its place, and the failure
+        is reported: a failing map grants nothing from any of its pairs, because the seal covers
+        the set, so a pair added outside the store cannot be told from the rest. The map is read
+        in one statement, so an honest write cannot tear the read."""
+        current = await self._store.get_ad_map(name)
+        if ad_map_seal_ok(self._store.row_sealer(), current):
+            return current
+        await self._report_seal_failure(
+            f"{ADSET_KIND}:{name}",
+            f"the {name} failed its integrity check and grants nothing",
+            {"kind": ADSET_KIND, "map": name},
+        )
+        return AdMap(name)
+
+    async def _ad_roles_for_groups(self, groups: Iterable[str]) -> set[str]:
+        """The role ids the AD group-to-role map gives ``groups``; none when the map fails its
+        seal. A directory role decision reads the map through here, or through :meth:`_ad_map`
+        once for a whole pass."""
+        return (await self._ad_map(AD_ROLE_MAP)).values_for(groups)
+
+    async def _ad_channels_for_groups(self, groups: Iterable[str]) -> frozenset[str]:
+        """The channels the AD group-to-channel map gives ``groups``; none when the map fails its
+        seal, which withdraws a directory-set scope rather than widening one."""
+        return frozenset((await self._ad_map(AD_SCOPE_MAP)).values_for(groups))
+
+    async def list_ad_group_role_map(self) -> list[tuple[str, str]]:
+        """The AD group-to-role map's ``(ad_group, role_id)`` pairs, for an administrator to read and
+        edit. None when the map fails its seal: an administrator who saves the map again seals what
+        they enter, and never re-seals a pair written outside the store (BACKLOG #2592)."""
+        return list((await self._ad_map(AD_ROLE_MAP)).pairs)
+
+    async def list_ad_group_scope_map(self) -> list[tuple[str, str]]:
+        """:meth:`list_ad_group_role_map`, for the AD group-to-channel map's ``(ad_group, channel)``
+        pairs."""
+        return list((await self._ad_map(AD_SCOPE_MAP)).pairs)
+
     async def identity_for_cert_user_id(self, user_id: str) -> Identity | None:
         """Resolve the users-row id a verified client cert maps to, or ``None`` when that account is
         unknown, disabled, or a directory account the directory does not confirm — WITHOUT a bearer
@@ -8063,18 +8163,14 @@ class AuthService:
             or user.directory_object_id != asked.directory_object_id
         ):
             return None
-        granted = await self._store.roles_for_ad_groups(answer.groups)
+        granted = await self._ad_roles_for_groups(answer.groups)
         kept = [role_id for role_id in user.role_ids if role_id in granted]
         if not kept:
             return None
         # The scope narrows on the same groups, by the rule login and the reconciler share. Its
         # TARGET roles decide the Administrator short-circuit there; here that is the kept set.
         administrator = Role.ADMINISTRATOR.value in kept
-        mapped = (
-            frozenset()
-            if administrator
-            else frozenset(await self._store.channels_for_ad_groups(answer.groups))
-        )
+        mapped = frozenset() if administrator else await self._ad_channels_for_groups(answer.groups)
         return await self._build_identity(
             _cert_narrowed_scope(user, mapped, administrator=administrator), role_ids=kept
         )
@@ -8358,15 +8454,17 @@ class AuthService:
         """Resolve the permission overlay for any custom (``custom:``-prefixed) role ids the user holds
         (ADR 0045 D3). Each is looked up in the ``roles`` table and its persisted ``permissions`` JSON
         defensively decoded (unknown/forbidden values dropped — deny-by-default). A built-in id, an
-        unknown id, or a row with no permissions contributes nothing."""
+        unknown id, or a row with no permissions contributes nothing. Each row is read through
+        :meth:`_load_role`, so a row that fails its integrity seal contributes nothing either
+        (BACKLOG #2592)."""
         granted: set[Permission] = set()
         for rid in role_ids:
             if not is_custom_role_id(rid):
                 continue
-            row = await self._store.get_role(rid)
+            row = await self._load_role(rid)
             if row is None:
-                continue  # custom role deleted since assignment → grants nothing (deny-by-default)
-            granted |= decode_custom_role_permissions(row["permissions"])
+                continue  # deleted since assignment, or failing its seal: grants nothing
+            granted |= decode_custom_role_permissions(row.permissions)
         return frozenset(granted)
 
     async def _build_identity(
@@ -10372,7 +10470,7 @@ class AuthService:
         fresh = await self._load_user(user.id)
         if fresh is None:
             return ACCOUNT_REFUSED
-        if not set(fresh.role_ids) <= await self._store.roles_for_ad_groups(answer.groups):
+        if not set(fresh.role_ids) <= await self._ad_roles_for_groups(answer.groups):
             return DIRECTORY_ROLES_DEMOTED
         return None
 
@@ -11514,18 +11612,20 @@ class AuthService:
 
     async def list_custom_roles(self) -> list[CustomRoleInfo]:
         """Every admin-defined custom role with its (defensively-decoded) permission set. Built-in rows
-        are excluded — they resolve from ``BUILTIN_ROLE_PERMISSIONS``, not the ``permissions`` column."""
+        are excluded — they resolve from ``BUILTIN_ROLE_PERMISSIONS``, not the ``permissions`` column.
+
+        A role whose row fails its integrity seal is listed with NO permissions, which is what it
+        grants (BACKLOG #2592). It stays listed so an administrator can save it again, which seals
+        what they choose, or delete it."""
         out: list[CustomRoleInfo] = []
-        for row in await self._store.list_roles():
-            if _row_builtin(row):
-                continue
-            perms = decode_custom_role_permissions(row["permissions"])
+        for row, holds in await self._load_custom_roles():
+            perms = decode_custom_role_permissions(row.permissions) if holds else frozenset()
             out.append(
                 CustomRoleInfo(
-                    id=str(row["id"]),
-                    display_name=str(row["display_name"]),
-                    description=(None if row["description"] is None else str(row["description"])),
-                    permissions=frozenset(perms),
+                    id=row.id,
+                    display_name=row.display_name,
+                    description=row.description,
+                    permissions=perms,
                 )
             )
         return out
@@ -11578,9 +11678,11 @@ class AuthService:
         rejects editing a built-in (or unknown) role. A permission *reduction* takes effect immediately:
         every user holding the role has their live sessions revoked so a narrowed set can't linger on an
         active token (ADR 0045 D3, mirroring :meth:`set_roles`). Audited. Raises :class:`ValueError` for
-        an unknown/built-in role and :class:`CustomRoleError` for an invalid permission set."""
-        existing = await self._store.get_role(role_id)
-        if existing is None or _row_builtin(existing):
+        an unknown/built-in role and :class:`CustomRoleError` for an invalid permission set.
+
+        The whole row is written from these arguments and sealed, so this also repairs a role whose
+        row fails its integrity seal (BACKLOG #2592); nothing is kept from the row it replaces."""
+        if not await self._custom_role_held(role_id):
             raise ValueError("no such custom role")
         perms = validate_custom_role_permissions(permissions)  # raises CustomRoleError
         await self._store.upsert_role(
@@ -11606,9 +11708,9 @@ class AuthService:
     async def delete_custom_role(self, role_id: str, *, actor: str) -> None:
         """Delete a custom role; its user/AD-group assignments are removed in the same transaction, and
         every assigned user's live sessions are revoked so the now-gone permissions don't linger on an
-        active token. Raises :class:`ValueError` for an unknown or built-in role. Audited."""
-        existing = await self._store.get_role(role_id)
-        if existing is None or _row_builtin(existing):
+        active token. Raises :class:`ValueError` for an unknown or built-in role. Audited. A role
+        whose row fails its integrity seal is deleted like any other (BACKLOG #2592)."""
+        if not await self._custom_role_held(role_id):
             raise ValueError("no such custom role")
         await self._revoke_sessions_for_role(role_id)  # before the rows are gone
         await self._store.delete_custom_role(role_id)

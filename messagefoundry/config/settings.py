@@ -4782,6 +4782,11 @@ _ALERT_EVENT_TYPES = frozenset(
         "bulk_export",
         "log_level_debug",
         "posture_loosened",
+        # vault BACKLOG #2742: the remote-debugging guard refused scripts another process
+        # injected into the engine. Keyed `remote_debug:refused`, with a process suffix where
+        # several engine processes share the store, which no connection can be named. It has no
+        # inverse: a refusal is an event, not a state that clears.
+        "remote_debug_refused",
         # NOTE: the INVERSE events (leadership_lost / dr_released / intake_resumed /
         # ad_reconcile_breaker_cleared / ad_reconcile_hold_released) are auto-resolve-only
         # (alert_sinks _AUTO_RESOLVE), NOT rule-targetable alert types -- a step-down, a fail-back,

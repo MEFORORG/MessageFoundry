@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.store.cell_tag import message_cell_aad
 from messagefoundry.store.crypto import (
     MARKER_PREFIX,
     PREFIX,
@@ -714,10 +715,10 @@ async def test_store_migration_skips_existing_v2_rows(tmp_path: Path) -> None:
     store = await MessageStore.open(db, cipher=make_cipher(key))
     try:
         # Hand-plant a v2 blob into a body column, bypassing the (v1-writing) store cipher. It must
-        # carry the cell's AAD (messages.raw, mid) so the store's cell-bound read path decrypts it.
+        # carry the cell's tag (messages.raw, mid, its channel) so the store's cell-bound read path decrypts it.
         mid = await store.enqueue_message(channel_id="ch", raw="placeholder", deliveries=[])
         v2_token = make_cipher(key, write_v2=True).encrypt(
-            ADT, aad=cell_aad("messages", "raw", mid)
+            ADT, aad=message_cell_aad("raw", message_id=mid, channel_id="ch")
         )
         await store._db.execute("UPDATE messages SET raw=? WHERE id=?", (v2_token, mid))
         await store._db.commit()
@@ -747,9 +748,9 @@ async def test_store_reads_mixed_v1_and_v2_rows(tmp_path: Path) -> None:
             "MSH|^~\\&|S|F|R|RF|20260101||ADT^A02|MSG2|P|2.5.1\rPID|1||200^^^H^MR||ROE^RICHARD\r"
         )
         m2 = await store.enqueue_message(channel_id="ch", raw="ph", deliveries=[])
-        # The planted v2 blob carries its cell's AAD (messages.raw, m2) so the cell-bound read decrypts it.
+        # The planted v2 blob carries its cell's tag (messages.raw, m2, its channel) so the cell-bound read decrypts it.
         v2_token = make_cipher(key, write_v2=True).encrypt(
-            other, aad=cell_aad("messages", "raw", m2)
+            other, aad=message_cell_aad("raw", message_id=m2, channel_id="ch")
         )
         await store._db.execute("UPDATE messages SET raw=? WHERE id=?", (v2_token, m2))
         await store._db.commit()
