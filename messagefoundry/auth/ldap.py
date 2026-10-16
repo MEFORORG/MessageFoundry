@@ -814,7 +814,7 @@ def _refuse_unanswered(conn: Any, operation: str, *, answers: frozenset[int] | N
     with its own set. A referral is refused first, as a referral, whatever ``answers`` holds, so
     the reconciler still reads it as referred (BACKLOG #2538).
     """
-    from ldap3.core.results import RESULT_CODES, RESULT_SUCCESS  # lazy, like every ldap3 import
+    from ldap3.core.results import RESULT_SUCCESS  # lazy, like every ldap3 import here
 
     _refuse_referral(conn, operation)
     result = conn.result
@@ -822,9 +822,20 @@ def _refuse_unanswered(conn: Any, operation: str, *, answers: frozenset[int] | N
         return
     code = result.get("result")
     if type(code) is not int:  # not isinstance: a bool is an int, and is no result code
-        code, name, shown, hint = None, "no code", "no readable result code", ""
-    elif code in (answers if answers is not None else (RESULT_SUCCESS,)):
-        return
+        raise _unanswered(operation, None)
+    if code not in (answers if answers is not None else (RESULT_SUCCESS,)):
+        raise _unanswered(operation, code)
+
+
+def _unanswered(operation: str, code: int | None) -> LdapUnansweredError:
+    """The refusal for ``operation`` ending with ``code``, warned once per operation and code name.
+
+    The text carries the code, ldap3's name for it and the operation, never directory text.
+    """
+    from ldap3.core.results import RESULT_CODES  # lazy, like every ldap3 import here
+
+    if code is None:
+        name, shown, hint = "no code", "no readable result code", ""
     else:
         name = RESULT_CODES.get(code, "an unknown result code")
         shown, hint = f"result code {code} ({name})", _UNANSWERED_HINTS.get(code, "")
@@ -835,15 +846,95 @@ def _refuse_unanswered(conn: Any, operation: str, *, answers: frozenset[int] | N
     # Keyed on ldap3's name, not the raw code: a directory chooses the code, and ldap3's table is
     # finite, so the set of warnings stays bounded.
     _warn_once(f"unanswered: {operation}: {name}", "%s Reported once per code.", message)
-    raise LdapUnansweredError(message, code=code, code_name=name)
+    return LdapUnansweredError(message, code=code, code_name=name)
 
 
 def _search(conn: Any, operation: str, **kwargs: Any) -> None:
     """``conn.search(**kwargs)``, refusing a referral result and any other result but success
     (:func:`_refuse_unanswered`). Every search in this module goes through here, so none can read
-    either as "no entries"; a test pins that."""
-    conn.search(**kwargs)
+    either as "no entries"; a test pins that.
+
+    A result code ldap3 has no name for is the same refusal; :func:`_unknown_result_code` says
+    why it never reaches :func:`_refuse_unanswered`.
+    """
+    try:
+        conn.search(**kwargs)
+    except KeyError as exc:
+        code = _unknown_result_code(exc)
+        if code is None:
+            raise
+        raise _unanswered(operation, code) from exc
     _refuse_unanswered(conn, operation)
+
+
+def _unknown_result_code(exc: KeyError) -> int | None:
+    """The result code ``exc`` names when it is ldap3 failing to name one, else ``None``.
+
+    BACKLOG #3010. ldap3 2.9.1 decodes with its fast decoder by default
+    (``Connection(fast_decoder=True)``), and that decoder looks a bind, search or extended result's
+    code up in ``RESULT_CODES`` (``utils/asn1.py``, ``ldap_result_to_dict_fast``, and
+    ``operation/bind.py``), so a code outside the table raises ``KeyError(code)`` from inside the
+    ldap3 call. Unmapped, that would escape every ``except LdapError`` and surface as an unhandled
+    error at sign-in. Only a ``KeyError`` whose sole argument is an integer missing from that table
+    is ldap3's; any other is the engine's own defect, and the caller lets it propagate.
+    """
+    from ldap3.core.results import RESULT_CODES  # lazy, like every ldap3 import here
+
+    code = exc.args[0] if len(exc.args) == 1 else None
+    return code if type(code) is int and code not in RESULT_CODES else None
+
+
+#: The simple paged results control (RFC 2696), which AD and ldap3 both name by this OID.
+_PAGED_RESULTS_OID = "1.2.840.113556.1.4.319"
+
+#: Entries asked for per page of a search that can return many. Below AD's default MaxPageSize
+#: (1000), the cap an unpaged search ends at with sizeLimitExceeded. A directory whose cap is lower
+#: returns smaller pages, which is still the whole answer.
+_PAGE_SIZE = 500
+
+#: Pages read before a paged search is refused as unfinished: 10,000 entries. Each page may take up
+#: to ``[auth].ad_receive_timeout``, so a directory that keeps returning a cookie would otherwise
+#: hold the sign-in or reconcile worker for as long as it keeps answering.
+_MAX_PAGES = 20
+
+
+def _paged_cookie(conn: Any) -> bytes | None:
+    """The cookie ``conn``'s last search returned for the next page, or ``None`` at the last page.
+
+    ldap3 decodes the control into ``result['controls'][oid]['value']['cookie']``. Absent, the
+    directory ignored the request for pages, which is allowed because it is sent non-critical; that
+    answer is then the whole answer or ends with a code :func:`_refuse_unanswered` refuses.
+    """
+    result = conn.result
+    controls = result.get("controls") if isinstance(result, dict) else None
+    control = controls.get(_PAGED_RESULTS_OID) if isinstance(controls, dict) else None
+    value = control.get("value") if isinstance(control, dict) else None
+    cookie = value.get("cookie") if isinstance(value, dict) else None
+    return cookie if isinstance(cookie, bytes) and cookie else None
+
+
+def _search_paged(conn: Any, operation: str, **kwargs: Any) -> list[Any]:
+    """Every entry of a search that can outrun a directory's unpaged cap, read page by page.
+
+    BACKLOG #3010. Each page goes through :func:`_search`, so a page that does not end with success
+    refuses the whole search, and the pages already read are dropped with it: a part of the answer
+    is never used as the whole. Unpaged, an account in more groups than the cap would end the
+    nested group search with sizeLimitExceeded, which that refusal turns into a failed sign-in.
+    """
+    entries: list[Any] = []
+    cookie: bytes | None = None
+    for _ in range(_MAX_PAGES):
+        _search(conn, operation, paged_size=_PAGE_SIZE, paged_cookie=cookie, **kwargs)
+        entries.extend(conn.entries)
+        cookie = _paged_cookie(conn)
+        if cookie is None:
+            return entries
+    message = (
+        f"AD returned more than {_MAX_PAGES} pages of {_PAGE_SIZE} for the {operation}; the engine "
+        "reads it as the directory not answering (BACKLOG #3010)."
+    )
+    _warn_once(f"unanswered: {operation}: pages", "%s Reported once.", message)
+    raise LdapUnansweredError(message)
 
 
 #: What opening an ldap3 socket can raise that is not an ldap3 error (BACKLOG #2566). ldap3's
@@ -880,6 +971,10 @@ def _socket_faults_as_ldap_error() -> Iterator[None]:
     of ``tests/test_ldap_referrals.py`` build that connection, so one would fail there first. And
     ``authenticate`` wraps the whole decoy bind, which must neither map nor swallow by itself.
 
+    It also maps a bind that ended with a result code ldap3 has no name for
+    (:func:`_unknown_result_code`) to the refusal a search gets for one, so it reads as an outage
+    and not as an unhandled error. Any other ``KeyError`` propagates.
+
     An ``LDAPException`` passes through untouched, even one that is also an ``OSError``,
     ``TypeError`` or ``ValueError``, so its own handler keeps its own text. The new text is fixed
     and names only the type: a fault's message is not the engine's to repeat. **That holds only for
@@ -902,6 +997,11 @@ def _socket_faults_as_ldap_error() -> Iterator[None]:
             else f"{kind.__module__}.{kind.__qualname__}"
         )
         raise LdapError(f"AD directory call failed: {name}") from exc
+    except KeyError as exc:
+        code = _unknown_result_code(exc)
+        if code is None:
+            raise
+        raise _unanswered("bind", code) from exc
 
 
 class LdapAuthenticator:
@@ -1312,7 +1412,8 @@ class LdapAuthenticator:
         if self._s.ad_use_nested_groups and self._s.ad_group_search_base:
             # A search the directory did not finish raises here (BACKLOG #3010), never a shorter
             # group list.
-            _search(
+            # Paged, so an account in more groups than the directory's unpaged cap still resolves.
+            groups = _search_paged(
                 conn,
                 "group search",
                 search_base=self._s.ad_group_search_base,
@@ -1320,7 +1421,7 @@ class LdapAuthenticator:
                 search_scope=ldap3.SUBTREE,
                 attributes=["distinguishedName"],
             )
-            found.extend(str(e.entry_dn) for e in conn.entries)
+            found.extend(str(e.entry_dn) for e in groups)
         canonical = [canonical_group_dn(dn) for dn in found]
         dropped = canonical.count(None)
         if dropped:
