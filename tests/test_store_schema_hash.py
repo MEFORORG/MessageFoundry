@@ -8,6 +8,8 @@ exercised by the gated server-store suites (``test_postgres_store.py`` / ``test_
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 
@@ -204,6 +206,46 @@ def test_pending_approvals_claim_owner_present_on_all_backends() -> None:
     assert "ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS claim_owner TEXT" in (
         postgres._SCHEMA
     )
+
+
+async def test_sqlite_adds_claim_owner_to_a_table_that_predates_it(tmp_path: Path) -> None:
+    """vault BACKLOG #3193: the test above reads the migration's TEXT. This runs it, on a SQLite
+    store whose ``pending_approvals`` was written before the column existed, and then has a claim
+    write the column and read it back."""
+    import sqlite3
+
+    from messagefoundry.store.store import MessageStore
+
+    path = tmp_path / "pre_claim_owner.db"
+    store = await MessageStore.open(path)
+    await store.close()
+    with sqlite3.connect(path) as db:
+        db.execute("ALTER TABLE pending_approvals DROP COLUMN claim_owner")
+        cols = {row[1] for row in db.execute("PRAGMA table_info(pending_approvals)")}
+    assert "claim_owner" not in cols  # the control: the column really is gone before the reopen
+
+    store = await MessageStore.open(path)
+    try:
+        await store.create_pending_approval(
+            approval_id="claimownermigration000000000001",
+            operation="dead_letter_replay",
+            params="{}",
+            requester="maker",
+            requester_user_id="maker-id",
+            requested_at=1_000.0,
+            expires_at=None,
+        )
+        assert await store.decide_pending_approval(
+            "claimownermigration000000000001",
+            status="executing",
+            approver="checker",
+            decided_at=1_001.0,
+            claim_owner="node:migrated",
+        )
+        [row] = await store.list_executing_approvals(claim_owner="node:migrated")
+        assert str(row["claim_owner"]) == "node:migrated"
+    finally:
+        await store.close()
 
 
 def test_known_login_addresses_table_present_on_all_backends() -> None:

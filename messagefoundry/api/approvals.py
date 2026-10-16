@@ -156,6 +156,25 @@ def _stored_params(approval_id: str, raw: Any) -> dict[str, Any] | None:
     return params
 
 
+def _audit_detail(fields: Mapping[str, Any]) -> str:
+    """``fields`` as an audit row's JSON detail, never raising (vault BACKLOG #3193).
+
+    ``default=str`` covers a value json cannot encode, such as a datetime, but not a dict key it
+    cannot encode, such as a tuple, nor a circular reference. Each top-level field that still fails
+    is written as its ``str()``, so the other fields survive intact."""
+    try:
+        return json.dumps(fields, default=str)
+    except (TypeError, ValueError):
+        safe: dict[str, Any] = {}
+        for key, value in fields.items():
+            try:
+                json.dumps(value, default=str)
+            except (TypeError, ValueError):
+                value = str(value)
+            safe[str(key)] = value
+        return json.dumps(safe, default=str)
+
+
 def _log_orphaned_write(task: asyncio.Future[Any], approval_id: str) -> None:
     """Log a shielded write whose caller was cancelled, since nothing else will read its error.
 
@@ -179,6 +198,23 @@ def _log_orphaned_write(task: asyncio.Future[Any], approval_id: str) -> None:
             "approval %s: a shielded outcome write failed after its caller was cancelled",
             approval_id,
             exc_info=error,
+        )
+
+
+def _log_orphaned_request(task: asyncio.Future[Any], approval_id: str) -> None:
+    """Log a request write whose caller was cancelled (vault BACKLOG #3193).
+
+    :meth:`ApprovalGate._file_request` logs and pages its own failures, so a failure is only read
+    here, which marks it retrieved. What only this callback can say is that the request was held
+    after the caller stopped waiting, so its requester never got the 202."""
+    if task.cancelled():
+        log.error("approval %s: a request write was cancelled", approval_id)
+        return
+    if task.exception() is None:
+        log.warning(
+            "approval %s: the request was held after its caller was cancelled, so the requester "
+            "got no 202 for it. A repeat by the same requester joins it",
+            task.result(),
         )
 
 
@@ -256,19 +292,26 @@ class ApprovalGate:
         # When each failing request is reported again (BACKLOG #2592).
         self._seal_failures_reported = SealFailureThrottle()
 
-    async def _shielded[T](self, coro: Coroutine[Any, Any, T], approval_id: str) -> T:
+    async def _shielded[T](
+        self,
+        coro: Coroutine[Any, Any, T],
+        approval_id: str,
+        *,
+        orphaned: Callable[[asyncio.Future[Any], str], None] = _log_orphaned_write,
+    ) -> T:
         """Await ``coro`` so that cancelling the CALLER does not cancel it (BACKLOG #1562).
 
         A cancellation delivered while this awaits reaches the caller at once, and the write finishes
-        on its own. Once the caller is gone nothing would read the write's error, so it is logged
-        once, with the approval id. :meth:`drain` waits for a write still running at shutdown."""
+        on its own. Once the caller is gone nothing would read the write's error, so ``orphaned``
+        reads it when the write ends, and logs it once, with the approval id. :meth:`drain` waits
+        for a write still running at shutdown."""
         task = asyncio.ensure_future(coro)
         self._inflight[task] = approval_id
         task.add_done_callback(self._forget)
         try:
             return await _outlive_caller(task)
         except asyncio.CancelledError:
-            task.add_done_callback(lambda t: _log_orphaned_write(t, approval_id))
+            task.add_done_callback(lambda t: orphaned(t, approval_id))
             raise
 
     def _forget(self, task: asyncio.Future[Any]) -> None:
@@ -490,7 +533,13 @@ class ApprovalGate:
         their params already, so for them the params would differ anyway.
 
         Every approver sees ``params`` in the queue; :class:`~messagefoundry.api.models.PendingApprovalInfo`
-        states what they may carry (BACKLOG #2458)."""
+        states what they may carry (BACKLOG #2458).
+
+        **The write outlives its caller, and a failed one is read back (vault BACKLOG #3193).** A
+        cancel, such as the request timeout, reaches the caller at once while the write finishes on
+        its own, as the claim in :meth:`approve` does, and :meth:`drain` waits for it at shutdown. A
+        write that reports an error is read back by its id, because a COMMIT can land with its reply
+        lost: :meth:`_file_request` says what each answer means."""
         if not self.gates(operation):
             return None
         # Enforce the write half of the invariant here, matching `create_upload`'s guard on
@@ -500,8 +549,48 @@ class ApprovalGate:
             raise ValueError(
                 "requester_user_id is required (a request with no owner id is unapprovable)"
             )
-        now = self._clock()
         approval_id = uuid4().hex
+        return await self._shielded(
+            self._file_request(
+                approval_id,
+                operation=operation,
+                params=json.dumps(dict(params), sort_keys=True),
+                requester=requester,
+                requester_user_id=requester_user_id,
+                client=client,
+            ),
+            approval_id,
+            orphaned=_log_orphaned_request,
+        )
+
+    async def _file_request(
+        self,
+        approval_id: str,
+        *,
+        operation: str,
+        params: str,
+        requester: str,
+        requester_user_id: str,
+        client: str | None,
+    ) -> str:
+        """The write :meth:`guard` makes, and what it does when that write reports an error.
+
+        A repeat's failure is raised as it is: the request it named stays held, so a retry joins
+        that request again, and only its ``approval.request_repeated`` row may be lost. A new
+        request's failure is read back by ``approval_id``, which nothing else can have used:
+
+        * **held**, with its seal intact: the COMMIT landed and only its reply was lost. The request
+          and its ``approval.requested`` row are one write, so both are in the store. The id is
+          returned, a WARNING is logged, and nothing pages. Answering an error here is what used to
+          let a retry the repeat rule misses file a second releasable copy.
+        * **absent**: the write most likely rolled back, so nothing is held. It is raised, logged at
+          ERROR and paged, since the store refused a write.
+        * **unknown**, because the read failed or the row failed its seal: it is raised, logged at
+          ERROR and paged, as it was before the read-back existed.
+
+        The off-box tee runs only after a commit the store saw succeed, so a held request's
+        ``approval.requested`` row reaches the local audit log and not the off-box copy."""
+        now = self._clock()
         expires_at = (
             None if self._settings.expiry_hours == 0 else now + self._settings.expiry_hours * 3600.0
         )
@@ -523,7 +612,7 @@ class ApprovalGate:
             held = await self._store.create_pending_approval(
                 approval_id=approval_id,
                 operation=operation,
-                params=json.dumps(dict(params), sort_keys=True),
+                params=params,
                 requester=requester,
                 requester_user_id=requester_user_id,
                 requested_at=now,
@@ -536,24 +625,38 @@ class ApprovalGate:
                 ),
                 on_repeat=_repeat,
             )
-        except Exception:
-            # Still raised. A write that failed before its COMMIT held nothing, but a COMMIT that
-            # landed before the error (a lost reply, a driver timeout) holds the request and its
-            # row, and a retry the repeat rule misses files a second one; docs/SECURITY.md lists
-            # the cases. Logged and paged, since the error alone reaches only this caller. A
-            # cancel (the request timeout) is a BaseException and skips this block entirely. A
-            # repeat's lost row is keyed on the request it named, which stays held.
-            lost_id, action = (
-                (repeat_of[-1], "approval.request_repeated")
-                if repeat_of
-                else (approval_id, "approval.requested")
-            )
+        except Exception:  # noqa: BLE001 - every store backend raises its own type
+            # The docstring says what each outcome means. Logged and paged where raised, since
+            # the error alone reaches only this caller. A repeat's lost row is keyed on the
+            # request it named, which stays held.
+            if repeat_of:
+                lost_id, action = repeat_of[-1], "approval.request_repeated"
+                state = "The request it named is still held under this id"
+            else:
+                lost_id, action = approval_id, "approval.requested"
+                landed = await self._read_back_request(approval_id)
+                if landed == "held":
+                    log.warning(
+                        "approval %s: the write that filed this %s request by %s reported an "
+                        "error, and reading it back found it held, with its approval.requested "
+                        "row in the same write; answering with its id",
+                        approval_id,
+                        operation,
+                        scrub_log_argument(requester),  # CodeQL py/log-injection
+                        exc_info=True,
+                    )
+                    return approval_id
+                state = (
+                    "Reading it back found no such request, so most likely nothing is held"
+                    if landed == "absent"
+                    else "It could not be read back, so it may be held with that row or not at all"
+                )
             log.exception(
-                "approval %s: the write carrying its %s audit row failed. The request is still "
-                "held under this id if this was a repeat. It is also held, with that row, if the "
-                "COMMIT landed before the error. Lost detail: actor=%s operation=%s",
+                "approval %s: the write carrying its %s audit row failed. %s. Lost detail: "
+                "actor=%s operation=%s",
                 lost_id,
                 action,
+                state,
                 scrub_log_argument(requester),  # CodeQL py/log-injection; see scrub_log_argument
                 operation,
             )
@@ -567,6 +670,22 @@ class ApprovalGate:
                 scrub_log_argument(requester),
             )
         return held
+
+    async def _read_back_request(self, approval_id: str) -> Literal["held", "absent", "unknown"]:
+        """Whether a request whose write reported an error is in the store (vault BACKLOG #3193).
+        ``unknown`` when the read fails, logged here, or the row fails its seal, which
+        :meth:`_verified` reports. Such a row can never be released, so a retry cannot make a
+        second releasable copy of it."""
+        try:
+            found = await self._store.get_pending_approval(approval_id)
+        except Exception:  # noqa: BLE001 - every store backend raises its own type
+            log.exception(
+                "approval %s: reading back a request whose write failed failed too", approval_id
+            )
+            return "unknown"
+        if found is None:
+            return "absent"
+        return "held" if await self._verified(found) is not None else "unknown"
 
     async def rejoin(
         self,
@@ -1021,8 +1140,8 @@ class ApprovalGate:
             status="approved",
             action="approval.approved",
             approver=approver,
-            # Serialized before any write, so a result that cannot be serialized is still a loud
-            # programming error rather than a line blaming the audit log.
+            # _settle serializes a result json cannot encode as text rather than raising, since
+            # the operation has already run.
             fields={
                 "approval_id": approval_id,
                 "operation": operation,
@@ -1068,9 +1187,9 @@ class ApprovalGate:
         status write failed."""
 
         def detail(moved: bool | None) -> str:
-            # default=str: a result json cannot encode must not raise here, before the status
-            # moves, after the operation ran. That would strand the row 'executing'.
-            return json.dumps(fields if flag is None else {**fields, flag: moved}, default=str)
+            # A result json cannot encode must not raise here, before the status moves, after the
+            # operation ran. That would strand the row 'executing'.
+            return _audit_detail(fields if flag is None else {**fields, flag: moved})
 
         combined = AuditAppend(action, actor=approver, detail=detail(True), client=client)
         moved: bool | None
@@ -1180,9 +1299,14 @@ class ApprovalGate:
             await self._approval_seal_failed(approval_id)
             return
         except Exception:  # noqa: BLE001 - the caller's cancellation is re-raised either way
+            # "Most likely": a COMMIT can land with its reply lost, and then the row and its
+            # approval.release_attempted row are both in the store, with nothing run. That row
+            # reads 'executing', and reconcile_after_restart marks it interrupted (vault BACKLOG #3193).
             log.exception(
-                "approval %s: the approve was cancelled and its claim failed, so its "
-                "approval.release_attempted row was not written",
+                "approval %s: the approve was cancelled and its claim failed, so most likely its "
+                "approval.release_attempted row was not written and nothing ran. If the COMMIT "
+                "landed anyway, the request reads 'executing' until this engine restarts and "
+                "marks it interrupted",
                 approval_id,
             )
             # The claim carries its audit row, so a failed claim lost that row too; page it, as

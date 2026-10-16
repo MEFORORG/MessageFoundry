@@ -14,6 +14,7 @@ named audit actions or status writes with the error a full disk gives.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -359,8 +360,6 @@ async def test_a_cut_off_release_whose_status_write_fails_still_audits_it(
     store: MessageStore,
 ) -> None:
     """The interrupted record's status write and audit row used to share one try."""
-    import asyncio
-
     sink = _Sink()
     started = asyncio.Event()
     settings = ApprovalsSettings(
@@ -447,3 +446,141 @@ async def test_a_lost_request_row_cannot_forge_a_log_line(
     assert "\r" not in lost and "\n" not in lost, lost
     assert "actor=maker\\r\\nFORGED approval operation=dead_letter_replay" in lost
     assert len(sink.lost) == 1 and sink.lost[0][1] == "approval.requested"
+
+
+# --- vault BACKLOG #3193: a failed request write is read back, and outlives its caller -----------
+
+
+class _LostReply(_StandingStore):
+    """The real store, whose request write COMMITS and then reports an error, as a COMMIT whose
+    reply is lost on the network does. ``read_fails`` fails the read-back too."""
+
+    def __init__(self, store: Any, *, read_fails: bool = False) -> None:
+        super().__init__(store)
+        self.read_fails = read_fails
+
+    async def create_pending_approval(self, **kw: Any) -> str:
+        await self._store.create_pending_approval(**kw)
+        raise sqlite3.OperationalError(_FAULT)
+
+    async def get_pending_approval(self, approval_id: str) -> Any:
+        if self.read_fails:
+            raise sqlite3.OperationalError(_FAULT)
+        return await self._store.get_pending_approval(approval_id)
+
+
+async def _guard(gate: ApprovalGate) -> str | None:
+    return await gate.guard(
+        "dead_letter_replay", {"lost": "reply"}, requester="maker", requester_user_id=_REQUESTER_ID
+    )
+
+
+async def test_a_request_whose_commit_landed_answers_its_id_and_pages_nothing(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The COMMIT landed and only its reply was lost. The guard used to raise, so the caller saw a
+    500 for a request that was held, and a retry the repeat rule missed filed a second releasable
+    copy. It now reads the request back and answers with its id."""
+    sink = _Sink()
+    gate = _gate(_LostReply(store), sink)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.approvals"):
+        approval_id = await _guard(gate)
+    assert approval_id is not None
+    assert [str(r["id"]) for r in await store.list_pending_approvals(now=0.0)] == [approval_id]
+    assert len(await store.list_audit(action="approval.requested")) == 1
+    assert sink.lost == []
+    assert any("reading it back found it held" in r.getMessage() for r in caplog.records)
+    # The retry the caller would have made joins it, through the real store's repeat rule.
+    assert await _guard(_gate(store, _Sink())) == approval_id
+    assert len(await store.list_pending_approvals(now=0.0)) == 1
+
+
+async def test_a_request_that_cannot_be_read_back_is_raised_and_paged(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """With the read-back failing too, nothing says whether the request is held, so the guard
+    raises and pages, as it did before the read-back existed."""
+    sink = _Sink()
+    gate = _gate(_LostReply(store, read_fails=True), sink)
+    with (
+        caplog.at_level(logging.ERROR, logger="messagefoundry.api.approvals"),
+        pytest.raises(sqlite3.OperationalError),
+    ):
+        await _guard(gate)
+    assert len(sink.lost) == 1 and sink.lost[0][1] == "approval.requested"
+    assert any("could not be read back" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_request_that_rolled_back_says_nothing_is_held(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    sink = _Sink()
+    gate = _gate(_Faulty(store, audit_fails=("approval.requested",)), sink)
+    with (
+        caplog.at_level(logging.ERROR, logger="messagefoundry.api.approvals"),
+        pytest.raises(sqlite3.OperationalError),
+    ):
+        await _guard(gate)
+    assert any("most likely nothing is held" in r.getMessage() for r in caplog.records)
+    assert await store.list_pending_approvals(now=0.0) == []
+
+
+class _SlowWrite(_StandingStore):
+    """The real store, whose request write waits for ``go`` before it runs."""
+
+    def __init__(self, store: Any) -> None:
+        super().__init__(store)
+        self.entered = asyncio.Event()
+        self.go = asyncio.Event()
+
+    async def create_pending_approval(self, **kw: Any) -> str:
+        self.entered.set()
+        await self.go.wait()
+        return str(await self._store.create_pending_approval(**kw))
+
+
+async def test_a_cancelled_request_write_finishes_and_a_repeat_joins_it(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A cancel, such as the request timeout, used to cancel the write itself, so a COMMIT in flight
+    was cut off with nothing saying whether it landed. The write now finishes on its own, drain()
+    waits for it, and the requester's retry joins the request rather than filing another."""
+    slow = _SlowWrite(store)
+    gate = _gate(slow, _Sink())
+    task = asyncio.create_task(_guard(gate))
+    await asyncio.wait_for(slow.entered.wait(), 10.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    slow.go.set()
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.approvals"):
+        assert await gate.drain(timeout=10.0) == []
+    [held] = [str(r["id"]) for r in await store.list_pending_approvals(now=0.0)]
+    assert any(
+        "held after its caller was cancelled" in r.getMessage() and held in r.getMessage()
+        for r in caplog.records
+    )
+    assert await _guard(gate) == held
+    assert len(await store.list_pending_approvals(now=0.0)) == 1
+
+
+async def test_an_unencodable_result_key_still_settles_the_release(store: MessageStore) -> None:
+    """``default=str`` covers a value json cannot encode, not a tuple key or a circular reference,
+    and either used to raise before the status moved, stranding the row 'executing'."""
+    settings = ApprovalsSettings(
+        enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=0.0
+    )
+    gate = ApprovalGate(_StandingStore(store), settings, resolve_identity=_resolve)
+    loop: dict[str, Any] = {"n": 1}
+    loop["self"] = loop
+
+    async def _execute(_p: Mapping[str, Any]) -> dict[str, Any]:
+        return {"by_pair": {(1, 2): 3}, "loop": loop, "requeued": 4}
+
+    gate.register("dead_letter_replay", "op", _execute, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await _request(gate)
+    await gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)
+    assert await _status(store, approval_id) == "approved"
+    [row] = await store.list_audit(action="approval.approved")
+    result = json.loads(str(row["detail"]))["result"]
+    assert isinstance(result, str) and "(1, 2)" in result and "'requeued': 4" in result
