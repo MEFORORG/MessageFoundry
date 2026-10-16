@@ -3546,9 +3546,9 @@ jobs:
           # THE RIG SIGNS IN (vault BACKLOG #2719). The engine serves with sign-in on, as shipped. The run
           # block provisions one Administrator before the engine starts, and every API read after that
           # carries that account's session (harness/load/rigadmin.py). Two settings follow:
-          #   require_mfa ON, as shipped -- THE ONE LEG THAT STARTS THE ENGINE WITH MFA REQUIRED (vault
+          #   require_mfa ON, as shipped -- THIS RIG LEG STARTS THE ENGINE WITH MFA REQUIRED (vault
           #     BACKLOG #2796). The rig account is enrolled with an authenticator key the run block
-          #     draws, and signs in with password and code in one request. Every other rig leg keeps
+          #     draws, and signs in with password and code in one request. The other rig legs keep
           #     require_mfa off; docs/LOAD-TESTING.md, "Rigs sign in", says why.
           #   an [alerts] channel -- with sign-in on, an enforcing start refuses without a way to send
           #     account-security notices. The gate reads configuration only; nothing listens there.
@@ -3657,7 +3657,8 @@ jobs:
               --report-json out/load/smoke-ci.json --report-csv out/load/smoke-ci.csv
             rc=$?
             # The engine's start-up census warns about a covered account with no authenticator app
-            # (ADR 0197). With MFA required and the rig account enrolled, it must not.
+            # (ADR 0197). With MFA required and the rig account enrolled, it must not. This reads
+            # an absence only: a census that never ran, or logged elsewhere, would pass it too.
             if grep -q "hold a chosen password and no authenticator app" engine.log; then
               echo "::error::the engine started with MFA required and named an account with no authenticator app"
               rc=1

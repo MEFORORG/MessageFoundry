@@ -32,12 +32,12 @@ an authenticator app at the terminal and offers no other way, so a rig has two c
   there before any engine code runs, never printed and never written to a file. The recovery codes
   the command issues are not shown anywhere, since the rig holds the key itself.
 
-  **Each sign-in with a key waits for the next 30-second TOTP step**, up to 30 seconds. The engine
-  takes a code only once, and counts a reused one as a wrong second factor, which feeds the lock
-  on the account. Provisioning spends the step it ran in, and so does every sign-in. Waiting for a
-  step that begins after the call started is the one rule that holds across processes. So a leg
-  that signs in many times pays that wait each time, and the key suits a leg that signs in once.
-  It covers sign-in only: a step-up re-proof (``/me/reauth``) takes the password alone.
+  **A sign-in with a key can wait up to about 30 seconds for a TOTP step nothing has spent.** The
+  engine takes a code only once, and counts a reused one as a wrong second factor, which feeds the
+  lock on the account. Provisioning spends a step, and so does every sign-in.
+  :func:`_code_in_a_fresh_step` says how the rig picks a step, and where that fails: processes
+  signing in at the same time with one key can collide. So the key suits a leg that signs in
+  once. It covers sign-in only: a step-up re-proof (``/me/reauth``) takes the password alone.
 
 Under ``[security].enforcement = enforce``, a rig's ``serve`` also needs a way to send
 account-security notices (:data:`NOTIFY_ENV`). A start with sign-in on refuses without one. The
@@ -112,9 +112,10 @@ __all__ = [
 #: one server store across runs exports both, since a store that already holds an Administrator
 #: cannot be provisioned again.
 #:
-#: These two hold the NAMES of environment variables, and messages below print them. CodeQL's
-#: clear-text-logging query labels a value by the name it is assigned to, so neither Python name
-#: spells a word its heuristics match (at least "password", "secret", "token" and "account").
+#: These three, ADMIN_FACTOR_ENV below included, hold the NAMES of environment variables, and
+#: messages below print them. CodeQL's clear-text-logging query labels a value by the name it is
+#: assigned to, so no such Python name spells a word its heuristics match (at least "password",
+#: "secret", "token" and "account").
 ADMIN_NAME_ENV = "MEFOR_RIG_ADMIN_USERNAME"
 ADMIN_PASS_ENV = "MEFOR_RIG_ADMIN_PASSWORD"
 #: The rig account's authenticator key, a base32 TOTP secret, for a leg whose engine requires MFA.
@@ -128,7 +129,9 @@ _NOTIFY_ADDRESS = "rig-operator@example.invalid"
 
 #: What a rig's ``serve`` carries so a rig account with no authenticator key (:data:`ADMIN_FACTOR_ENV`)
 #: can use the API. ``provision`` sets it for the provisioning child of such an account itself. A leg
-#: that supplies a key leaves it off and serves with MFA required.
+#: that supplies a key and wants MFA required leaves it off its ``serve``; the harness runners that
+#: start their own nodes (``failover.EngineNode``) apply it by default whatever the key, so their
+#: engines run with MFA off unless the node's environment says otherwise.
 SERVE_ENV: Mapping[str, str] = {"MEFOR_SECURITY_REQUIRE_MFA": "false"}
 
 #: What an ENFORCING rig's ``serve`` carries beside :data:`SERVE_ENV`: a configured channel for
@@ -264,6 +267,17 @@ def rig_admin() -> RigAdmin:
 # --- the second factor -------------------------------------------------------
 
 
+#: The shortest key the rig takes: 26 base32 characters, 130 bits, past RFC 4226's 128-bit floor.
+#: The shipped enrolment draws 32 (160 bits). The provisioning swap would write a shorter one as an
+#: Administrator's factor, since the store does not check its length.
+_MIN_KEY_CHARS = 26
+
+#: How far into a fresh step the rig computes its code. An engine on another host whose clock runs
+#: up to this much behind the rig's still judges the code inside that step at the shipped
+#: ``totp_skew_steps = 0``.
+_STEP_MARGIN_S = 1.0
+
+
 def _totp_code(key: str, at: float) -> str:
     """The engine's TOTP code for ``key`` at the instant ``at``.
 
@@ -271,15 +285,19 @@ def _totp_code(key: str, at: float) -> str:
     level, so this file still imports nothing beyond the standard library and there is one TOTP
     implementation to keep right. Every place that signs in with a key, or provisions one, has the
     engine installed. Raises :class:`RigAdminError`, naming the variable and never the value, on a
-    key that is not base32."""
+    key that is not base32 or is shorter than :data:`_MIN_KEY_CHARS`."""
     from messagefoundry.auth import totp
 
+    refusal = RigAdminError(
+        f"{ADMIN_FACTOR_ENV} does not hold a base32 TOTP key of at least 128 bits "
+        f"({_MIN_KEY_CHARS} characters)"
+    )
+    if len(key.strip().replace(" ", "").rstrip("=")) < _MIN_KEY_CHARS:
+        raise refusal
     try:
-        if not key.strip():
-            raise ValueError("empty")
         return totp.totp(key, now=at)
     except ValueError:  # binascii.Error, the engine's base32 refusal, is a ValueError
-        raise RigAdminError(f"{ADMIN_FACTOR_ENV} does not hold a base32 TOTP key") from None
+        raise refusal from None
 
 
 #: The clock and the wait :func:`_code_in_a_fresh_step` uses; tests replace them.
@@ -287,20 +305,54 @@ _now = time.time
 _pause = time.sleep
 
 
-def _code_in_a_fresh_step(key: str) -> str:
-    """A code for ``key`` from a TOTP step that began after this call did.
+class _SpentSteps:
+    """The latest TOTP step this process knows was spent on the rig account, and the lock that
+    makes this process's sign-ins with a key take their steps one at a time."""
 
-    The engine takes each step's code once, and counts a reused one as a wrong second factor. Any
-    earlier use of this key, by provisioning or by another sign-in in any process, finished before
-    this call began, so a step that begins after it has not been spent. The code is computed right
-    after the step turns, so the engine, on the same clock, judges it inside that step."""
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.last: int | None = None
+
+
+_spent = _SpentSteps()
+
+
+def _note_spent_step() -> None:
+    """Record that the rig account's key was used no later than now (a provisioning child ran)."""
     from messagefoundry.auth.totp import DEFAULT_PERIOD
 
-    began = int(_now() // DEFAULT_PERIOD)
-    while int((at := _now()) // DEFAULT_PERIOD) <= began:
-        # A floor on each wait, so a clock read just short of the boundary cannot spin.
-        _pause(max(0.05, (began + 1) * DEFAULT_PERIOD - at))
-    return _totp_code(key, at)
+    with _spent.lock:
+        step = int(_now() // DEFAULT_PERIOD)
+        _spent.last = step if _spent.last is None else max(_spent.last, step)
+
+
+def _code_in_a_fresh_step(key: str) -> str:
+    """A code for ``key`` from a TOTP step nothing in this process has spent, and that began after
+    this call did unless this process knows the last step spent.
+
+    The engine takes each step's code once, and counts a reused one as a wrong second factor, which
+    feeds the account's lock. Within this process the lock below hands each sign-in its own step,
+    and the step it takes is recorded. When this process has spent none and provisioned none, an
+    earlier use elsewhere (a provisioning child, a sign-in in an earlier process) finished before
+    this call began, so the call waits for a step that begins after it. That rule assumes the uses
+    happen one after another. PROCESSES THAT SIGN IN AT THE SAME TIME WITH ONE KEY CAN TAKE THE SAME
+    STEP, and all but one are refused, so the key suits a leg that signs in once.
+
+    The code is computed :data:`_STEP_MARGIN_S` into its step (see there)."""
+    from messagefoundry.auth.totp import DEFAULT_PERIOD
+
+    with _spent.lock:
+        floor = int(_now() // DEFAULT_PERIOD) if _spent.last is None else _spent.last
+        while True:
+            at = _now()
+            step = int(at // DEFAULT_PERIOD)
+            start = (step if step > floor else floor + 1) * DEFAULT_PERIOD + _STEP_MARGIN_S
+            if step > floor and at >= start:
+                break
+            # A floor on each wait, so a clock read just short of the target cannot spin.
+            _pause(max(0.05, start - at))
+        _spent.last = step
+        return _totp_code(key, at)
 
 
 def require_supplied_credential() -> None:
@@ -372,6 +424,9 @@ def provision(
             f"provisioning the rig Administrator did not finish in {_PROVISION_TIMEOUT_S:.0f} s"
         ) from None
     if done.returncode == 0:
+        if admin.totp_secret:
+            # The child spent a step no later than now; a sign-in from this process waits past it.
+            _note_spent_step()
         return True
     if done.returncode == EXIT_EXISTS:
         return False
@@ -597,12 +652,17 @@ def sign_in(base_url: str, admin: RigAdmin | None = None, *, cacert: str | None 
     (:func:`_code_in_a_fresh_step`), up to 30 seconds.
 
     Raises :class:`RigUnreachable` when the engine does not answer and :class:`RigSignInRefused`
-    when it answers anything but a usable session.
+    when it answers anything but a usable session, or when the key is unusable, which is checked
+    before any wait.
     """
     admin = admin or rig_admin()
     base = _checked_base(base_url)
     body = {"username": admin.username, "password": admin.password}
     if admin.totp_secret:
+        try:
+            _totp_code(admin.totp_secret, 0.0)
+        except RigAdminError as exc:
+            raise RigSignInRefused(str(exc)) from None
         body["totp_code"] = _code_in_a_fresh_step(admin.totp_secret)
     status, raw = _call("POST", f"{base}/auth/login", cacert=cacert, body=body)
     if status != 200:
