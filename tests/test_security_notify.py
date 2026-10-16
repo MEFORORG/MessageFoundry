@@ -247,8 +247,8 @@ def test_a_directory_sessions_ended_notice_renders_its_own_text_and_claims_no_di
 #: vault BACKLOG #3121. The description each directory-driven kind carries, pinned whole.
 _DIRECTORY_TEXT = {
     ROLES_CHANGED: (
-        "MessageFoundry read your groups in your organization's directory and changed your "
-        "account's roles to match them."
+        "MessageFoundry read your groups in your organization's directory, changed your "
+        "account's roles to match them, and ended any sessions already open on your account."
     ),
     ACCOUNT_DISABLED: (
         "Your organization's directory reports your account as disabled, so MessageFoundry ended "

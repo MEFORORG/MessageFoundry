@@ -10157,38 +10157,27 @@ class AuthService:
             # ended. The order is #1902's, rotate first and enable last, and is kept. Vault BACKLOG
             # #3113 item 8 is declined for that reason: enabling first would undo #1902.
             #
-            # A store refusal of the revoke is logged, not raised, so the refusal row below is
-            # still written (vault BACKLOG #3113). ``session_ended`` records what the revoke did.
-            # The token is not handed back either way, so the caller still cannot use the session;
-            # a session the revoke left live expires on its own timers. A fault that also refuses
-            # the read and the audit write below still loses the row: this covers a refusal of the
-            # revoke alone.
+            # A store refusal of the revoke is logged, not raised, so the confirm still answers
+            # ``session_lost`` (vault BACKLOG #3113). That covers aiosqlite's closed connection
+            # too, which it raises as a bare ``ValueError`` before sqlite3 is reached. A defect
+            # the helper re-raises still propagates, and the ``finally`` writes the refusal row
+            # first, so no exception the revoke raises can skip it. ``session_ended`` records
+            # what the revoke did. The token is not handed back either way, so the caller still
+            # cannot use the session; a session the revoke left live expires on its own timers.
+            # A fault that also refuses the read and the audit write below still loses the row.
             rotated = hash_token(elevation.token)
-            session_ended = await write_audit_soft(
-                lambda: self._store.revoke_session(rotated),
-                log=_log,
-                message="a refused TOTP enrolment for %s could not end the session it rotated",
-                args=lambda: (scrub_log_argument(identity.username),),
-                errors=_audit_write_errors(),
-                defects=AUDIT_WRITE_DEFECTS,
-            )
-            # The reason is the row's state read AFTER the refusal, not the write's own verdict,
-            # so a later write can blur it; it is a pointer for an operator, not a proof. Vault
-            # BACKLOG #3113 item 9 is declined: the write's own verdict would need ``enable_totp``
-            # to return a reason on all three store backends.
-            after = await self._load_user(identity.user_id)
-            if after is None:
-                reason = "account_gone"
-            elif after.totp_enabled:
-                reason = "already_enabled"
-            else:
-                reason = "secret_cleared"
-            await self._audit(
-                "auth.mfa_enroll_refused",
-                actor=identity.username,
-                detail=_json({"reason": reason, "session_ended": session_ended}),
-                client=client,
-            )
+            session_ended = False
+            try:
+                session_ended = await write_audit_soft(
+                    lambda: self._store.revoke_session(rotated),
+                    log=_log,
+                    message="a refused TOTP enrolment for %s could not end the session it rotated",
+                    args=lambda: (scrub_log_argument(identity.username),),
+                    errors=(*_audit_write_errors(), ValueError),
+                    defects=AUDIT_WRITE_DEFECTS,
+                )
+            finally:
+                await self._audit_enroll_refused(identity, session_ended, client=client)
             return Elevation(session_lost=True)
         await self._audit("auth.mfa_enrolled", actor=identity.username, client=client)
         # ADR 0197 Amendment A: enrolment now comes BEFORE the first rotation, so whoever intercepts
@@ -10207,6 +10196,29 @@ class AuthService:
         # programming error it re-raises cannot drop either.
         await self._mark_login_address_known(identity.user_id, client, enrolment=user)
         return elevation
+
+    async def _audit_enroll_refused(
+        self, identity: Identity, session_ended: bool, *, client: str | None
+    ) -> None:
+        """Write the ``auth.mfa_enroll_refused`` row for a confirm whose enable matched no row.
+
+        The reason is the row's state read AFTER the refusal, not the write's own verdict, so a
+        later write can blur it; it is a pointer for an operator, not a proof. Vault BACKLOG #3113
+        item 9 is declined: the write's own verdict would need ``enable_totp`` to return a reason
+        on all three store backends."""
+        after = await self._load_user(identity.user_id)
+        if after is None:
+            reason = "account_gone"
+        elif after.totp_enabled:
+            reason = "already_enabled"
+        else:
+            reason = "secret_cleared"
+        await self._audit(
+            "auth.mfa_enroll_refused",
+            actor=identity.username,
+            detail=_json({"reason": reason, "session_ended": session_ended}),
+            client=client,
+        )
 
     async def verify_mfa(
         self, token: str | None, code: str, *, client: str | None = None

@@ -2769,12 +2769,13 @@ An administrator clears a
 lost authenticator via `POST /users/{id}/reset-mfa` (which also revokes the user's sessions).
 A confirm turns TOTP on only while a secret is still staged and TOTP is still off (BACKLOG
 #2224). A reset can clear the secret during the confirm, or another confirm can turn TOTP on
-first. Either way the confirm turns nothing on and returns no recovery codes. It ends the session
-it just rotated and answers as a lost session: `401` on `POST /me/mfa/confirm`, and the sign-in
-page in the web console. It is audited `auth.mfa_enroll_refused`. Its `reason` is
+first. Either way the confirm turns nothing on and returns no recovery codes. It asks the store to
+end the session it just rotated, and answers as a lost session: `401` on `POST /me/mfa/confirm`,
+and the sign-in page in the web console. It is audited `auth.mfa_enroll_refused`. Its `reason` is
 `secret_cleared`, `already_enabled` or `account_gone`. That reason is read after the refusal, so a
 later write can blur it. Its `session_ended` is false when the store refused to end the rotated
-session; the token is still not handed back (vault BACKLOG #3113). The check is that some secret is
+session. The token is still not handed back, and the row is written whatever the revoke raised
+(vault BACKLOG #3113). The check is that some secret is
 staged, not that it is the one the confirm verified: a second enrolment start that re-stages the
 secret inside the same window is not caught by it. With
 `[security].require_mfa` on — **the default since BACKLOG #187 (secure-by-default, including the
@@ -4387,13 +4388,15 @@ Users are notified of security-relevant changes to their account through **two**
   failed attempts**, or a step-up re-auth that clears such a run (suspicious-login signals, 6.3.5); and **password change**, **email change**, **role
   change**, **account disable**, and a **directory rename** of the username (credential changes,
   6.3.7).
-  A notice for a change the directory drove names the directory and no administrator, and it closes
-  with "If you did not expect this change" rather than "If this was you". That covers at least the
+  A notice for a change the directory drove names the directory, not an administrator, as what made
+  the change. It closes with "If you did not expect this change, contact your MessageFoundry
+  administrator" rather than "If this was you". That covers at least the
   directory rename, the directory's email change, a role change applied by the session reconciler
   or by a directory sign-in's re-sync, and the reconciler's `account_disabled` when it read the
   account disabled (vault BACKLOG #3121). The role notice says the roles were changed to match the
   directory's groups, not that the console played no part: those groups map to roles through the
-  group-to-role map an administrator edits. When the reconciler ends an account's sessions because it
+  group-to-role map an administrator edits. Like the disable notice, it says the sessions already
+  open on the account were ended, which both of its senders do first. When the reconciler ends an account's sessions because it
   could not match the account or could not read its `userAccountControl`, it sends
   `directory_sessions_ended`, not `account_disabled` (vault BACKLOG #2140).
   The rename notice, `username_changed`, names the old and the new name, and is sent only when

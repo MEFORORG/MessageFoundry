@@ -171,11 +171,13 @@ _DESCRIPTIONS = {
 # its words, so neither takes the generic directory line: a re-sync's roles come from the
 # directory's groups through the group-to-role map, which an administrator edits in the console,
 # so "not from the MessageFoundry console" would be false for it. The disable says what the
-# reconciler did, which is end the sessions; no MessageFoundry row was disabled.
+# reconciler did, which is end the sessions; no MessageFoundry row was disabled. Both senders
+# of the role change end the sessions already open on the account first, the reconciler's pass
+# and the sign-in re-sync alike, so the role notice says so as the disable notice does.
 _DIRECTORY_DESCRIPTIONS = {
     ROLES_CHANGED: (
-        "MessageFoundry read your groups in your organization's directory and changed your "
-        "account's roles to match them."
+        "MessageFoundry read your groups in your organization's directory, changed your "
+        "account's roles to match them, and ended any sessions already open on your account."
     ),
     ACCOUNT_DISABLED: (
         "Your organization's directory reports your account as disabled, so MessageFoundry ended "
