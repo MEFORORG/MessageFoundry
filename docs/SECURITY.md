@@ -3057,10 +3057,10 @@ alone:
    While it is spent, a password re-verification through either route would be refused with 429.
    **A code at `POST /auth/mfa-verify` re-anchors too, and it draws a different budget.** On any
    session but an `oidc` one, a correct TOTP or recovery code from the new address re-anchors the
-   session there and clears the refusal, as `POST /me/reauth` does. That route draws the
-   **sign-in** window (per-IP and global, the budget `POST /auth/login` draws), not the per-actor
-   ceremony budget, so spending one leaves the other. Its console twin, `POST /ui/mfa`, draws the
-   per-actor ceremony budget like `POST /ui/reauth` (the route-to-limiter map has both rows).
+   session there and clears the refusal. That route draws the sign-in window, not the per-actor
+   ceremony budget ([the route-to-limiter map](#route--limiter-map) has its row), and it carries the
+   sign-in route's other conditions, such as the second-step lock. The console refusal sends the
+   browser to `/ui/reauth` instead, which draws the ceremony budget.
    Until the session re-verifies, its requests from the new address would still get the refusals
    above, so it would read no message and make none of those writes. Where the changing address
    belongs to a reverse proxy, declare that proxy in `[api].trusted_proxies`, so the engine

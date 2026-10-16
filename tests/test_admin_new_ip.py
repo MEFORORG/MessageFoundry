@@ -546,14 +546,15 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
     await eng.stop()
 
 
-def _client_at(
-    engine: Engine, service: AuthService, ip: str, *, app: FastAPI | None = None
-) -> httpx.AsyncClient:
-    """An API client whose requests originate from ``ip`` (set on the ASGI scope). ``app`` reuses an
-    app already built, such as one with a test route mounted."""
-    app = app if app is not None else create_app(engine, auth=service)
+def _client_for(app: FastAPI, ip: str) -> httpx.AsyncClient:
+    """A client of ``app`` whose requests originate from ``ip`` (set on the ASGI scope)."""
     transport = httpx.ASGITransport(app=app, client=(ip, 12345))
     return httpx.AsyncClient(transport=transport, base_url="http://t")
+
+
+def _client_at(engine: Engine, service: AuthService, ip: str) -> httpx.AsyncClient:
+    """An API client whose requests originate from ``ip`` (set on the ASGI scope)."""
+    return _client_for(create_app(engine, auth=service), ip)
 
 
 def _auth(token: str) -> dict[str, str]:
@@ -850,8 +851,9 @@ _STEP_UP_FACTORIES = {
 async def test_each_step_up_factory_refuses_a_new_address_holding_a_fresh_proof(
     engine: Engine, name: str
 ) -> None:
-    """RED when: one of the four step-up factories, in either branch, stops asking whether the request comes from a
-    new address (vault BACKLOG #3052 item 13; PR 2048's mutation run skipped all four). The caller
+    """RED when: one of the four step-up factories, in either branch, stops asking whether the
+    request comes from a new address (vault BACKLOG #3052 item 13; PR 2048's mutation run skipped
+    all four). The caller
     holds the proof the factory wants, a fresh sign-in window or a grant bound to its action, so
     the address is the only reason left to refuse. The control spends the same proof from the
     sign-in address and passes, so the refusal is not a stale proof.
@@ -884,12 +886,12 @@ async def test_each_step_up_factory_refuses_a_new_address_holding_a_fresh_proof(
         assert r.status_code == 200, r.text
         return str(r.json()["token"])
 
-    async with _client_at(engine, service, "10.0.0.1", app=app) as a:
+    async with _client_for(app, "10.0.0.1") as a:
         token = await proof(a, await _login_token(a))
         control = await a.post("/test/step-up-probe", headers=_auth(token))
         assert control.status_code == 200, (name, control.status_code, control.text)
         token = await proof(a, token)
-    async with _client_at(engine, service, "10.9.9.9", app=app) as b:
+    async with _client_for(app, "10.9.9.9") as b:
         r = await b.post("/test/step-up-probe", headers=_auth(token))
         assert (r.status_code, r.headers.get("X-Step-Up-Required")) == (403, "1"), (name, r.text)
         assert r.headers.get("X-Step-Up-Action") == action, name

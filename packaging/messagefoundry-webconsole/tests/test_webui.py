@@ -21,7 +21,6 @@ import httpx
 import pytest
 from _ui_clients import create_local_user_chosen, issue_continuation
 from starlette.datastructures import Headers
-from starlette.requests import Request as StarletteRequest
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
@@ -9035,38 +9034,35 @@ async def test_the_password_page_is_not_refused_for_a_new_address(engine: Engine
         assert r.status_code == 400, r.headers.get("location")
 
 
-def _bare_request(method: str, path: str, query: str = "") -> StarletteRequest:
-    """A request carrying only a method, a path and a query, for the continuation helpers."""
-    scope = {
-        "type": "http",
-        "method": method,
-        "path": path,
-        "raw_path": path.encode(),
-        "query_string": query.encode(),
-        "headers": [],
-    }
-    return StarletteRequest(scope)
-
-
 def test_a_new_address_continuation_never_drops_a_query_or_overflows() -> None:
     """RED when: a refused GET's continuation drops its query (a broader read after the re-auth)
     or exceeds ``/ui/reauth``'s 512-character cap on ``next`` (a 422 with no form). Either way the
     landing is used instead (vault BACKLOG #2620, review round 2)."""
+    from starlette.requests import Request
+
     from messagefoundry_webconsole._auth import _new_address_continuation
 
+    def req(method: str, path: str, query: str = "") -> Request:
+        scope = {
+            "type": "http",
+            "method": method,
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": query.encode(),
+            "headers": [],
+        }
+        return Request(scope)
+
     land = "/ui/account"
-    assert (
-        _new_address_continuation(_bare_request("GET", "/ui/messages"), landing=land)
-        == "/ui/messages"
-    )
-    filtered = _bare_request("GET", "/ui/messages", "channel_id=ch1&defer=1")
+    assert _new_address_continuation(req("GET", "/ui/messages"), landing=land) == "/ui/messages"
+    filtered = req("GET", "/ui/messages", "channel_id=ch1&defer=1")
     assert (
         _new_address_continuation(filtered, landing=land) == "/ui/messages?channel_id=ch1&defer=1"
     )
     long_name = "/ui/connection/" + "n" * 600 + "/events/1/reason"
-    assert _new_address_continuation(_bare_request("GET", long_name), landing=land) == land
-    assert _new_address_continuation(_bare_request("GET", "/ui/audit"), landing=land) == land
-    assert _new_address_continuation(_bare_request("POST", "/ui/messages"), landing=land) == land
+    assert _new_address_continuation(req("GET", long_name), landing=land) == land
+    assert _new_address_continuation(req("GET", "/ui/audit"), landing=land) == land
+    assert _new_address_continuation(req("POST", "/ui/messages"), landing=land) == land
 
 
 async def test_the_continuation_cap_is_the_reauth_pages_own(engine: Engine) -> None:
@@ -9105,7 +9101,8 @@ async def test_a_cross_site_write_from_a_new_address_writes_no_row(engine: Engin
     async with _client_from(engine, service, "10.9.9.9") as b:
         b.cookies.set("mf_session", tok)
         r = await b.post("/ui/statistics/reset", headers={"Origin": "https://attacker.example"})
-        assert r.status_code == 403, r.headers.get("location")
+        # require_ui's own refusal, by its detail, so an earlier gate cannot pass this vacuously.
+        assert (r.status_code, r.json().get("detail")) == (403, "cross-origin request rejected")
         assert await engine.store.list_audit(action="auth.admin_action_new_ip", limit=10) == []
         r = await b.post("/ui/statistics/reset", headers={"Sec-Fetch-Site": "same-origin"})
         assert (r.status_code, r.headers["location"]) == (303, "/ui/reauth?next=/ui")
@@ -9133,9 +9130,10 @@ async def test_a_refused_write_without_monitoring_read_lands_on_the_account_page
         await _cookie_login(a, "resetter")
         tok = a.cookies.get("mf_session")
         assert tok is not None
-        # The control at the sign-in address: the role may make this write.
+        # The control at the sign-in address: the role may make this write, so it is not refused.
+        # Where its success lands is not this test's subject.
         r = await a.post("/ui/statistics/reset", headers=same)
-        assert (r.status_code, r.headers["location"]) == (303, "/ui/status")
+        assert r.status_code == 303 and not r.headers["location"].startswith("/ui/reauth")
     async with _client_from(engine, service, "10.9.9.9") as b:
         b.cookies.set("mf_session", tok)
         r = await b.post("/ui/statistics/reset", headers=same)

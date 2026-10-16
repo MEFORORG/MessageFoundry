@@ -14,8 +14,10 @@
   (vault BACKLOG #3052):** "default off" was true when this was written and is stale. The default
   has been ON since BACKLOG #288 (owner ruling 2026-09-26, recorded in the
   [ADR 0068](0068-browser-webauthn-passkeys-offloopback.md) amendment of that date), and turning it
-  off is a named loosening in `docs/SECURITY-LOOSENING.md`. What the signal now refuses is the
-  ADR 0068 amendment of 2026-10-05 (vault BACKLOG #2620). **Device-posture assessment
+  off is a named loosening in `docs/SECURITY-LOOSENING.md`. Since vault BACKLOG #2620 the signal
+  also refuses requests, not only forces a step-up; the
+  [ADR 0068](0068-browser-webauthn-passkeys-offloopback.md) amendment of 2026-10-05 says which.
+  **Device-posture assessment
   for 8.4.2 is delegated to the deployment** — a managed/attested host + an mTLS client cert terminated
   at the **WP-15** reverse proxy — not built in-process (stdlib `ssl` does no device attestation).
   **Federated SSO (OAuth 2.0 / OIDC /
@@ -215,6 +217,14 @@ extension point at the same step-up boundary, not designed in detail here. *(WP-
 [ADR 0068](0068-browser-webauthn-passkeys-offloopback.md), 2026-07-03 — this sketch's design
 amendment; passkeys land at exactly this step-up boundary, local users only. Building — this note
 flips to "built" with the L5 code PRs.)*
+
+**CORRECTED 2026-10-16 (vault BACKLOG #3052):** the paragraph above, and the Status line's "enforced
+for the Administrator role via `[auth].require_mfa`", are stale and left as written. The key is now
+`[security].require_mfa`, on by default, covering every local account by default
+(`[security].require_mfa_scope`); the `[auth]` spelling is rejected at load. `docs/SECURITY.md` is
+the record. The L5 code has landed, so the "Building" note reads "built": WebAuthn passkeys (PR-A),
+the off-loopback hardening (PR-B) and `GET /ui/sso` (PR-C) are in the tree, and ADR 0068's own
+*Open items* list is still open.
 
 ### 4. WP-15 — Reverse-proxy / forwarded-header path (alternative termination)
 
