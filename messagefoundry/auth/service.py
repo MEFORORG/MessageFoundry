@@ -12889,8 +12889,9 @@ class AuthService:
         for every lock before this runs, so the newest one is always the current lock and a 15-minute
         campaign would look mailed forever. So a due notice writes its OWN row,
         ``auth.lock_notice``, with the closed-set lock kind as detail, and the next lock reads the
-        newest of those through ``list_audit``, as the first-seen login-address check reads its
-        baseline. No column needed.
+        newest of those through ``list_audit``. No column needed. (The first-seen login-address
+        check no longer reads its baseline this way: it reads the account's known-address record,
+        vault BACKLOG #2145 and #2947.)
 
         **With no notifier wired the row is still written, as ``mailed: false`` with
         ``reason: no_notifier``, and nothing is throttled** (BACKLOG #1131, owner ruling 2026-09-28).
