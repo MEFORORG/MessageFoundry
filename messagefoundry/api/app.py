@@ -40,7 +40,7 @@ import os
 import re
 import shutil
 import time
-from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass, fields, replace
 from datetime import UTC, datetime
@@ -216,7 +216,8 @@ from messagefoundry.api.multipart import (
     MultipartTooLargeError,
     parse_single_file_upload,
 )
-from messagefoundry.api.outlive import OutlivingOperations
+from messagefoundry.api.outlive import CANCEL_GRACE_SECONDS, OutlivingOperations
+from messagefoundry.api.outlive import DRAIN_TIMEOUT_SECONDS as OUTLIVING_DRAIN_SECONDS
 from messagefoundry.api.paging import page_total
 from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
@@ -1045,37 +1046,234 @@ async def _reconcile_approvals_after_restart(gate: ApprovalGate) -> None:
         )
 
 
-async def _drain_approval_gate(app: FastAPI) -> None:
-    """Let approval outcome writes still running land before the store closes (BACKLOG #2087).
+#: BACKLOG #3191: the wall-clock budget of everything the managed lifespan does after its yield,
+#: engine.stop() included. NSSM sends Ctrl+C and escalates after AppStopMethodConsole, 15000 ms
+#: (scripts/service/install-service.ps1). Before the lifespan sees the shutdown, uvicorn drains the
+#: open connections, which BACKLOG #3256 bounds where serve calls uvicorn.run. This budget plus that
+#: bound, plus a cut step's grace (below) for each step cut, must stay inside the window with room
+#: left for the interpreter to exit.
+_SHUTDOWN_BUDGET_SECONDS: Final = 10.0
+#: The share of that budget kept back for engine.stop(). Reserved, never a bound: the stop is not cut
+#: short, because it ends in store.close(), and a store left open keeps a non-daemon worker thread
+#: alive, which is the hang BACKLOG #2087 fixed. The stop's own waits are bounded inside the engine,
+#: and nothing here holds them to this reserve.
+_ENGINE_STOP_RESERVE_SECONDS: Final = 3.0
+#: The part of a step's bound handed to the step's own graceful wait, so that wait ends, and cancels
+#: what it owns, before the teardown cuts the step.
+_INNER_SHARE: Final = 0.8
+#: How long a step cut at its bound gets to unwind its cancellation before the teardown stops waiting
+#: for it and moves on, leaving it to finish or fail on its own.
+_CUT_GRACE_SECONDS: Final = 0.1
 
-    A write whose caller was cancelled, such as by a request timeout, finishes on its own, and would
-    otherwise meet a closed store. ``drain()`` is bounded, and a failure is logged rather than
-    raised, so the teardown steps after it still run. The gate is read through getattr
-    because a startup that failed early may not have built one."""
+#: Steps the teardown stopped waiting for. The event loop holds only a weak reference to a task, so
+#: this keeps one alive until it ends.
+_left_running: set[asyncio.Future[object]] = set()
+
+
+@dataclass(frozen=True)
+class _TeardownStep:
+    """One shutdown step for :func:`_run_teardown`.
+
+    ``floor`` is the time the step is guaranteed whatever the steps before it took. ``run`` is given
+    the step's bound and returns what to await. A step that does not apply is left out of the list,
+    which frees its floor. ``bounded=False`` runs the step to completion and is never cut; only
+    engine.stop() is run that way, and its ``floor`` is the reserve the steps before it leave it."""
+
+    label: str
+    floor: float
+    run: Callable[[float], Awaitable[object]]
+    bounded: bool = True
+
+
+def _log_late_outcome(label: str) -> Callable[[asyncio.Future[object]], None]:
+    """Log how a step the teardown left running ended, since nobody else reads it."""
+
+    def _done(work: asyncio.Future[object]) -> None:
+        _left_running.discard(work)
+        if not work.cancelled() and (error := work.exception()) is not None:
+            _log.error("shutdown: %s failed after the teardown moved on", label, exc_info=error)
+
+    return _done
+
+
+async def _await_step(work: asyncio.Future[object], bound: float | None, label: str) -> bool:
+    """Wait for one step, through any cancel of the caller, for at most ``bound`` seconds.
+
+    A cancel of the caller is noted once and does not reach the step: the step finishes, or is cut
+    at its bound, as it would have been with no cancel. At the bound the step is cancelled and gets
+    :data:`_CUT_GRACE_SECONDS` to unwind; one still running then is left to end on its own. Returns
+    whether the step ended on its own, so its outcome is the caller's to read.
+
+    The wait is asyncio.wait, never asyncio.shield: once the caller is cancelled, shield reports a
+    later failure of the step to the loop's exception handler as well, so it would be logged twice
+    (BACKLOG #2087, #2263)."""
+    loop = asyncio.get_running_loop()
+    give_up = None if bound is None else loop.time() + bound
+    cut = noted = False
+    while not work.done():
+        remaining = None if give_up is None else give_up - loop.time()
+        if remaining is not None and remaining <= 0:
+            if cut:
+                _log.error(
+                    "shutdown: %s was still running %.2fs after it was cut; continuing the "
+                    "teardown without it",
+                    label,
+                    _CUT_GRACE_SECONDS,
+                )
+                _left_running.add(work)
+                work.add_done_callback(_log_late_outcome(label))
+                return False
+            _log.error("shutdown: %s did not finish within %.2fs; cutting it", label, bound)
+            cut = True
+            work.cancel()
+            give_up = loop.time() + _CUT_GRACE_SECONDS
+            continue
+        try:
+            await asyncio.wait((work,), timeout=remaining)
+        except asyncio.CancelledError:
+            # Once per step: a cancel that is re-delivered on every pass of the loop, as an anyio
+            # cancel scope does, would otherwise log a line per pass.
+            if not noted:
+                noted = True
+                _log.warning(
+                    "shutdown: cancelled during %s; it and the remaining steps run before the "
+                    "cancel propagates",
+                    label,
+                )
+    return not (cut and work.cancelled())
+
+
+async def _run_teardown(steps: Sequence[_TeardownStep], budget: float) -> None:
+    """Run every step in order, whatever the steps before it did (BACKLOG #3191).
+
+    Each step runs as its own task. A step that raises, or overruns its bound and is cut, is logged,
+    and the next step runs. Each bounded step gets what is left of ``budget`` after the floors of the
+    steps still to come, and never less than its own floor, so a slow step spends slack and not a
+    later step's share. The whole run takes at most ``budget``, plus :data:`_CUT_GRACE_SECONDS` for
+    each step cut, plus whatever an unbounded step overruns its reserve by.
+
+    A cancel of the caller reaches no step (:func:`_await_step`), and is raised once every step has
+    run. So is the first exception that is not an :class:`Exception`, such as KeyboardInterrupt:
+    the steps after it still run, so engine.stop() still closes the store."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + budget
+    current = asyncio.current_task()
+    # Compared at the end, so a cancel that arrived while this ran is raised, and one already on its
+    # way out when the teardown began is left to the exception carrying it.
+    baseline = 0 if current is None else current.cancelling()
+    later = sum(step.floor for step in steps)
+    fatal: BaseException | None = None
+    for step in steps:
+        later -= step.floor
+        bound = max(step.floor, deadline - loop.time() - later)
+        work = asyncio.ensure_future(step.run(bound))
+        if not await _await_step(work, bound if step.bounded else None, step.label):
+            continue
+        try:
+            work.result()
+        except asyncio.CancelledError:
+            _log.error("shutdown: %s ended cancelled; continuing the teardown", step.label)
+        except Exception:
+            _log.exception("shutdown: %s failed; continuing the teardown", step.label)
+        except BaseException as exc:  # re-raised below, once the later steps have run
+            _log.exception("shutdown: %s raised; it is re-raised after the teardown", step.label)
+            fatal = fatal or exc
+    if fatal is not None:
+        raise fatal
+    if current is not None and current.cancelling() > baseline:
+        raise asyncio.CancelledError
+
+
+def _sync(fn: Callable[[], object]) -> Callable[[float], Awaitable[None]]:
+    """A synchronous call as a teardown step, so :func:`_run_teardown` guards its failure too."""
+
+    async def _step(_bound: float) -> None:
+        fn()
+
+    return _step
+
+
+def _app_drain_steps(
+    app: FastAPI, store: Store | None, auth: AuthService | None
+) -> list[_TeardownStep]:
+    """The drains an app runs at shutdown while the store is still open, in order.
+
+    Both lifespans run them: the managed one before engine.stop(), and the one
+    :func:`create_app` gives an app built around a caller's engine, before the caller stops it.
+
+    1. Long operations (vault BACKLOG #2751-#2753): a DR activate or release, or a config reload,
+       whose caller was cancelled is still running. It finishes, or is cancelled so its own
+       rollback arm restores state and records 'interrupted'. Before the approval drain, because a
+       released reload's outcome write follows the reload.
+    2. Approval outcome writes (BACKLOG #2087), which would otherwise meet a closed store.
+    3. Lock notices (BACKLOG #2216), which read and write the audit log and hand their mail to the
+       security notifier, so they drain before that notifier stops.
+    4. The open summary-access windows (M-5, BACKLOG #1640). Every clean restart otherwise dropped
+       the open hour's PHI-summary access audit, the rows that control exists to produce.
+
+    Each drain that has a graceful wait of its own is handed part of its bound for it, so it cancels
+    what it owns before the hard bound cuts it. The gate is read through getattr, because a startup
+    that failed early may not have built one. The summary auditor is read directly: create_app
+    always sets it, so a rename fails loudly inside the step's guard rather than silently skipping
+    the flush."""
+    outliving: OutlivingOperations = app.state.outliving_operations
+
+    async def _outliving(bound: float) -> None:
+        # At most a quarter of it waiting: the grace after is what lets a cancelled operation's
+        # rollback arm record 'interrupted' before the store closes.
+        wait = min(OUTLIVING_DRAIN_SECONDS, bound * _INNER_SHARE / 4)
+        await outliving.drain(wait, grace=min(CANCEL_GRACE_SECONDS, bound * _INNER_SHARE - wait))
+
+    steps = [_TeardownStep("the long-operations drain", 2.0, _outliving)]
     gate: ApprovalGate | None = getattr(app.state, "approval_gate", None)
-    if gate is None:
-        return
-    try:
-        await gate.drain()
-    except Exception:
-        _log.exception("approval gate: the shutdown drain failed; continuing the teardown")
+    if gate is not None:
+        steps.append(
+            _TeardownStep(
+                "the approval outcome-write drain", 0.5, lambda b: gate.drain(b * _INNER_SHARE)
+            )
+        )
+    if auth is not None:
+        # close_background is the shutdown call the service names, with its own bound (its drain
+        # and cancel grace, in auth/service.py). Only a bound below that cuts it before it cancels
+        # its notices itself; a notice cut that way meets the closed store and logs its own failure.
+        steps.append(
+            _TeardownStep("the lock-notice drain", 1.0, lambda _b: auth.close_background())
+        )
+    if store is not None:
+        steps.append(
+            _TeardownStep(
+                # Named for its loss: the flush clears its windows before it writes them, so a cut
+                # loses every row not yet written.
+                "the summary-access flush (a cut loses the unwritten windows' audit rows)",
+                0.5,
+                lambda _b: app.state.summary_auditor.flush(store),
+            )
+        )
+    return steps
 
 
 @asynccontextmanager
-async def _embedded_approvals_lifespan(app: FastAPI) -> AsyncIterator[None]:
+async def _embedded_lifespan(app: FastAPI) -> AsyncIterator[None]:
     """The lifespan :func:`create_app` gives an app built around a caller's engine.
 
-    The caller starts and stops the engine; this runs only the approval gate's own steps, which the
-    managed lifespan runs too. At start, :meth:`ApprovalGate.reconcile_after_restart`, before the
-    app serves an approval. At shutdown, :meth:`ApprovalGate.drain` (BACKLOG #2087), so a caller
-    that stops its engine after the app has shut down loses no outcome write. A caller that passes
-    its own ``lifespan`` replaces this one and runs these steps itself, with the store open."""
+    The caller starts and stops the engine. At start, this runs
+    :meth:`ApprovalGate.reconcile_after_restart`, before the app serves an approval. At shutdown it
+    runs the same drains the managed lifespan runs before engine.stop() (:func:`_app_drain_steps`,
+    BACKLOG #3191), so a caller that stops its engine after the app has shut down loses no outcome
+    write, notice or audit row. The lock-notice drain closes the caller's auth service, as
+    :meth:`AuthService.close_background` asks of any such app, so a later app over the same service
+    runs its notices inline. A caller that passes its own ``lifespan`` replaces this one and runs
+    these steps itself, with the store open."""
     # create_app installs this only beside an engine, and always builds the gate then.
     await _reconcile_approvals_after_restart(app.state.approval_gate)
     try:
         yield
     finally:
-        await _drain_approval_gate(app)
+        # The caller still has its engine to stop, so its reserve is left out of this budget.
+        await _run_teardown(
+            _app_drain_steps(app, app.state.engine.store, getattr(app.state, "auth", None)),
+            _SHUTDOWN_BUDGET_SECONDS - _ENGINE_STOP_RESERVE_SECONDS,
+        )
 
 
 def _build_approval_gate(
@@ -2946,8 +3144,8 @@ def create_app(
     if engine is not None and lifespan is None:
         # The embedded path: the caller owns the engine, and this app still owns its approval
         # gate's start and stop (BACKLOG #1562). A caller passing its own lifespan runs those
-        # steps itself; _embedded_approvals_lifespan names them.
-        lifespan = _embedded_approvals_lifespan
+        # steps itself; _embedded_lifespan names them.
+        lifespan = _embedded_lifespan
     app = FastAPI(
         title="MessageFoundry",
         version=__version__,
@@ -10330,7 +10528,7 @@ def create_managed_app(
                 # or opt out in writing via [alerts].security_notifications_required) is enforced fail-closed
                 # at startup by the serve gate (messagefoundry/__main__.py), which checks these SAME two
                 # conditions — not here. This task is owned by the lifespan (started here, drained + closed
-                # after the engine in the finally below).
+                # in the finally below, before engine.stop() closes the store it records in).
                 if auth_settings.notify_security_events and alerts_settings is not None:
                     security_notifier = security_notifier_from_settings(
                         alerts_settings,
@@ -10583,80 +10781,77 @@ def create_managed_app(
                     )
             yield
         finally:
-            # BACKLOG #2087: every step before engine.stop() sits in this try, so a cancel delivered
-            # to the lifespan mid-teardown, or a step that raises, still stops the engine. Without
-            # it the store's non-daemon worker keeps the process alive. The three store-reading tasks
-            # are cancelled first, before any await, so a step that raises or a cancel cannot leave
-            # one running when engine.stop() closes the store.
+            # BACKLOG #2087, #3191: every step after the yield runs whatever the steps before it
+            # did. A step that raises, overruns its bound or is cut by a cancel is logged and the
+            # next one runs, so a cancel delivered mid-teardown still drains, stops the engine and
+            # closes both notifiers, and is re-raised once they have run. Without engine.stop()
+            # the store's non-daemon worker keeps the process alive. The three store-reading tasks
+            # are cancelled first, before any await, so no step can leave one running when
+            # engine.stop() closes the store. _SHUTDOWN_BUDGET_SECONDS bounds the whole run.
             background = [t for t in (reconciler, reaper, credential_reminder) if t is not None]
             for task in background:
                 task.cancel()
-            try:
-                if upload_retention_runner is not None:
-                    await upload_retention_runner.stop()
-                # gather(return_exceptions): absorbs both our cancellation AND any exception a
-                # previously-died task stored, so it can't skip the steps below (review M-33).
-                await asyncio.gather(*background, return_exceptions=True)
-                # vault BACKLOG #2751-#2753: a DR activate or release, or a config reload, whose
-                # caller was cancelled is still running on its own. Let it finish, or cancel it so
-                # its own rollback arm restores state and records 'interrupted', while the store is
-                # open. Before the approval drain: a released reload's outcome write follows it.
-                try:
-                    await app.state.outliving_operations.drain()
-                except Exception:
-                    _log.exception(
-                        "long operations: the shutdown drain failed; continuing the teardown"
+
+            steps: list[_TeardownStep] = []
+            if upload_retention_runner is not None:
+                steps.append(
+                    _TeardownStep(
+                        "the upload retention runner's stop",
+                        0.5,
+                        lambda _b: upload_retention_runner.stop(),
                     )
-                # BACKLOG #2087: let approval outcome writes still running land before the store closes.
-                await _drain_approval_gate(app)
-                # BACKLOG #2216: a lock notice still in flight reads and writes the audit log, then
-                # hands its mail to the security notifier, so it drains before engine.stop() closes
-                # the store and before that notifier stops in the finally below. Bounded, and it logs
-                # and cancels what it cannot finish; guarded like the drains above so a failure
-                # cannot skip a later step.
-                if auth is not None:
-                    try:
-                        await auth.close_background()
-                    except Exception:
-                        _log.exception(
-                            "auth: the shutdown drain of background notices failed; continuing the "
-                            "teardown"
-                        )
-                # M-5 (BACKLOG #1640): flush the open summary-access window before the store closes.
-                # `_SummaryAuditCoalescer.flush` documents itself as the engine-shutdown path and NOTHING
-                # called it, so every clean restart dropped the open hour's PHI-summary access audit --
-                # the rows the control exists to produce, lost exactly when an operator restarts after a
-                # bulk census fetch.
-                #
-                # BEFORE engine.stop(), because that ends in store.close() and the emit needs the store.
-                # Guarded like the reaper above, so a store error here is logged rather than raised
-                # out of the teardown. Read directly, not through getattr: create_app always sets the
-                # auditor, so a rename should fail loudly inside this guard rather than silently skip
-                # the flush.
-                try:
-                    await app.state.summary_auditor.flush(store)
-                except Exception:
-                    _log.exception(
-                        "summary-access coalescer: the shutdown flush failed, so at least one open "
-                        "window's audit row is lost; continuing the teardown"
+                )
+            # return_exceptions absorbs both our cancellation AND any exception a task that died
+            # earlier stored (review M-33).
+            steps.append(
+                _TeardownStep(
+                    "the store-reading tasks",
+                    0.1,
+                    lambda _b: asyncio.gather(*background, return_exceptions=True),
+                )
+            )
+            steps += _app_drain_steps(app, store, auth)
+            if security_notifier is not None:
+                # It drains queued user emails, and records a notice it could not send in the audit
+                # log, so it closes while the store is open, after the lock notices that hand it
+                # mail (BACKLOG #3191).
+                steps.append(
+                    _TeardownStep(
+                        "the security notifier's close", 0.25, lambda _b: security_notifier.aclose()
                     )
-            finally:
-                if remove_security_signals is not None:
-                    remove_security_signals()
-                await engine.stop()
-                # B11: shut down the harness-only instrumented executor (None in production / other tests).
-                # The engine is stopped (no more to_thread work), so a non-blocking shutdown is clean.
-                shim_executor = getattr(app.state, "connscale_executor", None)
-                if shim_executor is not None:
-                    shim_executor.shutdown(wait=False)
-                if security_notifier is not None:
-                    await (
-                        security_notifier.aclose()
-                    )  # drain queued user emails, bounded by SMTP timeout
-                if notifier is not None:
-                    # Stop accepting alerts last (after the engine quiesces) so any final
-                    # connection_stopped/queue_buildup still drains; bounded by the transport timeouts.
-                    await notifier.aclose()
+                )
+            if remove_security_signals is not None:
+                steps.append(
+                    _TeardownStep(
+                        "the security-signal removal", 0.05, _sync(remove_security_signals)
+                    )
+                )
+            steps.append(
+                _TeardownStep(
+                    "engine.stop()",
+                    _ENGINE_STOP_RESERVE_SECONDS,
+                    lambda _b: engine.stop(),
+                    bounded=False,
+                )
+            )
+            # B11: the harness-only instrumented executor (None in production and other tests). The
+            # engine is stopped, so no more to_thread work: a non-blocking shutdown is clean.
+            shim_executor = getattr(app.state, "connscale_executor", None)
+            if shim_executor is not None:
+                steps.append(
+                    _TeardownStep(
+                        "the instrumented executor's shutdown",
+                        0.05,
+                        _sync(partial(shim_executor.shutdown, wait=False)),
+                    )
+                )
+            if notifier is not None:
+                # Last, after the engine quiesces, so a final connection_stopped or queue_buildup
+                # alert still drains.
+                steps.append(
+                    _TeardownStep("the alert notifier's close", 0.5, lambda _b: notifier.aclose())
+                )
+            await _run_teardown(steps, _SHUTDOWN_BUDGET_SECONDS)
 
     # Settings never select the open mode: only the caller's opt-in, checked at the top, does
     # (vault BACKLOG #2611, #2825).
