@@ -347,6 +347,65 @@ async def test_an_engine_fault_in_the_probe_has_its_own_reason_not_unavailable(
     assert "jdoe" not in warnings[0]
 
 
+def _fault_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == _SERVICE_LOGGER
+        and r.levelno == logging.WARNING
+        and "was refused: probe_fault" in r.getMessage()
+    ]
+
+
+async def test_a_probe_fault_warns_on_each_healthy_to_fault_transition_of_its_account(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3115, the Lander's ask on PR 2317. A fault logs one WARNING naming the exception
+    type, stays quiet while it persists, and warns again after that account's probe succeeded in
+    between. Another account's healthy answer does not re-arm it, or one account whose entry
+    always raises beside a healthy one would read as a flapping fault.
+
+    RED when: the fault WARNING is logged once per process, or omits the type, or a different
+    account's healthy answer re-arms it."""
+    service, _directory, user_id = await _directory_account(store, _VIEWERS)
+    user = await store.get_user(user_id)
+    assert user is not None
+    other = replace(user, id="synthetic-other-user-id")
+    caplog.set_level(logging.INFO, logger=_SERVICE_LOGGER)
+    real = service._directory_presence
+    faulting = True
+
+    async def _sometimes_raises(probed: UserRecord) -> reconcile.Probe | str:
+        if faulting and probed.id == user_id:
+            raise LookupError("synthetic engine fault")
+        return await real(user)  # the healthy answer, whichever row asked
+
+    monkeypatch.setattr(service, "_directory_presence", _sometimes_raises)
+
+    async def _ask(row: UserRecord) -> object:
+        answer = await service._cert_directory_presence(row)
+        service._note_cert_directory_answer(answer)
+        return answer
+
+    assert await _ask(user) == service_module.CERT_PROBE_FAULT
+    warnings = _fault_warnings(caplog)
+    assert len(warnings) == 1 and "LookupError" in warnings[0]
+    assert "jdoe" not in warnings[0] and "synthetic engine fault" not in warnings[0]
+
+    # A repeat while the fault persists is quiet, and so is it after ANOTHER account's healthy answer.
+    assert await _ask(user) == service_module.CERT_PROBE_FAULT
+    assert isinstance(await _ask(other), reconcile.Probe)
+    assert await _ask(user) == service_module.CERT_PROBE_FAULT
+    assert len(_fault_warnings(caplog)) == 1
+
+    # This account answers once, then faults again: a new outage, so a new WARNING.
+    faulting = False
+    assert isinstance(await _ask(user), reconcile.Probe)
+    faulting = True
+    assert await _ask(user) == service_module.CERT_PROBE_FAULT
+    assert len(_fault_warnings(caplog)) == 2
+
+
 @pytest.mark.parametrize(
     "moved",
     [
