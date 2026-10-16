@@ -952,7 +952,12 @@ async def test_a_referral_is_not_cleared_by_a_sample_that_missed_an_account_it_s
     try:
         names = ("jdoe", "asmith", "bwong")
         ldap = _FakeLdap({n: _principal(n) for n in names})
-        service = AuthService(store, _ad_settings(ad_session_recheck_max_users=1), ldap=ldap)  # type: ignore[arg-type]
+        # A budget of one needs a cap of 0, or the breaker could never trip and the load refuses it.
+        service = AuthService(
+            store,
+            _ad_settings(ad_session_recheck_max_users=1, ad_session_revoke_max=0),
+            ldap=ldap,  # type: ignore[arg-type]
+        )
         await service.initialize()
         for name in names:
             await _signed_in_ad_user(service, store, name)
@@ -1275,7 +1280,7 @@ async def test_a_pass_never_exceeds_its_bind_budget() -> None:
         ldap = _FakeLdap({n: _principal(n) for n in names})
         service = AuthService(
             store,
-            _ad_settings(ad_session_recheck_max_users=3),
+            _ad_settings(ad_session_recheck_max_users=3, ad_session_revoke_max=2),
             ldap=ldap,  # type: ignore[arg-type]
         )
         await service.initialize()
