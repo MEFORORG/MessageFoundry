@@ -9130,7 +9130,8 @@ class AuthService:
     #:
     #: A new action on either reauth-only action gate belongs here too. A test in
     #: ``tests/test_mfa_access_gate.py`` catches at least a missing one wired in the engine or
-    #: console packages. The action-less ``require_ui_reauth_only`` gate never consults it.
+    #: console packages. The action-less ``require_ui_reauth_only`` gate never consults it, so
+    #: ``finish_webauthn_registration`` asks it for ``webauthn_enroll`` itself (BACKLOG #3014).
     _PENDING_REFUSED_ACTIONS = frozenset(
         {
             STEP_UP_ACTION_MFA_ENROLL,
@@ -10861,9 +10862,11 @@ class AuthService:
         "behind a load balancer, begin and finish must reach the same node)"
     )
     _WEBAUTHN_LABEL_MAX = 100  # matches the column cap (ADR 0068 §4)
-    #: A passkey finish on a session that owes the account's existing factor (BACKLOG #3014).
-    _FACTOR_OWED = (
-        "this account already has a second factor; verify it first, then add the passkey again"
+    #: A passkey finish on a session that owes the account's existing factor (BACKLOG #3014). It
+    #: points back to the account page because the refusal ended the ceremony this page staged.
+    _FACTOR_PRESENT = (
+        "this account already has a second factor; verify it first, then start adding the passkey "
+        "again from the account page"
     )
 
     async def begin_webauthn_registration(
@@ -10912,7 +10915,8 @@ class AuthService:
         """Verify an attestation response and persist the passkey. Returns a not-``ok``
         :class:`Elevation` when the response fails verification (audited — parity with a wrong TOTP
         code); raises :class:`ValueError` for flow errors with safe, renderable messages (unknown
-        account, bad label, expired ceremony, duplicate label/credential). On success the enrolling
+        account, bad label, expired ceremony, duplicate label/credential, and a pending session on an
+        account that already holds a factor, BACKLOG #3014). On success the enrolling
         session is marked MFA-verified and re-keyed (exact :meth:`confirm_mfa_enrollment` parity,
         ASVS 7.2.4) — **no recovery codes are minted** (ADR 0068 decision 5). Accepts a directory
         account, for the reason :meth:`begin_mfa_enrollment` states.
@@ -10940,6 +10944,23 @@ class AuthService:
         if staged is None or staged.user_id != user.id:
             self._webauthn_challenges.pop((hash_token(token), "register"))
             raise ValueError(self._CEREMONY_EXPIRED)
+        # BACKLOG #3014: re-asked at finish, since a factor may have been bound since begin and the
+        # console's finish route rides the action-less gate. After the peek, so "ceremony expired"
+        # still answers first; before the floor, so this refusal reads the same at any elapsed time.
+        # It kills the stale ceremony. Read-then-act: a factor bound between here and the stamp below
+        # is not caught, as the begin gate's check is not.
+        if await self._factor_binding_is_blocked(token, STEP_UP_ACTION_WEBAUTHN_ENROLL):
+            self._webauthn_challenges.pop((hash_token(token), "register"))
+            session = await self._load_session(hash_token(token))
+            if session is None or session.revoked_at is not None:
+                return Elevation(session_lost=True)  # the check fails closed on a dead session
+            await self._audit(
+                "auth.webauthn_failed",
+                actor=identity.username,
+                detail=_json({"phase": "enroll", "reason": "factor_present"}),
+                client=client,
+            )
+            raise ValueError(self._FACTOR_PRESENT)
         if await self._enrolment_too_early(
             token, user, arrived_at, event="auth.webauthn_failed", client=client
         ):
@@ -10947,17 +10968,6 @@ class AuthService:
         pending = self._webauthn_challenges.pop((hash_token(token), "register"))
         if pending is None or pending.user_id != user.id:
             raise ValueError(self._CEREMONY_EXPIRED)
-        # BACKLOG #3014: re-asked at finish, since a factor may have been bound since begin and the
-        # console's finish route rides the action-less gate. After the pop, so the stale ceremony
-        # dies; after the floor, so its expired-before-failed order stands.
-        if await self._factor_binding_is_blocked(token, STEP_UP_ACTION_WEBAUTHN_ENROLL):
-            await self._audit(
-                "auth.webauthn_failed",
-                actor=identity.username,
-                detail=_json({"phase": "enroll", "reason": "factor_owed"}),
-                client=client,
-            )
-            raise ValueError(self._FACTOR_OWED)
         try:
             result = webauthn.verify_registration(
                 response_json=response_json,

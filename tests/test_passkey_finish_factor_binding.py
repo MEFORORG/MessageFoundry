@@ -134,10 +134,29 @@ async def test_a_ceremony_staged_before_totp_enrolment_cannot_finish_after_it(
     session = await store.get_session(hash_token(token))
     assert session is not None and session.mfa_verified_at is None
     rows = await store.list_audit(action="auth.webauthn_failed")
-    assert {"phase": "enroll", "reason": "factor_owed"} in [json.loads(r["detail"]) for r in rows]
+    assert {"phase": "enroll", "reason": "factor_present"} in [
+        json.loads(r["detail"]) for r in rows
+    ]
     # The refusal took the challenge, so the stale ceremony is dead, not waiting for a retry.
     with pytest.raises(ValueError, match="ceremony expired"):
         await _finish(service, identity, token, response)
+
+
+async def test_a_session_revoked_mid_ceremony_is_answered_as_lost_not_as_owing_a_factor(
+    store: MessageStore,
+) -> None:
+    """The factor check fails closed on a dead session. RED when: that fail-closed answer reaches
+    the caller as "already has a second factor" for an account that holds none."""
+    service = await _service(store, require_mfa=True)
+    identity, token = await _sign_in(service)
+    response = await _stage_passkey(service, identity, token)
+    await store.revoke_session(hash_token(token))
+
+    lost = await _finish(service, identity, token, response)
+
+    assert lost.session_lost is True and lost.ok is False
+    assert await store.list_webauthn_credentials(identity.user_id) == []
+    assert await store.list_audit(action="auth.webauthn_failed") == []
 
 
 async def test_a_session_that_proves_the_existing_factor_first_still_finishes(

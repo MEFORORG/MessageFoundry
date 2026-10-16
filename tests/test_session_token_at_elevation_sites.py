@@ -294,37 +294,12 @@ async def test_the_passkey_registration_elevates_the_enrolling_token_in_place() 
     A directory account is never covered, and its Kerberos session mints unstamped, so it is the
     not-yet-satisfied token a registration can still elevate.
     """
-    from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProbe
+    from tests.test_mfa_access_gate import _principal
 
-    principal = AdPrincipal(
-        username="tnguyen",
-        display_name="T Nguyen",
-        email="tnguyen@test.invalid",
-        dn="CN=tnguyen,OU=Staff,DC=test,DC=invalid",
-        groups=frozenset(),
-        directory_object_id="5e2a8c71-0d4f-4b39-9a6e-c1f7b3d2e804",
-    )
-
-    class _Directory:
-        def probe_principal(self, username: str, *, object_id: str | None = None) -> DirectoryProbe:
-            return DirectoryProbe(DirectoryAnswer.FOUND, principal)
-
-    store = await MessageStore.open(":memory:")
-    service = AuthService(
-        store,
-        AuthSettings(
-            mfa_verify_min_elapsed_seconds=0,
-            ad_enabled=True,
-            ad_server="ldaps://dc.test.invalid",
-            ad_user_search_base="OU=Staff,DC=test,DC=invalid",
-            ad_bind_dn="CN=svc-mefor,OU=Service,DC=test,DC=invalid",
-            ad_bind_password="synthetic",
-        ),
-        ldap=_Directory(),  # type: ignore[arg-type]
-    )
+    store, service = await _service()
     try:
         await service.initialize()
-        out = await service._complete_ad_login(principal, None, mfa_verified=False)
+        out = await service._complete_ad_login(_principal("adrotate"), None, mfa_verified=False)
         assert out.token is not None and out.identity is not None
         identity, enrolling = out.identity, out.token
         assert await service.mfa_satisfied(enrolling) is False
