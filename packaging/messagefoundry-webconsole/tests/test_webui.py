@@ -21,6 +21,7 @@ import httpx
 import pytest
 from _ui_clients import create_local_user_chosen, issue_continuation
 from starlette.datastructures import Headers
+from starlette.requests import Request as StarletteRequest
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
@@ -8975,7 +8976,11 @@ async def test_every_phi_page_has_a_reauth_continuation(engine: Engine) -> None:
     dependency's closure, so the set is derived and not a list kept by hand."""
     from fastapi.routing import APIRoute
 
-    from messagefoundry_webconsole._auth import is_unlock_action
+    from messagefoundry_webconsole._auth import (
+        _REAUTH_NEXT_MAX,
+        _new_address_continuation,
+        is_unlock_action,
+    )
 
     service = await _service(engine)
     app = create_app(engine, auth=service, serve_ui=True)
@@ -9000,6 +9005,14 @@ async def test_every_phi_page_has_a_reauth_continuation(engine: Engine) -> None:
                 assert is_unlock_action(concrete), f"{route.path} has no unlock continuation"
                 # Query-tolerant, so a filtered page comes back filtered.
                 assert is_unlock_action(concrete + "?a=1"), f"{route.path} drops its query"
+                # The continuation keeps the query while the whole target fits under the
+                # /ui/reauth cap on ``next``, and lands elsewhere once it does not, on each real
+                # page rather than one synthetic path (vault BACKLOG #3052 item 18).
+                land = "/ui/account"
+                fits = _bare_request("GET", concrete, "a=1")
+                assert _new_address_continuation(fits, landing=land) == concrete + "?a=1"
+                over = _bare_request("GET", concrete, "a=" + "x" * _REAUTH_NEXT_MAX)
+                assert _new_address_continuation(over, landing=land) == land, route.path
                 checked.append(route.path)
     # The control: the walk found the PHI pages it exists for, so a zero is not a pass.
     assert "/ui/messages/{message_id}" in checked and "/ui/dead-letters" in checked, checked
@@ -9034,25 +9047,26 @@ async def test_the_password_page_is_not_refused_for_a_new_address(engine: Engine
         assert r.status_code == 400, r.headers.get("location")
 
 
+def _bare_request(method: str, path: str, query: str = "") -> StarletteRequest:
+    """A request carrying only a method, a path and a query, for the continuation helpers."""
+    scope = {
+        "type": "http",
+        "method": method,
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": query.encode(),
+        "headers": [],
+    }
+    return StarletteRequest(scope)
+
+
 def test_a_new_address_continuation_never_drops_a_query_or_overflows() -> None:
     """RED when: a refused GET's continuation drops its query (a broader read after the re-auth)
     or exceeds ``/ui/reauth``'s 512-character cap on ``next`` (a 422 with no form). Either way the
     landing is used instead (vault BACKLOG #2620, review round 2)."""
-    from starlette.requests import Request
-
     from messagefoundry_webconsole._auth import _new_address_continuation
 
-    def req(method: str, path: str, query: str = "") -> Request:
-        scope = {
-            "type": "http",
-            "method": method,
-            "path": path,
-            "raw_path": path.encode(),
-            "query_string": query.encode(),
-            "headers": [],
-        }
-        return Request(scope)
-
+    req = _bare_request
     land = "/ui/account"
     assert _new_address_continuation(req("GET", "/ui/messages"), landing=land) == "/ui/messages"
     filtered = req("GET", "/ui/messages", "channel_id=ch1&defer=1")
@@ -9063,3 +9077,58 @@ def test_a_new_address_continuation_never_drops_a_query_or_overflows() -> None:
     assert _new_address_continuation(req("GET", long_name), landing=land) == land
     assert _new_address_continuation(req("GET", "/ui/audit"), landing=land) == land
     assert _new_address_continuation(req("POST", "/ui/messages"), landing=land) == land
+
+
+async def test_a_cross_site_write_from_a_new_address_writes_no_row(engine: Engine) -> None:
+    """RED when: ``require_ui`` asks the new-address question before its same-origin check (vault
+    BACKLOG #3052 item 11). In that order a cross-site page holding a replayed cookie would make
+    the engine write ``auth.admin_action_new_ip`` and send the notice before the write is refused.
+
+    The write carries no ``Sec-Fetch-Site`` and a foreign ``Origin``, as an older browser's would:
+    the fetch-metadata middleware lets an absent header through, so the refusal under test is
+    ``require_ui``'s own. The same-origin write from the same address is the control: it is sent
+    to ``/ui/reauth`` and writes the row, so the zero above it is not a signal that cannot fire."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client_from(engine, service, "10.0.0.1") as a:
+        await _cookie_login(a, "op")
+        tok = a.cookies.get("mf_session")
+        assert tok is not None
+    async with _client_from(engine, service, "10.9.9.9") as b:
+        b.cookies.set("mf_session", tok)
+        r = await b.post("/ui/statistics/reset", headers={"Origin": "https://attacker.example"})
+        assert r.status_code == 403, r.headers.get("location")
+        assert await engine.store.list_audit(action="auth.admin_action_new_ip", limit=10) == []
+        r = await b.post("/ui/statistics/reset", headers={"Sec-Fetch-Site": "same-origin"})
+        assert (r.status_code, r.headers["location"]) == (303, "/ui/reauth?next=/ui")
+    assert len(await engine.store.list_audit(action="auth.admin_action_new_ip", limit=10)) == 1
+
+
+async def test_a_refused_write_without_monitoring_read_lands_on_the_account_page(
+    engine: Engine,
+) -> None:
+    """RED when: a write refused for a new address continues to ``/ui`` for a session without
+    ``monitoring:read`` (vault BACKLOG #3052 item 12). ``/ui`` would refuse that session, so after
+    the re-auth it would land on a 403. A custom role holding ``monitoring:diagnose`` alone can
+    make the write; the Operator in ``test_a_cookie_replayed_from_a_second_address_is_sent_to_reauth``
+    is the control that lands on ``/ui``."""
+    service = await _service(engine)
+    role = await service.create_custom_role(
+        display_name="Counter Resetter",
+        description=None,
+        permissions=["monitoring:diagnose"],
+        actor="test",
+    )
+    await _add_with_role_ids(service, "resetter", [role.id])
+    same = {"Sec-Fetch-Site": "same-origin"}
+    async with _client_from(engine, service, "10.0.0.1") as a:
+        await _cookie_login(a, "resetter")
+        tok = a.cookies.get("mf_session")
+        assert tok is not None
+        # The control at the sign-in address: the role may make this write.
+        r = await a.post("/ui/statistics/reset", headers=same)
+        assert (r.status_code, r.headers["location"]) == (303, "/ui/status")
+    async with _client_from(engine, service, "10.9.9.9") as b:
+        b.cookies.set("mf_session", tok)
+        r = await b.post("/ui/statistics/reset", headers=same)
+        assert (r.status_code, r.headers["location"]) == (303, "/ui/reauth?next=/ui/account")
