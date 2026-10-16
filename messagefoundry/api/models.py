@@ -1678,6 +1678,10 @@ class SecurityPosture(BaseModel):
     client_network_denials: int = 0
     client_denied_last: str | None = None
     client_address_monoculture: bool = False
+    # Vault BACKLOG #2954: the deny-by-default refusal count (#2604) of the process that answered;
+    # under engine shards each process has its own. Empty is not proof that nothing was refused:
+    # api.security.undeclared_route_refusal_counts says what a key is and what the count misses.
+    undeclared_route_refusals: dict[str, int] = Field(default_factory=dict)
     # BACKLOG #2337: the recorded attestation of the vault_transit AES-GCM bound. None when the store
     # cipher is not vault_transit, where the engine counts the bound itself.
     transit_bound_attestation: TransitBoundAttestationView | None = None
