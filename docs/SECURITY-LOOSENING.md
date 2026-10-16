@@ -817,8 +817,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   writes `auth.admin_action_new_ip`, nothing notifies the account holder, and nothing forces a fresh
   step-up. A stolen token replayed from another host is the case this signal exists for.
 - **When acceptable:** a deployment whose operators reach the console through a pool of egress
-  addresses that rotates between requests (some NAT and VPN concentrators do), where every sensitive
-  action would otherwise re-prompt. Declaring `[api].trusted_proxies` correctly fixes the proxy case
+  addresses that rotates between requests (some NAT and VPN concentrators do). With the signal on,
+  each change of address would re-prompt every sensitive action, and would refuse every message
+  read and paced write, on the console as well as the API, until the session re-verifies from the
+  new address (vault BACKLOG #2620). Declaring `[api].trusted_proxies` correctly fixes the proxy case
   and is preferred over turning this off.
 - **Compensating controls:** keep `[auth].step_up_max_age_seconds` short and `require_action_step_up`
   on, restrict the operator surface with `[security].allowed_client_networks`, and review the

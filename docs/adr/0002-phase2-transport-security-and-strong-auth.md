@@ -10,7 +10,14 @@
   accounts is a supported deployment, so the engine carries its own MFA.)* On top of WP-14, the
   **multi-layer administrative-interface defense (ASVS 8.4.2, WP-L3-13) is now BUILT (2026-06-17)**:
   WP-14 MFA is wired as a genuine second factor at the step-up boundary, plus a **new-client-IP
-  contextual-risk signal** (`[auth].admin_new_ip_step_up`, default off). **Device-posture assessment
+  contextual-risk signal** (`[auth].admin_new_ip_step_up`, default off). **CORRECTED 2026-10-16
+  (vault BACKLOG #3052):** "default off" was true when this was written and is stale. The default
+  has been ON since BACKLOG #288 (owner ruling 2026-09-26, recorded in the
+  [ADR 0068](0068-browser-webauthn-passkeys-offloopback.md) amendment of that date), and turning it
+  off is a named loosening in `docs/SECURITY-LOOSENING.md`. Since vault BACKLOG #2620 (the ADR 0068
+  amendment of 2026-10-05) the signal also refuses the PHI reads and the paced writes from a new
+  address until the session re-verifies. The words "default off" are left as written and dated by
+  this correction. **Device-posture assessment
   for 8.4.2 is delegated to the deployment** — a managed/attested host + an mTLS client cert terminated
   at the **WP-15** reverse proxy — not built in-process (stdlib `ssl` does no device attestation).
   **Federated SSO (OAuth 2.0 / OIDC /
