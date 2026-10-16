@@ -2177,9 +2177,10 @@ def _run_connscale_remote(argv: list[str]) -> int:
         prog="harness connscale-remote",
         description="DRIVER-ONLY connscale (WS-C): drive already-running engines off-box + bind the "
         "correlation sink locally. Never spawns an engine. Each process signs in for itself as the "
-        "rig Administrator, so N processes from one address need the engine's "
-        "MEFOR_AUTH_MAX_SESSIONS_PER_USER and MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP above N (shipped 5 "
-        "and 10 per 60 s); the batch_ab engine half sizes both to its --sink-procs.",
+        "rig Administrator, so N processes from one address need at least N on the engine's "
+        "session cap (MEFOR_AUTH_MAX_SESSIONS_PER_USER) and on its per-address and all-clients "
+        "sign-in limits per window (MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP, _GLOBAL); the batch_ab "
+        "engine half sizes them to its --sink-procs.",
     )
     parser.add_argument(
         "--engine-url",

@@ -106,33 +106,39 @@ def test_plan_driver_bands_rejects_bad_input() -> None:
 
 # --- the rig's sign-in budget (BACKLOG #2795) ------------------------------------------------------
 
+_SESSIONS = "MEFOR_AUTH_MAX_SESSIONS_PER_USER"
+_PER_IP = "MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP"
+_GLOBAL = "MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL"
+
 
 @pytest.mark.parametrize(
-    ("procs", "size", "global_raised"),
-    [(1, 4, False), (6, 14, False), (11, 24, False), (29, 60, False), (30, 62, True)],
+    ("procs", "want"),
+    [
+        (1, {}),  # 4 is under every shipped limit, so none is touched, never lowered
+        (2, {_SESSIONS: "6"}),
+        (4, {_SESSIONS: "10"}),  # 10 is the shipped per-address limit: not above it
+        (6, {_SESSIONS: "14", _PER_IP: "14"}),
+        (11, {_SESSIONS: "24", _PER_IP: "24"}),
+        (29, {_SESSIONS: "60", _PER_IP: "60"}),
+        (30, {_SESSIONS: "62", _PER_IP: "62", _GLOBAL: "62"}),
+    ],
 )
-def test_rig_sign_in_env_sizes_both_limits_to_the_fleet(
-    procs: int, size: int, global_raised: bool
+def test_rig_sign_in_env_raises_each_limit_only_past_its_shipped_default(
+    procs: int, want: dict[str, str]
 ) -> None:
-    env = bb.rig_sign_in_env(procs)
-    assert env["MEFOR_AUTH_MAX_SESSIONS_PER_USER"] == str(size)
-    assert env["MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP"] == str(size)
-    if global_raised:
-        assert env["MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL"] == str(size)
-    else:
-        assert "MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL" not in env
+    assert bb.rig_sign_in_env(procs) == want
 
 
 def test_rig_sign_in_env_names_real_auth_settings_and_their_shipped_defaults() -> None:
     """The env names are spelled the way the engine's loader reads them, and the defaults the
-    docstring and the global threshold rest on are the shipped ones. A rename or a new default on
-    the engine side fails here rather than on the two-box rig."""
+    docstring rests on are the shipped ones. A rename or a new default on the engine side fails
+    here rather than on the two-box rig."""
     from messagefoundry.config.settings import AuthSettings, load_settings
 
     shipped = AuthSettings()
     assert shipped.max_sessions_per_user == 5
     assert shipped.login_rate_limit_per_ip == 10
-    assert shipped.login_rate_limit_global == bb._engine_login_global_default() == 60
+    assert shipped.login_rate_limit_global == 60
     assert shipped.login_rate_limit_window_seconds == 60.0
 
     auth = load_settings(environ=bb.rig_sign_in_env(30), default_file=False).auth
@@ -141,28 +147,26 @@ def test_rig_sign_in_env_names_real_auth_settings_and_their_shipped_defaults() -
     assert auth.login_rate_limit_global == 62
 
 
+def _sign_ins_admitted(environ: Mapping[str, str], attempts: int) -> list[bool]:
+    """``attempts`` sign-ins from one address, through the engine's own sign-in gate, built from
+    settings loaded from ``environ`` the way serve loads them. The gate runs before any store read."""
+    from typing import cast
+
+    from messagefoundry.auth.service import AuthService
+    from messagefoundry.config.settings import load_settings
+
+    auth = load_settings(environ=environ, default_file=False).auth
+    service = AuthService(cast(Any, None), auth)
+    return [service.allow_login_attempt("10.0.0.9") for _ in range(attempts)]
+
+
 def test_an_eleventh_process_meets_the_shipped_limit_and_the_sized_one_admits_the_fleet() -> None:
-    """The research answer, on the engine's own limiter: every process signs in once from the
-    load-gen box's one address inside one window, and a success counts as an attempt."""
-    from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
-    from messagefoundry.config.settings import AuthSettings
-
-    shipped = AuthSettings()
+    """The research answer: every process signs in once from the load-gen box's one address inside
+    one window, and a success counts as an attempt, so a stock engine refuses the eleventh."""
     procs = 11
-
-    def limiter(per_ip: int, glob: int) -> SlidingWindowRateLimiter:
-        return SlidingWindowRateLimiter(
-            per_key=per_ip, glob=glob, window_seconds=shipped.login_rate_limit_window_seconds
-        )
-
-    default = limiter(shipped.login_rate_limit_per_ip, shipped.login_rate_limit_global)
-    admitted = [default.allow("10.0.0.9") for _ in range(procs)]
-    assert admitted == [True] * 10 + [False], "the eleventh sign-in is the one refused (HTTP 429)"
-
-    env = bb.rig_sign_in_env(procs)
-    sized = limiter(int(env["MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP"]), shipped.login_rate_limit_global)
-    # Each process signs in, then signs in once more, as a process whose session was refused does.
-    assert all(sized.allow("10.0.0.9") for _ in range(2 * procs))
+    assert _sign_ins_admitted({}, procs) == [True] * 10 + [False]
+    # Sized, each process may sign in and then once more, as a process whose session was refused does.
+    assert all(_sign_ins_admitted(bb.rig_sign_in_env(procs), 2 * procs))
 
 
 def test_build_remote_argv_shape() -> None:
@@ -328,6 +332,9 @@ def _install_driver_fakes(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamesp
 
 
 async def test_batch_split_handshake_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The engine half setdefaults the sign-in env, so an exported value would stand in for it.
+    for name in (_SESSIONS, _PER_IP, _GLOBAL):
+        monkeypatch.delenv(name, raising=False)
     import asyncio
 
     eng_rec = _install_engine_fakes(monkeypatch)
@@ -391,7 +398,7 @@ async def test_batch_split_handshake_end_to_end(monkeypatch: pytest.MonkeyPatch)
         # half sizes the cap to the fleet it advertises.
         assert int(env["MEFOR_AUTH_MAX_SESSIONS_PER_USER"]) > 6
         # The same fleet signs in from one address, so the per-address sign-in limit is sized too.
-        assert env["MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP"] == env["MEFOR_AUTH_MAX_SESSIONS_PER_USER"]
+        assert env[_PER_IP] == env[_SESSIONS] == "14"
 
     # (2) The engine report carries every cell's PID + node id for CPU correlation.
     assert len(eng_report.cells) == len(cells)

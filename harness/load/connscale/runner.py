@@ -769,6 +769,14 @@ def _build_corpus(profile: ConnScaleProfile, ids: ControlIds) -> Corpus:
     return build_corpus(shim, ids)
 
 
+def _auth_shipped_default(field: str) -> int:
+    """The engine's shipped default for an integer ``[auth]`` field, read from its own settings model
+    rather than copied, so a rig that sizes a limit compares against the value a stock engine runs."""
+    from messagefoundry.config.settings import AuthSettings
+
+    return int(AuthSettings.model_fields[field].default)
+
+
 def _node_env(
     base: Mapping[str, str],
     *,
