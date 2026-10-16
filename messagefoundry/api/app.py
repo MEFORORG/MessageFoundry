@@ -7168,6 +7168,11 @@ def create_app(
         # rejects exactly this pairing for dual-control config reload). The owner survives as DATA in
         # `detail.uploader`, which is where it belongs.
         #
+        # BACKLOG #3184: where the lifespan's retention runner is running, the sweep is the runner's,
+        # woken here, so it is never on this request's path or under its deadline. Only an app with
+        # no runner (create_app alone) sweeps inline.
+        if us.wake_retention():
+            return _upload_info(meta)
         # BACKLOG #2261: the request deadline can cancel this handler mid-sweep. prune_on_save then
         # stops the sweep at its next file and still writes a row for each file it removed.
         prune_store = engine.store
