@@ -778,9 +778,10 @@ class ApprovalGate:
         self, r: ApprovalRow, params: dict[str, Any] | None
     ) -> ReleaseBlocked | None:
         """Why :meth:`approve` would refuse this request whoever approves it, or ``None`` (vault
-        BACKLOG #3192). The same tests, in the order approve() makes them, so a page offers no
-        Approve the gate always refuses. Read now, like the refusals it predicts, and silent on
-        the ones that depend on the approver, the request's age or the requester's standing."""
+        BACKLOG #3192). approve() refuses on exactly these, so a page offers no Approve the gate
+        always refuses. Read now, like the refusals it predicts, and silent on the ones that
+        depend on the approver, the request's age or the requester's standing. The self-approval
+        refusal sits between the first and the rest, because it needs the requester id."""
         if not r.requester_user_id:
             return "no_requester_id"
         if r.operation not in self._ops:
@@ -862,37 +863,36 @@ class ApprovalGate:
         writer. An executor must therefore not raise once its effects have happened, since a raise
         reads as "did not complete" and is compensated to ``failed``; see :data:`Executor`."""
         row = await self._require_pending(approval_id)
-        requester_user_id = row.requester_user_id
-        if not requester_user_id:
+        operation = row.operation
+        params = _stored_params(approval_id, row.params)
+        # vault BACKLOG #3192: the refusals no approver can get past are tested once, in
+        # _release_blocked, which the queue reads too, so the page's prediction cannot drift.
+        blocked = self._release_blocked(row, params)
+        if blocked == "no_requester_id":
             # Fail closed. A request with no recorded requester id cannot be checked for
-            # self-approval, and the stored NAME is not a usable fallback — after a rename it may
+            # self-approval, and the stored NAME is not a usable fallback -- after a rename it may
             # belong to somebody else, so comparing it would key the refusal on the wrong person.
-            # Deliberately NOT the 403 text below: this is a stale row, not an accusation.
-            #
-            # FALSY, not `is None`. An empty id would otherwise pass this check and then compare
-            # unequal below, silently switching the refusal off for that row — the same shape the
-            # read side of the upload-ownership check guards against with `bool(meta.uploader_id)`.
+            # Deliberately NOT the 403 text below: this is a stale row, not an accusation. FALSY,
+            # not `is None` (in _release_blocked): an empty id would otherwise compare unequal
+            # below, silently switching the refusal off for that row.
             raise ApprovalError(
                 409,
                 "this request predates requester-id attribution and can no longer be approved — "
                 "reject it and request the operation again",
             )
+        requester_user_id = row.requester_user_id
         if requester_user_id == approver_user_id:
             raise ApprovalError(403, "you cannot approve your own request")
-        operation = row.operation
-        op = self._ops.get(operation)
-        if (
-            op is None
-        ):  # registered op was removed between request and approval — refuse, stay pending
+        if blocked == "operation_unavailable":
+            # The registered op was removed between request and approval: refuse, stay pending.
             raise ApprovalError(409, f"operation '{operation}' is no longer available")
-        if not self.gates(operation):
+        if blocked == "not_gated":
             # Dual control was turned off for this operation after the request was held. Releasing
             # it now would run a held request under a control the deployment no longer applies,
             # and the request's own configured shape (who must approve, how old) says nothing
             # about that. Fail closed: refuse, stay pending until it expires or is rejected.
             await self._refuse_ungated(approval_id, row, approver=approver, client=client)
-        params = _stored_params(approval_id, row.params)
-        if params is None:
+        if blocked == "params_unreadable":
             # The queue lists such a row as "unreadable" (BACKLOG #2458). Refuse it as a 409 that
             # leaves the row pending for a reject, rather than a 500 from a bare parse. Before the
             # dwell floor, so a row that can never be released writes no too-early row or alert.
@@ -909,6 +909,11 @@ class ApprovalGate:
                 context="the release was refused",
             )
             raise ApprovalError(409, "request parameters are unreadable; reject it instead")
+        op = self._ops.get(operation)
+        if blocked is not None or not requester_user_id or op is None or params is None:
+            # Unreachable while every reason has its arm above. Fail closed if one is added
+            # without one, rather than release past a refusal the queue already predicts.
+            raise ApprovalError(409, f"this request cannot be released ({blocked})")
         # ASVS 2.4.2: the FLOOR on the request's age, beside the expiry CEILING in _require_pending.
         # Here, inside approve(), because every release path calls this method, so no caller can skip
         # it. Checked BEFORE the transition, so the row stays pending and the approver can simply

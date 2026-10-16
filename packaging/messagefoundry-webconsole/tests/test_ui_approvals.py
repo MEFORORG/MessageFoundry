@@ -526,30 +526,23 @@ def test_every_resolve_outcome_has_a_button_and_a_notice() -> None:
 
 
 def test_params_that_did_not_parse_or_are_empty_say_so() -> None:
-    def _row(params: dict[str, object] | None) -> PendingApprovalInfo:
-        return PendingApprovalInfo(
-            id="b" * 32,
-            operation="dead_letter_replay",
-            label="replay",
-            requester="maker",
-            requested_at=0.0,
-            params=params,
-            # What the engine sends beside params it could not read (vault BACKLOG #3192).
-            release_blocked=None if params is not None else "params_unreadable",
-        )
+    def _with(params: dict[str, object] | None) -> PendingApprovalInfo:
+        # What the engine sends beside params it could not read (vault BACKLOG #3192).
+        blocked = None if params is not None else "params_unreadable"
+        return _row("b" * 32, params=params, release_blocked=blocked)
 
-    unreadable = str(pages.approvals_page(ApprovalList(approvals=[_row(None)])))
+    unreadable = str(pages.approvals_page(ApprovalList(approvals=[_with(None)])))
     assert ">unreadable<" in unreadable
     # The gate refuses to release a row it cannot read, so the page does not offer Approve.
     assert "/approve" not in unreadable and "/reject" in unreadable
     assert "Its parameters are unreadable" in unreadable
-    assert ">none<" in str(pages.approvals_page(ApprovalList(approvals=[_row({})])))
+    assert ">none<" in str(pages.approvals_page(ApprovalList(approvals=[_with({})])))
     # The requester carry-over is left out while it repeats the Requester column...
     assert ">none<" in str(
-        pages.approvals_page(ApprovalList(approvals=[_row({"requester": "maker"})]))
+        pages.approvals_page(ApprovalList(approvals=[_with({"requester": "maker"})]))
     )
     # ...and shown when it differs, since the release audits under that value.
-    differs = str(pages.approvals_page(ApprovalList(approvals=[_row({"requester": "other"})])))
+    differs = str(pages.approvals_page(ApprovalList(approvals=[_with({"requester": "other"})])))
     assert "requester: other" in differs
 
 

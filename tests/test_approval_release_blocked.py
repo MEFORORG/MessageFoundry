@@ -18,7 +18,6 @@ because no request through ``guard`` can produce them.
 from __future__ import annotations
 
 import json
-import sqlite3
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import Any, get_args
@@ -30,35 +29,14 @@ from messagefoundry.api.approvals import ApprovalError, ApprovalGate
 from messagefoundry.api.models import ReleaseBlocked
 from messagefoundry.auth.permissions import Permission
 from messagefoundry.config.settings import ApprovalsSettings
-from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.store.store import MessageStore
 from tests._pending_approval_store_contract import _REQUESTER_ID, _resolve, _StandingStore
+from tests.test_approval_audit_outage import _Faulty, _Sink
 
 _REPLAY = "dead_letter_replay"
 _PURGE = "connection_purge"
 _RELOAD = "config_reload"
 _APPROVER_ID = "blocked-approver-id"
-
-
-class _Sink(LoggingAlertSink):
-    def __init__(self) -> None:
-        self.lost: list[tuple[str, str]] = []
-
-    def audit_write_failed(self, name: str, *, action: str) -> None:
-        self.lost.append((name, action))
-
-
-class _AuditFails(_StandingStore):
-    """The real store, refusing the named audit actions with the error a full disk gives."""
-
-    def __init__(self, store: Any, *actions: str) -> None:
-        super().__init__(store)
-        self.actions = actions
-
-    async def record_audit(self, action: str, **kw: Any) -> None:
-        if action in self.actions:
-            raise sqlite3.OperationalError("disk I/O error")
-        await self._store.record_audit(action, **kw)
 
 
 @pytest.fixture
@@ -157,7 +135,7 @@ async def test_a_lost_unreadable_params_row_still_answers_409_and_pages(
 ) -> None:
     approval_id = await _row(store, params="[1]")
     sink = _Sink()
-    gate = _gate(_AuditFails(store, "approval.params_unreadable"), [], sink)
+    gate = _gate(_Faulty(store, audit_fails=("approval.params_unreadable",)), [], sink)
     with pytest.raises(ApprovalError) as caught:
         await gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)
     assert caught.value.status == 409

@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -63,7 +64,7 @@ async def main():
         while not go.exists():
             if time.monotonic() > deadline:
                 raise SystemExit("no start signal within 60 s")
-            await asyncio.sleep(0.001)
+            await asyncio.sleep(0.005)
         started = time.time()
         for k in range(rounds):
             approval_id = uuid4().hex
@@ -158,16 +159,16 @@ async def assert_one_request_per_round(store: Any, answers: list[list[str]]) -> 
     held = set(first)
     assert len(held) == len(first), "two rounds were answered with one request"
     for action in ("approval.requested", "approval.request_repeated"):
-        named = [
+        named = Counter(
             json.loads(str(r["detail"])).get("approval_id")
             for r in await store.list_audit(action=action, limit=10_000)
-        ]
-        assert {i: named.count(i) for i in held} == dict.fromkeys(held, 1), action
-    for approval_id in held:
-        row = await store.get_pending_approval(approval_id)
-        assert row is not None and str(row["status"]) == "pending"
-    # Nothing else was filed for this run: every open request carrying its nonce is one of these.
-    nonce = json.loads(str((await store.get_pending_approval(first[0]))["params"]))["race"]
+        )
+        assert {i: named[i] for i in held} == dict.fromkeys(held, 1), action
+    # Every held id is still pending, and nothing else was filed for this run: the open requests
+    # carrying its nonce are exactly these.
+    one = await store.get_pending_approval(first[0])
+    assert one is not None
+    nonce = json.loads(str(one["params"]))["race"]
     filed = {
         str(r["id"])
         for r in await store.list_pending_approvals(now=0.0, limit=10_000)
