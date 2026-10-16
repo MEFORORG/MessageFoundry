@@ -411,15 +411,16 @@ def test_the_step_up_header_is_one_constant_on_both_sides() -> None:
     """Vault BACKLOG #3145 item 6: the gates, the two route refusals and the FastAPI-free client
     read one spelling, from the auth wire models, rather than four copies of a literal."""
     from messagefoundry.api import auth_models
-    from messagefoundry.apiclient import client as apiclient
 
     assert _STEP_UP_VIA_HEADER is auth_models.STEP_UP_VIA_HEADER == "X-Step-Up-Via"
-    assert apiclient.STEP_UP_VIA_HEADER is auth_models.STEP_UP_VIA_HEADER
-    assert apiclient.STEP_UP_VIA_IDP is auth_models.STEP_UP_VIA_IDP == "idp"
+    assert auth_models.STEP_UP_VIA_IDP == "idp"
+    # The client's use of the constant is behavioural: the replay tests above raise
+    # IdpStepUpRequired on the gate's own header. This pins that no copy of the literal is back.
     package = Path(auth_models.__file__).parent.parent
     for module in ("api/auth_routes.py", "apiclient/client.py", "api/security.py"):
         text = (package / module).read_text(encoding="utf-8")
         assert '"X-Step-Up-Via"' not in text, f"{module} spells the header out again"
+        assert "STEP_UP_VIA_HEADER" in text, f"{module} no longer reads the shared constant"
 
 
 async def test_a_store_fault_reading_the_mechanism_keeps_the_403(
