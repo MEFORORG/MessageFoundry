@@ -4086,7 +4086,11 @@ at once. The mass-revoke breaker is the brake on that, and a partial one. It abo
 revocations exceed **both** its floor and its fraction of the judged probes. Where few signed-in
 principals hold a directory scope, the pass stays under the fraction and revokes them all. Their next
 logins would read the same empty groups and withdraw the scope anyway. Revocations audit `auth.ad_session_revoked` and
-raise the `ad_session_revoked` alert, one per revoked principal, once the pass completes. A pass that
+raise the `ad_session_revoked` alert, one per revoked principal, once the pass completes. A revocation
+that ended no session and changed no role still writes its row, with `sessions: 0`, but raises no alert
+and sends the user no notice (BACKLOG #3085, owner ruling 2026-10-16). That is at least the case when
+two reconcilers on one store both revoke one account: the first alerts and notifies, the second only
+audits. A pass that
 fails part-way keeps the audit rows for what it already revoked, but raises no alert for them. A
 refused audit write does not end the pass (BACKLOG #3018): the reconciler logs it at ERROR, naming the
 action and the account, and the alert and the user's notice still go. The ERROR line is then the only

@@ -180,6 +180,9 @@ _FACTOR_CEREMONIES: Final = frozenset(
     {"mfa_enroll_confirm", "mfa_verify", "webauthn_enroll", "webauthn_assert"}
 )
 
+#: What ``AuthService._apply_reconcile_revocation`` did with one planned revocation (BACKLOG #3085).
+_RevocationApplied = Literal["skipped", "quiet", "reported"]
+
 
 @cache
 def _audit_write_errors() -> tuple[type[Exception], ...]:
@@ -6479,6 +6482,7 @@ class AuthService:
                 plan.asked,
             )
         applied: list[reconcile.SessionRevocation] = []
+        reported: list[reconcile.SessionRevocation] = []
         for revocation in plan.revocations:
             if (
                 self._reconcile_outcomes.get(revocation.user_id)
@@ -6494,8 +6498,11 @@ class AuthService:
             if revocation.user_id in self._reconcile_referred:
                 # The same, for the referral (BACKLOG #2538; `_forfeit_clears_on_attrition`).
                 self._advance_referral_standing("forfeit")
-            if await self._apply_reconcile_revocation(revocation):
+            outcome = await self._apply_reconcile_revocation(revocation)
+            if outcome != "skipped":
                 applied.append(revocation)
+            if outcome == "reported":
+                reported.append(revocation)
         for refresh in plan.renames:
             # BACKLOG #1532. Applied only on a pass that was NOT aborted, with every other write the
             # plan carries: the reconciler's invariant is that an aborted pass leaves the store
@@ -6526,10 +6533,14 @@ class AuthService:
         # only this report and never stops the probes and revocations above from running. A
         # failed write is logged, not raised (BACKLOG #2137), for the same reason as the hold's.
         await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
-        # What the pass DID, which is what the caller alerts on: a scope revocation skipped at apply
-        # time (ADR 0198) was audited as nothing, so it must page as nothing too. Marked after that,
-        # so the account a skipped revocation left signed in still counts toward the evidence.
-        return self._mark_reconcile_clears(replace(plan, revocations=tuple(applied)), users)
+        # The returned plan carries what the caller alerts on, the REPORTED revocations: a scope
+        # revocation skipped at apply time (ADR 0198) was audited as nothing, so it must page as
+        # nothing too, and a quiet one pages nobody (BACKLOG #3085). The clears are marked first,
+        # over every APPLIED revocation, quiet ones included: a quiet revocation's account holds no
+        # session now, and the account a skipped revocation left signed in still counts toward the
+        # evidence.
+        marked = self._mark_reconcile_clears(replace(plan, revocations=tuple(applied)), users)
+        return replace(marked, revocations=tuple(reported))
 
     def _mark_reconcile_clears(
         self, plan: reconcile.ReconcilePlan, users: Mapping[str, UserRecord]
@@ -7335,10 +7346,19 @@ class AuthService:
             defects=AUDIT_WRITE_DEFECTS,
         )
 
-    async def _apply_reconcile_revocation(self, revocation: reconcile.SessionRevocation) -> bool:
+    async def _apply_reconcile_revocation(
+        self, revocation: reconcile.SessionRevocation
+    ) -> _RevocationApplied:
         """Apply one planned revocation: persist a role re-diff (when that is why), drop the user's
         live sessions, audit, and notify the affected user out-of-band (ASVS 6.3.7). A scope
-        revocation writes no scope (ADR 0198): the next login does. Returns whether it applied."""
+        revocation writes no scope (ADR 0198): the next login does.
+
+        Returns ``"skipped"`` when it applied nothing, ``"reported"`` when it applied and must
+        alert, and ``"quiet"`` when it applied but ended no session and changed no role. The quiet
+        case is at least what the second of two reconcilers revoking one account sees (BACKLOG
+        #3085). Owner ruling 2026-10-16, "audit always": that revocation still writes its
+        ``auth.ad_session_revoked`` row, with ``sessions: 0``, and sends no notice; the caller
+        raises no alert for it."""
         user = await self._load_user(revocation.user_id)
         if revocation.reason == reconcile.SCOPE_CHANGED and (
             user is None or user.channel_scope != revocation.scope_from
@@ -7352,10 +7372,13 @@ class AuthService:
                 "directory reconcile: scope revocation for %s skipped; the stored scope changed",
                 revocation.username,
             )
-            return False
+            return "skipped"
+        roles_changed = False
         # No role write for an account that is gone or fails its seal (BACKLOG #2592): the store would
         # refuse it, and ending the sessions below needs no write to the account.
         if revocation.role_ids is not None and user is not None:
+            # Read before the write, so roles another reconciler already wrote are no change.
+            roles_changed = set(user.role_ids) != set(revocation.role_ids)
             await self._store.set_user_roles(
                 revocation.user_id, list(revocation.role_ids), assigned_by="ad-reconcile"
             )
@@ -7405,6 +7428,8 @@ class AuthService:
             revocation.username,
             revocation.reason,
         )
+        if not revoked and not roles_changed:
+            return "quiet"  # audited above, no notice and no alert: see the docstring
         # A directory-pushed disable or demotion is the same event to the user as a local one, so it
         # gets the same out-of-band notice the login-path re-sync sends (best-effort).
         #
@@ -7430,7 +7455,7 @@ class AuthService:
                 email=user.notify_email,
                 detail={"reason": revocation.reason},
             )
-        return True
+        return "reported"
 
     async def _report_directory_admin_loss(
         self,

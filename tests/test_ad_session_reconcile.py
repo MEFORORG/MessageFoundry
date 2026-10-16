@@ -47,7 +47,7 @@ from messagefoundry.auth.notifications import (
     USERNAME_CHANGED,
 )
 from messagefoundry.auth.permissions import Role
-from messagefoundry.auth.service import AuthService, DirectoryObjectIdMissing
+from messagefoundry.auth.service import AuthService, DirectoryObjectIdMissing, _RevocationApplied
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import CipherError
 from messagefoundry.store.store import (
@@ -3396,7 +3396,7 @@ async def test_the_pass_judges_the_scope_stored_after_its_probes() -> None:
         planned: list[reconcile.SessionRevocation] = []
         apply = service._apply_reconcile_revocation
 
-        async def spy(revocation: reconcile.SessionRevocation) -> bool:
+        async def spy(revocation: reconcile.SessionRevocation) -> _RevocationApplied:
             planned.append(revocation)
             return await apply(revocation)
 
@@ -3418,7 +3418,7 @@ async def test_a_scope_revocation_is_skipped_when_the_scope_moved_before_it_appl
         ldap.present["jdoe"] = _principal("jdoe", _GRP_B)
         apply = service._apply_reconcile_revocation
 
-        async def login_then_apply(revocation: reconcile.SessionRevocation) -> bool:
+        async def login_then_apply(revocation: reconcile.SessionRevocation) -> _RevocationApplied:
             await store.set_user_channel_scope(
                 revocation.user_id, json.dumps(["IB_B"]), source=SCOPE_SOURCE_AD
             )
@@ -3509,7 +3509,7 @@ async def test_each_revocation_reason_sends_its_decided_notice(reason: str) -> N
         if reason == reconcile.SCOPE_CHANGED:
             extra.update(scope_changed=True, scope_from=user.channel_scope, scope_to=None)
         revocation = reconcile.SessionRevocation(user.id, user.username, reason=reason, **extra)
-        assert await service._apply_reconcile_revocation(revocation)
+        assert await service._apply_reconcile_revocation(revocation) == "reported"
         expected = _NOTICE_FOR_REASON[reason]
         assert [e.event_type for e in notifier.sent] == ([] if expected is None else [expected])
         if expected is not None:
@@ -3530,7 +3530,7 @@ async def test_an_undecided_whole_account_reason_falls_to_the_neutral_notice() -
         revocation = reconcile.SessionRevocation(
             user.id, user.username, reason="directory_synthetic_new_reason"
         )
-        assert await service._apply_reconcile_revocation(revocation)
+        assert await service._apply_reconcile_revocation(revocation) == "reported"
         assert [e.event_type for e in notifier.sent] == [DIRECTORY_SESSIONS_ENDED]
     finally:
         await store.close()
@@ -3726,5 +3726,92 @@ async def test_the_login_path_rename_still_fails_on_a_refused_audit_write(
                 user_id=jdoe.id, old_username="jdoe", new_username="jdoe-new", held=None
             )
         assert refused == ["jdoe-new"]
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #3085 item 2: the second of two reconcilers revoking one account -----------------------
+
+
+def _revoked_rows(rows: list[Any]) -> list[dict[str, Any]]:
+    return [json.loads(a["detail"]) for a in rows if a["action"] == "auth.ad_session_revoked"]
+
+
+async def test_a_second_reconciler_revoking_one_account_audits_zero_and_alerts_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3085 item 2, owner ruling 2026-10-16 ("audit always"). Another process ends the
+    account's sessions between this pass's plan and its apply, so this pass ends none. It still
+    writes its ``auth.ad_session_revoked`` row, with ``sessions: 0``, and raises no alert and sends
+    no notice: the other process already did both. Before #3085 it sent both a second time."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap({"jdoe": _principal("jdoe")})
+        settings = _ad_settings(ad_session_recheck_strikes=1)
+        service = AuthService(store, settings, ldap=ldap)  # type: ignore[arg-type]
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        await service.initialize()
+        token = await _signed_in_ad_user(service, store, "jdoe")
+        notifier.sent.clear()
+        real_revoke = store.revoke_user_sessions
+
+        async def revoked_first_elsewhere(user_id: str) -> int:
+            await real_revoke(user_id)  # the other reconciler, which wins
+            return await real_revoke(user_id)
+
+        monkeypatch.setattr(store, "revoke_user_sessions", revoked_first_elsewhere)
+        ldap.present.clear()
+        plan = await service.reconcile_directory_sessions()
+        assert plan.aborted is None and plan.revocations == (), "a quiet revocation still alerts"
+        assert token is not None and await service.identity_for_token(token) is None
+        rows = _revoked_rows(await store.list_audit())
+        assert [r["sessions"] for r in rows] == [0], "the quiet revocation wrote no row"
+        assert notifier.sent == [], "a quiet revocation still sent a notice"
+        sink = _Sink()
+        _alert_reconcile_plan(plan, service, sink)
+        assert [e for e in sink.events if e[0] == "ad_session_revoked"] == []
+    finally:
+        await store.close()
+
+
+async def test_a_role_revocation_another_reconciler_applied_first_is_quiet() -> None:
+    """BACKLOG #3085 item 2, roles. The second apply of one role revocation finds the roles already
+    written and no session left, so it audits and reports nothing."""
+    store, _, service, _ = await _scoped_service(_GRP_A)
+    try:
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        target = () if await store.get_user_role_ids(user.id) else (Role.OPERATOR.value,)
+        revocation = reconcile.SessionRevocation(
+            user.id, user.username, reason="roles_changed", role_ids=target
+        )
+        assert await service._apply_reconcile_revocation(revocation) == "reported"
+        assert await service._apply_reconcile_revocation(revocation) == "quiet"
+        assert [e.event_type for e in notifier.sent] == [ROLES_CHANGED]
+        assert len(_revoked_rows(await store.list_audit())) == 2
+    finally:
+        await store.close()
+
+
+async def test_a_role_change_that_ends_no_session_still_reports() -> None:
+    """The control on the quiet case: a revocation that ends no session but does change the roles
+    still alerts and still tells the user, because something did happen to the account."""
+    store, _, service, _ = await _scoped_service(_GRP_A)
+    try:
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        await store.revoke_user_sessions(user.id)  # no session left to end
+        target = () if await store.get_user_role_ids(user.id) else (Role.OPERATOR.value,)
+        revocation = reconcile.SessionRevocation(
+            user.id, user.username, reason="roles_changed", role_ids=target
+        )
+        assert await service._apply_reconcile_revocation(revocation) == "reported"
+        assert [e.event_type for e in notifier.sent] == [ROLES_CHANGED]
+        assert [r["sessions"] for r in _revoked_rows(await store.list_audit())] == [0]
     finally:
         await store.close()

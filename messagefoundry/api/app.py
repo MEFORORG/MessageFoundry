@@ -9464,7 +9464,8 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     An engaged undetermined-wave hold is ``auth.ad_reconcile_held`` and becomes one
     ``ad_reconcile_held`` alert, on every pass while it holds, including one the breaker also aborts
     (ADR 0195). Each applied revocation is ``auth.ad_session_revoked`` and becomes one ``ad_session_revoked``
-    alert. A whole-directory outage aborts too, but it is audited as ``auth.ad_reconcile_skipped``
+    alert, except a quiet one (no session ended, no role changed), which the service leaves off the
+    returned plan (BACKLOG #3085; ``AuthService._apply_reconcile_revocation``). A whole-directory outage aborts too, but it is audited as ``auth.ad_reconcile_skipped``
     and pages nothing: the accounts are fine, the directory is not, and the pass is fail-open.
 
     A referral (BACKLOG #2538) is NOT an outage: it recurs until a search base is fixed. Any pass
