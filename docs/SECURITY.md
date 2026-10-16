@@ -401,6 +401,12 @@ gets you back in. `admin-unlock` clears a local lockout only (vault BACKLOG #271
 - At start, the engine checks for this. When every enabled Administrator needs an outside service,
   it logs a WARNING naming them and writes one `auth.no_local_administrator` audit row. It never
   refuses the start.
+- The `auth.federated_subject_bound`, `auth.federated_subject_rebound` and
+  `auth.federated_subject_unbound` audit rows carry `totp_enrolled` and `webauthn_enrolled`. They
+  say whether the account held each engine factor when the binding changed. A bind first removes
+  any old binding, then writes the new one. The fields are read when the old binding is removed,
+  so a bind or rebind row can miss a factor change made between the two steps. The
+  `bind_federated_subject` docstring says when that can happen.
 - Turning sign-in off is not a way back in. `serve` has no setting that turns it off, and a
   config that still carries the removed switch is refused at load (vault BACKLOG #2719). The
   old loopback mode could not repair an account anyway: with no auth service, creating
