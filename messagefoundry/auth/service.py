@@ -6860,6 +6860,9 @@ class AuthService:
             # ``old_username`` (BACKLOG #2291). The reconciler captured that at plan time, and a
             # sign-in may have renamed the row since, so it can name an account that no longer
             # exists. The audit actor and the warning both use the name an operator would find.
+            # Since BACKLOG #3069 skips a plan whose old name the row no longer holds, every caller
+            # past the pre-read passes a name equal to ``old_username``; the parameter is kept so
+            # the audit's source stays the row as read, not the plan.
             await self._audit(
                 "auth.ad_username_refresh_conflict",
                 actor=holds,
@@ -6909,7 +6912,9 @@ class AuthService:
         # read.
         #
         # A row that already carries the new name has nothing to change, so it gets no second audit
-        # row and no second notice. The notice names the name the row actually had, not the plan's.
+        # row and no second notice. A row that carries neither name was renamed by someone else
+        # since the caller read it, so the plan is stale and is skipped (BACKLOG #3069); past that
+        # check the row holds the caller's old name, so the notice and every refusal name it.
         # The write below compares on this name (BACKLOG #2290), so a refresh that read it just
         # before another refresh of this row wrote cannot write as well. And each refusal after
         # this read audits under this name (BACKLOG #2291), so the read comes BEFORE the ``held``
@@ -6938,6 +6943,26 @@ class AuthService:
                 "AD account %s already holds its directory name, so the rename refresh wrote "
                 "nothing and sends no second audit row or notice (BACKLOG #2291)",
                 user_id,
+            )
+            return
+        if before.username != old_username:
+            # BACKLOG #3069. The row holds neither the caller's old name nor its new one, so another
+            # writer renamed it after the caller read it: a sign-in after the reconciler planned, in
+            # the case that motivated this. The compare-and-set below compares on the name just
+            # read, so it would match and write this caller's older name over the newer one. Skip
+            # instead, and let the next pass or sign-in plan from a fresh read. Nothing was
+            # attempted, so no audit row, no conflict and no notice; INFO says why.
+            #
+            # AFTER the already-applied check, because a row that holds the new name is the no-op
+            # above, not a skip. BEFORE the ``held`` pre-check, because a stale plan is not a
+            # collision: filing one would send an operator looking for a holder this caller has no
+            # current claim against.
+            _log.info(
+                "AD account %s was renamed by another writer after this rename refresh was "
+                "planned (now %s), so the stale plan wrote nothing and sends no audit row or "
+                "notice (BACKLOG #3069)",
+                user_id,
+                scrub_log_argument(before.username),
             )
             return
         if held is not None and held.id != user_id:
@@ -7012,9 +7037,11 @@ class AuthService:
         #   - The row's name moved after the pre-read, so the compare failed: another refresh of
         #     this same row wrote first (BACKLOG #2290). That caller audits and notifies, so this one
         #     does neither. It is not a conflict either, because no other row holds anything. The
-        #     first writer wins, so when two refreshes carry DIFFERENT new names the stored one can
-        #     be the older of the two until the next sign-in or pass copies the directory's name
-        #     down again. Logged at INFO so the skipped write is visible without paging anyone.
+        #     first writer wins, so when two refreshes carry DIFFERENT new names and both read the
+        #     row before either wrote, the stored one can be the older of the two until the next
+        #     sign-in or pass copies the directory's name down again. In sequence the BACKLOG #3069
+        #     skip above stops the older one before it writes. Logged at INFO so the skipped write
+        #     is visible without paging anyone.
         if not written:
             after = await self._load_user(user_id)
             if after is None:
