@@ -28,6 +28,7 @@ from messagefoundry.auth.service import AuthService, Elevation
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry_webconsole.routes.core import _DIRECTORY_UNCONFIRMED_ERROR
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 
@@ -1207,6 +1208,35 @@ async def test_the_gate_says_the_directory_could_not_confirm_the_account(
         assert r.status_code == 400
         assert _DIRECTORY_UNCONFIRMED_TEXT in r.text
         assert "That code wasn" not in r.text
+
+
+async def test_the_directory_refusal_names_both_fixes(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3082, the console's half. An outage clears on a later try. A role lost in the
+    directory (``directory_roles_demoted``) never does, and a new sign-in, which takes the roles the
+    current groups grant, does. The engine hands the console the same
+    ``Elevation(directory_unconfirmed=True)`` for both causes and keeps the cause on the audit row,
+    so this one refusal is what a demoted operator and an operator meeting an outage both see. The
+    engine's half drives the real refusal for each cause:
+    ``test_the_route_says_the_directory_could_not_confirm_the_account`` in
+    tests/test_mfa_directory_recheck.py.
+
+    RED when: the text tells a demoted operator only to try again later, or names a group or role.
+    """
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _enroll_totp(service)
+    async with _client(engine, service) as c:
+        await _login(c)
+        _directory_refuses(service, monkeypatch)
+        r = await c.post("/ui/mfa", data={"code": "123456"})
+        assert r.status_code == 400
+        assert _DIRECTORY_UNCONFIRMED_ERROR in r.text
+        assert "Try again later." in _DIRECTORY_UNCONFIRMED_ERROR
+        assert "sign out and sign in again" in _DIRECTORY_UNCONFIRMED_ERROR
+        for internal in ("demoted", "group", "role"):
+            assert internal not in _DIRECTORY_UNCONFIRMED_ERROR.lower()
 
 
 async def test_the_reauth_code_leg_says_the_directory_could_not_confirm_the_account(

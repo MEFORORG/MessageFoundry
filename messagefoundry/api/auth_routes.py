@@ -161,9 +161,14 @@ _log = logging.getLogger(__name__)
 
 #: What ``/auth/mfa-verify`` and ``/me/reauth`` say when ``Elevation.directory_unconfirmed`` is set
 #: (BACKLOG #2023, #2027): the directory could not vouch for the account, so the proof was never
-#: checked. It names no directory internals; the precise reason is on the audit row.
+#: checked. It names no directory internals; the precise reason is on the audit row. One text covers
+#: every cause, so it names both fixes (BACKLOG #3082): an outage clears on a later try, and a role
+#: lost in the directory (``directory_roles_demoted``, #2240) clears only on a new sign-in, which
+#: takes the roles the current groups grant. The console's ``_DIRECTORY_UNCONFIRMED_ERROR`` says the
+#: same.
 _DIRECTORY_UNCONFIRMED_DETAIL = (
-    "the directory could not confirm this account; try again later, or ask an administrator"
+    "the directory could not confirm this account; try again later, and if it is still refused,"
+    " sign out and sign in again, or ask an administrator"
 )
 
 
