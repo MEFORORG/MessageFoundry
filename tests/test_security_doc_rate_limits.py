@@ -507,8 +507,12 @@ def _ninth_sweep_problems(config_text: str, connections_text: str) -> list[str]:
             "first-seen address is born with no window (BACKLOG #288)"
         )
     for clause in (
-        "not among its recent completed sign-ins (the hosts it finished a sign-in or passed a "
-        "step-up from, at most 90 days back)",
+        # vault BACKLOG #2964: the baseline and the record's writers, as the code reads them.
+        "an account with a baseline (it has finished a sign-in before, or its known-address "
+        "record holds a row of any age)",
+        "not seen in the last 90 days (the record holds the hosts it finished a sign-in, passed "
+        "a step-up or confirmed a factor enrolment from; a sign-in that stopped at its factor "
+        "adds nothing)",
         "A step-up from that address passes the challenge; signing in again does not.",
         "first-seen address challenge (BACKLOG #288)",
         "The check fails open",
