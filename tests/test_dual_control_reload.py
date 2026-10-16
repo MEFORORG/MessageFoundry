@@ -601,11 +601,11 @@ async def test_a_reload_row_written_after_a_flag_toggle_is_no_baseline(engine: E
     marks itself superseded too. The toggle is stood in for by the rebind it performs."""
     outcome = await engine.reload_detail(propagate=False)
     assert outcome.fingerprint is not None
-    assert await _record_reload_audit(engine, actor="before", outcome=outcome) == []
+    assert await _record_reload_audit(engine, actor="before", loaded=outcome) == []
     loaded = engine.loaded_config_fingerprint
     assert loaded is not None
     engine.loaded_config_fingerprint = dict(loaded)  # what set_connection_flag does
-    assert await _record_reload_audit(engine, actor="after", outcome=outcome) == []
+    assert await _record_reload_audit(engine, actor="after", loaded=outcome) == []
     rows = {r["actor"]: json.loads(r["detail"]) for r in await engine.store.list_audit()}
     assert "superseded" not in rows["before"]
     assert rows["after"]["superseded"] is True and rows["after"]["baseline_unchecked"] is True
@@ -866,12 +866,12 @@ async def test_the_other_lost_reload_rows_cannot_forge_a_log_line(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The same for the two sibling lost-row logs: a reload's own row after the swap, and the
-    attempt row an ungated reload writes first. The fake engine has no graph, so the first one
-    loses the row before its detail is built and logs the actor alone."""
+    attempt row an ungated reload writes first. The fake engine has no coordinator, so the first
+    one loses the row before its detail is built and logs the actor alone."""
     lost_actions: list[str] = []
     sink = SimpleNamespace(audit_write_failed=lambda name, *, action: lost_actions.append(action))
     with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
-        steps = await _record_reload_audit(_AUDIT_DOWN, actor=_FORGING_ACTOR)
+        steps = await _record_reload_audit(_AUDIT_DOWN, actor=_FORGING_ACTOR, loaded=None)
         with pytest.raises(HTTPException) as refused:
             await _audit_reload_attempt(
                 _AUDIT_DOWN,

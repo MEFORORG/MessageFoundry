@@ -254,18 +254,30 @@ class ReloadOutcome:
     ``fingerprint`` is the ADR 0041 D1 digest an applied reload took of ``directory`` before its
     swap, or ``None`` when it could not take one (and always for a dry run). The reload's audit row
     reads it here rather than off :attr:`Engine.loaded_config_fingerprint`: a second reload can swap
-    the graph again before the first one's row is written (vault BACKLOG #2257)."""
+    the graph again before the first one's row is written (vault BACKLOG #2257).
+
+    ``config_version`` is the shared cluster config version this reload applied: the one an
+    operator reload bumped the cluster to, or the one a convergence reload converged on. Both rows
+    carry it, so a follower's row names the operator act it followed (vault BACKLOG #3109). ``None``
+    on a single node, on a dry run, and when the bump failed."""
 
     registry: Registry
     applied: bool
     directory: Path
     failures: tuple[ReloadStepFailure, ...] = ()
     fingerprint: Mapping[str, object] | None = None
+    config_version: int | None = None
 
     @property
     def degraded(self) -> bool:
         """True when the graph swapped but at least one follow-on step did not complete."""
         return self.applied and bool(self.failures)
+
+    @property
+    def failed_steps(self) -> list[str]:
+        """The names of the follow-on steps in :attr:`failures`, as a reload's answer and its audit
+        row report them."""
+        return [f.step for f in self.failures]
 
 
 @runtime_checkable
@@ -682,6 +694,12 @@ class Engine:
         # which has no route to write one. The API sets it, since the row builder lives there and the
         # engine never imports the API. None (embedding, tests) writes no row.
         self.convergence_reload_audit: Callable[[ReloadOutcome], Awaitable[None]] | None = None
+        # vault BACKLOG #3109: the same for a convergence reload that raised, called with the fault
+        # and the shared version it was converging on. The runner retries that version every tick,
+        # so it is called once per version, not once per tick; _convergence_failure_reported is
+        # the last version it was called for.
+        self.convergence_reload_failed: Callable[[Exception, int], Awaitable[None]] | None = None
+        self._convergence_failure_reported: int | None = None
 
     @classmethod
     async def create(
@@ -2271,8 +2289,9 @@ class Engine:
         converged. Seeded first, such a bump is ahead of the seed, and the convergence loop reloads.
         A bump that lands between this read and the load costs one redundant reload of the same
         bytes, which is the safe side. That reload writes its own ``config_reload`` row, and when it
-        lands before the start's ``config_loaded`` row, that row is marked superseded with
-        ``loosenings`` null; the next start then compares against the reload's row.
+        lands before the start's ``config_loaded`` row, that row is marked superseded; it keeps its
+        ``loosenings``, read off the start's own graph (vault BACKLOG #3109). The next start then
+        compares against the reload's row.
         A failed read is logged and leaves :meth:`start` to seed, as it did before; it never refuses
         a start that the old order allowed."""
         if not self._coordinator.is_clustered():
@@ -2288,19 +2307,33 @@ class Engine:
             return
         self._config_version_seeded = True
 
-    async def _converge_reload(self) -> None:
-        """Re-read THIS node's own startup config dir to converge on a cluster reload (Track B Step 6).
+    async def _converge_reload(self, version: int) -> None:
+        """Re-read THIS node's own startup config dir to converge on shared config ``version``, a
+        cluster reload (Track B Step 6).
 
         Non-propagating (``propagate=False``): this is convergence, not initiation, so it must NOT bump
         the shared version token again (or nodes would chase each other's reloads). Passing ``None``
         reloads the startup ``--config`` dir.
 
         The swap then writes its own ``config_reload`` row through :attr:`convergence_reload_audit`
-        (vault BACKLOG #3076), as an operator reload does. Without it, the store's newest baseline
-        named the graph this node ran before converging, so a later start compared against the wrong
-        digest. A fault in that writer is logged and goes no further: the graph has swapped, and a
-        raise would make the runner retry a reload that already ran."""
-        outcome = await self.reload_detail(propagate=False)
+        (vault BACKLOG #3076), as an operator reload does, carrying ``version`` (vault BACKLOG #3109).
+        Without it, the store's newest baseline named the graph this node ran before converging, so a
+        later start compared against the wrong digest. A fault in that writer is logged and goes no
+        further: the graph has swapped, and a raise would make the runner retry a reload that already
+        ran. A reload that raises is passed to :attr:`convergence_reload_failed`, the first time it
+        raises for ``version`` only, and then re-raised, so the runner still retries it."""
+        try:
+            outcome = await self.reload_detail(propagate=False)
+        except Exception as exc:
+            first = version != self._convergence_failure_reported
+            self._convergence_failure_reported = version
+            if first and self.convergence_reload_failed is not None:
+                try:
+                    await self.convergence_reload_failed(exc, version)
+                except Exception:  # noqa: BLE001 - the reload's own fault is the one to raise
+                    log.exception("cluster: a convergence reload failed, and so did its audit")
+            raise
+        outcome = replace(outcome, config_version=version)
         if self.convergence_reload_audit is None:
             return
         try:
@@ -2976,9 +3009,11 @@ class Engine:
         # CANNOT move before the swap either: the bump TELLS every other node to converge, so bumping
         # first would announce a config this node had not applied, and a swap that then failed would
         # leave the cluster converging on a graph the initiator never took.
+        config_version: int | None = None
         if propagate and self._coordinator.is_clustered():
             try:
-                self._applied_config_version = await self._coordinator.bump_config_version()
+                config_version = await self._coordinator.bump_config_version()
+                self._applied_config_version = config_version
             except Exception as exc:
                 # This node IS running the new graph; only the cluster-wide announcement is missing, so
                 # the other nodes stay on the old config until the next bump or an operator reload
@@ -2997,6 +3032,7 @@ class Engine:
             directory=path,
             failures=tuple(failures),
             fingerprint=fingerprint,
+            config_version=config_version,
         )
 
     def _resolve_reload_target(self, config_dir: str | Path | None) -> Path:

@@ -2097,15 +2097,14 @@ refusal or cancellation whose own row then fails, and an unexpected fault in the
 alone. The 503 has the same two lost-COMMIT exceptions as the gate's, listed above, where the
 attempt row may have committed after all.
 
-**An inline or released reload's `config_reload` row names that reload's own config (vault
-BACKLOG #2257).** It is built from the reload's own result: its directory, connection counts and
-the digest it took before the swap. The row is written after the swap, so a second reload or a
-connection flag toggle can move the engine on first. The row then still names its own config, but
-is marked `superseded` and `baseline_unchecked`, so the next start passes over it and does not
-compare against it. Only a committed reload or a flag toggle that moves the engine's loaded
+**An inline, released or cluster convergence reload's `config_reload` row names that reload's own
+config (vault BACKLOG #2257, #3109).** It is built from the reload's own result: its directory,
+connection counts and the digest it took before the swap. The row is written after the swap, so a
+second reload or a connection flag toggle can move the engine on first. The row then still names
+its own config, but is marked `superseded` and `baseline_unchecked`, so the next start passes over
+it and does not compare against it. Only a committed reload or a flag toggle that moves the engine's loaded
 fingerprint counts. A later reload that fails and rolls back does not mark the row. The check
-runs just before the write, so a change after it is not caught. A cluster convergence reload's
-row is still read from the engine's live state when it is written.
+runs just before the write, so a change after it is not caught.
 
 **A released reload loads only the config its approval named (vault BACKLOG #2596, step 3).** When
 dual control holds a reload, the hold's `params` carry `fingerprint`: the ADR 0041 D1 content
@@ -5228,7 +5227,7 @@ under `monitoring:diagnose`, and a lock alert there would show lock state to a r
 withholds it from. **Switching the layer off is not yet reported as a posture loosening**:
 `[alerts].security_signals = false`, or a threshold of `0`, is absent from
 `GET /security/posture`. Nor does `posture_loosened` fire on a start whose `config_loaded` row
-records its loosenings as unknown, such as one a cluster convergence reload superseded.
+records its loosenings as unknown, such as one whose config snapshot could not be taken.
 
 **The console exports too, for an auditor with no bearer session (BACKLOG #2446).** `GET
 /audit/export` reads only an `Authorization` bearer, and an account that signs in only through OIDC

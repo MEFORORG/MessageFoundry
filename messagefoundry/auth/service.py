@@ -2776,6 +2776,13 @@ class AuthService:
         return self._settings.require_action_step_up
 
     @property
+    def settings(self) -> AuthSettings:
+        """The ``[auth]`` limits this service enforces. ``GET /security/posture`` reports its
+        loosenings from here, so an embedder that attaches a service with loosened limits sees them
+        named (vault BACKLOG #3215). Read it; never mutate it."""
+        return self._settings
+
+    @property
     def kerberos_enabled(self) -> bool:
         return self._settings.kerberos_enabled and self._ldap is not None
 

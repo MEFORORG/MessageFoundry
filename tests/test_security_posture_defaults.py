@@ -2302,7 +2302,8 @@ def test_the_revocation_attestation_is_actually_wired() -> None:
 #: ``_posture_body`` reaches the route through the ``allow_no_auth`` open mode, and the route names
 #: that mode (vault BACKLOG #3062). So the quiet posture here is that one entry and nothing else. A
 #: signed-in read was tried instead: it needs a service whose test settings are themselves loosened,
-#: which the route does not read from the service, so it only looked quieter.
+#: and the route reads its [auth] limits off that service (vault BACKLOG #3215), so it would name
+#: them too.
 _HARNESS_ONLY = ["allow_no_auth"]
 
 
@@ -3248,3 +3249,34 @@ async def test_managed_app_stashes_auth_settings_for_the_registry(tmp_path: Path
     switches = [entry["switch"] for entry in resp.json()["loosenings"]]
     assert "ad_session_recheck_seconds" in switches
     assert "backup.allow_unencrypted" in switches
+
+
+@pytest.mark.parametrize("skew", [1, 0], ids=["loosened", "control"])
+async def test_an_embedders_attached_service_supplies_the_auth_limits(
+    engine: Engine, skew: int
+) -> None:
+    """Vault BACKLOG #3215: ``create_app(engine, auth=service)`` stashes no ``[auth]`` settings, so
+    the route read the defaults and named none of the embedder's loosened limits. It now reads the
+    limits off the attached service, which is what enforces them. The control keeps the default
+    and must name nothing, so the loosened arm is not reporting a stash it found elsewhere."""
+    from messagefoundry.auth import Role
+    from tests.test_api_auth import _DEFAULT_PEER, _add, _auth, _login
+
+    service = AuthService(
+        engine.store,
+        AuthSettings(totp_skew_steps=skew, require_mfa=False, admin_write_min_interval_seconds=0),
+    )
+    await service.initialize()
+    app = create_app(engine, auth=service)
+    assert getattr(app.state, "auth_settings", None) is None, (
+        "control: the embedder path stashes none"
+    )
+    await _add(service, "root", Role.ADMINISTRATOR)
+    transport = httpx.ASGITransport(app=app, client=_DEFAULT_PEER)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+        signed_in = await _login(client, "root")
+        assert signed_in.status_code == 200, signed_in.text
+        resp = await client.get("/security/posture", headers=_auth(signed_in.json()["token"]))
+    assert resp.status_code == 200, resp.text
+    switches = [entry["switch"] for entry in resp.json()["loosenings"]]
+    assert ("totp_skew_steps" in switches) is (skew > 0)
