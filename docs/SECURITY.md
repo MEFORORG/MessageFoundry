@@ -2101,9 +2101,11 @@ attempt row may have committed after all.
 written: `trust_anchor`, `invalid_config`, `not_found`, `unreadable`, `digest_mismatch`,
 `no_approved_digest`, `digest_unavailable` and `store_unavailable`. A trust-anchor check that the
 store stops, by refusing the `auth.trust_anchor` audit read or write it needs, is
-`store_unavailable` (BACKLOG #3091). It is not `trust_anchor`, because nothing is known to be wrong
-with the anchor. An inline reload answers **503** for it; a released one answers 422, as every
-refused release does. An anchor file that cannot be read is still `trust_anchor`.
+`store_unavailable` (BACKLOG #3091). The checks of the file run before any store call, so this
+reason is written only for an anchor that passed them. An anchor they refuse is still
+`trust_anchor` when its audit row then fails, and so is an anchor file that cannot be read. An
+inline reload answers **503** for `store_unavailable`; a released one answers 422, as every
+refused release does. The engine log carries the store's error, redacted.
 
 **An inline or released reload's `config_reload` row names that reload's own config (vault
 BACKLOG #2257).** It is built from the reload's own result: its directory, connection counts and

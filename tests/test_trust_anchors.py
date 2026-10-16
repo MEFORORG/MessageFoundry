@@ -2622,3 +2622,50 @@ async def test_the_reload_route_audits_a_store_fault_in_an_anchor_check_as_store
         assert [json.loads(row["detail"])["reason"] for row in rows] == ["store_unavailable"]
     finally:
         await engine.stop()
+
+
+@_AUDIT_FAULTS
+async def test_a_refused_anchor_is_still_a_refusal_when_its_audit_row_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail: str
+) -> None:
+    """The verdict is reached before any store call, so a substituted anchor (a pin mismatch here)
+    whose audit read or write then fails is audited as trust_anchor, never as a store outage."""
+    from messagefoundry.config.wiring import WiringError
+
+    _judged_clean(monkeypatch)
+    spec = AnchorSpec("ad", "[auth].ad_tls_ca_cert_file", str(_pem(tmp_path)), "00" * 32)
+    preflight = ta.make_settings_anchor_preflight([spec], _FaultyAuditStore(fail), enforcing=True)  # type: ignore[arg-type]
+    assert preflight is not None
+    with pytest.raises(WiringError, match="a settings trust anchor was refused") as err:
+        await preflight()
+    assert isinstance(err.value.__cause__, TrustAnchorError)
+
+
+async def test_a_store_fault_fails_a_lane_without_marking_its_ca_refused(tmp_path: Path) -> None:
+    """An operator start of a lane whose CA check the store stopped reads failed, through the
+    TrustAnchorError the control route answers, but the lane is not marked refused, and the fixed
+    line says the file could not be checked rather than that it was refused."""
+    from messagefoundry.config.wiring import Registry
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+
+    async def stopped(_direction: str, _name: str, _settings: Any) -> None:
+        raise ta.AnchorStoreUnavailable("the store refused the trust-anchor audit read")
+
+    store = await MessageStore.open(tmp_path / "r.db")
+    try:
+        runner = RegistryRunner(
+            Registry(),
+            store,
+            egress=EgressSettings(deny_by_default=False),
+            lane_anchor_check=stopped,
+        )
+        with pytest.raises(TrustAnchorError, match="its tls_ca_file could not be checked") as err:
+            await runner._check_lane_anchor("outbound", "OUT", {}, fails_lane=True)
+        assert isinstance(err.value.__cause__, ta.AnchorStoreUnavailable)
+        assert ("outbound", "OUT") not in runner._anchor_refused
+        # A reload's pre-check (fails_lane=False) lets the store fault through for the reload to
+        # answer as store_unavailable.
+        with pytest.raises(ta.AnchorStoreUnavailable):
+            await runner._check_lane_anchor("outbound", "OUT", {}, fails_lane=False)
+    finally:
+        await store.close()

@@ -3655,6 +3655,21 @@ class RegistryRunner:
                 "server log and the auth.trust_anchor audit rows say why"
             )
             raise TrustAnchorError(f"{direction} connection '{name}': its {tail}") from exc
+        except AnchorStoreUnavailable as exc:
+            # BACKLOG #3091: the store stopped the check; the file is not known to be bad. A
+            # failing lane still fails with a fixed line, so an operator start reads `failed` and
+            # the control route answers it, but nothing is marked refused, and the next start
+            # checks the file again.
+            if not fails_lane:
+                raise
+            log.warning(
+                "%s connection %r: trust anchor could not be checked: %s", direction, name, exc
+            )
+            raise TrustAnchorError(
+                f"{direction} connection '{name}': its tls_ca_file could not be checked, because "
+                "the store refused the trust-anchor audit. Start the connection once the store is "
+                "back; the server log says why"
+            ) from exc
         if fails_lane:
             self._anchor_refused.pop((direction, name), None)
 
