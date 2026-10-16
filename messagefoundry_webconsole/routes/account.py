@@ -698,6 +698,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         ),
     ) -> Response:
         assert_same_origin(request)
+        # BACKLOG #3014: ui_mfa_verify's per-actor budget, after the gate's admin-write charge (that
+        # order is BACKLOG #2652's, left alone). JSON, so the page's fetch can read `error`.
+        client = client_ip(request)
+        if not allow_reauth_attempt(service, identity, client):
+            exc = _rate_limited(request, "passkey-enroll")
+            return JSONResponse({"ok": False, "error": exc.detail}, status_code=exc.status_code)
         rp = webauthn_rp(request)
         if rp is None:
             return JSONResponse({"ok": False, "error": "rp_unavailable"}, status_code=409)
@@ -716,13 +722,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 response_json,
                 label=label,
                 token=token,
-                client=client_ip(request),
+                client=client,
                 rp_id=rp[0],
                 origin=rp[1],
             )
         except ValueError as exc:
             # Service-authored, safe messages only (expired ceremony / duplicate label or
-            # credential / bad label / AD) — never reflected input.
+            # credential / bad label / a factor owed first) — never reflected input.
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
         if elevation.session_lost:
             return JSONResponse({"ok": False, "error": "session expired"}, status_code=401)

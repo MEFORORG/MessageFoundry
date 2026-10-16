@@ -6136,8 +6136,8 @@ def _data_attr(text: str, attr: str) -> dict:
     return json.loads(_html.unescape(m.group(1)))
 
 
-async def _browser_enroll(c: httpx.AsyncClient, *, label: str) -> object:
-    """Run the full browser registration ceremony; returns the enrolled soft authenticator."""
+async def _browser_stage(c: httpx.AsyncClient) -> tuple[object, dict]:
+    """Stage a browser registration ceremony; returns the soft authenticator and its attestation."""
     from _soft_webauthn import SoftAuthenticator
     from webauthn.helpers import base64url_to_bytes
 
@@ -6148,7 +6148,12 @@ async def _browser_enroll(c: httpx.AsyncClient, *, label: str) -> object:
     assert r.status_code == 200, r.text
     options = _data_attr(r.text, "data-mf-webauthn-create")
     auth = SoftAuthenticator(rp_id="t", origin="http://t")
-    resp = json.loads(auth.create_response(base64url_to_bytes(options["challenge"])))
+    return auth, json.loads(auth.create_response(base64url_to_bytes(options["challenge"])))
+
+
+async def _browser_enroll(c: httpx.AsyncClient, *, label: str) -> object:
+    """Run the full browser registration ceremony; returns the enrolled soft authenticator."""
+    auth, resp = await _browser_stage(c)
     r = await c.post(
         "/ui/account/webauthn/verify", json={"label": label, "response": resp}, headers=_SFS
     )
@@ -6285,6 +6290,33 @@ async def test_webauthn_json_endpoints_reject_bearer_without_cookie(engine: Engi
         assert r.status_code == 401
         r = await c.post("/ui/account/webauthn/verify", json={"response": {}}, headers=headers)
         assert r.status_code == 303  # require_ui-family: no cookie -> login redirect
+
+
+async def test_webauthn_verify_draws_on_the_ceremony_budget(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #3014: the passkey finish draws on the per-actor ceremony budget, as mfa/verify does.
+    # RED when: a denied budget still reaches the service, or answers with a body the page's fetch
+    # cannot read. The throttle comes before the service, so the ceremony survives it.
+    pytest.importorskip("webauthn")
+    service = await _service(engine)
+    async with _boss_client(engine, service) as c:
+        _auth, resp = await _browser_stage(c)
+        real = service.allow_reauth_attempt
+        monkeypatch.setattr(service, "allow_reauth_attempt", lambda _actor: False)
+        r = await c.post(
+            "/ui/account/webauthn/verify", json={"label": "k", "response": resp}, headers=_SFS
+        )
+        body = r.json()
+        assert r.status_code == 429 and body["ok"] is False and body["error"]
+        uid = await _uid(service, "boss")
+        assert await service.store.list_webauthn_credentials(uid) == []
+
+        monkeypatch.setattr(service, "allow_reauth_attempt", real)
+        r = await c.post(
+            "/ui/account/webauthn/verify", json={"label": "k", "response": resp}, headers=_SFS
+        )
+        assert r.status_code == 200 and r.json()["ok"] is True, r.text
 
 
 async def test_webauthn_cross_site_posts_rejected(engine: Engine) -> None:
