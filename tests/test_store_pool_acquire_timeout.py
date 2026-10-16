@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #1052 (ASVS 13.2.6) — every store pooled-connection borrow is BOUNDED.
+"""BACKLOG #1052 (ASVS 13.2.6) — every store pooled-connection borrow is BOUNDED, except the two
+session writes that follow a committed auth change, which wait on purpose (BACKLOG #2283 on
+Postgres, #3023 on SQL Server) and are pinned by name below.
 
 ``[store].connect_timeout`` bounds the login and ``[store].command_timeout`` the statement. Neither
 bounds the WAIT for a free pooled connection, and that wait was unbounded at three sites: the SQL
@@ -575,7 +577,7 @@ def test_sqlserver_acquire_really_is_the_sole_borrow_site() -> None:
         if "self._pool." in line and not allowed.search(line)
     ]
     assert stray == [], (
-        "a new SQL Server pool borrow appeared outside _acquire, so it is no longer the sole bounded"
+        "a new SQL Server pool borrow appeared outside _borrow, so it is no longer the sole"
         " chokepoint the docs claim it is:\n" + "\n".join(stray)
     )
 
@@ -651,17 +653,15 @@ def test_postgres_unbounded_post_commit_helper_has_exactly_its_two_callers() -> 
 
 
 def _sqlserver_functions_referencing(attr: str) -> list[str]:
-    """The methods of sqlserver.py that read ``attr`` or pass it as a keyword. Methods only: a
-    nested function would be counted under its enclosing method too."""
+    """Every function in sqlserver.py, at any depth, that reads ``attr`` or passes it as a
+    keyword. A nested function is named with its enclosing one, so a new site cannot hide."""
     import ast
 
     tree = ast.parse((_REPO / "messagefoundry/store/sqlserver.py").read_text(encoding="utf-8"))
     return sorted(
         {
             fn.name
-            for cls in tree.body
-            if isinstance(cls, ast.ClassDef)
-            for fn in cls.body
+            for fn in ast.walk(tree)
             if isinstance(fn, ast.AsyncFunctionDef | ast.FunctionDef)
             for node in ast.walk(fn)
             if (isinstance(node, ast.Attribute) and node.attr == attr)

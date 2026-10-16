@@ -2493,7 +2493,7 @@ class PostgresStore:
         ``_fetchall``/``_fetchone``/``_execute`` convenience trio, which were routed through here for
         exactly that reason — they called ``self._pool.fetch(...)``, which acquires inside asyncpg with
         no timeout, so leaving them outside would have left the class open while looking closed. It is
-        **not** every call in this module that can reach a pool. Unlike ``SqlServerStore._acquire``,
+        **not** every call in this module that can reach a pool. Unlike ``SqlServerStore._borrow``,
         which is that backend's sole borrow site,
         this is not yet a single chokepoint — do not describe it as one, and check
         ``tests/test_store_pool_acquire_timeout.py`` (which pins the set of borrows that bypass it)

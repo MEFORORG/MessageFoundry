@@ -3767,8 +3767,12 @@ async def acquire_pooled(pool: Any, *, timeout: float | None, backend: str) -> A
     shutdown mid-borrow would strand a slot the pool never recovers."""
     borrow: asyncio.Future[Any] = asyncio.ensure_future(_as_awaitable(pool.acquire()))
     try:
+        if timeout is None:
+            return await asyncio.shield(borrow)
         return await asyncio.wait_for(asyncio.shield(borrow), timeout)
     except TimeoutError as exc:
+        if timeout is None:  # the driver's own error: there is no limit to have reached
+            raise
         borrow.cancel()
         borrow.add_done_callback(partial(_salvage_late_borrow, pool, backend))
         raise StoreAcquireTimeout(

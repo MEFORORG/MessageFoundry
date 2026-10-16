@@ -127,7 +127,7 @@ from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.credential import constant_time_equal
 from messagefoundry.keyed_lock import KeyedLock as _KeyedLock
 from messagefoundry.keyed_lock import hold_keyed_lock as _hold_keyed_lock
-from messagefoundry.store.base import AdminStore, StoreAcquireTimeout, store_driver_errors
+from messagefoundry.store.base import AdminStore, store_driver_errors, store_open_errors
 from messagefoundry.store.crypto import MARKER_PREFIX, CipherError
 from messagefoundry.store.row_seal import (
     ADSET_KIND,
@@ -198,17 +198,19 @@ def _audit_write_errors() -> tuple[type[Exception], ...]:
 
 @cache
 def _session_write_errors() -> tuple[type[Exception], ...]:
-    """What a refused session write raises, at least on the store backends named here (BACKLOG
-    #3023): the drivers' own errors, the acquire timeout, and ``OSError`` for a connection lost at
-    the socket. Narrower than :func:`_audit_write_errors`, which also takes every ``RuntimeError``
-    and ``CipherError``: a session row's seal is a local HMAC, so no Transit call can refuse it, and
-    an engine ``RuntimeError`` other than the acquire timeout still reads as a defect."""
-    return (StoreAcquireTimeout, OSError, *store_driver_errors())
+    """What a refused session read or write raises, at least on the store backends named there
+    (BACKLOG #3023): :func:`~messagefoundry.store.base.store_open_errors`, which takes the drivers'
+    own errors, the acquire timeout, ``OSError`` for a connection lost at the socket, and pyodbc's
+    ``Error`` root, which pyodbc raises for an unmapped SQLSTATE such as a deadlock victim. Narrower
+    than :func:`_audit_write_errors`, which also takes every ``RuntimeError`` and ``CipherError``: a
+    session row's seal is a local HMAC, so no Transit call can refuse it, and an engine
+    ``RuntimeError`` other than the acquire timeout still reads as a defect."""
+    return store_open_errors()
 
 
 class _RotationStoreError(Exception):
     """A session rotation the store refused (BACKLOG #3023). ``old_revoked`` says whether the
-    best-effort revoke of the old hash that followed it landed."""
+    best-effort revokes that followed it all landed."""
 
     def __init__(self, old_revoked: bool) -> None:
         super().__init__("session rotation refused by the store")
@@ -7702,13 +7704,20 @@ class AuthService:
         **A rotation the store refuses fails closed (BACKLOG #3023).** A raise from the store, such
         as a lost connection or a pool shortage at the acquire limit, would otherwise leave the old
         token live and carrying whatever stamp the ceremony just wrote against it, which is what the
-        rotation exists to prevent. So the old hash is revoked, best effort, and
-        :class:`_RotationStoreError` is raised for :meth:`_elevated_hash` to audit and answer as
-        ``session_lost``. If that revoke is refused too, the old session stays live until it lapses;
-        the error records which. On SQL Server and Postgres the rotation waits out a pool shortage
-        rather than raising, so what reaches this branch there is a statement or connection
-        failure."""
-        session = await self._load_session(old_hash)
+        rotation exists to prevent. So the session is revoked, best effort, under both its old and
+        its new hash, since a re-key whose commit landed before the error reached us has already
+        moved the row. Then :class:`_RotationStoreError` is raised for :meth:`_elevated_hash` to
+        audit and answer as ``session_lost``. If a revoke is refused too, the session stays live
+        until it lapses; the error records which. On SQL Server and Postgres the re-key waits out a
+        pool shortage rather than raising, so what reaches this branch there is a statement or
+        connection failure, or a refused read before the re-key.
+
+        A cancellation is not an ``Exception``, so it skips this branch and propagates with the old
+        hash unrotated and unrevoked. The unbounded re-key makes that wait longer than it was."""
+        try:
+            session = await self._load_session(old_hash)
+        except _session_write_errors() as exc:
+            raise _RotationStoreError(await self._revoke_unrotated(old_hash, None, exc)) from exc
         if session is None:
             return None
         # Under the account's re-proof lock (BACKLOG #1138), so no rotation lands while a password
@@ -7724,28 +7733,42 @@ class AuthService:
                 await self._session_seal_failed(old_hash)
                 return None
             except _session_write_errors() as exc:
-                raise _RotationStoreError(await self._revoke_unrotated(old_hash, exc)) from exc
+                raise _RotationStoreError(
+                    await self._revoke_unrotated(old_hash, hash_token(new_token), exc)
+                ) from exc
             if not rotated:
                 return None
             self._rekey_token_state(old_hash, hash_token(new_token))
             return new_token
 
-    async def _revoke_unrotated(self, old_hash: str, cause: Exception) -> bool:
-        """Revoke a session whose rotation the store refused; ``True`` when the revoke landed
-        (BACKLOG #3023). Best effort: a second refusal is logged, never raised, so the caller still
-        fails closed. The log names the error class only, never the hash."""
-        try:
-            await self._store.revoke_session(old_hash)
-        except _session_write_errors() as exc:
-            outcome, revoked = f"its revoke was refused too ({type(exc).__name__})", False
-        else:
-            outcome, revoked = "the old session was revoked", True
+    async def _revoke_unrotated(
+        self, old_hash: str, new_hash: str | None, cause: Exception
+    ) -> bool:
+        """Revoke a session whose rotation the store refused, under ``old_hash`` and, when a re-key
+        was attempted, ``new_hash``; ``True`` when every revoke landed (BACKLOG #3023). Best effort: a
+        second refusal is logged, never raised, so the caller still fails closed. The log names the
+        error classes only, never a hash.
+
+        Each revoke is the ordinary, bounded ``revoke_session``. It has other callers that do not
+        follow a committed write, so it is not moved onto a store's unbounded post-commit borrow
+        here, and at the acquire limit it can be refused while the pool is still short."""
+        refused: list[str] = []
+        for token_hash in (old_hash, new_hash):
+            if token_hash is None:
+                continue
+            try:
+                await self._store.revoke_session(token_hash)
+            except _session_write_errors() as exc:
+                refused.append(type(exc).__name__)
+        outcome = (
+            f"a revoke was refused too ({', '.join(refused)})" if refused else "it was revoked"
+        )
         _log.warning(
             "auth: a session rotation was refused by the store (%s); %s",
             type(cause).__name__,
             outcome,
         )
-        return revoked
+        return not refused
 
     async def _elevated(
         self,
@@ -7814,17 +7837,24 @@ class AuthService:
         just before can run past it, for example while confirming an enrolment hashes its recovery
         codes. Refused here, before the rotation, so a confirming enrolment refused here does not
         turn MFA on. The ask is made before the rotation waits for the account's re-proof lock, so
-        a deadline that passes during that wait is not caught."""
-        if await self._rotation_lapsed(token_hash, ceremony=ceremony, client=client):
-            return Elevation(session_lost=True)
+        a deadline that passes during that wait is not caught.
+
+        A store refusal anywhere from the lapse check to the re-key fails closed (BACKLOG #3023):
+        see :meth:`_rotate_session_hash`."""
         rotated: str | None = None
         failure: dict[str, object] = {"reason": "session_gone"}
         try:
+            if await self._rotation_lapsed(token_hash, ceremony=ceremony, client=client):
+                return Elevation(session_lost=True)
             rotated = await self._rotate_session_hash(token_hash)
         except _RotationStoreError as refused:
-            # BACKLOG #3023: the store refused the re-key. The old session was revoked, best effort,
+            # BACKLOG #3023: the store refused the re-key. The session was revoked, best effort,
             # and this fails closed exactly as a session gone underneath the ceremony does.
             failure = {"reason": "store_error", "old_session_revoked": refused.old_revoked}
+        except _session_write_errors() as exc:
+            # The lapse check's own reads, refused: the ceremony's stamp is already on this hash.
+            revoked = await self._revoke_unrotated(token_hash, None, exc)
+            failure = {"reason": "store_error", "old_session_revoked": revoked}
         if rotated is None:
             await self._audit(
                 "auth.session_rotation_failed",

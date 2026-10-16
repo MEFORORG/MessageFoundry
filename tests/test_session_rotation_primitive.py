@@ -277,8 +277,53 @@ async def test_a_refused_rotation_still_fails_closed_when_the_revoke_is_refused_
     elevation = await service._elevated(token, ceremony="mfa_verify", actor="rot")
 
     assert elevation.session_lost is True and elevation.token is None
+    assert await service.identity_for_token(token) is not None, "the flag would be untrue"
     assert await _rotation_failures(service) == [
         {"ceremony": "mfa_verify", "reason": "store_error", "old_session_revoked": False}
+    ]
+
+
+async def test_a_rotation_whose_commit_landed_before_the_raise_leaves_no_live_session(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the branch revokes only the old hash. A re-key whose commit landed before a lost
+    connection reached us has already moved the row to the new hash, which nobody holds."""
+    service, token = await _service_and_token(engine)
+    identity = await service.identity_for_token(token)
+    assert identity is not None
+    real_rotate = service.store.rotate_session
+
+    async def landed_then_lost(token_hash: str, *, new_token_hash: str) -> bool:
+        await real_rotate(token_hash, new_token_hash=new_token_hash)
+        raise ConnectionResetError("lost after the commit")
+
+    monkeypatch.setattr(service.store, "rotate_session", landed_then_lost)
+
+    elevation = await service._elevated(token, ceremony="mfa_verify", actor="rot")
+
+    assert elevation.session_lost is True and elevation.token is None
+    assert await service.store.list_sessions(identity.user_id) == []
+    assert (await _rotation_failures(service))[0]["old_session_revoked"] is True
+
+
+async def test_a_refused_read_before_the_rotation_fails_closed_too(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the lapse check's reads sit outside the branch. They run after the ceremony's
+    stamp and before the re-key, so a raise there would leave the old token elevated."""
+    service, token = await _service_and_token(engine)
+
+    async def lapse_check_refused(token_hash: str, *, ceremony: str, client: str | None) -> bool:
+        raise StoreAcquireTimeout("postgres: store pool acquire timed out after 30s")
+
+    monkeypatch.setattr(service, "_rotation_lapsed", lapse_check_refused)
+
+    elevation = await service._elevated(token, ceremony="mfa_verify", actor="rot")
+
+    assert elevation.session_lost is True and elevation.token is None
+    assert await service.identity_for_token(token) is None
+    assert await _rotation_failures(service) == [
+        {"ceremony": "mfa_verify", "reason": "store_error", "old_session_revoked": True}
     ]
 
 

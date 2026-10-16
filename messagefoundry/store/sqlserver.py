@@ -4751,8 +4751,8 @@ class SqlServerStore:
         timeout was ever applied — a hung statement then held its queue/messages row X-locks forever.
 
         B11: the perf_counter pair records the acquire WAIT time (the PRIMARY pool-wait wall signal)
-        into the acquire-wait histogram. Every store DB call funnels through here (the single _acquire
-        chokepoint), so the connection-scale harness sees how long the per-lane workers wait for a
+        into the acquire-wait histogram. Every store DB call funnels through :meth:`_borrow` (the
+        single chokepoint), so the connection-scale harness sees how long the per-lane workers wait for a
         pooled connection as the pool saturates. Read-only/additive — the timing never changes the
         acquired connection or its release.
 
