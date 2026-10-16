@@ -756,6 +756,17 @@ def test_the_iso_2022_jp_text_probe_really_decodes_to_an_svg_tag() -> None:
     assert not svg_sanitize._has_svg_tag(_ISO2022_TEXT_THEN_SVG)
 
 
+def test_iso_2022_jp_text_with_a_lt_and_no_tag_is_served_plain_and_gzipped() -> None:
+    """The control for the escape pass: real escape sequences and a ``<`` with no ``svg`` tag,
+    which a browser would read as Japanese text, are served as stored."""
+    data = "note: value < 5, svg drawing attached later".encode("iso2022_jp")
+    data = "日本 ".encode("iso2022_jp") + data + " 語".encode("iso2022_jp")
+    assert b"\x1b$B" in data and b"\x1b(B" in data and b"<" in data
+    assert sanitize_if_svg("text/plain", data) is data
+    gz = _gz(data)
+    assert sanitize_if_svg("text/plain", gz) is gz
+
+
 @pytest.mark.parametrize(
     "data",
     [

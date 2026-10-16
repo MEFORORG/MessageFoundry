@@ -418,11 +418,12 @@ def _refuse_if_tagged(content: bytes) -> None:
     #3257). Only the tag counts: a namespace name in a PDF or a DICOM file is not refused.
 
     Markup holding the ISO-2022-JP escape is refused outright, but most binaries hold that byte, so
-    here only the tag spelled through an escape sequence is: the scan runs again with the sequences
-    removed, as a browser decoding the body in that encoding would read it."""
-    if _has_svg_tag(content) or (
-        _ESC in content and _has_svg_tag(_ISO2022_ESCAPE_RE.sub(b"", content))
-    ):
+    here only the tag spelled through an escape sequence is: the scan reads the bytes with the
+    sequences removed, as a browser decoding the body in that encoding would. Removing them breaks
+    no tag the raw bytes hold, since no byte of a tag's name or of the byte after it is ``ESC``."""
+    if _ESC in content:
+        content = _ISO2022_ESCAPE_RE.sub(b"", content)
+    if _has_svg_tag(content):
         raise SvgRejected("document that is not markup carries an svg start tag")
 
 
@@ -581,10 +582,11 @@ def _vet_gzip(label: str | None, body: bytes) -> bytes:
 
     A body that is not markup is cleared without inflating the rest of it, so neither damage nor an
     ``svg`` tag past the head is seen. A tag cut by the head's end is judged on the bytes the head
-    holds: ``<svg`` there is refused as if the tag went on, and ``<sv`` is past the head. Inflating every large PDF or image to the bound would undo
-    BACKLOG #1129. What the head scan does not reach rests on the route's content-type allow-list:
-    the body is declared only as an inert type, as an attachment with ``nosniff``, so a browser does
-    not render it as SVG or HTML. An SVG in EBCDIC is not seen either, here or in plain bytes.
+    holds: ``<svg`` there is refused as if the tag went on, and ``<sv`` is past the head. Inflating
+    every large PDF or image to the bound would undo BACKLOG #1129. What the head scan does not
+    reach rests on the route's content-type allow-list: the body is declared only as an inert type,
+    as an attachment with ``nosniff``, so a browser does not render it as SVG or HTML. An SVG in
+    EBCDIC is not seen either, here or in plain bytes.
 
     The head and the size check are trial passes that keep no output (BACKLOG #1129). Only a body
     they admit as whole markup is inflated again, and that pass is the one that keeps the document.
@@ -749,11 +751,12 @@ def sanitize_svg(body: bytes) -> bytes:
 
 
 def may_be_svg(body: bytes) -> bool:
-    """A cheap, non-blocking pre-check: ``False`` means :func:`sanitize_if_svg` would return ``body``
+    """A cheap pre-check: ``False`` means :func:`sanitize_if_svg` would return ``body``
     unchanged whatever its label, so the caller can skip the thread hop. Every other answer needs a
     ``<`` in the bytes: markup starts with one, and so does the ``svg`` tag a body that is not markup
     is refused for (BACKLOG #3257). The one exception is gzip, since an SVGZ reader inflates it
-    first. Most PDFs and images hold a ``<`` somewhere, so they take the hop."""
+    first. Most PDFs and images hold a ``<`` somewhere, so they take the hop. It is one byte search,
+    and a body with no ``<`` is searched to its end on the caller's thread."""
     return body.startswith(_GZIP_MAGIC) or b"<" in body
 
 
@@ -764,8 +767,8 @@ def sanitize_if_svg(label: str | None, body: bytes) -> bytes:
     refused, and so are bytes that are not markup but hold an ``svg`` start tag. A gzip body is
     judged by what it inflates to, and a sanitized SVG inside it is gzipped again.
 
-    Raises :class:`SvgRejected` for SVG that cannot be vetted. Blocking work: run it off the event
-    loop."""
+    Raises :class:`SvgRejected` for SVG that cannot be vetted, and for each refusal above. Blocking
+    work: run it off the event loop."""
     if body.startswith(_GZIP_MAGIC):
         return _vet_gzip(label, body)
     return _vet_markup(label, body)

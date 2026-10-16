@@ -542,7 +542,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 | X12 | An inbound whose content type is `x12` | `parsing/x12/` |
 | DICOM | An inbound DICOM association or payload | `parsing/dicom/`, `transports/dicom.py` |
 | A JSON payload for a database outbound | What a Handler built from a message | `transports/database.py` |
-| An attachment inside a stored message that is markup, or gzip, which may hold SVG | A sender, through the message. It is read when the attachment is downloaded. | `api/svg_sanitize.py` |
+| An attachment inside a stored message that holds a `<` byte, or is gzip, which may hold SVG | A sender, through the message. It is read when the attachment is downloaded. | `api/svg_sanitize.py` |
 | An uploaded file | The body of `POST /uploads`, or of `POST /ui/uploaded-logs/upload`, which the same handler serves. `api/multipart.py` is a hand-written `multipart/form-data` parser (ADR 0134), and its own comment calls each part's header block attacker-supplied. The route needs the files-upload permission and step-up authentication. | `api/app.py`, `api/multipart.py`, `uploads.py` |
 | A reference sync's file source | A file another system exports. `pipeline/reference_sync.py` re-reads it on a schedule and hands it to the code-set loader, and a dry run's reference preview in `pipeline/dryrun.py` does too. The same loader reads the code sets in the config directory, which are operator input. | `config/code_sets.py` |
 | The sandbox child's replies | The child runs your Routers and Handlers, so the parent treats what it sends back as untrusted | `pipeline/sandbox.py`, `pipeline/_sandbox_codec.py` |
@@ -680,12 +680,13 @@ or compression library:
   (BACKLOG #2391). ADR 0105's correction of 2026-10-07 states the bounds and the rules; read them
   there. In short, the inflate is bounded as it goes, so it never expands in memory past the bound,
   but a small stored gzip can still drive an inflate and a parse of nearly that much. A first
-  content byte other than `<`, in the head or in the whole output, clears the body, which is then
-  served as stored. The
+  content byte other than `<`, in the head or in the whole output, marks the body as not markup.
+  It is then served as stored unless the 64 KiB from that byte on hold an `svg` start tag
+  (BACKLOG #3257). The
   route refuses with HTTP 422 in at least these cases: damage the inflate reaches, such as a corrupt
   block, a failed check, a member cut short, too many members, or stray bytes between or after
-  members; markup larger than the bound; SVG it cannot sanitize; and SVG below a root that is not
-  `svg`. A sanitized SVG inside is served gzipped again. The inflated bytes stay in memory; nothing
+  members; markup larger than the bound; SVG it cannot sanitize; SVG below a root that is not
+  `svg`; and an `svg` start tag in bytes that are not markup, plain or gzipped. A sanitized SVG inside is served gzipped again. The inflated bytes stay in memory; nothing
   is written to disk, and the stored attachment is never changed.
 - `support/bundle.py` only writes a zip, the support bundle. It reads none.
 

@@ -1383,7 +1383,8 @@ control unchanged (`messages:view_raw`/`view_summary` RBAC, field-level redactio
   longer preview in the browser; the bytes are unchanged and still downloadable, since the allow-list
   governs the declared type and never whether the file is served. An SVG is the exception: the route
   serves a copy rebuilt from a tag and attribute allow-list, or refuses with HTTP 422 one it cannot
-  vet, and the stored value stays verbatim either way. What counts as an SVG, and what is kept or
+  vet, and the stored value stays verbatim either way. A document that is not an SVG but carries
+  an SVG element, or an `svg` start tag past leading text, is refused the same way. What counts as an SVG, and what is kept or
   refused, is recorded once, in ADR 0105's 2026-09-28 amendment.
 - **XSS-safe rendering.** All HL7/message content is escaped by an autoescape-by-default renderer and a
   strict CSP (`script-src 'self'`, no `unsafe-*`); attacker-influenced HL7 cannot execute in the DOM.
