@@ -90,7 +90,7 @@ $missing = switch ($PSCmdlet.ParameterSetName) {
     'Write' { if (-not $Write) { '-Write <name>' }; if (-not $From) { '-From <file>' } }
 }
 if ($missing) {
-    throw "$($PSCmdlet.ParameterSetName) arguments were given without $($missing -join ' and '). Nothing was moved or written. Add what is missing and re-run."
+    throw "$($PSCmdlet.ParameterSetName) needs a non-empty $($missing -join ' and '). Nothing was moved or written. Add what is missing and re-run."
 }
 
 . "$PSScriptRoot\mail-key.ps1"

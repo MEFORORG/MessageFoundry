@@ -121,7 +121,7 @@ $ErrorActionPreference = 'Stop'
 
 # -Sha without -Anchor: refuse by name, before anything is read or written. See $Anchor.
 if ($PSCmdlet.ParameterSetName -eq 'Anchor' -and -not $Anchor) {
-    throw "Anchoring needs -Anchor <slug>; -Sha alone does not anchor. Nothing was written. Add -Anchor and re-run."
+    throw "Anchoring needs a non-empty -Anchor <slug>; -Sha alone does not anchor. Nothing was written."
 }
 
 # Anchored on the SCRIPT, not the cwd, for the reason alloc.ps1 states once (BACKLOG #1060): an

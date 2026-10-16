@@ -6,15 +6,17 @@ A Mandatory parameter that a partial call binds without supplying makes PowerShe
 A caller whose stdin stays open and silent (the Bash tool) then waits forever. ``mail.ps1 -Send`` did
 this until PR 2332, and vault BACKLOG #3627 found the same shape in more coordination scripts.
 
-Neither condition may be dropped. ``-NonInteractive`` turns the prompt into an instant error, and
-``subprocess.run`` closes stdin so the prompt reads EOF; either one hides the hang and lets a test
-pass against the broken script.
+Neither condition may be dropped. ``-NonInteractive`` turns the prompt into an instant error. A
+launch without ``stdin=PIPE`` inherits the test process's stdin, which pytest's default capture
+points at a null device, so the prompt reads EOF. Either one hides the hang and lets a test pass
+against the broken script.
 """
 
 from __future__ import annotations
 
 import subprocess
-from collections.abc import Sequence
+import threading
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pytest
@@ -27,23 +29,32 @@ from tests._spawn_lock import single_spawn
 PROMPT_TIMEOUT = 45
 
 
-def run_holding_stdin_open(argv: Sequence[str], *, cwd: Path) -> tuple[int, str]:
+def run_holding_stdin_open(
+    argv: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = None
+) -> tuple[int, str]:
     """Run ``argv`` with stdin open and silent; return ``(exit code, stderr)``, or fail on a hang."""
+    err: list[str] = []
     # The context manager closes both pipes and reaps the process on every path, including the fail.
     with single_spawn(), subprocess.Popen(
-        list(argv), cwd=str(cwd), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+        list(argv), cwd=str(cwd), env=env, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE, text=True,
     ) as proc:  # fmt: skip
+        stream = proc.stderr
+        assert stream is not None
+        # Drained on a thread so a script that fails OPEN and writes past the pipe buffer is not
+        # misreported as a prompt hang. communicate() is not usable: it closes stdin, the condition
+        # under test.
+        reader = threading.Thread(target=lambda: err.append(stream.read()), daemon=True)
+        reader.start()
         try:
-            # A refusal is one short error, far under a pipe buffer, so wait() cannot deadlock on it.
-            # communicate() is not usable here: it closes stdin, which is the condition under test.
             rc = proc.wait(timeout=PROMPT_TIMEOUT)
         except subprocess.TimeoutExpired:
             proc.kill()
+            reader.join(timeout=5)
             # Either cause is possible here, so name both: a slow pwsh start under load looks the same.
             pytest.fail(
                 f"{' '.join(argv)} did not exit in {PROMPT_TIMEOUT}s: it is waiting on a stdin "
-                "prompt, or pwsh started very slowly"
+                f"prompt, or pwsh started very slowly. stderr so far: {''.join(err)[-2000:]!r}"
             )
-        assert proc.stderr is not None
-        return rc, proc.stderr.read()
+        reader.join()
+    return rc, "".join(err)

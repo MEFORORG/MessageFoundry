@@ -2349,6 +2349,7 @@ def test_a_mark_argument_without_mark_refuses_instead_of_prompting(tmp_path: Pat
             "-HomeDir", str(tmp_path), "-ConfigDir", str(root), "-Reason", "cancelled",
         ],
         cwd=tmp_path,
+        env=_env(None),
     )  # fmt: skip
     assert rc != 0, "a Mark argument without -Mark must be refused, not marked"
     assert "-Mark" in err, err
