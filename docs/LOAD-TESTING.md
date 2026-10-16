@@ -92,10 +92,10 @@ its nodes, and then signs in. You pass nothing.
 
 | When | What you do |
 |---|---|
-| You start `serve` yourself | Set `MEFOR_SECURITY_REQUIRE_MFA=false` on it. `provision-admin` enrols an authenticator app at a terminal and offers no other way, so the rig account has none. To keep MFA required instead, see *One leg runs with MFA required* below. |
+| You start `serve` yourself | Set `MEFOR_SECURITY_REQUIRE_MFA=false` on it: a rig account has no authenticator app unless the rig supplies a key. To keep MFA required instead, see *One leg runs with MFA required* below. |
 | That `serve` runs under `[security].enforcement = enforce` | Give it an `[alerts]` channel too. With sign-in on, an enforcing start refuses without a way to send account-security notices. The `load test (smoke, sqlite)` step in [`ci.yml`](../.github/workflows/ci.yml) shows the settings. |
 | You keep one store across runs | Use the same credential each run: set `MEFOR_RIG_ADMIN_USERNAME` and `MEFOR_RIG_ADMIN_PASSWORD` in the shell, and `MEFOR_RIG_ADMIN_TOTP_KEY` to the same key when the account has one. `provision-admin` declines when the store already has an Administrator, and a new run draws a new password, so the engine then refuses the sign-in. A fresh store needs none of these variables. |
-| The drive is a separate process from the engines (a second box, or `batch-driver` beside `batch-engine`) | Export the same two variables for both, and `MEFOR_RIG_ADMIN_TOTP_KEY` too when the account has a key. The drive signs in to engines another process started, and refuses to start without the credential: one drawn there could only be wrong. |
+| The drive is a separate process from the engines (a second box, or `batch-driver` beside `batch-engine`) | Export the same two variables for both. The drive signs in to engines another process started, and refuses to start without the credential: one drawn there could only be wrong. Keep `require_mfa` off and supply no key here: a split drive signs in from several processes at once, which a key does not suit (below). |
 
 #### One leg runs with MFA required
 

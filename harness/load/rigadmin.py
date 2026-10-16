@@ -28,8 +28,10 @@ an authenticator app at the terminal and offers no other way, so a rig has two c
   the terminal enrolment too, with that key and a code computed from it, and runs the rest of the
   shipped enrolment, at least the code check, the step consumption and the secret write.
   :func:`sign_in` sends a code with the password, in the combined ``POST /auth/login`` (ADR 0197).
-  The key travels as the password does: in memory, and in the environment of the child that
-  provisions, popped there before any engine code runs, never printed and never written to a file.
+  The key is held where the calling shell put it: in this process's environment, which a child
+  harness process inherits, and in memory. An engine node and the ``run`` child are kept from it;
+  the provisioning child is handed it and pops it before any engine code runs. It is never printed
+  and never written to a file.
   The recovery codes the command issues are not shown anywhere, since the rig holds the key itself.
 
   A sign-in with a key waits for a TOTP step to open, and suits a leg that signs in once;
@@ -128,7 +130,8 @@ _NOTIFY_ADDRESS = "rig-operator@example.invalid"
 #: can use the API. ``provision`` sets it for the provisioning child of such an account itself. A leg
 #: that supplies a key and wants MFA required leaves it off its ``serve``; the harness runners that
 #: start their own nodes (``failover.EngineNode``) apply it by default whatever the key, so their
-#: engines run with MFA off unless the node's environment says otherwise.
+#: engines run with MFA off unless the node's environment says otherwise. An account they enrol
+#: with a key still owes the code at every sign-in, and waits for it there.
 SERVE_ENV: Mapping[str, str] = {"MEFOR_SECURITY_REQUIRE_MFA": "false"}
 
 #: What an ENFORCING rig's ``serve`` carries beside :data:`SERVE_ENV`: a configured channel for
@@ -284,7 +287,16 @@ def _totp_code(key: str, at: float) -> str:
     level, so this file still imports nothing beyond the standard library and there is one TOTP
     implementation to keep right. Every place that signs in with a key, or provisions one, has the
     engine installed. Raises :class:`RigAdminError`, naming the variable and never the value, on a
-    key that is not base32 or is shorter than :data:`_MIN_KEY_CHARS`."""
+    key that is not base32 or is shorter than :data:`_MIN_KEY_CHARS` (:func:`_check_key`)."""
+    from messagefoundry.auth import totp
+
+    _check_key(key)
+    return totp.totp(key, now=at)
+
+
+def _check_key(key: str) -> None:
+    """Refuse, as :class:`RigAdminError` naming the variable and never the value, a key that is
+    shorter than :data:`_MIN_KEY_CHARS` or that the engine cannot read as base32."""
     from messagefoundry.auth import totp
 
     refusal = RigAdminError(
@@ -294,7 +306,7 @@ def _totp_code(key: str, at: float) -> str:
     if len(key.strip().replace(" ", "").rstrip("=")) < _MIN_KEY_CHARS:
         raise refusal
     try:
-        return totp.totp(key, now=at)
+        totp.totp(key, now=0.0)  # the engine's own base32 read
     except ValueError:  # binascii.Error, the engine's base32 refusal, is a ValueError
         raise refusal from None
 
@@ -472,7 +484,7 @@ def _provision_here(db: str | None, service_config: str | None) -> int:
         os.environ.update(SERVE_ENV)
     else:
         try:
-            _totp_code(factor, 0.0)  # a key that is not base32 is refused before any engine work
+            _check_key(factor)  # refused before any engine work
         except RigAdminError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
@@ -679,7 +691,7 @@ def sign_in(base_url: str, admin: RigAdmin | None = None, *, cacert: str | None 
     step: int | None = None
     if admin.totp_secret:
         try:
-            _totp_code(admin.totp_secret, 0.0)
+            _check_key(admin.totp_secret)
         except RigAdminError as exc:
             raise RigSignInRefused(str(exc)) from None
         body["totp_code"], step = _code_in_a_fresh_step(admin.totp_secret)

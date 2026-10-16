@@ -1051,14 +1051,19 @@ def test_the_mfa_leg_hands_its_key_to_provisioning_and_to_the_sign_in_and_masks_
     pytest.importorskip("yaml")
     run = str(_serving_step("ci.yml", "load-test", "messagefoundry serve")["run"])
     script = "\n".join(line for line in run.splitlines() if not line.lstrip().startswith("#"))
+    # One logical shell line per command: a line ending in a backslash continues into the next.
+    logical = script.replace("\\\n", " ").splitlines()
     handed = f'{rigadmin.ADMIN_FACTOR_ENV}="$rig_totp"'
     assert 'echo "::add-mask::$rig_totp"' in script
-    assert f"export {rigadmin.ADMIN_FACTOR_ENV}" not in script, "the key reaches the engine's env"
+    for line in logical:
+        words = line.split()
+        exported = bool(words) and words[0] in ("export", "declare", "typeset")
+        assert not (exported and rigadmin.ADMIN_FACTOR_ENV in line), "the key reaches the env"
     for command in ("harness.load.rigadmin provision", "harness.load.rigadmin run"):
-        at = script.find(command)
-        assert at != -1, command
-        # The variable prefixes the command: on its line or on the one continued into it.
-        assert handed in script[max(0, at - 200) : at], f"{command} is not handed the key"
+        lines = [line for line in logical if command in line]
+        assert len(lines) == 1, command
+        # The assignment prefixes the command on its own logical line, so the child gets it.
+        assert handed in lines[0].split(command)[0], f"{command} is not handed the key"
     # The census line that would name an account with no authenticator app fails the step. CONTROL:
     # the step's needle is the engine's own warning text, with its source literals joined, so a
     # reworded warning fails here rather than leaving the grep matching nothing.
@@ -1226,6 +1231,9 @@ async def test_a_rig_with_a_key_serves_with_mfa_required_and_signs_in_with_both_
         assert name not in node._env, f"{name} reached the engine's environment"
 
     await node.start()
+    # The step the provisioning child spent, so the sign-in's own record can be told from it.
+    provisioned = rigadmin._spent.last
+    assert provisioned >= 0, "provisioning with a key recorded no spent step"
     try:
         async with httpx.AsyncClient(timeout=4.0, verify=harness_ssl_context()) as client:
             deadline = time.monotonic() + 120.0
@@ -1249,7 +1257,7 @@ async def test_a_rig_with_a_key_serves_with_mfa_required_and_signs_in_with_both_
 
             # CONTROL for the wait: the code of the step that sign-in spent, sent again, is refused.
             # Computed from the recorded step and not the clock, which may have reached a new one.
-            assert rigadmin._spent.last >= 0, "the sign-in recorded no spent step"
+            assert rigadmin._spent.last > provisioned, "the sign-in recorded no spent step"
             spent = totp.totp(key, now=rigadmin._spent.last * 30 + 1)
             replay = await client.post(
                 f"{url}/auth/login",
