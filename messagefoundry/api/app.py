@@ -930,6 +930,31 @@ async def _record_upload_prune(store: Store, meta: UploadedFileMeta) -> None:
     )
 
 
+async def _record_upload_create(
+    store: Store, us: UploadStore, meta: UploadedFileMeta, *, actor: str, client: str | None
+) -> None:
+    """Write the ``upload.create`` row for a stored file, or remove the file (vault BACKLOG #3178).
+
+    The route runs this as an outliving operation, so a request deadline does not cut the row
+    short. A row that still fails, by an error or the shutdown drain's cancellation, removes the
+    pair, so no stored file is left with no row saying who created it. The other way round is
+    still possible: a row that committed and then raised, such as a cancellation while the store
+    releases its connection, removes a file its row names. The file name is not in the row
+    (vault BACKLOG #2619)."""
+    try:
+        await store.record_audit(
+            "upload.create",
+            actor=actor,
+            detail=json.dumps(
+                {"file_id": meta.file_id, "size": meta.size, "message_count": meta.message_count}
+            ),
+            client=client,
+        )
+    except BaseException:
+        await us.discard(meta.file_id)
+        raise
+
+
 def _dead_letter_replay_audit(
     *,
     actor: str | None,
@@ -7165,17 +7190,13 @@ def create_app(
                 client=client_ip(request),
             )
             raise HTTPException(409, str(exc)) from None
-        await engine.store.record_audit(
-            "upload.create",
-            actor=identity.username,
-            detail=json.dumps(
-                {
-                    "file_id": meta.file_id,
-                    "size": meta.size,
-                    "message_count": meta.message_count,
-                }
+        # Vault BACKLOG #3178: the creation row outlives the request, so a deadline that fires now
+        # still leaves the stored file with its row. A row that cannot be written removes the file.
+        await outliving.run(
+            _record_upload_create(
+                engine.store, us, meta, actor=identity.username, client=client_ip(request)
             ),
-            client=client_ip(request),
+            "upload.create audit",
         )
 
         # ASVS 5.2.4: opportunistic age-based retention sweep at save time (off-loop, best-effort). A prune
@@ -7549,18 +7570,27 @@ def create_app(
             await _authorized_upload_meta(request, engine, us, identity, file_id, "delete")
         except _UploadSidecarRefused:
             refused = True
+        client = client_ip(request)
+
+        async def _delete_and_record() -> UploadedFileMeta:
+            removed = await us.delete(file_id, sidecar_refused=refused)
+            await engine.store.record_audit(
+                "upload.delete",
+                actor=identity.username,
+                detail=json.dumps({"file_id": removed.file_id, "size": removed.size}),
+                client=client,
+            )
+            return removed
+
+        # Vault BACKLOG #3178: the unlink and its row run as one operation that outlives the
+        # request, so a deadline can no longer land between them and leave a removed file with no
+        # row. The shutdown drain can still cancel it, as it can any outliving operation.
         try:
-            meta = await us.delete(file_id, sidecar_refused=refused)
+            meta = await outliving.run(_delete_and_record(), "upload delete")
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
         except UploadUnreadableError:
             raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
-        await engine.store.record_audit(
-            "upload.delete",
-            actor=identity.username,
-            detail=json.dumps({"file_id": meta.file_id, "size": meta.size}),
-            client=client_ip(request),
-        )
         return UploadDeleteResult(file_id=meta.file_id, filename=meta.filename, deleted=True)
 
     # --- saved / layered Log-Search filter presets (BACKLOG #151, ADR 0136) --

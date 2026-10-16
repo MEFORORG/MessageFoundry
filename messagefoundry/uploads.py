@@ -926,8 +926,9 @@ class UploadStore:
         **A cancellation that reaches ``save`` after the pair landed removes it (BACKLOG #2262).**
         The caller writes ``upload.create`` only once this returns. A kept pair would be stored with
         no creation row, while the client was told the upload failed and may well retry it. A
-        removal the filesystem refuses is logged at ERROR. This covers ``save`` only. A caller
-        cancelled in its own audit write, after this returned, still keeps the file."""
+        removal the filesystem refuses is logged at ERROR. This covers ``save`` only. The API writes
+        the row after this returns as an operation the request deadline cannot cancel, and a row
+        that fails there removes the pair through :meth:`discard` (vault BACKLOG #3178)."""
         if not uploader_id:
             raise ValueError("uploader_id is required (an upload with no owner id is unreachable)")
         # Only the cheap size check runs on the loop; the sha256, the whole-file split, the cipher, and
@@ -1057,6 +1058,12 @@ class UploadStore:
                 except Exception:  # noqa: BLE001 — logged; the cancellation is what propagates
                     _log.error("could not remove cancelled upload %s", file_id, exc_info=True)
             raise
+
+    async def discard(self, file_id: str) -> None:
+        """Remove a stored pair whose ``upload.create`` row could not be written (vault BACKLOG
+        #3178), the way a save cancelled after it landed is removed. Cancel-resistant: the removal
+        finishes before a cancellation propagates. A refused removal is logged, never raised."""
+        await _to_thread_to_completion(self._discard_cancelled_sync, file_id)
 
     def _discard_cancelled_sync(self, file_id: str) -> None:
         """Remove a pair whose save was cancelled after it landed (BACKLOG #2262; see :meth:`save`).
