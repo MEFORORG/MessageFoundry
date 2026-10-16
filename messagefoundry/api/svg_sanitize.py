@@ -115,6 +115,9 @@ _ATTLIST_DECL_RE: Final = re.compile(rb"<!ATTLIST", re.IGNORECASE)
 #: is UTF-16 or UTF-32, which the scans read after removing NUL bytes. Markup holding it is not
 #: well-formed XML, so it reaches only the byte scans, which refuse it.
 _ESC: Final = b"\x1b"
+#: The escape sequences a browser's ISO-2022-JP decoder switches on, each of which decodes to
+#: nothing. Used only by the tag scan of bytes that are not markup.
+_ISO2022_ESCAPE_RE: Final = re.compile(rb"\x1b(?:\([BJI]|\$[@B])")
 #: The most steps the root scan may take: one per comment, processing instruction, declaration, quote
 #: or bracket. A real prolog takes a few dozen. Past this the scan stops and the document is treated
 #: as SVG, so it is refused rather than served unread.
@@ -221,7 +224,9 @@ _IMPORTANT: Final = "important"
 
 
 class SvgRejected(ValueError):
-    """The document is SVG but could not be vetted, so no copy of it may be served."""
+    """The document is SVG, or carries an SVG element or start tag, and could not be vetted, so no
+    copy of it may be served. A document that is not markup is refused here for the tag alone
+    (BACKLOG #3257), so the refused document need not be an SVG."""
 
 
 class _RootFound(Exception):
@@ -410,8 +415,14 @@ def _has_svg_tag(data: bytes) -> bool:
 
 def _refuse_if_tagged(content: bytes) -> None:
     """Refuse a document that is not markup when ``content`` holds an ``svg`` start tag (BACKLOG
-    #3257). Only the tag counts: a namespace name in a PDF or a DICOM file is not refused."""
-    if _has_svg_tag(content):
+    #3257). Only the tag counts: a namespace name in a PDF or a DICOM file is not refused.
+
+    Markup holding the ISO-2022-JP escape is refused outright, but most binaries hold that byte, so
+    here only the tag spelled through an escape sequence is: the scan runs again with the sequences
+    removed, as a browser decoding the body in that encoding would read it."""
+    if _has_svg_tag(content) or (
+        _ESC in content and _has_svg_tag(_ISO2022_ESCAPE_RE.sub(b"", content))
+    ):
         raise SvgRejected("document that is not markup carries an svg start tag")
 
 
@@ -569,7 +580,8 @@ def _vet_gzip(label: str | None, body: bytes) -> bytes:
     :func:`_gunzip_bounded` before anything is judged.
 
     A body that is not markup is cleared without inflating the rest of it, so neither damage nor an
-    ``svg`` tag past the head is seen. Inflating every large PDF or image to the bound would undo
+    ``svg`` tag past the head is seen. A tag cut by the head's end is judged on the bytes the head
+    holds: ``<svg`` there is refused as if the tag went on, and ``<sv`` is past the head. Inflating every large PDF or image to the bound would undo
     BACKLOG #1129. What the head scan does not reach rests on the route's content-type allow-list:
     the body is declared only as an inert type, as an attachment with ``nosniff``, so a browser does
     not render it as SVG or HTML. An SVG in EBCDIC is not seen either, here or in plain bytes.
@@ -749,8 +761,8 @@ def sanitize_if_svg(label: str | None, body: bytes) -> bytes:
     """``body`` unchanged unless it carries SVG, in which case the sanitized copy.
 
     An SVG document is sanitized. Markup whose root is not ``svg`` but which holds an SVG element is
-    refused. A gzip body is judged by what it inflates to, and a sanitized SVG inside it is gzipped
-    again.
+    refused, and so are bytes that are not markup but hold an ``svg`` start tag. A gzip body is
+    judged by what it inflates to, and a sanitized SVG inside it is gzipped again.
 
     Raises :class:`SvgRejected` for SVG that cannot be vetted. Blocking work: run it off the event
     loop."""

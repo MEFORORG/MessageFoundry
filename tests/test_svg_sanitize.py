@@ -746,6 +746,16 @@ def test_binaries_without_an_svg_tag_are_served_plain_and_gzipped(label: str, da
     assert sanitize_if_svg(label, gz) is gz
 
 
+#: Leading Japanese text, then ``<s ESC ( B vg``, which an ISO-2022-JP decoder reads as ``<svg``.
+_ISO2022_TEXT_THEN_SVG = b"note \x1b$B$3$s\x1b(B text <s\x1b(Bvg onload=alert(1)>"
+
+
+def test_the_iso_2022_jp_text_probe_really_decodes_to_an_svg_tag() -> None:
+    """Control for the escape case below: no byte scan sees the tag, the decoder does."""
+    assert "<svg onload" in _ISO2022_TEXT_THEN_SVG.decode("iso2022_jp")
+    assert not svg_sanitize._has_svg_tag(_ISO2022_TEXT_THEN_SVG)
+
+
 @pytest.mark.parametrize(
     "data",
     [
@@ -759,6 +769,7 @@ def test_binaries_without_an_svg_tag_are_served_plain_and_gzipped(label: str, da
         pytest.param(b"synthetic <svg", id="tag-at-the-end"),
         pytest.param("synthetic <svg onload=x>".encode("utf-16"), id="utf-16"),
         pytest.param(b"\x00" * 128 + b"DICM synthetic <svg onload=x>", id="dicom-then-svg"),
+        pytest.param(_ISO2022_TEXT_THEN_SVG, id="iso-2022-jp-escape"),
     ],
 )
 @pytest.mark.parametrize("label", ["image/svg+xml", "text/html", "text/plain", None])
@@ -781,13 +792,19 @@ def test_a_gzip_tag_scan_reads_the_head_from_the_first_content_byte(
 ) -> None:
     """The gzip head scan covers :data:`_GZIP_SNIFF_BYTES` from the first byte past leading noise,
     so leading whitespace does not shorten it: the head pass reads on to twice the head, and never
-    to the bound (BACKLOG #1129). A tag just inside that window is refused, and one just past it is
-    served, which is the recorded trade (BACKLOG #3257). The bounds are shrunk so the bodies stay
-    small; the trade is the same at 64 KiB."""
+    to the bound (BACKLOG #1129). A tag that ends inside that window is refused, and one just past
+    it is served, which is the recorded trade (BACKLOG #3257). A tag the window's end cuts is judged
+    on what the window holds: ``<svg`` is refused as if the tag went on, ``<sv`` is past the head.
+    The bounds are shrunk so the bodies stay small; the trade is the same at 64 KiB."""
     monkeypatch.setattr(svg_sanitize, "_GZIP_SNIFF_BYTES", 1024)
     lead = b" " * 900 + b"%PDF-1.4 "
+
+    def at_the_end(tail: bytes, rest: bytes) -> bytes:
+        """A body whose 1024-byte window past the noise ends with ``tail``, followed by ``rest``."""
+        return _gz(lead + b"A" * (1024 - 9 - len(tail)) + tail + rest + b"A" * 4096)
+
     calls = _spy_on_inflate(monkeypatch)
-    inside = _gz(lead + b"A" * (1024 - 9 - 4) + b"<svg" + b"A" * 4096)
+    inside = at_the_end(b"<svg onload=", b"x>")
     with pytest.raises(SvgRejected, match="svg start tag"):
         sanitize_if_svg("application/gzip", inside)
     assert calls == [(False, 1024), (False, 2048)]
@@ -795,6 +812,10 @@ def test_a_gzip_tag_scan_reads_the_head_from_the_first_content_byte(
     outside = _gz(lead + b"A" * 1024 + b"<svg onload=x>" + b"A" * 4096)
     assert sanitize_if_svg("application/gzip", outside) is outside
     assert calls == [(False, 1024), (False, 2048)]
+    with pytest.raises(SvgRejected, match="svg start tag"):
+        sanitize_if_svg("application/gzip", at_the_end(b"<svg", b"z/>"))
+    cut = at_the_end(b"<sv", b"g onload=x>")
+    assert sanitize_if_svg("application/gzip", cut) is cut
 
 
 def test_a_gzip_whose_content_starts_too_near_the_bound_is_refused(

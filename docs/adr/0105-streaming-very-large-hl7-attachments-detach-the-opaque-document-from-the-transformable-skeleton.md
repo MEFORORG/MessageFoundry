@@ -579,7 +579,9 @@ gzip bytes under a `+xml` label as `application/octet-stream`. *Corrected 2026-1
 and bytes that were not markup were served with no scan at all. So leading text before
 `<svg onload=...>` passed, under an SVG label too, and a browser reading such a body as HTML would
 run it. The scan looks for the tag only, never the SVG namespace name, so a PDF or a DICOM file that
-names the namespace is still served. What the scan does not reach rests on the inert-type
+names the namespace is still served. It also reads the tag spelled through an ISO-2022-JP escape
+sequence, which decodes to nothing; unlike markup, such a body is not refused for the escape byte
+alone, since most binaries hold it. What the scan does not reach rests on the inert-type
 allow-list: every type it declares is served as an attachment with `nosniff`, and none is SVG or
 HTML.
 
@@ -633,8 +635,11 @@ an internal DTD that `defusedxml` refuses. A `<!DOCTYPE>` with no entity declara
 since common editors still write the SVG 1.1 one. Illustrator files that declare entities are
 refused. The size bound caps the memory one download can take, and at most two downloads sanitize at
 once, because the work runs on the thread pool the pipeline's workers share. These are the only
-cases where the route refuses a linked attachment it can decode. `_safe_attachment_content_type`
-still decides only the declared type.
+cases where the route refuses a linked attachment it can decode. *Amended 2026-10-16 (BACKLOG
+#3257):* that sentence no longer holds. The 2026-10-07 correction below added refusals, and a body
+that is not markup is now refused when it holds an `svg` start tag; "What this leaves open" under
+that correction lists at least the documents with no SVG in them that these refuse.
+`_safe_attachment_content_type` still decides only the declared type.
 
 **Audited.** When the served bytes are a sanitized copy, the `attachment_download` audit row carries
 `"served": "sanitized-svg"`, so the row is never read as a download of the stored document's bytes.
@@ -690,7 +695,9 @@ real detach and the download, and fails against the sanitizer this correction re
    byte-order-mark bytes is not `<`, the body is not markup. It is refused when the 64 KiB from that
    byte on hold an `svg` start tag, and otherwise served as stored without reading the rest. Where
    the leading noise took part of the first 64 KiB, the head is read on to 128 KiB, so a full 64 KiB
-   past the noise is scanned. Damage past that head is not seen, and nor is a tag past it. That
+   past the noise is scanned, and damage that read reaches is refused as in step 2. The scan also
+   reads the tag spelled through an ISO-2022-JP escape sequence. Damage past the bytes read is not
+   seen, and nor is a tag past the head. That
    rests on the inert-type allow-list, as for plain bytes, and not on how a browser reads the
    document. *Amended 2026-10-16 (BACKLOG #3257):* this step read that the trade could not hide an
    SVG, *"since no browser renders a document as SVG when its first byte past that noise is not
@@ -751,10 +758,15 @@ declares or names the SVG namespace without using it is served.
   - any document whose root scan runs out of steps;
   - any gzip whose damage the inflate reaches before its head clears it, such as a small damaged
     PDF, whatever it holds;
+  - *added 2026-10-16 (BACKLOG #3257):* a body that is not markup and quotes an `svg` start tag as
+    data, such as a JSON value, a plain-text note or an MHTML report with an inline icon, whatever
+    its label;
   - *added 2026-10-16 (BACKLOG #3257):* a body that is not markup and holds the bytes of an `svg`
-    start tag by chance, such as compressed data in a large PDF or image. By arithmetic rather than
-    measurement, uniformly random bytes hold one about once in 15,000 bodies of 1 MiB. A gzip
-    body is exposed only through its scanned head.
+    start tag by chance, such as compressed data in a large PDF or image, or 16-bit DICOM samples
+    once NUL bytes are removed. By arithmetic rather than measurement, uniformly random bytes hold
+    one about once in 15,000 bodies of 1 MiB, and the chance grows with size, since a plain body
+    is scanned whole. A gzip body is exposed only through its scanned head, where a window that
+    ends on `<svg` is refused as if the tag went on.
 - *Added 2026-10-16 (BACKLOG #3257):* every plain download that holds a `<` byte anywhere now goes
   through the sanitizer on the thread pool, so the pre-check keeps only bodies with no `<` byte off
   it. Most PDFs and images hold one.
