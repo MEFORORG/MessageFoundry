@@ -57,7 +57,6 @@ from harness.load.connscale.report import (
 from harness.load.connscale.runner import (
     _CONFIG_DIR,
     ConnScaleError,
-    _auth_shipped_default,
     _await_node_healthy,
     _evaluate_slos,
     _node_env,
@@ -70,6 +69,14 @@ _HEALTH_TIMEOUT = 30.0
 _PORTS_READY_TIMEOUT = 60.0
 _STOP_GRACE = 5.0
 _DEFAULT_SINK_PROCS = 6  # the >= 5-6 sink-PROCESS attribution gate
+
+
+def _auth_shipped_default(setting: str) -> int:
+    """The engine's shipped default for an integer ``[auth]`` setting, read from its own settings
+    model rather than copied, so the rig compares against the value a stock engine runs."""
+    from messagefoundry.config.settings import AuthSettings
+
+    return int(AuthSettings.model_fields[setting].get_default(call_default_factory=True))
 
 
 #: The ``[auth]`` limits a fleet of rig sign-ins from one address meets, as ``(env name, field)``.
@@ -91,18 +98,20 @@ def rig_sign_in_env(procs: int) -> dict[str, str]:
     * the per-address sign-in limit (shipped 10 attempts per 60 s window, successes counted too):
       every process signs in at the start of the cell, inside one window, so an eleventh process
       would be refused with HTTP 429 (BACKLOG #2795);
-    * the all-clients sign-in limit (shipped 60 per window), which the same fleet meets past 29.
+    * the all-clients sign-in limit (shipped 60 per window), met by a sixty-first process.
 
     Each is raised to the fleet, doubled for a process that signs in again, plus two, and only when
     that size passes the shipped default, so a small fleet never runs below a stock engine. The
     per-address value also sets the engine's per-user credential-ceremony limit and its
-    repeated-credential audit limit, so those are raised with it.
+    repeated-credential audit limit, and the all-clients value that audit limit's global ceiling, so
+    those are raised with them. Each process signing in for itself keeps the rig's sessions apart;
+    one session handed to every process would need none of this, and is not what the rig does.
     """
     size = 2 * procs + 2
     return {
         name: str(size)
-        for name, field in _RIG_SIGN_IN_LIMITS
-        if size > _auth_shipped_default(field)
+        for name, setting in _RIG_SIGN_IN_LIMITS
+        if size > _auth_shipped_default(setting)
     }
 
 

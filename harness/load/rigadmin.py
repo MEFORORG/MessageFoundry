@@ -505,6 +505,7 @@ def sign_in(base_url: str, admin: RigAdmin | None = None, *, cacert: str | None 
         # The sign-in rate limit, not the credential (BACKLOG #2795): the stale-Administrator advice
         # below would send an operator after the wrong cause. Every attempt counts, successes too,
         # so a fleet of rig processes signing in from one address can meet the per-address limit.
+        # A refused attempt does not count, which is why waiting out the window clears it.
         raise RigSignInRefused(
             "the engine rate-limited the rig Administrator's sign-in (HTTP 429): too many sign-in "
             "attempts inside its window, which clears once the window passes. A rig of many "

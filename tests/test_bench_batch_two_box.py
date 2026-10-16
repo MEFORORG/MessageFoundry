@@ -18,7 +18,7 @@ import tempfile
 import types
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -150,8 +150,6 @@ def test_rig_sign_in_env_names_real_auth_settings_and_their_shipped_defaults() -
 def _sign_ins_admitted(environ: Mapping[str, str], attempts: int) -> list[bool]:
     """``attempts`` sign-ins from one address, through the engine's own sign-in gate, built from
     settings loaded from ``environ`` the way serve loads them. The gate runs before any store read."""
-    from typing import cast
-
     from messagefoundry.auth.service import AuthService
     from messagefoundry.config.settings import load_settings
 
@@ -396,7 +394,6 @@ async def test_batch_split_handshake_end_to_end(monkeypatch: pytest.MonkeyPatch)
         # Rigs sign in, and each of the six driver processes holds its own session as the one rig
         # Administrator. The engine's default cap of five would end them in turn, so the engine
         # half sizes the cap to the fleet it advertises.
-        assert int(env["MEFOR_AUTH_MAX_SESSIONS_PER_USER"]) > 6
         # The same fleet signs in from one address, so the per-address sign-in limit is sized too.
         assert env[_PER_IP] == env[_SESSIONS] == "14"
 

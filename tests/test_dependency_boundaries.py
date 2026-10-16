@@ -555,6 +555,11 @@ _CLIENT_ALLOWED: Mapping[str, _Allowance] = MappingProxyType(
             frozenset({"messagefoundry.config", "messagefoundry.pipeline", "messagefoundry.store"}),
             "certifies an engine-shard plan by running the loader and the sharding planner itself",
         ),
+        "harness/load/connscale/batchbox.py": _Allowance(
+            frozenset({"messagefoundry.config"}),
+            "reads the engine's shipped [auth] defaults, so the rig raises a sign-in limit only past "
+            "the value a stock engine runs (BACKLOG #2795)",
+        ),
         "harness/load/connscale/runner.py": _Allowance(
             frozenset({"messagefoundry.config", "messagefoundry.store"}),
             "owns the engine subprocess, and resets and inspects that engine's store between steps",
