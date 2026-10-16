@@ -2635,14 +2635,47 @@ def lockout_increment(
     return apply
 
 
-def totp_enable(recovery_code_hashes: Sequence[str], now: float) -> UserChange:
-    """What ``enable_totp`` writes, only where a secret is staged and TOTP is still off (BACKLOG
-    #2224). The enrolment confirm rotates the session BEFORE it enables TOTP (BACKLOG #1902), so an
-    ``admin_reset_mfa`` can clear the staged secret inside that window, and a second confirm can
-    enable first; either way this writes nothing and the caller refuses."""
+def totp_stage(sealed_secret: str | None, now: float) -> UserChange:
+    """What ``set_totp_secret`` writes: the sealed secret, only where TOTP is still off (BACKLOG
+    #3025). A begin that lands once TOTP is on writes nothing, so it can never replace the secret of
+    an enabled factor. There is no clear here: an empty secret raises, and ``disable_totp`` clears.
+
+    ``last_totp_step`` goes too, as in :func:`totp_disable`: the high-water mark belonged to the
+    secret being replaced, and a new secret has no history. Without that, a confirm refused because a
+    second begin replaced its secret leaves its spent step behind, and the replacing secret's own
+    code from the same 30 seconds is refused as a replay."""
+    if not sealed_secret:
+        raise ValueError("a TOTP secret is required")
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
-        if r.row.totp_secret is None or r.row.totp_enabled:
+        if r.row.totp_enabled:
+            return None
+        return r.changed(totp_secret=sealed_secret, last_totp_step=None, updated_at=float(now))
+
+    return apply
+
+
+def totp_enable(
+    recovery_code_hashes: Sequence[str], now: float, *, expected_secret_cell: str | None
+) -> UserChange:
+    """What ``enable_totp`` writes, only where TOTP is still off and the staged secret is still the
+    cell the caller verified (BACKLOG #2224, #3025). The enrolment confirm rotates the session BEFORE
+    it enables TOTP (BACKLOG #1902), so inside that window an ``admin_reset_mfa`` can clear the
+    staged secret, a second confirm can enable first, or a second begin can stage another secret;
+    in each case this writes nothing and the caller refuses.
+
+    The compare is on the stored cell, byte for byte. A write to another column of the row carries
+    the cell over unchanged, so it does not make the compare refuse. At least a stage, a clear,
+    ``totp_replace`` and a store-key rotation that re-encrypts the column do change it; a rotation
+    landing inside a confirm makes that confirm refuse, which fails closed and a retry succeeds.
+    ``None`` matches nothing."""
+
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if (
+            expected_secret_cell is None
+            or r.row.totp_secret != expected_secret_cell
+            or r.row.totp_enabled
+        ):
             return None
         return r.changed(
             totp_enabled=True,
@@ -14831,18 +14864,18 @@ class MessageStore:
     # --- MFA: native TOTP second factor (local accounts, WP-14) --------------
 
     async def set_totp_secret(
-        self, user_id: str, *, secret: str | None, now: float | None = None
-    ) -> None:
-        """Stage (or clear) a user's base32 TOTP secret, store-cipher encrypted at rest. Does **not**
-        enable MFA — enrollment is confirmed by :meth:`enable_totp` after the user proves a live code.
-        ``secret=None`` clears the staged secret."""
+        self, user_id: str, *, secret: str, now: float | None = None
+    ) -> str | None:
+        """Stage a user's base32 TOTP secret, store-cipher encrypted at rest, only where TOTP is still
+        off (BACKLOG #3025, see :func:`totp_stage`). Does **not** enable MFA — enrollment is
+        confirmed by :meth:`enable_totp` after the user proves a live code. Returns the stored cell,
+        which :meth:`enable_totp` compares against, or ``None`` when nothing was written."""
         now = time.time() if now is None else now
         sealed = self._enc(secret, aad=cell_aad("users", "totp_secret", user_id))
         async with _writer_guard(self._db, self._lock):
-            await self._write_user(
-                user_id, lambda r: r.changed(totp_secret=sealed, updated_at=float(now))
-            )
+            written = await self._write_user(user_id, totp_stage(sealed, now))
             await self._commit()
+        return None if written is None else sealed
 
     async def get_totp_secret(self, user_id: str) -> str | None:
         """The user's decrypted base32 TOTP secret, or ``None`` when not enrolled/staged."""
@@ -14857,14 +14890,20 @@ class MessageStore:
         return self._dec(cell, aad=cell_aad("users", "totp_secret", user_id))
 
     async def enable_totp(
-        self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
+        self,
+        user_id: str,
+        *,
+        recovery_code_hashes: list[str],
+        expected_secret_cell: str | None,
+        now: float | None = None,
     ) -> bool:
         """Activate TOTP for a user (post-confirm), storing the argon2id hashes of their one-time
-        recovery codes. Writes only where a secret is staged and TOTP is still off, and returns
-        whether it wrote (BACKLOG #2224, see :func:`totp_enable`)."""
+        recovery codes. Writes only where the staged secret is still ``expected_secret_cell`` and TOTP
+        is still off, and returns whether it wrote (BACKLOG #2224, #3025, see :func:`totp_enable`)."""
         now = time.time() if now is None else now
+        change = totp_enable(recovery_code_hashes, now, expected_secret_cell=expected_secret_cell)
         async with _writer_guard(self._db, self._lock):
-            written = await self._write_user(user_id, totp_enable(recovery_code_hashes, now))
+            written = await self._write_user(user_id, change)
             await self._commit()
         return written is not None
 

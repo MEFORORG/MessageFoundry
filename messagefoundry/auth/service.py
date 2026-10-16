@@ -3112,15 +3112,27 @@ class AuthService:
             # Enrolled BEFORE the role, which stays last, so every interruption still leaves a
             # roleless row a re-run completes -- and the repair branch above clears a half-enrolled
             # one before this runs again.
-            await self._store.set_totp_secret(user_id, secret=totp_secret)
+            # Conditional (BACKLOG #3025): another run that enabled TOTP on this row first makes
+            # the stage write nothing. The enable below is bound to the cell this run staged.
+            staged_cell = await self._store.set_totp_secret(user_id, secret=totp_secret)
+            if staged_cell is None:
+                raise FirstAdministratorRefused(
+                    "the authenticator enrolment was changed while this command ran, so this run "
+                    "did not stage its authenticator and granted no role; remove the authenticator "
+                    "entry it showed. If another provision-admin run is in progress, let it "
+                    "finish. Then run the command again"
+                )
             plain_codes = tuple(
                 totp.generate_recovery_codes(self._settings.mfa_recovery_code_count)
             )
             hashes = [await self._argon2(hash_password, c) for c in plain_codes]
-            # Conditional (BACKLOG #2224): a factor clear by another run's repair branch, or another
-            # run that enabled TOTP first, since the secret was staged above makes it match no row.
-            # Refused before the role, so the row stays roleless and a re-run completes it.
-            if not await self._store.enable_totp(user_id, recovery_code_hashes=hashes):
+            # Conditional (BACKLOG #2224, #3025): a factor clear by another run's repair branch,
+            # another run that enabled TOTP first, or another run that staged its own secret, since
+            # the secret was staged above makes it match no row. Refused before the role, so the
+            # row stays roleless and a re-run completes it.
+            if not await self._store.enable_totp(
+                user_id, recovery_code_hashes=hashes, expected_secret_cell=staged_cell
+            ):
                 raise FirstAdministratorRefused(
                     "the authenticator enrolment was changed while this command ran, so this run "
                     "did not turn TOTP on and granted no role; remove the authenticator entry it "
@@ -10038,10 +10050,17 @@ class AuthService:
         user = await self._load_user(identity.user_id)
         if user is None:
             raise ValueError("no such user")
+        already_enabled = "MFA is already enabled; disable it before re-enrolling"
         if user.totp_enabled:
-            raise ValueError("MFA is already enabled; disable it before re-enrolling")
+            raise ValueError(already_enabled)
         secret = totp.generate_secret()
-        await self._store.set_totp_secret(identity.user_id, secret=secret)
+        # Conditional (BACKLOG #3025): a confirm that enabled TOTP after the check above makes the
+        # stage write nothing, so a begin never replaces the secret of an enabled factor. Nothing
+        # written can also mean the row is gone, which is told apart by reading it again.
+        if await self._store.set_totp_secret(identity.user_id, secret=secret) is None:
+            if await self._load_user(identity.user_id) is None:
+                raise ValueError("no such user")
+            raise ValueError(already_enabled)
         await self._audit("auth.mfa_enroll_started", actor=identity.username)
         return MfaEnrollment(secret=secret, otpauth_uri=totp.otpauth_uri(secret, identity.username))
 
@@ -10058,8 +10077,9 @@ class AuthService:
         (or a time-step already consumed -- single-use, BACKLOG #1021) elevates nothing and carries
         none. A good code on a session revoked before the rotation returns ``session_lost`` with MFA
         still OFF (BACKLOG #1902), so a lost session never leaves MFA on with codes nobody saw. So
-        does a good code whose activation matches no row, because a reset cleared the staged secret
-        or a second confirm enabled first (BACKLOG #2224). That confirm ends the session it rotated,
+        does a good code whose activation matches no row, because a reset cleared the staged secret,
+        a second confirm enabled first (BACKLOG #2224), or a second begin staged a secret this
+        confirm never verified (BACKLOG #3025). That confirm ends the session it rotated,
         hands back no codes, and audits ``auth.mfa_enroll_refused``.
 
         This is one of the two legs that turn an MFA-pending session into an MFA-satisfied one for a
@@ -10076,6 +10096,10 @@ class AuthService:
         secret = self._totp_secret(user)
         if not secret:
             raise ValueError("no enrollment in progress")
+        # The stored cell this code is checked against. The enable below turns TOTP on only while
+        # the row still holds this cell (BACKLOG #3025), so a begin from another session that
+        # stages a different secret inside the ceremony cannot decide which factor is enabled.
+        verified_cell = user.totp_secret_cell
         if await self._enrolment_too_early(
             token, user, arrived_at, event="auth.mfa_failed", client=client
         ):
@@ -10124,10 +10148,13 @@ class AuthService:
         )
         if elevation.token is None:  # not ``ok``, spelled so mypy narrows the token below
             return elevation
-        if not await self._store.enable_totp(identity.user_id, recovery_code_hashes=hashes):
-            # BACKLOG #2224: the conditional enable matched no row, because an administrator's
-            # reset cleared the staged secret inside the rotation window, or a second confirm
-            # enabled TOTP first. This confirm turns nothing on and its codes are dropped. The
+        if not await self._store.enable_totp(
+            identity.user_id, recovery_code_hashes=hashes, expected_secret_cell=verified_cell
+        ):
+            # BACKLOG #2224, #3025: the conditional enable matched no row, because an
+            # administrator's reset cleared the staged secret inside the rotation window, a second
+            # confirm enabled TOTP first, or a second begin staged a secret this confirm never
+            # verified. This confirm turns nothing on and its codes are dropped. The
             # rotated session was stamped MFA-verified against a factor that is gone or not this
             # ceremony's, so it is ended rather than handed back: ``session_lost``, the same
             # fail-closed answer as a session revoked before the rotation.
@@ -10143,8 +10170,14 @@ class AuthService:
                 reason = "account_gone"
             elif after.totp_enabled:
                 reason = "already_enabled"
-            else:
+            elif after.totp_secret_cell is None:
                 reason = "secret_cleared"
+            elif after.totp_secret_cell != verified_cell:
+                reason = "secret_replaced"
+            else:
+                # The row still holds the verified cell with TOTP off, so the write lost to some
+                # other concurrent write to the row; a retry confirms.
+                reason = "write_lost"
             await self._audit(
                 "auth.mfa_enroll_refused",
                 actor=identity.username,

@@ -1528,8 +1528,10 @@ async def test_a_repair_of_a_row_that_holds_an_address_is_refused_without_an_ema
             must_change_password=False,
             password_generated=False,
         )
-        await store.set_totp_secret("roleless", secret="JBSWY3DPEHPK3PXP")
-        assert await store.enable_totp("roleless", recovery_code_hashes=["h1", "h2"])
+        staged_cell = await store.set_totp_secret("roleless", secret="JBSWY3DPEHPK3PXP")
+        assert await store.enable_totp(
+            "roleless", expected_secret_cell=staged_cell, recovery_code_hashes=["h1", "h2"]
+        )
         await store.add_webauthn_credential(
             WebAuthnCredential(
                 credential_id_hash="holder-passkey-hash",
@@ -2369,8 +2371,10 @@ async def test_the_repair_branch_clears_the_earlier_holders_factors_and_sessions
             must_change_password=False,
             password_generated=False,
         )
-        await store.set_totp_secret("earlier", secret="JBSWY3DPEHPK3PXP")
-        assert await store.enable_totp("earlier", recovery_code_hashes=["h1", "h2"])
+        staged_cell = await store.set_totp_secret("earlier", secret="JBSWY3DPEHPK3PXP")
+        assert await store.enable_totp(
+            "earlier", expected_secret_cell=staged_cell, recovery_code_hashes=["h1", "h2"]
+        )
         await store.add_webauthn_credential(
             WebAuthnCredential(
                 credential_id_hash="earlier-passkey-hash",
@@ -2455,10 +2459,19 @@ async def test_an_enable_that_matches_no_row_refuses_before_the_role(
         real_enable = store.enable_totp
 
         async def cleared_then_enable(
-            user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
+            user_id: str,
+            *,
+            recovery_code_hashes: list[str],
+            expected_secret_cell: str | None,
+            now: float | None = None,
         ) -> bool:
             await store.disable_totp(user_id)
-            return await real_enable(user_id, recovery_code_hashes=recovery_code_hashes, now=now)
+            return await real_enable(
+                user_id,
+                recovery_code_hashes=recovery_code_hashes,
+                expected_secret_cell=expected_secret_cell,
+                now=now,
+            )
 
         monkeypatch.setattr(store, "enable_totp", cleared_then_enable)
         kw = provision_totp()
@@ -2478,6 +2491,67 @@ async def test_an_enable_that_matches_no_row_refuses_before_the_role(
         done = await store.get_user(row.id)
         assert done is not None and done.totp_enabled
         assert Role.ADMINISTRATOR.value in await store.get_user_role_ids(row.id)
+    finally:
+        await store.close()
+
+
+async def test_a_re_stage_between_the_stage_and_the_enable_refuses_before_the_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3025: the enable is bound to the cell THIS run staged. Another run that stages its
+    own secret in between makes the enable match no row, so the run refuses before the role and
+    never turns on a secret it did not prove."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings())
+        real_enable = store.enable_totp
+        other_seed = PROVISION_TOTP_SECRET[::-1]
+
+        async def restaged_then_enable(user_id: str, **kw: object) -> bool:
+            assert await store.set_totp_secret(user_id, secret=other_seed) is not None
+            return await real_enable(user_id, **kw)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(store, "enable_totp", restaged_then_enable)
+        with pytest.raises(FirstAdministratorRefused, match="changed while this command ran"):
+            await service.provision_first_administrator(
+                username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
+            )
+        row = await store.get_user_by_username("site-admin")
+        assert row is not None and not row.totp_enabled
+        assert await store.get_totp_secret(row.id) == other_seed
+        assert not await store.get_user_role_ids(row.id)
+    finally:
+        await store.close()
+
+
+async def test_a_stage_that_lands_after_another_runs_enable_refuses_before_the_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3025: the stage is conditional on TOTP being off. Another run that enabled TOTP on
+    the row first makes this run's stage write nothing, so it refuses before hashing any codes or
+    granting the role, and the other run's enabled secret stands."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings())
+        real_stage = store.set_totp_secret
+        other_seed = PROVISION_TOTP_SECRET[::-1]
+
+        async def other_run_enabled_first(user_id: str, **kw: object) -> str | None:
+            cell = await real_stage(user_id, secret=other_seed)
+            assert await store.enable_totp(
+                user_id, recovery_code_hashes=[], expected_secret_cell=cell
+            )
+            return await real_stage(user_id, **kw)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(store, "set_totp_secret", other_run_enabled_first)
+        with pytest.raises(FirstAdministratorRefused, match="did not stage its authenticator"):
+            await service.provision_first_administrator(
+                username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
+            )
+        row = await store.get_user_by_username("site-admin")
+        assert row is not None and row.totp_enabled
+        assert await store.get_totp_secret(row.id) == other_seed
+        assert not await store.get_user_role_ids(row.id)
     finally:
         await store.close()
 
