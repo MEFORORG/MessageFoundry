@@ -121,14 +121,16 @@ class LdapReferralError(LdapError):
 class LdapUnansweredError(LdapError):
     """The directory ended an operation with a result code that is not an answer (BACKLOG #3010).
 
-    A subclass, so every ``except LdapError`` reads it as the directory not answering: the session
-    reconciler as unavailable, which never strikes, and a sign-in as ``auth.login_error``. It
-    carries the code so a caller can tell codes apart without parsing the text. ``code`` is the result code, or ``None``
-    when the result held none that is an integer; ``code_name`` is ldap3's name for it, never text
-    the directory sent.
+    A subclass, so every ``except LdapError`` handles it as before; :func:`_refuse_unanswered` says
+    what that means for each caller. ``code`` is the result code, or ``None`` when the result held
+    none that is an integer; ``code_name`` is ldap3's name for it, never text the directory sent.
+    Both default, so the exception survives a copy or a pickle, which rebuild it from its message
+    and then restore both from its ``__dict__``.
     """
 
-    def __init__(self, message: str, *, code: int | None, code_name: str) -> None:
+    def __init__(
+        self, message: str, *, code: int | None = None, code_name: str = "no code"
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.code_name = code_name
@@ -771,8 +773,9 @@ _UNANSWERED_HINTS: dict[int, str] = {
 
 
 def _refuse_unanswered(conn: Any, operation: str, *, answers: frozenset[int] | None = None) -> None:
-    """Raise :class:`LdapUnansweredError` unless ``conn``'s last operation ended with a result code
-    in ``answers``, which is success alone unless the caller names another set.
+    """Raise :class:`LdapReferralError` for a referral, and otherwise :class:`LdapUnansweredError`
+    unless ``conn``'s last operation ended with a result code in ``answers``, which is success alone
+    unless the caller names another set.
 
     BACKLOG #3010. ldap3 raises on none of these codes here. Every ``Connection`` in this module
     keeps ldap3's default ``raise_exceptions=False``, and even under ``True`` ldap3 2.9.1 passes
@@ -790,22 +793,30 @@ def _refuse_unanswered(conn: Any, operation: str, *, answers: frozenset[int] | N
     read as absence it would read every account absent at once, which the reconciler's mass-revoke
     breaker does not stop at or under its floor.
 
-    **The cost, named.** The reconciler's unavailable never revokes, so a code that recurs on every
-    pass, such as a deleted search base, stops offboarding for as long as it lasts. Making a
-    standing one visible is vault BACKLOG #3100's item 3; #3010's item 4 was deferred to it. This
-    warns once per operation and code, and the text carries no directory text: the code, ldap3's
-    name for it and the operation, never the diagnostic message the directory sent.
+    **What each caller makes of it.** The session reconciler reads an :class:`LdapError` as
+    unavailable, which never strikes; a sign-in writes ``auth.login_error``; the nested group search
+    raising means no caller sees a shorter group list.
+
+    **The cost, named.** Unavailable never revokes, so a code that recurs on every pass, such as a
+    deleted search base, stops offboarding and the role re-diff for as long as it lasts, and nothing
+    latches an alert for it. Making a standing one visible is #3010's item 4, which the batch
+    deferred to vault BACKLOG #3100's item 3. As filed, that item names the reconciler's broad
+    ``except Exception`` arm, which this error does not reach, so it must widen to cover the
+    ``except LdapError`` arm before the deferral holds. This warns once per operation and code, and
+    the text carries no directory text: the code, ldap3's name for it and the operation, never the
+    diagnostic message the directory sent.
 
     **A result that is not a dict is let through.** ldap3's synchronous strategy, the only one built
     here, reads ``self.result['type']`` straight after every search, so a real search cannot return
     without one. Only a test double can.
 
     ``answers`` is a parameter so an operation whose answers differ, such as a bind, can reuse this
-    with its own set. Run :func:`_refuse_referral` first: a referral is not success either, and only
-    that refusal reads as referred.
+    with its own set. A referral is refused first, as a referral, whatever ``answers`` holds, so
+    the reconciler still reads it as referred (BACKLOG #2538).
     """
     from ldap3.core.results import RESULT_CODES, RESULT_SUCCESS  # lazy, like every ldap3 import
 
+    _refuse_referral(conn, operation)
     result = conn.result
     if not isinstance(result, dict):
         return
@@ -828,11 +839,10 @@ def _refuse_unanswered(conn: Any, operation: str, *, answers: frozenset[int] | N
 
 
 def _search(conn: Any, operation: str, **kwargs: Any) -> None:
-    """``conn.search(**kwargs)``, refusing a referral result and then any result but success
+    """``conn.search(**kwargs)``, refusing a referral result and any other result but success
     (:func:`_refuse_unanswered`). Every search in this module goes through here, so none can read
     either as "no entries"; a test pins that."""
     conn.search(**kwargs)
-    _refuse_referral(conn, operation)
     _refuse_unanswered(conn, operation)
 
 
@@ -1300,8 +1310,8 @@ class LdapAuthenticator:
         # Direct membership from the user's memberOf attribute.
         found = list(member_of)
         if self._s.ad_use_nested_groups and self._s.ad_group_search_base:
-            # A search the directory did not finish raises here (BACKLOG #3010), so a busy answer
-            # is an outage to every caller, never a shorter group list that narrows the roles.
+            # A search the directory did not finish raises here (BACKLOG #3010), never a shorter
+            # group list.
             _search(
                 conn,
                 "group search",

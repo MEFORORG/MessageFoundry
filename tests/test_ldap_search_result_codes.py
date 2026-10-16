@@ -21,7 +21,9 @@ synchronous strategy leaves it. Synthetic data only; nothing here touches PHI.
 
 from __future__ import annotations
 
+import copy
 import logging
+import pickle
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
@@ -175,10 +177,26 @@ def test_a_caller_can_name_its_own_answers() -> None:
 
 
 def test_a_referral_is_still_refused_as_a_referral() -> None:
-    """The referral check runs first, so the reconciler still reads it as referred (#2538)."""
+    """The referral check runs first, so the reconciler still reads it as referred (#2538). It runs
+    inside the helper, so a caller that names its own answers cannot skip it or reorder it."""
     conn = _conn({"result": RESULT_REFERRAL, "referrals": ["ldap://dc1.other.test.invalid/"]})
     with pytest.raises(LdapReferralError):
         ldap_module._search(conn, "user search")
+    with pytest.raises(LdapReferralError):
+        ldap_module._refuse_unanswered(conn, "user bind", answers=frozenset({RESULT_REFERRAL}))
+
+
+def test_the_refusal_survives_a_copy_and_a_pickle() -> None:
+    """``BaseException`` rebuilds from its args alone, so required keywords would raise here."""
+    with pytest.raises(LdapUnansweredError) as refused:
+        ldap_module._search(_conn(_result(RESULT_BUSY)), "user search")
+    for clone in (copy.copy(refused.value), pickle.loads(pickle.dumps(refused.value))):
+        assert isinstance(clone, LdapUnansweredError)
+        assert (str(clone), clone.code, clone.code_name) == (
+            str(refused.value),
+            RESULT_BUSY,
+            "busy",
+        )
 
 
 @pytest.mark.parametrize("raw", [None, "0", True, False, 0.0], ids=repr)
@@ -318,6 +336,26 @@ async def test_an_account_that_left_the_directory_is_still_revoked(
         revoked = [r.username for _ in range(5) for r in (await _pass(service)).revocations]
         assert revoked == ["jdoe"]
         assert await _alive(service, tokens) == set()
+
+
+async def test_a_busy_account_beside_a_departed_one_is_left_alone_while_the_other_is_revoked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The partial outage: the pass is not aborted, so each probe is judged. The account whose
+    search the directory did not answer keeps its session; the one that left is revoked."""
+    async with _signed_in_estate(monkeypatch, ["jdoe", "asmith"]) as (
+        directory,
+        service,
+        store,
+        tokens,
+    ):
+        busy_id = ldap_module.object_guid_filter_value(directory.ids["jdoe"])
+        assert busy_id is not None
+        _answer_with(monkeypatch, RESULT_BUSY, when=lambda kw: busy_id in str(kw["search_filter"]))
+        directory.delete("asmith")
+        revoked = [r.username for _ in range(5) for r in (await _pass(service)).revocations]
+        assert revoked == ["asmith"]
+        assert await _alive(service, tokens) == {"jdoe"}
 
 
 # --- sign-in: a directory error, not an unknown user ---------------------------------------------
