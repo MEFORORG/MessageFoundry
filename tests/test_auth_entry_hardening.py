@@ -330,9 +330,13 @@ def test_limiter_drops_aged_buckets_of_keys_that_never_return(
     assert not limiter.allow("peer-0")
     assert limiter.retry_after("peer-0") == 30.0
     assert len(limiter._hits) == 1000
-    # Four windows later, one call for a new key drops the thousand that never returned.
+    # Four windows later the thousand that never returned drain, two per call, so no one call
+    # pays for the whole table.
     clock[0] = 1240.0
     assert limiter.allow("new")
+    assert len(limiter._hits) == 999  # two dropped, one added
+    for _ in range(499):
+        assert not limiter.would_allow("new")  # per_key=1: refused, and records nothing
     assert set(limiter._hits) == {"new"}
     # A bucket whose newest hit is still live survives; would_allow records nothing.
     clock[0] = 1290.0
@@ -366,6 +370,27 @@ def test_limiter_orders_buckets_by_newest_hit_so_eviction_stops_at_the_first_liv
     clock[0] = 1081.0
     assert limiter.would_allow("z")  # evicts "a" (1020), and records nothing for "z"
     assert list(limiter._hits) == ["c"]
+
+
+def test_limiter_table_stays_bounded_under_a_stream_of_new_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A peer-keyed table under a steady stream of addresses never seen again: one new key a second,
+    # for ten windows. The table never grows past the keys live at one time, plus the one added.
+    clock = [1000.0]
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    limiter = SlidingWindowRateLimiter(per_key=5, glob=0, window_seconds=60.0)
+    for n in range(600):
+        clock[0] = 1000.0 + n
+        assert limiter.allow(f"peer-{n}")
+        assert len(limiter._hits) <= 61
+    # A limiter with no per-key gate (the intake global window) keeps no buckets at all.
+    global_only = SlidingWindowRateLimiter(per_key=0, glob=1000, window_seconds=60.0)
+    for n in range(100):
+        assert global_only.allow(f"peer-{n}")
+    assert not global_only._hits
 
 
 async def test_admin_write_retry_after_is_whole_seconds_rounded_up_and_at_least_one(
