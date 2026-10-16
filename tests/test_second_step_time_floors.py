@@ -27,7 +27,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 from pydantic import ValidationError
 
-from messagefoundry.auth import oidc, totp
+from messagefoundry.auth import oidc, totp, webauthn
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.service import TOO_EARLY, AuthService, Elevation
 from messagefoundry.auth.tokens import hash_token
@@ -357,6 +357,55 @@ async def test_a_totp_enrolment_just_inside_the_floor_is_refused_and_spends_no_s
         assert await service.mfa_satisfied(served.token)
     finally:
         await store.close()
+
+
+async def test_a_totp_confirm_with_nothing_staged_answers_the_same_inside_and_past_the_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # RED when: confirm_mfa_enrollment runs the floor before its "no enrollment in progress" check
+    # (BACKLOG #3194). That order would answer a confirm with nothing staged as a wrong code inside
+    # the floor and as "no enrollment" past it, which tells timing, and would audit an enrolment
+    # attempt that could never have succeeded. The passkey twin is in the directory test below.
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings())
+        identity, token, _password = await login_admin(service)
+        session = await store.get_session(hash_token(token))
+        assert session is not None and session.mfa_verified_at is None
+        assert not await service.mfa_satisfied(token), "the session must owe its factor"
+        now = [session.created_at]
+        _fake_service_wall_clock(monkeypatch, now)
+        answers = []
+        for offset in (0.0, MFA_FLOOR + 0.001):  # inside the floor, then past it
+            now[0] = session.created_at + offset
+            with pytest.raises(ValueError) as refused:
+                await service.confirm_mfa_enrollment(identity, "000000", token=token)
+            answers.append(str(refused.value))
+        assert answers == ["no enrollment in progress"] * 2
+        assert await _audit_rows(store, "auth.mfa_failed") == []
+    finally:
+        await store.close()
+
+
+def test_a_challenge_peek_reads_without_consuming_and_hides_an_expired_one() -> None:
+    # RED when: ChallengeCache.peek consumes the entry, or returns one past its deadline (BACKLOG
+    # #3194). finish_webauthn_registration peeks before the floor, so a consuming peek would spend
+    # the ceremony on a floor refusal, and a stale one would let an expired ceremony reach the floor.
+    clock = [100.0]
+    cache = webauthn.ChallengeCache(ttl_seconds=10.0, clock=lambda: clock[0])
+    key = ("token-hash", "register")
+    assert cache.peek(key) is None
+    cache.put(key, "user-1", b"challenge")
+    first = cache.peek(key)
+    assert first is not None and first.user_id == "user-1" and first.challenge == b"challenge"
+    assert cache.peek(key) == first, "a peek consumed the ceremony"
+    assert cache.pop(key) == first  # CONTROL: pop still consumes it
+    assert cache.peek(key) is None and cache.pop(key) is None
+
+    cache.put(key, "user-1", b"challenge")
+    clock[0] += 10.0  # at the deadline, which pop already treats as expired
+    assert cache.peek(key) is None
+    assert cache.pop(key) is None
 
 
 async def test_an_enrolment_on_a_session_that_owes_no_factor_is_not_floored(

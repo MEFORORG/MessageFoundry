@@ -1,0 +1,161 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""The login-to-MFA floor on the console's two enrolment routes (BACKLOG #2389, #3194).
+
+``POST /ui/account/mfa/verify`` confirms a TOTP enrolment and ``POST /ui/account/webauthn/verify``
+finishes a passkey registration. Either can turn a session that still owes its factor into a
+satisfied one, so the service floors both against the session's mint
+(``[auth].mfa_verify_min_elapsed_seconds``). Every other console suite turns that floor off, so it
+can drive a ceremony at machine speed. These tests keep it ON, at its shipped default, and pin what
+each route answers inside it and past it.
+
+No test sleeps. The wall clock the service and the store read is held, so no time passes between
+the sign-in and the early attempt however slow the runner is, and the clock then moves only forward.
+A clock that stepped behind a session's own stamps would end the session.
+
+Each test names the mutation that must turn it RED.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+import uuid
+
+import pytest
+from _ui_clients import (
+    SAME_ORIGIN,
+    cookie_login,
+    held_totp_code,
+    hold_auth_wall_clock,
+    mint_bound_proof,
+    provision,
+    ui_client,
+)
+
+from messagefoundry.auth.ldap import AdPrincipal
+from messagefoundry.auth.service import TOO_EARLY, AuthService
+from messagefoundry.auth.tokens import hash_token
+from messagefoundry.config.settings import AuthSettings
+from messagefoundry.pipeline import Engine
+
+FLOOR = AuthSettings().mfa_verify_min_elapsed_seconds
+assert FLOOR > 0, "the floor ships off, so these tests would test nothing"
+
+
+async def _floored_service(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> tuple[AuthService, list[float]]:
+    """A service with the floor at its shipped default and require_mfa on, so a fresh sign-in owes
+    its factor, and the held clock it reads. Only the admin-write pacing floor is off, as in every
+    console suite: it is not the floor under test, and the ceremony posts several writes at once."""
+    now = [time.time()]
+    hold_auth_wall_clock(monkeypatch, now)
+    service = AuthService(
+        engine.store,
+        AuthSettings(admin_write_min_interval_seconds=0, login_rate_limit_enabled=False),
+    )
+    await service.initialize()
+    return service, now
+
+
+async def _too_early_rows(engine: Engine, action: str) -> list[dict[str, object]]:
+    rows = await engine.store.list_audit(action=action, limit=50)
+    details = [json.loads(str(r["detail"])) for r in rows if r["detail"]]
+    return [d for d in details if d.get("reason") == TOO_EARLY]
+
+
+async def test_a_console_totp_confirm_inside_the_floor_is_an_ordinary_invalid_code(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``confirm_mfa_enrollment`` stops calling the enrolment floor.
+
+    Inside the floor, a good code gets the page a wrong code gets, ``Invalid code.`` with a 400.
+    Past it, after a fresh step-up, the SAME code activates TOTP, so the refusal spent no step."""
+    service, now = await _floored_service(engine, monkeypatch)
+    user_id = await provision(service, "op", ["operator"])
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "op")
+        token = c.cookies.get("mf_session")
+        assert token
+        assert not await service.mfa_satisfied(token), "the session must owe its factor"
+        await mint_bound_proof(c, "/ui/account/mfa/enroll")
+        r = await c.post("/ui/account/mfa/enroll", headers=SAME_ORIGIN)
+        assert r.status_code == 200, r.text
+        secret = await service.store.get_totp_secret(user_id)
+        assert secret is not None
+        with held_totp_code(secret) as code:
+            await mint_bound_proof(c, "/ui/account/mfa/confirm")
+            early = await c.post("/ui/account/mfa/verify", data={"code": code}, headers=SAME_ORIGIN)
+            assert early.status_code == 400 and "Invalid code." in early.text
+            rows = await _too_early_rows(engine, "auth.mfa_failed")
+            assert [r.get("phase") for r in rows] == ["enroll"]
+            user = await service.store.get_user(user_id)
+            assert user is not None and not user.totp_enabled
+            assert user.second_step_failed_attempts == 0, "it charged the second-step lockout"
+
+            # CONTROL: past the floor, the SAME code activates TOTP and shows the recovery codes.
+            now[0] += FLOOR + 0.001
+            await mint_bound_proof(c, "/ui/account/mfa/confirm")
+            served = await c.post(
+                "/ui/account/mfa/verify", data={"code": code}, headers=SAME_ORIGIN
+            )
+        assert served.status_code == 200 and "shown once" in served.text, served.text
+    user = await service.store.get_user(user_id)
+    assert user is not None and user.totp_enabled
+
+
+async def test_a_console_passkey_registration_inside_the_floor_is_a_failed_verification(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``finish_webauthn_registration`` stops calling the enrolment floor.
+
+    The case the console can reach: a directory account is not covered in the ADR 0197 sense, so its
+    Kerberos session, minted unstamped under require_mfa, may register a first passkey. Inside the
+    floor the route answers ``400 passkey verification failed``, as for a response that fails
+    verification. Past it, the SAME response binds the passkey, so the ceremony stayed in flight."""
+    pytest.importorskip("webauthn")
+    from _soft_webauthn import SoftAuthenticator
+    from webauthn.helpers import base64url_to_bytes
+
+    service, now = await _floored_service(engine, monkeypatch)
+    principal = AdPrincipal(
+        username="adfloor",
+        display_name=None,
+        email=None,
+        dn="CN=adfloor,DC=x",
+        groups=frozenset(),
+        directory_object_id=str(uuid.uuid5(uuid.NAMESPACE_URL, "adfloor")),
+    )
+    out = await service._complete_ad_login(principal, None, mfa_verified=False)
+    assert out.ok and out.token is not None and out.identity is not None
+    assert not await service.mfa_satisfied(out.token), "the session must owe its factor"
+    # The ceremony is begun at the service. The begin route takes an action-bound password re-proof,
+    # and a directory account proves its password at the directory, which this suite has none of.
+    # The route under test is the finish, which needs only a recent re-proof, stamped here.
+    options = json.loads(
+        await service.begin_webauthn_registration(
+            out.identity, token=out.token, rp_id="t", rp_name="MessageFoundry"
+        )
+    )
+    await service.store.mark_session_reauthed(hash_token(out.token))
+    async with ui_client(engine, service, webauthn_rp_from_request=True) as c:
+        c.cookies.set("mf_session", out.token)
+        key = SoftAuthenticator(rp_id="t", origin="http://t")
+        response = json.loads(key.create_response(base64url_to_bytes(options["challenge"])))
+        body = {"label": "key", "response": response}
+
+        early = await c.post("/ui/account/webauthn/verify", json=body, headers=SAME_ORIGIN)
+        assert (early.status_code, early.json()) == (
+            400,
+            {"ok": False, "error": "passkey verification failed"},
+        )
+        rows = await _too_early_rows(engine, "auth.webauthn_failed")
+        assert [r.get("phase") for r in rows] == ["enroll"]
+        assert await service.store.list_webauthn_credentials(out.identity.user_id) == []
+
+        # CONTROL: past the floor, the SAME response binds the passkey and satisfies the session.
+        now[0] += FLOOR + 0.001
+        served = await c.post("/ui/account/webauthn/verify", json=body, headers=SAME_ORIGIN)
+        assert served.status_code == 200 and served.json()["ok"] is True, served.text
+    assert len(await service.store.list_webauthn_credentials(out.identity.user_id)) == 1
