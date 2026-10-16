@@ -336,15 +336,9 @@ async def test_expired_or_unknown_requests_are_refused(engine: Engine) -> None:
         assert (await c.get("/approvals", headers=admin)).json()["approvals"] == []
 
 
-async def test_purge_dual_control_skips_running_outbound(engine: Engine, tmp_path: Path) -> None:
-    # Findings #1/#4/#11 — the LOAD-BEARING dual-control guard. A purge held while the outbound was
-    # stopped, then RELEASED after the operator re-started the outbound, must cancel NOTHING: the
-    # require-quiesced re-check lives inside the `_purge` approval executor (ApprovalGate.approve runs it
-    # directly and has already claimed the row as 'executing', so it returns a fail-closed SKIP rather
-    # than raising, which would record a retryable precondition miss as a failed operation).
-    service = await _service(engine)
-    await _add(service, "op", Role.OPERATOR)
-    await _add(service, "approver", Role.ADMINISTRATOR)
+async def _quiesced_outbound_with_a_pending_row(engine: Engine, tmp_path: Path) -> str:
+    """Start a graph, stop its outbound ``OB`` until it quiesces, and queue one delivery to it,
+    which the paused lane keeps PENDING. Returns the message id."""
     inbox = tmp_path / "in"
     inbox.mkdir()
     (tmp_path / "out").mkdir()
@@ -378,9 +372,25 @@ async def test_purge_dual_control_skips_running_outbound(engine: Engine, tmp_pat
             break
         await asyncio.sleep(0.02)
     assert rr.outbound_quiesced("OB") is True
-    mid = await engine.store.enqueue_message(
-        channel_id="in1", raw=ADT, deliveries=[("OB", ADT)], source_type="file"
+    return str(
+        await engine.store.enqueue_message(
+            channel_id="in1", raw=ADT, deliveries=[("OB", ADT)], source_type="file"
+        )
     )
+
+
+async def test_purge_dual_control_skips_running_outbound(engine: Engine, tmp_path: Path) -> None:
+    # Findings #1/#4/#11 — the LOAD-BEARING dual-control guard. A purge held while the outbound was
+    # stopped, then RELEASED after the operator re-started the outbound, must cancel NOTHING: the
+    # require-quiesced re-check lives inside the `_purge` approval executor (ApprovalGate.approve runs it
+    # directly and has already claimed the row as 'executing', so it returns a fail-closed SKIP rather
+    # than raising, which would record a retryable precondition miss as a failed operation).
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    mid = await _quiesced_outbound_with_a_pending_row(engine, tmp_path)
+    rr = engine.registry_runner
+    assert rr is not None
 
     async with _client(engine, service, ON) as c:
         op = await _token(c, "op")
@@ -404,6 +414,57 @@ async def test_purge_dual_control_skips_running_outbound(engine: Engine, tmp_pat
     # The distinct approver's release is still audited (the skip lands in approval.approved).
     audited = {(str(r["action"]), str(r["actor"])) for r in await engine.store.list_audit(limit=50)}
     assert ("approval.approved", "approver") in audited
+    # A skip cancelled nothing, so it records no connection_purge row.
+    assert await engine.store.list_audit(action="connection_purge") == []
+
+
+async def _hold_a_purge(c: httpx.AsyncClient) -> str:
+    held = await c.post("/connections/OB/purge?scope=top", headers=await _token(c, "op"))
+    assert held.status_code == 202, held.text
+    assert held.json()["operation"] == "connection_purge"
+    return str(held.json()["approval_id"])
+
+
+async def test_a_released_purge_writes_the_requesters_connection_purge_row(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """Vault BACKLOG #3217: the released purge writes the same connection_purge row the inline
+    route writes, naming the outbound, the scope and the count, attributed to the REQUESTER. Before
+    it, an auditor filtering on the action name saw only ungated purges."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    mid = await _quiesced_outbound_with_a_pending_row(engine, tmp_path)
+    async with _client(engine, service, ON) as c:
+        approval_id = await _hold_a_purge(c)
+        ok = await c.post(f"/approvals/{approval_id}/approve", headers=await _token(c, "approver"))
+    assert ok.status_code == 200 and ok.json()["result"] == {"cancelled": 1}
+    assert {r["status"] for r in await engine.store.outbox_for(mid)} == {
+        OutboxStatus.CANCELLED.value
+    }
+    [row] = await engine.store.list_audit(action="connection_purge")
+    assert (row["actor"], row["client"], row["channel_id"]) == ("op", None, None)
+    assert json.loads(str(row["detail"])) == {"connection": "OB", "scope": "top", "cancelled": 1}
+
+
+async def test_a_released_purge_whose_audit_row_fails_cancels_nothing(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """Vault BACKLOG #3217: the row commits with the cancel, so a failed append cancels nothing
+    and the gate's compensation records the release as 'failed', which is then true."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    mid = await _quiesced_outbound_with_a_pending_row(engine, tmp_path)
+    async with _client(engine, service, ON) as c:
+        approval_id = await _hold_a_purge(c)
+        admin = await _token(c, "approver")
+        with failing_append(engine.store, "connection_purge"), pytest.raises(AppendFailed):
+            await c.post(f"/approvals/{approval_id}/approve", headers=admin)
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None and str(row["status"]) == "failed"
+    assert await engine.store.list_audit(action="connection_purge") == []
+    assert {r["status"] for r in await engine.store.outbox_for(mid)} == {OutboxStatus.PENDING.value}
 
 
 def test_settings_validator_rejects_unknown_operation() -> None:

@@ -28,6 +28,7 @@ from messagefoundry.store.store import (
     AlertSummary,
     MessageStore,
 )
+from tests._store_audit import ALERT_AUDIT
 
 # --- store lifecycle ---------------------------------------------------------
 
@@ -83,7 +84,10 @@ async def test_ack_transitions_and_excludes_from_open_count(tmp_path: Path) -> N
             event_type="connection_error", connection="OB_X", severity="critical", now=100.0
         )
         (a,) = await store.list_active_alert_instances(allowed_channels=None)
-        assert await store.ack_alert_instance(a.id, actor="scott", now=200.0) is True
+        assert (
+            await store.ack_alert_instance(a.id, actor="scott", now=200.0, audit=ALERT_AUDIT)
+            is True
+        )
         got = await store.get_alert_instance(a.id, allowed_channels=None)
         assert got is not None
         assert got.status == "acknowledged" and got.acked_by == "scott" and got.acked_at == 200.0
@@ -93,7 +97,7 @@ async def test_ack_transitions_and_excludes_from_open_count(tmp_path: Path) -> N
         }
         assert await store.count_open_alerts_by_connection() == {}
         # an unknown / already-resolved id returns False
-        assert await store.ack_alert_instance(99999, actor="scott") is False
+        assert await store.ack_alert_instance(99999, actor="scott", audit=ALERT_AUDIT) is False
     finally:
         await store.close()
 
@@ -106,7 +110,7 @@ async def test_acknowledged_refire_stays_acknowledged(tmp_path: Path) -> None:
             event_type="connection_error", connection="OB_X", severity="critical", now=100.0
         )
         (a,) = await store.list_active_alert_instances(allowed_channels=None)
-        await store.ack_alert_instance(a.id, actor="scott", now=120.0)
+        await store.ack_alert_instance(a.id, actor="scott", now=120.0, audit=ALERT_AUDIT)
         await store.upsert_alert_instance(
             event_type="connection_error", connection="OB_X", severity="critical", now=130.0
         )
@@ -126,9 +130,11 @@ async def test_resolve_and_reopen(tmp_path: Path) -> None:
             event_type="connection_error", connection="OB_X", severity="critical", now=100.0
         )
         (a,) = await store.list_active_alert_instances(allowed_channels=None)
-        assert await store.resolve_alert_instance(a.id, now=200.0) is True
+        assert await store.resolve_alert_instance(a.id, now=200.0, audit=ALERT_AUDIT) is True
         assert await store.list_active_alert_instances(allowed_channels=None) == []
-        assert await store.resolve_alert_instance(a.id) is False  # already resolved
+        assert (
+            await store.resolve_alert_instance(a.id, audit=ALERT_AUDIT) is False
+        )  # already resolved
         # the key is now free — a new fire opens a brand-new (distinct id) open instance
         await store.upsert_alert_instance(
             event_type="connection_error", connection="OB_X", severity="warning", now=300.0
@@ -183,7 +189,9 @@ async def test_count_open_by_connection(tmp_path: Path) -> None:
             for r in await store.list_active_alert_instances(allowed_channels=None)
             if r.connection == "OB_Y"
         ]
-        await store.ack_alert_instance(acked.id, actor="scott")  # ack drops OB_Y to 0 open
+        await store.ack_alert_instance(
+            acked.id, actor="scott", audit=ALERT_AUDIT
+        )  # ack drops OB_Y to 0 open
         assert await store.count_open_alerts_by_connection() == {"OB_X": 2}
     finally:
         await store.close()
@@ -235,7 +243,7 @@ async def test_summary_is_scoped_and_counts_acknowledged(tmp_path: Path) -> None
             for r in await store.list_active_alert_instances(allowed_channels=None)
             if r.connection == "IN_MINE"
         ]
-        await store.ack_alert_instance(mine.id, actor="scott")
+        await store.ack_alert_instance(mine.id, actor="scott", audit=ALERT_AUDIT)
 
         scoped = await store.summarize_active_alert_instances(allowed_channels=["IN_MINE"])
         assert scoped.total == 1, "acknowledged instances stay active and stay counted"
@@ -273,7 +281,7 @@ async def test_summary_ignores_resolved_and_unrankable_severities(tmp_path: Path
             for r in await store.list_active_alert_instances(allowed_channels=None)
             if r.severity == "critical"
         ]
-        await store.resolve_alert_instance(crit.id)
+        await store.resolve_alert_instance(crit.id, audit=ALERT_AUDIT)
         assert await store.summarize_active_alert_instances(allowed_channels=None) == AlertSummary(
             total=1, worst_severity=None
         )
@@ -350,7 +358,7 @@ async def test_purge_resolved_only(tmp_path: Path) -> None:
             for x in await store.list_active_alert_instances(allowed_channels=None)
             if x.connection == "OB_RESOLVED"
         ]
-        await store.resolve_alert_instance(r.id, now=100.0)
+        await store.resolve_alert_instance(r.id, now=100.0, audit=ALERT_AUDIT)
         purged = await store.purge_alert_instances(older_than=200.0)
         assert purged == 1  # the resolved one
         assert {
@@ -365,7 +373,7 @@ async def test_purge_resolved_only(tmp_path: Path) -> None:
             for x in await store.list_active_alert_instances(allowed_channels=None)
             if x.connection == "OB_RECENT"
         ]
-        await store.resolve_alert_instance(rec.id, now=500.0)
+        await store.resolve_alert_instance(rec.id, now=500.0, audit=ALERT_AUDIT)
         assert await store.purge_alert_instances(older_than=200.0) == 0
     finally:
         await store.close()
@@ -401,7 +409,7 @@ async def test_escalation_tier_persisted_monotonic(tmp_path: Path) -> None:
         (a,) = await store.list_active_alert_instances(allowed_channels=None)
         assert a.escalation_tier == 2
         # resolve + reopen starts a fresh instance at the fresh tier
-        await store.resolve_alert_instance(a.id, now=130.0)
+        await store.resolve_alert_instance(a.id, now=130.0, audit=ALERT_AUDIT)
         await store.upsert_alert_instance(
             event_type="connection_error", connection="OB_X", severity="warning", now=140.0
         )
@@ -421,7 +429,7 @@ async def test_suspend_and_resume_instance(tmp_path: Path) -> None:
         )
         (a,) = await store.list_active_alert_instances(allowed_channels=None)
         assert a.suspended_until is None
-        got = await store.suspend_alert_instance(a.id, until=500.0, now=100.0)
+        got = await store.suspend_alert_instance(a.id, until=500.0, now=100.0, audit=ALERT_AUDIT)
         assert got is not None and got.suspended_until == 500.0
         # AC-3: still open, still counted, still visible — suspend gates NOTIFICATION only.
         assert got.status == "open"
@@ -429,13 +437,13 @@ async def test_suspend_and_resume_instance(tmp_path: Path) -> None:
         (still,) = await store.list_active_alert_instances(allowed_channels=None)
         assert still.suspended_until == 500.0
         # resume clears the window
-        resumed = await store.resume_alert_instance(a.id)
+        resumed = await store.resume_alert_instance(a.id, audit=ALERT_AUDIT)
         assert resumed is not None and resumed.suspended_until is None
         # unknown / resolved id -> None (both suspend and resume)
-        assert await store.suspend_alert_instance(99999, until=500.0) is None
-        await store.resolve_alert_instance(a.id, now=600.0)
-        assert await store.suspend_alert_instance(a.id, until=700.0) is None
-        assert await store.resume_alert_instance(a.id) is None
+        assert await store.suspend_alert_instance(99999, until=500.0, audit=ALERT_AUDIT) is None
+        await store.resolve_alert_instance(a.id, now=600.0, audit=ALERT_AUDIT)
+        assert await store.suspend_alert_instance(a.id, until=700.0, audit=ALERT_AUDIT) is None
+        assert await store.resume_alert_instance(a.id, audit=ALERT_AUDIT) is None
     finally:
         await store.close()
 

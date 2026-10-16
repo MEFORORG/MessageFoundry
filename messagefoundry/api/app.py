@@ -954,16 +954,40 @@ def _dead_letter_replay_audit(
     return _row
 
 
+def _connection_purge_audit(
+    *, actor: str | None, name: str, scope: str, client: str | None
+) -> OperatorAudit[int]:
+    """The ``connection_purge`` row the inline route and the released purge both commit with the
+    cancel (BACKLOG #2624, vault BACKLOG #3217). Written UNCONDITIONALLY, cancelled=0 included
+    (BACKLOG #1641): a purge that cancels nothing is still a completed destructive command, unlike
+    a replay that re-transmitted nothing. No channel_id: purge targets an outbound, which spans
+    every inbound feeding it."""
+
+    def _row(cancelled: int) -> AuditAppend:
+        return AuditAppend(
+            "connection_purge",
+            actor=actor,
+            detail=json.dumps({"connection": name, "scope": scope, "cancelled": cancelled}),
+            client=client,
+        )
+
+    return _row
+
+
 def _purge_in_scope(identity: Identity) -> bool:
     """Whether ``identity`` may purge an outbound. A purge spans every inbound feeding it, so only an
     unscoped caller may. Read by the route and by the approval gate, like :func:`_replay_in_scope`."""
     return identity.allowed_channels is None
 
 
-def _purge_hold_params(name: str, scope: str) -> dict[str, Any]:
+def _purge_hold_params(name: str, scope: str, requester: str) -> dict[str, Any]:
     """What a held purge captures. The route's guard and its proof-free rejoin both read it, and a
-    repeat is recognised only when the two are identical (vault BACKLOG #2625 with #2445)."""
-    return {"name": name, "scope": scope}
+    repeat is recognised only when the two are identical (vault BACKLOG #2625 with #2445).
+
+    ``requester`` is the display name the released purge's ``connection_purge`` row is attributed
+    to (vault BACKLOG #3217), the way the replay and reload holds carry theirs: the executor sees
+    only these params."""
+    return {"name": name, "scope": scope, "requester": requester}
 
 
 async def _reload_hold_params(
@@ -1151,8 +1175,23 @@ def _build_approval_gate(
                 return {"cancelled": 0, "skipped": f"outbound owned by shard {owner}"}
             if not rr.outbound_quiesced(str(p["name"])):
                 return {"cancelled": 0, "skipped": "outbound running"}
+        # Vault BACKLOG #3217: the same connection_purge row the inline route writes, committed
+        # with the cancel and attributed to the REQUESTER, so a failed append cancels nothing and
+        # the gate's compensation records the release as 'failed'. `.get` as `_replay` reads it: a
+        # hold filed before the guard captured the key releases with no actor rather than a
+        # KeyError. No `client`, per _record_reload_audit's docstring.
+        requester = p.get("requester")
+        scope = "top" if p.get("scope") == "top" else "all"
         cancelled = await engine.store.cancel_queued(
-            None, str(p["name"]), top_only=(p.get("scope") == "top")
+            None,
+            str(p["name"]),
+            top_only=(scope == "top"),
+            audit=_connection_purge_audit(
+                actor=str(requester) if requester else None,
+                name=str(p["name"]),
+                scope=scope,
+                client=None,
+            ),
         )
         return {"cancelled": cancelled}
 
@@ -4470,7 +4509,11 @@ def create_app(
             and _purge_target_refusal(engine.registry_runner, name) is None
         ):
             held = await _rejoin_without_proof(
-                request, gate, "connection_purge", _purge_hold_params(name, scope), identity
+                request,
+                gate,
+                "connection_purge",
+                _purge_hold_params(name, scope, identity.username),
+                identity,
             )
             if held is not None:
                 return _held_reply(response, held, "connection_purge")
@@ -4514,45 +4557,25 @@ def create_app(
         ):  # dual-control: hold for a second approver when [approvals] gates purge
             pending = await gate.guard(
                 "connection_purge",
-                _purge_hold_params(name, scope),
+                _purge_hold_params(name, scope, identity.username),
                 requester=identity.username,
                 requester_user_id=identity.user_id,
                 client=client_ip(request),
             )
             if pending is not None:
                 return _held_reply(response, pending, "connection_purge")
-        client = client_ip(request)
-        # BACKLOG #1641: written UNCONDITIONALLY, cancelled=0 included. Deliberately NOT the
-        # `if requeued:` shape of the dead_letter_replay sibling: replay guards on "PHI was actually
-        # re-transmitted", but a purge that cancels nothing is still a completed destructive command
-        # against a live queue, and suppressing it leaves a zero-cancel purge indistinguishable from
-        # the 409s above, which changed nothing and wrote nothing.
-        #
-        # This row covers the UNGATED path ONLY. A dual-control purge returns 202 above and is
-        # executed later by the `_purge` executor in _build_approval_gate, which never re-enters this
-        # handler and writes no connection_purge row of its own. That path is not unaudited: the
-        # gate writes approval.requested and approval.release_attempted, both before the purge runs.
-        # The executor's {"cancelled": N} result is recorded only in approval.approved, which is
-        # written after the purge and whose failure is logged and paged rather than raised (BACKLOG
-        # #1940, vault BACKLOG #2255). So a gated purge's COUNT can be missing from the audit log
-        # while the release itself is still recorded. And all of those rows identify the operation
-        # only by approval_id: the connection NAME and the SCOPE live in the pending-approval row's
-        # params, not in the audit log. So a query of action='connection_purge' answers "which outbound, at
-        # what scope, cancelling how many" completely for ungated purges and not at all for gated
-        # ones, which still need a join back through approval_id. Closing that asymmetry is the
-        # sibling gap tracked for the _purge executor; it is deliberately not fixed here.
-        #
-        # No channel_id: purge targets an outbound, which spans every inbound feeding it. The row
-        # commits with the cancel (BACKLOG #2624), so no crash keeps one without the other.
+        # BACKLOG #1641: written UNCONDITIONALLY, cancelled=0 included, so a zero-cancel purge is
+        # told apart from the 409s above, which changed nothing and wrote nothing. The row commits
+        # with the cancel (BACKLOG #2624). A dual-control purge returns 202 above, and the `_purge`
+        # executor in _build_approval_gate writes the same row at release, attributed to the
+        # requester (vault BACKLOG #3217), so action='connection_purge' answers "which outbound, at
+        # what scope, cancelling how many" for gated and ungated purges alike.
         cancelled = await engine.store.cancel_queued(
             None,
             name,
             top_only=(scope == "top"),
-            audit=lambda n: AuditAppend(
-                "connection_purge",
-                actor=identity.username,
-                detail=json.dumps({"connection": name, "scope": scope, "cancelled": n}),
-                client=client,
+            audit=_connection_purge_audit(
+                actor=identity.username, name=name, scope=scope, client=client_ip(request)
             ),
         )
         return PurgeResult(cancelled=cancelled)
@@ -4901,6 +4924,15 @@ def create_app(
         this and reveal nothing: acknowledging an alert is not the act of reading its reason."""
         return redact_unauthorized(_alert_instance_row(a), identity)
 
+    def _alert_audit(
+        action: str, identity: Identity, request: Request, detail: Mapping[str, Any]
+    ) -> AuditAppend:
+        """The metadata-only row an alert mutation commits WITH its change (vault BACKLOG #3217).
+        The store appends it only when the change applied, so a 404 still writes nothing."""
+        return AuditAppend(
+            action, actor=identity.username, detail=json.dumps(detail), client=client_ip(request)
+        )
+
     def _alert_instance_row(a: Any) -> AlertInstanceInfo:
         return AlertInstanceInfo(
             id=a.id,
@@ -4969,15 +5001,14 @@ def create_app(
         # (a scoped read returns None for an instance on another connection). This mirrors the mutating-
         # route convention (replay_dead_letters pre-checks scope + raises 403 before mutating).
         await _require_alert_scope(engine, identity, alert_id)
-        ok = await engine.store.ack_alert_instance(alert_id, actor=identity.username)
+        # Vault BACKLOG #3217: the row commits with the change, so a failed append changes nothing.
+        ok = await engine.store.ack_alert_instance(
+            alert_id,
+            actor=identity.username,
+            audit=_alert_audit("alert_ack", identity, request, {"alert_id": alert_id}),
+        )
         if not ok:
             raise HTTPException(404, "alert instance not found or already resolved")
-        await engine.store.record_audit(
-            "alert_ack",
-            actor=identity.username,
-            detail=json.dumps({"alert_id": alert_id}),
-            client=client_ip(request),
-        )
         return await _alert_instance_echo(engine, identity, alert_id)
 
     @app.post("/alerts/{alert_id}/resolve", response_model=AlertInstanceInfo)
@@ -4993,15 +5024,12 @@ def create_app(
         # AC-7: scope-check before mutating (see ack_alert) — an out-of-scope id is refused with no
         # state change and no audit row.
         await _require_alert_scope(engine, identity, alert_id)
-        ok = await engine.store.resolve_alert_instance(alert_id)
+        ok = await engine.store.resolve_alert_instance(
+            alert_id,
+            audit=_alert_audit("alert_resolve", identity, request, {"alert_id": alert_id}),
+        )
         if not ok:
             raise HTTPException(404, "alert instance not found or already resolved")
-        await engine.store.record_audit(
-            "alert_resolve",
-            actor=identity.username,
-            detail=json.dumps({"alert_id": alert_id}),
-            client=client_ip(request),
-        )
         echo = await _alert_instance_echo(engine, identity, alert_id)
         # #81 (ADR 0133): a resolved condition is closed — drop the running notifier's in-memory suspend +
         # escalation state for the key, so a later re-open starts un-suspended at the base tier (matching
@@ -5027,19 +5055,19 @@ def create_app(
         # no state change and no audit row.
         await _require_alert_scope(engine, identity, alert_id)
         until = time.time() + body.minutes * 60.0
-        info = await engine.store.suspend_alert_instance(alert_id, until=until)
+        info = await engine.store.suspend_alert_instance(
+            alert_id,
+            until=until,
+            audit=_alert_audit(
+                "alert_suspend", identity, request, {"alert_id": alert_id, "minutes": body.minutes}
+            ),
+        )
         if info is None:
             raise HTTPException(404, "alert instance not found or already resolved")
         # Update the running notifier's in-memory suspend cache so the mute is honored immediately (the
         # durable suspended_until is the cross-restart record; the sink primes from it at startup). Best-
         # effort: absent in a JSON-only/no-transport deployment (the durable state still governs).
         _notifier_suspend(request, info.event_type, info.connection, until=until)
-        await engine.store.record_audit(
-            "alert_suspend",
-            actor=identity.username,
-            detail=json.dumps({"alert_id": alert_id, "minutes": body.minutes}),
-            client=client_ip(request),
-        )
         return _alert_instance_info(info, identity)
 
     @app.post("/alerts/{alert_id}/resume", response_model=AlertInstanceInfo)
@@ -5052,16 +5080,13 @@ def create_app(
         """Clear a windowed suspend (#143) so re-alerts resume immediately. Writes one metadata-only
         ``alert_resume`` audit row. 404 if the id is unknown or already resolved."""
         await _require_alert_scope(engine, identity, alert_id)
-        info = await engine.store.resume_alert_instance(alert_id)
+        info = await engine.store.resume_alert_instance(
+            alert_id,
+            audit=_alert_audit("alert_resume", identity, request, {"alert_id": alert_id}),
+        )
         if info is None:
             raise HTTPException(404, "alert instance not found or already resolved")
         _notifier_resume(request, info.event_type, info.connection)
-        await engine.store.record_audit(
-            "alert_resume",
-            actor=identity.username,
-            detail=json.dumps({"alert_id": alert_id}),
-            client=client_ip(request),
-        )
         return _alert_instance_info(info, identity)
 
     @app.post("/alerts/test-email", response_model=AlertTestEmailResult)

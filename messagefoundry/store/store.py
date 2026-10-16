@@ -6078,6 +6078,12 @@ def operator_audits[R](audit: OperatorAudit[R] | None, result: R) -> tuple[Audit
     return () if row is None else (row,)
 
 
+def if_applied(audit: AuditAppend) -> OperatorAudit[bool]:
+    """``audit`` when the mutation changed a row, otherwise nothing (vault BACKLOG #3217). The
+    operator alert mutations take one, so an unknown or resolved id records no row."""
+    return lambda applied: audit if applied else None
+
+
 class AuditedWrite:
     """Tee a write's audit rows off-box once its transaction has committed (BACKLOG #2624).
 
@@ -12725,7 +12731,7 @@ class MessageStore:
         *,
         top_only: bool = False,
         now: float | None = None,
-        audit: OperatorAudit[int] | None = None,
+        audit: OperatorAudit[int],
     ) -> int:
         """Soft-cancel **pending** deliveries for a destination: mark them ``cancelled``, append
         a ``cancelled`` audit event each, and finalize any message whose deliveries are now all
@@ -13466,34 +13472,45 @@ class MessageStore:
             escalation_tier=r["escalation_tier"],
         )
 
-    async def ack_alert_instance(
-        self, alert_id: int, *, actor: str, now: float | None = None
+    async def _commit_alert_change(
+        self, written: AuditedWrite, audit: AuditAppend, applied: bool
     ) -> bool:
-        # Operator ack: open|acknowledged → acknowledged, recording acked_by/acked_at. Idempotent (a
+        """Append an operator alert mutation's row, when its UPDATE matched, and commit both in the
+        one transaction (vault BACKLOG #3217), so a failed append changes nothing and a 404 writes
+        no row. Each caller spells its UPDATE at its own ``execute``, which the transaction-verb
+        guard reads (tests/test_writer_txn_is_the_only_begin.py)."""
+        await self._append_operator_audit(written, if_applied(audit), applied)
+        await self._commit()
+        return applied
+
+    async def ack_alert_instance(
+        self, alert_id: int, *, actor: str, audit: AuditAppend, now: float | None = None
+    ) -> bool:
+        # Operator ack: open|acknowledged -> acknowledged, recording acked_by/acked_at. Idempotent (a
         # re-ack is a no-op update). Returns True iff a non-resolved instance with this id existed (so
-        # the API can 404 a resolved/unknown id). Ack'ing a resolved instance is refused (no-op → False).
+        # the API can 404 a resolved/unknown id). Acking a resolved instance is refused (no-op, False).
         now = time.time() if now is None else now
-        async with _writer_guard(self._db, self._lock):
+        async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE alert_instance SET status='acknowledged', acked_by=?, acked_at=?"
                 " WHERE id=? AND status!='resolved'",
                 (actor, now, alert_id),
             )
-            await self._commit()
-            return cur.rowcount > 0
+            return await self._commit_alert_change(written, audit, cur.rowcount > 0)
 
-    async def resolve_alert_instance(self, alert_id: int, *, now: float | None = None) -> bool:
-        # Operator resolve: open|acknowledged → resolved, recording resolved_at. Returns True iff a
+    async def resolve_alert_instance(
+        self, alert_id: int, *, audit: AuditAppend, now: float | None = None
+    ) -> bool:
+        # Operator resolve: open|acknowledged -> resolved, recording resolved_at. Returns True iff a
         # non-resolved instance with this id existed.
         now = time.time() if now is None else now
-        async with _writer_guard(self._db, self._lock):
+        async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE alert_instance SET status='resolved', resolved_at=?"
                 " WHERE id=? AND status!='resolved'",
                 (now, alert_id),
             )
-            await self._commit()
-            return cur.rowcount > 0
+            return await self._commit_alert_change(written, audit, cur.rowcount > 0)
 
     async def resolve_alert_instances_for(
         self, *, event_type: str, connection: str, now: float | None = None
@@ -13511,36 +13528,38 @@ class MessageStore:
             return int(cur.rowcount)
 
     async def suspend_alert_instance(
-        self, alert_id: int, *, until: float, now: float | None = None
+        self, alert_id: int, *, until: float, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
         # #143 windowed suspend: mute NOTIFICATIONS for this instance's (event_type, connection) key until
         # `until` (an epoch). NOTIFICATION-only (ADR 0044 AC-3): the instance's status/count/visibility is
-        # untouched — only `suspended_until` is set, so it stays open on the dashboard. Refuses a resolved
+        # untouched; only `suspended_until` is set, so it stays open on the dashboard. Refuses a resolved
         # instance (a resolved condition has nothing to mute). Returns the updated row (for the API echo +
         # so the caller can seed the running sink's suspend cache), or None if unknown/already resolved.
-        async with _writer_guard(self._db, self._lock):
+        now = time.time() if now is None else now
+        async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE alert_instance SET suspended_until=? WHERE id=? AND status!='resolved'",
                 (until, alert_id),
             )
-            await self._commit()
-            if cur.rowcount == 0:
-                return None
+            applied = await self._commit_alert_change(written, audit, cur.rowcount > 0)
+        if not applied:
+            return None
         return await self.get_alert_instance(alert_id, allowed_channels=None)
 
     async def resume_alert_instance(
-        self, alert_id: int, *, now: float | None = None
+        self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
         # #143: clear a windowed suspend (re-alerts resume immediately). Idempotent (clearing an
         # un-suspended instance is a no-op UPDATE). Returns the row, or None if unknown/already resolved.
-        async with _writer_guard(self._db, self._lock):
+        now = time.time() if now is None else now
+        async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE alert_instance SET suspended_until=NULL WHERE id=? AND status!='resolved'",
                 (alert_id,),
             )
-            await self._commit()
-            if cur.rowcount == 0:
-                return None
+            applied = await self._commit_alert_change(written, audit, cur.rowcount > 0)
+        if not applied:
+            return None
         return await self.get_alert_instance(alert_id, allowed_channels=None)
 
     async def count_open_alerts_by_connection(self) -> dict[str, int]:

@@ -1105,8 +1105,11 @@ class QueueStore(StoreLifecycle, Protocol):
         *,
         top_only: bool = False,
         now: float | None = None,
-        audit: OperatorAudit[int] | None = None,
-    ) -> int: ...
+        audit: OperatorAudit[int],
+    ) -> int:
+        """``audit`` is REQUIRED (vault BACKLOG #3217): every purge records who ran it, in the
+        cancel's own transaction, so no caller can cancel a queue and write no row."""
+        ...
 
     # --- read helpers (API / console) ----------------------------------------
     # Row sequences are returned as Sequence[Row] (covariant) so a backend may return its own row
@@ -1376,15 +1379,20 @@ class QueueStore(StoreLifecycle, Protocol):
         """
         ...
 
+    # The four operator alert mutations below take a REQUIRED ``audit`` (vault BACKLOG #3217). The
+    # row is appended in the mutation's own transaction, and only when the change applied, so a
+    # failed append changes nothing and an unknown or resolved id writes no row.
     async def ack_alert_instance(
-        self, alert_id: int, *, actor: str, now: float | None = None
+        self, alert_id: int, *, actor: str, audit: AuditAppend, now: float | None = None
     ) -> bool:
         """Acknowledge a live instance (``open``/``acknowledged`` → ``acknowledged``), recording
         ``acked_by``/``acked_at``. Idempotent. Returns ``True`` iff a non-resolved instance with this id
         existed (so the API 404s a resolved/unknown id)."""
         ...
 
-    async def resolve_alert_instance(self, alert_id: int, *, now: float | None = None) -> bool:
+    async def resolve_alert_instance(
+        self, alert_id: int, *, audit: AuditAppend, now: float | None = None
+    ) -> bool:
         """Resolve a live instance (``open``/``acknowledged`` → ``resolved``), recording ``resolved_at``.
         Returns ``True`` iff a non-resolved instance with this id existed."""
         ...
@@ -1397,7 +1405,7 @@ class QueueStore(StoreLifecycle, Protocol):
         ...
 
     async def suspend_alert_instance(
-        self, alert_id: int, *, until: float, now: float | None = None
+        self, alert_id: int, *, until: float, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
         """Windowed suspend (#143, ADR 0044 amendment): set ``suspended_until`` on a live instance so its
         NOTIFICATIONS are muted until that epoch. **Notification-only** — status/count/visibility are
@@ -1407,7 +1415,7 @@ class QueueStore(StoreLifecycle, Protocol):
         ...
 
     async def resume_alert_instance(
-        self, alert_id: int, *, now: float | None = None
+        self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
         """Clear a windowed suspend (#143) so re-alerts resume immediately. Idempotent. Returns the
         updated instance, or ``None`` if unknown / already resolved."""

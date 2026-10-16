@@ -21,6 +21,7 @@ import pytest
 
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
+from tests._store_audit import no_purge_audit
 
 
 @pytest.fixture
@@ -625,7 +626,7 @@ async def test_cancel_queued_all_soft_cancels_and_finalizes(store: MessageStore)
     mid = await store.enqueue_message(
         channel_id="c1", raw="x", deliveries=[("d1", "p1")], now=100.0
     )
-    n = await store.cancel_queued("c1", "d1", now=101.0)
+    n = await store.cancel_queued("c1", "d1", now=101.0, audit=no_purge_audit)
     assert n == 1
     assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.CANCELLED.value
     # All deliveries terminal and none dead -> message finalizes as processed (not error).
@@ -638,7 +639,7 @@ async def test_cancel_queued_all_soft_cancels_and_finalizes(store: MessageStore)
 async def test_cancel_queued_top_only_cancels_the_head(store: MessageStore) -> None:
     m1 = await store.enqueue_message(channel_id="c1", raw="x", deliveries=[("d1", "p1")], now=100.0)
     m2 = await store.enqueue_message(channel_id="c1", raw="y", deliveries=[("d1", "p2")], now=101.0)
-    n = await store.cancel_queued("c1", "d1", top_only=True, now=102.0)
+    n = await store.cancel_queued("c1", "d1", top_only=True, now=102.0, audit=no_purge_audit)
     assert n == 1
     # The FIFO head (lowest rowid) is cancelled; the other stays queued.
     assert (await store.outbox_for(m1))[0]["status"] == OutboxStatus.CANCELLED.value
@@ -660,7 +661,9 @@ async def test_cancel_queued_top_only_cancels_a_backing_off_head(store: MessageS
     # The discriminating shape: the head is later-due than the row behind it, and blocks the lane.
     assert head_row["next_attempt_at"] > behind_row["next_attempt_at"]
     assert await store.claim_next_fifo("d1", now=103.0) is None
-    assert await store.cancel_queued(None, "d1", top_only=True, now=103.0) == 1
+    assert (
+        await store.cancel_queued(None, "d1", top_only=True, now=103.0, audit=no_purge_audit) == 1
+    )
     assert (await store.outbox_for(m1))[0]["status"] == OutboxStatus.CANCELLED.value
     assert (await store.outbox_for(m2))[0]["status"] == OutboxStatus.PENDING.value
     # The lane is unblocked: the row behind the purged head is now the claimable head.
@@ -673,7 +676,7 @@ async def test_cancel_queued_leaves_inflight_untouched(store: MessageStore) -> N
         channel_id="c1", raw="x", deliveries=[("d1", "p1")], now=100.0
     )
     await store.claim_ready(now=100.0)  # -> inflight
-    assert await store.cancel_queued("c1", "d1", now=101.0) == 0
+    assert await store.cancel_queued("c1", "d1", now=101.0, audit=no_purge_audit) == 0
     assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.INFLIGHT.value
 
 

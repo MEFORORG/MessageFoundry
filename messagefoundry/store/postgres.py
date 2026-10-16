@@ -270,6 +270,7 @@ from messagefoundry.store.store import (
     federated_unbind,
     first_sealed_approval,
     full_authentication_clear,
+    if_applied,
     load_audit_chain,
     lockout_clear,
     lockout_increment,
@@ -5954,28 +5955,44 @@ class PostgresStore:
             escalation_tier=int(r["escalation_tier"]),
         )
 
+    async def _alert_write(self, sql: str, *params: Any, audit: AuditAppend, now: float) -> bool:
+        """One operator alert UPDATE with its audit row, in one transaction (vault BACKLOG #3217).
+        The row is appended only when the UPDATE matched, so a 404 writes nothing."""
+        async with (
+            AuditedWrite(now) as written,
+            self._timed_acquire(record=False) as conn,
+            conn.transaction(),
+        ):
+            applied = _rowcount(await conn.execute(sql, *params)) > 0
+            await self._append_operator_audit(conn, written, if_applied(audit), applied)
+        return applied
+
     async def ack_alert_instance(
-        self, alert_id: int, *, actor: str, now: float | None = None
+        self, alert_id: int, *, actor: str, audit: AuditAppend, now: float | None = None
     ) -> bool:
         now = time.time() if now is None else now
-        result = await self._pool.execute(
+        return await self._alert_write(
             "UPDATE alert_instance SET status='acknowledged', acked_by=$1, acked_at=$2"
             " WHERE id=$3 AND status<>'resolved'",
             actor,
             now,
             alert_id,
+            audit=audit,
+            now=now,
         )
-        return _rowcount(result) > 0
 
-    async def resolve_alert_instance(self, alert_id: int, *, now: float | None = None) -> bool:
+    async def resolve_alert_instance(
+        self, alert_id: int, *, audit: AuditAppend, now: float | None = None
+    ) -> bool:
         now = time.time() if now is None else now
-        result = await self._pool.execute(
+        return await self._alert_write(
             "UPDATE alert_instance SET status='resolved', resolved_at=$1"
             " WHERE id=$2 AND status<>'resolved'",
             now,
             alert_id,
+            audit=audit,
+            now=now,
         )
-        return _rowcount(result) > 0
 
     async def resolve_alert_instances_for(
         self, *, event_type: str, connection: str, now: float | None = None
@@ -5991,28 +6008,30 @@ class PostgresStore:
         return _rowcount(result)
 
     async def suspend_alert_instance(
-        self, alert_id: int, *, until: float, now: float | None = None
+        self, alert_id: int, *, until: float, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
         # #143 windowed suspend (NOTIFICATION-only): set suspended_until on a live instance. Refuses a
         # resolved one; returns the updated row (for the API echo + seeding the sink cache) or None.
-        result = await self._pool.execute(
+        if not await self._alert_write(
             "UPDATE alert_instance SET suspended_until=$1 WHERE id=$2 AND status<>'resolved'",
             until,
             alert_id,
-        )
-        if _rowcount(result) == 0:
+            audit=audit,
+            now=time.time() if now is None else now,
+        ):
             return None
         return await self.get_alert_instance(alert_id, allowed_channels=None)
 
     async def resume_alert_instance(
-        self, alert_id: int, *, now: float | None = None
+        self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
         # #143: clear a windowed suspend. Idempotent; returns the row or None (unknown/already resolved).
-        result = await self._pool.execute(
+        if not await self._alert_write(
             "UPDATE alert_instance SET suspended_until=NULL WHERE id=$1 AND status<>'resolved'",
             alert_id,
-        )
-        if _rowcount(result) == 0:
+            audit=audit,
+            now=time.time() if now is None else now,
+        ):
             return None
         return await self.get_alert_instance(alert_id, allowed_channels=None)
 
@@ -7366,7 +7385,7 @@ class PostgresStore:
         *,
         top_only: bool = False,
         now: float | None = None,
-        audit: OperatorAudit[int] | None = None,
+        audit: OperatorAudit[int],
     ) -> int:
         """Soft-cancel **pending** deliveries for a destination: mark them ``cancelled``, log a
         ``cancelled`` event each, and finalize any message whose deliveries are now all terminal.

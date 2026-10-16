@@ -2175,8 +2175,10 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
 
 Unlike a reload, a released dead-letter replay fails closed (vault BACKLOG #2624). Its `dead_letter_replay` row
 commits in the same transaction as the re-queue. So when that row fails, nothing is re-queued, the
-request moves to `failed`, and `approval.failed` names the error type. A released purge still writes
-no `connection_purge` row of its own; its count is only in `approval.approved`.
+request moves to `failed`, and `approval.failed` names the error type. A released purge does the
+same with its `connection_purge` row, which names the outbound, the scope and the count and is
+attributed to the requester (vault BACKLOG #3217). A released purge that skips because the outbound
+is running or owned by another engine shard cancels nothing and writes no `connection_purge` row.
 
 **An audit or store outage that refuses writes answers a mapped status on at least these approval
 paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own audit row fails still

@@ -263,6 +263,7 @@ from messagefoundry.store.store import (
     federated_unbind,
     first_sealed_approval,
     full_authentication_clear,
+    if_applied,
     load_audit_chain,
     lockout_clear,
     lockout_increment,
@@ -7281,39 +7282,48 @@ class SqlServerStore:
             escalation_tier=int(r["escalation_tier"]),
         )
 
+    async def _alert_write(
+        self, sql: str, params: tuple[Any, ...], audit: AuditAppend, now: float
+    ) -> bool:
+        """One operator alert UPDATE with its audit row, in one transaction (vault BACKLOG #3217).
+        The row is appended only when the UPDATE matched, so a 404 writes nothing. The append takes
+        the audit applock at the tail, as :meth:`cancel_queued`'s does."""
+        async with AuditedWrite(now) as written, self._acquire() as conn:
+            try:
+                async with self._cursor(conn) as cur:
+                    await cur.execute(sql, params)
+                    applied = int(cur.rowcount) > 0
+                    await self._append_operator_audit(cur, written, if_applied(audit), applied)
+                    await self._commit(conn)
+            except Exception:
+                # The transaction may hold the audit applock and an audit row (BACKLOG #2624).
+                await self._rollback_or_discard(conn)
+                raise
+        return applied
+
     async def ack_alert_instance(
-        self, alert_id: int, *, actor: str, now: float | None = None
+        self, alert_id: int, *, actor: str, audit: AuditAppend, now: float | None = None
     ) -> bool:
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "UPDATE alert_instance SET status='acknowledged', acked_by=?, acked_at=?"
-                    " WHERE id=? AND status<>'resolved'",
-                    (actor, now, alert_id),
-                )
-                changed = cur.rowcount
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        return int(changed) > 0
+        return await self._alert_write(
+            "UPDATE alert_instance SET status='acknowledged', acked_by=?, acked_at=?"
+            " WHERE id=? AND status<>'resolved'",
+            (actor, now, alert_id),
+            audit,
+            now,
+        )
 
-    async def resolve_alert_instance(self, alert_id: int, *, now: float | None = None) -> bool:
+    async def resolve_alert_instance(
+        self, alert_id: int, *, audit: AuditAppend, now: float | None = None
+    ) -> bool:
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "UPDATE alert_instance SET status='resolved', resolved_at=?"
-                    " WHERE id=? AND status<>'resolved'",
-                    (now, alert_id),
-                )
-                changed = cur.rowcount
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        return int(changed) > 0
+        return await self._alert_write(
+            "UPDATE alert_instance SET status='resolved', resolved_at=?"
+            " WHERE id=? AND status<>'resolved'",
+            (now, alert_id),
+            audit,
+            now,
+        )
 
     async def resolve_alert_instances_for(
         self, *, event_type: str, connection: str, now: float | None = None
@@ -7334,42 +7344,29 @@ class SqlServerStore:
         return int(changed)
 
     async def suspend_alert_instance(
-        self, alert_id: int, *, until: float, now: float | None = None
+        self, alert_id: int, *, until: float, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
         # #143 windowed suspend (NOTIFICATION-only): set suspended_until on a live instance. Refuses a
         # resolved one; returns the updated row (for the API echo + seeding the sink cache) or None.
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "UPDATE alert_instance SET suspended_until=? WHERE id=? AND status<>'resolved'",
-                    (until, alert_id),
-                )
-                changed = cur.rowcount
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        if int(changed) == 0:
+        if not await self._alert_write(
+            "UPDATE alert_instance SET suspended_until=? WHERE id=? AND status<>'resolved'",
+            (until, alert_id),
+            audit,
+            time.time() if now is None else now,
+        ):
             return None
         return await self.get_alert_instance(alert_id, allowed_channels=None)
 
     async def resume_alert_instance(
-        self, alert_id: int, *, now: float | None = None
+        self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
         # #143: clear a windowed suspend. Idempotent; returns the row or None (unknown/already resolved).
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "UPDATE alert_instance SET suspended_until=NULL"
-                    " WHERE id=? AND status<>'resolved'",
-                    (alert_id,),
-                )
-                changed = cur.rowcount
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        if int(changed) == 0:
+        if not await self._alert_write(
+            "UPDATE alert_instance SET suspended_until=NULL WHERE id=? AND status<>'resolved'",
+            (alert_id,),
+            audit,
+            time.time() if now is None else now,
+        ):
             return None
         return await self.get_alert_instance(alert_id, allowed_channels=None)
 
@@ -11388,7 +11385,7 @@ class SqlServerStore:
         *,
         top_only: bool = False,
         now: float | None = None,
-        audit: OperatorAudit[int] | None = None,
+        audit: OperatorAudit[int],
     ) -> int:
         now = time.time() if now is None else now
         where = ["stage=?", "destination_name=?", "status=?"]

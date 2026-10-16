@@ -3024,7 +3024,8 @@ class Engine:
     # The operator mutations below take a REQUIRED ``audit``: the operator's audit row commits in the
     # mutation's own transaction, so a crash cannot keep the change and lose who made it (BACKLOG
     # #2624). Required, so a caller of these wrappers must say what it records. Purge has no wrapper:
-    # the API calls ``store.cancel_queued`` directly, where ``audit`` is optional.
+    # the API calls ``store.cancel_queued`` directly, where ``audit`` is required too (vault BACKLOG
+    # #3217).
     async def replay(self, message_id: str, *, audit: OperatorAudit[int]) -> int:
         """Re-queue every delivery for a message and wake the delivery workers."""
         requeued = await self.store.replay(message_id, audit=audit)
