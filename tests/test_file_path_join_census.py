@@ -474,7 +474,7 @@ SITES: dict[str, Site] = {
     ),
     "messagefoundry/anon/leak.py::_scanner": Site(1, INTERNAL, _PKG_LITERAL),
     "messagefoundry/anon/surrogates.py::_resolve_token_text": Site(
-        1, INTERNAL, "A fixed name under a parent of the package."
+        1, INTERNAL, "One fixed path under the folder that holds the package."
     ),
     "messagefoundry/api/tls.py::_generated_pair": Site(
         2, INTERNAL, "Fixed names in the engine's state directory."
@@ -579,6 +579,7 @@ SITES: dict[str, Site] = {
         OPERATOR,
         "Reads the git metadata of the operator's own config checkout; read only, to a commit hash.",
     ),
+    "messagefoundry/config/fingerprint.py::_require_listable": Site(1, OPERATOR, _CONFIG_FIXED),
     "messagefoundry/config/impact.py::_validate_new_name": Site(1, OPERATOR, _CODESETS),
     "messagefoundry/config/tls_policy.py::staged_crl": Site(
         1, INTERNAL, "A fixed name in a private temp directory this function made."
@@ -902,11 +903,11 @@ SCRIPT_SITES: dict[str, Site] = {
         7, OPERATOR, "Fixed names under the repo root, the helper source and the install directory."
     ),
     "scripts/service/install-service.ps1": Site(
-        22,
+        27,
         OPERATOR,
         "Fixed names under paths the operator passes or the script derives (repo root, install "
-        "root, project root, data directory, NSSM directory, temp), plus registry keys named after "
-        "the service's own images.",
+        "root and its site-packages and dist-info folders, project root, data directory, NSSM "
+        "directory, temp), plus registry keys named after the service's own images.",
     ),
     "scripts/service/uninstall-net-helper.ps1": Site(
         1, OPERATOR, "A fixed name under the install directory."

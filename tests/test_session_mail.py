@@ -40,12 +40,14 @@ import os
 import re
 import shutil
 import subprocess
+import uuid
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from tests._spawn_lock import spawn_burst
+from tests._session_pin import seed_pin
+from tests._spawn_lock import single_spawn, spawn_burst
 
 ROOT = Path(__file__).resolve().parents[1]
 COORD = ROOT / "scripts" / "coord"
@@ -450,6 +452,44 @@ def _send_addressed(repo: Path, session_id: str | None) -> subprocess.CompletedP
     return subprocess.run(
         args, cwd=str(repo), capture_output=True, text=True, timeout=TIMEOUT, check=False
     )
+
+
+def test_a_send_without_the_send_switch_fails_fast_instead_of_prompting(repo: Path) -> None:
+    """``-To``/``-Body`` with no ``-Send`` must refuse in seconds, naming the missing switch.
+
+    The incident and the mechanism are in the comment on ``$Send`` in mail.ps1.
+
+    THE CALLER'S CONDITIONS, NOT THE OTHER TESTS'. Every other send here passes ``-NonInteractive``,
+    which turns the prompt into an instant error and hides the hang. So this one omits it and holds
+    stdin OPEN: ``subprocess.run`` would close stdin, the prompt would read EOF, and the test would
+    pass against the broken script. Verified red against the pre-fix script before the fix.
+    """
+    # The context manager closes both pipes and reaps the process on every path, including the fail.
+    with single_spawn(), subprocess.Popen(
+        [
+            "pwsh", "-NoProfile", "-File", str(MAIL),
+            "-MailRoot", str(mail_root(repo)), "-To", str(repo), "-Body", "no send switch",
+        ],
+        cwd=str(repo), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE, text=True,
+    ) as proc:  # fmt: skip
+        try:
+            # stderr is one short error, far under a pipe buffer, so wait() cannot deadlock on it.
+            rc = proc.wait(timeout=TIMEOUT)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            # Either cause is possible here, so name both: a slow pwsh start under load looks the same.
+            pytest.fail(
+                f"mail.ps1 without -Send did not exit in {TIMEOUT}s: the stdin prompt is back, "
+                "or pwsh started very slowly"
+            )
+        assert proc.stderr is not None
+        err = proc.stderr.read()
+
+    assert rc != 0, "a send without -Send must be refused, not queued"
+    assert "-Send" in err, err
+    # Refused means NOTHING written. A box appearing would mean the guard ran after a write.
+    assert not (mail_root(repo) / "box").exists()
 
 
 def test_a_wrong_namespace_session_id_is_refused_at_SEND(repo: Path) -> None:
@@ -1291,13 +1331,22 @@ def test_unbounded_sender_metadata_cannot_push_the_preamble_off_the_top(
 
 def test_a_body_shaped_like_a_message_payload_is_withheld(repo: Path, tmp_path: Path) -> None:
     """DEFECT 7's backstop. It catches the realistic accident -- somebody pasting an ADT into a
-    handoff note -- and its presence is NOT evidence that the queue is PHI-safe."""
-    body = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|1|P|2.5\nPID|1||123456||DOE^JOHN"
-    seed(repo, tmp_path, [{"body": body}])
+    handoff note -- and its presence is NOT evidence that the queue is PHI-safe.
+
+    The patient id holds capital letters on purpose. The hook prints runs of digits near the withheld
+    body, at least in the message id, the sent time and the on-disk path. A digits-only id,
+    ``123456``, sat inside the id's time stamp at 12:34:56 UTC and failed a run (BACKLOG #3087). The
+    stem below is that run's id, pinned so every run meets that moment. ``QR123456K`` holds the same
+    six digits. No stamp carries a capital other than ``T`` or ``Z``, so Q, R and K keep it apart."""
+    mrn = "QR123456K"
+    body = f"MSH|^~\\&|A|B|C|D|20260101||ADT^A01|1|P|2.5\nPID|1||{mrn}||DOE^JOHN"
+    stem = "20261006T123456171-csxyd6"
+    seed(repo, tmp_path, [{"stem": stem, "body": body}])
     text = injection(run_drain(repo))
+    assert f"--- message id={stem}" in text
     assert "body withheld" in text
     assert "DOE^JOHN" not in text
-    assert "123456" not in text
+    assert mrn not in text
     assert "1 withheld" in text
     assert "docs/SESSION-MAIL.md" in text
     assert re.search(r"(\d+) bytes are on disk at", text)
@@ -1619,7 +1668,10 @@ def test_an_anchor_is_refused_when_the_cwd_does_not_exist(
     """
     info = seed(repo, tmp_path, [{"body": "vanished cwd"}], box_cwd=container)
     proc = run_drain(repo, cwd=container / "gone", anchor_repo=repo, run_from=container)
-    assert not proc.stdout.strip(), f"a vanished cwd was anchored: {proc.stdout!r}"
+    assert "vanished cwd" not in proc.stdout, f"a vanished cwd was anchored: {proc.stdout!r}"
+    # Not silence: since 2026-10-13 the drain says it read no box, so the reader cannot take the
+    # quiet for an empty box. It still reads nothing, anchored or not.
+    assert "NO BOX" in injection(proc) and "NOTHING WAS READ" in injection(proc), proc.stdout
     assert box_files(repo, str(info["key"]), "inbox")
 
 
@@ -1954,3 +2006,146 @@ def test_the_footer_reports_the_BACKLOG_and_not_only_this_pass(repo: Path, tmp_p
     assert "oldest" in text, (
         "the depth alone does not say whether the queue is aging toward its TTL"
     )
+
+
+# --------------------------------------------------------------------------------------------------
+# The input is read as UTF-8, because its `cwd` is the address.
+#
+# The desktop app starts a worktree session's hooks in the PRIMARY checkout (measured 2026-10-12), so
+# the payload `cwd` is the only thing naming the worktree. The drain used it, but read stdin through
+# [Console]::In, which decodes with the console code page: a UTF-8 e-acute arrived as two box-drawing
+# characters, git found no repository there, and the drain exited silent. The harness writes raw
+# UTF-8, so these tests do too, and the drain runs IN the primary, as the app runs it.
+# --------------------------------------------------------------------------------------------------
+
+ACCENTED = "caf\u00e9-linked"
+
+
+@pytest.fixture
+def accented_worktree(repo: Path, tmp_path: Path) -> Path:
+    """A worktree linked to ``repo`` whose path is not ASCII, holding one message sent to it."""
+    wt = Path(os.path.realpath(tmp_path)) / ACCENTED
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", "-b", "accented", str(wt)],
+        check=True,
+        capture_output=True,
+    )
+    send = subprocess.run(
+        [
+            "pwsh", "-NoProfile", "-NonInteractive", "-File", str(MAIL),
+            "-Send", "-MailRoot", str(mail_root(repo)), "-To", str(wt),
+            "-Body", "addressed to the accented worktree",
+        ],
+        cwd=str(wt),
+        capture_output=True,
+        timeout=TIMEOUT,
+        check=False,
+    )  # fmt: skip
+    assert send.returncode == 0, send.stderr.decode("utf-8", "replace")
+    return wt
+
+
+def _drain_in_primary(repo: Path, wt: Path, *, ascii_escaped: bool) -> str:
+    # A launch pinned the session to ``wt``; tests/_session_pin.py stands in for it.
+    seed_pin(repo, wt, SELF_ID)
+    payload = {"hook_event_name": "Stop", "session_id": SELF_ID, "cwd": str(wt)}
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(DRAIN)],
+        cwd=str(repo),
+        input=json.dumps(payload, ensure_ascii=ascii_escaped).encode("utf-8"),
+        capture_output=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+    out = proc.stdout.decode("utf-8", "replace").strip()
+    return str(json.loads(out)["hookSpecificOutput"]["additionalContext"]) if out else ""
+
+
+def test_a_worktree_whose_path_is_not_ascii_gets_its_mail(
+    repo: Path, accented_worktree: Path
+) -> None:
+    text = _drain_in_primary(repo, accented_worktree, ascii_escaped=False)
+    assert "    | addressed to the accented worktree" in text, text
+
+
+def test_the_same_address_escaped_to_ascii_gets_its_mail(
+    repo: Path, accented_worktree: Path
+) -> None:
+    """The control. Escaped as \\u00e9, the bytes are ASCII and any decoder reads them, so the
+    message is delivered. The arm above differs only in the bytes on stdin."""
+    text = _drain_in_primary(repo, accented_worktree, ascii_escaped=True)
+    assert "    | addressed to the accented worktree" in text, text
+
+
+# --------------------------------------------------------------------------------------------------
+# After a `cd`, the session's box is still the one of the worktree it started in. The Lander's point 4
+# on korus#223: with `cwd` in a sibling, the drain showed the sibling's box, and Stop filed the
+# sibling's mail as read. The SessionStart hooks pin the starting worktree; the drain only reads it.
+# --------------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def two_worktrees(repo: Path, tmp_path: Path) -> tuple[Path, Path]:
+    base = Path(os.path.realpath(tmp_path))
+    mine, sibling = base / "mine-wt", base / "sibling-wt"
+    for wt in (mine, sibling):
+        subprocess.run(
+            ["git", "-C", str(repo), "worktree", "add", "-q", "-b", wt.name, str(wt)],
+            check=True,
+            capture_output=True,
+        )
+    seed(repo, tmp_path, [{"body": "mail for the sibling"}], box_cwd=sibling)
+    seed(repo, tmp_path, [{"body": "mail for mine"}], box_cwd=mine)
+    return mine, sibling
+
+
+def test_after_a_cd_the_drain_shows_the_starting_worktrees_box(
+    repo: Path, tmp_path: Path, two_worktrees: tuple[Path, Path]
+) -> None:
+    mine, sibling = two_worktrees
+    seed_pin(repo, mine, SELF_ID)
+    # Not SessionStart: one with no source is a launch, whose `cwd` is where the session starts.
+    text = injection(run_drain(repo, cwd=sibling, run_from=repo, event="Stop"))
+    assert "mail for mine" in text, text
+    assert "mail for the sibling" not in text, "the session was shown its sibling's mail"
+
+
+def test_a_session_that_started_in_the_sibling_gets_the_siblings_box(
+    repo: Path, tmp_path: Path, two_worktrees: tuple[Path, Path]
+) -> None:
+    """The control: the same drain, for a session pinned in the sibling."""
+    _, sibling = two_worktrees
+    seed_pin(repo, sibling, SELF_ID)
+    text = injection(run_drain(repo, cwd=sibling, run_from=repo, event="Stop"))
+    assert "mail for the sibling" in text, text
+
+
+def test_with_no_pin_a_sibling_cwd_shows_no_box_and_consumes_nothing(
+    repo: Path, tmp_path: Path, two_worktrees: tuple[Path, Path]
+) -> None:
+    """THE LANDER'S POINT ON PR 2328 AND korus#223: with no pin, a sibling's `cwd` was answered for
+    as it stood, and Stop filed the sibling's mail as read. The arm above is its control."""
+    _, sibling = two_worktrees
+    text = injection(run_drain(repo, cwd=sibling, run_from=repo, event="Stop"))
+    assert "mail for the sibling" not in text, "an unpinned session was shown its sibling's mail"
+    assert "NO BOX" in text and "no pin records" in text, text
+    inboxes = list((mail_root(repo) / "box").glob("*/inbox/*.json"))
+    assert len(inboxes) == 2, f"a box was consumed: {inboxes}"
+
+
+def test_the_no_box_notice_is_throttled_and_obeys_the_off_switch(
+    repo: Path, tmp_path: Path
+) -> None:
+    seed(repo, tmp_path, [{"body": "waiting"}])
+    gone = Path(os.path.realpath(tmp_path)) / "deleted-worktree"
+    sid = f"nobox-{uuid.uuid4()}"
+    first = injection(run_drain(repo, cwd=gone, run_from=repo, session_id=sid))
+    assert "NO BOX" in first and "NOTHING WAS READ" in first, first
+    assert injection(run_drain(repo, cwd=gone, run_from=repo, session_id=sid)) == "", (
+        "the NO BOX notice repeated inside its cooldown"
+    )
+    (mail_root(repo) / "OFF").write_text("", encoding="utf-8")
+    other = f"nobox-{uuid.uuid4()}"
+    silenced = injection(run_drain(repo, cwd=gone, run_from=repo, session_id=other))
+    assert "NO BOX" not in silenced and "SUPPRESSED" in silenced, silenced

@@ -34,7 +34,9 @@ __all__ = [
     "LoggingAlertSink",
     "config_changed_detail",
     "crl_expiry_detail",
+    "crl_reload_refused_detail",
     "intake_pause_detail",
+    "remote_debug_refused_detail",
 ]
 
 log = logging.getLogger(__name__)
@@ -108,6 +110,43 @@ def crl_expiry_detail(*, held_copy: bool, detail: str, shared_with: tuple[str, .
             also += "; a held copy is matched by its file, so each of those rows reports it too"
         parts.append(f"{also}.")
     return " ".join(parts)
+
+
+def crl_reload_refused_detail(
+    *, remedy_class: str, stale_contexts: int, remedy: str, start_refuses: bool = False
+) -> str:
+    """The one-line description of a ``crl_reload_refused`` alert both sinks show (vault BACKLOG
+    #2904). Fixed words, a count and the engine's own remedy sentence: nothing read from the CRL.
+
+    The alert instance's reason column keeps only about the first 200 characters, so the class
+    and the count lead. A warning not to restart yet comes next, ahead of a remedy that names a
+    restart, because a reader may see only the start of the line. The reason is not part of this
+    alert, because it quotes CRL issuer names and dates; the reload's ERROR line has it."""
+    parts = [
+        f"CRL reload refused ({remedy_class}): {stale_contexts} running TLS context(s) keep the "
+        "copy they hold."
+    ]
+    if start_refuses:
+        parts.append(
+            "A start refuses this file too until its CRL takes effect, so do not restart before "
+            "then."
+        )
+    if remedy:
+        parts.append(f"{remedy}.")
+    parts.append("The crl_reload ERROR line in the engine log gives the reason.")
+    return " ".join(parts)
+
+
+def remote_debug_refused_detail(*, count: int, total: int) -> str:
+    """The one-line description of a ``remote_debug_refused`` alert both sinks show (vault BACKLOG
+    #2742). Counts and fixed words: never a script's file name, which the injecting process
+    chooses. The alert instance's reason column keeps only about the first 200 characters, so the
+    count leads."""
+    return (
+        f"refused {count} script(s) another process injected through the interpreter's remote "
+        f"debugging ({total} since this process started). None ran. WARNING lines in the engine "
+        "log may name the files."
+    )
 
 
 class AlertSink(Protocol):
@@ -291,6 +330,56 @@ class AlertSink(Protocol):
         two causes with opposite remedies."""
         ...
 
+    def crl_reload_refused(
+        self,
+        name: str,
+        *,
+        path: str,
+        remedy_class: str,
+        stale_contexts: int,
+        remedy: str,
+        start_refuses: bool = False,
+    ) -> None:
+        """The CRL reload refused to apply a replaced CRL file, so running TLS contexts keep the
+        copy they hold (vault BACKLOG #2904). A revocation added to the new file is not enforced
+        on those hops until the file is applied. :meth:`crl_expiry` cannot say this: it speaks
+        only once the held copy nears its ``nextUpdate``.
+
+        ``name`` is ``crl_reload:<path>``, with ``@node:<id>`` or ``@shard:<id>`` appended where
+        several engine processes share the store, because each process holds its own contexts.
+        ``<path>`` is the CRL file's absolute path, case-folded on Windows, and shortened to a
+        checksum plus its tail when long. ``path`` is the file's absolute path, case kept, as the
+        reload reads it; a relative path in a setting appears here in its absolute form.
+        ``remedy_class`` is
+        a short token for what the operator does next (``restart``, ``fix_file``, ``wait`` and so
+        on; ``pipeline/crl_reload.py`` holds the set). ``stale_contexts`` counts the contexts
+        still on the old copy when the alert was raised. ``remedy`` is the engine's own fixed
+        sentence for that class. ``start_refuses`` is True when the remedy names a restart and a
+        start would refuse the file too, until one of its CRLs takes effect.
+
+        **No CRL contents.** The refusal's reason quotes CRL issuer names and dates, so it stays
+        in the engine log and is never passed here. Not a connection-scoped event: one CRL file
+        can serve many hops, and the colon keeps ``name`` outside the connection-name grammar.
+
+        Raised once per file version, as the reload's ERROR line is logged: again only when the
+        file's bytes change or the reason does. Emitted on the event loop by
+        :class:`~messagefoundry.pipeline.crl_reload.CrlReloadRunner`;
+        :meth:`crl_reload_applied` is its auto-resolving inverse."""
+        ...
+
+    def crl_reload_applied(self, name: str, *, path: str) -> None:
+        """The INVERSE of :meth:`crl_reload_refused`: the refusal for the CRL file at ``path`` no
+        longer stands on this process. The file was applied to every context that held an older
+        copy, or it was put back to the bytes they hold, or no context holds it any more. Also
+        raised when the runner stops, because a restart rebuilds every context from the file.
+
+        Emits **no** notification (a recovery needs no page); it exists so durable alert-state
+        (ADR 0044) **auto-resolves** the open ``crl_reload_refused`` instance for the same
+        ``name``. Raised only for an alert this runner raised, and only once the refusal is gone
+        from the record: a pass that could not read the file, or that failed, clears nothing. A
+        process that dies without stopping leaves its alert open, for an operator to resolve."""
+        ...
+
     def secret_rotation_due(
         self,
         name: str,
@@ -422,6 +511,21 @@ class AlertSink(Protocol):
         or ``<directory>`` on a directory sign-in, where no administrator acted.
         No PHI. Emitted by the API's user-administration and directory sign-in routes, never from
         ``auth/``."""
+        ...
+
+    def no_enabled_administrator(self, name: str, *, via: str) -> None:
+        """A directory-driven role change took the built-in Administrator role from its last
+        enabled holder, so no enabled Administrator remains (vault BACKLOG #3229). The same event
+        as the ``auth.no_enabled_administrator`` audit row. ``name`` is ``user:<username>``, the
+        demoted account; ``via`` is ``ad-sync`` (a directory sign-in's role sync) or
+        ``ad-reconcile`` (the session reconciler).
+
+        The change was applied, not refused: by owner ruling 2026-10-13 (#3229) the directory
+        stays authoritative. This alert is how the operators learn the instance has no enabled
+        Administrator; ``provision-admin`` at the host runs again once none exists (vault BACKLOG
+        #2711 is the open recovery row). Nothing resolves it automatically. No PHI. Raised through
+        the callable :func:`no_enabled_administrator_alert` builds, which the API lifespan hands to
+        the auth service, so ``auth/`` never imports a sink."""
         ...
 
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
@@ -649,6 +753,35 @@ class AlertSink(Protocol):
         one."""
         ...
 
+    # --- vault BACKLOG #2742: a script the remote-debugging guard refused ----------------------
+
+    def remote_debug_refused(self, name: str, *, count: int, total: int) -> None:
+        """The engine's remote-debugging guard refused one or more scripts that another process
+        injected into this process (vault BACKLOG #2742, :mod:`messagefoundry.remotedebug`).
+        Nothing in them ran. It still means a process on this host was allowed to attach to the
+        engine and tried to run code inside it.
+
+        ``name`` is ``remote_debug:refused``, with ``@node:<id>`` or ``@shard:<id>`` appended
+        where several engine processes share the store, because the count is each process's own.
+        ``count`` is how many scripts were refused since the sink last took this alert, and
+        ``total`` how many since the process started.
+
+        **Never a script's file name.** The injecting process chooses it, so it stays in the
+        engine's log output, usually the guard's WARNING line (docs/SECURITY-LOOSENING.md names
+        the exceptions). Counts and this process's own label only: no message content, no PHI.
+
+        Raised at most once per pass of
+        :class:`~messagefoundry.pipeline.remote_debug_watch.RemoteDebugRefusalWatch`, on the event
+        loop, however many scripts were refused, so the injecting process does not set the rate.
+        The engine runs that watch. Of the commands, only ``serve`` builds an engine, so only
+        ``serve`` raises this. An application that builds its own engine may have no guard at
+        all; docs/SECURITY-LOOSENING.md says what that means. It is not a connection-scoped event,
+        so no rule's ``control_action`` fires on it. The colon keeps ``name`` outside the
+        connection-name grammar. Nothing resolves it: a refusal is an event, not a state that can
+        clear, so an operator resolves the instance. The ``remote_debug_refused`` audit row is the
+        durable record."""
+        ...
+
 
 class LoggingAlertSink:
     """Default :class:`AlertSink`: log each event at ``WARNING``. No PHI — only the connection name
@@ -817,6 +950,34 @@ class LoggingAlertSink:
                 path,
             )
 
+    def crl_reload_refused(
+        self,
+        name: str,
+        *,
+        path: str,
+        remedy_class: str,
+        stale_contexts: int,
+        remedy: str,
+        start_refuses: bool = False,
+    ) -> None:
+        # The reload has already logged the refusal at ERROR, with its reason. This line is the
+        # alert's own record on this stream, and it leaves the reason out as the notifier does.
+        log.warning(
+            "ALERT crl_reload_refused: %r CRL file %s: %s",
+            name,
+            path,
+            crl_reload_refused_detail(
+                remedy_class=remedy_class,
+                stale_contexts=stale_contexts,
+                remedy=remedy,
+                start_refuses=start_refuses,
+            ),
+        )
+
+    def crl_reload_applied(self, name: str, *, path: str) -> None:
+        # The inverse (auto-resolve) event; no page, so DEBUG: the runner already logged at INFO.
+        log.debug("ALERT crl_reload_applied: %r CRL file %s is no longer refused", name, path)
+
     def secret_rotation_due(
         self,
         name: str,
@@ -910,6 +1071,15 @@ class LoggingAlertSink:
             scrub_log_argument(repr(name)),
             scrub_log_argument(via),
             scrub_log_argument(repr(granted_by)),
+        )
+
+    def no_enabled_administrator(self, name: str, *, via: str) -> None:
+        # Scrubbed as administrator_granted's line above is, and for the same reason.
+        log.warning(
+            "ALERT no_enabled_administrator: a directory role change (%s) took Administrator from "
+            "%s, and no enabled Administrator remains",
+            scrub_log_argument(via),
+            scrub_log_argument(repr(name)),
         )
 
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
@@ -1059,6 +1229,16 @@ class LoggingAlertSink:
     def security_signal(self, name: str, *, signal: str, count: int, detail: str) -> None:
         log.warning("ALERT %s: %r %s (count %d)", signal, name, detail, count)
 
+    def remote_debug_refused(self, name: str, *, count: int, total: int) -> None:
+        # The guard usually logs one WARNING for each refusal, with the script's file name, but
+        # not always (docs/SECURITY-LOOSENING.md). This line is the alert's own record on this
+        # stream, and it carries no name.
+        log.warning(
+            "ALERT remote_debug_refused: %r %s",
+            name,
+            remote_debug_refused_detail(count=count, total=total),
+        )
+
 
 #: The ``integrity_drift`` subject for a store-cipher refusal (BACKLOG #1169). Its own subject so it
 #: throttles and routes apart from engine attestation and the audit-chain check.
@@ -1093,6 +1273,22 @@ def authority_seal_alert(sink: AlertSink) -> Callable[[str], None]:
             sink.integrity_drift(AUTHORITY_SEAL_SUBJECT, reason=reason, drift_count=1)
         except Exception:  # noqa: BLE001 — an alert-sink failure must never break a request
             log.warning("authority-seal integrity alert could not be delivered")
+
+    return _raise
+
+
+def no_enabled_administrator_alert(sink: AlertSink) -> Callable[[str, str], None]:
+    """An alert callable for :class:`~messagefoundry.auth.service.AuthService`: each call, with a
+    username and a ``via``, raises :meth:`AlertSink.no_enabled_administrator` keyed
+    ``user:<username>`` (vault BACKLOG #3229).
+
+    Never raises: an alert failure must not change what a sign-in or a reconcile pass does."""
+
+    def _raise(username: str, via: str) -> None:
+        try:
+            sink.no_enabled_administrator(f"user:{username}", via=via)
+        except Exception:  # noqa: BLE001 — an alert-sink failure must never break a request
+            log.warning("the no_enabled_administrator alert could not be delivered", exc_info=True)
 
     return _raise
 

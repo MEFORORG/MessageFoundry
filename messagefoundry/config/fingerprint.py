@@ -23,16 +23,21 @@ exactly like ``load_config`` itself.
 
 from __future__ import annotations
 
+import errno
 import hashlib
+import os
+import stat
 from pathlib import Path
 
 from messagefoundry.credential import constant_time_equal
 
 __all__ = [
     "FINGERPRINT_SCHEME",
+    "ConfigDirMissing",
     "config_fingerprint",
     "config_fingerprint_detail",
     "fingerprint_matches",
+    "is_missing_directory",
 ]
 
 # Version the scheme so a future change to *what* is hashed (or *how*) is itself detectable in the
@@ -62,22 +67,50 @@ _FINGERPRINT_GLOBS: tuple[str, ...] = (
 )
 
 
-def _iter_entries(base: Path) -> list[tuple[str, bytes]]:
+class ConfigDirMissing(FileNotFoundError):
+    """The directory a strict :func:`config_fingerprint` was asked for is not a directory. Its own
+    type, so a caller can tell it from a covered file that vanished, which is a plain
+    ``FileNotFoundError``."""
+
+
+#: The Windows errors that refuse a path's name itself: ERROR_INVALID_NAME (123), ERROR_BAD_PATHNAME
+#: (161) and ERROR_FILENAME_EXCED_RANGE (206). Python maps the first to EINVAL, not ENOENT.
+_INVALID_NAME_WINERRORS: frozenset[int] = frozenset({123, 161, 206})
+
+
+def is_missing_directory(exc: OSError) -> bool:
+    """Whether ``exc``, raised resolving or listing a directory, says no directory can be opened by
+    that path: nothing by that name, a file rather than a directory, a name or whole path too long
+    for the filesystem (ENAMETOOLONG, or Windows error 206), or a name Windows refuses, such as
+    ``sub?``. ``Path.is_dir`` answers ``False`` for all of them, so a caller that lists the
+    directory instead reports them as missing too (vault BACKLOG #2596). Any other error, such as
+    access denied, is not a missing directory."""
+    return (
+        isinstance(exc, (FileNotFoundError, NotADirectoryError))
+        or exc.errno == errno.ENAMETOOLONG
+        or getattr(exc, "winerror", None) in _INVALID_NAME_WINERRORS
+    )
+
+
+def _iter_entries(base: Path, *, strict: bool = False) -> list[tuple[str, bytes]]:
     """Return ``(posix-relpath, sha256(content))`` for every fingerprinted file, sorted.
 
     Sorting by relpath makes the fold order-independent (filesystem enumeration order can vary);
     keying on the *relative* path (not absolute) makes the digest location-independent, so two
     byte-identical bundles at different paths fingerprint identically. An unreadable file is
-    skipped rather than crashing the audit it feeds.
+    skipped rather than crashing the audit it feeds, unless ``strict`` (see
+    :func:`config_fingerprint`).
     """
     # Lazy: wiring is the loader, and this module stays importable without pulling it in at import time.
     from messagefoundry.config.wiring import config_py_files
 
+    if strict:
+        _require_listable(base)
     seen: set[Path] = set()
     entries: list[tuple[str, bytes]] = []
     globbed = (path for pattern in _FINGERPRINT_GLOBS for path in base.glob(pattern))
     for path in [*config_py_files(base), *globbed]:
-        if not path.is_file():
+        if not _is_file(path, strict=strict):
             continue
         resolved = path.resolve()
         if resolved in seen:
@@ -86,11 +119,54 @@ def _iter_entries(base: Path) -> list[tuple[str, bytes]]:
         try:
             data = path.read_bytes()
         except OSError:
+            if strict:
+                raise
             continue
         rel = path.relative_to(base).as_posix()
         entries.append((rel, hashlib.sha256(data).digest()))
     entries.sort()
     return entries
+
+
+def _require_listable(base: Path) -> None:
+    """Raise unless ``base`` and each folder a glob reads in it can be listed.
+
+    ``glob`` swallows a listing error, so a missing or unlistable directory would digest as an empty
+    bundle, and an unlistable ``codesets`` folder as a bundle without it. A missing ``base`` raises
+    :class:`ConfigDirMissing`, and so does one whose name no directory can have
+    (:func:`is_missing_directory`); any other fault raises its own ``OSError``. A sub-folder that
+    is missing by the same rule is fine: there is nothing in it to leave out."""
+    missing = False
+    try:
+        with os.scandir(base):
+            pass
+    except OSError as exc:
+        if not is_missing_directory(exc):
+            raise
+        missing = True
+    if missing:
+        # Raised after the handler, so the error it replaces does not ride __context__.
+        raise ConfigDirMissing(errno.ENOENT, "config directory not found", str(base))
+    for folder in sorted({Path(pattern).parent for pattern in _FINGERPRINT_GLOBS} - {Path(".")}):
+        try:
+            with os.scandir(base / folder):
+                pass
+        except OSError as exc:
+            # The same rule as base: a folder no path can open holds nothing the loader reads.
+            if not is_missing_directory(exc):
+                raise
+
+
+def _is_file(path: Path, *, strict: bool) -> bool:
+    """Whether ``path`` is a regular file, following links. ``Path.is_file`` answers ``False`` for a
+    path it cannot stat, so ``strict`` stats it instead and raises that error. A path that is gone
+    (a dangling link, or a file removed since the listing) is not a file either way."""
+    if not strict:
+        return path.is_file()
+    try:
+        return stat.S_ISREG(path.stat().st_mode)
+    except FileNotFoundError:
+        return False
 
 
 def _fold(entries: list[tuple[str, bytes]]) -> str:
@@ -106,9 +182,16 @@ def _fold(entries: list[tuple[str, bytes]]) -> str:
     return h.hexdigest()
 
 
-def config_fingerprint(directory: str | Path) -> str:
-    """Return a stable SHA-256 hex digest over the content of a config bundle's loaded files."""
-    return _fold(_iter_entries(Path(directory)))
+def config_fingerprint(directory: str | Path, *, strict: bool = False) -> str:
+    """Return a stable SHA-256 hex digest over the content of a config bundle's loaded files.
+
+    By default it is observational, as the module docstring says: a file it cannot read is left out,
+    and a missing directory digests as an empty bundle. ``strict`` is for a digest that GATES, the
+    one a dual-control approval binds (vault BACKLOG #2596). There a skipped file would leave bytes
+    the approval never covered, so ``strict`` raises instead: :class:`ConfigDirMissing` when
+    ``directory`` is not a directory, and the ``OSError`` when a folder it reads cannot be listed or
+    a file it covers cannot be stat'ed or read."""
+    return _fold(_iter_entries(Path(directory), strict=strict))
 
 
 def config_fingerprint_detail(directory: str | Path) -> dict[str, object]:

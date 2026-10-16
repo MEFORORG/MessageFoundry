@@ -552,8 +552,14 @@ gates a merge**, and no seat has to clear one.
   Builder's QA line under the `qa` label, or other evidence that code review ran against this
   change. Without it, the Lander sends the change to code review. The proof must cover the change
   being merged, so a conflict resolution the Lander wrote itself needs its own review. The Lander
-  reads what the review found, and a finding that names a defect the merge would ship goes back to
-  the owner for a ruling. Korus `roles/LANDER.md` *4a-quinquies* holds the rest; the full text is in
+  reads what the review found. **The Lander may merge when the open findings are filed as rows and
+  none changes behaviour or weakens a control (owner ruling 2026-10-12, in session).** A finding
+  that does either still goes to the owner for a ruling. **CORRECTED 2026-10-12:** this read *"a
+  finding that names a defect the merge would ship goes back to the owner for a ruling."* The
+  ruling does not let the Lander skip the review proof, or choose between two authors' deliberate
+  changes. Nor does it let the Lander decline a finding that names a defect the merge would ship.
+  Korus `roles/LANDER.md` *4a-quinquies* holds the rest. Where korus still carries the earlier
+  rule, this ruling is the newer one. The full text and the owner's words are in
   [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved in wave 3*.
 - **A PR's merge state is a join over clocks.** `mergeStateStatus` is the starting read, never the
   verdict, because it hides one blocking reason behind another. Gate on `mergeable == CONFLICTING`
@@ -605,8 +611,12 @@ gates a merge**, and no seat has to clear one.
   of record for the reasoning and the traps; do not restate them here.
 - Name [`docs/REVIEW-STANDARDS.md`](docs/REVIEW-STANDARDS.md) in the `code-review` skill's
   arguments as an instruction, never as a bare path: a bare path makes the skill review that file
-  instead of your diff. Name the diff too, so it matches what you committed. For example: `xhigh.
-  Review this branch's diff against origin/main; read docs/REVIEW-STANDARDS.md and apply its rules.`
+  instead of your diff. Name the diff too, so it matches what you committed. Write the level as a
+  bare first word, with no punctuation after it. For example: `xhigh Review this branch's diff
+  against origin/main; read docs/REVIEW-STANDARDS.md and apply its rules.` The period form,
+  `xhigh.`, does not parse as a level. In two trials the skill then ran at the previous call's
+  level (measured 2026-10-13). In your QA line, give the level you passed and quote the tag the
+  skill printed; korus `roles/BUILDER.md` *4e* has the format.
 - `pre-commit` does not run mypy. Run it by hand before you commit, or strict typing first fails in
   CI, after your process is gone.
 - If the full suite will not finish inside your turn, run the tests covering your change and push.

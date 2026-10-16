@@ -11,7 +11,8 @@ the engine adapter: a message with no parseable MSH / encoding characters is **r
 against the shared **allowlist** of value types, so an unrecognized or absent OBX-2 is redacted. The
 golden-corpus + adversarial parity tests pin the two to the same output / same refusal on the
 inputs they hold. The two do NOT agree on every input: ``docs/PHI.md`` section 9 names at least the
-cases known to differ (a header not in capitals, a ``BHS`` or ``FHS`` line, a short later header line).
+cases known to differ (a header not in capitals among them). A ``BHS`` or ``FHS`` rule now reaches
+the same field on both sides, and both refuse a short later header line (BACKLOG #2998).
 
 Never string-slices in the forbidden sense: it splits only on the message's *actual* field separator
 (read from MSH) and replaces whole fields — surrogate values never contain a field separator.
@@ -20,7 +21,13 @@ Never string-slices in the forbidden sense: it splits only on the message's *act
 from __future__ import annotations
 
 from .keying import Keyer
-from .rules import AnonError, FieldRule, SurrogateKind
+from .rules import (
+    HEADER_SEGMENTS,
+    AnonError,
+    FieldRule,
+    SurrogateKind,
+    _refuse_unwritable_rules,
+)
 from .surrogates import (
     Seps,
     normalized_message,
@@ -34,45 +41,6 @@ from .surrogates import (
 
 def _segment_id(path: str) -> str:
     return path.split("-", 1)[0]
-
-
-#: The lowest field number a rule may rewrite: 1 in any segment, because field 0 is the segment
-#: id, and 3 in MSH, because MSH-1 and MSH-2 hold the message's own delimiters. With either of
-#: those rewritten the output has no readable header, and the leak-check has no separators to
-#: walk it with.
-_FIRST_REWRITABLE_FIELD = 1
-_FIRST_REWRITABLE_MSH_FIELD = 3
-
-
-def _refuse_unwritable_rules(rules: tuple[FieldRule, ...]) -> None:
-    """Refuse a rule set that would rewrite a segment id, MSH-1 or MSH-2 (a body-free
-    :class:`AnonError`).
-
-    The field number is read with ``int()``, the way the adapters read it, so ``MSH-02`` and a
-    path with a stray space or newline are refused like ``MSH-2``. A path whose number ``int()``
-    cannot read is not a whole-field address, and it is not this check's to refuse.
-    ``FieldRule`` refuses every path that is not a whole-field address when the rule is built,
-    field 0 and ``MSH-02`` included (BACKLOG #2330). So for those spellings this check is a
-    second line, and for ``MSH-1`` and ``MSH-2`` it is the only one. A ``KEEP`` rewrites
-    nothing, so it is allowed. The same check runs in both adapters (BACKLOG #2265)."""
-    named: set[str] = set()
-    for rule in rules:
-        if rule.kind == SurrogateKind.KEEP:
-            continue
-        segment, _, number = rule.path.partition("-")
-        try:
-            field = int(number)
-        except ValueError:
-            continue
-        is_msh = segment.upper() == "MSH"
-        if field < (_FIRST_REWRITABLE_MSH_FIELD if is_msh else _FIRST_REWRITABLE_FIELD):
-            named.add(f"{segment}-{field}")
-    if named:
-        raise AnonError(
-            f"a rule names {', '.join(sorted(named))}, which no rule can rewrite: field 0 is the "
-            "segment id, and MSH-1 and MSH-2 hold the message's delimiters. Repair or remove a "
-            "later MSH line that carries data there. Refusing to emit"
-        )
 
 
 def _field_num(path: str) -> int:
@@ -104,10 +72,12 @@ def anonymize_message(
     for rule in rules:
         seg_id = _segment_id(rule.path)
         # An MSH rule applies to EVERY MSH line, as on the engine side: the leak-check counts an
-        # MSH-N rule's field as scrubbed, so it must be (BACKLOG #2265). MSH-1 is the field
-        # separator itself, so MSH-N sits one split index lower than any other segment's field N.
+        # MSH-N rule's field as scrubbed, so it must be (BACKLOG #2265). Field 1 of a header
+        # segment (MSH, BHS, FHS) is the field separator itself, so its field N sits one split
+        # index lower than any other segment's field N. The engine's parser and the leak-check
+        # number all three that way (BACKLOG #2998).
         is_msh = seg_id == "MSH"
-        index = _field_num(rule.path) - (1 if is_msh else 0)
+        index = _field_num(rule.path) - (1 if seg_id in HEADER_SEGMENTS else 0)
         for fields in segments:
             if fields[0] != seg_id and not (is_msh and fields is header):
                 continue

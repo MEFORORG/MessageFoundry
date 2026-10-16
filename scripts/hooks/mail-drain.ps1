@@ -175,6 +175,22 @@
     verifies its own. Do not open-code a move in this file. The measurement is in
     docs/adr/0161-async-session-mail-for-unreachable-peers.md.
 
+    THE INPUT IS READ AS UTF-8, because its `cwd` is the address. The desktop app starts a worktree
+    session's hooks in the PRIMARY checkout (measured 2026-10-12), so the payload `cwd` is the only
+    thing naming the worktree, and this script already used it. But it read stdin through
+    [Console]::In, which decodes with the console code page. Measured the same week, that turns a UTF-8
+    `cafe` with an acute e into `caf` plus two box-drawing characters. git then finds no repository at
+    that path and the drain exits silent, so that worktree's mail is never shown. The read now goes
+    through scripts/hooks/_hookinput.ps1.
+
+    WHICH BOX IS THE SESSION'S follows the rules in scripts/hooks/_hookinput.ps1: after a `cd`, the
+    box of the worktree the session started in, never the sibling's or another repository's.
+
+    A `cwd` THOSE RULES REFUSE READS NO BOX, and neither does a missing helper. Either says "NO BOX
+    ... NOTHING WAS READ", once per $NO_BOX_COOLDOWN_MINUTES and only past the OFF switch, because
+    silence there reads as an empty box, and any other box would be another session's mail for this
+    session's Stop to file.
+
     ASCII-only on purpose; run under pwsh 7 by the hook.
 #>
 
@@ -213,6 +229,7 @@ $ErrorActionPreference = 'SilentlyContinue'
 # The send-time check in mail.ps1 is advisory only: anyone who can write a file into the inbox skips
 # it entirely. The numbers and the reasoning that anchors them are in docs/SESSION-MAIL.md,
 # "Receiver-side caps"; these constants are the ENFORCING copy.
+$NO_BOX_COOLDOWN_MINUTES = 30  # how often a session is told its box could not be found
 $MAX_MESSAGES = 5       # rendered per injection
 $MAX_BODY_BYTES = 2000  # per message body, measured AFTER the sanitiser has scrubbed it to ASCII
 # 12800 = MAX_MESSAGES * (MAX_BODY_BYTES + FRAME_OVERHEAD_BYTES), AND THAT ARITHMETIC IS THE FIX FOR
@@ -694,10 +711,33 @@ function Test-ReceiptProtected {
 
 try {
     # --- Read the hook input. It carries session_id and cwd, which is our whole addressing substrate.
+    # As UTF-8 bytes through the shared helper; see the header for what the console decoder did.
+    # Tested for first: under SilentlyContinue a dot-source of a missing file does not throw.
     $stdinRaw = ''
-    if ([Console]::IsInputRedirected) { $stdinRaw = [Console]::In.ReadToEnd() }
+    $cwdFault = ''
+    $hookInput = Join-Path $PSScriptRoot '_hookinput.ps1'
+    $hasHelper = $false
+    try {
+        if (-not (Test-Path -LiteralPath $hookInput -PathType Leaf)) { throw 'scripts/hooks/_hookinput.ps1 is missing beside this hook' }
+        . $hookInput
+        $hasHelper = $true
+    } catch { $cwdFault = "the drain could not load its input reader ($($_.Exception.Message))" }
+    # The session's box is the worktree it STARTED in. A `cwd` that a `cd` moved into a sibling or
+    # another repository falls back to it (scripts/hooks/_hookinput.ps1), because any other box is
+    # another session's mail, which this session's Stop would then file as read.
+    $session = $null
+    if ($hasHelper) {
+        $stdinRaw = Read-CcxHookInput
+        # Read-only: this drain writes nowhere outside its mail root; the SessionStart hooks pin. A cwd
+        # in no checkout is the -AnchorRepo case, not a fault: the queue below is located from the
+        # anchor and the box keyed on that cwd, as before.
+        $session = Resolve-CcxHookSession -Text $stdinRaw -ReadOnly -AllowOutside
+        $cwdFault = $session.Reason
+    }
+    elseif ([Console]::IsInputRedirected) { try { $stdinRaw = [Console]::In.ReadToEnd() } catch { $stdinRaw = '' } }
     $hook = $null
-    try { $hook = $stdinRaw | ConvertFrom-Json } catch { }
+    if ($session) { $hook = $session.Payload }
+    else { try { $hook = $stdinRaw | ConvertFrom-Json } catch { } }
     # THE FALLBACK IS NOW LOAD-BEARING, not arbitrary. A payload with no hook_event_name must default to
     # a NON-CONSUMING event, because the default decides what happens to mail when the drain cannot tell
     # what woke it.
@@ -715,7 +755,9 @@ try {
     # rather than by inference. Adding a member is a measurement, not an edit.
     $consuming = ($eventName -eq 'Stop')
 
-    $cwd = if ($hook -and $hook.cwd) { [string]$hook.cwd } else { (Get-Location).Path }
+    # With a fault there is no session directory, so the queue is located from where the drain runs,
+    # only to reach the OFF switch and the NO BOX notice below. No box is read from it.
+    $cwd = if ($session -and $session.Dir) { [string]$session.Dir } else { (Get-Location).Path }
 
     # --- Locate the queue. Outside a repo this is not our business unless the caller passed an
     # anchor; say nothing and go.
@@ -755,6 +797,35 @@ try {
             "[mefor-mail] SUPPRESSED as of ${asOf}: the OFF switch is present at mefor-coord/mail/OFF. " +
             "Mail is still being queued and is NOT lost; it is not being shown. Remove that file to resume."
         )
+        exit 0
+    }
+
+    # --- NO BOX, AND SAID. The input named a directory the drain cannot use, with no starting worktree
+    # to fall back to, or the drain could not read the input as UTF-8. Showing any other box here would
+    # be showing another session's mail, and on Stop this session would then file it as read. So
+    # nothing is read, and the reader is told that this silence is not an empty box.
+    #
+    # AFTER the OFF switch and the mail-root check, so OFF still silences it and a repository with no
+    # mail says nothing. ONCE PER $NO_BOX_COOLDOWN_MINUTES FOR EACH SESSION, not at every SessionStart
+    # and Stop: a fault that persists would otherwise end every turn with this line. The stamp is
+    # outside the mail root, which the receipt sweep owns. A stamp that cannot be read or written
+    # means the line is said: noise is the safe failure of a silencer.
+    if ($cwdFault) {
+        # Per session AND per queue, so one repository's notice never silences another's. Without the
+        # helper there is no throttle, and the line is said every time.
+        $who = if ($sessionId) { 'sid:' + $sessionId } elseif ($hook -and $hook.cwd) { 'cwd:' + [string]$hook.cwd } else { 'reader:' + $PSScriptRoot }
+        $emit = $true
+        if ($hasHelper) {
+            $emit = Test-CcxSayOnce -Key "$who|$root" -Minutes $NO_BOX_COOLDOWN_MINUTES `
+                -Dir (Join-Path ([System.IO.Path]::GetTempPath()) 'mefor-mail-nobox')
+        }
+        if ($emit) {
+            Write-Injection -Event $eventName -Text (
+                "[mefor-mail] NO BOX. $((Get-Clean $cwdFault 300)), so this drain cannot tell which box is this " +
+                "session's and NOTHING WAS READ. This is not an empty box. As of ${asOf}. " +
+                "Said once per $NO_BOX_COOLDOWN_MINUTES minutes while it lasts."
+            )
+        }
         exit 0
     }
 

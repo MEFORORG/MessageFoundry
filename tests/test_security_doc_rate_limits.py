@@ -1774,7 +1774,12 @@ def _limiter_accessors() -> dict[str, str]:
 #: business failure. The narrow ``*FullError`` rule this widens missed the JWKS amplification bound
 #: entirely — ``JwksCache`` raises a plain ``JwksError``, so the completeness lock could not see that
 #: control 7's sibling on the OIDC *callback* leg had no row.
-_BOUND_MARKERS = ("bound", "throttled", "exceeds", "cap", "too many", "full")
+#: Each marker matches from the start of a word, with its inflections. As a bare substring, ``cap``
+#: matched inside "escape", so an LDAPS refusal reading "no escape" was taken for an
+#: anti-automation bound (vault BACKLOG #3230). The stems keep "exceeded", "bounded" and "throttle".
+_BOUND_MARKER_RE = re.compile(
+    r"\b(?:bound\w*|throttl\w*|exceed\w*|cap(?:s|ped|acity)?|too many|full)\b"
+)
 
 
 def _bounded_caches() -> set[str]:
@@ -1807,11 +1812,18 @@ def _bounded_caches() -> set[str]:
                         for part in ast.walk(sub.exc)
                         if isinstance(part, ast.Constant) and isinstance(part.value, str)
                     ).lower()
-                    if sub.exc.func.id.endswith("FullError") or any(
-                        marker in message for marker in _BOUND_MARKERS
-                    ):
+                    if sub.exc.func.id.endswith("FullError") or _BOUND_MARKER_RE.search(message):
                         found.add(node.name)
     return found
+
+
+def test_bound_markers_match_whole_words_only() -> None:
+    """A marker inside a longer word is not a bound: "escape" holds ``cap`` and bounds nothing."""
+    assert _BOUND_MARKER_RE.search("the pending-flow cap is reached")
+    assert _BOUND_MARKER_RE.search("jwks body exceeds the bound")
+    assert _BOUND_MARKER_RE.search("request rate exceeded; capacity reached")
+    assert not _BOUND_MARKER_RE.search("refused, with no escape")
+    assert not _BOUND_MARKER_RE.search("an unbounded capability, used fully")
 
 
 def _derived_protection_seams() -> dict[str, str]:

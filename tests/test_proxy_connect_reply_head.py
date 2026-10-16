@@ -363,7 +363,10 @@ def vault_session() -> Iterator[Any]:
     with requests.Session() as session:
         session.trust_env = False
         adapter = StrictReplyAdapter(
-            connector="Vault test hop", ssl_context_factory=ssl.create_default_context
+            connector="Vault test hop",
+            ssl_context_factory=ssl.create_default_context,
+            revocation_attested=True,
+            attestation_section="secrets",
         )
         session.mount("https://", adapter)
         session.mount("http://", adapter)

@@ -45,11 +45,11 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from tee import __version__, mefor_api
+from tee import __version__, mefor_api, mllp
 from tee.anon import anonymize_checked
 from tee.anon.keying import Keyer
 from tee.anon.leak import CoverageTally
-from tee.anon.rules import RuleError, kept_defaults, load_rules
+from tee.anon.rules import AnonError, RuleError, kept_defaults, load_rules, retargeted_defaults
 from tee.correlate import CorepointOutput, CorrelateConfig
 from tee.relay import Endpoint, RelayConfig, TeeRelay
 from tee.report import build_report
@@ -327,7 +327,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--require-full-coverage",
         action="store_true",
         help="refuse any field no rule scrubs and no anon.toml keep names (set ids, PID-8 and "
-        "PV1-2 excepted); off by default",
+        "PV1-2 excepted), and any line holding only a segment id unless a rule or a keep names "
+        "a field of that segment; off by default",
     )
     anon.add_argument(
         "--log-level",
@@ -580,20 +581,6 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    store = await RelayStore.open(args.db)
-    try:
-        rows = await store.captures(
-            direction=args.direction, since=args.since, before=args.before, limit=args.limit
-        )
-    finally:
-        await store.close()
-    if not rows:
-        print(
-            f"error: no captured bodies for direction={args.direction!r} in {args.db} — run the "
-            "relay with --capture-bodies or --capture-corepoint-copy",
-            file=sys.stderr,
-        )
-        return 1
 
     overlay = Path(args.overlay) if args.overlay else None
 
@@ -617,6 +604,25 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
     except RuleError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+    # The store is read AFTER both checks above. Read before them, a run with no captured bodies
+    # returned here and never read the overlay, so a bad one stayed hidden until a run that had
+    # bodies (BACKLOG #3003).
+    store = await RelayStore.open(args.db)
+    try:
+        rows = await store.captures(
+            direction=args.direction, since=args.since, before=args.before, limit=args.limit
+        )
+    finally:
+        await store.close()
+    if not rows:
+        print(
+            f"error: no captured bodies for direction={args.direction!r} in {args.db} — run the "
+            "relay with --capture-bodies or --capture-corepoint-copy",
+            file=sys.stderr,
+        )
+        return 1
+
     # Printed, not only logged by load_rules: --log-level ERROR hides that WARNING, and a keep
     # that turns off a default scrub must not be hidden. Addresses and kinds only (BACKLOG #2268).
     kept = kept_defaults(rules)
@@ -625,6 +631,20 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
             "warning: the overlay keeps "
             + ", ".join(f"{rule.path} ({rule.kind.value})" for rule in kept)
             + ", which turns off the default scrub of each: those fields are not rewritten",
+            file=sys.stderr,
+        )
+    # Printed for the same reason. A different kind can leave part of a field in the dataset
+    # while the leak-check counts the field as scrubbed (BACKLOG #3000).
+    retargeted = retargeted_defaults(rules)
+    if retargeted:
+        print(
+            "warning: the overlay retargets "
+            + ", ".join(
+                f"{default.path} ({default.kind.value} to {now.kind.value})"
+                for default, now in retargeted
+            )
+            + ", which replaces the default scrub of each: a different kind can leave part of "
+            "the field as captured",
             file=sys.stderr,
         )
 
@@ -641,12 +661,28 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
                 require_full_coverage=args.require_full_coverage,
                 on_report=coverage.add,
             )
-        except Exception:  # fail closed on ANY anonymizer error — never surface/emit the body
-            failed += 1  # it is a count, not a leak (LeakError, AnonError, or anything else)
+        except AnonError:
+            # Counted apart from the rest: anonymize refused the message before the leak-check
+            # built a report, so the coverage line would not show it at all (BACKLOG #3004).
+            # The error's text is not printed; the summary names the count and fixed causes.
+            coverage.refuse()
+            failed += 1
             continue
+        except Exception:  # fail closed on ANY anonymizer error — never surface/emit the body
+            failed += 1  # it is a count, not a leak (LeakError, or anything else)
+            continue
+        # The id is read from the anonymized body, with the reader the relay used for row.control_id,
+        # so it follows the rules; it is None when that body has no MSH-10. received_at is the
+        # relay's real receive time, which no MSH-7 rule touches (BACKLOG #2994). The surrogates
+        # are ASCII today, but this runs outside the catch above, so a character latin-1 cannot
+        # hold must give None rather than end the run.
+        try:
+            control_id, _ = mllp.peek_fields(anon.encode("latin-1"))
+        except UnicodeEncodeError:
+            control_id = None
         lines.append(
             json.dumps(
-                {"control_id": row.control_id, "raw": anon, "received_at": row.at},
+                {"control_id": control_id, "raw": anon, "received_at": row.at},
                 ensure_ascii=False,
             )
         )
@@ -658,11 +694,18 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
     else:
         print(coverage.summary(), file=sys.stderr)
     if failed:
+        before_check = (
+            f"{coverage.refused} of them were refused before the leak-check, as the coverage "
+            "line says. "
+            if coverage.refused
+            else ""
+        )
         print(
             f"error: {failed} of {len(rows)} message(s) failed anonymization, still carried a "
             "forbidden token or had a field nobody decided — refusing to write a dataset (fail "
-            "closed). Extend the rule map or add a keep in an anon.toml overlay, or repair lines "
-            "with a malformed segment id (no rule can reach one), then retry.",
+            f"closed). {before_check}Extend the rule map or add a keep in an anon.toml overlay, "
+            "or repair each line no rule can reach (a malformed segment id, or a header line "
+            "with no separator after its encoding characters), then retry.",
             file=sys.stderr,
         )
         return 1

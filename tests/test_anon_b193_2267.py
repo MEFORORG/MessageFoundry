@@ -83,13 +83,16 @@ def _run(db: str, out: Path, *extra: str) -> int:
 @pytest.mark.parametrize(
     ("body", "reason"),
     [
-        ('[hl7]\nkeep = ["PID-5"\n', "invalid TOML at line 3, column 1"),
+        # The parser's own answer is line 3 of a two-line file (BACKLOG #3003).
+        ('[hl7]\nkeep = ["PID-5"\n', "invalid TOML at the end of the file, line 2"),
         (b'[hl7]\nkeep = ["EVN-1"]\n# \xff\xfe\n', "UTF-8"),
         ('[hl7]\nkeep = ["PID-5.1"]\n', "PID-5.1"),
         ("[fhir]\n", "fhir"),
         (None, "cannot read anon overlay"),
+        # Every row would fail on this rule, so it must refuse the run, not the rows (#2997).
+        ('[hl7]\ndrop = ["MSH-2"]\n', "sets a rule on MSH-2"),
     ],
-    ids=["malformed", "not-utf8", "component-path", "unknown-table", "missing"],
+    ids=["malformed", "not-utf8", "component-path", "unknown-table", "missing", "unwritable-rule"],
 )
 def test_a_bad_overlay_refuses_the_run_once(
     body: str | bytes | None,
@@ -174,10 +177,52 @@ def test_keeping_a_default_scrubbed_field_is_printed(
     assert "DOE" not in line
 
 
+def test_retargeting_a_default_scrubbed_field_is_printed(
+    db: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # PID-5 pointed at the id kind rewrites the family name only (BACKLOG #3000).
+    overlay = _overlay(
+        tmp_path, '[hl7]\nkeep = ["EVN-1"]\n[hl7.fields]\n"PID-5" = "id"\n"PID-7" = "date"\n'
+    )
+    out = tmp_path / "ds.jsonl"
+
+    assert _run(db, out, "--overlay", overlay) == 0
+
+    # Once for the run, naming each field, the kind it had and the kind it has now.
+    (line,) = _warnings(capsys.readouterr().err)
+    assert "PID-5 (name to id)" in line
+    assert "PID-7 (dob to date)" in line
+    assert "EVN-1" not in line
+    # What the warning is about: the given name really is in the dataset, and the run passed.
+    dataset = out.read_text(encoding="utf-8")
+    assert "^JOHN" in dataset
+    assert "DOE" not in dataset
+    assert "JOHN" not in line
+
+
+def test_a_keep_and_a_retarget_each_get_a_line(
+    db: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    overlay = _overlay(tmp_path, '[hl7]\nkeep = ["PID-7"]\n[hl7.fields]\n"PID-5" = "id"\n')
+
+    assert _run(db, tmp_path / "ds.jsonl", "--overlay", overlay) == 0
+
+    keeps, retargets = _warnings(capsys.readouterr().err)
+    assert "keeps PID-7 (dob)" in keeps
+    assert "retargets PID-5 (name to id)" in retargets
+
+
 @pytest.mark.parametrize(
     "extra_body",
-    [None, '[hl7]\nkeep = ["EVN-1"]\n', '[hl7.fields]\n"ZPD-2" = "mrn"\n'],
-    ids=["no-overlay", "keep-unmapped", "add-a-rule"],
+    [
+        None,
+        '[hl7]\nkeep = ["EVN-1"]\n',
+        '[hl7.fields]\n"ZPD-2" = "mrn"\n',
+        # A retarget to the default's own kind changes nothing, and a drop blanks the field.
+        '[hl7.fields]\n"PID-5" = "name"\n',
+        '[hl7]\ndrop = ["PID-5"]\n',
+    ],
+    ids=["no-overlay", "keep-unmapped", "add-a-rule", "same-kind", "drop-a-default"],
 )
 def test_no_default_scrub_lost_means_no_warning(
     extra_body: str | None, db: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -191,10 +236,17 @@ def test_no_default_scrub_lost_means_no_warning(
     assert "DOE" not in out.read_text(encoding="utf-8")
 
 
-def test_the_keep_warning_reaches_real_stderr_at_every_log_level(db: str, tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "body",
+    ['[hl7]\nkeep = ["PID-5"]\n', '[hl7.fields]\n"PID-5" = "id"\n'],
+    ids=["keep", "retarget"],
+)
+def test_the_overlay_warning_reaches_real_stderr_at_every_log_level(
+    body: str, db: str, tmp_path: Path
+) -> None:
     # A print, not only a log line: --log-level ERROR hides the loader's WARNING and must not
     # hide this. The CLI's own logging setup runs here, which the in-process tests switch off.
-    overlay = _overlay(tmp_path, '[hl7]\nkeep = ["PID-5"]\n')
+    overlay = _overlay(tmp_path, body)
     env = {**os.environ, "MEFOR_ANON_SALT": _SALT}
     cmd = [sys.executable, "-m", "tee", "anonymize-captures", "--db", db, "--overlay", overlay]
 

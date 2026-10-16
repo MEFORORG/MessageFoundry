@@ -40,6 +40,7 @@ import threading
 import time
 from collections.abc import (
     AsyncIterator,
+    Awaitable,
     Callable,
     Collection,
     Iterable,
@@ -84,6 +85,20 @@ from messagefoundry.store.base import (
     warm_pool_target,
     warn_stale_schema_read_only,
 )
+from messagefoundry.store.cell_tag import (
+    CellTagError,
+    audits_cell_tag,
+    dead_letters_on_cell_tag,
+    is_row_tagged,
+    message_cell_aad,
+    open_message_cell,
+    open_preset_criteria,
+    preset_criteria_aad,
+    report_cell_tag_failures,
+    row_tag_aad,
+    row_tag_columns,
+    withhold_message_cells,
+)
 from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
@@ -97,7 +112,7 @@ from messagefoundry.store.crypto import (
     cell_aad,
     cipher_info,
     decrypt_json_cell,
-    report_unmarked,
+    report_sealed_surface,
     rotation_fingerprint_key,
 )
 from messagefoundry.store.document_strip import StripResult, cutoff_for
@@ -134,7 +149,13 @@ from messagefoundry.store.queue_tag import (
     queue_row_aad,
     report_queue_tag_failure,
 )
-from messagefoundry.store.row_seal import SESSION_KIND, RowSealer, RowSealError
+from messagefoundry.store.row_seal import (
+    SEAL_PREFIX,
+    SESSION_KIND,
+    USER_KIND,
+    RowSealer,
+    RowSealError,
+)
 from messagefoundry.store.sealed_cache import (
     new_reference_set,
     new_state_cache,
@@ -143,28 +164,32 @@ from messagefoundry.store.sealed_cache import (
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
-    _BUMP_SESSION_EPOCH_SQL,
     _SESSION_CAP_ORDER_SQL,
     _SESSION_CAP_RANK_NOT_AHEAD_SQL,
     _SESSION_INSERT,
     _SESSION_LIVE_SQL,
     _SESSION_NOT_AHEAD_SQL,
-    _SQL_ADMIN_GUARD_COUNTS,
+    _SQL_ADMIN_GUARD_HOLDERS,
+    _USER_ROLE_INSERT,
+    _USER_ROLES_CLEAR,
+    _WEBAUTHN_INSERT,
+    AD_MAPS,
+    AD_ROLE_MAP,
+    AD_SCOPE_MAP,
     AUDIT_KEY_EPOCH_ACTION,
-    FULL_AUTHENTICATION_LOCKOUT_CLEAR,
-    LOCKOUT_COLUMNS,
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
-    PASSWORD_CHANGE_LOCKOUT_CLEAR,
     REINGRESS_TARGET_PREFIX,
-    SCOPE_SOURCE_AD,
-    SCOPE_SOURCE_MANUAL,
     TRANSIT_ATTESTATION_COLUMNS,
     VIEWED_EVENT,
+    AdMap,
+    AdMapChange,
+    AdMapSql,
     AdminRemoval,
     AlertInstance,
     AlertSummary,
     AppendedAuditRow,
+    ApprovalRow,
     AuditAppend,
     AuditedWrite,
     AuditVerdict,
@@ -202,10 +227,15 @@ from messagefoundry.store.store import (
     ResendSourceAmbiguous,
     ResendSourceEmpty,
     ResendSourceNotFound,
+    RoleGrant,
+    RoleRow,
     SecretRotationMetaRow,
     SessionRecord,
     Stage,
+    UserAuthzRecord,
+    UserChange,
     UserRecord,
+    UserRow,
     WebAuthnCredential,
     _alert_summary,
     _append_channel_scope,
@@ -217,6 +247,9 @@ from messagefoundry.store.store import (
     _session_cap_groups,
     _session_live_params,
     _transit_attestation_row,
+    ad_map_write,
+    admin_guard_counts,
+    approval_update,
     audit_append_refusal,
     audit_append_secret,
     audit_seal_next,
@@ -225,33 +258,62 @@ from messagefoundry.store.store import (
     check_caller_event_kind,
     check_password_generated,
     delivery_key,
+    existing_roles_only,
+    federated_bind,
+    federated_unbind,
+    first_sealed_approval,
+    full_authentication_clear,
     load_audit_chain,
-    lockout_arms,
-    lockout_clear_set,
-    lockout_escalates,
+    lockout_clear,
+    lockout_increment,
     mfa_stamp,
+    new_approval_row,
     new_session_record,
-    next_lockout_state,
+    new_user_record,
     not_deployed_detail,
     operator_audits,
     owned_lane_scope,
-    password_claim_set,
+    passkey_digest,
+    password_change,
     read_transit_bound_attestation_rows,
     reauth_stamp,
+    recovery_code_spend,
+    report_approval_reseal,
+    report_refused_ad_role_map,
+    report_refused_role_holder,
+    report_role_reseal,
+    report_unsealed_approvals,
+    report_unsealed_role_records,
+    report_unsealed_users,
+    report_user_reseal,
     require_notify_email,
+    role_seal_ok,
     roll_audit_key_range,
-    rotation_factor_term,
+    rotation_reseal,
+    scope_if_source,
+    scope_withdrawal,
+    seal_approval,
+    seal_role,
     seal_session,
+    seal_user,
     session_insert_params,
     session_reseal_params,
     session_seal_ok,
     settle_transit_bound_attestation,
     should_record_event,
     tee_audits,
-    totp_enable_term,
+    totp_disable,
+    totp_enable,
+    totp_replace,
+    totp_step_spend,
     transit_attested_audit,
     transit_withdrawn_audit,
+    user_insert_params,
+    user_reseal_params,
+    user_seal_ok,
     verify_audit_rows,
+    webauthn_insert_params,
+    without_role,
 )
 from messagefoundry.store.transit_attestation import TransitBoundAttestation
 from messagefoundry.support.redact import redact_log_line
@@ -502,6 +564,45 @@ _CIPHER_MERGE_ATTEMPTS = 5
 _CIPHER_MERGE_BACKOFF = 0.05
 
 
+async def _retry_idempotent_merge[T](
+    op: Callable[[], Awaitable[T]], *, on_retry: Callable[[], Awaitable[None]] | None = None
+) -> T:
+    """Run an IDEMPOTENT insert-if-absent MERGE, retrying a transient write conflict with backoff.
+
+    Only for a statement a re-run cannot double-apply; an increment such as
+    :meth:`SqlServerStore.add_cipher_invocations` needs its own no-double-count guard instead.
+    ``on_retry`` runs before each re-issue, for a caller whose transaction must be rolled back."""
+    for attempt in range(1, _CIPHER_MERGE_ATTEMPTS + 1):
+        try:
+            return await op()
+        except Exception as exc:
+            if not _is_transient_write_conflict(exc) or attempt == _CIPHER_MERGE_ATTEMPTS:
+                raise
+            log.debug(
+                "insert-if-absent MERGE hit a %s, attempt %d of %d; retrying",
+                "lock timeout (HYT00)" if "HYT00" in str(exc) else "deadlock (1205)",
+                attempt,
+                _CIPHER_MERGE_ATTEMPTS,
+            )
+        if on_retry is not None:
+            await on_retry()
+        await asyncio.sleep(_CIPHER_MERGE_BACKOFF * attempt)
+    raise AssertionError("unreachable: the last attempt returns or raises")
+
+
+# BACKLOG #3383: write a surface's `keyed_surface` marker unless it exists. HOLDLOCK makes the
+# insert-if-absent safe under concurrent opens, as for `store_salt`. The OUTPUT row says whether this
+# statement wrote the marker; `cursor.rowcount` can read -1 here.
+_MERGE_KEYED_MARKER = (
+    "MERGE keyed_surface WITH (HOLDLOCK) AS t"
+    " USING (SELECT ? AS surface_table, ? AS surface_column, ? AS keyed_at) AS s"
+    " ON t.surface_table = s.surface_table AND t.surface_column = s.surface_column"
+    " WHEN NOT MATCHED THEN INSERT (surface_table, surface_column, keyed_at)"
+    " VALUES (s.surface_table, s.surface_column, s.keyed_at)"
+    " OUTPUT inserted.surface_table;"
+)
+
+
 # The lane column is NVARCHAR(256); a longer requested lane name can never match a real lane. On
 # the ADR 0114 proc path the lane list rides one JSON parameter through a server-side CAST — a
 # TRUNCATING cast could make an oversized name's prefix match a REAL lane, a shard-safety contract
@@ -579,16 +680,6 @@ def _encode_proc_lanes(lanes: Sequence[str]) -> str:
     return json.dumps(_keep_matchable_lanes(lanes))
 
 
-#: The SQL Server form of ``store.WITHDRAW_AD_SCOPE_SQL`` (BACKLOG #1927). Same binds, in the same
-#: order; ``withdraw_ad_channel_scope`` says why it differs.
-_WITHDRAW_AD_SCOPE_SQL_MSSQL = (
-    "UPDATE users SET channel_scope=NULL, channel_scope_source=?, updated_at=?"
-    " WHERE id=? AND channel_scope COLLATE Latin1_General_100_BIN2"
-    " = CAST(? AS NVARCHAR(MAX)) COLLATE Latin1_General_100_BIN2"
-    " AND (channel_scope_source IS NULL OR channel_scope_source <> ?)"
-)
-
-
 def _claim_proc_param_pins() -> list[tuple[int, int, int]]:
     """The 9 fixed parameter-descriptor pins for the claim procs' ``{CALL}``, in signature order
     (ADR 0114 §4): @now FLOAT, @stage NVARCHAR(16), @k INT, @pending/@inflight NVARCHAR(32),
@@ -635,6 +726,104 @@ _MSSQL_SESSION_RESEAL: Final = (
 _MSSQL_REVOKE_USER_SESSIONS_SQL: Final = (
     "UPDATE sessions SET revoked_at=?, seal='' OUTPUT inserted.token_hash"
     " WHERE user_id=? AND revoked_at IS NULL"
+)
+#: store.py's ``_USER_INSERT``, the sealed user record's one INSERT (BACKLOG #2592). Spelled here
+#: rather than imported so this module's own text shows it writes ``users``, whose ``totp_secret``
+#: cell the cipher sweeps must reach (``tests/test_store_cipher_sweep_parity.py`` reads the text).
+#: Used only by ``create_user``.
+_MSSQL_USER_INSERT: Final = (
+    "INSERT INTO users (id, username, auth_provider, display_name, email, notify_email, disabled,"
+    " created_at, updated_at, last_login_at, password_hash, password_changed_at,"
+    " must_change_password, failed_attempts, locked_until, channel_scope, totp_secret,"
+    " totp_enabled, totp_enrolled_at, totp_recovery_codes, last_totp_step, oidc_issuer,"
+    " oidc_subject, directory_object_id, password_claimed_at, channel_scope_source, lock_cycles,"
+    " second_step_failed_attempts, second_step_locked_until, second_step_lock_cycles,"
+    " password_generated, session_epoch, cred_digest, authz_seal)"
+    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+)
+#: store.py's ``_USER_RESEAL`` reporting through ``OUTPUT`` (BACKLOG #2592), which a session-wide
+#: ``SET NOCOUNT ON`` cannot hide (BACKLOG #2283). Used only by ``_write_user``.
+_MSSQL_USER_RESEAL: Final = (
+    "UPDATE users SET username=?, auth_provider=?, display_name=?, email=?, notify_email=?,"
+    " disabled=?, created_at=?, updated_at=?, last_login_at=?, password_hash=?,"
+    " password_changed_at=?, must_change_password=?, failed_attempts=?, locked_until=?,"
+    " channel_scope=?, totp_secret=?, totp_enabled=?, totp_enrolled_at=?, totp_recovery_codes=?,"
+    " last_totp_step=?, oidc_issuer=?, oidc_subject=?, directory_object_id=?,"
+    " password_claimed_at=?, channel_scope_source=?, lock_cycles=?,"
+    " second_step_failed_attempts=?, second_step_locked_until=?, second_step_lock_cycles=?,"
+    " password_generated=?, session_epoch=?, cred_digest=?, authz_seal=?"
+    " OUTPUT inserted.id WHERE id=? AND authz_seal=?"
+)
+# The approval statements (BACKLOG #2592); store.py's twins state the contract. The writes are used
+# only by `_write_approval`.
+_MSSQL_APPROVAL_COLUMNS: Final = (
+    "id, operation, params, requester, requester_user_id, requested_at, status,"
+    " approver, decided_at, expires_at, claim_owner, seal"
+)
+_MSSQL_APPROVAL_INSERT: Final = (
+    "INSERT INTO pending_approvals (id, operation, params, requester, requester_user_id,"
+    " requested_at, status, approver, decided_at, expires_at, claim_owner, seal)"
+    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+)
+_MSSQL_APPROVAL_UPDATE: Final = (
+    "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?, claim_owner = ?,"
+    " seal = ? WHERE id = ? AND status = ? AND seal COLLATE Latin1_General_100_BIN2 = ?"
+)
+# The role write and the map seal write (BACKLOG #2592), each a MERGE under HOLDLOCK; store.py
+# states the contract. Used only by `_write_role` and `_write_ad_map`.
+_MSSQL_ROLE_MERGE: Final = (
+    "MERGE roles WITH (HOLDLOCK) AS t"
+    " USING (SELECT ? AS id, ? AS display_name, ? AS description, ? AS builtin,"
+    " ? AS permissions, ? AS seal) AS s"
+    " ON t.id=s.id"
+    " WHEN MATCHED THEN UPDATE SET display_name=s.display_name,"
+    " description=s.description, builtin=s.builtin, permissions=s.permissions, seal=s.seal"
+    " WHEN NOT MATCHED THEN INSERT (id, display_name, description, builtin, permissions, seal)"
+    " VALUES (s.id, s.display_name, s.description, s.builtin, s.permissions, s.seal);"
+)
+_MSSQL_SET_SEAL_MERGE: Final = (
+    "MERGE authority_set_seal WITH (HOLDLOCK) AS t"
+    " USING (SELECT ? AS name, ? AS seal) AS s ON t.name=s.name"
+    " WHEN MATCHED THEN UPDATE SET seal=s.seal"
+    " WHEN NOT MATCHED THEN INSERT (name, seal) VALUES (s.name, s.seal);"
+)
+# Each AD directory map's statements; store.py's twin states the contract.
+_MSSQL_AD_MAP_SQL: Final[Mapping[str, AdMapSql]] = MappingProxyType(
+    {
+        AD_ROLE_MAP: AdMapSql(
+            read=(
+                "SELECT N'seal' AS k, seal AS a, CAST(NULL AS NVARCHAR(256)) AS b, 1 AS live"
+                " FROM authority_set_seal WHERE name=?"
+                " UNION ALL"
+                " SELECT N'pair' AS k, m.ad_group AS a, m.role_id AS b,"
+                " CASE WHEN r.id IS NULL THEN 0 ELSE 1 END AS live"
+                " FROM ad_group_role_map m LEFT JOIN roles r ON r.id = m.role_id"
+            ),
+            pairs="SELECT ad_group, role_id FROM ad_group_role_map",
+            clear="DELETE FROM ad_group_role_map",
+            insert="INSERT INTO ad_group_role_map (ad_group, role_id) VALUES (?,?)",
+        ),
+        AD_SCOPE_MAP: AdMapSql(
+            read=(
+                "SELECT N'seal' AS k, seal AS a, CAST(NULL AS NVARCHAR(256)) AS b, 1 AS live"
+                " FROM authority_set_seal WHERE name=?"
+                " UNION ALL"
+                " SELECT N'pair' AS k, ad_group AS a, channel AS b, 1 AS live"
+                " FROM ad_group_scope_map"
+            ),
+            pairs="SELECT ad_group, channel FROM ad_group_scope_map",
+            clear="DELETE FROM ad_group_scope_map",
+            insert="INSERT INTO ad_group_scope_map (ad_group, channel) VALUES (?,?)",
+        ),
+    }
+)
+#: The passkey deletes, each counted from ``OUTPUT`` for the same reason.
+_MSSQL_WEBAUTHN_DELETE_ONE: Final = (
+    "DELETE FROM webauthn_credentials OUTPUT deleted.credential_id_hash"
+    " WHERE user_id=? AND credential_id_hash=?"
+)
+_MSSQL_WEBAUTHN_DELETE_ALL: Final = (
+    "DELETE FROM webauthn_credentials OUTPUT deleted.credential_id_hash WHERE user_id=?"
 )
 
 
@@ -706,7 +895,8 @@ _SQL_SELECT_MESSAGE_STATUS: Final[str] = (
 )
 _SQL_UPDATE_MESSAGE_STATUS: Final[str] = "UPDATE messages SET status=? WHERE id=?"
 _SQL_SELECT_MESSAGE_EXISTS: Final[str] = "SELECT 1 FROM messages WHERE id=?"
-_SQL_SELECT_METADATA: Final[str] = "SELECT metadata FROM messages WHERE id=?"
+# The channel rides along because the metadata cell is bound to it (BACKLOG #2593).
+_SQL_SELECT_METADATA: Final[str] = "SELECT channel_id, metadata FROM messages WHERE id=?"
 _SQL_UPDATE_METADATA: Final[str] = (
     "UPDATE messages SET metadata=? WHERE id=?"  # SetMeta merge (#150)
 )
@@ -1920,6 +2110,15 @@ _SCHEMA: list[str] = [
         id INT NOT NULL PRIMARY KEY CHECK (id = 1),
         salt VARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
         created_at FLOAT NOT NULL)""",
+    # The keyed-surface marker (BACKLOG #3383) -- see the SQLite `_SCHEMA` and
+    # `MessageStore._encrypt_existing_rows` for when a row is written and what it decides. One row per
+    # cipher-covered (table, column); never deleted by the engine. BIN2 so the code-constant names
+    # compare byte for byte. 128 is a SQL Server identifier's maximum length. Non-secret.
+    """IF OBJECT_ID('keyed_surface','U') IS NULL CREATE TABLE keyed_surface (
+        surface_table NVARCHAR(128) COLLATE Latin1_General_100_BIN2 NOT NULL,
+        surface_column NVARCHAR(128) COLLATE Latin1_General_100_BIN2 NOT NULL,
+        keyed_at FLOAT NOT NULL,
+        PRIMARY KEY (surface_table, surface_column))""",
     # The vault_transit AES-GCM bound attestation (BACKLOG #2337) -- see the SQLite `_SCHEMA`. One row
     # at most, written only by `store attest-transit-bound` with its audit row in the same
     # transaction. BIN2 on key_name, because Transit key names compare case-sensitively, byte for
@@ -1948,7 +2147,7 @@ _SCHEMA: list[str] = [
         requester_user_id NVARCHAR(64) NULL,
         requested_at FLOAT NOT NULL, status NVARCHAR(20) NOT NULL DEFAULT 'pending',
         approver NVARCHAR(256) NULL, decided_at FLOAT NULL, expires_at FLOAT NULL,
-        claim_owner NVARCHAR(512) NULL)""",
+        claim_owner NVARCHAR(512) NULL, seal NVARCHAR(256) NOT NULL DEFAULT '')""",
     # COL_LENGTH-gated ADD for a pre-existing pending_approvals table; a no-op on a fresh DB (the
     # CREATE above has it). This MUST live in _SCHEMA: `_schema_hash()` stores a content marker of
     # this batch, so an on-open migration placed anywhere else is skipped whenever the marker already
@@ -1960,6 +2159,11 @@ _SCHEMA: list[str] = [
     # "node:" plus a cluster node id (nodes.node_id is NVARCHAR(256)) always fits.
     """IF COL_LENGTH('pending_approvals','claim_owner') IS NULL
         ALTER TABLE pending_approvals ADD claim_owner NVARCHAR(512) NULL""",
+    # BACKLOG #2592: the request's integrity seal, guarded and in _SCHEMA for the reason above. An
+    # existing row gets an empty seal, which a keyed store refuses; store.py's
+    # report_unsealed_approvals says why.
+    """IF COL_LENGTH('pending_approvals','seal') IS NULL
+        ALTER TABLE pending_approvals ADD seal NVARCHAR(256) NOT NULL DEFAULT ''""",
     """IF INDEXPROPERTY(OBJECT_ID('pending_approvals'),'ix_pending_approvals_status','IndexID') IS NULL
         CREATE INDEX ix_pending_approvals_status ON pending_approvals(status, requested_at)""",
     # BACKLOG #1268: `username` carries the same binary collation as every other identifier column in
@@ -2008,7 +2212,11 @@ _SCHEMA: list[str] = [
         -- engine-generated; wrong passwords arm no sign-in lock then.
         password_generated BIT NOT NULL DEFAULT 0,
         -- BACKLOG #2592: raised by every whole-account session revoke.
-        session_epoch INT NOT NULL DEFAULT 0)""",
+        session_epoch INT NOT NULL DEFAULT 0,
+        -- BACKLOG #2592: the digest of the account's passkeys, and the integrity seal over the
+        -- account's row and role rows. Both written only by the store's user write helper.
+        cred_digest NVARCHAR(64) NOT NULL DEFAULT '',
+        authz_seal NVARCHAR(256) NOT NULL DEFAULT '')""",
     """IF COL_LENGTH('users','channel_scope') IS NULL
         ALTER TABLE users ADD channel_scope NVARCHAR(MAX) NULL""",
     # MFA (WP-14): TOTP columns ALTER-ed in for a pre-existing users table (idempotent).
@@ -2058,6 +2266,13 @@ _SCHEMA: list[str] = [
     # session's epoch matches, so the add signs nobody out.
     """IF COL_LENGTH('users','session_epoch') IS NULL
         ALTER TABLE users ADD session_epoch INT NOT NULL DEFAULT 0""",
+    # BACKLOG #2592: the passkey digest and the account's integrity seal, for a users table created
+    # before them. An existing account gets an empty seal, which a keyed store refuses like a wrong
+    # one; store.py's report_unsealed_users says why nothing seals it here.
+    """IF COL_LENGTH('users','cred_digest') IS NULL
+        ALTER TABLE users ADD cred_digest NVARCHAR(64) NOT NULL DEFAULT ''""",
+    """IF COL_LENGTH('users','authz_seal') IS NULL
+        ALTER TABLE users ADD authz_seal NVARCHAR(256) NOT NULL DEFAULT ''""",
     # BACKLOG #1256: RE-TYPE A PRE-EXISTING MAX COLUMN, WHICH THE COL_LENGTH-GATED ADDs ABOVE CANNOT
     # REACH. They fire only when the column is ABSENT, so a users table created before this change
     # keeps NVARCHAR(MAX) -- and a MAX column CANNOT BE AN INDEX KEY, so the index below would fail
@@ -2111,20 +2326,41 @@ _SCHEMA: list[str] = [
     """IF OBJECT_ID('roles','U') IS NULL CREATE TABLE roles (
         id NVARCHAR(64) NOT NULL PRIMARY KEY, display_name NVARCHAR(128) NOT NULL,
         description NVARCHAR(512) NULL, builtin BIT NOT NULL DEFAULT 1,
-        permissions NVARCHAR(MAX) NULL)""",
+        permissions NVARCHAR(MAX) NULL, seal NVARCHAR(256) NOT NULL DEFAULT '')""",
     # Custom RBAC roles (ADR 0045): roles.permissions on a pre-existing DB. COL_LENGTH-gated; NULL on
     # existing built-in rows = resolves from code (byte-identical). Idempotent.
     """IF COL_LENGTH('roles','permissions') IS NULL
         ALTER TABLE roles ADD permissions NVARCHAR(MAX) NULL""",
+    # BACKLOG #2592: a role's integrity seal. An existing custom role gets an empty seal and grants
+    # nothing until an administrator saves it again; store.py's report_unsealed_role_records says why.
+    """IF COL_LENGTH('roles','seal') IS NULL
+        ALTER TABLE roles ADD seal NVARCHAR(256) NOT NULL DEFAULT ''""",
+    # BACKLOG #2592: one integrity seal per directory map, over its sorted pairs.
+    """IF OBJECT_ID('authority_set_seal','U') IS NULL CREATE TABLE authority_set_seal (
+        name NVARCHAR(64) NOT NULL PRIMARY KEY, seal NVARCHAR(256) NOT NULL DEFAULT '')""",
     """IF OBJECT_ID('user_roles','U') IS NULL CREATE TABLE user_roles (
         user_id NVARCHAR(64) NOT NULL, role_id NVARCHAR(64) NOT NULL, assigned_at FLOAT NOT NULL,
         assigned_by NVARCHAR(256) NULL, CONSTRAINT pk_user_roles PRIMARY KEY (user_id, role_id))""",
+    # BACKLOG #2592: the role foreign key SQLite and Postgres already have, so a grant that commits
+    # while its custom role is deleted fails one of the two writes instead of leaving a sealed role
+    # row with no role behind it. WITH NOCHECK so a store already holding such a row still opens;
+    # the key still refuses every later write, and the user write path drops a left-behind row.
+    """IF OBJECT_ID('fk_user_roles_role','F') IS NULL
+        ALTER TABLE user_roles WITH NOCHECK
+            ADD CONSTRAINT fk_user_roles_role FOREIGN KEY (role_id) REFERENCES roles(id)""",
+    # The key's check on a role delete, and that delete's holder read, seek this index rather than
+    # scan every account's role rows under locking reads.
+    """IF INDEXPROPERTY(OBJECT_ID('user_roles'),'ix_user_roles_role','IndexID') IS NULL
+        CREATE INDEX ix_user_roles_role ON user_roles(role_id)""",
     """IF OBJECT_ID('ad_group_role_map','U') IS NULL CREATE TABLE ad_group_role_map (
-        ad_group NVARCHAR(256) NOT NULL, role_id NVARCHAR(64) NOT NULL,
-        CONSTRAINT pk_ad_group_role_map PRIMARY KEY (ad_group, role_id))""",
+        -- BACKLOG #3187: 512 is the API's canonical group-DN cap. NONCLUSTERED because the key,
+        -- 2 x (512 + 64) bytes, is past a clustered key's 900 and inside a nonclustered one's 1700.
+        ad_group NVARCHAR(512) NOT NULL, role_id NVARCHAR(64) NOT NULL,
+        CONSTRAINT pk_ad_group_role_map PRIMARY KEY NONCLUSTERED (ad_group, role_id))""",
     """IF OBJECT_ID('ad_group_scope_map','U') IS NULL CREATE TABLE ad_group_scope_map (
-        ad_group NVARCHAR(256) NOT NULL, channel NVARCHAR(256) NOT NULL,
-        CONSTRAINT pk_ad_group_scope_map PRIMARY KEY (ad_group, channel))""",
+        -- BACKLOG #3187: NONCLUSTERED for the same reason; this key is 2 x (512 + 256) bytes.
+        ad_group NVARCHAR(512) NOT NULL, channel NVARCHAR(256) NOT NULL,
+        CONSTRAINT pk_ad_group_scope_map PRIMARY KEY NONCLUSTERED (ad_group, channel))""",
     """IF OBJECT_ID('sessions','U') IS NULL CREATE TABLE sessions (
         token_hash NVARCHAR(64) NOT NULL PRIMARY KEY, user_id NVARCHAR(64) NOT NULL,
         created_at FLOAT NOT NULL, expires_at FLOAT NOT NULL, last_used_at FLOAT NOT NULL,
@@ -3306,6 +3542,10 @@ class SqlServerStore:
                 await store.checkpoint_cipher_invocations()
                 # Runs at EVERY keyed open: seals legacy plaintext on still-unsealed surfaces (#1169).
                 await store._encrypt_existing_rows()
+            if store._row_sealer is not None:
+                report_unsealed_users(await store.count_unsealed_users())
+                report_unsealed_role_records(await store.count_unsealed_role_records())
+                report_unsealed_approvals(await store.count_unsealed_approvals())
             # The audit chain's state, and on a fresh keyed store its genesis row (#2594). The
             # genesis append takes the audit applock and needs INSERT and SELECT only.
             await load_audit_chain(store, read_only=read_only)
@@ -3401,9 +3641,10 @@ class SqlServerStore:
 
     async def _encrypt_existing_rows(self) -> None:
         """Seal legacy plaintext in the cipher-covered columns when encryption is enabled (STORE-1),
-        one (table, column) surface at a time, each in ONE transaction. A surface that already holds
-        ciphertext is SEALED and its unmarked values are refused at read, not sealed (BACKLOG #1169).
-        The SQLite twin documents why; :meth:`_seal_surface` carries the mechanics."""
+        one (table, column) surface at a time, each in ONE transaction. A surface with its
+        ``keyed_surface`` marker, or one that already holds ciphertext, is SEALED and its unmarked
+        values are refused at read, not sealed (BACKLOG #1169, #3383). The SQLite twin documents why
+        and when the marker is written; :meth:`_seal_surface` carries the mechanics."""
         if not self._cipher.encrypts:
             return
         # Version-agnostic anchor (M9): `mfenc:%` matches BOTH v1 and v2 ciphertext, so a v2 row is
@@ -3438,7 +3679,15 @@ class SqlServerStore:
             ("queue", "last_error"),
             ("search_presets", "criteria"),  # saved-search preset (ADR 0136) — id-keyed, nullable
         ):
-            total += await self._seal_surface(table, column, like, aad_cols=("id",))
+            # A message cell binds its channel and a preset's criteria its owner (#2593).
+            total += await self._seal_surface(
+                table,
+                column,
+                like,
+                aad_cols=row_tag_columns(table, column),
+                key_cols=("id",),
+                aad_of=partial(row_tag_aad, table, column),
+            )
         # `queue.payload` binds the row's routing fields, not its id alone (BACKLOG #2593).
         total += await self._seal_surface(
             "queue",
@@ -3521,50 +3770,74 @@ class SqlServerStore:
     ) -> int:
         """Seal one (table, column) surface's legacy plaintext in ONE transaction; return the count.
 
-        The SQLite twin (``MessageStore._seal_surface``) documents the three steps: derive the
-        surface's state from the data, reserve the whole burst on the AES-GCM bound first (ASVS
-        11.3.4), then seal every batch and commit once. ``aad_cols`` rebuild the cell AAD;
-        ``key_cols`` (default: ``aad_cols``) are what the UPDATE targets; ``aad_of`` builds the AAD
-        from the row instead (the queue payload's routing tag, BACKLOG #2593). Every identifier is a code
-        constant and is bracket-quoted (``key`` is a T-SQL reserved word); only the marker pattern is
-        a parameter.
+        The SQLite twin (``MessageStore._seal_surface``) documents the three steps: decide whether
+        the surface is sealed (its ``keyed_surface`` marker, or a marked value; BACKLOG #3383),
+        reserve the whole burst on the AES-GCM bound first (ASVS 11.3.4), then write the marker, seal
+        every batch and commit once. ``aad_cols`` rebuild the cell AAD; ``key_cols`` (default:
+        ``aad_cols``) are what the UPDATE targets; ``aad_of`` builds the AAD from the row instead
+        (the queue payload's routing tag, BACKLOG #2593). Every identifier is a code constant and is
+        bracket-quoted (``key`` is a T-SQL reserved word); only the marker pattern is a parameter.
 
         The state read and the reservation run on their own pooled connections BEFORE the seal's
-        transaction opens, because a reservation must commit independently of the seal it covers."""
+        transaction opens, because a reservation must commit independently of the seal it covers.
+        An engine shard's peer can still key the surface in between. So the marker MERGE is the seal
+        transaction's FIRST statement (:meth:`_claim_keyed_surface`): HOLDLOCK makes it wait on a
+        peer's uncommitted marker, and a committed one makes it insert nothing, and then this open
+        seals nothing."""
         keys = key_cols if key_cols is not None else aad_cols
         # DATALENGTH, not `<> ''`: T-SQL pads trailing spaces before comparing, so `N' ' <> N''` is
         # FALSE and a whitespace-only value would be skipped here and then refused forever at read,
         # where the cipher treats only a true '' as blank.
         pending_where = f"[{column}] NOT LIKE ? AND DATALENGTH([{column}]) > 0"
-        row = await self._fetchone(
-            f"SELECT COUNT_BIG(*) AS n FROM {table} WHERE {pending_where}", (like,)
-        )
-        pending = int(row["n"]) if row is not None else 0
-        if not pending:
+        count_sql = f"SELECT COUNT_BIG(*) AS n FROM {table} WHERE {pending_where}"
+        strict = not allows_unmarked(self._cipher)
+        keyed = await self._surface_keyed(table, column)
+        pending = await self._count_unmarked(count_sql, like)
+        is_sealed = keyed
+        if pending and strict and not keyed:
+            is_sealed = await self._surface_holds_ciphertext(table, column, like)
+            if is_sealed:
+                # As on SQLite: a peer may have sealed the rows between the count and the probe,
+                # so count again rather than report its legitimate seal as a plant.
+                pending = await self._count_unmarked(count_sql, like)
+        if not pending or (strict and is_sealed):
+            if pending:
+                report_sealed_surface(log, self._cipher, table, column, pending)
+            if not keyed:
+                await self._mark_surface_keyed(table, column)
             return 0
-        if not allows_unmarked(self._cipher):
-            marked = await self._fetchone(
-                f"SELECT TOP (1) 1 AS x FROM {table} WHERE [{column}] LIKE ?", (like,)
-            )
-            if marked is not None:
-                log.warning(
-                    "cipher column %s.%s holds %d unmarked value(s) beside sealed ones; they were NOT "
-                    "sealed and every read of them is refused (a stripped marker or a planted row). "
-                    "Set [store].allow_unmarked_ciphertext only if they are known to be legitimate",
-                    table,
-                    column,
-                    pending,
-                )
-                # Alert now, not only on a read: a planted row nobody reads would otherwise stay
-                # invisible except in the log. Names the cell only (BACKLOG #1169).
-                report_unmarked(self._cipher, table, column)
-                return 0
         await reserve_invocations_ahead(self._cipher, self.add_cipher_invocations, pending)
         select_cols = ", ".join(f"[{c}]" for c in dict.fromkeys((*keys, *aad_cols)))
         where_keys = " AND ".join(f"[{c}]=?" for c in keys)
         sealed = 0
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
+                if not await self._claim_keyed_surface(conn, cur, table, column) and strict:
+                    # A peer keyed this surface after the reads above, so it sealed the legacy
+                    # rows. Count what it left unmarked, then end the transaction: the MERGE
+                    # changed nothing.
+                    left = 0
+                    try:
+                        await cur.execute(count_sql, (like,))
+                        counted = await cur.fetchone()
+                        left = int(counted[0]) if counted is not None else 0
+                    except Exception as exc:
+                        # A diagnostic count must not fail the open. The next open's sweep counts
+                        # again and reports anything left.
+                        if not _is_transient_write_conflict(exc):
+                            raise
+                        log.warning(
+                            "could not recount %s.%s after another process keyed it (%s); the "
+                            "next open reports anything left unmarked",
+                            table,
+                            column,
+                            type(exc).__name__,
+                        )
+                    await conn.rollback()
+                    log.debug("cipher column %s.%s was keyed by another process", table, column)
+                    if left:
+                        report_sealed_surface(log, self._cipher, table, column, left)
+                    return 0
                 while True:
                     # autocommit is off, so every statement below shares one transaction, and this
                     # connection sees its own uncommitted UPDATEs: a sealed row stops matching.
@@ -3602,6 +3875,51 @@ class SqlServerStore:
         # Top the reserve back up for whatever follows; the burst itself was reserved above.
         await self._charge_bound_batch()
         return sealed
+
+    async def _surface_keyed(self, table: str, column: str) -> bool:
+        """Whether ``table.column`` has its persisted ``keyed_surface`` marker (BACKLOG #3383)."""
+        row = await self._fetchone(
+            "SELECT 1 AS x FROM keyed_surface WHERE surface_table = ? AND surface_column = ?",
+            (table, column),
+        )
+        return row is not None
+
+    async def _surface_holds_ciphertext(self, table: str, column: str, like: str) -> bool:
+        """Whether ``table.column`` holds at least one marked value: the data's own "sealed" signal."""
+        row = await self._fetchone(
+            f"SELECT TOP (1) 1 AS x FROM {table} WHERE [{column}] LIKE ?", (like,)
+        )
+        return row is not None
+
+    async def _count_unmarked(self, count_sql: str, like: str) -> int:
+        """The ``n`` that ``count_sql`` (a ``COUNT_BIG(*) AS n``) returns for ``like``."""
+        row = await self._fetchone(count_sql, (like,))
+        return int(row["n"]) if row is not None else 0
+
+    async def _mark_surface_keyed(self, table: str, column: str) -> None:
+        """Write ``table.column``'s marker in its own transaction, unless it exists.
+
+        Every engine shard's open marks every surface, so these MERGEs collide by design. A lock
+        timeout or a deadlock leaves nothing committed, and the MERGE is idempotent, so it retries
+        as :meth:`_ensure_store_salt` does."""
+
+        async def merge() -> None:
+            await self._execute_output(_MERGE_KEYED_MARKER, (table, column, time.time()))
+
+        await _retry_idempotent_merge(merge)
+
+    async def _claim_keyed_surface(self, conn: Any, cur: Any, table: str, column: str) -> bool:
+        """Write ``table.column``'s marker as the FIRST statement of the seal's transaction, unless it
+        exists. Returns whether THIS call wrote it; the caller commits or rolls back.
+
+        Retried like :meth:`_mark_surface_keyed`. A deadlock victim's transaction is already gone,
+        and nothing came before this statement, so the rollback and the re-issue lose nothing."""
+
+        async def merge() -> bool:
+            await cur.execute(_MERGE_KEYED_MARKER, (table, column, time.time()))
+            return bool(await cur.fetchall())
+
+        return await _retry_idempotent_merge(merge, on_retry=conn.rollback)
 
     @staticmethod
     async def _ensure_database_options(
@@ -5076,12 +5394,20 @@ class SqlServerStore:
                         source_type,
                         control_id,
                         message_type,
-                        self._cipher.encrypt(raw, aad=cell_aad("messages", "raw", mid)),
+                        self._cipher.encrypt(
+                            raw, aad=message_cell_aad("raw", message_id=mid, channel_id=channel_id)
+                        ),
                         status,
                         None,
                         # EF-3: MRN/name is PHI — ciphered at rest
-                        self._enc(summary, aad=cell_aad("messages", "summary", mid)),
-                        self._enc(metadata, aad=cell_aad("messages", "metadata", mid)),
+                        self._enc(
+                            summary,
+                            aad=message_cell_aad("summary", message_id=mid, channel_id=channel_id),
+                        ),
+                        self._enc(
+                            metadata,
+                            aad=message_cell_aad("metadata", message_id=mid, channel_id=channel_id),
+                        ),
                         MessageOrigin.PARTNER.value,  # vault BACKLOG #2615: plain by design
                         None,
                     ),
@@ -5305,11 +5631,16 @@ class SqlServerStore:
                     "passthrough",
                     None,
                     None,
-                    self._cipher.encrypt(body, aad=cell_aad("messages", "raw", new_mid)),
+                    self._cipher.encrypt(
+                        body, aad=message_cell_aad("raw", message_id=new_mid, channel_id=pt_channel)
+                    ),
                     MessageStatus.RECEIVED.value,
                     None,
                     None,
-                    self._enc(child_meta, aad=cell_aad("messages", "metadata", new_mid)),
+                    self._enc(
+                        child_meta,
+                        aad=message_cell_aad("metadata", message_id=new_mid, channel_id=pt_channel),
+                    ),
                     origin=MessageOrigin.REINGRESS,
                 ),
             )
@@ -5391,11 +5722,16 @@ class SqlServerStore:
                     "passthrough",
                     None,
                     None,
-                    self._cipher.encrypt(body, aad=cell_aad("messages", "raw", new_mid)),
+                    self._cipher.encrypt(
+                        body, aad=message_cell_aad("raw", message_id=new_mid, channel_id=pt_channel)
+                    ),
                     MessageStatus.RECEIVED.value,
                     None,
                     None,
-                    self._enc(child_meta, aad=cell_aad("messages", "metadata", new_mid)),
+                    self._enc(
+                        child_meta,
+                        aad=message_cell_aad("metadata", message_id=new_mid, channel_id=pt_channel),
+                    ),
                     origin=MessageOrigin.REINGRESS,
                 ),
             )
@@ -5551,12 +5887,25 @@ class SqlServerStore:
                             source_type,
                             control_id,
                             message_type,
-                            self._cipher.encrypt(raw, aad=cell_aad("messages", "raw", mid)),
+                            self._cipher.encrypt(
+                                raw,
+                                aad=message_cell_aad("raw", message_id=mid, channel_id=channel_id),
+                            ),
                             MessageStatus.RECEIVED.value,
                             None,
                             # EF-3: MRN/name is PHI — ciphered at rest
-                            self._enc(summary, aad=cell_aad("messages", "summary", mid)),
-                            self._enc(metadata, aad=cell_aad("messages", "metadata", mid)),
+                            self._enc(
+                                summary,
+                                aad=message_cell_aad(
+                                    "summary", message_id=mid, channel_id=channel_id
+                                ),
+                            ),
+                            self._enc(
+                                metadata,
+                                aad=message_cell_aad(
+                                    "metadata", message_id=mid, channel_id=channel_id
+                                ),
+                            ),
                             origin.value,  # vault BACKLOG #2615: plain by design
                             origin_actor,
                         ),
@@ -5861,6 +6210,7 @@ class SqlServerStore:
             _close_sync_cursor(cur)
         return True
 
+    @dead_letters_on_cell_tag
     async def transform_handoff(
         self,
         *,
@@ -5955,14 +6305,21 @@ class SqlServerStore:
                 # depth 0).
                 # Read the message's current metadata ONCE if either PT re-ingress or SetMeta needs it.
                 pmeta_dec: str | None = None
+                # Bound to the message row's own channel (BACKLOG #2593); a cell that fails that
+                # tag raises CellTagError, and the decorator dead-letters the routed row.
+                msg_channel = channel_id
                 if pt_deliveries or meta_ops:
                     await cur.execute(_SQL_SELECT_METADATA, (message_id,))
                     prow = await cur.fetchone()
-                    pmeta_dec = (
-                        self._dec(prow[0], aad=cell_aad("messages", "metadata", message_id))
-                        if prow
-                        else None
-                    )
+                    if prow is not None:
+                        msg_channel = str(prow[0])
+                        pmeta_dec = open_message_cell(
+                            self._cipher,
+                            "metadata",
+                            prow[1],
+                            message_id=message_id,
+                            channel_id=msg_channel,
+                        )
                 if pt_deliveries:
                     parent_meta = _parent_meta_from_row(pmeta_dec)
                     for pt_name, body in pt_deliveries:
@@ -5986,7 +6343,12 @@ class SqlServerStore:
                     await cur.execute(
                         _SQL_UPDATE_METADATA,
                         (
-                            self._enc(merged, aad=cell_aad("messages", "metadata", message_id)),
+                            self._enc(
+                                merged,
+                                aad=message_cell_aad(
+                                    "metadata", message_id=message_id, channel_id=msg_channel
+                                ),
+                            ),
                             message_id,
                         ),
                     )
@@ -6150,14 +6512,21 @@ class SqlServerStore:
             for dest_name, payload in deliveries:
                 self._insert_outbound_sync(cur, message_id, channel_id, dest_name, payload, now)
             pmeta_dec: str | None = None
+            # Bound to the message row's own channel (BACKLOG #2593). A cell that fails that tag
+            # raises CellTagError after the rollback below; the fused caller dead-letters the row.
+            msg_channel = channel_id
             if pt_deliveries or meta_ops:
                 cur.execute(_SQL_SELECT_METADATA, (message_id,))
                 prow = cur.fetchone()
-                pmeta_dec = (
-                    self._dec(prow[0], aad=cell_aad("messages", "metadata", message_id))
-                    if prow
-                    else None
-                )
+                if prow is not None:
+                    msg_channel = str(prow[0])
+                    pmeta_dec = open_message_cell(
+                        self._cipher,
+                        "metadata",
+                        prow[1],
+                        message_id=message_id,
+                        channel_id=msg_channel,
+                    )
             if pt_deliveries:
                 parent_meta = _parent_meta_from_row(pmeta_dec)
                 for pt_name, body in pt_deliveries:
@@ -6180,7 +6549,12 @@ class SqlServerStore:
                 cur.execute(
                     _SQL_UPDATE_METADATA,
                     (
-                        self._enc(merged, aad=cell_aad("messages", "metadata", message_id)),
+                        self._enc(
+                            merged,
+                            aad=message_cell_aad(
+                                "metadata", message_id=message_id, channel_id=msg_channel
+                            ),
+                        ),
                         message_id,
                     ),
                 )
@@ -6642,7 +7016,11 @@ class SqlServerStore:
                 )
                 row = await cur.fetchone()
                 effective_id = str(row[0]) if row is not None else preset_id
-                enc = self._enc(criteria, aad=cell_aad("search_presets", "criteria", effective_id))
+                # Bound to the row id and its owner (BACKLOG #2593).
+                enc = self._enc(
+                    criteria,
+                    aad=preset_criteria_aad(preset_id=effective_id, owner_user_id=owner_user_id),
+                )
                 if row is not None:
                     await cur.execute(
                         "UPDATE search_presets SET criteria=?, updated_at=? WHERE id=?",
@@ -6669,6 +7047,7 @@ class SqlServerStore:
             (owner_user_id,),
         )
 
+    @audits_cell_tag
     async def get_search_preset(
         self, *, preset_id: str, owner_user_id: str, now: float | None = None
     ) -> dict[str, Any] | None:
@@ -6679,8 +7058,10 @@ class SqlServerStore:
         )
         if row is None:
             return None
-        row["criteria"] = self._dec(
-            row["criteria"], aad=cell_aad("search_presets", "criteria", preset_id)
+        # Bound to the row id and its owner (BACKLOG #2593): a preset moved to another owner outside
+        # the store refuses here.
+        row["criteria"] = open_preset_criteria(
+            self._cipher, row["criteria"], preset_id=preset_id, owner_user_id=owner_user_id
         )
         # #306: stamp last-USED, best-effort and AFTER the read — a usage hint must never fail the
         # recall it annotates (SQLite parity). The returned dict carries the PRE-stamp value.
@@ -7034,8 +7415,41 @@ class SqlServerStore:
         ``False`` if the work-row was already consumed. A corrupt/unparseable ref or a re-ingress that
         would exceed ``correlation_depth_cap`` is dead-lettered (and the token still consumed). The
         re-ingress message id is content-addressed (deterministic), so a re-run never double-inserts the
-        child."""
-        now = time.time() if now is None else now
+        child. An origin whose metadata cell fails its row tag (BACKLOG #2593) is consumed like a
+        corrupt ref, and the failure is audited once the transaction has closed."""
+        tag_failures: list[CellTagError] = []
+        try:
+            return await self._ingress_handoff_txn(
+                response_row_id=response_row_id,
+                loopback_channel_id=loopback_channel_id,
+                correlation_depth_cap=correlation_depth_cap,
+                control_id=control_id,
+                message_type=message_type,
+                summary=summary,
+                peek_failed=peek_failed,
+                peek_error=peek_error,
+                now=time.time() if now is None else now,
+                tag_failures=tag_failures,
+            )
+        finally:
+            await report_cell_tag_failures(self, tag_failures)
+
+    async def _ingress_handoff_txn(
+        self,
+        *,
+        response_row_id: str,
+        loopback_channel_id: str,
+        correlation_depth_cap: int,
+        control_id: str | None,
+        message_type: str | None,
+        summary: str | None,
+        peek_failed: bool,
+        peek_error: str | None,
+        now: float,
+        tag_failures: list[CellTagError],
+    ) -> bool:
+        """:meth:`ingress_handoff`'s one transaction. An origin tag failure is appended to
+        ``tag_failures`` for the caller to audit."""
         # ADR 0157 C1: both DEAD branches below are TERMINAL on a claimed RESPONSE work-row AND
         # finalize the origin, so both are guarded. The SUCCESS path is deliberately NOT guarded: it
         # ADMITS a message, and fencing it would turn a permitted duplicate into a LOST re-ingress.
@@ -7054,17 +7468,13 @@ class SqlServerStore:
                     return False  # already consumed by a committed prior run (idempotent no-op)
                 work_row = dict(zip((*QUEUE_TAG_COLUMNS, "payload"), wr, strict=True))
                 origin_id = work_row["message_id"]
-                # (2) Decrypt + parse the artifact ref; ANY failure -> consume-and-dead-letter.
-                try:
-                    ref = (
-                        self._cipher.decrypt(work_row["payload"], aad=queue_row_aad(work_row)) or ""
-                    )
-                    origin_msg_id, dest, seq_s = ref.split("\x1f")
-                    seq = int(seq_s)
-                except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
+
+                async def _consume_dead(label: str, error: str, event_detail: str) -> bool:
+                    # An unrecoverable token: dead-letter it + ERROR the origin in THIS transaction
+                    # and CONSUME it (status flipped), never re-loop.
                     await self._exec_terminal(
                         cur,
-                        "ingress_handoff(corrupt-ref)",
+                        label,
                         (response_row_id,),
                         "UPDATE queue SET status=?, last_error=?, next_attempt_at=?, updated_at=?"
                         + output
@@ -7073,8 +7483,7 @@ class SqlServerStore:
                         (
                             OutboxStatus.DEAD.value,
                             self._enc(  # H4
-                                "re-ingress work-row reference is corrupt/unparseable",
-                                aad=cell_aad("queue", "last_error", response_row_id),
+                                error, aad=cell_aad("queue", "last_error", response_row_id)
                             ),
                             now,
                             now,
@@ -7083,10 +7492,24 @@ class SqlServerStore:
                         ),
                         checked=bool(guard),
                     )
-                    await self._event(cur, origin_id, "dead", None, "re-ingress ref corrupt", now)
+                    await self._event(cur, origin_id, "dead", None, event_detail, now)
                     await self._maybe_finalize(cur, origin_id, now)  # preceded by step-1 SELECT
                     await self._commit(conn)
-                    return True  # CONSUME (status flipped), never re-loop
+                    return True
+
+                # (2) Decrypt + parse the artifact ref; ANY failure -> consume-and-dead-letter.
+                try:
+                    ref = (
+                        self._cipher.decrypt(work_row["payload"], aad=queue_row_aad(work_row)) or ""
+                    )
+                    origin_msg_id, dest, seq_s = ref.split("\x1f")
+                    seq = int(seq_s)
+                except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
+                    return await _consume_dead(
+                        "ingress_handoff(corrupt-ref)",
+                        "re-ingress work-row reference is corrupt/unparseable",
+                        "re-ingress ref corrupt",
+                    )
                 # (3) Read the immutable artifact body.
                 await cur.execute(
                     "SELECT body FROM response"
@@ -7102,14 +7525,31 @@ class SqlServerStore:
                     else ""
                 ) or ""
                 # (4) Correlation lineage from the origin's metadata (parse once).
-                await cur.execute("SELECT metadata FROM messages WHERE id=?", (origin_id,))
-                mrow = await cur.fetchone()
-                # EF-3: metadata ciphered at rest, bound to the origin message's cell
-                meta_json = (
-                    self._dec(mrow[0], aad=cell_aad("messages", "metadata", origin_id))
-                    if mrow
-                    else None
+                await cur.execute(
+                    "SELECT channel_id, metadata FROM messages WHERE id=?", (origin_id,)
                 )
+                mrow = await cur.fetchone()
+                # EF-3: metadata ciphered at rest, bound to the origin message's cell and its
+                # channel (BACKLOG #2593). A cell that fails that tag makes the token unrecoverable.
+                try:
+                    meta_json = (
+                        open_message_cell(
+                            self._cipher,
+                            "metadata",
+                            mrow[1],
+                            message_id=origin_id,
+                            channel_id=mrow[0],
+                        )
+                        if mrow
+                        else None
+                    )
+                except CellTagError as err:
+                    tag_failures.append(err)  # audited once the transaction has closed
+                    return await _consume_dead(
+                        "ingress_handoff(origin-tag)",
+                        str(err),
+                        "re-ingress origin failed its integrity check",
+                    )
                 loaded = json.loads(meta_json) if meta_json else {}
                 origin_meta = loaded if isinstance(loaded, dict) else {}
                 child_depth = int(origin_meta.get("correlation_depth", 0) or 0) + 1
@@ -7167,7 +7607,12 @@ class SqlServerStore:
                             "reingress",
                             control_id,
                             message_type,
-                            self._cipher.encrypt(body, aad=cell_aad("messages", "raw", new_mid)),
+                            self._cipher.encrypt(
+                                body,
+                                aad=message_cell_aad(
+                                    "raw", message_id=new_mid, channel_id=loopback_channel_id
+                                ),
+                            ),
                             MessageStatus.ERROR.value
                             if peek_failed
                             else MessageStatus.RECEIVED.value,
@@ -7176,11 +7621,23 @@ class SqlServerStore:
                                 (peek_error or "re-ingress body failed HL7 peek")
                                 if peek_failed
                                 else None,
-                                aad=cell_aad("messages", "error", new_mid),
+                                aad=message_cell_aad(
+                                    "error", message_id=new_mid, channel_id=loopback_channel_id
+                                ),
                             ),
                             # EF-3: MRN/name is PHI — ciphered at rest
-                            self._enc(summary, aad=cell_aad("messages", "summary", new_mid)),
-                            self._enc(child_meta, aad=cell_aad("messages", "metadata", new_mid)),
+                            self._enc(
+                                summary,
+                                aad=message_cell_aad(
+                                    "summary", message_id=new_mid, channel_id=loopback_channel_id
+                                ),
+                            ),
+                            self._enc(
+                                child_meta,
+                                aad=message_cell_aad(
+                                    "metadata", message_id=new_mid, channel_id=loopback_channel_id
+                                ),
+                            ),
                             MessageOrigin.REINGRESS.value,  # vault BACKLOG #2615: plain by design
                             None,
                         ),
@@ -7617,6 +8074,10 @@ class SqlServerStore:
         # cell-bound writer, `mfenc:v4:<alg>:<kid>:<salt>:` (ADR 0196). Built off the cipher (not a baked-in
         # v1 prefix+keyid) so a v4-active rotation matches its own rows and the loop terminates.
         active_like = f"{cipher.active_marker_prefix}%"
+        # BACKLOG #2592: the user re-seal pass first; store.py's reencrypt_to_active says why.
+        report_user_reseal(*await self.reseal_user_records())
+        report_role_reseal(*await self.reseal_role_records())
+        report_approval_reseal(*await self.reseal_approval_records())
         total = 0
         # summary/metadata (EF-3): MRN/name PHI on messages — rotated like raw. error/last_error (H4):
         # exception text that may embed raw HL7 fragments — rotated too, or a later retired-key drop
@@ -7632,6 +8093,17 @@ class SqlServerStore:
             ("queue", "last_error"),
             ("search_presets", "criteria"),  # saved-search preset (ADR 0136) — id-keyed
         ):
+            if is_row_tagged(table, column):
+                # A message cell or a preset's criteria rebinds its row tag (BACKLOG #2593).
+                total += await self._reencrypt_tagged_to_active(
+                    active_like,
+                    batch,
+                    table=table,
+                    column=column,
+                    select=", ".join(row_tag_columns(table, column)),
+                    aad_of=partial(row_tag_aad, table, column),
+                )
+                continue
             while True:
                 rows = await self._fetchall(
                     f"SELECT TOP (?) id, {column} AS v FROM {table}"
@@ -7662,7 +8134,14 @@ class SqlServerStore:
                 await self._charge_bound_batch()
                 total += len(rows)
         # `queue.payload` rebinds the row's routing tag, old and new ciphertext alike (#2593).
-        total += await self._reencrypt_queue_payload_to_active(active_like, batch)
+        total += await self._reencrypt_tagged_to_active(
+            active_like,
+            batch,
+            table="queue",
+            column="payload",
+            select=QUEUE_TAG_SELECT,
+            aad_of=queue_row_aad,
+        )
         # `state` has a composite PK (namespace, [key]) — its own pass (can't ride the id-keyed loop
         # above). transform_handoff writes state.value encrypted, so a rotation MUST rotate it too or a
         # later retired-key drop silently loses all transform cross-message state (review HIGH).
@@ -7835,21 +8314,28 @@ class SqlServerStore:
             log.info("ended %d session(s): a store key rotation signs every operator out", ended)
         return total
 
-    async def _reencrypt_queue_payload_to_active(self, active_like: str, batch: int) -> int:
-        """Re-seal ``queue.payload`` under the active key, rebinding each row's routing tag
-        (:func:`queue_row_aad`, BACKLOG #2593). The id-keyed loop's shape, with the tag columns
-        selected so the decrypt and the encrypt share one tag.
-        A cell that does not open under its own tag with a key this process holds
-        (:func:`is_tag_failure`) is left as it is and counted in a WARNING: no
-        claim or read can ever open it, and re-sealing it would make it look genuine. Any other
-        failure, a retired key that was not supplied above all, still stops the rotation. Pages by
-        ``id``, since a skipped row still matches the marker filter."""
+    async def _reencrypt_tagged_to_active(
+        self,
+        active_like: str,
+        batch: int,
+        *,
+        table: str,
+        column: str,
+        select: str,
+        aad_of: Callable[[dict[str, Any]], bytes],
+    ) -> int:
+        """Re-seal an id-keyed cell whose tag binds more than the row id under the active key,
+        rebinding each row's tag (``queue.payload``'s routing tag, a message cell's channel, a
+        preset's owner; BACKLOG #2593). The SQLite twin documents it: ``select`` names the tag's
+        columns, ``id`` among them; a cell that fails its own tag under a held key is left and counted
+        in a WARNING; any other failure still stops the rotation; pages by ``id``. All identifiers are
+        code constants."""
         total = skipped = 0
         after = ""
         while True:
             rows = await self._fetchall(
-                f"SELECT TOP (?) {QUEUE_TAG_SELECT}, payload FROM queue"
-                " WHERE payload NOT LIKE ? AND payload <> '' AND id > ? ORDER BY id",
+                f"SELECT TOP (?) {select}, {column} AS v FROM {table}"
+                f" WHERE {column} NOT LIKE ? AND {column} <> '' AND id > ? ORDER BY id",
                 (batch, active_like, after),
             )
             if not rows:
@@ -7858,16 +8344,18 @@ class SqlServerStore:
             updates: list[tuple[str, str]] = []
             for r in rows:
                 try:
-                    updates.append((self._reencrypt_value(r["payload"], queue_row_aad(r)), r["id"]))
+                    updates.append((self._reencrypt_value(r["v"], aad_of(r)), r["id"]))
                 except CipherError:
-                    if not is_tag_failure(self._cipher, r["payload"]):
+                    if not is_tag_failure(self._cipher, r["v"]):
                         raise
                     skipped += 1
             if updates:
                 async with self._acquire() as conn, self._cursor(conn) as cur:
                     try:
                         for enc, rid in updates:
-                            await cur.execute("UPDATE queue SET payload=? WHERE id=?", (enc, rid))
+                            await cur.execute(
+                                f"UPDATE {table} SET {column}=? WHERE id=?", (enc, rid)
+                            )
                         await self._commit(conn)
                     except Exception:
                         await conn.rollback()
@@ -7876,9 +8364,11 @@ class SqlServerStore:
                 total += len(updates)
         if skipped:
             log.warning(
-                "rotation left %d queue row(s) whose payload does not open under its own tag"
-                " under a held key; no claim or read opens them (BACKLOG #2593)",
+                "rotation left %d %s.%s value(s) that do not open under their own row's tag"
+                " under a held key; no read opens them (BACKLOG #2593)",
                 skipped,
+                table,
+                column,
             )
         return total
 
@@ -8047,22 +8537,35 @@ class SqlServerStore:
         docs = 0
         reclaimed = 0
         updates: list[tuple[str, float, str]] = []
+        failures: list[CellTagError] = []
         for row in rows:
             cutoff = cutoff_for(row["channel_id"], older_than, connection_cutoffs)
             if row["received_at"] >= cutoff:
                 continue
             try:
-                raw = self._cipher.decrypt(row["raw"], aad=cell_aad("messages", "raw", row["id"]))
+                raw = open_message_cell(
+                    self._cipher,
+                    "raw",
+                    row["raw"],
+                    message_id=row["id"],
+                    channel_id=row["channel_id"],
+                )
             except CipherError as exc:
                 # Contain ONE row, as the claim sites do: a refused (unmarked) or undecryptable body
                 # must not abort the whole retention pass. The row is left exactly as found; the
                 # message names only the cell and the message id, never the body (BACKLOG #1169).
+                if isinstance(exc, CellTagError):
+                    # BACKLOG #2593: the read already logged and alerted it, once per hour; it is
+                    # audited below. No second WARNING on every pass.
+                    failures.append(exc)
+                    continue
                 log.warning(
                     "document strip skipped message %s: its body could not be read: %s",
                     row["id"],
                     exc,
                 )
                 continue
+            assert raw is not None  # raw is NOT NULL
             new_raw, n_docs, n_bytes = _strip_documents(
                 raw,
                 pruned_at=now,
@@ -8073,7 +8576,12 @@ class SqlServerStore:
                 continue
             updates.append(
                 (
-                    self._cipher.encrypt(new_raw, aad=cell_aad("messages", "raw", row["id"])),
+                    self._cipher.encrypt(
+                        new_raw,
+                        aad=message_cell_aad(
+                            "raw", message_id=row["id"], channel_id=row["channel_id"]
+                        ),
+                    ),
                     now,
                     row["id"],
                 )
@@ -8092,6 +8600,7 @@ class SqlServerStore:
                 except Exception:
                     await conn.rollback()
                     raise
+        await report_cell_tag_failures(self, failures)
         return StripResult(
             messages_stripped=msgs, documents_stripped=docs, bytes_reclaimed=reclaimed
         )
@@ -8327,13 +8836,24 @@ class SqlServerStore:
                         source_type,
                         control_id,
                         message_type,
-                        self._cipher.encrypt(raw, aad=cell_aad("messages", "raw", mid)),
+                        self._cipher.encrypt(
+                            raw, aad=message_cell_aad("raw", message_id=mid, channel_id=channel_id)
+                        ),
                         status.value,
                         # H4: error may embed raw HL7 fragments — ciphered at rest
-                        self._enc(error, aad=cell_aad("messages", "error", mid)),
+                        self._enc(
+                            error,
+                            aad=message_cell_aad("error", message_id=mid, channel_id=channel_id),
+                        ),
                         # EF-3: MRN/name is PHI — ciphered at rest
-                        self._enc(summary, aad=cell_aad("messages", "summary", mid)),
-                        self._enc(metadata, aad=cell_aad("messages", "metadata", mid)),
+                        self._enc(
+                            summary,
+                            aad=message_cell_aad("summary", message_id=mid, channel_id=channel_id),
+                        ),
+                        self._enc(
+                            metadata,
+                            aad=message_cell_aad("metadata", message_id=mid, channel_id=channel_id),
+                        ),
                         MessageOrigin.PARTNER.value,  # vault BACKLOG #2615: plain by design
                         None,
                     ),
@@ -9385,7 +9905,9 @@ class SqlServerStore:
                 await conn.rollback()
                 raise
 
-    async def mark_done(self, outbox_id: str, now: float | None = None) -> None:
+    async def mark_done(
+        self, outbox_id: str, now: float | None = None, *, reply_dropped: str | None = None
+    ) -> bool:
         now = time.time() if now is None else now
         output, guard, guard_params = self._resolve_guard()  # ADR 0157 C1: TERMINAL
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
@@ -9397,7 +9919,7 @@ class SqlServerStore:
                 row = await cur.fetchone()
                 if row is None:
                     await self._commit(conn)
-                    return
+                    return False
                 message_id, destination_name, handler_name, attempts = (
                     row[0],
                     row[1],
@@ -9427,11 +9949,18 @@ class SqlServerStore:
                 await self._event(
                     cur, message_id, "delivered", destination_name, f"attempt {attempts}", now
                 )
+                if reply_dropped is not None:
+                    await self._event(
+                        cur, message_id, "reply_dropped", destination_name, reply_dropped, now
+                    )
                 await self._maybe_finalize(cur, message_id, now)
                 await self._commit(conn)
+                return True
             except Exception:
                 await conn.rollback()
                 raise
+        # _fence_scope swallowed a fenced write: rolled back and re-pended, so nothing was recorded.
+        return False
 
     async def mark_batch_done(self, outbox_ids: Sequence[str], now: float | None = None) -> None:
         """Complete N delivered outbound rows in ONE transaction — the batch counterpart of
@@ -10318,6 +10847,7 @@ class SqlServerStore:
             outbox_id=row["outbox_id"],
         )
 
+    @audits_cell_tag
     async def resend_to(
         self,
         *,
@@ -10421,8 +10951,12 @@ class SqlServerStore:
                                 f"message {message_id} edited body is empty -- cannot resend"
                             )
                         # Correlate the child to the origin (mirrors `reingress`).
-                        raw_meta = self._dec(
-                            mrow[3], aad=cell_aad("messages", "metadata", message_id)
+                        raw_meta = open_message_cell(
+                            self._cipher,
+                            "metadata",
+                            mrow[3],
+                            message_id=message_id,
+                            channel_id=src_channel,
                         )
                         try:
                             parent_meta = json.loads(raw_meta) if raw_meta else {}
@@ -10453,13 +10987,19 @@ class SqlServerStore:
                                 None,
                                 mrow[2],  # message_type
                                 self._cipher.encrypt(
-                                    body, aad=cell_aad("messages", "raw", child_mid)
+                                    body,
+                                    aad=message_cell_aad(
+                                        "raw", message_id=child_mid, channel_id=src_channel
+                                    ),
                                 ),
                                 MessageStatus.ROUTED.value,
                                 None,
                                 None,
                                 self._enc(
-                                    child_meta, aad=cell_aad("messages", "metadata", child_mid)
+                                    child_meta,
+                                    aad=message_cell_aad(
+                                        "metadata", message_id=child_mid, channel_id=src_channel
+                                    ),
                                 ),
                                 MessageOrigin.OPERATOR_EDIT.value,  # vault BACKLOG #2615
                                 actor,
@@ -10602,6 +11142,7 @@ class SqlServerStore:
                 await self._rollback_or_discard(conn)
                 raise
 
+    @audits_cell_tag
     async def reingress(
         self,
         *,
@@ -10664,8 +11205,12 @@ class SqlServerStore:
                         await self._append_operator_audit(cur, written, audit, outcome)
                         await self._commit(conn)
                         return outcome
-                    raw_meta = self._dec(
-                        metadata_ciphertext, aad=cell_aad("messages", "metadata", origin_message_id)
+                    raw_meta = open_message_cell(
+                        self._cipher,
+                        "metadata",
+                        metadata_ciphertext,
+                        message_id=origin_message_id,
+                        channel_id=channel_id,
                     )
                     try:
                         parent_meta = json.loads(raw_meta) if raw_meta else {}
@@ -10697,12 +11242,20 @@ class SqlServerStore:
                                 source_type,
                                 None,
                                 message_type,
-                                self._cipher.encrypt(raw, aad=cell_aad("messages", "raw", new_mid)),
+                                self._cipher.encrypt(
+                                    raw,
+                                    aad=message_cell_aad(
+                                        "raw", message_id=new_mid, channel_id=channel_id
+                                    ),
+                                ),
                                 MessageStatus.RECEIVED.value,
                                 None,
                                 None,
                                 self._enc(
-                                    child_meta, aad=cell_aad("messages", "metadata", new_mid)
+                                    child_meta,
+                                    aad=message_cell_aad(
+                                        "metadata", message_id=new_mid, channel_id=channel_id
+                                    ),
                                 ),
                                 MessageOrigin.OPERATOR_EDIT.value,  # vault BACKLOG #2615
                                 actor,
@@ -10888,32 +11441,39 @@ class SqlServerStore:
 
     # --- read helpers --------------------------------------------------------
 
+    @audits_cell_tag
     async def get_message(self, message_id: str) -> dict[str, Any] | None:
         record = await self._fetchone("SELECT * FROM messages WHERE id=?", (message_id,))
         if record is not None:
-            mid = record["id"]
-            # decrypt the body for display, bound to the messages cell (ASVS 11.3.3)
-            record["raw"] = self._cipher.decrypt(
-                record["raw"], aad=cell_aad("messages", "raw", mid)
-            )
-            # H4: error may embed raw HL7 fragments
-            record["error"] = self._dec(record["error"], aad=cell_aad("messages", "error", mid))
-            # EF-3: MRN/name PHI, ciphered at rest
-            record["summary"] = self._dec(
-                record["summary"], aad=cell_aad("messages", "summary", mid)
-            )
-            record["metadata"] = self._dec(  # EF-3
-                record["metadata"], aad=cell_aad("messages", "metadata", mid)
-            )
+            # Decrypt for display: raw (the body), error (may embed raw HL7 fragments, H4), summary
+            # and metadata (EF-3 PHI). Each cell is bound to the row's id and channel (ASVS 11.3.3,
+            # BACKLOG #2593), so a cell that fails that tag refuses the whole read.
+            for column in ("raw", "error", "summary", "metadata"):
+                record[column] = open_message_cell(
+                    self._cipher,
+                    column,
+                    record[column],
+                    message_id=record["id"],
+                    channel_id=record["channel_id"],
+                )
         return record
 
+    @audits_cell_tag
     async def message_metadata_json(self, message_id: str) -> str | None:
         # #68: decrypt ONLY the metadata column (never the raw PHI body) for the delivery worker's
         # per-message dynamic headers. Off the perf-critical claim path; read only for opted-in outbounds.
-        record = await self._fetchone("SELECT metadata FROM messages WHERE id=?", (message_id,))
+        record = await self._fetchone(
+            "SELECT channel_id, metadata FROM messages WHERE id=?", (message_id,)
+        )
         if record is None:
             return None
-        return self._dec(record["metadata"], aad=cell_aad("messages", "metadata", message_id))
+        return open_message_cell(
+            self._cipher,
+            "metadata",
+            record["metadata"],
+            message_id=message_id,
+            channel_id=record["channel_id"],
+        )
 
     async def list_messages(
         self,
@@ -10946,12 +11506,19 @@ class SqlServerStore:
             " ORDER BY received_at DESC, id DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
             (*params, offset, limit),
         )
+        # error (H4) and summary/metadata (EF-3) open under the row's tag (BACKLOG #2593). A row that
+        # fails still lists by its plaintext columns with its cells withheld; drift is alerted and audited.
+        failures: list[CellTagError] = []
         for r in rows:
-            mid = r["id"]
-            r["error"] = self._dec(r["error"], aad=cell_aad("messages", "error", mid))  # H4
-            # EF-3: summary/metadata ciphered at rest
-            r["summary"] = self._dec(r["summary"], aad=cell_aad("messages", "summary", mid))
-            r["metadata"] = self._dec(r["metadata"], aad=cell_aad("messages", "metadata", mid))
+            withhold_message_cells(
+                self._cipher,
+                r,
+                ("error", "summary", "metadata"),
+                message_id=r["id"],
+                channel_id=r["channel_id"],
+                failures=failures,
+            )
+        await report_cell_tag_failures(self, failures)
         return rows
 
     async def count_messages(
@@ -11006,14 +11573,22 @@ class SqlServerStore:
             "  ORDER BY received_at DESC, id DESC OFFSET 0 ROWS FETCH NEXT ? ROWS ONLY)",
             (*params, spec.fetch_limit),
         )
-        return await asyncio.to_thread(self._scan_rows, spec, newest_first(rows), limit)
+        failures: list[CellTagError] = []
+        result = await asyncio.to_thread(self._scan_rows, spec, newest_first(rows), limit, failures)
+        await report_cell_tag_failures(self, failures)
+        return result
 
     def _scan_rows(
-        self, spec: SearchSpec, candidates: list[dict[str, Any]], limit: int
+        self,
+        spec: SearchSpec,
+        candidates: list[dict[str, Any]],
+        limit: int,
+        failures: list[CellTagError],
     ) -> MessageSearchResult:
         """Off-loop decrypt+match loop (mirrors ``MessageStore._scan_rows``). Bounded by
         ``spec.scan_limit`` decrypts and ``limit`` matches; returns metadata-only rows (the decrypted
-        ``raw`` is dropped, so the PHI surface equals ``list_messages``)."""
+        ``raw`` is dropped, so the PHI surface equals ``list_messages``). A candidate whose cells fail
+        the row's tag is left out, and its error goes to ``failures`` (BACKLOG #2593)."""
         out: list[dict[str, Any]] = []
         scanned = 0
         truncated = False
@@ -11022,20 +11597,23 @@ class SqlServerStore:
                 truncated = True
                 break
             scanned += 1
-            cid = cand["id"]
-            raw = self._dec(cand.get("raw"), aad=cell_aad("messages", "raw", cid))
-            summary = self._dec(cand.get("summary"), aad=cell_aad("messages", "summary", cid))
-            if row_matches(spec, raw=raw, summary=summary):
-                d = dict(cand)
-                d["error"] = self._dec(d.get("error"), aad=cell_aad("messages", "error", cid))
-                d["summary"] = self._dec(d.get("summary"), aad=cell_aad("messages", "summary", cid))
-                d["metadata"] = self._dec(
-                    d.get("metadata"), aad=cell_aad("messages", "metadata", cid)
-                )
-                d.pop("raw", None)
-                out.append(d)
-                if len(out) >= limit:
-                    break
+            d = dict(cand)
+            stored_raw = d.pop("raw", None)
+
+            tag = {"message_id": d["id"], "channel_id": d["channel_id"]}
+            try:
+                d["summary"] = open_message_cell(self._cipher, "summary", d.get("summary"), **tag)
+                raw = open_message_cell(self._cipher, "raw", stored_raw, **tag)
+                if not row_matches(spec, raw=raw, summary=d["summary"]):
+                    continue
+                for column in ("error", "metadata"):
+                    d[column] = open_message_cell(self._cipher, column, d.get(column), **tag)
+            except CellTagError as err:
+                failures.append(err)
+                continue
+            out.append(d)
+            if len(out) >= limit:
+                break
         return MessageSearchResult(rows=out, scanned=scanned, matched=len(out), truncated=truncated)
 
     async def list_dead(
@@ -11051,20 +11629,29 @@ class SqlServerStore:
         rows = await self._fetchall(
             "SELECT o.id AS outbox_id, o.message_id, o.channel_id, o.destination_name,"
             " o.attempts, o.last_error, o.updated_at,"
-            " m.control_id, m.message_type, m.received_at, m.summary"
+            " m.control_id, m.message_type, m.received_at, m.summary,"
+            " m.channel_id AS message_channel_id"
             f" FROM queue o JOIN messages m ON m.id = o.message_id{where}"
             " ORDER BY o.updated_at DESC, o.id DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
             (*params, offset, limit),
         )
+        failures: list[CellTagError] = []
         for r in rows:
             # Mixed-table join: last_error is queue's (o.id → outbox_id), summary is the messages
-            # row's (keyed by message_id) — each binds to its own cell (ASVS 11.3.3).
+            # row's (keyed by message_id and bound to the message's own channel, BACKLOG #2593) —
+            # each binds to its own cell (ASVS 11.3.3).
             r["last_error"] = self._dec(
                 r["last_error"], aad=cell_aad("queue", "last_error", r["outbox_id"])
             )
-            r["summary"] = self._dec(
-                r["summary"], aad=cell_aad("messages", "summary", r["message_id"])
+            withhold_message_cells(
+                self._cipher,
+                r,
+                ("summary",),
+                message_id=r["message_id"],
+                channel_id=r.pop("message_channel_id"),
+                failures=failures,
             )
+        await report_cell_tag_failures(self, failures)
         return rows
 
     async def count_dead(
@@ -11342,20 +11929,17 @@ class SqlServerStore:
         Those concurrent opens can make a MERGE time out or lose a deadlock, as the invocation MERGE's
         can. Unlike that one, this statement is idempotent -- a re-run after a row exists inserts
         nothing -- so it retries without needing a no-double-count guard."""
-        for attempt in range(_CIPHER_MERGE_ATTEMPTS):
-            try:
-                await self._execute(
-                    "MERGE store_salt WITH (HOLDLOCK) AS t"
-                    " USING (SELECT 1 AS id, ? AS salt, ? AS created_at) AS s ON t.id = s.id"
-                    " WHEN NOT MATCHED THEN INSERT (id, salt, created_at)"
-                    " VALUES (s.id, s.salt, s.created_at);",
-                    (candidate, time.time()),
-                )
-                break
-            except Exception as exc:
-                if not _is_transient_write_conflict(exc) or attempt == _CIPHER_MERGE_ATTEMPTS - 1:
-                    raise
-            await asyncio.sleep(_CIPHER_MERGE_BACKOFF * (attempt + 1))
+
+        async def merge() -> None:
+            await self._execute(
+                "MERGE store_salt WITH (HOLDLOCK) AS t"
+                " USING (SELECT 1 AS id, ? AS salt, ? AS created_at) AS s ON t.id = s.id"
+                " WHEN NOT MATCHED THEN INSERT (id, salt, created_at)"
+                " VALUES (s.id, s.salt, s.created_at);",
+                (candidate, time.time()),
+            )
+
+        await _retry_idempotent_merge(merge)
         row = await self._fetchone("SELECT salt FROM store_salt WHERE id = 1")
         if row is None:  # the MERGE above ran, so only a concurrent delete reaches here
             raise RuntimeError("store_salt has no row after an insert-if-absent")
@@ -11835,31 +12419,25 @@ class SqlServerStore:
         on_repeat: Callable[[str], AuditAppend] | None = None,
     ) -> str:
         """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5).
-        The Store protocol states the ``audit`` and ``on_repeat`` contract and what is returned."""
-        sql = (
-            "INSERT INTO pending_approvals "
-            "(id, operation, params, requester, requester_user_id, requested_at, status, expires_at)"
-            " VALUES (?,?,?,?,?,?,'pending',?)"
+        The Store protocol states the ``audit`` and ``on_repeat`` contract and what is returned.
+        The row is sealed, and a repeat joins only an open request whose seal holds (BACKLOG
+        #2592); store.py's twin says why."""
+        row = new_approval_row(
+            approval_id=approval_id,
+            operation=operation,
+            params=params,
+            requester=requester,
+            requester_user_id=requester_user_id,
+            requested_at=requested_at,
+            expires_at=expires_at,
         )
-        args = (
-            approval_id,
-            operation,
-            params,
-            requester,
-            requester_user_id,
-            requested_at,
-            expires_at,
-        )
-        if audit is None and on_repeat is None:
-            await self._execute(sql, args)
-            return approval_id
-        # vault BACKLOG #2445: the open request a repeat joins. Oldest first: that is the request
-        # every earlier caller got. The three text columns carry no COLLATE, so without one here
-        # they would compare under the database default, which is case-INSENSITIVE on a stock
+        # vault BACKLOG #2445: the open requests a repeat may join. Oldest first: that is the
+        # request every earlier caller got. The three text columns carry no COLLATE, so without one
+        # here they would compare under the database default, which is case-INSENSITIVE on a stock
         # install: 'OB_ACME' would join a hold for 'OB_Acme'. SQLite and Postgres compare bytes,
         # and so does this, as BACKLOG #1268 does for the other identifier columns.
         match = (
-            "SELECT TOP (1) id FROM pending_approvals"
+            "SELECT " + _MSSQL_APPROVAL_COLUMNS + " FROM pending_approvals"
             " WHERE operation COLLATE Latin1_General_100_BIN2 = ?"
             " AND params COLLATE Latin1_General_100_BIN2 = CAST(? AS NVARCHAR(MAX))"
             " COLLATE Latin1_General_100_BIN2"
@@ -11882,17 +12460,21 @@ class SqlServerStore:
                         # pending_approvals key, so every approval write takes the applock and
                         # then the row, never the reverse (no AB/BA deadlock across processes).
                         await self._open_under_audit_applock(cur)
+                        joined = None
                         if on_repeat is not None:
                             # Under the applock, which every request takes anyway for its own row
                             # and which is re-entrant per transaction, this read sees every request
                             # committed before it, so two repeats cannot both find none and insert.
                             await cur.execute(match, match_args)
-                            found = await cur.fetchone()
-                            if found is not None:
-                                held = str(found[0])
-                                append = on_repeat(held)
-                        if held == approval_id:
-                            await cur.execute(sql, args)
+                            joined = first_sealed_approval(
+                                self._row_sealer, await self._fetch_dicts(cur)
+                            )
+                        if joined is None:
+                            await self._write_approval(cur, row)
+                        else:
+                            assert on_repeat is not None  # `joined` is read only with it
+                            held = joined.id
+                            append = on_repeat(held)
                         audits: tuple[AuditAppend, ...] = () if append is None else (append,)
                         appended = await self._append_audits(cur, audits, now=now)
                         await self._commit(conn)
@@ -11902,6 +12484,21 @@ class SqlServerStore:
                     raise
         tee_audits(audits, appended, ts=now)
         return held
+
+    async def _write_approval(
+        self, cur: Any, new: ApprovalRow, *, current: ApprovalRow | None = None
+    ) -> bool:
+        """The one writer of a ``pending_approvals`` row (BACKLOG #2592); store.py's
+        ``MessageStore._write_approval`` states the contract. Call it on ``cur`` inside an open
+        transaction. Returns whether a row was written."""
+        sealer = self._row_sealer
+        if current is None:
+            await cur.execute(_MSSQL_APPROVAL_INSERT, seal_approval(sealer, new).write_params())
+            return True
+        await cur.execute(
+            _MSSQL_APPROVAL_UPDATE, approval_update(sealer, current, new).update_params(current)
+        )
+        return int(cur.rowcount) > 0
 
     async def _open_under_audit_applock(self, cur: Any) -> None:
         """Open a transaction on ``cur`` and take ``_AUDIT_APPEND_LOCK`` in it, before it locks
@@ -11913,17 +12510,15 @@ class SqlServerStore:
 
     async def get_pending_approval(self, approval_id: str) -> dict[str, Any] | None:
         return await self._fetchone(
-            "SELECT id, operation, params, requester, requester_user_id, requested_at, status,"
-            " approver, decided_at, expires_at FROM pending_approvals WHERE id = ?",
+            "SELECT " + _MSSQL_APPROVAL_COLUMNS + " FROM pending_approvals WHERE id = ?",
             (approval_id,),
         )
 
     async def list_pending_approvals(self, *, now: float, limit: int = 100) -> list[dict[str, Any]]:
-        """Open (still-``pending``, unexpired) approval requests, newest-first."""
+        """Open (still-``pending``, unexpired) approval requests, newest-first. Every column, so
+        the gate can check each row's seal (BACKLOG #2592)."""
         return await self._fetchall(
-            # requester_user_id: see the SQLite twin (BACKLOG #2460).
-            "SELECT TOP (?) id, operation, params, requester, requester_user_id, requested_at,"
-            " status, approver, decided_at, expires_at FROM pending_approvals"
+            "SELECT TOP (?) " + _MSSQL_APPROVAL_COLUMNS + " FROM pending_approvals"
             " WHERE status = 'pending' AND (expires_at IS NULL OR expires_at > ?)"
             " ORDER BY requested_at DESC",
             (limit, now),
@@ -11933,8 +12528,7 @@ class SqlServerStore:
         """Released requests cut off mid-run, oldest-first (BACKLOG #1562). No expiry filter, and the
         order: the Store protocol says why."""
         return await self._fetchall(
-            "SELECT TOP (?) id, operation, params, requester, requester_user_id, requested_at,"
-            " status, approver, decided_at, expires_at FROM pending_approvals"
+            "SELECT TOP (?) " + _MSSQL_APPROVAL_COLUMNS + " FROM pending_approvals"
             " WHERE status = 'interrupted'"
             " ORDER BY requested_at ASC",
             (limit,),
@@ -11953,36 +12547,45 @@ class SqlServerStore:
     ) -> bool:
         """Atomically move a request in ``from_status`` to ``status``.
         Returns ``True`` iff this call made the transition — guards against a double decision.
-        The SQLite twin documents why the guard is a parameter (ASVS 2.3.3); the Store protocol
-        states the ``audit`` and ``claim_owner`` contracts (vault BACKLOG #2255, BACKLOG #1562)."""
-        sql = (
-            "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?,"
-            " claim_owner = COALESCE(?, claim_owner) WHERE id = ? AND status = ?"
-        )
-        args = (status, approver, decided_at, claim_owner, approval_id, from_status)
-        if audit is None:
-            async with self._acquire() as conn, self._cursor(conn) as cur:
-                try:
-                    await cur.execute(sql, args)
-                    count = cur.rowcount
-                    await self._commit(conn)
-                except Exception:
-                    await conn.rollback()
-                    raise
-            return int(count) > 0
+        The SQLite twin documents why the guard is a parameter (ASVS 2.3.3) and how the move goes
+        through the write helper (BACKLOG #2592); the Store protocol states the ``audit`` and
+        ``claim_owner`` contracts (vault BACKLOG #2255, BACKLOG #1562). The row is read under
+        ``UPDLOCK``, so a concurrent decision waits for this one and then finds the row moved."""
         now = time.time()
         # Same lock order as `record_audit`: the in-process gate, then the connection. Then the
-        # audit applock BEFORE the UPDATE locks the row, the order create_pending_approval uses.
+        # audit applock BEFORE the read locks the row, the order create_pending_approval uses.
         async with self._audit_lock:  # noqa: SIM117
             async with self._acquire() as conn:
                 try:
                     async with self._cursor(conn) as cur:
                         await self._open_under_audit_applock(cur)
-                        await cur.execute(sql, args)
-                        moved = int(cur.rowcount) > 0
+                        await cur.execute(
+                            "SELECT "
+                            + _MSSQL_APPROVAL_COLUMNS
+                            + " FROM pending_approvals WITH (UPDLOCK, ROWLOCK) WHERE id = ?",
+                            (approval_id,),
+                        )
+                        found = await self._fetch_dicts(cur)
+                        current = ApprovalRow.from_mapping(found[0]) if found else None
+                        moved = (
+                            current is not None
+                            and current.status == from_status
+                            and await self._write_approval(
+                                cur,
+                                current.decided(
+                                    status=status,
+                                    approver=approver,
+                                    decided_at=decided_at,
+                                    claim_owner=claim_owner,
+                                ),
+                                current=current,
+                            )
+                        )
                         # Before the one commit, so a failed append rolls the transition back. A
                         # transition that matched no row writes no audit row.
-                        audits: tuple[AuditAppend, ...] = (audit,) if moved else ()
+                        audits: tuple[AuditAppend, ...] = (
+                            (audit,) if moved and audit is not None else ()
+                        )
                         appended = await self._append_audits(cur, audits, now=now)
                         await self._commit(conn)
                 except Exception:
@@ -11997,21 +12600,64 @@ class SqlServerStore:
     ) -> list[dict[str, Any]]:
         """Released requests still claimed as ``executing``, oldest claim first (BACKLOG #1562).
         The Store protocol says who reads it, why, and what ``claim_owner`` filters. The owner
-        compares under BIN2, so two owners differing only in case stay two owners."""
+        compares under BIN2, so two owners differing only in case stay two owners. Every column,
+        so the gate can check each row's seal (BACKLOG #2592)."""
         if claim_owner is None:
             return await self._fetchall(
-                "SELECT TOP (?) id, operation, requester, approver, decided_at, claim_owner"
-                " FROM pending_approvals WHERE status = 'executing'"
+                "SELECT TOP (?) " + _MSSQL_APPROVAL_COLUMNS + " FROM pending_approvals"
+                " WHERE status = 'executing'"
                 " ORDER BY decided_at ASC",
                 (limit,),
             )
         return await self._fetchall(
-            "SELECT TOP (?) id, operation, requester, approver, decided_at, claim_owner"
-            " FROM pending_approvals WHERE status = 'executing'"
+            "SELECT TOP (?) " + _MSSQL_APPROVAL_COLUMNS + " FROM pending_approvals"
+            " WHERE status = 'executing'"
             " AND (claim_owner COLLATE Latin1_General_100_BIN2 = ? OR claim_owner IS NULL)"
             " ORDER BY decided_at ASC",
             (limit, claim_owner),
         )
+
+    async def count_unsealed_approvals(self) -> int:
+        """store.py's ``MessageStore.count_unsealed_approvals`` states the contract."""
+        row = await self._fetchone(
+            "SELECT COUNT(*) AS n FROM pending_approvals WHERE seal = ''"
+            " AND status IN ('pending', 'executing', 'interrupted')"
+        )
+        return int(row["n"]) if row else 0
+
+    async def reseal_approval_records(self) -> tuple[int, int]:
+        """Re-seal every approval request under the active key, for ``rotate-key`` (BACKLOG
+        #2592); store.py's ``MessageStore.reseal_approval_records`` states the contract."""
+        sealer = self._row_sealer
+        if sealer is None:
+            return 0, 0
+        rows = await self._fetchall(
+            "SELECT id FROM pending_approvals WHERE seal <> ''"
+            " AND seal COLLATE Latin1_General_100_BIN2 NOT LIKE ? ORDER BY id",
+            (f"{SEAL_PREFIX}{sealer.key_id}:%",),
+        )
+        resealed = refused = 0
+        for found in rows:
+            async with self._acquire() as conn, self._cursor(conn) as cur:
+                try:
+                    await cur.execute(
+                        "SELECT "
+                        + _MSSQL_APPROVAL_COLUMNS
+                        + " FROM pending_approvals WITH (UPDLOCK, ROWLOCK) WHERE id = ?",
+                        (str(found["id"]),),
+                    )
+                    locked = await self._fetch_dicts(cur)
+                    if locked:
+                        current = ApprovalRow.from_mapping(locked[0])
+                        resealed += await self._write_approval(cur, current, current=current)
+                    await self._commit(conn)
+                except RowSealError:
+                    await conn.rollback()
+                    refused += 1
+                except Exception:
+                    await conn.rollback()
+                    raise
+        return resealed, refused
 
     async def _execute_with_audits(
         self, sql: str, params: tuple[Any, ...], audits: Sequence[AuditAppend], *, now: float
@@ -12039,6 +12685,26 @@ class SqlServerStore:
                 except Exception:
                     # BACKLOG #1940: see _rollback_or_discard. It runs after the cursor block, so a
                     # detached close of the raw connection cannot race the cursor's own close.
+                    await self._rollback_or_discard(conn)
+                    raise
+        tee_audits(audits, appended, ts=now)
+
+    async def _write_user_with_audits(
+        self, user_id: str, change: UserChange, audits: Sequence[AuditAppend], *, now: float
+    ) -> None:
+        """:meth:`_write_user` with its ``audits`` appended in the same transaction (BACKLOG
+        #2592); the lock order and the audit scope are :meth:`_execute_with_audits`'s."""
+        if not audits:
+            await self._write_user_txn(user_id, change)
+            return
+        async with self._audit_lock:  # noqa: SIM117
+            async with self._acquire() as conn:
+                try:
+                    async with self._cursor(conn) as cur:
+                        await self._write_user(cur, user_id, change)
+                        appended = await self._append_audits(cur, audits, now=now)
+                        await self._commit(conn)
+                except Exception:
                     await self._rollback_or_discard(conn)
                     raise
         tee_audits(audits, appended, ts=now)
@@ -12094,33 +12760,209 @@ class SqlServerStore:
     ) -> None:
         check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
-        sql = (
-            "INSERT INTO users (id, username, auth_provider, display_name, email, notify_email,"
-            " disabled, created_at, updated_at, last_login_at, password_hash, password_changed_at,"
-            " must_change_password, failed_attempts, locked_until, directory_object_id,"
-            " password_generated)"
-            " VALUES (?,?,?,?,?,?,0,?,?,NULL,?,?,?,0,NULL,?,?)"
+        record = new_user_record(
+            user_id=user_id,
+            username=username,
+            auth_provider=auth_provider,
+            display_name=display_name,
+            email=email,
+            notify_email=birth_notify_email(email, adopt=adopt_notify_email, typed=notify_email),
+            password_hash=password_hash,
+            must_change_password=must_change_password,
+            password_generated=password_generated,
+            directory_object_id=directory_object_id,
+            now=now,
         )
-        params = (
-            user_id,
-            username,
-            auth_provider,
-            display_name,
-            email,
-            birth_notify_email(email, adopt=adopt_notify_email, typed=notify_email),
-            now,
-            now,
-            password_hash,
-            now if password_hash is not None else None,
-            1 if must_change_password else 0,
-            directory_object_id,
-            1 if password_generated else 0,
+        # BACKLOG #2592: the whole row, sealed, in one INSERT.
+        await self._execute_with_audits(
+            _MSSQL_USER_INSERT,
+            user_insert_params(seal_user(self._row_sealer, record)),
+            audits,
+            now=now,
         )
-        await self._execute_with_audits(sql, params, audits, now=now)
 
     async def get_user(self, user_id: str) -> UserRecord | None:
         d = await self._fetchone("SELECT * FROM users WHERE id=?", (user_id,))
         return UserRecord.from_mapping(d) if d else None
+
+    async def get_user_role_grants(self, user_id: str) -> list[RoleGrant]:
+        """The account's role rows, whole, as its user seal covers them (BACKLOG #2592)."""
+        rows = await self._fetchall(
+            "SELECT role_id, assigned_at, assigned_by FROM user_roles WHERE user_id=?", (user_id,)
+        )
+        return [RoleGrant.from_mapping(r) for r in rows]
+
+    @staticmethod
+    async def _fetch_dicts(cur: Any) -> list[dict[str, Any]]:
+        """The rows the cursor's last SELECT returned, as dicts, draining it so the same cursor's
+        next statement is clean."""
+        columns = [c[0] for c in cur.description]
+        return [dict(zip(columns, row, strict=True)) for row in await cur.fetchall()]
+
+    async def _read_user_record(
+        self, cur: Any, user_id: str, *, lock: bool = True
+    ) -> UserAuthzRecord | None:
+        """The account's whole authorization record, read on ``cur`` inside an open transaction with
+        the account row held under ``UPDLOCK, ROWLOCK``, so the compare on the seal is a second
+        guard and not the only one (BACKLOG #2592). ``lock=False`` reads it unlocked, for a check
+        that writes nothing."""
+        if lock:
+            await cur.execute("SELECT * FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?", (user_id,))
+        else:
+            await cur.execute("SELECT * FROM users WHERE id=?", (user_id,))
+        rows = await self._fetch_dicts(cur)
+        if not rows:
+            return None
+        await cur.execute(
+            "SELECT role_id, assigned_at, assigned_by FROM user_roles WHERE user_id=?", (user_id,)
+        )
+        grants = [RoleGrant.from_mapping(g) for g in await self._fetch_dicts(cur)]
+        return UserAuthzRecord.of(UserRow.from_mapping(rows[0]), grants)
+
+    async def _write_user(
+        self, cur: Any, user_id: str, change: UserChange
+    ) -> UserAuthzRecord | None:
+        """The one writer of a user's sealed record (BACKLOG #2592); store.py's
+        ``MessageStore._write_user`` states the contract. Call it on ``cur`` inside an open
+        transaction. The write reports through ``OUTPUT`` (BACKLOG #2283)."""
+        current = await self._read_user_record(cur, user_id)
+        if current is None:
+            return None
+        if not user_seal_ok(self._row_sealer, current):
+            raise RowSealError(USER_KIND)
+        changed = change(current)
+        if changed is None:
+            return None
+        if changed.roles != current.roles:
+            await cur.execute("SELECT id FROM roles")
+            present = [str(r[0]) for r in await cur.fetchall()]
+            changed = existing_roles_only(current, changed, present)
+        updated = seal_user(self._row_sealer, changed)
+        await cur.execute(_MSSQL_USER_RESEAL, user_reseal_params(updated, current))
+        if not await cur.fetchall():
+            return None
+        if updated.roles != current.roles:
+            await cur.execute(_USER_ROLES_CLEAR, (current.row.id,))
+            for grant in updated.roles:
+                await cur.execute(
+                    _USER_ROLE_INSERT,
+                    (current.row.id, grant.role_id, grant.assigned_at, grant.assigned_by),
+                )
+        return updated
+
+    async def _write_user_txn(self, user_id: str, change: UserChange) -> UserAuthzRecord | None:
+        """:meth:`_write_user` in a transaction of its own, committed before it returns."""
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                updated = await self._write_user(cur, user_id, change)
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return updated
+
+    async def _account_passkeys(self, cur: Any, user_id: str) -> list[WebAuthnCredential]:
+        await cur.execute("SELECT * FROM webauthn_credentials WHERE user_id=?", (user_id,))
+        return [WebAuthnCredential.from_mapping(d) for d in await self._fetch_dicts(cur)]
+
+    async def _write_passkeys(
+        self,
+        cur: Any,
+        user_id: str,
+        statement: str,
+        params: tuple[object, ...],
+        *,
+        counted: bool,
+        removes_all: bool = False,
+    ) -> int:
+        """Run one passkey write and re-seal the account over its new passkey digest, on ``cur``
+        inside an open transaction (BACKLOG #2592); store.py's ``MessageStore._write_passkeys``
+        states the contract. ``counted`` says the statement reports through ``OUTPUT``, which is
+        read for the count; an INSERT reports nothing and counts as 0."""
+
+        current = await self._read_user_record(cur, user_id)
+        if current is not None:
+            if not user_seal_ok(self._row_sealer, current):
+                raise RowSealError(USER_KIND)
+            if (
+                self._row_sealer is not None
+                and not removes_all
+                and passkey_digest(await self._account_passkeys(cur, user_id))
+                != current.row.cred_digest
+            ):
+                raise RowSealError(USER_KIND)
+        await cur.execute(statement, params)
+        count = len(await cur.fetchall()) if counted else 0
+        if current is not None:
+            digest = passkey_digest(await self._account_passkeys(cur, user_id))
+            await self._write_user(cur, user_id, lambda r: r.changed(cred_digest=digest))
+        return count
+
+    async def _write_passkeys_txn(
+        self,
+        user_id: str,
+        statement: str,
+        params: tuple[object, ...],
+        *,
+        counted: bool,
+        removes_all: bool = False,
+    ) -> int:
+        """:meth:`_write_passkeys` in a transaction of its own."""
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                count = await self._write_passkeys(
+                    cur, user_id, statement, params, counted=counted, removes_all=removes_all
+                )
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return count
+
+    async def _bump_session_epoch(self, cur: Any, user_id: str) -> None:
+        """Raise the account's session epoch through the write helper, on ``cur`` inside an open
+        transaction (BACKLOG #2592); store.py's ``MessageStore._bump_session_epoch`` says why a
+        record that fails its seal does not stop the revoke that called this."""
+        try:
+            await self._write_user(cur, user_id, UserAuthzRecord.bump_epoch)
+        except RowSealError:
+            log.warning("an account's record failed its integrity seal; its sessions end anyway")
+
+    async def reseal_user_records(self) -> tuple[int, int]:
+        """Re-seal every user record under the active key, for ``rotate-key`` (BACKLOG #2592);
+        store.py's ``MessageStore.reseal_user_records`` states the contract."""
+        sealer = self._row_sealer
+        if sealer is None:
+            return 0, 0
+        cipher = self._cipher
+        if not isinstance(cipher, AesGcmCipher):  # no in-process keys, so no sealer either
+            return 0, 0
+        change = rotation_reseal(sealer, cipher.active_marker_prefix, self._reencrypt_value)
+        # Only records the pass has work on; store.py's reseal_user_records says why.
+        rows = await self._fetchall(
+            "SELECT id FROM users WHERE authz_seal <> '' AND (authz_seal NOT LIKE ?"
+            " OR (totp_secret IS NOT NULL AND totp_secret <> '' AND totp_secret NOT LIKE ?))"
+            " ORDER BY id",
+            (f"{SEAL_PREFIX}{sealer.key_id}:%", f"{cipher.active_marker_prefix}%"),
+        )
+        resealed = refused = 0
+        for row in rows:
+            try:
+                written = await self._write_user_txn(str(row["id"]), change)
+            except RowSealError:
+                refused += 1
+                continue
+            resealed += written is not None
+        if resealed:
+            # Each re-encrypted TOTP secret is an AES-GCM invocation under the active key (ASVS
+            # 11.3.4); charged here, as each generic rotation batch charges its own.
+            await self._charge_bound_batch()
+        return resealed, refused
+
+    async def count_unsealed_users(self) -> int:
+        """How many accounts carry no integrity seal (BACKLOG #2592)."""
+        row = await self._fetchone("SELECT COUNT(*) AS n FROM users WHERE authz_seal = ''")
+        return int(row["n"]) if row else 0
 
     async def get_user_by_username(self, username: str) -> UserRecord | None:
         d = await self._fetchone("SELECT * FROM users WHERE username=?", (username,))
@@ -12167,42 +13009,23 @@ class SqlServerStore:
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
-        claim_set = password_claim_set(must_change_password, "?")
-        claim_args: tuple[float, ...] = () if must_change_password else (now,)
-        condition = rotation_factor_term("1") if require_totp else ""
-        # OUTPUT, never ``cursor.rowcount``: a session-wide ``SET NOCOUNT ON`` suppresses the count
-        # (see ``_RESOLVE_OUTPUT``), and a conditional rotation must know whether it matched.
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "UPDATE users SET password_hash=?, password_changed_at=?, must_change_password=?,"
-                    f"{claim_set}"
-                    f" {PASSWORD_CHANGE_LOCKOUT_CLEAR}, password_generated=?, updated_at=?"
-                    f" OUTPUT inserted.id WHERE id=?{condition}",
-                    (
-                        password_hash,
-                        now,
-                        1 if must_change_password else 0,
-                        *claim_args,
-                        1 if password_generated else 0,
-                        now,
-                        user_id,
-                    ),
-                )
-                written = bool(await cur.fetchall())
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        return written
+        change = password_change(
+            password_hash=password_hash,
+            password_generated=password_generated,
+            must_change_password=must_change_password,
+            require_totp=require_totp,
+            now=now,
+        )
+        # The write helper reads ``OUTPUT``, never ``cursor.rowcount`` (see ``_RESOLVE_OUTPUT``),
+        # and a conditional rotation must know whether it matched.
+        return await self._write_user_txn(user_id, change) is not None
 
     async def set_password_hash(
         self, user_id: str, *, password_hash: str, now: float | None = None
     ) -> None:
         now = time.time() if now is None else now
-        await self._execute(
-            "UPDATE users SET password_hash=?, updated_at=? WHERE id=?",
-            (password_hash, now, user_id),
+        await self._write_user_txn(
+            user_id, lambda r: r.changed(password_hash=password_hash, updated_at=float(now))
         )
 
     # --- MFA: native TOTP second factor (local accounts, WP-14) --------------
@@ -12217,28 +13040,26 @@ class SqlServerStore:
             if secret
             else None
         )
-        await self._execute(
-            "UPDATE users SET totp_secret=?, updated_at=? WHERE id=?", (enc, now, user_id)
+        await self._write_user_txn(
+            user_id, lambda r: r.changed(totp_secret=enc, updated_at=float(now))
         )
 
     async def get_totp_secret(self, user_id: str) -> str | None:
         d = await self._fetchone("SELECT totp_secret FROM users WHERE id=?", (user_id,))
-        if not d or d["totp_secret"] is None:
-            return None
-        return self._cipher.decrypt(d["totp_secret"], aad=cell_aad("users", "totp_secret", user_id))
+        return self.open_totp_secret(user_id, d["totp_secret"] if d else None)
+
+    def open_totp_secret(self, user_id: str, cell: str | None) -> str | None:
+        """See :meth:`MessageStore.open_totp_secret` (BACKLOG #3510)."""
+        return self._dec(cell, aad=cell_aad("users", "totp_secret", user_id))
 
     async def enable_totp(
         self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
     ) -> bool:
         now = time.time() if now is None else now
-        # Conditional (see ``totp_enable_term``, #2224). The OUTPUT rowset, never the row count,
-        # says whether it wrote, for the reason ``_execute_output`` gives.
-        rows = await self._execute_output(
-            "UPDATE users SET totp_enabled=1, totp_enrolled_at=?, totp_recovery_codes=?,"
-            f" updated_at=? OUTPUT inserted.id WHERE id=?{totp_enable_term('0')}",
-            (now, json.dumps(recovery_code_hashes), now, user_id),
+        # Conditional (see ``totp_enable``, #2224); the write helper's OUTPUT says whether it wrote.
+        return (
+            await self._write_user_txn(user_id, totp_enable(recovery_code_hashes, now)) is not None
         )
-        return bool(rows)
 
     async def replace_totp_enrolment(
         self,
@@ -12257,42 +13078,26 @@ class SqlServerStore:
 
         Both counts come from ``OUTPUT`` rowsets, as :meth:`revoke_user_sessions` counts (BACKLOG
         #2283): ``cursor.rowcount`` under a session-wide ``SET NOCOUNT ON`` reports ``-1``. The
-        compare-and-set is spelled per case rather than with ``IS NOT DISTINCT FROM``, which
-        arrived only in SQL Server 2022. Same lock order as ``record_audit``: the in-process gate,
-        then the connection."""
+        compare-and-set is ``totp_replace``'s, null-safe in Python. Same lock order as
+        ``record_audit``: the in-process gate, then the connection."""
         now = time.time() if now is None else now
-        enrolled_term = (
-            " AND totp_enrolled_at IS NULL"
-            if expected_enrolled_at is None
-            else " AND totp_enrolled_at = ?"
-        )
-        params: tuple[Any, ...] = (
-            self._cipher.encrypt(secret, aad=cell_aad("users", "totp_secret", user_id)),
-            now,
-            json.dumps(recovery_code_hashes),
-            step,
-            now,
-            user_id,
-            *(() if expected_enrolled_at is None else (expected_enrolled_at,)),
+        change = totp_replace(
+            sealed_secret=self._cipher.encrypt(
+                secret, aad=cell_aad("users", "totp_secret", user_id)
+            ),
+            recovery_code_hashes=recovery_code_hashes,
+            step=step,
+            expected_enrolled_at=expected_enrolled_at,
+            now=now,
         )
         async with self._audit_lock:  # noqa: SIM117
             async with self._acquire() as conn:
                 try:
                     async with self._cursor(conn) as cur:
-                        await cur.execute(
-                            "UPDATE users SET totp_secret=?, totp_enrolled_at=?,"
-                            " totp_recovery_codes=?, last_totp_step=?, updated_at=?"
-                            " OUTPUT inserted.id"
-                            " WHERE id=? AND totp_enabled=1 AND totp_secret IS NOT NULL"
-                            + enrolled_term,
-                            params,
-                        )
-                        swapped = await cur.fetchall()  # drain, so the next execute is clean
-                        if not swapped:
+                        if await self._write_user(cur, user_id, change) is None:
                             # Nothing written, so nothing is revoked or audited.
                             await conn.rollback()
                             return None
-                        await cur.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
                         await cur.execute(_MSSQL_REVOKE_USER_SESSIONS_SQL, (now, user_id))
                         revoked = len(await cur.fetchall())
                         appended = await self._append_audits(cur, (audit,), now=now)
@@ -12307,12 +13112,8 @@ class SqlServerStore:
 
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
-        await self._execute(
-            # ``last_totp_step`` too: see the SQLite twin (ADR 0197 Amendment A).
-            "UPDATE users SET totp_secret=NULL, totp_enabled=0, totp_enrolled_at=NULL,"
-            " totp_recovery_codes=NULL, last_totp_step=NULL, updated_at=? WHERE id=?",
-            (now, user_id),
-        )
+        # ``last_totp_step`` too: see ``totp_disable`` (ADR 0197 Amendment A).
+        await self._write_user_txn(user_id, lambda r: totp_disable(r, now))
 
     async def get_recovery_code_hashes(self, user_id: str) -> list[str]:
         d = await self._fetchone("SELECT totp_recovery_codes FROM users WHERE id=?", (user_id,))
@@ -12323,66 +13124,20 @@ class SqlServerStore:
     async def consume_recovery_code_hash(
         self, user_id: str, code_hash: str, *, now: float | None = None
     ) -> bool:
-        """Atomically remove one recovery-code hash; ``True`` iff present. The ``UPDLOCK`` SELECT +
-        UPDATE run in one transaction, so concurrent verifications can't double-spend a single-use
-        recovery code (WP-14)."""
+        """Atomically remove one recovery-code hash; ``True`` iff present. The write helper's
+        ``UPDLOCK`` read and its write run in one transaction, so concurrent verifications can't
+        double-spend a single-use recovery code (WP-14)."""
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "SELECT totp_recovery_codes FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?",
-                    (user_id,),
-                )
-                # fetchall reads the codes AND drains the SELECT so the same-cursor UPDATE below is clean.
-                # Deterministic close before the pooled connection is reused is `_cursor`'s job (EF-6);
-                # the early-return commits below then release a cursor that gets closed on block exit.
-                rows = await cur.fetchall()
-                raw = rows[0][0] if rows else None
-                if raw is None:
-                    await self._commit(conn)
-                    return False
-                hashes = [str(h) for h in json.loads(raw)]
-                if code_hash not in hashes:
-                    await self._commit(conn)
-                    return False  # already consumed by a concurrent caller
-                hashes.remove(code_hash)
-                await cur.execute(
-                    "UPDATE users SET totp_recovery_codes=?, updated_at=? WHERE id=?",
-                    (json.dumps(hashes), now, user_id),
-                )
-                await self._commit(conn)
-                return True
-            except Exception:
-                await conn.rollback()
-                raise
+        written = await self._write_user_txn(user_id, recovery_code_spend(code_hash, now))
+        return written is not None
 
     async def consume_totp_step(self, user_id: str, step: int) -> bool:
         """Atomically record ``step`` as the user's highest consumed TOTP time-step; ``True`` iff newly
         consumed (strictly greater than any prior step). A code replayed inside its ±1-step verify
         window resolves to a non-greater step and returns ``False`` — single-use per ASVS 6.5.1. The
-        ``UPDLOCK`` SELECT + UPDATE run in one transaction so concurrent verifications can't both win."""
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "SELECT last_totp_step FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?",
-                    (user_id,),
-                )
-                # fetchall reads the step AND drains the SELECT so the same-cursor UPDATE below is clean;
-                # `_cursor` closes the cursor before the pooled connection is reused (EF-6).
-                rows = await cur.fetchall()
-                if not rows:
-                    await self._commit(conn)
-                    return False
-                last = rows[0][0]
-                if last is not None and last >= step:
-                    await self._commit(conn)
-                    return False  # already consumed (or an older step) — replay within the window
-                await cur.execute("UPDATE users SET last_totp_step=? WHERE id=?", (step, user_id))
-                await self._commit(conn)
-                return True
-            except Exception:
-                await conn.rollback()
-                raise
+        write helper's ``UPDLOCK`` read and its write run in one transaction so concurrent
+        verifications can't both win."""
+        return await self._write_user_txn(user_id, totp_step_spend(step)) is not None
 
     # --- WebAuthn credentials (WP-14b, ADR 0068) ------------------------------
 
@@ -12391,27 +13146,10 @@ class SqlServerStore:
         material, not a secret — excluded from cipher + rekey). A duplicate ``(user_id, label)``
         raises pyodbc's IntegrityError via ``ux_webauthn_label`` — the caller renders it as the
         same "label already in use" error as its pre-check (the concurrent-enroll race, ADR 0068
-        §4)."""
-        await self._execute(
-            "INSERT INTO webauthn_credentials (credential_id_hash, credential_id, user_id,"
-            " rp_id, public_key, sign_count, transports, device_type, backed_up, label,"
-            " aaguid, created_at, last_used_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                cred.credential_id_hash,
-                cred.credential_id,
-                cred.user_id,
-                cred.rp_id,
-                cred.public_key,
-                cred.sign_count,
-                json.dumps(cred.transports) if cred.transports is not None else None,
-                cred.device_type,
-                1 if cred.backed_up else 0,
-                cred.label,
-                cred.aaguid,
-                cred.created_at,
-                cred.last_used_at,
-            ),
+        §4). The account is re-sealed over its new passkey digest in the same transaction (BACKLOG
+        #2592)."""
+        await self._write_passkeys_txn(
+            cred.user_id, _WEBAUTHN_INSERT, webauthn_insert_params(cred), counted=False
         )
 
     async def list_webauthn_credentials(self, user_id: str) -> list[WebAuthnCredential]:
@@ -12445,31 +13183,20 @@ class SqlServerStore:
 
     async def delete_webauthn_credential(self, user_id: str, credential_id_hash: str) -> bool:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
-        predicate keeps the action self-scoped even if a foreign id-hash is submitted)."""
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "DELETE FROM webauthn_credentials WHERE user_id=? AND credential_id_hash=?",
-                    (user_id, credential_id_hash),
-                )
-                count = cur.rowcount
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        return int(count) > 0
+        predicate keeps the action self-scoped even if a foreign id-hash is submitted). The account
+        is re-sealed over its new passkey digest in the same transaction (BACKLOG #2592), and the
+        count is read from ``OUTPUT`` (BACKLOG #2283)."""
+        count = await self._write_passkeys_txn(
+            user_id, _MSSQL_WEBAUTHN_DELETE_ONE, (user_id, credential_id_hash), counted=True
+        )
+        return count > 0
 
     async def delete_all_webauthn_credentials(self, user_id: str) -> int:
-        """Remove every credential for a user (``admin_reset_mfa``); returns the count removed."""
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))
-                count = cur.rowcount
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        return max(int(count), 0)
+        """Remove every credential for a user (``admin_reset_mfa``); returns the count removed.
+        The account is re-sealed over its empty passkey digest in the same transaction."""
+        return await self._write_passkeys_txn(
+            user_id, _MSSQL_WEBAUTHN_DELETE_ALL, (user_id,), counted=True, removes_all=True
+        )
 
     async def update_webauthn_sign_count(
         self, credential_id_hash: str, *, expected: int, new: int, used_at: float
@@ -12507,9 +13234,8 @@ class SqlServerStore:
         self, user_id: str, *, disabled: bool, now: float | None = None
     ) -> None:
         now = time.time() if now is None else now
-        await self._execute(
-            "UPDATE users SET disabled=?, updated_at=? WHERE id=?",
-            (1 if disabled else 0, now, user_id),
+        await self._write_user_txn(
+            user_id, lambda r: r.changed(disabled=bool(disabled), updated_at=float(now))
         )
 
     async def update_user_profile(
@@ -12527,9 +13253,9 @@ class SqlServerStore:
         back and restore the defect the split removes. ``audits``: see
         ``AuthStore.update_user_profile``."""
         now = time.time() if now is None else now
-        await self._execute_with_audits(
-            "UPDATE users SET display_name=?, email=?, updated_at=? WHERE id=?",
-            (display_name, email, now, user_id),
+        await self._write_user_with_audits(
+            user_id,
+            lambda r: r.changed(display_name=display_name, email=email, updated_at=float(now)),
             audits,
             now=now,
         )
@@ -12544,8 +13270,8 @@ class SqlServerStore:
         """
         cleaned = require_notify_email(email)
         now = time.time() if now is None else now
-        await self._execute(
-            "UPDATE users SET notify_email=?, updated_at=? WHERE id=?", (cleaned, now, user_id)
+        await self._write_user_txn(
+            user_id, lambda r: r.changed(notify_email=cleaned, updated_at=float(now))
         )
 
     async def list_known_login_addresses(self, user_id: str, *, since: float) -> list[str]:
@@ -12619,21 +13345,28 @@ class SqlServerStore:
                         await cur.execute("SELECT TOP (1) id FROM users WHERE id=?", (user_id,))
                         await cur.fetchall()
                         await self._applock(cur, _ADMIN_GUARD_LOCK)
-                        await cur.execute(
-                            _SQL_ADMIN_GUARD_COUNTS, (user_id, user_id, admin_role_id)
+                        await cur.execute(_SQL_ADMIN_GUARD_HOLDERS, (user_id, admin_role_id))
+                        holders = [(str(r[0]), bool(r[1])) for r in await cur.fetchall()]
+                        target, others = await admin_guard_counts(
+                            holders,
+                            self._row_sealer,
+                            lambda holder: self._read_user_record(cur, holder, lock=False),
                         )
-                        target, others = await cur.fetchone() or (0, 0)
                         if target and not others:
                             await conn.rollback()  # nothing written; releases the applock
                             return False
                     if change is AdminRemoval.DISABLE:
-                        await cur.execute(
-                            "UPDATE users SET disabled=1, updated_at=? WHERE id=?", (now, user_id)
+                        await self._write_user(
+                            cur, user_id, lambda r: r.changed(disabled=True, updated_at=float(now))
                         )
                     elif change is AdminRemoval.DELETE:
                         await self._delete_user_rows(cur, user_id)
                     elif change is AdminRemoval.SET_ROLES:
-                        await self._replace_user_roles(cur, user_id, role_ids, assigned_by, now)
+                        await self._write_user(
+                            cur,
+                            user_id,
+                            lambda r: r.with_roles(role_ids, assigned_by=assigned_by, now=now),
+                        )
                     else:
                         assert_never(change)
                     await self._commit(conn)
@@ -12662,20 +13395,14 @@ class SqlServerStore:
 
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
-        await self._execute(
-            f"UPDATE users SET last_login_at=?, {FULL_AUTHENTICATION_LOCKOUT_CLEAR},"
-            " updated_at=? WHERE id=?",
-            (now, now, user_id),
-        )
+        await self._write_user_txn(user_id, lambda r: full_authentication_clear(r, now))
 
     async def clear_lockout(
         self, user_id: str, *, reset_cycles: bool = False, now: float | None = None
     ) -> None:
         now = time.time() if now is None else now
-        await self._execute(
-            f"UPDATE users SET {lockout_clear_set(reset_cycles=reset_cycles)}, updated_at=?"
-            " WHERE id=?",
-            (now, user_id),
+        await self._write_user_txn(
+            user_id, lambda r: lockout_clear(r, reset_cycles=reset_cycles, now=now)
         )
 
     async def record_login_failure(
@@ -12687,9 +13414,13 @@ class SqlServerStore:
         now: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
-        await self._execute(
-            "UPDATE users SET failed_attempts=?, locked_until=?, updated_at=? WHERE id=?",
-            (failed_attempts, locked_until, now, user_id),
+        await self._write_user_txn(
+            user_id,
+            lambda r: r.changed(
+                failed_attempts=int(failed_attempts),
+                locked_until=_opt_float(locked_until),
+                updated_at=float(now),
+            ),
         )
 
     async def increment_login_failure(
@@ -12711,43 +13442,17 @@ class SqlServerStore:
         than three; the same locked read carries the ``auth_provider`` and ``totp_enabled`` that
         decide the escalation (ADR 0197). Returns ``(0, False, 0)`` for an unknown user."""
         now = time.time() if now is None else now
-        attempts_col, until_col, cycles_col = LOCKOUT_COLUMNS[counter]
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    f"SELECT {attempts_col}, {until_col}, {cycles_col}, auth_provider, totp_enabled,"
-                    " password_generated FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?",
-                    (user_id,),
-                )
-                # fetchall reads the counters AND drains the SELECT so the same-cursor UPDATE below is
-                # clean; `_cursor` closes the cursor before the pooled connection is reused (EF-6).
-                rows = await cur.fetchall()
-                if not rows:
-                    await self._commit(conn)
-                    return LockoutIncrement(0, False, 0)
-                state = next_lockout_state(
-                    failed_attempts=int(rows[0][0]),
-                    locked_until=_opt_float(rows[0][1]),
-                    lock_cycles=int(rows[0][2]),
-                    now=now,
-                    threshold=threshold,
-                    lockout_seconds=lockout_seconds,
-                    max_lockout_seconds=max_lockout_seconds,
-                    escalate=lockout_escalates(
-                        counter, auth_provider=str(rows[0][3]), totp_enabled=bool(rows[0][4])
-                    ),
-                    lockable=lockout_arms(counter, password_generated=bool(rows[0][5])),
-                )
-                await cur.execute(
-                    f"UPDATE users SET {attempts_col}=?, {until_col}=?, {cycles_col}=?,"
-                    " updated_at=? WHERE id=?",
-                    (state.attempts, state.locked_until, state.cycles, now, user_id),
-                )
-                await self._commit(conn)
-                return LockoutIncrement(state.attempts, state.just_locked, state.cycles)
-            except Exception:
-                await conn.rollback()
-                raise
+        out: list[LockoutIncrement] = []
+        change = lockout_increment(
+            counter,
+            threshold=threshold,
+            lockout_seconds=lockout_seconds,
+            max_lockout_seconds=max_lockout_seconds,
+            now=now,
+            out=out,
+        )
+        written = await self._write_user_txn(user_id, change)
+        return out[0] if written is not None else LockoutIncrement(0, False, 0)
 
     async def upsert_role(
         self,
@@ -12758,19 +13463,21 @@ class SqlServerStore:
         builtin: bool = True,
         permissions: str | None = None,
     ) -> None:
-        # Single atomic MERGE under HOLDLOCK (range-locks the key) so two concurrent seeders can't both
-        # find the row absent and both INSERT the same PK -> violation (the UPDATE-then-INSERT race).
-        await self._execute(
-            "MERGE roles WITH (HOLDLOCK) AS t"
-            " USING (SELECT ? AS id, ? AS display_name, ? AS description, ? AS builtin,"
-            " ? AS permissions) AS s"
-            " ON t.id=s.id"
-            " WHEN MATCHED THEN UPDATE SET display_name=s.display_name,"
-            " description=s.description, builtin=s.builtin, permissions=s.permissions"
-            " WHEN NOT MATCHED THEN INSERT (id, display_name, description, builtin, permissions)"
-            " VALUES (s.id, s.display_name, s.description, s.builtin, s.permissions);",
-            (role_id, display_name, description, 1 if builtin else 0, permissions),
-        )
+        row = RoleRow(role_id, display_name, description, bool(builtin), permissions, "")
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await self._write_role(cur, row)
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def _write_role(self, cur: Any, row: RoleRow) -> None:
+        """The one writer of a ``roles`` row (BACKLOG #2592); store.py's
+        ``MessageStore._write_role`` states the contract. Call it on ``cur`` inside an open
+        transaction. One MERGE under HOLDLOCK (range-locks the key), so two concurrent seeders
+        cannot both find the row absent and both INSERT the same key."""
+        await cur.execute(_MSSQL_ROLE_MERGE, seal_role(self._row_sealer, row).write_params())
 
     async def list_roles(self) -> list[dict[str, Any]]:
         return await self._fetchall("SELECT * FROM roles ORDER BY id")
@@ -12789,8 +13496,27 @@ class SqlServerStore:
                 if row is None or int(row[0]) != 0:
                     await conn.rollback()
                     return False
-                await cur.execute("DELETE FROM user_roles WHERE role_id=?", (role_id,))
-                await cur.execute("DELETE FROM ad_group_role_map WHERE role_id=?", (role_id,))
+                # BACKLOG #2592: each holder re-sealed without the role, and only a refused holder's
+                # own row deleted; store.py says why there is no bulk delete. A grant committed
+                # after the holder read keeps its row, so the role delete below then fails the
+                # foreign key, fk_user_roles_role. No role-row lock is taken here.
+                await cur.execute("SELECT user_id FROM user_roles WHERE role_id=?", (role_id,))
+                holders = [str(h[0]) for h in await cur.fetchall()]
+                for holder in holders:
+                    try:
+                        await self._write_user(cur, holder, without_role(role_id))
+                    except RowSealError:
+                        report_refused_role_holder()
+                        await cur.execute(
+                            "DELETE FROM user_roles WHERE role_id=? AND user_id=?",
+                            (role_id, holder),
+                        )
+                # The map is re-sealed only when it verifies; store.py says why.
+                try:
+                    await self._write_ad_map(cur, AD_ROLE_MAP, lambda m: m.without_value(role_id))
+                except RowSealError:
+                    report_refused_ad_role_map()
+                    await cur.execute("DELETE FROM ad_group_role_map WHERE role_id=?", (role_id,))
                 await cur.execute("DELETE FROM roles WHERE id=?", (role_id,))
                 await self._commit(conn)
                 return True
@@ -12813,26 +13539,9 @@ class SqlServerStore:
         now: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await self._replace_user_roles(cur, user_id, role_ids, assigned_by, now)
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-
-    @staticmethod
-    async def _replace_user_roles(
-        cur: Any, user_id: str, role_ids: Sequence[str], assigned_by: str | None, now: float
-    ) -> None:
-        """Replace the account's role rows, inside the caller's transaction."""
-        await cur.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
-        for role_id in role_ids:
-            await cur.execute(
-                "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by)"
-                " VALUES (?,?,?,?)",
-                (user_id, role_id, now, assigned_by),
-            )
+        await self._write_user_txn(
+            user_id, lambda r: r.with_roles(role_ids, assigned_by=assigned_by, now=now)
+        )
 
     async def set_user_channel_scope(
         self,
@@ -12843,9 +13552,11 @@ class SqlServerStore:
         now: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
-        await self._execute(
-            "UPDATE users SET channel_scope=?, channel_scope_source=?, updated_at=? WHERE id=?",
-            (scope_json, source, now, user_id),
+        await self._write_user_txn(
+            user_id,
+            lambda r: r.changed(
+                channel_scope=scope_json, channel_scope_source=source, updated_at=float(now)
+            ),
         )
 
     async def set_user_channel_scope_if_source(
@@ -12857,48 +13568,24 @@ class SqlServerStore:
         expected_source: ChannelScopeSource | None,
         now: float | None = None,
     ) -> bool:
-        """The compare-and-set scope write (BACKLOG #2098); see ``AuthStore``. Two literal
-        statements rather than one: ``IS NOT DISTINCT FROM`` arrived only in SQL Server 2022, and
-        ``= ?`` never matches NULL."""
+        """The compare-and-set scope write (BACKLOG #2098); see ``AuthStore``. The compare is
+        ``scope_if_source``'s, in Python, so ``None`` matches NULL with no SQL Server 2022 form."""
         now = time.time() if now is None else now
-        if expected_source is None:
-            count = await self._execute(
-                "UPDATE users SET channel_scope=?, channel_scope_source=?, updated_at=?"
-                " WHERE id=? AND channel_scope_source IS NULL",
-                (scope_json, source, now, user_id),
-            )
-        else:
-            count = await self._execute(
-                "UPDATE users SET channel_scope=?, channel_scope_source=?, updated_at=?"
-                " WHERE id=? AND channel_scope_source = ?",
-                (scope_json, source, now, user_id, expected_source),
-            )
-        return count > 0
+        change = scope_if_source(scope_json, source, expected_source, now)
+        return await self._write_user_txn(user_id, change) is not None
 
     async def withdraw_ad_channel_scope(
         self, user_id: str, expected_scope: str, *, now: float | None = None
     ) -> bool:
         """Withdraw a directory-derived scope to NULL (BACKLOG #1927); see ``AuthStore``.
 
-        Its own statement, not the shared ``WITHDRAW_AD_SCOPE_SQL``, for two reasons. The column
-        has no COLLATE, so a plain ``=`` would compare under the database default, usually
-        case-insensitive: a newer scope differing only in case would match and be withdrawn,
-        where SQLite and Postgres refuse it. And the bound value is CAST to NVARCHAR(MAX), so a
-        scope over 4000 characters compares as NVARCHAR(MAX) whatever long type the driver binds
-        it as."""
+        The compare is ``scope_withdrawal``'s, in Python (BACKLOG #2592), so it is byte-exact
+        whatever the column's collation and however long the scope: the two properties the
+        collation-pinned, NVARCHAR(MAX)-cast statement this replaced existed to give."""
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    _WITHDRAW_AD_SCOPE_SQL_MSSQL,
-                    (SCOPE_SOURCE_AD, now, user_id, expected_scope, SCOPE_SOURCE_MANUAL),
-                )
-                count = cur.rowcount
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        return int(count) > 0
+        return (
+            await self._write_user_txn(user_id, scope_withdrawal(expected_scope, now)) is not None
+        )
 
     async def set_user_username(
         self, user_id: str, username: str, *, expected_username: str, now: float | None = None
@@ -12936,14 +13623,32 @@ class SqlServerStore:
         # BIN2 is a BINARY collation, so `other.username=?` compares byte for byte on this backend
         # exactly as it does on SQLite and PostgreSQL. The divergence is real for the id column and
         # imaginary for this one, which is why the cross-backend case arm runs on all three.
+        #
+        # BACKLOG #2592: the guard is now a read in the same transaction, then the sealed write
+        # under the account's UPDLOCK. It still only narrows the window, as above.
         now = time.time() if now is None else now
-        written = await self._execute_output(
-            "UPDATE users SET username=?, updated_at=? OUTPUT inserted.id"
-            " WHERE id=? AND username=? AND NOT EXISTS"
-            " (SELECT 1 FROM users other WHERE other.username=? AND other.id<>?)",
-            (username, now, user_id, expected_username, username, user_id),
-        )
-        return bool(written)
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    "SELECT 1 FROM users WHERE username=? AND id<>?", (username, user_id)
+                )
+                taken = bool(await cur.fetchall())
+                written = None
+                if not taken:
+                    written = await self._write_user(
+                        cur,
+                        user_id,
+                        lambda r: (
+                            r.changed(username=username, updated_at=float(now))
+                            if r.row.username == expected_username
+                            else None
+                        ),
+                    )
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return written is not None
 
     async def set_user_federated_subject(
         self,
@@ -12961,26 +13666,16 @@ class SqlServerStore:
 
         The ``UPDATE users`` takes the row lock that a guarded ``create_session`` asks for with
         ``UPDLOCK, ROWLOCK``, and both take it before they touch ``sessions``. So an in-flight
-        insert either commits first and is swept below, or waits and then reads the row bound."""
+        insert either commits first and is swept below, or waits and then reads the row bound. The
+        write helper's ``UPDLOCK`` read takes that lock now (BACKLOG #2592)."""
         now = time.time() if now is None else now
-        sql = (
-            "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?"
-            " AND oidc_issuer IS NULL AND oidc_subject IS NULL"
-            if expect_unbound
-            else "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?"
-        )
+        change = federated_bind(issuer, subject, expect_unbound=expect_unbound, now=now)
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                await cur.execute(
-                    sql,
-                    (issuer, subject, now, user_id),
-                )
-                written = cur.rowcount
-                if written is None or int(written) <= 0:
+                if await self._write_user(cur, user_id, change) is None:
                     # Nothing written, so nothing is revoked. The rollback frees the connection.
                     await conn.rollback()
                     return None
-                await cur.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
                 await cur.execute(
                     "UPDATE sessions SET revoked_at=?, seal='' WHERE user_id=? AND revoked_at IS NULL",
                     (now, user_id),
@@ -13044,11 +13739,7 @@ class SqlServerStore:
                     return FederatedUnbind(
                         username=username, issuer=None, subject=None, sessions_revoked=0
                     )
-                await cur.execute(
-                    "UPDATE users SET oidc_issuer=NULL, oidc_subject=NULL, updated_at=? WHERE id=?",
-                    (now, user_id),
-                )
-                await cur.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
+                await self._write_user(cur, user_id, lambda r: federated_unbind(r, now))
                 await cur.execute(
                     "UPDATE sessions SET revoked_at=?, seal='' WHERE user_id=? AND revoked_at IS NULL",
                     (now, user_id),
@@ -13066,15 +13757,14 @@ class SqlServerStore:
         )
 
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
-        normalized = sorted({g.strip().lower() for g in groups if g.strip()})
-        if not normalized:
-            return set()
-        placeholders = ",".join("?" * len(normalized))  # count-bound, not user text
-        rows = await self._fetchall(
-            f"SELECT DISTINCT role_id FROM ad_group_role_map WHERE ad_group IN ({placeholders})",
-            tuple(normalized),
-        )
-        return {str(r["role_id"]) for r in rows}
+        """The role ids the role map gives ``groups``, its seal UNCHECKED; store.py's twin says
+        why. BACKLOG #2592: a pair whose role has no roles row is left out, because this backend's
+        map has no role foreign key and can hold a deleted role's id. The user write path refuses
+        such an id, which would refuse the sign-in; SQLite and Postgres refuse the map row itself."""
+        return (await self.get_ad_map(AD_ROLE_MAP)).values_for(groups)
+
+    async def get_ad_map(self, name: str) -> AdMap:
+        return AdMap.from_rows(name, await self._fetchall(_MSSQL_AD_MAP_SQL[name].read, (name,)))
 
     async def list_ad_group_role_map(self) -> list[dict[str, Any]]:
         return await self._fetchall(
@@ -13082,30 +13772,105 @@ class SqlServerStore:
         )
 
     async def set_ad_group_role_map(self, entries: Iterable[tuple[str, str]]) -> None:
-        pairs = sorted({(g.strip().lower(), r) for g, r in entries if g.strip()})
+        await self._replace_ad_map(AdMap.from_entries(AD_ROLE_MAP, entries))
+
+    async def _replace_ad_map(self, replacement: AdMap) -> None:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                await cur.execute("DELETE FROM ad_group_role_map")
-                for ad_group, role_id in pairs:
-                    await cur.execute(
-                        "INSERT INTO ad_group_role_map (ad_group, role_id) VALUES (?,?)",
-                        (ad_group, role_id),
-                    )
+                await self._write_ad_map(cur, replacement.name, replacement)
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
 
-    async def channels_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
-        normalized = sorted({g.strip().lower() for g in groups if g.strip()})
-        if not normalized:
-            return set()
-        placeholders = ",".join("?" * len(normalized))  # count-bound, not user text
-        rows = await self._fetchall(
-            f"SELECT DISTINCT channel FROM ad_group_scope_map WHERE ad_group IN ({placeholders})",
-            tuple(normalized),
+    async def _write_ad_map(self, cur: Any, name: str, change: AdMapChange) -> bool:
+        """The one writer of an AD directory map and its seal (BACKLOG #2592); store.py's
+        ``MessageStore._write_ad_map`` states the contract. Call it on ``cur`` inside an open
+        transaction. The map's seal key is read under ``UPDLOCK, HOLDLOCK`` first, which locks it
+        whether or not its row exists yet, so two writes of one map run one after the other."""
+        sql = _MSSQL_AD_MAP_SQL[name]
+        await cur.execute(
+            "SELECT seal FROM authority_set_seal WITH (UPDLOCK, HOLDLOCK) WHERE name=?", (name,)
         )
-        return {str(r["channel"]) for r in rows}
+        seal_rows = await cur.fetchall()
+        await cur.execute(sql.pairs)
+        current = AdMap.of(
+            name,
+            [(str(r[0]), str(r[1])) for r in await cur.fetchall()],
+            str(seal_rows[0][0] or "") if seal_rows else "",
+        )
+        new = ad_map_write(self._row_sealer, current, change)
+        if new is None:
+            return False
+        if new.pairs != current.pairs:
+            await cur.execute(sql.clear)
+            for pair in new.pairs:
+                await cur.execute(sql.insert, pair)
+        await cur.execute(_MSSQL_SET_SEAL_MERGE, (name, new.seal))
+        return True
+
+    async def count_unsealed_role_records(self) -> int:
+        """store.py's ``MessageStore.count_unsealed_role_records`` states the contract."""
+        row = await self._fetchone(
+            "SELECT COUNT(*) AS n FROM roles WHERE builtin = 0 AND seal = ''"
+        )
+        unsealed = int(row["n"]) if row else 0
+        for name in AD_MAPS:
+            current = await self.get_ad_map(name)
+            unsealed += 1 if current.pairs and not current.seal else 0
+        return unsealed
+
+    async def reseal_role_records(self) -> tuple[int, int]:
+        """Re-seal every role definition and both AD directory maps under the active key, for
+        ``rotate-key`` (BACKLOG #2592); store.py's ``MessageStore.reseal_role_records`` states the
+        contract."""
+        sealer = self._row_sealer
+        if sealer is None:
+            return 0, 0
+        rows = await self._fetchall(
+            "SELECT id FROM roles WHERE seal <> '' AND seal NOT LIKE ? ORDER BY id",
+            (f"{SEAL_PREFIX}{sealer.key_id}:%",),
+        )
+        resealed = refused = 0
+        for found in rows:
+            async with self._acquire() as conn, self._cursor(conn) as cur:
+                try:
+                    await cur.execute(
+                        "SELECT * FROM roles WITH (UPDLOCK, ROWLOCK) WHERE id=?",
+                        (str(found["id"]),),
+                    )
+                    locked = await self._fetch_dicts(cur)
+                    if locked:
+                        role = RoleRow.from_mapping(locked[0])
+                        if role_seal_ok(sealer, role):
+                            await self._write_role(cur, role)
+                            resealed += 1
+                        else:
+                            refused += 1
+                    await self._commit(conn)
+                except Exception:
+                    await conn.rollback()
+                    raise
+        for name in AD_MAPS:
+            current = await self.get_ad_map(name)
+            if not current.seal or sealer.is_active(current.seal):
+                continue
+            async with self._acquire() as conn, self._cursor(conn) as cur:
+                try:
+                    resealed += await self._write_ad_map(cur, name, lambda m: m)
+                    await self._commit(conn)
+                except RowSealError:
+                    await conn.rollback()
+                    refused += 1
+                except Exception:
+                    await conn.rollback()
+                    raise
+        return resealed, refused
+
+    async def channels_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
+        """The channels the channel map gives ``groups``, its seal UNCHECKED; store.py's twin says
+        why."""
+        return (await self.get_ad_map(AD_SCOPE_MAP)).values_for(groups)
 
     async def list_ad_group_scope_map(self) -> list[dict[str, Any]]:
         return await self._fetchall(
@@ -13113,21 +13878,7 @@ class SqlServerStore:
         )
 
     async def set_ad_group_scope_map(self, entries: Iterable[tuple[str, str]]) -> None:
-        pairs = sorted(
-            {(g.strip().lower(), c.strip()) for g, c in entries if g.strip() and c.strip()}
-        )
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute("DELETE FROM ad_group_scope_map")
-                for ad_group, channel in pairs:
-                    await cur.execute(
-                        "INSERT INTO ad_group_scope_map (ad_group, channel) VALUES (?,?)",
-                        (ad_group, channel),
-                    )
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
+        await self._replace_ad_map(AdMap.from_entries(AD_SCOPE_MAP, entries))
 
     async def create_session(
         self,
@@ -13331,7 +14082,7 @@ class SqlServerStore:
         now = time.time() if now is None else now
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                await cur.execute(_BUMP_SESSION_EPOCH_SQL, (user_id,))
+                await self._bump_session_epoch(cur, user_id)
                 if except_token_hash is None:
                     await cur.execute(_MSSQL_REVOKE_USER_SESSIONS_SQL, (now, user_id))
                 else:

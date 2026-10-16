@@ -10,10 +10,12 @@ the env-only passphrase, and that a bad/missing password never leaks into the er
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import errno
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -796,6 +798,178 @@ def test_self_signed_rejects_non_positive_days(
     rc = main(["cert", "self-signed", "--cn", "dev.local", "--days", "0", "--out-dir", str(out)])
     assert rc == 2
     assert not (out / "key.pem").exists()
+
+
+# --- cert self-signed: both files or neither (BACKLOG #3073) ---------------------------------
+
+
+def test_self_signed_refuses_to_overwrite_an_existing_cert(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A cert.pem with no key.pem beside it was replaced without a word. It is refused now, the way
+    an existing key is, and the refusal writes nothing.
+
+    Mutation: drop the existence check and the exclusive create. Red: the operator's cert is gone."""
+    out = tmp_path / "o"
+    out.mkdir()
+    (out / "cert.pem").write_bytes(b"THE-OPERATORS-CERT\n")
+
+    rc = main(["cert", "self-signed", "--cn", "a.local", "--out-dir", str(out)])
+    assert rc == 2
+    assert "refusing to overwrite an existing certificate file" in capsys.readouterr().err
+    assert (out / "cert.pem").read_bytes() == b"THE-OPERATORS-CERT\n"
+    assert not (out / "key.pem").exists()
+
+
+def _cert_open_dies_midway(monkeypatch: pytest.MonkeyPatch) -> None:
+    real_open = Path.open
+
+    def _open(self: Path, *a: Any, **k: Any) -> Any:
+        handle = real_open(self, *a, **k)
+        return _HandleThatDiesMidWrite(handle) if self.name == "cert.pem" else handle
+
+    monkeypatch.setattr(Path, "open", _open)
+
+
+def test_a_failed_cert_write_leaves_neither_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The key is written first. A cert write that then failed left that key behind, with a
+    traceback, and the next run refused because the key existed. Now the run removes the key it
+    wrote and the truncated cert, and says so in its own failure line.
+
+    Mutation: drop the cleanup. Red: key.pem is still there."""
+    _cert_open_dies_midway(monkeypatch)
+    out = tmp_path / "o"
+
+    rc = main(["cert", "self-signed", "--cn", "a.local", "--out-dir", str(out), "--json"])
+    assert rc == 2
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "No space left on device" in error
+    assert f"removed {out / 'key.pem'}, {out / 'cert.pem'}, which this run wrote" in error
+    assert "could not remove" not in error
+    assert list(out.iterdir()) == []
+
+
+def test_an_interrupted_cert_write_still_removes_the_new_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupt is not an OSError. Between the two writes it must still remove the key this run
+    wrote, then propagate, or the orphan key makes every later run refuse.
+
+    Mutation: narrow the cleanup back to `except OSError`. Red: key.pem is still there."""
+
+    class _HandleInterruptedMidWrite(_HandleThatDiesMidWrite):
+        def write(self, _data: bytes) -> int:
+            raise KeyboardInterrupt
+
+    real_open = Path.open
+
+    def _open(self: Path, *a: Any, **k: Any) -> Any:
+        handle = real_open(self, *a, **k)
+        return _HandleInterruptedMidWrite(handle) if self.name == "cert.pem" else handle
+
+    monkeypatch.setattr(Path, "open", _open)
+    out = tmp_path / "o"
+
+    with contextlib.suppress(KeyboardInterrupt):  # run_cli may turn it into an exit code instead
+        main(["cert", "self-signed", "--cn", "a.local", "--out-dir", str(out), "--json"])
+    assert list(out.iterdir()) == []
+
+
+def test_a_cert_that_appears_after_the_check_is_kept_and_the_new_key_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The cleanup removes only what THIS run wrote. A cert.pem created between the existence check
+    and the cert write is refused by the exclusive create and left intact, and only the new key goes.
+
+    Mutation: write the cert with `write_bytes`, or unlink cert.pem on FileExistsError. Red: the
+    other writer's cert is replaced or deleted."""
+    import messagefoundry.__main__ as cli
+
+    real_write_key = cli._write_private_key
+
+    def _write_key_then_race(path: Path, pem: bytes) -> None:
+        real_write_key(path, pem)
+        (path.parent / "cert.pem").write_bytes(b"ANOTHER-WRITERS-CERT\n")
+
+    monkeypatch.setattr(cli, "_write_private_key", _write_key_then_race)
+    out = tmp_path / "o"
+
+    rc = main(["cert", "self-signed", "--cn", "a.local", "--out-dir", str(out), "--json"])
+    assert rc == 2
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "refusing to overwrite" in error
+    assert f"removed {out / 'key.pem'}, which this run wrote" in error
+    assert (out / "cert.pem").read_bytes() == b"ANOTHER-WRITERS-CERT\n"
+    assert not (out / "key.pem").exists()
+
+
+def test_a_key_the_cleanup_cannot_remove_is_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """If the cleanup itself fails, the failure line names the file left behind, so the operator
+    knows the next run will refuse until it is removed."""
+    _cert_open_dies_midway(monkeypatch)
+
+    def _unlink(self: Path, missing_ok: bool = False) -> None:
+        raise PermissionError(errno.EACCES, "Access is denied", str(self))
+
+    monkeypatch.setattr(Path, "unlink", _unlink)
+    out = tmp_path / "o"
+
+    rc = main(["cert", "self-signed", "--cn", "a.local", "--out-dir", str(out), "--json"])
+    assert rc == 2
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert f"could not remove {out / 'key.pem'}" in error
+    assert "remove it before running again" in error
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        pytest.param(["--cn", "a" * 65], "<= 64", id="65-char-cn"),
+        pytest.param(["--cn", "bücher.example"], "A-label", id="non-ascii-cn"),
+        pytest.param(["--cn", "a.local", "--days", "99999999999"], "is too large", id="huge-days"),
+    ],
+)
+def test_a_make_self_signed_refusal_is_the_commands_own_failure(
+    args: list[str], expected: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`make_self_signed` raised past the command, into the CLI's last-resort handler: a CRITICAL
+    "uncaught exception" log line and exit 1. Each is now the command's own failure: exit 2, the
+    `--json` shape `{"error": ...}`, and nothing on disk.
+
+    Mutation: drop either `except` arm around the mint. Red: exit 1, not 2."""
+    out = tmp_path / "o"
+    rc = main(["cert", "self-signed", *args, "--out-dir", str(out), "--json"])
+    captured = capsys.readouterr()
+    assert rc == 2
+    body = json.loads(captured.out)
+    assert list(body) == ["error"]
+    assert body["error"].startswith("cannot mint the certificate: ")
+    assert expected in body["error"]
+    assert "last-resort" not in captured.err
+    assert not out.exists()
+
+
+def test_self_signed_human_output_labels_ip_sans_and_the_key_protection(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The console called every name `SAN(DNS)`, IP addresses included, and said the key is "0600",
+    which is a POSIX mode. The labels now match the minted file, and the protection is the one this
+    platform applies."""
+    out = tmp_path / "o"
+    argv = ["cert", "self-signed", "--cn", "127.0.0.1", "--san", "localhost", "--out-dir", str(out)]
+    assert main(argv) == 0
+    printed = capsys.readouterr().out
+    assert "SAN=IP:127.0.0.1, DNS:localhost" in printed
+    assert "SAN(DNS)" not in printed
+    if sys.platform == "win32":
+        assert "SYSTEM, Administrators" in printed
+        assert "0600" not in printed
+    else:
+        assert "mode 0600" in printed
 
 
 def test_read_cert_facts_is_best_effort_on_unparseable_extensions(

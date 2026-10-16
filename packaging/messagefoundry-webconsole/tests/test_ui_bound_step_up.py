@@ -14,6 +14,7 @@ after its own input checks. Upload resend also needs ``messages:edit``. The JSON
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, unquote, urlsplit
@@ -31,10 +32,18 @@ from _ui_clients import (
     seed_message,
     ui_client,
 )
+from fastapi import FastAPI
+from starlette.requests import Request
 
 from messagefoundry.auth import Role
 from messagefoundry.config.settings import StoreSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry_webconsole._auth import (
+    _ISSUED_CONTINUATIONS,
+    _issue_continuation,
+    continuation_issued,
+    lookup_ui_action,
+)
 
 NO_SUCH = "0" * 32
 EDITED = ADT.replace("DOE^JANE", "DOE^JOHN")
@@ -60,6 +69,44 @@ async def test_config_reload_takes_its_own_proof(engine: Engine) -> None:
         assert _reauth_next(ran) is None, ran.headers
         again = await c.post("/ui/config/reload", headers=SAME_ORIGIN)
         assert _reauth_next(again) == "/ui/config/reload"  # single use
+
+
+async def test_a_console_reload_held_by_dual_control_names_its_config_digest(
+    tmp_path: Path,
+) -> None:
+    """Vault BACKLOG #2596, step 3, through the console seam: the console calls the reload core
+    with no params of its own, so the core must take the digest the release is checked against."""
+    from messagefoundry.config.fingerprint import config_fingerprint
+    from messagefoundry.config.settings import ApprovalsSettings, EgressSettings
+
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "cfg.py").write_text(
+        "from messagefoundry import outbound, File\n"
+        f"outbound('FILE-OUT_T_ADT', File(directory={str(tmp_path / 'out')!r}))\n",
+        encoding="utf-8",
+    )
+    gated = ApprovalsSettings(enabled=True, operations=["config_reload"], min_dwell_seconds=0.0)
+    engine = await Engine.create(
+        tmp_path / "ui.db",
+        poll_interval=0.02,
+        config_dir=cfg,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        service = await auth_service(engine)
+        await provision(service, "adm", [Role.ADMINISTRATOR.value])
+        async with ui_client(engine, service, approvals=gated) as c:
+            await cookie_login(c, "adm")
+            await mint_bound_proof(c, "/ui/config/reload")
+            held = await c.post("/ui/config/reload", headers=SAME_ORIGIN)
+            assert _reauth_next(held) is None, held.headers
+        [pending] = await engine.store.list_pending_approvals(now=0.0)
+        assert str(pending["operation"]) == "config_reload"
+        params = json.loads(str(pending["params"]))
+        assert params["fingerprint"] == config_fingerprint(cfg)
+    finally:
+        await engine.stop()
 
 
 async def test_purge_takes_its_own_proof(engine: Engine) -> None:
@@ -147,22 +194,22 @@ async def test_the_editor_asks_before_it_opens_and_the_resubmit_spends_it(engine
         )
         assert bad.status_code == 400 and "choose an outbound connection" in bad.text
         assert (await c.get(editor)).status_code == 200
-        # A resubmit the engine refuses (ch1 is no registered inbound) has spent the proof.
+        # A resubmit the engine refuses before its store write (ch1 is no registered inbound) gives
+        # the proof back (owner ruling 2026-10-13, #3241 R1), so the editor still opens and the
+        # operator's next submit asks for no new password. Before the ruling it spent the proof.
         sent = await c.post(
             post,
             data={"raw": EDITED, "idempotency_key": "k2", "mode": "reroute"},
             headers=SAME_ORIGIN,
         )
         assert sent.status_code == 400 and _reauth_next(sent) is None
-        assert _reauth_next(await c.get(editor)) == editor
-        # The refused submit left no spend record, so resubmitting the re-rendered editor with
-        # the SAME key asks for a proof again rather than riding on the one it spent.
+        assert (await c.get(editor)).status_code == 200
         again = await c.post(
             post,
             data={"raw": "MSH|other", "idempotency_key": "k2", "mode": "reroute"},
             headers=SAME_ORIGIN,
         )
-        assert _reauth_next(again) == editor
+        assert again.status_code == 400 and _reauth_next(again) is None
 
 
 async def test_an_edit_resubmit_repeated_with_one_proof_lands_once(
@@ -381,3 +428,192 @@ def test_the_browse_page_offers_resend_only_to_a_role_that_can_resend() -> None:
     reader = str(uploaded_log_detail(result, can_resend=False))
     assert confirm not in reader
     assert "messages:edit" in reader
+
+
+async def test_the_purge_confirm_page_holds_the_purge_proof(engine: Engine) -> None:
+    """Owner ruling 2026-10-13 (#3241 R2): a fresh window no longer opens the purge confirm page,
+    because its POST would then ask for a re-auth after the operator confirmed. The page holds the
+    proof and spends nothing, so the POST still spends it once."""
+    service = await auth_service(engine)
+    await provision(service, "op", [Role.OPERATOR.value])
+    page = "/ui/connections/purge-confirm"
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "op")
+        assert _reauth_next(await c.get(page)) == page  # the window alone: refused
+        await mint_bound_proof(c, page)
+        assert (await c.get(page)).status_code == 200
+        assert (await c.get(page)).status_code == 200  # held, not spent
+        ran = await c.post("/ui/connections/OB_X/purge/all", headers=SAME_ORIGIN)
+        assert _reauth_next(ran) is None and ran.status_code == 404
+        assert _reauth_next(await c.get(page)) == page  # the POST spent it
+
+
+async def test_a_crafted_reauth_toward_an_unlock_page_mints_nothing_bound(engine: Engine) -> None:
+    """Owner ruling 2026-10-13 (#3241 R3): /ui/reauth mints an unlock page's grant only when a gate
+    issued that page to this session. A link straight to /ui/reauth?next=<unlock page> still
+    re-authenticates, then ends on the page that says nothing ran, with nothing bound."""
+    service = await auth_service(engine)
+    await provision(service, "op", [Role.OPERATOR.value])
+    page = "/ui/connections/purge-confirm"
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "op")
+        crafted = await c.post(
+            "/ui/reauth", data={"next": page, "password": PW}, headers=SAME_ORIGIN
+        )
+        assert crafted.status_code == 200 and "Nothing ran" in crafted.text
+        # CONTROL: the gate's own refusal issues the page, and the same re-auth then mints.
+        assert _reauth_next(await c.get(page)) == page
+        issued = await c.post(
+            "/ui/reauth", data={"next": page, "password": PW}, headers=SAME_ORIGIN
+        )
+        assert issued.status_code == 303 and issued.headers["location"] == page
+        assert (await c.get(page)).status_code == 200
+        # One issue mints one grant: the password re-auth spent it, so a second crafted re-auth
+        # with no new refusal in between ends on the page that says nothing ran.
+        again = await c.post("/ui/reauth", data={"next": page, "password": PW}, headers=SAME_ORIGIN)
+        assert again.status_code == 200 and "Nothing ran" in again.text
+
+
+async def test_an_unlock_page_issued_during_a_crafted_reauth_keeps_its_issue(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A re-auth toward an unlock page that was not issued when its POST arrived mints nothing. If
+    another tab is issued that page while the password check runs, this re-auth must neither spend
+    that issue nor answer with the auto-submit form, which is only for a body-less POST action. The
+    other tab's own re-auth then still mints and redirects to the page. This covers the password
+    check's await only; an issue made between the form's GET and its POST is read at the POST."""
+    service = await auth_service(engine)
+    await provision(service, "op", [Role.OPERATOR.value])
+    page = "/ui/connections/purge-confirm"
+    real_reauth = service.reauth
+
+    async def reauth_while_another_tab_is_issued(*args: Any, **kwargs: Any) -> Any:
+        _issue_continuation(_get_request(page, kwargs["token"]), page)
+        return await real_reauth(*args, **kwargs)
+
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "op")
+        monkeypatch.setattr(service, "reauth", reauth_while_another_tab_is_issued)
+        crafted = await c.post(
+            "/ui/reauth", data={"next": page, "password": PW}, headers=SAME_ORIGIN
+        )
+        assert crafted.status_code == 200 and "Nothing ran" in crafted.text
+        monkeypatch.setattr(service, "reauth", real_reauth)
+        # The other tab's issue survived, so its re-auth mints and goes back to the page.
+        other = await c.post("/ui/reauth", data={"next": page, "password": PW}, headers=SAME_ORIGIN)
+        assert other.status_code == 303 and other.headers["location"] == page
+        assert (await c.get(page)).status_code == 200
+
+
+async def test_an_auto_retry_issued_during_a_crafted_reauth_is_not_submitted(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The auto-retry twin of the test above: a crafted re-auth toward a body-less POST action that
+    another tab is issued during the password check ends on "nothing ran", not on the auto-submit
+    form, and leaves the issue for the other tab."""
+    service = await auth_service(engine)
+    await provision(service, "adm", [Role.ADMINISTRATOR.value])
+    action = "/ui/config/reload"
+    real_reauth = service.reauth
+
+    async def reauth_while_another_tab_is_issued(*args: Any, **kwargs: Any) -> Any:
+        _ISSUED_CONTINUATIONS.issue(kwargs["token"], action)
+        return await real_reauth(*args, **kwargs)
+
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "adm")
+        monkeypatch.setattr(service, "reauth", reauth_while_another_tab_is_issued)
+        crafted = await c.post(
+            "/ui/reauth", data={"next": action, "password": PW}, headers=SAME_ORIGIN
+        )
+        assert crafted.status_code == 200 and "Nothing ran" in crafted.text
+        monkeypatch.setattr(service, "reauth", real_reauth)
+        other = await c.post(
+            "/ui/reauth", data={"next": action, "password": PW}, headers=SAME_ORIGIN
+        )
+        assert other.status_code == 200 and "Nothing ran" not in other.text  # the auto-submit
+
+
+async def test_an_auto_retry_entry_that_lapses_during_the_reauth_leaves_no_armed_grant(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An issued auto-retry action whose entry lapses while the password check runs mints a grant
+    and then ends on "nothing ran". That exit spends the grant, so the next submit asks again."""
+    service = await auth_service(engine)
+    await provision(service, "adm", [Role.ADMINISTRATOR.value])
+    action = "/ui/config/reload"
+    real_reauth = service.reauth
+
+    async def reauth_while_the_entry_lapses(*args: Any, **kwargs: Any) -> Any:
+        _ISSUED_CONTINUATIONS.consume(kwargs["token"], action)
+        return await real_reauth(*args, **kwargs)
+
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "adm")
+        assert _reauth_next(await c.post(action, headers=SAME_ORIGIN)) == action  # issued
+        monkeypatch.setattr(service, "reauth", reauth_while_the_entry_lapses)
+        lapsed = await c.post(
+            "/ui/reauth", data={"next": action, "password": PW}, headers=SAME_ORIGIN
+        )
+        assert lapsed.status_code == 200 and "Nothing ran" in lapsed.text
+        assert _reauth_next(await c.post(action, headers=SAME_ORIGIN)) == action
+
+
+def _get_request(path: str, token: str) -> Request:
+    """A same-origin GET for ``path`` on the session ``token``, as a gate refusal sees it."""
+    return Request(
+        {
+            "type": "http",
+            "app": FastAPI(),  # Sec-Fetch-Site: same-origin settles the origin check
+            "method": "GET",
+            "scheme": "http",
+            "path": path,
+            "query_string": b"",
+            "server": ("127.0.0.1", 8765),
+            "headers": [
+                (b"host", b"127.0.0.1:8765"),
+                (b"sec-fetch-site", b"same-origin"),
+                (b"cookie", f"mf_session={token}".encode()),
+            ],
+        }
+    )
+
+
+async def test_a_link_opened_from_outside_the_browser_issues_nothing(engine: Engine) -> None:
+    """A GET with ``Sec-Fetch-Site: none`` (a typed URL, a bookmark, a link in an email) is refused
+    without issuing the page, so a crafted link to the page itself pre-arms nothing. The page asks
+    again, and the console's own navigation then issues it."""
+    service = await auth_service(engine)
+    await provision(service, "op", [Role.OPERATOR.value])
+    page = "/ui/connections/purge-confirm"
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "op")
+        outside = await c.get(page, headers={"Sec-Fetch-Site": "none"})
+        assert _reauth_next(outside) == page
+        r = await c.post("/ui/reauth", data={"next": page, "password": PW}, headers=SAME_ORIGIN)
+        assert r.status_code == 200 and "Nothing ran" in r.text
+        # CONTROL: the same refusal from the console's own navigation issues it.
+        inside = await c.get(page, headers={"Sec-Fetch-Site": "same-origin"})
+        assert _reauth_next(inside) == page
+        r = await c.post("/ui/reauth", data={"next": page, "password": PW}, headers=SAME_ORIGIN)
+        assert r.status_code == 303 and r.headers["location"] == page
+        assert (await c.get(page)).status_code == 200
+
+
+def test_a_window_only_unlock_page_is_never_issued() -> None:
+    """A window-only unlock page (one binding no action) always continues, so a gate refusing it
+    records nothing: an entry would only fill the per-session cap and evict a pending auto-retry
+    issue. CONTROL: the same refusal toward an action-bound unlock page is recorded."""
+    token = "t" * 43
+    window_only, bound = "/ui/ad-groups", "/ui/connections/purge-confirm"
+    wo_action, bound_action = lookup_ui_action(window_only), lookup_ui_action(bound)
+    assert wo_action is not None and wo_action.unlock and wo_action.action is None
+    assert bound_action is not None and bound_action.unlock and bound_action.action is not None
+
+    def _get(path: str) -> Request:
+        return _get_request(path, token)
+
+    _issue_continuation(_get(window_only), window_only)
+    assert not continuation_issued(token, window_only)
+    _issue_continuation(_get(bound), bound)
+    assert continuation_issued(token, bound)

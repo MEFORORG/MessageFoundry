@@ -27,10 +27,11 @@ import socket
 import subprocess
 import sys
 import time
+import warnings
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import NoReturn, cast
 
 import httpx
 import pytest
@@ -47,6 +48,7 @@ from messagefoundry.config.settings import (
     CertMonitorSettings,
     EgressSettings,
     SecretRotationSettings,
+    SecretsSettings,
     SecuritySettings,
     StoreSettings,
     security_loosenings,
@@ -202,23 +204,51 @@ def start_target(tmp_path: Path) -> Iterator[Callable[[str], _Target]]:
             target.process.wait(timeout=_WAIT)
 
 
+class InjectionNotMeasured(UserWarning):
+    """The real injection did not run in this test process, so nothing here showed that the
+    interpreter drops a script when the hook raises (vault BACKLOG #2742)."""
+
+
+#: Every such warning starts with this, so a hosted log can be searched for one fixed string.
+_NOT_MEASURED = "REMOTE-DEBUG INJECTION NOT MEASURED"
+
+
+def _skip_unmeasured(reason: str) -> NoReturn:
+    """Skip the injection test, and warn first.
+
+    The hosted test legs run ``pytest -q``, which prints no skip reasons, so a skip alone leaves
+    no line in the log. pytest does print its warnings summary under ``-q``, with the test's
+    name and this text. The injection test skips through here and nowhere else, as it stands. A
+    skip added to it some other way would be silent again, and nothing pins that. A test that
+    was deselected or never collected leaves no warning either."""
+    warnings.warn(f"{_NOT_MEASURED}: {reason}", InjectionNotMeasured, stacklevel=2)
+    pytest.skip(reason)
+
+
+def _not_measured(caught: pytest.WarningsRecorder) -> list[warnings.WarningMessage]:
+    """The ``InjectionNotMeasured`` warnings in ``caught``. ``pytest.warns`` records every
+    category, so an unrelated warning raised inside the block must not be counted."""
+    return [w for w in caught if issubclass(w.category, InjectionNotMeasured)]
+
+
 def _inject(target: _Target) -> None:
     try:
         sys.remote_exec(target.pid, str(target.script))
     except PermissionError as exc:
         # The platform refused the attach itself (ptrace scope on Linux, no task port on macOS).
         # Nothing was measured, in either direction.
-        pytest.skip(f"this platform refused to attach to a child process: {exc}")
+        _skip_unmeasured(f"this platform refused to attach to a child process: {exc}")
 
 
 @pytest.mark.timeout(_INJECTION_TEST_TIMEOUT)
-@pytest.mark.skipif(
-    not sys.is_remote_debug_enabled(),
-    reason="this test process was started with remote debugging off, so it cannot inject",
-)
 def test_an_injected_script_runs_without_the_hook_and_not_with_it(
     start_target: Callable[[str], _Target],
 ) -> None:
+    # Checked here and not in a ``skipif`` mark, which would skip with no warning.
+    if not sys.is_remote_debug_enabled():
+        _skip_unmeasured(
+            "this test process was started with remote debugging off, so it cannot inject"
+        )
     control, guarded, loud = (start_target(mode) for mode in ("unguarded", "guarded", "loud"))
     for target in (control, guarded, loud):
         target.wait_until_ready()
@@ -252,6 +282,47 @@ def test_an_injected_script_runs_without_the_hook_and_not_with_it(
     # path is on standard error, so the check on the guarded target could have failed.
     assert directory in loud.stderr.read_text("utf-8", errors="replace")
     assert directory not in guarded.stderr.read_text("utf-8", errors="replace")
+
+
+def test_a_refused_attach_skips_with_a_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The skip alone leaves nothing in a ``pytest -q`` log, so the warning is what is read."""
+    target = cast("_Target", SimpleNamespace(pid=1, script=Path("never_injected.py")))
+
+    def refused(pid: int, script: str) -> None:
+        raise PermissionError("the platform said no")
+
+    monkeypatch.setattr(sys, "remote_exec", refused)
+    with pytest.warns(InjectionNotMeasured) as caught, pytest.raises(pytest.skip.Exception):
+        _inject(target)
+    (warning,) = _not_measured(caught)
+    assert str(warning.message).startswith(f"{_NOT_MEASURED}: ")
+    assert "the platform said no" in str(warning.message)
+
+    # CONTROL: an attach the platform allows neither skips nor warns, so both checks above could
+    # have failed.
+    monkeypatch.setattr(sys, "remote_exec", lambda pid, script: None)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        try:
+            _inject(target)
+        except pytest.skip.Exception:
+            # Named here: a skip that left this test would report the whole test as skipped.
+            pytest.fail("an attach the platform allowed was skipped")
+
+
+def test_a_test_process_that_cannot_inject_skips_with_a_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other way the injection test skips. A ``skipif`` mark would skip it with no warning."""
+    monkeypatch.setattr(sys, "is_remote_debug_enabled", lambda: False)
+
+    def start(mode: str) -> _Target:
+        raise AssertionError("a target was started in a process that cannot inject")
+
+    with pytest.warns(InjectionNotMeasured) as caught, pytest.raises(pytest.skip.Exception):
+        test_an_injected_script_runs_without_the_hook_and_not_with_it(start)
+    (warning,) = _not_measured(caught)
+    assert str(warning.message).startswith(f"{_NOT_MEASURED}: ")
 
 
 # --- the hook function -------------------------------------------------------------------------
@@ -774,6 +845,7 @@ def _names(remote_debug: RemoteDebugPosture | None) -> list[str]:
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
             backup=BackupSettings(),
+            secrets=SecretsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=remote_debug,

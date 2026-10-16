@@ -569,8 +569,9 @@ def test_the_store_crl_closes_its_own_gate_on_the_pinned_ca_branch(
 
 def test_the_store_refusal_names_a_lever_that_exists_for_it() -> None:
     """SDS-3.7 applied to the refusal TEXT. The guard's connection-shaped default names
-    ``[tls].crl_file``, an egress terminator and a connection's ``tls_revocation_attested``; none
-    reaches the store, which resolves no trust anchor and is not a connection. Telling that operator to
+    ``[tls].crl_file`` and a connection's ``tls_revocation_attested`` (BACKLOG #2987 removed an
+    egress terminator, which no call site could set); neither reaches the store, which resolves
+    no trust anchor and is not a connection. Telling that operator to
     set one of them is a refusal whose remedy cannot be performed.
 
     ``ssl_crl_file`` is named ALONE since BACKLOG #300. It used to be named with ``ssl_root_cert``,
@@ -1353,8 +1354,8 @@ def test_a_syslog_forwarder_with_no_posture_is_unchanged() -> None:
 
 def test_the_forwarder_refusal_names_a_lever_that_exists_for_it(crl_bundle: str) -> None:
     """SDS-3.7 applied to the refusal TEXT rather than to the gate. The guard's default remediation
-    names ``[tls].crl_file``, an egress terminator and a connection's ``tls_revocation_attested``, and
-    all three are unreachable for a hop that is not a connection -- ``[tls].crl_file`` reaches a
+    names ``[tls].crl_file`` and a connection's ``tls_revocation_attested``, and both are
+    unreachable for a hop that is not a connection -- ``[tls].crl_file`` reaches a
     context only through a ``Destination``'s trust-anchor policy, and there is no connection to carry
     the flag. A refusal whose remedy cannot be performed is a control resting on a false premise, so
     this hop substitutes the setting that actually closes its own gate."""

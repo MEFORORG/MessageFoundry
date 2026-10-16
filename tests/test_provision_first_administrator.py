@@ -847,9 +847,15 @@ def test_a_store_sealed_under_another_key_is_could_not_start(
     sealing_key = generate_key()
     db = tmp_path / "sealed.db"
 
-    # A plaintext state row, sealed by the second keyed open: the migration path the store's own
-    # encryption tests use. Synthetic value, no message content.
-    _existing_empty_store(db, sealing_key)
+    # A plaintext state row in a store no key has opened yet, sealed by the first keyed open: the
+    # migration path the store's own encryption tests use. Synthetic value, no message content. It is
+    # planted BEFORE that open, because a keyed open records every cipher surface as keyed (BACKLOG
+    # #3383), and a plaintext row written there afterwards is refused as a plant, not sealed.
+    async def create_keyless() -> None:
+        store = await MessageStore.open(db)
+        await store.close()
+
+    asyncio.run(create_keyless())
     con = sqlite3.connect(db)
     con.execute(
         "INSERT INTO state (namespace, key, value, set_at, message_id) VALUES (?,?,?,?,?)",
@@ -1825,7 +1831,7 @@ def test_cli_wires_the_notifier_drains_it_and_reports_the_takeover(
     _keyed_store_with_roleless_account(db, key, email="holder@example.invalid")
     recorder = _Recorder()
     monkeypatch.setattr(
-        "messagefoundry.__main__._offline_security_notifier", lambda _settings: recorder
+        "messagefoundry.__main__._offline_security_notifier", lambda _settings, _posture: recorder
     )
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     argv = ["provision-admin", "--username", "site-admin", "--db", str(db)]
@@ -1853,7 +1859,7 @@ def test_cli_says_nobody_was_told_when_the_account_had_no_address(
     _keyed_store_with_roleless_account(db, key, email=None)
     recorder = _Recorder()
     monkeypatch.setattr(
-        "messagefoundry.__main__._offline_security_notifier", lambda _settings: recorder
+        "messagefoundry.__main__._offline_security_notifier", lambda _settings, _posture: recorder
     )
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     assert (

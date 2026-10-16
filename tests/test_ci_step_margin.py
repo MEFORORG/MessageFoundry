@@ -1174,6 +1174,9 @@ def test_every_engine_leg_clears_its_own_recorded_maximum_at_its_step_cap() -> N
     two Windows caps are sized from an anchor in ci.yml's engine note rather than from their rows,
     so they carry the floor only.
 
+    Re-falsified at the 2026-10-13 re-measure, against the 28:07 row: `step_timeout` set to 36
+    (36:00 / 28:07 = 1.280x) went RED on the floor, and set to 39 went RED on the rule. Restored
+    both times. The original record, at the 2026-10-07 row:
     Falsified by setting ubuntu's `step_timeout` to 31 against its 24:36 row (31:00 / 24:36 =
     1.260x): RED on the floor, naming the leg and both numbers. Falsified by setting it to 35: RED on
     the rule. Restored both times.

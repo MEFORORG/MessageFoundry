@@ -4,14 +4,19 @@
 
 from __future__ import annotations
 
+import io
 import json
 import random
 import re
+import sys
 import time
+import unicodedata
 from pathlib import Path
 
 import pytest
 
+from messagefoundry.controlchars import CONTROL_CATEGORIES
+from messagefoundry_toolkit import __main__ as toolkit
 from messagefoundry_toolkit import adr_analyze
 from messagefoundry_toolkit.__main__ import main
 from messagefoundry_toolkit.adr_analyze import analyze_adrs
@@ -417,3 +422,25 @@ def test_control_characters_in_record_text_are_escaped_on_the_terminal(
     assert main(["adr-analyze", "--adr-dir", str(adr), "--repo-root", str(root), "--json"]) == 0
     (item,) = json.loads(capsys.readouterr().out)["open_clarifications"]
     assert item["item"] == raw
+
+
+def test_the_terminal_escapes_the_log_categories_on_a_cp1252_console(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #2976 item 2: the toolkit escapes the engine's own ``CONTROL_CATEGORIES``, so a lone
+    surrogate (Cs), a private-use code point (Co) and an unassigned one (Cn) print as text. Before,
+    the toolkit's own set left those three out, and ``_safe_print`` turned each into ``?`` on a
+    cp1252 console. The stream here raises on anything cp1252 cannot write, so the line must also
+    survive the console. Built from integers, so no editor can show or rewrite them."""
+    codes = {0xD800: "Cs", 0xE000: "Co", 0xFFFF: "Cn"}
+    # The categories this test is about, read from the interpreter rather than assumed.
+    assert {code: unicodedata.category(chr(code)) for code in codes} == codes
+    # The set the function actually reads, so a local copy of the categories cannot pass.
+    used = toolkit._print_record_line.__globals__["CONTROL_CATEGORIES"]
+    assert used is CONTROL_CATEGORIES, "a copy, not the engine's own set"
+    raw = io.BytesIO()
+    console = io.TextIOWrapper(raw, encoding="cp1252", errors="strict", newline="")
+    monkeypatch.setattr(sys, "stdout", console)
+    toolkit._print_record_line("a" + "".join(chr(code) for code in codes) + "\\z")
+    console.flush()
+    assert raw.getvalue() == b"a\\ud800\\ue000\\uffff\\\\z\n"

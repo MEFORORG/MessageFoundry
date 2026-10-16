@@ -167,11 +167,11 @@ async def test_totp_connection_event_alert_roundtrip(tmp_path: Path) -> None:
     key = generate_key()
     store = await _open_bound(tmp_path / "misc.db", key)
     try:
-        await store._db.execute(
-            "INSERT INTO users (id, username, auth_provider, created_at, updated_at) "
-            "VALUES ('u1','alice','local',0,0)"
+        # Through the store, so the account carries its integrity seal (BACKLOG #2592): the TOTP
+        # write below refuses a keyed row the store never sealed.
+        await store.create_user(
+            user_id="u1", username="alice", auth_provider="local", password_generated=False, now=0
         )
-        await store._db.commit()
         await store.set_totp_secret("u1", secret="JBSWY3DPEHPK3PXP")
         assert await store.get_totp_secret("u1") == "JBSWY3DPEHPK3PXP"
         await store.record_connection_event(

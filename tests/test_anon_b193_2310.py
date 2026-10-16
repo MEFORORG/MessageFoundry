@@ -97,7 +97,8 @@ def test_a_malformed_overlay_keeps_the_file_off_the_chain(
     # The operator still gets the file and the place, which is all the fix needs.
     text = str(caught.value)
     assert str(overlay) in text
-    assert "line 4, column 1" in text
+    # The file has three lines and ends in a newline. The parser's own answer was line 4.
+    assert "at the end of the file, line 3" in text
 
 
 @_BOTH

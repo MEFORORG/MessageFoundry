@@ -31,6 +31,7 @@ from messagefoundry.config.settings import (
     CertMonitorSettings,
     EgressSettings,
     SecretRotationSettings,
+    SecretsSettings,
     SecuritySettings,
     ServiceSettings,
     StoreSettings,
@@ -158,6 +159,7 @@ def _loosening_names(sec: SecuritySettings) -> list[str]:
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
             backup=BackupSettings(),
+            secrets=SecretsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -763,16 +765,23 @@ def test_a_serve_refusal_still_prints_the_opt_out_audit(
 async def test_a_reload_is_judged_against_the_opt_outs_the_engine_started_with(
     tmp_path: Path,
 ) -> None:
-    """The reload path takes a config dir and nothing else, so the guard built at start is the one
-    every reload runs. A new static hop is refused by name; the opted-out one is not."""
+    """The reload path takes no opt-out argument, so the guard built at start is the one every
+    reload runs. A new static hop is refused by name; the opted-out one is not."""
+    import dataclasses
     import inspect
+
+    from messagefoundry.pipeline.engine import ApprovedConfig
 
     assert list(inspect.signature(Engine.reload_detail).parameters) == [
         "self",
         "config_dir",
         "dry_run",
         "propagate",
+        "approval",
     ]
+    # ``approval`` binds a dual-control reload to a config digest (BACKLOG #2596). It must carry
+    # the digest and nothing else, or a reload could pass in opt-outs the engine did not start with.
+    assert [f.name for f in dataclasses.fields(ApprovedConfig)] == ["fingerprint"]
     cfg = tmp_path / "cfg"
     _write_graph(cfg, basic=True)
     with (cfg / "feed.py").open("a", encoding="utf-8") as f:

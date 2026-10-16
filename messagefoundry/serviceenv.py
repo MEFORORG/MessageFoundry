@@ -47,6 +47,7 @@ import threading
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Protocol
 
 from messagefoundry.service_status import is_safe_service_name
@@ -397,6 +398,35 @@ def service_env_refusal(posture: ServiceEnvPosture) -> str | None:
         "retired key belongs in the shell that runs `messagefoundry rotate-key`, not in the "
         'service. [security].enforcement = "warn" does not change this refusal. See '
         'docs/SERVICE.md, "Protect the store encryption key at rest"'
+    )
+
+
+def missing_service_config_refusal(
+    posture: ServiceEnvPosture, service_config: str | None
+) -> str | None:
+    """Why ``serve`` or ``supervise`` must not start as a service without an absolute
+    ``--service-config``, or None (vault BACKLOG #2626, step 2).
+
+    ``service_config`` is the flag as anchored under ``--project-root``. With no flag, or a
+    relative one and no root, the engine reads a ``messagefoundry.toml`` from its working
+    directory. A service should start from the settings file it was registered with, by absolute
+    path. The refusal applies only when the reading found the service, so a start from a shell, the
+    developer loop, is unchanged. An ``UNOBSERVABLE`` reading with no service name settles nothing
+    either way and does not refuse, for the reason the module docstring gives."""
+    if posture.service_name is None:
+        return None
+    if service_config is None:
+        started = "no --service-config"
+    elif not Path(service_config).is_absolute():
+        started = f"--service-config {service_config!r}, which is not an absolute path"
+    else:
+        return None
+    return (
+        f"this engine runs as the Windows service {posture.service_name!r} and was started with "
+        f"{started}, so it would read a messagefoundry.toml from its working directory. Register "
+        "the settings file by absolute path: run install-service.ps1 again with -ServiceConfig "
+        "<path>, or `messagefoundry service install` with --service-config <path>. See "
+        'docs/SERVICE.md, "Install"'
     )
 
 

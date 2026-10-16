@@ -76,6 +76,13 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # the change that breaks it. Its other half reads docs/SECURITY.md, which is what makes it a
         # doc-drift guard, but the doc half is not the reason it stays.
         "test_adaptive_attributes_doc_drift.py",
+        # Reads messagefoundry/config/ai_policy.py, messagefoundry/anon/__init__.py and
+        # harness/load/corpus.py off disk (BACKLOG #2996). It fails when the ai_policy or corpus
+        # docstring calls the anonymizer's output PHI-free again. Its anon/__init__.py arm is about
+        # the "byte-identical tee/anon/" claim only: it fails when that docstring makes the claim
+        # again. Either change arrives as an ENGINE or harness diff, which does not trip the
+        # tooling path gate. Its other arms read docs/*.md, and they are not the reason it stays.
+        "test_anon_doc_claims.py",
         # Lists messagefoundry/ as a directory and holds every folder token in the Mermaid blocks of
         # docs/architecture-diagram.md (`pipeline/`, `store/`, ...) to a folder that exists. What
         # breaks that arm is an engine package being renamed or removed, which arrives as an ENGINE
@@ -269,6 +276,11 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         "test_sds_rule_ids_are_stable.py",
         # this file: it guards the partition, so it must run wherever the partition matters
         "test_tooling_partition.py",
+        # Reads every module under messagefoundry/ and harness/ and lists each call that hands a
+        # posture toward a Vault hop (vault BACKLOG #2983). What breaks it is a new caller in the
+        # engine, which arrives as an ENGINE diff. Its one import of a test module is how it
+        # shares that module's walk of the package.
+        "test_vault_posture_census.py",
     }
 )
 

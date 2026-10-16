@@ -4390,7 +4390,7 @@ turned off and I need you to do it." Do not disable it yourself.
 #                                 TRANSFERS a live one, and the rightful holder's next -Take reports
 #                                 "already claimed by another session": the exact duplicate build the
 #                                 registry exists to stop.
-#   overlap-cache.json            overlap.ps1 trusts it as data for 60s, bounded only against a future
+#   overlap-cache/<hash>.json     overlap.ps1 trusts it as data for 60s, bounded only against a future
 #                                 stamp and a root/HEAD mismatch. A `rows: []` payload makes collision_gate.ps1
 #                                 read "RESOLVED, and nobody else is touching it" and ALLOW with no
 #                                 additionalContext -- indistinguishable from a real all-clear, which is
@@ -4524,8 +4524,8 @@ foreach ($r in $roots) {
         @{ Name = "gate-unresolved"
            What = "the collision gate's unresolved-notice throttle"
            Fix  = 'let scripts\hooks\collision_gate.ps1 stamp it; writing one HIDES its warning' }
-        @{ Name = "overlap-cache.json"
-           What = "the collision gate's peer-overlap input"
+        @{ Name = "overlap-cache"
+           What = "the collision gate's peer-overlap input (one cache file per querying worktree)"
            Fix  = 'pwsh -NoProfile -File scripts\coord\overlap.ps1 -Refresh' }
         @{ Name = "announce/off"
            What = "the REPO-WIDE announce kill switch"

@@ -788,8 +788,22 @@ try {
     $CurrentPhase = "setup"
 
     # --- install under the DEFAULT virtual account (no -ServiceAccount, no -AllowLocalSystem) ------
-    & (Join-Path $PSScriptRoot "install-service.ps1") -ServiceName $ServiceName -AppExe $AppExe `
-        -NssmDir $NssmDir -Config $ConfigDir -DataDir $DataDir -Port $Port -LogLevel INFO -Environment prod -LockConfigDir
+    # The service refuses to start with no --service-config (vault BACKLOG #2626 step 2). This arm
+    # sets everything through the environment, so the file holds only a comment. It sits in a folder
+    # of its own beside the data directory, which -LockConfigDir locks.
+    $ServiceConfig = Join-Path "$($DataDir.TrimEnd('\'))-settings" "messagefoundry.toml"
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ServiceConfig) | Out-Null
+    [System.IO.File]::WriteAllText($ServiceConfig, "# ADR 0183 store-access arm: set through the service's environment.`n")
+    # The installer refuses an editable or user-writable engine install (vault BACKLOG #2626), and
+    # the launcher on PATH is the checkout's editable one. So the service runs the installer's
+    # default root, which the CI job builds from the wheel first, unless -AppExe names another.
+    # -ProjectRoot keeps the value file this checkout's environments\prod.toml, as it was when the
+    # service ran from the checkout.
+    $installArgs = @{}
+    if ($PSBoundParameters.ContainsKey('AppExe')) { $installArgs['AppExe'] = $AppExe }
+    & (Join-Path $PSScriptRoot "install-service.ps1") -ServiceName $ServiceName @installArgs `
+        -NssmDir $NssmDir -Config $ConfigDir -ServiceConfig $ServiceConfig -ProjectRoot $RepoRoot `
+        -DataDir $DataDir -Port $Port -LogLevel INFO -Environment prod -LockConfigDir
     $startName = (Get-CimInstance Win32_Service -Filter "Name='$ServiceName'").StartName
     Add-Reading "SCM run-as account for '$ServiceName' is '$startName'"
     # The engine's store rule reads the data directory's OWNER as well as its DACL, so record it.

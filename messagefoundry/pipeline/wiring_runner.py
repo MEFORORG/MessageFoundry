@@ -201,6 +201,7 @@ from messagefoundry.store import (
     StreamingAttachmentsUnsupported,
 )
 from messagefoundry.store.base import AuditStore, pool_over_provisioned_warning
+from messagefoundry.store.cell_tag import CellTagError, CellTagSink, dead_letter_on_cell_tag
 from messagefoundry.store.crypto import CipherError
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.sealed_cache import point_in_time
@@ -218,6 +219,7 @@ from messagefoundry.transports.base import (
     IntakeAuditSink,
     IntakeGate,
     IntakeRateLimiter,
+    ReplyBodyDropped,
     SyncReplyResolver,
 )
 from messagefoundry.transports.database import DatabaseLookupExecutor
@@ -1088,7 +1090,7 @@ class _RoutedPrep:
     while every store handoff stays serial and in ascending claim order — so per-destination outbound
     FIFO (``ORDER BY seq``, ADR 0059; correct only under one serial writer per lane) is preserved.
     Exactly one field is populated: ``missing_handler`` (the row's handler is gone → dead-letter on
-    apply), ``error`` (the handler raised → internal-error policy on apply), or ``outcome`` (the
+    apply), ``tag_failure`` (the loopback metadata read failed its tag → dead-letter on apply), ``error`` (the handler raised → internal-error policy on apply), or ``outcome`` (the
     transform produced deliveries/state/meta to hand off). A handler raise is captured here rather than
     raised so a concurrent ``gather`` never cancels a sibling (ADR 0057 policy is applied on the serial
     apply, in claim order)."""
@@ -1096,6 +1098,8 @@ class _RoutedPrep:
     missing_handler: bool = False
     error: Exception | None = None
     outcome: TransformOutcome | None = None
+    #: The loopback metadata read met a cell that fails its row tag → dead-letter on apply (#2593).
+    tag_failure: CellTagError | None = None
 
 
 def _contiguous_by_message(items: Sequence[OutboxItem]) -> list[list[OutboxItem]]:
@@ -1972,9 +1976,16 @@ class RegistryRunner:
         """Wake every stage worker now (e.g. after a replay re-queues rows at an unknown stage)."""
         self._wake_all(Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE, Stage.OUTBOUND)
 
+    @property
+    def env_values(self) -> dict[str, Any]:
+        """The values ``env()`` refs resolve against when connectors are (re)built. The engine
+        reads them back after :meth:`reload`, which owns the swap (vault BACKLOG #2596)."""
+        return self._env_values
+
     def set_env_values(self, values: Mapping[str, Any]) -> None:
-        """Replace the environment values used to resolve ``env()`` refs when (re)building connectors.
-        The engine calls this on reload so a promote picks up edited values without a restart (M-23)."""
+        """Replace the environment values used to resolve ``env()`` refs when (re)building connectors,
+        outside a reload. A reload passes its values to :meth:`reload` instead, which swaps them with
+        the graph under its lock and restores them on a rollback (vault BACKLOG #2596, M-23)."""
         self._env_values = dict(values)
 
     # --- connection-event capture (Corepoint-style transport/lifecycle log, #46) ----------------
@@ -2378,29 +2389,96 @@ class RegistryRunner:
         except FutureCancelledError as exc:  # an Exception, unlike asyncio's CancelledError
             raise DbLookupError(f"db_lookup on {connection!r}: the query was cancelled") from exc
 
-    def _build_fhir_lookup_executor(self) -> FhirLookupExecutor | None:
+    def _build_fhir_lookup_executor(
+        self, *, isolated: dict[str, Exception] | None = None
+    ) -> FhirLookupExecutor | None:
         """Build the live FHIR-read executor from the current graph's ``FhirLookup`` specs, or ``None`` if
         the graph declares none (so ``fhir_lookup`` is unavailable and its runner is not activated). Mirrors
         :meth:`_build_lookup_executor`: resolves ``env()`` in each spec and fail-closed egress-checks the
-        FHIR host against ``[egress].allowed_http`` (ADR 0043), exactly as the FHIR outbound is gated."""
-        if not self.registry.fhir_lookups:
+        FHIR host against ``[egress].allowed_http`` (ADR 0043), exactly as the FHIR outbound is gated.
+
+        ``isolated`` is :meth:`start`'s form (vault BACKLOG #3008). A lookup that fails to build, such
+        as one whose hop is refused, is then isolated as :meth:`_start_outbound` isolates a lane: the
+        executor records it failed and refuses every read on it, the rest of the graph starts, and its
+        exception goes into ``isolated``. The caller logs and alerts each one once the start has
+        succeeded, so no alert says the engine went on when a later step unwound the start. Without
+        it, a failure raises, as a reload's build does once its build check passed. A failure that no
+        single lookup's build reproduces is graph-wide, and raises either way."""
+        specs = self.registry.fhir_lookups
+        if not specs:
             return None
-        resolved: dict[str, dict[str, Any]] = {}
-        for name, spec in self.registry.fhir_lookups.items():
+
+        def build(
+            names: Iterable[str], failed: Mapping[str, str] | None = None
+        ) -> FhirLookupExecutor:
             # ADR 0126 proxy default + ADR 0173 declaration-only revocation mirror.
-            resolved[name] = _fhir_lookup_settings(spec, self._env_values, self._egress)
-        # #200 (ADR 0092): stamp the derived posture around the live executor build so each connection's
-        # cleartext/verify-off hop guard (refuse_cleartext_egress / refuse_verify_off) captures THIS
-        # instance's posture rather than the unstamped fail-closed default. engine.start()/reload build
-        # the executor here outside build_check_registry's active_hop_posture scope, so an unstamped build
-        # would either fail-closed a legit dev read or (via the send-time re-assertion) mis-key the hop.
-        with active_hop_posture(self._hop_posture):
-            # #1180 (ADR 0093): a FhirLookup connection has no Destination to carry the instance
-            # [tls] anchor policy, so it is threaded explicitly here — the sanctioned live read
-            # against an internal FHIR server could otherwise never name an internal CA.
-            return FhirLookupExecutor(
-                resolved, egress=self._egress, trust_anchor_policy=self._trust_anchor_policy
-            )
+            resolved = {
+                name: _fhir_lookup_settings(specs[name], self._env_values, self._egress)
+                for name in names
+            }
+            # #200 (ADR 0092): stamp the derived posture around the live executor build so each
+            # connection's cleartext/verify-off hop guard (refuse_cleartext_egress / refuse_verify_off)
+            # captures THIS instance's posture rather than the unstamped fail-closed default.
+            # engine.start()/reload build the executor here outside build_check_registry's
+            # active_hop_posture scope, so an unstamped build would either fail-closed a legit dev read
+            # or (via the send-time re-assertion) mis-key the hop.
+            with active_hop_posture(self._hop_posture):
+                # #1180 (ADR 0093): a FhirLookup connection has no Destination to carry the instance
+                # [tls] anchor policy, so it is threaded explicitly here — the sanctioned live read
+                # against an internal FHIR server could otherwise never name an internal CA.
+                return FhirLookupExecutor(
+                    resolved,
+                    egress=self._egress,
+                    trust_anchor_policy=self._trust_anchor_policy,
+                    failed=failed,
+                )
+
+        try:
+            return build(specs)  # a healthy graph builds once, as it always did
+        except Exception:
+            if isolated is None:
+                raise
+        # Something failed, so build each lookup alone to find which. Broad on purpose, as the lane's
+        # isolation in _start_outbound is: one lookup's build failure costs that lookup only. A build
+        # opens no socket, so nothing is dialled. It does load CA and CRL files and logs its warning
+        # and attestation lines, so on this path each surviving lookup logs them again per build.
+        # That cost falls only on a start that already failed, and keeps the healthy start to one build.
+        errors: dict[str, Exception] = {}
+        for name in specs:
+            try:
+                build([name])
+            except Exception as exc:
+                errors[name] = exc
+        failed = {name: safe_exc(err) for name, err in errors.items()}
+        executor = build([name for name in specs if name not in errors], failed)
+        isolated.update(errors)
+        return executor
+
+    def _record_fhir_lookup_failed(self, name: str, reason: str, exc: BaseException) -> None:
+        """Log and alert a ``FhirLookup`` that failed to build at start, as :meth:`_record_failed`
+        does for a connection (ADR 0031, vault BACKLOG #3008). The executor keeps the record. The
+        alert names the lookup by its record name, so it is not taken for a connection of the same
+        name."""
+        self._log_and_alert_start_failure(
+            f"fhir lookup {name!r}",
+            fhir_lookup_record_name(name),
+            "reload or restart; every Handler call to it fails closed meanwhile",
+            reason,
+            exc,
+        )
+
+    def fhir_lookup_failed(self, name: str) -> str | None:
+        """The failure reason if the ``FhirLookup`` of this name failed to build at start, else
+        ``None`` (vault BACKLOG #3008). The lookup twin of :meth:`outbound_failed`."""
+        return self.degraded_fhir_lookups().get(name)
+
+    def degraded_fhir_lookups(self) -> dict[str, str]:
+        """Snapshot of ``{lookup: reason}`` for each ``FhirLookup`` that failed to build at start
+        (vault BACKLOG #3008). Empty when every lookup built, when none is declared, or when the
+        graph is not running: teardown keeps the last executor, and a stopped or unwound start must
+        not keep naming its failures."""
+        executor = self._fhir_lookup_executor
+        return executor.failed if executor is not None and self._running else {}
 
     def _run_fhir_lookup(
         self,
@@ -3451,11 +3529,23 @@ class RegistryRunner:
                     exc,
                     exc_info=not refused,
                 )
+                if isinstance(exc, ValueError):
+                    # No lane is marked here, so a reload reads the changed setting.
+                    what = _ANCHOR_SETTING_REFUSED
+                    advice = "Fix the setting, then reload; the server log says why"
+                elif refused:
+                    what = "tls_ca_file was refused"
+                    advice = (
+                        "Fix the file, then reload; the server log and the auth.trust_anchor "
+                        "audit rows say why"
+                    )
+                else:
+                    # The check did not run, so nothing says the file is at fault.
+                    what = "tls_ca_file could not be checked"
+                    advice = "The server log says why; reload once the cause is fixed"
                 fixed = TrustAnchorError(
-                    f"{direction} connection '{name}': its tls_ca_file "
-                    f"{'was refused' if refused else 'could not be checked'} on this passive DR "
-                    "standby, and POST /dr/activate needs it. Fix the file, then reload; the "
-                    "server log and the auth.trust_anchor audit rows say why"
+                    f"{direction} connection '{name}': its {what} on this passive DR standby, "
+                    f"and POST /dr/activate needs it. {advice}"
                 )
                 self._record_failed(name, fixed, kind=direction)
 
@@ -3539,7 +3629,11 @@ class RegistryRunner:
         A refusal that fails a lane is raised as a fixed line naming the connection. The refusal
         text names the CA's path, the folders above it and its SHA-256, so it goes to the server
         log only, as the connection-test route keeps it from API callers (BACKLOG #1142). The lane
-        status and the ``connection_stopped`` alert carry the fixed line."""
+        status and the ``connection_stopped`` alert carry the fixed line. A ``ValueError`` is a
+        refused setting, not a refused file, and its line says so (vault BACKLOG #3224). The
+        reverse does not hold: a pin that is not a SHA-256 raises ``TrustAnchorError`` and still
+        takes the file's line. The exception type cannot tell those two apart; the check that
+        raises would have to say which it is."""
         if self._lane_anchor_check is None:
             return
         try:
@@ -3549,10 +3643,17 @@ class RegistryRunner:
                 raise
             self._anchor_refused[(direction, name)] = _anchor_key(settings)
             log.warning("%s connection %r: trust anchor refused: %s", direction, name, exc)
-            raise TrustAnchorError(
-                f"{direction} connection '{name}': its tls_ca_file was refused. Fix the file, then "
-                "start the connection; the server log and the auth.trust_anchor audit rows say why"
-            ) from exc
+            # The setting's advice names both steps. The reload takes in the changed value. It
+            # also rebuilds the lane when the CA path or the pin changed. A change to any other
+            # value, such as the url, leaves the failure kept, and the start then builds the lane.
+            tail = (
+                f"{_ANCHOR_SETTING_REFUSED}. Fix the setting, then reload and start the "
+                "connection; the server log says why"
+                if isinstance(exc, ValueError)
+                else "tls_ca_file was refused. Fix the file, then start the connection; the "
+                "server log and the auth.trust_anchor audit rows say why"
+            )
+            raise TrustAnchorError(f"{direction} connection '{name}': its {tail}") from exc
         if fails_lane:
             self._anchor_refused.pop((direction, name), None)
 
@@ -3625,7 +3726,17 @@ class RegistryRunner:
             return False
         try:
             settings = self._anchor_lane_settings(new)
-        except Exception:  # noqa: BLE001 - an unresolvable value is a change; the build reports it
+        except Exception as exc:  # noqa: BLE001 - an unresolvable value is a change
+            # The line says only what happened here (vault BACKLOG #3224). The reload that
+            # asked resolves the same settings again and is refused on them, so the lane's
+            # record and mark stay as they were.
+            log.info(
+                "%s connection %r: its kept trust-anchor failure could not be compared, because "
+                "its settings no longer resolve: %s",
+                direction,
+                name,
+                safe_exc(exc),
+            )
             return False
         return _anchor_key(settings) == key
 
@@ -3783,8 +3894,11 @@ class RegistryRunner:
             await self._aclose_quietly(connector, name)
             self._destinations.pop(name, None)
             # vault BACKLOG #2371: a CA refusal on a lane already recorded failed is not alerted
-            # again. A calendar window open reaches here once per window, and the refusal was
-            # alerted when the lane first failed. Other build failures alert as before.
+            # again. A calendar window open reaches here once per window, and the lane was
+            # alerted when it first failed. Other build failures alert as before. A lane that
+            # first failed for another reason keeps that older reason in its status; the CA
+            # refusal is in the server log and the auth.trust_anchor rows (vault BACKLOG #3224,
+            # item 3, declined: recording it again is what the alert-storm test pins against).
             if not (isinstance(exc, TrustAnchorError) and ("outbound", name) in self._failed):
                 self._record_failed(name, exc, kind="outbound")
             return
@@ -4405,20 +4519,32 @@ class RegistryRunner:
         bare name: an alert row is addressed to the operator's connection, and the detail says which
         direction failed to start."""
         reason = safe_exc(exc)
-        self._failed[(kind, name)] = reason
-        log.error(
-            "%s connection %r failed to start — ISOLATED, engine continues (fix the cause, then "
-            "reload%s): %s",
-            kind,
+        self._failed[(kind, name)] = reason  # stored before the alert fires, so a sink reads it
+        self._log_and_alert_start_failure(
+            f"{kind} connection {name!r}",
             name,
-            " or restart it" if kind == "inbound" else "",
+            "reload or restart it" if kind == "inbound" else "reload",
+            reason,
+            exc,
+        )
+
+    def _log_and_alert_start_failure(
+        self, subject: str, alert_name: str, recovery: str, reason: str, exc: BaseException
+    ) -> None:
+        """The ADR 0031 signal for one thing that failed to start and was isolated: an ERROR line
+        and a ``connection_stopped`` alert. ``reason`` is ``safe_exc(exc)``. Shared by a connection
+        (:meth:`_record_failed`) and a ``FhirLookup`` (:meth:`_record_fhir_lookup_failed`)."""
+        log.error(
+            "%s failed to start — ISOLATED, engine continues (fix the cause, then %s): %s",
+            subject,
+            recovery,
             reason,
             exc_info=exc,
         )
         try:
-            self._alert_sink.connection_stopped(name, detail=f"failed to start: {reason}")
+            self._alert_sink.connection_stopped(alert_name, detail=f"failed to start: {reason}")
         except Exception:
-            log.exception("alert sink raised on connection_stopped for %r", name)
+            log.exception("alert sink raised on connection_stopped for %r", alert_name)
 
     # --- #122 / ADR 0162: fail-closed application-log write guard ------------
 
@@ -5010,12 +5136,14 @@ class RegistryRunner:
                         else "any ordering=unordered outbound (ADR 0066 D4)",
                         self._pooled_sweep_interval,
                     )
+            fhir_lookup_isolated: dict[str, Exception] = {}  # vault BACKLOG #3008, alerted below
             try:
                 # Per-connection fault isolation (ADR 0031): a single outbound build / inbound bind
                 # failure no longer aborts startup — it is recorded + alerted and the rest of the graph
                 # still comes up (a failed connection must not crash the engine). The outer except below
                 # stays a backstop for genuinely fatal, graph-wide startup errors (the store, the
-                # lookup executor), which still unwind + raise.
+                # DB-lookup executor), which still unwind + raise. A FhirLookup is isolated per
+                # lookup below (vault BACKLOG #3008).
                 # #122 (ADR 0162): this runner came up into an unwritable application log, so the
                 # delivery tier is paused BEFORE its lanes are built — see
                 # :meth:`_park_delivery_for_log_failure` for why "before" is load-bearing. The intake
@@ -5028,7 +5156,14 @@ class RegistryRunner:
                 # None when no DatabaseLookup is declared, keeping the transform path byte-identical. A
                 # failure here is graph-wide (not one connection), so let it hit the backstop below.
                 self._lookup_executor = self._build_lookup_executor()
-                self._fhir_lookup_executor = self._build_fhir_lookup_executor()
+                # Vault BACKLOG #3008, owner ruling R3 of 2026-10-05: a FhirLookup that fails to build
+                # is isolated like a lane. It is recorded failed, the Handlers that call it fail closed,
+                # and the other feeds start. On every start, matching how a lane is isolated: a Manager
+                # decision under the owner's standing driver rules, 2026-10-11, not an owner ruling.
+                # A restart and a clustered node's start on promotion both come through here.
+                self._fhir_lookup_executor = self._build_fhir_lookup_executor(
+                    isolated=fhir_lookup_isolated
+                )
                 # ADR 0057: compute the inline-fast-path eligibility now that the lookup executors are
                 # known (P-lookup needs both to be None). Default-OFF unless an inbound opted in.
                 self._recompute_inline_ok()
@@ -5096,15 +5231,31 @@ class RegistryRunner:
                 if self._log_write_stopped:
                     await self._unbind_for_log_failure()
             except Exception:
-                # A truly fatal startup error (store / lookup executor — NOT a single connection, which
+                # A truly fatal startup error (store / DB-lookup executor — NOT a single connection, which
                 # is isolated above) must not leave half the graph wired with _running still False:
                 # unwind everything we started so the listeners are released and a retry can rebind (M-8).
                 log.exception("wiring start failed; unwinding the partial start")
+                for lookup_name, lookup_exc in fhir_lookup_isolated.items():
+                    # Vault BACKLOG #3008: logged, so a retry does not hide the refusal, but not
+                    # alerted, since the alert says the engine continues and this start did not.
+                    log.error(
+                        "fhir lookup %r also failed to build during the unwound start: %s",
+                        lookup_name,
+                        safe_exc(lookup_exc),
+                        exc_info=lookup_exc,
+                    )
                 # Explicitly SHUTDOWN (ADR 0157): a partial start is not a demotion — there is no lease
                 # being handed over, so there is nothing to bound and no reason to abandon a listener.
                 await self._teardown_unsafe(TeardownReason.SHUTDOWN)
                 raise
             self._running = True
+            # Vault BACKLOG #3008: after _running is set, so a sink polling /status reads the record
+            # the alert names, and before anything else here can raise past it.
+            failed_lookups = self.degraded_fhir_lookups()
+            for lookup_name, lookup_exc in fhir_lookup_isolated.items():
+                self._record_fhir_lookup_failed(
+                    lookup_name, failed_lookups[lookup_name], lookup_exc
+                )
             # #147 (ADR 0095): spawn one active-window scheduler task per SCHEDULED connection. Each
             # AUTO-STARTs/STOPs its connection through the same start_inbound/stop_inbound (or
             # start_outbound/stop_outbound) path the API uses — a schedule-park is a clean stop, never a
@@ -5136,6 +5287,14 @@ class RegistryRunner:
                     len(self.filtered_inbound()),
                     len(self.filtered_outbound()),
                     self._dr_standby.value,
+                )
+            if failed_lookups:
+                # Vault BACKLOG #3008: a lookup is not a connection, so it is not in the count below.
+                log.warning(
+                    "wiring started with %d FhirLookup(s) failed to start (isolated, engine "
+                    "running; every Handler call to one fails closed): %s",
+                    len(failed_lookups),
+                    ", ".join(f"{n} ({r})" for n, r in sorted(failed_lookups.items())),
                 )
             if self._failed:
                 log.warning(
@@ -6176,7 +6335,7 @@ class RegistryRunner:
             # (In per_lane the equivalent check sits inside the worker loop's own except:backoff.)
             log.exception("pooled buildup check failed for stage %s lane %s", stage, lane)
 
-    def build_check(self, registry: Registry) -> None:
+    def build_check(self, registry: Registry, env_values: Mapping[str, Any] | None = None) -> None:
         """Construct (and discard) every connector in ``registry`` so a bad connector spec fails
         BEFORE a reload quiesces anything — i.e. the running graph is left untouched. Construction
         is side-effect-free (no socket bind / file I/O — binding happens later in ``start_inbound``).
@@ -6189,11 +6348,14 @@ class RegistryRunner:
         on a backend that can't re-ingress (Postgres/SQL Server/any non-SQLite) BEFORE the swap, so a
         reload/promote can never bring a PT-on-non-SQLite graph live; the reference-set backend
         allow-list (:func:`check_reference_backend_supported`) does the same for an ADR 0006
-        ``Reference(...)`` on a backend with no snapshot store (SQL Server)."""
+        ``Reference(...)`` on a backend with no snapshot store (SQL Server).
+
+        ``env_values`` defaults to the runner's own. A dry run passes the values it re-read, so it
+        checks them without making them the live graph's (vault BACKLOG #2596)."""
         build_check_registry(
             registry,
             inbound_bind_host=self._inbound_bind_host,
-            env_values=self._env_values,
+            env_values=self._env_values if env_values is None else env_values,
             egress=self._egress,
             reserved_bindings=self._reserved_bindings,
             posture=self._hop_posture,
@@ -6695,7 +6857,9 @@ class RegistryRunner:
             )
         return stranded
 
-    async def reload(self, new_registry: Registry | None = None) -> None:
+    async def reload(
+        self, new_registry: Registry | None = None, env_values: Mapping[str, Any] | None = None
+    ) -> None:
         """Atomically swap to ``new_registry`` on the running graph (whole-config swap).
 
         ``None`` re-applies the graph that is current once the reload lock is held, so a reload
@@ -6726,7 +6890,17 @@ class RegistryRunner:
         async with self._reload_lock:
             if new_registry is None:
                 new_registry = self.registry
-            self.build_check(new_registry)  # raises before any change on a bad connector
+            # ``env_values`` go live with the graph, under the same lock. A refused or rolled-back
+            # reload puts the previous ones back before it restarts the previous graph's intake
+            # (vault BACKLOG #2596). ``None`` keeps the runner's values.
+            old_env_values = self._env_values
+            if env_values is not None:
+                self._env_values = dict(env_values)
+            try:
+                self.build_check(new_registry)  # raises before any change on a bad connector
+            except BaseException:
+                self._env_values = old_env_values
+                raise
             # What the clear below removes, so a reload that is refused or rolled back puts it
             # back and leaves the markers as they were (vault BACKLOG #3262).
             cleared: dict[tuple[Direction, str], str] | None = None
@@ -6756,6 +6930,7 @@ class RegistryRunner:
                     old, new_registry, old_inbound_names
                 )
             except BaseException:
+                self._env_values = old_env_values
                 self._restore_dr_markers(cleared)
                 raise
             # Step 2 rebuilds both lookup executors for the new graph; the rollback restores these.
@@ -6925,6 +7100,7 @@ class RegistryRunner:
                         "reload failed; rolling back inbound intake to the previous graph"
                     )
                 self.registry = old
+                self._env_values = old_env_values
                 self._restore_dr_markers(cleared)
                 # The lookup executors and ADR 0057 inline eligibility follow the registry back, before
                 # the first await below, so no worker that reads them after the restore pairs the old
@@ -8183,6 +8359,12 @@ class RegistryRunner:
                 retry_until = failed.retry_at
                 self._note_retry_exhausted(name, exc, failed, message_id=item.message_id)
                 await self._delivery_failure_alert_checks(name)
+        except CellTagError as exc:
+            # BACKLOG #2593: the dynamic_headers metadata read met a cell that fails its channel
+            # tag (alerted at the read). Nothing was sent. Dead-letter the row and audit it, as the
+            # transform stage does, rather than take the internal-error arm, whose STOP policy would
+            # halt the whole lane on one message.
+            await dead_letter_on_cell_tag(self._cell_tag_sink, item.id, exc)
         except _StoreReadFault as exc:
             # Vault BACKLOG #2756: a store READ the send needed failed (the document re-attach or the
             # dynamic_headers metadata), so nothing was sent and nothing is wrong with the message.
@@ -8256,7 +8438,9 @@ class RegistryRunner:
             # AND mark the row done in ONE transaction (exactly-once capture). A non-capturing
             # outbound returns None → plain mark_done, byte-identical. The XOR (never both)
             # is the single-writer discipline that yields exactly one captured reply per row.
-            if response is not None:
+            # A ReplyBodyDropped is a non-capturing delivery too: plain mark_done, which also
+            # writes the drop. Tested by exclusion, so any other reply is captured as before.
+            if response is not None and not isinstance(response, ReplyBodyDropped):
                 # ADR 0013 Increment 2: if this outbound declares reingress_to, the same
                 # capture transaction also produces a Stage.RESPONSE work-row; wake the
                 # re-ingress worker. Read live from the registry (a reload swaps it).
@@ -8304,9 +8488,30 @@ class RegistryRunner:
             else:
                 # PHASE (b): the store completion round-trip (plain mark_done — the non-capturing path).
                 _done_t0 = time.perf_counter_ns() if self._delivery_phase_timing else 0
-                await self.store.mark_done(item.id)
+                # vault BACKLOG #3040 items 2 and 5: a ReplyBodyDropped means the partner answered
+                # 2xx and its reply body was dropped: over the byte bound, or (BACKLOG #2989) cut
+                # short or misframed. The reply_dropped event commits with the DONE flip, and the
+                # WARNING follows that write and says what it did. Status, problem and names only.
+                dropped = response if isinstance(response, ReplyBodyDropped) else None
+                if dropped is None:
+                    await self.store.mark_done(item.id)
+                else:
+                    recorded = await self.store.mark_done(item.id, reply_dropped=dropped.detail)
                 if self._delivery_phase_timing:
                     self._delivery_phase_stats.record_mark_done(time.perf_counter_ns() - _done_t0)
+                if dropped is not None:
+                    log.warning(
+                        "delivery worker %r: outbox row %s (message %s) answered with status %s "
+                        "and a response body %s; the body is dropped, and %s",
+                        name,
+                        item.id,
+                        item.message_id,
+                        dropped.status,
+                        dropped.problem,
+                        "the row is recorded as delivered with a reply_dropped event"
+                        if recorded
+                        else "the store recorded nothing: the row was gone or the write was fenced",
+                    )
             # Emit the throttled per-process summary (send_ack vs mark_done) after a delivered row —
             # a no-op between windows. Only on the delivered path (a retried/dead-lettered row records
             # neither phase, so there is nothing new to summarize).
@@ -9346,6 +9551,13 @@ class RegistryRunner:
             result = await self._fused_transform_and_handoff(name, ic, item)
             if result.xform_exc is not None:  # CONTENT: a handler raise → internal-error policy
                 return await self._apply_transform_internal_error(name, item, result.xform_exc)
+            if isinstance(result.handoff_exc, CellTagError):
+                # BACKLOG #2593: the message's own metadata cell failed its row tag (in the sync
+                # handoff, which rolled back, or in the loopback read). Dead-letter the row (message
+                # ERROR) and audit it, as the async transform_handoff does, rather than re-pend a
+                # row that would fail the same way until the inbound stopped.
+                await dead_letter_on_cell_tag(self._cell_tag_sink, item.id, result.handoff_exc)
+                return _ItemOutcome.PROCESSED, None
             if result.handoff_exc is not None:  # INFRA: acquire/handoff fault → propagate → T17
                 raise result.handoff_exc
             # LOOP-side publish of the committed transform-state (the sync twin never mutates the
@@ -9364,6 +9576,12 @@ class RegistryRunner:
         # concurrent-batch entry (which does not pre-check) is self-contained.
         prep = await self._prepare_routed(name, ic, item)
         return await self._apply_routed(name, item, prep)
+
+    @property
+    def _cell_tag_sink(self) -> CellTagSink:
+        """The store as the dead-letter-and-audit sink a cell-tag failure needs (BACKLOG #2593).
+        ``record_audit`` lives on AuditStore, which every shipped backend implements."""
+        return cast(CellTagSink, self.store)
 
     async def _prepare_routed(
         self,
@@ -9411,8 +9629,12 @@ class RegistryRunner:
         # and the metadata read is skipped entirely for non-loopback inbounds).
         response_view: dict[str, Any] | None = None
         if ic.spec.type is ConnectorType.LOOPBACK:
-            msg = await self.store.get_message(item.message_id)
-            raw_meta = msg.get("metadata") if msg else None
+            # Only the metadata cell is read. One that fails its row tag (BACKLOG #2593) makes the
+            # row a dead-letter on apply, not an infrastructure fault that re-pends it forever.
+            try:
+                raw_meta = await self.store.message_metadata_json(item.message_id)
+            except CellTagError as err:
+                return _RoutedPrep(tag_failure=err)
             meta = json.loads(raw_meta) if raw_meta else {}
             corr = meta.get("correlation_id") if isinstance(meta, dict) else None
             if corr:
@@ -9502,6 +9724,10 @@ class RegistryRunner:
         :meth:`_process_routed_item` exactly: handler-missing → dead-letter (``PROCESSED``); handler
         raise → internal-error policy (``STOP``/``CONTINUE``); else ``transform_handoff`` + lane wakes
         (``PROCESSED``). Returns ``(outcome, None)`` — the routed path never re-pends-with-backoff."""
+        if prep.tag_failure is not None:
+            # BACKLOG #2593: the loopback read met a message cell that fails its row tag.
+            await dead_letter_on_cell_tag(self._cell_tag_sink, item.id, prep.tag_failure)
+            return _ItemOutcome.PROCESSED, None
         if prep.missing_handler:
             # Handler gone (removed/renamed since routing). Can't transform this row;
             # dead-letter it (message ERROR, replayable once restored) — the per-row analogue
@@ -9680,8 +9906,20 @@ class RegistryRunner:
         # byte-identical to the split _process_routed_item path.
         response_view: dict[str, Any] | None = None
         if ic.spec.type is ConnectorType.LOOPBACK:
-            msg = await self.store.get_message(item.message_id)
-            raw_meta = msg.get("metadata") if msg else None
+            # Only the metadata cell is read. One that fails its row tag (BACKLOG #2593) comes back
+            # as the handoff fault the caller dead-letters, as the split path's prep does.
+            try:
+                raw_meta = await self.store.message_metadata_json(item.message_id)
+            except CellTagError as err:
+                return _FusedTransformResult(
+                    deliveries=[],
+                    pt_deliveries=[],
+                    applied_state=[],
+                    xform_exc=None,
+                    handoff_exc=err,
+                    outbound_wakes=(),
+                    ingress_wakes=(),
+                )
             meta = json.loads(raw_meta) if raw_meta else {}
             corr = meta.get("correlation_id") if isinstance(meta, dict) else None
             if corr:
@@ -10979,6 +11217,13 @@ def _insecure_bind_cause(source: Source) -> str:
         return f"tls_hop_attested; reason: {source.tls_hop_attested_reason or '(none provided)'}"
     # serve folds [security].require_encryption_for_remote = false into the same flag (ADR 0118).
     return "--allow-insecure-bind / require_encryption_for_remote = false"
+
+
+#: What a lane's fixed refusal line says for a ``ValueError`` from its CA check (vault BACKLOG
+#: #3224). That is a setting the check refused, such as a blank or unread ``tls_ca_pin`` or a
+#: ``tls_ca_file`` value that is no path. Mending the file does nothing for it, and a start alone
+#: reads the same setting again. Each site adds its own advice.
+_ANCHOR_SETTING_REFUSED = "tls_ca_pin or tls_ca_file setting was refused"
 
 
 def _anchor_key(settings: Mapping[str, Any]) -> tuple[str, object]:

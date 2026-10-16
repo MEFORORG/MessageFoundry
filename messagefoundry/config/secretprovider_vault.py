@@ -41,6 +41,7 @@ from messagefoundry.config.tls_policy import (
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import SecretsSettings
+    from messagefoundry.config.tls_policy import HopPosture
 
 #: The optional extra that carries ``hvac`` — named in every fail-closed message. Deliberately the SAME
 #: extra the store's Vault KeyProvider uses (no second Vault dependency).
@@ -104,10 +105,25 @@ def _vault_ca_kwargs(addr: str | None) -> dict[str, str]:
     return vault_client_verify_kwargs(ca_file=ca, addr=addr, cell=f"[secrets].provider={_EXTRA!r}")
 
 
-def _build_client(addr: str | None, token: str | None) -> Any:
+def _build_client(
+    addr: str | None,
+    token: str | None,
+    *,
+    revocation_attested: bool,
+    posture: HopPosture | None = None,
+    revocation_reason: str | None = None,
+) -> Any:
     """Construct an ``hvac.Client``. Factored out so tests can substitute a fake KV backend without a live
     Vault. ``addr``/``token`` pass through; when ``None``, hvac falls back to its own VAULT_ADDR/VAULT_TOKEN
-    environment conventions."""
+    environment conventions.
+
+    ``revocation_attested`` is ``[secrets].vault_revocation_attested`` (vault BACKLOG #2983). It is
+    REQUIRED, so no caller builds this client without saying whether the hop is attested. Pass the
+    setting, or ``False`` where no settings are in scope, which fails closed.
+
+    ``posture`` is the instance posture the caller was handed, or ``None``. ``None`` counts as
+    enforcing, so leaving it out is the strict answer. ``revocation_reason`` is the attestation's
+    reason, for the one line an attested crossing logs."""
     hvac = _import_hvac()
     # allow_redirects=False (BACKLOG #1042, ASVS 15.3.2/1.3.6): hvac's default is True, and this was
     # one of the three clients that did not carry the no-redirect policy every other shipped HTTP
@@ -142,12 +158,19 @@ def _build_client(addr: str | None, token: str | None) -> Any:
 
     try:
         mount_strict_reply_adapter(
-            client, connector=_VAULT_KV_CONNECTOR, ssl_context_factory=context_factory
+            client,
+            connector=_VAULT_KV_CONNECTOR,
+            ssl_context_factory=context_factory,
+            revocation_attested=revocation_attested,
+            attestation_section="secrets",
+            posture=posture,
+            revocation_reason=revocation_reason,
         )
     except InsecureHopRefused as exc:
         # BACKLOG #2317: the mount refuses an address that would send the token in cleartext,
-        # before any I/O. Raised as this provider's own fail-closed type, which every caller
-        # handles, with the refusal's fixed text kept whole.
+        # before any I/O. Vault BACKLOG #2983: it also refuses an off-box https:// Vault whose
+        # revocation nothing checks and nobody attested. Raised as this provider's own
+        # fail-closed type, which every caller handles, with the refusal's fixed text kept whole.
         raise SecretProviderError(str(exc)) from exc
     return client
 
@@ -173,8 +196,12 @@ def _split_ref(ref: str) -> tuple[str, str]:
 class VaultSecretProvider:
     """``vault`` — read a connector credential from Vault KV v2 (ADR 0019 §5)."""
 
-    def __init__(self, settings: SecretsSettings) -> None:
+    def __init__(self, settings: SecretsSettings, *, posture: HopPosture | None = None) -> None:
         self._settings = settings
+        # The instance posture the caller holds, for the revocation guard on this hop (vault
+        # BACKLOG #2983). Kept, because the provider dials on every `resolve`, long after it was
+        # built. `None` counts as enforcing.
+        self._posture = posture
 
     def resolve(self, ref: str) -> str:
         path, field = _split_ref(ref)
@@ -186,7 +213,13 @@ class VaultSecretProvider:
         # from Vault KV" — turning a configuration refusal into what reads as a connectivity failure,
         # the same mistake ADR 0180 records for the LDAPS site. Fail-closed is unchanged either way:
         # both paths propagate and the subsystem refuses to come up.
-        client = _build_client(addr, token)
+        client = _build_client(
+            addr,
+            token,
+            revocation_attested=self._settings.vault_revocation_attested,
+            posture=self._posture,
+            revocation_reason=self._settings.vault_revocation_attested_reason,
+        )
         try:
             # read_secret_version returns {'data': {'data': {<field>: <value>, ...}, 'metadata': {...}}}.
             response: Any = client.secrets.kv.v2.read_secret_version(path=path, mount_point=mount)
@@ -217,9 +250,11 @@ class VaultSecretProvider:
         return value
 
 
-def build_provider(settings: SecretsSettings) -> VaultSecretProvider:
+def build_provider(
+    settings: SecretsSettings, *, posture: HopPosture | None = None
+) -> VaultSecretProvider:
     """The dispatch entrypoint ``secretprovider._load_external_provider`` imports and calls by name."""
-    return VaultSecretProvider(settings)
+    return VaultSecretProvider(settings, posture=posture)
 
 
 # --- what this hop's token must be able to do (BACKLOG #305, ASVS 13.2.2) ---------------------------
@@ -259,14 +294,32 @@ def secrets_vault_address() -> str:
     return addr
 
 
-def secrets_vault_client(address: str, token: str) -> Any:
+def secrets_vault_client(
+    address: str,
+    token: str,
+    *,
+    revocation_attested: bool,
+    posture: HopPosture | None = None,
+    revocation_reason: str | None = None,
+) -> Any:
     """The connector-secret hop's Vault client, built by the same :func:`_build_client`
     :meth:`VaultSecretProvider.resolve` uses: same TLS narrowing, same anchor, no redirects, and the
     same cleartext-address refusal (BACKLOG #2317). For ``check-privileges``, which reads the token's
     own grants through it and changes nothing. Take ``address`` from :func:`secrets_vault_address`
     and ``token`` from :func:`secrets_vault_token`; both refuse an unset variable, and the client
-    uses exactly the values they returned."""
-    return _build_client(address, token)
+    uses exactly the values they returned.
+
+    **The same revocation rule too** (vault BACKLOG #2983). ``revocation_attested`` is
+    ``[secrets].vault_revocation_attested`` and is REQUIRED, with ``revocation_reason`` beside it
+    and the caller's ``posture``. So this client crosses an off-box ``https://`` Vault where
+    :meth:`VaultSecretProvider.resolve` would, and its refusal names the pair this path reads."""
+    return _build_client(
+        address,
+        token,
+        revocation_attested=revocation_attested,
+        posture=posture,
+        revocation_reason=revocation_reason,
+    )
 
 
 def kv_required_capabilities(refs: Iterable[str]) -> dict[str, frozenset[str]]:

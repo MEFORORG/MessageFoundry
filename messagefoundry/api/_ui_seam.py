@@ -395,12 +395,21 @@ from typing import Any
 #: before each page, and ``/ui/audit/export`` passes its cookie session. The digest did not move,
 #: for the same reason. A call without ``token`` raises TypeError before any row is read.
 #:
+#: Vault BACKLOG #3198: ``AuthService`` gained ``abandon_oidc_login``, which the ``/ui/oidc``
+#: callback calls for an ``error=`` or malformed sign-in callback, so a forged one cannot end a
+#: sign-in in flight. It returns whether the flow was consumed. ``LoginOutcome`` and ``OidcStepUp``
+#: gained ``flow_consumed``, which the route reads to keep the flow cookie when a refusal consumed
+#: nothing. The route types its ``LoginOutcome`` so discovery sees that class (and ``RolesGained``,
+#: one of its field types), which it did not before. The digest moved because the
+#: surface grew. An older console on this engine is refused at mount; a newer console on an older
+#: engine would call a method that does not exist.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "05d283512c738b8b"
+ENGINE_UI_SEAM: str = "1b9da0aae75dbd52"
 
 
 @dataclass(frozen=True, slots=True)
@@ -495,10 +504,11 @@ class CoreHandlers:
     # object-flag toggle (config:deploy). TOML-managed connections only — a code-first one is refused 409.
     set_connection_flag: Callable[..., Awaitable[Any]]
     # Dual-control approvals (ASVS 2.3.5, BACKLOG #1982): the console's Approvals page. The JSON
-    # gates are require(APPROVALS_APPROVE) on the list and require_paced(APPROVALS_APPROVE) on approve
-    # and reject, so each /ui route asserts approvals:approve through require_ui, which paces a /ui
-    # write the same way. The resolve of an interrupted release (BACKLOG #2460) has the JSON gate
-    # require_step_up, so its /ui route takes require_ui_step_up for the same fresh re-proof.
+    # gates are require(APPROVALS_APPROVE) on the list and require_paced(APPROVALS_APPROVE) on
+    # reject, so those /ui routes assert approvals:approve through require_ui, which paces a /ui
+    # write the same way. The resolve of an interrupted release (BACKLOG #2460) and, since owner
+    # ruling 2026-10-13 (#3241 R4), the approve have the JSON gate require_step_up, so their /ui
+    # routes take require_ui_step_up for the same fresh re-proof.
     list_approvals: Callable[..., Awaitable[Any]]
     approve_action: Callable[..., Awaitable[Any]]
     reject_action: Callable[..., Awaitable[Any]]

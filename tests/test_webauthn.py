@@ -273,16 +273,16 @@ async def test_an_unusable_stored_key_fails_the_assertion_audited_not_raised(
         identity, token, _ = await login_admin(service)
         auth, token = await _enroll(service, identity, token)
 
-        real_get = store.get_webauthn_credential
+        real_list = store.list_webauthn_credentials
 
-        async def mislabelled(credential_id_hash: str) -> WebAuthnCredential | None:
-            cred = await real_get(credential_id_hash)
-            if cred is None:
-                return None
+        async def mislabelled(user_id: str) -> list[WebAuthnCredential]:
             wrong_curve = bytes_to_base64url(auth.cose_public_key(crv=2))
-            return dataclasses.replace(cred, public_key=wrong_curve)
+            return [
+                dataclasses.replace(cred, public_key=wrong_curve)
+                for cred in await real_list(user_id)
+            ]
 
-        monkeypatch.setattr(store, "get_webauthn_credential", mislabelled)
+        monkeypatch.setattr(store, "list_webauthn_credentials", mislabelled)
         before = (await _events(service, identity.username)).count("auth.webauthn_failed")
         ok, _ = await _assert_once(service, token, auth)
         assert ok is False
@@ -343,15 +343,15 @@ async def test_a_stored_key_registration_would_refuse_fails_sign_in_audited(
             {1: 2, 3: -7, -1: 2, -2: nums.x.to_bytes(48, "big"), -3: nums.y.to_bytes(48, "big")}
         )
         signer = dataclasses.replace(auth, _key=key)  # same credential id, P-384 signature
-        real_get = store.get_webauthn_credential
+        real_list = store.list_webauthn_credentials
 
-        async def on_p384(credential_id_hash: str) -> WebAuthnCredential | None:
-            cred = await real_get(credential_id_hash)
-            if cred is None:
-                return None
-            return dataclasses.replace(cred, public_key=bytes_to_base64url(p384))
+        async def on_p384(user_id: str) -> list[WebAuthnCredential]:
+            return [
+                dataclasses.replace(cred, public_key=bytes_to_base64url(p384))
+                for cred in await real_list(user_id)
+            ]
 
-        monkeypatch.setattr(store, "get_webauthn_credential", on_p384)
+        monkeypatch.setattr(store, "list_webauthn_credentials", on_p384)
         with (
             caplog.at_level(logging.WARNING, logger=_WEBAUTHN_LOG),
             caplog.at_level(logging.WARNING, logger=_SERVICE_LOG),

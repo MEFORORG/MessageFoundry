@@ -121,7 +121,9 @@ class _ScriptedVault:
 def _client(port: int) -> Any:
     from messagefoundry.config import secretprovider_vault
 
-    return secretprovider_vault._build_client(f"http://127.0.0.1:{port}", _TOKEN)
+    return secretprovider_vault._build_client(
+        f"http://127.0.0.1:{port}", _TOKEN, revocation_attested=False
+    )
 
 
 def _get(client: Any) -> Any:
@@ -147,7 +149,7 @@ def test_both_vault_client_builders_mount_the_strict_reader(module: str, transit
     from messagefoundry.transports.strict_requests import MAX_VAULT_REPLY_BYTES, StrictReplyAdapter
 
     mod = importlib.import_module(module)
-    client = mod._build_client("https://vault.example.test:8200", _TOKEN)
+    client = mod._build_client("https://vault.example.test:8200", _TOKEN, revocation_attested=True)
     session = client.adapter.session
     for url in ("https://vault.example.test:8200/v1/x", "http://vault.example.test:8200/v1/x"):
         adapter = session.get_adapter(url)
@@ -160,7 +162,11 @@ def test_a_client_with_no_requests_session_fails_closed() -> None:
 
     with pytest.raises(ValueError, match="no requests session"):
         mount_strict_reply_adapter(
-            object(), connector="Vault test hop", ssl_context_factory=ssl.create_default_context
+            object(),
+            connector="Vault test hop",
+            ssl_context_factory=ssl.create_default_context,
+            revocation_attested=True,
+            attestation_section="secrets",
         )
 
 
@@ -261,7 +267,11 @@ def _session_with(limit: int) -> Any:
     session = requests.Session()
     # A plain-http hop never calls the factory; it is required, so one is passed.
     adapter = StrictReplyAdapter(
-        connector="Vault test hop", limit=limit, ssl_context_factory=ssl.create_default_context
+        connector="Vault test hop",
+        limit=limit,
+        ssl_context_factory=ssl.create_default_context,
+        revocation_attested=True,
+        attestation_section="secrets",
     )
     session.mount("http://", adapter)
     return session
@@ -328,7 +338,9 @@ def test_the_transit_cipher_reads_through_the_strict_reader_and_reuses_its_conne
     with _ScriptedVault(
         [(_ok(sealed), False), (_ok(sealed), False), (_chunk_size(b"-5"), True)]
     ) as server:
-        client = keyprovider_vault._build_client(f"http://127.0.0.1:{server.port}", _TOKEN)
+        client = keyprovider_vault._build_client(
+            f"http://127.0.0.1:{server.port}", _TOKEN, revocation_attested=False
+        )
         cipher = TransitCipher(client, "mefor-store-dek")
         assert cipher.encrypt("synthetic", aad=b"cell").endswith("vault:v1:c3ludGhldGlj")
         assert cipher.encrypt("synthetic", aad=b"cell").endswith("vault:v1:c3ludGhldGlj")
@@ -377,7 +389,9 @@ def test_a_bare_cr_in_a_transit_reply_head_is_refused_and_its_connection_closed(
 
     sealed = _ok(b'{"data": {"ciphertext": "vault:v1:c3ludGhldGlj"}}')
     with _ScriptedVault([(sealed, False), (reply, False), (sealed, False)]) as server:
-        client = keyprovider_vault._build_client(f"http://127.0.0.1:{server.port}", _TOKEN)
+        client = keyprovider_vault._build_client(
+            f"http://127.0.0.1:{server.port}", _TOKEN, revocation_attested=False
+        )
         cipher = TransitCipher(client, "mefor-store-dek")
         assert cipher.encrypt("synthetic", aad=b"cell").endswith("vault:v1:c3ludGhldGlj")
         with pytest.raises(CipherError, match="framed its reply head ambiguously"):
@@ -458,7 +472,10 @@ def test_every_pool_the_adapter_builds_reads_the_head_strictly(scheme: str) -> N
     from messagefoundry.transports.strict_requests import StrictReplyAdapter
 
     adapter = StrictReplyAdapter(
-        connector="Vault test hop", ssl_context_factory=ssl.create_default_context
+        connector="Vault test hop",
+        ssl_context_factory=ssl.create_default_context,
+        revocation_attested=True,
+        attestation_section="secrets",
     )
     stock = {"http": urllib3.connection.HTTPConnection, "https": urllib3.connection.HTTPSConnection}
     managers = [adapter.poolmanager, adapter.proxy_manager_for("http://proxy.example.test:3128")]

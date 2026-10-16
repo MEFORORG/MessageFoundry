@@ -37,6 +37,10 @@ actions*. Probing the directory at release is not built.
 The gate cannot prove the approver is a second person (BACKLOG #315); what it flags instead is
 stated once, on :meth:`ApprovalGate._approver_changes`.
 
+Each request row carries an integrity seal over every column (BACKLOG #2592), so its captured
+params and its requester id cannot be changed outside the store unseen. The gate reads requests
+only through :meth:`ApprovalGate._verified`; one that fails is reported and acts on nothing.
+
 The registry (op key -> executor) is populated by the API wiring, where the engine is in scope; this
 module owns only the generic hold/approve/reject mechanics over the ``pending_approvals`` store table.
 """
@@ -48,7 +52,7 @@ import json
 import logging
 import math
 import time
-from collections.abc import Awaitable, Callable, Coroutine, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, NoReturn
 from uuid import uuid4
@@ -56,12 +60,18 @@ from uuid import uuid4
 from messagefoundry.audit_write import write_audit_soft
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.permissions import Permission
+from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION
 from messagefoundry.config.settings import ApprovalsSettings
 from messagefoundry.controlchars import scrub_log_argument
-from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink, authority_seal_alert
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.store.base import Store
-from messagefoundry.store.store import AuditAppend
+from messagefoundry.store.row_seal import (
+    APPROVAL_KIND,
+    RowSealError,
+    SealFailureThrottle,
+)
+from messagefoundry.store.store import ApprovalRow, AuditAppend, approval_seal_ok
 
 log = logging.getLogger(__name__)
 
@@ -109,6 +119,13 @@ DEFAULT_CLAIM_OWNER = "engine"
 #: sits further back is not found there and falls through to the proof and :meth:`ApprovalGate.guard`,
 #: whose own repeat rule still joins it; only the proof-free path is lost.
 REJOIN_SCAN_LIMIT = 1000
+
+#: The refusal for a request whose row fails its integrity seal (BACKLOG #2592). Nothing re-seals
+#: such a row, so it can be neither released, rejected nor resolved; it expires.
+_SEAL_REFUSAL = (
+    "this request failed its integrity check, so it cannot be released, rejected or resolved. "
+    "Request the operation again if it is still needed"
+)
 
 
 @dataclass(frozen=True)
@@ -236,6 +253,8 @@ class ApprovalGate:
         # reference to a running task. Per gate rather than per module (BACKLOG #2087), so drain()
         # sees only this gate's writes and no set outlives the loop its tasks ran on.
         self._inflight: dict[asyncio.Future[Any], str] = {}
+        # When each failing request is reported again (BACKLOG #2592).
+        self._seal_failures_reported = SealFailureThrottle()
 
     async def _shielded[T](self, coro: Coroutine[Any, Any, T], approval_id: str) -> T:
         """Await ``coro`` so that cancelling the CALLER does not cancel it (BACKLOG #1562).
@@ -327,18 +346,21 @@ class ApprovalGate:
         interrupted: list[str] = []
         unsettled: list[str] = []
         # Filtered in SQL, so other owners' stranded rows cannot push ours past the read's cap.
-        for row in await self._store.list_executing_approvals(claim_owner=me):
-            approval_id = str(row["id"])
-            owner = row["claim_owner"]
-            approver = None if row["approver"] is None else str(row["approver"])
+        # A row that fails its seal is reported and left as it is: the store would refuse the move
+        # anyway, and nothing re-seals it (BACKLOG #2592).
+        for row in await self._verified_rows(
+            await self._store.list_executing_approvals(claim_owner=me)
+        ):
+            approval_id = row.id
+            approver = row.approver
             detail = json.dumps(
                 {
                     "approval_id": approval_id,
-                    "operation": str(row["operation"]),
-                    "requester": str(row["requester"]),
+                    "operation": row.operation,
+                    "requester": row.requester,
                     "approver": approver,
-                    "claim_owner": None if owner is None else str(owner),
-                    "claimed_at": (None if row["decided_at"] is None else float(row["decided_at"])),
+                    "claim_owner": row.claim_owner,
+                    "claimed_at": row.decided_at,
                     "reason": "engine_restart",
                     "recorded": True,
                 }
@@ -354,6 +376,11 @@ class ApprovalGate:
                     from_status="executing",
                     audit=AuditAppend("approval.interrupted", actor="system", detail=detail),
                 )
+            except RowSealError:
+                # Changed outside the store between the read and the move. Nothing re-seals it,
+                # so no later start can move it either (BACKLOG #2592).
+                await self._approval_seal_failed(approval_id)
+                continue
             except Exception:  # noqa: BLE001 - every store backend raises its own type
                 log.exception(
                     "approval %s: could not mark this process's leftover 'executing' release "
@@ -370,18 +397,20 @@ class ApprovalGate:
                     approval_id,
                 )
         foreign: list[str] = []
-        for row in await self._store.list_executing_approvals():
-            owner = row["claim_owner"]
+        # Only logged, never acted on, so this read needs no seal check. Its values are scrubbed,
+        # since an unchecked row may carry anything.
+        for other in await self._store.list_executing_approvals():
+            owner = other["claim_owner"]
             if owner is None or str(owner) == me:
-                continue  # a row of ours whose move failed, already logged above
-            foreign.append(str(row["id"]))
+                continue  # a row of ours, already moved, logged or reported above
+            foreign.append(str(other["id"]))
             log.warning(
                 "approval %s: still 'executing' under claim owner %s since %s. This process is "
                 "%s, so it leaves the row alone; it moves to 'interrupted' only when an engine "
                 "with that owner starts, which an unpinned cluster node never does",
-                row["id"],
-                owner,
-                row["decided_at"],
+                scrub_log_argument(str(other["id"])),
+                scrub_log_argument(str(owner)),
+                scrub_log_argument(str(other["decided_at"])),
                 me,
             )
         if interrupted:
@@ -416,7 +445,9 @@ class ApprovalGate:
         gate enforces. A request already pending keeps the deadline stamped when it was made."""
         return self._settings.model_copy(deep=True)
 
-    def _gated(self, operation: str) -> bool:
+    def gates(self, operation: str) -> bool:
+        """Whether :meth:`guard` would hold ``operation`` now. A route reads it to capture params
+        that cost a read, such as a reload's config digest, only for a request that will be held."""
         return self._settings.enabled and operation in self._settings.operations
 
     async def guard(
@@ -460,7 +491,7 @@ class ApprovalGate:
 
         Every approver sees ``params`` in the queue; :class:`~messagefoundry.api.models.PendingApprovalInfo`
         states what they may carry (BACKLOG #2458)."""
-        if not self._gated(operation):
+        if not self.gates(operation):
             return None
         # Enforce the write half of the invariant here, matching `create_upload`'s guard on
         # `uploader_id`: a row persisted without an owner id is unapprovable, and refusing it at the
@@ -564,20 +595,23 @@ class ApprovalGate:
         expired between them is still named in the 202. Nothing new runs or is held because of it.
         The read also covers only the newest :data:`REJOIN_SCAN_LIMIT` open requests; past that, the
         repeat needs a proof, and :meth:`guard` then joins it."""
-        if not self._gated(operation) or not requester_user_id:
+        if not self.gates(operation) or not requester_user_id:
             return None
         wanted = json.dumps(dict(params), sort_keys=True)
-        rows = await self._store.list_pending_approvals(now=self._clock(), limit=REJOIN_SCAN_LIMIT)
-        matches = [
+        # Matched first and checked after, so the seal check runs on the one or two rows that match
+        # rather than on the whole scan.
+        matches = await self._verified_rows(
             r
-            for r in rows
+            for r in await self._store.list_pending_approvals(
+                now=self._clock(), limit=REJOIN_SCAN_LIMIT
+            )
             if str(r["operation"]) == operation
             and str(r["params"]) == wanted
             and str(r["requester_user_id"] or "") == requester_user_id
-        ]
+        )
         if not matches:
             return None
-        held = str(min(matches, key=lambda r: float(r["requested_at"]))["id"])
+        held = min(matches, key=lambda r: r.requested_at).id
         try:
             await self._store.record_audit(
                 "approval.request_repeated",
@@ -606,38 +640,41 @@ class ApprovalGate:
 
     async def list_pending(self, *, caller_user_id: str | None = None) -> list[dict[str, Any]]:
         """Requests awaiting a second approver: ``pending`` and unexpired. ``caller_user_id`` marks
-        the caller's own requests (``caller_is_requester``)."""
-        rows = await self._store.list_pending_approvals(now=self._clock())
+        the caller's own requests (``caller_is_requester``). A request that fails its integrity
+        seal is left out and reported (BACKLOG #2592): it can be neither released nor rejected."""
+        rows = await self._verified_rows(
+            await self._store.list_pending_approvals(now=self._clock())
+        )
         return [self._queue_entry(r, caller_user_id) for r in rows]
 
     async def list_interrupted(self, *, caller_user_id: str | None = None) -> list[dict[str, Any]]:
         """Releases cut off mid-run and awaiting an operator's record of what happened
         (:meth:`resolve_interrupted`). They do not expire. ``caller_user_id`` as for
         :meth:`list_pending`."""
-        rows = await self._store.list_interrupted_approvals()
+        rows = await self._verified_rows(await self._store.list_interrupted_approvals())
         return [self._queue_entry(r, caller_user_id) for r in rows]
 
-    def _queue_entry(self, r: Any, caller_user_id: str | None) -> dict[str, Any]:
-        operation = str(r["operation"])
+    def _queue_entry(self, r: ApprovalRow, caller_user_id: str | None) -> dict[str, Any]:
+        operation = r.operation
         return {
             # BACKLOG #2460: keyed on the immutable id, like the refusals it predicts (#1540), so a
             # page can hide Approve from the requester. A row with no id never matches; approve
             # refuses it anyway.
             "caller_is_requester": bool(caller_user_id)
-            and str(r["requester_user_id"] or "") == caller_user_id,
-            "id": str(r["id"]),
+            and (r.requester_user_id or "") == caller_user_id,
+            "id": r.id,
             "operation": operation,
             "label": self._label(operation),
-            "params": _stored_params(str(r["id"]), r["params"]),
-            "requester": str(r["requester"]),
-            "requested_at": float(r["requested_at"]),
-            "expires_at": (None if r["expires_at"] is None else float(r["expires_at"])),
-            "status": str(r["status"]),
-            "approver": (None if r["approver"] is None else str(r["approver"])),
-            "decided_at": (None if r["decided_at"] is None else float(r["decided_at"])),
+            "params": _stored_params(r.id, r.params),
+            "requester": r.requester,
+            "requested_at": r.requested_at,
+            "expires_at": r.expires_at,
+            "status": r.status,
+            "approver": r.approver,
+            "decided_at": r.decided_at,
             # The same test approve() refuses on (approval.no_longer_gated), so a page can stop
             # offering a release the gate would refuse. Read now, like the refusal it predicts.
-            "gated": self._gated(operation),
+            "gated": self.gates(operation),
         }
 
     async def approve(
@@ -686,7 +723,7 @@ class ApprovalGate:
         writer. An executor must therefore not raise once its effects have happened, since a raise
         reads as "did not complete" and is compensated to ``failed``; see :data:`Executor`."""
         row = await self._require_pending(approval_id)
-        requester_user_id = row["requester_user_id"]
+        requester_user_id = row.requester_user_id
         if not requester_user_id:
             # Fail closed. A request with no recorded requester id cannot be checked for
             # self-approval, and the stored NAME is not a usable fallback — after a rename it may
@@ -701,21 +738,21 @@ class ApprovalGate:
                 "this request predates requester-id attribution and can no longer be approved — "
                 "reject it and request the operation again",
             )
-        if str(requester_user_id) == approver_user_id:
+        if requester_user_id == approver_user_id:
             raise ApprovalError(403, "you cannot approve your own request")
-        operation = str(row["operation"])
+        operation = row.operation
         op = self._ops.get(operation)
         if (
             op is None
         ):  # registered op was removed between request and approval — refuse, stay pending
             raise ApprovalError(409, f"operation '{operation}' is no longer available")
-        if not self._gated(operation):
+        if not self.gates(operation):
             # Dual control was turned off for this operation after the request was held. Releasing
             # it now would run a held request under a control the deployment no longer applies,
             # and the request's own configured shape (who must approve, how old) says nothing
             # about that. Fail closed: refuse, stay pending until it expires or is rejected.
             await self._refuse_ungated(approval_id, row, approver=approver, client=client)
-        params = _stored_params(approval_id, row["params"])
+        params = _stored_params(approval_id, row.params)
         if params is None:
             # The queue lists such a row as "unreadable" (BACKLOG #2458). Refuse it as a 409 that
             # leaves the row pending for a reject, rather than a 500 from a bare parse. Before the
@@ -735,7 +772,7 @@ class ApprovalGate:
         # `min_dwell > 0` first, so a floor of 0 really is "no floor". Without it a clock reading even
         # 1 ms behind requested_at gives a negative age, and `age < 0.0` would refuse the approve.
         min_dwell = self._settings.min_dwell_seconds
-        age = self._clock() - float(row["requested_at"])
+        age = self._clock() - row.requested_at
         if min_dwell > 0 and age < min_dwell:
             # vault BACKLOG #2255: a refusal runs nothing, so an audit log that refuses this row
             # must not turn the documented 409 into a 500. The loss is logged and paged instead.
@@ -747,7 +784,7 @@ class ApprovalGate:
                     {
                         "approval_id": approval_id,
                         "operation": operation,
-                        "requester": str(row["requester"]),
+                        "requester": row.requester,
                         "age_seconds": round(age, 3),
                         "min_dwell_seconds": min_dwell,
                     }
@@ -783,13 +820,13 @@ class ApprovalGate:
         # account, so a directory-side change counts once it reaches that copy (module docstring). Checked
         # BEFORE the transition, so a refused request stays pending, like a removed operation above.
         # It can still be rejected, or released later if the requester's authority is restored.
-        reason = await self._requester_standing(str(requester_user_id), op, params)
+        reason = await self._requester_standing(requester_user_id, op, params)
         if reason is not None:
             await self._refuse_stale_requester(
                 approval_id,
                 operation=op,
                 approver=approver,
-                requester=str(row["requester"]),
+                requester=row.requester,
                 reason=reason,
                 client=client,
             )
@@ -800,8 +837,8 @@ class ApprovalGate:
             )
         # BACKLOG #315 (b): READ the approver's account now, before the transition, so no store read
         # sits between the transition and the executor. The flag is written in the `finally` below.
-        changed = await self._approver_changes(approver_user_id, float(row["requested_at"]))
-        requester = str(row["requester"])
+        changed = await self._approver_changes(approver_user_id, row.requested_at)
+        requester = row.requester
         # Claim the row FIRST (atomic, guards a double-approve race); only then execute. The claim
         # moves it to 'executing', not 'approved' (BACKLOG #1562): 'approved' is written only once the
         # executor has returned, so the status never asserts an outcome the gate has not seen.
@@ -834,6 +871,12 @@ class ApprovalGate:
         )
         try:
             claimed = await _outlive_caller(claim)
+        except RowSealError as exc:
+            # The row changed outside the store after it was read, and the store refused the claim
+            # (BACKLOG #2592). Nothing ran, and nothing was written. The cause carries the row kind
+            # only, never a value.
+            await self._approval_seal_failed(approval_id)
+            raise ApprovalError(409, _SEAL_REFUSAL) from exc
         except asyncio.CancelledError:
             # Cancelled while claiming. The UPDATE can still commit, and the row would then sit in
             # 'executing' for an operation that never started. Settle it once the claim lands. The
@@ -1040,6 +1083,12 @@ class ApprovalGate:
                 from_status="executing",
                 audit=combined,
             )
+        except RowSealError:
+            # The claimed row changed outside the store while the operation ran (BACKLOG #2592).
+            # The store wrote nothing and will refuse the status alone too, so the row stays
+            # 'executing'. The outcome row below is the record of what happened.
+            await self._approval_seal_failed(approval_id)
+            moved = None
         except Exception:  # noqa: BLE001 - the outcome stands; see the docstring
             log.exception(
                 "approval %s: %s, but writing the '%s' status with its %s row failed; writing the "
@@ -1096,6 +1145,9 @@ class ApprovalGate:
                 decided_at=self._clock(),
                 from_status="executing",
             )
+        except RowSealError:
+            await self._approval_seal_failed(approval_id)
+            return None
         except Exception:  # noqa: BLE001 - the caller's outcome stands either way
             log.exception(
                 "approval %s: writing the '%s' status alone failed too; the row may still read "
@@ -1122,6 +1174,11 @@ class ApprovalGate:
         it did not commit, the row is still ``pending`` and there is nothing to settle."""
         try:
             claimed = await claim
+        except RowSealError:
+            # The store refused the claim and wrote nothing (BACKLOG #2592), so no audit row was
+            # lost: report the failed seal, as the uncancelled path does.
+            await self._approval_seal_failed(approval_id)
+            return
         except Exception:  # noqa: BLE001 - the caller's cancellation is re-raised either way
             log.exception(
                 "approval %s: the approve was cancelled and its claim failed, so its "
@@ -1261,7 +1318,7 @@ class ApprovalGate:
             log.exception("approval %s: the stale-requester alert failed to emit", approval_id)
 
     async def _refuse_ungated(
-        self, approval_id: str, row: Any, *, approver: str, client: str | None
+        self, approval_id: str, row: ApprovalRow, *, approver: str, client: str | None
     ) -> NoReturn:
         """Refuse a release whose operation dual control no longer gates, and say why.
 
@@ -1269,7 +1326,7 @@ class ApprovalGate:
         ``[approvals].operations``. The audit row is ``approval.no_longer_gated``, written soft like
         the other refusals: it runs nothing, so a lost row must not turn the 409 into a 500. The
         request stays ``pending``; the approver rejects it, or it expires."""
-        operation = str(row["operation"])
+        operation = row.operation
         if not self._settings.enabled:
             reason, why = "approvals_disabled", "dual control is now off ([approvals].enabled)"
         else:
@@ -1285,7 +1342,7 @@ class ApprovalGate:
                 {
                     "approval_id": approval_id,
                     "operation": operation,
-                    "requester": str(row["requester"]),
+                    "requester": row.requester,
                     "reason": reason,
                 }
             ),
@@ -1446,7 +1503,7 @@ class ApprovalGate:
         ``audit_write_failed``, and the request stays pending: reject it again once the store
         accepts writes."""
         row = await self._require_pending(approval_id)
-        operation = str(row["operation"])
+        operation = row.operation
         moved = await self._decide_or_503(
             approval_id,
             what="rejection",
@@ -1460,7 +1517,7 @@ class ApprovalGate:
                     {
                         "approval_id": approval_id,
                         "operation": operation,
-                        "requester": str(row["requester"]),
+                        "requester": row.requester,
                     }
                 ),
                 client=client,  # ADR 0150: the rejecting approver's address
@@ -1470,7 +1527,7 @@ class ApprovalGate:
             raise ApprovalError(409, "request was already decided")
         return {
             "operation": operation,
-            "requested_by": str(row["requester"]),
+            "requested_by": row.requester,
             "rejected_by": approver,
         }
 
@@ -1522,15 +1579,14 @@ class ApprovalGate:
         status = RESOLVE_OUTCOMES.get(outcome)
         if status is None:
             raise ApprovalError(422, f"unknown outcome '{outcome}'")
-        row = await self._store.get_pending_approval(approval_id)
-        if row is None:
-            raise ApprovalError(404, "no such approval request")
-        current = str(row["status"])
-        if current != "interrupted":
-            raise ApprovalError(
-                409, f"request is {current}; only an interrupted request can be resolved"
-            )
-        requester_user_id = row["requester_user_id"]
+        row = await self._load(
+            approval_id,
+            status="interrupted",
+            wrong=lambda current: (
+                f"request is {current}; only an interrupted request can be resolved"
+            ),
+        )
+        requester_user_id = row.requester_user_id
         if not requester_user_id:
             # Fail closed, for the reason approve() gives: with no id there is no way to tell the
             # requester apart from anyone else, and the stored name is not a usable key.
@@ -1539,13 +1595,13 @@ class ApprovalGate:
                 "this request has no recorded requester id, so it cannot be checked for "
                 "self-resolution and cannot be resolved here",
             )
-        if str(requester_user_id) == resolver_user_id:
+        if requester_user_id == resolver_user_id:
             raise ApprovalError(403, "you cannot resolve your own request")
         # BACKLOG #2125 (docstring above): read before the write, as approve reads before its claim.
-        changed = await self._approver_changes(resolver_user_id, float(row["requested_at"]))
-        operation = str(row["operation"])
-        requester = str(row["requester"])
-        releaser = None if row["approver"] is None else str(row["approver"])
+        changed = await self._approver_changes(resolver_user_id, row.requested_at)
+        operation = row.operation
+        requester = row.requester
+        releaser = row.approver
         detail = json.dumps(
             {
                 "approval_id": approval_id,
@@ -1554,7 +1610,7 @@ class ApprovalGate:
                 "approver": releaser,
                 "outcome": outcome,
                 "status": status,
-                "interrupted_at": (None if row["decided_at"] is None else float(row["decided_at"])),
+                "interrupted_at": row.decided_at,
             }
         )
 
@@ -1649,6 +1705,11 @@ class ApprovalGate:
                 from_status=from_status,
                 audit=audit,
             )
+        except RowSealError as exc:
+            # The row changed outside the store after it was read (BACKLOG #2592). The store wrote
+            # nothing, so the audit row was not lost: this is a refusal, not a fault.
+            await self._approval_seal_failed(approval_id)
+            raise ApprovalError(409, _SEAL_REFUSAL) from exc
         except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
             raise self._store_fault(
                 approval_id, exc, what=what, action=audit.action, retry=retry
@@ -1675,16 +1736,88 @@ class ApprovalGate:
         self._alert_lost_audit(approval_id, action)
         return ApprovalError(503, f"the store could not record this {what}. {retry}")
 
-    async def _require_pending(self, approval_id: str) -> Any:
-        row = await self._store.get_pending_approval(approval_id)
-        if row is None:
-            raise ApprovalError(404, "no such approval request")
-        if str(row["status"]) != "pending":
-            raise ApprovalError(409, f"request is already {row['status']}")
-        expires_at = row["expires_at"]
-        if expires_at is not None and float(expires_at) <= self._clock():
+    async def _require_pending(self, approval_id: str) -> ApprovalRow:
+        row = await self._load(
+            approval_id, status="pending", wrong=lambda current: f"request is already {current}"
+        )
+        if row.expires_at is not None and row.expires_at <= self._clock():
             raise ApprovalError(409, "request has expired")
         return row
+
+    # --- the request loaders (BACKLOG #2592) -------------------------------------------------------
+
+    async def _load(
+        self, approval_id: str, *, status: str, wrong: Callable[[str], str]
+    ) -> ApprovalRow:
+        """The request ``approval_id`` names, in ``status``, its integrity seal checked. With
+        :meth:`_verified_rows`, the ONLY reader of the store's request readers in this gate;
+        ``tests/test_approval_seal.py`` holds that. Raises 404 for no such request, 409 with
+        ``wrong(<its status>)`` for one in another status, and 409 for one that fails its seal,
+        which is reported.
+
+        The status is compared before the seal is checked. A decided row is acted on by nothing, so
+        a stale click on one, or on one written before the seal, answers "already decided" rather
+        than raising a tamper alarm. A status changed outside the store can only refuse here: a row
+        that reads as wanted is still checked whole."""
+        found = await self._store.get_pending_approval(approval_id)
+        if found is None:
+            raise ApprovalError(404, "no such approval request")
+        if str(found["status"]) != status:
+            raise ApprovalError(409, wrong(scrub_log_argument(str(found["status"]))))
+        row = await self._verified(found)
+        if row is None:
+            raise ApprovalError(409, _SEAL_REFUSAL)
+        return row
+
+    async def _verified_rows(self, found: Iterable[Any]) -> list[ApprovalRow]:
+        """The rows of a request read whose seal holds, in order. Each one that fails is reported
+        and left out."""
+        out: list[ApprovalRow] = []
+        for each in found:
+            row = await self._verified(each)
+            if row is not None:
+                out.append(row)
+        return out
+
+    async def _verified(self, found: Any) -> ApprovalRow | None:
+        """``found`` as a checked :class:`ApprovalRow`, or ``None`` when its seal fails, which is
+        reported. Its params and requester id are what a release acts on and what the
+        self-approval refusal compares, so a row changed outside the store acts on nothing."""
+        try:
+            row = ApprovalRow.from_mapping(found)
+        except RowSealError:
+            await self._approval_seal_failed(str(found["id"]))
+            return None
+        if approval_seal_ok(self._store.row_sealer(), row):
+            return row
+        await self._approval_seal_failed(row.id)
+        return None
+
+    async def _approval_seal_failed(self, approval_id: str) -> None:
+        """Report a request whose row failed its integrity seal (BACKLOG #2592): a WARNING, an
+        ``integrity.authority_seal_failed`` audit row and an ``integrity_drift`` alert, at most once
+        per :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS` per request, as the auth service reports
+        the rows it checks. The report names the request by its id, never a row value. A failed
+        audit write is logged and paged, not raised, so it does not turn a refusal into an error."""
+        if not self._seal_failures_reported.due(approval_id):
+            return
+        # The id comes from the row that failed, so it is scrubbed before it reaches a log line or
+        # an alert (CodeQL py/log-injection).
+        ref = scrub_log_argument(approval_id)
+        reason = (
+            f"an {APPROVAL_KIND} request failed its integrity check and acts on nothing"
+            f" (approval {ref})"
+        )
+        log.warning("%s", reason)
+        await self._record_audit_soft(
+            ref,
+            AUTHORITY_SEAL_FAILED_ACTION,
+            actor="system",
+            detail=json.dumps({"kind": APPROVAL_KIND, "approval_id": approval_id}),
+            client=None,
+            context="a request failed its integrity seal",
+        )
+        authority_seal_alert(self._alert_sink)(reason)
 
     def _label(self, operation: str) -> str:
         op = self._ops.get(operation)

@@ -11,14 +11,16 @@ Two layers, because either alone can pass on a broken fix:
 
 * **Ten arms, with the refusal injected.** ``_post`` and ``_probe`` on REST, SOAP, FHIR and
   DICOMweb, and ``_get`` and ``_probe`` on the ``FhirLookup`` read. Each has a control showing a
-  genuine bad request value still reports as one. The token hop in ``smart.py`` has its own arm and
-  its own test, in ``tests/test_outbound_forward_proxy.py``.
+  genuine bad request value still reports as one. The token hop in ``smart.py`` has its own arm,
+  tested in ``tests/test_outbound_forward_proxy.py`` and, for its code, at the end of this file.
 * **On the wire, through the real opener.** A loopback peer sends the challenge, so the refusal is
   the one the Digest handlers raise and not one a test invented. A SHA-256 challenge is the control:
   it is answered and the send succeeds, so the new arm does not swallow a working exchange.
 
-The last test drives the delivery worker, since the classification is only worth having if the lane
-stops and the queue stays.
+The delivery-worker tests show the lane stops and the queue stays, since the classification is only
+worth having if it does. The section at the end holds the follow-ups of BACKLOG #2989: an
+unsupported ``qop``, a challenge with no nonce or realm, a 407 on a request that bypassed the proxy,
+the token hop, and a send-time hop refusal that wins over a Digest refusal.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from __future__ import annotations
 import http.client
 import http.server
 import threading
+import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -36,7 +39,7 @@ import pytest
 from messagefoundry.config.fhir_lookup import FhirLookupError
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
-from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
+from messagefoundry.config.tls_policy import HopPosture, InsecureHopRefused, active_hop_posture
 from messagefoundry.config.wiring import FHIR, DICOMweb, Registry, Rest, Soap
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
@@ -48,6 +51,8 @@ from messagefoundry.transports.http_auth import HttpAuthError, with_http_digest
 from messagefoundry.transports.rest import (
     AUTH_CHALLENGE_REFUSED,
     AUTH_CHALLENGE_REFUSED_CODE,
+    INSECURE_HOP_REFUSED_CODE,
+    InsecureHopGuard,
     auth_challenge_refused,
 )
 from tests._egress_policy import permitting
@@ -492,3 +497,155 @@ async def test_a_bad_request_value_still_dead_letters_one_row(tmp_path: Path) ->
     assert outcome is _ItemOutcome.PROCESSED
     assert status == OutboxStatus.DEAD.value
     assert sink.stopped == []
+
+
+# --- BACKLOG #2989: the follow-ups to engine PR 2013 ----------------------------------------------
+
+
+def _assert_refused_challenge(err: NegativeAckError) -> None:
+    assert err.code == AUTH_CHALLENGE_REFUSED_CODE
+    assert (err.permanent, err.config_fault) == (True, True)
+    assert isinstance(err.__cause__, HttpAuthError)
+
+
+#: Finding 1. urllib raised ``URLError("qop ... is not supported")`` for both, which read as an
+#: unreachable host and was retried. The second is a legal list, written with a space.
+_AUTH_INT = 'Digest realm="r", nonce="n0nce", qop="auth-int", algorithm=SHA-256'
+_AUTH_INT_THEN_AUTH = 'Digest realm="r", nonce="n0nce", qop="auth-int, auth", algorithm=SHA-256'
+#: Finding 4. urllib returned None on the KeyError, so each read as a plain 401 or 407.
+_NO_NONCE = 'Digest realm="r", qop="auth", algorithm=SHA-256'
+_NO_REALM = 'Digest nonce="n0nce", qop="auth", algorithm=SHA-256'
+
+
+@pytest.mark.parametrize(
+    "challenge", [_AUTH_INT, _NO_NONCE, _NO_REALM], ids=["auth-int", "no-nonce", "no-realm"]
+)
+@pytest.mark.parametrize("ctype", _ORIGIN_DIGEST, ids=lambda c: c.value)
+def test_an_unanswerable_endpoint_challenge_is_a_configuration_fault(
+    ctype: ConnectorType, challenge: str
+) -> None:
+    with _Challenger(401, challenge) as origin:
+        dest = _build(ctype, f"{origin.url}/x", digest=True)
+        with pytest.raises(NegativeAckError) as ei:
+            _send(ctype, dest)
+        _assert_refused_challenge(ei.value)
+    assert origin.answered == []
+    assert origin.requests == 1
+
+
+@pytest.mark.usefixtures("no_bypass")
+@pytest.mark.parametrize(
+    "challenge", [_AUTH_INT, _NO_NONCE, _NO_REALM], ids=["auth-int", "no-nonce", "no-realm"]
+)
+@pytest.mark.parametrize("ctype", list(_FACTORY), ids=lambda c: c.value)
+def test_an_unanswerable_proxy_challenge_is_a_configuration_fault(
+    ctype: ConnectorType, challenge: str
+) -> None:
+    with _Challenger(407, challenge) as proxy:
+        dest = _through_digest_proxy(ctype, proxy.url)
+        with pytest.raises(NegativeAckError) as ei:
+            _send(ctype, dest)
+        _assert_refused_challenge(ei.value)
+    assert proxy.answered == []
+
+
+@pytest.mark.parametrize("ctype", _ORIGIN_DIGEST, ids=lambda c: c.value)
+def test_a_qop_list_that_offers_auth_is_answered_with_auth(ctype: ConnectorType) -> None:
+    """THE CONTROL for the qop refusal, and the half of finding 1 that must SUCCEED: the peer
+    offers ``auth`` after a space, so the engine answers with ``qop=auth`` and nothing else."""
+    with _Challenger(401, _AUTH_INT_THEN_AUTH) as origin:
+        dest = _build(ctype, f"{origin.url}/x", digest=True)
+        assert _send(ctype, dest)[1] == 200
+    (answer,) = origin.answered
+    assert "qop=auth," in answer
+    assert "auth-int" not in answer
+
+
+@pytest.mark.usefixtures("no_bypass")
+def test_a_proxy_qop_list_that_offers_auth_is_answered_with_auth() -> None:
+    with _Challenger(407, _AUTH_INT_THEN_AUTH) as proxy:
+        dest = _through_digest_proxy(ConnectorType.REST, proxy.url)
+        assert _send(ConnectorType.REST, dest)[1] == 200
+    (answer,) = proxy.answered
+    assert "qop=auth," in answer
+
+
+def test_a_bypassed_407_carrying_ntlm_surfaces_as_the_407() -> None:
+    """Finding 5. The opener is built for an off-box destination behind a Digest proxy, so it
+    carries the proxy Digest handler. A request to a loopback origin goes direct (vault BACKLOG
+    #2579), and that origin answers 407 with NTLM. The 407 did not come from the proxy, so the
+    proxy handler must not screen it: before the fix it raised ``HttpAuthError``, which a send
+    reports as the proxy's refused challenge and which stops the lane."""
+    dest = _through_digest_proxy(ConnectorType.REST, "http://127.0.0.1:3128")
+    with _Challenger(407, 'NTLM realm="r"') as origin:
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            dest._opener.open(urllib.request.Request(f"{origin.url}/x"), timeout=10)
+        ei.value.close()
+    assert ei.value.code == 407
+    assert origin.answered == []
+
+
+def test_the_token_hop_refusal_is_the_same_configuration_fault() -> None:
+    """Finding 3. The token hop gave this refusal a retryable ``DeliveryError``, so a bearer
+    connection behind a refusing proxy retried when the token had to be minted and stopped when
+    it was cached."""
+    from messagefoundry.transports.smart import request_token
+
+    refused = _refusal()
+    req = urllib.request.Request("http://127.0.0.1:9/token")
+    opener: Any = _Raises(refused)
+    with pytest.raises(NegativeAckError) as ei:
+        request_token(opener, req, timeout=1, endpoint="SMART token endpoint", connector="c")
+    err = ei.value
+    assert err.code == AUTH_CHALLENGE_REFUSED_CODE
+    assert (err.permanent, err.config_fault) == (True, True)
+    assert str(err) == f"SMART token endpoint {AUTH_CHALLENGE_REFUSED}"
+    assert "MD5-PEER-TOKEN" not in str(err)
+    assert err.__cause__ is refused
+
+
+class _CountingRefuser:
+    """An opener that counts its calls and meets a refused Digest challenge on each."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def open(self, req: urllib.request.Request, timeout: float | None = None) -> Any:
+        self.calls += 1
+        raise _refusal()
+
+
+@pytest.mark.parametrize("ctype", list(_FACTORY), ids=lambda c: c.value)
+def test_a_send_time_hop_refusal_wins_over_a_digest_refusal(
+    ctype: ConnectorType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding 10, and the interaction the review of engine PR 2013 measured with no test. The hop
+    re-check runs before the opener, so a refused hop is what the send reports, and the opener is
+    never called. Before the fix the refusal left ``_post`` as a raw ``InsecureHopRefused``."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    # Through a Digest web proxy, the one Digest every destination has. Origin Digest over an
+    # off-box cleartext hop is refused when the destination is built.
+    dest = _through_digest_proxy(ctype, "http://127.0.0.1:3128")
+    opener = _CountingRefuser()
+    dest._opener = opener
+    # Control: with the permitting guard the destination was built with, the send reaches the
+    # opener and meets the Digest refusal.
+    with pytest.raises(NegativeAckError) as control:
+        _send(ctype, dest)
+    assert control.value.code == AUTH_CHALLENGE_REFUSED_CODE
+    assert opener.calls == 1
+
+    dest._hop_guard = InsecureHopGuard(
+        posture=HopPosture(enforcing=True),
+        attested=False,
+        cell="HTTP cleartext egress",
+        connection="OB",
+    )
+    with pytest.raises(NegativeAckError) as ei:
+        _send(ctype, dest)
+    err = ei.value
+    assert err.code == INSECURE_HOP_REFUSED_CODE == "insecure-hop-refused"
+    assert (err.permanent, err.config_fault, err.credential_fault) == (True, True, False)
+    assert str(err).startswith(f"{_LABEL[ctype]} send refused: ")
+    assert isinstance(err.__cause__, InsecureHopRefused)
+    assert opener.calls == 1, "the opener was called after the hop was refused"

@@ -721,6 +721,16 @@ def _per_backend_cipher_counts() -> dict[str, int]:
             ):
                 # BACKLOG #2593: the queue payload's tag has its own builder, not a cell_aad literal.
                 pairs.add(("queue", "payload"))
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                # BACKLOG #2593: a message cell's and a preset's tags have their own builders too.
+                if node.func.id == "preset_criteria_aad":
+                    pairs.add(("search_presets", "criteria"))
+                if (
+                    node.func.id == "message_cell_aad"
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                ):
+                    pairs.add(("messages", str(node.args[0].value)))
         # The doc counts CELLS THAT CAN HOLD A ROW. `shared_body` is created by every backend's DDL
         # and declared cipher-covered, but the server backends never INSERT into it (the ADR 0100
         # body-dedup path is SQLite-only), so §2 states the count "minus shared_body.body". Asserted,
@@ -1835,13 +1845,13 @@ _CODE_PROBE_DELETIONS: tuple[tuple[str, str, str, Callable[[str], bool]], ...] =
     ),
     (
         "pipeline/dr_backup.py",
-        "resolve_active_key(self._store_settings)",
+        "resolve_active_key(self._store_settings, posture=self._hop_posture)",
         "None",
         lambda src: source_calls(src, "resolve_active_key"),
     ),
     (
         "pipeline/dr_backup.py",
-        "build_store_cipher(settings)",
+        "build_store_cipher(settings, posture=posture)",
         "None",
         lambda src: source_calls(src, "build_store_cipher"),
     ),

@@ -219,6 +219,32 @@ def _alternation(words: tuple[str, ...]) -> str:
 # ``tls_key_password`` -- two prefix segments each) and nothing in this tree comes close.
 _LABEL_PREFIX = r"(?:[A-Za-z0-9]+[._-]){0,6}"
 
+# Where a label may start: at a word boundary, or right after a percent-encoded character (BACKLOG
+# #2999). A ``%XX`` escape ends in a hex digit, and a hex digit is a word character, so ``\b`` does
+# not fire between it and a label. A label glued to an encoded separator, as in ``a=1%2Cpassword=x``
+# or ``x%3Bbearer <tok>``, was therefore never read, and its value printed. The lookbehind is fixed
+# width, so it adds a start position only right after a ``%XX`` triplet and keeps the scan linear.
+# The cost is over-redaction where the escape decodes to a letter or digit, as in ``%41token=x``,
+# which is the direction this module may fail in. ``_LABEL_PREFIX`` is not changed: a prefixed label
+# such as ``%2Cclient_secret`` was already read, because "2Cclient_" is one prefix segment.
+# ``messagefoundry.redaction._CREDENTIAL_AHEAD`` deliberately does NOT take this start, because
+# taking it printed PHI; its comment gives the measurement and the credential shape that costs.
+#
+# FOUR PATTERNS TAKE IT, AND ``_MEFOR_SECRET`` DOES NOT. That pattern runs first and its value takes a
+# trailing quote, so with this start it read a ``MEFOR_`` label glued by an escape INSIDE another
+# label's quoted value and ate that value's closer: ``password='pq1 pq2%20MEFOR_X=v' rest`` printed
+# "pq2", which the patterns before hid (found by code review, 17,989 of 200,000 nested shapes).
+# An engine secret echoes as ``(env 'MEFOR_X'='<value>')``, never glued by an escape, so it keeps
+# ``\b``. A ``MEFOR_`` label right after an escape is therefore still not read; that is a residual.
+#
+# THE START IS A TRADE, NOT ONLY A WIDENING, because the passes run one after another and each reads
+# what the last one wrote (the OPEN DEFECTS list below). A label read now that was not read before
+# can end an earlier value where it used to run on. Measured over 40,000 seeded label-dense lines
+# with escape glue, against the patterns before #2999: 577 lines print a value they hid, and 9,012
+# hide one they printed. The structured differential in
+# ``tests/test_log_redaction_secret_domain.py`` reads 0 printed.
+_LABEL_START = r"(?:\b|(?<=%[0-9A-Fa-f]{2}))"
+
 # A QUOTED value span, for the two quoting forms a credential value actually arrives in (BACKLOG
 # #1685). Both exist for one reason: a value is quoted PRECISELY so it may carry the characters that
 # would otherwise end it -- ";", "=" and spaces -- and those are exactly what a plain value class
@@ -484,11 +510,13 @@ _KEYWORD_INITIALS = "".join(
     sorted({word[0] for word in _CREDENTIAL_WORDS + _KEY_MATERIAL_WORDS + _TOKEN_WORDS})
 )
 #: A label up to where its value starts: the keyword, an optional quote, the ":" or "=", and an auth
-#: scheme word after a token label.
+#: scheme word after a token label. A token label takes the quote only before ":"; ``_BEARER`` says
+#: why.
 _LABEL_HEAD = (
     r"(?=(?i:[" + _KEYWORD_INITIALS + r"]))"
     r"(?:(?i:" + _alternation(_CREDENTIAL_WORDS + _KEY_MATERIAL_WORDS) + r")\b['\"]?\s*+[:=]\s*+"
-    r"|(?i:" + _alternation(_TOKEN_WORDS) + r")\b\s*+[:=]\s*+(?:(?i:bearer|basic|digest)\s++)?"
+    r"|(?i:" + _alternation(_TOKEN_WORDS) + r")\b(?:['\"]\s*+:|\s*+[:=])\s*+"
+    r"(?:(?i:bearer|basic|digest)\s++)?"
     r")"
 )
 _MEFOR_LABEL_HEAD = r"\b(?-i:" + re.escape(_ENV_PREFIX) + r"[A-Z0-9_]++)\b['\"]?\s*+[:=]\s*+"
@@ -631,9 +659,20 @@ _PLAIN_SCHEME_VALUE = (
 #
 # A QUOTED value is taken whole when :data:`_GUARDED_QUOTED_VALUE` allows it, and a BRACED one never;
 # the reason is on ``_CREDENTIAL_KV``. Otherwise the plain class takes the value up to its first quote.
+#
+# A QUOTED KEY IS A LABEL (BACKLOG #3038). A quote after the label, then a colon, reads a JSON or dict
+# key, ``{"access_token": "v"}``; without it the closing quote stopped the match and the value
+# printed. ONLY BEFORE A COLON, unlike the other families, which take a quote before "=" too. Taking
+# ``'=`` here as well printed 147 value atoms the patterns before it hid, in
+# ``test_the_change_prints_no_value_the_pre_change_patterns_hid``: a token label in a ``'label'=``
+# echo then ran its plain value over a later key-material label. JSON and dict keys end in a colon,
+# so the colon form is the whole of #3038. :data:`_LABEL_HEAD` takes the same form, so a later quoted
+# token key still stops a plain value. The match is rewritten as ``label=<placeholder>``, as every
+# family's is, so the JSON shape is not kept. It takes no braced value: ``{"session": {"u": 1}}``
+# loses only its "{", exactly as ``session={"u": 1}`` does.
 _BEARER = re.compile(
-    r"(?i)\b(" + _LABEL_PREFIX + r"(?:" + _alternation(_TOKEN_WORDS) + r"))\b"
-    r"\s*[:=]\s*(?:(?:bearer|basic|digest)\s+)?"
+    r"(?i)" + _LABEL_START + r"(" + _LABEL_PREFIX + r"(?:" + _alternation(_TOKEN_WORDS) + r"))\b"
+    r"(?:['\"]\s*:|\s*[:=])\s*(?:(?:bearer|basic|digest)\s+)?"
     r"(?:" + _GUARDED_QUOTED_VALUE + r"|" + _PLAIN_VALUE + r")"
 )
 
@@ -657,7 +696,9 @@ _BEARER = re.compile(
 # quoted label, as in ``Bearer password="v w"``, this pattern does not match, and the label's own
 # pattern takes its value. The pattern before the stop redacted the word "password" there, so no
 # later pass saw the label, and "v w" printed.
-_AUTH_SCHEME = re.compile(r"(?i)\b(bearer)\s+(?=['\"]?[^\s'\",;]{4})" + _PLAIN_SCHEME_VALUE)
+_AUTH_SCHEME = re.compile(
+    r"(?i)" + _LABEL_START + r"(bearer)\s+(?=['\"]?[^\s'\",;]{4})" + _PLAIN_SCHEME_VALUE
+)
 
 # A MEFOR_* secret echoed as "MEFOR_FOO=value" or "MEFOR_FOO: value": never carry the value. The
 # optional quotes match the shape ``resolve_env_settings`` produces -- "(env 'MEFOR_VALUE_PW'='<value>')"
@@ -731,7 +772,13 @@ _MEFOR_SECRET = re.compile(
 # Each of the four residuals above, from the unclosed quote on, printed the same text before BACKLOG
 # #1685's remainder; none is new.
 _CREDENTIAL_KV = re.compile(
-    r"(?i)\b(" + _LABEL_PREFIX + r"(?:" + _alternation(_CREDENTIAL_WORDS) + r"))\b"
+    r"(?i)"
+    + _LABEL_START
+    + r"("
+    + _LABEL_PREFIX
+    + r"(?:"
+    + _alternation(_CREDENTIAL_WORDS)
+    + r"))\b"
     r"['\"]?\s*[:=]\s*"
     r"(?:"
     + _ODBC_BRACED
@@ -761,7 +808,13 @@ _CREDENTIAL_KV = re.compile(
 # A quoted value is taken whole, and so is a braced one when its closer ends the value; the guard is
 # on ``_CREDENTIAL_KV``'s residuals.
 _KEY_MATERIAL = re.compile(
-    r"(?i)\b(" + _LABEL_PREFIX + r"(?:" + _alternation(_KEY_MATERIAL_WORDS) + r"))\b"
+    r"(?i)"
+    + _LABEL_START
+    + r"("
+    + _LABEL_PREFIX
+    + r"(?:"
+    + _alternation(_KEY_MATERIAL_WORDS)
+    + r"))\b"
     r"['\"]?\s*[:=]\s*"
     r"(?:"
     + _GUARDED_BRACED_VALUE

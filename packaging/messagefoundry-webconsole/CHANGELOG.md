@@ -75,6 +75,9 @@ this line.**
   takes that base class (`BACKLOG #2289`); it took `Request | WebSocket`. The console still
   passes a `Request` or a `WebSocket`, and both fit, so no console call changed. The signature
   is on the seam the console pins, so the supported digest moved.
+- **Seam only: `/status` names the FHIR lookups that failed to start.** `EngineInfo` gains
+  `fhir_lookups_failed` (vault `BACKLOG #3008`). The console does not show it yet, but the field
+  is on the seam it pins, so the supported digest moved.
 
 ### Fixed
 
@@ -89,6 +92,17 @@ this line.**
 
 ### Security
 
+- **The audit page shows where each entry came from.** `/ui/audit` has a Client column, which
+  shows the address the engine recorded for the entry, or a dash when no client was in scope.
+  An operator tracing a run of refused sign-ins can now see their source on the page, not only in
+  the export. No seam change: `AuditEntry.client` was already sent. (vault BACKLOG #3197)
+- **A forged federated sign-in callback no longer cancels the real one.** A callback to
+  `/ui/oidc/callback` that does not carry the flow's own `state` now keeps the flow cookie, so
+  the real IdP return can still finish the sign-in. That covers an `error=` or malformed callback
+  too, which the engine now ends only when its `state` matches. Any page can send a browser to
+  that URL with the cookie, and clearing it ended the sign-in in flight. Seam change:
+  `AuthService` gains `abandon_oidc_login`, and `LoginOutcome` and `OidcStepUp` carry
+  `flow_consumed`, which the route reads instead of a reason slug. (vault BACKLOG #3198)
 - **Changing a second factor now offers to sign out your other sessions.** Confirming a TOTP
   enrolment, turning TOTP off, adding a passkey and removing one each end with an offer to end
   every other session and keep this one (ASVS 7.4.3). The enrolment confirm shows it below the
@@ -121,8 +135,9 @@ this line.**
   that action.** A fresh session window no longer reaches them. Each needs a re-authentication made
   for it, which it spends. The re-auth page mints that proof when it continues to the action's
   confirm page, editor or auto-retry. The message editor asks for it before it opens, and the
-  resubmit spends it only after its own input checks pass. A refusal from the engine comes after the
-  spend, so the next submit asks again and re-opens the editor. A completed resend now answers with
+  resubmit spends it only after its own input checks pass. An engine refusal at or after the
+  store write keeps the spend, so the next submit asks again and re-opens the editor. A completed
+  resend now answers with
   a 303 to a new GET outcome page, `/ui/messages/{id}/resend-done` (post-redirect-get), so a
   refresh re-renders the outcome and sends nothing. The confirm page always mints its own
   idempotency key; one in its query string is ignored. A double-click on a resend or an
@@ -130,12 +145,21 @@ this line.**
   proof: the same key, target and source, or the same edited body. A resend whose key the store
   already holds needs no proof whatever its source, since the store answers it as a duplicate.
   A repeat that arrives while the first is still running waits for it. If the engine refused the
-  first, the repeat gets the same refusal and runs nothing, and the next submit asks for a proof
-  again. A repeat of a request the store committed is answered as a duplicate, a request
-  cancelled after that commit included. Upload resend also needs `messages:edit`, on the
+  first, the repeat gets the same refusal and runs nothing. An edit-resend refused before the
+  store write gives its proof back (vault BACKLOG #3241), so the next submit needs no new
+  password; any other refusal leaves the next submit asking for a proof again. A repeat of a
+  request the store committed is answered as a duplicate, a request cancelled after that commit
+  included. Upload resend also needs `messages:edit`, on the
   confirm page and on the POST, and the browse page offers its form only to a role that holds
   it. Seam change: `AuthService.holds_action_step_up` and the core handler `prior_resend` are
   new, and the console imports five new step-up action constants. (vault BACKLOG #2625)
+- **Approve asks for a fresh step-up, and an unlock page's grant needs an issued page.** The
+  Approvals page's approve now takes `require_ui_step_up`, as resolve does; a stale window lands
+  back on the page to approve again. A re-auth toward a confirm page or the editor mints its bound
+  grant only when a gate issued that page to this session. Otherwise a password re-auth ends on
+  the page saying nothing ran, and a federated one on the console's landing page. The purge and upload-resend confirm pages hold the action proof without spending it.
+  `/ui/messages/{id}/resend-done` now needs `key` and renders from the store's record of the
+  resend. (vault BACKLOG #3241)
 - **A route-level sign-in reject records where it came from.** The `/ui/oidc` start and callback
   legs and `GET /ui/sso` refuse some sign-ins themselves. Examples are a missing flow cookie, an
   IdP error, a malformed callback or Negotiate token, a failed start, and a non-navigation fetch.

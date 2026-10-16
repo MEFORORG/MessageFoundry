@@ -334,6 +334,30 @@ the relaxed posture. The pass does not reach the HTTP inbound or any polling sou
   and `count_and_log` detectors, and a strict xfail SHALL fail once the defect is fixed.
   → `tests/test_dast_ingress_sweep.py::test_a_known_defect_never_silences_liveness_time_or_log`
 
+## Amendment — 2026-10-12, action-bound step-up rows are re-proved, not exempted
+
+**This supersedes the 2026-09-05 amendment's sentence that the action-scoped rows "are entered in
+the policy's `unreachable_allowlist`".** That amendment is a dated record and is left standing.
+Vault BACKLOG #2625 bound seven more rows to an action, which took the exemptions to 17. A row the
+reach passes exempt is a row they never measure (vault BACKLOG #3241).
+
+**What changed.** When a privileged reach probe gets a 403 that names an action in
+`X-Step-Up-Action`, the sweep re-proves the scan password for that action through `POST /me/reauth`,
+carries the re-keyed token forward, and sends the probe once more. That is what the IDE and the
+harness do. A second refusal is scored like any other row. A refused re-proof is exit 2. The BFLA
+passes never re-prove, because a low-privilege caller must be refused before any step-up is asked.
+The receipt counts the re-proofs and lists their rows by method and path template. It never records
+the action, which is a header value.
+
+**What it measured.** On 2026-10-12, write reach was 61 of 61 and GET reach 48 of 49. The GET
+holdout is the mTLS-only `GET /service/identity`, now the policy's only exemption. Sixteen rows were
+re-proved. `POST /config/reload` needed none, because it takes its proof inside the route, and a
+body-less probe stops at 422 first. The write-reach floor rose from 40 to 55.
+
+**What it does not change.** The posture is still relaxed, and step-up freshness is still 86400 s.
+Re-proving shows that the sweep reaches each row with a proof. It does not show that a proof bound
+to one action fails to open another; `tests/test_bound_step_up_injection.py` pins that.
+
 ## Options considered
 
 1. **Loopback uvicorn + a derived route table + three passes, no new dependency** — **CHOSEN.** Runs

@@ -666,6 +666,17 @@ def test_the_step_up_handler_re_proves_on_a_session_of_its_own(
     assert client.step_up() is False
 
 
+def test_a_token_poller_gets_no_reload_client() -> None:
+    """A ``--token`` poller drives an engine the rig did not start, so it holds no password to
+    re-prove with (vault BACKLOG #3241 declines that limb). It is told so, with no request made."""
+    poller = EnginePoller("https://127.0.0.1:1", "a-token", origin=0.0)
+    poller._clients = [object()]  # type: ignore[list-item]
+    assert not poller.holds_rig_session
+    assert asyncio.run(poller.reload_client()) is None
+    # CONTROL: a rig poller does hold the session that lets it re-prove.
+    assert EnginePoller("https://127.0.0.1:1", RIG_SESSION, origin=0.0).holds_rig_session
+
+
 def test_an_unreachable_engine_reads_as_an_api_error_and_a_refusal_does_not(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -844,24 +855,33 @@ async def test_a_rig_node_serves_with_sign_in_on_and_the_rig_reads_it_signed_in(
         await poller.open()
         try:
             assert await poller.sample_once() is not None
-            # A caller about to TIME a reload proves for it first (vault BACKLOG #2625): a
-            # session of the client's own, holding a proof bound to config_reload. The held
-            # session every other client uses is left alone.
+            # A caller about to TIME a reload proves for it first (vault BACKLOG #2625), on a
+            # client of its own holding a proof bound to config_reload (vault BACKLOG #3241).
+            # Neither the held session nor the sampler's client is re-keyed.
             before = rigadmin._held.token
             primary = poller.client
             assert primary is not None
-            await poller.prove_sign_in()
-            assert rigadmin._held.token == before
-            assert primary.token not in (None, before)
+            sampler_token = primary.token
+            proved = await poller.reload_client()
+            assert proved is not None and proved is not primary
+            assert rigadmin._held.token == before and primary.token == sampler_token
+            assert proved.token not in (None, before)
             assert await poller.sample_once() is not None
             # The proof opens the reload with no step-up retry, and only once.
-            primary.set_step_up_handler(None)
-            result = await asyncio.to_thread(primary.reload_config)
+            result = await asyncio.to_thread(proved.reload_config)
             assert getattr(result, "inbound", None) is not None, result
             await asyncio.sleep(0.3)  # past the engine's admin-write gap
             with pytest.raises(ApiError) as refused:
-                await asyncio.to_thread(primary.reload_config)
+                await asyncio.to_thread(proved.reload_config)
             assert refused.value.status == 403
+            # Ending it signs its session out, so a run of reloads holds one session at a time.
+            ended = proved.token
+            await poller.end_reload_client(proved)
+            async with httpx.AsyncClient(timeout=4.0, verify=harness_ssl_context()) as check:
+                me = await check.get(
+                    f"{node.url}/auth/me", headers={"Authorization": f"Bearer {ended}"}
+                )
+            assert me.status_code == 401, me.status_code
         finally:
             await poller.close()
         # CONTROL: the same poller with no session reads nothing.

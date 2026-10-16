@@ -112,7 +112,9 @@ class _FakeClient:
 def _use_fake(monkeypatch: pytest.MonkeyPatch, transit: _FakeTransit | None = None) -> _FakeTransit:
     transit = transit or _FakeTransit()
     monkeypatch.setenv("MEFOR_STORE_TRANSIT_KEY", _KEY_NAME)
-    monkeypatch.setattr(crypto_transit, "_build_client", lambda addr, token: _FakeClient(transit))
+    monkeypatch.setattr(
+        crypto_transit, "_build_client", lambda addr, token, **_: _FakeClient(transit)
+    )
     return transit
 
 
@@ -192,7 +194,7 @@ def test_audit_hmac_failure_is_type_only(monkeypatch: pytest.MonkeyPatch) -> Non
 
     monkeypatch.setenv("MEFOR_STORE_TRANSIT_KEY", _KEY_NAME)
     monkeypatch.setattr(
-        crypto_transit, "_build_client", lambda addr, token: _FakeClient(_BoomOnHmac())
+        crypto_transit, "_build_client", lambda addr, token, **_: _FakeClient(_BoomOnHmac())
     )
     cipher = build_transit_cipher(StoreSettings())
     with pytest.raises(CipherError) as excinfo:
@@ -266,7 +268,7 @@ def test_unreachable_transit_fails_closed_type_only(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(
         crypto_transit,
         "_build_client",
-        lambda addr, token: _FakeClient(_BoomTransit()),  # type: ignore[arg-type]
+        lambda addr, token, **_: _FakeClient(_BoomTransit()),  # type: ignore[arg-type]
     )
     with pytest.raises(KeyProviderError) as excinfo:
         build_transit_cipher(StoreSettings())
@@ -417,7 +419,7 @@ def test_transit_encrypt_failure_is_type_only(monkeypatch: pytest.MonkeyPatch) -
             raise RuntimeError("transit echoed PHI: DOE^JANE")
 
     monkeypatch.setattr(
-        crypto_transit, "_build_client", lambda addr, token: _FakeClient(_BoomOnEncrypt())
+        crypto_transit, "_build_client", lambda addr, token, **_: _FakeClient(_BoomOnEncrypt())
     )
     cipher = build_transit_cipher(StoreSettings())
     with pytest.raises(CipherError) as excinfo:

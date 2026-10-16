@@ -66,6 +66,7 @@ from messagefoundry.store.privilege import (
 from messagefoundry.store.row_seal import RowSealer
 from messagefoundry.store.store import (
     UPLOAD_RESERVATION_STALE_AFTER,
+    AdMap,
     AdminRemoval,
     AlertInstance,
     AlertSummary,
@@ -101,6 +102,7 @@ from messagefoundry.store.store import (
     ResendSourceAmbiguous,
     ResendSourceEmpty,
     ResendSourceNotFound,
+    RoleGrant,
     SessionRecord,
     Stage,
     StreamingAttachmentsUnsupported,
@@ -722,7 +724,18 @@ class QueueStore(StoreLifecycle, Protocol):
         needed, and a raise always fails that start closed."""
         return None
 
-    async def mark_done(self, outbox_id: str, now: float | None = None) -> None: ...
+    async def mark_done(
+        self, outbox_id: str, now: float | None = None, *, reply_dropped: str | None = None
+    ) -> bool:
+        """Mark one delivered outbound row ``DONE``, with its ``delivered`` event, in one
+        transaction. ``reply_dropped``, when given, is the detail of a ``reply_dropped`` event
+        written in the same transaction: the partner answered 2xx and its reply body was over the
+        byte bound and dropped (vault BACKLOG #3040 item 5). It carries the status and the bound,
+        never a byte of the reply. Returns ``True`` when this call wrote the ``DONE`` flip and its
+        events, and ``False`` when it wrote nothing: a vanished row, or a write the H1 fence rolled
+        back (vault BACKLOG #3040 item 2). It does not check the row's status first, so a row some
+        other writer already made ``DONE`` is written again and returns ``True``."""
+        ...
 
     async def mark_batch_done(self, outbox_ids: Sequence[str], now: float | None = None) -> None:
         """Complete N delivered outbound rows in **one transaction** — the batch counterpart of
@@ -1859,16 +1872,24 @@ class AuditStore(Protocol):
           pre-existing table. It is **not** backfilled: after a rename the stored name may belong to
           somebody else, so resolving it to an id would key the refusal on the wrong person -- the
           exact error the column exists to remove.
-        * A NULL is therefore refused **fail closed** at approve time, never fallen back from."""
+        * A NULL is therefore refused **fail closed** at approve time, never fallen back from.
+
+        **The row is sealed (BACKLOG #2592).** It is written through one helper per backend, with an
+        integrity seal over every column. A repeat joins only an open request whose seal holds; a
+        match that fails is logged and the request is filed on its own."""
         ...
 
-    async def get_pending_approval(self, approval_id: str) -> Row | None: ...
+    async def get_pending_approval(self, approval_id: str) -> Row | None:
+        """One request with every column, its seal included, or ``None``. Unchecked:
+        ``ApprovalGate`` checks the seal where it reads a request (BACKLOG #2592)."""
+        ...
 
     async def list_pending_approvals(self, *, now: float, limit: int = 100) -> Sequence[Row]:
         """Open (``pending``, unexpired) requests, newest first. Each row projects at least ``id``,
         ``operation``, ``params``, ``requester``, ``requester_user_id`` (BACKLOG #2460: the queue
         marks the caller's own requests by it), ``requested_at``, ``status``, ``approver``,
-        ``decided_at`` and ``expires_at``."""
+        ``decided_at`` and ``expires_at``. Every read here projects every column, ``claim_owner``
+        and ``seal`` included, so the gate can check each row's seal (BACKLOG #2592)."""
         ...
 
     async def list_interrupted_approvals(self, *, limit: int = 100) -> Sequence[Row]:
@@ -1910,7 +1931,12 @@ class AuditStore(Protocol):
         the claim (``pending`` to ``executing``): it names the engine process that will run the
         operation, so that process can recognise its own claims after a restart
         (``ApprovalGate.reconcile_after_restart``). Engine shards and cluster nodes share one store,
-        and the owner is what keeps one process from settling a sibling's live release."""
+        and the owner is what keeps one process from settling a sibling's live release.
+
+        **The move checks the row's seal first (BACKLOG #2592).** It reads the row, and raises
+        :class:`~messagefoundry.store.row_seal.RowSealError`, writing nothing, when the seal does
+        not verify, so a row changed outside the store is never re-sealed. Otherwise it writes the
+        moved row and a new seal, guarded on the status and the seal it read."""
         ...
 
     async def list_executing_approvals(
@@ -1921,11 +1947,21 @@ class AuditStore(Protocol):
         ``claim_owner``, when given, keeps only the rows that owner claimed and the rows with no
         owner, filtered in SQL so other owners' rows cannot push them past ``limit``.
 
-        Projects ``id``, ``operation``, ``requester``, ``approver``, ``decided_at`` (when it was
-        claimed) and ``claim_owner``. Read at startup by ``ApprovalGate.reconcile_after_restart``,
+        Projects every column, as :meth:`list_pending_approvals` does; ``decided_at`` is when it
+        was claimed. Read at startup by ``ApprovalGate.reconcile_after_restart``,
         which settles the rows this process owns and reports the rest. An ``executing`` row is
         normally short-lived, so the cap is generous; oldest first so a row stuck longest is never
         the one past it."""
+        ...
+
+    async def count_unsealed_approvals(self) -> int:
+        """How many ``pending``, ``executing`` or ``interrupted`` requests carry no integrity seal
+        (BACKLOG #2592). A keyed open names the count."""
+        ...
+
+    async def reseal_approval_records(self) -> tuple[int, int]:
+        """Re-seal every approval request under the active key, for ``rotate-key`` (BACKLOG
+        #2592). Returns ``(re-sealed, refused)``; one that fails its seal is left as it is."""
         ...
 
     async def audit_anchor(self) -> tuple[int, str]: ...
@@ -2136,7 +2172,7 @@ class AuthStore(Protocol):
     #
     # ADR 0197: a password change also clears BOTH locks and both failure counts, and zeroes the
     # second-step cycle count, because the password those failures proved is gone. The sign-in cycle
-    # count stays (``store.PASSWORD_CHANGE_LOCKOUT_CLEAR``).
+    # count stays (``store.password_change``).
     #
     # ADR 0197 Amendment A: ``password_generated`` is REQUIRED, with no default, for the reason
     # ``create_user`` gives: the generated paths pass True and every holder-chosen path passes False.
@@ -2232,6 +2268,11 @@ class AuthStore(Protocol):
     ) -> None: ...
 
     async def get_totp_secret(self, user_id: str) -> str | None: ...
+
+    # BACKLOG #3510: decrypt a ``users.totp_secret`` cell the caller already holds, from a record
+    # whose seal it checked, so the sign-in code is checked against that record's secret and not a
+    # second, unchecked read. ``None`` for no cell. No I/O.
+    def open_totp_secret(self, user_id: str, cell: str | None) -> str | None: ...
 
     # CONDITIONAL (BACKLOG #2224): writes only where a secret is staged (``totp_secret IS NOT NULL``)
     # and TOTP is still off, in the same UPDATE, and returns whether a row was written. An
@@ -2350,7 +2391,11 @@ class AuthStore(Protocol):
         permissions: str | None = None,
     ) -> None:
         """Create-or-update a role. ``permissions`` is a JSON array of ``Permission`` wire values for a
-        custom role (ADR 0045), or ``None`` for a built-in row (which resolves from code)."""
+        custom role (ADR 0045), or ``None`` for a built-in row (which resolves from code).
+
+        The row is written whole and sealed (BACKLOG #2592), through one helper per backend. The
+        service checks the seal where it reads a custom role; the readers here return rows
+        unchecked. Saving a role again seals it, which is how one that fails is repaired."""
         ...
 
     async def list_roles(self) -> Sequence[Row]: ...
@@ -2363,6 +2408,36 @@ class AuthStore(Protocol):
         ...
 
     async def get_user_role_ids(self, user_id: str) -> list[str]: ...
+
+    async def get_user_role_grants(self, user_id: str) -> list[RoleGrant]:
+        """The account's role rows, whole, as its integrity seal covers them (BACKLOG #2592).
+
+        The store writes the user seal: every write to ``users``, ``user_roles`` or the account's
+        passkeys goes through one helper per backend, which verifies the record it read before it
+        re-seals it and raises :class:`~messagefoundry.store.row_seal.RowSealError` rather than
+        re-seal a record that fails. Deleting needs no key. :class:`AuthService` checks the seal,
+        in its one user loader; the store's readers return rows unchecked."""
+        ...
+
+    async def reseal_user_records(self) -> tuple[int, int]:
+        """Re-seal every user record under the active key, for ``rotate-key`` (BACKLOG #2592).
+        Returns ``(re-sealed, refused)``; a record that fails its seal is left as it is."""
+        ...
+
+    async def count_unsealed_users(self) -> int:
+        """How many accounts carry no integrity seal (BACKLOG #2592)."""
+        ...
+
+    async def reseal_role_records(self) -> tuple[int, int]:
+        """Re-seal every role definition and the AD group-to-role map under the active key, for
+        ``rotate-key`` (BACKLOG #2592). Returns ``(re-sealed, refused)``; one that fails its seal
+        is left as it is."""
+        ...
+
+    async def count_unsealed_role_records(self) -> int:
+        """How many custom roles carry no integrity seal, plus one for each AD directory map that
+        has pairs and no seal (BACKLOG #2592)."""
+        ...
 
     # --- saved-search presets (ADR 0136, BACKLOG #151) — per-user, criteria encrypted at rest -----
 
@@ -2405,7 +2480,14 @@ class AuthStore(Protocol):
         *,
         assigned_by: str | None = None,
         now: float | None = None,
-    ) -> None: ...
+    ) -> None:
+        """Replace the account's roles with ``role_ids``. Raises ``UnknownRoleError``, writing
+        nothing, when an id the account does not already hold has no ``roles`` row as the write
+        reads it; a role deleted after that read fails the ``user_roles`` foreign key instead, with
+        the driver's integrity error. A held id with no row is dropped (BACKLOG #2592,
+        ``store.existing_roles_only``). :meth:`remove_unless_last_admin` with ``SET_ROLES`` does
+        the same."""
+        ...
 
     async def remove_unless_last_admin(
         self,
@@ -2584,13 +2666,23 @@ class AuthStore(Protocol):
         """
         ...
 
-    async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]: ...
+    async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
+        """The role ids the AD group-to-role map gives ``groups``, its seal UNCHECKED."""
+        ...
+
+    async def get_ad_map(self, name: str) -> AdMap:
+        """One whole AD directory map (``AD_ROLE_MAP`` or ``AD_SCOPE_MAP``) and its seal, read in
+        one statement (BACKLOG #2592). Unchecked: :class:`AuthService` checks the seal in its one
+        map loader. Each map is written whole and sealed, through one helper per backend."""
+        ...
 
     async def list_ad_group_role_map(self) -> Sequence[Row]: ...
 
     async def set_ad_group_role_map(self, entries: Iterable[tuple[str, str]]) -> None: ...
 
-    async def channels_for_ad_groups(self, groups: Iterable[str]) -> set[str]: ...
+    async def channels_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
+        """The channels the AD group-to-channel map gives ``groups``, its seal UNCHECKED."""
+        ...
 
     async def list_ad_group_scope_map(self) -> Sequence[Row]: ...
 
@@ -2839,7 +2931,7 @@ class Store(QueueStore, AuditStore, AuthStore, Protocol):
     """
 
 
-def resolve_active_key(settings: StoreSettings) -> str | None:
+def resolve_active_key(settings: StoreSettings, *, posture: HopPosture | None = None) -> str | None:
     """The effective base64 active key, sourced through the :class:`KeyProvider` seam selected by
     ``[store].key_provider`` (ADR 0019). The default ``auto`` provider is the env-then-DPAPI ladder —
     ``encryption_key`` (env/config) if set, else the Windows DPAPI-protected ``encryption_key_file``
@@ -2856,8 +2948,13 @@ def resolve_active_key(settings: StoreSettings) -> str | None:
     to the same contract.
 
     So does a pinned built-in provider that ignores the key the settings name (BACKLOG #2077):
-    ``dpapi`` with only ``MEFOR_STORE_ENCRYPTION_KEY``, or ``env`` with only a key file."""
-    return _checked_active_key(resolve_key_provider(settings).active_key(), settings)
+    ``dpapi`` with only ``MEFOR_STORE_ENCRYPTION_KEY``, or ``env`` with only a key file.
+
+    ``posture`` is the instance posture the caller holds, for an external provider's hop guard
+    (vault BACKLOG #2983). ``None`` counts as enforcing there."""
+    return _checked_active_key(
+        resolve_key_provider(settings, posture=posture).active_key(), settings
+    )
 
 
 def _checked_active_key(key: str | None, settings: StoreSettings) -> str | None:
@@ -2883,7 +2980,9 @@ def _checked_active_key(key: str | None, settings: StoreSettings) -> str | None:
     return key
 
 
-def resolve_decrypt_keys(settings: StoreSettings) -> list[str]:
+def resolve_decrypt_keys(
+    settings: StoreSettings, *, posture: HopPosture | None = None
+) -> list[str]:
     """The full **decrypt-capable** base64 keyring for this store — the active key followed by every
     retired (decrypt-only) key — sourced through the same :class:`KeyProvider` seam as
     :func:`resolve_active_key`/``open_store`` (ADR 0019). This is exactly the set the store cipher can
@@ -2891,8 +2990,8 @@ def resolve_decrypt_keys(settings: StoreSettings) -> list[str]:
     *any* value the store could read — e.g. the DR restore-verify checking a backup taken under a
     now-retired key after a rotation (ADR 0049 AC-5: "incl. retired keys") — uses this, not just the
     active key. Order is active-first; duplicates and empties are dropped; an unset active key yields an
-    empty list (identity cipher)."""
-    provider = resolve_key_provider(settings)
+    empty list (identity cipher). ``posture`` is as on :func:`resolve_active_key`."""
+    provider = resolve_key_provider(settings, posture=posture)
     ordered: list[str] = []
     active = _checked_active_key(provider.active_key(), settings)
     if active:
@@ -2910,7 +3009,7 @@ def resolve_decrypt_keys(settings: StoreSettings) -> list[str]:
     return keyring
 
 
-def build_store_cipher(settings: StoreSettings) -> Cipher:
+def build_store_cipher(settings: StoreSettings, *, posture: HopPosture | None = None) -> Cipher:
     """Build the at-rest cipher for ``settings`` — the SAME construction ``open_store`` uses (active key
     + retired decrypt-only keyring, ``write_v2=aad_bind``). Exposed so a store-DECOUPLED PHI-at-rest
     surface — the offline uploaded-logs files (ADR 0134) — encrypts under the identical DEK / keyring /
@@ -2921,9 +3020,14 @@ def build_store_cipher(settings: StoreSettings) -> Cipher:
     it: at least a key that is not base64 of 32 bytes, an unknown ``cipher_provider`` and a Transit
     client setting it refuses. Each comes from the settings or the key provider before the store
     reads a row, so a caller can treat that class as "could not start" where a bare ``ValueError``
-    from the open could mean anything (vault BACKLOG #3054, item 8)."""
+    from the open could mean anything (vault BACKLOG #3054, item 8).
+
+    ``posture`` is the instance posture the caller holds. It reaches the two Vault hops a cipher
+    build can dial, the key provider and the Transit cipher, whose revocation guard is keyed on it
+    (vault BACKLOG #2983). ``None`` counts as enforcing there, so a caller with no posture gets
+    the strict answer."""
     try:
-        return _build_store_cipher(settings)
+        return _build_store_cipher(settings, posture)
     except ValueError as exc:
         raise StoreCipherConfigError(str(exc)) from exc
 
@@ -2933,14 +3037,14 @@ class StoreCipherConfigError(ValueError):
     text is the build error's, which names settings and variables, never a key."""
 
 
-def _build_store_cipher(settings: StoreSettings) -> Cipher:
+def _build_store_cipher(settings: StoreSettings, posture: HopPosture | None) -> Cipher:
     if settings.cipher_provider == "vault_transit":
         # ADR 0138: bulk at-rest crypto INSIDE Vault/OpenBao Transit — the plaintext DEK never enters
         # engine heap (ASVS 13.3.3). Lazy-imported so the base install pulls no Vault SDK; fails closed at
         # open (KeyProviderError → serve refuses) rather than degrading to plaintext.
         from messagefoundry.store.crypto_transit import build_transit_cipher
 
-        return build_transit_cipher(settings)
+        return build_transit_cipher(settings, posture=posture)
     if settings.cipher_provider != "aesgcm":
         raise ValueError(
             f"[store].cipher_provider={settings.cipher_provider!r} is not a known cipher provider "
@@ -2948,7 +3052,7 @@ def _build_store_cipher(settings: StoreSettings) -> Cipher:
         )
     retired = [k.strip() for k in settings.encryption_keys_retired.split(",") if k.strip()]
     return make_cipher(
-        resolve_active_key(settings),
+        resolve_active_key(settings, posture=posture),
         retired,
         write_v2=settings.aad_bind,
         allow_unmarked=settings.allow_unmarked_ciphertext,
@@ -3315,7 +3419,9 @@ async def open_store(
     # decrypt-only, write_v2=aad_bind — which now defaults ON, so new writes are cell-bound mfenc:v4 (ADR 0196);
     # aad_bind=false selects the frozen v1 writer, byte-identical at rest). `vault_transit` runs the bulk
     # crypto inside Vault/OpenBao Transit so the DEK never enters heap (ASVS 13.3.3). No key → identity.
-    cipher = build_store_cipher(settings)
+    # The posture goes to the cipher build as it is. `None` is not replaced by the ambient
+    # posture there: on a Vault hop an unknown posture counts as enforcing (vault BACKLOG #2983).
+    cipher = build_store_cipher(settings, posture=posture)
     setter = getattr(cipher, "set_refusal_hook", None)
     if refusal_hook is not None and callable(setter):
         setter(refusal_hook)

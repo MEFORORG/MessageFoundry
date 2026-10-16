@@ -94,6 +94,12 @@ class DastTarget:
     #: repr, a log line or the receipt. It raises :class:`DastTargetUnusable` when a session can no
     #: longer be minted, which the runner turns into exit 2 rather than a clean-looking wall of 401s.
     relogin: Callable[[str], Awaitable[str]]
+    #: Re-prove a session's password for ONE action, the one a ``403`` named in ``X-Step-Up-Action``,
+    #: and return the session's re-keyed token (vault BACKLOG #3241). ``POST /me/reauth`` re-keys the
+    #: session, so the token it was given no longer authenticates. Same closure rule as ``relogin``:
+    #: the password never leaves it. It raises :class:`DastTargetUnusable` when the re-proof is
+    #: refused, because a reach pass that cannot pass a step-up wall measures the wall.
+    reprove: Callable[[str, str], Awaitable[str]]
 
 
 def _scan_password() -> str:
@@ -303,11 +309,42 @@ async def dast_target(
             async with httpx.AsyncClient(base_url=base_url, timeout=30.0) as fresh:
                 return await _login(fresh, username, password)
 
+        async def reprove(token: str, action: str) -> str:
+            """``POST /me/reauth`` with the scan password and ``purpose=action``; the new token.
+
+            Under ``open-auth`` no step-up gate can refuse (authentication is off), so nothing calls
+            it there; it hands the sentinel back unchanged. The status alone goes into a refusal's
+            message, never the body, for the reason :func:`_login` gives.
+            """
+            if canary == "open-auth":
+                return token
+            async with httpx.AsyncClient(base_url=base_url, timeout=30.0) as fresh:
+                response = await fresh.post(
+                    "/me/reauth",
+                    json={"password": password, "purpose": action},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            rekeyed: object = None
+            if response.status_code == 200:
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = None
+                rekeyed = payload.get("token") if isinstance(payload, dict) else None
+            if not isinstance(rekeyed, str) or not rekeyed:
+                raise DastTargetUnusable(
+                    f"POST /me/reauth answered {response.status_code} to an action-bound re-proof, "
+                    "or returned no token. A reach pass that cannot pass a step-up wall measured "
+                    "the wall, so this run measured nothing behind it."
+                )
+            return rekeyed
+
         yield DastTarget(
             base_url=base_url,
             admin_token=admin_token,
             viewer_token=viewer_token,
             relogin=relogin,
+            reprove=reprove,
             app=app,
             posture=_posture(canary=canary),
             identities={

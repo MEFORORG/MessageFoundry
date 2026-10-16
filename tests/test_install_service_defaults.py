@@ -77,20 +77,175 @@ def test_config_has_no_default_and_its_absence_is_refused() -> None:
     assert missing < text.index("$NssmPath = Resolve-Nssm")
 
 
-def test_only_the_default_install_root_is_checked_for_broad_write() -> None:
-    """The check on a passed -AppExe waits on an owner ruling, so the one call sits under the
-    default-install condition and refuses there."""
+def test_every_install_is_checked_for_broad_write_before_anything_acts() -> None:
+    """Vault BACKLOG #2626 step 1: a passed -AppExe or -PythonExe is checked as the default root
+    is, so the one call sits under no condition, and it refuses before the NSSM copy."""
     text = _text()
-    listed = [m.start() for m in re.finditer(r"\$installFiles = @\(\$AppExe, \$PythonExe,", text)]
-    assert len(listed) == 1, listed
-    guard = text.rindex("if ($UsesDefaultInstall) {", 0, listed[0])
-    assert text[guard : listed[0]].count("}") == 0, (
-        "the list is not inside the default-install block"
+    calls = [m.start() for m in re.finditer(r"= Get-EngineInstallProblem -InstallRoot ", text)]
+    assert len(calls) == 1, calls
+    line_start = text.rindex("\n", 0, calls[0]) + 1
+    assert text[line_start : calls[0]] == "$installProblem ", (
+        "the call is indented under a condition"
     )
-    # The launcher, the interpreter the service runs and the package it imports.
-    assert "Lib\\site-packages\\messagefoundry\\__init__.py" in text[listed[0] : listed[0] + 200]
-    assert "Get-NssmHomeProblem -File $_" in text[listed[0] : listed[0] + 500]
-    assert "throw" in text[listed[0] : listed[0] + 700]
+    assert (
+        "Get-EngineInstallProblem -InstallRoot $AppDirectory -PythonExe $PythonExe -AppExe $AppExe"
+        in text
+    )
+    assert "throw" in text[calls[0] : calls[0] + 300]
+    assert calls[0] < text.index("$NssmPath = Resolve-Nssm")
+    # The old check, under the default-install condition only, is gone.
+    assert "$installFiles" not in text
+    assert "or pass -AppExe." not in text
+
+
+def test_the_working_directory_is_the_install_root_never_the_checkout() -> None:
+    text = _text()
+    assert "$AppDirectory = Get-EngineInstallRoot -PythonExe $PythonExe" in text
+    assert "else { $RepoRoot }" not in text
+    assert "Invoke-Nssm set $ServiceName AppDirectory $AppDirectory" in text
+    # The interpreter is known, and refused when missing, before the root is worked out from it.
+    assert text.index(
+        "if (-not $PythonExe -or -not (Test-Path -LiteralPath $PythonExe"
+    ) < text.index("$AppDirectory = Get-EngineInstallRoot")
+    # A passed -AppExe gets the folder above -Config as its project root too, not the checkout.
+    assert "else { $ProjectRoot = Split-Path -Parent $Config }" in text
+
+
+# A test's temp folder is never administrator-only, so the ACL reading is set per path, as
+# tests/test_nssm_pin.py sets it. Defined after the lifted functions, so it wins.
+_BROAD_STUB = """
+  $broadFor = @{}
+  function Get-BroadWriteHolders { param($Path) if ($broadFor.ContainsKey("$Path")) { $broadFor["$Path"] } }
+"""
+
+
+def _venv(root: Path, *, package: bool = True) -> dict[str, Path]:
+    scripts = root / "Scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "python.exe").write_bytes(b"")
+    (scripts / "messagefoundry.exe").write_bytes(b"")
+    (root / "pyvenv.cfg").write_text("home = C:\\Python314\n", encoding="utf-8")
+    site = root / "Lib" / "site-packages"
+    site.mkdir(parents=True)
+    init = site / "messagefoundry" / "__init__.py"
+    if package:
+        init.parent.mkdir()
+        init.write_text("", encoding="utf-8")
+    return {
+        "root": root,
+        "python": scripts / "python.exe",
+        "app": scripts / "messagefoundry.exe",
+        "init": init,
+        "site": site,
+        "cfg": root / "pyvenv.cfg",
+    }
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows install layout and paths")
+def test_a_user_writable_install_is_refused_and_an_admin_only_one_passes(tmp_path: Path) -> None:
+    """Vault BACKLOG #2626 step 1. Each case is one venv with one place a broad principal can
+    write: the root, a folder above it, the interpreter, the launcher, the package and
+    pyvenv.cfg. The admin-only venv is the control that the check passes what it should."""
+    assert _SCRIPT is not None
+    names = ["root", "above", "python", "app", "init", "cfg"]
+    venvs = {name: _venv(tmp_path / "chain" / name / "venv") for name in names + ["clean"]}
+    no_package = _venv(tmp_path / "chain" / "nopkg" / "venv", package=False)
+    editable = _venv(tmp_path / "chain" / "editable" / "venv")
+    (editable["site"] / "__editable__.messagefoundry-0.5.1.pth").write_text("", encoding="utf-8")
+    # The two markers integrity.py's _declares_editable also reads, each in a venv of its own.
+    direct_url = _venv(tmp_path / "chain" / "directurl" / "venv")
+    dist = direct_url["site"] / "messagefoundry-0.5.1.dist-info"
+    dist.mkdir()
+    (dist / "direct_url.json").write_text(
+        '{"url": "file:///C:/src", "dir_info": {"editable": true}}', encoding="utf-8"
+    )
+    record = _venv(tmp_path / "chain" / "record" / "venv")
+    dist = record["site"] / "messagefoundry-0.5.1.dist-info"
+    dist.mkdir()
+    (dist / "RECORD").write_text(
+        "messagefoundry/__init__.py,sha256=x,1\n_messagefoundry.pth,sha256=y,2\n", encoding="utf-8"
+    )
+    # A wheel install's own dist-info: a RECORD of package rows and no direct_url.json.
+    wheel = venvs["clean"]["site"] / "messagefoundry-0.5.1.dist-info"
+    wheel.mkdir()
+    (wheel / "RECORD").write_text("messagefoundry/__init__.py,sha256=x,1\n", encoding="utf-8")
+    lines = []
+    for name in names:
+        v = venvs[name]
+        where = v["root"].parent if name == "above" else v[name]
+        lines.append(f"  $broadFor[{_psq(str(where))}] = 'BUILTIN\\Users'")
+
+    def call(v: dict[str, Path], app: bool = True) -> str:
+        return (
+            f"Get-EngineInstallProblem -InstallRoot {_psq(str(v['root']))} "
+            f"-PythonExe {_psq(str(v['python']))}"
+            + (f" -AppExe {_psq(str(v['app']))}" if app else "")
+        )
+
+    cases = {name: call(venvs[name]) for name in names}
+    cases["clean"] = call(venvs["clean"])
+    cases["clean_no_app"] = call(venvs["clean"], app=False)
+    cases["nopkg"] = call(no_package)
+    cases["editable"] = call(editable)
+    cases["directurl"] = call(direct_url)
+    cases["record"] = call(record)
+    cases["root_of_venv"] = (
+        f"Get-EngineInstallRoot -PythonExe {_psq(str(venvs['clean']['python']))}"
+    )
+    cases["root_of_system"] = "Get-EngineInstallRoot -PythonExe 'C:\\Python314\\python.exe'"
+    body = (
+        "\n".join(lines)
+        + "\n  $res = [ordered]@{}\n"
+        + "".join(f"  $res[{_psq(k)}] = [string]({v})\n" for k, v in cases.items())
+        + "  $res | ConvertTo-Json -Compress\n"
+    )
+    script = _extract(
+        _SCRIPT, ["Get-NssmHomeProblem", "Get-EngineInstallRoot", "Get-EngineInstallProblem"], ""
+    )
+    # The stub goes after the lifted functions, inside the same scope, so it wins.
+    script = script[: script.rindex("}")] + _BROAD_STUB + body + "}"
+    got = json.loads(_ok(script, tmp_path).strip().splitlines()[-1])
+
+    for name in names:
+        assert "BUILTIN\\Users" in got[name], (name, got[name])
+    assert "on '" + str(venvs["above"]["root"].parent) + "'" in got["above"]
+    assert got["clean"] == ""
+    assert got["clean_no_app"] == ""
+    assert "is missing" in got["nopkg"] and "editable" in got["nopkg"]
+    assert "__editable__.messagefoundry-0.5.1.pth" in got["editable"]
+    assert "direct_url.json" in got["directurl"]
+    assert "RECORD names _messagefoundry.pth" in got["record"]
+    # A holder of the file itself is named with the file's path.
+    assert "BUILTIN\\Users on '" + str(venvs["python"]["python"]) + "'" in got["python"]
+    assert got["root_of_venv"] == str(venvs["clean"]["root"])
+    assert got["root_of_system"] == "C:\\Python314"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="reads a real Windows access list")
+def test_the_real_acl_reading_refuses_a_folder_in_the_users_profile(tmp_path: Path) -> None:
+    """No stub: a venv under the user's temp folder, as a checkout's venv is under its profile,
+    is refused by the real reading. Its owner is the user, who is not an administrator SID."""
+    assert _SCRIPT is not None
+    v = _venv(tmp_path / "venv")
+    body = (
+        f"  Get-EngineInstallProblem -InstallRoot {_psq(str(v['root']))} "
+        f"-PythonExe {_psq(str(v['python']))} -AppExe {_psq(str(v['app']))}\n"
+    )
+    out = _ok(
+        _extract(
+            _SCRIPT,
+            [
+                "Get-BroadWriteHolders",
+                "Get-NssmHomeProblem",
+                "Get-EngineInstallRoot",
+                "Get-EngineInstallProblem",
+            ],
+            body,
+        ),
+        tmp_path,
+    )
+    # A holder on a folder of the chain, not a missing package or an unread listing.
+    assert " on '" in out, f"the real reading did not name a broad holder: {out!r}"
 
 
 def test_python_exe_alone_needs_no_launcher() -> None:
@@ -133,6 +288,18 @@ def test_the_settings_file_and_project_root_are_registered_by_absolute_path() ->
     # Both are normalised with the other paths (tests/test_service_install_manifest.py holds when).
     assert "$ServiceConfig = Resolve-AbsolutePath $ServiceConfig" in text
     assert "$ProjectRoot = Resolve-AbsolutePath $ProjectRoot" in text
+
+
+def test_the_install_refuses_when_there_is_no_settings_file_to_register() -> None:
+    """Vault BACKLOG #2626 step 2: `serve` as the service refuses to start with no
+    --service-config, so the installer refuses at install time instead of registering a service
+    that cannot start. The refusal sits after the default is looked up and before the command line
+    is built, so nothing has acted yet."""
+    text = _text()
+    default = text.index("else { $ServiceConfig = Get-DefaultServiceConfig -Anchor $ValuesAnchor }")
+    refusal = text.index('if (-not $ServiceConfig) {\n    throw ("no settings file to register: ')
+    params = text.index("$AppParams = ")
+    assert default < refusal < params
 
 
 def test_lock_config_dir_locks_each_start_folder_it_may() -> None:

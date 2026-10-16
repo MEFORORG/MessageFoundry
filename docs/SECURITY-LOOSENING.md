@@ -35,6 +35,68 @@ section reference.
 
 ---
 
+## No escape sends a credential to an unverified peer
+
+On the hops in the table below, the engine will not send a credential to a peer whose identity it
+has not checked. The rule does not yet reach every hop or every kind of credential: at least the
+cases in *The rule does not reach every hop yet*, below, still cross. This section is the one
+statement of that rule; other pages link here.
+
+A peer is unverified when the hop is cleartext, when the certificate check or the name check is off,
+or when an SSH host key is unknown. The engine refuses each case below when it builds the connection
+or starts the service, except SFTP: the host key is known only once the server answers, so that
+refusal comes at connect, before the password is sent. **No lever in this guide lifts a refusal in
+the table below.** That covers `MEFOR_ALLOW_INSECURE_TLS`, `[security].enforcement = warn`,
+`tls_hop_attested`, `cleartext_accepted` and a loopback host. Each refusal names the connection, or
+the `[auth]` setting for the AD bind, and offers only settings that do fix it. `Email` and `Direct`
+check the credential before the cleartext and verify-off checks, so a credentialed hop is never
+pointed at one of those levers.
+
+| Hop | Refused when it carries a credential and | What fixes it |
+|---|---|---|
+| `Email`, `Direct` (SMTP AUTH) | the hop is cleartext, or `tls_verify` or `tls_check_hostname` is off | turn TLS and both checks on; pin a private CA with `tls_ca_file` |
+| `Ftp` | it is plain FTP (`tls = false`) | use FTPS (`tls = true`) or `Sftp` |
+| `Ftp` with `tls = true` (FTPS) | `tls_verify` or `tls_check_hostname` is off | turn both checks on; pin a private CA with `tls_ca_file` |
+| `Rest`, `Soap`, `FHIR`, `DICOMweb`, `FhirLookup` | `verify_tls = false` on an `https` URL | turn `verify_tls` on; pin a private CA with `tls_ca_file` |
+| `Sftp` with a `password` | the server's host key is not in `known_hosts` | add the host key to `known_hosts` |
+| `[auth]` AD binds over LDAPS | `ad_tls_verify = false` | turn it on; pin a private CA with `ad_tls_ca_cert_file` |
+
+A credential here means at least a password, a static or minted bearer token, an HTTP Basic or Digest
+pair, a SOAP WS-Security UsernameToken or body secret, a credential-looking `url` query parameter, and
+a static header that settings views would mask, such as `Authorization` or an API key. That last
+test leans toward caution: a header named like a key, such as `X-Routing-Key`, also counts. The
+HTTP family reads its auth-setting credentials from the same reader as the static-credential
+inventory. That inventory does not yet count a static header or a `url` query credential, so for
+those two kinds this rule is the wider of the two. A hop with no credential is not refused by this
+rule. Its own loosening entry decides it.
+
+An AD bind always carries a credential, because the service account must bind first. So
+`ad_tls_verify = false` over LDAPS is refused in every case.
+
+**The rule does not reach every hop yet.** At least these still send a credential to a peer the
+engine has not verified, when the lever named beside each is set:
+
+- an HTTP-family credential over plain `http`, under `cleartext_accepted` or `tls_hop_attested`;
+- an HTTP-family secret the refusal cannot see as a credential, on a `verify_tls = false` hop or
+  over plain `http`, under that hop's own levers. That covers at least a static header with a
+  neutral name, such as `X-Session`, and a secret in the path of the `url`. The test for a
+  credential header reads the header's name, and the `url` test reads only its query;
+- the store login, under `[store].trust_server_certificate = true` or `[store].encrypt = false`;
+- a SQL Server `DATABASE` connection's login, under `trust_server_certificate = true` or
+  `encrypt = false`;
+- the AD binds over plain `ldap://`, under `ad_allow_insecure_ldap = true`;
+- the `[alerts]` SMTP relay login, under `email_tls_verify = false`;
+- the AI broker's `[ai].api_key` over a plain `http` endpoint, and a secret in the path of an
+  alert webhook URL over `http`, each under `MEFOR_ALLOW_INSECURE_TLS` at
+  `[security].enforcement = warn`;
+- a credential header a Handler stamps per message under `dynamic_headers`, on a `verify_tls =
+  false` hop. The refusal reads settings, so it cannot see one.
+
+An SFTP login by private key to an unknown host key is outside this rule too. The key itself never
+leaves the engine.
+
+---
+
 ## The switches
 
 | Group | Switch | Secure default |
@@ -89,6 +151,7 @@ section reference.
 | | `[auth].totp_skew_steps` | `0` (`1` or `2` is named. The load refuses any other value) |
 | | `[auth].initial_password_expiry_hours` | `72` h (a life above `72` h is named, and `0` or less means a temporary password never expires) |
 | | `[approvals].min_dwell_seconds`, `expiry_hours` | `2.0` s / `72` h (*conditional* — a loosening only while `[approvals].enabled` holds at least one operation; a floor below `2.0` s or an expiry above `72` h, and `0` turns either off) |
+| | `[approvals].operations` | `["connection_purge", "dead_letter_replay"]` (*conditional* — a loosening only while `[approvals].enabled` is on; a list that leaves out either default operation is named, and so is an empty list, which holds nothing; named as `approvals.operations`) |
 | | `[api].trusted_proxies` | `[]` (any entry covering more than one address is named, a `/31` or `/127` included, because every host inside it may set `X-Forwarded-For`. Entries covering every address, such as `0.0.0.0/0` or `::/0`, trust it from every peer, as the refused `*` would, and get their own wording) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | | `[cert_monitor].warn_days`, `[secret_rotation].warn_days` | `30` / `14` (`0` turns that credential reminder off, and a smaller value makes it later; named as `cert_monitor.warn_days` and `secret_rotation.warn_days`) |
@@ -96,6 +159,7 @@ section reference.
 | | `[api].plaintext_upstream_hop_acknowledged` | `false` (*conditional* — a loosening only while `[api].tls_terminated_upstream` is set with no `[api].tls_cert_file`, the one topology where the engine serves the proxy-to-engine hop in plaintext) |
 | | `[api].expose_docs` | `false` (`true` serves at least `/docs`, `/redoc` and `/openapi.json` with no sign-in) |
 | | `[backup].allow_unencrypted` | `false` (`true` lets a keyless instance write a cleartext backup archive; named as `backup.allow_unencrypted`) |
+| | `[store].vault_revocation_attested`, `[secrets].vault_revocation_attested` | `false` / `false` (`true`, with its mandatory reason, lifts the revocation refusal on that section's Vault hops; named as `store.vault_revocation_attested` and `secrets.vault_revocation_attested`) |
 | Process environment | `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` | unset (*conditional* — an environment variable, not a setting. Honoured only with `MEFOR_SECURITY_ENFORCEMENT=warn` in the same environment, and refused under `enforce`. See its entry below) |
 | Per-connection | `cleartext_accepted` | `false` on every outbound / `FhirLookup` (*connection-scoped* — see below) |
 | | `tls_allow_expired` | `false` on all six outbound connectors that take it, and on an `Ftp` (FTPS) poller (*connection-scoped*) |
@@ -116,14 +180,15 @@ keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admi
 `[auth].oidc_callback_floor_exempt_amr`,
 `[auth].max_sessions_per_user`, `[auth].oidc_flow_cache_max`,
 `[auth].step_up_max_age_seconds`, `[auth].totp_skew_steps`, `[auth].initial_password_expiry_hours`,
-`[approvals].min_dwell_seconds`, `[approvals].expiry_hours`,
+`[approvals].min_dwell_seconds`, `[approvals].expiry_hours`, `[approvals].operations`,
 `[secret_rotation].enforce_store_key_expiry`, `[secret_rotation].warn_days`,
 `[cert_monitor].warn_days`, `[[alerts.rules]]`, `[api].trusted_proxies`,
-`[api].plaintext_upstream_hop_acknowledged`, `[api].expose_docs` and `[backup].allow_unencrypted` sit in their own sections for cohesion, and the per-connection rows are per-**connection** facts, not service
+`[api].plaintext_upstream_hop_acknowledged`, `[api].expose_docs`, `[backup].allow_unencrypted`,
+`[store].vault_revocation_attested` and `[secrets].vault_revocation_attested` sit in their own sections for cohesion, and the per-connection rows are per-**connection** facts, not service
 settings at all. They are listed here anyway, because the rule is *one shipped
 posture, loosen only* — a deviation the registry cannot see is a second posture by the back door. The
 section settings are named by `security_loosenings()` from the loaded
-`[store]`/`[auth]`/`[approvals]`/`[secret_rotation]`/`[cert_monitor]`/`[alerts]`/`[api]`/`[backup]` sections; the per-connection
+`[store]`/`[auth]`/`[approvals]`/`[secret_rotation]`/`[cert_monitor]`/`[alerts]`/`[api]`/`[backup]`/`[secrets]` sections; the per-connection
 rows are resolved from the loaded connection graph and passed in by name (see their entries below for
 exactly which surfaces see them, and which cannot).
 
@@ -560,9 +625,11 @@ This section is kept rather than deleted, because the claim it used to make is t
   seals it into genuine ciphertext, after which no evidence of the substitution survives. Cell binding
   (`aad_bind`) does not cover this: a moved ciphertext has a tag to fail, and a plaintext value has none
   (ASVS 11.3.3, BACKLOG #1169).
-- **When acceptable:** a store that holds legitimate unmarked values beside ciphertext in one column —
-  for example rows written by a keyless run of a store that was keyed before. Turn it on for one keyed
-  open to seal them, then turn it back off. It is a no-op with **no `[store].encryption_key`**.
+- **When acceptable:** a store that holds legitimate unmarked values in a column that is already
+  sealed. One example is rows written by a keyless run of a store that was keyed before. Since
+  BACKLOG #3383, a keyed open records each column in `keyed_surface`. A recorded column stays sealed
+  even with no ciphertext in it, so this covers a table that had emptied out too. Turn it on for one
+  keyed open to seal them, then turn it back off. It is a no-op with **no `[store].encryption_key`**.
 - **Compensating controls:** database-level access control, because planting a row needs store write
   access. Nothing in the engine detects the plant once this is on.
 - **Reversible:** yes. Turning it back off refuses unmarked values again from the next read; anything
@@ -1001,6 +1068,34 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   approval queue, and reject a stale request rather than leave it pending.
 - **Reversible:** yes, immediately — restore the default (or delete the line) and restart.
 
+### `[approvals].operations` without a default operation — that action runs on one caller's authority
+> **Conditional** on `[approvals].enabled` (vault BACKLOG #3123, ASVS 2.3.5). Dual control ships off,
+> so a list written while it is off is not named. With it on, the default list holds
+> `connection_purge` and `dead_letter_replay`. A list that leaves either out is named as
+> `approvals.operations`, and the entry names each operation left out. An **empty** list loads and
+> holds nothing, so it is named too, with its own wording. Adding `config_reload` holds more and is
+> not named, and it does not make up for a default operation left out.
+- **What you lose:** the second approver for each operation left out. A purge or a dead-letter replay
+  left out of the list runs at once, on the caller's own authority. With an empty list every action
+  does, as it would with dual control off.
+- **When acceptable:** a site that has decided one of the two does not need a second person, such as
+  a replay its on-call operator must be able to run alone. There is no good case for an
+  empty list with dual control on: turn dual control off instead, so the setting says what the
+  engine does.
+- **Compensating controls:** nothing here supplies the second person. An operation left out still
+  needs its own permission and step-up, and the route table in [SECURITY.md](SECURITY.md) lists
+  both. Those limit who may run it and guard a stolen session; one person can still pass both.
+  Review the audit rows for the action itself, since a call that is not held writes no
+  `approval.requested` row.
+- **Where it is reported:** `security_loosenings()` names it, so at least the serve-time warning,
+  `messagefoundry security show`, `GET /security/posture` and the start's `config_loaded` audit row
+  list it. Nothing refuses it. The
+  serve-time advisory about exposed dual control reads `enabled` only, so it stays quiet for a
+  narrowed or an empty list.
+- **Reversible:** yes, immediately — restore the default (or delete the `operations` line) and
+  restart. [SECURITY.md](SECURITY.md#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235)
+  says what happens to a request that was already held when its operation left the list.
+
 ### `[api].trusted_proxies` covering more than one address, up to every address — a host that is not the proxy may set its own source address
 > **Not conditional on sign-in** ([BACKLOG #1131](BACKLOG.md)): a forged source address poisons the audit
 > trail either way. **Any entry covering more than one address is named**, IPv4 or IPv6, however small:
@@ -1079,6 +1174,72 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `encrypted: false`. Nothing refuses the flag, and `messagefoundry check` has no line for it.
 - **Reversible:** yes. Configure a store key, set the flag back to `false` (or delete the line) and
   restart. Archives already written in cleartext stay cleartext; delete them once a sealed one exists.
+
+### `[store].vault_revocation_attested = true` or `[secrets].vault_revocation_attested = true` — revocation of a Vault certificate is taken on trust
+> **Settings-scoped, one pair per Vault** (vault BACKLOG #2983, owner ruling 2026-10-13). The
+> `[store]` pair covers both store hops, the `vault` key provider and the `vault_transit` cipher,
+> which read one address. The `[secrets]` pair covers the connector secret provider. Each flag
+> needs its own `vault_revocation_attested_reason`.
+- **What the engine refuses without it:** each of the three Vault hops verifies the Vault server's
+  certificate, and its handshake checks no CRL and no OCSP. So the client build refuses a Vault
+  that is off the box. On the box means a loopback host reached with no proxy, decided on the
+  address the client will really dial, hvac's `VAULT_ADDR` fallback included. A loopback Vault
+  behind a proxy is not on the box. The refusal applies under `[security].enforcement = enforce`,
+  and wherever a client is built without a known posture, which counts as enforcing.
+- **Which callers know the posture:** at least `serve`, `check-privileges` and
+  `provision-admin` hand it to the guard. On an instance at `enforcement = warn` they cross an
+  unattested off-box Vault with a WARNING. **A command that holds no posture refuses that
+  Vault even on a `warn` instance.** That includes at least `rotate-key`, `backup` and
+  `audit-verify`, at least today. **`verify` passes no posture to either of its Vault hops, on
+  purpose:** its store opens and its OIDC client-credential read are judged by one rule. So on a
+  `warn` instance `verify` can fail a Vault hop that `serve` crosses with a WARNING. `warn`
+  alone therefore does not make an off-box Vault usable by every command: set the pair. This
+  bullet is the one place the docs name callers. `tests/test_vault_posture_census.py` is the list itself: what
+  each call passes.
+- **`check-privileges` follows the same rule.** It builds each Vault client with that hop's own
+  pair and its own posture. So it probes an off-box Vault only where `serve` would reach it, and
+  otherwise reports the token as not observed, with the refusal.
+- **What you lose:** that refusal. A revoked but unexpired Vault certificate is then accepted
+  unless something outside the engine stops it. These hops carry the key that unwraps the store
+  DEK, every at-rest cell under `vault_transit`, and connector credentials.
+  **Setting the flag adds no check on the wire.**
+- **What the attestation can truthfully rest on:** not on the engine. No CRL lever is built for
+  these hops, so the flag is the only way across. The main honest basis is a **short-lived Vault
+  server certificate**: a lifetime short enough that expiry does the work revocation would. Put
+  that lifetime in the reason.
+- **Know which CA the hop trusts before you attest.** With `MEFOR_STORE_VAULT_CA_FILE` or
+  `MEFOR_SECRETS_VAULT_CA_FILE` set, the hop trusts only that file. With it unset, hvac and
+  requests choose the anchor. It may come from at least `VAULT_CACERT` or `VAULT_CAPATH`,
+  `REQUESTS_CA_BUNDLE` or `CURL_CA_BUNDLE`, or the public certifi bundle. Then there is no single
+  PKI to review, and a reason that names "our PKI" may not describe the certificate the hop
+  accepts. Set the CA file first.
+- **What it cannot do:** it never lifts the hop's other refusals: an `http://` Vault off the
+  box, proxy credentials sent in cleartext, or a hop that verifies no peer. It is also not the
+  process-wide `MEFOR_TLS_REVOCATION_ATTESTED`. That variable does **not** cross a Vault hop
+  under an enforcing or unknown posture, because it cannot say which hop's certificate was
+  reviewed (BACKLOG #299). **On an instance at `enforcement = warn` it does change something:**
+  where the posture reaches the guard, it turns the warning into a silent crossing, and no line
+  is logged. The shared rule every revocation guard decides by ranks it so.
+- **Named gap, the proxy leg:** through an `https://` proxy the hop has a second TLS leg, to the
+  proxy. Nothing checks revocation of the proxy's certificate, and this attestation does not
+  claim it. The Vault leg's own TLS, inside the tunnel, is what protects the token.
+- **How it is reported:** at least five ways. `security_loosenings()` names it as
+  `store.vault_revocation_attested` or `secrets.vault_revocation_attested`, with the reason, so
+  `messagefoundry security show` and `GET /security/posture` list it. The serve-time loosening
+  WARNING prints that entry, reason included, at each start. The start's `config_loaded` audit
+  row lists the switch name. `messagefoundry check` lists each set pair, with its reason, on its
+  `vault-revocation-attested` line. And a hop that crosses an enforcing or unknown posture on
+  its attestation logs a WARNING that carries the reason. That line is written **once per
+  process for each hop**, not at each crossing: the secret provider builds a client on every
+  read. The key provider and the Transit cipher share one line.
+  **None of these is an `audit` table row that carries the reason**: all three clients can be
+  built before the store opens.
+  The entry is named whenever the flag is set, whether or not a Vault provider is selected.
+- **At load:** the flag without a reason, a blank reason, a reason without the flag, or a reason
+  holding a control character or a lone surrogate is refused when the settings load.
+  `messagefoundry security show` does not stop on a file that will not load: it marks its report
+  partial and lists no attestation from that file.
+- **Reversible:** yes. Delete both lines and restart. An off-box Vault hop then refuses again.
 
 ### `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1` **with `MEFOR_SECURITY_ENFORCEMENT=warn`** — config Python loads from a place others can write
 > **An environment variable, not a setting, and refused under `[security].enforcement = enforce`**
@@ -1160,8 +1321,8 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   At least the connector verify-off cells keep the clamped `MEFOR_ALLOW_INSECURE_TLS` escape; the
   `[alerts]` SMTP hop is governed instead by the `allow_unverified_alert_smtp_tls` acknowledgment above
   (its construction sits outside the posture scope the clamp reads), so "the clamped escape" is not a
-  universal statement about verify-off hops and should not be read as one. Nor does this declaration
-  reach an SMTP `AUTH` over cleartext, which is refused outright.
+  universal statement about verify-off hops and should not be read as one. Nor does it lift a
+  credential refusal: see [No escape sends a credential to an unverified peer](#no-escape-sends-a-credential-to-an-unverified-peer).
 
 ### `tls_hop_attested = true` on a connection — a hop attested secure by means the engine cannot see
 > **Connection-scoped**, like `cleartext_accepted` above, and settable in both directions. It is a
@@ -1174,7 +1335,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **What you lose:** the engine stops protecting that hop and takes your word that something else does.
   A cleartext or verify-off hop the enforcing gates would refuse is **allowed**: this is the one per-hop
   declaration that yields ALLOW rather than WARN. The crossing is logged, but the hop is recorded as
-  secure, not as an accepted risk. That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a verify-off HTTP-family egress hop (at least the MLLP, FTPS and email verify-off refusals do not read it) and a weakened database TLS
+  secure, not as an accepted risk. That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a verify-off HTTP-family egress hop that carries no credential (at least the MLLP, FTPS and email verify-off refusals do not read it) and a weakened database TLS
   hop. If the claim is false, the payload and any credential the connection carries cross in the clear,
   and nothing about the hop looks wrong afterwards.
 - **When acceptable:** the hop really is secure, and the engine cannot see why. A TLS-terminating proxy or
@@ -1197,7 +1358,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `messagefoundry security show` never loads the connection graph, and the `serve`-time warning fires
   before the graph loads. Both say so in their scope text.
 - **What it cannot do:** it does not reach a revocation refusal. That is `tls_revocation_attested`, a
-  different claim. It does not permit SMTP `AUTH` over cleartext, which is refused outright.
+  different claim. It does not lift a credential refusal: see
+  [No escape sends a credential to an unverified peer](#no-escape-sends-a-credential-to-an-unverified-peer).
+  CORRECTED 2026-10-12 (vault BACKLOG #3230): it used to let a credentialed `verify_tls = false`
+  HTTP-family hop cross.
 
 ### `tls_allow_expired = true` on a connection — an expired certificate accepted indefinitely
 > **Connection-scoped**, like `cleartext_accepted` above: a parameter on one outbound connection —
@@ -1252,15 +1416,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **When acceptable:** a partner whose certificate names a different host than the one you dial, such
   as an IP address, while they reissue it. Prefer a private trust anchor in `tls_ca_file`, which narrows
   "any certificate from the anchor" to the partner's own CA.
-- **Compensating controls:** a private `tls_ca_file` is the one that matters. With credentials it is
-  not available at all: `Email` and `Direct` refuse it outright when they carry an SMTP credential,
-  and FTPS refuses it outright, in both directions, when a `username` or `password` is set (vault
-  BACKLOG #2636). No escape variable or posture unlocks either refusal. CORRECTED 2026-10-06: FTPS
-  was warned and not refused here, so a credentialed FTPS hop with the name check off would have
-  sent its login to any peer holding a certificate from the anchor. The weaker FTPS posture is
-  refused the same way: a credentialed FTPS hop with `tls_verify = false` is refused outright, as
-  `Email` and `Direct` refuse it, and the clamped `MEFOR_ALLOW_INSECURE_TLS` escape governs only an
-  anonymous FTPS hop.
+- **Compensating controls:** a private `tls_ca_file` is the one that matters. On a hop that carries
+  a credential this loosening is not available at all: see
+  [No escape sends a credential to an unverified peer](#no-escape-sends-a-credential-to-an-unverified-peer).
+  CORRECTED 2026-10-06 (vault BACKLOG #2636): FTPS was warned and not refused here.
 - **It is never silent:** a WARNING at each construction naming the connection and the host; a
   `tls-check-hostname` line in `messagefoundry check` naming every declaring connection and its peer;
   and a `tls_check_hostname` entry in `security_loosenings()`, and so in `GET /security/posture` on a
@@ -1273,7 +1432,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   fires before the graph is loaded, as for `tls_allow_expired`.
 - **What it cannot do:** on a hop with no credential it is **advisory only**, on the
   `tls_allow_expired` precedent. No posture gate keys on it, and `[security].enforcement = enforce`
-  does not refuse it. The credentialed refusals above are absolute and do not depend on enforcement. Where it is NOT reported is the
+  does not refuse it. Where it is NOT reported is the
   same list as `cleartext_accepted` above: `messagefoundry security show` and a graphless
   `GET /security/posture` say so in `loosenings_scope`.
 
@@ -1295,8 +1454,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   name it. That name belongs in the reason. On a listener, prefer `tls_crl_file`, which checks
   revocation in the engine and needs no attestation.
 - **What it cannot do:** it never reaches a cleartext or verify-off hop, which keep their own
-  refusals. It is a claim about one named hop, which is why it crosses an enforcing instance where the
-  process-wide `MEFOR_TLS_REVOCATION_ATTESTED` does not (BACKLOG #299).
+  refusals. It is a claim about one named connection, which is why it crosses an enforcing instance
+  where the process-wide `MEFOR_TLS_REVOCATION_ATTESTED` does not (BACKLOG #299). That is one hop on
+  a connection with no token endpoint. It is two on any connection that signs in to a SMART or
+  OAuth2 token endpoint, a `FhirLookup` included, so the reason has to hold for both.
 - **How it is recorded:** a flag without a reason, a blank reason, or a reason without the flag fails
   at load, on both authoring surfaces. Each time the attestation lets a hop through that an enforcing
   instance would otherwise refuse, the engine logs a WARNING naming the hop and your reason, at every
@@ -1531,11 +1692,86 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   toolkit (`messagefoundry-toolkit`) start through their own entry points and install none.
   The interpreter raises an event before it runs an injected script. The hook raises on that
   event, and the interpreter then drops the script. A refusal logs a WARNING with the script's
-  file name, and no audit row. The name is written in printable ASCII. Every other character,
+  file name. Under `serve` it is also audited and it raises an alert, as the next point says.
+  The name is written in printable ASCII. Every other character,
   and the backslash itself, is written as a backslash escape. So a character a log sink cannot
   encode does not keep the line out of that sink. Where refusals arrive faster than they are
   logged, lines past a backlog of 64 are dropped. Every refusal is counted, and once one has
   been refused the entry carries the count.
+- **Under `serve`, a refusal also writes an audit row and raises an alert** (vault BACKLOG
+  #2742, owner ruling 2026-10-13). Both are named `remote_debug_refused`.
+  - **One row and one alert for each read, with a count.** The engine reads the count of
+    refusals as it starts, every 30 seconds after that, and once more as it stops. The read at
+    stop can be cut off, as the point on stopping says. When the count has risen, the engine
+    raises one alert and writes one audit row, however many scripts were refused in between.
+    Each carries `count` and `total`, defined under *Count from the latest row's `total`* below.
+    The injecting process chooses how often it tries. However often that is, each read adds at
+    most one row and one alert, so it cannot fill the audit log or the pager faster than that. A
+    caller who can restart the engine adds a read at each start and stop.
+  - **No file name.** The injecting process chooses the script's name, so neither the row nor
+    the alert carries it. The engine's log output can still hold the name. Usually it is in the
+    refusal's WARNING line, bounded and escaped. In the case below where the guard reads as
+    missing, the interpreter writes the full path to standard error instead. Some refusals have
+    no line with the name at all. At least these do: one past the backlog of 64, one still
+    waiting to be logged when the process exits, and every one where the thread that writes the
+    lines could not start.
+  - **Counted from the start of the process.** The first read reports every refusal since the
+    process started, so one made before the engine opened its store is recorded. A process that
+    is killed leaves no row and no alert for the refusals since its last read. Their WARNING
+    lines may remain, within the limits the point above gives.
+  - **The row.** Its actor is `system`. Its detail holds the two counts, the engine process's
+    label as `process` (`node:<node_id>`, `shard:<id>`, or null on a lone engine) and its
+    process id. The alert is raised first and does not wait for the row. If the store refuses
+    the row, or has not taken it within 30 seconds, the engine gives up on it and logs an ERROR.
+    A write still running at 30 seconds is cancelled first, and the read waits for the cancel to
+    finish. Each later read tries the row again, with the count so far, until the store takes
+    it. While a row is owed and the store hangs, each read waits like this. The 30 seconds
+    between reads start only when a read ends. So reads then come at least about 60 seconds
+    apart, and so do the alerts for new refusals.
+  - **The alert.** Its `connection` is `remote_debug:refused`, with `@node:<node_id>` or
+    `@shard:<id>` appended where several engine processes share the store. A rule can match
+    `event_type = "remote_debug_refused"`. With no `[alerts]` transport it is a WARNING line.
+    If the alert sink raises, the engine logs an ERROR. Each later read raises the alert again,
+    with the count so far, until the sink takes it. A notifier whose queue is full is different:
+    it drops the alert with a WARNING and does not raise, so no later read raises it again.
+    Nothing resolves it, because a refusal is an event and
+    not a state that can clear. An operator resolves it. A second alert inside the notifier's
+    cooldown updates the open alert and does not page again. So a page's `count` covers only its
+    own read. The alert list's own count is the number of reads that raised it, not the number
+    of scripts.
+  - **Stopping can lose the last row and the last alert.** The read at stop has no later read.
+    A row or an alert it cannot deliver is lost. Where the store or the sink refused it, its
+    ERROR line still says the next pass will retry. The engine stops the reads late in its own
+    stop, after the message graph has stopped. It then gives them about 5 seconds to finish,
+    which covers a read already in progress as well as the read at stop. If they have not
+    finished, the engine cancels them, waits up to about 5 seconds more, and logs a WARNING that
+    a row may be missing. A row cut off this way has no ERROR line. The engine then goes on
+    stopping, even if a read is still running. A read in progress that is cancelled this way
+    keeps the read at stop from running at all. Refusals that no read had reached then get
+    neither a row nor an alert. Their WARNING lines may remain, within the limits the **No file
+    name** point gives.
+  - **Count from the latest row's `total`, not from a sum of `count`.** In a row, `count` is the
+    number refused since the last row the engine saw written. In an alert, it is the number
+    since the last alert the sink took. `total` is the number since the process started. A sum
+    of `count` can count some refusals twice. At least one case does: a row whose write timed
+    out after the store had committed it is written again by a later read. So take the latest
+    row's `total` for each run of an engine process. It is a lower bound, because refusals after
+    the last row the store took have no row. A restart starts `total` again at 0, and the row
+    carries no mark of the run. A row's `process` and `pid` cannot always tell two runs apart.
+    On a lone engine `process` is null, and the operating system can reuse a process id.
+  - **Of the commands, only `serve` raises it.** The engine runs the reads and holds the
+    notifier, and no other `messagefoundry` command builds an engine. So a refusal under
+    `supervise`, `rotate-key`, `backup`, `restore` or the rest leaves the WARNING line and
+    nothing else. That holds even for `rotate-key` and `backup`, which open the store.
+  - **An application that builds its own engine can run with no guard.** It runs the reads too,
+    through `create_managed_app` or `Engine.create`. Only the guard refuses a script and counts
+    it. Where the remote-debugging interface is on and the guard is not in the process, an
+    injected script is not refused at all: it runs. The count then stays at 0, so there is no
+    row and no alert. An application that builds the API reports `remote_debug_unguarded`, as
+    that entry below says. One that builds only an `Engine` reports it nowhere. The guard goes
+    in wherever `messagefoundry.__main__` is imported, or
+    `messagefoundry.remotedebug.install_remote_debug_guard()` is called. An audit hook added
+    earlier can still refuse it.
 - **This is a residual, not a closed path.** At least two things stay open. A script injected
   during start-up, before the hook is installed, runs. A caller that can restart the engine can
   aim for that window. The hook goes in when the command-line module is imported, ahead of its
@@ -1557,7 +1793,15 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   connection secrets and the messages in flight. An application that builds the API without
   `serve` reports this, until something in it imports the command-line module, which installs
   the hook. `messagefoundry/api/tls.py` does that when it writes a key. `serve` would report it
-  only if another audit hook refused the engine's.
+  in at least two cases. Both need an audit hook that something else added to the process first.
+  In one, that hook refused the engine's, so the engine's hook is missing and an injected script
+  runs. In the other, that hook raises on the event the engine uses to ask whether its own hook
+  is there. The engine's hook is then in place and refuses a script, but the entry still reads
+  as unguarded. A refusal in that state writes no WARNING, and the entry shows no count of
+  refusals. The interpreter reports each one on standard error, with the script's full path.
+  The refusal is still counted, so under `serve` the `remote_debug_refused` audit row and alert
+  still come. In the first case nothing is refused, so there is no row and no alert. The entry cannot tell the two cases apart, so read
+  it as the first, and look for what else in the process adds an audit hook.
 - **Where it is reported:** the serve-time loosening warning and `GET /security/posture`, each for
   the engine's own process. `supervise` logs one WARNING at start for the supervisor process.
   It logs the line a second time once its off-box log forwarder is installed, so the collector's

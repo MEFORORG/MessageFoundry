@@ -504,9 +504,15 @@ def test_postgres_borrows_outside_the_bounded_helper_are_pinned() -> None:
     # The helper keeps the count; its docstring gives the reasoning.
     # Still 35 on 2026-10-11: BACKLOG #2592 turned that helper into `_after_commit_txn`, one
     # unbounded `self._pool.acquire()` in place of its one `self._pool.execute`.
-    assert (len(store_sites), len(cluster_sites)) == (35, 0), (
-        "the measured population of pool borrows OUTSIDE the bounded helper moved from 35 (store)"
-        " + 0 (cluster), measured 2026-10-05. Re-read the CONNECTIONS.md scope note before changing"
+    # Store 35 -> 33 on 2026-10-12, a drop: BACKLOG #2592 moved the two passkey deletes, which
+    # borrowed with `self._pool.execute`, into a transaction on the bounded `_timed_acquire`, so
+    # each re-seals its account in the same transaction.
+    # Store 33 -> 32 on 2026-10-14, a drop: BACKLOG #2592 moved `decide_pending_approval`'s audit-free
+    # UPDATE, which borrowed with `self._pool.execute`, into a transaction on the bounded
+    # `_timed_acquire`, so the move reads the row and checks its seal before it writes.
+    assert (len(store_sites), len(cluster_sites)) == (32, 0), (
+        "the measured population of pool borrows OUTSIDE the bounded helper moved from 32 (store)"
+        " + 0 (cluster), measured 2026-10-14. Re-read the CONNECTIONS.md scope note before changing"
         " this number. Sites scanned:\n" + "\n".join(store_sites + cluster_sites)
     )
 

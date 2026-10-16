@@ -30,12 +30,15 @@ from .._auth import assert_same_origin, register_ui_action, require_ui, require_
 #: the outcome themselves. Query-tolerant so the landing can carry that ``?m=`` notice code, which
 #: the page reads from an allow-list only.
 _RESOLVE_REAUTH_LANDING = "/ui/approvals?m=choose_again"
+#: The same landing for an approve that met a stale window (owner ruling 2026-10-13, #3241 R4), and
+#: for the same reason: a link must never be able to release a held operation for the approver.
+_APPROVE_REAUTH_LANDING = "/ui/approvals?m=approve_again"
 register_ui_action(
     r"^/ui/approvals(\?[^#]*)?$",
     Permission.APPROVALS_APPROVE,
     auto_retry=False,
     unlock=True,
-    label="Record the outcome of an interrupted release",
+    label="Return to the approvals page to approve or resolve a request",
 )
 
 
@@ -54,21 +57,22 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     """``GET /ui/approvals`` and the approve, reject and resolve POSTs.
 
     Each calls its JSON handler directly, which SKIPS that handler's own gate:
-    ``require(APPROVALS_APPROVE)`` on the list, ``require_paced(APPROVALS_APPROVE)`` on approve and
-    reject, ``require_step_up(APPROVALS_APPROVE)`` on resolve. So each route asserts
-    ``approvals:approve`` through ``require_ui``, which also paces a /ui write per actor (BACKLOG
-    #287) and checks provenance before it charges, and the resolve through ``require_ui_step_up``,
-    which asks for the same fresh re-proof the JSON resolve does. The POSTs call
-    ``assert_same_origin`` inline as well, as every /ui write does.
+    ``require(APPROVALS_APPROVE)`` on the list, ``require_paced(APPROVALS_APPROVE)`` on reject,
+    ``require_step_up(APPROVALS_APPROVE)`` on approve (owner ruling 2026-10-13, #3241 R4) and on
+    resolve. So the list and reject assert ``approvals:approve`` through ``require_ui``, which also
+    paces a /ui write per actor (BACKLOG #287) and checks provenance before it charges, and approve
+    and resolve through ``require_ui_step_up``, which asks for the same fresh re-proof the JSON
+    routes do. The POSTs call ``assert_same_origin`` inline as well, as every /ui write does.
 
     The identity is passed through unchanged, because the self-approval and self-resolution
     refusals live in the gate and key on ``identity.user_id`` (BACKLOG #1540). The id takes the JSON
     route's own ``ResourceId`` type, since calling the handler directly skips its path validation
     too.
 
-    Approve and reject are not registered with ``register_ui_action``: that registry serves the
-    step-up re-auth continuation, and plain ``require_ui`` never routes through ``/ui/reauth``. The
-    resolve's gate does, so the page is registered above as its landing, never the resolve."""
+    Approve, reject and resolve are not registered with ``register_ui_action``: that registry
+    serves the step-up re-auth continuation, and a continuation that re-POSTed an approve or a
+    resolve would let whoever wrote the link decide it. Approve and resolve land the operator back on
+    the page, registered above, to click again."""
     core = deps.core
 
     @app.get("/ui/approvals", response_class=HTMLResponse)
@@ -87,7 +91,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def ui_approve(
         approval_id: ResourceId,
         request: Request,
-        identity: Identity = Depends(require_ui(Permission.APPROVALS_APPROVE)),
+        identity: Identity = Depends(
+            require_ui_step_up(
+                Permission.APPROVALS_APPROVE, reauth_next=lambda _r: _APPROVE_REAUTH_LANDING
+            )
+        ),
         gate: Any = Depends(deps.get_gate),
     ) -> Response:
         assert_same_origin(request)

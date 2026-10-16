@@ -72,6 +72,7 @@ _NOTICES: dict[str, str] = {
         "Recorded: the interrupted release's effects were not applied. Nothing was re-run."
     ),
     "choose_again": "Nothing was recorded. You proved it is you; choose the outcome again.",
+    "approve_again": "Nothing was released. You proved it is you; approve the request again.",
 }
 
 # The resolve buttons, one per ResolveOutcome; a test pins that every outcome has one.
@@ -107,6 +108,8 @@ _NONE_MEANS: dict[str, str] = {
     "channel_id": "any inbound connection",
     "destination_name": "any destination",
     "config_dir": "the engine's startup config directory",
+    # A held reload's digest (vault BACKLOG #2596): with none, the engine refuses the release.
+    "fingerprint": "no config digest was taken, so the engine will refuse this release",
 }
 
 # Guidance for a refusal, keyed by the status the engine raised. The engine's own message follows it

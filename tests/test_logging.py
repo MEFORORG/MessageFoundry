@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import contextlib
 import importlib.util
 import io
 import json
@@ -22,9 +24,8 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
-from uvicorn.protocols.utils import get_path_with_query_string
 
-from messagefoundry import __main__, secretscrub
+from messagefoundry import __main__, logging_setup, secretscrub
 from messagefoundry.controlchars import has_lone_surrogate
 from messagefoundry.logging_setup import (
     _CREDENTIAL_QUERY_KEYS,
@@ -53,11 +54,21 @@ SYNTHETIC_PHI = "PID|1||100^^^H^MR||DOE^JANE^Q||19800101|F"
 
 @pytest.fixture(autouse=True)
 def _restore_root_logger() -> Iterator[None]:
-    """configure_logging mutates the global root logger; snapshot and restore it."""
+    """configure_logging mutates the global root logger and uvicorn's named loggers; snapshot and
+    restore both, so no test in this file leaves an order dependence behind.
+
+    ``tests/conftest.py`` puts back only the ``uvicorn`` parent's level and propagation, not its
+    handlers and not ``uvicorn.error`` or ``uvicorn.access``. Widening that suite-wide restore would
+    cover the other files that call configure_logging; it is outside this file."""
     root = logging.getLogger()
     saved_handlers = root.handlers[:]
     saved_set = set(saved_handlers)
     saved_level = root.level
+    saved_uvicorn = {
+        name: (lg.level, lg.propagate, lg.handlers[:])
+        for name in logging_setup._UVICORN_LOGGERS
+        for lg in (logging.getLogger(name),)
+    }
     try:
         yield
     finally:
@@ -68,6 +79,14 @@ def _restore_root_logger() -> Iterator[None]:
         for handler in saved_handlers:
             root.addHandler(handler)
         root.setLevel(saved_level)
+        for name, (level, propagate, handlers) in saved_uvicorn.items():
+            lg = logging.getLogger(name)
+            lg.setLevel(level)  # setLevel, not assignment: it clears the isEnabledFor cache
+            lg.propagate = propagate
+            for handler in lg.handlers[:]:
+                if handler not in handlers:
+                    handler.close()  # as the root half does, for a handler the test added
+            lg.handlers[:] = handlers
 
 
 # --- configure_logging -------------------------------------------------------
@@ -1831,7 +1850,37 @@ _LOG_ESCAPED_CLASSES = {
     "c0_and_del": (0x01, 0x08, 0x1B, 0x7F),
     "soft_hyphen": (0xAD,),
     "astral": (0xE0001, 0xF0000),
+    # Categories Co and Cn in the Basic Multilingual Plane. U+FFFF is a noncharacter, unassigned in
+    # every Unicode version, so no table update can move it out of Cn (BACKLOG #2976).
+    "private_use_and_unassigned": (0xE000, 0xFFFF),
 }
+
+#: Every class above, named a second time. The tests below are parametrised over the keys of
+#: ``_LOG_ESCAPED_CLASSES``, so a class removed there would silently lose its cases. Adding a class
+#: means adding it here too.
+_LOG_ESCAPED_CLASS_NAMES = frozenset(
+    {
+        "c1",
+        "bidi",
+        "separator",
+        "surrogate",
+        "c0_and_del",
+        "soft_hyphen",
+        "astral",
+        "private_use_and_unassigned",
+    }
+)
+
+
+def test_the_log_alphabet_classes_are_all_present() -> None:
+    """Not parametrised, on purpose (engine PR 2012, review comment 5987939300). The tests below
+    take one case per key of ``_LOG_ESCAPED_CLASSES``. If the dict lost a key, or every key, pytest
+    would run fewer cases or report the tests as skipped, and the run would stay green. Each
+    class's own ``len(codes) >= 1`` check cannot see that, because it never runs."""
+    missing = _LOG_ESCAPED_CLASS_NAMES - _LOG_ESCAPED_CLASSES.keys()
+    assert not missing, f"_LOG_ESCAPED_CLASSES lost the classes {sorted(missing)}"
+    unlisted = _LOG_ESCAPED_CLASSES.keys() - _LOG_ESCAPED_CLASS_NAMES
+    assert not unlisted, f"add {sorted(unlisted)} to _LOG_ESCAPED_CLASS_NAMES"
 
 
 def _expected_log_escape(code: int) -> str:
@@ -1923,6 +1972,52 @@ def test_ordinary_non_ascii_text_reaches_every_sink_unchanged(
     """The control for the test above: the wider alphabet is control characters, not non-ASCII."""
     for out in _write_one_record_through_every_sink(fmt, _PLAIN_NON_ASCII, tmp_path, capsys):
         _assert_logged(fmt, out, _PLAIN_NON_ASCII)
+
+
+def test_a_filter_less_json_formatter_limit_is_real_and_stated() -> None:
+    """BACKLOG #2976 item 3, kept as a documented limit by a Manager ruling: ``JsonFormatter`` does
+    not escape or redact on its own, and its docstring says so. Two halves, tied together.
+
+    The behaviour: on a handler with no filters, ``json.dumps`` escapes the C0 controls, and every
+    other character of the log alphabet comes out raw. A credential and the message's PHI pass too.
+    The wording: the docstring states that limit, names each kind of character that passes, and
+    names the missing redaction. If someone adds escaping inside the formatter, the first half goes
+    red and the docstring must change with it. If someone softens the docstring, the second half
+    goes red. ``test_every_configured_sink_escapes_the_wider_log_alphabet`` is the other side: every
+    configured sink escapes the same characters."""
+    class_codes = sorted({code for codes in _LOG_ESCAPED_CLASSES.values() for code in codes})
+    # Split before CR and LF join, so the C0 half is never kept non-empty by those two alone.
+    c0 = [code for code in class_codes if code < 0x20]
+    others = [code for code in class_codes if code >= 0x20]
+    # Either half with no code points would pass its absence check below without testing anything.
+    assert len(c0) >= 1, "the classes name no C0 control"
+    assert len(others) >= 1, "the classes name no character outside C0"
+    # DEL alone would keep the second half non-empty; the docstring's limit is about non-ASCII too.
+    assert len([code for code in others if code >= 0x80]) >= 1, "the classes name no non-ASCII"
+    # CR and LF are not in the classes; they are added so the framing assertion has input to fail on.
+    codes = sorted({0x0A, 0x0D, *class_codes})
+    message = "a" + "".join(chr(code) for code in codes) + f"z password=pw-Jf_A-91 {SYNTHETIC_PHI}"
+    record = logging.LogRecord("t", logging.INFO, __file__, 1, "%s", (message,), None)
+    line = JsonFormatter().format(record)
+    assert "\n" not in line and "\r" not in line, "a C0 control broke the one-line framing"
+    c0_left_raw = [hex(code) for code in c0 if chr(code) in line]
+    others_escaped = [hex(code) for code in others if chr(code) not in line]
+    assert not c0_left_raw, f"json.dumps no longer escapes the C0 controls {c0_left_raw}"
+    assert not others_escaped, (
+        f"JsonFormatter now escapes {others_escaped} on its own. Update its docstring's limit "
+        "paragraph, and keep the JSON-valid spelling the audit tee relies on (vault BACKLOG #3012)."
+    )
+    assert "pw-Jf_A-91" in line and SYNTHETIC_PHI in line, "the formatter now redacts by itself"
+
+    doc = " ".join((JsonFormatter.__doc__ or "").split())
+    for phrase in (
+        "A handler with this formatter and no filters is not safe",
+        "DEL, the C1 controls, the format characters",
+        "U+2028 and U+2029, a lone surrogate, and the private-use and unassigned code points",
+        "leaves the message, its arguments and ``stack_info`` unredacted",
+        "scrubs no credential",
+    ):
+        assert phrase in doc, f"JsonFormatter's docstring no longer says: {phrase!r}"
 
 
 def test_the_c0_escape_is_spelled_as_json() -> None:
@@ -2081,10 +2176,51 @@ def test_the_installed_chain_scrubs_a_custom_delimiter_body() -> None:
 # The next three constants MIRROR ``_GROWTH_LENGTHS``, ``_MAX_GROWTH`` and ``_SHIPPED_BEFORE_DSN`` in
 # that file. They are copied rather than imported so this arm does not move when that file is
 # rewired. The reasoning behind each value is recorded there and not repeated here; if that file
-# retunes one, retune its mirror in the same change.
+# retunes one, retune its mirror in the same change. ``test_the_access_arm_constants_mirror_the_scan_arm``
+# reds when the two drift apart.
 _ACCESS_GROWTH_LENGTHS = (2048, 16384)
 _ACCESS_MAX_GROWTH = 24.0
 _PRE_1547_DSN_PASSWORD = r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s:/@]+):[^\s/@]+@"
+
+#: Each mirror above, keyed by the name of the constant it copies in the scan arm's file.
+_MIRRORED_CONSTANTS: dict[str, object] = {
+    "_GROWTH_LENGTHS": _ACCESS_GROWTH_LENGTHS,
+    "_MAX_GROWTH": _ACCESS_MAX_GROWTH,
+    "_SHIPPED_BEFORE_DSN": _PRE_1547_DSN_PASSWORD,
+}
+
+
+def test_the_access_arm_constants_mirror_the_scan_arm() -> None:
+    """The three mirrors above equal the constants they copy. Read from the other file's source, not
+    imported, so this file still does not depend on that module importing cleanly."""
+    source = (Path(__file__).parent / "test_log_redaction_secret_domain.py").read_text(
+        encoding="utf-8"
+    )
+    found: dict[str, object] = {}
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            target, value = node.target, node.value
+        else:
+            continue
+        if not (isinstance(target, ast.Name) and target.id in _MIRRORED_CONSTANTS):
+            continue
+        # The last assignment wins, as at import. A computed value is not a literal, so it clears
+        # any earlier literal and the key check below names it.
+        found.pop(target.id, None)
+        with contextlib.suppress(ValueError, TypeError, SyntaxError, RecursionError):
+            found[target.id] = ast.literal_eval(value)
+    assert found.keys() == _MIRRORED_CONSTANTS.keys(), (
+        f"found only {sorted(found)} of {sorted(_MIRRORED_CONSTANTS)} as module-level literals in "
+        "test_log_redaction_secret_domain.py; a renamed or computed constant leaves its mirror unpinned"
+    )
+    for name, mirror in _MIRRORED_CONSTANTS.items():
+        assert found[name] == mirror, (
+            f"test_log_redaction_secret_domain.py's {name} is {found[name]!r} and its mirror here is "
+            f"{mirror!r}. Retune the mirror in the same change."
+        )
+
 
 #: uvicorn's access-log format, as ``h11_impl`` and ``httptools_impl`` pass it to
 #: ``access_logger.info``. With ``log_config=None`` no ``AccessFormatter`` is installed, so the root
@@ -2157,6 +2293,11 @@ class _CountingPattern:
     """A compiled pattern that counts each time it is applied to text holding ``needle``, and is
     otherwise the real one.
 
+    It overlaps ``_RecordingPattern`` in ``tests/test_log_redaction_secret_domain.py`` on purpose. That
+    one counts every application, which suits its direct calls; this one must filter by needle, for
+    the reason below. It is kept here for the reason the constants above are copied: this arm should
+    not move when that file is rewired.
+
     The swap is process-wide, so a record another thread logs during the window would be counted too
     if every application were. Counting only text that holds this test's own run keeps such a record
     out of the reading."""
@@ -2197,27 +2338,28 @@ def _dsn_passes_during(monkeypatch: pytest.MonkeyPatch, target: str) -> int:
     return len(seen)
 
 
-@pytest.fixture
-def _uvicorn_loggers_restored() -> Iterator[None]:
-    """``configure_logging`` sets level, propagation and handlers on uvicorn's named loggers, which
-    neither root-logger restore puts back. Put them back, so these arms leave no order dependence."""
-    names = ("uvicorn", "uvicorn.error", "uvicorn.access")
-    saved = {
-        name: (lg.level, lg.propagate, lg.handlers[:])
-        for name in names
-        for lg in (logging.getLogger(name),)
-    }
-    try:
-        yield
-    finally:
-        for name, (level, propagate, handlers) in saved.items():
-            lg = logging.getLogger(name)
-            lg.setLevel(level)  # setLevel, not assignment: it clears the isEnabledFor cache
-            lg.propagate = propagate
-            lg.handlers[:] = handlers
+def _credential_pass_inputs(monkeypatch: pytest.MonkeyPatch, target: str) -> list[str]:
+    """The text ``CredentialScrubFilter`` hands ``scrub_credentials`` for one access record on ``target``.
+
+    That is the formatted line AFTER ``RedactionFilter`` and ``CredentialQueryScrubFilter`` have run,
+    which is what the admission gate inside ``scrub_credentials`` reads. The filter resolves
+    ``scrub_credentials`` from the ``logging_setup`` module global on every call, so swapping the
+    global reaches the installed filter. The needle is the same as ``_dsn_passes_during``'s."""
+    needle = target[:64]
+    seen: list[str] = []
+    real = secretscrub.scrub_credentials  # the object logging_setup imports by name
+
+    def recorded(text: str, **kwargs: Any) -> str:
+        if needle in text:
+            seen.append(text)
+        return real(text, **kwargs)
+
+    with monkeypatch.context() as m:
+        m.setattr(logging_setup, "scrub_credentials", recorded)
+        _emit_access(target)
+    return seen
 
 
-@pytest.mark.usefixtures("_uvicorn_loggers_restored")
 def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2226,8 +2368,11 @@ def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
     ``configure_logging`` builds the root handler and routes ``uvicorn.access`` into it, as ``serve``
     does with ``log_config=None``. This arm installs the default stdout sink only, with no log file
     and no forwarder. The record is emitted on ``uvicorn.access`` with uvicorn's own format and
-    argument tuple, so every filter on every installed handler runs on it. Each further filtered sink
-    repeats the pass, which the count below asserts as one pass per filtered handler.
+    argument tuple, so every filter on every installed handler runs on it. That default install has
+    ONE filtered handler, so the count below, one DSN pass per filtered handler, only ever runs with
+    one, and the arm asserts that rather than assuming it. It does not exercise a second sink: adding
+    a file or forwarder here would time a different chain from the one this arm names, and a second
+    handler's filters read a record the first one already rewrote.
 
     One measurement covers both halves of the item. The emit runs on a running event loop and is
     synchronous there, so its growth across lengths is the growth of the loop stall a client could
@@ -2261,7 +2406,11 @@ def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
         for handler in logging.getLogger().handlers
         if any(isinstance(f, CredentialScrubFilter) for f in handler.filters)
     ]
-    assert filtered, "configure_logging installed no handler carrying the credential scrub"
+    assert len(filtered) == 1, (
+        f"configure_logging installed {len(filtered)} handler(s) carrying the credential scrub. This "
+        "arm times the one-handler default and reads the gate input of that one handler; revisit "
+        "both, and the docstring, before changing the expected count."
+    )
 
     # The structural arms first: they say what the timings below are about. The recorder can only
     # count a method it wraps, so a public re.Pattern callable missing from the set would read as a
@@ -2284,10 +2433,30 @@ def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
         "filtered handler(s). Zero means the record never reached the pass, so the timings below would "
         "be about other filters; more than one per handler means the pass now runs repeatedly."
     )
-    # ``token=nothing`` is only a test of the DSN gate if the entry gate lets it through.
-    assert secretscrub._admits(
-        _request_target(longest, "token=nothing").casefold(), secretscrub._ANY_HINT
+    # ``token=nothing`` is only a test of the DSN gate if the entry gate lets it through. Ask the
+    # gate about the text it actually reads: the query filter has rewritten the value by then, so
+    # the line ends ``?token=<redacted> HTTP/1.1" 401``, not the raw target.
+    gate_inputs = _credential_pass_inputs(monkeypatch, _request_target(longest, "token=nothing"))
+    assert len(gate_inputs) == len(filtered), (
+        f"the credential pass received the token=nothing line {len(gate_inputs)} times across "
+        f"{len(filtered)} filtered handler(s), so the gate check below would read the wrong text"
     )
+    for text in gate_inputs:
+        assert secretscrub._admits(secretscrub._gate_fold(text), secretscrub._ANY_HINT), (
+            f"the entry gate turns away the token=nothing line as the credential pass sees it, "
+            f"ending {text[-40:]!r}, so the token=nothing arm below no longer tests the DSN gate"
+        )
+    # And ``x=nothing`` is only a test of the ENTRY gate if that gate turns it away.
+    entry_inputs = _credential_pass_inputs(monkeypatch, _request_target(longest, "x=nothing"))
+    assert len(entry_inputs) == len(filtered), (
+        f"the credential pass received the x=nothing line {len(entry_inputs)} times across "
+        f"{len(filtered)} filtered handler(s), so the gate check below would read nothing"
+    )
+    for text in entry_inputs:
+        assert not secretscrub._admits(secretscrub._gate_fold(text), secretscrub._ANY_HINT), (
+            f"the entry gate admits the x=nothing line, ending {text[-40:]!r}, so the x=nothing arm "
+            "below now tests the DSN gate a second time instead of the entry gate"
+        )
     for query in ("x=nothing", "token=nothing"):
         unmarked_passes = _dsn_passes_during(monkeypatch, _request_target(longest, query))
         assert unmarked_passes == 0, (
@@ -2298,6 +2467,10 @@ def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
 
     with monkeypatch.context() as m:
         m.setattr(secretscrub, "_DSN_PASSWORD", re.compile(_PRE_1547_DSN_PASSWORD))
+        # Three rounds, against five for the arm under test: the control only has to clear the bound.
+        # Measured 2026-10-13 on a dev box, it read 70x in 2.0 s at three rounds and 112x in 0.6 s at
+        # one. Each endpoint keeps the minimum of three samples, so one slow short emit under load is
+        # discarded rather than pulling the reading under the bound and redding a sound harness.
         before_growth = _access_growth(rounds=3)
     assert before_growth > _ACCESS_MAX_GROWTH, (
         f"with the pre-#1547 pattern swapped in, the access chain grew only {before_growth:.1f}x "
@@ -2314,7 +2487,6 @@ def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
     )
 
 
-@pytest.mark.usefixtures("_uvicorn_loggers_restored")
 @pytest.mark.parametrize(
     "lead",
     ("", "9-", "x" * 200),
@@ -2356,6 +2528,9 @@ def test_the_access_format_this_file_copies_is_uvicorns(module: str) -> None:
     source, so an upgrade that changes the format reds here rather than leaving the arm measuring a
     record uvicorn no longer writes. Read as text, because importing ``httptools_impl`` needs the
     optional ``httptools`` package."""
+    # Imported here, not at module level: it is a uvicorn internal, and only this test needs it.
+    from uvicorn.protocols.utils import get_path_with_query_string
+
     spec = importlib.util.find_spec(f"uvicorn.protocols.http.{module}")
     assert spec is not None and spec.origin is not None, f"uvicorn has no {module}"
     source = Path(spec.origin).read_text(encoding="utf-8")
@@ -2369,6 +2544,171 @@ def test_the_access_format_this_file_copies_is_uvicorns(module: str) -> None:
     assert "access_logger.info(" in source and f"'{_UVICORN_ACCESS_FORMAT}'" in source, (
         f"uvicorn's {module} no longer calls access_logger.info with {_UVICORN_ACCESS_FORMAT!r}. "
         "Update the copy and the argument tuple _emit_access passes."
+    )
+
+
+# --- BACKLOG #3002: the query filter must not swallow a later credential label -------------------
+#
+# CredentialQueryScrubFilter runs before CredentialScrubFilter. Its value ran on through a separator
+# and a later label, and stopped at the quote that opened that label's value. So the label was gone
+# before the credential pass could read it, and the quoted value printed on every configured sink.
+
+#: The separators the row and the secretscrub family name, less "&", which always ended the value,
+#: and less ".", "-" and "_", which are label characters and the residual pinned below.
+_QUERY_STOP_SEPARATORS = (";", ",", ":", "=", "|", "/", "+")
+
+#: Synthetic values, one per piece that must not print. Shorter than any base64 sweep reads.
+_QUERY_TOKEN_VALUE = "qtk-Qs_A-81"
+_QUERY_SECOND_VALUES = ("pw-Qs_B-82", "pw-Qs_C-83")
+
+
+def _query_swallow_lines() -> list[tuple[str, str]]:
+    """``(the label that must stay visible, line)``: a token query value, a separator, then a
+    credential label of each family whose value is quoted and holds a space, written each way a
+    label's value can start past the end of the query value."""
+    head, tail = _QUERY_SECOND_VALUES
+    shapes = (
+        ("password", '="{} {}"'),
+        ("secret", "='{} {}'"),
+        ("ad_bind_password", '= "{} {}"'),
+        ("api_key", ' = "{} {}"'),
+        ("private_key", "'='{} {}'"),
+        ("MEFOR_DB_PW", '="{} {}"'),
+    )
+    return [
+        (label, f"retry token={_QUERY_TOKEN_VALUE}{sep}{label}{rest.format(head, tail)} for svc")
+        for sep in _QUERY_STOP_SEPARATORS
+        for label, rest in shapes
+    ]
+
+
+@pytest.mark.parametrize("fmt", ["text", "json"])
+def test_a_query_value_stops_before_a_later_credential_label(
+    fmt: str, tmp_path: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #3002 closing step 2, through ``configure_logging`` as ``serve`` installs it: the
+    stdout sink and the log file, the message and the exception, in both formats. No value piece
+    prints, and the later label stays visible so a reader sees which credential was there."""
+    cases = _query_swallow_lines()
+    failures: list[str] = []
+    for index, (label, line) in enumerate(cases):
+        # A fresh directory per case, so the log file holds this case's record and no other.
+        case_dir = tmp_path / str(index)
+        case_dir.mkdir()
+        for sink, out in zip(
+            ("stdout", "file"),
+            _write_one_record_through_every_sink(fmt, line, case_dir, capsys),
+            strict=True,
+        ):
+            printed = [v for v in (_QUERY_TOKEN_VALUE, *_QUERY_SECOND_VALUES) if v in out]
+            if printed:
+                failures.append(f"{fmt} {sink}: {printed} printed from {line!r}")
+            # The message and the exception each carry the label. A MEFOR_ label is the exception:
+            # CredentialScrubFilter's token pass takes it after its own value is redacted, so it
+            # leaves a stray quote and no label. Both values are still hidden.
+            elif out.count(label) < 2 and not label.startswith("MEFOR_"):
+                failures.append(f"{fmt} {sink}: the label {label} was lost: {out!r}")
+    assert not failures, f"{len(failures)} failures, first: {failures[:2]}"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        f"token={_QUERY_TOKEN_VALUE};b;c end",
+        f"token={_QUERY_TOKEN_VALUE},b,c end",
+        f"token={_QUERY_TOKEN_VALUE};pass;c end",
+        f"token={_QUERY_TOKEN_VALUE};password=b end",
+        f"token={_QUERY_TOKEN_VALUE};password=b;c end",
+        # A label with an empty or unquoted value: a base64 code's tail can read like one.
+        f"token={_QUERY_TOKEN_VALUE};password= end",
+        f"token={_QUERY_TOKEN_VALUE}/ab.secret= end",
+        f"token={_QUERY_TOKEN_VALUE}+Pwd= end",
+        f"token={_QUERY_TOKEN_VALUE}/Pwd=",
+    ],
+)
+def test_a_query_value_with_no_label_value_outside_it_is_hidden_whole(line: str) -> None:
+    """Closing step 4, and the narrowing control. A bare ";" or "," inside one value does not stop
+    it. Nor does a label whose value is not quoted: inside the query value, empty, or after a
+    space. The query filter hides the value whole, as before, so nothing a reader saw hidden now
+    prints. A review found the empty case printing a base64 code's tail before the quote was
+    required."""
+    out = logging_setup._scrub_credential_query(line)
+    expected = f"token={CREDENTIAL_PLACEHOLDER}" + (" end" if line.endswith(" end") else "")
+    assert out == expected, out
+
+
+@pytest.mark.parametrize("sep", [".", "-", "_"])
+def test_a_label_glued_on_by_a_label_character_still_goes_with_the_value(
+    sep: str, tmp_path: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """THE RESIDUAL, TWO-SIDED. ".", "-" and "_" are label characters, so the query value does not
+    stop there and the quoted value still prints through the chain. That shape is owned by #2966's
+    owner ruling and #3122, not by #3002. If this goes red because the value no longer prints, the
+    residual is closed: say so on #2966 and #3122, and delete this test."""
+    head, tail = _QUERY_SECOND_VALUES
+    line = f'retry token={_QUERY_TOKEN_VALUE}{sep}password="{head} {tail}" for svc'
+    out, _file = _write_one_record_through_every_sink("text", line, tmp_path, capsys)
+    assert _QUERY_TOKEN_VALUE not in out
+    assert f'"{head} {tail}"' in out, f"the glued residual is closed on {sep!r}: {out!r}"
+
+
+def test_the_query_stop_words_are_secretscrubs_label_words() -> None:
+    """The DRIFT GATE. ``_QUERY_STOP_WORDS`` copies ``secretscrub``'s private tuples. A word added
+    there and not here would let the query value swallow that label again."""
+    assert set(logging_setup._QUERY_STOP_WORDS) == {
+        *secretscrub._CREDENTIAL_WORDS,
+        *secretscrub._TOKEN_WORDS,
+        *secretscrub._KEY_MATERIAL_WORDS,
+    }
+    assert secretscrub._ENV_PREFIX in logging_setup._LABEL_WITH_ITS_VALUE_OUTSIDE
+    # The bounded label prefix too: widened there and not here, longer labels would be swallowed.
+    assert secretscrub._LABEL_PREFIX in logging_setup._LABEL_WITH_ITS_VALUE_OUTSIDE
+
+
+#: A separator then a near-miss label: six prefix segments and a word one letter short, so the
+#: stop's lookahead walks its whole bounded reach at every separator and then fails.
+_QUERY_COST_UNIT = ";a.b.c.d.e.f.passwor"
+
+
+def _query_scrub_seconds(length: int, rounds: int) -> float:
+    """The minimum time of one ``_scrub_credential_query`` call on a ``length``-character value."""
+    line = "token=" + (_QUERY_COST_UNIT * (length // len(_QUERY_COST_UNIT) + 1))[:length]
+    return _best_of(lambda: logging_setup._scrub_credential_query(line), rounds)
+
+
+#: 8x apart, as ``_ACCESS_GROWTH_LENGTHS`` are, but half as long, so the quadratic control stays
+#: affordable on a slow runner.
+_QUERY_GROWTH_LENGTHS = (1024, 8192)
+
+
+def _query_scrub_growth(rounds: int) -> float:
+    short, long_ = _QUERY_GROWTH_LENGTHS
+    return _query_scrub_seconds(long_, rounds) / _query_scrub_seconds(short, rounds)
+
+
+def test_the_query_stop_keeps_the_scan_linear(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BACKLOG #3002: the stop runs a lookahead at every separator in a value, on attacker-
+    influenceable text, on every record. Bounded the way the access-chain arm above is: the growth
+    across 8x the length, against the same ``_ACCESS_MAX_GROWTH``.
+
+    THE POSITIVE CONTROL is the tempting wrong stop: "stop before a separator if a label follows
+    anywhere later in the value". Its lookahead scans to the end of the value from every separator,
+    which is quadratic, and the same harness must catch it."""
+    shipped = logging_setup._CREDENTIAL_QUERY_RE
+    unbounded = shipped.pattern.replace("(?!", "(?![^&\\s\"']*?", 1)
+    assert unbounded != shipped.pattern, "the control pattern did not change"
+    quadratic = re.compile(unbounded, shipped.flags)
+    with monkeypatch.context() as m:
+        m.setattr(logging_setup, "_CREDENTIAL_QUERY_RE", quadratic)
+        before = _query_scrub_growth(rounds=3)
+    assert before > _ACCESS_MAX_GROWTH, (
+        f"the quadratic control grew only {before:.1f}x, so this harness cannot fail. Fix the "
+        "harness, not the bound."
+    )
+    growth = _query_scrub_growth(rounds=5)
+    assert growth <= _ACCESS_MAX_GROWTH, (
+        f"one query scrub grew {growth:.1f}x for 8x the value length, over the "
+        f"{_ACCESS_MAX_GROWTH}x bound"
     )
 
 

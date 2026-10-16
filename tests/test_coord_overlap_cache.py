@@ -30,10 +30,12 @@ gets carried, and the value is exactly what is wrong here.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -78,8 +80,12 @@ def _repo(root: Path, name: str) -> Path:
 
 
 def _cache_path(repo: Path) -> Path:
+    """One cache file per querying root, named as overlap.ps1 names it."""
     common = _git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
-    return Path(common) / "mefor-coord" / "overlap-cache.json"
+    top = _git(repo, "rev-parse", "--path-format=absolute", "--show-toplevel").strip()
+    norm = top.replace("\\", "/").rstrip("/").lower()
+    key = hashlib.sha256(norm.encode("utf-8")).hexdigest()[:8]
+    return Path(common) / "mefor-coord" / "overlap-cache" / f"{key}.json"
 
 
 def _run(repo: Path, sandbox: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -221,3 +227,20 @@ def test_the_cache_is_keyed_on_the_querying_head_and_not_only_its_root(tmp_path:
         "the cached map survived a HEAD move under the same root, so the answer describes a commit "
         "the caller has since taken -- the peer is credited with the caller's own work"
     )
+
+
+def test_a_write_sweeps_cache_files_a_day_old_and_keeps_fresh_ones(tmp_path: Path) -> None:
+    """One cache file per querying root, so files for removed worktrees must not pile up forever."""
+    repo = _repo(tmp_path, "sweep")
+    cache = _cache_path(repo)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    stale = cache.parent / "deadbeef.json"
+    fresh = cache.parent / "feedface.json"
+    for f in (stale, fresh):
+        f.write_text("{}", encoding="utf-8")
+    two_days_ago = time.time() - 2 * 86400
+    os.utime(stale, (two_days_ago, two_days_ago))
+    _run(repo, tmp_path, "-Json", "-Refresh")
+    assert cache.exists(), "the control: the walk wrote its own cache file"
+    assert not stale.exists(), "a cache file two days old was not swept"
+    assert fresh.exists(), "a fresh cache file of another root was swept"

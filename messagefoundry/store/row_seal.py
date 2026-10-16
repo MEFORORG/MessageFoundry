@@ -10,6 +10,12 @@ It is a MAC, not a ciphertext. An ``mfenc:`` value is a sealed CELL (encrypted);
 is a sealed ROW (authenticated). The row stays readable plaintext; the seal makes a change to it that
 was not made through the store's own write helper detectable by any process that holds the key.
 
+**Except a rollback** (BACKLOG #3510). A seal covers one record and nothing outside it counts the
+record's versions, so an earlier copy that the helper sealed, put back whole with its seal (and, for
+a user, its role rows), verifies. That restores whatever the copy held: a removed role, an old
+password, a cleared lockout. The seal proves a record was written by the helper, not that it is the
+latest one.
+
 **Whose key.** The seal key is derived from the store key's authorization root and the store id
 (:func:`~messagefoundry.store.crypto.derive_row_seal_key`). The key id in a stored seal is a one-way
 digest of that derived key, so it changes when either input changes. A process with no in-process
@@ -27,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import time
 from collections.abc import Iterable
 from typing import Final
 
@@ -38,6 +45,26 @@ SEAL_PREFIX: Final = "mfseal:v1:"
 
 #: The kind a session row is sealed under. Each sealed table has its own kind.
 SESSION_KIND: Final = "session"
+
+#: The kind a user's authorization record is sealed under: the ``users`` row, the account's
+#: ``user_roles`` rows and a digest of its passkeys, under one seal.
+USER_KIND: Final = "user"
+
+#: The kind a ``roles`` row is sealed under: one seal per role definition, over the whole row.
+ROLE_KIND: Final = "role"
+
+#: The kind a directory map is sealed under: one seal per map, over its sorted pairs, stored in
+#: ``authority_set_seal``. The map's name is inside the sealed bytes, so one map's seal never
+#: verifies for another.
+ADSET_KIND: Final = "adset"
+
+#: The kind a ``pending_approvals`` row is sealed under: one seal per dual-control request, over
+#: the whole row, so its captured params and its requester id are bound to the request.
+APPROVAL_KIND: Final = "approval"
+
+#: The label a passkey digest is computed under. Not a seal kind: the digest is a plain SHA-256 that
+#: the user seal covers, so it needs no key of its own.
+PASSKEYS_LABEL: Final = "passkeys"
 
 # Leads every encoding, so a seal can never be mistaken for a MAC over some other construction.
 _SCHEME: Final = b"mfseal/v1"
@@ -63,6 +90,36 @@ class RowSealError(Exception):
     def __init__(self, kind: str) -> None:
         super().__init__(f"the {kind} row's integrity seal does not verify; the write was refused")
         self.kind = kind
+
+
+#: How often one failing row is reported again while it keeps being presented, in seconds.
+SEAL_FAILURE_REPORT_INTERVAL_SECONDS: Final = 300.0
+#: How many failing rows a :class:`SealFailureThrottle` remembers; the oldest is forgotten first.
+SEAL_FAILURE_TRACK_MAX: Final = 1024
+
+
+class SealFailureThrottle:
+    """Decides when a row that failed its seal is reported again (BACKLOG #2592): at most once per
+    :data:`SEAL_FAILURE_REPORT_INTERVAL_SECONDS` per key, remembering at most
+    :data:`SEAL_FAILURE_TRACK_MAX` keys. One per reporter: the auth service and the approval gate
+    each hold one, so both follow one policy."""
+
+    __slots__ = ("_last",)
+
+    def __init__(self) -> None:
+        self._last: dict[str, float] = {}
+
+    def due(self, key: str) -> bool:
+        """Whether ``key`` should be reported now; if so, records that it was."""
+        now = time.monotonic()
+        last = self._last.get(key)
+        if last is not None and now - last < SEAL_FAILURE_REPORT_INTERVAL_SECONDS:
+            return False
+        self._last.pop(key, None)
+        if len(self._last) >= SEAL_FAILURE_TRACK_MAX:
+            self._last.pop(next(iter(self._last)))
+        self._last[key] = now
+        return True
 
 
 def _part(value: bytes) -> bytes:
@@ -107,8 +164,9 @@ class RowSealer:
         self._key = bytes(key)
         #: The non-secret id every seal this sealer writes names.
         self.key_id: str = row_seal_key_id(self._key)
-        # The seal keys the retired store keys derive, by id. Nothing is ACCEPTED under them; they
-        # only tell a row a retired key genuinely sealed from one nobody sealed.
+        # The seal keys the retired store keys derive, by id. A session is never accepted under one;
+        # they tell a session a retired key genuinely sealed from one nobody sealed. A user record
+        # is, through verify_held, until rotate-key re-seals it under the active key.
         self._retired: dict[str, bytes] = {
             row_seal_key_id(k): bytes(k) for k in retired_keys if bytes(k) != self._key
         }
@@ -165,3 +223,23 @@ class RowSealer:
             and parsed[0] == self.key_id
             and self._matches(self._key, kind, fields, parsed[1])
         )
+
+    def verify_held(
+        self, kind: str, fields: Iterable[tuple[str, object]], stored: str | None
+    ) -> bool:
+        """Whether ``stored`` is a seal over ``fields`` under the key it names, when that key is the
+        active one or a retired one this process holds.
+
+        For the records that outlive a key change: a user, which ``rotate-key`` re-seals under the
+        active key and which must keep resolving until it has. A session never uses this; its seal
+        verifies under the active key alone (:meth:`verify`)."""
+        parsed = self._parse(stored)
+        if parsed is None:
+            return False
+        key = self._key if parsed[0] == self.key_id else self._retired.get(parsed[0])
+        return key is not None and self._matches(key, kind, fields, parsed[1])
+
+    def is_active(self, stored: str | None) -> bool:
+        """Whether ``stored`` names the active key. Says nothing about whether it verifies."""
+        parsed = self._parse(stored)
+        return parsed is not None and parsed[0] == self.key_id
