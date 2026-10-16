@@ -6,7 +6,8 @@
 via the comment-preserving, validate-before-persist writer and reflects it on the LIVE registry without a
 reload. It is scoped to ``connections.toml``-managed connections ONLY — the SCOPE FORK: a code-first
 connection has no TOML home for it, so the write is refused (→ 409 at the API), and this lane makes NO
-store schema change."""
+store schema change. A cluster node refuses it too (vault BACKLOG #2933), and the engine records the
+``connection_flag_set`` row itself (vault BACKLOG #2945)."""
 
 from __future__ import annotations
 
@@ -244,6 +245,57 @@ def test_flagged_survives_toml_roundtrip(tmp_path: Path) -> None:
 
     reg = load_config(tmp_path)
     assert reg.outbound["OB_TOML"].flagged is True
+
+
+async def test_a_cluster_node_refuses_the_toggle_and_writes_nothing(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #2933: each cluster node loads its own config directory, which
+    docs/CLUSTERING.md requires to be identical on every node. A toggle on one node could reach only
+    that node's connections.toml, so the nodes' files would diverge. A cluster node refuses it before
+    any write: the file, the live flag and the audit trail are all unchanged. RED on the unfixed
+    engine, which never read ``is_clustered()`` and wrote the file."""
+    from messagefoundry.pipeline.engine import ClusteredConfigWrite
+
+    toml_path = tmp_path / "connections.toml"
+    before = toml_path.read_bytes()
+    monkeypatch.setattr(type(engine.coordinator), "is_clustered", lambda self: True)
+    with pytest.raises(ClusteredConfigWrite, match="cluster node"):
+        await engine.set_connection_flag("OB_TOML", direction="outbound", flagged=True)
+    assert toml_path.read_bytes() == before
+    assert engine.registry_runner is not None
+    assert engine.registry_runner.registry.outbound["OB_TOML"].flagged is False
+    assert await engine.store.list_audit(action="connection_flag_set") == []
+    # A WiringError, so the route answers it 409 as it does every refused flag write.
+    assert issubclass(ClusteredConfigWrite, WiringError)
+
+    # Control: the same engine, single-node again, writes the flag and records the row.
+    monkeypatch.undo()
+    await engine.set_connection_flag("OB_TOML", direction="outbound", flagged=True)
+    assert "flagged = true" in toml_path.read_text(encoding="utf-8")
+    assert len(await engine.store.list_audit(action="connection_flag_set")) == 1
+
+
+async def test_the_toggle_records_its_own_baseline_row(engine: Engine, tmp_path: Path) -> None:
+    """Vault BACKLOG #2945: the write, its digest and the ``connection_flag_set`` row come from one
+    engine helper, so the row names the digest of the bytes just written, under the actor given."""
+    import json
+
+    from messagefoundry.config.fingerprint import config_fingerprint_detail
+
+    engine.loaded_config_fingerprint = config_fingerprint_detail(tmp_path)
+    returned = await engine.set_connection_flag(
+        "OB_TOML", direction="outbound", flagged=True, actor="alice", client="127.0.0.1"
+    )
+    on_disk = config_fingerprint_detail(tmp_path)["fingerprint"]
+    assert returned is not None and returned["fingerprint"] == on_disk
+    assert engine.loaded_config_fingerprint == returned
+    rows = await engine.store.list_audit(action="connection_flag_set")
+    assert [row["actor"] for row in rows] == ["alice"]
+    detail = json.loads(rows[0]["detail"])
+    assert detail["fingerprint"] == on_disk
+    assert detail["connection"] == "OB_TOML" and detail["flagged"] is True
+    assert detail["node"] == engine.coordinator.node_id
 
 
 async def test_the_toggle_takes_its_digests_under_the_config_edit_lock(

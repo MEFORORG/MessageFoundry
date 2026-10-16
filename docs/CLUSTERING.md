@@ -582,6 +582,15 @@ sensitive: the **row** leases (see below) and the `nodes.last_seen` heartbeat be
 2. **Identical config on every node.** Each node loads the graph (Connections / Routers / Handlers) from
    its **own** config dir; convergence coordinates the reload *version*, not the files. Deploy the same
    config dir to all nodes.
+
+   So a cluster node refuses every engine write to a config file, because the write could reach
+   only its own copy. The one such write today is the connection flag toggle (`POST
+   /connections/{name}/flag`, the web console's object-of-interest flag). On a cluster node it is
+   refused with **409**, and nothing is written. The node's `connections.toml`, its live flag and the
+   audit trail are all unchanged. To flag a connection in a cluster, set `flagged = true` on its entry
+   in the `connections.toml` you deploy to every node, then reload. The engine refuses rather than
+   propagates because no engine path reaches another node's config dir. Vault BACKLOG #2933 records
+   that decision.
 3. **Coordinated config changes.** Apply a config change as a **coordinated (not rolling) restart**, so
    nodes don't run divergent graphs across the change window.
 
