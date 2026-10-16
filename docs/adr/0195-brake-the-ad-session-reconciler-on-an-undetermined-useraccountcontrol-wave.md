@@ -39,6 +39,8 @@
   drops its `judged` key, which would now always equal `probed`. `ReconcilePlan.judged` carries the
   rule. `tests/test_ad_session_reconcile.py::test_held_probes_stay_in_the_breakers_count` pins it,
   and `::test_a_hold_now_lets_a_false_absence_wave_under_the_breaker` pins the cost.
+- **Note 2026-10-16 (BACKLOG #3057).** The rule is unchanged. The hold's state stays in process
+  memory, and "What a restart does to the hold", under the rule, says what a restart then costs.
 - **Related:** [ADR 0079](0079-kerberos-idp-session-coordination.md) (mechanism 2, the directory
   session reconciler, and its mass-revoke breaker) · [CLAUDE.md](../../CLAUDE.md) section 0 (not
   deployed) and section 11 (SDS-3.6, SDS-3.7) · BACKLOG #1639 (the fail-closed read this follows) ·
@@ -226,7 +228,7 @@ at one.
    enum as it stands, since its type bound and its value-sorted cap expect numbers. So the build
    either widens that helper or carries the outcome in the strike ledger's value.
    *Note 2026-10-16 (BACKLOG #3057): this record, the strike counts and rule item 6's latch stay in
-   process memory, by decision. What a restart then does is in the note under rule item 6.*
+   process memory, by decision. See "What a restart does to the hold", below the limits.*
 4. **What updates the record.** This pass's outcomes are written in BEFORE the hold is judged. A
    `PRESENT`, `DISABLED`, `ABSENT` or `UNDETERMINED` probe replaces the account's entry. An
    `UNAVAILABLE` probe leaves the prior entry in place, so a directory blip on one held account does
@@ -240,44 +242,8 @@ at one.
    engaged, it releases only when `u == 0`. Without that, attrition would defeat it: as a partial
    wave's sessions expire, the last held account would read as a single and be revoked. The rule
    applies at any estate size, with no floor.
-
-   **Note 2026-10-16 (BACKLOG #3057): a restart, in both directions.** A Manager decision, upheld
-   by adversarial review, not an owner ruling. The latch (`_reconcile_hold_latched`), the strike
-   counts (`_reconcile_strikes`) and rule item 3's outcome record (`_reconcile_outcomes`) stay
-   plain attributes of the service object, so a restart empties all three. They are not moved to
-   the store, and the latch is not rebuilt at start from an `ad_reconcile_held` alert instance an
-   earlier run left open. The reasons:
-
-   - This rule is an availability brake. It exists so that a lost read right does not sign out an
-     estate, and a restart that releases one account does not undo that.
-   - A latch rebuilt from an open instance would hold a genuine lone unreadable account to the
-     absolute session cap. This ADR says such an account starts striking once a pass also reads a
-     readable account (*Option 5's failure mode*, above).
-   - A fresh process cannot tell whether an earlier run's latch was still holding an account. That
-     is why it does not resolve an inherited `ad_reconcile_held` instance (BACKLOG #2136).
-
-   **Direction 1: the latch is lost, so attrition could revoke the last held account.** Suppose a
-   held wave's sessions end until one held account is left, and the engine then restarts. The new
-   process would know only that one account, so it would read as a single. A pass that also reads
-   the attribute on another account would strike it, and revoke it once its strikes reach
-   `ad_session_recheck_strikes` (2 at the default). At a strike count of 1 with an
-   `ad_session_recheck_max_users` below the estate size, a fresh process could also revoke an
-   earlier run's held wave one account at a time, as under *Limits of the rule at non-default
-   settings* below. **The user-facing cost:** each such revocation would sign the holder out, and,
-   where the account has a notification address, email them the neutral `DIRECTORY_SESSIONS_ENDED`
-   security notice, for an account nobody disabled.
-
-   **Direction 2: the strike counts reset, so a real revocation would come later.** A restart
-   would also forget the strikes of a genuinely disabled or absent account. The comment beside
-   `_reconcile_strikes` in `auth/service.py` calls that "biased toward NOT revoking". The account
-   would be revoked `ad_session_recheck_strikes` passes after the restart instead. The reconciler
-   sleeps one `ad_session_recheck_seconds` interval before its first pass. So an engine that
-   restarted more often than the strike count times that interval would never revoke the account
-   through the reconciler. It takes longer still when the probe budget does not reach the account
-   on every pass. Only the absolute session cap would then end those sessions.
-
-   `docs/SECURITY.md` states direction 1 for operators, in
-   [Directory session reconciliation](../SECURITY.md#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2).
+   *Note 2026-10-16 (BACKLOG #3057): this latch does not survive a restart. See "What a restart
+   does to the hold", below the limits.*
 7. **While held.** Every `UNDETERMINED` probe plans no revocation, and its strike count is reset to
    0. So an account still unreadable after a fix needs `ad_session_recheck_strikes` fresh passes
    before it is revoked. That covers an access change that is still replicating. The existing breaker
@@ -301,6 +267,51 @@ at one.
 is seen is revoked on that first pass. With `ad_session_recheck_max_users` of 1, `r` is 0 on every
 pass that probes an undetermined account, so a genuine single is held until its sessions expire.
 Both settings are allowed today.
+
+**What a restart does to the hold (note 2026-10-16, BACKLOG #3057).** A Manager decision, upheld by
+adversarial review, not an owner ruling. The latch (`_reconcile_hold_latched`), the strike counts
+(`_reconcile_strikes`) and rule item 3's outcome record (`_reconcile_outcomes`) stay plain
+attributes of the service object. Restarting a process that runs the reconciler empties all three.
+That includes one engine shard child that `supervise` relaunches, and one `[cluster]` node, because
+each runs its own reconciler against the shared store. The three are not moved to the store, and
+the latch is not rebuilt at start from an `ad_reconcile_held` alert instance an earlier run left
+open. The reasons:
+
+- The hold is an availability brake. The latch only ever stops a revocation, so losing it errs
+  toward revoking, never toward keeping a session.
+- An open instance does not say whether an earlier run's latch was still holding an account. That
+  is why a process does not resolve an inherited instance (BACKLOG #2136). That rule settles the
+  unknown toward a missed alert clear; this note settles it toward revocation, as the first reason
+  does. A latch trusted from the instance would hold any lone unreadable account the new process
+  found, a genuine one included, until no undetermined account was left: at worst, to the absolute
+  session cap. *Option 5's failure mode* above says such an account starts striking once a pass
+  also reads a readable account.
+- Keeping the held accounts themselves with the durable alert instance is a different design, close
+  to design 2 of BACKLOG #3083. That open row decides it; this note does not.
+
+**Direction 1: the latch is lost, so held accounts could be revoked.** `docs/SECURITY.md`, in
+[Directory session reconciliation](../SECURITY.md#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2),
+states the default case: the last held account left at a restart is struck and revoked. By the
+limit above, at a strike count of 1 with an `ad_session_recheck_max_users` below the number of
+signed-in accounts, a fresh process could also revoke an earlier run's held wave one account at a
+time. **The user-facing cost:** each such revocation would end the sessions of an account nobody
+disabled. Sign-in would refuse the holder while the attribute stayed unreadable (constraint 1), so
+it would be a lock-out, not just a sign-out. Where security notices are configured and the account
+has a notification address, the holder would also be emailed the neutral
+`DIRECTORY_SESSIONS_ENDED` notice.
+
+**Direction 2: the strike counts reset, so a genuine revocation would come later.** A restart also
+forgets the strikes of a genuinely disabled or absent account, which would then be revoked
+`ad_session_recheck_strikes` passes after the restart. The comment beside `_reconcile_strikes` in
+`auth/service.py` calls that "biased toward NOT revoking". The reconciler sleeps one
+`ad_session_recheck_seconds` interval before its first pass and after each pass. So a process
+restarting more often than roughly the strike count times that interval would never revoke the
+account through the reconciler. The window is wider when the probe budget skips the account on a
+pass, or a pass runs long. A process restarting more often than one interval would run no pass at
+all, so no role or scope change would be revoked either. Those sessions would then end only at
+expiry, at sign-out, or by an operator's revocation. The same comment's "at most one extra interval
+of exposure", and `docs/SECURITY.md`'s bound of interval times strikes, do not hold across repeated
+restarts. This note does not correct them.
 
 ## Acceptance Criteria
 
