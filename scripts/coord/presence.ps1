@@ -148,6 +148,11 @@ foreach ($s in $occ.Sessions) {
         IsPrimary = $s.IsPrimary
         Branch    = $s.Branch
         Kind      = $s.Kind
+        # Kind cannot tell a scheduled-task run from a person's session; the transcript can. Only read
+        # for a row the default view keeps, since the filter below drops the rest.
+        Scheduled = if ($All -or (Test-OccupancyVeto $s.State)) {
+            Test-ScheduledTaskSession -Root $s.Root -SessionId $s.SessionId
+        } else { $false }
         IsSelf    = ($selfPids -contains [int]$s.Pid)
         StartedAt = $s.StartedAt
     }
