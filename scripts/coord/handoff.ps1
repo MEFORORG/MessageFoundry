@@ -63,9 +63,9 @@ param(
     [Parameter(ParameterSetName = 'Report')][switch]$Json,
 
     # Move ONE entry to _retired-<date>/. Refuses on any hold unless -Force.
-    # -Retire, -Write and -From are NOT Mandatory, ON PURPOSE: -Force alone binds the Retire set and
-    # -From or -Replace alone the Write set, and a Mandatory prompt there hangs a caller with stdin
-    # open (tests/_no_prompt.py, vault BACKLOG #3627). The refusal is right after this param block.
+    # -Retire, -Write and -From are NOT Mandatory, ON PURPOSE: a partial call binds the Retire or
+    # Write set without them (-Force alone, for one), and a Mandatory prompt there hangs a caller with
+    # stdin open (tests/_no_prompt.py, vault BACKLOG #3627). The refusal is right after this param block.
     [Parameter(ParameterSetName = 'Retire')][string]$Retire,
     [Parameter(ParameterSetName = 'Retire')][switch]$Force,
 
@@ -90,7 +90,7 @@ $missing = switch ($PSCmdlet.ParameterSetName) {
     'Write' { if (-not $Write) { '-Write <name>' }; if (-not $From) { '-From <file>' } }
 }
 if ($missing) {
-    throw "$($PSCmdlet.ParameterSetName) arguments were given without $($missing -join ' and '). Nothing was moved or written. Add it and re-run."
+    throw "$($PSCmdlet.ParameterSetName) arguments were given without $($missing -join ' and '). Nothing was moved or written. Add what is missing and re-run."
 }
 
 . "$PSScriptRoot\mail-key.ps1"

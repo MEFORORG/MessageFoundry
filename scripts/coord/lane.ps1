@@ -20,9 +20,9 @@
 #>
 [CmdletBinding(DefaultParameterSetName = 'State')]
 param(
-    # NEITHER IS Mandatory, ON PURPOSE: a bare call, or -Note or -Capacity alone, binds this default
-    # set, and a Mandatory prompt there hangs a caller with stdin open (tests/_no_prompt.py, vault
-    # BACKLOG #3627). The refusal is right after this param block.
+    # NEITHER IS Mandatory, ON PURPOSE: any call missing either number binds this default set (a bare
+    # call, for one), and a Mandatory prompt there hangs a caller with stdin open
+    # (tests/_no_prompt.py, vault BACKLOG #3627). The refusal is right after this param block.
     [Parameter(ParameterSetName = 'State')][ValidateRange(0, 99)][int]$Free,
     [Parameter(ParameterSetName = 'State')][ValidateRange(0, 99)][int]$InFlight,
     [Parameter(ParameterSetName = 'State')][string]$Note = '',

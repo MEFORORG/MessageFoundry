@@ -21,7 +21,9 @@ import pytest
 
 from tests._spawn_lock import single_spawn
 
-# Below pyproject.toml's --timeout=60 so a hang fails the calling test by name rather than the leg.
+# Below pyproject.toml's --timeout=60 so a hang usually fails the calling test by name rather than the
+# leg. Not always: a wait inside single_spawn() for a racer storm counts against the same per-test
+# clock, so a launch that waits out a storm and then hangs can still hit pytest-timeout first.
 PROMPT_TIMEOUT = 45
 
 

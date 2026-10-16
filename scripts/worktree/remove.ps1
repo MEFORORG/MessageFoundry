@@ -98,9 +98,9 @@ param(
     # \A..\z for the reason given in new.ps1's param block; keep all four copies identical.
     # Position 0, and -RepoRoot position 1, are what this script bound before it had parameter sets:
     # `remove.ps1 alerts` must keep working.
-    # NOT Mandatory, ON PURPOSE: a bare call, or -Force, -DeleteBranch or -RepoRoot alone, binds this
-    # default set, and a Mandatory prompt there hangs a caller with stdin open (tests/_no_prompt.py,
-    # vault BACKLOG #3627). The refusal is right after this param block.
+    # NOT Mandatory, ON PURPOSE: any call without -Name, -Path or -List binds this default set (a bare
+    # call, or -Force alone, for example), and a Mandatory prompt there hangs a caller with stdin open
+    # (tests/_no_prompt.py, vault BACKLOG #3627). The refusal is right after this param block.
     [Parameter(Position = 0, ParameterSetName = 'ByName')]
     [ValidatePattern('\A[A-Za-z0-9._-]+\z')]
     [string]$Name,
