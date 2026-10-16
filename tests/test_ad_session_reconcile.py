@@ -3470,8 +3470,8 @@ async def test_a_scope_revocation_sends_no_account_disabled_notice() -> None:
 
 
 #: vault BACKLOG #2140. The notice each revocation reason sends, decided once. ``None`` is no notice.
-#: ACCOUNT_DISABLED says an administrator disabled the account, so only the reason that READ the
-#: disabled bit may send it.
+#: ACCOUNT_DISABLED says the directory reports the account disabled, so only the reason that READ
+#: the disabled bit may send it.
 _NOTICE_FOR_REASON: dict[str, str | None] = {
     "directory_disabled": ACCOUNT_DISABLED,
     "directory_absent": DIRECTORY_SESSIONS_ENDED,
@@ -3511,7 +3511,9 @@ async def test_each_revocation_reason_sends_its_decided_notice(reason: str) -> N
         expected = _NOTICE_FOR_REASON[reason]
         assert [e.event_type for e in notifier.sent] == ([] if expected is None else [expected])
         if expected is not None:
-            assert notifier.sent[0].detail == {"reason": reason}
+            # ``source`` words ROLES_CHANGED and ACCOUNT_DISABLED for the directory (vault
+            # BACKLOG #3121); every reconciler notice carries it.
+            assert notifier.sent[0].detail == {"reason": reason, "source": "directory"}
     finally:
         await store.close()
 

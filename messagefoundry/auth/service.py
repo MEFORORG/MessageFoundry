@@ -5448,12 +5448,14 @@ class AuthService:
             # A directory-pushed privilege change is the same privilege change to the same user as a
             # local one, so notify the affected user out-of-band too (ASVS 6.3.7), matching set_roles().
             # Best-effort; the change is also visible in the audited /me/security-events feed.
+            # ``source`` words it for the directory, as the reconciler's notice is (vault BACKLOG
+            # #3121): no administrator made this change, so "if this was you" cannot apply.
             await self._notify_security(
                 ROLES_CHANGED,
                 username=user.username,
                 email=user.notify_email,
                 client=client,
-                detail={"roles": role_ids},
+                detail={"roles": role_ids, "source": "directory"},
             )
         ad_roles = _roles_from_ids(role_ids)
         ad_custom_permissions = await self._custom_permissions_for_ids(role_ids)
@@ -7382,9 +7384,13 @@ class AuthService:
         # ``ad_session_revoked`` alert record it.
         #
         # ACCOUNT_DISABLED only when the pass READ the disabled bit (vault BACKLOG #2140). That
-        # notice says an administrator disabled the account, which an absent account or an unreadable
-        # attribute does not establish, so every other whole-account reason, including any added
-        # later, gets the neutral DIRECTORY_SESSIONS_ENDED.
+        # notice says the directory reports the account disabled, which an absent account or an
+        # unreadable attribute does not establish, so every other whole-account reason, including
+        # any added later, gets the neutral DIRECTORY_SESSIONS_ENDED.
+        #
+        # ``source`` makes the renderer word ROLES_CHANGED and ACCOUNT_DISABLED for the directory,
+        # with no administrator in them and no "if this was you" (vault BACKLOG #3121). The
+        # login-path re-sync tags its ROLES_CHANGED the same way.
         if revocation.role_ids is not None:
             kind = ROLES_CHANGED
         elif revocation.reason == reconcile.REVOKE_REASONS[reconcile.ProbeOutcome.DISABLED]:
@@ -7396,7 +7402,7 @@ class AuthService:
                 kind,
                 username=user.username,
                 email=user.notify_email,
-                detail={"reason": revocation.reason},
+                detail={"reason": revocation.reason, "source": "directory"},
             )
         return True
 

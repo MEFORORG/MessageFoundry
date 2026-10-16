@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.auth.notifications import (
+    ACCOUNT_DISABLED,
     ACCOUNT_LOCKED,
     ADMIN_NEW_IP,
     DIRECTORY_SESSIONS_ENDED,
@@ -24,6 +25,7 @@ from messagefoundry.auth.notifications import (
     NOTIFY_EMAIL_SET,
     PASSWORD_RESET,
     RECOVERY_CODE_USED,
+    ROLES_CHANGED,
     TEMPORARY_CREDENTIAL_EXPIRING,
     TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER,
     USERNAME_CHANGED,
@@ -210,11 +212,91 @@ def test_a_directory_sessions_ended_notice_renders_its_own_text_and_claims_no_di
     body = _build_body(SecurityEvent(DIRECTORY_SESSIONS_ENDED, username="jdoe", email=None))
     text = (_SUBJECTS[DIRECTORY_SESSIONS_ENDED] + "\n" + body).lower()
     assert "a security event occurred on your account." not in text
-    assert "directory" in text and "sessions" in text
+    # The description itself, not words the subject alone would satisfy (vault BACKLOG #3121).
+    assert (
+        "A check against your organization's directory ended your MessageFoundry sessions."
+        in body.splitlines()
+    )
     for claim in ("disabled", "deleted", "if this was you"):
         assert claim not in text
     assert body.endswith(
         "If you did not expect this change, contact your MessageFoundry administrator."
+    )
+
+
+#: vault BACKLOG #3121. The description each directory-driven kind carries, pinned whole.
+_DIRECTORY_TEXT = {
+    ROLES_CHANGED: "Your account's roles were changed.",
+    ACCOUNT_DISABLED: (
+        "Your organization's directory reports your account as disabled, so MessageFoundry ended "
+        "your sessions."
+    ),
+}
+_DIRECTORY_LINE = (
+    "This change came from your organization's directory, not from the MessageFoundry console."
+)
+_DIRECTORY_CLOSING = "If you did not expect this change, contact your MessageFoundry administrator."
+_ADMIN_TEXT = {
+    ROLES_CHANGED: "Your account's roles were changed by an administrator.",
+    ACCOUNT_DISABLED: "Your account was disabled by an administrator.",
+}
+_IF_THIS_WAS_YOU = (
+    "If this was you, no action is needed. If not, contact your MessageFoundry administrator."
+)
+
+
+@pytest.mark.parametrize("kind", [ROLES_CHANGED, ACCOUNT_DISABLED])
+def test_a_directory_role_or_disable_notice_names_the_directory_and_no_administrator(
+    kind: str,
+) -> None:
+    """vault BACKLOG #3121. The reconciler and the sign-in re-sync tag these ``source`` directory:
+    no administrator made the change and the holder did nothing, so neither the administrator
+    wording nor "if this was you" may appear."""
+    body = _build_body(
+        SecurityEvent(
+            kind,
+            username="jdoe",
+            email="j@example.org",
+            detail={"reason": "directory_disabled", "source": "directory"},
+        )
+    )
+    lines = body.splitlines()
+    assert _DIRECTORY_TEXT[kind] in lines
+    assert _DIRECTORY_LINE in lines
+    assert _ADMIN_TEXT[kind] not in lines
+    assert "if this was you" not in body.lower()
+    assert body.endswith(_DIRECTORY_CLOSING)
+
+
+@pytest.mark.parametrize("kind", [ROLES_CHANGED, ACCOUNT_DISABLED])
+def test_an_administrator_role_or_disable_notice_keeps_its_wording(kind: str) -> None:
+    """vault BACKLOG #3121, closing item 2: the notice an administrator's own act sends keeps its
+    text. Kept by the row's instruction, not judged correct: "if this was you" on an administrator's
+    act is the shape BACKLOG #1141 fixed for the reset notice, and vault #3072 item 10 names."""
+    body = _build_body(SecurityEvent(kind, username="jdoe", email="j@example.org"))
+    lines = body.splitlines()
+    assert _ADMIN_TEXT[kind] in lines
+    assert _DIRECTORY_TEXT[kind] not in lines
+    assert "directory" not in body.lower()
+    assert body.endswith(_IF_THIS_WAS_YOU)
+
+
+def test_the_sign_in_role_re_sync_notice_says_where_the_sign_in_came_from() -> None:
+    """vault BACKLOG #3121. The sign-in re-sync passes the client address, and a directory notice
+    must not print it as the address of whoever made the change."""
+    body = _build_body(
+        SecurityEvent(
+            ROLES_CHANGED,
+            username="jdoe",
+            email="j@example.org",
+            client_ip="203.0.113.7",
+            detail={"roles": ["viewer"], "source": "directory"},
+        )
+    )
+    assert "Source IP" not in body
+    assert (
+        "MessageFoundry picked up this change during a sign-in to your account from 203.0.113.7."
+        in body.splitlines()
     )
 
 
