@@ -23,7 +23,7 @@ from pathlib import Path
 import httpx
 import pytest
 from _totp_clock import pin_totp_clock
-from fastapi import Depends, Request
+from fastapi import Depends, FastAPI, Request
 
 from messagefoundry.api import create_app
 from messagefoundry.api.security import (
@@ -546,9 +546,13 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
     await eng.stop()
 
 
-def _client_at(engine: Engine, service: AuthService, ip: str) -> httpx.AsyncClient:
-    """An API client whose requests originate from ``ip`` (set on the ASGI scope)."""
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service), client=(ip, 12345))
+def _client_at(
+    engine: Engine, service: AuthService, ip: str, *, app: FastAPI | None = None
+) -> httpx.AsyncClient:
+    """An API client whose requests originate from ``ip`` (set on the ASGI scope). ``app`` reuses an
+    app already built, such as one with a test route mounted."""
+    app = app if app is not None else create_app(engine, auth=service)
+    transport = httpx.ASGITransport(app=app, client=(ip, 12345))
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 
 
@@ -816,10 +820,10 @@ async def test_an_http_reveal_from_a_second_address_is_refused(engine: Engine) -
 
 # --- vault BACKLOG #3052 item 13: each of the four step-up factories asks --------------------------
 
-#: The four JSON step-up factories in ``api/security.py``, each with the action its proof is bound
-#: to (``None`` for the two that read the session window), and whether the route spends the proof
-#: itself. Each factory asks the new-address question inline, so a test through one route pins only
-#: that one factory. ``require_step_up_action`` asks in two branches, so it is here twice: its
+#: Five cases over the four JSON step-up factories in ``api/security.py``: each with the action its
+#: proof is bound to (``None`` for the two that read the session window), and whether the route
+#: spends the proof itself. Each factory asks the new-address question inline, so a case pins only
+#: its own factory. ``require_step_up_action`` asks in two branches, so it has two cases: its
 #: ``proof_in_route=True`` branch asks before the route's own spend.
 _STEP_UP_FACTORIES = {
     "require_step_up": (require_step_up, None, False),
@@ -846,7 +850,7 @@ _STEP_UP_FACTORIES = {
 async def test_each_step_up_factory_refuses_a_new_address_holding_a_fresh_proof(
     engine: Engine, name: str
 ) -> None:
-    """RED when: one of the four step-up factories stops asking whether the request comes from a
+    """RED when: one of the four step-up factories, in either branch, stops asking whether the request comes from a
     new address (vault BACKLOG #3052 item 13; PR 2048's mutation run skipped all four). The caller
     holds the proof the factory wants, a fresh sign-in window or a grant bound to its action, so
     the address is the only reason left to refuse. The control spends the same proof from the
@@ -870,10 +874,6 @@ async def test_each_step_up_factory_refuses_a_new_address_holding_a_fresh_proof(
 
     app.add_api_route("/test/step-up-probe", probe, methods=["POST"])
 
-    def at(ip: str) -> httpx.AsyncClient:
-        transport = httpx.ASGITransport(app=app, client=(ip, 12345))
-        return httpx.AsyncClient(transport=transport, base_url="http://t")
-
     async def proof(c: httpx.AsyncClient, token: str) -> str:
         """A fresh grant bound to ``action``; the sign-in window already serves the others."""
         if action is None:
@@ -884,12 +884,12 @@ async def test_each_step_up_factory_refuses_a_new_address_holding_a_fresh_proof(
         assert r.status_code == 200, r.text
         return str(r.json()["token"])
 
-    async with at("10.0.0.1") as a:
+    async with _client_at(engine, service, "10.0.0.1", app=app) as a:
         token = await proof(a, await _login_token(a))
         control = await a.post("/test/step-up-probe", headers=_auth(token))
         assert control.status_code == 200, (name, control.status_code, control.text)
         token = await proof(a, token)
-    async with at("10.9.9.9") as b:
+    async with _client_at(engine, service, "10.9.9.9", app=app) as b:
         r = await b.post("/test/step-up-probe", headers=_auth(token))
         assert (r.status_code, r.headers.get("X-Step-Up-Required")) == (403, "1"), (name, r.text)
         assert r.headers.get("X-Step-Up-Action") == action, name

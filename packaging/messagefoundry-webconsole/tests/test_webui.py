@@ -8976,11 +8976,7 @@ async def test_every_phi_page_has_a_reauth_continuation(engine: Engine) -> None:
     dependency's closure, so the set is derived and not a list kept by hand."""
     from fastapi.routing import APIRoute
 
-    from messagefoundry_webconsole._auth import (
-        _REAUTH_NEXT_MAX,
-        _new_address_continuation,
-        is_unlock_action,
-    )
+    from messagefoundry_webconsole._auth import is_unlock_action
 
     service = await _service(engine)
     app = create_app(engine, auth=service, serve_ui=True)
@@ -9005,14 +9001,6 @@ async def test_every_phi_page_has_a_reauth_continuation(engine: Engine) -> None:
                 assert is_unlock_action(concrete), f"{route.path} has no unlock continuation"
                 # Query-tolerant, so a filtered page comes back filtered.
                 assert is_unlock_action(concrete + "?a=1"), f"{route.path} drops its query"
-                # The continuation keeps the query while the whole target fits under the
-                # /ui/reauth cap on ``next``, and lands elsewhere once it does not, on each real
-                # page rather than one synthetic path (vault BACKLOG #3052 item 18).
-                land = "/ui/account"
-                fits = _bare_request("GET", concrete, "a=1")
-                assert _new_address_continuation(fits, landing=land) == concrete + "?a=1"
-                over = _bare_request("GET", concrete, "a=" + "x" * _REAUTH_NEXT_MAX)
-                assert _new_address_continuation(over, landing=land) == land, route.path
                 checked.append(route.path)
     # The control: the walk found the PHI pages it exists for, so a zero is not a pass.
     assert "/ui/messages/{message_id}" in checked and "/ui/dead-letters" in checked, checked
@@ -9066,17 +9054,37 @@ def test_a_new_address_continuation_never_drops_a_query_or_overflows() -> None:
     landing is used instead (vault BACKLOG #2620, review round 2)."""
     from messagefoundry_webconsole._auth import _new_address_continuation
 
-    req = _bare_request
     land = "/ui/account"
-    assert _new_address_continuation(req("GET", "/ui/messages"), landing=land) == "/ui/messages"
-    filtered = req("GET", "/ui/messages", "channel_id=ch1&defer=1")
+    assert (
+        _new_address_continuation(_bare_request("GET", "/ui/messages"), landing=land)
+        == "/ui/messages"
+    )
+    filtered = _bare_request("GET", "/ui/messages", "channel_id=ch1&defer=1")
     assert (
         _new_address_continuation(filtered, landing=land) == "/ui/messages?channel_id=ch1&defer=1"
     )
     long_name = "/ui/connection/" + "n" * 600 + "/events/1/reason"
-    assert _new_address_continuation(req("GET", long_name), landing=land) == land
-    assert _new_address_continuation(req("GET", "/ui/audit"), landing=land) == land
-    assert _new_address_continuation(req("POST", "/ui/messages"), landing=land) == land
+    assert _new_address_continuation(_bare_request("GET", long_name), landing=land) == land
+    assert _new_address_continuation(_bare_request("GET", "/ui/audit"), landing=land) == land
+    assert _new_address_continuation(_bare_request("POST", "/ui/messages"), landing=land) == land
+
+
+async def test_the_continuation_cap_is_the_reauth_pages_own(engine: Engine) -> None:
+    """RED when: ``_REAUTH_NEXT_MAX`` and ``GET /ui/reauth``'s own cap on ``next`` drift apart
+    (vault BACKLOG #3052 item 18). The unit test above reads the constant, so a refused PHI read
+    whose continuation fits it could still be answered 422, with no form, by the page it is sent
+    to. A query-tolerant unlock target exactly at the cap renders; one character over is refused."""
+    from messagefoundry_webconsole._auth import _REAUTH_NEXT_MAX, is_unlock_action
+
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    base = "/ui/messages?channel_id="
+    at_cap = base + "c" * (_REAUTH_NEXT_MAX - len(base))
+    assert len(at_cap) == _REAUTH_NEXT_MAX and is_unlock_action(at_cap)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        assert (await c.get("/ui/reauth", params={"next": at_cap})).status_code == 200
+        assert (await c.get("/ui/reauth", params={"next": at_cap + "c"})).status_code == 422
 
 
 async def test_a_cross_site_write_from_a_new_address_writes_no_row(engine: Engine) -> None:
