@@ -2663,13 +2663,15 @@ async def test_a_begin_inside_the_confirm_window_cannot_choose_the_enabled_secre
         assert len(rows) == 1 and '"reason": "secret_replaced"' in str(rows[0]["detail"])
 
         # The replacing secret confirms through its own ceremony, and that is what is enabled. Its
-        # code comes from the SAME 30-second step the refused confirm spent: the stage forgot that
-        # step's high-water mark, which belonged to the replaced secret.
+        # code comes from a later step: the stage keeps the high-water mark, so the step the refused
+        # confirm spent stays spent.
         monkeypatch.setattr(service, "_elevated", real_elevated)
         again = await service.login(ADMIN_USERNAME, password)
         assert again.token is not None
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
         confirmed = await service.confirm_mfa_enrollment(
-            identity, totp.totp(second[0].secret, now=t0), token=again.token
+            identity, totp.totp(second[0].secret, now=t1), token=again.token
         )
         assert confirmed.ok
         assert (await service.mfa_status(identity)).enabled is True

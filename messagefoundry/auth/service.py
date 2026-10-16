@@ -10077,9 +10077,9 @@ class AuthService:
         (or a time-step already consumed -- single-use, BACKLOG #1021) elevates nothing and carries
         none. A good code on a session revoked before the rotation returns ``session_lost`` with MFA
         still OFF (BACKLOG #1902), so a lost session never leaves MFA on with codes nobody saw. So
-        does a good code whose activation matches no row, because a reset cleared the staged secret,
-        a second confirm enabled first (BACKLOG #2224), or a second begin staged a secret this
-        confirm never verified (BACKLOG #3025). That confirm ends the session it rotated,
+        does a good code whose activation matches no row, for example because a reset cleared the
+        staged secret, a second confirm enabled first (BACKLOG #2224), or a second begin staged a
+        secret this confirm never verified (BACKLOG #3025). That confirm ends the session it rotated,
         hands back no codes, and audits ``auth.mfa_enroll_refused``.
 
         This is one of the two legs that turn an MFA-pending session into an MFA-satisfied one for a
@@ -10151,7 +10151,7 @@ class AuthService:
         if not await self._store.enable_totp(
             identity.user_id, recovery_code_hashes=hashes, expected_secret_cell=verified_cell
         ):
-            # BACKLOG #2224, #3025: the conditional enable matched no row, because an
+            # BACKLOG #2224, #3025: the conditional enable matched no row, for example because an
             # administrator's reset cleared the staged secret inside the rotation window, a second
             # confirm enabled TOTP first, or a second begin staged a secret this confirm never
             # verified. This confirm turns nothing on and its codes are dropped. The

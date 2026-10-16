@@ -2556,6 +2556,27 @@ async def test_a_stage_that_lands_after_another_runs_enable_refuses_before_the_r
         await store.close()
 
 
+async def test_the_provisioning_codes_step_stays_spent_after_the_stage() -> None:
+    """BACKLOG #3025 review: provision consumes its code's step BEFORE it stages the secret, so the
+    stage must not reset the step high-water mark, or the code typed at the terminal would pass the
+    first sign-in's second factor again (ASVS 6.5.1, BACKLOG #1021)."""
+    from messagefoundry.auth import totp
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings())
+        kw = provision_totp()
+        await service.provision_first_administrator(
+            username="site-admin", password=_PASSWORD, actor="test", **kw
+        )
+        row = await store.get_user_by_username("site-admin")
+        assert row is not None and row.totp_enabled
+        step = int(kw["totp_code_read_at"] // totp.DEFAULT_PERIOD)
+        assert not await store.consume_totp_step(row.id, step)
+    finally:
+        await store.close()
+
+
 async def test_a_sign_in_during_the_repair_does_not_survive_into_the_administrator_role() -> None:
     """Review round 2: the earlier holder's password works until the repair writes the new one. A
     session minted in that window must not outlive the repair, so the sessions are revoked again

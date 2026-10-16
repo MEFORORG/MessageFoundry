@@ -2640,17 +2640,17 @@ def totp_stage(sealed_secret: str | None, now: float) -> UserChange:
     #3025). A begin that lands once TOTP is on writes nothing, so it can never replace the secret of
     an enabled factor. There is no clear here: an empty secret raises, and ``disable_totp`` clears.
 
-    ``last_totp_step`` goes too, as in :func:`totp_disable`: the high-water mark belonged to the
-    secret being replaced, and a new secret has no history. Without that, a confirm refused because a
-    second begin replaced its secret leaves its spent step behind, and the replacing secret's own
-    code from the same 30 seconds is refused as a replay."""
+    ``last_totp_step`` is kept on purpose. ``provision_first_administrator`` consumes its code's
+    step BEFORE it stages, and that step must stay spent. The cost: after a confirm refused because a
+    second begin replaced its secret, the replacing secret's code from the same 30 seconds can be
+    refused as a replay, and the holder uses the next code."""
     if not sealed_secret:
         raise ValueError("a TOTP secret is required")
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
         if r.row.totp_enabled:
             return None
-        return r.changed(totp_secret=sealed_secret, last_totp_step=None, updated_at=float(now))
+        return r.changed(totp_secret=sealed_secret, updated_at=float(now))
 
     return apply
 
