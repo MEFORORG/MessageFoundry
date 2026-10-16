@@ -3648,8 +3648,8 @@ jobs:
           if [ -n "$ready" ]; then
             # `run` first checks the engine refuses a request with no session, then signs in and
             # hands the session to the load CLI as --token. Its exit code is the load CLI's. It signs
-            # in ONCE, with a code from a TOTP step nothing has spent, so it waits up to 30 s first:
-            # the engine counts a reused code as a wrong second factor, and provisioning spent one.
+            # in ONCE, and first waits for a TOTP step to open, up to about 31 s; _code_in_a_fresh_step
+            # in harness/load/rigadmin.py says why.
             MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" MEFOR_RIG_ADMIN_TOTP_KEY="$rig_totp" \
               python -m harness.load.rigadmin run \
               --engine https://127.0.0.1:8765 --cacert "$cert" -- \

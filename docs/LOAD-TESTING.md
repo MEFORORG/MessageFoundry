@@ -94,7 +94,7 @@ its nodes, and then signs in. You pass nothing.
 |---|---|
 | You start `serve` yourself | Set `MEFOR_SECURITY_REQUIRE_MFA=false` on it. `provision-admin` enrols an authenticator app at a terminal and offers no other way, so the rig account has none. To keep MFA required instead, see *One leg runs with MFA required* below. |
 | That `serve` runs under `[security].enforcement = enforce` | Give it an `[alerts]` channel too. With sign-in on, an enforcing start refuses without a way to send account-security notices. The `load test (smoke, sqlite)` step in [`ci.yml`](../.github/workflows/ci.yml) shows the settings. |
-| You keep one store across runs | Use the same credential each run: set `MEFOR_RIG_ADMIN_USERNAME` and `MEFOR_RIG_ADMIN_PASSWORD` in the shell. `provision-admin` declines when the store already has an Administrator, and a new run draws a new password, so the engine then refuses the sign-in. A fresh store needs neither variable. |
+| You keep one store across runs | Use the same credential each run: set `MEFOR_RIG_ADMIN_USERNAME` and `MEFOR_RIG_ADMIN_PASSWORD` in the shell, and `MEFOR_RIG_ADMIN_TOTP_KEY` to the same key when the account has one. `provision-admin` declines when the store already has an Administrator, and a new run draws a new password, so the engine then refuses the sign-in. A fresh store needs none of these variables. |
 | The drive is a separate process from the engines (a second box, or `batch-driver` beside `batch-engine`) | Export the same two variables for both, and `MEFOR_RIG_ADMIN_TOTP_KEY` too when the account has a key. The drive signs in to engines another process started, and refuses to start without the credential: one drawn there could only be wrong. |
 
 #### One leg runs with MFA required
@@ -108,26 +108,24 @@ The sign-in sends the password and a code in one request, the combined sign-in o
 is added to `provision-admin`: it still takes no authenticator key as input. To do the same by hand:
 
 ```bash
-# Drop MEFOR_SECURITY_REQUIRE_MFA=false from step 0, and use a fresh store. The key is handed to
-# the two rigadmin commands only, never exported, so `serve` never holds it.
+# In step 0, export MEFOR_SECURITY_REQUIRE_MFA=true in place of false, and use a fresh store. The
+# key is handed to the two rigadmin commands only, never exported, so `serve` never holds it.
 rig_totp="$(python -c 'from messagefoundry.auth import totp; print(totp.generate_secret())')"
 MEFOR_RIG_ADMIN_TOTP_KEY="$rig_totp" python -m harness.load.rigadmin provision --db ./load.db
 # ...serve as in step 2, then drive as in step 3 with the same prefix:
 MEFOR_RIG_ADMIN_TOTP_KEY="$rig_totp" python -m harness.load.rigadmin run --engine ... -- ...
 ```
 
-A sign-in with a key can wait up to about 30 seconds for a TOTP step nothing has spent. The engine
-takes each step's code once and counts a reused one as a wrong second factor, which feeds the lock
-on the account. Provisioning spends a step, and so does every sign-in. Processes that sign in at
-the same time with one key can take the same step, and all but one are then refused, so the key
-suits a leg that signs in once.
+A sign-in with a key first waits for a TOTP step to open, up to about 31 seconds, and processes
+that sign in at the same time with one key can be refused, so the key suits a leg that signs in
+once. `_code_in_a_fresh_step` in [`rigadmin.py`](../harness/load/rigadmin.py) says why.
 
 **The other rig legs keep `require_mfa` off, on purpose**: at least the benchmark legs, the
 server-store load smokes, the container and service smokes, and the harness runners that start
 their own nodes. Those legs measure throughput, store
 access, failover and the container and service start, and the second factor touches none of that:
 it is checked once, at sign-in, and every request after it carries the session. The cost of a key
-would be real there: a wait of up to 30 seconds at each sign-in, and runners that sign in more than
+would be real there: the wait above at each sign-in, and runners that sign in more than
 once (a poller renewing its session, a step-up re-proof, a split drive with a session per process)
 would wait at each. A re-proof (`/me/reauth`) takes the password alone, so the key does not cover
 it. One CI rig leg is enough to show an engine that requires MFA starts, admits an enrolled rig account,

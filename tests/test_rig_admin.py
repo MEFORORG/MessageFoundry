@@ -61,9 +61,10 @@ def _env_for_a_sqlite_store(**extra: str) -> dict[str, str]:
     return {**kept, **extra}
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def fresh_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Give a test its own credential and session holders, and put the process's back after."""
+    """Give every test its own credential, session and spent-step holders, and no rig variable from
+    the calling shell, and put the process's back after."""
     monkeypatch.setattr(rigadmin, "_credential", rigadmin._HeldAdmin())
     monkeypatch.setattr(rigadmin, "_held", rigadmin._HeldSession())
     monkeypatch.setattr(rigadmin, "_spent", rigadmin._SpentSteps())
@@ -94,16 +95,14 @@ def test_a_drawn_password_cannot_spell_a_deny_listed_word_or_the_username() -> N
 
 
 def test_the_credential_comes_from_the_environment_when_it_is_there(
-    fresh_state: None, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv(rigadmin.ADMIN_NAME_ENV, "bench-operator")
     monkeypatch.setenv(rigadmin.ADMIN_PASS_ENV, "f" * 48)
     assert rigadmin.rig_admin() == RigAdmin("bench-operator", "f" * 48)
 
 
-def test_a_drawn_credential_is_published_for_a_child_process_and_drawn_once(
-    fresh_state: None,
-) -> None:
+def test_a_drawn_credential_is_published_for_a_child_process_and_drawn_once() -> None:
     first = rigadmin.rig_admin()
     assert first.username == rigadmin._DEFAULT_USERNAME
     # A child harness process (connscale-remote under batchbox) must sign in as the same account.
@@ -120,7 +119,7 @@ def test_the_password_is_not_in_the_repr() -> None:
 
 
 def test_the_authenticator_key_comes_only_from_the_environment_and_stays_out_of_the_repr(
-    fresh_state: None, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A leg opts in to MFA by supplying the key. The rig never draws one."""
     assert rigadmin.rig_admin().totp_secret is None
@@ -195,51 +194,96 @@ def _clocked(monkeypatch: pytest.MonkeyPatch, start: float) -> _FakeClock:
 
 
 @pytest.mark.parametrize("start", [3_000.0, 3_000.001, 3_014.5, 3_029.999])
-def test_a_sign_in_code_comes_from_a_step_that_began_after_the_call(
+def test_a_sign_in_code_comes_from_the_next_step_a_margin_into_it(
     monkeypatch: pytest.MonkeyPatch, start: float
 ) -> None:
-    """THE REPLAY TRAP. Provisioning spends the step it ran in, and so does each sign-in; the engine
-    counts a reused code as a wrong second factor, which feeds the account's lock. A process that
-    knows of no spent step takes the NEXT step, even when the call lands on a step's first instant,
-    and computes the code a margin into it, for an engine whose clock runs a little behind."""
+    """THE REPLAY TRAP. A step that began before the call may already be spent elsewhere, by a
+    provisioning child or a sign-in in an earlier process, and the engine counts a reused code as a
+    wrong second factor, which feeds the account's lock. So a sign-in takes the NEXT step, even when
+    the call lands on a step's first instant, and sends its code a margin into it."""
     clock = _clocked(monkeypatch, start)
     key = totp.generate_secret()
-    code = rigadmin._code_in_a_fresh_step(key)
-    step = int(start // 30) + 1
-    assert int(clock.at // 30) == step, "the code is not from the next step"
+    code, step = rigadmin._code_in_a_fresh_step(key)
+    assert step == int(start // 30) + 1, "the code is not from the next step"
     assert step * 30 + rigadmin._STEP_MARGIN_S <= clock.at <= step * 30 + 1.1
     assert code == totp.totp(key, now=clock.at)
-    assert rigadmin._spent.last == step
+    assert rigadmin._spent.claimed == step
+    assert rigadmin._spent.last == -1, "a step was recorded as spent before any request"
 
 
-def test_sign_ins_in_one_process_never_share_a_step_and_skip_a_needless_wait(
+def test_a_code_is_never_sent_with_less_than_the_margin_left_in_its_step(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Within a process each sign-in takes its own step: the second waits past the first's. Once
-    the process knows the last step spent (by provisioning here, or by a sign-in), a later step
-    that is already past it is used with no wait for the next one."""
-    clock = _clocked(monkeypatch, 3_010.0)
-    key = totp.generate_secret()
-    rigadmin._code_in_a_fresh_step(key)
-    first = rigadmin._spent.last
-    rigadmin._code_in_a_fresh_step(key)
-    assert rigadmin._spent.last == (first or 0) + 1, "two sign-ins shared a step"
+    """THE DEFECT THIS RULE REPLACED. With step 99 spent and the call at 3029.995, the earlier rule
+    took step 100 at once, since it was past step 99 and past the opening margin, and sent a code
+    with 5 ms left. The engine judges at ``totp_skew_steps = 0`` on its own clock, so that code
+    lands in the next step and counts as a wrong second factor."""
+    clock = _clocked(monkeypatch, 3_029.995)
+    rigadmin._note_spent_step(99)
+    code, step = rigadmin._code_in_a_fresh_step(totp.generate_secret())
+    assert step == 101
+    assert (step + 1) * 30 - clock.at >= rigadmin._STEP_MARGIN_S, "sent too near the step's end"
+    assert clock.at >= step * 30 + rigadmin._STEP_MARGIN_S
 
-    # Provisioning ran in step 100; the sign-in starts at step 102, so it does not wait for 103.
-    clock = _clocked(monkeypatch, 100 * 30 + 5.0)
-    rigadmin._note_spent_step()
-    clock.at = 102 * 30 + 7.0
-    rigadmin._code_in_a_fresh_step(key)
-    assert clock.pauses == [] and rigadmin._spent.last == 102
+
+def test_a_wait_that_overruns_into_the_closing_margin_takes_the_next_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A suspended process can wake late. The code still goes with the margin left on both sides."""
+    clock = _clocked(monkeypatch, 3_010.0)
+    late = [30.0]  # the first wait ends 30 s late, at 3061, past step 101's closing margin
+
+    def pause(seconds: float) -> None:
+        clock.pause(seconds + (late.pop() if late else 0.0))
+
+    monkeypatch.setattr(rigadmin, "_pause", pause)
+    _code, step = rigadmin._code_in_a_fresh_step(totp.generate_secret())
+    assert step == 103 and clock.at == 103 * 30 + rigadmin._STEP_MARGIN_S
+    assert rigadmin._spent.claimed == 103
+
+
+def test_sign_ins_in_one_process_take_distinct_steps_in_call_order_and_wait_holding_no_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each call claims a later step than the one before, before it waits. The wait holds no lock,
+    so a step recorded while one sign-in waits is never blocked behind it."""
+    clock = _clocked(monkeypatch, 3_010.0)
+    assert [rigadmin._claim_next_step(), rigadmin._claim_next_step()] == [101, 102]
+
+    clock = _clocked(monkeypatch, 3_010.0)
+    free: list[bool] = []
+
+    def pause(seconds: float) -> None:
+        taken = rigadmin._spent.lock.acquire(blocking=False)
+        if taken:
+            rigadmin._spent.lock.release()
+        free.append(taken)
+        clock.pause(seconds)
+
+    monkeypatch.setattr(rigadmin, "_pause", pause)
+    key = totp.generate_secret()
+    _code, first = rigadmin._code_in_a_fresh_step(key)
+    _code, second = rigadmin._code_in_a_fresh_step(key)
+    assert (first, second) == (101, 102), "two sign-ins shared a step"
+    assert free and all(free), "a wait held the lock"
+
+
+def test_the_last_spent_step_bounds_the_claim_when_the_clock_reads_earlier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wall clock stepped back must not hand out a step this process already spent."""
+    _clocked(monkeypatch, 3_010.0)
+    rigadmin._note_spent_step(105)
+    assert rigadmin._claim_next_step() == 106
 
 
 def test_provision_with_a_key_records_the_step_its_child_spent(
-    fresh_state: None, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clock = _clocked(monkeypatch, 200 * 30 + 3.0)
     _fake_child(monkeypatch, 0)
     rigadmin.provision(env={}, admin=RigAdmin("rig-operator", "0f" * 24))
-    assert rigadmin._spent.last is None, "an account with no key spent a step"
+    assert rigadmin._spent.last == -1, "an account with no key spent a step"
     rigadmin.provision(env={}, admin=RigAdmin("rig-operator", "0f" * 24, totp.generate_secret()))
     assert rigadmin._spent.last == int(clock.at // 30)
 
@@ -251,9 +295,9 @@ def test_sign_in_with_a_key_sends_both_factors_in_one_request(
     calls = _answers(monkeypatch, (200, {"token": "session-1"}))
     asked: list[str] = []
 
-    def fresh(key: str) -> str:
+    def fresh(key: str) -> tuple[str, int]:
         asked.append(key)
-        return "123456"
+        return "123456", 77
 
     monkeypatch.setattr(rigadmin, "_code_in_a_fresh_step", fresh)
     key = totp.generate_secret()
@@ -265,6 +309,28 @@ def test_sign_in_with_a_key_sends_both_factors_in_one_request(
         "password": "ab" * 24,
         "totp_code": "123456",
     }
+    assert rigadmin._spent.last == 77
+
+
+def test_a_sign_in_spends_its_step_only_when_the_engine_answered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A request that never reached the engine spent nothing there. A refusal is an answer."""
+    monkeypatch.setattr(rigadmin, "_code_in_a_fresh_step", lambda key: ("123456", 77))
+    admin = RigAdmin("rig-operator", "ab" * 24, totp.generate_secret())
+
+    def unreachable(*_a: object, **_k: object) -> tuple[int, bytes]:
+        raise rigadmin.RigUnreachable("the engine did not answer (ConnectionRefusedError)")
+
+    monkeypatch.setattr(rigadmin, "_call", unreachable)
+    with pytest.raises(rigadmin.RigUnreachable):
+        rigadmin.sign_in("https://127.0.0.1:1", admin)
+    assert rigadmin._spent.last == -1, "a step was spent by a request that got no answer"
+
+    _answers(monkeypatch, (401, {"detail": "invalid credentials"}))
+    with pytest.raises(rigadmin.RigSignInRefused):
+        rigadmin.sign_in("https://127.0.0.1:1", admin)
+    assert rigadmin._spent.last == 77
 
 
 # --- the hop -----------------------------------------------------------------
@@ -621,7 +687,7 @@ def test_a_loopback_engine_is_dialled_direct_when_a_proxy_is_set(
 
 
 def test_one_sign_in_serves_every_node_until_one_refuses_it(
-    fresh_state: None, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     signed_in_at: list[str] = []
 
@@ -823,7 +889,7 @@ def test_a_client_refused_the_held_session_signs_in_again_at_its_own_node(
 
 
 def test_the_step_up_handler_re_proves_on_a_session_of_its_own(
-    fresh_state: None, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Vault BACKLOG #2625: the reload takes a proof bound to its action, which no sign-in mints.
     So the handler signs in to a PRIVATE session (never the held one, which every other client
@@ -884,7 +950,7 @@ def test_an_unreachable_engine_reads_as_an_api_error_and_a_refusal_does_not(
 
 
 def test_a_drive_of_another_processs_engines_refuses_to_draw_its_own_credential(
-    fresh_state: None, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A split drive signs in to engines another process provisioned. A password drawn in the drive
     could only be wrong, and each wrong try counts against the account. So it refuses first."""
@@ -1137,7 +1203,7 @@ async def test_a_rig_node_serves_with_sign_in_on_and_the_rig_reads_it_signed_in(
 
 @pytest.mark.timeout(300)
 async def test_a_rig_with_a_key_serves_with_mfa_required_and_signs_in_with_both_factors(
-    fresh_state: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Vault BACKLOG #2796: the shipped ``require_mfa = true``, an Administrator enrolled through the
     shipped ``provision-admin`` with only its terminal reads replaced, and a combined sign-in."""
@@ -1181,8 +1247,10 @@ async def test_a_rig_with_a_key_serves_with_mfa_required_and_signs_in_with_both_
             stats = await client.get(f"{url}/stats", headers={"Authorization": f"Bearer {held}"})
             assert stats.status_code == 200, stats.status_code
 
-            # CONTROL for the wait: the code that sign-in just spent, sent again at once, is refused.
-            spent = totp.totp(key)
+            # CONTROL for the wait: the code of the step that sign-in spent, sent again, is refused.
+            # Computed from the recorded step and not the clock, which may have reached a new one.
+            assert rigadmin._spent.last >= 0, "the sign-in recorded no spent step"
+            spent = totp.totp(key, now=rigadmin._spent.last * 30 + 1)
             replay = await client.post(
                 f"{url}/auth/login",
                 json={"username": admin.username, "password": password, "totp_code": spent},
