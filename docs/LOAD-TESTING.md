@@ -90,10 +90,39 @@ its nodes, and then signs in. You pass nothing.
 
 | When | What you do |
 |---|---|
-| You start `serve` yourself | Set `MEFOR_SECURITY_REQUIRE_MFA=false` on it. `provision-admin` enrols an authenticator app at a terminal and offers no other way, so the rig account has none. |
+| You start `serve` yourself | Set `MEFOR_SECURITY_REQUIRE_MFA=false` on it. `provision-admin` enrols an authenticator app at a terminal and offers no other way, so the rig account has none. To keep MFA required instead, see *One leg runs with MFA required* below. |
 | That `serve` runs under `[security].enforcement = enforce` | Give it an `[alerts]` channel too. With sign-in on, an enforcing start refuses without a way to send account-security notices. The `load test (smoke, sqlite)` step in [`ci.yml`](../.github/workflows/ci.yml) shows the settings. |
 | You keep one store across runs | Use the same credential each run: set `MEFOR_RIG_ADMIN_USERNAME` and `MEFOR_RIG_ADMIN_PASSWORD` in the shell. `provision-admin` declines when the store already has an Administrator, and a new run draws a new password, so the engine then refuses the sign-in. A fresh store needs neither variable. |
 | The drive is a separate process from the engines (a second box, or `batch-driver` beside `batch-engine`) | Export the same two variables for both. The drive signs in to engines another process started, and refuses to start without the credential: one drawn there could only be wrong. |
+
+#### One leg runs with MFA required
+
+The `load test (smoke, sqlite)` step in [`ci.yml`](../.github/workflows/ci.yml) starts its engine
+with `[security].require_mfa` on, as shipped (vault BACKLOG #2796). Its run block draws an
+authenticator key, a base32 TOTP secret, beside the password, and hands it to `rigadmin provision`
+and `rigadmin run` in `MEFOR_RIG_ADMIN_TOTP_KEY`. The provisioning child replaces the terminal
+enrolment with that key and a code computed from it, and runs the rest of the shipped enrolment.
+The sign-in sends the password and a code in one request, the combined sign-in of ADR 0197. Nothing
+is added to `provision-admin`: it still takes no authenticator key as input. To do the same by hand:
+
+```bash
+export MEFOR_RIG_ADMIN_TOTP_KEY="$(python -c 'from messagefoundry.auth import totp; print(totp.generate_secret())')"
+# ...then drop MEFOR_SECURITY_REQUIRE_MFA=false from step 0, and run steps 1 to 3 above on a
+# fresh store. Both rigadmin commands read the key from the environment.
+```
+
+Each sign-in with a key first waits for the next 30-second TOTP step, up to 30 seconds. The engine
+takes each step's code once and counts a reused one as a wrong second factor, which feeds the lock
+on the account. Provisioning spends a step, and so does every sign-in.
+
+**Every other rig leg keeps `require_mfa` off, on purpose.** Those legs measure throughput, store
+access, failover and the container and service start, and the second factor touches none of that:
+it is checked once, at sign-in, and every request after it carries the session. The cost of a key
+would be real there: a wait of up to 30 seconds at each sign-in, and runners that sign in more than
+once (a poller renewing its session, a step-up re-proof, a split drive with a session per process)
+would wait at each. A re-proof (`/me/reauth`) takes the password alone, so the key does not cover
+it. One leg is enough to show an engine that requires MFA starts, admits an enrolled rig account,
+and names no account without an authenticator app at start.
 
 **Signed-in polling is in the numbers, and the report measures its share.** The poller's reads are
 not free. For each signed-in request the engine stamps the session's last use, one commit. With

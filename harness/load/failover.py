@@ -169,9 +169,10 @@ class EngineNode:
             self._env.setdefault("MEFOR_ALLOW_INSECURE_CONFIG_SOURCE", "1")
         # RIGS SIGN IN (harness.load.rigadmin). `serve` always requires sign-in (vault BACKLOG #2719):
         # `start` provisions the rig Administrator in this node's store first, and the API reads below
-        # carry that account's session. The rig password stays out of the engine's environment; only
-        # the provisioning child is handed it.
+        # carry that account's session. The rig password and any authenticator key stay out of the
+        # engine's environment; only the provisioning child is handed them.
         self._env.pop(rigadmin.ADMIN_PASS_ENV, None)
+        self._env.pop(rigadmin.ADMIN_FACTOR_ENV, None)
         for name, value in rigadmin.SERVE_ENV.items():
             self._env.setdefault(name, value)
         self._config_dir = config_dir

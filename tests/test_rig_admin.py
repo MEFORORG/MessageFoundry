@@ -25,6 +25,7 @@ import http.server
 import io
 import json
 import os
+import re
 import socket
 import struct
 import subprocess
@@ -45,6 +46,7 @@ from harness.load.failover import EngineNode
 from harness.load.rigadmin import RIG_SESSION, RigAdmin
 from harness.load.tlsmat import harness_ssl_context
 from messagefoundry.apiclient import ApiError
+from messagefoundry.auth import totp
 from messagefoundry.auth.policy import CONTEXT_WORDS, PasswordPolicy
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -66,7 +68,7 @@ def fresh_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(rigadmin, "_held", rigadmin._HeldSession())
     # Set, then deleted: `rig_admin` publishes a drawn password into the environment itself, and
     # monkeypatch can only undo a variable it has seen.
-    for name in (rigadmin.ADMIN_PASS_ENV, rigadmin.ADMIN_NAME_ENV):
+    for name in (rigadmin.ADMIN_PASS_ENV, rigadmin.ADMIN_NAME_ENV, rigadmin.ADMIN_FACTOR_ENV):
         monkeypatch.setenv(name, "")
         monkeypatch.delenv(name)
 
@@ -111,6 +113,97 @@ def test_a_drawn_credential_is_published_for_a_child_process_and_drawn_once(
 def test_the_password_is_not_in_the_repr() -> None:
     admin = RigAdmin("rig-operator", "a1" * 24)
     assert "a1a1" not in repr(admin) and "rig-operator" in repr(admin)
+
+
+# --- the second factor (vault BACKLOG #2796) ---------------------------------
+
+
+def test_the_authenticator_key_comes_only_from_the_environment_and_stays_out_of_the_repr(
+    fresh_state: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A leg opts in to MFA by supplying the key. The rig never draws one."""
+    assert rigadmin.rig_admin().totp_secret is None
+    assert rigadmin.ADMIN_FACTOR_ENV not in os.environ, "a key was drawn and published"
+    monkeypatch.setattr(rigadmin, "_credential", rigadmin._HeldAdmin())
+    key = totp.generate_secret()
+    monkeypatch.setenv(rigadmin.ADMIN_FACTOR_ENV, key)
+    admin = rigadmin.rig_admin()
+    assert admin.totp_secret == key
+    assert key not in repr(admin)
+
+
+def test_the_rig_computes_the_engines_totp_codes() -> None:
+    key = totp.generate_secret()
+    for at in (0.0, 29.999, 30.0, 1_700_000_000.5, time.time()):
+        code = rigadmin._totp_code(key, at)
+        assert totp.verify_totp_step(key, code, now=at, window=0) == int(at // 30), at
+    # Read as the engine reads a key: case, spaces and stripped padding do not matter.
+    key = totp.generate_secret()
+    spaced = " ".join(key[i : i + 4] for i in range(0, len(key), 4)).lower()
+    assert rigadmin._totp_code(spaced, 1e9) == totp.totp(key, now=1e9)
+
+
+@pytest.mark.parametrize("key", ["", "not base32!", "1111"])
+def test_a_key_that_is_not_base32_is_refused_by_name_and_never_by_value(key: str) -> None:
+    with pytest.raises(rigadmin.RigAdminError, match=rigadmin.ADMIN_FACTOR_ENV) as refused:
+        rigadmin._totp_code(key, 0.0)
+    assert not key or key not in str(refused.value)
+
+
+class _FakeClock:
+    """``rigadmin._now`` and ``rigadmin._pause``: the clock moves only when the rig waits."""
+
+    def __init__(self, start: float) -> None:
+        self.at = start
+        self.pauses: list[float] = []
+
+    def now(self) -> float:
+        return self.at
+
+    def pause(self, seconds: float) -> None:
+        self.pauses.append(seconds)
+        self.at += seconds
+
+
+@pytest.mark.parametrize("start", [3_000.0, 3_000.001, 3_014.5, 3_029.999])
+def test_a_sign_in_code_comes_from_a_step_that_began_after_the_call(
+    monkeypatch: pytest.MonkeyPatch, start: float
+) -> None:
+    """THE REPLAY TRAP. Provisioning spends the step it ran in, and so does each sign-in; the engine
+    counts a reused code as a wrong second factor, which feeds the account's lock. So the code is
+    always from the NEXT step, even when the call lands on a step's first instant."""
+    clock = _FakeClock(start)
+    monkeypatch.setattr(rigadmin, "_now", clock.now)
+    monkeypatch.setattr(rigadmin, "_pause", clock.pause)
+    key = totp.generate_secret()
+    code = rigadmin._code_in_a_fresh_step(key)
+    assert int(clock.at // 30) == int(start // 30) + 1, "the code is not from the next step"
+    assert clock.at - start <= 30.0 + 0.05
+    assert code == totp.totp(key, now=clock.at)
+    assert clock.pauses, "the rig computed a code without waiting for a fresh step"
+
+
+def test_sign_in_with_a_key_sends_both_factors_in_one_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The combined sign-in of ADR 0197: one POST carrying the password and a fresh code."""
+    calls = _answers(monkeypatch, (200, {"token": "session-1"}))
+    asked: list[str] = []
+
+    def fresh(key: str) -> str:
+        asked.append(key)
+        return "123456"
+
+    monkeypatch.setattr(rigadmin, "_code_in_a_fresh_step", fresh)
+    key = totp.generate_secret()
+    admin = RigAdmin("rig-operator", "ab" * 24, key)
+    assert rigadmin.sign_in("https://127.0.0.1:1", admin) == "session-1"
+    assert asked == [key]
+    assert calls[0]["body"] == {
+        "username": "rig-operator",
+        "password": "ab" * 24,
+        "totp_code": "123456",
+    }
 
 
 # --- the hop -----------------------------------------------------------------
@@ -528,6 +621,40 @@ def test_provision_hands_the_password_to_the_child_in_its_environment_and_never_
     assert env == {"MEFOR_STORE_PATH": "rig.db", "PATH": "/x"}, "the caller's env was changed"
 
 
+def test_provision_hands_the_key_to_the_child_only_from_the_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The key goes in the child's environment, never on argv, and only when the account holds one:
+    a stray key in the caller's environment must not enrol an account that has none."""
+    key = totp.generate_secret()
+    stray = {"PATH": "/x", rigadmin.ADMIN_FACTOR_ENV: totp.generate_secret()}
+    seen = _fake_child(monkeypatch, 0)
+    rigadmin.provision(env=stray, admin=RigAdmin("rig-operator", "0f" * 24, key))
+    assert seen["env"][rigadmin.ADMIN_FACTOR_ENV] == key
+    assert key not in " ".join(seen["argv"])
+    seen = _fake_child(monkeypatch, 0)
+    rigadmin.provision(env=stray, admin=RigAdmin("rig-operator", "0f" * 24))
+    assert rigadmin.ADMIN_FACTOR_ENV not in seen["env"]
+
+
+def test_run_hands_its_child_neither_the_password_nor_the_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(rigadmin, "_require_sign_in", lambda *_a, **_k: None)
+    monkeypatch.setattr(rigadmin, "sign_in", lambda *_a, **_k: "a-session")
+    monkeypatch.setenv(rigadmin.ADMIN_PASS_ENV, "ab" * 24)
+    monkeypatch.setenv(rigadmin.ADMIN_FACTOR_ENV, totp.generate_secret())
+    child = (
+        "import os, sys; "
+        f"sys.exit(9 if {rigadmin.ADMIN_PASS_ENV!r} in os.environ else "
+        f"8 if {rigadmin.ADMIN_FACTOR_ENV!r} in os.environ else 0)"
+    )
+    code = rigadmin.main(
+        ["run", "--engine", "https://127.0.0.1:1", "--", sys.executable, "-c", child]
+    )
+    assert code == 0, code
+
+
 def test_a_store_that_already_had_an_administrator_is_not_a_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -770,8 +897,10 @@ def test_each_workflow_leg_carries_the_settings_this_module_names() -> None:
     pytest.importorskip("yaml")
     enforcing = {**rigadmin.SERVE_ENV, **rigadmin.NOTIFY_ENV}
     assert len(enforcing) == 5, "CONTROL FAILED: the module's settings changed shape"
+    # Vault BACKLOG #2796: the sqlite load smoke is the one leg that keeps MFA required.
+    with_mfa = {**rigadmin.NOTIFY_ENV, "MEFOR_SECURITY_REQUIRE_MFA": "true"}
     legs: list[tuple[str, str, dict[str, str]]] = [
-        ("ci.yml", "load-test", enforcing),
+        ("ci.yml", "load-test", with_mfa),
         ("benchmark.yml", "baseline-sqlite", enforcing),
         ("ci.yml", "load-test-sqlserver", dict(rigadmin.SERVE_ENV)),
         ("benchmark.yml", "baseline-postgres", dict(rigadmin.SERVE_ENV)),
@@ -787,6 +916,29 @@ def test_each_workflow_leg_carries_the_settings_this_module_names() -> None:
     for name, value in enforcing.items():
         assert f"-e {name}={value} " in docker, f"docker-smoke: {name}"
         assert f'"{name}={value}" `' in service, f"windows-service-smoke: {name}"
+
+
+def test_the_mfa_leg_hands_its_key_to_provisioning_and_to_the_sign_in_and_masks_it() -> None:
+    """Vault BACKLOG #2796. Read from the step's script with comment lines dropped, so prose about
+    the key cannot pass for the commands that carry it."""
+    pytest.importorskip("yaml")
+    run = str(_serving_step("ci.yml", "load-test", "messagefoundry serve")["run"])
+    script = "\n".join(line for line in run.splitlines() if not line.lstrip().startswith("#"))
+    handed = f'{rigadmin.ADMIN_FACTOR_ENV}="$rig_totp"'
+    assert 'echo "::add-mask::$rig_totp"' in script
+    assert f"export {rigadmin.ADMIN_FACTOR_ENV}" not in script, "the key reaches the engine's env"
+    for command in ("harness.load.rigadmin provision", "harness.load.rigadmin run"):
+        at = script.find(command)
+        assert at != -1, command
+        # The variable prefixes the command: on its line or on the one continued into it.
+        assert handed in script[max(0, at - 200) : at], f"{command} is not handed the key"
+    # The census line that would name an account with no authenticator app fails the step. CONTROL:
+    # the step's needle is the engine's own warning text, with its source literals joined, so a
+    # reworded warning fails here rather than leaving the grep matching nothing.
+    needle = "hold a chosen password and no authenticator app"
+    assert f'grep -q "{needle}" engine.log' in script
+    source = (_ROOT / "messagefoundry" / "auth" / "service.py").read_text(encoding="utf-8")
+    assert needle in re.sub(r'"\s+"', "", source), "the census warning no longer says this"
 
 
 # --- one real engine ---------------------------------------------------------
@@ -918,5 +1070,69 @@ async def test_a_rig_node_serves_with_sign_in_on_and_the_rig_reads_it_signed_in(
         wrong = RigAdmin(rigadmin.rig_admin().username, "0" * 48)
         with pytest.raises(rigadmin.RigSignInRefused, match="HTTP 401"):
             await asyncio.to_thread(rigadmin.sign_in, url, wrong, cacert=pin)
+    finally:
+        await node.stop()
+
+
+@pytest.mark.timeout(300)
+async def test_a_rig_with_a_key_serves_with_mfa_required_and_signs_in_with_both_factors(
+    fresh_state: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Vault BACKLOG #2796: the shipped ``require_mfa = true``, an Administrator enrolled through the
+    shipped ``provision-admin`` with only its terminal reads replaced, and a combined sign-in."""
+    key = totp.generate_secret()
+    password = rigadmin._new_password()
+    monkeypatch.setenv(rigadmin.ADMIN_PASS_ENV, password)
+    monkeypatch.setenv(rigadmin.ADMIN_FACTOR_ENV, key)
+    admin = rigadmin.rig_admin()
+    assert admin.totp_secret == key
+
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "IB_RIG_PROOF.py").write_text(_CONFIG.format(port=_free_port()), encoding="utf-8")
+    base_env = _env_for_a_sqlite_store(
+        MEFOR_STORE_PATH=str(tmp_path / "rig.db"), MEFOR_SECURITY_REQUIRE_MFA="true"
+    )
+    node = EngineNode("rig-mfa", _free_port(), env=base_env, config_dir=str(config), cwd=tmp_path)
+    assert node._env["MEFOR_SECURITY_REQUIRE_MFA"] == "true"
+    for name in (rigadmin.ADMIN_PASS_ENV, rigadmin.ADMIN_FACTOR_ENV):
+        assert name not in node._env, f"{name} reached the engine's environment"
+
+    await node.start()
+    try:
+        async with httpx.AsyncClient(timeout=4.0, verify=harness_ssl_context()) as client:
+            deadline = time.monotonic() + 120.0
+            while not await node.healthy(client):
+                assert node.alive, f"the node exited during startup:\n{node.log_tail()}"
+                assert time.monotonic() < deadline, f"never healthy:\n{node.log_tail()}"
+                await asyncio.sleep(0.25)
+            url, pin = node.url, node.cacert
+
+            # CONTROL: MFA is really required. The password alone is answered with a demand for
+            # the second factor, which the rig reads as a refusal.
+            with pytest.raises(rigadmin.RigSignInRefused, match="second factor"):
+                await asyncio.to_thread(
+                    rigadmin.sign_in, url, RigAdmin(admin.username, password), cacert=pin
+                )
+
+            # THE POINT: both factors in one request give a session the API answers.
+            held = await asyncio.to_thread(rigadmin.sign_in, url, admin, cacert=pin)
+            stats = await client.get(f"{url}/stats", headers={"Authorization": f"Bearer {held}"})
+            assert stats.status_code == 200, stats.status_code
+
+            # CONTROL for the wait: the code that sign-in just spent, sent again at once, is refused.
+            spent = totp.totp(key)
+            replay = await client.post(
+                f"{url}/auth/login",
+                json={"username": admin.username, "password": password, "totp_code": spent},
+            )
+            assert replay.status_code == 401, replay.status_code
+
+        # The start-up census names no covered account without an authenticator app, and neither
+        # factor reached the engine's log.
+        log = node.log_tail(limit=8 * 1024 * 1024)
+        assert log, "CONTROL FAILED: the engine log is empty"
+        assert "hold a chosen password and no authenticator app" not in log, log[-4000:]
+        assert key not in log and password not in log
     finally:
         await node.stop()
