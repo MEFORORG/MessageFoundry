@@ -507,24 +507,49 @@ def test_a_later_page_that_did_not_end_with_success_refuses_the_whole_search(
 def test_a_directory_that_never_stops_paging_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ldap_module, "_MAX_PAGES", 3)
     conn = _PagedConn([_page(RESULT_SUCCESS, [object()], b"synthetic-again")])
-    with pytest.raises(LdapUnansweredError, match="more than 3 pages"):
+    with pytest.raises(LdapUnansweredError, match="still paging after 3 pages") as refused:
         ldap_module._search_paged(conn, "group search")
     assert len(conn.calls) == 3
+    assert (refused.value.code, refused.value.code_name) == (None, "too many pages")
 
 
-@pytest.mark.parametrize(
-    "result",
-    [
-        None,
-        {"result": 0},
-        {"result": 0, "controls": None},
-        {"result": 0, "controls": {ldap_module._PAGED_RESULTS_OID: None}},
+_UNREADABLE_CONTROLS = [
+    pytest.param(None, id="no-result"),
+    pytest.param({"result": 0}, id="no-controls"),
+    pytest.param({"result": 0, "controls": None}, id="controls-none"),
+    pytest.param(
+        {"result": 0, "controls": {ldap_module._PAGED_RESULTS_OID: None}}, id="control-none"
+    ),
+    pytest.param(
         {"result": 0, "controls": {ldap_module._PAGED_RESULTS_OID: {"value": {"cookie": "x"}}}},
-    ],
-    ids=["no-result", "no-controls", "controls-none", "control-none", "cookie-not-bytes"],
-)
-def test_a_cookie_that_is_absent_or_unreadable_ends_the_paging(result: object) -> None:
+        id="cookie-not-bytes",
+    ),
+]
+
+
+@pytest.mark.parametrize("result", _UNREADABLE_CONTROLS)
+def test_a_control_that_is_absent_or_unreadable_reads_as_none(result: object) -> None:
     assert ldap_module._paged_cookie(SimpleNamespace(result=result)) is None
+
+
+def test_an_empty_cookie_reads_as_the_last_page_not_as_no_control() -> None:
+    conn = _PagedConn([_page(RESULT_SUCCESS, [], b"")])
+    conn.search()
+    assert ldap_module._paged_cookie(conn) == b""
+
+
+@pytest.mark.parametrize("result", _UNREADABLE_CONTROLS[1:])
+def test_a_later_page_that_drops_the_paging_control_refuses_the_whole_search(
+    result: dict[str, Any],
+) -> None:
+    """The directory was paging, so a page that does not say whether it is the last cannot be
+    read as the last: the pages read so far are not the whole answer."""
+    later = {**result, "_entries": [object()]}
+    conn = _PagedConn([_page(RESULT_SUCCESS, [object()], b"synthetic-cookie-1"), later])
+    with pytest.raises(LdapUnansweredError, match="dropped the paging control") as refused:
+        ldap_module._search_paged(conn, "group search")
+    assert (refused.value.code, refused.value.code_name) == (None, "paging control lost")
+    assert len(conn.calls) == 2
 
 
 def _paged_groups(monkeypatch: pytest.MonkeyPatch, pages: list[dict[str, Any]]) -> list[object]:
@@ -639,6 +664,9 @@ _IN_CHAIN = b"1.2.840.113556.1.4.1941"  # the nested group search's matching rul
 
 _USER_DN = "CN=alice,OU=Users,DC=example,DC=com"
 
+#: RFC 4511 ExtendedRequest and ExtendedResponse, [APPLICATION 23] and [APPLICATION 24].
+_EXTENDED_REQUEST, _EXTENDED_RESPONSE = 0x77, 0x78
+
 #: One message a loopback server sends: its protocolOp, and its controls (empty for none).
 _Reply = tuple[bytes, bytes]
 
@@ -665,11 +693,14 @@ def _entry(dn: str) -> _Reply:
 
 class _ScriptedDc:
     """A loopback LDAP server, after ``tests/test_ldap_referrals.py``'s ``_FakeDc``. Binds end with
-    ``bind_code``; each search is answered by ``answer(raw request)``. ``searches`` holds every
+    ``bind_code``, an extended operation such as Who am I with ``extended_code``; each search is
+    answered by ``answer(raw request)``. ``searches`` holds every
     search request's bytes."""
 
-    def __init__(self, answer: Callable[[bytes], list[_Reply]], bind_code: int) -> None:
-        self._answer, self._bind_code = answer, bind_code
+    def __init__(
+        self, answer: Callable[[bytes], list[_Reply]], bind_code: int, extended_code: int
+    ) -> None:
+        self._answer, self._bind_code, self._extended_code = answer, bind_code, extended_code
         self.searches: list[bytes] = []
         self._listener = socket.create_server(("127.0.0.1", 0))
         self.port: int = self._listener.getsockname()[1]
@@ -692,6 +723,8 @@ class _ScriptedDc:
                 op = body[2 + body[1]]
                 if op == _BIND_REQUEST:
                     replies = [_done(self._bind_code, tag=_BIND_RESPONSE)]
+                elif op == _EXTENDED_REQUEST:
+                    replies = [_done(self._extended_code, tag=_EXTENDED_RESPONSE)]
                 elif op == _SEARCH_REQUEST:
                     self.searches.append(raw)
                     replies = self._answer(raw)
@@ -709,11 +742,14 @@ class _ScriptedDc:
 
 @contextlib.contextmanager
 def _scripted_dc(
-    answer: Callable[[bytes], list[_Reply]], *, bind_code: int = RESULT_SUCCESS
+    answer: Callable[[bytes], list[_Reply]],
+    *,
+    bind_code: int = RESULT_SUCCESS,
+    extended_code: int = RESULT_SUCCESS,
 ) -> Iterator[tuple[_ScriptedDc, LdapAuthenticator]]:
     """A loopback server, and an authenticator pointed at it over plain ``ldap://``: the property
     under test is the decode, not the hop's TLS."""
-    dc = _ScriptedDc(answer, bind_code)
+    dc = _ScriptedDc(answer, bind_code, extended_code)
     try:
         settings = _ad_settings(
             ad_server=f"ldap://127.0.0.1:{dc.port}", ad_allow_insecure_ldap=True
@@ -858,3 +894,29 @@ def test_the_bind_account_read_names_the_code_and_keeps_the_identity(
         assert "distinguished name" not in problem and "may not read" not in problem
     else:
         assert hint in problem
+
+
+def test_a_who_am_i_ending_with_an_unknown_code_is_reported_and_the_group_read_still_runs() -> None:
+    """ldap3's decoder raises the same ``KeyError`` on an extended response. A failed Who am I is
+    not a bind failure, so it is reported in ``whoami_error`` and the group read still runs."""
+    conn = _conn(_result(RESULT_SUCCESS), entries=[])
+    conn.extend = SimpleNamespace(standard=SimpleNamespace(who_am_i=_raising(4242)))
+    conn.unbind = lambda: True
+    authenticator = LdapAuthenticator(_ad_settings())
+    authenticator._service_conn = lambda: conn  # type: ignore[method-assign]
+    reading = authenticator.read_bind_account()
+    assert reading.bound and reading.authzid is None
+    assert reading.whoami_error is not None
+    assert "Who am I with result code 4242 (an unknown result code)" in reading.whoami_error
+    assert reading.problem is not None and "returned no entry" in reading.problem
+
+
+def test_real_ldap3_maps_a_who_am_i_that_ends_with_an_unknown_code() -> None:
+    with _scripted_dc(lambda _raw: [_done(RESULT_SUCCESS)], extended_code=4242) as (
+        dc,
+        authenticator,
+    ):
+        reading = authenticator.read_bind_account()
+    assert reading.bound and reading.authzid is None
+    assert reading.whoami_error is not None and "result code 4242" in reading.whoami_error
+    assert len(dc.searches) == 1, "the group read did not run after the failed Who am I"
