@@ -1026,3 +1026,133 @@ async def test_a_step_up_from_a_roamed_address_records_it_and_moves_the_anchor()
         assert len(unevaluated) == 1
     finally:
         await store.close()
+
+
+# --- follow-ups from the review of engine PR 1999 (vault BACKLOG #2964) ---
+
+
+def _owing_service(store: MessageStore) -> AuthService:
+    """An account under ``require_mfa`` owes a factor. The floor is off so a test can enrol on the
+    session it just signed in (BACKLOG #2389)."""
+    return AuthService(
+        store,
+        AuthSettings(require_mfa=True, mfa_verify_min_elapsed_seconds=0, mfa_recovery_code_count=1),
+        security_notifier=_FakeNotifier(),
+    )
+
+
+async def test_a_first_local_sign_in_that_owes_a_factor_records_no_baseline() -> None:
+    """The local leg's ``not mfa_required`` gate, for an account with no baseline yet. That verdict
+    is one that seeds the record, so only the gate keeps a holder of the password alone from
+    writing the account's first known address before the factor."""
+    store = await MessageStore.open(":memory:")
+    try:
+        owed = _owing_service(store)
+        await owed.initialize()
+        uid = await _operator(owed)
+        out = await owed.login("oper", PW, client="10.1.1.1")
+        assert out.ok and out.mfa_required
+        rows = await store.list_audit(actor="oper", action="auth.login_address_unevaluated")
+        assert len(rows) == 1 and '"reason": "no_baseline"' in str(rows[0]["detail"])
+        assert await store.list_known_login_addresses(uid, since=0.0) == []
+    finally:
+        await store.close()
+
+
+async def test_an_enrolment_records_its_address_after_its_audit_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The enrolment's write runs after ``auth.mfa_enrolled`` is appended, so no address is ever
+    known for an enrolment that has no audit row. A store fault in that append skips the write,
+    and the account's next proved factor writes it instead."""
+    store = await MessageStore.open(":memory:")
+    try:
+        owed = _owing_service(store)
+        await owed.initialize()
+        uid = await _operator(owed)
+        out = await owed.login("oper", PW, client="10.1.1.1")
+        assert out.ok and out.identity is not None and out.token is not None
+        seen_at_write: list[list[str]] = []
+        real = store.remember_login_address
+
+        async def _spy(user_id: str, address: str, *, now: float) -> None:
+            seen_at_write.append(await _actions(store, "oper"))
+            await real(user_id, address, now=now)
+
+        monkeypatch.setattr(store, "remember_login_address", _spy)
+        await _enrol_totp(owed, out.identity, out.token, client="10.1.1.1")
+        assert len(seen_at_write) == 1
+        assert "auth.mfa_enrolled" in seen_at_write[0]
+        assert await store.list_known_login_addresses(uid, since=0.0) == ["10.1.1.1"]
+    finally:
+        await store.close()
+
+
+async def test_verify_mfa_records_its_address_inside_the_account_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``verify_mfa`` writes while it still holds the account's sign-in queue, so a local sign-in
+    queued behind it classifies against the written address rather than reading NEW."""
+    store = await MessageStore.open(":memory:")
+    try:
+        owed = _owing_service(store)
+        await owed.initialize()
+        await _operator(owed)
+        queue_held: list[bool] = []
+        real = store.remember_login_address
+        key = service_module._credential_lock_key("oper")
+
+        async def _spy(user_id: str, address: str, *, now: float) -> None:
+            entry = owed._credential_locks.get(key)
+            queue_held.append(entry is not None and entry.lock.locked())
+            await real(user_id, address, now=now)
+
+        monkeypatch.setattr(store, "remember_login_address", _spy)
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        first = await owed.login("oper", PW, client="10.1.1.1")
+        assert first.ok and first.identity is not None and first.token is not None
+        secret = await _enrol_totp(owed, first.identity, first.token, client="10.1.1.1", now=t0)
+        new = await owed.login("oper", PW, client="203.0.113.8")
+        assert new.ok and new.mfa_required and new.token is not None
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        assert (
+            await owed.verify_mfa(new.token, totp.totp(secret, now=t1), client="203.0.113.8")
+        ).ok
+        # The enrolment takes no queue, so its write is the control that the spy can read False.
+        assert queue_held == [False, True]
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("method", "fault"),
+    [("remember_login_address", TypeError), ("forget_login_addresses", AttributeError)],
+)
+async def test_a_programming_error_in_the_record_does_not_lose_the_enrolment_reply(
+    monkeypatch: pytest.MonkeyPatch, method: str, fault: type[Exception]
+) -> None:
+    """The record's helper logs and never raises, even a ``TypeError`` or an ``AttributeError``.
+    It runs after the enrolment has committed, so a raise there would lose the reply that carries
+    the rotated token and the recovery codes, with TOTP already on."""
+    store = await MessageStore.open(":memory:")
+    try:
+        owed = _owing_service(store)
+        await owed.initialize()
+        await _operator(owed)
+        out = await owed.login("oper", PW, client="10.1.1.1")
+        assert out.ok and out.identity is not None and out.token is not None
+
+        async def _broken(*_a: object, **_kw: object) -> None:
+            raise fault("synthetic programming error")
+
+        monkeypatch.setattr(store, method, _broken)
+        enroll = await owed.begin_mfa_enrollment(out.identity)
+        elevation = await owed.confirm_mfa_enrollment(
+            out.identity, fresh_totp(enroll.secret), token=out.token, client="10.1.1.1"
+        )
+        assert elevation.ok and elevation.token is not None
+        assert elevation.recovery_codes
+    finally:
+        await store.close()
