@@ -7332,7 +7332,7 @@ class AuthService:
         the breaker or the referral. It would also skip every account after this one. So a store
         refusal is logged at ERROR, naming the action and the actor, and the pass goes on. The log
         line is then the only record of that row: nothing retries it. A revocation or rename it
-        records has already committed; its notice still goes, and a revocation still alerts.
+        records has already committed, and any notice or alert it was due still goes.
 
         A defect is raised, not passed over (:data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS`).
         """
@@ -7340,7 +7340,7 @@ class AuthService:
             lambda: self._audit(action, actor=actor, detail=detail, client=client),
             log=_log,
             message="directory reconcile: the %s audit row for %s could not be written; the pass "
-            "goes on, so its alerts still fire",
+            "goes on",
             args=lambda: (action, scrub_log_argument(actor)),
             errors=_audit_write_errors(),
             defects=AUDIT_WRITE_DEFECTS,
@@ -7373,12 +7373,18 @@ class AuthService:
                 revocation.username,
             )
             return "skipped"
-        roles_changed = False
         # No role write for an account that is gone or fails its seal (BACKLOG #2592): the store would
-        # refuse it, and ending the sessions below needs no write to the account.
-        if revocation.role_ids is not None and user is not None:
-            # Read before the write, so roles another reconciler already wrote are no change.
-            roles_changed = set(user.role_ids) != set(revocation.role_ids)
+        # refuse it, and ending the sessions below needs no write to the account. None either when
+        # the stored roles already match, as they do once another reconciler wrote them (BACKLOG
+        # #3085). Read before the write, so two reconcilers that both read the old roles before
+        # either wrote both count it as a change, and both report.
+        roles_changed = False
+        if (
+            revocation.role_ids is not None
+            and user is not None
+            and set(user.role_ids) != set(revocation.role_ids)
+        ):
+            roles_changed = True
             await self._store.set_user_roles(
                 revocation.user_id, list(revocation.role_ids), assigned_by="ad-reconcile"
             )
