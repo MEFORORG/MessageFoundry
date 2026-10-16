@@ -511,8 +511,10 @@ class ResealResult:
     dropping that key would make it permanently unreadable, so a non-zero ``skipped`` means "fix the
     cause and run it again before you retire anything". ``rotate-key`` exits non-zero and writes no
     rotation stamp while it is non-zero (BACKLOG #3181). It includes a value no configured key opens,
-    which the pass leaves as it was and moves past. A body that is missing or is not text is NOT
-    counted here: no key reads it and no re-run changes it (``unsealable``, ``body_lost``).
+    which the pass leaves as it was and moves past. A readable-sized body that is missing or is not
+    text is not counted here when its sidecar is readable: no key reads that body and no re-run
+    changes it (``unsealable``, ``body_lost``). At least a body too large for an upload, one that is
+    not a regular file, and a sidecar that is not text are still skips.
 
     The counts use different units. ``resealed`` counts VALUES: each body or sidecar it rewrites
     adds one. ``skipped`` counts UPLOADS: a pair adds at most one, whichever half failed (BACKLOG

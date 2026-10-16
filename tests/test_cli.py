@@ -627,13 +627,32 @@ def test_rotate_key_fails_and_writes_no_stamp_when_an_uploaded_file_is_skipped(
     exit 0 and stamp the rotation for ASVS 13.3.4, so a wrapper or an operator would drop a key that
     is still load-bearing. It now fails, prints no OK line, and writes no stamp. Once the cause is
     fixed, a re-run completes and stamps. A directory in the body's place stands in for a cause an
-    operator can fix."""
-    from messagefoundry.store.crypto import generate_key
+    operator can fix. The store starts with a stamp naming the OLD key, as it would after any start,
+    so the re-run's changed-fingerprint test is the one exercised."""
+    import asyncio
+
+    from messagefoundry.store.crypto import generate_key, make_cipher
+    from messagefoundry.store.store import MessageStore
 
     monkeypatch.chdir(tmp_path)
     db, uploads = tmp_path / "rot-skip.db", tmp_path / "uploads"
     key_a, key_b = generate_key(), generate_key()
     file_id = _seed_store_and_upload(db, uploads, key_a)
+    old_key_id = _key_id_and_stamp(db, key_a)[0]
+
+    async def stamp_the_old_key() -> None:
+        store = await MessageStore.open(db, cipher=make_cipher(key_a))
+        try:
+            await store.upsert_secret_rotation_meta(
+                "MEFOR_STORE_ENCRYPTION_KEY",
+                fingerprint=old_key_id,
+                tracked_since="2025-01-01",
+                last_rotated="2025-01-01",
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(stamp_the_old_key())
     blob = uploads / f"{file_id}.blob"
     body = blob.read_bytes()
     blob.unlink()
@@ -647,7 +666,7 @@ def test_rotate_key_fails_and_writes_no_stamp_when_an_uploaded_file_is_skipped(
     assert "were NOT fully re-sealed" in captured.err
     assert "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED" in captured.err
     new_key_id, stamped = _key_id_and_stamp(db, key_b)
-    assert stamped is None  # the seed wrote none, and this run wrote none
+    assert stamped == old_key_id  # this run left the old key's stamp as it was
 
     # Fixed and re-run: the rotation completes, and only now is it stamped.
     blob.rmdir()
