@@ -201,6 +201,31 @@ async def test_one_corrupt_body_does_not_abort_the_pass(
     assert (await dropped.read_bytes(good)).decode() == _ADT
 
 
+async def test_a_file_that_cannot_be_written_is_a_skip_and_the_pass_goes_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One upload whose re-sealed value cannot be written (disk full, a read-only file) is a skip,
+    left as it was, and the pass still re-seals the others (BACKLOG #3181)."""
+    import messagefoundry.uploads as uploads_module
+
+    root = tmp_path / "uploads"
+    key_a, key_b = generate_key(), generate_key()
+    seeder = _keyed_store(root, key_a)
+    bad, good = await _seed(seeder), await _seed(seeder)
+    real_write = uploads_module._atomic_write_text
+
+    def _write(root_: Path, path: Path, text: str) -> None:
+        if path.name.startswith(bad):
+            raise PermissionError("read-only file")
+        real_write(root_, path, text)
+
+    monkeypatch.setattr(uploads_module, "_atomic_write_text", _write)
+    result = await _keyed_store(root, key_b, (key_a,)).reseal_to_active()
+    assert result == ResealResult(resealed=2, skipped=1)
+    assert (await _keyed_store(root, key_a).read_bytes(bad)).decode() == _ADT  # untouched
+    assert (await _keyed_store(root, key_b).read_bytes(good)).decode() == _ADT
+
+
 async def test_an_encrypt_refusal_still_aborts_the_pass(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -262,6 +287,8 @@ async def test_a_body_unreadable_for_another_cause_is_still_a_skip(tmp_path: Pat
 
     result = await _keyed_store(root, key_b, (key_a,)).reseal_to_active()
     assert result == ResealResult(resealed=1, skipped=1)
+    # The retired-key sidecar is still re-sealed, and reads under the new key alone (BACKLOG #2322).
+    assert (await _keyed_store(root, key_b).get_meta(fid)).filename == "acme.hl7"
 
 
 @pytest.mark.parametrize("break_body", [_remove, _garble], ids=["missing", "undecodable"])

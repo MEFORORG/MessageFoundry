@@ -9242,7 +9242,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
             # fingerprint; preserve the tracked-since floor. NON-SECRET (key-id + dates only).
             # Not after a skipped upload (BACKLOG #3181): part of that file may still be under the
             # prior key, so the rotation is not done, and a stamp would tell the watcher it was. The
-            # re-run that seals it still sees the old fingerprint here and stamps then.
+            # re-run that seals it still sees the old fingerprint here and stamps then, unless an
+            # engine start came first: `reconcile_rotation_meta` stamps a changed DEK on its own.
             if isinstance(store, SecretRotationMetaStore) and not uploads.skipped:
                 key_id = store.cipher_info().active_key_id
                 if key_id:
@@ -9286,9 +9287,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
         # A value couldn't be decrypted by any supplied key — the prior key is missing — or it was an
         # unmarked value the cipher refuses (#1169); the message names which, and the cell. Nothing is
         # corrupted: every pass is all-or-nothing per batch AND idempotent, so re-running with the
-        # key supplied finishes the job. This arm is the store's pass: the uploaded-file pass counts
-        # a value no key opens as a skip and moves on (BACKLOG #3181), and the skip fails the command
-        # below. Either way the ASVS 13.3.4 rotation stamp is unwritten. That is safe precisely
+        # key supplied finishes the job. This arm is the store's pass, and an ENCRYPT refusal in the
+        # uploaded-file pass, such as the AES-GCM invocation ceiling. That pass counts a value no key
+        # opens as a skip and moves on (BACKLOG #3181), and the skip fails the command below. Either way the ASVS 13.3.4 rotation stamp is unwritten. That is safe precisely
         # because both passes skip what is already under the active key -- it is a resumable
         # rotation, not a rollback.
         # One case no key finishes: a row whose tag verified but which is not UTF-8, or not JSON at
@@ -9344,10 +9345,12 @@ def _rotate_key(args: argparse.Namespace) -> int:
         # that key now destroys it. So the command fails, and the rotation stamp was not written.
         print(
             f"error: {uploads.skipped} uploaded file(s) were NOT fully re-sealed -- part of each "
-            "may still be under the prior key. Either it could not be read, or no configured key "
-            "opens it: a prior key was not supplied, or the file is damaged. The log names each "
-            "file and its cause. Fix the cause and re-run rotate-key BEFORE removing "
-            "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED. The key rotation is recorded only once a run completes.",
+            "may still be under the prior key. It could not be read or written, or no configured "
+            "key opens it: a prior key was not supplied, or the file is damaged. The log names each "
+            "file and its cause. Fix the cause and re-run rotate-key BEFORE retiring any prior key "
+            "(MEFOR_STORE_ENCRYPTION_KEYS_RETIRED). This run did not stamp the key's rotation date; "
+            "note that serve stamps a changed key when it next starts, whether or not a run "
+            "completed.",
             file=sys.stderr,
         )
     if not rolled_ok:

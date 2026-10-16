@@ -1537,7 +1537,7 @@ class UploadStore:
                     if kind == "body" and self._lost_body_size(path) is not None:
                         # BACKLOG #3181: the body is missing or is not text, so no key reads it and
                         # no re-run changes that. It holds nothing under the OLD key, so it is not a
-                        # skip; counting one sent the operator to re-run forever. The sidecar is
+                        # skip; counting one would fail every later run for good. The sidecar is
                         # still handled below, as the unsealable kind when it is plaintext.
                         body_lost = True
                         _log.warning(
@@ -1593,24 +1593,38 @@ class UploadStore:
                     # skip, which fails the command and withholds the rotation stamp (BACKLOG
                     # #3181). One bad upload used to abort the whole pass, and the CLI then blamed
                     # a missing prior key for what may be one damaged file. An encrypt-side refusal
-                    # is not caught here and still aborts. The message is safe to log: a
-                    # CipherError names key ids and marker versions, never a value.
+                    # is not caught here and still aborts. Only the cause's class is logged: a
+                    # malformed marker's key id is cut from the stored text up to the next ':', so
+                    # the cipher's message can carry a piece of a damaged or planted file.
                     pair_skipped = True
                     _log.warning(
-                        "uploaded file %s (%s): skipped, no configured key opens it: %s",
+                        "uploaded file %s (%s): skipped, no configured key opens it (%s)",
                         fid,
                         kind,
-                        exc,
+                        type(exc.__cause__ or exc).__name__,
                     )
                     del stored  # the pass goes on now, so free the buffer as the write path does
                     continue
-                had_plaintext |= plaintext
                 # Drop each file-sized buffer before the next iteration allocates its own. Without
                 # this the previous file's plaintext stays reachable from the frame while the next
                 # one is read, roughly doubling peak memory for no reason.
                 del stored
-                _atomic_write_text(root, path, sealed)
-                del sealed
+                try:
+                    _atomic_write_text(root, path, sealed)
+                except OSError as exc:
+                    # The write failed and the temp-and-replace left the file as it was. A skip, like
+                    # a read failure, so one file that cannot be written does not stop the pass.
+                    pair_skipped = True
+                    _log.warning(
+                        "uploaded file %s (%s): skipped, could not be written: %s",
+                        fid,
+                        kind,
+                        codec_safe_str(exc),
+                    )
+                    continue
+                finally:
+                    del sealed
+                had_plaintext |= plaintext
                 resealed += 1
             # Once per pair, whichever half failed. A skipped pair is not readable yet, so its
             # sealed plaintext half did not turn it "from refused into readable".
