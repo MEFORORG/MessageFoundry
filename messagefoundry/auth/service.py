@@ -10861,6 +10861,10 @@ class AuthService:
         "behind a load balancer, begin and finish must reach the same node)"
     )
     _WEBAUTHN_LABEL_MAX = 100  # matches the column cap (ADR 0068 §4)
+    #: A passkey finish on a session that owes the account's existing factor (BACKLOG #3014).
+    _FACTOR_OWED = (
+        "this account already has a second factor; verify it first, then add the passkey again"
+    )
 
     async def begin_webauthn_registration(
         self, identity: Identity, *, token: str, rp_id: str, rp_name: str
@@ -10943,6 +10947,17 @@ class AuthService:
         pending = self._webauthn_challenges.pop((hash_token(token), "register"))
         if pending is None or pending.user_id != user.id:
             raise ValueError(self._CEREMONY_EXPIRED)
+        # BACKLOG #3014: re-asked at finish, since a factor may have been bound since begin and the
+        # console's finish route rides the action-less gate. After the pop, so the stale ceremony
+        # dies; after the floor, so its expired-before-failed order stands.
+        if await self._factor_binding_is_blocked(token, STEP_UP_ACTION_WEBAUTHN_ENROLL):
+            await self._audit(
+                "auth.webauthn_failed",
+                actor=identity.username,
+                detail=_json({"phase": "enroll", "reason": "factor_owed"}),
+                client=client,
+            )
+            raise ValueError(self._FACTOR_OWED)
         try:
             result = webauthn.verify_registration(
                 response_json=response_json,

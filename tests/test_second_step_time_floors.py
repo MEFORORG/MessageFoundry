@@ -395,7 +395,8 @@ async def test_a_passkey_registration_just_inside_the_floor_is_refused_and_keeps
     rp, origin = "t", "http://t"
     # An account with TOTP, signed in again, so its session OWES the factor. The service floor is
     # tested on this state directly; the routes refuse to begin a registration here until the TOTP
-    # is proven, so the directory test below is the case a route can reach.
+    # is proven, and the finish refuses it too, so the directory test below is the case a route can
+    # reach.
     store, service, token, _code, minted = await _pending_totp_session(monkeypatch)
     try:
         pending = await store.get_session(hash_token(token))
@@ -426,13 +427,17 @@ async def test_a_passkey_registration_just_inside_the_floor_is_refused_and_keeps
         user = await store.get_user(identity.user_id)
         assert user is not None and user.second_step_failed_attempts == 0, "it charged the lockout"
 
-        # CONTROL: the refusal left the ceremony in flight, so the SAME response is served now.
+        # CONTROL: the refusal left the ceremony in flight. Past the floor the SAME response reaches
+        # the finish-time factor check (BACKLOG #3014), which runs after the ceremony is taken, so
+        # its refusal, not "ceremony expired", is what proves the ceremony survived. This session
+        # owes the TOTP it never proved, so that check refuses it; the directory test below is the
+        # case that is served.
         now[0] = minted + MFA_FLOOR + 0.001
-        served = await service.finish_webauthn_registration(
-            identity, response, label="key", token=token, rp_id=rp, origin=origin
-        )
-        assert served.ok and served.token is not None
-        assert await service.mfa_satisfied(served.token)
+        with pytest.raises(ValueError, match="already has a second factor"):
+            await service.finish_webauthn_registration(
+                identity, response, label="key", token=token, rp_id=rp, origin=origin
+            )
+        assert not await service.mfa_satisfied(token)
     finally:
         await store.close()
 
