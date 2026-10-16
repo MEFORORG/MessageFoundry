@@ -25,12 +25,16 @@ class SlidingWindowRateLimiter:
 
     A falsy ``per_key``/``glob`` disables that dimension.
 
-    A key's bucket goes once its newest hit leaves the window, whether or not the key comes back
-    (BACKLOG #2714). The table is ordered by each key's newest hit. Each call drops at most
-    ``_EVICT_PER_CALL`` aged buckets from the front, and stops early at the first live one. A call
+    A key's aged bucket is dropped by a later call for ANY key, not only for that key (BACKLOG
+    #2714). Eviction is lazy: the table is ordered by each key's newest hit, and each call drops at
+    most ``_EVICT_PER_CALL`` aged buckets from the front, stopping at the first live one. A call
     adds at most one bucket, and aged buckets sit at the front, so the table cannot grow while any
-    aged bucket remains. It never grows past the most keys live at one time. The cap keeps each call's cost constant: the login path is
-    unauthenticated, and one call that dropped a million aged buckets would stall the event loop.
+    aged bucket remains. It never grows past the most keys live at one time. It does not shrink
+    while nobody calls: after a burst, the aged buckets go two per later call on this limiter.
+
+    The cap bounds the work spent on other keys' buckets, so no call walks the table. The login
+    path is unauthenticated, and one call that dropped a million aged buckets would stall the
+    event loop. It does not bound the prune of the global window or of the caller's own bucket.
     A limiter with no per-key gate (falsy ``per_key`` and no gap) keeps no buckets at all.
 
     ``min_interval_seconds`` adds a GAP floor beside the count (BACKLOG #2301, ASVS 2.4.2): a hit
@@ -153,7 +157,8 @@ class SlidingWindowRateLimiter:
             return self._window
         bucket = self._hits[key]  # a per-key gate fired, so the key has hits
         # Each wait is written as the gate writes its own test (``now - last < gap`` in
-        # ``_has_room``, ``hit <= now - window`` in ``_prune``). Regrouping the same sum rounds
+        # ``_has_room``, ``hit <= cutoff`` in ``_aged``, with ``cutoff = now - window`` as
+        # ``_has_room`` computes it). Regrouping the same sum rounds
         # differently, and could then report 0.0 for a key the gate still refuses.
         wait = self._min_interval - (now - bucket[-1])
         if self._per_key and len(bucket) >= self._per_key:

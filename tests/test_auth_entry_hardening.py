@@ -376,7 +376,7 @@ def test_limiter_table_stays_bounded_under_a_stream_of_new_keys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # A peer-keyed table under a steady stream of addresses never seen again: one new key a second,
-    # for ten windows. The table never grows past the keys live at one time, plus the one added.
+    # for ten windows. The table never grows past the 60 keys live at one time, the new one included.
     clock = [1000.0]
     monkeypatch.setattr(
         "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
@@ -385,12 +385,20 @@ def test_limiter_table_stays_bounded_under_a_stream_of_new_keys(
     for n in range(600):
         clock[0] = 1000.0 + n
         assert limiter.allow(f"peer-{n}")
-        assert len(limiter._hits) <= 61
+        assert len(limiter._hits) == min(n + 1, 60)
     # A limiter with no per-key gate (the intake global window) keeps no buckets at all.
     global_only = SlidingWindowRateLimiter(per_key=0, glob=1000, window_seconds=60.0)
     for n in range(100):
         assert global_only.allow(f"peer-{n}")
     assert not global_only._hits
+    # A gap with no count still keeps buckets, or the gap would never fire.
+    gap_only = SlidingWindowRateLimiter(
+        per_key=0, glob=0, window_seconds=60.0, min_interval_seconds=1.0
+    )
+    assert gap_only.allow("a")
+    assert not gap_only.allow("a")
+    clock[0] += 1.0
+    assert gap_only.allow("a")
 
 
 async def test_admin_write_retry_after_is_whole_seconds_rounded_up_and_at_least_one(
