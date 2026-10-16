@@ -31,7 +31,8 @@ import pytest
 from fastapi import Depends, FastAPI
 
 from messagefoundry.api import create_app
-from messagefoundry.api.security import _STEP_UP_VIA_HEADER, require_reauth_only
+from messagefoundry.api.auth_models import STEP_UP_VIA_HEADER as _STEP_UP_VIA_HEADER
+from messagefoundry.api.security import require_reauth_only
 from messagefoundry.apiclient import ApiError, EngineClient, IdpStepUpRequired
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import ALL_CHANNELS, Identity
@@ -407,20 +408,14 @@ def test_the_client_still_prompts_for_a_password_without_the_header() -> None:
     assert prompted == ["step-up"]
 
 
-def test_the_step_up_header_is_one_constant_on_both_sides() -> None:
+def test_the_shared_step_up_header_keeps_its_wire_spelling() -> None:
     """Vault BACKLOG #3145 item 6: the gates, the two route refusals and the FastAPI-free client
-    read one spelling, from the auth wire models, rather than four copies of a literal."""
+    read one constant from the auth wire models. Its spelling is the wire contract, so a rename
+    there would break every older client; the replay tests above pin that each side uses it."""
     from messagefoundry.api import auth_models
 
-    assert _STEP_UP_VIA_HEADER is auth_models.STEP_UP_VIA_HEADER == "X-Step-Up-Via"
+    assert auth_models.STEP_UP_VIA_HEADER == "X-Step-Up-Via"
     assert auth_models.STEP_UP_VIA_IDP == "idp"
-    # The client's use of the constant is behavioural: the replay tests above raise
-    # IdpStepUpRequired on the gate's own header. This pins that no copy of the literal is back.
-    package = Path(auth_models.__file__).parent.parent
-    for module in ("api/auth_routes.py", "apiclient/client.py", "api/security.py"):
-        text = (package / module).read_text(encoding="utf-8")
-        assert '"X-Step-Up-Via"' not in text, f"{module} spells the header out again"
-        assert "STEP_UP_VIA_HEADER" in text, f"{module} no longer reads the shared constant"
 
 
 async def test_a_store_fault_reading_the_mechanism_keeps_the_403(

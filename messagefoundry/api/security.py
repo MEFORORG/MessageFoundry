@@ -18,7 +18,6 @@ import logging
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass
-from functools import cache
 from typing import Any, get_args
 
 from fastapi import (
@@ -54,7 +53,7 @@ from messagefoundry.credential import client_cert_principal_under_issuer
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cert_expiry import peer_cert_expiry
 from messagefoundry.redaction import safe_exc
-from messagefoundry.store.base import store_driver_errors
+from messagefoundry.store.base import store_call_errors
 from messagefoundry.store.store import UserRecord
 
 log = logging.getLogger(__name__)
@@ -1129,19 +1128,6 @@ _IDP_STEP_UP_DETAIL = (
     " browser, not with a password: repeat the action in the web console, which opens /ui/reauth"
     " for it"
 )
-#: Set to ``idp`` on an ``oidc`` session's step-up refusal, so a client can branch on a header
-#: rather than parse the detail. Absent on every other refusal.
-_STEP_UP_VIA_HEADER = STEP_UP_VIA_HEADER
-
-
-@cache
-def _session_read_faults() -> tuple[type[Exception], ...]:
-    """What a refused session read raises: the drivers' errors, plus ``RuntimeError`` and
-    ``OSError`` as :func:`~messagefoundry.store.base.store_driver_errors` asks, and aiosqlite's
-    ``ValueError`` for a closed connection. A caller re-raises
-    :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` first, so a bug is not read as a fault.
-    Built on first use, because naming a server driver imports it."""
-    return (RuntimeError, OSError, ValueError, *store_driver_errors())
 
 
 async def _step_up_refusal(
@@ -1160,7 +1146,7 @@ async def _step_up_refusal(
         via_idp = await auth.session_steps_up_at_idp(token)
     except AUDIT_WRITE_DEFECTS:
         raise
-    except _session_read_faults() as exc:
+    except store_call_errors() as exc:
         # Vault BACKLOG #3145 item 6: the read only picks the wording, and the gate has already
         # refused, so a store fault keeps the 403 rather than becoming a 500. It answers with the
         # password wording; an oidc client's POST /me/reauth then asks again and is told the IdP.
@@ -1171,7 +1157,9 @@ async def _step_up_refusal(
         )
         via_idp = False
     if via_idp:
-        headers[_STEP_UP_VIA_HEADER] = STEP_UP_VIA_IDP
+        # Set to ``idp`` on an ``oidc`` session's step-up refusal, so a client can branch on a
+        # header rather than parse the detail. Absent on every other refusal.
+        headers[STEP_UP_VIA_HEADER] = STEP_UP_VIA_IDP
         return HTTPException(status.HTTP_403_FORBIDDEN, _IDP_STEP_UP_DETAIL, headers=headers)
     return HTTPException(status.HTTP_403_FORBIDDEN, _STEP_UP_DETAIL, headers=headers)
 

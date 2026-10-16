@@ -143,6 +143,7 @@ _HTTP_PENDING_APPROVAL = 202
 #: makes a lost reply rarer than the 5 s default did, and does not rule one out. Every other
 #: request keeps the client's own timeout.
 SIGN_IN_TIMEOUT_SECONDS = 30.0
+_SIGN_IN_TIMEOUT = httpx.Timeout(SIGN_IN_TIMEOUT_SECONDS)
 
 
 class ApiError(RuntimeError):
@@ -1141,7 +1142,7 @@ class EngineClient:
                 "/me/reauth",
                 json=body,
                 _allow_step_up=False,
-                timeout=httpx.Timeout(SIGN_IN_TIMEOUT_SECONDS),
+                timeout=_SIGN_IN_TIMEOUT,
             )
         )
 
@@ -1193,7 +1194,7 @@ class EngineClient:
                 "/auth/mfa-verify",
                 json={"code": code},
                 _allow_mfa=False,
-                timeout=httpx.Timeout(SIGN_IN_TIMEOUT_SECONDS),
+                timeout=_SIGN_IN_TIMEOUT,
             )
         )
 
@@ -1693,9 +1694,7 @@ class EngineClient:
         if prior and self._token_cell.issued_here:
             body["supersedes"] = prior
         result = _decode(
-            self._request(
-                "POST", "/auth/login", json=body, timeout=httpx.Timeout(SIGN_IN_TIMEOUT_SECONDS)
-            ),
+            self._request("POST", "/auth/login", json=body, timeout=_SIGN_IN_TIMEOUT),
             LoginResponse,
         )
         self._hold_issued(result.token)
