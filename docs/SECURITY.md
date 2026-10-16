@@ -2767,14 +2767,17 @@ account `[security].require_mfa` covers, which keeps TOTP because in this releas
 way past the sign-in lock (ADR 0197 Amendment A). Such an account's first factor must be TOTP, too.
 An administrator clears a
 lost authenticator via `POST /users/{id}/reset-mfa` (which also revokes the user's sessions).
-A confirm turns TOTP on only while a secret is still staged and TOTP is still off (BACKLOG
-#2224). If a reset clears the secret during the confirm, or another confirm turns TOTP on first,
-the confirm turns nothing on and returns no recovery codes. It ends the session it just rotated and
-answers as a lost session: `401` on `POST /me/mfa/confirm`, and the sign-in page in the web
-console. It is audited `auth.mfa_enroll_refused`, whose `reason` is `secret_cleared`,
-`already_enabled` or `account_gone`, read after the refusal. The check is that some secret is
-staged, not that it is the one the confirm verified: a second enrolment start that re-stages the
-secret inside the same window is not caught by it. With
+A confirm turns TOTP on only while the row still holds the staged secret the confirm verified,
+and TOTP is still off (BACKLOG #2224, #3025): the enable is a compare-and-set on the stored
+`totp_secret` cell the code was checked against. If a reset clears the secret during the confirm,
+another confirm turns TOTP on first, or a second enrolment start re-stages a different secret
+inside the same window, the confirm turns nothing on and returns no recovery codes. It ends the
+session it just rotated and answers as a lost session: `401` on `POST /me/mfa/confirm`, and the
+sign-in page in the web console. It is audited `auth.mfa_enroll_refused`. Its `reason` is
+`account_gone`, `already_enabled`, `secret_cleared`, `secret_replaced` or `write_lost`, read from
+the row after the refusal, so it points an operator at the likely cause rather than proving it.
+`write_lost` means the row still held the verified secret with TOTP off, so the enable lost to
+some other concurrent write, and a retry confirms. With
 `[security].require_mfa` on — **the default since BACKLOG #187 (secure-by-default, including the
 loopback bind)** — **every account** must satisfy MFA under the default scope,
 `every_local_account` (a value now wider than its name, BACKLOG #1144). Setting the scope to
