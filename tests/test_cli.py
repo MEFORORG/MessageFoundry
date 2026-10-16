@@ -599,24 +599,119 @@ def test_rotate_key_also_reseals_the_uploaded_file_store(
     assert asyncio.run(read_with_b_only()).decode() == ADT_A01
 
 
-def test_rotate_key_warns_when_an_uploaded_file_could_not_be_resealed(
+def _key_id_and_stamp(db: Path, key: str) -> tuple[str, str | None]:
+    """The store's active key id, and the fingerprint the ASVS 13.3.4 rotation stamp names (``None``
+    when there is no stamp)."""
+    import asyncio
+
+    from messagefoundry.store.crypto import make_cipher
+    from messagefoundry.store.store import MessageStore
+
+    async def run() -> tuple[str, str | None]:
+        store = await MessageStore.open(db, cipher=make_cipher(key))
+        try:
+            key_id = store.cipher_info().active_key_id
+            assert key_id
+            row = (await store.get_secret_rotation_meta()).get("MEFOR_STORE_ENCRYPTION_KEY")
+            return key_id, None if row is None else row.fingerprint
+        finally:
+            await store.close()
+
+    return asyncio.run(run())
+
+
+def test_rotate_key_fails_and_writes_no_stamp_when_an_uploaded_file_is_skipped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A skipped file is STILL under the prior key, so "OK" alone would mislead the operator into
-    dropping a key that is still load-bearing. The warning names that consequence."""
+    """BACKLOG #3181: a skipped file may STILL be under the prior key. The command used to print OK,
+    exit 0 and stamp the rotation for ASVS 13.3.4, so a wrapper or an operator would drop a key that
+    is still load-bearing. It now fails, prints no OK line, and writes no stamp. Once the cause is
+    fixed, a re-run completes and stamps. A directory in the body's place stands in for a cause an
+    operator can fix."""
     from messagefoundry.store.crypto import generate_key
 
     monkeypatch.chdir(tmp_path)
     db, uploads = tmp_path / "rot-skip.db", tmp_path / "uploads"
     key_a, key_b = generate_key(), generate_key()
     file_id = _seed_store_and_upload(db, uploads, key_a)
+    blob = uploads / f"{file_id}.blob"
+    body = blob.read_bytes()
+    blob.unlink()
+    blob.mkdir()
+
+    _rotate_env(monkeypatch, active=key_b, retired=key_a, uploads=uploads)
+    assert main(["rotate-key", "--db", str(db)]) == 1
+    captured = capsys.readouterr()
+    assert "OK:" not in captured.out
+    assert "PARTIAL:" in captured.out
+    assert "were NOT fully re-sealed" in captured.err
+    assert "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED" in captured.err
+    new_key_id, stamped = _key_id_and_stamp(db, key_b)
+    assert stamped != new_key_id
+
+    # Fixed and re-run: the rotation completes, and only now is it stamped.
+    blob.rmdir()
+    blob.write_bytes(body)
+    assert main(["rotate-key", "--db", str(db)]) == 0
+    assert "OK:" in capsys.readouterr().out
+    assert _key_id_and_stamp(db, key_b) == (new_key_id, new_key_id)
+
+
+def test_rotate_key_fails_when_no_key_opens_an_uploaded_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #3181: an upload no configured key opens used to abort the whole pass with the store
+    pass's "rotation aborted" message. It is now one skip, so the command fails the same way, names
+    both causes, and still runs the audit step. Here the upload was sealed under a key that is not
+    supplied at all."""
+    import asyncio
+
+    from messagefoundry.store.crypto import generate_key, make_cipher
+    from messagefoundry.uploads import UploadStore
+
+    monkeypatch.chdir(tmp_path)
+    db, uploads = tmp_path / "rot-foreign.db", tmp_path / "uploads"
+    key_a, key_b = generate_key(), generate_key()
+    _seed_store_and_upload(db, uploads, key_a)
+    stranger = make_cipher(generate_key(), write_v2=True)
+    asyncio.run(
+        UploadStore(uploads, stranger, max_bytes=1 << 20).save(
+            data=ADT_A01.encode(), filename="other.hl7", uploader="op", uploader_id="u-op"
+        )
+    )
+
+    _rotate_env(monkeypatch, active=key_b, retired=key_a, uploads=uploads)
+    assert main(["rotate-key", "--db", str(db)]) == 1
+    captured = capsys.readouterr()
+    assert "rotation aborted" not in captured.err
+    assert "1 uploaded file(s) were NOT fully re-sealed" in captured.err
+    assert "no configured key" in captured.err
+    assert "OK:" not in captured.out
+    new_key_id, stamped = _key_id_and_stamp(db, key_b)
+    assert stamped != new_key_id
+
+
+def test_rotate_key_completes_over_an_upload_whose_body_is_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #3181: a missing body under a sealed sidecar is under no key, and no re-run brings it
+    back. Counted as a skip, it would fail every rotation from then on. It is a note, the sidecar is
+    re-sealed, and the rotation completes and is stamped."""
+    from messagefoundry.store.crypto import generate_key
+
+    monkeypatch.chdir(tmp_path)
+    db, uploads = tmp_path / "rot-lost.db", tmp_path / "uploads"
+    key_a, key_b = generate_key(), generate_key()
+    file_id = _seed_store_and_upload(db, uploads, key_a)
     (uploads / f"{file_id}.blob").unlink()  # a half-deleted pair
 
     _rotate_env(monkeypatch, active=key_b, retired=key_a, uploads=uploads)
     assert main(["rotate-key", "--db", str(db)]) == 0
-    err = capsys.readouterr().err
-    assert "could not be read and were NOT fully re-sealed" in err
-    assert "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED" in err
+    captured = capsys.readouterr()
+    assert "note: 1 uploaded file(s) have a body that is missing or is not text" in captured.out
+    assert "NOT fully re-sealed" not in captured.err
+    new_key_id, stamped = _key_id_and_stamp(db, key_b)
+    assert stamped == new_key_id
 
 
 def test_rotate_key_requires_a_key(

@@ -9240,7 +9240,10 @@ def _rotate_key(args: argparse.Namespace) -> int:
             # ASVS 13.3.4: stamp the DEK rotation so the watcher's clock resets automatically (rotation
             # auto-detected). The store is open under the NEW active key, so its key-id is the new
             # fingerprint; preserve the tracked-since floor. NON-SECRET (key-id + dates only).
-            if isinstance(store, SecretRotationMetaStore):
+            # Not after a skipped upload (BACKLOG #3181): part of that file may still be under the
+            # prior key, so the rotation is not done, and a stamp would tell the watcher it was. The
+            # re-run that seals it still sees the old fingerprint here and stamps then.
+            if isinstance(store, SecretRotationMetaStore) and not uploads.skipped:
                 key_id = store.cipher_info().active_key_id
                 if key_id:
                     today = datetime.datetime.now(tz=datetime.UTC).date().isoformat()
@@ -9283,10 +9286,11 @@ def _rotate_key(args: argparse.Namespace) -> int:
         # A value couldn't be decrypted by any supplied key — the prior key is missing — or it was an
         # unmarked value the cipher refuses (#1169); the message names which, and the cell. Nothing is
         # corrupted: every pass is all-or-nothing per batch AND idempotent, so re-running with the
-        # key supplied finishes the job. Note the command now spans TWO surfaces (the store, then
-        # the uploaded-file store), so a failure in the second leaves the FIRST already committed
-        # and the ASVS 13.3.4 rotation stamp unwritten. That is safe precisely because both passes
-        # skip what is already under the active key — it is a resumable rotation, not a rollback.
+        # key supplied finishes the job. This arm is the store's pass: the uploaded-file pass counts
+        # a value no key opens as a skip and moves on (BACKLOG #3181), and the skip fails the command
+        # below. Either way the ASVS 13.3.4 rotation stamp is unwritten. That is safe precisely
+        # because both passes skip what is already under the active key -- it is a resumable
+        # rotation, not a rollback.
         # One case no key finishes: a row whose tag verified but which is not UTF-8, or not JSON at
         # the open's cache warm-up, is corrupt, and its message says so (BACKLOG #2308).
         print(f"error: rotation aborted — {exc}", file=sys.stderr)
@@ -9304,8 +9308,10 @@ def _rotate_key(args: argparse.Namespace) -> int:
         f" (+{uploads.resealed} uploaded-file value(s) re-sealed)"
     )
     # "OK:" only when the whole rotation, audit chain included, is done: a wrapper reading stdout must
-    # not see OK and drop the retired key while the audit roll failed (BACKLOG #1904).
-    print(f"OK: {done}" if rolled_ok else f"PARTIAL: {done}")
+    # not see OK and drop the retired key while the audit roll failed (BACKLOG #1904), or while an
+    # uploaded file may still be under that key (BACKLOG #3181).
+    complete = rolled_ok and not uploads.skipped
+    print(f"OK: {done}" if complete else f"PARTIAL: {done}")
     if uploads.sealed_plaintext:
         # BACKLOG #1169: these were plaintext uploads that a keyed store refused on read until now.
         # Sealing makes them readable, and it would seal a planted file just the same, so say how
@@ -9325,13 +9331,23 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "they hold nothing under the prior key. The retention prune removes them once they "
             "expire."
         )
-    if uploads.skipped:
-        # Say it plainly and on stderr: a skipped file is STILL under the old key, so retiring that
-        # key now destroys it. This is the one outcome where "OK" alone would mislead.
+    if uploads.body_lost:
+        # BACKLOG #3181: a body no key reads is not a skip, or every re-run would fail on it. Its
+        # sidecar was re-sealed, so nothing of it is left under the prior key.
         print(
-            f"warning: {uploads.skipped} uploaded file(s) could not be read and were NOT fully "
-            "re-sealed — part of each may still be under the prior key. Fix the cause and re-run "
-            "rotate-key BEFORE removing MEFOR_STORE_ENCRYPTION_KEYS_RETIRED.",
+            f"note: {uploads.body_lost} uploaded file(s) have a body that is missing or is not text. "
+            "No key can read it, and nothing of them is left under the prior key. Delete them, or "
+            "the retention prune removes them once they expire."
+        )
+    if uploads.skipped:
+        # Say it plainly and on stderr: a skipped file may STILL be under the old key, so retiring
+        # that key now destroys it. So the command fails, and the rotation stamp was not written.
+        print(
+            f"error: {uploads.skipped} uploaded file(s) were NOT fully re-sealed -- part of each "
+            "may still be under the prior key. Either it could not be read, or no configured key "
+            "opens it: a prior key was not supplied, or the file is damaged. The log names each "
+            "file and its cause. Fix the cause and re-run rotate-key BEFORE removing "
+            "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED. The key rotation is recorded only once a run completes.",
             file=sys.stderr,
         )
     if not rolled_ok:
@@ -9345,8 +9361,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"OK: {rolled_msg}")
-    return 0
+    print(f"{'OK' if complete else 'note'}: {rolled_msg}")
+    return 0 if complete else 1
 
 
 def _backup(args: argparse.Namespace) -> int:

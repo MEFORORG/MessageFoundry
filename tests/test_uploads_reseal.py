@@ -157,17 +157,66 @@ async def test_reseal_returns_zeros_for_a_cipher_it_cannot_rotate(tmp_path: Path
     assert await _keyed_store(root, None).reseal_to_active() == ResealResult()
 
 
-async def test_reseal_raises_rather_than_dropping_a_file_it_cannot_open(tmp_path: Path) -> None:
-    """A missing prior key aborts BEFORE any write, so the operator is told to supply it instead of
-    losing data. Asserting the file still opens under the original key is the half that matters: a
-    pass that raised *after* rewriting would leave a shredded file behind."""
+async def test_a_file_no_key_opens_is_skipped_and_left_as_it_was(tmp_path: Path) -> None:
+    """A missing prior key is a skip, never a write, so the operator is told to supply it instead of
+    losing data (BACKLOG #3181: it used to abort the pass). Asserting the file still opens under the
+    original key is the half that matters: a pass that wrote anyway would leave a shredded file."""
     root = tmp_path / "uploads"
     key_a, key_b = generate_key(), generate_key()
     fid = await _seed(_keyed_store(root, key_a))
 
-    with pytest.raises(CipherError):
-        await _keyed_store(root, key_b).reseal_to_active()  # key A never supplied
+    # Key A never supplied: neither half opens, and the pair counts once.
+    assert await _keyed_store(root, key_b).reseal_to_active() == ResealResult(skipped=1)
 
+    assert (await _keyed_store(root, key_a).read_bytes(fid)).decode() == _ADT
+
+
+async def test_one_corrupt_body_does_not_abort_the_pass(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3181: one damaged upload raised ``CipherError`` out of the pass, so every upload after
+    it stayed under the prior key, and the CLI blamed a missing prior key. It is now a skip, named in
+    the log, and the pass seals every other upload."""
+    root = tmp_path / "uploads"
+    key_a, key_b = generate_key(), generate_key()
+    seeder = _keyed_store(root, key_a)
+    bad, good = await _seed(seeder), await _seed(seeder)
+    blob = root / f"{bad}.blob"
+    sealed = blob.read_text(encoding="utf-8")
+    # Change one base64 character well inside the ciphertext (clear of the marker and any padding),
+    # so the tag no longer verifies under any key.
+    damaged = sealed[:-20] + ("A" if sealed[-20] != "A" else "B") + sealed[-19:]
+    blob.write_text(damaged, encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        result = await _keyed_store(root, key_b, (key_a,)).reseal_to_active()
+    # The good pair's two halves, and the bad pair's sidecar, which is listed already.
+    assert result == ResealResult(resealed=3, skipped=1)
+    assert blob.read_text(encoding="utf-8") == damaged  # nothing written over it
+    assert any(
+        bad in r.getMessage() and "no configured key opens it" in r.getMessage()
+        for r in caplog.records
+    )
+    dropped = _keyed_store(root, key_b)
+    assert (await dropped.read_bytes(good)).decode() == _ADT
+
+
+async def test_an_encrypt_refusal_still_aborts_the_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a value no key OPENS is a skip. A refusal on the encrypt side, such as the AES-GCM
+    invocation ceiling, says to stop encrypting, so it still aborts the pass before any write."""
+    root = tmp_path / "uploads"
+    key_a, key_b = generate_key(), generate_key()
+    fid = await _seed(_keyed_store(root, key_a))
+    rotator = _keyed_store(root, key_b, (key_a,))
+
+    def _refuse(plaintext: str, *, aad: bytes | None = None) -> str:
+        raise CipherError("AES-GCM invocation ceiling reached")
+
+    monkeypatch.setattr(rotator._cipher, "encrypt", _refuse)
+    with pytest.raises(CipherError, match="ceiling"):
+        await rotator.reseal_to_active()
     assert (await _keyed_store(root, key_a).read_bytes(fid)).decode() == _ADT
 
 
@@ -180,26 +229,39 @@ def _remove(path: Path) -> None:
 
 
 @pytest.mark.parametrize("break_body", [_remove, _garble], ids=["missing", "undecodable"])
-async def test_a_skipped_body_under_rotation_still_reseals_its_sidecar(
+async def test_a_lost_body_under_a_sealed_sidecar_is_not_a_skip(
     tmp_path: Path, break_body: Callable[[Path], None]
 ) -> None:
-    """A half-deleted or unreadable pair must not be reported as re-sealed.
-
-    ``skipped`` is what tells the operator NOT to retire the prior key yet, so it has to be non-zero
-    here; counting the pass as clean is the failure that loses the file two commands later.
+    """BACKLOG #3181: a body that is missing or is not text is under no key, and no re-run changes
+    that. Counted as a skip, it failed every later ``rotate-key`` for good. It is ``body_lost``.
 
     The sidecar under the retired key IS re-sealed (BACKLOG #2322). It is listed already, so sealing
     it lists nothing new, and left under the old key it would drop out of reach of ``prune_expired``
-    once that key goes. Only a PLAINTEXT sidecar is held back; see the next test.
+    once that key goes. So nothing of the upload is left under the prior key. Only a PLAINTEXT
+    sidecar is held back; see the next test. A re-run counts it the same way, and still not as a skip.
     """
     root = tmp_path / "uploads"
     key_a, key_b = generate_key(), generate_key()
     fid = await _seed(_keyed_store(root, key_a))
     break_body(root / f"{fid}.blob")
 
+    rotator = _keyed_store(root, key_b, (key_a,))
+    assert await rotator.reseal_to_active() == ResealResult(resealed=1, body_lost=1)
+    assert await rotator.reseal_to_active() == ResealResult(body_lost=1)
+    assert (await _keyed_store(root, key_b).get_meta(fid)).filename == "acme.hl7"
+
+
+async def test_a_body_unreadable_for_another_cause_is_still_a_skip(tmp_path: Path) -> None:
+    """The control for the test above: a body that cannot be opened for a cause an operator can fix
+    may still be under the prior key, so it stays a skip. A directory in its place stands in."""
+    root = tmp_path / "uploads"
+    key_a, key_b = generate_key(), generate_key()
+    fid = await _seed(_keyed_store(root, key_a))
+    (root / f"{fid}.blob").unlink()
+    (root / f"{fid}.blob").mkdir()
+
     result = await _keyed_store(root, key_b, (key_a,)).reseal_to_active()
     assert result == ResealResult(resealed=1, skipped=1)
-    assert (await _keyed_store(root, key_b).get_meta(fid)).filename == "acme.hl7"
 
 
 @pytest.mark.parametrize("break_body", [_remove, _garble], ids=["missing", "undecodable"])
