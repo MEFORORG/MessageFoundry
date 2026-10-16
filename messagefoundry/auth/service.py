@@ -209,8 +209,9 @@ def _session_write_errors() -> tuple[type[Exception], ...]:
 
 
 class _RotationStoreError(Exception):
-    """A session rotation the store refused (BACKLOG #3023). ``old_revoked`` says whether the
-    best-effort revokes that followed it all landed."""
+    """A session rotation the store refused (BACKLOG #3023). ``old_revoked`` says whether every
+    best-effort revoke that followed it landed, under the old hash and the new one; the audit row
+    records it as ``revokes_landed``."""
 
     def __init__(self, old_revoked: bool) -> None:
         super().__init__("session rotation refused by the store")
@@ -7767,6 +7768,7 @@ class AuthService:
             "auth: a session rotation was refused by the store (%s); %s",
             type(cause).__name__,
             outcome,
+            exc_info=cause,  # a SQL defect is caught here too, so its traceback must survive
         )
         return not refused
 
@@ -7850,17 +7852,25 @@ class AuthService:
         except _RotationStoreError as refused:
             # BACKLOG #3023: the store refused the re-key. The session was revoked, best effort,
             # and this fails closed exactly as a session gone underneath the ceremony does.
-            failure = {"reason": "store_error", "old_session_revoked": refused.old_revoked}
+            failure = {"reason": "store_error", "revokes_landed": refused.old_revoked}
         except _session_write_errors() as exc:
             # The lapse check's own reads, refused: the ceremony's stamp is already on this hash.
             revoked = await self._revoke_unrotated(token_hash, None, exc)
-            failure = {"reason": "store_error", "old_session_revoked": revoked}
+            failure = {"reason": "store_error", "revokes_landed": revoked}
         if rotated is None:
-            await self._audit(
-                "auth.session_rotation_failed",
-                actor=actor,
-                detail=_json({"ceremony": ceremony, **failure}),
-                client=client,
+            # Soft, so a refused audit write still answers session_lost rather than a 500: the
+            # answer is the fail-closed control, and the row only records it.
+            await write_audit_soft(
+                lambda: self._audit(
+                    "auth.session_rotation_failed",
+                    actor=actor,
+                    detail=_json({"ceremony": ceremony, **failure}),
+                    client=client,
+                ),
+                log=_log,
+                message="the auth.session_rotation_failed audit row could not be written",
+                errors=_session_write_errors(),
+                defects=AUDIT_WRITE_DEFECTS,
             )
             return Elevation(session_lost=True)
         await self._audit(

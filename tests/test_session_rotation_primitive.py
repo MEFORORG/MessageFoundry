@@ -255,7 +255,7 @@ async def test_a_rotation_the_store_refuses_fails_closed_and_revokes_the_old_tok
     assert elevation.session_lost is True and elevation.token is None
     assert await service.identity_for_token(token) is None, "the unrotated token still resolves"
     assert await _rotation_failures(service) == [
-        {"ceremony": "mfa_verify", "reason": "store_error", "old_session_revoked": True}
+        {"ceremony": "mfa_verify", "reason": "store_error", "revokes_landed": True}
     ]
 
 
@@ -279,7 +279,7 @@ async def test_a_refused_rotation_still_fails_closed_when_the_revoke_is_refused_
     assert elevation.session_lost is True and elevation.token is None
     assert await service.identity_for_token(token) is not None, "the flag would be untrue"
     assert await _rotation_failures(service) == [
-        {"ceremony": "mfa_verify", "reason": "store_error", "old_session_revoked": False}
+        {"ceremony": "mfa_verify", "reason": "store_error", "revokes_landed": False}
     ]
 
 
@@ -303,7 +303,7 @@ async def test_a_rotation_whose_commit_landed_before_the_raise_leaves_no_live_se
 
     assert elevation.session_lost is True and elevation.token is None
     assert await service.store.list_sessions(identity.user_id) == []
-    assert (await _rotation_failures(service))[0]["old_session_revoked"] is True
+    assert (await _rotation_failures(service))[0]["revokes_landed"] is True
 
 
 async def test_a_refused_read_before_the_rotation_fails_closed_too(
@@ -323,7 +323,7 @@ async def test_a_refused_read_before_the_rotation_fails_closed_too(
     assert elevation.session_lost is True and elevation.token is None
     assert await service.identity_for_token(token) is None
     assert await _rotation_failures(service) == [
-        {"ceremony": "mfa_verify", "reason": "store_error", "old_session_revoked": True}
+        {"ceremony": "mfa_verify", "reason": "store_error", "revokes_landed": True}
     ]
 
 
