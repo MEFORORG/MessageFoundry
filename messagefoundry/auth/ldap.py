@@ -16,6 +16,8 @@ own defaults are ``None`` on both, i.e. wait forever. ``ldap3``/``spnego`` are i
 local-only deployment never touches them.
 
 **No referral is followed, and one is refused** (BACKLOG #2530); :func:`_refuse_referral` says why.
+**A search that ends with any result code but success is refused too** (BACKLOG #3010), never read
+as no entries; :func:`_refuse_unanswered` says why.
 """
 
 from __future__ import annotations
@@ -116,6 +118,22 @@ class LdapReferralError(LdapError):
     """
 
 
+class LdapUnansweredError(LdapError):
+    """The directory ended an operation with a result code that is not an answer (BACKLOG #3010).
+
+    A subclass, so every ``except LdapError`` reads it as the directory not answering: the session
+    reconciler as unavailable, which never strikes, and a sign-in as ``auth.login_error``. It
+    carries the code so a caller can tell codes apart without parsing the text. ``code`` is the result code, or ``None``
+    when the result held none that is an integer; ``code_name`` is ldap3's name for it, never text
+    the directory sent.
+    """
+
+    def __init__(self, message: str, *, code: int | None, code_name: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.code_name = code_name
+
+
 class DirectoryAnswer(Enum):
     """What one password-free lookup of one account established (ADR 0195 rule item 2).
 
@@ -128,8 +146,10 @@ class DirectoryAnswer(Enum):
 
     #: The entry was found and ``userAccountControl`` proved it enabled.
     FOUND = "found"
-    #: The search matched nothing, or an id-keyed probe held an id the filter builder cannot parse,
-    #: so no search ran, or an id-keyed search's entry did not read back that id (BACKLOG #2027).
+    #: The search ended with success and matched nothing, or an id-keyed probe held an id the
+    #: filter builder cannot parse, so no search ran, or an id-keyed search's entry did not read
+    #: back that id (BACKLOG #2027). A search that ended with any other result code raises
+    #: :class:`LdapUnansweredError` instead (BACKLOG #3010).
     NOT_FOUND = "not_found"
     #: The entry was found and ``userAccountControl`` read, with ACCOUNTDISABLE (0x2) set.
     DISABLED = "disabled"
@@ -738,11 +758,82 @@ def _refuse_referral(conn: Any, operation: str) -> None:
     raise LdapReferralError(message)
 
 
+#: What a refused code most likely means, where the code points at the configuration rather than at
+#: a passing load. Engine text only. Each names what the operation was aimed at, which for a search
+#: is its configured base and for the bind-account read is ``[auth].ad_bind_dn``.
+_UNANSWERED_HINTS: dict[int, str] = {
+    32: " noSuchObject usually means the configured base or DN does not exist, or the service "
+    "account cannot see it.",
+    34: " invalidDNSyntax usually means a configured DN is not a distinguished name, such as a UPN "
+    "or DOMAIN\\user.",
+    50: " insufficientAccessRights means the service account may not read it.",
+}
+
+
+def _refuse_unanswered(conn: Any, operation: str, *, answers: frozenset[int] | None = None) -> None:
+    """Raise :class:`LdapUnansweredError` unless ``conn``'s last operation ended with a result code
+    in ``answers``, which is success alone unless the caller names another set.
+
+    BACKLOG #3010. ldap3 raises on none of these codes here. Every ``Connection`` in this module
+    keeps ldap3's default ``raise_exceptions=False``, and even under ``True`` ldap3 2.9.1 passes
+    sizeLimitExceeded (4) and timeLimitExceeded (3) through (``DO_NOT_RAISE_EXCEPTIONS``). So a
+    search the directory did not finish -- busy (51), unavailable (52), unwillingToPerform (53),
+    adminLimitExceeded (11), a time or size limit -- came back with no entries, or some. Read on, the
+    user search answered ``NOT_FOUND``, which the session reconciler counts toward revoking the
+    account, and the nested group search answered fewer groups, which narrows the account's roles.
+
+    **Which code is an answer.** For a search, success alone. A search that ended with success and
+    matched nothing is the one result that means "no such entry", so only it reads ``NOT_FOUND``,
+    and offboarding still revokes. Every other code says the directory did not answer the question
+    asked, so any entries that came with it are not the whole answer and none is used. That
+    includes noSuchObject (32): on these searches it names the search BASE, not the account, so
+    read as absence it would read every account absent at once, which the reconciler's mass-revoke
+    breaker does not stop at or under its floor.
+
+    **The cost, named.** The reconciler's unavailable never revokes, so a code that recurs on every
+    pass, such as a deleted search base, stops offboarding for as long as it lasts. Making a
+    standing one visible is vault BACKLOG #3100's item 3; #3010's item 4 was deferred to it. This
+    warns once per operation and code, and the text carries no directory text: the code, ldap3's
+    name for it and the operation, never the diagnostic message the directory sent.
+
+    **A result that is not a dict is let through.** ldap3's synchronous strategy, the only one built
+    here, reads ``self.result['type']`` straight after every search, so a real search cannot return
+    without one. Only a test double can.
+
+    ``answers`` is a parameter so an operation whose answers differ, such as a bind, can reuse this
+    with its own set. Run :func:`_refuse_referral` first: a referral is not success either, and only
+    that refusal reads as referred.
+    """
+    from ldap3.core.results import RESULT_CODES, RESULT_SUCCESS  # lazy, like every ldap3 import
+
+    result = conn.result
+    if not isinstance(result, dict):
+        return
+    code = result.get("result")
+    if type(code) is not int:  # not isinstance: a bool is an int, and is no result code
+        code, name, shown, hint = None, "no code", "no readable result code", ""
+    elif code in (answers if answers is not None else (RESULT_SUCCESS,)):
+        return
+    else:
+        name = RESULT_CODES.get(code, "an unknown result code")
+        shown, hint = f"result code {code} ({name})", _UNANSWERED_HINTS.get(code, "")
+    message = (
+        f"AD ended the {operation} with {shown}, which is not an answer; the engine reads it as "
+        f"the directory not answering (BACKLOG #3010).{hint}"
+    )
+    # Keyed on ldap3's name, not the raw code: a directory chooses the code, and ldap3's table is
+    # finite, so the set of warnings stays bounded.
+    _warn_once(f"unanswered: {operation}: {name}", "%s Reported once per code.", message)
+    raise LdapUnansweredError(message, code=code, code_name=name)
+
+
 def _search(conn: Any, operation: str, **kwargs: Any) -> None:
-    """``conn.search(**kwargs)``, refusing a referral result. Every search in this module goes
-    through here, so none can read one as "no entries"; a test pins that."""
+    """``conn.search(**kwargs)``, refusing a referral result and then any result but success
+    (:func:`_refuse_unanswered`). Every search in this module goes through here, so none can read
+    either as "no entries"; a test pins that."""
     conn.search(**kwargs)
     _refuse_referral(conn, operation)
+    _refuse_unanswered(conn, operation)
 
 
 #: What opening an ldap3 socket can raise that is not an ldap3 error (BACKLOG #2566). ldap3's
@@ -1209,6 +1300,8 @@ class LdapAuthenticator:
         # Direct membership from the user's memberOf attribute.
         found = list(member_of)
         if self._s.ad_use_nested_groups and self._s.ad_group_search_base:
+            # A search the directory did not finish raises here (BACKLOG #3010), so a busy answer
+            # is an outage to every caller, never a shorter group list that narrows the roles.
             _search(
                 conn,
                 "group search",
@@ -1423,27 +1516,26 @@ class LdapAuthenticator:
                     attributes=["tokenGroups", "memberOf", "primaryGroupID"],
                 )
             except (ldap3.core.exceptions.LDAPException, LdapError) as exc:
-                # An LdapError is a refused referral, whose text is the engine's own.
+                # An LdapError is a refused referral, or a read that ended with a result code that
+                # is not success (BACKLOG #3010): noSuchObject, invalidDNSyntax for a bind identity
+                # that is a UPN rather than a DN, insufficientAccessRights. Both texts are the
+                # engine's own, naming the code and never the directory's diagnostic message.
                 why = str(exc) if isinstance(exc, LdapError) else type(exc).__name__
                 return BindAccountReading(
                     who, problem=f"group membership not read: {why}", whoami_error=whoami_error
                 )
             entry = svc.entries[0] if svc.entries else None
-            result = svc.result if isinstance(svc.result, dict) else {}
         except ldap3.core.exceptions.LDAPException as exc:
             raise LdapError(str(exc)) from exc
         finally:
             with contextlib.suppress(ldap3.core.exceptions.LDAPException):
                 svc.unbind()
         if entry is None:
-            # ldap3 does not raise on a failed search here, so the result code is the only record of
-            # why: invalidDNSyntax for a bind identity that is a UPN or DOMAIN\\user rather than a
-            # DN, insufficientAccessRights for an entry the account may not read.
-            why = result.get("description") or "no result code"
+            # A base read that ended with success and no entry: no directory should answer so.
             return BindAccountReading(
                 who,
-                problem=f"group membership not read: the base read of [auth].ad_bind_dn returned "
-                f"no entry ({why}); the read needs a distinguished name the account may read",
+                problem="group membership not read: the base read of [auth].ad_bind_dn returned "
+                "no entry; the read needs a distinguished name the account may read",
                 whoami_error=whoami_error,
             )
         raw = entry["tokenGroups"].raw_values if "tokenGroups" in entry else ()
