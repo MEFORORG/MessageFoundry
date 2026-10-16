@@ -2176,7 +2176,10 @@ def _run_connscale_remote(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="harness connscale-remote",
         description="DRIVER-ONLY connscale (WS-C): drive already-running engines off-box + bind the "
-        "correlation sink locally. Never spawns an engine.",
+        "correlation sink locally. Never spawns an engine. Each process signs in for itself as the "
+        "rig Administrator, so N processes from one address need the engine's "
+        "MEFOR_AUTH_MAX_SESSIONS_PER_USER and MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP above N (shipped 5 "
+        "and 10 per 60 s); the batch_ab engine half sizes both to its --sink-procs.",
     )
     parser.add_argument(
         "--engine-url",

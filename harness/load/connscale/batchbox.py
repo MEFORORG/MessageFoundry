@@ -71,6 +71,41 @@ _STOP_GRACE = 5.0
 _DEFAULT_SINK_PROCS = 6  # the >= 5-6 sink-PROCESS attribution gate
 
 
+def _engine_login_global_default() -> int:
+    """The engine's shipped ``[auth].login_rate_limit_global``, read from its own settings model
+    rather than copied, as ``shardcert`` reads the pool size."""
+    from messagefoundry.config.settings import AuthSettings
+
+    return int(AuthSettings.model_fields["login_rate_limit_global"].default)
+
+
+def rig_sign_in_env(procs: int) -> dict[str, str]:
+    """The ``[auth]`` env a cell's engine needs so ``procs`` driver processes can all sign in.
+
+    Each of the driver's ``procs`` ``connscale-remote`` processes holds its own session as the one rig
+    Administrator, signed in from the one load-gen box address. Two engine limits meet that fleet:
+
+    * the per-user session cap (default 5): past it a login ends the user's oldest session, so a sixth
+      process would end the first one's, which would sign in again and end the next;
+    * the per-address sign-in limit (default 10 attempts per 60 s window, successes counted too):
+      every process signs in at the start of the cell, inside one window, so an eleventh process
+      would be refused with HTTP 429 (BACKLOG #2795).
+
+    Both are sized to the fleet, doubled for a process that signs in again, plus two. The all-clients
+    limit (default 60) is raised to the same size only when that size passes it, so a rig of up to 29
+    processes leaves it at the shipped value. Each process still signs in for itself: a session token
+    is never handed across processes.
+    """
+    size = 2 * procs + 2
+    env = {
+        "MEFOR_AUTH_MAX_SESSIONS_PER_USER": str(size),
+        "MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP": str(size),
+    }
+    if size > _engine_login_global_default():
+        env["MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL"] = str(size)
+    return env
+
+
 # --- the matrix cell ---------------------------------------------------------
 
 
@@ -572,13 +607,11 @@ async def run_batch_engine(
             install_executor_shim=False,
             db_path=None,  # batch is SQL-Server-scoped: the store comes from MEFOR_STORE_*
         )
-        # RIGS SIGN IN, AND THIS RIG'S DRIVE IS SPLIT OVER PROCESSES. Each of the driver's `procs`
-        # connscale-remote processes holds its own session as the one rig Administrator. The engine
-        # keeps five sessions for a user by default and ends the oldest past that, so a sixth
-        # process would end the first one's session, which would sign in again and end the next.
-        # So the cap is sized to the fleet this cell advertises, doubled for a process that signs
-        # in again. setdefault, so an operator's own value stands.
-        node_env.setdefault("MEFOR_AUTH_MAX_SESSIONS_PER_USER", str(2 * procs + 2))
+        # RIGS SIGN IN, AND THIS RIG'S DRIVE IS SPLIT OVER PROCESSES: the session cap and the
+        # sign-in rate limit are sized to the fleet this cell advertises (rig_sign_in_env says why).
+        # setdefault, so an operator's own value stands.
+        for key, value in rig_sign_in_env(procs).items():
+            node_env.setdefault(key, value)
         node = EngineNode(
             f"batch-{cell.cell_id}", api_port, env=node_env, config_dir=_CONFIG_DIR, cwd=cwd
         )

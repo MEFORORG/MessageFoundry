@@ -500,6 +500,16 @@ def sign_in(base_url: str, admin: RigAdmin | None = None, *, cacert: str | None 
         cacert=cacert,
         body={"username": admin.username, "password": admin.password},
     )
+    if status == 429:
+        # The sign-in rate limit, not the credential (BACKLOG #2795): the stale-Administrator advice
+        # below would send an operator after the wrong cause. Every attempt counts, successes too,
+        # so a fleet of rig processes signing in from one address can meet the per-address limit.
+        raise RigSignInRefused(
+            "the engine rate-limited the rig Administrator's sign-in (HTTP 429): too many sign-in "
+            "attempts inside its window. A rig of many processes signing in from one address needs "
+            "MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP (and past the all-clients limit, "
+            "MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL) sized to its sign-ins on the engine it starts."
+        )
     if status != 200:
         raise RigSignInRefused(
             f"the engine refused the rig Administrator's sign-in (HTTP {status}). If this store "

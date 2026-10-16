@@ -104,6 +104,67 @@ def test_plan_driver_bands_rejects_bad_input() -> None:
         bb.plan_driver_bands(inbound_base=2600, count=0, sink_base=40000, sink_procs=6)
 
 
+# --- the rig's sign-in budget (BACKLOG #2795) ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("procs", "size", "global_raised"),
+    [(1, 4, False), (6, 14, False), (11, 24, False), (29, 60, False), (30, 62, True)],
+)
+def test_rig_sign_in_env_sizes_both_limits_to_the_fleet(
+    procs: int, size: int, global_raised: bool
+) -> None:
+    env = bb.rig_sign_in_env(procs)
+    assert env["MEFOR_AUTH_MAX_SESSIONS_PER_USER"] == str(size)
+    assert env["MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP"] == str(size)
+    if global_raised:
+        assert env["MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL"] == str(size)
+    else:
+        assert "MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL" not in env
+
+
+def test_rig_sign_in_env_names_real_auth_settings_and_their_shipped_defaults() -> None:
+    """The env names are spelled the way the engine's loader reads them, and the defaults the
+    docstring and the global threshold rest on are the shipped ones. A rename or a new default on
+    the engine side fails here rather than on the two-box rig."""
+    from messagefoundry.config.settings import AuthSettings, load_settings
+
+    shipped = AuthSettings()
+    assert shipped.max_sessions_per_user == 5
+    assert shipped.login_rate_limit_per_ip == 10
+    assert shipped.login_rate_limit_global == bb._engine_login_global_default() == 60
+    assert shipped.login_rate_limit_window_seconds == 60.0
+
+    auth = load_settings(environ=bb.rig_sign_in_env(30), default_file=False).auth
+    assert auth.max_sessions_per_user == 62
+    assert auth.login_rate_limit_per_ip == 62
+    assert auth.login_rate_limit_global == 62
+
+
+def test_an_eleventh_process_meets_the_shipped_limit_and_the_sized_one_admits_the_fleet() -> None:
+    """The research answer, on the engine's own limiter: every process signs in once from the
+    load-gen box's one address inside one window, and a success counts as an attempt."""
+    from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
+    from messagefoundry.config.settings import AuthSettings
+
+    shipped = AuthSettings()
+    procs = 11
+
+    def limiter(per_ip: int, glob: int) -> SlidingWindowRateLimiter:
+        return SlidingWindowRateLimiter(
+            per_key=per_ip, glob=glob, window_seconds=shipped.login_rate_limit_window_seconds
+        )
+
+    default = limiter(shipped.login_rate_limit_per_ip, shipped.login_rate_limit_global)
+    admitted = [default.allow("10.0.0.9") for _ in range(procs)]
+    assert admitted == [True] * 10 + [False], "the eleventh sign-in is the one refused (HTTP 429)"
+
+    env = bb.rig_sign_in_env(procs)
+    sized = limiter(int(env["MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP"]), shipped.login_rate_limit_global)
+    # Each process signs in, then signs in once more, as a process whose session was refused does.
+    assert all(sized.allow("10.0.0.9") for _ in range(2 * procs))
+
+
 def test_build_remote_argv_shape() -> None:
     plan = bb.BandPlan(index=2, inbound_base=2604, conn_count=1, sink_base=40002, sink_ports=1)
     argv = bb.build_remote_argv(
@@ -329,6 +390,8 @@ async def test_batch_split_handshake_end_to_end(monkeypatch: pytest.MonkeyPatch)
         # Administrator. The engine's default cap of five would end them in turn, so the engine
         # half sizes the cap to the fleet it advertises.
         assert int(env["MEFOR_AUTH_MAX_SESSIONS_PER_USER"]) > 6
+        # The same fleet signs in from one address, so the per-address sign-in limit is sized too.
+        assert env["MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP"] == env["MEFOR_AUTH_MAX_SESSIONS_PER_USER"]
 
     # (2) The engine report carries every cell's PID + node id for CPU correlation.
     assert len(eng_report.cells) == len(cells)
