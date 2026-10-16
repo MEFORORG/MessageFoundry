@@ -412,7 +412,7 @@ def _canonical_group_dns(groups: list[str]) -> list[str]:
     so it is refused rather than stored. The canonical form is the one ``_resolve_groups`` gives a
     member's groups, so a key matches however it escapes a value (:func:`canonical_group_dn`). The
     store still strips and folds case, which changes nothing in that form. A key that is blank
-    once its ASCII white space is trimmed stays blank, and the store drops it as it always has. A
+    once a space, a tab and a line break are trimmed stays blank, and the store drops it as it always has. A
     canonical key longer than :data:`_STORED_GROUP_MAX` is refused too."""
     # Outer white space is trimmed first: a pasted key often carries a line break, and the last
     # RDN of a group DN is a domain component, which holds none. Only a space, a tab and a line

@@ -21,8 +21,10 @@ from typing import Any
 import httpx
 import pytest
 import spnego
+from fastapi import HTTPException
 
 from messagefoundry.api import create_app
+from messagefoundry.api.auth_routes import _canonical_group_dns
 from messagefoundry.auth import ldap as ldap_mod
 from messagefoundry.auth.ldap import (
     LdapAuthenticator,
@@ -162,7 +164,7 @@ async def test_a_stored_short_name_key_matches_no_group(store: MessageStore) -> 
         f"  {LEGIT}  ",  # the store strips; so does the check
         "CN=MF-Admins, OU=Groups,DC=example",  # a space after a separator is padding
         "CN=C# Developers,DC=example",  # a "#" after a value's first character is literal
-        "CN=MF-Admins,\r\nOU=Groups,\tDC=example",  # ASCII white space pads a type (#3222)
+        "CN=MF-Admins,\r\nOU=Groups,\tDC=example",  # a tab or line break pads a type (#3222)
     ],
 )
 def test_a_full_dn_is_a_group_dn(value: str) -> None:
@@ -189,7 +191,7 @@ def test_a_full_dn_is_a_group_dn(value: str) -> None:
         "1..2=MF-Admins,DC=example",
         ".1=MF-Admins,DC=example",
         "1.=MF-Admins,DC=example",
-        # Only ASCII white space pads an attribute type (BACKLOG #3222). ``str.strip()`` also took
+        # Only a space, a tab or a line break pads a type (BACKLOG #3222). ``str.strip()`` also took
         # a no-break space and an em space, so these passed.
         "\u00a0CN=MF-Admins,OU=Groups,DC=example,DC=com",
         "CN=MF-Admins,\u2003OU=Groups,DC=example,DC=com",
@@ -415,27 +417,34 @@ _INVISIBLE_EDGE_KEYS = {
 }
 
 
+@pytest.mark.parametrize("key", list(_INVISIBLE_EDGE_KEYS.values()), ids=list(_INVISIBLE_EDGE_KEYS))
+def test_a_key_with_an_invisible_edge_is_refused(key: str) -> None:
+    """BACKLOG #3222: the routes trim only a space, a tab and a line break, and refuse a key that
+    still starts or ends with a character that does not print. The 400 names the key in its
+    ``ascii()`` form, so the character can be seen. CONTROL: the line-break test above."""
+    with pytest.raises(HTTPException) as caught:
+        _canonical_group_dns([LEGIT, key])
+    assert caught.value.status_code == 400
+    assert "does not print" in caught.value.detail
+    assert caught.value.detail.endswith(f"refused: {ascii(key.strip(' \t\r\n'))}")
+
+
 @pytest.mark.parametrize(
     ("path", "field", "value"),
     [("/ad-group-map", "role", Role.OPERATOR.value), ("/ad-group-scope-map", "channel", "*")],
     ids=["role-map", "scope-map"],
 )
-@pytest.mark.parametrize("key", list(_INVISIBLE_EDGE_KEYS.values()), ids=list(_INVISIBLE_EDGE_KEYS))
-async def test_a_key_with_an_invisible_edge_is_refused(
-    engine: Engine, path: str, field: str, value: str, key: str
+async def test_both_map_routes_refuse_an_invisible_edge(
+    engine: Engine, path: str, field: str, value: str
 ) -> None:
-    """BACKLOG #3222: the routes trim only a space, a tab and a line break, and refuse a key that
-    still starts or ends with a character that does not print. The 400 names the key in its
-    ``ascii()`` form, so the character can be seen. CONTROL: the line-break test above."""
+    """Both PUT routes reach the refusal above, and store nothing from the body."""
     transport = await _admin_transport(engine)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         h = await _admin_headers(c)
-        body = {"entries": [{"ad_group": key, field: value}]}
+        body = {"entries": [{"ad_group": f"{LEGIT} ", field: value}]}
         r = await c.put(path, json=body, headers=h)
         assert r.status_code == 400, r.text
-        detail = r.json()["detail"]
-        assert "does not print" in detail
-        assert ascii(key.strip(" \t\r\n")) in detail
+        assert "does not print" in r.json()["detail"]
         assert (await c.get(path, headers=h)).json()["entries"] == []
 
 

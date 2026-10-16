@@ -4889,7 +4889,7 @@ async def test_ad_group_maps_roundtrip(engine: Engine) -> None:
             r = await _post_pairs(c, path, [("ad_group", "MEFOR-Ops"), (partner, value)])
             assert r.status_code == 400 and "full distinguished name" in r.text
             # A no-break space at the end is refused too, not trimmed (BACKLOG #3222).
-            nbsp = "CN=MEFOR-Ops,OU=Groups,DC=example,DC=invalid "
+            nbsp = "CN=MEFOR-Ops,OU=Groups,DC=example,DC=invalid\u00a0"
             r = await _post_pairs(c, path, [("ad_group", nbsp), (partner, value)])
             assert r.status_code == 400 and "does not print" in r.text
         assert len(await service.store.list_ad_group_role_map()) == 1
