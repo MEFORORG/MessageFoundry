@@ -1049,7 +1049,8 @@ async def _reconcile_approvals_after_restart(gate: ApprovalGate) -> None:
 #: BACKLOG #3191: the wall-clock budget of everything the managed lifespan does after its yield,
 #: engine.stop() included. NSSM sends Ctrl+C and escalates after AppStopMethodConsole, 15000 ms
 #: (scripts/service/install-service.ps1). Before the lifespan sees the shutdown, uvicorn drains the
-#: open connections, which BACKLOG #3256 bounds where serve calls uvicorn.run. This budget plus that
+#: open connections. BACKLOG #3256 is to bound that drain where serve calls uvicorn.run; it was not on
+#: main when this was written, so until it is that drain is unbounded. This budget plus that
 #: bound, plus a cut step's grace (below) for each step cut, must stay inside the window with room
 #: left for the interpreter to exit.
 _SHUTDOWN_BUDGET_SECONDS: Final = 10.0
@@ -1153,8 +1154,9 @@ async def _run_teardown(steps: Sequence[_TeardownStep], budget: float) -> None:
     each step cut, plus whatever an unbounded step overruns its reserve by.
 
     A cancel of the caller reaches no step (:func:`_await_step`), and is raised once every step has
-    run. So is the first exception that is not an :class:`Exception`, such as KeyboardInterrupt:
-    the steps after it still run, so engine.stop() still closes the store."""
+    run. So is the first other exception a step ends with that is not an :class:`Exception`: the
+    steps after it still run, so engine.stop() still closes the store. KeyboardInterrupt and
+    SystemExit are not among them, since asyncio raises those out of the event loop itself."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + budget
     current = asyncio.current_task()
@@ -1166,7 +1168,9 @@ async def _run_teardown(steps: Sequence[_TeardownStep], budget: float) -> None:
     for step in steps:
         later -= step.floor
         bound = max(step.floor, deadline - loop.time() - later)
-        work = asyncio.ensure_future(step.run(bound))
+        # Called inside the task, so an error raised while building the awaitable is the step's
+        # failure like any other, and cannot skip the steps after it.
+        work = asyncio.ensure_future(_invoke(step.run, bound))
         if not await _await_step(work, bound if step.bounded else None, step.label):
             continue
         try:
@@ -1184,6 +1188,11 @@ async def _run_teardown(steps: Sequence[_TeardownStep], budget: float) -> None:
         raise asyncio.CancelledError
 
 
+async def _invoke(run: Callable[[float], Awaitable[object]], bound: float) -> object:
+    """A step's body, as the coroutine :func:`_run_teardown` runs in the step's own task."""
+    return await run(bound)
+
+
 def _sync(fn: Callable[[], object]) -> Callable[[float], Awaitable[None]]:
     """A synchronous call as a teardown step, so :func:`_run_teardown` guards its failure too."""
 
@@ -1194,7 +1203,7 @@ def _sync(fn: Callable[[], object]) -> Callable[[float], Awaitable[None]]:
 
 
 def _app_drain_steps(
-    app: FastAPI, store: Store | None, auth: AuthService | None
+    app: FastAPI, store: Store | None, auth: AuthService | None, *, owns_auth: bool
 ) -> list[_TeardownStep]:
     """The drains an app runs at shutdown while the store is still open, in order.
 
@@ -1232,12 +1241,19 @@ def _app_drain_steps(
                 "the approval outcome-write drain", 0.5, lambda b: gate.drain(b * _INNER_SHARE)
             )
         )
-    if auth is not None:
+    if auth is not None and owns_auth:
         # close_background is the shutdown call the service names, with its own bound (its drain
         # and cancel grace, in auth/service.py). Only a bound below that cuts it before it cancels
         # its notices itself; a notice cut that way meets the closed store and logs its own failure.
         steps.append(
             _TeardownStep("the lock-notice drain", 1.0, lambda _b: auth.close_background())
+        )
+    elif auth is not None:
+        # A service the caller owns is joined, never closed: closing it would make every later
+        # notice over it run inline on the sign-in path, which #2216 moved them off. The caller
+        # closes it before it stops its engine, as close_background asks.
+        steps.append(
+            _TeardownStep("the lock-notice drain", 1.0, lambda _b: auth.drain_background())
         )
     if store is not None:
         steps.append(
@@ -1260,10 +1276,10 @@ async def _embedded_lifespan(app: FastAPI) -> AsyncIterator[None]:
     :meth:`ApprovalGate.reconcile_after_restart`, before the app serves an approval. At shutdown it
     runs the same drains the managed lifespan runs before engine.stop() (:func:`_app_drain_steps`,
     BACKLOG #3191), so a caller that stops its engine after the app has shut down loses no outcome
-    write, notice or audit row. The lock-notice drain closes the caller's auth service, as
-    :meth:`AuthService.close_background` asks of any such app, so a later app over the same service
-    runs its notices inline. A caller that passes its own ``lifespan`` replaces this one and runs
-    these steps itself, with the store open."""
+    write, notice or audit row. The lock notices of an auth service the caller passed in are waited
+    for, not closed: the service is the caller's, which closes it with
+    :meth:`AuthService.close_background` before it stops its engine. A caller that passes its own
+    ``lifespan`` replaces this one and runs these steps itself, with the store open."""
     # create_app installs this only beside an engine, and always builds the gate then.
     await _reconcile_approvals_after_restart(app.state.approval_gate)
     try:
@@ -1271,7 +1287,9 @@ async def _embedded_lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         # The caller still has its engine to stop, so its reserve is left out of this budget.
         await _run_teardown(
-            _app_drain_steps(app, app.state.engine.store, getattr(app.state, "auth", None)),
+            _app_drain_steps(
+                app, app.state.engine.store, getattr(app.state, "auth", None), owns_auth=False
+            ),
             _SHUTDOWN_BUDGET_SECONDS - _ENGINE_STOP_RESERVE_SECONDS,
         )
 
@@ -10787,7 +10805,7 @@ def create_managed_app(
             # closes both notifiers, and is re-raised once they have run. Without engine.stop()
             # the store's non-daemon worker keeps the process alive. The three store-reading tasks
             # are cancelled first, before any await, so no step can leave one running when
-            # engine.stop() closes the store. _SHUTDOWN_BUDGET_SECONDS bounds the whole run.
+            # engine.stop() closes the store. _SHUTDOWN_BUDGET_SECONDS bounds the steps that can be cut.
             background = [t for t in (reconciler, reaper, credential_reminder) if t is not None]
             for task in background:
                 task.cancel()
@@ -10808,9 +10826,12 @@ def create_managed_app(
                     "the store-reading tasks",
                     0.1,
                     lambda _b: asyncio.gather(*background, return_exceptions=True),
+                    # Never cut, as before: a task left running here would meet the store that
+                    # engine.stop() closes.
+                    bounded=False,
                 )
             )
-            steps += _app_drain_steps(app, store, auth)
+            steps += _app_drain_steps(app, store, auth, owns_auth=True)
             if security_notifier is not None:
                 # It drains queued user emails, and records a notice it could not send in the audit
                 # log, so it closes while the store is open, after the lock notices that hand it

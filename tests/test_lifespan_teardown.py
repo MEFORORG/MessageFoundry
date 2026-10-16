@@ -63,6 +63,22 @@ async def test_a_step_that_raises_does_not_skip_the_next() -> None:
     assert calls == ["boom", "next"]
 
 
+async def test_a_step_that_raises_while_it_is_built_does_not_skip_the_next() -> None:
+    calls: list[str] = []
+
+    def _raises_at_once(_bound: float) -> Awaitable[None]:
+        raise AttributeError("PROBE: an attribute the step reads is gone")
+
+    await _run_teardown(
+        [
+            _TeardownStep("raises at once", 0.1, _raises_at_once),
+            _TeardownStep("stop", 0.1, _record(calls, "stop"), bounded=False),
+        ],
+        1.0,
+    )
+    assert calls == ["stop"]
+
+
 async def test_a_base_exception_runs_the_later_steps_then_is_raised() -> None:
     calls: list[str] = []
 
@@ -412,7 +428,9 @@ async def test_the_embedded_app_runs_the_same_drains_at_shutdown(engine: Engine)
         return []
 
     class _Auth:
-        async def close_background(self) -> None:
+        """Joined, never closed: the caller owns the service."""
+
+        async def drain_background(self) -> None:
             calls.append("lock notices")
 
     async with app.router.lifespan_context(app):

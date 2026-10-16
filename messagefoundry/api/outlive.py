@@ -48,8 +48,10 @@ DRAIN_TIMEOUT_SECONDS = 0.5
 #: because at least one arm waits on a process: a cancelled DR takeover hook is killed and reaped
 #: for up to ``_HOOK_REAP_SECONDS`` before the activation's arm writes its row, so this is that
 #: bound plus a second for the write. It is an upper limit: the API lifespans hand the drain a share
-#: of one shutdown budget (``_SHUTDOWN_BUDGET_SECONDS`` in ``api/app.py``, BACKLOG #3191), and when
-#: other steps are busy that share is shorter, so the drain logs the operations still rolling back.
+#: of one shutdown budget (``_SHUTDOWN_BUDGET_SECONDS`` in ``api/app.py``, BACKLOG #3191). With the
+#: managed lifespan's full set of steps that share is below this even when they are idle, so a
+#: takeover hook that takes its whole reap can still be rolling back when the store closes, and the
+#: drain logs it.
 CANCEL_GRACE_SECONDS = _HOOK_REAP_SECONDS + 1.0
 
 
@@ -132,7 +134,7 @@ class OutlivingOperations:
             return []
         cancelled = sorted(self._inflight.get(task, "?") for task in left)
         log.warning(
-            "shutdown: cancelling %d operation(s) still running after %.0fs: %s",
+            "shutdown: cancelling %d operation(s) still running after %.1fs: %s",
             len(left),
             timeout,
             ", ".join(cancelled),
@@ -142,7 +144,7 @@ class OutlivingOperations:
         _done, stuck = await asyncio.wait(left, timeout=grace)
         if stuck:
             log.error(
-                "shutdown: %d cancelled operation(s) had not finished rolling back after %.0fs",
+                "shutdown: %d cancelled operation(s) had not finished rolling back after %.1fs",
                 len(stuck),
                 grace,
             )
