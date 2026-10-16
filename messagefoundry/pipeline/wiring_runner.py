@@ -3662,9 +3662,8 @@ class RegistryRunner:
             # checks the file again.
             if not fails_lane:
                 raise
-            log.warning(
-                "%s connection %r: trust anchor could not be checked: %s", direction, name, exc
-            )
+            # No WARNING here: the check logged the store's error once, and a scheduled poller
+            # retries at every in-window tick.
             raise TrustAnchorError(
                 f"{direction} connection '{name}': its tls_ca_file could not be checked, because "
                 "the store refused the trust-anchor audit. Start the connection once the store is "
@@ -3847,14 +3846,22 @@ class RegistryRunner:
         if self._lane_anchor_check is None:
             return []
         passed: list[tuple[Direction, str]] = []
+        store_fault: AnchorStoreUnavailable | None = None
         for direction, name, settings in self._reload_anchor_lanes(old, new, old_inbound_names):
             try:
                 await self._check_lane_anchor(direction, name, settings, fails_lane=False)
-            except (TrustAnchorError, AnchorStoreUnavailable, ValueError) as exc:
-                # A store fault is not a refused CA; the helper answers it apart (BACKLOG #3091).
+            except AnchorStoreUnavailable as exc:
+                # Not a refused CA. Go on, so a later lane's refused CA refuses as one; the store
+                # fault refuses the reload only if none does (BACKLOG #3091).
+                store_fault = store_fault or exc
+                continue
+            except (TrustAnchorError, ValueError) as exc:
                 error = refused_connection_anchor(exc)
                 raise error from error.__cause__
             passed.append((direction, name))
+        if store_fault is not None:
+            error = refused_connection_anchor(store_fault)
+            raise error from error.__cause__
         return passed
 
     async def _ensure_destination_built(self, name: str) -> None:
