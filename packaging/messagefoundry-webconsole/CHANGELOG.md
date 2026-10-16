@@ -92,6 +92,15 @@ this line.**
 
 ### Security
 
+- **The users list shows channel scopes only to an administrator.** The engine now sends each
+  account's channel scope to a `users:manage` holder only, so `/ui/users` drops its Channel scope
+  and Scope source columns for any other reader rather than showing every account as "(none)".
+  (vault BACKLOG #3189)
+- **The bulk control and bulk purge pages no longer write a malformed name into the audit log.** A
+  channel-scoped operator's selection that is not a valid connection name is still recorded as an
+  `auth.channel_denied` row naming the operator and host, but the row carries no channel. It used to
+  carry the submitted text whole, bounded only by the request size. The page now answers such a
+  selection "not a valid connection name", as it does for any other operator. (vault BACKLOG #3031)
 - **The audit page shows where each entry came from.** `/ui/audit` has a Client column, which
   shows the address the engine recorded for the entry, or a dash when no client was in scope.
   An operator tracing a run of refused sign-ins can now see their source on the page, not only in

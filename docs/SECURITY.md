@@ -1857,17 +1857,30 @@ the same permission set on the same method reds CI until it is listed here.
 
 > **The per-name connection routes do not tell a scoped caller which names exist (BACKLOG #2551).**
 > This covers at least `GET /connections/{name}/metadata` and `POST /connections/{name}/test`,
-> `/test-credential`, `/start`, `/stop` and `/restart`. Each checks the scope before it looks the
-> name up. A scoped caller reaches only an inbound in its own scope. Every other name gets one 403,
+> `/test-credential`, `/start`, `/stop` and `/restart`, and the web console's bulk start, stop and
+> restart. All of them resolve the name through one helper, `_resolve_connection` in
+> `messagefoundry/api/app.py` (BACKLOG #3031). It looks the name up among the inbounds first and
+> checks the scope then, and the answer does not depend on that order. A scoped caller reaches only
+> an inbound in its own scope. Every other name gets one 403,
 > one body and one `auth.channel_denied` row: an inbound outside its scope, any outbound, and a
 > name that exists nowhere. That holds even when the caller's scope lists the outbound or the
 > unknown name, since a scope is not checked against the registry (BACKLOG #2640). Only an
 > unscoped caller gets 404 for an unknown name. So a denial row can name a channel inside the
 > actor's own scope, for example one a reload removed. Read such a row as a miss, not a probe.
-> With the engine not started there is no graph and no name exists. Every route still checks the
-> scope first, so a name outside it gets the 403. A name inside it gets 503 from the first three
-> routes and 404 from the control routes, with no denial row. Names still show elsewhere. At
-> least the Prometheus exposition above lists them.
+> On a deployment with more than one engine shard the same row has a second cause. Each engine
+> shard's graph holds only its own inbounds, and each serves its own API port. So a scoped caller
+> who asks one engine shard about an in-scope inbound that another owns gets the 403 and a denial
+> row, for a channel it may reach. The row does not say which engine shard answered. To read one,
+> look the named inbound up in the whole config, which `messagefoundry check` reads: an inbound
+> that exists and that the actor's scope lists was asked of the wrong engine shard, or was removed
+> by a reload. That case was read from the code, not run on more than one engine shard (BACKLOG
+> #3031).
+> With an engine bound but not started there is no graph and no name exists. Every route still
+> checks the scope first, so a name outside it gets the 403. A name inside it gets 503 from the
+> first three routes and 404 from the control routes, with no denial row. With no engine bound at
+> all, every one of these routes answers 503 `engine not started` before any scope check, the same
+> answer for every name. Names still show elsewhere. At least the Prometheus exposition above
+> lists them.
 > `POST /connections/{name}/flag` refuses the same way (BACKLOG #1152). A scoped caller flags only
 > an inbound in its own scope, and every other target gets that 403, before the engine looks the
 > name up. An in-scope inbound the graph holds, or any in-scope name when no graph is loaded,
@@ -1876,7 +1889,8 @@ the same permission set on the same method reds CI until it is listed here.
 > only the rules that name no connection outside its scope: `connection` is `*` or a name in its
 > scope, and `control_target` is unset or in it.
 > `tests/test_channel_rbac.py` pins the six routes, not that list.
-> `tests/test_object_scope_flag_and_alert_rules.py` pins the flag route and the rules.
+> `tests/test_object_scope_flag_and_alert_rules.py` pins the flag route and the rules. The console's
+> `test_webui.py` pins the bulk page's 403 for an in-scope name no connection uses, on both roles.
 
 > **Single-route data rules: at least these routes narrow or refuse by scope or owner, each in its
 > own way (BACKLOG #1151).** Their route rows above point here. A *scoped caller* is any
@@ -1976,10 +1990,23 @@ the same permission set on the same method reds CI until it is listed here.
 >
 > The store reads that take `allowed_channels` require it, so a caller cannot read every channel by
 > leaving it out. A test refuses a literal `allowed_channels=None` on those reads under
-> `messagefoundry/api/`. The table also lists at least three unscoped routes that no
-> backlog item tracks yet: `GET /security/posture` names connections, `GET /users` returns every
-> account's channel scope to a `users:read` holder, and `POST /config/reload` acts on every
-> connection.
+> `messagefoundry/api/`. The table's class for routes that no backlog item tracked is empty since
+> BACKLOG #3189 classed its three:
+>
+> - `GET /security/posture` shows a scoped reader a per-connection entry only for an inbound in its
+>   own scope that the graph holds. That covers the loosenings, the static-credential hops and
+>   their opt-outs, and the audit row. `loosenings_scope` and `static_credential_hops_scope` then
+>   say the reading is narrowed. Anything that names no connection is shown whole.
+> - `GET /users` sends each account's `channel_scope` and `channel_scope_source` only to a
+>   `users:manage` holder, the tier `GET /users/{user_id}/channel-scope` reads on. Everyone else
+>   gets null for both, which there means "not shown", as `lock_state` does. The console's user
+>   list drops both scope columns for such a reader.
+> - `POST /config/reload` refuses a scoped caller 403, a dry run included, because a reload loads
+>   the whole graph and a dry run's reply describes it. So a deployer needs the all-channels grant.
+>   The refusal writes one `auth.channel_denied` row naming no channel. The approval gate refuses
+>   to release a held reload whose requester has been scoped since, as it does for a purge.
+>
+> `tests/test_channel_scope_posture_users_reload.py` pins all three.
 
 > **`/config/reload` executes Python** from the target directory in-process, so it is constrained
 > beyond the `config:deploy` permission: the directory must resolve **within** an allowed root —

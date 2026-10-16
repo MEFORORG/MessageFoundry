@@ -137,6 +137,9 @@ class UserSummary(BaseModel):
     roles: list[str]
     #: Per-channel RBAC, as STORED: the allowed connection names, ``["*"]`` for the explicit
     #: all-channels grant, or ``None`` when nobody has set a scope — which denies (BACKLOG #1152).
+    #: ``GET /users`` sends this and ``channel_scope_source`` only to a ``users:manage`` caller, the
+    #: tier ``GET /users/{id}/channel-scope`` reads on (BACKLOG #3189). Everyone else gets ``None``
+    #: for both, which from that route means NOT SHOWN TO YOU, as ``lock_state`` does.
     channel_scope: list[str] | None = None
     #: Who last wrote ``channel_scope`` (BACKLOG #1958): ``"ad"`` for the AD login sync,
     #: ``"manual"`` for an administrator, ``None`` when no scope writer has run. The rule it decides

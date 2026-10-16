@@ -1539,6 +1539,13 @@ STATIC_CREDENTIAL_HOPS_COMPLETE = (
 )
 #: The same field's prefix when a half could not be read; the route appends which half and why.
 STATIC_CREDENTIAL_HOPS_PARTIAL = "partial, not read: "
+#: ``SecurityPosture.loosenings_scope`` for a channel-scoped reader (BACKLOG #3189), and the half
+#: ``static_credential_hops_scope`` names for one. Such a reader is shown a per-connection entry only
+#: for an inbound in its own scope that the running graph holds.
+POSTURE_NARROWED_TO_SCOPE = (
+    "narrowed to your channel scope: a per-connection entry is listed only for an inbound in "
+    "your scope, so one on any other connection is NOT included"
+)
 
 
 class StaticCredentialHopView(BaseModel):
@@ -1596,9 +1603,10 @@ class SecurityPosture(BaseModel):
     # PHI-only gates are (defensibly) relaxed. Read-only; the IDE is the sole authoring surface.
     security: dict[str, object] = Field(default_factory=dict)
     loosenings: list[SecurityLoosening] = Field(default_factory=list)
-    # ``None`` = the loosening list above is COMPLETE. A string names what it could NOT see — set only
+    # ``None`` = the loosening list above is COMPLETE. A string names what it could NOT see — set
     # when this engine has no loaded connection graph (an embedding, or an app queried before start),
-    # where the ADR 0153 per-connection ``cleartext_accepted`` declarations are unreadable. Reporting a
+    # where the ADR 0153 per-connection ``cleartext_accepted`` declarations are unreadable, and for a
+    # channel-scoped reader, whose list is narrowed (POSTURE_NARROWED_TO_SCOPE, BACKLOG #3189). Reporting a
     # settings-only subset with no marker would understate the posture, which is the one thing this
     # route must not do; ``messagefoundry security show`` carries the same marker for the same reason.
     loosenings_scope: str | None = None

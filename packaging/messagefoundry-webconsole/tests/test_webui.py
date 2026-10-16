@@ -3688,6 +3688,46 @@ def test_users_page_scope_column_shows_what_the_account_reaches() -> None:
     assert _scope_cell(_u(["administrator"], ["IB_A"])) == "all (administrator)"
 
 
+def test_users_page_hides_the_scope_columns_from_a_reader_who_is_not_shown_scopes() -> None:
+    """BACKLOG #3189: the engine shows channel scopes only to a users:manage holder, and sends
+    anyone else null. This page renders a null scope as "(none)", "reaches nothing", so for such a
+    reader it must drop both scope columns rather than print that beside every account."""
+    from messagefoundry.api.auth_models import UserSummary
+    from messagefoundry_webconsole.pages.admin import users_page
+
+    withheld = UserSummary(
+        id="u", username="u", auth_provider="local", disabled=False, roles=["operator"]
+    )
+    hidden = str(users_page([withheld], show_scope=False))
+    assert "Channel scope" not in hidden and "Scope source" not in hidden
+    assert "(none)" not in hidden
+    # The control: the same row on the page a users:manage holder gets carries both columns.
+    shown = str(users_page([withheld], show_scope=True))
+    assert "<th>Channel scope</th>" in shown and "<th>Scope source</th>" in shown
+
+
+async def test_users_page_shows_scopes_only_to_a_users_manage_holder(engine: Engine) -> None:
+    """The route half of the rule above: a users:read-only reader, here a custom role, sees no
+    account's channels on /ui/users, while an administrator sees them (BACKLOG #3189)."""
+    service = await _service(engine)
+    role = await service.create_custom_role(
+        display_name="User reader", description=None, permissions=["users:read"], actor="test"
+    )
+    await _add_with_role_ids(service, "reader", [role.id])
+    await _add(service, "scoped-op", Role.OPERATOR)
+    await service.set_channel_scope(await _uid(service, "scoped-op"), ["IB_SECRET"], actor="test")
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "reader")
+        r = await c.get("/ui/users")
+        assert r.status_code == 200, r.text
+        assert "scoped-op" in r.text
+        assert "IB_SECRET" not in r.text and "Channel scope" not in r.text
+    async with _boss_client(engine, service) as c:
+        r = await c.get("/ui/users")
+        assert r.status_code == 200
+        assert "IB_SECRET" in r.text and "<th>Channel scope</th>" in r.text
+
+
 async def test_l4a_actions_registered_in_correct_allowlists(engine: Engine) -> None:
     # Form pages are unlock targets; body-less path actions are auto-retry; body-carrying POST paths
     # are in NEITHER list (they can only be reached by a fresh same-origin form submit).
@@ -7773,6 +7813,69 @@ async def test_bulk_control_forbidden_target_does_not_abort_batch(
         assert "403" in r.text and "out1" in r.text  # the forbidden target is enumerated
     assert rr.inbound_running("in1") is False  # the in-scope target still applied (batch continued)
     assert rr.outbound_running("out1") is True  # the forbidden target was NOT stopped
+
+
+async def test_bulk_control_answers_an_in_scope_unknown_name_with_the_audited_403(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """BACKLOG #3031 finding 1: the bulk page always passes a ``role``, and the JSON routes never do,
+    so this is the only test of the refusal on the role-keyed path.
+
+    A scoped operator whose scope lists names no connection uses must get the same audited 403 for
+    them as for an out-of-scope connection, on both roles. A 404 there would tell it which listed
+    names exist (BACKLOG #2640). The mutant this kills applied the early refusal only when ``role``
+    was ``None`` or the name was an outbound: both selections below then answered 404."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await service.set_channel_scope(
+        await _uid(service, "op"), ["in1", "ghost_in", "ghost_out"], actor="admin"
+    )
+    await _start_two_out(engine, tmp_path)
+
+    async def denied() -> list[str | None]:
+        rows = await engine.store.list_audit(limit=100, action="auth.channel_denied")
+        return sorted(r["channel_id"] for r in rows)
+
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await _post_pairs(
+            c,
+            "/ui/connections/bulk-control",
+            [
+                ("action", "stop"),
+                ("sel", _rowkey("source", "ghost_in")),
+                ("sel", _rowkey("destination", "in1", "ghost_out")),
+            ],
+        )
+        assert r.status_code == 200, r.text
+        assert r.text.count("403: not authorized for this connection") == 2, r.text
+        assert "404" not in r.text and "no such connection" not in r.text
+    assert await denied() == ["ghost_in", "ghost_out"]
+
+
+async def test_bulk_routes_audit_a_scoped_malformed_name_without_writing_it(
+    engine: Engine,
+) -> None:
+    """BACKLOG #3031 finding 5: a scoped actor's malformed name is still a recorded denial, but the
+    row carries no channel. The name is caller-chosen text bounded only by the request body, and it
+    used to be written whole to ``audit_log.channel_id``."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await service.set_channel_scope(await _uid(service, "op"), ["in1"], actor="admin")
+    long_bad = "bad name " + "x" * 5000
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await _post_pairs(
+            c,
+            "/ui/connections/bulk-control",
+            [("action", "stop"), ("sel", _rowkey("source", long_bad))],
+        )
+        assert r.status_code == 200, r.text
+        assert "not applied: not a valid connection name" in r.text
+        assert long_bad not in r.text
+    rows = await engine.store.list_audit(limit=100, action="auth.channel_denied")
+    assert [(row["actor"], row["channel_id"]) for row in rows] == [("op", None)]
+    assert all("xxxxx" not in str(dict(row)) for row in rows)
 
 
 async def test_bulk_control_bad_action_404(engine: Engine) -> None:

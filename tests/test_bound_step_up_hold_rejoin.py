@@ -340,6 +340,7 @@ def _called_names(node: ast.AST) -> set[str]:
 _BEFORE_THE_SPEND = frozenset(
     {
         "_purge_in_scope",
+        "_reload_in_scope",
         "_purge_target_refusal",
         "_purge_hold_params",
         "_reload_hold_params",

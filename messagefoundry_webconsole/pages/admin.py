@@ -248,11 +248,16 @@ def _lock_card(user: UserSummary) -> Markup:
     )
 
 
-def users_page(users: Sequence[UserSummary]) -> Markup:
+def users_page(users: Sequence[UserSummary], *, show_scope: bool = True) -> Markup:
     """The user list: every account with provider, roles, scope, and status; links to the admin forms.
 
     The Lock column appears only when the engine disclosed lock state, which it does only to a
-    users:manage holder (BACKLOG #1131). An empty column would read as "nobody is locked"."""
+    users:manage holder (BACKLOG #1131). An empty column would read as "nobody is locked".
+
+    The two scope columns appear only when ``show_scope`` is set, which the route sets for a
+    users:manage holder, the only caller the engine shows scopes to (BACKLOG #3189). The engine's
+    null for anyone else means "not shown", and this page would render it as "(none)", which reads
+    as "reaches nothing"."""
     show_lock = any(u.lock_state is not None for u in users)
     rows: list[list[object]] = []
     for u in users:
@@ -262,23 +267,17 @@ def users_page(users: Sequence[UserSummary]) -> Markup:
             u.display_name or "",
             u.email or "",
             ", ".join(u.roles),
-            _scope_cell(u),
-            _scope_source_text(u),
-            "disabled" if u.disabled else "active",
         ]
+        if show_scope:
+            row += [_scope_cell(u), _scope_source_text(u)]
+        row.append("disabled" if u.disabled else "active")
         if show_lock:
             row.append(_lock_cell(u))
         rows.append(row)
-    headers = [
-        "Username",
-        "Provider",
-        "Display name",
-        "Email",
-        "Roles",
-        "Channel scope",
-        "Scope source",
-        "Status",
-    ]
+    headers = ["Username", "Provider", "Display name", "Email", "Roles"]
+    if show_scope:
+        headers += ["Channel scope", "Scope source"]
+    headers.append("Status")
     if show_lock:
         headers.append("Lock")
     return page(

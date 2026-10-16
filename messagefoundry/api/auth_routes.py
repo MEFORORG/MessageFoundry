@@ -1115,14 +1115,25 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # [diagnostics].audit_all_authz off, this GET writes no grant row. The web console calls
         # this handler in-process and writes none at all, an open gap (BACKLOG #1197).
         # One instant for the whole list, so every row answers "locked now?" for the same now.
-        lock_state_at = time.time() if identity.has(Permission.USERS_MANAGE) else None
+        manager = identity.has(Permission.USERS_MANAGE)
+        lock_state_at = time.time() if manager else None
         summaries: list[UserSummary] = []
         for user in await service.store.list_users():
             role_ids = await service.store.get_user_role_ids(user.id)
             # No credential_expires_at here, deliberately (BACKLOG #1141). This route needs only
             # users:read, and which accounts hold a live admin-issued temporary password, and until
             # when, is a target list. The users:manage surfaces state it.
-            summaries.append(_user_summary(user, role_ids, lock_state_at=lock_state_at))
+            summary = _user_summary(user, role_ids, lock_state_at=lock_state_at)
+            if not manager:
+                # BACKLOG #3189: every account's channel scope, and who wrote it, go only to a
+                # users:manage holder, the tier GET /users/{id}/channel-scope reads on. users:read
+                # can be minted into a custom role, which can be channel-scoped, and the list would
+                # otherwise name every other account's channels to it. Withheld, both read null,
+                # which from this route means "not shown to you", as lock_state's null does.
+                summary = summary.model_copy(
+                    update={"channel_scope": None, "channel_scope_source": None}
+                )
+            summaries.append(summary)
         return summaries
 
     @app.get("/users/{user_id}/permissions", response_model=UserPermissions)
