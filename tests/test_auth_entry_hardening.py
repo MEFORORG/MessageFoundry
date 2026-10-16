@@ -311,6 +311,63 @@ def test_limiter_retry_after_hides_other_keys_when_the_global_budget_is_full(
     assert limiter.retry_after("c") == 60.0  # not the 29 s until a's hit ages out
 
 
+def test_limiter_drops_aged_buckets_of_keys_that_never_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #2714: a bucket used to go only inside a later call for the same key, so a table
+    # keyed on a peer address grew with every address ever seen. Now any call drops aged buckets,
+    # whoever calls.
+    clock = [1000.0]
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    limiter = SlidingWindowRateLimiter(per_key=1, glob=0, window_seconds=60.0)
+    for n in range(1000):
+        assert limiter.allow(f"peer-{n}")
+    assert len(limiter._hits) == 1000
+    # Inside the window nothing has aged out, and a refused key keeps the bucket retry_after reads.
+    clock[0] = 1030.0
+    assert not limiter.allow("peer-0")
+    assert limiter.retry_after("peer-0") == 30.0
+    assert len(limiter._hits) == 1000
+    # Four windows later, one call for a new key drops the thousand that never returned.
+    clock[0] = 1240.0
+    assert limiter.allow("new")
+    assert set(limiter._hits) == {"new"}
+    # A bucket whose newest hit is still live survives; would_allow records nothing.
+    clock[0] = 1290.0
+    assert limiter.allow("late")
+    clock[0] = 1300.5
+    assert not limiter.would_allow("late")
+    assert set(limiter._hits) == {"late"}
+    assert list(limiter._hits["late"]) == [1290.0]
+
+
+def test_limiter_orders_buckets_by_newest_hit_so_eviction_stops_at_the_first_live_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The table is ordered by each key's newest hit, so a call drops aged buckets from the front
+    # and never scans the rest. A key that returns moves to the back, past an older key.
+    clock = [1000.0]
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    limiter = SlidingWindowRateLimiter(per_key=2, glob=0, window_seconds=60.0)
+    assert limiter.allow("a")
+    clock[0] = 1010.0
+    assert limiter.allow("b")
+    clock[0] = 1020.0
+    assert limiter.allow("a")  # "a" now has the newer hit
+    assert list(limiter._hits) == ["b", "a"]
+    clock[0] = 1071.0
+    assert limiter.allow("c")  # drops "b" (1010), keeps "a" (1020) though its first hit is older
+    assert list(limiter._hits) == ["a", "c"]
+    assert list(limiter._hits["a"]) == [1000.0, 1020.0]  # its own hits prune on its own call
+    clock[0] = 1081.0
+    assert limiter.would_allow("z")  # evicts "a" (1020), and records nothing for "z"
+    assert list(limiter._hits) == ["c"]
+
+
 async def test_admin_write_retry_after_is_whole_seconds_rounded_up_and_at_least_one(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:

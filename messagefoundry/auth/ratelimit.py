@@ -12,7 +12,7 @@ window. Calls are synchronous and complete without ``await``, so they're atomic 
 from __future__ import annotations
 
 import time
-from collections import deque
+from collections import OrderedDict, deque
 
 __all__ = ["SlidingWindowRateLimiter"]
 
@@ -20,8 +20,13 @@ __all__ = ["SlidingWindowRateLimiter"]
 class SlidingWindowRateLimiter:
     """Allow up to ``per_key`` hits per key and ``glob`` hits overall within ``window_seconds``.
 
-    A falsy ``per_key``/``glob`` disables that dimension. Empty per-key buckets are dropped as they
-    age out, so memory is bounded by the number of *active* keys in the window.
+    A falsy ``per_key``/``glob`` disables that dimension.
+
+    A key's bucket is dropped once its newest hit leaves the window, whether or not the key comes
+    back (BACKLOG #2714), so after each call the table holds only keys with a hit in the window. The
+    table is ordered by each key's newest hit, so every call drops aged buckets from the front and
+    stops at the first live one. That costs constant work per call on average, never a scan of the
+    whole table, which matters because the login path is unauthenticated.
 
     ``min_interval_seconds`` adds a GAP floor beside the count (BACKLOG #2301, ASVS 2.4.2): a hit
     for a key is refused while that key's last allowed hit is younger than this. A count alone
@@ -43,13 +48,29 @@ class SlidingWindowRateLimiter:
         if min_interval_seconds and min_interval_seconds >= window_seconds:
             raise ValueError("min_interval_seconds must be shorter than window_seconds")
         self._min_interval = min_interval_seconds
-        self._hits: dict[str, deque[float]] = {}
+        # Ordered oldest-newest-hit first: ``allow`` moves a key to the end as it appends.
+        self._hits: OrderedDict[str, deque[float]] = OrderedDict()
         self._global_hits: deque[float] = deque()
 
     def _prune(self, dq: deque[float], now: float) -> None:
         cutoff = now - self._window
         while dq and dq[0] <= cutoff:
             dq.popleft()
+
+    def _evict_aged(self, now: float) -> None:
+        """Drop buckets from the front of the table while their newest hit has left the window.
+
+        Only a bucket with no live hit goes, so a key a caller is being refused for keeps its
+        bucket: :meth:`retry_after` reads it right after :meth:`_has_room` refuses. The test is
+        :meth:`_prune`'s own, ``hit <= cutoff``, not its negation: under a NaN window every
+        comparison is false, and ``hit > cutoff`` would then evict what ``_prune`` keeps.
+        """
+        cutoff = now - self._window
+        while self._hits:
+            key, bucket = next(iter(self._hits.items()))
+            if bucket and not bucket[-1] <= cutoff:
+                return
+            del self._hits[key]
 
     def _has_room(self, key: str, now: float) -> bool:
         """Prune both windows to ``now`` and report whether an attempt for ``key`` would fit.
@@ -61,6 +82,7 @@ class SlidingWindowRateLimiter:
         :meth:`would_allow` sells. Dropping the prune would compare against stale counts.
         """
         self._prune(self._global_hits, now)
+        self._evict_aged(now)
         bucket = self._hits.get(key)
         if bucket is not None:
             self._prune(bucket, now)
@@ -79,6 +101,7 @@ class SlidingWindowRateLimiter:
             return False  # a rejected attempt does not count toward the window
         self._global_hits.append(now)
         self._hits.setdefault(key, deque()).append(now)
+        self._hits.move_to_end(key)
         return True
 
     def would_allow(self, key: str) -> bool:
