@@ -3059,7 +3059,9 @@ alone:
    session but an `oidc` one, a correct TOTP or recovery code from the new address re-anchors the
    session there and clears the refusal. That route draws the sign-in window, not the per-actor
    ceremony budget ([the route-to-limiter map](#route--limiter-map) has its row), and it carries the
-   sign-in route's other conditions, such as the second-step lock. The console refusal sends the
+   sign-in route's other conditions, such as the second-step lock. That window is per address and
+   also engine-wide, so moving frequent re-verification onto this route would spend the sign-in
+   budget every user shares. The console refusal sends the
    browser to `/ui/reauth` instead, which draws the ceremony budget.
    Until the session re-verifies, its requests from the new address would still get the refusals
    above, so it would read no message and make none of those writes. Where the changing address

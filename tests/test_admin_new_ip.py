@@ -47,6 +47,7 @@ from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_admin, create_local_user_chosen
+from tests._bound_proof import prove
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 NEW_USER = {
@@ -878,13 +879,7 @@ async def test_each_step_up_factory_refuses_a_new_address_holding_a_fresh_proof(
 
     async def proof(c: httpx.AsyncClient, token: str) -> str:
         """A fresh grant bound to ``action``; the sign-in window already serves the others."""
-        if action is None:
-            return token
-        r = await c.post(
-            "/me/reauth", headers=_auth(token), json={"password": PW, "purpose": action}
-        )
-        assert r.status_code == 200, r.text
-        return str(r.json()["token"])
+        return token if action is None else await prove(c, token, PW, action)
 
     async with _client_for(app, "10.0.0.1") as a:
         token = await proof(a, await _login_token(a))

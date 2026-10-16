@@ -5,7 +5,7 @@
   off-loopback TLS a hard release gate (Gate #4)**, so **WP-13a (API/WSS TLS), WP-13b (MLLP-over-TLS),
   and WP-15 (reverse-proxy / forwarded headers) are authorized for v0.1**. **WP-14 (TOTP MFA) is now
   BUILT (2026-06-17)** — native RFC 6238 TOTP for local accounts, enforced for the Administrator role
-  via `[auth].require_mfa` + the step-up gate; AD/Entra MFA stays delegated. *(Supersedes the
+  via `[auth].require_mfa` + the step-up gate (stale: see the 2026-10-16 correction in section 3); AD/Entra MFA stays delegated. *(Supersedes the
   2026-06-14 "defer to 0.2" decision — the owner pulled MFA forward because some level of local
   accounts is a supported deployment, so the engine carries its own MFA.)* On top of WP-14, the
   **multi-layer administrative-interface defense (ASVS 8.4.2, WP-L3-13) is now BUILT (2026-06-17)**:
@@ -224,7 +224,8 @@ for the Administrator role via `[auth].require_mfa`", are stale and left as writ
 (`[security].require_mfa_scope`); the `[auth]` spelling is rejected at load. `docs/SECURITY.md` is
 the record. The L5 code has landed, so the "Building" note reads "built": WebAuthn passkeys (PR-A),
 the off-loopback hardening (PR-B) and `GET /ui/sso` (PR-C) are in the tree, and ADR 0068's own
-*Open items* list is still open.
+*Open items* list is still open. The rest of this section's flow, such as its status codes and
+route names, was not re-verified by this correction; `docs/SECURITY.md` is the record for it.
 
 ### 4. WP-15 — Reverse-proxy / forwarded-header path (alternative termination)
 
