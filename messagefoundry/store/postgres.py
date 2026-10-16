@@ -367,6 +367,9 @@ _LOCK_CLASS_OUTBOUND_LANE = 4
 # Vault BACKLOG #2779: one lock for every last-administrator guarded write, so two of them, from any
 # shard, cannot both read the same two administrators and both remove one.
 _LOCK_CLASS_ADMIN_GUARD = 5
+# Vault BACKLOG #3180: one lock per uploader, so two shards' upload reserves for the same
+# uploader cannot both read the same in-flight sums and both insert a slot.
+_LOCK_CLASS_UPLOAD_QUOTA = 6
 _AUDIT_LOCK = "mefor_audit_chain"
 _ADMIN_GUARD_LOCK = "mefor_last_admin"
 
@@ -761,16 +764,17 @@ _SCHEMA: list[str] = [
         audit_seq   BIGINT NOT NULL,
         audit_hash  TEXT NOT NULL
     )""",
-    # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112) — see the SQLite `_SCHEMA`
-    # for the in-flight-only rationale. This is the backend a real sharded deployment runs:
-    # `require_unified_store` makes a server DB mandatory past one shard. No PHI (an account id and
-    # two counters).
-    """CREATE TABLE IF NOT EXISTS upload_quota (
-        uploader_id    TEXT PRIMARY KEY,
-        inflight_files BIGINT NOT NULL DEFAULT 0,
-        inflight_bytes BIGINT NOT NULL DEFAULT 0,
+    # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112), one row per upload in
+    # flight (vault BACKLOG #3180) — see the SQLite `_SCHEMA` for the rationale. This is the backend
+    # a real sharded deployment runs: `require_unified_store` makes a server DB mandatory past one
+    # shard. No PHI (two ids, a size and a timestamp).
+    """CREATE TABLE IF NOT EXISTS upload_reservation (
+        reservation_id TEXT PRIMARY KEY,
+        uploader_id    TEXT NOT NULL,
+        size_bytes     BIGINT NOT NULL,
         since          DOUBLE PRECISION NOT NULL
     )""",
+    "CREATE INDEX IF NOT EXISTS ix_upload_reservation_uploader ON upload_reservation (uploader_id)",
     """CREATE TABLE IF NOT EXISTS pending_approvals (
         id           TEXT PRIMARY KEY,
         operation    TEXT NOT NULL,
@@ -8484,71 +8488,72 @@ class PostgresStore:
     async def reserve_upload_quota(
         self,
         uploader_id: str,
+        reservation_id: str,
         *,
-        files: int,
         size_bytes: int,
-        max_files: int = 0,
-        max_total_bytes: int = 0,
+        max_files: int,
+        max_total_bytes: int,
         stale_after: float = UPLOAD_RESERVATION_STALE_AFTER,
     ) -> bool:
-        """Atomically reserve (or release) an uploader's in-flight upload budget — see
+        """Atomically reserve one in-flight upload slot named ``reservation_id`` — see
         :meth:`messagefoundry.store.base.Store.reserve_upload_quota` for the contract, and the SQLite
         twin for the statement shape.
 
-        One statement carries the budget predicate into the ``DO UPDATE``, so no other connection can
-        land between the read and the write. ``RETURNING`` (absent on a refusal) discriminates applied
-        from refused."""
+        A per-uploader advisory lock serializes the reserves of one uploader across every shard, so
+        the sums each one reads already hold the previous holder's committed row: under READ
+        COMMITTED a statement sees what committed before it began. ``RETURNING`` (absent on a
+        refusal) discriminates applied from refused."""
+        if max_files < 1 or size_bytes > max_total_bytes:
+            # Fail closed before touching the store: a headroom that cannot hold one slot.
+            return False
         now = time.time()
-        if files <= 0:
-            # RELEASE — unconditional, clamped at zero (a double release cannot mint budget).
-            await self._execute(
-                "UPDATE upload_quota SET"
-                " inflight_files = GREATEST(0, inflight_files + $2),"
-                " inflight_bytes = GREATEST(0, inflight_bytes + $3),"
-                " since = GREATEST(since, $4)"  # never backwards (BACKLOG #2648)
-                " WHERE uploader_id = $1",
+        stale = now - max(0.0, stale_after)
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            await self._advisory_lock(conn, _LOCK_CLASS_UPLOAD_QUOTA, f"upload_quota:{uploader_id}")
+            await conn.execute(
+                "DELETE FROM upload_reservation WHERE uploader_id = $1 AND since <= $2",
                 uploader_id,
-                int(files),
+                stale,
+            )
+            applied = await conn.fetchval(
+                "INSERT INTO upload_reservation (reservation_id, uploader_id, size_bytes, since)"
+                " SELECT $1::text, $2::text, $3::bigint, $4::double precision"
+                " WHERE (SELECT COUNT(*) FROM upload_reservation WHERE uploader_id = $2::text)"
+                " + 1 <= $5::bigint"
+                " AND (SELECT COALESCE(SUM(size_bytes), 0) FROM upload_reservation"
+                " WHERE uploader_id = $2::text) + $3::bigint <= $6::bigint"
+                " RETURNING 1",
+                reservation_id,
+                uploader_id,
                 int(size_bytes),
                 now,
+                int(max_files),
+                int(max_total_bytes),
             )
-            return True
-        if files > max_files or size_bytes > max_total_bytes:
-            # Fail closed before touching the row: the insert branch applies unconditionally.
-            return False
-        stale = now - max(0.0, stale_after)
-        row = await self._fetchone(
-            "INSERT INTO upload_quota (uploader_id, inflight_files, inflight_bytes, since)"
-            " VALUES ($1,$2,$3,$4)"
-            " ON CONFLICT (uploader_id) DO UPDATE SET"
-            " inflight_files ="
-            " CASE WHEN upload_quota.since <= $5 THEN 0 ELSE upload_quota.inflight_files END + $2,"
-            " inflight_bytes ="
-            " CASE WHEN upload_quota.since <= $5 THEN 0 ELSE upload_quota.inflight_bytes END + $3,"
-            # Every applied reserve refreshes it, never backwards (BACKLOG #2648).
-            " since = GREATEST(upload_quota.since, $4)"
-            " WHERE (CASE WHEN upload_quota.since <= $5 THEN 0"
-            " ELSE upload_quota.inflight_files END) + $2 <= $6"
-            " AND (CASE WHEN upload_quota.since <= $5 THEN 0"
-            " ELSE upload_quota.inflight_bytes END) + $3 <= $7"
-            " RETURNING 1 AS applied",
-            uploader_id,
-            int(files),
-            int(size_bytes),
-            now,
-            stale,
-            int(max_files),
-            int(max_total_bytes),
+        return applied is not None
+
+    async def release_upload_quota(self, reservation_id: str) -> None:
+        """See :meth:`messagefoundry.store.base.Store.release_upload_quota`."""
+        await self._execute(
+            "DELETE FROM upload_reservation WHERE reservation_id = $1", reservation_id
         )
-        return row is not None
+
+    async def touch_upload_quota(self, reservation_id: str) -> None:
+        """See :meth:`messagefoundry.store.base.Store.touch_upload_quota`."""
+        await self._execute(
+            "UPDATE upload_reservation SET since = GREATEST(since, $2) WHERE reservation_id = $1",
+            reservation_id,
+            time.time(),
+        )
 
     async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
         """See :meth:`messagefoundry.store.base.Store.upload_quota_in_flight`."""
         row = await self._fetchone(
-            "SELECT inflight_files, inflight_bytes FROM upload_quota WHERE uploader_id = $1",
+            "SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes), 0) AS b"
+            " FROM upload_reservation WHERE uploader_id = $1",
             uploader_id,
         )
-        return (int(row["inflight_files"]), int(row["inflight_bytes"])) if row else (0, 0)
+        return (int(row["n"]), int(row["b"])) if row else (0, 0)
 
     async def cipher_invocations(self, key_id: str) -> int:
         """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet)."""

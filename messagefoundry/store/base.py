@@ -1487,56 +1487,69 @@ class QueueStore(StoreLifecycle, Protocol):
     async def reserve_upload_quota(
         self,
         uploader_id: str,
+        reservation_id: str,
         *,
-        files: int,
         size_bytes: int,
-        max_files: int = 0,
-        max_total_bytes: int = 0,
+        max_files: int,
+        max_total_bytes: int,
         stale_after: float = UPLOAD_RESERVATION_STALE_AFTER,
     ) -> bool:
-        """Atomically reserve (or release) an uploader's IN-FLIGHT upload budget; return whether the
-        reserve applied. The cross-process half of the per-uploader upload quota, and not the whole
-        decision: the caller decides after reserving, from :meth:`upload_quota_in_flight` plus a
-        fresh disk scan (BACKLOG #1941).
+        """Atomically reserve ONE in-flight upload slot for ``uploader_id``, named
+        ``reservation_id``; return whether it applied. The cross-process half of the per-uploader
+        upload quota, and not the whole decision: the caller decides after reserving, from
+        :meth:`upload_quota_in_flight` plus a fresh disk scan (BACKLOG #1941).
 
         **Why the store owns this.** ``UploadStore._quota_lock`` is an ``asyncio.Lock``, so it is
         per-event-loop and therefore per-process. Engine sharding is the built, shipped, default
         scaling axis and nothing partitions ``uploads_dir`` per shard, so N shards over one directory
         hold N independent locks and each can overshoot the budget by one file. Every shard sits on
         the ONE unified store (ADR 0063 — and ``require_unified_store`` makes a server DB mandatory
-        past one shard), so this row is authoritative for all of them.
+        past one shard), so these rows are authoritative for all of them.
 
         **What is counted here, and what is not.** The files already ON DISK are counted by the
         caller's sidecar scan, which is uncached and therefore already fleet-visible. The gap this
         closes is only the uploads IN FLIGHT on other shards — reserved but not yet landed, so
         invisible to any scan. The caller passes its remaining HEADROOM (cap minus what its scan
-        observed) as ``max_files`` / ``max_total_bytes``; this method holds only the in-flight sum.
+        observed) as ``max_files`` / ``max_total_bytes``; the store holds only the in-flight rows.
 
-        ``files > 0`` reserves: the post-add in-flight totals must fit inside the headroom or nothing
-        is written and this returns ``False`` (fail-closed — a caller that forgets the headroom
-        arguments gets the 0 defaults and is refused). ``files <= 0`` releases, always applies,
-        clamps at zero, ignores the headroom arguments and returns ``True``.
+        **One row per reservation (vault BACKLOG #3180).** The reserve applies only if the
+        uploader's live reservations plus this one fit inside the headroom; otherwise nothing is
+        written and this returns ``False``. A headroom that cannot fit one slot is refused before
+        the store is touched. The caller mints ``reservation_id``, so it can pay the slot back with
+        :meth:`release_upload_quota` even when it never learned whether the reserve committed.
 
-        ``stale_after`` bounds a leak: a process killed between reserve and release never releases,
-        and its slot would otherwise consume the uploader's budget forever. A row with no activity
-        for longer than ``stale_after`` seconds is reset to zero before the add. Activity is an
-        applied reserve or any release, and both move the row's clock to now, never backwards, so a
-        host whose clock lags cannot age a row a sibling keeps fresh. A release of zero
-        files and zero bytes is therefore a pure touch, which is how a live save keeps its slot
-        past ``stale_after`` (BACKLOG #2648). So the reset normally reclaims only slots no live
-        process holds. When it does reclaim a live one, it can only restore the pre-ledger
+        ``stale_after`` bounds a leak: a process killed between reserve and release never releases.
+        Before the add, every reservation of this uploader whose own clock is older than
+        ``stale_after`` seconds is deleted. Each reservation has its own clock, which only its own
+        reserve and :meth:`touch_upload_quota` move, so a leaked slot is reclaimed once its window
+        passes however active the uploader stays. A live save keeps its slot by touching it
+        (BACKLOG #2648). When the reclaim does take a live slot, it can only restore the pre-ledger
         behaviour (an overshoot bounded by the number of concurrent writers), never something
         worse."""
         ...
 
+    async def release_upload_quota(self, reservation_id: str) -> None:
+        """Pay back the reservation ``reservation_id`` by deleting its row (vault BACKLOG #3180).
+
+        Idempotent, and it touches no other reservation, so it is safe after a reserve whose outcome
+        is unknown: a reserve that never committed leaves no row, and this deletes nothing."""
+        ...
+
+    async def touch_upload_quota(self, reservation_id: str) -> None:
+        """Move the reservation's clock to now, never backwards, so a slow save keeps its slot past
+        ``stale_after`` (BACKLOG #2648). A no-op once the reservation is released or reclaimed.
+        Never backwards, so a host whose clock lags cannot age a reservation a faster host
+        stamped."""
+        ...
+
     async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
         """``(files, bytes)`` currently reserved in flight for ``uploader_id``, as stored; ``(0, 0)``
-        when the uploader has no row. A plain read that writes nothing.
+        when the uploader has no reservation. A plain read that writes nothing.
 
         The caller reserves, THEN reads this, THEN scans the disk (BACKLOG #1941). That order is what
         makes the cross-shard quota hold; ``messagefoundry.uploads.UploadQuotaError`` carries the
-        argument. Read raw on purpose, with no staleness reset: a reset here could only drop
-        reservations, which lets an upload through, never refuses one."""
+        argument. Read raw on purpose, with no staleness filter: dropping a reservation here could
+        only let an upload through, never refuse one."""
         ...
 
     # --- retention / purge + maintenance (PHI.md §8) -------------------------

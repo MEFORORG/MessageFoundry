@@ -2131,14 +2131,17 @@ _SCHEMA: list[str] = [
         reason NVARCHAR(1000) NOT NULL, actor NVARCHAR(256) NOT NULL,
         attested_at FLOAT NOT NULL, audit_seq BIGINT NOT NULL,
         audit_hash NVARCHAR(64) NOT NULL)""",
-    # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112) — see the SQLite `_SCHEMA`
-    # for the in-flight-only rationale. One of the two backends a real sharded deployment runs
-    # (`require_unified_store` makes a server DB mandatory past one shard). No PHI (an account id and
-    # two counters). BIN2 collation matches the other id-keyed tables.
-    """IF OBJECT_ID('upload_quota','U') IS NULL CREATE TABLE upload_quota (
-        uploader_id NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL PRIMARY KEY,
-        inflight_files BIGINT NOT NULL DEFAULT 0, inflight_bytes BIGINT NOT NULL DEFAULT 0,
-        since FLOAT NOT NULL)""",
+    # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112), one row per upload in
+    # flight (vault BACKLOG #3180) — see the SQLite `_SCHEMA` for the rationale. One of the two
+    # backends a real sharded deployment runs (`require_unified_store` makes a server DB mandatory
+    # past one shard). No PHI (two ids, a size and a timestamp). BIN2 collation matches the other
+    # id-keyed tables.
+    """IF OBJECT_ID('upload_reservation','U') IS NULL CREATE TABLE upload_reservation (
+        reservation_id NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL PRIMARY KEY,
+        uploader_id NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
+        size_bytes BIGINT NOT NULL, since FLOAT NOT NULL)""",
+    """IF INDEXPROPERTY(OBJECT_ID('upload_reservation'),'ix_upload_reservation_uploader','IndexID')
+        IS NULL CREATE INDEX ix_upload_reservation_uploader ON upload_reservation(uploader_id)""",
     # BACKLOG #1540: `requester` is a DISPLAY label; `requester_user_id` is the authorization key the
     # self-approval refusal compares (the Store protocol's create_pending_approval says why).
     # NVARCHAR(64) matches users.id and this table's own id column.
@@ -12097,93 +12100,94 @@ class SqlServerStore:
     async def reserve_upload_quota(
         self,
         uploader_id: str,
+        reservation_id: str,
         *,
-        files: int,
         size_bytes: int,
-        max_files: int = 0,
-        max_total_bytes: int = 0,
+        max_files: int,
+        max_total_bytes: int,
         stale_after: float = UPLOAD_RESERVATION_STALE_AFTER,
     ) -> bool:
-        """Atomically reserve (or release) an uploader's in-flight upload budget — see
+        """Atomically reserve one in-flight upload slot named ``reservation_id`` — see
         :meth:`messagefoundry.store.base.Store.reserve_upload_quota` for the contract, and the SQLite
         twin for the statement shape.
 
-        MERGE with HOLDLOCK is the SQL Server upsert that is safe under the concurrent opens of an
-        engine-shard fleet (a bare IF EXISTS/INSERT races) — the same pattern
-        :meth:`add_cipher_invocations` uses. The budget predicate rides ``WHEN MATCHED AND``, so a
-        refusal matches no rows and ``OUTPUT`` returns nothing."""
-        now = time.time()
-        if files <= 0:
-            # RELEASE — unconditional, clamped at zero (a double release cannot mint budget).
-            await self._execute(
-                "UPDATE upload_quota SET"
-                " inflight_files = CASE WHEN inflight_files + ? < 0 THEN 0 ELSE inflight_files + ? END,"
-                " inflight_bytes = CASE WHEN inflight_bytes + ? < 0 THEN 0 ELSE inflight_bytes + ? END,"
-                " since = CASE WHEN since > ? THEN since ELSE ? END"  # never backwards (#2648)
-                " WHERE uploader_id = ?",
-                (
-                    int(files),
-                    int(files),
-                    int(size_bytes),
-                    int(size_bytes),
-                    now,
-                    now,
-                    uploader_id,
-                ),
-            )
-            return True
-        if files > max_files or size_bytes > max_total_bytes:
-            # Fail closed before touching the row: WHEN NOT MATCHED inserts unconditionally.
+        A per-uploader applock serializes the reserves of one uploader across every shard. Under
+        RCSI each statement reads what committed before it began, and the previous holder committed
+        before it let the applock go, so the sums read here hold its row. ``OUTPUT`` reports the
+        insert, which a session-wide ``SET NOCOUNT ON`` cannot hide (BACKLOG #2283)."""
+        if max_files < 1 or size_bytes > max_total_bytes:
+            # Fail closed before touching the store: a headroom that cannot hold one slot.
             return False
+        now = time.time()
         stale = now - max(0.0, stale_after)
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        async with self._acquire() as conn:
             try:
-                await cur.execute(
-                    "MERGE upload_quota WITH (HOLDLOCK) AS t"
-                    " USING (SELECT ? AS uploader_id, ? AS files, ? AS size_bytes, ? AS now_ts,"
-                    " ? AS stale_ts, ? AS max_files, ? AS max_total_bytes) AS s"
-                    " ON t.uploader_id = s.uploader_id"
-                    " WHEN MATCHED AND"
-                    " (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_files END)"
-                    " + s.files <= s.max_files"
-                    " AND (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_bytes END)"
-                    " + s.size_bytes <= s.max_total_bytes"
-                    " THEN UPDATE SET"
-                    " t.inflight_files ="
-                    " (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_files END) + s.files,"
-                    " t.inflight_bytes ="
-                    " (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_bytes END)"
-                    " + s.size_bytes,"
-                    # Every applied reserve refreshes it, never backwards (BACKLOG #2648).
-                    " t.since = CASE WHEN t.since > s.now_ts THEN t.since ELSE s.now_ts END"
-                    " WHEN NOT MATCHED THEN"
-                    " INSERT (uploader_id, inflight_files, inflight_bytes, since)"
-                    " VALUES (s.uploader_id, s.files, s.size_bytes, s.now_ts)"
-                    " OUTPUT INSERTED.inflight_files;",
-                    (
-                        uploader_id,
-                        int(files),
-                        int(size_bytes),
-                        now,
-                        stale,
-                        int(max_files),
-                        int(max_total_bytes),
-                    ),
-                )
-                row = await cur.fetchone()
-                await self._commit(conn)
+                async with self._cursor(conn) as cur:
+                    # This read OPENS the transaction the applock attaches to, as in record_audit:
+                    # the autocommit=False pool begins one only on a statement that touches a
+                    # table, and `@LockOwner='Transaction'` needs one open. Value discarded.
+                    await cur.execute(
+                        "SELECT TOP (1) reservation_id FROM upload_reservation WHERE uploader_id = ?",
+                        (uploader_id,),
+                    )
+                    await cur.fetchall()
+                    await self._applock(cur, f"mefor:upload_quota:{uploader_id}")
+                    await cur.execute(
+                        "DELETE FROM upload_reservation WHERE uploader_id = ? AND since <= ?",
+                        (uploader_id, stale),
+                    )
+                    await cur.execute(
+                        "INSERT INTO upload_reservation"
+                        " (reservation_id, uploader_id, size_bytes, since)"
+                        " OUTPUT inserted.reservation_id"
+                        " SELECT ?, ?, ?, ?"
+                        " WHERE (SELECT COUNT(*) FROM upload_reservation WHERE uploader_id = ?)"
+                        " + 1 <= ?"
+                        " AND (SELECT COALESCE(SUM(size_bytes), 0) FROM upload_reservation"
+                        " WHERE uploader_id = ?) + ? <= ?",
+                        (
+                            reservation_id,
+                            uploader_id,
+                            int(size_bytes),
+                            now,
+                            uploader_id,
+                            int(max_files),
+                            uploader_id,
+                            int(size_bytes),
+                            int(max_total_bytes),
+                        ),
+                    )
+                    row = await cur.fetchone()
+                    await self._commit(conn)
             except Exception:
-                await conn.rollback()
+                # The transaction may hold the applock; after the cursor closes, as cancel_queued.
+                await self._rollback_or_discard(conn)
                 raise
         return row is not None
+
+    async def release_upload_quota(self, reservation_id: str) -> None:
+        """See :meth:`messagefoundry.store.base.Store.release_upload_quota`."""
+        await self._execute(
+            "DELETE FROM upload_reservation WHERE reservation_id = ?", (reservation_id,)
+        )
+
+    async def touch_upload_quota(self, reservation_id: str) -> None:
+        """See :meth:`messagefoundry.store.base.Store.touch_upload_quota`."""
+        now = time.time()
+        await self._execute(
+            "UPDATE upload_reservation SET since = CASE WHEN since > ? THEN since ELSE ? END"
+            " WHERE reservation_id = ?",
+            (now, now, reservation_id),
+        )
 
     async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
         """See :meth:`messagefoundry.store.base.Store.upload_quota_in_flight`."""
         row = await self._fetchone(
-            "SELECT inflight_files, inflight_bytes FROM upload_quota WHERE uploader_id = ?",
+            "SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes), 0) AS b"
+            " FROM upload_reservation WHERE uploader_id = ?",
             (uploader_id,),
         )
-        return (int(row["inflight_files"]), int(row["inflight_bytes"])) if row else (0, 0)
+        return (int(row["n"]), int(row["b"])) if row else (0, 0)
 
     async def cipher_invocations(self, key_id: str) -> int:
         """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet)."""

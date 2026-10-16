@@ -143,18 +143,24 @@ def _assert_one_budget(b_outcome: object, a_outcome: object, sidecars: list[Path
 
 
 async def _assert_in_flight_contract(store: Any, uploader_id: str) -> None:
-    """The read the fix depends on: raw in-flight totals, (0, 0) for an unknown uploader."""
+    """The read the fix depends on: raw in-flight totals, (0, 0) for an unknown uploader. A release
+    pays back its own reservation only, and a repeat of it, or of an unknown id, changes nothing
+    (vault BACKLOG #3180)."""
+    small, large = f"{uploader_id}-s", f"{uploader_id}-l"
     assert await store.upload_quota_in_flight(uploader_id) == (0, 0)
     assert await store.reserve_upload_quota(
-        uploader_id, files=1, size_bytes=10, max_files=5, max_total_bytes=100
+        uploader_id, small, size_bytes=10, max_files=5, max_total_bytes=100
     )
     assert await store.reserve_upload_quota(
-        uploader_id, files=1, size_bytes=20, max_files=5, max_total_bytes=100
+        uploader_id, large, size_bytes=20, max_files=5, max_total_bytes=100
     )
     assert await store.upload_quota_in_flight(uploader_id) == (2, 30)
-    await store.reserve_upload_quota(uploader_id, files=-1, size_bytes=-10)
+    await store.release_upload_quota(small)
     assert await store.upload_quota_in_flight(uploader_id) == (1, 20)
-    await store.reserve_upload_quota(uploader_id, files=-1, size_bytes=-20)
+    await store.release_upload_quota(small)
+    await store.release_upload_quota(f"{uploader_id}-never-reserved")
+    assert await store.upload_quota_in_flight(uploader_id) == (1, 20)
+    await store.release_upload_quota(large)
     assert await store.upload_quota_in_flight(uploader_id) == (0, 0)
 
 
@@ -236,21 +242,22 @@ async def test_upload_quota_in_flight_reads_what_reserve_and_release_left(
 
 
 @pytest.mark.parametrize("pair", _BACKENDS)
-async def test_a_live_reserve_joining_an_old_row_is_not_reclaimed_with_it(
+async def test_a_leaked_slot_is_reclaimed_while_the_uploader_stays_active(
     tmp_path: Path, pair: _Pair
 ) -> None:
-    """BACKLOG #2648. Shard A's slot leaked, then shard B reserved and is mid-write. Shard C's
-    reserve arrives once A's slot is past the window but B's is not, and must still count B. The
-    reserve used to keep the row's old clock when it joined a non-zero row, so the reset dropped
-    B's live slot along with A's leaked one, and C counted neither B's file nor B's slot."""
-    uploader_id = f"u-2648-{uuid.uuid4().hex}"
+    """Vault BACKLOG #3180, with BACKLOG #2648. Shard A's slot leaked, then shard B reserved and is
+    mid-write. Shard C's reserve arrives once A's slot is past the window but B's is not. It must
+    reclaim A's slot and still count B's. Each reservation has its own clock, so B's activity no
+    longer keeps A's leak alive. Red before #3180: one row held one clock for every slot, so B's
+    reserve kept A's leaked slot counted, and C read ``(3, 30)``."""
+    uploader_id = f"u-3180-{uuid.uuid4().hex}"
     async with pair(tmp_path) as (shard_ab, shard_c):
 
-        async def _reserve(store: Any, stale_after: float = 300.0) -> bool:
+        async def _reserve(store: Any, name: str, stale_after: float = 300.0) -> bool:
             return bool(
                 await store.reserve_upload_quota(
                     uploader_id,
-                    files=1,
+                    f"{uploader_id}-{name}",
                     size_bytes=10,
                     max_files=10,
                     max_total_bytes=1000,
@@ -258,14 +265,14 @@ async def test_a_live_reserve_joining_an_old_row_is_not_reclaimed_with_it(
                 )
             )
 
-        assert await _reserve(shard_ab)  # shard A, never released
+        assert await _reserve(shard_ab, "a")  # shard A, never released
         await asyncio.sleep(2.0)
-        assert await _reserve(shard_ab)  # shard B, mid-write
+        assert await _reserve(shard_ab, "b")  # shard B, mid-write
         # Shard C: A's slot is twice the window old, B's is well inside it.
-        assert await _reserve(shard_c, stale_after=1.0)
-        # B's reserve moved the clock, so nothing was reclaimed: A's leaked slot stays while the
-        # row is active (it clears once the uploader is idle), and B's live slot is counted.
-        assert await shard_c.upload_quota_in_flight(uploader_id) == (3, 30)
-        # Drain the row, so a server-backend run leaves nothing in flight behind it.
-        await shard_c.reserve_upload_quota(uploader_id, files=-3, size_bytes=-30)
+        assert await _reserve(shard_c, "c", stale_after=1.0)
+        # A's leaked slot is gone; B's live slot and C's own are counted.
+        assert await shard_c.upload_quota_in_flight(uploader_id) == (2, 20)
+        # Release what is left, so a server-backend run leaves nothing in flight behind it.
+        for name in ("b", "c"):
+            await shard_c.release_upload_quota(f"{uploader_id}-{name}")
         assert await shard_c.upload_quota_in_flight(uploader_id) == (0, 0)

@@ -910,10 +910,11 @@ class MessageOrigin(StrEnum):
     REINGRESS = "reingress"
 
 
-#: How long an uploader's quota row may go with no activity before the next reserve reclaims its
-#: slots (seconds) — ASVS 2.3.4, BACKLOG #1112. Activity is an applied reserve, a release, or a live
-#: save's heartbeat (BACKLOG #2648), so a save slower than this keeps its slot. The reclaim exists
-#: only so a process killed between reserve and release cannot consume an uploader's budget forever.
+#: How long an upload reservation may go with no activity before its uploader's next reserve
+#: reclaims it (seconds) — ASVS 2.3.4, BACKLOG #1112. Activity is the reservation's own reserve or
+#: its live save's heartbeat (BACKLOG #2648, vault BACKLOG #3180), so a save slower than this keeps
+#: its slot. The reclaim exists only so a slot that is never released, such as one held by a process
+#: killed between reserve and release, cannot consume an uploader's budget forever.
 #: Defined here (not in ``base``) because ``base`` imports THIS module, never the reverse; ``base``
 #: re-exports it as the public name. See :meth:`Store.reserve_upload_quota`.
 UPLOAD_RESERVATION_STALE_AFTER = 300.0
@@ -6810,21 +6811,23 @@ CREATE TABLE IF NOT EXISTS transit_bound_attestation (
     audit_hash  TEXT NOT NULL
 );
 
--- Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112). One row per uploader holding
--- only the IN-FLIGHT total: uploads reserved but not yet landed in `uploads_dir`, and therefore
--- invisible to the sidecar scan that counts everything already on disk. The scan is uncached and so
--- already fleet-visible; this row is what the per-event-loop `UploadStore._quota_lock` cannot give:
--- a shard's upload in flight, visible to its siblings. It is not the whole decision; see
--- `uploads.UploadQuotaError` (BACKLOG #1941). `since` is the row's last activity: an applied
--- reserve, a release, or a live save's heartbeat (BACKLOG #2648). A row idle that long while
--- non-zero holds only leaked slots, so a reservation leaked by a killed process is reclaimed
--- rather than consuming the uploader's budget forever. No PHI: an account id and two counters.
-CREATE TABLE IF NOT EXISTS upload_quota (
-    uploader_id    TEXT PRIMARY KEY,
-    inflight_files INTEGER NOT NULL DEFAULT 0,
-    inflight_bytes INTEGER NOT NULL DEFAULT 0,
+-- Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112). One row per upload IN
+-- FLIGHT: reserved but not yet landed in `uploads_dir`, and therefore invisible to the sidecar scan
+-- that counts everything already on disk. The scan is uncached and so already fleet-visible; these
+-- rows are what the per-event-loop `UploadStore._quota_lock` cannot give: a shard's upload in
+-- flight, visible to its siblings. It is not the whole decision; see `uploads.UploadQuotaError`
+-- (BACKLOG #1941). `reservation_id` is the save's own id, so a release pays back only its own slot
+-- (vault BACKLOG #3180). `since` is that reservation's last activity: its reserve or a live save's
+-- heartbeat (BACKLOG #2648). A reservation idle that long is a leak, from a killed process or a
+-- release that never landed, and the uploader's next reserve deletes it. No PHI: two ids, a size
+-- and a timestamp.
+CREATE TABLE IF NOT EXISTS upload_reservation (
+    reservation_id TEXT PRIMARY KEY,
+    uploader_id    TEXT NOT NULL,
+    size_bytes     INTEGER NOT NULL,
     since          REAL NOT NULL
 );
+CREATE INDEX IF NOT EXISTS ix_upload_reservation_uploader ON upload_reservation(uploader_id);
 
 CREATE TABLE IF NOT EXISTS pending_approvals (
     id           TEXT PRIMARY KEY,
@@ -14312,72 +14315,44 @@ class MessageStore:
     async def reserve_upload_quota(
         self,
         uploader_id: str,
+        reservation_id: str,
         *,
-        files: int,
         size_bytes: int,
-        max_files: int = 0,
-        max_total_bytes: int = 0,
+        max_files: int,
+        max_total_bytes: int,
         stale_after: float = UPLOAD_RESERVATION_STALE_AFTER,
     ) -> bool:
-        """Atomically reserve (or release) an uploader's in-flight upload budget — see
+        """Atomically reserve one in-flight upload slot named ``reservation_id`` — see
         :meth:`messagefoundry.store.base.Store.reserve_upload_quota` for the contract.
 
-        The reserve is ONE statement: an upsert whose ``DO UPDATE`` carries the budget predicate, so
-        the read and the write cannot be separated by another connection. That is what makes it
-        exclusive across processes rather than across coroutines. ``rowcount`` discriminates applied
-        from refused; the row is left untouched on a refusal."""
-        now = time.time()
-        if files <= 0:
-            # RELEASE — always applies, clamped at zero so a double release cannot mint budget. Never
-            # conditional: refusing a release would strand the reservation it is paying back.
-            async with _writer_guard(self._db, self._lock):
-                await self._db.execute(
-                    "UPDATE upload_quota SET"
-                    " inflight_files = MAX(0, inflight_files + ?),"
-                    " inflight_bytes = MAX(0, inflight_bytes + ?),"
-                    # Never backwards: a host whose clock lags must not age a live row (#2648).
-                    " since = MAX(since, ?)"
-                    " WHERE uploader_id = ?",
-                    (int(files), int(size_bytes), now, uploader_id),
-                )
-                await self._commit()
-            return True
-        if files > max_files or size_bytes > max_total_bytes:
-            # Fail closed BEFORE touching the row: the insert branch below (no row yet) applies
-            # unconditionally, so an empty uploader with zero headroom must be refused here.
+        The reclaim and the reserve run in one transaction under the one writer connection, and the
+        reserve is ONE statement whose ``WHERE`` carries the budget, so no other connection can
+        write between the sums it reads and the row it inserts. ``rowcount`` discriminates applied
+        from refused."""
+        if max_files < 1 or size_bytes > max_total_bytes:
+            # Fail closed before touching the store: a headroom that cannot hold one slot.
             return False
+        now = time.time()
         stale = now - max(0.0, stale_after)
         async with _writer_guard(self._db, self._lock):
+            await self._db.execute(
+                "DELETE FROM upload_reservation WHERE uploader_id = ? AND since <= ?",
+                (uploader_id, stale),
+            )
             cur = await self._db.execute(
-                "INSERT INTO upload_quota (uploader_id, inflight_files, inflight_bytes, since)"
-                " VALUES (?,?,?,?)"
-                " ON CONFLICT(uploader_id) DO UPDATE SET"
-                " inflight_files ="
-                " CASE WHEN upload_quota.since <= ? THEN 0 ELSE upload_quota.inflight_files END + ?,"
-                " inflight_bytes ="
-                " CASE WHEN upload_quota.since <= ? THEN 0 ELSE upload_quota.inflight_bytes END + ?,"
-                # Every applied reserve refreshes `since`, as a release does: a live slot joining
-                # an old row must not be reclaimed along with it (BACKLOG #2648). Never backwards,
-                # so a host whose clock lags cannot age a row a sibling keeps fresh.
-                " since = MAX(upload_quota.since, ?)"
-                " WHERE (CASE WHEN upload_quota.since <= ? THEN 0"
-                " ELSE upload_quota.inflight_files END) + ? <= ?"
-                " AND (CASE WHEN upload_quota.since <= ? THEN 0"
-                " ELSE upload_quota.inflight_bytes END) + ? <= ?",
+                "INSERT INTO upload_reservation (reservation_id, uploader_id, size_bytes, since)"
+                " SELECT ?, ?, ?, ?"
+                " WHERE (SELECT COUNT(*) FROM upload_reservation WHERE uploader_id = ?) + 1 <= ?"
+                " AND (SELECT COALESCE(SUM(size_bytes), 0) FROM upload_reservation"
+                " WHERE uploader_id = ?) + ? <= ?",
                 (
+                    reservation_id,
                     uploader_id,
-                    int(files),
                     int(size_bytes),
                     now,
-                    stale,
-                    int(files),
-                    stale,
-                    int(size_bytes),
-                    now,
-                    stale,
-                    int(files),
+                    uploader_id,
                     int(max_files),
-                    stale,
+                    uploader_id,
                     int(size_bytes),
                     int(max_total_bytes),
                 ),
@@ -14386,15 +14361,33 @@ class MessageStore:
             await self._commit()
         return applied
 
+    async def release_upload_quota(self, reservation_id: str) -> None:
+        """See :meth:`messagefoundry.store.base.Store.release_upload_quota`."""
+        async with _writer_guard(self._db, self._lock):
+            await self._db.execute(
+                "DELETE FROM upload_reservation WHERE reservation_id = ?", (reservation_id,)
+            )
+            await self._commit()
+
+    async def touch_upload_quota(self, reservation_id: str) -> None:
+        """See :meth:`messagefoundry.store.base.Store.touch_upload_quota`."""
+        async with _writer_guard(self._db, self._lock):
+            await self._db.execute(
+                "UPDATE upload_reservation SET since = MAX(since, ?) WHERE reservation_id = ?",
+                (time.time(), reservation_id),
+            )
+            await self._commit()
+
     async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
         """See :meth:`messagefoundry.store.base.Store.upload_quota_in_flight`."""
         async with self._read() as db:
             cur = await db.execute(
-                "SELECT inflight_files, inflight_bytes FROM upload_quota WHERE uploader_id = ?",
+                "SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes), 0) AS b"
+                " FROM upload_reservation WHERE uploader_id = ?",
                 (uploader_id,),
             )
             row = await cur.fetchone()
-        return (int(row["inflight_files"]), int(row["inflight_bytes"])) if row else (0, 0)
+        return (int(row["n"]), int(row["b"])) if row else (0, 0)
 
     async def audit_anchor(self) -> tuple[int, str]:
         """The audit log's external anchor: ``(seq, head_hash)`` of its newest row, or ``(0, "")``

@@ -1110,6 +1110,20 @@ async def _drain_approval_gate(app: FastAPI) -> None:
         _log.exception("approval gate: the shutdown drain failed; continuing the teardown")
 
 
+async def _drain_upload_stragglers(app: FastAPI) -> None:
+    """Let the upload-quota ledger calls and save-time sweeps a cancelled upload left running land
+    before the store closes (vault BACKLOG #3180). Bounded, and a failure is logged rather than
+    raised, so the teardown steps after it still run. Read through getattr: an app with no
+    ``uploads_dir`` has no upload store."""
+    uploads: UploadStore | None = getattr(app.state, "upload_store", None)
+    if uploads is None:
+        return
+    try:
+        await uploads.drain_stragglers()
+    except Exception:
+        _log.exception("uploads: the shutdown drain failed; continuing the teardown")
+
+
 @asynccontextmanager
 async def _embedded_approvals_lifespan(app: FastAPI) -> AsyncIterator[None]:
     """The lifespan :func:`create_app` gives an app built around a caller's engine.
@@ -10649,6 +10663,7 @@ def create_managed_app(
             try:
                 if upload_retention_runner is not None:
                     await upload_retention_runner.stop()
+                await _drain_upload_stragglers(app)
                 # gather(return_exceptions): absorbs both our cancellation AND any exception a
                 # previously-died task stored, so it can't skip the steps below (review M-33).
                 await asyncio.gather(*background, return_exceptions=True)

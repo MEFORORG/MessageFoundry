@@ -199,7 +199,7 @@ def test_the_reservation_is_released_so_the_next_upload_is_not_locked_out(tmp_pa
             # And the ledger itself is back at zero in-flight: a reserve with a headroom of exactly
             # one succeeds, which it could not if either completed save had left a slot outstanding.
             assert await store.reserve_upload_quota(
-                "u-alice", files=1, size_bytes=1, max_files=1, max_total_bytes=1
+                "u-alice", "probe", size_bytes=1, max_files=1, max_total_bytes=1
             ), "a completed upload left its reservation outstanding"
         finally:
             await store.close()
@@ -209,24 +209,24 @@ def test_the_reservation_is_released_so_the_next_upload_is_not_locked_out(tmp_pa
 
 def test_a_leaked_reservation_is_reclaimed_once_it_goes_stale(tmp_path: Path) -> None:
     """A process killed between reserve and release leaks its reservation. It must not consume the
-    uploader's budget forever: a row with no activity for longer than ``stale_after`` is reset on
-    the next reserve."""
+    uploader's budget forever: a reservation with no activity for longer than ``stale_after`` is
+    deleted on the next reserve."""
 
     async def _run() -> None:
         store = await MessageStore.open(tmp_path / "engine.db")
         try:
             # Simulate the crash: reserve, never release.
             assert await store.reserve_upload_quota(
-                "u-alice", files=1, size_bytes=10, max_files=1, max_total_bytes=100
+                "u-alice", "leaked", size_bytes=10, max_files=1, max_total_bytes=100
             )
             # A live reservation blocks the next one (this is the control that the leak is real).
             assert not await store.reserve_upload_quota(
-                "u-alice", files=1, size_bytes=10, max_files=1, max_total_bytes=100
+                "u-alice", "second", size_bytes=10, max_files=1, max_total_bytes=100
             )
             # Once stale, the same call succeeds — the leak self-heals.
             assert await store.reserve_upload_quota(
                 "u-alice",
-                files=1,
+                "third",
                 size_bytes=10,
                 max_files=1,
                 max_total_bytes=100,
@@ -292,7 +292,12 @@ def test_a_slow_save_keeps_its_slot_past_the_staleness_window(
         async with _a_save_held_mid_write(tmp_path) as (store, uploads, save):
             await asyncio.sleep(0.6)
             applied = await store.reserve_upload_quota(
-                "u-alice", files=1, size_bytes=5, max_files=1, max_total_bytes=4096, stale_after=0.3
+                "u-alice",
+                "sibling",
+                size_bytes=5,
+                max_files=1,
+                max_total_bytes=4096,
+                stale_after=0.3,
             )
         assert isinstance(save.result(), UploadedFileMeta)
         assert not uploads._heartbeats, "the heartbeat outlived its save"
@@ -326,28 +331,30 @@ def test_the_heartbeat_stops_at_its_lifetime_cap(
 
 def test_a_lagging_clock_never_moves_the_row_backwards(tmp_path: Path) -> None:
     """BACKLOG #2648. ``since`` is stamped from each writer's own clock. A shard whose clock lags
-    must not age a row a sibling keeps fresh, or the sibling's next reserve reclaims live slots.
-    The row is stamped an hour ahead to stand in for the sibling; a reserve, a release and a touch
-    from this host must all leave that stamp where it is."""
+    must not age a reservation a faster host stamped, or a sibling's next reserve reclaims a live
+    slot. The reservation is stamped an hour ahead to stand in for that host; a touch from this
+    host, and a reserve and a release of another reservation, must all leave that stamp where it
+    is (vault BACKLOG #3180: only its own touch could move it)."""
 
     async def _run() -> None:
         store = await MessageStore.open(tmp_path / "engine.db")
         try:
             assert await store.reserve_upload_quota(
-                "u-alice", files=1, size_bytes=10, max_files=5, max_total_bytes=100
+                "u-alice", "ahead", size_bytes=10, max_files=5, max_total_bytes=100
             )
             ahead = time.time() + 3600.0
             await store._db.execute(
-                "UPDATE upload_quota SET since = ? WHERE uploader_id = ?", (ahead, "u-alice")
+                "UPDATE upload_reservation SET since = ? WHERE reservation_id = ?",
+                (ahead, "ahead"),
             )
             await store._db.commit()
             assert await store.reserve_upload_quota(
-                "u-alice", files=1, size_bytes=10, max_files=5, max_total_bytes=100
+                "u-alice", "other", size_bytes=10, max_files=5, max_total_bytes=100
             )
-            await store.reserve_upload_quota("u-alice", files=-1, size_bytes=-10)
-            await store.reserve_upload_quota("u-alice", files=0, size_bytes=0)
+            await store.release_upload_quota("other")
+            await store.touch_upload_quota("ahead")
             cur = await store._db.execute(
-                "SELECT since FROM upload_quota WHERE uploader_id = ?", ("u-alice",)
+                "SELECT since FROM upload_reservation WHERE reservation_id = ?", ("ahead",)
             )
             row = await cur.fetchone()
             assert row is not None and float(row[0]) == ahead
