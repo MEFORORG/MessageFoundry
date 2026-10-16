@@ -92,6 +92,11 @@ this line.**
 
 ### Security
 
+- **A session revoke that ends nothing is audited, with your address.** The revoke button on
+  `/ui/account/sessions` now passes the request's address to the engine, which writes one
+  `auth.session_revoke_missed` row when the id names no session or another account's. The notice
+  is unchanged. `AuthService.revoke_own_session` takes a required keyword `client`, which the seam
+  digest does not record, so a skew raises TypeError on that call. (vault BACKLOG #3260)
 - **The audit page shows where each entry came from.** `/ui/audit` has a Client column, which
   shows the address the engine recorded for the entry, or a dash when no client was in scope.
   An operator tracing a run of refused sign-ins can now see their source on the page, not only in

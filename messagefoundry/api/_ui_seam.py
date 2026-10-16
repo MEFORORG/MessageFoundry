@@ -404,6 +404,11 @@ from typing import Any
 #: surface grew. An older console on this engine is refused at mount; a newer console on an older
 #: engine would call a method that does not exist.
 #:
+#: Vault BACKLOG #3260, limb 2: ``AuthService.revoke_own_session`` takes a required keyword
+#: ``client``, the address on its new ``auth.session_revoke_missed`` row and on its
+#: ``auth.session_revoked`` row, and ``/ui/account/sessions/{id}/revoke`` passes it. The digest did
+#: not move, for the same reason as #3259, and the same TypeError skew applies to that call.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders

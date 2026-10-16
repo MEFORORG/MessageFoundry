@@ -962,6 +962,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.delete("/me/sessions/{session_id}", response_model=SimpleMessage)
     async def revoke_my_session(
         session_id: DigestId,
+        request: Request,
         service: AuthService = Depends(_service),
         # 7.5.2 (ASVS): terminating a session needs a fresh PASSWORD re-proof BOUND TO THIS ACTION
         # (BACKLOG #1149) — single-use, so the login-seeded window no longer satisfies it. Still the
@@ -971,7 +972,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         identity: Identity = Depends(require_reauth_only_action(STEP_UP_ACTION_SESSION_TERMINATE)),
     ) -> SimpleMessage:
         # Ownership-checked in the service: a 404 (not 403) avoids confirming another user's session id.
-        if not await service.revoke_own_session(identity, session_id, actor=identity.username):
+        # A miss writes one audit row there, the same for an unknown and a foreign id (vault
+        # BACKLOG #3260, limb 2), and the answer here is unchanged.
+        if not await service.revoke_own_session(
+            identity, session_id, actor=identity.username, client=client_ip(request)
+        ):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such session")
         return SimpleMessage(detail="session revoked")
 

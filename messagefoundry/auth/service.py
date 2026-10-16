@@ -2027,6 +2027,11 @@ _REMINDER_ISSUER_ACTION: Final = "auth.temporary_credential_expiring_issuer"
 #: current credential's is the newest, so a page this size is ample.
 _REMINDER_MARK_PAGE: Final = 50
 
+#: Vault BACKLOG #3260, limb 2 (owner ruling 2026-10-16): the row a self-service revoke of one
+#: session writes when it ends nothing, because the id names no session or another account's.
+#: One action for both, and the same detail, so the row cannot tell the two apart either.
+SESSION_REVOKE_MISSED_ACTION: Final = "auth.session_revoke_missed"
+
 #: Vault BACKLOG #3260: the row an admin route writes when it refuses the caller's own account.
 #: Its detail's ``op`` names the route, one of :data:`SelfTargetOp`.
 SELF_TARGET_REFUSED_ACTION: Final = "auth.self_target_refused"
@@ -8479,18 +8484,41 @@ class AuthService:
                 await self._session_seal_failed(row.token_hash)  # see identity_for_token
         return kept
 
-    async def revoke_own_session(self, identity: Identity, session_id: str, *, actor: str) -> bool:
+    async def revoke_own_session(
+        self, identity: Identity, session_id: str, *, actor: str, client: str | None
+    ) -> bool:
         """Revoke one of ``identity``'s **own** sessions by id (its ``token_hash``). Returns ``False``
         if the session doesn't exist or isn't the caller's — so the API answers 404 without revealing
-        or letting a user touch another's session. Audited."""
+        or letting a user touch another's session. Audited.
+
+        A miss writes :data:`SESSION_REVOKE_MISSED_ACTION` (vault BACKLOG #3260, limb 2; owner
+        ruling 2026-10-16). Its detail is the id's first 12 characters, as the success row's is,
+        and nothing else: an unknown id and another account's id write the same row, so the trail
+        records no ownership a caller could not already learn. The write is soft with no defect
+        re-raised, for the reason ``api.auth_routes._refuse_if_self`` gives: a raise would replace
+        the answer the caller is owed. ``client`` is required, as on
+        :meth:`audit_self_target_refused`, because both planes call this from a request."""
         session = await self._load_session(session_id)
         if session is None or session.user_id != identity.user_id:
+            await write_audit_soft(
+                lambda: self._audit(
+                    SESSION_REVOKE_MISSED_ACTION,
+                    actor=actor,
+                    detail=_json({"session": session_id[:12]}),
+                    client=client,
+                ),
+                log=_log,
+                message="a missed session revoke by %s stands, but its audit row failed",
+                args=lambda: (scrub_log_argument(actor),),
+                defects=(),
+            )
             return False
         await self._store.revoke_session(session_id)
         await self._audit(
             "auth.session_revoked",
             actor=actor,
             detail=_json({"scope": "self", "session": session_id[:12]}),
+            client=client,
         )
         return True
 

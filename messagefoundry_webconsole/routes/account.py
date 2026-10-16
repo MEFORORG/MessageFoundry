@@ -626,8 +626,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # time the POST lands: the target may have completed MFA or a step-up on its own device in
         # between. Reporting "revoked" then would tell the operator a session had ended while it was
         # still live under its new id. An unknown id and a foreign id
-        # read the same, so the notice discloses nothing the JSON twin's 404 does not.
-        revoked = await service.revoke_own_session(identity, session_id, actor=identity.username)
+        # read the same, so the notice discloses nothing the JSON twin's 404 does not. A miss writes
+        # the same audit row the JSON twin's does, in the service (vault BACKLOG #3260, limb 2).
+        revoked = await service.revoke_own_session(
+            identity, session_id, actor=identity.username, client=client_ip(request)
+        )
         outcome = "revoked" if revoked else "revoke_missed"
         return RedirectResponse(f"/ui/account/sessions?m={outcome}", status_code=303)
 
