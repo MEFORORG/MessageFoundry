@@ -160,6 +160,12 @@ CONFIG_WRITE_ACTIONS: tuple[str, ...] = get_args(ConfigWriteAction)
 #: and ``tests/test_config_write_census.py`` pins the two to one spelling.
 CONFIG_BASELINE_UNCHECKED_KEY = "baseline_unchecked"
 
+#: The keys :meth:`Engine.write_baseline_config` writes into a row's detail itself: the node, the
+#: digest fields of ``config_fingerprint_detail``, and the unchecked mark. A caller may not set them.
+_BASELINE_ROW_KEYS: frozenset[str] = frozenset(
+    {"node", "fingerprint", "scheme", "files", "git_head", CONFIG_BASELINE_UNCHECKED_KEY}
+)
+
 
 class ConfigReloadDenied(Exception):
     """A /config/reload target lies outside the allowed reload roots (RCE guard).
@@ -2346,19 +2352,25 @@ class Engine:
     ) -> dict[str, object] | None:
         """Write a file the config digest covers, take the digest, and record the baseline row.
 
-        The one engine path for such a write (vault BACKLOG #2945). The start's config-change check
-        compares its digest with the newest baseline row, so an engine write that recorded no digest
-        would raise ``config_changed`` at the next start for a change the engine itself made.
-        ``tests/test_config_write_census.py`` fails when engine code writes a config file any other
-        way, and its census says why each other writer stays outside.
+        Every engine write of such a file goes through here (vault BACKLOG #2945). The start's
+        config-change check compares its digest with the newest baseline row, so an engine write
+        that recorded no digest would raise ``config_changed`` at the next start for a change the
+        engine itself made. ``tests/test_config_write_census.py`` fails when engine code writes a
+        config file any other way, and its census says why each other writer stays outside.
 
         ``write`` gets the running config directory. It runs on a worker thread while this engine's
         own write lock and the cross-process ``connections.toml`` edit lock are both held, so a
-        ``connection`` CLI edit cannot land between the write and either digest. It raises
+        ``connection`` CLI edit cannot land between the write and either digest. That lock is
+        ``connections.toml``'s only: a ``codeset`` or ``impact`` CLI edit takes another lock or
+        none, so one landing during ``write`` can still be taken into the after digest. It raises
         :class:`WiringError` to refuse, and then nothing is recorded. ``reflect``, when given, then
-        runs on the event loop, still under the engine lock, to show the write on the live graph.
-        Last, the row is written under ``action`` with ``detail``, this node's id and the fingerprint
-        returned, still under the engine lock, so two writes' rows land in the order of their writes.
+        runs on the event loop, still under the engine lock, to show the write on the live graph; a
+        failure there is logged and the row is still written. Last, the row is written under
+        ``action`` with ``detail``, this node's id and the fingerprint returned, still under the
+        engine lock, so two writes' rows land in the order of their writes. ``detail`` must be JSON
+        and may not set a key the helper writes (:data:`_BASELINE_ROW_KEYS`); either fault raises
+        before anything is written. Once the write starts, a cancelled caller does not stop the
+        write or its row.
 
         Returns the ADR 0041 D1 fingerprint the row records (vault BACKLOG #2597). When the directory
         held the loaded bytes before this write, it is the digest of the directory just written, and
@@ -2378,9 +2390,15 @@ class Engine:
             raise ClusteredConfigWrite(
                 "this engine is a cluster node, so it does not write config files: each node loads "
                 "its own config directory, and a write here would change this node's copy only "
-                "(docs/CLUSTERING.md). Make the change in the config deployed to every node, then "
-                "reload"
+                "(docs/CLUSTERING.md). Make the change in the config deployed to every node, and "
+                "apply it with a coordinated restart"
             )
+        # Checked before the write, since a fault here after it would leave a landed write with no
+        # row. The helper owns these keys; a caller's own would be read as the baseline digest.
+        clash = set(detail) & _BASELINE_ROW_KEYS
+        if clash:
+            raise ValueError(f"config write detail may not set {sorted(clash)}")
+        json.dumps(detail)
         config_dir = self.running_config_dir
         if config_dir is None:
             raise WiringError("no config directory is configured, so a config write cannot persist")
@@ -2427,47 +2445,58 @@ class Engine:
                     after = None
                 return after, True
 
-        # Serialize the whole read-modify-write, live reflect and row under the engine-level lock, so
-        # two concurrent writes can't interleave (lost update / racing temp files) and their rows land
-        # in write order; the write itself runs off the event loop (file I/O, and a full load_config
-        # in a validating writer's callback).
-        async with self._toml_write_lock:
-            loaded = self.loaded_config_fingerprint
-            loaded_fp = loaded.get("fingerprint") if loaded is not None else None
-            after, vouched = await asyncio.to_thread(_locked_write, loaded_fp)
-            if reflect is not None:
-                reflect()
-            fingerprint: dict[str, object] | None
-            if not vouched:
-                fingerprint = loaded
-            elif after is None:
-                # No digest of what is on disk now. The loaded one would read as a change at the
-                # next start, so the row records none and that start compares nothing.
-                fingerprint = None
-            else:
-                # The running graph now matches these bytes (the write was reflected live), so the
-                # provenance baseline moves with it.
-                self.loaded_config_fingerprint = after
-                fingerprint = after
-            await self.store.record_audit(
-                action,
-                actor=actor,
-                detail=json.dumps(
-                    {
-                        **detail,
-                        "node": self._coordinator.node_id,
-                        **(fingerprint or {}),
-                        # A process whose start never checked its config cannot vouch for it.
-                        **(
-                            {CONFIG_BASELINE_UNCHECKED_KEY: True}
-                            if self.config_baseline_unchecked
-                            else {}
-                        ),
-                    }
-                ),
-                client=client,
-            )
-            return fingerprint
+        async def _apply() -> dict[str, object] | None:
+            # Serialize the whole read-modify-write, live reflect and row under the engine-level
+            # lock, so two concurrent writes can't interleave (lost update / racing temp files) and
+            # their rows land in write order; the write itself runs off the event loop (file I/O,
+            # and a full load_config in a validating writer's callback).
+            async with self._toml_write_lock:
+                loaded = self.loaded_config_fingerprint
+                loaded_fp = loaded.get("fingerprint") if loaded is not None else None
+                after, vouched = await asyncio.to_thread(_locked_write, loaded_fp)
+                if reflect is not None:
+                    # The write has landed, so a failed reflect costs the live view, never the row.
+                    try:
+                        reflect()
+                    except Exception:  # noqa: BLE001 - logged; the durable file is the truth
+                        log.exception("config written; reflecting it on the live graph failed")
+                fingerprint: dict[str, object] | None
+                if not vouched:
+                    fingerprint = loaded
+                elif after is None:
+                    # No digest of what is on disk now. The loaded one would read as a change at
+                    # the next start, so the row records none and that start compares nothing.
+                    fingerprint = None
+                else:
+                    fingerprint = after
+                await self.store.record_audit(
+                    action,
+                    actor=actor,
+                    detail=json.dumps(
+                        {
+                            **detail,
+                            "node": self._coordinator.node_id,
+                            **(fingerprint or {}),
+                            # A process whose start never checked its config cannot vouch for it.
+                            **(
+                                {CONFIG_BASELINE_UNCHECKED_KEY: True}
+                                if self.config_baseline_unchecked
+                                else {}
+                            ),
+                        }
+                    ),
+                    client=client,
+                )
+                if vouched and after is not None:
+                    # The running graph now matches these bytes (the write was reflected live), so
+                    # the provenance baseline moves with it, once the row that records it is in.
+                    self.loaded_config_fingerprint = after
+                return fingerprint
+
+        # Shielded: once the write can land, a cancelled caller (a request deadline, a client that
+        # went away) must not leave it on disk with no row, which the next start would report as a
+        # change nobody made. The write and its row finish; only the caller stops waiting.
+        return await asyncio.shield(_apply())
 
     async def set_connection_flag(
         self,
@@ -2475,8 +2504,8 @@ class Engine:
         *,
         direction: str,
         flagged: bool,
-        actor: str | None = None,
-        client: str | None = None,
+        actor: str | None,
+        client: str | None,
     ) -> dict[str, object] | None:
         """Set the operator "object of interest" flag on a ``connections.toml``-managed connection (#131,
         ADR 0007 amendment) — the FIRST console→``connections.toml`` write seam.

@@ -16,11 +16,13 @@ file and the def it sits in, and must be listed with a verdict. A new call site 
 classified ``helper`` fails :func:`test_every_engine_config_write_goes_through_the_helper` unless
 it calls the helper.
 
-Scope, stated rather than implied. The census finds calls to the writer functions in
-:data:`WRITERS`, by name. A direct ``write_text`` or ``os.replace`` into a config directory is a
-different shape: :func:`test_no_engine_code_writes_a_config_path_directly` catches one whose target
-expression names the config directory, and cannot follow a path that reached it through a variable
-of another name. The IDE extension and the PySide6 harness are not engine code and are not read.
+Scope, stated rather than implied. The census finds references to the writer functions in
+:data:`WRITERS`, by name, whether called or handed on as a callable, across :data:`PACKAGES`. A
+writer reached under another name (an alias, or a wrapper outside :data:`LIBRARY`) is not seen. A
+direct ``write_text`` or ``os.replace`` into a config directory is a different shape:
+:func:`test_no_engine_code_writes_a_config_path_directly` catches one whose target expression names
+the config directory, and cannot follow a path that reached it through a variable of another name.
+The IDE extension and the PySide6 harness are not engine code and are not read.
 """
 
 from __future__ import annotations
@@ -35,10 +37,15 @@ import pytest
 
 from messagefoundry.api import app as app_module
 from messagefoundry.pipeline import engine as engine_module
-from tests._ast_sites import call_sites, callee_name
+from tests._ast_sites import call_sites
 
 REPO = Path(__file__).resolve().parents[1]
-PACKAGE = REPO / "messagefoundry"
+#: The packages that run in the engine process or ship beside it: the engine, the web console
+#: mounted in it at /ui, and the toolkit split out of it.
+PACKAGES = tuple(
+    REPO / name
+    for name in ("messagefoundry", "messagefoundry_webconsole", "messagefoundry_toolkit")
+)
 
 #: The helper every engine config write goes through.
 HELPER = "write_baseline_config"
@@ -134,9 +141,25 @@ def _rel(path: Path) -> str:
     return path.relative_to(REPO).as_posix()
 
 
+def _names_writer(node: ast.expr) -> bool:
+    if isinstance(node, ast.Attribute):
+        return node.attr in WRITERS
+    return isinstance(node, ast.Name) and node.id in WRITERS
+
+
+def _is_writer_ref(node: ast.AST) -> bool:
+    """A call that uses a writer: calls one, or hands one on as a callable, as ``asyncio.to_thread(
+    connections_edit.upsert_connection, ...)`` or ``functools.partial`` would. Only the callee and
+    the arguments count, so a local of the same name used as a receiver (``__main__``'s argparse
+    ``import_corepoint.add_argument``) is not a writer."""
+    return isinstance(node, ast.Call) and any(
+        _names_writer(part) for part in [node.func, *node.args, *(k.value for k in node.keywords)]
+    )
+
+
 def _writer_sites(tree: ast.Module) -> set[str]:
-    """The defs in ``tree`` that call a writer: class names down to the outermost function, so a
-    call in a nested ``_write`` closure is charged to the method that defines it."""
+    """The defs in ``tree`` that reference a writer: class names down to the outermost function,
+    so a call in a nested ``_write`` closure is charged to the method that defines it."""
     sites: set[str] = set()
 
     def walk(node: ast.AST, owner: list[str], in_function: bool) -> None:
@@ -148,12 +171,36 @@ def _writer_sites(tree: ast.Module) -> set[str]:
                     is_def = not isinstance(child, ast.ClassDef)
                     walk(child, [*owner, child.name], is_def)
                 continue
-            if isinstance(child, ast.Call) and callee_name(child) in WRITERS:
+            if _is_writer_ref(child):
                 sites.add(".".join(owner) or "<module>")
             walk(child, owner, in_function)
 
     walk(tree, [], False)
     return sites
+
+
+def _unrouted_writer_refs(node: ast.AST) -> list[int]:
+    """The lines in def ``node`` that reference a writer outside every nested def handed to the
+    helper by name, so a ``helper`` def cannot route one write through it and make another
+    beside it."""
+    routed = {
+        arg.id
+        for call in call_sites(node, HELPER)
+        for arg in [*call.args, *(k.value for k in call.keywords)]
+        if isinstance(arg, ast.Name)
+    }
+    lines: list[int] = []
+
+    def walk(current: ast.AST) -> None:
+        for child in ast.iter_child_nodes(current):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name in routed:
+                continue
+            if isinstance(child, ast.Call) and _is_writer_ref(child):
+                lines.append(child.lineno)
+            walk(child)
+
+    walk(node)
+    return lines
 
 
 def _def_node(tree: ast.Module, qualname: str) -> ast.AST:
@@ -189,21 +236,26 @@ def _unlisted(trees: Mapping[str, ast.Module]) -> list[str]:
 
 
 def _helper_bypasses(trees: Mapping[str, ast.Module]) -> list[str]:
-    """A census ``helper`` def, present in ``trees``, that does not call the helper."""
-    return [
-        f"{path}: {site} writes a config file without Engine.{HELPER}"
-        for (path, site), (verdict, _why) in CENSUS.items()
-        if verdict == "helper"
-        and path in trees
-        and not call_sites(_def_node(trees[path], site), HELPER)
-    ]
+    """A census ``helper`` def, present in ``trees``, with a writer reference outside the defs it
+    hands to the helper (including one that never calls the helper at all)."""
+    problems: list[str] = []
+    for (path, site), (verdict, _why) in CENSUS.items():
+        if verdict != "helper" or path not in trees:
+            continue
+        lines = _unrouted_writer_refs(_def_node(trees[path], site))
+        if lines:
+            problems.append(f"{path}: {site} writes a config file without Engine.{HELPER}")
+    return problems
 
 
 @functools.cache
 def _package_trees() -> dict[str, ast.Module]:
-    """Every engine module, parsed once for the whole file: a full pass costs seconds."""
+    """Every module in :data:`PACKAGES`, parsed once for the whole file: a full pass costs
+    seconds."""
     return {
-        _rel(path): ast.parse(path.read_text(encoding="utf-8")) for path in PACKAGE.rglob("*.py")
+        _rel(path): ast.parse(path.read_text(encoding="utf-8"))
+        for package in PACKAGES
+        for path in package.rglob("*.py")
     }
 
 
@@ -231,24 +283,40 @@ def test_the_guard_refuses_an_unlisted_writer_and_a_helper_bypass() -> None:
     """Positive controls, so the passes above are the census holding and not a scan that found
     nothing. An unlisted engine function calling a writer is refused, and so is the real flag
     toggle with its helper call taken out."""
-    rogue = "def toggle(d, obj):\n    connections_edit.upsert_connection(d, obj, validate=None)\n"
-    assert _unlisted({"messagefoundry/pipeline/rogue.py": ast.parse(rogue)}) == [
-        "messagefoundry/pipeline/rogue.py: toggle writes a config file and is not in CENSUS; "
-        f"classify it, and if it runs in the engine, route the write through Engine.{HELPER}"
-    ]
+    for rogue in (
+        "def toggle(d, obj):\n    connections_edit.upsert_connection(d, obj, validate=None)\n",
+        # Handed on as a callable rather than called: the usual way off the event loop.
+        "async def toggle(d, obj):\n"
+        "    await asyncio.to_thread(connections_edit.upsert_connection, d, obj, validate=None)\n",
+    ):
+        assert _unlisted({"messagefoundry/pipeline/rogue.py": ast.parse(rogue)}) == [
+            "messagefoundry/pipeline/rogue.py: toggle writes a config file and is not in CENSUS; "
+            f"classify it, and if it runs in the engine, route the write through Engine.{HELPER}"
+        ]
 
     engine_path = "messagefoundry/pipeline/engine.py"
     real = (REPO / engine_path).read_text(encoding="utf-8")
-    assert f"self.{HELPER}(" in real
-    bypassed = ast.parse(real.replace(f"self.{HELPER}(", "self._not_the_helper("))
-    assert _helper_bypasses({engine_path: bypassed}) == [
+    refused = [
         f"{engine_path}: Engine.set_connection_flag writes a config file without Engine.{HELPER}"
     ]
+    assert f"self.{HELPER}(" in real
+    bypassed = ast.parse(real.replace(f"self.{HELPER}(", "self._not_the_helper("))
+    assert _helper_bypasses({engine_path: bypassed}) == refused
+    # Still calling the helper, but also writing beside it, outside the def it hands over.
+    anchor = "        def _reflect() -> None:\n"
+    assert anchor in real
+    beside = real.replace(
+        anchor,
+        "        connections_edit.remove_connection(cfg, name, validate=None)\n\n" + anchor,
+    )
+    assert _helper_bypasses({engine_path: ast.parse(beside)}) == refused
 
 
 def test_the_start_reads_every_action_the_helper_records() -> None:
     """The start's baseline list is built from the helper's action names (``*CONFIG_WRITE_ACTIONS``),
     so a write recorded under a new name is a baseline with no second list to keep in step."""
+    # Holds by construction today; it fails if the splat is ever replaced by a literal tuple.
+    assert set(engine_module.CONFIG_WRITE_ACTIONS) <= set(app_module._CONFIG_BASELINE_ACTIONS)
     assert {"config_loaded", "config_reload"} <= set(app_module._CONFIG_BASELINE_ACTIONS)
     # The helper marks an unchecked row with the key the start-row comparison skips.
     assert engine_module.CONFIG_BASELINE_UNCHECKED_KEY == app_module._BASELINE_UNCHECKED
@@ -267,21 +335,27 @@ _CONFIG_PATH_NAMES = (
 
 def _write_targets(call: ast.Call) -> list[ast.expr]:
     """The path expressions ``call`` writes to, for the shapes this guard knows: ``x.write_text``,
-    ``x.write_bytes``, ``x.open("w")``, ``open(x, "w")`` (and ``a``/``x`` modes), and the
-    destination of ``os.replace``/``os.rename`` and the ``shutil`` copies and move."""
+    ``x.write_bytes``, ``x.open("w")`` and ``open(x, "w")`` with the mode positional or keyword
+    (any of ``w``/``a``/``x``/``+``), the destination of ``os.replace``/``os.rename`` and the
+    ``shutil`` copies and move, and of the one-argument ``Path.replace``/``Path.rename``."""
     func = call.func
 
-    def writes(mode: ast.expr | None) -> bool:
+    def mode_writes(mode: ast.expr | None) -> bool:
         return (
             isinstance(mode, ast.Constant)
             and isinstance(mode.value, str)
-            and bool(set(mode.value) & set("wax"))
+            and bool(set(mode.value) & set("wax+"))
         )
+
+    def mode_of(position: int) -> ast.expr | None:
+        if len(call.args) > position:
+            return call.args[position]
+        return next((k.value for k in call.keywords if k.arg == "mode"), None)
 
     if isinstance(func, ast.Attribute):
         if func.attr in {"write_text", "write_bytes"}:
             return [func.value]
-        if func.attr == "open" and call.args and writes(call.args[0]):
+        if func.attr == "open" and mode_writes(mode_of(0)):
             return [func.value]
         module = func.value.id if isinstance(func.value, ast.Name) else None
         destination_writers = {
@@ -290,11 +364,12 @@ def _write_targets(call: ast.Call) -> list[ast.expr]:
         }
         if module and func.attr in destination_writers.get(module, set()) and len(call.args) > 1:
             return [call.args[1]]
-    if isinstance(func, ast.Name) and func.id == "open" and call.args:
-        mode = call.args[1] if len(call.args) > 1 else None
-        mode = mode or next((k.value for k in call.keywords if k.arg == "mode"), None)
-        if writes(mode):
+        # Path.replace(target) and Path.rename(target). str.replace takes two arguments, so one
+        # argument and no keywords keeps it out.
+        if func.attr in {"replace", "rename"} and len(call.args) == 1 and not call.keywords:
             return [call.args[0]]
+    if isinstance(func, ast.Name) and func.id == "open" and call.args and mode_writes(mode_of(1)):
+        return [call.args[0]]
     return []
 
 
@@ -324,6 +399,9 @@ def test_no_engine_code_writes_a_config_path_directly() -> None:
         "os.replace(tmp, self.running_config_dir / CONNECTIONS_FILE_NAME)",
         "open(config_dir / 'codesets' / 'x.csv', 'w')",
         "(config_dir / 'environments' / 'dev.toml').open('a')",
+        "(config_dir / 'environments' / 'dev.toml').open(mode='r+')",
+        "candidate.replace(cfg_dir / CONNECTIONS_FILE_NAME)",
+        "tmp.rename(config_dir / 'codesets' / 'x.csv')",
     ],
 )
 def test_the_direct_write_scan_sees_each_shape(line: str) -> None:

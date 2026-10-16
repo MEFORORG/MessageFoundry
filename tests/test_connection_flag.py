@@ -88,7 +88,9 @@ async def test_flag_toggle_persists_and_reflects(engine: Engine, tmp_path: Path)
     assert engine.registry_runner is not None
     assert engine.registry_runner.registry.outbound["OB_TOML"].flagged is False
 
-    await engine.set_connection_flag("OB_TOML", direction="outbound", flagged=True)
+    await engine.set_connection_flag(
+        "OB_TOML", direction="outbound", flagged=True, actor="tester", client=None
+    )
 
     # Persisted to connections.toml (comment intact), and reflected on the LIVE registry immediately.
     text = toml_path.read_text(encoding="utf-8")
@@ -97,7 +99,9 @@ async def test_flag_toggle_persists_and_reflects(engine: Engine, tmp_path: Path)
     assert engine.registry_runner.registry.outbound["OB_TOML"].flagged is True
 
     # Toggling back clears it.
-    await engine.set_connection_flag("OB_TOML", direction="outbound", flagged=False)
+    await engine.set_connection_flag(
+        "OB_TOML", direction="outbound", flagged=False, actor="tester", client=None
+    )
     assert engine.registry_runner.registry.outbound["OB_TOML"].flagged is False
     assert "flagged = false" in toml_path.read_text(encoding="utf-8")
 
@@ -136,10 +140,14 @@ async def test_flag_toggle_and_dry_run_carry_the_engines_escape(
                 await eng.reload_detail(str(tmp_path), dry_run=True)
         eng.add_registry(load_config(tmp_path))
         if allow:
-            await eng.set_connection_flag("OB_TOML", direction="outbound", flagged=True)
+            await eng.set_connection_flag(
+                "OB_TOML", direction="outbound", flagged=True, actor="tester", client=None
+            )
         else:
             with pytest.raises(WiringError, match="without TLS"):
-                await eng.set_connection_flag("OB_TOML", direction="outbound", flagged=True)
+                await eng.set_connection_flag(
+                    "OB_TOML", direction="outbound", flagged=True, actor="tester", client=None
+                )
     finally:
         await eng.stop()
 
@@ -169,7 +177,9 @@ async def test_a_listener_start_leaves_down_refuses_no_reload_toggle_or_dr_activ
         await eng.add_registry(load_config(tmp_path)).start()
 
         async def _flag() -> None:
-            await eng.set_connection_flag("OB_TOML", direction="outbound", flagged=True)
+            await eng.set_connection_flag(
+                "OB_TOML", direction="outbound", flagged=True, actor="tester", client=None
+            )
 
         steps = {
             "dry run": lambda: eng.reload_detail(str(tmp_path), dry_run=True),
@@ -192,7 +202,9 @@ async def test_a_listener_start_leaves_down_refuses_no_reload_toggle_or_dr_activ
 
 
 async def test_flag_toggle_reflects_on_inbound(engine: Engine, tmp_path: Path) -> None:
-    await engine.set_connection_flag("IB_TOML", direction="inbound", flagged=True)
+    await engine.set_connection_flag(
+        "IB_TOML", direction="inbound", flagged=True, actor="tester", client=None
+    )
     assert engine.registry_runner is not None
     assert engine.registry_runner.registry.inbound["IB_TOML"].flagged is True
     assert "flagged = true" in (tmp_path / "connections.toml").read_text(encoding="utf-8")
@@ -203,13 +215,17 @@ async def test_flag_toggle_refuses_code_first(engine: Engine, tmp_path: Path) ->
     write is refused and connections.toml is left untouched (no store schema change is ever attempted)."""
     before = (tmp_path / "connections.toml").read_text(encoding="utf-8")
     with pytest.raises(WiringError, match="not managed in connections.toml"):
-        await engine.set_connection_flag("OB_CODE", direction="outbound", flagged=True)
+        await engine.set_connection_flag(
+            "OB_CODE", direction="outbound", flagged=True, actor="tester", client=None
+        )
     assert (tmp_path / "connections.toml").read_text(encoding="utf-8") == before
 
 
 async def test_flag_toggle_rejects_bad_direction(engine: Engine) -> None:
     with pytest.raises(WiringError, match="direction"):
-        await engine.set_connection_flag("OB_TOML", direction="sideways", flagged=True)
+        await engine.set_connection_flag(
+            "OB_TOML", direction="sideways", flagged=True, actor="tester", client=None
+        )
 
 
 async def test_concurrent_flag_writes_both_land(engine: Engine, tmp_path: Path) -> None:
@@ -218,8 +234,12 @@ async def test_concurrent_flag_writes_both_land(engine: Engine, tmp_path: Path) 
     with no leftover temp (the unique per-write temp is renamed or cleaned up). Locks the #131/#136
     review's concurrency fix (the FIRST console→TOML write seam)."""
     await asyncio.gather(
-        engine.set_connection_flag("OB_TOML", direction="outbound", flagged=True),
-        engine.set_connection_flag("IB_TOML", direction="inbound", flagged=True),
+        engine.set_connection_flag(
+            "OB_TOML", direction="outbound", flagged=True, actor="tester", client=None
+        ),
+        engine.set_connection_flag(
+            "IB_TOML", direction="inbound", flagged=True, actor="tester", client=None
+        ),
     )
     reg = load_config(tmp_path)  # the file still parses + loads cleanly
     assert reg.outbound["OB_TOML"].flagged is True  # neither update was lost
@@ -261,7 +281,9 @@ async def test_a_cluster_node_refuses_the_toggle_and_writes_nothing(
     before = toml_path.read_bytes()
     monkeypatch.setattr(type(engine.coordinator), "is_clustered", lambda self: True)
     with pytest.raises(ClusteredConfigWrite, match="cluster node"):
-        await engine.set_connection_flag("OB_TOML", direction="outbound", flagged=True)
+        await engine.set_connection_flag(
+            "OB_TOML", direction="outbound", flagged=True, actor="tester", client=None
+        )
     assert toml_path.read_bytes() == before
     assert engine.registry_runner is not None
     assert engine.registry_runner.registry.outbound["OB_TOML"].flagged is False
@@ -271,7 +293,9 @@ async def test_a_cluster_node_refuses_the_toggle_and_writes_nothing(
 
     # Control: the same engine, single-node again, writes the flag and records the row.
     monkeypatch.undo()
-    await engine.set_connection_flag("OB_TOML", direction="outbound", flagged=True)
+    await engine.set_connection_flag(
+        "OB_TOML", direction="outbound", flagged=True, actor="tester", client=None
+    )
     assert "flagged = true" in toml_path.read_text(encoding="utf-8")
     assert len(await engine.store.list_audit(action="connection_flag_set")) == 1
 
@@ -296,6 +320,49 @@ async def test_the_toggle_records_its_own_baseline_row(engine: Engine, tmp_path:
     assert detail["fingerprint"] == on_disk
     assert detail["connection"] == "OB_TOML" and detail["flagged"] is True
     assert detail["node"] == engine.coordinator.node_id
+
+
+async def test_the_helper_refuses_a_detail_it_cannot_record_before_writing(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """A detail key the helper writes itself, or a value JSON cannot carry, is refused before the
+    write, so a fault there can never leave a landed write with no row."""
+    wrote: list[Path] = []
+    for detail in ({"fingerprint": "f" * 64}, {"path": tmp_path}):
+        with pytest.raises((ValueError, TypeError)):
+            await engine.write_baseline_config(
+                "connection_flag_set", wrote.append, detail=detail, actor="tester", client=None
+            )
+    assert wrote == []
+    assert await engine.store.list_audit(action="connection_flag_set") == []
+
+
+async def test_a_cancelled_caller_does_not_cost_a_landed_write_its_row(engine: Engine) -> None:
+    """Once the write is under way, cancelling the caller (a request deadline, a client that went
+    away) still lets the write and its row finish, so the next start sees no change nobody made."""
+    import threading
+
+    started, release = threading.Event(), threading.Event()
+
+    def _write(_cfg: Path) -> None:
+        started.set()
+        release.wait(20)
+
+    caller = asyncio.ensure_future(
+        engine.write_baseline_config(
+            "connection_flag_set", _write, detail={"probe": True}, actor="tester", client=None
+        )
+    )
+    assert await asyncio.to_thread(started.wait, 20)
+    caller.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    for _ in range(200):
+        if await engine.store.list_audit(action="connection_flag_set"):
+            break
+        await asyncio.sleep(0.05)
+    assert len(await engine.store.list_audit(action="connection_flag_set")) == 1
 
 
 async def test_the_toggle_takes_its_digests_under_the_config_edit_lock(
@@ -333,6 +400,8 @@ async def test_the_toggle_takes_its_digests_under_the_config_edit_lock(
         return real(self, path)
 
     monkeypatch.setattr(Engine, "fingerprint_bundle_blocking", _recording)
-    await engine.set_connection_flag("OB_TOML", direction="outbound", flagged=True)
+    await engine.set_connection_flag(
+        "OB_TOML", direction="outbound", flagged=True, actor="tester", client=None
+    )
     assert held_at_digest == [True, True], "control: both digests were taken, each under the lock"
     assert not _probe(), "control: the probe reads the lock as free once the toggle returns"
