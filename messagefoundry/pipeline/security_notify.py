@@ -582,7 +582,7 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
                 log.warning(
                     "security notice %s for %s dropped: the account has no notification address on "
                     "file, so it was not told out of band (the event is usually still in the audit "
-                    "log; a refused directory-reconciler audit write leaves no row)",
+                    "log)",
                     event.event_type,
                     event.username,
                 )

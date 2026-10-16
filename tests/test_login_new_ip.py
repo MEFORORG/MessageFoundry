@@ -64,7 +64,7 @@ class _RaisingNotifier:
 async def _service(
     store: MessageStore, notifier: object | None = None, **over: object
 ) -> AuthService:
-    settings = AuthSettings(require_mfa=False, **over)  # type: ignore[arg-type]
+    settings = AuthSettings(**{"require_mfa": False, **over})  # type: ignore[arg-type]
     service = AuthService(store, settings, security_notifier=notifier)  # type: ignore[arg-type]
     await service.initialize()
     return service
@@ -1031,13 +1031,15 @@ async def test_a_step_up_from_a_roamed_address_records_it_and_moves_the_anchor()
 # --- follow-ups from the review of engine PR 1999 (vault BACKLOG #2964) ---
 
 
-def _owing_service(store: MessageStore) -> AuthService:
+async def _owing_service(store: MessageStore) -> AuthService:
     """An account under ``require_mfa`` owes a factor. The floor is off so a test can enrol on the
     session it just signed in (BACKLOG #2389)."""
-    return AuthService(
+    return await _service(
         store,
-        AuthSettings(require_mfa=True, mfa_verify_min_elapsed_seconds=0, mfa_recovery_code_count=1),
-        security_notifier=_FakeNotifier(),
+        _FakeNotifier(),
+        require_mfa=True,
+        mfa_verify_min_elapsed_seconds=0,
+        mfa_recovery_code_count=1,
     )
 
 
@@ -1047,8 +1049,7 @@ async def test_a_first_local_sign_in_that_owes_a_factor_records_no_baseline() ->
     writing the account's first known address before the factor."""
     store = await MessageStore.open(":memory:")
     try:
-        owed = _owing_service(store)
-        await owed.initialize()
+        owed = await _owing_service(store)
         uid = await _operator(owed)
         out = await owed.login("oper", PW, client="10.1.1.1")
         assert out.ok and out.mfa_required
@@ -1067,8 +1068,7 @@ async def test_an_enrolment_records_its_address_after_its_audit_row(
     and the account's next proved factor writes it instead."""
     store = await MessageStore.open(":memory:")
     try:
-        owed = _owing_service(store)
-        await owed.initialize()
+        owed = await _owing_service(store)
         uid = await _operator(owed)
         out = await owed.login("oper", PW, client="10.1.1.1")
         assert out.ok and out.identity is not None and out.token is not None
@@ -1095,8 +1095,7 @@ async def test_verify_mfa_records_its_address_inside_the_account_queue(
     queued behind it classifies against the written address rather than reading NEW."""
     store = await MessageStore.open(":memory:")
     try:
-        owed = _owing_service(store)
-        await owed.initialize()
+        owed = await _owing_service(store)
         await _operator(owed)
         queue_held: list[bool] = []
         real = store.remember_login_address
@@ -1138,8 +1137,7 @@ async def test_a_programming_error_in_the_record_does_not_lose_the_enrolment_rep
     the rotated token and the recovery codes, with TOTP already on."""
     store = await MessageStore.open(":memory:")
     try:
-        owed = _owing_service(store)
-        await owed.initialize()
+        owed = await _owing_service(store)
         await _operator(owed)
         out = await owed.login("oper", PW, client="10.1.1.1")
         assert out.ok and out.identity is not None and out.token is not None

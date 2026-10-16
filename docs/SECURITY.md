@@ -3529,14 +3529,14 @@ The honest limits of that model, one sentence each:
   `auth.login_new_ip` audit row is not debounced, so each of those sign-ins writes one.
   ASVS 8.2.4 asks for more than one meaningful signal, and a second, non-address signal is not
   built.
-- The known-address record carries five costs, accepted as they stand (vault BACKLOG #2964).
+- The known-address record carries these costs, accepted as they stand (vault BACKLOG #2964).
   None of them lets an address become known before its factor.
   - Every finished sign-in from a known address writes the record again: an upsert, then a
     prune, two commits that each take the SQLite writer lock.
   - The record has no row cap per account, and its read has no limit. Only the 90-day prune
     bounds it, so an account that signs in from many hosts inside 90 days grows both. A cap
     would be a change to all three store backends.
-  - The write rule sits in eight hand-placed calls, one per leg, and is not tied to one change of
+  - The write rule sits in one hand-placed call per leg, and is not tied to one change of
     session state, so a new leg that forgets the call records nothing.
   - A step-up does extra store reads before it writes: the account, and whether it owes a factor.
   - A passkey assertion and a factor enrolment record the address without moving the session's
