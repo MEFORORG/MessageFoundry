@@ -32,7 +32,11 @@ from messagefoundry.api import create_app
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import ALL_CHANNELS, Identity
 from messagefoundry.auth.ldap import AdPrincipal
-from messagefoundry.auth.service import STEP_UP_ACTION_SESSION_TERMINATE, AuthService
+from messagefoundry.auth.service import (
+    STEP_UP_ACTION_SESSION_TERMINATE,
+    AuthService,
+    _requirement_covers,
+)
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
@@ -1176,6 +1180,37 @@ def test_the_per_user_rule_reads_no_provider_at_all(engine: Engine) -> None:
             )
             is True
         ), f"provider {provider!r} must not change the answer"
+
+
+async def test_an_unrecognized_provider_row_is_covered_by_the_gates_and_the_census(
+    engine: Engine,
+) -> None:
+    """RED when: ``_requirement_covers`` allow-lists ``LOCAL`` again (BACKLOG #3117).
+
+    A local account with a chosen password and no factor is covered. Planting an unknown provider
+    on its row must leave it covered: AC-A3a's helper says so, and the enrol-first gate still sends
+    it to enrolment. ``ad`` is the one value that leaves it out. The census names only the local
+    row: password sign-in refuses every other provider before it counts a failure, so no other row
+    can be locked, and naming one would ask for a reset that issues it nothing."""
+    service = await _service(engine)
+    user_id = await _add(service, "rogue", Role.VIEWER)
+    identity = await service.identity_for_user_id(user_id)
+    assert identity is not None
+    db = cast(MessageStore, engine.store)._db
+    for provider, covered, censused in (
+        ("local", True, True),
+        ("saml-from-the-future", True, False),
+        ("ad", False, False),
+    ):
+        await db.execute("UPDATE users SET auth_provider = ? WHERE id = ?", (provider, user_id))
+        await db.commit()
+        row = await engine.store.get_user(user_id)
+        assert row is not None and not row.totp_enabled and row.password_hash is not None
+        roles = frozenset({Role.VIEWER})
+        assert _requirement_covers(service._settings, row, roles) is covered, provider
+        assert await service.must_enrol_before_rotating(identity) is covered, provider
+        census = await service.lockable_account_census()
+        assert ("rogue" in census.no_way_past) is censused, provider
 
 
 # --- 6.8.4: the directory legs assert nothing, so the engine assumes nothing --
