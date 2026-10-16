@@ -824,9 +824,12 @@ class Elevation:
       the session was ended because its temporary password lapsed, with the proof checked or not,
       as that ``auth.temp_password_expired`` row records; or (``confirm_mfa_enrollment`` only,
       BACKLOG #2224) the proof was good but turning TOTP on matched no row, so the confirm ended
-      the session it had just rotated, as its ``auth.mfa_enroll_refused`` row records. Fails
-      CLOSED: no token is handed back. Held apart from a wrong proof so a route answers 401 rather than re-prompting on a
-      session that no longer exists. The ``auth.reauth`` row's ``session_revoked`` says which.
+      the session it had just rotated, as its ``auth.mfa_enroll_refused`` row records. That row's
+      ``session_ended`` is false when the store refused the revoke (vault BACKLOG #3113): the
+      rotated session then still exists, but its token was never handed back. Fails CLOSED: no
+      token is handed back. Held apart from a wrong proof so a route answers 401 rather than
+      re-prompting on a session that is gone or unreachable. For a password re-auth, the
+      ``auth.reauth`` row's ``session_revoked`` says which cause applied.
 
     ``recovery_codes`` is populated only by :meth:`AuthService.confirm_mfa_enrollment` (shown once).
 
@@ -835,7 +838,7 @@ class Elevation:
     correct code as incorrect. A password re-proof is never refused for a lock (BACKLOG #1138).
 
     ``ok`` is DERIVED, not stored, and that is load-bearing rather than tidiness. Held as a field it
-    was a second spelling of ``token is not None`` -- true of all 19 constructions -- so the type
+    was a second spelling of ``token is not None`` -- true of every construction then -- so the type
     could represent a state the system never produces, mypy could not narrow ``token`` from ``ok``,
     and every consuming site paid ``if not elevation.ok or elevation.token is None``: a second clause
     whose only job was to re-derive the first in a form the checker accepts. As a property the
@@ -3120,13 +3123,20 @@ class AuthService:
             # Conditional (BACKLOG #2224): a factor clear by another run's repair branch, or another
             # run that enabled TOTP first, since the secret was staged above makes it match no row.
             # Refused before the role, so the row stays roleless and a re-run completes it.
+            #
+            # The words must not say to remove the entry this run showed (vault BACKLOG #3113).
+            # Staging is unconditional, so the last run to stage owns the staged secret, and another
+            # run's enable can turn on THIS run's secret before this enable is refused (the re-stage
+            # race, vault BACKLOG #3025). So this run cannot tell whether its entry is live.
             if not await self._store.enable_totp(user_id, recovery_code_hashes=hashes):
                 raise FirstAdministratorRefused(
                     "the authenticator enrolment was changed while this command ran, so this run "
-                    "did not turn TOTP on and granted no role; remove the authenticator entry it "
-                    "showed. "
+                    "did not turn TOTP on and granted no role. Another run may have turned on the "
+                    "secret this run showed, so keep the authenticator entry it showed until a "
+                    "sign-in to this account shows which entry works. "
                     "If another provision-admin run is in progress, let it finish. Then run the "
-                    "command again"
+                    "command again: it reads that account and either completes it or says why it "
+                    "cannot"
                 )
         if notify_email is not None:
             # Unconditional rather than fresh-path-only, because the invariant "the supplied address
@@ -10066,7 +10076,8 @@ class AuthService:
         still OFF (BACKLOG #1902), so a lost session never leaves MFA on with codes nobody saw. So
         does a good code whose activation matches no row, because a reset cleared the staged secret
         or a second confirm enabled first (BACKLOG #2224). That confirm ends the session it rotated,
-        hands back no codes, and audits ``auth.mfa_enroll_refused``.
+        hands back no codes, and audits ``auth.mfa_enroll_refused``, whose ``session_ended`` says
+        whether the store took the revoke (vault BACKLOG #3113).
 
         This is one of the two legs that turn an MFA-pending session into an MFA-satisfied one for a
         FIRST enrolment, so it rotates for the same reason ``verify_mfa`` does: without it a pre-MFA
@@ -10117,7 +10128,10 @@ class AuthService:
         # the rotation has succeeded; on a lost session MFA stays off and the staged secret stays put,
         # and the user signs in again and confirms with a code from a later step (this one is spent).
         # The cost: if enable_totp itself fails after a good rotation, the new token is never handed
-        # back, so the user is signed out with MFA still off. That fails closed, and a retry works.
+        # back, so the user is signed out with MFA still off. That fails closed. A retry is not
+        # always a plain one (vault BACKLOG #3113): it needs a code from a later step, since this one
+        # is spent, and where the enable matched no row (#2224, below) a reset may have cleared the
+        # staged secret, so the user starts the enrolment again.
         # Stamp against the OLD hash, then rotate — never the other way round.
         async with self._sealed_stamp(hash_token(token)):
             await self._store.mark_session_mfa_verified(hash_token(token))
@@ -10140,10 +10154,25 @@ class AuthService:
             #
             # Known cost: ``_elevated`` already ran the session cap for the rotated session, so
             # at the cap that run may have ended the account's oldest full session, and it stays
-            # ended. The order is #1902's, rotate first and enable last, and is kept.
-            await self._store.revoke_session(hash_token(elevation.token))
+            # ended. The order is #1902's, rotate first and enable last, and is kept. Vault BACKLOG
+            # #3113 item 8 is declined for that reason: enabling first would undo #1902.
+            #
+            # A store refusal of the revoke is logged, not raised, so the refusal row below is
+            # still written (vault BACKLOG #3113). ``session_ended`` records what the revoke did.
+            # The token is not handed back either way, so the caller still cannot use the session.
+            rotated = hash_token(elevation.token)
+            session_ended = await write_audit_soft(
+                lambda: self._store.revoke_session(rotated),
+                log=_log,
+                message="a refused TOTP enrolment for %s could not end the session it rotated",
+                args=lambda: (scrub_log_argument(identity.username),),
+                errors=_audit_write_errors(),
+                defects=AUDIT_WRITE_DEFECTS,
+            )
             # The reason is the row's state read AFTER the refusal, not the write's own verdict,
-            # so a later write can blur it; it is a pointer for an operator, not a proof.
+            # so a later write can blur it; it is a pointer for an operator, not a proof. Vault
+            # BACKLOG #3113 item 9 is declined: the write's own verdict would need ``enable_totp``
+            # to return a reason on all three store backends.
             after = await self._load_user(identity.user_id)
             if after is None:
                 reason = "account_gone"
@@ -10154,7 +10183,7 @@ class AuthService:
             await self._audit(
                 "auth.mfa_enroll_refused",
                 actor=identity.username,
-                detail=_json({"reason": reason, "session_ended": True}),
+                detail=_json({"reason": reason, "session_ended": session_ended}),
                 client=client,
             )
             return Elevation(session_lost=True)
