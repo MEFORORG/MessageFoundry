@@ -379,6 +379,117 @@ async def test_postgres_post_commit_session_writes_wait_out_a_busy_pool(
     assert pool.statements and pool.statements[-1].startswith("UPDATE sessions")
 
 
+class _MssqlSessionCursor:
+    """The cursor the busy SQL Server pool's connection hands out: answers the session row read
+    with one live unsealed row and the re-key's ``OUTPUT`` with one row."""
+
+    def __init__(self, statements: list[str]) -> None:
+        self._statements = statements
+        self._last = ""
+        self.description: list[tuple[str]] = []
+
+    async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
+        self._statements.append(sql)
+        self._last = sql
+        if sql.startswith("SELECT * FROM sessions"):
+            self.description = [
+                (c,)
+                for c in (
+                    "token_hash",
+                    "user_id",
+                    "created_at",
+                    "expires_at",
+                    "last_used_at",
+                    "revoked_at",
+                    "client",
+                    "user_epoch",
+                    "seal",
+                )
+            ]
+
+    async def fetchall(self) -> list[Any]:
+        if self._last.startswith("SELECT * FROM sessions"):
+            return [("a" * 64, "u", 1.0, 9e9, 1.0, None, None, 0, "")]
+        if self._last.startswith("SELECT session_epoch"):
+            return [(0,)]
+        return [("b" * 64,), ("c" * 64,)]
+
+    async def close(self) -> None:
+        return None
+
+
+class _MssqlSessionConn(_Conn):
+    def __init__(self, statements: list[str]) -> None:
+        super().__init__("busy")
+        self._statements = statements
+
+    async def cursor(self) -> _MssqlSessionCursor:
+        return _MssqlSessionCursor(self._statements)
+
+    async def commit(self) -> None:
+        return None
+
+    async def rollback(self) -> None:
+        return None
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [("revoke_user_sessions", 2), ("rotate_session", True)],
+)
+async def test_sqlserver_post_commit_session_writes_wait_out_a_busy_pool(
+    name: str, expected: object
+) -> None:
+    """BACKLOG #3023: the SQL Server half of the Postgres test above. Both writes borrow through
+    ``_acquire_after_commit``, so a busy pool delays them rather than failing them after their
+    caller's change committed. The control proves the stand-in does time a bounded borrow out, and
+    the release proves the unbounded borrow still goes back to the pool."""
+    pool = _BusyPool()
+    pool.conn = _MssqlSessionConn(pool.statements)
+    store = _sqlserver_store(pool)
+    store._row_sealer = None  # keyless: the re-key rewrites the row with an empty seal
+    with pytest.raises(StoreAcquireTimeout):
+        async with store._acquire():
+            pytest.fail("the bounded borrow must time out on a busy pool")
+
+    async def bump(cur: Any, user_id: str) -> None:
+        # The sealed epoch write needs a users row this stand-in cannot serve; it runs live in CI.
+        pool.statements.append("raise the epoch")
+
+    store._bump_session_epoch = bump
+    calls = {
+        "revoke_user_sessions": lambda: store.revoke_user_sessions("u", now=1.0),
+        "rotate_session": lambda: store.rotate_session("a" * 64, new_token_hash="b" * 64),
+    }
+    task = asyncio.create_task(calls[name]())
+    await asyncio.sleep(FAST * 4)  # well past the acquire timeout
+    assert not task.done(), f"{name} gave up on a busy pool after its caller's write committed"
+    pool.gate.set()
+    assert await asyncio.wait_for(task, timeout=5) == expected
+    assert pool.statements and pool.statements[-1].startswith("UPDATE sessions")
+    assert pool.released == [pool.conn] and pool.checked_out == []
+    assert store._acquire_wait.summary().count == 1, "the post-commit wait left the histogram"
+
+
+async def test_sqlserver_post_commit_borrow_keeps_the_cancellation_quarantine() -> None:
+    """ADR 0159 on the unbounded borrow: a cancellation mid-body still quarantines the connection
+    before it is released, so it is never lent again with its transaction open."""
+    pool = _ReadyPool()
+    store = _sqlserver_store(pool)
+    order: list[str] = []
+
+    async def quarantine(conn: Any) -> None:
+        order.append(f"quarantine {pool.released!r}")
+
+    store._release_dirty = quarantine
+    with pytest.raises(asyncio.CancelledError):
+        async with store._acquire_after_commit() as conn:
+            assert conn is pool.conn
+            raise asyncio.CancelledError
+    assert order == ["quarantine []"], "the cancelled connection was released before quarantine"
+    assert pool.released == [pool.conn]
+
+
 async def test_sqlserver_store_releases_a_healthy_borrow() -> None:
     """Positive control for the acquire/release restructure: the connection still goes back."""
     pool = _ReadyPool()
@@ -451,10 +562,11 @@ def _unbounded_borrow_sites(relpath: str) -> list[str]:
 
 
 def test_sqlserver_acquire_really_is_the_sole_borrow_site() -> None:
-    """The SQL Server claim in docs/CONNECTIONS.md — "every store call is bounded" — rests on
-    ``_acquire`` being the ONLY place that borrows. Anything else touching ``self._pool`` must be
+    """The SQL Server claim in docs/CONNECTIONS.md rests on ``_borrow`` being the ONLY place that
+    borrows, through the bounded ``acquire_pooled``. Anything else touching ``self._pool`` must be
     lifecycle, metrics or the paired release; a new borrow added elsewhere would silently reopen
-    BACKLOG #1052 on that backend. Reports the offending LINES, not a count."""
+    BACKLOG #1052 on that backend. Reports the offending LINES, not a count. Which callers may
+    borrow without the bound is the next test's pin."""
     allowed = re.compile(r"self\._pool\.(close|wait_closed|maxsize|size|freesize|release)\b")
     src = (_REPO / "messagefoundry/store/sqlserver.py").read_text(encoding="utf-8")
     stray = [
@@ -536,6 +648,43 @@ def test_postgres_unbounded_post_commit_helper_has_exactly_its_two_callers() -> 
         "a new caller reached the unbounded post-commit borrow; give it the bounded `_execute`"
         " unless it too follows a committed write nothing retries, then update this pin"
     )
+
+
+def _sqlserver_functions_referencing(attr: str) -> list[str]:
+    """The methods of sqlserver.py that read ``attr`` or pass it as a keyword. Methods only: a
+    nested function would be counted under its enclosing method too."""
+    import ast
+
+    tree = ast.parse((_REPO / "messagefoundry/store/sqlserver.py").read_text(encoding="utf-8"))
+    return sorted(
+        {
+            fn.name
+            for cls in tree.body
+            if isinstance(cls, ast.ClassDef)
+            for fn in cls.body
+            if isinstance(fn, ast.AsyncFunctionDef | ast.FunctionDef)
+            for node in ast.walk(fn)
+            if (isinstance(node, ast.Attribute) and node.attr == attr)
+            or (isinstance(node, ast.keyword) and node.arg == attr)
+        }
+    )
+
+
+def test_sqlserver_unbounded_post_commit_borrow_has_exactly_its_two_writes() -> None:
+    """BACKLOG #3023: the SQL Server counterpart of the Postgres pin above. The unbounded borrow is
+    reached from ``revoke_user_sessions`` directly and from ``rotate_session`` through
+    ``_write_session_txn(after_commit=True)``, the only call passing that keyword; nothing else. ``_borrow`` with no limit is passed
+    only by ``_acquire_after_commit``. A third write moved onto it would pass every offline test,
+    so its callers are pinned by name."""
+    assert _sqlserver_functions_referencing("_acquire_after_commit") == [
+        "_write_session_txn",
+        "revoke_user_sessions",
+    ], (
+        "a new caller reached the SQL Server unbounded post-commit borrow; give it `_acquire` unless"
+        " it too follows a committed write nothing retries, then update this pin"
+    )
+    assert _sqlserver_functions_referencing("after_commit") == ["rotate_session"]
+    assert _sqlserver_functions_referencing("_borrow") == ["_acquire", "_acquire_after_commit"]
 
 
 # --- the setting -------------------------------------------------------------

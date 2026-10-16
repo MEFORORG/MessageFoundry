@@ -3745,8 +3745,12 @@ def _salvage_late_borrow(pool: Any, backend: str, borrow: asyncio.Future[Any]) -
 _LATE_RELEASES: set[asyncio.Future[None]] = set()
 
 
-async def acquire_pooled(pool: Any, *, timeout: float, backend: str) -> Any:
+async def acquire_pooled(pool: Any, *, timeout: float | None, backend: str) -> Any:
     """Borrow a pooled connection within ``timeout`` seconds, or raise :class:`StoreAcquireTimeout`.
+
+    ``timeout=None`` waits without a limit and never raises :class:`StoreAcquireTimeout`, for a
+    borrow that must not fail at the limit (BACKLOG #3023). It keeps the salvage on cancellation
+    described below.
 
     The single bounded chokepoint both server backends' ``_acquire`` helpers go through, so there is
     one place that decides what happens at the limit and the two cannot drift. The caller releases the

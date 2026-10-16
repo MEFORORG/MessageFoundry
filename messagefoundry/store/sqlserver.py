@@ -50,7 +50,12 @@ from collections.abc import (
     Sequence,
 )
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
+from contextlib import (
+    AbstractAsyncContextManager,
+    AsyncExitStack,
+    asynccontextmanager,
+    contextmanager,
+)
 from dataclasses import replace
 from functools import partial
 from time import perf_counter
@@ -4733,8 +4738,7 @@ class SqlServerStore:
 
     # --- helpers -------------------------------------------------------------
 
-    @asynccontextmanager
-    async def _acquire(self) -> AsyncIterator[Any]:
+    def _acquire(self) -> AbstractAsyncContextManager[Any]:
         """Acquire a pooled connection with the configured command (statement) timeout applied.
 
         ``[store].connect_timeout`` is only the *login* timeout, and it reaches the driver as
@@ -4760,12 +4764,41 @@ class SqlServerStore:
         transient stage failure. The ``async with pool.acquire()`` became an explicit
         acquire/release only because the bound has to sit between the two; aioodbc's context manager
         does nothing on exit but ``await pool.release(conn)`` (0.5.0 ``utils.py:86-103``), and the
-        ADR 0159 ordering below is preserved exactly — the quarantine still runs BEFORE the release,
-        which is what makes a poisoned connection unlendable."""
+        ADR 0159 ordering in :meth:`_borrow` is preserved exactly — the quarantine still runs BEFORE
+        the release, which is what makes a poisoned connection unlendable.
+
+        **One exception to the bound, on purpose:** :meth:`_acquire_after_commit` (BACKLOG #3023)."""
+        return self._borrow(self._settings.acquire_timeout)
+
+    def _acquire_after_commit(self) -> AbstractAsyncContextManager[Any]:
+        """:meth:`_acquire` with NO acquire limit, for a session write that FOLLOWS a write its caller
+        has already committed (BACKLOG #3023). Everything else :meth:`_acquire` does is kept: the
+        call gate, the command timeout, the ADR 0159 quarantine before the release, and the
+        acquire-wait histogram.
+
+        ``rotate_session`` and ``revoke_user_sessions`` finish what an auth change started: a reset
+        password, a disabled account, a changed role, a completed factor ceremony. By the time they
+        run, that change is committed. Under ``[store].acquire_timeout`` a saturated pool would make
+        them raise after it, and nothing retries them: a reset password would leave every other
+        session live with no audit row, and a factor ceremony would leave the old token elevated and
+        unrotated. Waiting for a connection finishes the write once the pool frees. This is the
+        Postgres store's ``_after_commit_txn`` choice (BACKLOG #2283), brought to SQL Server.
+
+        Waiting finishes the write only for a pool shortage. ``[store].command_timeout`` still bounds
+        the statement, and a lost connection still fails it. The same callers make other bounded
+        writes after their change commits, such as stamps and audit rows, and those can still fail at
+        the limit. Callers with no earlier write, such as "sign out everywhere else", wait the same
+        way, as on Postgres. The wait holds whatever lock its caller holds, such as a ceremony's
+        per-account lock, until the pool frees. ``tests/test_store_pool_acquire_timeout.py`` pins
+        which methods reach this borrow."""
+        return self._borrow(None)
+
+    @asynccontextmanager
+    async def _borrow(self, timeout: float | None) -> AsyncIterator[Any]:
+        """The body of :meth:`_acquire` and :meth:`_acquire_after_commit`, and the sole place this
+        store borrows from its pool. ``timeout`` is the acquire limit; ``None`` waits without one."""
         t0 = perf_counter()
-        conn = await acquire_pooled(
-            self._pool, timeout=self._settings.acquire_timeout, backend="sqlserver"
-        )
+        conn = await acquire_pooled(self._pool, timeout=timeout, backend="sqlserver")
         self._acquire_wait.record((perf_counter() - t0) * 1000.0)
         try:
             _install_call_gate(conn)  # BACKLOG #2049: one pyodbc call at a time on this connection
@@ -13974,10 +14007,17 @@ class SqlServerStore:
         return updated if written else None
 
     async def _write_session_txn(
-        self, token_hash: str, change: Callable[[SessionRecord], SessionRecord]
+        self,
+        token_hash: str,
+        change: Callable[[SessionRecord], SessionRecord],
+        *,
+        after_commit: bool = False,
     ) -> SessionRecord | None:
-        """:meth:`_write_session` in a transaction of its own, committed before it returns."""
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        """:meth:`_write_session` in a transaction of its own, committed before it returns.
+        ``after_commit`` borrows through :meth:`_acquire_after_commit`; only ``rotate_session``
+        passes it."""
+        borrow = self._acquire_after_commit() if after_commit else self._acquire()
+        async with borrow as conn, self._cursor(conn) as cur:
             try:
                 updated = await self._write_session(cur, token_hash, change)
                 await self._commit(conn)
@@ -14041,9 +14081,10 @@ class SqlServerStore:
         The token hash is sealed, so the re-key goes through :meth:`_write_session` (BACKLOG
         #2592), whose write reads an ``OUTPUT`` rowset and never ``cursor.rowcount`` (BACKLOG
         #2283). ``token_hash`` is ``NVARCHAR(64)`` and a hex digest is exactly 64 chars, so the
-        clustered-PK row move is width-safe."""
+        clustered-PK row move is width-safe. The borrow is :meth:`_acquire_after_commit`'s, for the
+        reason it gives (BACKLOG #3023)."""
         rotated = await self._write_session_txn(
-            token_hash, lambda s: replace(s, token_hash=new_token_hash)
+            token_hash, lambda s: replace(s, token_hash=new_token_hash), after_commit=True
         )
         return rotated is not None
 
@@ -14078,9 +14119,10 @@ class SqlServerStore:
         Raises the account's session epoch and re-seals the kept session in the same transaction
         (BACKLOG #2592); store.py's ``MessageStore.revoke_user_sessions`` says why. The epoch bump
         runs first, so it takes the account row's lock before any session row, the order
-        ``create_session`` takes them in."""
+        ``create_session`` takes them in. The borrow is :meth:`_acquire_after_commit`'s, for the
+        reason it gives (BACKLOG #3023)."""
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        async with self._acquire_after_commit() as conn, self._cursor(conn) as cur:
             try:
                 await self._bump_session_epoch(cur, user_id)
                 if except_token_hash is None:
