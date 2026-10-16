@@ -183,6 +183,14 @@ class TrustAnchorError(Exception):
     trusting it."""
 
 
+class AnchorStoreUnavailable(Exception):
+    """The store refused an audit read or write that a trust-anchor check needs (BACKLOG #3091).
+
+    It is **not** a :class:`TrustAnchorError`: nothing is known to be wrong with the anchor, so a
+    reload it stops audits ``reason="store_unavailable"``, not ``trust_anchor``. Its ``__cause__``
+    is the backend's own exception; this is the one class a caller can catch."""
+
+
 @dataclass(frozen=True)
 class AnchorSpec:
     """One operator-supplied trust anchor to preflight.
@@ -1277,12 +1285,15 @@ def inbound_ca_cadata(name: str, settings: Mapping[str, Any], *, enforcing: bool
         raise _unreadable_anchor(spec, exc) from exc
 
 
-def _unreadable_anchor(spec: AnchorSpec, exc: OSError) -> TrustAnchorError:
+def _unreadable_anchor(spec: AnchorSpec, exc: OSError | ValueError) -> TrustAnchorError:
     """The refusal for an anchor file that cannot be read. It names the setting, and so the
-    connection, which the bare ``OSError`` does not. The caller raises it ``from exc``."""
-    return TrustAnchorError(
-        f"{spec.setting}: could not read the trust anchor {spec.path!r}: {exc.strerror or exc}"
-    )
+    connection, which the bare ``OSError`` does not. The caller raises it ``from exc``.
+
+    A ``ValueError`` is a path the OS cannot take, such as one with a NUL in it or one that is not
+    UTF-8. :func:`codec_safe_str` renders it, so a codec error's own text names the byte and not
+    the input (vault BACKLOG #3295)."""
+    why = exc.strerror if isinstance(exc, OSError) and exc.strerror else codec_safe_str(exc)
+    return TrustAnchorError(f"{spec.setting}: could not read the trust anchor {spec.path!r}: {why}")
 
 
 def connection_anchor_specs(
@@ -1484,7 +1495,10 @@ async def _last_fingerprint(store: Store, label: str) -> str | None:
     before, inclusively, so a row at that instant is read twice and never skipped."""
     until: float | None = None
     for _page in range(_FINGERPRINT_PAGES):
-        rows = await store.list_audit(action=AUDIT_ACTION, limit=_FINGERPRINT_PAGE, until=until)
+        try:
+            rows = await store.list_audit(action=AUDIT_ACTION, limit=_FINGERPRINT_PAGE, until=until)
+        except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
+            raise _store_unavailable(label, "read", exc) from exc
         for row in rows:
             detail_raw = row["detail"]
             if not detail_raw:
@@ -1507,7 +1521,20 @@ async def _last_fingerprint(store: Store, label: str) -> str | None:
 
 async def _record(store: Store, spec: AnchorSpec, event: str, **extra: object) -> None:
     detail = {"label": spec.label, "setting": spec.setting, "event": event, **extra}
-    await store.record_audit(AUDIT_ACTION, actor=None, detail=json.dumps(detail))
+    try:
+        await store.record_audit(AUDIT_ACTION, actor=None, detail=json.dumps(detail))
+    except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
+        raise _store_unavailable(spec.label, "write", exc) from exc
+
+
+def _store_unavailable(label: str, what: str, exc: Exception) -> AnchorStoreUnavailable:
+    """The fault for a store call the check of ``label`` needed. It names the backend's exception
+    type and not its text, which can carry a connection string or a statement. The caller raises it
+    ``from exc``, which keeps the store's own exception as its cause."""
+    return AnchorStoreUnavailable(
+        f"the store refused the trust-anchor audit {what} for {label!r} ({type(exc).__name__}); "
+        "the anchor itself was not judged"
+    )
 
 
 async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> str:
@@ -1529,14 +1556,23 @@ async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> 
 
     An anchor whose consumer reads ``cafile=`` (``loads_verified_bytes`` False, the outbound CAs,
     vault BACKLOG #2371) skips the shape check. ``cafile=`` loads a ``TRUSTED CERTIFICATE`` block,
-    for one, so refusing it here would refuse what the build accepts."""
-    verdict = await asyncio.to_thread(evaluate_anchor, spec)
+    for one, so refusing it here would refuse what the build accepts.
+
+    **Only the file read and the PEM load become an anchor refusal** (BACKLOG #3091). An
+    ``OSError`` or a ``ValueError`` from them, such as a missing file or a NUL in the path, is raised as a
+    :class:`TrustAnchorError` that names the setting (:func:`_unreadable_anchor`). A store call that
+    fails raises :class:`AnchorStoreUnavailable` instead, so a store fault no longer reads as a
+    refused anchor."""
     shape_error: TrustAnchorError | None = None
-    if verdict.pin_ok is not False and spec.loads_verified_bytes:
-        try:
-            await asyncio.to_thread(anchor_cadata, verdict.data, spec)
-        except TrustAnchorError as exc:
-            shape_error = exc
+    try:
+        verdict = await asyncio.to_thread(evaluate_anchor, spec)
+        if verdict.pin_ok is not False and spec.loads_verified_bytes:
+            try:
+                await asyncio.to_thread(anchor_cadata, verdict.data, spec)
+            except TrustAnchorError as exc:
+                shape_error = exc
+    except (OSError, ValueError) as exc:
+        raise _unreadable_anchor(spec, exc) from exc
     # The item 6 escape, the one `_enforce_verdict` grants: a matching pin over the bytes loaded.
     pin_escapes = verdict.pin_ok is True and spec.loads_verified_bytes
     previous = await _last_fingerprint(store, spec.label)
@@ -1645,7 +1681,10 @@ def make_settings_anchor_preflight(
     row. A refusal is re-raised as ``WiringError`` caused by a :class:`TrustAnchorError`, so the reload
     route answers 422 and audits ``reason="trust_anchor"``, as it did when it ran this itself. An
     unreadable anchor (``OSError``, or ``ValueError`` from a NUL in its path) counts as a refused
-    anchor, as it did there.
+    anchor, as it did there, and its text names the setting (BACKLOG #3105, item 6). A store that
+    refuses the audit read or write is not a refused anchor (BACKLOG #3091): it is re-raised as
+    ``WiringError`` caused by :class:`AnchorStoreUnavailable` (:func:`anchor_store_refusal`), which
+    the route audits as ``reason="store_unavailable"``.
 
     **A reload that passes does not apply a changed anchor** (BACKLOG #2185). No reload rebuilds the
     consumers that loaded these files, so each keeps the bytes it read at start. When this
@@ -1661,41 +1700,45 @@ def make_settings_anchor_preflight(
 
     async def preflight() -> None:
         try:
+            # An unreadable anchor arrives as a TrustAnchorError naming its setting (_preflight_one).
             seen = await run_anchor_preflight(frozen, store, enforcing=enforcing)
+            await _report_restart_required(frozen, store, seen=seen)
         except TrustAnchorError as exc:
             raise WiringError(f"a settings trust anchor was refused: {exc}") from exc
-        except (OSError, ValueError) as exc:
-            # An unreadable anchor is a refused anchor, as it was when the reload route ran this.
-            # codec_safe_str: a file that is not UTF-8 arrives here as a ValueError too, and its
-            # own text names the byte (vault BACKLOG #3295).
-            unreadable = TrustAnchorError(
-                f"a trust anchor could not be read: {codec_safe_str(exc)}"
-            )
-            unreadable.__cause__ = exc
-            raise WiringError(f"a settings trust anchor was refused: {unreadable}") from unreadable
-        await _report_restart_required(frozen, store, seen=seen)
+        except AnchorStoreUnavailable as exc:
+            error = anchor_store_refusal(exc)
+            raise error from exc
 
     return preflight
 
 
-async def _preflight_connection(store: Store, spec: AnchorSpec, *, enforcing: bool) -> None:
-    """:func:`_preflight_one` for a connection's CA, with an unreadable file refused by name."""
-    try:
-        await _preflight_one(store, spec, enforcing=enforcing)
-    except OSError as exc:
-        raise _unreadable_anchor(spec, exc) from exc
+def anchor_store_refusal(exc: AnchorStoreUnavailable) -> WiringError:
+    """A trust-anchor check the store stopped, as the ``WiringError`` a reload refuses with
+    (BACKLOG #3091). Its cause is ``exc``, so the reload routes audit
+    ``reason="store_unavailable"`` rather than ``trust_anchor``. Raise it ``from exc``. The
+    settings preflight calls it; the connection checks reach it through
+    :func:`refused_connection_anchor`."""
+    from messagefoundry.config.wiring import WiringError
+
+    error = WiringError(f"a trust anchor could not be checked: {exc}")
+    error.__cause__ = exc
+    return error
 
 
 def refused_connection_anchor(exc: Exception) -> WiringError:
     """A connection CA refusal as the ``WiringError`` a reload answers with 422 (BACKLOG #2183).
 
     Its cause is always a :class:`TrustAnchorError`, so the reload routes audit
-    ``reason="trust_anchor"``. Any other exception, such as an ``OSError`` or a ``ValueError`` for a
-    blank ``tls_ca_pin`` or an ``env()`` path with a NUL in it, is wrapped in one first, keeping its
-    text. Raise it ``from`` its own ``__cause__``, which keeps that chain. Shared by the registry preflight and the
-    runner's reload check of the lane CAs (vault BACKLOG #2371)."""
+    ``reason="trust_anchor"``. Any other exception, such as a ``ValueError`` for a blank
+    ``tls_ca_pin``, is wrapped in one first, keeping its text. The one exception is
+    :class:`AnchorStoreUnavailable`, which is not a refusal: it is answered by
+    :func:`anchor_store_refusal`, so the routes audit ``reason="store_unavailable"`` (BACKLOG
+    #3091). Raise it ``from`` its own ``__cause__``, which keeps that chain. Shared by the registry
+    preflight and the runner's reload check of the lane CAs (vault BACKLOG #2371)."""
     from messagefoundry.config.wiring import WiringError
 
+    if isinstance(exc, AnchorStoreUnavailable):
+        return anchor_store_refusal(exc)
     refused = exc if isinstance(exc, TrustAnchorError) else TrustAnchorError(str(exc))
     if refused is not exc:
         refused.__cause__ = exc
@@ -1721,9 +1764,10 @@ def make_registry_anchor_preflight(store: Store, *, enforcing: bool) -> Registry
     ) -> None:
         try:
             # Inside the try: a blank tls_ca_pin raises ValueError while the specs are collected.
+            # An unreadable CA arrives as a TrustAnchorError naming its setting (_preflight_one).
             for spec in registry_anchor_specs(registry, env_values, lanes=lanes):
-                await _preflight_connection(store, spec, enforcing=enforcing)
-        except (TrustAnchorError, OSError, ValueError) as exc:
+                await _preflight_one(store, spec, enforcing=enforcing)
+        except (TrustAnchorError, AnchorStoreUnavailable, ValueError) as exc:
             error = refused_connection_anchor(exc)
             raise error from error.__cause__
 
@@ -1752,7 +1796,9 @@ def make_lane_anchor_check(store: Store, *, enforcing: bool) -> LaneAnchorCheck:
 
     It raises :class:`TrustAnchorError` for a refused or unreadable file, and ``ValueError`` for a
     blank or unread ``tls_ca_pin``. Each names the connection. A lane with no CA it reads is a
-    no-op: no store call, no audit row.
+    no-op: no store call, no audit row. A store that refuses the audit read or write raises
+    :class:`AnchorStoreUnavailable`, which is not a refusal and is not remembered below, so the
+    next check reads the file again (BACKLOG #3091).
 
     **A repeat of the last refusal writes no rows.** A scheduled poller retries its bind at every
     window tick, and each audited refusal would add rows. Enough of them would push a quiet
@@ -1779,7 +1825,7 @@ def make_lane_anchor_check(store: Store, *, enforcing: bool) -> LaneAnchorCheck:
             refused[spec.label] = prior
             raise TrustAnchorError(prior[1])
         try:
-            await _preflight_connection(store, spec, enforcing=enforcing)
+            await _preflight_one(store, spec, enforcing=enforcing)
         except TrustAnchorError as exc:
             refused[spec.label] = (now, str(exc))
             raise

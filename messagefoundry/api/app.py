@@ -286,6 +286,7 @@ from messagefoundry.auth.service import (
 )
 from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
+    AnchorStoreUnavailable,
     TrustAnchorError,
     make_lane_anchor_check,
     make_registry_anchor_preflight,
@@ -1712,7 +1713,9 @@ async def _audit_refused_reload(
     with reason ``not_found`` and answers 404. A bad graph writes ``config_reload_failed`` and
     answers 422; its reason is ``trust_anchor`` when a trust anchor refused it inside the engine,
     an inbound connection's CA (BACKLOG #1142) or a settings anchor (BACKLOG #2034), so one audit
-    filter sees both, and ``invalid_config`` otherwise. A released reload whose config is not the
+    filter sees both, and ``invalid_config`` otherwise. A trust-anchor check the store stopped, by
+    refusing its audit read or write, writes reason ``store_unavailable`` and answers 503 (BACKLOG
+    #3091); it is neither a refused anchor nor a bad graph. A released reload whose config is not the
     one its approval named writes ``config_reload_failed`` with reason ``digest_mismatch``, or
     ``no_approved_digest`` when the hold took none, with both digests, and answers 422 (vault
     BACKLOG #2596); only the executor meets it. One whose digest could not be taken now writes
@@ -1785,6 +1788,16 @@ async def _audit_refused_reload(
             else "the engine could not read the config to check it against this request's "
             "approval; see the engine log"
         )
+    elif isinstance(exc.__cause__, AnchorStoreUnavailable):
+        # BACKLOG #3091: the store refused a trust-anchor check's audit read or write. Nothing is
+        # known to be wrong with the anchor or the config, so neither of the reasons below fits.
+        _log.warning(
+            "config reload failed (store unavailable): %s",
+            scrub_log_argument(safe_exc(exc, limit=_REFUSAL_LOG_LIMIT)),
+        )
+        action, detail["reason"] = "config_reload_failed", "store_unavailable"
+        status = 503
+        answer = "the engine could not reach its store to check a trust anchor; see the engine log"
     else:
         anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
         _log.warning(

@@ -40,6 +40,7 @@ from typing import Any, Literal, NamedTuple, Protocol, cast
 
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.auth.trust_anchors import (
+    AnchorStoreUnavailable,
     LaneAnchorCheck,
     TrustAnchorError,
     refused_connection_anchor,
@@ -3834,7 +3835,8 @@ class RegistryRunner:
         for direction, name, settings in self._reload_anchor_lanes(old, new, old_inbound_names):
             try:
                 await self._check_lane_anchor(direction, name, settings, fails_lane=False)
-            except (TrustAnchorError, ValueError) as exc:
+            except (TrustAnchorError, AnchorStoreUnavailable, ValueError) as exc:
+                # A store fault is not a refused CA; the helper answers it apart (BACKLOG #3091).
                 error = refused_connection_anchor(exc)
                 raise error from error.__cause__
             passed.append((direction, name))
