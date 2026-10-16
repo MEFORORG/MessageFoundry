@@ -4087,7 +4087,10 @@ revocations exceed **both** its floor and its fraction of the judged probes. Whe
 principals hold a directory scope, the pass stays under the fraction and revokes them all. Their next
 logins would read the same empty groups and withdraw the scope anyway. Revocations audit `auth.ad_session_revoked` and
 raise the `ad_session_revoked` alert, one per revoked principal, once the pass completes. A pass that
-fails part-way keeps the audit rows for what it already revoked, but raises no alert for them.
+fails part-way keeps the audit rows for what it already revoked, but raises no alert for them. A
+refused audit write does not end the pass (BACKLOG #3018): the reconciler logs it at ERROR, naming the
+action and the account, and the alert and the user's notice still go. The ERROR line is then the only
+record of that row, and nothing writes it later.
 
 **The probe is keyed on the directory's immutable `objectGUID`**, the same identifier a directory login
 is identified by, and a renamed account's stored username is refreshed from the directory on the same

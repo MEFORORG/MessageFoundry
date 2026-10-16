@@ -29,6 +29,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+from messagefoundry.api.app import _alert_reconcile_plan
 from messagefoundry.auth import channel_scope, reconcile
 from messagefoundry.auth.identity import SessionMechanism
 from messagefoundry.auth.ldap import (
@@ -56,6 +57,7 @@ from messagefoundry.store.store import (
     UserRecord,
 )
 from tests._admin_account import create_local_user_chosen
+from tests.test_approval_requester_recheck import _Sink
 
 PW = "Sup3rSecret!!"
 
@@ -3530,5 +3532,199 @@ async def test_an_undecided_whole_account_reason_falls_to_the_neutral_notice() -
         )
         assert await service._apply_reconcile_revocation(revocation)
         assert [e.event_type for e in notifier.sent] == [DIRECTORY_SESSIONS_ENDED]
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #3018: a refused audit write inside one account's apply does not end the pass ----------
+
+
+def _refuse_first(
+    monkeypatch: pytest.MonkeyPatch, store: MessageStore, action: str, refusal: Exception
+) -> list[str]:
+    """Make the store refuse the first ``action`` row it sees. Returns the refused row's actor,
+    once there is one, so a test can tell which account lost its row."""
+    real_record = store.record_audit
+    refused: list[str] = []
+
+    async def failing(name: str, **kwargs: Any) -> None:
+        if name == action and not refused:
+            refused.append(kwargs["actor"])
+            raise refusal
+        await real_record(name, **kwargs)
+
+    monkeypatch.setattr(store, "record_audit", failing)
+    return refused
+
+
+def _logged_at_error(caplog: pytest.LogCaptureFixture, *needles: str) -> bool:
+    return any(
+        r.levelno == logging.ERROR and all(n in r.getMessage() for n in needles)
+        for r in caplog.records
+    )
+
+
+async def _actors(store: MessageStore, action: str) -> list[str]:
+    return sorted(a["actor"] for a in await store.list_audit() if a["action"] == action)
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [sqlite3.OperationalError("synthetic: disk I/O error"), CipherError("synthetic: Transit down")],
+    ids=["driver", "transit-mac"],
+)
+async def test_a_refused_revocation_audit_row_still_ends_the_sessions_and_tells_everyone(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, refusal: Exception
+) -> None:
+    """BACKLOG #3018 steps 1, 3, 5 and 6. The store refuses the FIRST account's
+    ``auth.ad_session_revoked`` row. Its sessions still end, its user is still told, the pass goes
+    on to the second account, and the returned plan still carries both, so the lifespan task still
+    raises both alerts. The refusal is logged at ERROR naming the action and the account. Before
+    #3018 the refusal raised out of the pass, after the sessions were already gone."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap({"jdoe": _principal("jdoe"), "asmith": _principal("asmith")})
+        settings = _ad_settings(ad_session_recheck_strikes=1)
+        service = AuthService(store, settings, ldap=ldap)  # type: ignore[arg-type]
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        await service.initialize()
+        tokens = [await _signed_in_ad_user(service, store, n) for n in ("jdoe", "asmith")]
+        notifier.sent.clear()
+        refused = _refuse_first(monkeypatch, store, "auth.ad_session_revoked", refusal)
+        ldap.present.clear()  # both accounts leave the directory
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
+            plan = await service.reconcile_directory_sessions()
+        assert len(refused) == 1, "no revocation audit write was refused"
+        assert plan.aborted is None
+        assert sorted(r.username for r in plan.revocations) == ["asmith", "jdoe"]
+        for token in tokens:
+            assert token is not None and await service.identity_for_token(token) is None
+        rows = await _actors(store, "auth.ad_session_revoked")
+        assert rows == sorted({"asmith", "jdoe"} - set(refused)), "the pass stopped at the refusal"
+        assert sorted(e.username for e in notifier.sent) == ["asmith", "jdoe"], (
+            "the refused account's user was not told"
+        )
+        assert _logged_at_error(caplog, "auth.ad_session_revoked", refused[0]), (
+            "the refused write was not logged at ERROR naming the action and the account"
+        )
+        sink = _Sink()
+        _alert_reconcile_plan(plan, service, sink)
+        revoked = sorted(e[1] for e in sink.events if e[0] == "ad_session_revoked")
+        assert revoked == ["asmith", "jdoe"]
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("defect", [NotImplementedError, RecursionError, sqlite3.ProgrammingError])
+async def test_a_defect_in_a_revocation_audit_write_is_still_raised(
+    monkeypatch: pytest.MonkeyPatch, defect: type[Exception]
+) -> None:
+    """BACKLOG #3018. The soft write passes a store refusal and nothing else: a defect in the code
+    still ends the pass, as it does for the pass's own rows (BACKLOG #2137)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap({"jdoe": _principal("jdoe")})
+        settings = _ad_settings(ad_session_recheck_strikes=1)
+        service = AuthService(store, settings, ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        await _signed_in_ad_user(service, store, "jdoe")
+        refused = _refuse_first(monkeypatch, store, "auth.ad_session_revoked", defect("synthetic"))
+        ldap.present.clear()
+        with pytest.raises(defect):
+            await service.reconcile_directory_sessions()
+        assert refused == ["jdoe"]
+    finally:
+        await store.close()
+
+
+async def test_a_refused_rename_audit_row_does_not_stop_the_next_rename(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3018 steps 1 and 3, for ``_refresh_cached_username`` on the reconciler. The store
+    refuses the first rename's ``auth.ad_username_refreshed`` row. That rename has already
+    committed and its user is still told; the second rename is still applied and audited, and the
+    pass returns its plan. No later pass writes the missing row: that is the item's step 7."""
+    store = await MessageStore.open(":memory:")
+    try:
+        names = ("jdoe", "asmith")
+        ldap = _FakeLdap({n: _principal(n) for n in names})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        await service.initialize()
+        for name in names:
+            await _signed_in_ad_user(service, store, name)
+        notifier.sent.clear()
+        refusal = sqlite3.OperationalError("synthetic: disk I/O error")
+        refused = _refuse_first(monkeypatch, store, "auth.ad_username_refreshed", refusal)
+        ldap.present = {
+            f"{n}-new": _principal(f"{n}-new", object_id=_object_id_for(n)) for n in names
+        }
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
+            plan = await service.reconcile_directory_sessions()
+        assert len(refused) == 1, "no rename audit write was refused"
+        assert plan.aborted is None and len(plan.renames) == 2
+        for name in names:
+            assert await store.get_user_by_username(f"{name}-new") is not None, (
+                "a rename was skipped"
+            )
+        rows = await _actors(store, "auth.ad_username_refreshed")
+        assert rows == sorted({"jdoe-new", "asmith-new"} - set(refused))
+        told = sorted(e.username for e in notifier.sent if e.event_type == USERNAME_CHANGED)
+        assert told == ["asmith-new", "jdoe-new"], "the refused rename's user was not told"
+        assert _logged_at_error(caplog, "auth.ad_username_refreshed", refused[0])
+    finally:
+        await store.close()
+
+
+async def test_a_refused_rename_conflict_audit_row_does_not_end_the_pass(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3018, the third bare write: ``auth.ad_username_refresh_conflict`` in the nested
+    refusal helper. Refused on the reconciler, it is logged at ERROR, the lockout warning still
+    reaches the log, and the pass returns its plan."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap({"jdoe": _principal("jdoe")})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        await _signed_in_ad_user(service, store, "jdoe")
+        await store.create_user(
+            user_id="departed-row", username="jbloggs", auth_provider="ad", password_generated=False
+        )
+        refusal = sqlite3.OperationalError("synthetic: disk I/O error")
+        refused = _refuse_first(monkeypatch, store, "auth.ad_username_refresh_conflict", refusal)
+        ldap.present = {"jbloggs": _principal("jbloggs", object_id=_object_id_for("jdoe"))}
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            plan = await service.reconcile_directory_sessions()
+        assert refused == ["jdoe"], "the conflict audit write was not refused"
+        assert plan.aborted is None
+        assert _logged_at_error(caplog, "auth.ad_username_refresh_conflict", "jdoe")
+        assert any("already held by another account" in r.getMessage() for r in caplog.records)
+    finally:
+        await store.close()
+
+
+async def test_the_login_path_rename_still_fails_on_a_refused_audit_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3018 leaves sign-in alone: only the reconciler passes ``audit_soft``. Called the way
+    the login path calls it, a refused ``auth.ad_username_refreshed`` write still raises."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap({"jdoe": _principal("jdoe")})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        await _signed_in_ad_user(service, store, "jdoe")
+        jdoe = await store.get_user_by_username("jdoe")
+        assert jdoe is not None
+        refusal = sqlite3.OperationalError("synthetic: disk I/O error")
+        refused = _refuse_first(monkeypatch, store, "auth.ad_username_refreshed", refusal)
+        with pytest.raises(sqlite3.OperationalError):
+            await service._refresh_cached_username(
+                user_id=jdoe.id, old_username="jdoe", new_username="jdoe-new", held=None
+            )
+        assert refused == ["jdoe-new"]
     finally:
         await store.close()

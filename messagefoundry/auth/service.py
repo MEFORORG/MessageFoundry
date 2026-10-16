@@ -6511,6 +6511,8 @@ class AuthService:
                 old_username=refresh.old_username,
                 new_username=refresh.new_username,
                 held=await self._load_user_by_username(refresh.new_username),
+                # BACKLOG #3018: a refused audit write here must not skip the renames after it.
+                audit_soft=True,
             )
         # BACKLOG #2538. After the revocations, like the hold below: the referred accounts were left
         # unjudged, and every other account's revocation above has already been applied.
@@ -6777,8 +6779,13 @@ class AuthService:
         new_username: str,
         held: UserRecord | None,
         client: str | None = None,
+        audit_soft: bool = False,
     ) -> None:
         """Copy a directory-reported rename down onto a row's cached ``username`` (BACKLOG #1532).
+
+        ``audit_soft`` is passed by the reconciler alone (BACKLOG #3018), so its audit writes go
+        through :meth:`_audit_reconciler_row`. The login path leaves it off, so there a refused
+        write still fails the sign-in, as it always has.
 
         **ONE implementation for two callers, deliberately.** The login path
         (:meth:`_upsert_ad_user`) and the ADR 0079 reconciler pass both reach a renamed account and
@@ -6817,6 +6824,8 @@ class AuthService:
         id and its current session, but its next sign-in is refused with ``directory_identity_conflict``
         until an operator removes the row holding the name. See the comment on that branch.
         """
+
+        write_audit = self._audit_reconciler_row if audit_soft else self._audit
 
         async def _refuse(held_by: str | None, detected: str, holds: str) -> None:
             # A DIFFERENT ROW ALREADY HOLDS THE NAME. Two accounts cannot share one; refusing the
@@ -6859,7 +6868,7 @@ class AuthService:
             # ``old_username`` (BACKLOG #2291). The reconciler captured that at plan time, and a
             # sign-in may have renamed the row since, so it can name an account that no longer
             # exists. The audit actor and the warning both use the name an operator would find.
-            await self._audit(
+            await write_audit(
                 "auth.ad_username_refresh_conflict",
                 actor=holds,
                 detail=_json(
@@ -7032,7 +7041,7 @@ class AuthService:
                     scrub_log_argument(after.username),
                 )
             return
-        await self._audit(
+        await write_audit(
             "auth.ad_username_refreshed",
             actor=new_username,
             detail=_json({"user_id": user_id, "source": "directory"}),
@@ -7292,26 +7301,36 @@ class AuthService:
             ),
         )
 
-    async def _audit_reconciler_row(self, action: str, *, detail: str) -> bool:
-        """Write one of the reconcile pass's own rows, and say whether it was written.
+    async def _audit_reconciler_row(
+        self,
+        action: str,
+        *,
+        detail: str,
+        actor: str = "<reconciler>",
+        client: str | None = None,
+    ) -> bool:
+        """Write one of the reconcile pass's rows, and say whether it was written.
 
         BACKLOG #2137. These rows are the held row, the breaker's aborted row, the outage's skipped
-        row, the referral's row (BACKLOG #2538) and the unkeyed-binding report. Each is written
-        after the pass's revocations, or on a pass that applies none. **A failed write here does
-        not end the pass.** If it raised, the pass would return no plan, and the lifespan task
-        would raise no alert for the revocations already applied, nor for the hold, the breaker or
-        the referral. So a store refusal is logged at ERROR, naming the action, and the pass goes
-        on. The log line is then the only record of that row. A per-revocation audit write is not routed through here: that one
-        still raises.
+        row, the referral's row (BACKLOG #2538) and the unkeyed-binding report. Since BACKLOG #3018
+        they also include each account's ``auth.ad_session_revoked`` row and, on the reconciler's
+        call only, a rename's ``auth.ad_username_refreshed`` and
+        ``auth.ad_username_refresh_conflict`` rows; those name the account as ``actor``. **A failed
+        write here does not end the pass.** If it raised, the pass would return no plan, and the
+        lifespan task would raise no alert for the revocations already applied, nor for the hold,
+        the breaker or the referral. It would also skip every account after this one. So a store
+        refusal is logged at ERROR, naming the action and the actor, and the pass goes on. The log
+        line is then the only record of that row: nothing retries it. A revocation or rename it
+        records has already committed; its notice still goes, and a revocation still alerts.
 
         A defect is raised, not passed over (:data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS`).
         """
         return await write_audit_soft(
-            lambda: self._audit(action, actor="<reconciler>", detail=detail),
+            lambda: self._audit(action, actor=actor, detail=detail, client=client),
             log=_log,
-            message="directory reconcile: the %s audit row could not be written; the pass goes on, "
-            "so its alerts still fire",
-            args=(action,),
+            message="directory reconcile: the %s audit row for %s could not be written; the pass "
+            "goes on, so its alerts still fire",
+            args=lambda: (action, scrub_log_argument(actor)),
             errors=_audit_write_errors(),
             defects=AUDIT_WRITE_DEFECTS,
         )
@@ -7350,7 +7369,9 @@ class AuthService:
                 user, before=user.role_ids, after=revocation.role_ids, via="ad-reconcile"
             )
         revoked = await self._store.revoke_user_sessions(revocation.user_id)
-        await self._audit(
+        # Soft (BACKLOG #3018): the writes above are already applied, so a raise would only cost
+        # the notice below, the later accounts and the alerts. See `_audit_reconciler_row`.
+        await self._audit_reconciler_row(
             "auth.ad_session_revoked",
             actor=revocation.username,
             detail=_json(

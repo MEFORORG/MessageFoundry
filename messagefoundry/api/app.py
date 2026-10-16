@@ -9477,9 +9477,11 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
 
     Reads the RETURNED plan, so it sees only a pass that finished. A failed write of the pass's own
     held, aborted, skipped, referred or unkeyed-binding row no longer ends the pass (BACKLOG #2137):
-    the service logs it at ERROR and returns the plan, so these alerts still fire. A pass that raised
-    part-way for another reason, such as inside one revocation, has already audited the revocations
-    it applied before that point; those rows stand, and no alert is raised for them.
+    the service logs it at ERROR and returns the plan, so these alerts still fire. Since BACKLOG
+    #3018 the same holds for a revocation's own ``auth.ad_session_revoked`` row and a rename's rows:
+    a refused write is logged and the revocation still alerts. A pass that raised part-way for
+    another reason, such as a store fault ending one account's sessions, has already audited the
+    revocations it applied before that point; those rows stand, and no alert is raised for them.
 
     Each standing alert also gets its inverse, which pages nobody and resolves the open instance
     (BACKLOG #2136): ``ad_reconcile_breaker_cleared`` and ``ad_reconcile_hold_released``, and
