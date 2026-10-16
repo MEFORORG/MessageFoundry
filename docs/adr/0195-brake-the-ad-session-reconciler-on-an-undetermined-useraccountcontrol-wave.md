@@ -225,6 +225,8 @@ at one.
    is pruned to live candidates the same way, and a restart resets it. `prune_ledger` cannot hold an
    enum as it stands, since its type bound and its value-sorted cap expect numbers. So the build
    either widens that helper or carries the outcome in the strike ledger's value.
+   *Note 2026-10-16 (BACKLOG #3057): this record, the strike counts and rule item 6's latch stay in
+   process memory, by decision. What a restart then does is in the note under rule item 6.*
 4. **What updates the record.** This pass's outcomes are written in BEFORE the hold is judged. A
    `PRESENT`, `DISABLED`, `ABSENT` or `UNDETERMINED` probe replaces the account's entry. An
    `UNAVAILABLE` probe leaves the prior entry in place, so a directory blip on one held account does
@@ -238,6 +240,44 @@ at one.
    engaged, it releases only when `u == 0`. Without that, attrition would defeat it: as a partial
    wave's sessions expire, the last held account would read as a single and be revoked. The rule
    applies at any estate size, with no floor.
+
+   **Note 2026-10-16 (BACKLOG #3057): a restart, in both directions.** A Manager decision, upheld
+   by adversarial review, not an owner ruling. The latch (`_reconcile_hold_latched`), the strike
+   counts (`_reconcile_strikes`) and rule item 3's outcome record (`_reconcile_outcomes`) stay
+   plain attributes of the service object, so a restart empties all three. They are not moved to
+   the store, and the latch is not rebuilt at start from an `ad_reconcile_held` alert instance an
+   earlier run left open. The reasons:
+
+   - This rule is an availability brake. It exists so that a lost read right does not sign out an
+     estate, and a restart that releases one account does not undo that.
+   - A latch rebuilt from an open instance would hold a genuine lone unreadable account to the
+     absolute session cap. This ADR says such an account starts striking once a pass also reads a
+     readable account (*Option 5's failure mode*, above).
+   - A fresh process cannot tell whether an earlier run's latch was still holding an account. That
+     is why it does not resolve an inherited `ad_reconcile_held` instance (BACKLOG #2136).
+
+   **Direction 1: the latch is lost, so attrition could revoke the last held account.** Suppose a
+   held wave's sessions end until one held account is left, and the engine then restarts. The new
+   process would know only that one account, so it would read as a single. A pass that also reads
+   the attribute on another account would strike it, and revoke it once its strikes reach
+   `ad_session_recheck_strikes` (2 at the default). At a strike count of 1 with an
+   `ad_session_recheck_max_users` below the estate size, a fresh process could also revoke an
+   earlier run's held wave one account at a time, as under *Limits of the rule at non-default
+   settings* below. **The user-facing cost:** each such revocation would sign the holder out, and,
+   where the account has a notification address, email them the neutral `DIRECTORY_SESSIONS_ENDED`
+   security notice, for an account nobody disabled.
+
+   **Direction 2: the strike counts reset, so a real revocation would come later.** A restart
+   would also forget the strikes of a genuinely disabled or absent account. The comment beside
+   `_reconcile_strikes` in `auth/service.py` calls that "biased toward NOT revoking". The account
+   would be revoked `ad_session_recheck_strikes` passes after the restart instead. The reconciler
+   sleeps one `ad_session_recheck_seconds` interval before its first pass. So an engine that
+   restarted more often than the strike count times that interval would never revoke the account
+   through the reconciler. It takes longer still when the probe budget does not reach the account
+   on every pass. Only the absolute session cap would then end those sessions.
+
+   `docs/SECURITY.md` states direction 1 for operators, in
+   [Directory session reconciliation](../SECURITY.md#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2).
 7. **While held.** Every `UNDETERMINED` probe plans no revocation, and its strike count is reset to
    0. So an account still unreadable after a fix needs `ad_session_recheck_strikes` fresh passes
    before it is revoked. That covers an access change that is still replicating. The existing breaker
