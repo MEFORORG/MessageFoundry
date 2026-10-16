@@ -135,6 +135,15 @@ _FRAMING_HEADERS = frozenset({"content-encoding", "content-length", "transfer-en
 # handlers by test_apiclient_approval_hold.py, which reads the code back rather than trusting 202.
 _HTTP_PENDING_APPROVAL = 202
 
+#: How long a request that can wait in the engine's per-account queue may go silent, in seconds
+#: (vault BACKLOG #2950): the sign-in, and the two elevations that also rotate the token and queue
+#: on that account, ``reauth`` behind the re-proof lock and ``verify_mfa`` behind the credential
+#: lock. Matches the IDE's ``SIGN_IN_TIMEOUT_MS`` (``ide/src/signInSession.ts``). The queue has no
+#: bound (``keyed_lock.hold_keyed_lock`` takes no timeout), so no value covers every wait: this
+#: makes a lost reply rarer than the 5 s default did, and does not rule one out. Every other
+#: request keeps the client's own timeout.
+SIGN_IN_TIMEOUT_SECONDS = 30.0
+
 
 class ApiError(RuntimeError):
     """An API call failed (transport error, a non-2xx response, or an undecodable 2xx body)."""
@@ -1124,7 +1133,17 @@ class EngineClient:
         body: dict[str, str] = {"password": password}
         if action is not None:
             body["purpose"] = action
-        self._adopt_rotated(self._request("POST", "/me/reauth", json=body, _allow_step_up=False))
+        # Vault BACKLOG #2950: it rotates the token and queues behind the account's re-proof lock,
+        # so it gets the sign-in's timeout (see SIGN_IN_TIMEOUT_SECONDS).
+        self._adopt_rotated(
+            self._request(
+                "POST",
+                "/me/reauth",
+                json=body,
+                _allow_step_up=False,
+                timeout=httpx.Timeout(SIGN_IN_TIMEOUT_SECONDS),
+            )
+        )
 
     def set_mfa_handler(self, handler: Callable[[], bool] | None) -> None:
         """Register the callback invoked when the engine demands a second factor (403 +
@@ -1166,8 +1185,16 @@ class EngineClient:
         for an ``oidc`` session that already met its factor, whose code was not checked either
         (BACKLOG #2142). Does not itself trigger the MFA handler."""
         self._refuse_credential_on_cleartext("a second factor")
+        # Vault BACKLOG #2950: it rotates the token and queues behind the account's credential
+        # lock, so it gets the sign-in's timeout (see SIGN_IN_TIMEOUT_SECONDS).
         self._adopt_rotated(
-            self._request("POST", "/auth/mfa-verify", json={"code": code}, _allow_mfa=False)
+            self._request(
+                "POST",
+                "/auth/mfa-verify",
+                json={"code": code},
+                _allow_mfa=False,
+                timeout=httpx.Timeout(SIGN_IN_TIMEOUT_SECONDS),
+            )
         )
 
     def disable_mfa(self) -> None:
@@ -1648,10 +1675,12 @@ class EngineClient:
           ends the old one, and the reply then fails to arrive, times out or will not decode, this
           client still holds the old token, which is dead, and never learns the new one.
           ``login`` raises :class:`ApiError` and every later call on the held token is refused
-          with a 401 until the caller signs in again. A timeout is the likely way in: the client
-          timeout (5 s per phase by default) also bounds this request, and a sign-in waiting in the
-          engine's per-account queue can take longer, while the engine goes on to finish it.
-          Before, the old token stayed live in that case. The new session nobody holds stays valid
+          with a 401 until the caller signs in again. A timeout is the likely way in: a sign-in
+          waiting in the engine's per-account queue can outlast the client, while the engine goes
+          on to finish it. This request therefore gets :data:`SIGN_IN_TIMEOUT_SECONDS` (30 s per
+          phase) rather than the client's 5 s default (vault BACKLOG #2950). That makes a lost
+          reply rarer, not impossible: the queue has no bound, so a long enough queue still
+          outlasts it. Before, the old token stayed live in that case. The new session nobody holds stays valid
           until it idles out or expires, as it did before. This is the accepted price of ending the
           old session ahead of the cap. It is not harmless.
 
@@ -1663,7 +1692,12 @@ class EngineClient:
         prior = self._token
         if prior and self._token_cell.issued_here:
             body["supersedes"] = prior
-        result = _decode(self._request("POST", "/auth/login", json=body), LoginResponse)
+        result = _decode(
+            self._request(
+                "POST", "/auth/login", json=body, timeout=httpx.Timeout(SIGN_IN_TIMEOUT_SECONDS)
+            ),
+            LoginResponse,
+        )
         self._hold_issued(result.token)
         self._user = result.user
         # A step-up purpose stashed for the old session must not bind the new one's next reauth().
