@@ -29,6 +29,7 @@ from messagefoundry.config.settings import ApprovalsSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.store.store import MessageStore
+from tests._approval_repeat_two_process import assert_one_request_per_round, race_repeat_requests
 from tests._pending_approval_store_contract import (
     _REQUESTER_ID,
     _assert_repeat_request_contract,
@@ -195,6 +196,20 @@ async def test_a_lost_repeat_row_pages_on_the_request_it_named(
 async def test_repeat_request_store_contract(store: MessageStore) -> None:
     """The SQLite leg of the cross-backend repeat contract."""
     await _assert_repeat_request_contract(store)
+
+
+async def test_repeats_racing_from_two_processes_file_one_request(tmp_path: Path) -> None:
+    """Vault BACKLOG #3236, the SQLite leg: two processes, each with its own store over one file,
+    race the same repeat in every round, and each round holds one request. The in-process race
+    above cannot show this, because the store's own lock serializes it first."""
+    path = tmp_path / "two_process.db"
+    await (await MessageStore.open(path)).close()  # the schema exists before either child opens
+    answers = await asyncio.to_thread(race_repeat_requests, str(path), tmp_path)
+    store = await MessageStore.open(path)
+    try:
+        await assert_one_request_per_round(store, answers)
+    finally:
+        await store.close()
 
 
 async def test_a_repeated_replay_post_answers_the_same_202(tmp_path: Path) -> None:
