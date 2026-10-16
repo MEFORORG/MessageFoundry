@@ -362,10 +362,12 @@ def _user_summary(
     *,
     credential_expires_at: float | None = None,
     lock_state_at: float | None = None,
+    show_scope: bool = True,
 ) -> UserSummary:
     """``lock_state_at`` is the instant to evaluate the account's locks at, and passing it is what
     DISCLOSES them: pass it only on a ``users:manage`` surface (BACKLOG #1131). Left ``None``, the
-    summary carries ``lock_state=None``, which reads as "not shown", never as "not locked"."""
+    summary carries ``lock_state=None``, which reads as "not shown", never as "not locked".
+    ``show_scope=False`` withholds the channel scope and its source the same way (BACKLOG #3189)."""
     return UserSummary(
         id=user.id,
         username=user.username,
@@ -375,8 +377,8 @@ def _user_summary(
         notify_email=user.notify_email,
         disabled=user.disabled,
         roles=sorted(role_ids),
-        channel_scope=_parse_channel_scope(user.channel_scope),
-        channel_scope_source=user.channel_scope_source,
+        channel_scope=_parse_channel_scope(user.channel_scope) if show_scope else None,
+        channel_scope_source=user.channel_scope_source if show_scope else None,
         credential_expires_at=credential_expires_at,
         lock_state=None if lock_state_at is None else _lock_state(user, lock_state_at),
     )
@@ -1123,17 +1125,13 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             # No credential_expires_at here, deliberately (BACKLOG #1141). This route needs only
             # users:read, and which accounts hold a live admin-issued temporary password, and until
             # when, is a target list. The users:manage surfaces state it.
-            summary = _user_summary(user, role_ids, lock_state_at=lock_state_at)
-            if not manager:
-                # BACKLOG #3189: every account's channel scope, and who wrote it, go only to a
-                # users:manage holder, the tier GET /users/{id}/channel-scope reads on. users:read
-                # can be minted into a custom role, which can be channel-scoped, and the list would
-                # otherwise name every other account's channels to it. Withheld, both read null,
-                # which from this route means "not shown to you", as lock_state's null does.
-                summary = summary.model_copy(
-                    update={"channel_scope": None, "channel_scope_source": None}
-                )
-            summaries.append(summary)
+            # BACKLOG #3189: every account's channel scope, and who wrote it, go only to a
+            # users:manage holder, the tier GET /users/{id}/channel-scope reads on. users:read can
+            # be minted into a custom role, which can be channel-scoped, and the list would
+            # otherwise name every other account's channels to it.
+            summaries.append(
+                _user_summary(user, role_ids, lock_state_at=lock_state_at, show_scope=manager)
+            )
         return summaries
 
     @app.get("/users/{user_id}/permissions", response_model=UserPermissions)

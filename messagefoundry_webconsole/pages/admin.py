@@ -248,7 +248,7 @@ def _lock_card(user: UserSummary) -> Markup:
     )
 
 
-def users_page(users: Sequence[UserSummary], *, show_scope: bool = True) -> Markup:
+def users_page(users: Sequence[UserSummary], *, show_scope: bool) -> Markup:
     """The user list: every account with provider, roles, scope, and status; links to the admin forms.
 
     The Lock column appears only when the engine disclosed lock state, which it does only to a

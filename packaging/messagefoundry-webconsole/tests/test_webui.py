@@ -4292,7 +4292,7 @@ def test_scope_source_renders_in_words() -> None:
     assert _scope_source_text(_u("manual")) == "set by an administrator"
     assert _scope_source_text(_u(None)) == "not recorded"
     assert _scope_source_text(_u("future")) == "future"
-    listing = str(users_page([_u("ad")]))
+    listing = str(users_page([_u("ad")], show_scope=True))
     assert "<th>Scope source</th>" in listing
     assert "directory (AD group map)" in listing
 
