@@ -3140,9 +3140,13 @@ class AuthService:
         # BACKLOG #2915: the notice goes out HERE, after the last refusal above and BEFORE the address
         # write below. After the address write, a crash before the role left the operator's address
         # on a roleless row, and the re-run read it as the earlier holder's, so the earlier holder
-        # was never told. Any earlier slot would tell them of a takeover a later refusal cancels.
-        # A crash between this notice and the address write sends the notice again on the re-run.
-        # That duplicate is the accepted at-least-once cost; no state records a sent notice.
+        # was never told. An earlier slot would tell them of a takeover that a later refusal leaves
+        # unfinished. A refusal above, on the repair branch, has still cleared their factors and
+        # sessions and tells nobody; that predates #2915 and is shipped open.
+        # Two at-least-once costs remain, and no state records a sent notice. A crash between this
+        # notice and the address write sends the earlier holder a second notice on the re-run. A
+        # crash after the address write makes the re-run send one to the operator's own address,
+        # and its audit row then records that notice, not the earlier holder's.
         #
         # The notice goes out BEFORE the audit row, so the row records its real outcome rather than a
         # forecast: `_notify_security` swallows a notifier failure, and a row written first would then
@@ -12130,6 +12134,9 @@ class AuthService:
         ASVS 6.3.7, as on the bind: the holder's federated sign-in stopped working and their
         sessions ended. The account is read for its address only AFTER the clear, and only for that;
         every audited field comes out of the clear's transaction.
+
+        That includes ``totp_enrolled`` and ``webauthn_enrolled`` (vault BACKLOG #2711 step 3): whether
+        the account still held each engine factor when its federated binding went.
         """
         await self._audit(
             "auth.federated_subject_unbound",
@@ -12141,6 +12148,8 @@ class AuthService:
                     "issuer": outcome.issuer,
                     "subject": outcome.subject,
                     "sessions_revoked": outcome.sessions_revoked,
+                    "totp_enrolled": outcome.totp_enrolled,
+                    "webauthn_enrolled": outcome.webauthn_enrolled,
                 }
             ),
         )
@@ -12210,6 +12219,13 @@ class AuthService:
 
         Emits ``auth.federated_subject_bound`` or ``auth.federated_subject_rebound`` naming the
         actor, and notifies the account holder naming the issuer but not the subject (ASVS 6.3.7).
+
+        **The row's ``totp_enrolled`` and ``webauthn_enrolled`` come from the CLEAR's transaction**
+        (vault BACKLOG #2711 step 3), not the bind's, because the clear is the one that returns a
+        record. So they can be stale by one gap: a factor enrolled or removed between the clear and
+        the write is not reflected. At least these can make that change: a session still live on a
+        first bind, a Windows SSO session minted in the gap on a rebind (the row is unbound then),
+        and an administrator's MFA reset. This is the one place the gap is described.
         """
         issuer = self._settings.oidc_issuer
         if not issuer:
@@ -12367,6 +12383,9 @@ class AuthService:
             "issuer": issuer,
             "subject": subject,
             "sessions_revoked": revoked,
+            # Vault BACKLOG #2711 step 3, from the clear's transaction (see the docstring).
+            "totp_enrolled": cleared.totp_enrolled,
+            "webauthn_enrolled": cleared.webauthn_enrolled,
         }
         if rebind:
             detail.update(

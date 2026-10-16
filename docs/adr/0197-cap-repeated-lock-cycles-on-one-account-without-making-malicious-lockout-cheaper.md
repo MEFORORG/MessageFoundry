@@ -346,9 +346,9 @@ discriminator the attacker lacks: the owner's TOTP secret.
    owner to ask an administrator for a password reset, or the host operator for `admin-unlock`, and
    then to replace whichever factor was right.
    *Amended 2026-10-16 by vault BACKLOG #2947:* the comparison with the first-seen login-address
-   check no longer holds. Since vault BACKLOG #2145 (engine PR 1999) that check reads its baseline
-   from a per-account known-address record, the `known_login_addresses` table, not through
-   `list_audit`; `AuthService._classify_login_address` describes it. The throttle's own design is
+   check no longer holds. Since vault BACKLOG #2145 (engine PR 1999), that check reads its baseline
+   from the `known_login_addresses` table, not through `list_audit`.
+   `AuthService._classify_login_address` describes that per-account record. The throttle's own design is
    unchanged: it still reads the newest of its own audit rows through `list_audit`.
 8. **Administrators.** `admin-unlock` clears both locks and both failure counts. It reports both
    old expiry times and both cycle counts, on stdout and in `--json`, and writes them to its audit

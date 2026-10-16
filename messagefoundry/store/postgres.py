@@ -1171,6 +1171,8 @@ _PG_SESSION_RESEAL: Final = (
 _PG_REVOKE_USER_SESSIONS_SQL: Final = (
     "UPDATE sessions SET revoked_at=$1, seal='' WHERE user_id=$2 AND revoked_at IS NULL"
 )
+#: Whether the account holds at least one passkey.
+_PG_WEBAUTHN_ANY_FOR_USER: Final = "SELECT 1 FROM webauthn_credentials WHERE user_id=$1 LIMIT 1"
 
 # The `$n` twins of store.py's sealed user-record statements (BACKLOG #2592), used only by
 # `create_user`, `_write_user` and the passkey writer; store.py states the contract.
@@ -9049,9 +9051,7 @@ class PostgresStore:
 
     async def has_webauthn_credentials(self, user_id: str) -> bool:
         """True when the user has at least one enrolled passkey (the second-factor predicate)."""
-        d = await self._fetchone(
-            "SELECT 1 FROM webauthn_credentials WHERE user_id=$1 LIMIT 1", user_id
-        )
+        d = await self._fetchone(_PG_WEBAUTHN_ANY_FOR_USER, user_id)
         return d is not None
 
     async def any_webauthn_credentials(self) -> bool:
@@ -9432,7 +9432,8 @@ class PostgresStore:
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
-                "SELECT username, oidc_issuer, oidc_subject FROM users WHERE id=$1 FOR UPDATE",
+                "SELECT username, oidc_issuer, oidc_subject, totp_enabled, cred_digest FROM users"
+                " WHERE id=$1 FOR UPDATE",
                 user_id,
             )
             if row is None:
@@ -9447,11 +9448,24 @@ class PostgresStore:
                     sessions_revoked=0,
                     changed=True,
                 )
+            # Vault BACKLOG #2711 step 3. A statement of its own AFTER the row lock: under READ
+            # COMMITTED it takes a fresh snapshot, so it sees a passkey whose write (which re-seals
+            # this row) committed while the lock above waited. A passkey counts when either the
+            # table or the sealed digest names one, as the service's own predicate reads it.
+            totp_enrolled = bool(row["totp_enabled"])
+            webauthn_enrolled = await conn.fetchval(
+                _PG_WEBAUTHN_ANY_FOR_USER, user_id
+            ) is not None or bool(row["cred_digest"])
             if issuer is None and subject is None:
                 # Already unbound: write NOTHING, so a no-op cannot sign the account out. AND, not
                 # OR: a half row has something to clear (see FederatedUnbind).
                 return FederatedUnbind(
-                    username=row["username"], issuer=None, subject=None, sessions_revoked=0
+                    username=row["username"],
+                    issuer=None,
+                    subject=None,
+                    sessions_revoked=0,
+                    totp_enrolled=totp_enrolled,
+                    webauthn_enrolled=webauthn_enrolled,
                 )
             await self._write_user(conn, user_id, lambda r: federated_unbind(r, now))
             result = await conn.execute(_PG_REVOKE_USER_SESSIONS_SQL, now, user_id)
@@ -9460,6 +9474,8 @@ class PostgresStore:
                 issuer=issuer,
                 subject=subject,
                 sessions_revoked=_rowcount(result),
+                totp_enrolled=totp_enrolled,
+                webauthn_enrolled=webauthn_enrolled,
             )
 
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
