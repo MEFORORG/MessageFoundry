@@ -29,6 +29,8 @@ import httpx
 from pydantic import BaseModel, ValidationError
 
 from messagefoundry.api.auth_models import (
+    STEP_UP_VIA_HEADER,
+    STEP_UP_VIA_IDP,
     AdGroupMap,
     AdGroupMapEntry,
     AuditList,
@@ -147,8 +149,10 @@ class IdpStepUpRequired(ApiError):
 
     Raised on a 403 carrying ``X-Step-Up-Via: idp``, which the engine sends for a session minted by
     the federated (``oidc``) sign-in. ``POST /me/reauth`` refuses such a session, so this client
-    raises instead of prompting for a password. Its step-up runs in the web console at
-    ``/ui/reauth``, through the IdP, and this client cannot perform it: that leg needs a browser and
+    raises instead of prompting for a password. Its step-up runs in the web console, through the
+    IdP: repeating the action there sends the browser to ``/ui/reauth`` with that action named
+    (a bare ``/ui/reauth`` names none and returns to ``/ui``; vault BACKLOG #3145). This client
+    cannot perform it: that leg needs a browser and
     re-keys the session it steps up. A subclass of :class:`ApiError`, so a caller that catches only
     that still sees the refusal."""
 
@@ -1034,8 +1038,13 @@ class EngineClient:
                 **kw,
             )
         # BACKLOG #2158: an ``oidc`` session steps up at the IdP, in a browser. POST /me/reauth
-        # refuses it, so the password prompt below would only earn a second 403.
-        if response.status_code == 403 and response.headers.get("X-Step-Up-Via") == "idp":
+        # refuses it, so the password prompt below would only earn a second 403. Vault BACKLOG
+        # #3145 item 6 asked to run the registered handler first; declined, because that handler
+        # can only re-prove a password, which is the second 403.
+        if (
+            response.status_code == 403
+            and response.headers.get(STEP_UP_VIA_HEADER) == STEP_UP_VIA_IDP
+        ):
             raise IdpStepUpRequired(_error_detail(response), status=response.status_code)
         # Step-up re-verification (ASVS 7.5.3): the engine refuses a sensitive op with 403 +
         # X-Step-Up-Required when this session hasn't re-proved its credential recently. Prompt the

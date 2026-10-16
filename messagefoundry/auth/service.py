@@ -91,7 +91,7 @@ from messagefoundry.auth.notifications import (
     notice_kind_log_label,
 )
 from messagefoundry.auth.oidc import PendingFlow
-from messagefoundry.auth.oidc_http import build_idp_opener, jwks_fetcher
+from messagefoundry.auth.oidc_http import build_idp_opener_from_settings, jwks_fetcher
 from messagefoundry.auth.passwords import hash_password, needs_rehash, verify_password
 from messagefoundry.auth.permissions import (
     CUSTOM_ROLE_ID_PREFIX,
@@ -2622,13 +2622,10 @@ class AuthService:
             # preflight honors [security].enforcement (warn ≠ refuse) — a pin mismatch always refuses,
             # a group/world-writable DACL refuses only at enforce. Without the dial this seam would
             # hardcode enforce and make warn-mode startup unreachable for the OIDC anchor.
-            self._oidc_opener = build_idp_opener(
-                settings.oidc_tls_ca_cert_file,
-                pin=settings.oidc_tls_ca_cert_pin,
-                enforcing=self._trust_anchors_enforcing,
-                # BACKLOG #299: revocation checking against the IdP certificate. This hop resolves no
-                # trust anchor, so it carries its own CRL setting rather than inheriting [tls].crl_file.
-                crl_file=settings.oidc_tls_crl_file,
+            # BACKLOG #299: the CRL file is this hop's own knob, not [tls].crl_file; the helper
+            # passes it. The federation check builds through the same helper (vault #3145).
+            self._oidc_opener = build_idp_opener_from_settings(
+                settings, enforcing=self._trust_anchors_enforcing
             )
             # BACKLOG #1887: must follow the opener, whose finished context it reads.
             _refuse_idp_revocation(settings, self._oidc_opener, hop_posture)
@@ -4848,9 +4845,11 @@ class AuthService:
             return flow
         actor = await self._step_up_actor(flow)
         if flow.step_up_session_hash is None:
-            return await self._step_up_refused(FLOW_PURPOSE_MISMATCH, actor=actor, client=client)
+            return await self._step_up_refused(
+                FLOW_PURPOSE_MISMATCH, actor=actor, client=client, flow=flow
+            )
         return await self._step_up_refused(
-            reason, actor=actor, client=client, return_to=flow.return_to
+            reason, actor=actor, client=client, return_to=flow.return_to, flow=flow
         )
 
     async def _redeem_step_up_flow(
@@ -4910,8 +4909,9 @@ class AuthService:
         The session is re-anchored to the callback's address when the callback has one. The
         ``auth.reauth`` row a completed step-up writes, including one whose rotation lost the
         session, also records the start leg's address as ``start_client`` and whether the two are
-        different hosts as ``client_moved`` (BACKLOG #2160). The refusal rows above carry neither.
-        A move is recorded, never refused. Behind a proxy the engine does not trust, both legs carry
+        different hosts as ``client_moved`` (BACKLOG #2160). So does a refusal made after the flow
+        was redeemed (vault BACKLOG #3145); one made before carries neither. A move is recorded,
+        never refused. Behind a proxy the engine does not trust, both legs carry
         the proxy's address, so ``client_moved`` reads false there.
 
         Not padded to a deadline, unlike the sign-in callback: the caller already holds a session,
@@ -4926,7 +4926,9 @@ class AuthService:
         actor = await self._step_up_actor(flow)
         token_hash = flow.step_up_session_hash
         if token_hash is None:
-            return await self._step_up_refused(FLOW_PURPOSE_MISMATCH, actor=actor, client=client)
+            return await self._step_up_refused(
+                FLOW_PURPOSE_MISMATCH, actor=actor, client=client, flow=flow
+            )
         # BACKLOG #2301 (ASVS 2.4.2): max_age=0 and prompt=login make the person authenticate at the
         # IdP, so a step-up callback faster than a person can do that is refused. Before the code is
         # redeemed, so the refused flow spends nothing at the token endpoint.
@@ -4936,7 +4938,7 @@ class AuthService:
         arrived_too_early = self._oidc_callback_too_early(flow)
         if arrived_too_early and not self._oidc_callback_floor_exempt_values():
             return await self._step_up_refused(
-                TOO_EARLY, actor=actor, client=client, return_to=return_to
+                TOO_EARLY, actor=actor, client=client, return_to=return_to, flow=flow
             )
         try:
             principal_claims = await asyncio.to_thread(
@@ -4945,7 +4947,7 @@ class AuthService:
         except oidc.ClaimsError as exc:
             # exc.reason is closed-set, so nothing IdP-influenced reaches the audit row.
             return await self._step_up_refused(
-                exc.reason, actor=actor, client=client, return_to=return_to
+                exc.reason, actor=actor, client=client, return_to=return_to, flow=flow
             )
         except oidc.TokenRefusedError as exc:
             # The endpoint answered. As on the sign-in leg, that is not an outage (#1948), and the
@@ -4956,6 +4958,7 @@ class AuthService:
                 client=client,
                 return_to=return_to,
                 extra={"status": exc.status},
+                flow=flow,
             )
         except (OSError, ValueError, http.client.HTTPException) as exc:
             # The sign-in leg's outage arm, for the same reasons (#1948). Only the exception TYPE,
@@ -4967,6 +4970,7 @@ class AuthService:
                     client=client,
                     return_to=return_to,
                     extra=_idp_error_fields(exc),
+                    flow=flow,
                 )
             self.mark_oidc_unavailable(type(exc).__name__)
             return await self._step_up_refused(
@@ -4975,6 +4979,7 @@ class AuthService:
                 client=client,
                 return_to=return_to,
                 extra=_idp_error_fields(exc),
+                flow=flow,
             )
         floor_exempt_amr = (
             self._oidc_callback_floor_exemption(principal_claims.amr) if arrived_too_early else ()
@@ -4982,7 +4987,7 @@ class AuthService:
         if arrived_too_early and not floor_exempt_amr:
             # The opted-in site's too-early callback whose amr names no exempt value (BACKLOG #2388).
             return await self._step_up_refused(
-                TOO_EARLY, actor=actor, client=client, return_to=return_to
+                TOO_EARLY, actor=actor, client=client, return_to=return_to, flow=flow
             )
         now = time.time()
         session = await self._load_session(token_hash)
@@ -4996,12 +5001,22 @@ class AuthService:
             or not session.is_live(now=now, idle_seconds=self.session_idle_seconds)
         ):
             return await self._step_up_refused(
-                "session_gone", actor=actor, client=client, return_to=return_to, lost=True
+                "session_gone",
+                actor=actor,
+                client=client,
+                return_to=return_to,
+                lost=True,
+                flow=flow,
             )
         user = await self._load_user(session.user_id)
         if user is None or user.disabled or user.auth_provider != AuthProvider.AD.value:
             return await self._step_up_refused(
-                "session_gone", actor=actor, client=client, return_to=return_to, lost=True
+                "session_gone",
+                actor=actor,
+                client=client,
+                return_to=return_to,
+                lost=True,
+                flow=flow,
             )
         if (user.oidc_issuer, user.oidc_subject) != (
             principal_claims.issuer,
@@ -5016,7 +5031,7 @@ class AuthService:
             # the claims ladder is filed as a subject mismatch whatever its auth_time. Both tests
             # below judge this session's identity, so neither is the right name for someone else.
             return await self._step_up_refused(
-                STEP_UP_SUBJECT_MISMATCH, actor=actor, client=client, return_to=return_to
+                STEP_UP_SUBJECT_MISMATCH, actor=actor, client=client, return_to=return_to, flow=flow
             )
         # FRESHNESS, two tests, and both must pass. max_age=0 and prompt=login ask the IdP to
         # authenticate the user afresh, so a conforming IdP's auth_time postdates this request.
@@ -5025,7 +5040,7 @@ class AuthService:
         skew = self._settings.oidc_clock_skew_seconds
         if flow.issued_at <= 0 or principal_claims.auth_time < flow.issued_at - skew:
             return await self._step_up_refused(
-                STEP_UP_NOT_FRESH, actor=actor, client=client, return_to=return_to
+                STEP_UP_NOT_FRESH, actor=actor, client=client, return_to=return_to, flow=flow
             )
         # (b) Against the IdP's own clock (BACKLOG #2143): auth_time must be LATER than the one the
         # session holds, which is the sign-in's or the last step-up's. No skew applies, because
@@ -5041,11 +5056,19 @@ class AuthService:
         held_auth_time = session.idp_auth_time
         if held_auth_time is None:
             return await self._step_up_refused(
-                STEP_UP_IDP_AUTH_TIME_MISSING, actor=actor, client=client, return_to=return_to
+                STEP_UP_IDP_AUTH_TIME_MISSING,
+                actor=actor,
+                client=client,
+                return_to=return_to,
+                flow=flow,
             )
         if principal_claims.auth_time <= held_auth_time:
             return await self._step_up_refused(
-                STEP_UP_IDP_AUTH_TIME_NOT_LATER, actor=actor, client=client, return_to=return_to
+                STEP_UP_IDP_AUTH_TIME_NOT_LATER,
+                actor=actor,
+                client=client,
+                return_to=return_to,
+                flow=flow,
             )
         # The DIRECTORY still has the account. The password re-bind this leg replaces failed for a
         # disabled or deleted AD object, and the sign-in leg refuses one as not_in_directory. An IdP
@@ -5053,13 +5076,17 @@ class AuthService:
         # the directory itself, by the row's immutable id as the sign-in leg does (BACKLOG #1532).
         if self._ldap is None:
             return await self._step_up_refused(
-                "not_configured", actor=actor, client=client, return_to=return_to
+                "not_configured", actor=actor, client=client, return_to=return_to, flow=flow
             )
         if not user.directory_object_id:
             # Never a name-only lookup: a directory may reissue a freed name to someone else. The
             # sign-in leg refuses such a row for the same reason (BACKLOG #2027).
             return await self._step_up_refused(
-                DIRECTORY_OBJECT_ID_MISSING, actor=actor, client=client, return_to=return_to
+                DIRECTORY_OBJECT_ID_MISSING,
+                actor=actor,
+                client=client,
+                return_to=return_to,
+                flow=flow,
             )
         try:
             principal = await asyncio.to_thread(
@@ -5070,18 +5097,18 @@ class AuthService:
                 "directory lookup failed during a federated step-up: %s", type(exc).__name__
             )
             return await self._step_up_refused(
-                "directory_unavailable", actor=actor, client=client, return_to=return_to
+                "directory_unavailable", actor=actor, client=client, return_to=return_to, flow=flow
             )
         if principal is None:
             return await self._step_up_refused(
-                "not_in_directory", actor=actor, client=client, return_to=return_to
+                "not_in_directory", actor=actor, client=client, return_to=return_to, flow=flow
             )
         # BACKLOG #3174: the answer must name the row's own directory object before its groups are
         # trusted, by the test the sign-in leg and the AD step-up re-bind apply.
         mismatch = _directory_answer_mismatch(principal, user.directory_object_id)
         if mismatch is not None:
             return await self._step_up_refused(
-                mismatch, actor=actor, client=client, return_to=return_to
+                mismatch, actor=actor, client=client, return_to=return_to, flow=flow
             )
         # BACKLOG #2154: the account's stored roles must all be among the roles its current groups
         # map to, the same test _directory_step_up_refusal applies on the TOTP and passkey legs
@@ -5092,11 +5119,16 @@ class AuthService:
         fresh = await self._load_user(user.id)
         if fresh is None:
             return await self._step_up_refused(
-                "session_gone", actor=actor, client=client, return_to=return_to, lost=True
+                "session_gone",
+                actor=actor,
+                client=client,
+                return_to=return_to,
+                lost=True,
+                flow=flow,
             )
         if not set(fresh.role_ids) <= await self._ad_roles_for_groups(principal.groups):
             return await self._step_up_refused(
-                DIRECTORY_ROLES_DEMOTED, actor=actor, client=client, return_to=return_to
+                DIRECTORY_ROLES_DEMOTED, actor=actor, client=client, return_to=return_to, flow=flow
             )
         purpose = flow.step_up_purpose
         # The password leg's three ORDER-CRITICAL steps (see :meth:`reauth`), against the hash.
@@ -5123,14 +5155,9 @@ class AuthService:
             self._grant_action_step_up(hash_token(elevation.token), purpose)
         self.clear_oidc_unavailable()
         # BACKLOG #2160: the start leg staged its caller's address, and the session is re-anchored
-        # to the callback's above. Record whether the address moved mid-ceremony, compared as the
-        # new-address signal compares. Recorded only: refusing a move, or anchoring to the start
-        # address, would change ADR 0142 Amendment B and needs a ruling first. None when either
-        # address is unknown, since an empty string matches nothing and proves no move.
-        start_client = flow.client_ip or None
-        client_moved = (
-            not self._same_host(start_client, client) if start_client and client else None
-        )
+        # to the callback's above. Record whether the address moved mid-ceremony. Recorded only:
+        # refusing a move, or anchoring to the start address, would change ADR 0142 Amendment B
+        # and needs a ruling first.
         detail: dict[str, object] = {
             "ok": elevation.ok,
             "provider": AuthProvider.AD.value,
@@ -5139,8 +5166,7 @@ class AuthService:
             "session_lost": elevation.session_lost,
             "grant_refused": grant_refused,
             "session_revoked": False,
-            "start_client": start_client,
-            "client_moved": client_moved,
+            **self._step_up_address_fields(flow, client),
         }
         if floor_exempt_amr:
             # BACKLOG #2388: present only when the exemption let a too-early callback through, and
@@ -5160,6 +5186,21 @@ class AuthService:
         user = await self._load_user(session.user_id) if session is not None else None
         return user.username if user is not None else "<oidc>"
 
+    def _step_up_address_fields(self, flow: PendingFlow, client: str | None) -> dict[str, object]:
+        """``start_client`` and ``client_moved`` for a step-up row (BACKLOG #2160, vault #3145).
+
+        ``start_client`` is the address the start leg staged on the flow, never a value from the
+        IdP's token. ``client_moved`` compares it with the callback's as the new-address signal
+        compares (:meth:`_same_host`), and is None when either address is unknown, since an empty
+        string matches nothing and proves no move."""
+        start_client = flow.client_ip or None
+        return {
+            "start_client": start_client,
+            "client_moved": (
+                not self._same_host(start_client, client) if start_client and client else None
+            ),
+        }
+
     async def _step_up_refused(
         self,
         reason: str,
@@ -5170,11 +5211,17 @@ class AuthService:
         lost: bool = False,
         extra: Mapping[str, object] | None = None,
         flow_consumed: bool = True,
+        flow: PendingFlow | None = None,
     ) -> OidcStepUp:
         """Audit and package one refusal of the federated step-up leg. ``reason`` is closed-set.
 
         ``extra`` adds fields to the audit row only, such as a received status or an exception
-        type (BACKLOG #1948). It never carries IdP text."""
+        type (BACKLOG #1948). It never carries IdP text.
+
+        ``flow`` adds ``start_client`` and ``client_moved``, as the success row carries them (vault
+        BACKLOG #3145). Only a refusal made after the flow was redeemed passes it: before ``state``
+        matched, the callback is not shown to belong to the flow, and some refusals have no flow
+        at all, so those rows carry neither field."""
         # `extra` first, so it can never overwrite a closed-set field.
         detail: dict[str, object] = {
             **(extra or {}),
@@ -5182,6 +5229,7 @@ class AuthService:
             "provider": AuthProvider.AD.value,
             "mech": "oidc",
             "reason": reason,
+            **(self._step_up_address_fields(flow, client) if flow is not None else {}),
         }
         await self._audit("auth.reauth", actor=actor, detail=_json(detail), client=client)
         return OidcStepUp(

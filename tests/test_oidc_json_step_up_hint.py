@@ -172,6 +172,9 @@ def _assert_idp_hint(site: str, r: httpx.Response, action: str | None) -> None:
     assert r.headers.get("X-Step-Up-Action") == action, site
     detail = r.json()["detail"]
     assert "/ui/reauth" in detail, (site, detail)
+    # Vault BACKLOG #3145 item 6: a bare /ui/reauth names no action and bounces to /ui, so the
+    # hint sends the reader back through the action, which reaches /ui/reauth with it named.
+    assert "repeat the action in the web console" in detail, (site, detail)
     assert "/me/reauth" not in detail, (site, detail)
     # BACKLOG #2142: a code opens no window on an oidc session, so the hint must not name it.
     assert "mfa-verify" not in detail, (site, detail)
@@ -402,3 +405,35 @@ def test_the_client_still_prompts_for_a_password_without_the_header() -> None:
         client.close()
     assert not isinstance(raised.value, IdpStepUpRequired)
     assert prompted == ["step-up"]
+
+
+def test_the_step_up_header_is_one_constant_on_both_sides() -> None:
+    """Vault BACKLOG #3145 item 6: the gates, the two route refusals and the FastAPI-free client
+    read one spelling, from the auth wire models, rather than four copies of a literal."""
+    from messagefoundry.api import auth_models
+    from messagefoundry.apiclient import client as apiclient
+
+    assert _STEP_UP_VIA_HEADER is auth_models.STEP_UP_VIA_HEADER == "X-Step-Up-Via"
+    assert apiclient.STEP_UP_VIA_HEADER is auth_models.STEP_UP_VIA_HEADER
+    assert apiclient.STEP_UP_VIA_IDP is auth_models.STEP_UP_VIA_IDP == "idp"
+    package = Path(auth_models.__file__).parent.parent
+    for module in ("api/auth_routes.py", "apiclient/client.py", "api/security.py"):
+        text = (package / module).read_text(encoding="utf-8")
+        assert '"X-Step-Up-Via"' not in text, f"{module} spells the header out again"
+
+
+async def test_a_store_fault_reading_the_mechanism_keeps_the_403(
+    engine: Engine, service: AuthService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: a store fault in the read that picks the refusal's wording turns the gate's 403
+    into a 500 (vault BACKLOG #3145 item 6). It keeps the refusal and the password wording."""
+    uid = await _add_admin(service)
+    token = await _session(service, uid, "tok-fault-oidc", mechanism="oidc")
+
+    async def refused_read(token: str | None) -> bool:
+        raise OSError("the store connection dropped")
+
+    monkeypatch.setattr(service, "session_steps_up_at_idp", refused_read)
+    async with _client_at(engine, service, HOME) as c:
+        r = await c.post("/me/mfa/enroll", headers=_auth(token))
+    _assert_password_refusal("require_reauth_only_action", r, STEP_UP_ACTION_MFA_ENROLL)

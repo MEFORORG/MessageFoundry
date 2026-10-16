@@ -280,17 +280,15 @@ def _idp_opener(
     return the ``fed.idp_tls`` FAIL or ERROR row that says why it did not build. Reads the anchor
     and CRL files; opens no socket. ``anchor=False`` leaves the anchor and its pin out, for
     :func:`idp_revocation_result` alone."""
-    from messagefoundry.auth.oidc_http import build_idp_opener
+    from messagefoundry.auth.oidc_http import build_idp_opener_from_settings
     from messagefoundry.auth.trust_anchors import TrustAnchorError
     from messagefoundry.config.settings import SecurityEnforcement
 
-    auth = settings.auth
     try:
-        return build_idp_opener(
-            auth.oidc_tls_ca_cert_file if anchor else None,
-            pin=auth.oidc_tls_ca_cert_pin if anchor else None,
+        return build_idp_opener_from_settings(
+            settings.auth,
             enforcing=settings.security.enforcement is SecurityEnforcement.ENFORCE,
-            crl_file=auth.oidc_tls_crl_file,
+            anchor=anchor,
         )
     except OSError as exc:
         return CheckResult(*_TLS_ROW, Status.FAIL, f"could not build the pinned TLS context: {exc}")

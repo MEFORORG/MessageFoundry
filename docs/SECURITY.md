@@ -3855,7 +3855,13 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   `/ui/login?e=rate_limited` and a WARNING log), a return the `Sec-Fetch-Mode` check refuses
   (audited `auth.login_failed`), and any refusal at the start leg `POST /ui/reauth/oidc`. A refusal those two methods decide changes nothing and re-renders the
   step-up page with a plain message, except one that finds the session gone, which sends the operator to sign in. A refusal after the `state`
-  check is filed under the staged session's account. A cancel at the IdP returns to the same page.
+  check is filed under the staged session's account. That row, and the row of a completed step-up,
+  also carry `start_client`, the address the start leg staged on the flow, and `client_moved`,
+  whether the callback came from another host by the new-address comparison, or null when either
+  address is unknown (BACKLOG #2160, vault BACKLOG #3145). Neither is ever read from the token. A
+  refusal before the `state` check names neither. A move is recorded, never refused. Behind a proxy
+  the engine does not trust, both legs carry the proxy's address, so `client_moved` reads false
+  there. A cancel at the IdP returns to the same page.
   A callback without the flow's own `state` consumes nothing, and the flow waits for the real
   return. The sign-in callback follows the same rule, an `error=` or malformed one included
   (BACKLOG #3198). A password is

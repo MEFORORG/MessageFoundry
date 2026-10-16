@@ -10276,7 +10276,9 @@ def create_managed_app(
                 # This process cannot vouch for a config it never checked: its flag rows say so.
                 engine.config_baseline_unchecked = start_outcome in _UNCHECKED_OUTCOMES
                 # Raised here, before engine.start(), so new bytes that make the start itself fail
-                # still page on every attempt of a crash loop. Never raises.
+                # still page on every attempt of a crash loop. Never raises. Vault BACKLOG #3145
+                # item 1 (a gate-refused restart pages on every attempt) is declined: that is this
+                # contract, pinned by test_the_alert_fires_even_when_the_start_then_fails (#2597).
                 if start_config is not None and start_config.changed:
                     _raise_config_changed(notifier or LoggingAlertSink(), engine, start_config)
             except BaseException:
@@ -10367,7 +10369,10 @@ def create_managed_app(
                 # any connection starts rather than after. Both touch only the store: initialize()
                 # seeds the built-in roles and the gate reads the users. A refusal here also comes
                 # before the start's opt-in audit-chain walk, so that walk cannot alert on such a
-                # start. Everything else that uses the service stays below the start.
+                # start. Vault BACKLOG #3145 item 2 is declined: the walk runs inside engine.start(),
+                # and moving it ahead of this gate reorders the start whose failure paging
+                # test_the_alert_fires_even_when_the_start_then_fails pins (#2597). Everything else
+                # that uses the service stays below the start.
                 await auth.initialize()
                 app.state.auth = auth
                 await _assert_security_notice_is_deliverable(

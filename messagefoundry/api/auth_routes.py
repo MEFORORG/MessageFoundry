@@ -29,6 +29,8 @@ from fastapi.responses import StreamingResponse
 from messagefoundry.api._ui_seam import AdminHandlers
 from messagefoundry.api.auth_models import (
     _GROUP_MAX,
+    STEP_UP_VIA_HEADER,
+    STEP_UP_VIA_IDP,
     AdGroupMap,
     AdGroupMapEntry,
     AdGroupScopeEntry,
@@ -749,13 +751,14 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 # the message names the leg that works. The header is the one the step-up gates
                 # send such a session (BACKLOG #2158), so a client branches on it here too rather
                 # than parsing the detail. No X-Step-Up-Required: this is the step-up itself.
-                # Typed out because api/security.py keeps its constant private; a test pins the
-                # name and the value to what the gates send.
+                # The constants the gates send too (vault BACKLOG #3145); a test pins the two
+                # to each other.
                 raise HTTPException(
                     status.HTTP_403_FORBIDDEN,
                     "this session was signed in through the identity provider; re-authenticate"
-                    " there through the web console at /ui/reauth, not with a password",
-                    headers={"X-Step-Up-Via": "idp"},
+                    " there, not with a password: repeat the action in the web console, which"
+                    " opens /ui/reauth for it",
+                    headers={STEP_UP_VIA_HEADER: STEP_UP_VIA_IDP},
                 )
             if elevation.directory_unconfirmed:
                 # BACKLOG #2027: the directory could not judge the password, so "failed" would
@@ -802,8 +805,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 raise HTTPException(
                     status.HTTP_403_FORBIDDEN,
                     "this session was signed in through the identity provider and owes no code;"
-                    " step up there through the web console at /ui/reauth",
-                    headers={"X-Step-Up-Via": "idp"},
+                    " step up there by repeating the action in the web console, which opens"
+                    " /ui/reauth for it",
+                    headers={STEP_UP_VIA_HEADER: STEP_UP_VIA_IDP},
                 )
             if elevation.directory_unconfirmed:
                 # BACKLOG #2023: the code was never checked, and the token still authenticates, so a
