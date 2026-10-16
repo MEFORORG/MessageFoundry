@@ -334,7 +334,7 @@ async def test_an_engine_fault_in_the_probe_has_its_own_reason_not_unavailable(
     for _ in range(3):
         assert await service.identity_for_cert_user_id(user_id) is None
 
-    # Once per process, like a configuration refusal, and never as a directory outage.
+    # One WARNING while the fault persists, and never as a directory outage.
     assert _outage_records(caplog, logging.WARNING) == []
     warnings = [
         r.getMessage()
@@ -357,53 +357,138 @@ def _fault_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
     ]
 
 
-async def test_a_probe_fault_warns_on_each_healthy_to_fault_transition_of_its_account(
-    store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """BACKLOG #3115, the Lander's ask on PR 2317. A fault logs one WARNING naming the exception
-    type, stays quiet while it persists, and warns again after that account's probe succeeded in
-    between. Another account's healthy answer does not re-arm it, or one account whose entry
-    always raises beside a healthy one would read as a flapping fault.
-
-    RED when: the fault WARNING is logged once per process, or omits the type, or a different
-    account's healthy answer re-arms it."""
-    service, _directory, user_id = await _directory_account(store, _VIEWERS)
+async def _faulting_service(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> tuple[AuthService, _Directory, UserRecord, dict[str, bool]]:
+    """A directory account whose certificate probe raises while ``state["faulting"]`` is set.
+    Any other row probes as the account would, so another account answers beside it."""
+    service, directory, user_id = await _directory_account(store, _VIEWERS)
     user = await store.get_user(user_id)
     assert user is not None
-    other = replace(user, id="synthetic-other-user-id")
-    caplog.set_level(logging.INFO, logger=_SERVICE_LOGGER)
     real = service._directory_presence
-    faulting = True
+    state = {"faulting": True}
 
     async def _sometimes_raises(probed: UserRecord) -> reconcile.Probe | str:
-        if faulting and probed.id == user_id:
+        if state["faulting"] and probed.id == user_id:
             raise LookupError("synthetic engine fault")
-        return await real(user)  # the healthy answer, whichever row asked
+        return await real(user)
 
     monkeypatch.setattr(service, "_directory_presence", _sometimes_raises)
+    return service, directory, user, state
 
-    async def _ask(row: UserRecord) -> object:
-        answer = await service._cert_directory_presence(row)
-        service._note_cert_directory_answer(answer)
-        return answer
 
-    assert await _ask(user) == service_module.CERT_PROBE_FAULT
+async def _ask(service: AuthService, row: UserRecord) -> object:
+    answer = await service._cert_directory_presence(row)
+    service._note_cert_directory_answer(answer)
+    return answer
+
+
+@pytest.mark.parametrize(
+    "between",
+    [
+        DirectoryAnswer.FOUND,
+        DirectoryAnswer.DISABLED,
+        DirectoryAnswer.NOT_FOUND,
+        DirectoryAnswer.UNDETERMINED,
+    ],
+    ids=lambda answer: answer.name.lower(),
+)
+async def test_a_probe_fault_warns_on_each_healthy_to_fault_transition_of_its_account(
+    store: MessageStore,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    between: DirectoryAnswer,
+) -> None:
+    """BACKLOG #3115, the Lander's ask on PR 2317. A fault logs one WARNING naming the exception
+    type, stays quiet while it persists, and warns again once the same account got any directory
+    answer in between. Another account's healthy answer does not end it, or one account whose
+    entry always raises beside a healthy one would read as a flapping fault.
+
+    RED when: the fault WARNING is logged once per process, or omits the type, or another
+    account's answer ends the fault, or an answer other than present does not."""
+    monkeypatch.setattr(service_module, "_CERT_OUTAGE_LOG_INTERVAL_SECONDS", 0.0)
+    service, directory, user, state = await _faulting_service(store, monkeypatch)
+    other = replace(user, id="synthetic-other-user-id")
+    caplog.set_level(logging.INFO, logger=_SERVICE_LOGGER)
+
+    assert await _ask(service, user) == service_module.CERT_PROBE_FAULT
     warnings = _fault_warnings(caplog)
     assert len(warnings) == 1 and "LookupError" in warnings[0]
     assert "jdoe" not in warnings[0] and "synthetic engine fault" not in warnings[0]
 
-    # A repeat while the fault persists is quiet, and so is it after ANOTHER account's healthy answer.
-    assert await _ask(user) == service_module.CERT_PROBE_FAULT
-    assert isinstance(await _ask(other), reconcile.Probe)
-    assert await _ask(user) == service_module.CERT_PROBE_FAULT
+    # A repeat while the fault persists is quiet, and so is it after ANOTHER account's answer.
+    assert await _ask(service, user) == service_module.CERT_PROBE_FAULT
+    assert isinstance(await _ask(service, other), reconcile.Probe)
+    assert await _ask(service, user) == service_module.CERT_PROBE_FAULT
     assert len(_fault_warnings(caplog)) == 1
 
-    # This account answers once, then faults again: a new outage, so a new WARNING.
-    faulting = False
-    assert isinstance(await _ask(user), reconcile.Probe)
-    faulting = True
-    assert await _ask(user) == service_module.CERT_PROBE_FAULT
+    # This account gets a directory answer once, then faults again: a new WARNING.
+    state["faulting"] = False
+    directory.answer = between
+    assert await _ask(service, user) != service_module.CERT_PROBE_FAULT
+    state["faulting"] = True
+    assert await _ask(service, user) == service_module.CERT_PROBE_FAULT
     assert len(_fault_warnings(caplog)) == 2
+
+
+async def test_a_flapping_probe_fault_warns_at_most_once_an_interval_and_is_never_silent(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An account whose probe alternates between raising and answering must not log a WARNING per
+    request. A fault inside the interval logs its WARNING on its first repeat after it.
+
+    RED when: the per-account WARNING has no interval, or a fault inside it is never logged."""
+    service, _directory, user, state = await _faulting_service(store, monkeypatch)
+    caplog.set_level(logging.INFO, logger=_SERVICE_LOGGER)
+    for _ in range(3):
+        state["faulting"] = True
+        assert await _ask(service, user) == service_module.CERT_PROBE_FAULT
+        state["faulting"] = False
+        assert isinstance(await _ask(service, user), reconcile.Probe)
+    assert len(_fault_warnings(caplog)) == 1
+
+    # The interval passes while the account faults again.
+    state["faulting"] = True
+    assert await _ask(service, user) == service_module.CERT_PROBE_FAULT
+    service._cert_probe_fault_warned_at[user.id] -= service_module._CERT_OUTAGE_LOG_INTERVAL_SECONDS
+    assert await _ask(service, user) == service_module.CERT_PROBE_FAULT
+    assert len(_fault_warnings(caplog)) == 2
+
+
+async def test_an_answer_to_a_probe_issued_before_the_fault_does_not_end_it(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Probes overlap. A slow answer to a probe that started before the fault says nothing about
+    whether the fault cleared, so the next fault stays quiet.
+
+    RED when: the fault ends in completion order rather than issue order."""
+    monkeypatch.setattr(service_module, "_CERT_OUTAGE_LOG_INTERVAL_SECONDS", 0.0)
+    service, directory, user_id = await _directory_account(store, _VIEWERS)
+    user = await store.get_user(user_id)
+    assert user is not None
+    caplog.set_level(logging.INFO, logger=_SERVICE_LOGGER)
+    real = service._directory_presence
+    release = asyncio.Event()
+    calls = 0
+
+    async def _first_slow_then_raises(probed: UserRecord) -> reconcile.Probe | str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await release.wait()
+            return await real(probed)
+        raise LookupError("synthetic engine fault")
+
+    monkeypatch.setattr(service, "_directory_presence", _first_slow_then_raises)
+    slow = asyncio.create_task(service._cert_directory_presence(user))
+    async with asyncio.timeout(10):
+        while calls == 0:
+            await asyncio.sleep(0)
+    assert await service._cert_directory_presence(user) == service_module.CERT_PROBE_FAULT
+    release.set()
+    assert isinstance(await slow, reconcile.Probe)
+    assert await service._cert_directory_presence(user) == service_module.CERT_PROBE_FAULT
+    assert len(_fault_warnings(caplog)) == 1
 
 
 @pytest.mark.parametrize(

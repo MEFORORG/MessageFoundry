@@ -209,11 +209,12 @@ or group removal never reached the certificate path at all.
   WARNING logs its own on its first refusal after that minute, so a long one is never silent. A
   change of reason during a logged outage logs one INFO, at most once a minute. A configuration
   refusal (no directory wired, no `directory_object_id`) logs one WARNING per reason per process.
-  `probe_fault` is an engine fault raised past the directory layer's own catch, which is not a
-  directory outage (BACKLOG #3115). It logs one WARNING naming the exception type each time an
-  account's probe goes from answering to faulting, and stays below WARNING while that account's
-  fault persists. Only a directory answer for the same account ends it, so another account's
-  healthy answer does not. A fault the directory layer raises still reads as `unavailable`.
+  `probe_fault` is an engine fault raised past the directory layer's own catch, so it is not a
+  directory outage (BACKLOG #3115). When an account's probe starts to fault, it logs one WARNING
+  that names the exception type. Repeats log at DEBUG. The fault ends only when a later probe of
+  the same account gets a directory answer, of any kind. Another account's answer does not end it.
+  One account's WARNINGs are at least a minute apart, and a fault inside that minute warns on its
+  first repeat after it. A fault the directory layer raises still reads as `unavailable`.
 - **The answer vouches for one account.** The row read after the probe must still carry the
   `directory_object_id` and provider the probe asked about, or the request is refused.
 

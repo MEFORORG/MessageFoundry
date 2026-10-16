@@ -282,8 +282,8 @@ _CERT_PROBE_SLOT_WAIT_SECONDS = 2.0
 #: The refusal reason when no probe slot freed in time. Not a directory answer.
 CERT_PROBE_SATURATED = "probe_capacity_saturated"
 #: The refusal reason when the certificate path's probe raised past every catch below it: an engine
-#: fault, so it is not a directory outage (BACKLOG #3115). Logged once per account each time that
-#: account's probe goes from answering to faulting (``_note_cert_probe_fault``).
+#: fault, so it is not a directory outage (BACKLOG #3115). ``_note_cert_probe_fault`` says what it
+#: logs.
 CERT_PROBE_FAULT = "probe_fault"
 #: Refusals that say the directory could not be asked, not what it said about the account. The
 #: certificate path logs these once per outage rather than once per request.
@@ -295,8 +295,11 @@ _CERT_DIRECTORY_OUTAGES = frozenset(
     }
 )
 #: The least time between two certificate-path outage WARNINGs, so a flapping outage cannot log
-#: one WARNING and INFO pair per request.
+#: one WARNING and INFO pair per request. The per-account probe-fault WARNING uses it too.
 _CERT_OUTAGE_LOG_INTERVAL_SECONDS = 60.0
+#: Bound on the accounts the certificate path tracks a probe fault for. Evicting one only lets its
+#: next fault log a WARNING early, so the bound is about memory, not correctness.
+_CERT_PROBE_FAULT_TRACKED_MAX = 4096
 #: The level ``_probe_principal`` logs an unexpected directory fault at. WARNING for the reconciler
 #: and step-up; the certificate path sets DEBUG in its probe task's own context (BACKLOG #2316).
 _PROBE_FAULT_LOG_LEVEL: ContextVar[int] = ContextVar(
@@ -2079,6 +2082,20 @@ def _allowed_channels(user: UserRecord, roles: frozenset[Role]) -> frozenset[str
     return channel_scope.scope_channels(user.channel_scope)
 
 
+def _cert_outcome(answer: reconcile.Probe | str) -> str:
+    """The certificate path's outcome string for ``answer``: a probe's outcome, or the bare reason
+    a refusal carries (``_directory_presence`` returns some directory answers as strings)."""
+    return answer.outcome.value if isinstance(answer, reconcile.Probe) else answer
+
+
+def _bounded_put[V](table: dict[str, V], key: str, value: V) -> None:
+    """Set ``table[key]``, evicting the oldest entry first when the table already holds
+    :data:`_CERT_PROBE_FAULT_TRACKED_MAX` others."""
+    if key not in table and len(table) >= _CERT_PROBE_FAULT_TRACKED_MAX:
+        del table[next(iter(table))]
+    table[key] = value
+
+
 def _cert_narrowed_scope[U: UserRecord](
     user: U, mapped: frozenset[str], *, administrator: bool
 ) -> U:
@@ -2421,9 +2438,11 @@ class AuthService:
         self._cert_outage_kind_noted_at: float | None = None
         #: Configuration refusals already logged by this process.
         self._cert_config_refusals_logged: set[str] = set()
-        #: Ids of accounts whose last certificate-path probe raised and was logged
-        #: (`_note_cert_probe_fault`). An id leaves when that account's probe gets an answer.
-        self._cert_probe_faulting: set[str] = set()
+        #: Certificate-path probe-fault state per account id (`_note_cert_probe_fault`): the
+        #: sequence number of the latest faulting probe, and the time of the last WARNING.
+        self._cert_probe_seq = 0
+        self._cert_probe_faulting: dict[str, int] = {}
+        self._cert_probe_fault_warned_at: dict[str, float] = {}
         self._login_limiter: SlidingWindowRateLimiter | None = (
             SlidingWindowRateLimiter(
                 per_key=settings.login_rate_limit_per_ip,
@@ -8282,6 +8301,8 @@ class AuthService:
         # This task's own context, so the DEBUG level never reaches the reconciler or step-up. A
         # fault on one account's entry would otherwise log a WARNING naming it on every request;
         # the outage line below reports it once instead.
+        self._cert_probe_seq += 1
+        seq = self._cert_probe_seq
         token = _PROBE_FAULT_LOG_LEVEL.set(logging.DEBUG)
         try:
             answer = await self._directory_presence(user)
@@ -8289,36 +8310,60 @@ class AuthService:
             # Returned, never raised: a raise from a probe whose caller was cancelled would reach
             # the loop's exception handler through the shield, one ERROR per orphaned request.
             # It fails closed under its own reason. The traceback can quote a directory value, so
-            # it goes to DEBUG and names no account.
-            _log.debug("certificate-path directory probe raised", exc_info=True)
-            self._note_cert_probe_fault(user.id, exc)
+            # it goes to DEBUG and names the account only by its row id.
+            _log.debug(
+                "certificate-path directory probe of user id %s raised", user.id, exc_info=True
+            )
+            self._note_cert_probe_fault(user.id, seq, exc)
             return CERT_PROBE_FAULT
         finally:
             _PROBE_FAULT_LOG_LEVEL.reset(token)
-        if isinstance(answer, reconcile.Probe) and answer.outcome.value in _CERT_DIRECTORY_ANSWERS:
-            self._cert_probe_faulting.discard(user.id)
+        faulted = self._cert_probe_faulting.get(user.id)
+        # Only a probe that started after the latest fault ends it, so a slow answer to a probe
+        # issued before the fault cannot.
+        if (
+            faulted is not None
+            and seq > faulted
+            and _cert_outcome(answer) in _CERT_DIRECTORY_ANSWERS
+        ):
+            del self._cert_probe_faulting[user.id]
         return answer
 
-    def _note_cert_probe_fault(self, user_id: str, exc: Exception) -> None:
-        """Log a certificate-path probe fault at WARNING when this account's probe goes from
-        answering to faulting, naming the exception type, and at DEBUG while the fault persists.
+    def _note_cert_probe_fault(self, user_id: str, seq: int, exc: Exception) -> None:
+        """Log a certificate-path probe fault (:data:`CERT_PROBE_FAULT`) without one line per
+        request: one WARNING naming the exception type when an account's probe starts to fault,
+        then DEBUG while it persists.
 
-        Keyed by account, because the fault this exists for is one account's entry that always
-        raises. A process-wide latch would let any other account's healthy answer end it, so that
-        one account would log a fresh WARNING per healthy request beside it, and read as flapping.
-        Only an answer the directory gave for the same account ends the fault, so an outage between
-        two faults does not. Logged in the probe task, so a caller that stopped waiting still counts.
-        The line names no account and never the exception's message, which can quote a directory
-        value."""
+        The fault ends when a probe of the same account, started after the fault, gets any answer
+        from the directory: present, absent, disabled or undetermined. An outage does not end it.
+        WARNINGs for one account are at least :data:`_CERT_OUTAGE_LOG_INTERVAL_SECONDS` apart. A
+        fault that starts inside that interval logs its WARNING on its first repeat after the
+        interval, so an account that flaps logs about once a minute and is never silent.
+
+        The state is keyed by account because the case it exists for is one account's entry that
+        always raises. Keyed process-wide, any other account's healthy answer would end it, and the
+        one account would read as flapping. It runs in the probe task, so a fault still counts when
+        its caller stopped waiting. The WARNING names no account and never the exception's message,
+        which can quote a directory value."""
         kind = type(exc).__name__
-        if user_id in self._cert_probe_faulting:
-            _log.debug("certificate-path directory probe raised %s again", kind)
+        faulted = self._cert_probe_faulting.get(user_id)
+        if faulted is not None:
+            self._cert_probe_faulting[user_id] = max(faulted, seq)
+            _log.debug(
+                "certificate-path directory probe of user id %s raised %s again", user_id, kind
+            )
             return
-        self._cert_probe_faulting.add(user_id)
+        now = time.monotonic()
+        last = self._cert_probe_fault_warned_at.get(user_id)
+        if last is not None and now - last < _CERT_OUTAGE_LOG_INTERVAL_SECONDS:
+            _log.debug("certificate-path directory probe of user id %s raised %s", user_id, kind)
+            return
+        _bounded_put(self._cert_probe_faulting, user_id, seq)
+        _bounded_put(self._cert_probe_fault_warned_at, user_id, now)
         _log.warning(
             "an mTLS certificate identity for a directory account was refused: %s (the probe "
-            "raised %s). Logged again for that account only after its probe gets an answer from "
-            "the directory",
+            "raised %s). Logged again for that account after its probe gets an answer from the "
+            "directory, at most once a minute",
             CERT_PROBE_FAULT,
             kind,
         )
@@ -8345,13 +8390,12 @@ class AuthService:
         interval, and the closing INFO names the latest reason.
 
         A configuration refusal (no directory wired, a row with no immutable id) asks nothing and
-        moves neither way. It logs one WARNING per reason per process instead. Nor does
-        :data:`CERT_PROBE_FAULT`, which says nothing about the directory. The probe logs that
-        itself, per account, in :meth:`_note_cert_probe_fault`.
+        moves neither way. It logs one WARNING per reason per process instead.
+        :data:`CERT_PROBE_FAULT` moves neither way either; :meth:`_note_cert_probe_fault` logs it.
 
         The lines name no account. Every service request during an outage is refused the same way,
         and the username is not the useful fact."""
-        outcome = answer.outcome.value if isinstance(answer, reconcile.Probe) else answer
+        outcome = _cert_outcome(answer)
         if outcome in _CERT_DIRECTORY_OUTAGES:
             now = time.monotonic()
             latched = self._cert_directory_outage
