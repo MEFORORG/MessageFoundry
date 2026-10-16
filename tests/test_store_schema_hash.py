@@ -213,13 +213,14 @@ async def test_sqlite_adds_claim_owner_to_a_table_that_predates_it(tmp_path: Pat
     store whose ``pending_approvals`` was written before the column existed, and then has a claim
     write the column and read it back."""
     import sqlite3
+    from contextlib import closing
 
     from messagefoundry.store.store import MessageStore
 
     path = tmp_path / "pre_claim_owner.db"
     store = await MessageStore.open(path)
     await store.close()
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db, db:
         db.execute("ALTER TABLE pending_approvals DROP COLUMN claim_owner")
         cols = {row[1] for row in db.execute("PRAGMA table_info(pending_approvals)")}
     assert "claim_owner" not in cols  # the control: the column really is gone before the reopen

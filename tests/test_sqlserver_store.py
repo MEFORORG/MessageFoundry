@@ -910,11 +910,15 @@ async def test_approval_repeats_racing_from_two_processes_file_one_request(store
     )
 
     answers = await asyncio.to_thread(race_repeat_requests, "sqlserver", tmp_path)
-    held = await assert_one_request_per_round(store, answers)
-    for approval_id in held:
-        await store.decide_pending_approval(
-            approval_id, status="rejected", approver="race-cleanup", decided_at=1_100.0
-        )
+    try:
+        await assert_one_request_per_round(store, answers)
+    finally:
+        # The fixture does not clear pending_approvals, so a failed run must not leave its open
+        # requests behind for a later test that lists the queue.
+        for approval_id in {each for answered in answers for each in answered}:
+            await store.decide_pending_approval(
+                approval_id, status="rejected", approver="race-cleanup", decided_at=1_100.0
+            )
 
 
 async def test_operator_mutations_commit_with_their_audit_rows(store) -> None:

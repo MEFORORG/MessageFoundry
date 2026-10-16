@@ -475,7 +475,7 @@ async def _guard(gate: ApprovalGate) -> str | None:
     )
 
 
-async def test_a_request_whose_commit_landed_answers_its_id_and_pages_nothing(
+async def test_a_request_whose_commit_landed_answers_its_id(
     store: MessageStore, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The COMMIT landed and only its reply was lost. The guard used to raise, so the caller saw a
@@ -488,7 +488,8 @@ async def test_a_request_whose_commit_landed_answers_its_id_and_pages_nothing(
     assert approval_id is not None
     assert [str(r["id"]) for r in await store.list_pending_approvals(now=0.0)] == [approval_id]
     assert len(await store.list_audit(action="approval.requested")) == 1
-    assert sink.lost == []
+    # Paged still: the off-box copy of its row was never written.
+    assert sink.lost == [(f"approval:{approval_id}", "approval.requested")]
     assert any("reading it back found it held" in r.getMessage() for r in caplog.records)
     # The retry the caller would have made joins it, through the real store's repeat rule.
     assert await _guard(_gate(store, _Sink())) == approval_id
@@ -557,7 +558,7 @@ async def test_a_cancelled_request_write_finishes_and_a_repeat_joins_it(
         assert await gate.drain(timeout=10.0) == []
     [held] = [str(r["id"]) for r in await store.list_pending_approvals(now=0.0)]
     assert any(
-        "held after its caller was cancelled" in r.getMessage() and held in r.getMessage()
+        "joined after its caller was cancelled" in r.getMessage() and held in r.getMessage()
         for r in caplog.records
     )
     assert await _guard(gate) == held

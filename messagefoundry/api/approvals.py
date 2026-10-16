@@ -161,17 +161,21 @@ def _audit_detail(fields: Mapping[str, Any]) -> str:
     """``fields`` as an audit row's JSON detail, never raising (vault BACKLOG #3193).
 
     ``default=str`` covers a value json cannot encode, such as a datetime, but not a dict key it
-    cannot encode, such as a tuple, nor a circular reference. Each top-level field that still fails
-    is written as its ``str()``, so the other fields survive intact."""
+    cannot encode, such as a tuple, a circular reference, a nesting too deep, or a ``__str__`` that
+    raises. Each top-level field that still fails is written as its ``str()``, or as a marker
+    naming its type when that raises too, so the other fields survive intact."""
     try:
         return json.dumps(fields, default=str)
-    except (TypeError, ValueError):
+    except Exception:  # noqa: BLE001 - any encoding failure here would strand a settled row
         safe: dict[str, Any] = {}
         for key, value in fields.items():
             try:
                 json.dumps(value, default=str)
-            except (TypeError, ValueError):
-                value = str(value)
+            except Exception:  # noqa: BLE001 - as above
+                try:
+                    value = str(value)
+                except Exception:  # noqa: BLE001 - as above
+                    value = f"<unencodable {type(value).__name__}>"
             safe[str(key)] = value
         return json.dumps(safe, default=str)
 
@@ -207,14 +211,15 @@ def _log_orphaned_request(task: asyncio.Future[Any], approval_id: str) -> None:
 
     :meth:`ApprovalGate._file_request` logs and pages its own failures, so a failure is only read
     here, which marks it retrieved. What only this callback can say is that the request was held
-    after the caller stopped waiting, so its requester never got the 202."""
+    after the caller stopped waiting, so this call got no 202. For a repeat the held request is
+    the older one it joined, whose own 202 may have reached the requester."""
     if task.cancelled():
         log.error("approval %s: a request write was cancelled", approval_id)
         return
     if task.exception() is None:
         log.warning(
-            "approval %s: the request was held after its caller was cancelled, so the requester "
-            "got no 202 for it. A repeat by the same requester joins it",
+            "approval %s: a request was filed or joined after its caller was cancelled, so that "
+            "call got no 202. A repeat by the same requester joins this request",
             task.result(),
         )
 
@@ -582,8 +587,9 @@ class ApprovalGate:
 
         * **held**, with its seal intact: the COMMIT landed and only its reply was lost. The request
           and its ``approval.requested`` row are one write, so both are in the store. The id is
-          returned, a WARNING is logged, and nothing pages. Answering an error here is what used to
-          let a retry the repeat rule misses file a second releasable copy.
+          returned and a WARNING is logged. Answering an error here is what used to let a retry
+          the repeat rule misses file a second releasable copy. It still pages, for the reason
+          below.
         * **absent**: the write most likely rolled back, so nothing is held. It is raised, logged at
           ERROR and paged, since the store refused a write.
         * **unknown**, because the read failed or the row failed its seal: it is raised, logged at
@@ -640,12 +646,16 @@ class ApprovalGate:
                     log.warning(
                         "approval %s: the write that filed this %s request by %s reported an "
                         "error, and reading it back found it held, with its approval.requested "
-                        "row in the same write; answering with its id",
+                        "row in the same write; answering with its id. The row's off-box copy "
+                        "was not written",
                         approval_id,
                         operation,
                         scrub_log_argument(requester),  # CodeQL py/log-injection
                         exc_info=True,
                     )
+                    # Still paged: the store tees off-box only after a commit it saw succeed, so
+                    # the forwarded audit stream lacks this row and nothing else reports the gap.
+                    self._alert_lost_audit(approval_id, "approval.requested")
                     return approval_id
                 state = (
                     "Reading it back found no such request, so most likely nothing is held"
@@ -679,14 +689,16 @@ class ApprovalGate:
         second releasable copy of it."""
         try:
             found = await self._store.get_pending_approval(approval_id)
+            if found is None:
+                return "absent"
+            # Inside the try: a row the checker cannot even parse must still end in the caller's
+            # ERROR line and page, not escape them.
+            return "held" if await self._verified(found) is not None else "unknown"
         except Exception:  # noqa: BLE001 - every store backend raises its own type
             log.exception(
                 "approval %s: reading back a request whose write failed failed too", approval_id
             )
             return "unknown"
-        if found is None:
-            return "absent"
-        return "held" if await self._verified(found) is not None else "unknown"
 
     async def rejoin(
         self,
@@ -778,10 +790,9 @@ class ApprovalGate:
         self, r: ApprovalRow, params: dict[str, Any] | None
     ) -> ReleaseBlocked | None:
         """Why :meth:`approve` would refuse this request whoever approves it, or ``None`` (vault
-        BACKLOG #3192). approve() refuses on exactly these, so a page offers no Approve the gate
-        always refuses. Read now, like the refusals it predicts, and silent on the ones that
-        depend on the approver, the request's age or the requester's standing. The self-approval
-        refusal sits between the first and the rest, because it needs the requester id."""
+        BACKLOG #3192). approve() refuses on exactly these, so the queue cannot predict a refusal
+        the gate does not make; :class:`~messagefoundry.api.models.PendingApprovalInfo` states
+        what each value means and what ``None`` does not promise."""
         if not r.requester_user_id:
             return "no_requester_id"
         if r.operation not in self._ops:
@@ -814,7 +825,8 @@ class ApprovalGate:
             # The same test approve() refuses on (approval.no_longer_gated), so a page can stop
             # offering a release the gate would refuse. Read now, like the refusal it predicts.
             "gated": self.gates(operation),
-            "release_blocked": self._release_blocked(r, params),
+            # Only a pending row can be approved; an interrupted one is resolved instead.
+            "release_blocked": self._release_blocked(r, params) if r.status == "pending" else None,
         }
 
     async def approve(
@@ -846,9 +858,9 @@ class ApprovalGate:
         :meth:`_settle`.
 
         **The writes on this path answer a mapped status in a store outage (vault BACKLOG #2255).** A
-        refusal's own audit row (``approval.too_early``, ``approval.stale_requester``,
-        ``approval.no_longer_gated``) that fails to write is logged and the refusal still answers
-        409, since it runs nothing. A release whose approver account changed after the request
+        refusal's own audit row (at least ``approval.too_early``, ``approval.stale_requester``,
+        ``approval.no_longer_gated`` and ``approval.params_unreadable``) that fails to write is
+        logged and the refusal still answers 409, since it runs nothing. A release whose approver account changed after the request
         writes ``approval.approver_provenance``. That row is soft too, and pages if it fails. It is
         written whether the operation succeeded, failed or was cut off. Many failed writes on this path also page
         ``audit_write_failed``, but not all of them. docs/SECURITY.md, in its approvals section,

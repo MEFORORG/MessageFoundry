@@ -549,9 +549,10 @@ class PendingApprovalInfo(BaseModel):
     approver is, or is ``None`` (vault BACKLOG #3192). Each value is a 409 the gate raises, in the
     order it raises them: ``no_requester_id`` (the row predates requester-id attribution),
     ``operation_unavailable`` (no such operation is registered), ``not_gated`` (as ``gated`` above)
-    and ``params_unreadable``. ``None`` does not promise a release: the self-approval refusal, the
-    dwell floor and the requester's standing are read at release. It lets a page offer only the
-    reject, and has no meaning on an ``interrupted`` row."""
+    and ``params_unreadable``. ``None`` does not promise a release. At least the self-approval
+    refusal, the expiry, the dwell floor, the requester's standing, the row's seal and the
+    operation's own refusals, such as a held reload with no config digest, are met only at
+    release. It lets a page offer only the reject. It is ``None`` on an ``interrupted`` row."""
 
     id: str
     operation: str

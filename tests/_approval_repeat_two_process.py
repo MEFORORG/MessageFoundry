@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -110,25 +111,29 @@ def race_repeat_requests(target: str, signal_dir: Path, *, rounds: int = 25) -> 
     go = signal_dir / f"race-go-{nonce}"
     argv = [sys.executable, "-c", _CHILD, target, nonce, str(rounds), str(go)]
     procs: list[subprocess.Popen[str]] = []
+    # Each child's stderr goes to a file, never a pipe: a pipe nobody reads fills and blocks the
+    # child, and the wait for READY below would then never end.
+    errs = [signal_dir / f"race-err-{nonce}-{n}.txt" for n in range(2)]
     try:
-        for _ in range(2):
-            procs.append(
-                subprocess.Popen(
-                    argv,
-                    cwd=_REPO_ROOT,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
+        for err_path in errs:
+            with err_path.open("w", encoding="utf-8") as err_file:
+                procs.append(
+                    subprocess.Popen(
+                        argv,
+                        cwd=_REPO_ROOT,
+                        stdout=subprocess.PIPE,
+                        stderr=err_file,
+                        text=True,
+                    )
                 )
-            )
-        for proc in procs:
-            assert proc.stdout is not None
-            ready = proc.stdout.readline()
+        for proc, err_path in zip(procs, errs, strict=True):
+            ready = _readline_within(proc, 120.0)
             if ready.strip() != "READY":
-                _, err = proc.communicate(timeout=60)
-                raise AssertionError(f"a child never opened its store: {ready!r}\n{err[-4000:]}")
+                raise AssertionError(
+                    f"a child never opened its store: {ready!r}\n{_tail(err_path)}"
+                )
         go.touch()  # both are open and polling, so neither starts with a head start of an open
-        outs = [proc.communicate(timeout=300) for proc in procs]
+        outs = [proc.communicate(timeout=300)[0] for proc in procs]
     finally:
         for proc in procs:
             if proc.poll() is None:
@@ -136,8 +141,8 @@ def race_repeat_requests(target: str, signal_dir: Path, *, rounds: int = 25) -> 
                 proc.communicate()
     answers: list[list[str]] = []
     spans: list[tuple[float, float]] = []
-    for proc, (out, err) in zip(procs, outs, strict=True):
-        assert proc.returncode == 0, f"a child exited {proc.returncode}: {err[-4000:]}"
+    for proc, out, err_path in zip(procs, outs, errs, strict=True):
+        assert proc.returncode == 0, f"a child exited {proc.returncode}: {_tail(err_path)}"
         [line] = [each for each in out.splitlines() if each.startswith("HELD ")]
         report = json.loads(line.removeprefix("HELD "))
         answers.append([str(each) for each in report["held"]])
@@ -146,6 +151,29 @@ def race_repeat_requests(target: str, signal_dir: Path, *, rounds: int = 25) -> 
     # the checks below with no race at all.
     assert max(s for s, _ in spans) < min(e for _, e in spans), spans
     return answers
+
+
+def _readline_within(proc: subprocess.Popen[str], timeout: float) -> str:
+    """The child's next stdout line, or ``""`` when none comes within ``timeout`` seconds. A
+    child that dies first closes stdout, so the read ends; one that hangs is killed, which ends it
+    too."""
+    stdout = proc.stdout
+    assert stdout is not None
+    line: list[str] = []
+    reader = threading.Thread(target=lambda: line.append(stdout.readline()), daemon=True)
+    reader.start()
+    reader.join(timeout)
+    if reader.is_alive():
+        proc.kill()
+        reader.join(10.0)
+    return line[0] if line else ""
+
+
+def _tail(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")[-4000:]
+    except OSError as exc:
+        return f"(stderr unreadable: {exc})"
 
 
 async def assert_one_request_per_round(store: Any, answers: list[list[str]]) -> set[str]:

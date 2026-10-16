@@ -22,11 +22,9 @@ hand-built POST either way.
 **Each row shows the parameters its hold captured** (BACKLOG #2458), so an approver sees what a
 release would do. A ``None`` reads as the scope it means, such as all inbound connections.
 
-**A pending row the gate always refuses offers no Approve** (vault BACKLOG #3192). The engine names
-the reason in ``release_blocked``, from the same tests its release refusals use: the row predates
-requester-id attribution, its operation is not registered, dual control no longer gates it, or its
-parameters are unreadable. The page offers the reject and says why, rather than a button the gate
-answers with 409. The reject reads Withdraw on the requester's own row and Reject on anyone
+**A pending row the gate refuses whoever approves it offers no Approve** (vault BACKLOG #3192). The
+engine names the reason in ``release_blocked``; ``PendingApprovalInfo`` says what each value means.
+The page offers the reject and says why, rather than a button the gate answers with 409. The reject reads Withdraw on the requester's own row and Reject on anyone
 else's, and the note names the same verb.
 
 Every value goes through the escaping ``el`` builder.

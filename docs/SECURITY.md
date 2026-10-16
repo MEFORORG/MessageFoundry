@@ -2062,8 +2062,8 @@ with that advice beside it.
 **`GET /approvals` names a release the gate refuses whoever approves it (vault BACKLOG #3192).**
 Each request's `release_blocked` is one of `no_requester_id`, `operation_unavailable`,
 `not_gated` and `params_unreadable`, read from the same tests the release refuses on, in the same
-order, or `null`. `null` is not a promise: the self-approval refusal, the dwell floor and the
-requester's standing are read only at release. The console's Approvals page offers a blocked
+order, or `null`. `null` is not a promise: at least the self-approval refusal, the dwell floor,
+the requester's standing and the operation's own refusals are met only at release. The console's Approvals page offers a blocked
 request only Reject, or Withdraw on the requester's own row, with a note saying why. A release
 refused for unreadable parameters writes an `approval.params_unreadable` row against the
 approver, which carries no parameters. The other two refusals the field names that are not
@@ -2204,8 +2204,8 @@ least these paths. The alert is keyed `approval:<id>` and carries the row's acti
   row's detail;
 - the `approval.approver_provenance` row a release or a resolution writes after it has gone ahead.
   The log line carries the row's detail;
-- the request or repeat write, unless a failed request reads back as held, as below. The log line
-  names the actor and the operation;
+- the request or repeat write, including one that reads back as held, as below. The log line names
+  the actor and the operation, or is a WARNING for a held one;
 - a claim, a rejection or a resolution that answers 503, and a claim whose approve was cancelled.
   The log line carries the exception, not the row's detail.
 
@@ -2230,8 +2230,8 @@ does not read back as held, is not mapped either. It answers a raw 500, or the r
 The request and its `approval.requested` row are one write, as above. When that write reports an
 error, the gate reads the request back by its id. If it is held and its seal holds, the COMMIT
 landed and only its reply was lost. The gate then answers the same **202** with that id, logs a
-WARNING, and pages nothing. Its row reaches the local audit log but not the off-box copy, which
-is written only after a commit the store saw succeed. A cancel reaches the caller at once, while
+WARNING, and still pages. Its row reaches the local audit log but not the off-box copy, which is
+written only after a commit the store saw succeed, and the page is what reports that gap. A cancel reaches the caller at once, while
 the write finishes on its own, and the shutdown drain waits for it.
 
 A retry can still file a second request. At least these cases leave the request held while the
