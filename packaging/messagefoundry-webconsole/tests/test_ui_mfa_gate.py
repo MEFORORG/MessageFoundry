@@ -21,6 +21,7 @@ import pytest
 from _ui_clients import SAME_ORIGIN, create_local_user_chosen, held_totp_code
 
 from messagefoundry.api import create_app
+from messagefoundry.api.auth_routes import _DIRECTORY_UNCONFIRMED_DETAIL
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.passwords import hash_password
@@ -1206,37 +1207,30 @@ async def test_the_gate_says_the_directory_could_not_confirm_the_account(
         _directory_refuses(service, monkeypatch)
         r = await c.post("/ui/mfa", data={"code": "123456"})
         assert r.status_code == 400
-        assert _DIRECTORY_UNCONFIRMED_TEXT in r.text
+        assert _DIRECTORY_UNCONFIRMED_ERROR in r.text
         assert "That code wasn" not in r.text
 
 
-async def test_the_directory_refusal_names_both_fixes(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_the_directory_refusal_names_both_fixes() -> None:
     """BACKLOG #3082, the console's half. An outage clears on a later try. A role lost in the
     directory (``directory_roles_demoted``) never does, and a new sign-in, which takes the roles the
     current groups grant, does. The engine hands the console the same
     ``Elevation(directory_unconfirmed=True)`` for both causes and keeps the cause on the audit row,
-    so this one refusal is what a demoted operator and an operator meeting an outage both see. The
-    engine's half drives the real refusal for each cause:
+    so this one text is what a demoted operator and an operator meeting an outage both see; the gate
+    test above shows it on the page. The engine's half drives the real refusal for each cause:
     ``test_the_route_says_the_directory_could_not_confirm_the_account`` in
     tests/test_mfa_directory_recheck.py.
 
-    RED when: the text tells a demoted operator only to try again later, or names a group or role.
-    """
-    service = await _service(engine)
-    await _add(service, "op", Role.OPERATOR)
-    await _enroll_totp(service)
-    async with _client(engine, service) as c:
-        await _login(c)
-        _directory_refuses(service, monkeypatch)
-        r = await c.post("/ui/mfa", data={"code": "123456"})
-        assert r.status_code == 400
-        assert _DIRECTORY_UNCONFIRMED_ERROR in r.text
-        assert "Try again later." in _DIRECTORY_UNCONFIRMED_ERROR
-        assert "sign out and sign in again" in _DIRECTORY_UNCONFIRMED_ERROR
+    It also keeps the console's text in step with the API's 403 detail, which a client of the API
+    shows instead: both name the same fixes, and neither names a group or role.
+
+    RED when either text tells a demoted operator only to try again later."""
+    for text in (_DIRECTORY_UNCONFIRMED_ERROR, _DIRECTORY_UNCONFIRMED_DETAIL):
+        said = text.lower()
+        for fix in ("try again later", "sign out and sign in again", "ask an administrator"):
+            assert fix in said, (fix, text)
         for internal in ("demoted", "group", "role"):
-            assert internal not in _DIRECTORY_UNCONFIRMED_ERROR.lower()
+            assert internal not in said, (internal, text)
 
 
 async def test_the_reauth_code_leg_says_the_directory_could_not_confirm_the_account(

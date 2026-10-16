@@ -611,9 +611,16 @@ async def test_a_local_account_is_never_probed(store: MessageStore) -> None:
     assert directory.probes == []
 
 
-@pytest.mark.parametrize("cause", ["disabled", "outage", "demotion"])
+@pytest.mark.parametrize(
+    ("cause", "outcome"),
+    [
+        ("disabled", "disabled"),
+        ("outage", "unavailable"),
+        ("demotion", "directory_roles_demoted"),
+    ],
+)
 async def test_the_route_says_the_directory_could_not_confirm_the_account(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cause: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cause: str, outcome: str
 ) -> None:
     """The API answers 403, not the wrong-code 401, and names the directory as the reason. RED when
     the text tells a demoted account only to try again later: a retry never clears a role lost in
@@ -648,13 +655,8 @@ async def test_the_route_says_the_directory_could_not_confirm_the_account(
         for internal in ("MF-Operators", "MF-Viewers", "operator", "viewer", "demoted", "group"):
             assert internal not in detail
         # The cause the test set is the one the engine met: the precise reason is on the audit row.
-        outcome = {
-            "disabled": "disabled",
-            "outage": "unavailable",
-            "demotion": "directory_roles_demoted",
-        }
         audited = [row["outcome"] for row in await _audited_mfa_failures(engine.store)]
-        assert audited == [outcome[cause]]
+        assert audited == [outcome]
     finally:
         await engine.stop()
 

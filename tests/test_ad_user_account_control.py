@@ -978,16 +978,22 @@ HELD = ("ad_reconcile_held", "directory-reconciler")
 REFERRAL = ("ad_reconcile_aborted", _REFERRAL_ALERT_SOURCE)
 
 
-async def _left_open_by_an_earlier_run(store: MessageStore) -> None:
+async def _left_open_by_an_earlier_run(
+    store: MessageStore, alerts: frozenset[tuple[str, str]] = frozenset({ABORTED, HELD})
+) -> None:
+    """The breaker's and the hold's instances, or only those in ``alerts``, as an earlier run of
+    the engine left them open."""
     last_run = NotifierAlertSink([], store=store)
-    last_run.ad_reconcile_aborted(
-        "directory-reconciler", reason="mass_revoke_breaker", probed=12, detail="tripped"
-    )
-    last_run.ad_reconcile_held(
-        "directory-reconciler", reason=HOLD_REASON, undetermined=2, detail="held"
-    )
+    if ABORTED in alerts:
+        last_run.ad_reconcile_aborted(
+            "directory-reconciler", reason="mass_revoke_breaker", probed=12, detail="tripped"
+        )
+    if HELD in alerts:
+        last_run.ad_reconcile_held(
+            "directory-reconciler", reason=HOLD_REASON, undetermined=2, detail="held"
+        )
     await _settle(last_run)
-    assert await _open_alerts(store) == {ABORTED, HELD}
+    assert await _open_alerts(store) == alerts
 
 
 async def _alerted_pass(service: AuthService, sink: NotifierAlertSink) -> ReconcilePlan:
@@ -1938,13 +1944,30 @@ def test_only_a_process_alone_on_its_store_is_the_sole_reconciler() -> None:
     assert not _is_sole_reconciler(clustered, None, _runner(None))  # a [cluster] node
 
 
+#: An SMTP transport, which wires the notifier; no message is sent by the lifespan tests.
+_SMTP_ALERTS = AlertsSettings(
+    email_smtp_host="smtp.example.invalid",
+    email_from="alerts@example.invalid",
+    email_to=["ops@example.invalid"],
+    security_notifications_required=False,
+)
+
+
+@pytest.mark.parametrize("alerts", [None, _SMTP_ALERTS], ids=["no-alerts", "smtp-alerts"])
 @pytest.mark.parametrize("sole", [False, True], ids=["not-sole", "sole"])
 async def test_the_lifespan_passes_the_sole_reconciler_answer_to_the_reconciler_task(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sole: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sole: bool, alerts: AlertsSettings | None
 ) -> None:
     """The call site in ``create_managed_app``. The test above pins what the answer is; this one
     pins that the lifespan asks for it, with the process's own coordinator, filter and runner, and
-    hands it on. A call site passing ``True`` regardless fails the ``not-sole`` case."""
+    hands it on. A call site passing ``True`` regardless fails the ``not-sole`` case.
+
+    It also pins ``alert_state`` (BACKLOG #3084, item 4). With no ``[alerts]`` transport nothing
+    records an instance, so it is ``None``. With one, the notifier records instances in the
+    engine's store, and the reconciler must read that same store to tell an earlier run's open
+    instance from its own. The ``smtp-alerts`` cases are RED when the call site passes
+    ``alert_state=None`` regardless: a restarted engine whose own pass trips would then resolve
+    the earlier run's row."""
     asked: list[tuple[object, object, object]] = []
     handed: list[bool] = []
     states: list[object] = []
@@ -1973,6 +1996,7 @@ async def test_the_lifespan_passes_the_sole_reconciler_answer_to_the_reconciler_
             enforcement=SecurityEnforcement.WARN, allow_unencrypted_phi=True
         ),
         egress_settings=EgressSettings(deny_by_default=False),
+        alerts_settings=alerts,
     )
     async with app.router.lifespan_context(app):
         for _ in range(200):
@@ -1981,56 +2005,10 @@ async def test_the_lifespan_passes_the_sole_reconciler_answer_to_the_reconciler_
             await asyncio.sleep(0.005)
         engine = app.state.engine
         assert asked == [(engine.coordinator, None, engine.registry_runner)]
+        assert (app.state.notifier is not None) is (alerts is not None)
     assert handed == [sole]
-    assert states == [None]  # no [alerts] notifier, so nothing records an instance to read
-
-
-async def test_the_lifespan_hands_the_reconciler_the_engines_own_store_when_alerts_are_wired(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The second lifespan case (BACKLOG #3084, item 4). With an ``[alerts]`` transport the notifier
-    records alert instances in the engine's store, and the reconciler must read that same store to
-    tell an earlier run's open instance from its own. The case above has no notifier and pins
-    ``None``.
-
-    RED when the call site passes ``alert_state=None`` regardless: a restarted engine whose own pass
-    trips would then resolve the earlier run's row, and no other test sees it."""
-    states: list[object] = []
-
-    async def reconciler(
-        auth: AuthService,
-        interval: float,
-        sink: AlertSink,
-        *,
-        sole_reconciler: bool,
-        alert_state: object,
-    ) -> None:
-        states.append(alert_state)
-
-    monkeypatch.setattr(app_module, "_directory_reconciler", reconciler)
-    app = create_managed_app(
-        store_settings=StoreSettings(path=str(tmp_path / "alerts.db"), allow_unencrypted_phi=True),
-        auth_settings=_settings(),
-        security_settings=SecuritySettings(
-            enforcement=SecurityEnforcement.WARN, allow_unencrypted_phi=True
-        ),
-        egress_settings=EgressSettings(deny_by_default=False),
-        # An SMTP transport wires the notifier; no message is sent in this test.
-        alerts_settings=AlertsSettings(
-            email_smtp_host="smtp.example.invalid",
-            email_from="alerts@example.invalid",
-            email_to=["ops@example.invalid"],
-            security_notifications_required=False,
-        ),
-    )
-    async with app.router.lifespan_context(app):
-        for _ in range(200):
-            if states:
-                break
-            await asyncio.sleep(0.005)
-        assert app.state.notifier is not None, "the alerts transport wired no notifier"
-        engine_store = app.state.engine.store
-    assert len(states) == 1 and states[0] is engine_store
+    assert len(states) == 1
+    assert states[0] is (None if alerts is None else engine.store)
 
 
 class _PlanAuth:
@@ -2453,30 +2431,6 @@ async def test_a_process_never_resolves_an_instance_an_earlier_run_left_open() -
         await store.close()
 
 
-async def test_a_failed_alert_state_read_costs_a_clear_and_never_makes_one() -> None:
-    """Until a read of alert state succeeds, the loop cannot tell inherited instances from its
-    own, so every clear is dropped. What is open at the first read that succeeds then counts as
-    inherited, including a trip this process opened meanwhile: a missed clear, never a false
-    one."""
-    store = await MessageStore.open(":memory:")
-    real = store.list_active_alert_instances
-    failures = [sqlite3.OperationalError("synthetic: database is locked")]
-
-    async def failing_once(**kwargs: Any) -> list[Any]:
-        if failures:
-            raise failures.pop()
-        return await real(**kwargs)
-
-    try:
-        store.list_active_alert_instances = failing_once  # type: ignore[method-assign]
-        auth = _ScriptedAuth([_BOTH_CLEAR], {0: partial(_open_both_again, store)})
-        await _run_reconciler(auth, store, NotifierAlertSink([], store=store), passes=4)
-        assert await _open_alerts(store) == {ABORTED, HELD}
-        assert not failures, "the read never failed"
-    finally:
-        await store.close()
-
-
 def test_every_clear_flag_names_the_instance_it_resolves() -> None:
     """``_without_inherited_clears`` drops a flag its map does not name, so a ``*_clear`` flag left
     out of the map is a clear that never fires on an engine with alert state (BACKLOG #2538)."""
@@ -2534,12 +2488,12 @@ async def test_a_process_never_resolves_a_referral_an_earlier_run_left_open() ->
         await store.close()
 
 
-def _scripted_reads(
-    store: MessageStore, script: list[str]
-) -> tuple[Callable[..., Awaitable[list[Any]]], list[str]]:
-    """``list_active_alert_instances`` that answers read ``n`` as ``script[n]`` says, and every read
-    past the script as the last entry: ``real`` reads the store, ``fail`` raises a driver error and
-    ``hang`` never returns. Returns the stand-in and the log of what each read did."""
+def _script_reads(
+    monkeypatch: pytest.MonkeyPatch, store: MessageStore, script: list[str]
+) -> list[str]:
+    """Patch ``list_active_alert_instances`` to answer read ``n`` as ``script[n]`` says, and every
+    read past the script as the last entry: ``real`` reads the store, ``fail`` raises a driver
+    error and ``hang`` never returns. Returns the log of what each read did."""
     real = store.list_active_alert_instances
     done: list[str] = []
 
@@ -2552,18 +2506,20 @@ def _scripted_reads(
             await asyncio.Event().wait()
         return await real(**kwargs)
 
-    return read, done
+    monkeypatch.setattr(store, "list_active_alert_instances", read)
+    return done
 
 
 @pytest.mark.parametrize(
     ("script", "resolves"),
     [
         (["real"], True),
+        (["fail", "real"], False),
+        (["hang", "real"], False),
         (["real", "fail"], False),
         (["real", "hang"], False),
-        (["hang", "real"], False),
     ],
-    ids=["control", "later-read-fails", "later-read-hangs", "first-read-hangs"],
+    ids=["control", "first-read-fails", "first-read-hangs", "later-read-fails", "later-read-hangs"],
 )
 async def test_a_pass_whose_alert_read_fails_or_runs_long_drops_its_clears(
     monkeypatch: pytest.MonkeyPatch, script: list[str], resolves: bool
@@ -2572,32 +2528,29 @@ async def test_a_pass_whose_alert_read_fails_or_runs_long_drops_its_clears(
     failed or ran past the bound drops its clears: a missed clear, never a false one. The first
     read fixes what counts as inherited; the later one is each pass's own, in
     ``_without_inherited_clears``. The store is empty when the loop starts, so the trip and hold the
-    first pass opens are this process's own, and the control resolves both.
+    first pass opens are this process's own, and the control resolves both. Until a first read
+    succeeds the loop cannot tell inherited instances from its own, so what is open at the first
+    read that succeeds counts as inherited, including the trip and hold this process opened
+    meanwhile.
 
     RED when a failed later read keeps the pass's clears (``later-read-fails``), or when either read
     has no bound: a hung read then stalls the loop, and the pass count is never reached."""
     monkeypatch.setattr(app_module, "_RECONCILE_ALERT_READ_TIMEOUT", 0.01)
     store = await MessageStore.open(":memory:")
     try:
-        real = store.list_active_alert_instances
-        read, done = _scripted_reads(store, script)
-        store.list_active_alert_instances = read  # type: ignore[method-assign,assignment]
+        done = _script_reads(monkeypatch, store, script)
         auth = _ScriptedAuth([_BOTH_CLEAR], {0: partial(_open_both_again, store)})
         await _run_reconciler(auth, store, NotifierAlertSink([], store=store), passes=4)
-        assert script[-1] in done, f"the scripted read never ran: {done}"
-        store.list_active_alert_instances = real  # type: ignore[method-assign]
+        assert done[: len(script)] == script, f"the scripted reads did not all run: {done}"
+        monkeypatch.undo()
         assert await _open_alerts(store) == (set() if resolves else {ABORTED, HELD})
     finally:
         await store.close()
 
 
-@pytest.mark.parametrize(
-    ("left_open", "own"),
-    [(HELD, ABORTED), (ABORTED, HELD)],
-    ids=["hold-inherited", "trip-inherited"],
-)
+@pytest.mark.parametrize("left_open", [HELD, ABORTED], ids=["hold-inherited", "trip-inherited"])
 async def test_an_inherited_row_keeps_only_its_own_clear_from_resolving(
-    left_open: tuple[str, str], own: tuple[str, str]
+    left_open: tuple[str, str],
 ) -> None:
     """BACKLOG #3084, item 5: the hold's clear against an inherited hold row alone. An earlier run
     left one reconcile alert open, and this process opens the other. A pass the service marks clear
@@ -2607,20 +2560,10 @@ async def test_an_inherited_row_keeps_only_its_own_clear_from_resolving(
     inherited row is resolved."""
     store = await MessageStore.open(":memory:")
     try:
-        last_run = NotifierAlertSink([], store=store)
-        if left_open == HELD:
-            last_run.ad_reconcile_held(
-                "directory-reconciler", reason=HOLD_REASON, undetermined=2, detail="held"
-            )
-        else:
-            last_run.ad_reconcile_aborted(
-                "directory-reconciler", reason="mass_revoke_breaker", probed=12, detail="tripped"
-            )
-        await _settle(last_run)
-        assert await _open_alerts(store) == {left_open}
+        await _left_open_by_an_earlier_run(store, frozenset({left_open}))
         auth = _ScriptedAuth([_BOTH_CLEAR], {0: partial(_open_both_again, store)})
         await _run_reconciler(auth, store, NotifierAlertSink([], store=store), passes=4)
-        assert await _open_alerts(store) == {left_open}, f"{own} stayed open, or {left_open} closed"
+        assert await _open_alerts(store) == {left_open}, "own row stayed open, or inherited closed"
     finally:
         await store.close()
 

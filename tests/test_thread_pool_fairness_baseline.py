@@ -74,6 +74,7 @@ from messagefoundry.pipeline.connscale_shim import InstrumentedThreadPoolExecuto
 from messagefoundry.store.store import MessageStore
 from messagefoundry_webconsole._service import _service as console_service
 from scripts.security import route_gates
+from tests._ast_sites import call_sites, find_funcs, parse_source
 
 _POOL = 4
 # The baseline's budget. A verify with no free thread cannot finish at any budget, so the value only
@@ -396,17 +397,20 @@ _STREAMING_PACKAGES = ("messagefoundry", "messagefoundry_webconsole", "messagefo
 _STREAMING_ACCEPTED: dict[str, str] = {}
 
 
-def _yields_here(func: ast.AsyncFunctionDef) -> bool:
-    """Whether ``func`` itself yields, which makes it an async generator. A ``yield`` inside a nested
-    function, lambda or class belongs to that scope, so the walk does not enter one."""
-    pending: list[ast.AST] = list(func.body)
-    while pending:
-        node = pending.pop()
-        if isinstance(node, ast.Yield | ast.YieldFrom):
-            return True
-        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef):
-            pending.extend(ast.iter_child_nodes(node))
-    return False
+def _is_async_generator(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Whether ``func`` is an ``async def`` that itself yields. A ``yield`` inside a nested
+    function, lambda or class belongs to that scope, and ``route_gates._own_nodes`` does not enter
+    one."""
+    return isinstance(func, ast.AsyncFunctionDef) and any(
+        isinstance(node, ast.Yield | ast.YieldFrom) for node in route_gates._own_nodes(func)
+    )
+
+
+def _names_streaming_response(expr: ast.expr) -> bool:
+    """``StreamingResponse`` or ``<anything>.StreamingResponse``, the shapes ``callee_name`` reads."""
+    return (isinstance(expr, ast.Name) and expr.id == "StreamingResponse") or (
+        isinstance(expr, ast.Attribute) and expr.attr == "StreamingResponse"
+    )
 
 
 def _sync_streaming_bodies(source: str, where: str) -> dict[str, str]:
@@ -420,11 +424,7 @@ def _sync_streaming_bodies(source: str, where: str) -> dict[str, str]:
     guard fails closed: a list, a name bound earlier, a sync generator, a call through an attribute.
     An aliased import and a subclass are named too, because either would hide a call from the walk.
     """
-    tree = ast.parse(source)
-    defs: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-            defs.setdefault(node.name, []).append(node)
+    tree = parse_source(source)
     found: dict[str, str] = {}
     for node in ast.walk(tree):
         at = f"{where}:{getattr(node, 'lineno', 0)}"
@@ -432,28 +432,26 @@ def _sync_streaming_bodies(source: str, where: str) -> dict[str, str]:
             for alias in node.names:
                 if alias.name.rpartition(".")[2] == "StreamingResponse" and alias.asname:
                     found[at] = f"imported as {alias.asname}"
-        elif isinstance(node, ast.ClassDef):
-            if any(ast.unparse(base).endswith("StreamingResponse") for base in node.bases):
-                found[at] = f"class {node.name} subclasses StreamingResponse"
-        elif isinstance(node, ast.Call) and ast.unparse(node.func).endswith("StreamingResponse"):
-            content = node.args[0] if node.args else None
-            for keyword in node.keywords:
-                if keyword.arg == "content":
-                    content = keyword.value
-            if content is None:
-                found[at] = "no body argument"
-                continue
-            body = ast.unparse(content)
-            if not (isinstance(content, ast.Call) and isinstance(content.func, ast.Name)):
-                found[at] = f"body {body} is not a call to a named function"
-                continue
-            candidates = defs.get(content.func.id, [])
-            if not candidates:
-                found[at] = f"body {body} calls a function not defined in this module"
-            elif not all(
-                isinstance(d, ast.AsyncFunctionDef) and _yields_here(d) for d in candidates
-            ):
-                found[at] = f"body {body} calls a function that is not an async generator"
+        elif isinstance(node, ast.ClassDef) and any(map(_names_streaming_response, node.bases)):
+            found[at] = f"class {node.name} subclasses StreamingResponse"
+    for call in call_sites(tree, "StreamingResponse"):
+        at = f"{where}:{call.lineno}"
+        content = call.args[0] if call.args else None
+        for keyword in call.keywords:
+            if keyword.arg == "content":
+                content = keyword.value
+        if content is None:
+            found[at] = "no body argument"
+            continue
+        body = ast.unparse(content)
+        if not (isinstance(content, ast.Call) and isinstance(content.func, ast.Name)):
+            found[at] = f"body {body} is not a call to a named function"
+            continue
+        candidates = find_funcs(tree, content.func.id)
+        if not candidates:
+            found[at] = f"body {body} calls a function not defined in this module"
+        elif not all(_is_async_generator(d) for d in candidates):
+            found[at] = f"body {body} calls a function that is not an async generator"
     return found
 
 
@@ -465,17 +463,23 @@ def test_no_streaming_response_is_handed_a_sync_body() -> None:
 
     The fix is an ``async def`` generator, as ``_iter_csv`` in ``export_audit`` and
     ``_iter_ndjson`` in the message export are. A body that really blocks goes in
-    :data:`_STREAMING_ACCEPTED` with its reason."""
+    :data:`_STREAMING_ACCEPTED` with its reason.
+
+    A file whose text never spells ``StreamingResponse`` is not parsed: every shape the classifier
+    names (a call, an aliased import, a subclass) spells it, and parsing the whole tree cost about
+    8 s a run."""
     root = Path(__file__).resolve().parents[1]
     calls = 0
     found: dict[str, str] = {}
     for package in _STREAMING_PACKAGES:
         for path in sorted((root / package).rglob("*.py")):
             source = path.read_text(encoding="utf-8")
-            calls += source.count("StreamingResponse(")
+            if "StreamingResponse" not in source:
+                continue
+            calls += len(call_sites(parse_source(source), "StreamingResponse"))
             found.update(_sync_streaming_bodies(source, path.relative_to(root).as_posix()))
-    # Coverage beside the verdict: the audit export and the message export both build one, so a walk
-    # that stops finding files cannot pass on an empty tree.
+    # Coverage beside the verdict: the audit export and the message export each make one call, and
+    # this counts calls in code, not mentions, so a walk that stops finding them cannot pass.
     assert calls >= 2, calls
     assert {at: why for at, why in found.items() if at not in _STREAMING_ACCEPTED} == {}
 
