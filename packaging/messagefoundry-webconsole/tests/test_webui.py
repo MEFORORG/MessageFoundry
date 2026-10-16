@@ -4844,6 +4844,17 @@ async def test_builtin_role_edit_is_404(engine: Engine) -> None:
         assert (await c.get("/ui/roles/administrator/edit")).status_code == 404
 
 
+async def test_ad_group_inputs_show_an_example_dn(engine: Engine) -> None:
+    """BACKLOG #3222: both maps take a full DN only, so every group input says what one looks
+    like. Three blank rows per map, and no stored rows yet."""
+    service = await _service(engine)
+    async with _boss_client(engine, service) as c:
+        r = await c.get("/ui/ad-groups")
+        assert r.status_code == 200
+        hint = 'placeholder="CN=MF-Admins,OU=Groups,DC=example,DC=com"'
+        assert r.text.count(hint) == r.text.count('name="ad_group"') == 6
+
+
 async def test_ad_group_maps_roundtrip(engine: Engine) -> None:
     service = await _service(engine)
     async with _boss_client(engine, service) as c:
@@ -4877,7 +4888,12 @@ async def test_ad_group_maps_roundtrip(engine: Engine) -> None:
             value = "administrator" if partner == "role" else "*"
             r = await _post_pairs(c, path, [("ad_group", "MEFOR-Ops"), (partner, value)])
             assert r.status_code == 400 and "full distinguished name" in r.text
+            # A no-break space at the end is refused too, not trimmed (BACKLOG #3222).
+            nbsp = "CN=MEFOR-Ops,OU=Groups,DC=example,DC=invalid "
+            r = await _post_pairs(c, path, [("ad_group", nbsp), (partner, value)])
+            assert r.status_code == 400 and "does not print" in r.text
         assert len(await service.store.list_ad_group_role_map()) == 1
+        assert await service.store.list_ad_group_scope_map() == []
         # Scope map round-trip.
         r = await _post_pairs(
             c,

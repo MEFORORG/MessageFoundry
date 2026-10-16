@@ -616,7 +616,10 @@ def canonical_group_dn(text: str) -> str | None:
             if ch in ",+":
                 return None  # a separator before any "="
             if ch == "=":
-                name = text[start:i].strip()
+                # Only a space, a tab or a line break pads a type, so a DN pasted wrapped at its
+                # commas still parses. A bare strip() also took Unicode white space, such as a
+                # no-break space (BACKLOG #3222).
+                name = text[start:i].strip(" \t\r\n")
                 if not _is_dn_attr_type(name):
                     return None
                 attr, tokens = name.lower(), []

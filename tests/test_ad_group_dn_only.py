@@ -162,6 +162,7 @@ async def test_a_stored_short_name_key_matches_no_group(store: MessageStore) -> 
         f"  {LEGIT}  ",  # the store strips; so does the check
         "CN=MF-Admins, OU=Groups,DC=example",  # a space after a separator is padding
         "CN=C# Developers,DC=example",  # a "#" after a value's first character is literal
+        "CN=MF-Admins,\r\nOU=Groups,\tDC=example",  # ASCII white space pads a type (#3222)
     ],
 )
 def test_a_full_dn_is_a_group_dn(value: str) -> None:
@@ -184,6 +185,15 @@ def test_a_full_dn_is_a_group_dn(value: str) -> None:
         "CN=MF-Admins,DC=example\\",  # a trailing lone backslash
         "CN=\\ff,DC=example",  # not UTF-8 once unescaped
         "C N=MF-Admins,DC=example",  # not an attribute type
+        # A dotted OID with an empty arc (BACKLOG #3222): the ``part and`` guard refuses each.
+        "1..2=MF-Admins,DC=example",
+        ".1=MF-Admins,DC=example",
+        "1.=MF-Admins,DC=example",
+        # Only ASCII white space pads an attribute type (BACKLOG #3222). ``str.strip()`` also took
+        # a no-break space and an em space, so these passed.
+        "\u00a0CN=MF-Admins,OU=Groups,DC=example,DC=com",
+        "CN=MF-Admins,\u2003OU=Groups,DC=example,DC=com",
+        "CN\u00a0=MF-Admins,OU=Groups,DC=example,DC=com",
         "CN=\ud800,DC=example",  # a lone surrogate cannot be encoded
         "example\\MF-Admins",
         "",
@@ -390,6 +400,56 @@ async def test_a_pasted_key_with_a_line_break_still_maps(engine: Engine) -> None
         assert (await c.put("/ad-group-map", json=body, headers=h)).status_code == 200
         got = (await c.get("/ad-group-map", headers=h)).json()["entries"]
         assert got == [{"ad_group": LEGIT.lower(), "role": Role.OPERATOR.value}]
+
+
+#: Keys whose edge holds a character that does not print. ``str.strip()`` trimmed the white-space
+#: ones to the bare DN; the zero-width space and byte-order mark were kept and stored a dead key.
+_INVISIBLE_EDGE_KEYS = {
+    "nbsp-lead": f"\u00a0{LEGIT}",
+    "nbsp-trail": f"{LEGIT}\u00a0",
+    "em-space-lead": f"\u2003{LEGIT}\r\n",
+    "em-space-trail": f"{LEGIT}\u2003",
+    "zero-width-space-trail": f"{LEGIT}\u200b",
+    "bom-lead": f"\ufeff{LEGIT}",
+    "nbsp-only": "\u00a0",
+}
+
+
+@pytest.mark.parametrize(
+    ("path", "field", "value"),
+    [("/ad-group-map", "role", Role.OPERATOR.value), ("/ad-group-scope-map", "channel", "*")],
+    ids=["role-map", "scope-map"],
+)
+@pytest.mark.parametrize("key", list(_INVISIBLE_EDGE_KEYS.values()), ids=list(_INVISIBLE_EDGE_KEYS))
+async def test_a_key_with_an_invisible_edge_is_refused(
+    engine: Engine, path: str, field: str, value: str, key: str
+) -> None:
+    """BACKLOG #3222: the routes trim only a space, a tab and a line break, and refuse a key that
+    still starts or ends with a character that does not print. The 400 names the key in its
+    ``ascii()`` form, so the character can be seen. CONTROL: the line-break test above."""
+    transport = await _admin_transport(engine)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _admin_headers(c)
+        body = {"entries": [{"ad_group": key, field: value}]}
+        r = await c.put(path, json=body, headers=h)
+        assert r.status_code == 400, r.text
+        detail = r.json()["detail"]
+        assert "does not print" in detail
+        assert ascii(key.strip(" \t\r\n")) in detail
+        assert (await c.get(path, headers=h)).json()["entries"] == []
+
+
+async def test_a_dn_refusal_names_an_invisible_character(engine: Engine) -> None:
+    """BACKLOG #3222: a no-break space inside the key, before an attribute type, is refused as no
+    DN, and the 400 names the key in ``ascii()`` form rather than as a lookalike of a valid DN."""
+    transport = await _admin_transport(engine)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _admin_headers(c)
+        key = "CN=MF-Admins,\u00a0OU=Groups,DC=example,DC=com"
+        body = {"entries": [{"ad_group": key, "role": Role.OPERATOR.value}]}
+        r = await c.put("/ad-group-map", json=body, headers=h)
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"].endswith(f"refused: {ascii(key)}")
 
 
 def test_resolve_groups_canonicalises_direct_and_nested_dns() -> None:
