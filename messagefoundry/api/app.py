@@ -9438,6 +9438,18 @@ async def _directory_reconciler(
             if inherited is None and alert_state is not None:
                 found = await _open_reconcile_instances(alert_state)
                 inherited = None if found is None else frozenset(found)
+                if found:
+                    # Once, at the read that fixes the set (BACKLOG #3084): every clear of these
+                    # instances is dropped for this process's life, and without this line only
+                    # docs/CONFIGURATION.md would say so. Keys only; an instance carries no PHI.
+                    _log.warning(
+                        "directory reconcile: %s already open before this process's first pass, "
+                        "so this process will not resolve %s itself; an operator resolves it",
+                        ", ".join(
+                            f"{event} ({source})" for source, event in sorted(found.values())
+                        ),
+                        "that alert" if len(found) == 1 else "those alerts",
+                    )
             plan = await auth.reconcile_directory_sessions()
             if not sole_reconciler or inherited is None:
                 plan = _without_clears(plan)
@@ -9563,9 +9575,15 @@ _RECONCILE_CLEAR_RESOLVES: Final[Mapping[str, tuple[str, str]]] = {
 }
 
 
+#: The bound on one read of reconcile alert state, in seconds (BACKLOG #3084). A read that runs
+#: past it fails as any other failed read does, so it drops clears and never delays a pass's pages
+#: or revocations for longer than this.
+_RECONCILE_ALERT_READ_TIMEOUT: Final[float] = 10.0
+
+
 async def _open_reconcile_instances(store: Store) -> dict[int, tuple[str, str]] | None:
     """``id -> (connection, event_type)`` of the open or acknowledged reconcile alert instances, or
-    None when the read failed, which is logged.
+    None when the read failed or ran past :data:`_RECONCILE_ALERT_READ_TIMEOUT`, which is logged.
 
     Catches ``Exception``, on purpose and only around this one read. Its failures are no closed
     family: each backend's driver errors, the engine's own ``RuntimeError``, aiosqlite's
@@ -9573,9 +9591,12 @@ async def _open_reconcile_instances(store: Store) -> dict[int, tuple[str, str]] 
     that escaped would cost the pass's pages, or the whole pass, through the loop's own catch. Any
     failure here only drops a clear, which is a missed clear, never a false one."""
     try:
-        rows = await store.list_active_alert_instances(
-            allowed_channels=sorted({source for source, _ in _RECONCILE_CLEAR_RESOLVES.values()})
-        )
+        async with asyncio.timeout(_RECONCILE_ALERT_READ_TIMEOUT):
+            rows = await store.list_active_alert_instances(
+                allowed_channels=sorted(
+                    {source for source, _ in _RECONCILE_CLEAR_RESOLVES.values()}
+                )
+            )
     except asyncio.CancelledError:
         raise
     except Exception as exc:
