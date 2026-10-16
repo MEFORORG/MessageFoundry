@@ -139,6 +139,10 @@ log = logging.getLogger(__name__)
 #: (BACKLOG #2272). Short: a write that has not landed by then is logged and lost, as before.
 _ALERT_STATE_DRAIN_SECONDS = 5.0
 
+#: How long stop waits for config writes whose callers were cancelled (vault BACKLOG #2945), so
+#: their audit rows reach the store before it closes. Short, for the same reason as above.
+_CONFIG_WRITE_DRAIN_SECONDS = 5.0
+
 #: How long a DR release waits for the staged queue to drain before it hands back anyway, leaving
 #: the rest queued (vault BACKLOG #2752). Kept well under the API's 120 s request deadline
 #: (``api/request_timeout.py``) with room for the release hook's default 30 s bound and the
@@ -665,6 +669,10 @@ class Engine:
         # `connections_edit.locked`, an OS file lock the `connection` CLI in another process takes too
         # (vault BACKLOG #2782); that one is blocking and is only ever taken in a worker thread.
         self._toml_write_lock = asyncio.Lock()
+        # The config writes write_baseline_config has started and not finished. A caller that is
+        # cancelled stops waiting but leaves its write running, so stop() waits for these before it
+        # closes the store, or such a write would land with no row (vault BACKLOG #2945).
+        self._config_writes: set[asyncio.Task[dict[str, object] | None]] = set()
         # Background store-pool pre-warm (Workstream A — failover drain): fired on graph start/promotion
         # AFTER the on-promotion recovery, so it never competes with recovery for the pool. At most one is
         # in flight (a re-promotion cancels the prior one — see _fire_pool_warm); tracked only so stop()
@@ -695,7 +703,7 @@ class Engine:
         configured = [*config_reload_roots, *([config_dir] if config_dir else [])]
         self._reload_roots_lexical = lexical_roots([*configured, *self._reload_roots])
         # The directory the most recent APPLIED reload loaded from (resolved). At least the provenance
-        # drift check, set_connection_flag and a DR activation (vault BACKLOG #2840) trust it to name
+        # drift check, write_baseline_config and a DR activation (vault BACKLOG #2840) trust it to name
         # where the running graph came from, so a dry run or a failed reload never moves it (vault
         # BACKLOG #2598).
         self.last_reload_dir: Path | None = None
@@ -706,8 +714,9 @@ class Engine:
         # and detect on-disk DRIFT. Holds only a one-way hash + a commit sha — never resolved env values.
         self.loaded_config_fingerprint: dict[str, object] | None = None
         # vault BACKLOG #2597: True when this process's start never checked its config against the
-        # store's baseline (the read failed, or the start took no digest). Every flag toggle row it
-        # writes is then marked, so a later start passes over it to the last checked baseline. A
+        # store's baseline (the read failed, or the start took no digest). Every row it writes through
+        # write_baseline_config, such as a flag toggle's, is then marked, so a later start passes over
+        # it to the last checked baseline. A
         # reload row, operator or convergence, is not marked: the reload vouches for what it loaded.
         self.config_baseline_unchecked = False
         # vault BACKLOG #3076: writes the config_reload audit row for a cluster convergence reload,
@@ -2369,8 +2378,9 @@ class Engine:
         ``action`` with ``detail``, this node's id and the fingerprint returned, still under the
         engine lock, so two writes' rows land in the order of their writes. ``detail`` must be JSON
         and may not set a key the helper writes (:data:`_BASELINE_ROW_KEYS`); either fault raises
-        before anything is written. Once the write starts, a cancelled caller does not stop the
-        write or its row.
+        before anything is written. A caller cancelled while it waits for the engine lock gets no
+        write. Once the lock is held, a cancelled caller stops waiting but does not stop the write or
+        its row, and :meth:`stop` waits for such a write before it closes the store.
 
         Returns the ADR 0041 D1 fingerprint the row records (vault BACKLOG #2597). When the directory
         held the loaded bytes before this write, it is the digest of the directory just written, and
@@ -2398,20 +2408,18 @@ class Engine:
         clash = set(detail) & _BASELINE_ROW_KEYS
         if clash:
             raise ValueError(f"config write detail may not set {sorted(clash)}")
-        json.dumps(detail)
-        config_dir = self.running_config_dir
-        if config_dir is None:
-            raise WiringError("no config directory is configured, so a config write cannot persist")
-        cfg_dir: Path = config_dir
+        json.dumps(dict(detail))
 
-        def _digest() -> dict[str, object] | None:
+        def _digest(cfg_dir: Path) -> dict[str, object] | None:
             # Already on a worker thread and holding the lock, so the blocking twin of
             # `fingerprint_bundle`: the same best-effort rule, with no hop back through the loop
             # or a second executor thread while the lock is held.
             digest, _reason = self.fingerprint_bundle_blocking(cfg_dir)
             return digest
 
-        def _locked_write(loaded_fp: object) -> tuple[dict[str, object] | None, bool]:
+        def _locked_write(
+            cfg_dir: Path, loaded_fp: object
+        ) -> tuple[dict[str, object] | None, bool]:
             """The write and both digests, all under the cross-process lock (vault BACKLOG #2782).
 
             The lock spans the whole of ``write``, so a read-modify-write in it cannot lose a
@@ -2423,7 +2431,7 @@ class Engine:
                 # vault BACKLOG #2597: whether the directory still holds the bytes the running
                 # graph loaded, read before this write changes it. With no loaded digest there is
                 # nothing to vouch against, so the two reads are skipped.
-                before = _digest() if isinstance(loaded_fp, str) else None
+                before = _digest(cfg_dir) if isinstance(loaded_fp, str) else None
                 write(cfg_dir)
                 # The digest covers the whole directory, so it may vouch for this write only when
                 # the write is the one change since the load. Otherwise another edit is on disk
@@ -2439,21 +2447,25 @@ class Engine:
                 # digest, never the answer: a raise would report a landed write as failed, with
                 # no audit row.
                 try:
-                    after = _digest()
+                    after = _digest(cfg_dir)
                 except Exception:  # noqa: BLE001 - see the comment above; logged, never silent
                     log.exception("config written; its config fingerprint was not taken")
                     after = None
                 return after, True
 
         async def _apply() -> dict[str, object] | None:
-            # Serialize the whole read-modify-write, live reflect and row under the engine-level
-            # lock, so two concurrent writes can't interleave (lost update / racing temp files) and
-            # their rows land in write order; the write itself runs off the event loop (file I/O,
-            # and a full load_config in a validating writer's callback).
-            async with self._toml_write_lock:
+            """The write, reflect and row, with the engine lock already held; releases it."""
+            try:
+                # Read under the lock, so a reload that applied while this write queued sends it to
+                # the directory the running graph now comes from.
+                config_dir = self.running_config_dir
+                if config_dir is None:
+                    raise WiringError(
+                        "no config directory is configured, so a config write cannot persist"
+                    )
                 loaded = self.loaded_config_fingerprint
                 loaded_fp = loaded.get("fingerprint") if loaded is not None else None
-                after, vouched = await asyncio.to_thread(_locked_write, loaded_fp)
+                after, vouched = await asyncio.to_thread(_locked_write, config_dir, loaded_fp)
                 if reflect is not None:
                     # The write has landed, so a failed reflect costs the live view, never the row.
                     try:
@@ -2468,6 +2480,10 @@ class Engine:
                     # the next start, so the row records none and that start compares nothing.
                     fingerprint = None
                 else:
+                    # The running graph now matches these bytes (the write was reflected live), so
+                    # the provenance baseline moves with it. Before the row: a row that fails to
+                    # write must not leave this process's baseline behind its own disk and graph.
+                    self.loaded_config_fingerprint = after
                     fingerprint = after
                 await self.store.record_audit(
                     action,
@@ -2487,16 +2503,30 @@ class Engine:
                     ),
                     client=client,
                 )
-                if vouched and after is not None:
-                    # The running graph now matches these bytes (the write was reflected live), so
-                    # the provenance baseline moves with it, once the row that records it is in.
-                    self.loaded_config_fingerprint = after
                 return fingerprint
+            finally:
+                self._toml_write_lock.release()
 
-        # Shielded: once the write can land, a cancelled caller (a request deadline, a client that
-        # went away) must not leave it on disk with no row, which the next start would report as a
-        # change nobody made. The write and its row finish; only the caller stops waiting.
-        return await asyncio.shield(_apply())
+        # The engine lock serializes the whole read-modify-write, live reflect and row, so two
+        # concurrent writes can't interleave (lost update / racing temp files) and their rows land in
+        # write order. It is taken here, unshielded: a caller cancelled while it waits has started
+        # nothing, and gets no write. Once it is held, the rest runs as a tracked task under a
+        # shield, so a caller cancelled from then on (a request deadline, a client that went away)
+        # stops waiting but cannot leave the write on disk with no row, which the next start would
+        # report as a change nobody made. stop() waits for these tasks before it closes the store.
+        await self._toml_write_lock.acquire()
+        task = asyncio.ensure_future(_apply())
+        self._config_writes.add(task)
+        task.add_done_callback(self._config_write_done)
+        return await asyncio.shield(task)
+
+    def _config_write_done(self, task: asyncio.Task[dict[str, object] | None]) -> None:
+        """Forget a finished config write. When its caller has gone, nobody else reads how it
+        ended, so a failure is logged here; one whose caller is still waiting is logged twice."""
+        self._config_writes.discard(task)
+        exc = None if task.cancelled() else task.exception()
+        if exc is not None:
+            log.warning("config write failed: %s", safe_exc(exc))
 
     async def set_connection_flag(
         self,
@@ -2604,7 +2634,7 @@ class Engine:
     def running_config_dir(self) -> Path | None:
         """The directory the running graph came from: the last applied reload's, else the startup
         ``--config`` dir. Readers include at least the provenance drift check,
-        :meth:`set_connection_flag` and a DR activation's disk drift check (vault BACKLOG #3067).
+        :meth:`write_baseline_config` and a DR activation's disk drift check (vault BACKLOG #3067).
         A DR activation does not reload it: it re-applies the running graph."""
         return self.last_reload_dir or self.config_dir
 
@@ -3485,6 +3515,18 @@ class Engine:
             self._warm_pool_task.cancel()
             await asyncio.gather(self._warm_pool_task, return_exceptions=True)
             self._warm_pool_task = None
+        # A config write whose caller was cancelled is still running, and its row needs the store
+        # (vault BACKLOG #2945). Bounded, as the alert drain below is: one still running past it
+        # is logged, and its row is then lost to the closed store.
+        if self._config_writes:
+            _done, pending = await asyncio.wait(
+                set(self._config_writes), timeout=_CONFIG_WRITE_DRAIN_SECONDS
+            )
+            if pending:
+                log.warning(
+                    "%d config write(s) still running at stop; their audit rows may be lost",
+                    len(pending),
+                )
         # Clears raised on the way out are background writes: an unpinned cluster node's intake
         # alerts (BACKLOG #2272) and the coordinator's leadership release. Give them a bounded chance
         # to land before the store closes. Last, so it covers every stop step above.

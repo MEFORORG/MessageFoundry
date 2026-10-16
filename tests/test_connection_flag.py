@@ -353,9 +353,11 @@ async def test_a_cancelled_caller_does_not_cost_a_landed_write_its_row(engine: E
             "connection_flag_set", _write, detail={"probe": True}, actor="tester", client=None
         )
     )
-    assert await asyncio.to_thread(started.wait, 20)
-    caller.cancel()
-    release.set()
+    try:
+        assert await asyncio.to_thread(started.wait, 20)
+        caller.cancel()
+    finally:
+        release.set()
     with pytest.raises(asyncio.CancelledError):
         await caller
     for _ in range(200):
@@ -363,6 +365,107 @@ async def test_a_cancelled_caller_does_not_cost_a_landed_write_its_row(engine: E
             break
         await asyncio.sleep(0.05)
     assert len(await engine.store.list_audit(action="connection_flag_set")) == 1
+
+
+async def test_a_caller_cancelled_before_its_write_starts_gets_no_write(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """A caller still queued for the engine lock has started nothing, so cancelling it leaves the
+    file and the audit trail alone, even once the lock frees. Under the round-one shield the queued
+    write ran later anyway, under the name of a caller who had been told it failed."""
+    toml_path = tmp_path / "connections.toml"
+    before = toml_path.read_bytes()
+    await engine._toml_write_lock.acquire()
+    try:
+        caller = asyncio.ensure_future(
+            engine.set_connection_flag(
+                "OB_TOML", direction="outbound", flagged=True, actor="tester", client=None
+            )
+        )
+        await asyncio.sleep(0.1)
+        assert not caller.done(), "control: the toggle is queued on the held lock"
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+    finally:
+        engine._toml_write_lock.release()
+    await asyncio.sleep(0.5)
+    assert toml_path.read_bytes() == before
+    assert await engine.store.list_audit(action="connection_flag_set") == []
+    assert not engine._toml_write_lock.locked()
+
+
+async def test_a_failed_row_does_not_leave_the_loaded_digest_behind(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The loaded digest moves with the write, before the row. If the row then fails, this
+    process's baseline still matches its own disk and live graph, so its next toggle vouches again
+    and records the true digest. The round-one order kept the old digest, and every later row
+    recorded it until a reload."""
+    from messagefoundry.config.fingerprint import config_fingerprint_detail
+
+    engine.loaded_config_fingerprint = config_fingerprint_detail(tmp_path)
+
+    async def _refused(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("the audit store refused the row")
+
+    monkeypatch.setattr(engine.store, "record_audit", _refused)
+    with pytest.raises(RuntimeError, match="refused the row"):
+        await engine.set_connection_flag(
+            "OB_TOML", direction="outbound", flagged=True, actor="tester", client=None
+        )
+    assert engine.loaded_config_fingerprint == config_fingerprint_detail(tmp_path)
+    monkeypatch.undo()
+    returned = await engine.set_connection_flag(
+        "OB_TOML", direction="outbound", flagged=False, actor="tester", client=None
+    )
+    assert returned is not None
+    assert returned["fingerprint"] == config_fingerprint_detail(tmp_path)["fingerprint"]
+
+
+async def test_stop_waits_for_a_write_whose_caller_was_cancelled(tmp_path: Path) -> None:
+    """stop() lets a write whose caller has gone finish before it closes the store, so the write's
+    row lands. With the round-one untracked task the store closed under it and the row was lost."""
+    import threading
+
+    cfg = _config_dir(tmp_path)
+    eng = await Engine.create(
+        tmp_path / "flag.db",
+        poll_interval=0.02,
+        config_dir=cfg,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    eng.add_registry(load_config(cfg))
+    started, release = threading.Event(), threading.Event()
+    recorded: list[str] = []
+    real_record = eng.store.record_audit
+
+    async def _recording(action: str, **kwargs: object) -> None:
+        await real_record(action, **kwargs)  # type: ignore[arg-type]
+        recorded.append(action)
+
+    eng.store.record_audit = _recording  # type: ignore[method-assign]
+
+    def _write(_cfg: Path) -> None:
+        started.set()
+        release.wait(20)
+
+    caller = asyncio.ensure_future(
+        eng.write_baseline_config(
+            "connection_flag_set", _write, detail={"probe": True}, actor="tester", client=None
+        )
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 20)
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        stopping = asyncio.ensure_future(eng.stop())
+        await asyncio.sleep(0.2)
+    finally:
+        release.set()
+    await stopping
+    assert recorded == ["connection_flag_set"]
 
 
 async def test_the_toggle_takes_its_digests_under_the_config_edit_lock(

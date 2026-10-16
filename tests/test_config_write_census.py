@@ -181,12 +181,13 @@ def _writer_sites(tree: ast.Module) -> set[str]:
 
 def _unrouted_writer_refs(node: ast.AST) -> list[int]:
     """The lines in def ``node`` that reference a writer outside every nested def handed to the
-    helper by name, so a ``helper`` def cannot route one write through it and make another
-    beside it."""
+    helper as its ``write`` argument, so a ``helper`` def cannot route one write through it and
+    make another beside it, or in what it hands over as ``reflect``. The helper takes ``write``
+    second, after ``action``, or by keyword."""
     routed = {
         arg.id
         for call in call_sites(node, HELPER)
-        for arg in [*call.args, *(k.value for k in call.keywords)]
+        for arg in [*call.args[1:2], *(k.value for k in call.keywords if k.arg == "write")]
         if isinstance(arg, ast.Name)
     }
     lines: list[int] = []
@@ -310,6 +311,16 @@ def test_the_guard_refuses_an_unlisted_writer_and_a_helper_bypass() -> None:
         "        connections_edit.remove_connection(cfg, name, validate=None)\n\n" + anchor,
     )
     assert _helper_bypasses({engine_path: ast.parse(beside)}) == refused
+    # Inside the def handed over as `reflect`, which runs outside the edit lock and after the digest.
+    reflect_anchor = "            rr = self._registry_runner\n"
+    assert reflect_anchor in real
+    in_reflect = real.replace(
+        reflect_anchor,
+        "            connections_edit.remove_connection(cfg, name, validate=None)\n"
+        + reflect_anchor,
+        1,
+    )
+    assert _helper_bypasses({engine_path: ast.parse(in_reflect)}) == refused
 
 
 def test_the_start_reads_every_action_the_helper_records() -> None:
