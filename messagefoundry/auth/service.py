@@ -37,7 +37,7 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from enum import Enum
-from functools import cache
+from functools import cache, partial
 from types import MappingProxyType
 from typing import Any, Final, Literal, TypeVar
 from uuid import uuid4
@@ -2443,6 +2443,11 @@ class AuthService:
         self._cert_probe_seq = 0
         self._cert_probe_faulting: dict[str, int] = {}
         self._cert_probe_fault_warned_at: dict[str, float] = {}
+        #: Probes still running per account id, and, for an account that left the probe set while
+        #: some ran, the sequence number they predate (`_forget_cert_probe_fault`). Both hold only
+        #: accounts with a probe running, so the probe cap bounds them.
+        self._cert_probe_inflight: dict[str, int] = {}
+        self._cert_probe_left_at: dict[str, int] = {}
         self._login_limiter: SlidingWindowRateLimiter | None = (
             SlidingWindowRateLimiter(
                 per_key=settings.login_rate_limit_per_ip,
@@ -8242,9 +8247,13 @@ class AuthService:
         cannot get a slot within :data:`_CERT_PROBE_SLOT_WAIT_SECONDS` is refused. Refusals do not
         log one line per request; :meth:`_note_cert_directory_answer` says what they log."""
         user = await self._load_user(user_id)
+        # An account out of the probe set drops any fault tracked for it. A disable by a writer
+        # other than update_user reaches this process first here.
         if user is None or user.disabled:
+            self._forget_cert_probe_fault(user_id if user is None else user.id)
             return None
         if user.auth_provider != AuthProvider.AD.value:
+            self._forget_cert_probe_fault(user.id)
             return await self._build_identity(user)
         answer = await self._cert_directory_presence(user)
         self._note_cert_directory_answer(answer)
@@ -8262,6 +8271,7 @@ class AuthService:
             or user.auth_provider != asked.auth_provider
             or user.directory_object_id != asked.directory_object_id
         ):
+            self._forget_cert_probe_fault(asked.id)
             return None
         granted = await self._ad_roles_for_groups(answer.groups)
         kept = [role_id for role_id in user.role_ids if role_id in granted]
@@ -8282,27 +8292,38 @@ class AuthService:
         The slot is held until the probe itself ends, not until this caller stops waiting. The
         probe's worker thread cannot be cancelled, so releasing on a cancelled request would let
         the threads outnumber the cap. The probe therefore runs as its own task, shielded, and
-        releases its slot when it finishes."""
+        releases its slot when it finishes.
+
+        The probe is numbered and counted as running here, before the slot wait, so a request that
+        read the account before it left the probe set is a probe that predates the exit even while
+        it waits for a slot (:meth:`_forget_cert_probe_fault`)."""
+        self._cert_probe_seq += 1
+        seq = self._cert_probe_seq
+        self._cert_probe_inflight[user.id] = self._cert_probe_inflight.get(user.id, 0) + 1
+        started = False
         try:
-            async with asyncio.timeout(_CERT_PROBE_SLOT_WAIT_SECONDS):
-                await self._cert_probe_slots.acquire()
-        except TimeoutError:
-            return CERT_PROBE_SATURATED
-        try:
-            task = asyncio.create_task(self._cert_probe(user))
-        except BaseException:
-            self._cert_probe_slots.release()
-            raise
+            try:
+                async with asyncio.timeout(_CERT_PROBE_SLOT_WAIT_SECONDS):
+                    await self._cert_probe_slots.acquire()
+            except TimeoutError:
+                return CERT_PROBE_SATURATED
+            try:
+                task = asyncio.create_task(self._cert_probe(user, seq))
+            except BaseException:
+                self._cert_probe_slots.release()
+                raise
+            started = True
+        finally:
+            if not started:
+                self._cert_probe_ended(user.id)
         self._cert_probe_tasks.add(task)
-        task.add_done_callback(self._cert_probe_done)
+        task.add_done_callback(partial(self._cert_probe_done, user.id))
         return await asyncio.shield(task)
 
-    async def _cert_probe(self, user: UserRecord) -> reconcile.Probe | str:
+    async def _cert_probe(self, user: UserRecord, seq: int) -> reconcile.Probe | str:
         # This task's own context, so the DEBUG level never reaches the reconciler or step-up. A
         # fault on one account's entry would otherwise log a WARNING naming it on every request;
         # the outage line below reports it once instead.
-        self._cert_probe_seq += 1
-        seq = self._cert_probe_seq
         token = _PROBE_FAULT_LOG_LEVEL.set(logging.DEBUG)
         try:
             answer = await self._directory_presence(user)
@@ -8329,48 +8350,98 @@ class AuthService:
             del self._cert_probe_faulting[user.id]
         return answer
 
+    def _cert_probe_ended(self, user_id: str) -> None:
+        """Count one of ``user_id``'s probes as no longer running. The last one to end drops the
+        account's exit mark, since no probe that predates it is left."""
+        running = self._cert_probe_inflight[user_id] - 1
+        if running:
+            self._cert_probe_inflight[user_id] = running
+        else:
+            del self._cert_probe_inflight[user_id]
+            self._cert_probe_left_at.pop(user_id, None)
+
     def _note_cert_probe_fault(self, user_id: str, seq: int, exc: Exception) -> None:
         """Log a certificate-path probe fault (:data:`CERT_PROBE_FAULT`) without one line per
-        request: one WARNING naming the exception type when an account's probe starts to fault,
-        then DEBUG while it persists.
+        request: at most one WARNING a minute per account, naming the exception type, and DEBUG
+        for the rest.
 
         The fault ends when a probe of the same account, started after the fault, gets any answer
         from the directory: present, absent, disabled or undetermined. An outage does not end it.
-        WARNINGs for one account are at least :data:`_CERT_OUTAGE_LOG_INTERVAL_SECONDS` apart. A
-        fault that starts inside that interval logs its WARNING on its first repeat after the
-        interval, so an account that flaps logs about once a minute and is never silent.
+        The WARNING follows time, not that state. A fault logs one when
+        :data:`_CERT_OUTAGE_LOG_INTERVAL_SECONDS` has passed since the account's last WARNING,
+        whether it is a repeat or a new fault. Inside the interval it logs at DEBUG. So a fault
+        that returns after the account went unprobed for a while warns. A fault that persists warns
+        about once a minute. A fault that starts and clears inside one interval logs only at DEBUG.
+        The state decides only whether a DEBUG line says the fault is a repeat.
 
         The state is keyed by account because the case it exists for is one account's entry that
         always raises. Keyed process-wide, any other account's healthy answer would end it, and the
-        one account would read as flapping. It runs in the probe task, so a fault still counts when
-        its caller stopped waiting. The WARNING names no account and never the exception's message,
-        which can quote a directory value."""
+        one account would read as flapping. An account that leaves or re-enters the probe set, when
+        this process sees it, starts afresh (:meth:`_forget_cert_probe_fault`). A fault from a
+        probe that predates that move logs at DEBUG and is recorded nowhere. It runs in the probe
+        task, so a fault still counts when its caller stopped waiting. The WARNING names no account
+        and never the exception's message, which can quote a directory value."""
         kind = type(exc).__name__
-        faulted = self._cert_probe_faulting.get(user_id)
-        if faulted is not None:
-            self._cert_probe_faulting[user_id] = max(faulted, seq)
+        if seq <= self._cert_probe_left_at.get(user_id, 0):
             _log.debug(
-                "certificate-path directory probe of user id %s raised %s again", user_id, kind
+                "certificate-path directory probe of user id %s raised %s after the account left"
+                " the probe set",
+                user_id,
+                kind,
             )
             return
+        faulted = self._cert_probe_faulting.get(user_id)
+        _bounded_put(
+            self._cert_probe_faulting, user_id, seq if faulted is None else max(faulted, seq)
+        )
         now = time.monotonic()
         last = self._cert_probe_fault_warned_at.get(user_id)
         if last is not None and now - last < _CERT_OUTAGE_LOG_INTERVAL_SECONDS:
-            _log.debug("certificate-path directory probe of user id %s raised %s", user_id, kind)
+            _log.debug(
+                "certificate-path directory probe of user id %s raised %s%s",
+                user_id,
+                kind,
+                "" if faulted is None else " again",
+            )
             return
-        _bounded_put(self._cert_probe_faulting, user_id, seq)
         _bounded_put(self._cert_probe_fault_warned_at, user_id, now)
         _log.warning(
             "an mTLS certificate identity for a directory account was refused: %s (the probe "
-            "raised %s). Logged again for that account after its probe gets an answer from the "
-            "directory, at most once a minute",
+            "raised %s). Logged again for that account at most once a minute while it faults",
             CERT_PROBE_FAULT,
             kind,
         )
 
-    def _cert_probe_done(self, task: asyncio.Task[reconcile.Probe | str]) -> None:
+    def _forget_cert_probe_fault(self, user_id: str) -> None:
+        """Drop ``user_id``'s probe-fault state from both tables, when the account leaves the
+        certificate path's probe set (disabled locally, deleted, or no longer a directory account)
+        or re-enters it (enabled again). Its next fault then warns at once, inside the interval or
+        not.
+
+        At least these callers see a move: :meth:`update_user` when its save moves the flag,
+        :meth:`delete_user`, and :meth:`identity_for_cert_user_id` when it reads the account out of
+        the set. On a move none of them sees, the account's next fault still warns once the
+        interval since its last WARNING has passed.
+
+        A probe of the account still running or waiting for a slot read the account before the
+        move, so its fault says nothing about the account as it is. The current sequence number is
+        kept until those probes end. :meth:`_note_cert_probe_fault` logs their faults at DEBUG and
+        records nothing. Without that, each one would recreate the state just dropped and warn.
+
+        A move this process never sees keeps the state, for example a disable and re-enable by
+        another writer with no certificate request between them. So does a delete by an id spelled
+        differently from the stored one, on a store that compares ids without case."""
+        self._cert_probe_faulting.pop(user_id, None)
+        self._cert_probe_fault_warned_at.pop(user_id, None)
+        if user_id in self._cert_probe_inflight:
+            self._cert_probe_left_at[user_id] = self._cert_probe_seq
+
+    def _cert_probe_done(self, user_id: str, task: asyncio.Task[reconcile.Probe | str]) -> None:
         self._cert_probe_slots.release()
         self._cert_probe_tasks.discard(task)
+        # Here rather than in the task's own finally, which never runs for a task cancelled
+        # before its first step.
+        self._cert_probe_ended(user_id)
         if not task.cancelled():
             # Only a BaseException that is not an Exception can end here; _cert_probe returns
             # everything else. Retrieved so it is not also reported as never retrieved.
@@ -11681,7 +11752,14 @@ class AuthService:
             )
             if not refused:
                 await self._store.revoke_user_sessions(user_id)
+                # After the write, so a request that read the row before it predates the exit.
+                self._forget_cert_probe_fault(user_id)
         elif disabled is not None:
+            if before is not None and before.disabled:
+                # Re-entry only: every save posts the flag, and an ordinary edit must not reset a
+                # still-faulting account. Before the write, so no request reads the row enabled
+                # ahead of the reset.
+                self._forget_cert_probe_fault(user_id)
             await self._store.set_user_disabled(user_id, disabled=False)
         updated: dict[str, Any] = {"user_id": user_id}
         if refused:
@@ -11731,6 +11809,7 @@ class AuthService:
             user_id, AdminRemoval.DELETE, admin_role_id=Role.ADMINISTRATOR.value
         ):
             raise LastAdministratorRefused("cannot delete the last administrator")
+        self._forget_cert_probe_fault(user_id)
         await self._audit("user.deleted", actor=actor, detail=_json({"user_id": user_id}))
 
     async def set_roles(self, user_id: str, roles: Sequence[str], *, actor: str) -> None:
