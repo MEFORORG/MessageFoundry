@@ -2059,6 +2059,16 @@ runs it without a second approver. `GET /approvals` marks such a request `gated:
 the same settings test at listing time, and the console's Approvals page offers it only Reject,
 with that advice beside it.
 
+**`GET /approvals` names a release the gate refuses whoever approves it (vault BACKLOG #3192).**
+Each request's `release_blocked` is one of `no_requester_id`, `operation_unavailable`,
+`not_gated` and `params_unreadable`, read from the same tests the release refuses on, in the same
+order, or `null`. `null` is not a promise: the self-approval refusal, the dwell floor and the
+requester's standing are read only at release. The console's Approvals page offers a blocked
+request only Reject, or Withdraw on the requester's own row, with a note saying why. A release
+refused for unreadable parameters writes an `approval.params_unreadable` row against the
+approver, which carries no parameters. The other two refusals the field names that are not
+already audited, `no_requester_id` and `operation_unavailable`, still write no row.
+
 **Each state change and its audit row are one write (vault BACKLOG #2255).** The store
 moves the request and appends its audit row in one transaction, so the two commit or roll back
 together. That holds for the request itself (`approval.requested`), the claim, the rejection, each
@@ -2182,8 +2192,8 @@ no `connection_purge` row of its own; its count is only in `approval.approved`.
 
 **An audit or store outage that refuses writes answers a mapped status on at least these approval
 paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own audit row fails still
-answers **409**: that is at least `approval.too_early`, `approval.stale_requester` and
-`approval.no_longer_gated`. A claim, a rejection or a resolution that the store cannot write with
+answers **409**: that is at least `approval.too_early`, `approval.stale_requester`,
+`approval.no_longer_gated` and `approval.params_unreadable`. A claim, a rejection or a resolution that the store cannot write with
 its audit row answers **503**. The request does not move, except where a COMMIT lands despite the
 error, as stated above.
 

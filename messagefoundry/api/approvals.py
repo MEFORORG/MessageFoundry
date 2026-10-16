@@ -57,6 +57,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, NoReturn
 from uuid import uuid4
 
+from messagefoundry.api.models import ReleaseBlocked
 from messagefoundry.audit_write import write_audit_soft
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.permissions import Permission
@@ -773,8 +774,26 @@ class ApprovalGate:
         rows = await self._verified_rows(await self._store.list_interrupted_approvals())
         return [self._queue_entry(r, caller_user_id) for r in rows]
 
+    def _release_blocked(
+        self, r: ApprovalRow, params: dict[str, Any] | None
+    ) -> ReleaseBlocked | None:
+        """Why :meth:`approve` would refuse this request whoever approves it, or ``None`` (vault
+        BACKLOG #3192). The same tests, in the order approve() makes them, so a page offers no
+        Approve the gate always refuses. Read now, like the refusals it predicts, and silent on
+        the ones that depend on the approver, the request's age or the requester's standing."""
+        if not r.requester_user_id:
+            return "no_requester_id"
+        if r.operation not in self._ops:
+            return "operation_unavailable"
+        if not self.gates(r.operation):
+            return "not_gated"
+        if params is None:
+            return "params_unreadable"
+        return None
+
     def _queue_entry(self, r: ApprovalRow, caller_user_id: str | None) -> dict[str, Any]:
         operation = r.operation
+        params = _stored_params(r.id, r.params)
         return {
             # BACKLOG #2460: keyed on the immutable id, like the refusals it predicts (#1540), so a
             # page can hide Approve from the requester. A row with no id never matches; approve
@@ -784,7 +803,7 @@ class ApprovalGate:
             "id": r.id,
             "operation": operation,
             "label": self._label(operation),
-            "params": _stored_params(r.id, r.params),
+            "params": params,
             "requester": r.requester,
             "requested_at": r.requested_at,
             "expires_at": r.expires_at,
@@ -794,6 +813,7 @@ class ApprovalGate:
             # The same test approve() refuses on (approval.no_longer_gated), so a page can stop
             # offering a release the gate would refuse. Read now, like the refusal it predicts.
             "gated": self.gates(operation),
+            "release_blocked": self._release_blocked(r, params),
         }
 
     async def approve(
@@ -876,6 +896,18 @@ class ApprovalGate:
             # The queue lists such a row as "unreadable" (BACKLOG #2458). Refuse it as a 409 that
             # leaves the row pending for a reject, rather than a 500 from a bare parse. Before the
             # dwell floor, so a row that can never be released writes no too-early row or alert.
+            # Audited like the other refusals (vault BACKLOG #3192), soft for the same reason. The
+            # detail carries no params: they are what could not be read.
+            await self._record_audit_soft(
+                approval_id,
+                "approval.params_unreadable",
+                actor=approver,
+                detail=json.dumps(
+                    {"approval_id": approval_id, "operation": operation, "requester": row.requester}
+                ),
+                client=client,  # ADR 0150: the approver's address, matching this row's actor
+                context="the release was refused",
+            )
             raise ApprovalError(409, "request parameters are unreadable; reject it instead")
         # ASVS 2.4.2: the FLOOR on the request's age, beside the expiry CEILING in _require_pending.
         # Here, inside approve(), because every release path calls this method, so no caller can skip

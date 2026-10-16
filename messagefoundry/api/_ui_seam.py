@@ -404,12 +404,18 @@ from typing import Any
 #: surface grew. An older console on this engine is refused at mount; a newer console on an older
 #: engine would call a method that does not exist.
 #:
+#: Vault BACKLOG #3192: ``PendingApprovalInfo`` gained ``release_blocked``, typed by the new alias
+#: ``ReleaseBlocked``, which the Approvals page reads to stop offering Approve on a row the gate
+#: always refuses. The page imports the alias, so a newer console fails at import on an older
+#: engine; an older console on this engine is refused at mount. The digest moved because the DTO
+#: surface grew.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "1b9da0aae75dbd52"
+ENGINE_UI_SEAM: str = "bd77ef41628d287c"
 
 
 @dataclass(frozen=True, slots=True)
