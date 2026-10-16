@@ -1132,12 +1132,15 @@ async def _embedded_approvals_lifespan(app: FastAPI) -> AsyncIterator[None]:
     managed lifespan runs too. At start, :meth:`ApprovalGate.reconcile_after_restart`, before the
     app serves an approval. At shutdown, :meth:`ApprovalGate.drain` (BACKLOG #2087), so a caller
     that stops its engine after the app has shut down loses no outcome write. A caller that passes
-    its own ``lifespan`` replaces this one and runs these steps itself, with the store open."""
+    its own ``lifespan`` replaces this one and runs these steps itself, with the store open. The
+    shutdown also drains the upload store's stragglers first (vault BACKLOG #3180)."""
     # create_app installs this only beside an engine, and always builds the gate then.
     await _reconcile_approvals_after_restart(app.state.approval_gate)
     try:
         yield
     finally:
+        # Vault BACKLOG #3180: the upload ledger calls too, while the caller's store is open.
+        await _drain_upload_stragglers(app)
         await _drain_approval_gate(app)
 
 

@@ -1159,8 +1159,15 @@ class UploadStore:
             raise
         except Exception:
             # Its outcome is unknown, and a release by id pays back exactly what it took, if
-            # anything. The release never raises, so the ledger error is what propagates.
-            await self._release_across_shards(reservation=reservation, uploader_id=uploader_id)
+            # anything. Held rather than awaited: a failing store would otherwise make this error
+            # path wait out a second store call while every queued save waits on _quota_lock, and
+            # an unpaid slot only makes the quota stricter until it goes stale.
+            self._hold(
+                asyncio.ensure_future(
+                    self._release_across_shards(reservation=reservation, uploader_id=uploader_id)
+                ),
+                cap=_LEDGER_STRAGGLER_MAX_SECONDS,
+            )
             raise
         if not ok:
             raise self._shard_refusal(

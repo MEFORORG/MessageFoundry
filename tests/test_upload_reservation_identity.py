@@ -82,6 +82,7 @@ async def test_a_reserve_that_raises_after_its_commit_is_released_by_its_id(
     store = _uploads(tmp_path, _CommitThenFail())
     with pytest.raises(ConnectionError):
         await store.save(data=b"x\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    assert await _settled(store), "the release by id never finished"
     assert await ledger_db.upload_quota_in_flight("u-op") == (0, 0)
     assert not (tmp_path / "uploads").exists() or not list((tmp_path / "uploads").iterdir())
 
