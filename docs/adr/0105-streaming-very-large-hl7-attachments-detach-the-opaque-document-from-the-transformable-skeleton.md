@@ -569,10 +569,19 @@ R10 of 2026-09-23 graded the cell `partial` on exactly that gap.
    decision and its limits are recorded beside the table in `api/app.py`.
 
 **How an SVG is recognised.** Only markup can be an SVG. Markup here means bytes whose first byte,
-after any whitespace, NUL or byte-order mark, is `<`. No SVG reader renders anything else, so a PDF
-or an image under an SVG label is served as before. That covers SVGZ too: ingress already relabels
+after any whitespace, NUL or byte-order mark, is `<`. Bytes that are not markup are refused when
+they hold an `svg` start tag, under any prefix and in any case, and are otherwise served as before,
+so a PDF or an image under an SVG label is unchanged. That covers SVGZ too: ingress already relabels
 gzip bytes under a `+xml` label as `application/octet-stream`. *Corrected 2026-10-07 (BACKLOG
 #2391):* the relabel changes only the label, so that sentence was wrong. See the correction below.
+
+*Amended 2026-10-16 (BACKLOG #3257):* the first rule read *"No SVG reader renders anything else"*,
+and bytes that were not markup were served with no scan at all. So leading text before
+`<svg onload=...>` passed, under an SVG label too, and a browser reading such a body as HTML would
+run it. The scan looks for the tag only, never the SVG namespace name, so a PDF or a DICOM file that
+names the namespace is still served. What the scan does not reach rests on the inert-type
+allow-list: every type it declares is served as an attachment with `nosniff`, and none is SVG or
+HTML.
 
 Markup is an SVG when either of two things holds:
 
@@ -678,12 +687,19 @@ real detach and the download, and fails against the sanitizer this correction re
    2026-10-07:* the first version of this correction served such a body as stored, unsanitized.
    The Lander found it on PR 2158.
 3. The first 64 KiB is inflated first. If its first byte past leading whitespace, NUL and
-   byte-order-mark bytes is not `<`, the body is served as stored without reading the rest. Damage
-   past that head is not seen. That cannot hide an SVG from a browser, since no browser renders a
-   document as SVG when its first byte past that noise is not `<`. A reader that autodetects EBCDIC
-   could; plain bytes rest on the same assumption. Bytes that are only that noise for the whole head
-   do not clear the body: it is inflated up to the bound, and the same first-byte rule then applies
-   to the whole output.
+   byte-order-mark bytes is not `<`, the body is not markup. It is refused when the 64 KiB from that
+   byte on hold an `svg` start tag, and otherwise served as stored without reading the rest. Where
+   the leading noise took part of the first 64 KiB, the head is read on to 128 KiB, so a full 64 KiB
+   past the noise is scanned. Damage past that head is not seen, and nor is a tag past it. That
+   rests on the inert-type allow-list, as for plain bytes, and not on how a browser reads the
+   document. *Amended 2026-10-16 (BACKLOG #3257):* this step read that the trade could not hide an
+   SVG, *"since no browser renders a document as SVG when its first byte past that noise is not
+   `<`"*, and a head that was not markup was served with no scan. Inflating the rest of every large
+   PDF or image would undo BACKLOG #1129, so the scan stops at the head. A reader that autodetects
+   EBCDIC could still find an SVG; plain bytes rest on the same assumption. Bytes that are only that
+   noise for the whole head do not clear the body: it is inflated up to the bound, and the same rule
+   then applies from the first byte past the noise. If that byte lies so near the bound that no
+   full 64 KiB fits past it, the body is refused.
 4. Markup that passes the bound is refused, since it cannot be vetted.
 5. Otherwise the inflated document is judged like plain bytes. A sanitized SVG is gzipped again, so
    the served copy keeps the stored representation. The audit row says `sanitized-svg`.
@@ -734,4 +750,11 @@ declares or names the SVG namespace without using it is served.
     no `xmlns`;
   - any document whose root scan runs out of steps;
   - any gzip whose damage the inflate reaches before its head clears it, such as a small damaged
-    PDF, whatever it holds.
+    PDF, whatever it holds;
+  - *added 2026-10-16 (BACKLOG #3257):* a body that is not markup and holds the bytes of an `svg`
+    start tag by chance, such as compressed data in a large PDF or image. By arithmetic rather than
+    measurement, uniformly random bytes hold one about once in 15,000 bodies of 1 MiB. A gzip
+    body is exposed only through its scanned head.
+- *Added 2026-10-16 (BACKLOG #3257):* every plain download that holds a `<` byte anywhere now goes
+  through the sanitizer on the thread pool, so the pre-check keeps only bodies with no `<` byte off
+  it. Most PDFs and images hold one.

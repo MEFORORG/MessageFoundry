@@ -22,6 +22,9 @@ the code meets them.
 - Markup whose root is not ``svg`` but which carries an SVG element anywhere, such as XHTML or an HTML
   page with an inline ``<svg>``, is refused rather than rewritten (BACKLOG #2391). Rewriting would
   change the parts that are not SVG, and those are verbatim clinical content.
+- Bytes that are not markup, such as leading text before ``<svg onload=...>``, are scanned for an
+  ``svg`` start tag and refused when one is found (BACKLOG #3257). Only the tag counts, so a PDF or a
+  DICOM file that names the SVG namespace is still served.
 - A gzip body, which is what an SVGZ file is, is inflated under the same size bound and vetted like
   plain bytes. A sanitized SVG inside is served gzipped again (BACKLOG #2391).
 - Trial passes that keep no output check the gzip's size bound, its member cap and its soundness
@@ -397,27 +400,49 @@ def _contains_svg(body: bytes) -> bool:
     # holds as text there is a live element to it. Only a literal ``<svg`` makes one there: the
     # namespace parts of the trace add nothing, since expat resolved the namespaces and HTML
     # ignores them, so a well-formed document that only declares or names the namespace is served.
-    return _SVG_TAG_RE.search(_without_nul(body)) is not None
+    return _has_svg_tag(body)
+
+
+def _has_svg_tag(data: bytes) -> bool:
+    """Whether ``data`` holds an ``svg`` start tag, under any prefix and in any case."""
+    return _SVG_TAG_RE.search(_without_nul(data)) is not None
+
+
+def _refuse_if_tagged(content: bytes) -> None:
+    """Refuse a document that is not markup when ``content`` holds an ``svg`` start tag (BACKLOG
+    #3257). Only the tag counts: a namespace name in a PDF or a DICOM file is not refused."""
+    if _has_svg_tag(content):
+        raise SvgRejected("document that is not markup carries an svg start tag")
 
 
 class _FirstContentWatch:
-    """A gzip decompressor for the shared inflate loop that notes the first byte past leading noise.
+    """A gzip decompressor for the shared inflate loop that notes what follows leading noise.
 
     A trial pass keeps no output, so this is how it still learns whether the document starts as
-    markup. The walk makes one per member and passes in the ``first`` the members before it found,
-    since a reader joins the members into one document."""
+    markup. It also keeps ``head``, the first :data:`_GZIP_SNIFF_BYTES` past that noise, for the tag
+    scan of a document that is not markup. One watch spans a walk, and :meth:`next_member` gives it
+    a fresh decompressor for each member, since a reader joins the members into one document."""
 
-    __slots__ = ("first", "inner")
+    __slots__ = ("first", "head", "inner")
 
-    def __init__(self, first: bytes | None) -> None:
-        self.first = first
+    def __init__(self) -> None:
+        self.first: bytes | None = None
+        self.head = bytearray()
+        self.next_member()
+
+    def next_member(self) -> None:
         self.inner = zlib.decompressobj(wbits=31)
 
     def _see(self, piece: bytes) -> bytes:
+        start = 0
         if self.first is None:
             match = _FIRST_CONTENT_BYTE_RE.search(piece)
-            if match is not None:
-                self.first = match.group()
+            if match is None:
+                return piece
+            self.first, start = match.group(), match.start()
+        room = _GZIP_SNIFF_BYTES - len(self.head)
+        if room > 0:
+            self.head += piece[start : start + room]
         return piece
 
     def decompress(self, data: Buffer, max_length: int = 0, /) -> bytes:
@@ -445,11 +470,18 @@ class _Gunzipped:
 
     ``output`` is the document, and is empty unless the walk kept its output and the body inflated
     whole. ``whole`` is false only when the output passed the walk's limit. ``first`` is the first
-    byte past leading noise among the bytes inflated, or ``None`` when there was none."""
+    byte past leading noise among the bytes inflated, or ``None`` when there was none. ``head`` is
+    the first :data:`_GZIP_SNIFF_BYTES` inflated from that byte on, whatever ``output`` holds."""
 
     output: bytes
     whole: bool
     first: bytes | None
+    head: bytes
+
+    @property
+    def head_short(self) -> bool:
+        """Whether the walk stopped at its limit before ``head`` filled."""
+        return not self.whole and len(self.head) < _GZIP_SNIFF_BYTES
 
 
 def _gunzip_bounded(body: bytes, limit: int, *, keep_output: bool) -> _Gunzipped:
@@ -465,12 +497,13 @@ def _gunzip_bounded(body: bytes, limit: int, *, keep_output: bool) -> _Gunzipped
     none of a call's output when the call raises, so there is no partial document to judge, and a
     reader that skips the trailer check could still show one. A corrupt body is never served."""
     view = memoryview(body)
-    first: bytes | None = None
+    watch = _FirstContentWatch()
     parts: list[bytes] = []
     produced = 0
     position = 0
-    for _ in range(_MAX_GZIP_MEMBERS):
-        watch = _FirstContentWatch(first)
+    for member in range(_MAX_GZIP_MEMBERS):
+        if member:
+            watch.next_member()
         try:
             result = bounded_inflate(
                 view[position:],
@@ -481,7 +514,7 @@ def _gunzip_bounded(body: bytes, limit: int, *, keep_output: bool) -> _Gunzipped
                 exact_ceiling=True,
             )
         except InflateCeilingExceeded:
-            return _Gunzipped(b"", False, watch.first)
+            return _Gunzipped(b"", False, watch.first, bytes(watch.head))
         except zlib.error:
             # The refusal is raised after the except ends, so the zlib error stays off its chain,
             # as in sanitize_svg (BACKLOG #1796).
@@ -490,14 +523,13 @@ def _gunzip_bounded(body: bytes, limit: int, *, keep_output: bool) -> _Gunzipped
             corrupt = False
         if corrupt:
             raise SvgRejected("gzip body is corrupt")
-        first = watch.first
         if not result.eof:
             raise SvgRejected("gzip body is cut short")
         parts.append(result.output)
         produced += result.produced
         position += result.end
         if _NOT_NUL_RE.search(view, position) is None:
-            return _Gunzipped(b"".join(parts), True, first)
+            return _Gunzipped(b"".join(parts), True, watch.first, bytes(watch.head))
         if bytes(view[position : position + 2]) != _GZIP_MAGIC:
             raise SvgRejected("gzip body has bytes after its last member")
     raise SvgRejected(f"gzip body has more than {_MAX_GZIP_MEMBERS} members")
@@ -506,6 +538,7 @@ def _gunzip_bounded(body: bytes, limit: int, *, keep_output: bool) -> _Gunzipped
 def _vet_markup(label: str | None, body: bytes) -> bytes:
     """:func:`sanitize_if_svg` for bytes that are not gzip."""
     if not _is_markup(body):
+        _refuse_if_tagged(body)
         return body
     if "svg" in (label or "").casefold() or _root_is_svg(body):
         return sanitize_svg(body)
@@ -514,28 +547,48 @@ def _vet_markup(label: str | None, body: bytes) -> bytes:
     return body
 
 
+def _refuse_gzip_if_tagged(walk: _Gunzipped) -> None:
+    """:func:`_refuse_if_tagged` over the head of a gzip walk that found no markup. A walk the bound
+    stopped before it held a full head past the leading noise is refused, since the tag could sit
+    just past what it read. Only the trial pass can be that walk: the head pass reads on first."""
+    if walk.head_short:
+        raise SvgRejected("gzip body reaches the bound before a full head past its leading noise")
+    _refuse_if_tagged(walk.head)
+
+
 def _vet_gzip(label: str | None, body: bytes) -> bytes:
     """:func:`sanitize_if_svg` for a gzip body. Only markup inside it is the sanitizer's business.
 
-    A body is cleared as not markup only once its first byte past leading noise is seen and is not
-    ``<``. A body that inflates to nothing but whitespace within the bound has not shown that byte,
-    so it is treated as markup: a reader that inflates the rest may find an SVG there. A gzip that is
-    not sound is refused by :func:`_gunzip_bounded` before anything is judged.
+    A body is treated as not markup only once its first byte past leading noise is seen and is not
+    ``<``. It is then cleared unless the first :data:`_GZIP_SNIFF_BYTES` from that byte on hold an
+    ``svg`` start tag, which refuses it, as the whole of a plain body is scanned (BACKLOG #3257).
+    Leading noise does not shorten that head: a walk that stopped before it held a full head past
+    the noise reads on, and one the bound stopped first is refused. A body that inflates to nothing
+    but whitespace within the bound has not shown that byte, so it is treated as markup: a reader
+    that inflates the rest may find an SVG there. A gzip that is not sound is refused by
+    :func:`_gunzip_bounded` before anything is judged.
 
-    The head is cleared without reading the rest of the body, so damage past the head is not seen.
-    That cannot hide an SVG from a browser: no browser renders a document as SVG when its first
-    byte past that noise is not ``<``. A reader that autodetects EBCDIC could, which is the same
-    assumption :func:`may_be_svg` makes for plain bytes.
+    A body that is not markup is cleared without inflating the rest of it, so neither damage nor an
+    ``svg`` tag past the head is seen. Inflating every large PDF or image to the bound would undo
+    BACKLOG #1129. What the head scan does not reach rests on the route's content-type allow-list:
+    the body is declared only as an inert type, as an attachment with ``nosniff``, so a browser does
+    not render it as SVG or HTML. An SVG in EBCDIC is not seen either, here or in plain bytes.
 
     The head and the size check are trial passes that keep no output (BACKLOG #1129). Only a body
     they admit as whole markup is inflated again, and that pass is the one that keeps the document.
     So markup over the bound is refused before any of it is held."""
     head = _gunzip_bounded(body, _GZIP_SNIFF_BYTES, keep_output=False)
     if head.first not in (None, b"<"):
+        if head.head_short:
+            # Leading noise took part of the head. The noise is no longer than the head, so twice
+            # the head holds a full one past it.
+            head = _gunzip_bounded(body, 2 * _GZIP_SNIFF_BYTES, keep_output=False)
+        _refuse_gzip_if_tagged(head)
         return body
     # A body that inflated whole within the head needs no second trial pass.
     trial = head if head.whole else _gunzip_bounded(body, _MAX_SVG_BYTES, keep_output=False)
     if trial.first not in (None, b"<"):
+        _refuse_gzip_if_tagged(trial)
         return body
     if not trial.whole:
         # Markup that passes the bound cannot be vetted, and a reader may still show the part that
@@ -685,10 +738,11 @@ def sanitize_svg(body: bytes) -> bytes:
 
 def may_be_svg(body: bytes) -> bool:
     """A cheap, non-blocking pre-check: ``False`` means :func:`sanitize_if_svg` would return ``body``
-    unchanged whatever its label, so the caller can skip the thread hop for a PDF or an image. Only
-    markup can be SVG, and no SVG reader renders bytes that do not start with ``<``. The one
-    exception is gzip, since an SVGZ reader inflates it first."""
-    return body.startswith(_GZIP_MAGIC) or _is_markup(body)
+    unchanged whatever its label, so the caller can skip the thread hop. Every other answer needs a
+    ``<`` in the bytes: markup starts with one, and so does the ``svg`` tag a body that is not markup
+    is refused for (BACKLOG #3257). The one exception is gzip, since an SVGZ reader inflates it
+    first. Most PDFs and images hold a ``<`` somewhere, so they take the hop."""
+    return body.startswith(_GZIP_MAGIC) or b"<" in body
 
 
 def sanitize_if_svg(label: str | None, body: bytes) -> bytes:
