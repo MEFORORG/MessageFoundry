@@ -20,8 +20,11 @@
 #>
 [CmdletBinding(DefaultParameterSetName = 'State')]
 param(
-    [Parameter(ParameterSetName = 'State', Mandatory)][ValidateRange(0, 99)][int]$Free,
-    [Parameter(ParameterSetName = 'State', Mandatory)][ValidateRange(0, 99)][int]$InFlight,
+    # NEITHER IS Mandatory, ON PURPOSE: a bare call, or -Note or -Capacity alone, binds this default
+    # set, and a Mandatory prompt there hangs a caller with stdin open (tests/_no_prompt.py, vault
+    # BACKLOG #3627). The refusal is right after this param block.
+    [Parameter(ParameterSetName = 'State')][ValidateRange(0, 99)][int]$Free,
+    [Parameter(ParameterSetName = 'State')][ValidateRange(0, 99)][int]$InFlight,
     [Parameter(ParameterSetName = 'State')][string]$Note = '',
     [Parameter(ParameterSetName = 'State')][ValidateRange(1, 99)][int]$Capacity = 4,
     # Stamp that a dispatcher asked. Carries NO number and cannot produce an at-capacity reading.
@@ -31,6 +34,13 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# A level needs both numbers: refuse by name, before anything is read or written. See $Free. Bound,
+# not truthy, because 0 is a real answer for either.
+if ($PSCmdlet.ParameterSetName -eq 'State' -and
+    -not ($PSBoundParameters.ContainsKey('Free') -and $PSBoundParameters.ContainsKey('InFlight'))) {
+    throw "A lane level needs both -Free and -InFlight (or use -Asked or -Show). Nothing was written."
+}
 
 . (Join-Path $PSScriptRoot 'mail-key.ps1')
 

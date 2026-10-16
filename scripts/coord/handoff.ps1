@@ -63,12 +63,15 @@ param(
     [Parameter(ParameterSetName = 'Report')][switch]$Json,
 
     # Move ONE entry to _retired-<date>/. Refuses on any hold unless -Force.
-    [Parameter(ParameterSetName = 'Retire', Mandatory)][string]$Retire,
+    # -Retire, -Write and -From are NOT Mandatory, ON PURPOSE: -Force alone binds the Retire set and
+    # -From or -Replace alone the Write set, and a Mandatory prompt there hangs a caller with stdin
+    # open (tests/_no_prompt.py, vault BACKLOG #3627). The refusal is right after this param block.
+    [Parameter(ParameterSetName = 'Retire')][string]$Retire,
     [Parameter(ParameterSetName = 'Retire')][switch]$Force,
 
     # Copy ONE document from -From into handoffs/<name>. Refuses an existing name unless -Replace.
-    [Parameter(ParameterSetName = 'Write', Mandatory)][string]$Write,
-    [Parameter(ParameterSetName = 'Write', Mandatory)][string]$From,
+    [Parameter(ParameterSetName = 'Write')][string]$Write,
+    [Parameter(ParameterSetName = 'Write')][string]$From,
     [Parameter(ParameterSetName = 'Write')][switch]$Replace,
 
     # Overridable so tests exercise the real logic against a fixture instead of the live directory.
@@ -80,6 +83,16 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# A partial -Retire or -Write call: refuse by name, before anything is read or written. See $Retire.
+$missing = switch ($PSCmdlet.ParameterSetName) {
+    'Retire' { if (-not $Retire) { '-Retire <name>' } }
+    'Write' { if (-not $Write) { '-Write <name>' }; if (-not $From) { '-From <file>' } }
+}
+if ($missing) {
+    throw "$($PSCmdlet.ParameterSetName) arguments were given without $($missing -join ' and '). Nothing was moved or written. Add it and re-run."
+}
+
 . "$PSScriptRoot\mail-key.ps1"
 . "$PSScriptRoot\box-activity.ps1"
 

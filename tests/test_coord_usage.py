@@ -57,6 +57,7 @@ from typing import Any
 import pytest
 from _bash_resolver import probe_env, require_bash
 
+from tests._no_prompt import run_holding_stdin_open
 from tests._spawn_lock import run_single
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -2336,6 +2337,23 @@ def test_a_cancelled_account_reports_unavailable_and_never_a_percentage(tmp_path
     _, _, human = reader("-StateDir", str(state))
     assert _PCT.search(human) is None, f"a percentage survived under a cancelled account:\n{human}"
     assert "NO SUBSCRIPTION" in human
+
+
+def test_a_mark_argument_without_mark_refuses_instead_of_prompting(tmp_path: Path) -> None:
+    """Vault BACKLOG #3627: ``-Reason`` alone binds the ``Mark`` set without ``-Mark``. Red pre-fix."""
+    root = tmp_path / ".claude-account-9"
+    root.mkdir()
+    rc, err = run_holding_stdin_open(
+        [
+            "pwsh", "-NoProfile", "-File", str(AVAIL),
+            "-HomeDir", str(tmp_path), "-ConfigDir", str(root), "-Reason", "cancelled",
+        ],
+        cwd=tmp_path,
+    )  # fmt: skip
+    assert rc != 0, "a Mark argument without -Mark must be refused, not marked"
+    assert "-Mark" in err, err
+    # Refused means NOTHING written: the marker's publish directory is created on the write path.
+    assert not (root / "mefor-usage").exists()
 
 
 def test_a_damaged_marker_fails_closed_rather_than_reading_as_available(tmp_path: Path) -> None:

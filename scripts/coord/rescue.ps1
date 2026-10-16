@@ -106,7 +106,10 @@
 [CmdletBinding(DefaultParameterSetName = 'Check')]
 param(
     # Write a rescue ref under refs/rescue/<slug>, capturing HEAD unless -Sha says otherwise.
-    [Parameter(ParameterSetName = 'Anchor', Mandatory)][string]$Anchor,
+    # NOT Mandatory, ON PURPOSE: `-Sha <commit>` alone binds this set, and a Mandatory prompt there
+    # hangs a caller with stdin open (tests/_no_prompt.py, vault BACKLOG #3627). The refusal is
+    # right after this param block.
+    [Parameter(ParameterSetName = 'Anchor')][string]$Anchor,
     # The commit to capture. Defaults to HEAD.
     [Parameter(ParameterSetName = 'Anchor')][string]$Sha,
     # Audit every rescue ref reachable from this repository.
@@ -115,6 +118,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# -Sha without -Anchor: refuse by name, before anything is read or written. See $Anchor.
+if ($PSCmdlet.ParameterSetName -eq 'Anchor' -and -not $Anchor) {
+    throw "Anchoring needs -Anchor <slug>; -Sha alone does not anchor. Nothing was written. Add -Anchor and re-run."
+}
 
 # Anchored on the SCRIPT, not the cwd, for the reason alloc.ps1 states once (BACKLOG #1060): an
 # absolute -File invocation from another worktree must act on the checkout the script lives in.
