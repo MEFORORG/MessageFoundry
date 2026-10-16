@@ -10491,7 +10491,8 @@ def create_managed_app(
                 # an ERROR and returns, and is guarded like the census: a policy-level fact must
                 # never refuse the start, whatever a later policy clause raises. It runs off the loop
                 # (vault BACKLOG #3164): a pathological context-word list makes the generator retry
-                # its policy screens many times, and the loop already serves the API by now.
+                # its policy screens many times, and the engine's listeners and workers already run
+                # on the loop by now.
                 try:
                     await asyncio.to_thread(auth.probe_credential_generation)
                 except Exception:  # noqa: BLE001 -- see the comment above

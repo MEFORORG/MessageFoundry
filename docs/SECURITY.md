@@ -4387,11 +4387,13 @@ Users are notified of security-relevant changes to their account through **two**
   failed attempts**, or a step-up re-auth that clears such a run (suspicious-login signals, 6.3.5); and **password change**, **email change**, **role
   change**, **account disable**, and a **directory rename** of the username (credential changes,
   6.3.7).
-  A notice for a change the directory made names the directory and no administrator, and it closes
+  A notice for a change the directory drove names the directory and no administrator, and it closes
   with "If you did not expect this change" rather than "If this was you". That covers at least the
   directory rename, the directory's email change, a role change applied by the session reconciler
   or by a directory sign-in's re-sync, and the reconciler's `account_disabled` when it read the
-  account disabled (vault BACKLOG #3121). When the reconciler ends an account's sessions because it
+  account disabled (vault BACKLOG #3121). The role notice says the roles were changed to match the
+  directory's groups, not that the console played no part: those groups map to roles through the
+  group-to-role map an administrator edits. When the reconciler ends an account's sessions because it
   could not match the account or could not read its `userAccountControl`, it sends
   `directory_sessions_ended`, not `account_disabled` (vault BACKLOG #2140).
   The rename notice, `username_changed`, names the old and the new name, and is sent only when

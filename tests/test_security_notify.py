@@ -37,6 +37,7 @@ from messagefoundry.pipeline.security_notify import (
     _SUBJECTS,
     SecurityEventNotifier,
     _build_body,
+    _subject,
     security_notifier_from_settings,
 )
 
@@ -204,19 +205,38 @@ def test_a_non_last_factor_removal_renders_its_own_subject_and_body() -> None:
     assert "disabled" not in body.lower()
 
 
-def test_a_directory_sessions_ended_notice_renders_its_own_text_and_claims_no_disable() -> None:
+#: The generic line a directory email change or rename carries (BACKLOG #1139).
+_DIRECTORY_LINE = (
+    "This change came from your organization's directory, not from the MessageFoundry console."
+)
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        pytest.param({}, id="untagged"),
+        # The shape the reconciler mails since vault BACKLOG #3121.
+        pytest.param({"reason": "directory_absent", "source": "directory"}, id="as-sent"),
+    ],
+)
+def test_a_directory_sessions_ended_notice_renders_its_own_text_and_claims_no_disable(
+    detail: dict[str, Any],
+) -> None:
     """vault BACKLOG #2140. Both renderers fall back silently, so a half-wired kind would mail the
     generic wording. The directory never answered that the account is disabled or gone, so the text
-    must not say either, and an engine act cannot carry the "if this was you" closing."""
+    must not say either, nor that the directory changed anything, and an engine act cannot carry
+    the "if this was you" closing."""
     assert DIRECTORY_SESSIONS_ENDED in _SUBJECTS
-    body = _build_body(SecurityEvent(DIRECTORY_SESSIONS_ENDED, username="jdoe", email=None))
-    text = (_SUBJECTS[DIRECTORY_SESSIONS_ENDED] + "\n" + body).lower()
+    event = SecurityEvent(DIRECTORY_SESSIONS_ENDED, username="jdoe", email=None, detail=detail)
+    body = _build_body(event)
+    text = (_subject(event) + "\n" + body).lower()
     assert "a security event occurred on your account." not in text
     # The description itself, not words the subject alone would satisfy (vault BACKLOG #3121).
     assert (
         "A check against your organization's directory ended your MessageFoundry sessions."
         in body.splitlines()
     )
+    assert _DIRECTORY_LINE not in body.splitlines()
     for claim in ("disabled", "deleted", "if this was you"):
         assert claim not in text
     assert body.endswith(
@@ -226,15 +246,15 @@ def test_a_directory_sessions_ended_notice_renders_its_own_text_and_claims_no_di
 
 #: vault BACKLOG #3121. The description each directory-driven kind carries, pinned whole.
 _DIRECTORY_TEXT = {
-    ROLES_CHANGED: "Your account's roles were changed.",
+    ROLES_CHANGED: (
+        "MessageFoundry read your groups in your organization's directory and changed your "
+        "account's roles to match them."
+    ),
     ACCOUNT_DISABLED: (
         "Your organization's directory reports your account as disabled, so MessageFoundry ended "
         "your sessions."
     ),
 }
-_DIRECTORY_LINE = (
-    "This change came from your organization's directory, not from the MessageFoundry console."
-)
 _DIRECTORY_CLOSING = "If you did not expect this change, contact your MessageFoundry administrator."
 _ADMIN_TEXT = {
     ROLES_CHANGED: "Your account's roles were changed by an administrator.",
@@ -250,22 +270,24 @@ def test_a_directory_role_or_disable_notice_names_the_directory_and_no_administr
     kind: str,
 ) -> None:
     """vault BACKLOG #3121. The reconciler and the sign-in re-sync tag these ``source`` directory:
-    no administrator made the change and the holder did nothing, so neither the administrator
-    wording nor "if this was you" may appear."""
-    body = _build_body(
-        SecurityEvent(
-            kind,
-            username="jdoe",
-            email="j@example.org",
-            detail={"reason": "directory_disabled", "source": "directory"},
-        )
+    the holder did nothing, so neither the administrator wording nor "if this was you" may appear.
+    Nor the generic directory line: a role re-sync runs through the group-to-role map an
+    administrator edits in the console, so "not from the MessageFoundry console" could be false."""
+    event = SecurityEvent(
+        kind,
+        username="jdoe",
+        email="j@example.org",
+        detail={"reason": "directory_disabled", "source": "directory"},
     )
+    body = _build_body(event)
     lines = body.splitlines()
     assert _DIRECTORY_TEXT[kind] in lines
-    assert _DIRECTORY_LINE in lines
+    assert _DIRECTORY_LINE not in lines
     assert _ADMIN_TEXT[kind] not in lines
     assert "if this was you" not in body.lower()
     assert body.endswith(_DIRECTORY_CLOSING)
+    # The administrator subject says the MessageFoundry account was disabled, which is false here.
+    assert "was disabled" not in _subject(event)
 
 
 @pytest.mark.parametrize("kind", [ROLES_CHANGED, ACCOUNT_DISABLED])

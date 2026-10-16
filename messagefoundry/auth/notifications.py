@@ -50,8 +50,9 @@ PASSWORD_RESET = "password_reset"  # nosec B105 — event label, not a credentia
 TEMPORARY_CREDENTIAL_EXPIRING = "temporary_credential_expiring"
 TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER = "temporary_credential_expiring_issuer"
 EMAIL_CHANGED = "email_changed"  # 6.3.7 — the account's email address was changed
-# 6.3.7 -- the account's roles changed: an administrator's act, or the directory's, which the
-# reconciler and the sign-in re-sync tag with ``detail["source"] == "directory"`` (vault BACKLOG #3121).
+# 6.3.7 -- the account's roles changed: an administrator's act, or a re-sync from the directory's
+# groups, which the reconciler and the sign-in re-sync tag ``detail["source"] == "directory"``
+# (vault BACKLOG #3121).
 ROLES_CHANGED = "roles_changed"
 # 6.3.7 -- the directory renamed the account and the engine copied the new name onto the row
 # (BACKLOG #2017). When it is sent is stated once, at the send site in

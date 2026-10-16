@@ -13,7 +13,6 @@ here describes what a deploying site would inherit, never a live exposure.
 from __future__ import annotations
 
 import asyncio
-import base64
 import io
 import json
 import sys
@@ -2714,9 +2713,9 @@ def test_the_last_wrong_code_is_not_told_to_try_again(
 
 # --- vault BACKLOG #3113 item 1: the run that loses an enrolment race --------------------------
 
-#: A second synthetic base32 secret, so the two runs show different entries. Encoded here rather
-#: than written as a literal, which the gitleaks generic-api-key rule reads as a credential.
-_OTHER_TOTP_SECRET = base64.b32encode(b"1234567890").decode("ascii")
+#: A second synthetic base32 secret, so the two runs show different entries. Two symbols on
+#: purpose, for the reason ``_PASSWORD`` above is low-entropy: it must not look like a secret.
+_OTHER_TOTP_SECRET = "ABABABABABABABAB"
 
 
 async def test_the_run_that_loses_an_enrolment_race_is_not_told_to_remove_a_live_entry(
@@ -2770,9 +2769,15 @@ async def test_the_run_that_loses_an_enrolment_race_is_not_told_to_remove_a_live
         row = await store.get_user("roleless")
         assert row is not None and row.totp_enabled
         assert await store.get_totp_secret("roleless") == _OTHER_TOTP_SECRET
+        # The winning run reported success over a secret it did not show. That is the race
+        # itself, vault BACKLOG #3025, pinned here as the premise and not as a wanted outcome.
         message = str(lost.value)
         assert "did not turn TOTP on and granted no role" in message
         assert "remove" not in message.lower()
         assert "keep the authenticator entry it showed" in message
     finally:
+        # A failure above must not leave the second run running against a closed store.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await store.close()

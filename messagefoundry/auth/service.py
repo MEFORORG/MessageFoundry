@@ -5459,7 +5459,7 @@ class AuthService:
             # local one, so notify the affected user out-of-band too (ASVS 6.3.7), matching set_roles().
             # Best-effort; the change is also visible in the audited /me/security-events feed.
             # ``source`` words it for the directory, as the reconciler's notice is (vault BACKLOG
-            # #3121): no administrator made this change, so "if this was you" cannot apply.
+            # #3121): the holder did not make this change, so "if this was you" cannot apply.
             await self._notify_security(
                 ROLES_CHANGED,
                 username=user.username,
@@ -10159,7 +10159,10 @@ class AuthService:
             #
             # A store refusal of the revoke is logged, not raised, so the refusal row below is
             # still written (vault BACKLOG #3113). ``session_ended`` records what the revoke did.
-            # The token is not handed back either way, so the caller still cannot use the session.
+            # The token is not handed back either way, so the caller still cannot use the session;
+            # a session the revoke left live expires on its own timers. A fault that also refuses
+            # the read and the audit write below still loses the row: this covers a refusal of the
+            # revoke alone.
             rotated = hash_token(elevation.token)
             session_ended = await write_audit_soft(
                 lambda: self._store.revoke_session(rotated),
