@@ -618,6 +618,7 @@ def account_page(
     passkeys: Sequence[Mapping[str, object]] | None = None,
     webauthn_notice: str | None = None,
     session_offer: int | None = None,
+    factor_owed: bool = False,
 ) -> Markup:
     """The signed-in user's account overview: identity, password rotation, and MFA posture/actions.
 
@@ -625,7 +626,10 @@ def account_page(
     last_used_at / backed_up / usable / credential_id_hash) — this module never touches the store.
     ``webauthn_notice`` renders the fail-closed copy in place of the Add-a-passkey form (extra
     absent / public_origin unset). ``session_offer`` is the count of the caller's other sessions,
-    given only on the one view a factor change earned (BACKLOG #1147); ``None`` or 0 renders none."""
+    given only on the one view a factor change earned (BACKLOG #1147); ``None`` or 0 renders none.
+    ``factor_owed`` decides the "REQUIRES MFA" line, read only when TOTP is off: the account rule
+    (``mfa.required``) OR this session (``not mfa_satisfied``) owes a factor. The route computes it
+    because the session half is not in ``mfa`` (BACKLOG #3116)."""
     banner = el("p", error, class_="banner") if error else Markup("")
     note = el("p", notice, class_="muted") if notice else Markup("")
     offer = _session_offer(session_offer or 0)
@@ -661,7 +665,7 @@ def account_page(
     else:
         status_line = el(
             "p",
-            "Not enrolled." + (" This account REQUIRES MFA — enroll now." if mfa.required else ""),
+            "Not enrolled." + (" This account REQUIRES MFA — enroll now." if factor_owed else ""),
             class_="muted",
         )
         action = el(

@@ -33,6 +33,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_worktree_remove_path import REAL_SCRIPTS, copy_real_scripts, settle_worktrees
+
 _REPO = Path(__file__).resolve().parents[1]
 _NEW_PS1 = _REPO / "scripts" / "worktree" / "new.ps1"
 _REMOVE_PS1 = _REPO / "scripts" / "worktree" / "remove.ps1"
@@ -119,13 +121,11 @@ class Fixture:
 @pytest.fixture
 def fx(tmp_path: Path) -> Fixture:
     f = Fixture(tmp_path)
-    tracked = f.primary / "scripts" / "worktree"
-    tracked.mkdir(parents=True)
-    shutil.copyfile(_REMOVE_PS1, tracked / "remove.ps1")
+    copy_real_scripts(f.primary)
     _git(f.primary, "init", "-q", "-b", "main")
     _git(f.primary, "config", "user.email", "t@example.invalid")
     _git(f.primary, "config", "user.name", "t")
-    _git(f.primary, "add", "--", "scripts/worktree/remove.ps1")
+    _git(f.primary, "add", "--", *REAL_SCRIPTS)
     _git(f.primary, "commit", "-qm", "seed")
     _git(
         f.primary,
@@ -179,6 +179,8 @@ def test_every_printed_cleanup_command_actually_removes_the_worktree(fx: Fixture
         wt = fx.worktree(fx.primary.parent / f"repo-adv{i}", f"adv{i}")
         assert str(wt).replace("\\", "/") in _registered(fx.primary)
 
+        # remove.ps1 refuses a tree written to inside its quiet period, and this one is seconds old.
+        settle_worktrees(fx.primary)
         proc = _run(_render(cmd, repo_root=fx.primary, worktree=wt, name=f"adv{i}"))
 
         assert proc.returncode == 0, f"advice failed: {cmd}\n{proc.stdout}\n{proc.stderr}"
@@ -220,6 +222,7 @@ def test_the_advice_that_used_to_be_printed_still_throws_today(fx: Fixture) -> N
     assert str(fx.primary.parent / "repo-feature") in retired.stderr
     assert target.exists()
 
+    settle_worktrees(fx.primary)
     for cmd in _advice_commands():
         if not target.exists():
             break

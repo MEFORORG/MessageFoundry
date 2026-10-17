@@ -2896,6 +2896,11 @@ def _serve(args: argparse.Namespace) -> int:
 
     for _env_line in unread_env_warnings(settings):
         logging.getLogger("messagefoundry.config.settings").warning("%s", _env_line)
+    # BACKLOG #3085 (owner ruling 2026-10-17, "Warn, don't refuse"): a recheck budget at or below
+    # the revoke cap leaves the mass-revoke breaker unable to trip. Logged here, once logging
+    # reaches its handlers, and only by serve, so other commands that resolve settings stay quiet.
+    if (_breaker_note := settings.auth.breaker_budget_warning()) is not None:
+        logging.getLogger("messagefoundry.config.settings").warning("%s", _breaker_note)
     # BACKLOG #1125 (owner ruling 2026-10-11): an environment proxy must not attach silently. Named
     # as soon as logging reaches its handlers, before the first hop that could use it.
     from messagefoundry.transports.ambient_proxy import warn_ambient_proxy

@@ -12,15 +12,17 @@ Synthetic HL7 only. The variable these configs read holds a marker, never a secr
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
-from messagefoundry.config import settings
+from messagefoundry.config import settings, wiring
 from messagefoundry.config.run_context import RunContext
 from messagefoundry.config.settings import EgressSettings
-from messagefoundry.config.wiring import Registry, load_config
+from messagefoundry.config.wiring import Registry, WiringError, config_code_digest, load_config
 from messagefoundry.pipeline import _sandbox_codec as codec
 from messagefoundry.pipeline.dryrun import transform_one
 from messagefoundry.pipeline.sandbox import (
@@ -32,6 +34,7 @@ from messagefoundry.pipeline.sandbox import (
     graph_differences,
     graph_shape,
 )
+from messagefoundry.pipeline.sharding import filter_registry_for_shard
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store.store import MessageStore
 from tests.test_child_process_environment import _SECRET_NAMES
@@ -112,6 +115,127 @@ def test_a_worker_whose_graph_differs_from_the_engines_is_refused(
     assert "reload" in text
     # What differs, and on which side: the engine has two handlers the worker never built.
     assert "handlers (engine only: h_1, h_2)" in text
+
+
+def test_a_config_module_edited_on_disk_refuses_the_worker_though_every_name_matches(
+    config_dir: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #2724 item 3. The engine loaded the config, then a Handler's body changed on
+    disk with no reload. Every name is the same, so only the digest of the modules' bytes can tell.
+    The control is the comparison on the same edit with the digest taken out of the engine's shape:
+    the worker then comes up and answers from the edited body, which is the divergence this
+    refuses."""
+    monkeypatch.delenv(_VARIABLE, raising=False)
+    registry = load_config(config_dir)
+    graph = Path(config_dir) / "graph.py"
+    graph.write_text(_GRAPH.replace('"COUNT="', '"EDITED="'), encoding="utf-8")
+
+    with pytest.raises(SandboxError) as refused:
+        _dispatch(registry, config_dir)
+    text = str(refused.value)
+    assert "config module content (the engine loaded" in text
+    assert "reload" in text
+    # Only the bytes differ, so the refusal does not send the operator after a variable.
+    assert "pass_environment" not in text
+
+    blind = dataclasses.replace(graph_shape(registry), code_digest=None)
+    session = SandboxSession(
+        SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=30.0),
+        inbound="IB_PARITY",
+        config_dir=config_dir,
+        env=None,
+        graph=lambda: blind,
+    )
+    try:
+        deliveries, _, _, _ = transform_one(
+            registry, "h_0", RAW, sandbox=session, run_context=RunContext()
+        )
+    finally:
+        session.close()
+    assert str(deliveries[0].payload) == "EDITED=1"
+
+
+def test_a_module_rewritten_while_the_load_runs_refuses_the_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The digest is read before the modules run. A rewrite in between would let a worker pass the
+    comparison with code its digest does not describe, so the load is refused. The control is
+    the same load with nothing rewritten."""
+    monkeypatch.delenv(_VARIABLE, raising=False)
+    (tmp_path / "graph.py").write_text(_GRAPH, encoding="utf-8")
+    assert load_config(tmp_path).code_digest is not None
+    real = wiring._exec_module
+
+    def rewrite_then_run(path: Path, helpers: Any) -> None:
+        path.write_text(_GRAPH + "\n# edited\n", encoding="utf-8")
+        real(path, helpers)
+
+    monkeypatch.setattr(wiring, "_exec_module", rewrite_then_run)
+    with pytest.raises(WiringError, match="changed on disk while they were loading"):
+        load_config(tmp_path)
+
+
+def test_a_module_unreadable_after_the_load_is_not_called_an_edit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(_VARIABLE, raising=False)
+    (tmp_path / "graph.py").write_text(_GRAPH, encoding="utf-8")
+    real = wiring._exec_module
+    real_read = Path.read_bytes
+    ran: list[bool] = []
+
+    def refuse_after_the_load(self: Path) -> bytes:
+        if ran and self.name == "graph.py":
+            raise PermissionError("held open")
+        return real_read(self)
+
+    def run(path: Path, helpers: Any) -> None:
+        real(path, helpers)
+        ran.append(True)
+
+    monkeypatch.setattr(wiring, "_exec_module", run)
+    monkeypatch.setattr(Path, "read_bytes", refuse_after_the_load)
+    with pytest.raises(WiringError, match="could not be read again"):
+        load_config(tmp_path)
+
+
+def test_an_unreadable_module_leaves_no_digest_and_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    (tmp_path / "graph.py").write_text("X = 1\n", encoding="utf-8")
+    real = Path.read_bytes
+
+    def refuse(self: Path) -> bytes:
+        if self.name == "graph.py":
+            raise PermissionError("held open")
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", refuse)
+    with caplog.at_level("WARNING", logger="messagefoundry.config.wiring"):
+        assert config_code_digest(tmp_path) is None
+    assert "not compared" in caplog.text and "held open" in caplog.text
+
+
+def test_the_code_digest_covers_each_module_a_load_may_run(tmp_path: Path) -> None:
+    """A ``_`` helper counts, as the loader runs it when a sibling imports it. A file that is not a
+    config module does not, and the digest is of bytes, not of a listing."""
+    (tmp_path / "graph.py").write_text("X = 1\n", encoding="utf-8")
+    first = config_code_digest(tmp_path)
+    assert first is not None and len(first) == 64
+    assert config_code_digest(tmp_path) == first
+    (tmp_path / "notes.txt").write_text("not config\n", encoding="utf-8")
+    assert config_code_digest(tmp_path) == first
+    (tmp_path / "_helper.py").write_text("Y = 1\n", encoding="utf-8")
+    with_helper = config_code_digest(tmp_path)
+    assert with_helper != first
+    (tmp_path / "_helper.py").write_text("Y = 2\n", encoding="utf-8")
+    assert config_code_digest(tmp_path) not in (first, with_helper)
+
+
+def test_an_engine_shard_keeps_the_code_digest(config_dir: str) -> None:
+    registry = load_config(config_dir)
+    assert registry.code_digest == config_code_digest(Path(config_dir))
+    assert filter_registry_for_shard(registry, "any").code_digest == registry.code_digest
 
 
 def test_a_refused_worker_is_not_started_again_for_the_same_graph(
@@ -239,6 +363,25 @@ def test_each_part_of_the_shape_is_compared(changes: dict[str, object], expected
     assert difference.startswith(expected + " (")
 
 
+_DIGEST_A = "a" * 64
+_DIGEST_B = "b" * 64
+
+
+def test_the_code_digest_is_compared_whenever_the_engine_has_one() -> None:
+    """A worker of the same build that reports no digest could not read its modules, so it is
+    refused rather than passed. An engine with none, a graph built in code, compares names only."""
+    ours, theirs = _shape(code_digest=_DIGEST_A), _shape(code_digest=_DIGEST_B)
+    assert graph_differences(ours, theirs) == [
+        "config module content (the engine loaded aaaaaaaaaaaa, the worker loaded bbbbbbbbbbbb)"
+    ]
+    assert graph_differences(ours, _shape(code_digest=_DIGEST_A)) == []
+    assert graph_differences(ours, _shape()) == [
+        "config module content (the engine loaded aaaaaaaaaaaa, the worker loaded none: it could "
+        "not read them)"
+    ]
+    assert graph_differences(_shape(), theirs) == []
+
+
 def test_a_difference_names_a_few_of_the_names_and_the_side_that_has_them() -> None:
     worker = _shape(handlers=frozenset({"h", "w1", "w2", "w3", "w4"}), routers=frozenset())
     assert graph_differences(_shape(), worker) == [
@@ -258,7 +401,16 @@ def test_an_engine_shard_compares_only_the_bindings_it_holds() -> None:
 
 def test_the_shape_crosses_the_pipe_and_back() -> None:
     assert codec.decode_boot_reply(codec.encode_ready(_shape())) == (_shape(), "")
+    with_digest = _shape(code_digest=_DIGEST_A)
+    assert codec.decode_boot_reply(codec.encode_ready(with_digest)) == (with_digest, "")
     assert codec.decode_boot_reply(codec.encode_bootfail("why")) == (None, "why")
+
+
+@pytest.mark.parametrize("digest", ["A" * 64, "a" * 63, "not hex\n" * 8, "g" * 64])
+def test_a_code_digest_from_the_worker_must_be_a_sha256(digest: str) -> None:
+    """The worker writes it, and the engine prints its start into a refusal."""
+    with pytest.raises(codec.SandboxCodecError):
+        codec.decode_boot_reply(codec.encode_ready(_shape(code_digest=digest)))
 
 
 def test_the_shape_of_a_loaded_graph(config_dir: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -271,6 +423,7 @@ def test_the_shape_of_a_loaded_graph(config_dir: str, monkeypatch: pytest.Monkey
         handlers=frozenset({"h_0"}),
         accepts=frozenset(),
         outbound=frozenset({"OB_PARITY"}),
+        code_digest=config_code_digest(Path(config_dir)),
     )
 
 
