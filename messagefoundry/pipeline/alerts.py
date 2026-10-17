@@ -546,10 +546,11 @@ class AlertSink(Protocol):
         ``name`` labels the source: ``"directory-reconciler"`` for the breaker,
         ``"directory-reconciler-referral"`` for a referral, and
         ``"directory-reconciler-probe-fault"`` for a probe fault, so each is its own instance and
-        throttle. ``reason`` is one of those three closed-set slugs. ``probed`` is, for the breaker
-        and for a probe fault, how many principals the pass judged, the breaker's denominator, and
-        for a referral how many probes the pass sent to the directory, which leaves out an id-less
-        row (BACKLOG #3170). ``detail`` is the operator-facing explanation the auth service
+        throttle. ``reason`` is one of those three closed-set slugs. ``probed`` is, for the breaker,
+        how many principals the pass judged, its denominator; for a probe fault, the same total of
+        candidates the pass took up, asked or not, which counts the faulted accounts it left
+        unjudged and any id-less row; and for a referral how many probes the pass sent to the
+        directory, which leaves out an id-less row (BACKLOG #3170). ``detail`` is the operator-facing explanation the auth service
         latches. No PHI. Emitted by the API-lifespan reconciler task, never from ``auth/``. A
         whole-directory outage is NOT this event: it is
         audited as ``auth.ad_reconcile_skipped`` and pages nothing, because the accounts are fine."""
@@ -1093,8 +1094,8 @@ class LoggingAlertSink:
 
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
         log.warning(
-            # The count is the judged total for the breaker and a probe fault, or a referral's probes
-            # asked (BACKLOG #3170).
+            # The count is the candidates the pass took up for the breaker and a probe fault, or a
+            # referral's probes asked (BACKLOG #3170); see AlertSink.ad_reconcile_aborted.
             "ALERT ad_reconcile_aborted: %r left accounts unrevoked, counting %d principal(s) "
             "(%s): %s",
             name,

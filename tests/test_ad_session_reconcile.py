@@ -664,20 +664,26 @@ def test_an_unkeyed_probe_does_not_hide_an_outage_or_a_referral_only_pass() -> N
 
 
 @pytest.mark.parametrize(
-    "asked",
+    ("asked", "aborted"),
     [
-        [reconcile.Probe("a", "a", reconcile.ProbeOutcome.UNAVAILABLE)],
-        [reconcile.Probe("r", "r", reconcile.ProbeOutcome.REFERRED)],
-        [
-            reconcile.Probe("a", "a", reconcile.ProbeOutcome.UNAVAILABLE),
-            reconcile.Probe("r", "r", reconcile.ProbeOutcome.REFERRED),
-        ],
+        ([reconcile.Probe("a", "a", reconcile.ProbeOutcome.UNAVAILABLE)], "directory_unavailable"),
+        ([reconcile.Probe("r", "r", reconcile.ProbeOutcome.REFERRED)], reconcile.REFERRAL_ABORT),
+        (
+            [
+                reconcile.Probe("a", "a", reconcile.ProbeOutcome.UNAVAILABLE),
+                reconcile.Probe("r", "r", reconcile.ProbeOutcome.REFERRED),
+            ],
+            reconcile.REFERRAL_ABORT,
+        ),
         # BACKLOG #3100 shares the referral's early return, so a pass of faults only is one too.
-        [reconcile.Probe("f", "f", reconcile.ProbeOutcome.FAULT)],
-        [
-            reconcile.Probe("a", "a", reconcile.ProbeOutcome.UNAVAILABLE),
-            reconcile.Probe("f", "f", reconcile.ProbeOutcome.FAULT),
-        ],
+        ([reconcile.Probe("f", "f", reconcile.ProbeOutcome.FAULT)], reconcile.PROBE_FAULT_ABORT),
+        (
+            [
+                reconcile.Probe("a", "a", reconcile.ProbeOutcome.UNAVAILABLE),
+                reconcile.Probe("f", "f", reconcile.ProbeOutcome.FAULT),
+            ],
+            reconcile.PROBE_FAULT_ABORT,
+        ),
     ],
     ids=[
         "outage",
@@ -688,15 +694,17 @@ def test_an_unkeyed_probe_does_not_hide_an_outage_or_a_referral_only_pass() -> N
     ],
 )
 def test_an_unkeyed_row_is_struck_on_a_pass_that_judged_nothing(
-    asked: list[reconcile.Probe],
+    asked: list[reconcile.Probe], aborted: str
 ) -> None:
     """BACKLOG #3170 item 3. An UNKEYED row is judged without the directory, so a pass that learned
     nothing from it still strikes the row. Only the strike: the asked probes' strikes, the outcome
-    record the hold reads, and the hold's latch all stay as they were.
+    record the hold reads, and the hold's latch all stay as they were. The abort slug is pinned
+    too, so an id-less row cannot hide which kind of pass this was (BACKLOG #2434, #3100).
 
     RED before #3170: both early returns carried no strikes, so such a row went unstruck."""
     unkeyed = reconcile.Probe("k", "k", reconcile.ProbeOutcome.UNKEYED)
     plan = _plan([*asked, unkeyed], prior_strikes={"k": 1, "a": 1, "r": 1, "f": 1}, latched=True)
+    assert plan.aborted == aborted
     assert plan.judged_nothing
     assert plan.strikes == {"k": 2}
     assert plan.outcomes == {} and plan.latched and not plan.hold
