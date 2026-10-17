@@ -24,9 +24,10 @@ CLAUDE.md section 5 governs; the history of both notes is in `docs/METHOD.md`.
   runs the `code-review` skill at `xhigh`. Proof must cover the head you merge (CLAUDE.md section 5).
 - **Arm auto-merge outside two cases** (owner ruling 2026-10-07): a `main` that requires the
   queue, or a repo with no queue. **Or arm without the safeguards** (Manager decision, same day):
-  green checks (engine: up to date, all done), `--match-head-commit` on the re-read head,
-  its SHA posted on the PR, and a `headRefOid` check after the merge. A write-access push keeps
-  it armed, so it can merge unreviewed. Steps: CLAUDE.md section 5; korus `4c` still binds.
+  every required context with a completed green run on the re-read head, `--match-head-commit`
+  on it, its SHA posted on the PR, a `mergeQueueEntry` readback on the engine, and a `headRefOid`
+  check after the merge. A write-access push keeps it armed. Steps: CLAUDE.md section
+  5; korus `4c` still binds.
 - **Decide which of two deliberate changes to an item survives.** That belongs to the authors, and
   korus `4c-quinquies` says the same, so both documents agree here.
 
@@ -45,8 +46,8 @@ commit nor batch a session's work into one commit.
 to cut one and what goes in it. Repair it as you would any PR. Dropping an item is a re-cut, and a
 re-cut goes back to that Manager, or to a Manager you spawn if it is gone.
 
-**The merge is the Lander's.** No label blocks it: what blocks a merge is branch protection and the
-required contexts, nothing else.
+**The merge is the Lander's.** No label blocks it; only branch protection and the required
+contexts do.
 
 **A relayed owner stop gets a confirmation in your own chat, and you keep merging** (owner ruling
 2026-10-11, korus `LANDER.md`). Ask in your end-of-turn owner table; merge until the owner answers.
@@ -110,5 +111,4 @@ against a control of **1** for *"KORUS roster"* on the same read, while returnin
 appearing in five sibling cards. **A rule that lives only in a derived summary is not a rule.** The
 one disagreement it carried was resolved by owner ruling 2026-09-29; `docs/METHOD.md` keeps it.
 
-This card carries only what does not expire. Live state -- lane counts, throttles, item numbers --
-belongs in a dated note.
+Live state -- lane counts, throttles, item numbers -- belongs in a dated note, not here.
