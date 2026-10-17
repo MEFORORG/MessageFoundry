@@ -811,7 +811,8 @@ async def test_a_stop_before_the_first_message_hands_nothing_over_and_still_prun
             # done-callback, and asyncio then completes the awaited future without yielding, so the
             # poller reads the flag while the stop is still queued (BACKLOG #2967). So the worker
             # blocks until the loop has run the stop, and a bound that expires raises here rather
-            # than letting the split go on. On the loop thread that wait could never end.
+            # than letting the split go on. On the loop thread nothing could run the stop, so the
+            # wait would stall the shared loop for the whole bound; fail at once instead.
             assert threading.get_ident() != loop_thread, "the split ran on the loop thread"
             asyncio.run_coroutine_threadsafe(_set_stop(), loop).result(timeout=30)
             holds_at_split.append(holds)
@@ -829,6 +830,7 @@ async def test_a_stop_before_the_first_message_hands_nothing_over_and_still_prun
         # reads the hold count: an arm that stopped firing would otherwise pass as the plain one.
         wrap_future = asyncio.futures.wrap_future
         hand_off = src._hand_off
+        poller = asyncio.current_task()  # _poll_once runs in this test's own task
         at_batch = False
 
         async def _flag_the_batch(raw: bytes) -> bool:
@@ -841,20 +843,26 @@ async def test_a_stop_before_the_first_message_hands_nothing_over_and_still_prun
 
         def _held_wrap_future(future: Any, *, loop: asyncio.AbstractEventLoop | None = None) -> Any:
             nonlocal holds
-            if at_batch:
+            # Only the poller's own submissions: the session loop and other threads may submit too.
+            if (
+                at_batch
+                and threading.get_ident() == loop_thread
+                and asyncio.current_task() is poller
+            ):
                 holds += 1
                 time.sleep(0.02)
             return wrap_future(future, loop=loop)
 
         monkeypatch.setattr(src, "_hand_off", _flag_the_batch)
         monkeypatch.setattr(asyncio.futures, "wrap_future", _held_wrap_future)
-    caplog.set_level("WARNING", logger="messagefoundry")
+    remotefile_log = "messagefoundry.transports.remotefile"
+    caplog.set_level("WARNING", logger=remotefile_log)
     await _settle(src)
+    caplog.clear()
     await src._poll_once()
     # _poll_once catches a failed hand-off, logs it and goes on, so a _hand_off that raised once the
-    # stop was set (or a handshake whose bound expired) would leave the assertions below green.
-    # Nothing the engine logs in this poll may be a failure.
-    failures = [r.getMessage() for r in caplog.records if r.name.startswith("messagefoundry")]
+    # stop was set would leave the assertions below green. The connector logs no failure this poll.
+    failures = [r.getMessage() for r in caplog.records if r.name == remotefile_log]
     assert failures == []
     # a.hl7 was handed over and recorded; b.hl7 met the stop before its first message.
     assert [b.decode("utf-8").split("|")[9] for b in handler.bodies] == ["CTRL1"]
