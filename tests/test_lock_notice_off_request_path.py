@@ -14,13 +14,12 @@ Each test that asserts an absence carries a control showing the instrument can s
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
 import threading
 import time
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
@@ -843,6 +842,7 @@ async def test_a_closed_notifier_refuses_to_start_again() -> None:
     which raises nothing."""
     relay = _relay()
     relay.start()  # the control
+    assert relay._task is not None, "the instrument cannot see a started drain loop"
     await relay.aclose()
     with pytest.raises(RuntimeError, match="closed"):
         relay.start()
@@ -882,7 +882,7 @@ async def test_after_a_cut_close_a_notice_reported_queued_is_sent(
         with pytest.raises(TimeoutError):  # the teardown's bound, cutting the close
             await asyncio.wait_for(relay.aclose(), 0.05)
         assert relay._queue.qsize() == 1, "the cut close left no stop sentinel to test against"
-        with contextlib.suppress(RuntimeError):  # refusing is one way to keep the property below
+        with suppress(RuntimeError):  # refusing is one way to keep the property below
             relay.start()
         late = SecurityEvent(PASSWORD_CHANGED, username="b", email="b@x.test")
         answered = await relay.notify(late)

@@ -541,7 +541,10 @@ def _build_body(event: SecurityEvent) -> str:
 
 
 class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
-    """Emails the affected user about a security event, on a bounded background queue."""
+    """Emails the affected user about a security event, on a bounded background queue.
+
+    Single use: once :meth:`aclose` has begun, :meth:`notify` refuses every event and :meth:`start`
+    raises ``RuntimeError`` (vault BACKLOG #3120). Build a new notifier rather than restart one."""
 
     def __init__(
         self,
@@ -667,7 +670,7 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         task.add_done_callback(self._recording.discard)
 
     def start(self) -> None:
-        # Never again once closed (vault BACKLOG #3120). A close the teardown cut short leaves its
+        # Never again once closed (vault BACKLOG #3120). A close the teardown cut short can leave its
         # stop sentinel on the queue, so a drain loop started again would read it and stop, and
         # notify() would answer True for events nothing sends. The engine builds a new notifier for
         # each lifespan rather than restart one.

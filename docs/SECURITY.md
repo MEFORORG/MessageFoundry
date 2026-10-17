@@ -5533,9 +5533,8 @@ bound falls below those two seconds. A pending notice is then not cancelled and 
 reaches the security notifier before that notifier begins to close is queued and drained like any
 other. One that reaches it later is refused, since nothing would send it (vault BACKLOG #3120), so
 no mail goes and its `auth.lock_notice` row says `mailed: false`, which holds back no later notice.
-If the store has closed by then, the throttle read before the refusal fails open and the row write
-after it fails, each logged. No mail goes and no row is written, so nothing holds back the next
-lock's notice of the kind. A failed `auth.lock_notice` row write also changes: it used to fail
+If the store has closed by then, that row write fails and is logged. The notice still went
+unmailed, and a missing `mailed: false` row costs nothing at the next lock. A failed `auth.lock_notice` row write also changes: it used to fail
 the request, and now it is logged instead. The mail goes before its row, so that failure costs at
 most a duplicate mail at the next lock. Each such line names no account and no lock. It still tells
 a `logs:view` reader when some notice failed.

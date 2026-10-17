@@ -13689,8 +13689,8 @@ class AuthService:
                 )
         except Exception as exc:  # noqa: BLE001 - fails open by design, and is logged
             _log.error(
-                "a security-notice throttle read failed (%s); the notice is offered to the notifier "
-                "unthrottled, and the notifier's answer decides whether it is recorded as mailed",
+                "a security-notice throttle read failed (%s); the throttle did not hold the notice "
+                "back, and whether it is mailed is up to the notifier",
                 type(exc).__name__,
             )
             return False
