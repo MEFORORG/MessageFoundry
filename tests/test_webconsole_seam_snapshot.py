@@ -189,15 +189,22 @@ def test_the_digest_does_not_depend_on_the_seam_it_produces() -> None:
     sys.modules["_seam_gen_circ"] = module
     spec.loader.exec_module(module)
 
+    import messagefoundry_webconsole as console
+
     before = module.contract_digest()
     original = seam_module.ENGINE_UI_SEAM
+    supported = console.SUPPORTED_ENGINE_SEAMS
     try:
         seam_module.ENGINE_UI_SEAM = "deadbeefdeadbeef"
         module.ENGINE_UI_SEAM = "deadbeefdeadbeef"
+        # The console's copy moves too: the route-gate section mounts the console under its pin
+        # (BACKLOG #2709), so a gate capturing that pin would feed the seam back into its digest.
+        console.SUPPORTED_ENGINE_SEAMS = frozenset({"deadbeefdeadbeef"})
         assert module.contract_digest() == before
     finally:
         seam_module.ENGINE_UI_SEAM = original
         module.ENGINE_UI_SEAM = original
+        console.SUPPORTED_ENGINE_SEAMS = supported
 
 
 def test_the_digest_moves_when_a_rendered_dto_gains_a_field() -> None:
@@ -336,6 +343,172 @@ def test_auth_service_classes_render_required_fields_and_refuse_unknown_shapes(
 
     with pytest.raises(TypeError, match="cannot be rendered exactly"):
         module._auth_service_symbol(Plain)
+
+
+def _load_script(monkeypatch: pytest.MonkeyPatch, name: str) -> Any:
+    """Load the generator by path, undoing its ``sys.path`` insert and module registration."""
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    spec = importlib.util.spec_from_file_location(name, _SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _session_only_dr_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Plant the released console 0.4.0's DR gate: ``require_ui(DR_OPERATE)``, the session alone.
+
+    Only the two DR routes change. ``monitoring_writes`` looks the factory up when ``mount_ui``
+    registers its routes, so a mount after this call registers the planted gate."""
+    from messagefoundry.auth import Permission
+    from messagefoundry_webconsole import _auth
+    from messagefoundry_webconsole.routes import monitoring_writes
+
+    step_up = _auth.require_ui_step_up
+
+    def planted(*permissions: Permission, **kwargs: Any) -> Any:
+        if permissions == (Permission.DR_OPERATE,):
+            return _auth.require_ui(*permissions)
+        return step_up(*permissions, **kwargs)
+
+    monkeypatch.setattr(monitoring_writes, "require_ui_step_up", planted)
+
+
+def test_the_route_gate_table_records_the_dr_step_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The two DR routes read as the step-up factory over ``dr:operate`` (vault BACKLOG #2709).
+
+    The session-only gate the released 0.4.0 carries must render differently, or the digest
+    cannot tell the two consoles apart."""
+    dr_routes = {"POST /ui/dr/activate", "POST /ui/dr/release"}
+    module = _load_script(monkeypatch, "_seam_gen_dr_rows")
+    rows = dict(module.console_route_gates())
+    _session_only_dr_gate(monkeypatch)
+    planted = dict(module.console_route_gates())
+
+    step_up = "_auth:require_ui_step_up.<locals>.dependency"
+    session = "_auth:require_ui.<locals>.dependency"
+    for path in dr_routes:
+        assert step_up in rows[path], rows[path]
+        assert step_up not in planted[path] and session in planted[path], planted[path]
+        for table in (rows, planted):
+            assert "permissions=[dr:operate]" in table[path]
+    # The control: the plant changed the two DR rows and nothing else.
+    assert {k for k in rows if rows[k] != planted[k]} == dr_routes
+
+
+def test_a_console_whose_dr_route_is_session_only_is_refused_at_mount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vault BACKLOG #2709's closing test. Engine PR 1910 put a step-up on the console's two DR
+    routes and moved neither the console version nor the digest, so the released 0.4.0, which
+    keeps the session-only gate, passed the handshake.
+
+    A console wheel pins the digest derived from its own tree. So the planted console here pins the
+    digest its tree derives, as a wheel built from it would. The load-bearing assertion is that the
+    plant moves the digest: once it does, the refusal is the ordinary ``assert_engine_seam`` on the
+    engine's real mount path, which this test drives rather than assumes. The control first: the
+    unplanted console derives the engine's seam and mounts."""
+    import messagefoundry_webconsole
+    from messagefoundry.api._ui_seam import ENGINE_UI_SEAM
+    from messagefoundry.api.app import create_app
+    from messagefoundry_webconsole import UiSeamMismatch
+
+    module = _load_script(monkeypatch, "_seam_gen_dr_mount")
+    assert module.contract_digest() == ENGINE_UI_SEAM
+    create_app(serve_ui=True)
+
+    _session_only_dr_gate(monkeypatch)
+    planted = module.contract_digest()
+    assert planted != ENGINE_UI_SEAM
+    monkeypatch.setattr(messagefoundry_webconsole, "SUPPORTED_ENGINE_SEAMS", frozenset({planted}))
+    with pytest.raises(UiSeamMismatch, match=ENGINE_UI_SEAM):
+        create_app(serve_ui=True)
+
+
+def test_a_gate_setting_moves_the_rendering_and_an_unknown_capture_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A switch the factory captured is part of the gate, not only the factory's name:
+    ``allow_mfa_pending=True`` turns the MFA gate off without renaming anything. So is a captured
+    hook: swapping ``pending_refusal`` for another function moves the rendering. A captured value
+    the renderer cannot render exactly must raise rather than render as something no change to it
+    could move."""
+    from messagefoundry.api.security import mark_route_gate
+    from messagefoundry.auth import Permission
+    from messagefoundry_webconsole import _auth
+
+    module = _load_script(monkeypatch, "_seam_gen_gate_render")
+
+    def render(*permissions: Permission, **settings: Any) -> str:
+        rendered: str = module._render_callable(_auth.require_ui(*permissions, **settings), {})
+        return rendered
+
+    async def refuse_one(_request: Any, _identity: Any) -> None:
+        return None
+
+    async def refuse_other(_request: Any, _identity: Any) -> None:
+        raise RuntimeError("refused")
+
+    plain = render(Permission.DR_OPERATE)
+    assert render(Permission.DR_OPERATE) == plain  # stable
+    assert render(Permission.DR_OPERATE, allow_mfa_pending=True) != plain
+    assert render(Permission.MONITORING_READ) != plain
+    hooked = render(Permission.DR_OPERATE, pending_refusal=refuse_one)
+    assert hooked not in (plain, render(Permission.DR_OPERATE, pending_refusal=refuse_other))
+
+    opaque = object()
+
+    async def gate() -> object:
+        return opaque
+
+    with pytest.raises(TypeError, match="cannot render exactly"):
+        module._render_callable(mark_route_gate(gate), {})
+
+
+def test_a_gate_body_or_a_helper_it_calls_moves_the_rendering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A gate weakened in its body, or in a console helper it calls by name, keeps its name and its
+    captured values, so only the source digest can tell. A comment-only edit must not move it."""
+    import importlib
+
+    from messagefoundry.auth import Permission
+    from messagefoundry_webconsole import _auth
+
+    module = _load_script(monkeypatch, "_seam_gen_gate_body")
+    probe = tmp_path / "e2709_gate_probe.py"
+    probe.write_text("def gate():\n    return 1\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    imported = importlib.import_module("e2709_gate_probe")
+    before = module._render_callable(imported.gate, {})
+
+    probe.write_text("def gate():\n    # a comment\n    return 1\n", encoding="utf-8")
+    assert module._render_callable(importlib.reload(imported).gate, {}) == before
+    probe.write_text("def gate():\n    return 2\n", encoding="utf-8")
+    assert module._render_callable(importlib.reload(imported).gate, {}) != before
+
+    gate = _auth.require_ui_step_up_action("dr_probe", Permission.DR_OPERATE)
+    helper_before = module._render_callable(gate, {})
+
+    async def always_ok(*_args: Any, **_kwargs: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(_auth, "_ui_action_step_up_ok", always_ok)
+    assert module._render_callable(gate, {}) != helper_before
+
+
+def test_the_route_gate_table_refuses_a_console_from_another_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The route-gate section reads the IMPORTED console, the other sections read its source. A
+    console imported from another tree, such as a non-editable copy in site-packages, would make
+    the two describe different consoles, so the section refuses to run."""
+    module = _load_script(monkeypatch, "_seam_gen_other_tree")
+    module.console_route_gates()  # the control: this repository's console is accepted
+    monkeypatch.setattr(module, "_CONSOLE_PACKAGE_DIR", tmp_path / "messagefoundry_webconsole")
+    with pytest.raises(RuntimeError, match="not from"):
+        module.console_route_gates()
 
 
 def _digest_by_path(env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
