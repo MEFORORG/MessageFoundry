@@ -329,7 +329,7 @@ Keep the message store on a fast *local* disk, not a network share — the stage
 
 ### Platform, runtime & store
 
-- **OS.** Windows Server 2022/2025 is the primary supported platform (Windows-service deploy via NSSM); Windows Server 2019 and Windows 10/11 are supported; the engine also runs on modern Linux (under systemd — no bundled installer); macOS is development only.
+- **OS.** Windows Server 2022/2025 is the primary supported platform (Windows-service deploy via NSSM); Windows Server 2019 and Windows 10/11 are supported; Linux is [not supported for v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target); macOS is development only.
 
 - **Runtime.** Python 3.14+ (64-bit). Whether the default install needs a C compiler depends on the interpreter; see [SYSTEM-REQUIREMENTS.md](SYSTEM-REQUIREMENTS.md). The Windows service uses NSSM (registering it needs admin rights).
 
