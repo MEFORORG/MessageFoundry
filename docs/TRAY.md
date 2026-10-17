@@ -39,10 +39,13 @@ point already resolves to it. The tray needs no elevation to run (service contro
 elevation per-action — see below). It is Windows-only at runtime; on any other OS `main()` prints a
 friendly note and exits.
 
-**A tray you start by hand may exit at once, with no message**, if your environment sets
-`PYTHONFAULTHANDLER` or `PYTHONDEVMODE`. Both hand starts above run `pythonw.exe` without `-E`.
-Start it once with neither variable set, then turn on **Start at Login**, whose command carries
-`-E`. `docs/DANGEROUS-FUNCTIONALITY.md` section 3 gives the measurement and what it did not cover.
+**A tray started from Explorer or a Start-menu shortcut may exit at once, with no message**, if
+your environment sets `PYTHONFAULTHANDLER` or `PYTHONDEVMODE`, at least. All three starts above run
+`pythonw.exe` without `-E`, and a start with no stderr then stops before any tray code runs. To
+get past it, start the tray once from a terminal with those variables cleared, for example
+`$env:PYTHONFAULTHANDLER = $null; $env:PYTHONDEVMODE = $null; messagefoundry-tray`, and turn on
+**Start at Login**, whose command carries `-E`. `docs/DANGEROUS-FUNCTIONALITY.md` section 3 gives
+the measurement and what it did not cover.
 
 To **start it automatically at login**, use the tray's **Start at Login** menu item (opt-in, off by
 default). It writes an `HKCU\…\Run` entry pinning the absolute `pythonw.exe` you launched with, so it

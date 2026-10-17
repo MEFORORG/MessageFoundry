@@ -238,20 +238,27 @@ sets that window. **A tray started by hand gets neither the script nor the optio
 and that limit is open.**
 
 **A hand start may also exit before any code runs (vault BACKLOG #2914).** It gets no `-E`, so the
-user's `PYTHON*` variables reach it. Started with no standard handles, both a GUI-script launcher
-of the kind pip writes and `pythonw -m`, each running a stand-in for the tray, exited 1 under
-`PYTHONFAULTHANDLER=1` and under `PYTHONDEVMODE=1`, and ran under neither. Measured 2026-10-16 on
-Windows, Python 3.14.7, by `tests/test_tray_hand_start.py`. A start from Explorer or a Start-menu
-shortcut was not measured. `docs/TRAY.md` tells an operator whose tray does not appear to start
-it once with neither variable set and then turn on Start at Login, whose command carries `-E`;
-the menu item is unreachable from a tray that exited. Shipping a hand start that carries `-E`
-was rejected.
-A GUI-script launcher passes no interpreter options: the installer writes its first line from the
-interpreter's path. A second command for the operator to type, `pythonw -E -P -m
-messagefoundry.tray`, would be a hand-written copy of what Start at Login already writes, with
-the same costs, such as dropping `PYTHONHOME`.
+user's `PYTHON*` variables reach it. `tests/test_tray_hand_start.py` measured it on Windows, Python
+3.14.7, on 2026-10-16, with a stand-in for the tray that records whether it had a stderr. A
+GUI-script launcher of the kind pip writes, and `pythonw -m`, were each started with no standard
+handles. The launcher was also started through ShellExecute (`os.startfile`), the Windows
+shell's call for opening a file. With neither variable set, each start ran the stand-in, with no stderr.
+With `PYTHONFAULTHANDLER=1`, and again with `PYTHONDEVMODE=1`, none of them ran it; the two
+starts that report an exit code exited 1. `pythonw -m` that inherited its parent's handles, as
+from a terminal that hands its own on, had a stderr and ran under each variable. Not measured:
+the installed `messagefoundry-tray` launcher itself, a real click in Explorer or the Start menu,
+and a start typed into an interactive console window. `docs/TRAY.md` gives the operator's remedy.
 
-The `messagefoundry-tray` command is a launcher the installer writes. Its console twin from the same install,
+Shipping a hand start that carries `-E` was rejected. A GUI-script launcher passes no interpreter
+options: the installer writes its first line from the interpreter's path. A documented command
+to type instead, such as `pythonw -E -P -m messagefoundry.tray`, would not match the login
+command, which also turns remote debugging off, uses the bootstrap script in a checkout, and adds
+`-s` where `PYTHONNOUSERSITE` is set. Start at Login already writes the right command for the
+install it runs from.
+
+The `messagefoundry-tray` command is a launcher the installer writes. It was not run to measure its
+import path, because that starts a real tray; the stand-in measurement above covers only the
+exit. Its console twin from the same install,
 `messagefoundry.exe`, has the same form: a small program with the entry-point script archived
 inside it. Run from a working directory holding a decoy `messagefoundry` package,
 `messagefoundry.exe --version` loaded the real package, while `python -m messagefoundry --version`
