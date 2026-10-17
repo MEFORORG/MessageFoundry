@@ -181,9 +181,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 name, req, engine=engine, identity=identity, request=request
             )
         except HTTPException as exc:
-            if (
-                exc.status_code == 409
-            ):  # scope fork (code-first) or a validate-before-persist failure
+            # At least: the scope fork (code-first), a validate-before-persist failure, or a
+            # connections.toml the engine's account cannot write (vault BACKLOG #3106).
+            if exc.status_code == 409:
                 return HTMLResponse(pages.flag_rejected(name, str(exc.detail)))
             raise
         return RedirectResponse("/ui", status_code=303)

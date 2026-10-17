@@ -664,6 +664,35 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     the layout also depends on at least these, which it does not check: every directory above the
     config directory is writable only by root; a file that is a link points into such a directory;
     and the file system reports real owners and modes (a network mount may synthesize them).
+    - **Why the loader does not walk the directories above it (vault BACKLOG #3106).** The trust
+      anchor check, `anchor_path.posix_path_verdict`, does walk them: it reads every directory from
+      `/` down to the file, follows each link and reads its target's directories too, and reads the
+      file system type of each. Here that walk would refuse a config directory whose parent another
+      account can write, or a module that is a link into such a directory. It is not taken here, at
+      least for these reasons. It answers *indeterminate* for any file system outside its short
+      allowlist (`POSIX_TRUSTED_FS` in `messagefoundry/auth/anchor_path.py`), such as a CIFS, NFS,
+      FUSE or 9p mount, and for one whose type it cannot read. The loader then has to choose
+      between refusing every start from such a file system and passing what the walk could not
+      vouch for, and that choice has not been made. A Kubernetes ConfigMap or projected volume
+      reaches each file through two links (`<file>` to `..data/<file>`, and `..data` to a dated
+      folder the kubelet swaps on update), and that layout has not been measured against the walk.
+      It has not been measured against the current check either (see `docker/README.md`). And the
+      POSIX check is shared: the `serve` start check of the settings and value files
+      (`assert_trusted_start_paths`) runs the same code, so adding the walk there changes what
+      every start refuses, and adding it to the config load alone gives the two checks different
+      answers to one question.
+    - **The exposure that leaves is a known limit, not a safe layout.** An account that can write
+      any directory above the config directory can rename that directory and put a link or another
+      directory in its place. A substitute put there after the check runs unchecked, and one put
+      there before it passes when it is a link to any directory owned by root or by the engine's
+      own account that is not group- or world-writable, such as the engine's data directory.
+      Nothing here detects either. An account that can write the directory a link points into can
+      replace the file the check passed. Before you deploy, run `namei -l <config dir>` to list
+      every directory on the path. It does not look inside the directory, so also run `ls -lR` on
+      the config directory, which lists at least its `codesets` and `environments` folders, and
+      run `namei -l` on every file there that is a link. Each directory those commands list must be owned by root, or by the engine's own
+      account for the config directory itself, with no group or other write bit. The shipped
+      image's `/config` sits directly under `/`, which is root-owned.
   - **The cache folder is checked because it runs.** Python's source loader runs a matching
     `__pycache__\*.pyc` in place of the `.py` beside it and never compares the two. A cache file
     the check did not read could run under a source it passed (vault BACKLOG #2596).
