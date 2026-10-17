@@ -14,7 +14,8 @@ they cannot be outrun the same way:
 
 * every case carries every sentinel, in a real secret field where the case allows one and in an
   ignored extra key where it does not, so each case would show a leak of any of them;
-* the cases enumerate the refusals in ``_require_ad_fields``, ``_require_oidc_fields`` and the
+* the cases enumerate the refusals in at least ``_require_ad_fields``,
+  ``_refuse_a_breaker_that_cannot_trip``, ``_require_oidc_fields`` and the
   ``ServiceSettings`` cross-section checks, plus generic field, type and section-shape errors;
 * a sweep refuses every section with a non-mapping value, so a section added later is covered
   without anyone adding a case for it;
@@ -139,6 +140,17 @@ _AUTH_CASES: dict[str, tuple[dict[str, Any], dict[str, Any], str]] = {
         {"ad_session_recheck_seconds": 60, "ad_bind_password": _BIND_PASSWORD, **_CARRIER},
         {},
         "ad_session_recheck_seconds requires ad_enabled",
+    ),
+    # _refuse_a_breaker_that_cannot_trip (BACKLOG #3085)
+    "breaker_fraction_one": (
+        _auth(ad_session_revoke_max_fraction=1.0),
+        {},
+        "the mass-revoke breaker can never trip",
+    ),
+    "breaker_budget_at_cap": (
+        _auth(ad_session_recheck_max_users=5),
+        {},
+        "the mass-revoke breaker can never trip",
     ),
     # _require_oidc_fields, in the order it refuses
     "oidc_without_ad": (

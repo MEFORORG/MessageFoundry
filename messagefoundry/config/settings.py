@@ -3198,6 +3198,8 @@ class AuthSettings(_Section):
     # population — the signature of a misconfiguration, not of offboarding. Below the floor the breaker
     # cannot distinguish the two cases and revokes.
     #
+    # `_refuse_a_breaker_that_cannot_trip` refuses the settings under which that AND can never hold.
+    #
     # A service account that loses read on `userAccountControl` ALONE is NOT this breaker's case any
     # more (ADR 0195, BACKLOG #2039). Those accounts read UNDETERMINED, not "not found", and the
     # reconciler holds them without revoking under the rule ADR 0195 states (`hold_engaged` in
@@ -3718,13 +3720,11 @@ class AuthSettings(_Section):
     @field_validator("ad_session_revoke_max_fraction")
     @classmethod
     def _check_ad_revoke_fraction(cls, value: float) -> float:
-        # A 0.0 fraction can never be exceeded by a non-negative count in the AND-form trip test, which
-        # would silently disable the proportional half of the breaker; refuse it rather than pretend.
+        # A 0.0 fraction would make the breaker absolute-only: any revocation exceeds it. A 1.0
+        # fraction is the opposite, never exceeded, so it disables the whole breaker;
+        # `_refuse_a_breaker_that_cannot_trip` refuses that while the reconciler can run (#3085).
         if not 0.0 < value <= 1.0:
-            raise ValueError(
-                "ad_session_revoke_max_fraction must be > 0.0 and <= 1.0 (1.0 = the proportional "
-                "half of the breaker never trips; the absolute ad_session_revoke_max still applies)"
-            )
+            raise ValueError("ad_session_revoke_max_fraction must be > 0.0 and <= 1.0")
         return value
 
     @property
@@ -3798,6 +3798,38 @@ class AuthSettings(_Section):
             raise ValueError(
                 "ad_session_recheck_seconds requires ad_enabled (the reconciler re-resolves "
                 "principals through the same LDAP service-account bind)"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _refuse_a_breaker_that_cannot_trip(self) -> AuthSettings:
+        """BACKLOG #3085. Refuse the two settings under which the mass-revoke breaker never trips.
+
+        ``breaker_tripped`` in ``auth/reconcile.py`` trips only when a pass's revocations exceed
+        BOTH thresholds. A pass judges at most ``ad_session_recheck_max_users`` accounts and revokes
+        no more than it judged. So a budget at or below ``ad_session_revoke_max`` never exceeds the
+        absolute half, and a 1.0 fraction never exceeds the proportional half. Either one leaves the
+        whole breaker dead, and a site would not be told. Checked only while the reconciler can run;
+        with AD off or the interval at 0 these knobs are inert, and the shipped defaults pass.
+        """
+        if not (self.ad_enabled and self.ad_session_recheck_seconds > 0):
+            return self
+        problems: list[str] = []
+        if self.ad_session_revoke_max_fraction >= 1.0:
+            problems.append(
+                "ad_session_revoke_max_fraction must be below 1.0 (a pass never revokes more "
+                "accounts than it probed)"
+            )
+        if self.ad_session_recheck_max_users <= self.ad_session_revoke_max:
+            problems.append(
+                "ad_session_recheck_max_users must be greater than ad_session_revoke_max (a pass "
+                "probes at most ad_session_recheck_max_users accounts)"
+            )
+        if problems:
+            raise ValueError(
+                "while the directory reconciler runs, "
+                + "; and ".join(problems)
+                + ", or the mass-revoke breaker can never trip"
             )
         return self
 
