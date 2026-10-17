@@ -433,6 +433,11 @@ async def test_whole_frames_with_quiet_gaps_longer_than_the_deadline_are_not_cut
         ("tcp", b"\r", False),
         ("mllp", b"Z", True),  # CONTROL: any other byte after a completed frame starts the clock
         ("mllp", b"\r\n\r", True),  # CONTROL: line ends past the two-byte allowance are noise
+        # vault BACKLOG #2938: the newline after an X12 IEA terminator takes the same allowance.
+        ("x12", b"\r\n", False),
+        ("x12", b"\n", False),  # the CR arrived with the IEA, so the LF is the second byte
+        ("x12", b"Z", True),  # CONTROL: a byte that is not a line end starts the clock
+        ("x12", b"\r\n\r", True),  # CONTROL: three line ends are past the allowance
     ],
 )
 async def test_line_end_bytes_ending_a_frame_do_not_start_the_frame_deadline(
@@ -452,7 +457,8 @@ async def test_line_end_bytes_ending_a_frame_do_not_start_the_frame_deadline(
     framing = {"framing": "mllp"} if kind == "tcp" else {}
     source = _build(kind, max_frame_seconds=0.3, receive_timeout=5.0, **framing)
     source.on_connection_event = events
-    whole = _whole_frame("mllp")
+    # X12's frame is the interchange through its IEA terminator; the CR here is its first line end.
+    whole = _whole_frame("x12") + b"\r" if kind == "x12" else _whole_frame("mllp")
     # The `\n` row sends the CR with the frame, so the LF is the second line-end byte.
     first = whole if after == b"\n" else whole[:-1]
 

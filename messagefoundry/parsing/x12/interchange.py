@@ -43,6 +43,14 @@ _WHITESPACE_STR = " \t\r\n\x0b\x0c"
 # A segment that is the IEA trailer, after cosmetic whitespace. Matched in place with pos/endpos, so the
 # check never copies a segment, however long.
 _IEA_SEGMENT = re.compile(rb"[ \t\r\n\x0b\x0c]*IEA")
+#: Line-end bytes a sender may put after an interchange's closing terminator, such as a newline after
+#: ``IEA*...~``. Up to :data:`_FRAME_TAIL_MAX` of them directly after a completed interchange are its
+#: ending, however reads split them (vault BACKLOG #2938). The cap keeps a peer from trickling them
+#: to hold a listener's frame deadline off: past it they are inter-interchange noise like any byte.
+#: The same rule as ``messagefoundry.framing.FrameDecoder``'s, kept local so this pure parsing module
+#: imports nothing from the transport layer.
+_FRAME_TAIL_BYTES = frozenset(b"\r\n")
+_FRAME_TAIL_MAX = 2
 
 
 def split(raw: str) -> list[str]:
@@ -101,6 +109,15 @@ class X12FrameReader:
         # received begins; ``_scan`` is where the terminator search picks up, at or after it.
         self._seg_start = 0
         self._scan = 0
+        #: Line-end bytes the last completed interchange may still take as its ending; 0 once any
+        #: other byte has followed it. See :data:`_FRAME_TAIL_BYTES`.
+        self._tail_left = 0
+        #: Whether the most recent :meth:`feed` held nothing but line-end bytes ending the
+        #: interchange before it. Such a read finishes that interchange rather than starting anything,
+        #: which is how a listener's frame deadline tells it from inter-interchange noise (vault
+        #: BACKLOG #2938). Set when :meth:`feed` is called, before its generator is iterated. It only
+        #: observes: the bytes still go to the buffer, so the noise handling is unchanged.
+        self.trailer_only = False
 
     @property
     def in_frame(self) -> bool:
@@ -110,6 +127,18 @@ class X12FrameReader:
         return self._buf.startswith(b"ISA")
 
     def feed(self, data: bytes) -> Iterator[bytes]:
+        """Yield each interchange completed by ``data``, carrying any partial one to the next call.
+
+        :attr:`trailer_only` is decided here, eagerly, so it never describes an earlier read; the
+        reassembly itself still runs lazily as the generator is iterated.
+        """
+        owed = _leading_line_ends(data, self._tail_left)
+        self.trailer_only = 0 < owed == len(data)
+        # Any other byte ends the allowance: what follows it is not the interchange's ending.
+        self._tail_left = self._tail_left - owed if self.trailer_only else 0
+        return self._frames(data)
+
+    def _frames(self, data: bytes) -> Iterator[bytes]:
         self._buf.extend(data)
         while True:
             frame = self._take_one()
@@ -163,6 +192,10 @@ class X12FrameReader:
                 frame = bytes(buf[:end])
                 del buf[:end]
                 self._seg_start = self._scan = 0
+                # What the read held past the terminator: line ends alone are owed to this
+                # interchange, so the allowance left is what they have not used yet.
+                owed = _leading_line_ends(buf, _FRAME_TAIL_MAX)
+                self._tail_left = _FRAME_TAIL_MAX - owed if owed == len(buf) else 0
                 return frame
             self._seg_start = self._scan = idx + len(terminator)
 
@@ -177,6 +210,7 @@ class X12FrameReader:
     def _clear(self) -> None:
         self._buf.clear()
         self._seg_start = self._scan = 0
+        self._tail_left = 0
 
     def _check_cap(self) -> None:
         # Called from every path that returns with the interchange still open. Only one of those can
@@ -189,6 +223,14 @@ class X12FrameReader:
             raise X12FrameError(
                 f"X12 interchange exceeded {self.max_interchange_bytes} bytes before the IEA segment"
             )
+
+
+def _leading_line_ends(data: bytes | bytearray, limit: int) -> int:
+    """How many of the first ``limit`` bytes of ``data`` are line ends, up to the first that is not."""
+    count, size = 0, min(limit, len(data))
+    while count < size and data[count] in _FRAME_TAIL_BYTES:
+        count += 1
+    return count
 
 
 def check_integrity(raw: str) -> list[str]:

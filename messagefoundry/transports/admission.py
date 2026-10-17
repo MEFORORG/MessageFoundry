@@ -357,11 +357,13 @@ class FrameClock:
         ``in_frame`` would never reach a peer trickling them. So any bytes must lead to a completed
         frame within ``max_frame_seconds`` of read time; the engine's own waits are withheld.
 
-        ``trailer_only`` (:attr:`~messagefoundry.framing.FrameDecoder.trailer_only`) is the one
-        exception: a read holding only the line-end bytes that end the frame before it, such as
-        MLLP's CR arriving after its FS, belongs to that completed frame and starts nothing (vault
-        BACKLOG #2847). Without it a healthy peer that went quiet after such a read would be cut
-        here. It is required, so a new caller cannot leave it out by accident.
+        ``trailer_only`` (:attr:`~messagefoundry.framing.FrameDecoder.trailer_only`, or
+        :attr:`~messagefoundry.parsing.x12.interchange.X12FrameReader.trailer_only` for X12) is the
+        one exception: a read holding only the line-end bytes that end the frame before it, such as
+        MLLP's CR arriving after its FS or a newline after an X12 ``IEA``, belongs to that completed
+        frame and starts nothing (vault BACKLOG #2847, #2938). Without it a healthy peer that went
+        quiet after such a read would be cut here. It is required, so a new caller cannot leave it
+        out by accident.
         """
         if decoded:
             self.opened_at = time.monotonic() if in_frame else None
