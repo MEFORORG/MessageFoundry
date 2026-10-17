@@ -139,7 +139,7 @@ Server-side `state` is a CSRF/mix-up defence, **not** a browser binding — whoe
 
 - **AC-1** — WHILE `[auth].oidc_enabled` is false, THE SYSTEM SHALL behave byte-identically to the
   pre-federation build: no `/ui/oidc/*` routes, `providers.oidc == false`, and unchanged session expiry.
-  → `packaging/messagefoundry-webconsole/tests/test_webui.py` <!-- console-package suite -->
+  → `packaging/messagefoundry-webconsole/tests/test_webui_oidc.py` <!-- console-package suite -->
 
 - **AC-2** — WHEN a federated login completes, THE SYSTEM SHALL resolve roles from on-prem AD via
   `resolve_principal`, never from a token claim.
@@ -183,7 +183,7 @@ Server-side `state` is a CSRF/mix-up defence, **not** a browser binding — whoe
   carries the cookie but not the flow's own `state`, including an `error=` or malformed callback,
   THEN THE SYSTEM SHALL refuse it and consume nothing, keeping the flow and its cookie for the real
   IdP return (BACKLOG #3198).
-  → `packaging/messagefoundry-webconsole/tests/test_webui.py` <!-- console-package suite -->
+  → `packaging/messagefoundry-webconsole/tests/test_webui_oidc.py` <!-- console-package suite -->
 
 - **AC-8** — WHILE the IdP is unreachable, THE SYSTEM SHALL continue to serve local, LDAPS, and Kerberos
   logins, and SHALL recover without an engine restart once it returns.

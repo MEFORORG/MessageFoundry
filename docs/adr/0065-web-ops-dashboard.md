@@ -207,27 +207,27 @@ desktop-console retirement ("option c", gated per #75).
 
 - **AC-1** — WHEN `serve_ui` is False (default), THE SYSTEM SHALL register no `/ui` routes and no
   `/ui/static` mount (a JSON-only deployment is unchanged).
-  → `tests/test_webui.py::test_ui_absent_when_disabled`
+  → `tests/test_webui_core.py::test_ui_absent_when_disabled`
 - **AC-2** — WHEN a request presents the `mf_session` cookie but no `Authorization` header to a JSON API
   route, THE SYSTEM SHALL respond 401 (the cookie is confined to `/ui`; `bearer_token()` stays header-only).
-  → `tests/test_webui.py::test_cookie_not_accepted_on_json_api`
+  → `tests/test_webui_core.py::test_cookie_not_accepted_on_json_api`
 - **AC-3** — WHEN a browser logs in at `POST /ui/login`, THE SYSTEM SHALL set an `mf_session` cookie with
   `HttpOnly` and `SameSite=Strict` (and `Secure` over https), and `POST /ui/logout` SHALL clear it and
   revoke the session.
-  → `tests/test_webui.py::test_login_sets_confined_cookie_and_logout_revokes`
+  → `tests/test_webui_core.py::test_login_sets_confined_cookie_and_logout_revokes`
 - **AC-4** — WHEN a `/ui` HTML page renders a message field containing HTML metacharacters, THE SYSTEM
   SHALL emit them escaped (no executable markup reaches the DOM).
-  → `tests/test_webui.py::test_hostile_hl7_is_escaped`
+  → `tests/test_webui_core.py::test_hostile_hl7_is_escaped`
 - **AC-5** — WHEN a `/ui` HTML response is returned, THE SYSTEM SHALL set `Cache-Control: no-store` and a
   `Content-Security-Policy` with no `unsafe-eval`/`unsafe-inline`, while nosniff / X-Frame-Options DENY
   remain.
-  → `tests/test_webui.py::test_ui_security_headers`
+  → `tests/test_webui_core.py::test_ui_security_headers`
 - **AC-6** — WHEN `serve_ui` is True with a non-loopback host and no `exposure_protected`, THE SYSTEM SHALL
   refuse to start, even under `--allow-insecure-bind`.
-  → `tests/test_webui.py::test_serve_ui_offloopback_requires_tls`
+  → `tests/test_webui_core.py::test_serve_ui_offloopback_requires_tls`
 - **AC-7** — THE SYSTEM SHALL reuse the single audited `GET /messages/{id}` PHI path (record_view +
   record_audit) for the `/ui` message-detail raw view (no second PHI path).
-  → `tests/test_webui.py::test_ui_message_detail_audits_like_json`
+  → `tests/test_webui_core.py::test_ui_message_detail_audits_like_json`
 
 > M1 ships **no third-party static assets**: the live-poll layer is a ~15-line first-party `app.js`
 > (couldn't/wouldn't vendor htmx offline; a first-party poller keeps the third-party JS supply chain at
