@@ -185,17 +185,33 @@ the flag to lint your config too.
 
 ### Job 3 — `audit-pin`: "your pin is now vulnerable" tripwire
 
-Runs `pip-audit -r requirements.txt` against the pinned engine and its resolved dependency closure. So a
-vulnerability **disclosed against the version you're pinned to** — after you adopted it — turns *your*
-CI red automatically. Your remediation clock starts without anyone reading an advisory email.
+Runs `pip-audit` against the pinned engine and its resolved dependency closure. So a vulnerability
+**disclosed against the version you're pinned to** — after you adopted it — turns *your* CI red
+automatically. Your remediation clock starts without anyone reading an advisory email.
+
+It runs on a **Windows** runner, because Windows is the engine's only supported deployment platform
+and `pip-audit` evaluates each dependency's environment marker against the runner. A dependency whose
+marker does not match is skipped silently, so on a Linux runner the job would never audit the engine's
+Windows-only dependencies (at least `colorama` and `sspilib`):
+
+- **Engine-only `requirements.txt`** (the default): `pip-audit -r requirements.txt --desc`, which
+  resolves on Windows the closure your deployment installs.
+- **Hashed `requirements.lock` committed**: the job installs the pinned engine with `--no-deps` and
+  runs its own auditor, `python -P -m messagefoundry.security.audit_all_platforms requirements.lock`.
+  That is the code the engine's own required audit runs. It dry-run installs the lock with
+  `--require-hashes`, then audits **every pin, whatever its marker**, under `pip-audit --strict`, so a
+  pin PyPI cannot look up (a private package) fails the job. `pip-compile` locks only the platform
+  it runs on, so generate the lock on Windows, or with `uv export`, which writes every platform's
+  pins.
+- The job runs engine code, so it waits on `verify-engine`, as `check` does.
 
 > `verify-engine` proves *who built* the wheel you pin; `audit-pin` proves *that pin hasn't since gone
 > vulnerable*. Together they cover both halves of the supply-chain question on every PR.
 
 - **Remediate** by bumping the engine pin in `requirements.txt` to a release that fixed it (the engine's
   own fast-response ships fixes promptly — see its `SECURITY.md` dependency-CVE SLA).
-- **Accept a triaged advisory** with `pip-audit --ignore-vuln <ID>` (record why, per your own change
-  control) — e.g. a CVE in a path your config never wires.
+- **Accept a triaged advisory** by appending `--ignore-vuln <ID>` to the audit line that runs (record
+  why, per your own change control) — e.g. a CVE in a path your config never wires.
 
 ---
 
