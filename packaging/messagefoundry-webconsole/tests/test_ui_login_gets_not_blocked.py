@@ -124,18 +124,22 @@ async def test_oidc_start_get_with_neither_header_redirects_to_the_idp(engine: E
 
 
 @pytest.mark.parametrize(
-    "headers",
+    ("headers", "detail"),
     [
-        {"Sec-Fetch-Site": "cross-site"},
-        {"Sec-Fetch-Site": "same-site"},
-        {"Origin": "http://evil.example"},
+        ({"Sec-Fetch-Site": "cross-site"}, "cross-site request rejected"),
+        ({"Sec-Fetch-Site": "same-site"}, "cross-site request rejected"),
+        ({"Origin": "http://evil.example"}, "cross-origin request rejected"),
     ],
     ids=["cross-site", "same-site", "foreign-origin"],
 )
 async def test_oidc_start_get_still_refuses_what_it_refused(
-    engine: Engine, headers: dict[str, str]
+    engine: Engine, headers: dict[str, str], detail: str
 ) -> None:
-    """Not weakened: the skipped-interstitial GET names a foreign source and mints nothing."""
+    """Not weakened: the skipped-interstitial GET names a foreign source and mints nothing.
+
+    The refusal is pinned to ``assert_same_origin``'s own JSON answer, not to the status alone:
+    the fetch-metadata middleware answers a cross-site request with a 403 too, as plain text, so a
+    bare 403 could not say which of the two refused."""
     service = await _service(engine, held=Role.OPERATOR, bind=True)
     async with _client(engine, service, interstitial=False) as c:
         r = await c.get(
@@ -151,6 +155,8 @@ async def test_oidc_start_get_still_refuses_what_it_refused(
             follow_redirects=False,
         )
     assert r.status_code == 403, r.text
+    assert r.headers["content-type"].startswith("application/json"), r.text
+    assert r.json() == {"detail": detail}
     assert "set-cookie" not in r.headers
 
 

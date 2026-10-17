@@ -228,6 +228,9 @@ def _in_process_ui_clients_send_what_a_browser_sends() -> Iterator[None]:
     cross-site, same-site and ``Origin``-fallback test still exercises the branch it names. A request
     marked :data:`HEADERLESS_UI_REQUEST` is sent untouched too. Only the in-process ASGI transport is
     wrapped, so a real outbound ``httpx`` call is never altered.
+
+    The engine suite's ``tests/conftest.py`` carries a copy, because this suite does not inherit
+    that file. ``tests/test_browser_standin_copies_agree.py`` there fails if the two drift apart.
     """
     original = httpx.ASGITransport.handle_async_request
 

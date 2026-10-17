@@ -888,6 +888,14 @@ def _provision_admin_enrols_a_synthetic_authenticator() -> Iterator[None]:
         yield
 
 
+#: The console suite's per-request opt-out (its ``_ui_clients.HEADERLESS_UI_REQUEST``), honoured by
+#: the stand-in below too: one run collects both suites, and this session-scoped wrapper then sits
+#: under the console's own, where it would re-add the header a refusal test left off.
+#: ``test_browser_standin_copies_agree.py`` holds this value and the wrapper to the console's copy.
+HEADERLESS_UI_REQUEST = "mf_headerless_ui_request"
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _in_process_ui_clients_send_what_a_browser_sends() -> Iterator[None]:
     """Give a state-changing /ui request that names no provenance ``Sec-Fetch-Site: same-origin``.
@@ -898,8 +906,9 @@ def _in_process_ui_clients_send_what_a_browser_sends() -> Iterator[None]:
     its own form POST. It only fills a GAP: a request that already carries either header is sent
     untouched, and only the in-process ASGI transport is wrapped.
 
-    The console suite's own ``conftest.py`` carries the same stand-in, with the opt-out its refusal
-    tests need. That suite does not inherit this file, which is why there are two.
+    The console suite's own ``conftest.py`` carries the same stand-in. That suite is separately
+    versioned and does not inherit this file, which is why there are two; the wrapper below must
+    stay identical to that one, and ``test_browser_standin_copies_agree.py`` fails if it does not.
     """
     import httpx
 
@@ -908,12 +917,9 @@ def _in_process_ui_clients_send_what_a_browser_sends() -> Iterator[None]:
     @functools.wraps(original)
     async def as_a_browser(self: httpx.ASGITransport, request: httpx.Request) -> httpx.Response:
         if (
-            request.method not in {"GET", "HEAD", "OPTIONS"}
+            request.method not in _SAFE_METHODS
             and request.url.path.startswith("/ui")
-            # The console suite's opt-out (its _ui_clients.HEADERLESS_UI_REQUEST). Honoured here
-            # too: one run collects both suites, and this session-scoped wrapper then sits under
-            # the console's own, where it would re-add the header a refusal test left off.
-            and not request.extensions.get("mf_headerless_ui_request")
+            and not request.extensions.get(HEADERLESS_UI_REQUEST)
             and "sec-fetch-site" not in request.headers
             and "origin" not in request.headers
         ):
