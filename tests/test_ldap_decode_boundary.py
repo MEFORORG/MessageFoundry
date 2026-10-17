@@ -36,6 +36,7 @@ from messagefoundry.auth.ldap import LdapError, LdapUndecodableError
 from tests._ast_sites import callee_name, parse_source
 from tests.test_ldap_referrals import _BIND_PASSWORD, _BIND_RESPONSE, _SEARCH_DONE, _tlv
 from tests.test_ldap_search_result_codes import (
+    _EXTENDED_RESPONSE,
     _IN_CHAIN,
     _USER_DN,
     _done,
@@ -111,9 +112,9 @@ def _bare_bind(port: int) -> None:
 def _reading_connection(exc: BaseException) -> Any:
     """The ldap3 connection whose response read raised ``exc``, found the way the boundary finds
     it. A premise check closes it, so the loopback server's thread does not wait out its timeout."""
-    reader = ldap_module._response_reader(exc)
-    assert reader is not None, "the premise: ldap3 raised this while reading a response"
-    return reader.connection
+    connection = ldap_module._reading_connection(exc)
+    assert connection is not None, "the premise: ldap3 raised this while reading a response"
+    return connection
 
 
 # --- the service-account bind, and the socket it leaves open -------------------------------------
@@ -239,8 +240,10 @@ def test_a_paged_control_ldap3_cannot_decode_is_an_outage_and_is_not_abandoned(
             with _service_conn(authenticator) as conn, pytest.raises(fault):
                 conn.search(search_base="OU=Groups", search_filter="(cn=*)", paged_size=5)
             dc.searches.clear()
-        with _service_conn(authenticator) as conn, pytest.raises(LdapError) as refused:
-            authenticator._resolve_groups(conn, _USER_DN, [])
+        with _service_conn(authenticator) as conn:
+            with pytest.raises(LdapError) as refused:
+                authenticator._resolve_groups(conn, _USER_DN, [])
+            assert conn.closed, "the stream may be out of step, so the socket is closed"
         _assert_undecodable(refused.value, "group search", fault)
         assert len(dc.searches) == (2 if later else 1), "a search was sent after the refusal"
         assert all(_IN_CHAIN in raw for raw in dc.searches)
@@ -273,6 +276,31 @@ def test_a_search_ending_with_a_code_ldap3_has_no_name_for_is_an_outage(code: in
         with pytest.raises(LdapError) as refused:
             authenticator.probe_principal("alice")
     _assert_undecodable(refused.value, "user search", KeyError)
+
+
+def test_a_who_am_i_value_that_is_not_utf8_is_reported_and_the_group_read_still_runs() -> None:
+    """Round-one review finding. ldap3 decodes the Who am I value in ``populate_result``, after
+    the response read has returned, so the boundary looks for that frame too. THE PREMISE first:
+    the bare call raises ``UnicodeError``, whose text quotes the directory's bytes. ldap3 decodes
+    that value with the client encoding (``stdin``'s) and then UTF-8, so the bytes are ones neither
+    cp1252 nor UTF-8 decodes."""
+    value = b"u:EXAMPLE\\synthetic-\x81\x8d"
+    reply = (
+        _result(_EXTENDED_RESPONSE, RESULT_SUCCESS, extra=_tlv(0x8B, value)),
+        b"",
+    )
+    with _scripted_dc(lambda _raw: [_done(RESULT_SUCCESS)], extended_reply=reply) as (
+        dc,
+        authenticator,
+    ):
+        with _service_conn(authenticator) as conn, pytest.raises(UnicodeError):
+            conn.extend.standard.who_am_i()
+        reading = authenticator.read_bind_account()
+    assert reading.bound and reading.authzid is None
+    assert reading.whoami_error is not None
+    assert "Who am I with a response ldap3 could not decode (UnicodeError)" in reading.whoami_error
+    assert "synthetic" not in reading.whoami_error
+    assert len(dc.searches) == 1, "the group read did not run after the failed Who am I"
 
 
 def test_a_who_am_i_ldap3_cannot_decode_is_reported_and_the_group_read_still_runs() -> None:
@@ -356,12 +384,32 @@ def test_an_ldap3_error_passes_through_for_its_own_handler() -> None:
 def test_the_ldap3_methods_the_origin_check_names_still_exist() -> None:
     """A rename in ldap3 would send every decode fault back to an unhandled error at sign-in; this
     names the cause in one place, where the loopback tests would each fail on it."""
+    from ldap3.extend.operation import ExtendedOperation
+    from ldap3.extend.standard.whoAmI import WhoAmI
     from ldap3.strategy.base import BaseStrategy
     from ldap3.strategy.sync import SyncStrategy
 
-    assert {"get_response", "_get_response"} == set(ldap_module._RESPONSE_READERS)
+    readers = dict(ldap_module._RESPONSE_READERS)
+    assert readers["ldap3.strategy."] == {"get_response", "_get_response"}
     assert "get_response" in vars(BaseStrategy)
     assert "_get_response" in vars(SyncStrategy)
+    assert readers["ldap3.extend."] == {"decode_response", "populate_result", "set_response"}
+    assert {"decode_response", "set_response"} <= set(vars(ExtendedOperation))
+    assert "populate_result" in vars(WhoAmI)
+
+
+def test_an_unbind_error_never_replaces_the_refusal() -> None:
+    """Round-one review finding. The decoy bind swallows an ``LDAPException`` and the real bind
+    maps it, so an unbind failing after an undecodable bind would tell an absent account from a
+    present one. After a clean block, the unbind's error still propagates."""
+    unbind_fault = ldap3.core.exceptions.LDAPSocketSendError("synthetic")
+    conn = SimpleNamespace(unbind=_raise(unbind_fault))
+    refusal = LdapUndecodableError("synthetic refusal")
+    with pytest.raises(LdapUndecodableError) as raised, ldap_module._released(conn):
+        raise refusal
+    assert raised.value is refusal
+    with pytest.raises(ldap3.core.exceptions.LDAPSocketSendError), ldap_module._released(conn):
+        pass
 
 
 def test_the_refusal_warns_once_per_operation_and_fault(caplog: pytest.LogCaptureFixture) -> None:

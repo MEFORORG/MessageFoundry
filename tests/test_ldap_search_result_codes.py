@@ -560,8 +560,11 @@ def test_a_later_page_answered_with_a_referral_is_refused_and_abandoned() -> Non
     ],
     ids=["ldap3-error", "refused"],
 )
-def test_an_abandon_that_fails_leaves_the_original_refusal(fault: Exception) -> None:
+def test_an_abandon_that_fails_leaves_the_original_refusal(
+    fault: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
     """Best effort: what the abandon answers, or raises, never replaces why the search failed."""
+    caplog.set_level(logging.DEBUG, logger=ldap_module.__name__)
     conn = _PagedConn(
         [
             _page(RESULT_SUCCESS, [object()], b"synthetic-cookie-1"),
@@ -573,6 +576,10 @@ def test_an_abandon_that_fails_leaves_the_original_refusal(fault: Exception) -> 
         ldap_module._search_paged(conn, "group search")
     assert refused.value is not fault
     assert len(conn.abandons) == 1
+    if not isinstance(fault, LdapError):  # a refusal is warned by _search; an ldap3 error is not
+        logged = [r for r in caplog.records if "abandon of a refused group search" in r.message]
+        assert [r.levelname for r in logged] == ["DEBUG"]
+        assert "synthetic" not in logged[0].getMessage()
 
 
 def test_a_directory_that_never_stops_paging_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -730,8 +737,8 @@ def _entry(dn: str) -> _Reply:
 class _ScriptedDc:
     """A loopback LDAP server, after ``tests/test_ldap_referrals.py``'s ``_FakeDc``. A bind is
     answered by ``bind_reply(raw request)``, or with success where that is absent or returns
-    ``None``; an extended operation such as Who am I ends with ``extended_code``; each search is
-    answered by ``answer(raw request)``. ``searches`` holds every search request's bytes, and
+    ``None``; an extended operation such as Who am I is answered with ``extended_reply``, or ends
+    with ``extended_code``; each search is answered by ``answer(raw request)``. ``searches`` holds every search request's bytes, and
     ``ended`` is set when a client's socket closes."""
 
     def __init__(
@@ -739,8 +746,10 @@ class _ScriptedDc:
         answer: Callable[[bytes], list[_Reply]],
         extended_code: int,
         bind_reply: Callable[[bytes], _Reply | None] | None = None,
+        extended_reply: _Reply | None = None,
     ) -> None:
         self._answer, self._extended_code, self._bind_reply = answer, extended_code, bind_reply
+        self._extended_reply = extended_reply
         self.searches: list[bytes] = []
         self.ended = threading.Event()
         self._listener = socket.create_server(("127.0.0.1", 0))
@@ -767,7 +776,10 @@ class _ScriptedDc:
                         scripted = self._bind_reply(raw) if self._bind_reply else None
                         replies = [scripted or _done(RESULT_SUCCESS, tag=_BIND_RESPONSE)]
                     elif op == _EXTENDED_REQUEST:
-                        replies = [_done(self._extended_code, tag=_EXTENDED_RESPONSE)]
+                        replies = [
+                            self._extended_reply
+                            or _done(self._extended_code, tag=_EXTENDED_RESPONSE)
+                        ]
                     elif op == _SEARCH_REQUEST:
                         self.searches.append(raw)
                         replies = self._answer(raw)
@@ -791,10 +803,11 @@ def _scripted_dc(
     *,
     extended_code: int = RESULT_SUCCESS,
     bind_reply: Callable[[bytes], _Reply | None] | None = None,
+    extended_reply: _Reply | None = None,
 ) -> Iterator[tuple[_ScriptedDc, LdapAuthenticator]]:
     """A loopback server, and an authenticator pointed at it over plain ``ldap://``: the property
     under test is the decode, not the hop's TLS."""
-    dc = _ScriptedDc(answer, extended_code, bind_reply)
+    dc = _ScriptedDc(answer, extended_code, bind_reply, extended_reply)
     try:
         settings = _ad_settings(
             ad_server=f"ldap://127.0.0.1:{dc.port}", ad_allow_insecure_ldap=True
