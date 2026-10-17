@@ -235,8 +235,8 @@ own; `git update-index --skip-worktree .claude/settings.json` keeps that local.
 
 This is the one list of what an engine version bump edits, and it is kept here only. It holds
 at least these edits; if a bump needs one it does not name, add it here. The comments in the
-harness and toolkit `pyproject.toml` files, ADR 0201, `.github/workflows/release.yml` and the pin
-failures in `tests/test_packaging.py` point here. Nothing performs these edits for you. CI fails a
+harness and toolkit `pyproject.toml` files, ADR 0201 and the pin failures in
+`tests/test_packaging.py` are at least the places that point here. Nothing performs these edits for you. CI fails a
 release pull request that leaves a test-held pin behind (items 2 to 4 and the README pins of item
 5), but not one that skips the rest of item 5, so make them all in the pull request that moves the
 version.
