@@ -560,9 +560,10 @@ class SandboxWorkerRefused(SandboxError):
     engine graph is refused from the session's cached refusal with ``first`` False, so the runner
     raises its ``sandbox_worker_refused`` alert once per refusal, not once per message (vault
     BACKLOG #2724, owner ruling 2026-10-16). ``content_only`` is True when the config modules'
-    bytes are the only difference, so the cause is an edit on disk with no reload."""
+    bytes are the only difference, so the cause is an edit on disk with no reload. Both default
+    to False only so that a copy or an unpickle, which passes the message alone, still builds."""
 
-    def __init__(self, message: str, *, first: bool, content_only: bool) -> None:
+    def __init__(self, message: str, *, first: bool = False, content_only: bool = False) -> None:
         super().__init__(message)
         self.first = first
         self.content_only = content_only
@@ -766,7 +767,11 @@ class SandboxSession:
                 # FAIL CLOSED. A worker that loaded a different graph would answer for this inbound
                 # from that graph, and nothing in its answers would say so.
                 self._kill(proc)
-                content_only = all(d.startswith(_CONTENT_DIFFERS) for d in differing)
+                # Only an edit on disk when the worker read its modules: a worker that could not
+                # read them reports no digest, and that is not an edit.
+                content_only = worker_graph.code_digest is not None and all(
+                    d.startswith(_CONTENT_DIFFERS) for d in differing
+                )
                 causes = (
                     "The config files changed on disk since the engine loaded them: reload the "
                     "config."
@@ -777,9 +782,11 @@ class SandboxSession:
                     "under an allowlisted environment: name each such variable in "
                     "[sandbox].pass_environment and restart."
                 )
+                # Short before the differences: a dead-lettered message keeps about the first 200
+                # characters of this, behind its stage prefix and the exception's type name.
                 refusal = (
-                    f"sandbox worker for inbound {self._inbound!r} was refused: the graph it loaded "
-                    f"differs from the one the engine is serving. {'. '.join(differing)}. {causes}"
+                    f"sandbox worker for inbound {self._inbound!r} refused: its graph differs from "
+                    f"the engine's. {'. '.join(differing)}. {causes}"
                 )
                 self._refused = (engine_graph, refusal, content_only)
                 raise SandboxWorkerRefused(refusal, first=True, content_only=content_only)

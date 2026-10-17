@@ -1221,22 +1221,24 @@ and the engine refuses it, though every name may still match. Before that compar
 worker ran an edited Router or Handler body nobody had reloaded. What you see while it lasts
 (vault BACKLOG #2724):
 
-1. The message in hand fails with an error that begins `sandbox worker for inbound '<name>' was
-   refused` and names `config module content` with the two digests. It fails at the stage that
-   asked for the worker, routing or transform, after the message was acknowledged.
+1. The message in hand fails with an error that contains `sandbox worker for inbound '<name>'
+   refused` and then `config module content` with the two digests. It fails at the stage that
+   asked for the worker, routing or transform, after the message was acknowledged. A message's
+   stored error keeps about 200 characters, so it may lose the digests. The engine log has the
+   whole refusal once, in a `WARNING` line that begins `inbound '<name>': sandbox worker`.
 2. The engine raises a `sandbox_worker_refused` alert for the inbound, under either
    `internal_error` setting. Its `connection` is the inbound's name, and its text names the cause
-   and says to reload the config. It carries fixed words only, never the message or the refusal's
-   digests; the message's last error has those.
+   and says to reload the config. It carries fixed words only, never the message or the refusal.
 3. Under the default `[delivery].internal_error = "continue"` the message is dead-lettered with
    status `ERROR`, the error is its last error, and the log has a `WARNING` naming the inbound and
    the error type. Under `"stop"` the inbound stops, the head message is held, and the
    `connection_stopped` alert fires as well.
 4. Every later message on that inbound is refused the same way, without starting another worker,
-   until a reload changes the graph the engine serves. Those refusals raise no further alert.
-   Other inbounds are refused too, as soon as their own workers start, and each raises its own
-   alert. A reload that does not clear the cause raises the alert again. Nothing resolves it on
-   its own, so resolve it in the alert list once the reload is done.
+   until a reload changes the graph the engine serves. Those refusals raise no further alert and
+   log no further `WARNING` line of their own. Other inbounds are refused too, as soon as their
+   own workers start, and each raises its own alert. A reload that does not clear the cause
+   raises the alert again. Nothing resolves it on its own, so resolve it in the alert list once
+   the reload is done.
 5. `GET /config/provenance` reports `drift` as true, because the files on disk no longer match the
    ones the engine loaded.
 

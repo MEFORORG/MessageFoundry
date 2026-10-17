@@ -153,22 +153,22 @@ def remote_debug_refused_detail(*, count: int, total: int) -> str:
 def sandbox_worker_refused_detail(*, content_only: bool) -> str:
     """The one-line description of a ``sandbox_worker_refused`` alert both sinks show (vault
     BACKLOG #2724). Fixed words that name the cause and the remedy: never a message body, and not
-    the refusal itself, which the message's last error carries. The alert instance's reason column
-    keeps only about the first 200 characters, so the cause and the remedy lead."""
+    the refusal itself, which the runner logs whole in a WARNING line. The alert instance's reason
+    column keeps only about the first 200 characters, so the cause and the remedy lead."""
     if content_only:
         cause = (
-            "a config file changed on disk since the engine loaded it, with no reload. Reload the "
+            "A config file changed on disk since the engine loaded it, with no reload. Reload the "
             "config."
         )
     else:
         cause = (
-            "a config file changed on disk with no reload (reload the config), or config reads a "
-            "variable the worker lacks (add it to [sandbox].pass_environment and restart)."
+            "Most often a config file changed on disk with no reload: reload the config. Or config "
+            "reads a variable the worker lacks: add it to [sandbox].pass_environment and restart."
         )
     return (
-        f"sandbox worker refused: {cause} Until then every message on this inbound fails at "
-        'routing or transform: dead-lettered as ERROR under internal_error = "continue", or the '
-        'inbound stops under "stop". The message\'s last error names what differs.'
+        f"{cause} Until then every message on this inbound fails at routing or transform: "
+        'dead-lettered as ERROR under internal_error = "continue", or the inbound stops under '
+        '"stop". A WARNING line in the engine log names what differs.'
     )
 
 
@@ -814,8 +814,9 @@ class AlertSink(Protocol):
         modules' bytes differ: a config file was edited on disk with no reload.
 
         Raised once per refusal, on the event loop, by the runner: not again for each later
-        message the session refuses from its cached refusal. A reload makes fresh sessions, so a
-        refusal that outlives the reload raises again. ``name`` is the inbound connection's name.
+        message the session refuses from its cached refusal, and not for a refusal computed
+        against a graph a reload has since replaced. A reload makes fresh sessions, so a refusal
+        that outlives the reload raises again. A sink that raises here is logged, not retried. ``name`` is the inbound connection's name.
         Fixed words only, built by :func:`sandbox_worker_refused_detail`: no message content, no
         PHI. Not in the control-action set: a restart reloads nothing, so it cannot clear this.
         Nothing resolves it automatically; an operator resolves the instance after the reload."""
@@ -1280,7 +1281,7 @@ class LoggingAlertSink:
 
     def sandbox_worker_refused(self, name: str, *, content_only: bool) -> None:
         log.warning(
-            "ALERT sandbox_worker_refused: inbound %r %s",
+            "ALERT sandbox_worker_refused: inbound %r: %s",
             name,
             sandbox_worker_refused_detail(content_only=content_only),
         )

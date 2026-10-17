@@ -12,7 +12,9 @@ Synthetic HL7 only.
 
 from __future__ import annotations
 
+import copy
 import logging
+import pickle
 from pathlib import Path
 from typing import Any, cast
 
@@ -24,7 +26,7 @@ from messagefoundry.config.settings import (
     _ALERT_EVENT_TYPES,
     EgressSettings,
 )
-from messagefoundry.config.wiring import load_config
+from messagefoundry.config.wiring import Registry, load_config
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
 from messagefoundry.pipeline.alerts import LoggingAlertSink, sandbox_worker_refused_detail
 from messagefoundry.pipeline.dryrun import transform_one
@@ -32,10 +34,12 @@ from messagefoundry.pipeline.sandbox import (
     SandboxMode,
     SandboxPolicy,
     SandboxSession,
+    SandboxSessionClosed,
     SandboxWorkerRefused,
     graph_shape,
 )
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.redaction import safe_text
 from messagefoundry.store.store import MessageStore
 from tests.test_alert_sinks import _drain as _drain_transports
 from tests.test_alert_sinks import _RecordingTransport
@@ -73,36 +77,104 @@ def _edit(cfg: Path) -> None:
     (cfg / "graph.py").write_text(_GRAPH.replace('"COUNT="', '"EDITED="'), encoding="utf-8")
 
 
+def _runner(registry: Registry, store: MessageStore, cfg: Path, sink: Any) -> RegistryRunner:
+    return RegistryRunner(
+        registry,
+        store,
+        sandbox_policy=SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=30.0),
+        sandbox_config_source=(str(cfg), None),
+        egress=EgressSettings(deny_by_default=False),
+        alert_sink=sink,
+    )
+
+
 async def test_the_first_refusal_alerts_once_and_later_messages_do_not(
-    edited_config: Path, tmp_path: Path
+    edited_config: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Through the runner's own dispatch chokepoint: the refusal still raises (the message still
     fails and dead-letters under the policy), the alert fires on the first, and the cached
-    refusals for the next messages on the same inbound raise no second alert."""
+    refusals for the next messages on the same inbound raise no second alert. The whole refusal,
+    digests included, is logged once."""
     registry = load_config(edited_config)
     _edit(edited_config)
     sink = _Recorder()
     store = await MessageStore.open(tmp_path / "refusal.db")
     try:
-        runner = RegistryRunner(
-            registry,
-            store,
-            sandbox_policy=SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=30.0),
-            sandbox_config_source=(str(edited_config), None),
-            egress=EgressSettings(deny_by_default=False),
-            alert_sink=cast(Any, sink),
-        )
+        runner = _runner(registry, store, edited_config, cast(Any, sink))
         try:
-            for _ in range(3):
-                with pytest.raises(SandboxWorkerRefused):
-                    await runner._off_loop_sandboxed(
-                        "IB_PARITY", transform_one, registry, "h_0", RAW, run_context=RunContext()
-                    )
+            with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.wiring_runner"):
+                for _ in range(3):
+                    with pytest.raises(SandboxWorkerRefused):
+                        await runner._off_loop_sandboxed(
+                            "IB_PARITY",
+                            transform_one,
+                            registry,
+                            "h_0",
+                            RAW,
+                            run_context=RunContext(),
+                        )
             assert sink.refused == [("IB_PARITY", True)]
         finally:
             await runner._close_sandbox_sessions()
     finally:
         await store.close()
+    (line,) = [
+        r.getMessage() for r in caplog.records if "sandbox worker for inbound" in r.getMessage()
+    ]
+    assert line.startswith("inbound 'IB_PARITY': sandbox worker for inbound 'IB_PARITY' refused")
+    assert "the worker loaded" in line and _BODY_MARKER not in line
+
+
+async def test_a_refusal_reached_through_the_closed_session_retry_alerts(tmp_path: Path) -> None:
+    """The retry after a reload closed the session mid-dispatch is inside the alerting arm too."""
+    registry = Registry()
+    sink = _Recorder()
+    calls: list[int] = []
+
+    def dispatch(_registry: Registry, *, sandbox: Any) -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            raise SandboxSessionClosed("closed")
+        raise SandboxWorkerRefused("refused", first=True, content_only=False)
+
+    store = await MessageStore.open(tmp_path / "retry.db")
+    try:
+        runner = _runner(registry, store, tmp_path, cast(Any, sink))
+        with pytest.raises(SandboxWorkerRefused):
+            await runner._off_loop_sandboxed("IB_X", dispatch, registry)
+    finally:
+        await store.close()
+    assert len(calls) == 2
+    assert sink.refused == [("IB_X", False)]
+
+
+async def test_a_refusal_against_a_replaced_graph_does_not_alert(tmp_path: Path) -> None:
+    """A reload swapped the registry while the refused spawn compared with the old one. The
+    reload is the remedy, so an alert would stay open with nothing left to fix."""
+    old, new = Registry(), Registry()
+    sink = _Recorder()
+    store = await MessageStore.open(tmp_path / "stale.db")
+    try:
+        runner = _runner(new, store, tmp_path, cast(Any, sink))
+
+        def dispatch(_registry: Registry, *, sandbox: Any) -> None:
+            raise SandboxWorkerRefused("refused", first=True, content_only=True)
+
+        with pytest.raises(SandboxWorkerRefused):
+            await runner._off_loop_sandboxed("IB_X", dispatch, old)
+        assert sink.refused == []
+        # CONTROL: the same refusal against the graph being served does alert.
+        with pytest.raises(SandboxWorkerRefused):
+            await runner._off_loop_sandboxed("IB_X", dispatch, new)
+        assert sink.refused == [("IB_X", True)]
+    finally:
+        await store.close()
+
+
+def test_the_refusal_survives_a_copy_and_a_pickle() -> None:
+    exc = SandboxWorkerRefused("refused", first=True, content_only=True)
+    for clone in (copy.copy(exc), pickle.loads(pickle.dumps(exc))):
+        assert (str(clone), clone.first, clone.content_only) == ("refused", True, True)
 
 
 def test_only_the_comparing_spawn_is_marked_first(edited_config: Path) -> None:
@@ -130,21 +202,14 @@ async def test_the_shipped_notifier_carries_fixed_words_and_no_body(
     edited_config: Path, tmp_path: Path
 ) -> None:
     """What an operator's webhook receives and what the alert list shows. The CONTROL is the
-    refusal itself, which the message's last error carries: it names what differs."""
+    refusal itself, which the engine log carries: it names what differs."""
     registry = load_config(edited_config)
     _edit(edited_config)
     transport, state = _RecordingTransport("webhook"), _RecordingStore()
     sink = NotifierAlertSink([transport], store=cast(Any, state))
     store = await MessageStore.open(tmp_path / "notifier.db")
     try:
-        runner = RegistryRunner(
-            registry,
-            store,
-            sandbox_policy=SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=30.0),
-            sandbox_config_source=(str(edited_config), None),
-            egress=EgressSettings(deny_by_default=False),
-            alert_sink=sink,
-        )
+        runner = _runner(registry, store, edited_config, sink)
         try:
             with pytest.raises(SandboxWorkerRefused) as refused:
                 await runner._off_loop_sandboxed(
@@ -171,11 +236,12 @@ async def test_the_shipped_notifier_carries_fixed_words_and_no_body(
 def test_the_detail_names_the_cause_and_the_remedy_first() -> None:
     edited = sandbox_worker_refused_detail(content_only=True)
     names = sandbox_worker_refused_detail(content_only=False)
-    # The alert instance's reason column keeps about the first 200 characters.
-    for detail in (edited, names):
-        assert "reload the config" in detail[:200].lower()
-    assert "changed on disk" in edited[:200] and "pass_environment" not in edited
-    assert "[sandbox].pass_environment" in names[:200]
+    # The alert instance's reason column keeps what this bound leaves (docs/PHI.md section 8).
+    kept_edited, kept_names = safe_text(edited, limit=200), safe_text(names, limit=200)
+    assert "Reload the config." in kept_edited and "changed on disk" in kept_edited
+    assert "pass_environment" not in edited
+    assert "reload the config" in kept_names
+    assert "add it to [sandbox].pass_environment and restart" in kept_names
 
 
 def test_the_logging_sink_warns(caplog: pytest.LogCaptureFixture) -> None:
@@ -184,7 +250,7 @@ def test_the_logging_sink_warns(caplog: pytest.LogCaptureFixture) -> None:
     (record,) = caplog.records
     assert record.levelno == logging.WARNING
     assert record.getMessage().startswith(
-        "ALERT sandbox_worker_refused: inbound 'IB_PARITY' sandbox worker refused: a config file"
+        "ALERT sandbox_worker_refused: inbound 'IB_PARITY': A config file changed on disk"
     )
 
 
