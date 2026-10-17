@@ -140,7 +140,9 @@ log = logging.getLogger(__name__)
 _ALERT_STATE_DRAIN_SECONDS = 5.0
 
 #: How long stop waits for config writes whose callers were cancelled (vault BACKLOG #2945), so
-#: their audit rows reach the store before it closes. Short, for the same reason as above.
+#: their audit rows reach the store before it closes. Short, for the same reason as above. Only
+#: when nothing drained them first: the managed API lifespan does, under its shutdown budget
+#: (BACKLOG #3191), and stop then does not wait again.
 _CONFIG_WRITE_DRAIN_SECONDS = 5.0
 
 #: How long a DR release waits for the staged queue to drain before it hands back anyway, leaving
@@ -2569,10 +2571,10 @@ class Engine:
         # nothing, and gets no write. Once it is held, the rest runs as a tracked task the caller
         # only waits on, so a caller cancelled from then on (a request deadline, a client that went
         # away) stops waiting but cannot leave the write on disk with no row, which the next start
-        # would report as a change nobody made. stop() waits for these tasks before it closes the
-        # store. asyncio.wait rather than asyncio.shield, as approvals._outlive_caller does: a
-        # shield reports a failure after its caller has gone to the loop's handler with a raw
-        # traceback, where this logs it once, rendered by safe_exc.
+        # would report as a change nobody made. drain_config_writes waits for these tasks before
+        # the store closes. asyncio.wait rather than asyncio.shield, as approvals._outlive_caller
+        # does: a shield reports a failure after its caller has gone to the loop's handler with a
+        # raw traceback, where this logs it once, rendered by safe_exc.
         await self._toml_write_lock.acquire()
         task = asyncio.ensure_future(_apply())
         self._config_writes.add(task)
@@ -2588,6 +2590,26 @@ class Engine:
         """Release the engine lock and forget a finished config write, however it ended."""
         self._config_writes.discard(task)
         self._toml_write_lock.release()
+
+    async def drain_config_writes(self, timeout: float) -> None:
+        """Refuse every later config write, then wait up to ``timeout`` for the running ones.
+
+        A write whose caller was cancelled is still running, and its row needs the store (vault
+        BACKLOG #2945). One still running past ``timeout`` is logged, and its row is then lost to
+        the closed store. The gate closes first, so a caller still queued for the engine lock is
+        refused once it gets the lock rather than starting a write this drain never saw. Waiting
+        never cancels a write: one cut short would leave its file written with no row. Called by
+        the managed API lifespan, under its shutdown budget (BACKLOG #3191), and otherwise by
+        :meth:`stop`."""
+        self._config_writes_closed = True
+        if not self._config_writes:
+            return
+        _done, pending = await asyncio.wait(set(self._config_writes), timeout=timeout)
+        if pending:
+            log.warning(
+                "%d config write(s) still running at stop; their audit rows may be lost",
+                len(pending),
+            )
 
     async def set_connection_flag(
         self,
@@ -3582,20 +3604,11 @@ class Engine:
             await asyncio.gather(self._warm_pool_task, return_exceptions=True)
             self._warm_pool_task = None
         # A config write whose caller was cancelled is still running, and its row needs the store
-        # (vault BACKLOG #2945). Bounded, as the alert drain below is: one still running past it
-        # is logged, and its row is then lost to the closed store.
-        # Closed first, so a caller still queued for the engine lock is refused once it gets the
-        # lock rather than starting a write this drain never saw.
-        self._config_writes_closed = True
-        if self._config_writes:
-            _done, pending = await asyncio.wait(
-                set(self._config_writes), timeout=_CONFIG_WRITE_DRAIN_SECONDS
-            )
-            if pending:
-                log.warning(
-                    "%d config write(s) still running at stop; their audit rows may be lost",
-                    len(pending),
-                )
+        # (vault BACKLOG #2945). The managed API lifespan has already drained them under its
+        # shutdown budget (BACKLOG #3191) and closed the gate, so a second wait here would only
+        # spend time past that budget. A caller with no such lifespan gets the fixed bound.
+        if not self._config_writes_closed:
+            await self.drain_config_writes(_CONFIG_WRITE_DRAIN_SECONDS)
         # Clears raised on the way out are background writes: an unpinned cluster node's intake
         # alerts (BACKLOG #2272) and the coordinator's leadership release. Give them a bounded chance
         # to land before the store closes. Last, so it covers every stop step above.

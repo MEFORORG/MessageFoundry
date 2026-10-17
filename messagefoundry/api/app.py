@@ -11030,6 +11030,18 @@ def create_managed_app(
                 )
             )
             steps += _app_drain_steps(app, store, auth, owns_auth=True)
+            # Vault BACKLOG #2945: a config write whose caller was cancelled still writes its audit
+            # row. Drained here, under the budget, rather than by the fixed wait engine.stop() runs
+            # for a caller with no lifespan; draining closes the engine's gate, so engine.stop()
+            # then does not wait again. Handed part of its bound, so its wait ends before the step
+            # is cut; the wait never cancels a write.
+            steps.append(
+                _TeardownStep(
+                    "the config-write drain",
+                    0.25,
+                    lambda b: engine.drain_config_writes(b * _INNER_SHARE),
+                )
+            )
             if security_notifier is not None:
                 # It drains queued user emails, and records a notice it could not send in the audit
                 # log, so it closes while the store is open, after the lock notices that hand it
