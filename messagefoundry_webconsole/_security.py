@@ -230,7 +230,12 @@ from starlette.datastructures import MutableHeaders
 from starlette.responses import PlainTextResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from ._auth import _CROSS_ORIGIN_FETCH, browser_hardening_enabled, security_headers_context
+from ._auth import (
+    _CONFLICTING_FETCH_SITE,
+    _CROSS_ORIGIN_FETCH,
+    browser_hardening_enabled,
+    security_headers_context,
+)
 from ._html import reset_csp_nonce, set_csp_nonce
 
 #: The route (registered in :mod:`.routes.core`) the browser POSTs CSP violation reports to, and the
@@ -358,6 +363,13 @@ class UiFetchMetadataMiddleware:
     builds its client with no headers at all. So this rejects only a header that is PRESENT and says
     cross-site or same-site.
 
+    **``Sec-Fetch-Site`` LINES THAT DISAGREE ARE REFUSED, ON EVERY METHOD.** A browser sets the
+    header once. This walk used to keep the last line while ``_auth``'s checks read the first, so the
+    two could rule on different values of one request. Both now refuse such a request with the same
+    403 (``_auth._sec_fetch_site``), and repeated lines with one value are that value. This refuses
+    only requests carrying two values, which no browser sends, so the absence rule below is
+    unchanged.
+
     **403, NEVER 404.** The tray classifies 404 as DISABLED and every other status as ENABLED, so a
     404 here would make it report a healthy console as switched off. A later "return 404 rather than
     disclose the route" hardening pass would look like an improvement and silently break the tray.
@@ -401,15 +413,21 @@ class UiFetchMetadataMiddleware:
         # Read from the raw scope rather than building a Request: this runs for every /ui asset, and
         # header names on the wire are lower-cased bytes by ASGI contract.
         site = mode = dest = user = None
+        conflicting_site = False
         for key, value in scope.get("headers") or ():
             if key == b"sec-fetch-site":
-                site = value.decode("latin-1")
+                line = value.decode("latin-1")
+                conflicting_site = conflicting_site or (site is not None and line != site)
+                site = line
             elif key == b"sec-fetch-mode":
                 mode = value.decode("latin-1")
             elif key == b"sec-fetch-dest":
                 dest = value.decode("latin-1")
             elif key == b"sec-fetch-user":
                 user = value.decode("latin-1")
+        if conflicting_site:
+            await PlainTextResponse(_CONFLICTING_FETCH_SITE, status_code=403)(scope, receive, send)
+            return
         if site is None or site not in _CROSS_ORIGIN_FETCH:
             await self.app(scope, receive, send)
             return

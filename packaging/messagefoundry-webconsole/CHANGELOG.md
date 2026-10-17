@@ -97,6 +97,12 @@ this line.**
 
 ### Security
 
+- **A `/ui` request whose `Sec-Fetch-Site` lines disagree is refused.** It answers `403` on any
+  method. The fetch-metadata middleware used to keep the last such line while the same-origin
+  check read the first, so the two could judge different values of one request. Both now refuse
+  it with the same reason. A browser sends the header once, and repeated lines that carry one
+  value are judged as that value, so no browser request changes. No seam change.
+  (vault BACKLOG #3316)
 - **The passkey registration finish draws on the per-actor ceremony budget.**
   `POST /ui/account/webauthn/verify` now charges the same budget as `POST /ui/account/mfa/verify`,
   and answers a throttle with a JSON 429 the page can show. No seam change. (BACKLOG #3014)

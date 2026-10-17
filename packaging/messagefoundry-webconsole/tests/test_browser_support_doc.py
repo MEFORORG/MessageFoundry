@@ -35,6 +35,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from _ui_clients import origin_check_request
 from fastapi import HTTPException
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from starlette.datastructures import Headers
@@ -224,9 +225,8 @@ async def test_each_fetch_metadata_rows_absence_verdict_matches_the_middleware()
 
 
 def _fake_request(headers: dict[str, str]) -> Any:
-    state = SimpleNamespace(public_origin=None, loopback=False, webauthn_rp_from_request=True)
     # A POST: the row is the form-POST row, and the check keeps its earlier rule on a GET.
-    return SimpleNamespace(method="POST", headers=headers, app=SimpleNamespace(state=state))
+    return origin_check_request("POST", headers)
 
 
 def test_the_form_post_origin_rows_absence_verdict_matches_assert_same_origin() -> None:

@@ -17,13 +17,14 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
+from starlette.datastructures import Headers
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import totp
@@ -46,6 +47,25 @@ ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE
 
 #: The same-origin header the console's CSRF guard requires on a /ui POST.
 SAME_ORIGIN = {"Sec-Fetch-Site": "same-origin"}
+
+
+def origin_check_request(
+    method: str, headers: Mapping[str, str] | Sequence[tuple[str, str]], **state: Any
+) -> Any:
+    """The fewest request attributes ``_auth.assert_same_origin`` reads, for driving it directly.
+
+    ``headers`` is a mapping, or ``(name, value)`` pairs where one name may repeat, as on the wire.
+    ``state`` overrides the app-state posture, which defaults to the ``Host`` fallback: no public
+    origin and no proxy in front of a loopback bind.
+    """
+    pairs = headers.items() if isinstance(headers, Mapping) else headers
+    raw = [(name.lower().encode("latin-1"), value.encode("latin-1")) for name, value in pairs]
+    posture = {"public_origin": None, "loopback": False, "webauthn_rp_from_request": True}
+    return SimpleNamespace(
+        method=method,
+        headers=Headers(raw=raw),
+        app=SimpleNamespace(state=SimpleNamespace(**{**posture, **state})),
+    )
 
 
 async def auth_service(engine: Engine) -> AuthService:
