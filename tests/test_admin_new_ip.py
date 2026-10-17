@@ -23,17 +23,31 @@ from pathlib import Path
 import httpx
 import pytest
 from _totp_clock import pin_totp_clock
+from fastapi import Depends, FastAPI, Request
 
 from messagefoundry.api import create_app
+from messagefoundry.api.security import (
+    require_reauth_only,
+    require_reauth_only_action,
+    require_step_up,
+    require_step_up_action,
+    spend_step_up_action,
+)
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import ALL_CHANNELS, Identity
 from messagefoundry.auth.notifications import ADMIN_NEW_IP, SecurityEvent
-from messagefoundry.auth.service import _NEW_IP_PER_SESSION_MAX, AuthService
+from messagefoundry.auth.service import (
+    _NEW_IP_PER_SESSION_MAX,
+    STEP_UP_ACTION_ADMIN_USER_UPDATE,
+    STEP_UP_ACTION_SESSION_TERMINATE,
+    AuthService,
+)
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_admin, create_local_user_chosen
+from tests._bound_proof import prove
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 NEW_USER = {
@@ -534,10 +548,15 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
     await eng.stop()
 
 
+def _client_for(app: FastAPI, ip: str) -> httpx.AsyncClient:
+    """A client of ``app`` whose requests originate from ``ip`` (set on the ASGI scope)."""
+    transport = httpx.ASGITransport(app=app, client=(ip, 12345))
+    return httpx.AsyncClient(transport=transport, base_url="http://t")
+
+
 def _client_at(engine: Engine, service: AuthService, ip: str) -> httpx.AsyncClient:
     """An API client whose requests originate from ``ip`` (set on the ASGI scope)."""
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service), client=(ip, 12345))
-    return httpx.AsyncClient(transport=transport, base_url="http://t")
+    return _client_for(create_app(engine, auth=service), ip)
 
 
 def _auth(token: str) -> dict[str, str]:
@@ -597,7 +616,9 @@ async def test_admin_route_from_new_ip_forces_step_up_then_clears(engine: Engine
         blocked = await b.post("/users", headers=_auth(token), json=n2)
         assert blocked.status_code == 403
         assert blocked.headers.get("X-Step-Up-Required") == "1"
-        # A non-sensitive route from the new address is NOT blocked (advisory + admin-scope only).
+        # A base-gate route from the new address is NOT blocked: the base gate never asks. Since
+        # vault BACKLOG #2620 the PHI reads and the paced writes do ask, and refuse (see the tests
+        # below); this route is neither.
         assert (await b.get("/auth/me", headers=_auth(token))).status_code == 200
         # Re-verifying from the new address re-anchors the session; the admin op then succeeds.
         ok = await b.post("/me/reauth", headers=_auth(token), json={"password": PW})
@@ -798,3 +819,77 @@ async def test_an_http_reveal_from_a_second_address_is_refused(engine: Engine) -
             r = await b.get(path, params={"reveal": 1}, headers=_auth(token))
             assert (r.status_code, r.headers.get("X-Step-Up-Required")) == (403, "1"), path
         assert (await b.get("/events", headers=_auth(token))).status_code == 200
+
+
+# --- vault BACKLOG #3052 item 13: each of the four step-up factories asks --------------------------
+
+#: Five cases over the four JSON step-up factories in ``api/security.py``: each with the action its
+#: proof is bound to (``None`` for the two that read the session window), and whether the route
+#: spends the proof itself. Each factory asks the new-address question inline, so a case pins only
+#: its own factory. ``require_step_up_action`` asks in two branches, so it has two cases: its
+#: ``proof_in_route=True`` branch asks before the route's own spend.
+_STEP_UP_FACTORIES = {
+    "require_step_up": (require_step_up, None, False),
+    "require_reauth_only": (require_reauth_only, None, False),
+    "require_step_up_action": (
+        lambda: require_step_up_action(STEP_UP_ACTION_ADMIN_USER_UPDATE),
+        STEP_UP_ACTION_ADMIN_USER_UPDATE,
+        False,
+    ),
+    "require_step_up_action-proof_in_route": (
+        lambda: require_step_up_action(STEP_UP_ACTION_ADMIN_USER_UPDATE, proof_in_route=True),
+        STEP_UP_ACTION_ADMIN_USER_UPDATE,
+        True,
+    ),
+    "require_reauth_only_action": (
+        lambda: require_reauth_only_action(STEP_UP_ACTION_SESSION_TERMINATE),
+        STEP_UP_ACTION_SESSION_TERMINATE,
+        False,
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_STEP_UP_FACTORIES))
+async def test_each_step_up_factory_refuses_a_new_address_holding_a_fresh_proof(
+    engine: Engine, name: str
+) -> None:
+    """RED when: one of the four step-up factories, in either branch, stops asking whether the
+    request comes from a new address (vault BACKLOG #3052 item 13; PR 2048's mutation run skipped
+    all four). The caller
+    holds the proof the factory wants, a fresh sign-in window or a grant bound to its action, so
+    the address is the only reason left to refuse. The control spends the same proof from the
+    sign-in address and passes, so the refusal is not a stale proof.
+
+    A probe route is mounted on each factory directly, because ``require_reauth_only`` guards no
+    shipped route and the others share theirs with other gates."""
+    make_gate, action, spends = _STEP_UP_FACTORIES[name]
+    service = _new_ip_service(engine)
+    await service.initialize()
+    await _add_admin(service, "boss")
+    app = create_app(engine, auth=service)
+
+    gate = Depends(make_gate())
+
+    async def probe(request: Request, _: Identity = gate) -> dict[str, str]:
+        if spends:
+            assert action is not None
+            await spend_step_up_action(request, action)
+        return {"ok": "1"}
+
+    app.add_api_route("/test/step-up-probe", probe, methods=["POST"])
+
+    async def proof(c: httpx.AsyncClient, token: str) -> str:
+        """A fresh grant bound to ``action``; the sign-in window already serves the others."""
+        return token if action is None else await prove(c, token, PW, action)
+
+    async with _client_for(app, "10.0.0.1") as a:
+        token = await proof(a, await _login_token(a))
+        control = await a.post("/test/step-up-probe", headers=_auth(token))
+        assert control.status_code == 200, (name, control.status_code, control.text)
+        token = await proof(a, token)
+    async with _client_for(app, "10.9.9.9") as b:
+        r = await b.post("/test/step-up-probe", headers=_auth(token))
+        assert (r.status_code, r.headers.get("X-Step-Up-Required")) == (403, "1"), (name, r.text)
+        assert r.headers.get("X-Step-Up-Action") == action, name
+    assert isinstance(engine.store, MessageStore)
+    assert await _new_ip_rows(engine.store) == ["10.9.9.9"], name

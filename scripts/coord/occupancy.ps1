@@ -175,7 +175,14 @@ function Get-OwningGitCommonDir([string]$Path) {
             $txt = ''
             try { $txt = Get-Content -LiteralPath $dot -Raw -EA Stop } catch { return '' }
             if (-not ($txt -match 'gitdir:\s*(\S.*)')) { return '' }
-            $gitdir = ConvertTo-Norm ($Matches[1].Trim())
+            $raw = $Matches[1].Trim()
+            # `worktree add --relative-paths` (git 2.48+) writes the pointer relative to the
+            # checkout. Unresolved, it compared unequal to this repo's common dir, so a deregistered
+            # relative-path checkout was read as another repo's and the fence stayed available.
+            if (-not [System.IO.Path]::IsPathRooted($raw)) {
+                try { $raw = [System.IO.Path]::GetFullPath((Join-Path $cur $raw)) } catch { return '' }
+            }
+            $gitdir = ConvertTo-Norm $raw
             # A LINKED worktree's pointer names <common-dir>/worktrees/<name>. Fold it onto the common
             # dir so both spellings compare as the one identity.
             if ($gitdir -match '^(.+)/worktrees/[^/]+$') { return $Matches[1] }

@@ -92,7 +92,7 @@ from messagefoundry.connection_names import (
     inbound_record_name,
     is_connection_name,
 )
-from messagefoundry.controlchars import scrub_control_chars
+from messagefoundry.controlchars import scrub_control_chars, scrub_log_argument
 from messagefoundry.credential import CERT_NAME_PREFIXES
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
 from messagefoundry.redaction import safe_name
@@ -5264,6 +5264,11 @@ class Registry:
     # an operator reload from another root the workers load the root the running graph came from,
     # not the startup dir (vault BACKLOG #3094). Carried with the graph, so it swaps atomically.
     source_dir: Path | None = None
+    # A digest of the config modules' bytes as this load read them
+    # (:func:`config_code_digest`), or
+    # None for a graph built in code or a module that could not be read. A sandbox worker loads the
+    # directory again, and the engine refuses one whose digest differs (vault BACKLOG #2724).
+    code_digest: str | None = None
 
     def inbound_names(self) -> frozenset[str]:
         """Every inbound connection NAME in the deployment — the pinned unfiltered set when this is one
@@ -7383,6 +7388,44 @@ def handler(
 # --- loader ------------------------------------------------------------------
 
 
+#: The scheme of :func:`config_code_digest`, apart from the config fingerprint's because it
+#: hashes a different set of files.
+_CODE_DIGEST_SCHEME: Final = b"mefor-config-code:v1\n"
+
+
+def config_code_digest(directory: Path) -> str | None:
+    """A SHA-256 over every config module a load of ``directory`` may run, ``_`` helpers included:
+    each file's name and the digest of its bytes, in :func:`config_py_files` order (vault BACKLOG
+    #2724).
+
+    The loader records it on the graph, and a sandbox worker's load records its own; the engine
+    refuses a worker whose digest differs. Python modules only: ``connections.toml`` changes the
+    graph's names, which are compared anyway, and the worker serves the code sets the engine hands
+    it, not its own read. None when a module cannot be read, which is logged.
+
+    Kept here rather than built on :mod:`messagefoundry.config.fingerprint`: importing that module
+    would give every importer of the loader its comparison and hash operations in the crypto
+    inventory (``scripts/security/crypto_inventory_check.py``)."""
+    digest = hashlib.sha256(_CODE_DIGEST_SCHEME)
+    try:
+        for path in config_py_files(directory):
+            if not path.is_file():
+                continue
+            digest.update(path.name.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(hashlib.sha256(path.read_bytes()).digest())
+            digest.update(b"\0")
+    except OSError as exc:
+        _logger.warning(
+            "config module digest unavailable for %s, so a sandbox worker's config code is not "
+            "compared with this load's: %s",
+            scrub_log_argument(str(directory)),
+            scrub_log_argument(str(exc)),
+        )
+        return None
+    return digest.hexdigest()
+
+
 def config_py_files(directory: Path) -> list[Path]:
     """Every ``*.py`` in ``directory`` the loader may run or import, sorted: dot-named files excluded.
 
@@ -7822,7 +7865,8 @@ def load_config(directory: str | Path, *, allow_empty: bool = False) -> Registry
         raise FileNotFoundError(f"config directory not found: {directory}")
     _assert_safe_config_source(directory)
     # Resolved, so a worker that spawns later loads this target even if a link in the path moves.
-    registry = Registry(source_dir=directory.resolve())
+    # The digest is read just before the modules run (vault BACKLOG #2724).
+    registry = Registry(source_dir=directory.resolve(), code_digest=config_code_digest(directory))
     # Load the bundle's reference tables (codesets/ relative to the config dir) BEFORE importing the
     # config modules, so a module-top-level code_set(...) capture resolves. A bad/duplicate table is a
     # WiringError here (fail loud), like a bad env value; a missing codesets/ dir is fine (no tables).
@@ -7834,6 +7878,9 @@ def load_config(directory: str | Path, *, allow_empty: bool = False) -> Registry
         for path in config_py_files(directory):
             if not path.name.startswith("_"):
                 _exec_module(path, helpers)
+        if registry.code_digest is not None:
+            # Inside the block, so a refusal discards this load's modules like any failed load.
+            _require_unchanged_code(directory, registry.code_digest)
     # Connections may also be authored as data (ADR 0007): merge connections.toml into the SAME
     # registry the code-first inbound()/outbound() calls populated, before validating the whole graph.
     # Imported lazily to avoid a wiring<->connections_file import cycle. A name in both surfaces is a
@@ -7850,6 +7897,23 @@ def load_config(directory: str | Path, *, allow_empty: bool = False) -> Registry
         load_connections_file(conn_file, registry)
     registry.validate(allow_empty=allow_empty)
     return registry
+
+
+def _require_unchanged_code(directory: Path, before: str) -> None:
+    """Refuse a load whose config modules changed on disk while it ran (vault BACKLOG #2724).
+
+    The digest was read before the modules ran. A module rewritten in between ran bytes the digest
+    does not describe, and a sandbox worker would then pass the comparison with edited code."""
+    after = config_code_digest(directory)
+    if after is None:
+        raise WiringError(
+            f"config modules in {directory} could not be read again after the load, so what ran "
+            "cannot be shown to match what was read; load again"
+        )
+    if after != before:  # both are public digests of public bytes; nothing to time
+        raise WiringError(
+            f"config modules in {directory} changed on disk while they were loading; load again"
+        )
 
 
 # Group-write (0o020) | world-write (0o002): a writable bit for anyone but the owner.

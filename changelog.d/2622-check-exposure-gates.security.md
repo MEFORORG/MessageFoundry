@@ -6,8 +6,11 @@
   site that relies on that flag under `enforcement = "warn"` would see `check` refuse what `serve`
   admits. The gates run only on a listener the engine would bind: deployed and `auto_start`. On a
   running engine, a reload and a flag toggle also skip one the DR run-profile parks, and gate one an
-  operator started. A listener outside its schedule window is gated, because the scheduler binds it
-  when the window opens. A listener left unbound meets the same gates when it is started. **One
+  operator started. An `auto_start` listener outside its schedule window is gated, because the
+  scheduler binds it when the window opens. An operator start of an `auto_start = false` listener
+  meets the same gates. A `deployed = false` listener cannot be started (the start raises
+  `NotDeployedError`); the reload that deploys it meets the gates if the engine would then bind
+  it, and otherwise its first start does. **One
   exposed listener the engine would bind refuses the whole config at build check**, where engine
   start isolates only that listener. While it stands, a reload, dry-run reload, promote, connection
   edit, connection-flag toggle, DR activation and a cluster follower's convergence reload are all
