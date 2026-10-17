@@ -2771,14 +2771,15 @@ A confirm turns TOTP on only while the row still holds the staged secret the con
 and TOTP is still off (BACKLOG #2224, #3025): the enable is a compare-and-set on the stored
 `totp_secret` cell the code was checked against. If a reset clears the secret during the confirm,
 another confirm turns TOTP on first, or a second enrolment start re-stages a different secret
-inside the same window, the confirm turns nothing on and returns no recovery codes. The compare is
-on the stored ciphertext, so at least a store-key rotation that re-encrypts the column inside the
-window refuses too, and reads as `secret_replaced` below although no second enrolment started; a
-retry confirms. It ends the
-session it just rotated and answers as a lost session: `401` on `POST /me/mfa/confirm`, and the
-sign-in page in the web console. It is audited `auth.mfa_enroll_refused`. Its `reason` is
-`account_gone`, `already_enabled`, `secret_cleared`, `secret_replaced` or `write_lost`, read from
-the row after the refusal, so it points an operator at the likely cause rather than proving it.
+inside the same window, the confirm turns nothing on and returns no recovery codes. The refused
+confirm ends the session it just rotated and answers as a lost session: `401` on
+`POST /me/mfa/confirm`, and the sign-in page in the web console. It is audited
+`auth.mfa_enroll_refused`. The `reason` values it records include `account_gone`, `already_enabled`,
+`secret_cleared`, `secret_replaced` and `write_lost`, each read from the row after the refusal,
+so it points an operator at the likely cause rather than proving it. The compare is on the stored
+ciphertext, so at least a store-key rotation that re-encrypts the column inside the window refuses
+too, and reads as `secret_replaced` although no second enrolment started; signing in again and
+confirming with a later code succeeds.
 `write_lost` means the row still held the verified secret with TOTP off, so the enable lost to
 some other concurrent write, and a retry confirms. With
 `[security].require_mfa` on — **the default since BACKLOG #187 (secure-by-default, including the

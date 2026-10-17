@@ -5815,6 +5815,7 @@ class AuthService:
                     old_username=existing.username,
                     new_username=principal.username,
                     held=by_name,
+                    from_plan=False,
                     client=client,
                 )
             # BACKLOG #1139. AN ABSENT DIRECTORY ATTRIBUTE IS NOT AN INSTRUCTION TO ERASE.
@@ -6778,16 +6779,14 @@ class AuthService:
         old_username: str,
         new_username: str,
         held: UserRecord | None,
+        from_plan: bool,
         client: str | None = None,
-        from_plan: bool = False,
     ) -> None:
         """Copy a directory-reported rename down onto a row's cached ``username`` (BACKLOG #1532).
 
-        ``from_plan`` is True for the reconciler, whose ``new_username`` comes from a probe made
-        earlier in the pass and can be older than a rename a sign-in wrote since. Only then does a
-        row that holds neither name mean the request is stale (BACKLOG #3069). The login caller's
-        name comes from the bind it just made, so it is the newest the engine has, and it still
-        writes over whatever the row holds.
+        ``from_plan`` is required, so each caller states its policy (BACKLOG #3069; the reasoning
+        is at the skip below, and only there). True for the reconciler: a row that holds neither
+        the plan's old name nor its new one is skipped. False for the login, which writes.
 
         **ONE implementation for two callers, deliberately.** The login path
         (:meth:`_upsert_ad_user`) and the ADR 0079 reconciler pass both reach a renamed account and
@@ -6868,9 +6867,7 @@ class AuthService:
             # ``old_username`` (BACKLOG #2291). The reconciler captured that at plan time, and a
             # sign-in may have renamed the row since, so it can name an account that no longer
             # exists. The audit actor and the warning both use the name an operator would find.
-            # Since BACKLOG #3069 the reconciler's stale plan is skipped before any refusal, so on
-            # that path the two names agree. On the login path they can still differ, when a pass
-            # wrote between the sign-in's read and this one.
+            # On the reconciler's path the two names now agree (BACKLOG #3069, the skip below).
             await self._audit(
                 "auth.ad_username_refresh_conflict",
                 actor=holds,
@@ -6954,28 +6951,34 @@ class AuthService:
             )
             return
         if from_plan and before.username != old_username:
-            # BACKLOG #3069. The row holds neither the plan's old name nor its new one, so another
-            # writer renamed it after the reconciler planned, most likely a sign-in carrying a
-            # newer directory name. The compare-and-set below compares on the name just read, so it
-            # would match and write the plan's older name over the newer one. Skip instead, and let
-            # the next pass plan from a fresh read. Nothing was attempted, so no audit row, no
-            # conflict and no notice; INFO says why.
+            # BACKLOG #3069. THE ONE STATEMENT OF THIS RULE. The row holds neither the plan's old
+            # name (read when the pass listed its accounts) nor its new one, so another writer,
+            # most likely a sign-in, renamed it since. The compare-and-set below compares on the
+            # name just read, so it would match and could write an older name over a newer one.
+            # Skip, and let the next pass plan from a fresh read. Nothing was attempted, so no audit
+            # row, no conflict and no notice; INFO says why.
             #
-            # RECONCILER ONLY. A sign-in's name comes from the bind it just made. Skipping it here
-            # would keep a name the reconciler wrote from an older probe, the inverse of the point.
-            #
-            # NOT A VERSION CHECK. Name equality cannot see a directory that renamed the account
-            # away and back (jdoe -> jdoe-married -> jdoe): the row still holds the plan's old name,
-            # so the plan writes. The next pass's probe copies the directory's name down again.
+            # A HEURISTIC ON NAMES, NOT AN ORDERING OF DIRECTORY READS. Nothing here knows which
+            # directory read is newer, so at least these residuals stand:
+            #   - the sign-in may have written before this pass's probe, so the skipped plan can
+            #     hold the NEWER name; the label then lags until the next pass or sign-in;
+            #   - a directory that renamed the account away and back (jdoe -> jdoe-married -> jdoe)
+            #     leaves the row on the plan's old name, so the plan writes and notifies;
+            #   - the login (``from_plan`` False) writes whatever it carries, so a sign-in whose
+            #     bind ran before a pass that probed and wrote a newer name can still write the
+            #     older one. It is exempt because its name came from a bind made moments before,
+            #     and skipping it would as often keep an older name a pass wrote.
+            # Each converges on the next sign-in or pass, which copies the directory's name down.
             #
             # AFTER the already-applied check, because a row that holds the new name is the no-op
             # above, not a skip. BEFORE the ``held`` pre-check, because a stale plan is not a
             # collision: filing one would send an operator looking for a holder this caller has no
             # current claim against.
             _log.info(
-                "AD account %s was renamed by another writer after this reconciler pass planned "
-                "its rename to %s (now %s), so the stale plan wrote nothing and sends no audit "
-                "row or notice (BACKLOG #3069)",
+                "AD account %s was renamed by another writer after this reconciler pass read it, "
+                "so its planned rename to %s was skipped (the row now holds %s); nothing was "
+                "written, audited or sent, and the next pass plans from a fresh read "
+                "(BACKLOG #3069)",
                 user_id,
                 scrub_log_argument(new_username),
                 scrub_log_argument(before.username),
