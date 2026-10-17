@@ -346,6 +346,19 @@ def select_candidates(
     return ordered[: max(budget, 0)]
 
 
+def _unkeyed_strikes(probes: list[Probe], prior_strikes: Mapping[str, int]) -> dict[str, int]:
+    """The strikes of a pass that judged nothing (BACKLOG #3170 item 3).
+
+    An UNKEYED row was judged without the directory, so an outage or a pass of referrals only still
+    strikes it, as any other pass does. Only the strike: its outcome is not recorded, so the hold's
+    record, and so its carry-over, stays as it was, and an aborted pass revokes nothing."""
+    return {
+        p.user_id: prior_strikes.get(p.user_id, 0) + 1
+        for p in probes
+        if p.outcome is ProbeOutcome.UNKEYED
+    }
+
+
 def plan_pass(
     probes: Iterable[Probe],
     *,
@@ -380,14 +393,6 @@ def plan_pass(
     # BACKLOG #2434. The caller reads a row it may not ask about as UNKEYED, so that outcome is
     # the one mark of "never asked": it says nothing about whether the directory answered.
     asked = sum(1 for p in probes if p.outcome is not ProbeOutcome.UNKEYED)
-    # BACKLOG #3170 item 3. An UNKEYED row was judged without the directory, so a pass that learned
-    # nothing from the directory still strikes it, as any other pass does. Only the strike: its
-    # outcome is not recorded here, so the hold's record, and so its carry-over, stays as it was.
-    unkeyed_strikes = {
-        p.user_id: prior_strikes.get(p.user_id, 0) + 1
-        for p in probes
-        if p.outcome is ProbeOutcome.UNKEYED
-    }
 
     if referred and len(unavailable) + len(referred) == asked:
         # BACKLOG #2538. Nothing the pass asked was answered, as on an outage, so it judges nothing
@@ -395,7 +400,7 @@ def plan_pass(
         # failures is not read as a plain outage, which pages nobody. A user search base in another
         # domain of the forest refers every probe, and this is the shape it takes.
         return ReconcilePlan(
-            strikes=unkeyed_strikes,
+            strikes=_unkeyed_strikes(probes, prior_strikes),
             probed=len(probes),
             asked=asked,
             unavailable=len(unavailable),
@@ -411,7 +416,7 @@ def plan_pass(
         # zero-revocation pass. The hold is not judged on a pass that learned nothing, so its state
         # carries over.
         return ReconcilePlan(
-            strikes=unkeyed_strikes,
+            strikes=_unkeyed_strikes(probes, prior_strikes),
             probed=len(probes),
             asked=asked,
             unavailable=len(unavailable),
