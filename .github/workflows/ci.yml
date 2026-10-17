@@ -3961,7 +3961,9 @@ jobs:
   # day); the nightly keeps both Server SKUs covered daily and workflow_dispatch
   # re-validates a specific merge on demand.
   windows-service-smoke:
-    name: windows service smoke (${{ matrix.os }}, py${{ matrix.python-version }})
+    # One expression for the os slot, so the check-list name keeps the shape ci-gate's CHECK_NAMES
+    # table holds, "windows service smoke (*, py*)". An account leg reads "(windows-2025, localsystem, py3.14)".
+    name: windows service smoke (${{ matrix.account && format('{0}, {1}', matrix.os, matrix.account) || matrix.os }}, py${{ matrix.python-version }})
     # This repo only: it spins up 2x-billed hosted Windows runners on BOTH Server SKUs, which is free
     # here (public) and billed to the owner of a fork. Nightly schedule + manual dispatch only. ci-gate
     # `needs` this job, but a `skipped` leg counts as a pass there, so gating it off a fork cannot wedge
@@ -3974,9 +3976,20 @@ jobs:
         # Windows Server 2022 + 2025 on the supported deploy Python (3.14), so the real NSSM
         # install->serve->MLLP path is validated on the version we ship, on each Server SKU. This job
         # is push/dispatch-only, so the Windows minutes cost no PR time.
+        #
+        # vault BACKLOG #2702: account legs install the service under an account other than its own
+        # virtual account, which the installer gives SID type none. Each must start, take a message
+        # and run with exactly the privilege list the installer writes. One Server SKU each.
+        # - localsystem (-AllowLocalSystem) is listed. Its first run is in the merge queue.
+        # - localuser (-ServiceAccount, a local user created on the runner) is WIRED BUT NOT LISTED,
+        #   for the reason docs/SERVICE.md "Restrict the service token" gives (the store's
+        #   _hardening_refusal in messagefoundry/store/store.py). Add this row once that changes:
+        #     - { os: windows-2025, python-version: "3.14", account: localuser }
+        # - A gMSA gets no leg. docs/SERVICE.md "Restrict the service token" says why.
         include:
           - { os: windows-2022, python-version: "3.14" }
           - { os: windows-2025, python-version: "3.14" }
+          - { os: windows-2025, python-version: "3.14", account: localsystem }
     defaults:
       run:
         shell: pwsh
@@ -3991,6 +4004,12 @@ jobs:
     env:
       SMOKE_NSSM_DIR: C:\Program Files\MessageFoundry\nssm
       SMOKE_NSSM_CACHED_EXE: C:\mefor-ci-cache\nssm-2.24-win64\nssm.exe
+      # vault BACKLOG #2702: virtual (the installer's default), localsystem or localuser. Steps
+      # that hold for one account only name it in their `if:`.
+      SMOKE_ACCOUNT: ${{ matrix.account || 'virtual' }}
+      # The local user the localuser leg creates. Its password is drawn at run time and never
+      # leaves the step outputs, masked.
+      SMOKE_LOCAL_USER: mefor-svc
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -4091,6 +4110,28 @@ jobs:
           "::add-mask::$drawn"
           "password=$drawn" >> $env:GITHUB_OUTPUT
 
+      # vault BACKLOG #2702, the localuser leg: a local account for the service to run as, made for
+      # this run on a runner that is thrown away after it. The password is drawn here and masked
+      # before anything can echo it, the way the rig password above is. The server's complexity
+      # policy wants three of upper case, lower case, digits and symbols, and hex alone is two, so
+      # the drawn hex is wrapped in characters of the other two kinds. The installer grants the
+      # account "Log on as a service" itself; this step creates it and nothing else.
+      - name: Create the local service account (localuser leg)
+        id: svc
+        if: env.SMOKE_ACCOUNT == 'localuser'
+        run: |
+          $drawn = (& python -c "import secrets; print('Mf-' + secrets.token_hex(24) + '-Q9')").Trim()
+          if (-not $drawn) { throw "could not draw the local service account's password" }
+          "::add-mask::$drawn"
+          # New-LocalUser is a Windows PowerShell module, so it runs there. The password reaches it
+          # through this process's environment, never a command line.
+          $env:SMOKE_LOCAL_USER_PASSWORD = $drawn
+          powershell -NoProfile -NonInteractive -Command '$ErrorActionPreference = "Stop"; $s = ConvertTo-SecureString $env:SMOKE_LOCAL_USER_PASSWORD -AsPlainText -Force; New-LocalUser -Name $env:SMOKE_LOCAL_USER -Password $s -PasswordNeverExpires -AccountNeverExpires -Description "windows-service-smoke run-as account" | Out-Null'
+          $made = $LASTEXITCODE
+          Remove-Item Env:SMOKE_LOCAL_USER_PASSWORD
+          if ($made -ne 0) { throw "could not create the local account $env:SMOKE_LOCAL_USER (exit $made)" }
+          "password=$drawn" >> $env:GITHUB_OUTPUT
+
       # Run the install/uninstall scripts under Windows PowerShell 5.1 (shell: powershell) to
       # match what the console launches on an end-user machine — catches 5.1-only behaviour
       # (e.g. native-command stderr aborting under ErrorActionPreference=Stop). On a cache hit the
@@ -4106,7 +4147,24 @@ jobs:
           NSSM_CACHE_HIT: ${{ github.event_name == 'merge_group' && steps.nssm-cache.outputs.cache-hit || 'false' }}
           NSSM_PIN: ${{ steps.nssm-pin.outputs.pin }}
           MEFOR_RIG_ADMIN_PASSWORD: ${{ steps.rig.outputs.password }}
+          SMOKE_LOCAL_USER_PASSWORD: ${{ steps.svc.outputs.password }}
         run: |
+          # vault BACKLOG #2702: the account this leg runs the service as. $account is what the
+          # installer is handed; $grantee is the name the grants below write for it, SYSTEM's SID
+          # for LocalSystem. The installer itself writes no named grant for LocalSystem.
+          $account = @{}
+          $grantee = "NT SERVICE\MessageFoundry"
+          if ($env:SMOKE_ACCOUNT -eq "localsystem") {
+            $account['AllowLocalSystem'] = $true
+            $grantee = "*S-1-5-18"
+          } elseif ($env:SMOKE_ACCOUNT -eq "localuser") {
+            $grantee = "$env:COMPUTERNAME\$env:SMOKE_LOCAL_USER"
+            $account['ServiceAccount'] = $grantee
+            $account['ServiceAccountPassword'] = ConvertTo-SecureString $env:SMOKE_LOCAL_USER_PASSWORD -AsPlainText -Force
+          } elseif ($env:SMOKE_ACCOUNT -ne "virtual") {
+            throw "unknown SMOKE_ACCOUNT '$env:SMOKE_ACCOUNT'"
+          }
+          Remove-Item Env:SMOKE_LOCAL_USER_PASSWORD -ErrorAction SilentlyContinue
           # The checkout's editable launcher, for `gen-key` below. The service does not run it.
           $exe = (Get-Command messagefoundry).Source
           $cached = @{}
@@ -4128,12 +4186,13 @@ jobs:
           # install path rather than the MEFOR_ALLOW_INSECURE_CONFIG_SOURCE dev escape. It also locks
           # environments\, the value file's folder, which `serve` now refuses to read when Users can
           # write it (vault BACKLOG #2626). -Config is named because it no longer has a default.
-          # #224: NO -ServiceAccount and NO -AllowLocalSystem, so this install exercises the NEW DEFAULT -
+          # #224: on the virtual-account legs, NO -ServiceAccount and NO -AllowLocalSystem, so this install exercises the NEW DEFAULT -
           # the least-privilege virtual account NT SERVICE\MessageFoundry (no password). This leg is the
           # gate for that flip: it proves the virtual account is granted config-read (RX, via the
           # -LockConfigDir path that now runs AFTER ObjectName so the per-service SID resolves) + data-dir
-          # read/write, gets SeServiceLogonRight, and actually starts and serves /health + MLLP. Pass
-          # -AllowLocalSystem here if a run-as-LocalSystem smoke is ever needed instead.
+          # read/write, gets SeServiceLogonRight, and actually starts and serves /health + MLLP. The
+          # account legs (vault BACKLOG #2702) add -AllowLocalSystem or -ServiceAccount through
+          # @account, set at the top of this script.
           # Vault BACKLOG #2626 step 2: `serve` as the service refuses to start with no
           # --service-config. This rig sets everything through the service's environment, so the
           # file is empty. It sits in a folder of its own outside the checkout, so -LockConfigDir
@@ -4145,7 +4204,7 @@ jobs:
           $serviceConfig = "C:\ProgramData\MessageFoundry-settings\messagefoundry.toml"
           New-Item -ItemType Directory -Force -Path (Split-Path -Parent $serviceConfig) | Out-Null
           [System.IO.File]::WriteAllText($serviceConfig, "# windows-service-smoke: set through the service's environment.`n")
-          .\scripts\service\install-service.ps1 -NssmDir $env:SMOKE_NSSM_DIR -Config samples\config -ProjectRoot $PWD -ServiceConfig $serviceConfig -LogLevel INFO -Environment prod -LockConfigDir @cached
+          .\scripts\service\install-service.ps1 -NssmDir $env:SMOKE_NSSM_DIR -Config samples\config -ProjectRoot $PWD -ServiceConfig $serviceConfig -LogLevel INFO -Environment prod -LockConfigDir @cached @account
           # The installer only warns when it cannot lock a folder, and `serve` would then refuse the
           # settings file at start. So run the check `serve` runs on the file and its folder, and
           # fail here, by name, rather than as a service that never comes up.
@@ -4156,10 +4215,10 @@ jobs:
           # grant to Users there no longer counts. So they get the grant docs/SERVICE.md tells an operator
           # to add for any directory a File connection writes. The installer grants the data
           # directory itself; the "Verify the service token" step below shows a directory with
-          # no such grant is refused.
+          # no such grant is refused. The account legs write the same grant for their own account.
           foreach ($d in "in", "dev-inbox", "out") {
             New-Item -ItemType Directory -Force -Path $d | Out-Null
-            & icacls $d /grant "NT SERVICE\MessageFoundry:(OI)(CI)M" | Out-Null
+            & icacls $d /grant "${grantee}:(OI)(CI)M" | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "could not grant the service account on '$d' (icacls exit $LASTEXITCODE)" }
           }
           # The shipped samples graph includes a mutual-TLS WS-* SOAP feed (IB_IMMUNIZATION_VXU) whose
@@ -4210,8 +4269,11 @@ jobs:
           # local user can read, so the key reaches it the way docs/SERVICE.md says first: a DPAPI
           # key file, made from the same key while it is in this shell, and readable by the
           # service's virtual account. The service is registered above, so that account exists.
+          # An account leg grants its own account; LocalSystem needs none, since the file always
+          # names SYSTEM.
           $storeKeyFile = "C:\ProgramData\MessageFoundry\store.key.dpapi"
-          cmd /c "python -m messagefoundry protect-key --out ""$storeKeyFile"" --grant-account ""NT SERVICE\MessageFoundry"" 2>&1"
+          $keyGrant = if ($env:SMOKE_ACCOUNT -eq "localsystem") { "" } else { " --grant-account ""$grantee""" }
+          cmd /c "python -m messagefoundry protect-key --out ""$storeKeyFile""$keyGrant 2>&1"
           $protected = $LASTEXITCODE
           Remove-Item Env:MEFOR_STORE_ENCRYPTION_KEY
           if ($provisioned -ne 0) { throw "could not provision the rig Administrator (exit $provisioned)" }
@@ -4549,7 +4611,9 @@ jobs:
       #    running afterwards, so the stop step below still has a running service to stop.
       #
       # NOT PROVEN HERE: an explicit -ServiceAccount, a gMSA and -AllowLocalSystem. The installer
-      # does not set the restricted SID for those, and no leg installs under them. Nor is a real
+      # does not set the restricted SID for those, so this step runs on the virtual-account legs
+      # only; the next step reads the account legs (localsystem; localuser is wired, not listed), and
+      # no leg runs a gMSA. Nor is a real
       # network share: the probe's credential is made up, so it runs the logon and the
       # impersonation and never the SMB hop, which the far end checks and this token does not.
       #
@@ -4571,6 +4635,7 @@ jobs:
       # probe's report is checked for the account as well, so a set that did change it goes red.
       # The name is quoted: unquoted, YAML reads " #2702)" as a comment and cuts the name there.
       - name: "Verify the service token is restricted (vault BACKLOG #2702)"
+        if: env.SMOKE_ACCOUNT == 'virtual'
         run: |
           # Two commands below exit non-zero on a run that worked, and say so where they are
           # called. Set here so that never depends on the runner's default for this preference.
@@ -4716,6 +4781,81 @@ jobs:
           & python $probe check-inside --report $report --service-sid $serviceSid --privilege $privilege
           Assert-Native "the check on what the service token can do"
 
+      # vault BACKLOG #2702, the account legs. The installer gives LocalSystem and a local user the
+      # same one-entry RequiredPrivileges list as the virtual account, and SID type none, with a
+      # warning. The health and message steps above show the engine still starts and takes a
+      # message under that list. This step shows the list took: it reads the registration, then the
+      # token of the service's root process and of the engine's processes under it, through service_token_probe.py
+      # check-privileges, whose control is this shell. It does not put the probe in the engine's
+      # place: with SID type none there is no write restriction for it to show.
+      #
+      # IF THE LOCALSYSTEM LEG CANNOT START OR SERVE with SeChangeNotifyPrivilege alone, that is a
+      # finding about the privilege list and not a flake. Do not widen the list to make it pass;
+      # read the service logs and report it.
+      - name: "Verify the service token under another account (vault BACKLOG #2702)"
+        if: env.SMOKE_ACCOUNT != 'virtual'
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $privilege = "SeChangeNotifyPrivilege"
+          $probe = Join-Path $PWD "scripts\ci\service_token_probe.py"
+          function Assert-Native([string]$What) {
+            if ($LASTEXITCODE -ne 0) { throw "$What failed (exit $LASTEXITCODE)" }
+          }
+
+          # --- 1. the registration -----------------------------------------------------------------
+          $sidType = (& sc.exe qsidtype MessageFoundry | Out-String); Assert-Native "sc.exe qsidtype MessageFoundry"
+          $privs = (& sc.exe qprivs MessageFoundry | Out-String); Assert-Native "sc.exe qprivs MessageFoundry"
+          "===== sc.exe qsidtype MessageFoundry ====="; $sidType
+          "===== sc.exe qprivs MessageFoundry ====="; $privs
+          $none = '(?m)SID_TYPE\s*:\s*NONE\s*$'
+          # CONTROL: the other two values must NOT match, or the pattern matches everything.
+          foreach ($not in "SERVICE_SID_TYPE:  RESTRICTED", "SERVICE_SID_TYPE:  UNRESTRICTED") {
+            if ($not -match $none) { throw "CONTROL FAILED: '$not' reads as NONE, so the pattern proves nothing" }
+          }
+          if ($sidType -notmatch $none) { throw "the service SID type is not NONE, which is what the installer writes for this account" }
+          $listed = @([regex]::Matches($privs, 'Se[A-Za-z]+Privilege') | ForEach-Object { $_.Value } | Sort-Object -Unique)
+          if (($listed -join ',') -ne $privilege) {
+            throw "the registration lists [$($listed -join ', ')], not exactly $privilege"
+          }
+
+          # --- 2. the running engine's token -------------------------------------------------------
+          # The SID of the account this leg asked for, so a service that runs as some other account
+          # under the same registration fails on the user.
+          if ($env:SMOKE_ACCOUNT -eq "localsystem") { $accountSid = "S-1-5-18" }
+          else {
+            $accountSid = ([Security.Principal.NTAccount]"$env:COMPUTERNAME\$env:SMOKE_LOCAL_USER").Translate(
+              [Security.Principal.SecurityIdentifier]).Value
+          }
+          $svc = Get-CimInstance Win32_Service -Filter "Name='MessageFoundry'"
+          if (-not $svc -or -not $svc.ProcessId) { throw "the service is not running, so there is no token to read" }
+          "the Service Control Manager runs MessageFoundry as $($svc.StartName); this leg expects $accountSid"
+          # Every process under the service's root, the walk the token step above makes: the venv's
+          # python.exe starts the interpreter that runs the engine as a child of its own.
+          $all = @(Get-CimInstance Win32_Process)
+          $tree = @($all | Where-Object { [int]$_.ProcessId -eq [int]$svc.ProcessId })
+          $frontier = $tree
+          while ($frontier.Count -gt 0) {
+            $frontier = @(foreach ($parent in $frontier) {
+              $all | Where-Object {
+                ([int]$_.ParentProcessId -eq [int]$parent.ProcessId) -and
+                ($_.CreationDate -ge $parent.CreationDate) -and
+                (@($tree | ForEach-Object { [int]$_.ProcessId }) -notcontains [int]$_.ProcessId)
+              }
+            })
+            $tree += $frontier
+          }
+          $tree | Format-Table ProcessId, ParentProcessId, Name -AutoSize | Out-String
+          # The same names the token step above reads, the launcher's included.
+          $procs = @($tree[0]) + @($tree | Select-Object -Skip 1 | Where-Object {
+            $_.Name -in @("messagefoundry.exe", "python.exe", "pythonw.exe")
+          })
+          if (-not ($procs | Where-Object { $_.Name -eq "python.exe" })) {
+            throw "no python.exe runs under the service, so the engine's own token was not read"
+          }
+          $pids = @($procs | ForEach-Object { "--pid"; "$($_.ProcessId)" })
+          & python $probe check-privileges --account-sid $accountSid --privilege $privilege --control-pid $PID @pids
+          Assert-Native "the token check on the running service"
+
       # BACKLOG #2747: THE STOP'S EXIT CODE IS NOT THIS STEP'S RESULT. This step used to be the stop
       # command alone, so that command's exit code decided it. In job 111525536301 (windows-2022,
       # 2026-10-04) it printed "Unexpected status SERVICE_RUNNING in response to STOP control" and
@@ -4832,14 +4972,17 @@ jobs:
       # `!cancelled()` rather than the default `success()`: both readings are wanted on every run, so
       # the start-first arm still runs when the provision-first arm or the service smoke went red.
       # Windows PowerShell 5.1, matching the install step above. timeout-minutes bounds a hung arm.
+      #
+      # The three arms run on the virtual-account legs only: each installs the default account
+      # itself, so on an account leg it would repeat what those legs already measure.
       - name: Store access, auth on -- provision first, then the service (ADR 0183 Wave 0)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.SMOKE_ACCOUNT == 'virtual' }}
         timeout-minutes: 15
         shell: powershell
         run: .\scripts\service\measure-store-access.ps1 -Order ProvisionFirst -NssmDir $env:SMOKE_NSSM_DIR -DataDir C:\ProgramData\MessageFoundry-w0-provision-first
 
       - name: Store access, auth on -- the service first, then the operator (ADR 0183 Wave 0)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.SMOKE_ACCOUNT == 'virtual' }}
         timeout-minutes: 15
         shell: powershell
         run: .\scripts\service\measure-store-access.ps1 -Order StartFirst -NssmDir $env:SMOKE_NSSM_DIR -DataDir C:\ProgramData\MessageFoundry-w0-start-first
@@ -4854,13 +4997,13 @@ jobs:
       # nobody named -- the retired default coming back -- and reds the arm. It reds the way the two
       # arms above do: an ::error annotation per failure, then RED lines and a throw.
       - name: Store access, auth on -- start first, then provision, end to end (ADR 0183 Wave 2)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.SMOKE_ACCOUNT == 'virtual' }}
         timeout-minutes: 15
         shell: powershell
         run: .\scripts\service\measure-store-access.ps1 -Order StartFirstEndToEnd -NssmDir $env:SMOKE_NSSM_DIR -DataDir C:\ProgramData\MessageFoundry-w2-start-first-e2e
 
       - name: Upload store-access logs (ADR 0183 Wave 0)
-        if: always()
+        if: ${{ always() && env.SMOKE_ACCOUNT == 'virtual' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: store-access-logs-${{ matrix.os }}-py${{ matrix.python-version }}
@@ -4874,7 +5017,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: service-logs-${{ matrix.os }}-py${{ matrix.python-version }}
+          # The account is in the name: two legs share a Server SKU, and an artifact name must be unique.
+          name: service-logs-${{ matrix.os }}-py${{ matrix.python-version }}-${{ env.SMOKE_ACCOUNT }}
           path: C:\ProgramData\MessageFoundry\logs\
           if-no-files-found: ignore
 
