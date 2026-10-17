@@ -925,7 +925,7 @@ class MLLPDestination(DestinationConnector):
         return f"{name}: {' '.join(extras)}" if extras else name
 
     def check_frame(self, payload: str, *, rewrite: bool = True) -> None:
-        """ADR 0205 rule 1 on ``payload`` without sending it: raise the permanent
+        """ADR 0205 rule 1 and ADR 0209 on ``payload`` without sending it: raise the permanent
         :class:`NegativeAckError` :meth:`send` would. With ``rewrite`` it checks the payload as
         :meth:`send` frames it, after the same delimiter rewrites, which drop a frame byte at either
         end; a payload those rewrites refuse raises their permanent ``reencode`` refusal, as
