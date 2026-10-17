@@ -9456,12 +9456,11 @@ async def _directory_reconciler(
             _log.exception("directory reconcile: pass failed; will retry next interval")
 
 
-#: The source label of the referral's own ``ad_reconcile_aborted`` instance (BACKLOG #2538). Apart
-#: from the breaker's ``directory-reconciler``, so each has its own instance, throttle and detail,
-#: and an alert rule can match one source without the other.
+#: The source label of the referral's own ``ad_reconcile_aborted`` instance (BACKLOG #2538), apart
+#: from the breaker's ``directory-reconciler``. :func:`_alert_reconcile_plan` says why.
 _REFERRAL_ALERT_SOURCE = "directory-reconciler-referral"
 #: The source label of the probe fault's own ``ad_reconcile_aborted`` instance (BACKLOG #3100), apart
-#: from the breaker's and the referral's for the same reasons.
+#: from the breaker's and the referral's for the same reason.
 _PROBE_FAULT_ALERT_SOURCE = "directory-reconciler-probe-fault"
 
 
@@ -9480,9 +9479,11 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     with a referred probe is ``auth.ad_reconcile_referred`` and becomes one ``ad_reconcile_aborted``
     alert with reason ``directory_referral``, under its own source label
     (:data:`_REFERRAL_ALERT_SOURCE`), beside whatever else the pass raised. The type is reused, not
-    new. Its own source keeps it apart from the breaker's instance: acknowledging or suspending a
-    standing referral must not silence a later breaker trip, and each keeps its own detail. An
-    ``[alerts]`` rule keyed on the event type alone still matches both.
+    new. **The one statement of why each condition has its own source** (BACKLOG #3100 item 13):
+    its own source gives it its own instance, throttle and detail, so acknowledging or suspending a
+    standing referral or fault must not silence a later breaker trip, and one detail cannot hide
+    another. An ``[alerts]`` rule keyed on the event type alone still matches all of them; a rule
+    whose source pattern matches one label and not the others keeps them apart.
 
     A probe fault (BACKLOG #3100) is not an outage either: the engine could not read what the
     directory returned for an account, and that account is left unrevoked while it lasts. Any pass
@@ -9498,7 +9499,7 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     another reason, such as a store fault ending one account's sessions, has already audited the
     revocations it applied before that point; those rows stand, and no alert is raised for them.
 
-    Each standing alert also gets its inverse, which pages nobody and resolves the open instance
+    Each standing alert but the probe fault's also gets its inverse, which pages nobody and resolves the open instance
     (BACKLOG #2136): ``ad_reconcile_breaker_cleared`` and ``ad_reconcile_hold_released``, and
     ``ad_reconcile_breaker_cleared`` under the referral's source for the referral's instance. The
     auth service decides when a pass is evidence of a clear (``plan.breaker_clear``,

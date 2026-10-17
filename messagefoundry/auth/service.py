@@ -420,6 +420,20 @@ _BreakerStanding = Literal["fresh", "tripped", "forfeit"]
 _ReferralStanding = Literal["fresh", "referred", "forfeit"]
 
 
+def _advance_watched[S: (_BreakerStanding, _ReferralStanding)](
+    current: S, event: S, opened: S
+) -> S:
+    """The one state machine behind the breaker's and the referral's standing (BACKLOG #2136,
+    #2538). ``opened`` moves a fresh process to ``opened``: a pass here watched the alert open.
+    ``"forfeit"`` moves any standing to ``"forfeit"``, which is never left. Anything else is no move.
+    """
+    if event == "forfeit":
+        return "forfeit"
+    if event == opened and current == "fresh":
+        return opened
+    return current
+
+
 # Bounds on the per-session re-proof failure counts (BACKLOG #1138). A count is NEVER evicted while
 # its entry is younger than the absolute session lifetime, because evicting it would hand that session
 # a fresh budget. When the map is full, entries older than that lifetime go first; if it is still
@@ -2608,7 +2622,7 @@ class AuthService:
         #: (BACKLOG #2136). `_mark_reconcile_clears` reports no breaker clear while one is signed in.
         self._reconcile_unconfirmed: set[str] = set()
         #: Whether THIS process may resolve the durable ``ad_reconcile_aborted`` instance (BACKLOG
-        #: #2136), on the rule `_mark_reconcile_clears` states for both alerts: a process clears
+        #: #2136), on the rule `_mark_reconcile_clears` states for every alert: a process clears
         #: only what it watched open. ``"fresh"``: no pass here has tripped, so it resolves no
         #: trip, whatever an earlier run left open. ``"tripped"``: a pass here tripped, so a clear
         #: it then sees is of a trip it watched. ``"forfeit"``: an account signed in at a trip left
@@ -6519,11 +6533,13 @@ class AuthService:
         # BACKLOG #2434. An id-less row is never probed, so no pass can read it PRESENT. Marked, it
         # would stay unconfirmed until its UNKEYED revocation forfeits the clear, every time.
         keyed = {uid for uid, user in users.items() if _holds_directory_key(user)}
+        read_present = {
+            uid
+            for uid, outcome in plan.outcomes.items()
+            if outcome is reconcile.ProbeOutcome.PRESENT
+        }
         if plan.aborted is None:
-            present = reconcile.ProbeOutcome.PRESENT
-            self._reconcile_unconfirmed.difference_update(
-                uid for uid, outcome in plan.outcomes.items() if outcome is present
-            )
+            self._reconcile_unconfirmed -= read_present
         elif not plan.judged_nothing:
             self._reconcile_unconfirmed = set(keyed)
             self._advance_breaker_standing("tripped")
@@ -6534,10 +6550,7 @@ class AuthService:
             self._reconcile_referred = set(keyed)
             self._advance_referral_standing("referred")
         else:
-            present = reconcile.ProbeOutcome.PRESENT
-            self._reconcile_referred.difference_update(
-                uid for uid, outcome in plan.outcomes.items() if outcome is present
-            )
+            self._reconcile_referred -= read_present
         referral = next((p for p in probes if p.outcome is reconcile.ProbeOutcome.REFERRED), None)
         if plan.aborted is not None:
             if not plan.directory_referral and not plan.probe_fault:
@@ -6662,7 +6675,9 @@ class AuthService:
           pass did not just revoke. A probe that could not reach the directory leaves none.
         * A pass in which any probe was referred marks none of the three (BACKLOG #2538). A
           referred account has no answer from this pass, and an older one on record may predate
-          the referral.
+          the referral. So a standing referral keeps the breaker's and the hold's instances open
+          after their own causes are gone: a missed clear, never a false one (BACKLOG #3100 item
+          7). A pass with a probe fault marks none either, for the same reason. Unlike a referral, a fault is not carried to later passes, so a later pass whose sample misses the faulting account can still mark one (left open under BACKLOG #3100).
         * The referral's own instance is clear when, on top of the first test, every account signed
           in at the last referral has since read PRESENT on a pass with no referral
           (``_reconcile_referred``), and ``_reconcile_referral_standing`` is ``"referred"``: a
@@ -6709,7 +6724,7 @@ class AuthService:
         **The usual cost is a missed clear, with one reconciler on the store.** An account that
         never answers keeps every instance open while it is signed in. So does a hold, for the
         breaker's instance. So does a reconciler that is switched off, and so does every cluster
-        or multi-shard engine. A fresh process keeps both instances an earlier run left open, and
+        or multi-shard engine. A fresh process keeps every instance an earlier run left open, and
         a forfeited one keeps the instance it forfeited (`_forfeit_clears_on_attrition` says
         when). An operator resolves those by hand. **At least this case can still clear
         falsely.** Any engine that declares neither ``[cluster]`` nor more than one shard clears
@@ -6813,11 +6828,9 @@ class AuthService:
         aloud because the in-process breaker message still clears on the next pass that is not
         aborted, while the durable instance stays open for an operator.
         """
-        current = self._reconcile_breaker_standing
-        if event == "tripped" and current == "fresh":
-            self._reconcile_breaker_standing = "tripped"
-        elif event == "forfeit" and current != "forfeit":
-            self._reconcile_breaker_standing = "forfeit"
+        before = self._reconcile_breaker_standing
+        self._reconcile_breaker_standing = _advance_watched(before, event, "tripped")
+        if before != "forfeit" and self._reconcile_breaker_standing == "forfeit":
             _log.warning(
                 "directory reconcile: an account signed in at the last breaker trip left before a "
                 "pass read it clean, so this process will not resolve ad_reconcile_aborted itself "
@@ -6834,11 +6847,9 @@ class AuthService:
         :meth:`_forfeit_clears_on_attrition`. ``"forfeit"`` is never left. The latched referral
         message is then kept until a restart too, because the test that releases it is the clear's.
         """
-        current = self._reconcile_referral_standing
-        if event == "referred" and current == "fresh":
-            self._reconcile_referral_standing = "referred"
-        elif event == "forfeit" and current != "forfeit":
-            self._reconcile_referral_standing = "forfeit"
+        before = self._reconcile_referral_standing
+        self._reconcile_referral_standing = _advance_watched(before, event, "referred")
+        if before != "forfeit" and self._reconcile_referral_standing == "forfeit":
             _log.warning(
                 "directory reconcile: an account signed in at the last LDAP referral left before a "
                 "pass read it without one, so this process will not resolve the referral's "
@@ -7344,10 +7355,8 @@ class AuthService:
         ``_mark_reconcile_clears`` releases the latched message on the referral clear's test.
 
         **Its own latch and its own alert instance**, apart from the breaker's: the lifespan task
-        raises it as ``ad_reconcile_aborted`` under its own source label. A shared instance would
-        let an operator who acknowledges or suspends a standing referral also silence a later
-        breaker trip, and would let one detail hide the other. An ``[alerts]`` rule keyed on the
-        event type alone still matches both; only a rule naming the exact source keeps them apart.
+        raises it as ``ad_reconcile_aborted`` under its own source label, for the reason
+        ``api/app.py::_alert_reconcile_plan`` states.
 
         The message is the alert's detail, so it names the settings to change FIRST: the store
         keeps only the first 200 characters of an alert instance's reason. It carries counts and
@@ -7411,10 +7420,9 @@ class AuthService:
         bound on that gap: every pass with a fault latches the message, logs it at ERROR, and
         writes an ``auth.ad_reconcile_faulted`` row, and the lifespan task raises it as
         ``ad_reconcile_aborted`` with reason ``probe_fault`` under its own source label. Its own
-        audit action and source for the referral's reason: an ``auth.ad_reconcile_skipped`` row
-        reads as benign, and a shared alert instance would let an acknowledged fault silence a
-        later breaker trip or referral. **Nothing resolves that instance automatically**: an
-        operator resolves it once the fault is gone.
+        audit action, because an ``auth.ad_reconcile_skipped`` row reads as benign, and its own
+        source for the reason ``api/app.py::_alert_reconcile_plan`` states. **Nothing resolves
+        that instance automatically**: an operator resolves it once the fault is gone.
 
         Called on every pass that judged something, and on a pass of referrals or faults only; an
         outage pass does not call it. A pass with no fault that judged something releases the
