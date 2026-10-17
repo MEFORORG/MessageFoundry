@@ -3411,8 +3411,9 @@ and a cluster follower's convergence reload. A follower whose own settings refus
 keep its old graph, log the refusal and retry each interval.
 The build check runs the gates only on a listener the engine would bind: deployed and `auto_start`.
 On a running engine it also skips one the DR run-profile parks, and it gates one an operator
-started. It gates a listener outside its schedule window, because the scheduler binds it when the
-window opens. So `deployed = false`, or `auto_start = false` with the listener stopped, lets those
+started. It gates an `auto_start` listener outside its schedule window, because the scheduler binds
+it when the window opens. It does not gate an operator-started `auto_start = false` listener outside
+its window: the reload leaves it unbound and the scheduler never starts it. So `deployed = false`, or `auto_start = false` with the listener stopped, lets those
 paths through while the listener stays unbound. An operator start of an `auto_start = false`
 listener meets the same refusal. A `deployed = false` listener cannot be started: that start
 raises `NotDeployedError`. The reload that deploys it meets the refusal if the engine would then
