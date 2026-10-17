@@ -62,6 +62,7 @@ from harness.load.report import EXIT_OK, EXIT_SLO_VIOLATION, SloCheck
 from harness.load.sender import ConnectionPool, Dispatcher
 from harness.load.sink import CorrelationSink
 from harness.load.tlsmat import harness_ssl_context, harness_tls_material
+from messagefoundry.proctree import ADOPT_CREATIONFLAGS, resume_into_job, terminate_job
 
 log = logging.getLogger(__name__)
 
@@ -177,6 +178,8 @@ class EngineNode:
         self._config_dir = config_dir
         self._cwd = cwd
         self._proc: asyncio.subprocess.Process | None = None
+        #: The Windows kill-on-close job holding this node's engine tree (see `_spawn`).
+        self._job: int | None = None
         # Bench-only (default OFF): when MEFOR_BENCH_KEEP_NODE_LOGS names a directory, persist this
         # node's captured stdout to <dir>/<node_id>.log and do NOT unlink it on stop() — so a rig run
         # can read each shard's throttled phase-timing summary after the fleet is torn down. Unset =>
@@ -213,11 +216,7 @@ class EngineNode:
         restart leg times its recovery."""
         if provision:
             await self.provision()
-        self._proc = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "messagefoundry",
-            "serve",
+        await self._spawn(
             "--config",
             self._config_dir,
             "--port",
@@ -228,11 +227,47 @@ class EngineNode:
             # off-box reach) needs the dev override so serve's off-loopback plaintext-MLLP gate
             # warns instead of refusing; a co-located loopback bind adds nothing (byte-identical).
             *_insecure_bind_args(self._env),
+        )
+
+    async def _spawn(self, *serve_args: str) -> None:
+        """Start ``messagefoundry serve <serve_args>`` with its whole tree tied to this process.
+
+        Measured 2026-10-17 on a developer box: 54 connscale engines up to 16.5 hours old, each a
+        venv launcher whose parent pytest worker was dead, plus the live interpreter under it. The
+        owner had died before :meth:`stop` ran -- a pytest-timeout ``os._exit``, a killed worker --
+        so no ``finally`` could help. So on Windows the engine starts suspended and joins a
+        kill-on-close job before it runs (``messagefoundry.proctree``): when this process exits by
+        any route, Windows closes the job's handle and ends the tree. A fresh job per spawn, so
+        :meth:`kill` takes one node's tree and never a peer's. POSIX keeps the single-process
+        behaviour it had; nothing measured leaks there yet."""
+        self._end_tree()
+        proc = await self._exec(sys.executable, "-m", "messagefoundry", "serve", *serve_args)
+        try:
+            self._job = resume_into_job(proc.pid, who=f"node {self.node_id}")
+        except OSError:
+            # It could not be resumed, so it never ran: kill it rather than leave it frozen.
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            await proc.wait()
+            raise
+        self._proc = proc
+
+    async def _exec(self, *argv: str) -> asyncio.subprocess.Process:
+        """The one subprocess call. A seam, so a test can tie a cheap tree here, not a real engine."""
+        return await asyncio.create_subprocess_exec(
+            *argv,
             env=self._env,
             cwd=str(self._cwd),
             stdout=self._log,
             stderr=asyncio.subprocess.STDOUT,
+            creationflags=ADOPT_CREATIONFLAGS,
         )
+
+    def _end_tree(self) -> None:
+        """End every process still in this node's job, and the job with it."""
+        if self._job is not None:
+            terminate_job(self._job)
+            self._job = None
 
     @property
     def alive(self) -> bool:
@@ -245,7 +280,12 @@ class EngineNode:
         return self._proc.pid if self._proc is not None else None
 
     def kill(self) -> None:
-        """SIGKILL — the faithful crash. No-op if already gone."""
+        """SIGKILL — the faithful crash. No-op if already gone.
+
+        The whole tree, where a job holds it: the engine's own children die with it, as they would
+        in a real crash of the host process. The job goes even when the root has already
+        exited, because what the root started can outlive it."""
+        self._end_tree()
         if self._proc is not None and self._proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 self._proc.kill()
@@ -264,6 +304,8 @@ class EngineNode:
                     proc.kill()
                 with contextlib.suppress(Exception):
                     await proc.wait()
+        # Whatever the root left behind goes with the job, whichever branch above ran.
+        self._end_tree()
         with contextlib.suppress(Exception):
             self._log.close()
         # The startup-failure tail is captured into the FailoverError before teardown, so the log file is
