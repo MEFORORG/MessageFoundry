@@ -71,10 +71,15 @@ def _uploads_settings(tmp_path: Path) -> StoreSettings:
     return StoreSettings(uploads_dir=str(tmp_path / "uploads"), max_upload_bytes=1_000_000)
 
 
-def _keyed_store(root: Path) -> UploadStore:
+def _keyed_store(root: Path, *, max_files_per_user: int = 100) -> UploadStore:
     """A store over ``root`` under a fresh key: the engine here is keyless, so swapping this in for
     the app's own store is "the key is now enabled" for every upload already on disk."""
-    return UploadStore(root, make_cipher(generate_key(), write_v2=True), max_bytes=10**6)
+    return UploadStore(
+        root,
+        make_cipher(generate_key(), write_v2=True),
+        max_bytes=10**6,
+        max_files_per_user=max_files_per_user,
+    )
 
 
 async def _make_user(engine: Engine, role: Role, *, name: str) -> AuthService:
@@ -1357,3 +1362,89 @@ async def test_an_override_holder_deletes_an_upload_rotate_key_cannot_seal(
     assert detail["file_id"] == fid
     assert set(detail) == {"file_id", "size"}  # no file name (vault BACKLOG #2619)
     assert "acme" not in str(rows[0]["detail"])
+
+
+@_BREAKS
+async def test_a_409_names_the_unreadable_uploads_it_bills_and_never_their_names(
+    engine: Engine, tmp_path: Path, break_body: Callable[[Path], None]
+) -> None:
+    """BACKLOG #3183: an upload ``rotate-key`` cannot seal bills its uploader's quota but is never
+    listed, so an uploader at the cap was refused over files they could not see. The 409 now says
+    how many it billed that way and how many bytes they hold. It names no file, and neither does
+    the ``upload.reject_quota`` audit row that keeps the same text: the name sits in a plaintext
+    sidecar nobody can verify, and an operator may have chosen it to hold a patient identifier."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    root = tmp_path / "uploads"
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = reproving_transport(PW, app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        r = await c.post("/uploads", files={"file": ("acme.hl7", BATCH, "text/plain")}, headers=h)
+        fid = r.json()["file_id"]  # the test engine is keyless, so this is a plaintext upload
+        blob = root / f"{fid}.blob"
+        break_body(blob)
+        on_disk = blob.stat().st_size if blob.exists() else 0
+        # The key is now enabled, and the uploader is at a one-file cap.
+        app.state.upload_store = _keyed_store(root, max_files_per_user=1)
+
+        assert (await c.get("/uploads", headers=h)).json()["files"] == []
+        r = await c.post("/uploads", files={"file": ("b.hl7", ADT2, "text/plain")}, headers=h)
+        assert r.status_code == 409, r.text
+        assert f"are not listed: 1, holding {on_disk} bytes" in r.text
+        assert "acme" not in r.text and fid not in r.text
+
+    rows = [a for a in await engine.store.list_audit() if a["action"] == "upload.reject_quota"]
+    assert len(rows) == 1, rows
+    reason = json.loads(str(rows[0]["detail"]))["reason"]
+    assert f"holding {on_disk} bytes" in reason
+    assert "acme" not in reason and fid not in reason
+
+
+async def test_a_refused_upload_read_through_a_route_alerts_without_promising_a_seal(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """BACKLOG #3183, route level: a by-id read of a plaintext upload on a keyed store reaches the
+    ``upload-cipher`` alert through ``store_cipher_refusal_forwarder``. The test installs that
+    forwarder on the swapped-in store's cipher itself, so it does not prove ``serve`` wires it.
+    The reason offers ``rotate-key``, names what is left when that fails, and names no file."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+    from messagefoundry.pipeline.alerts import UPLOAD_CIPHER_SUBJECT, store_cipher_refusal_forwarder
+
+    class _Sink:
+        def __init__(self) -> None:
+            self.reasons: list[tuple[str, str]] = []
+
+        def integrity_drift(self, name: str, *, reason: str, drift_count: int) -> None:
+            self.reasons.append((name, reason))
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    await _add_user(service, Role.ADMINISTRATOR, name="root")
+    root = tmp_path / "uploads"
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = reproving_transport(PW, app=app)
+    sink = _Sink()
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        ha = await _login(c, "root")
+        r = await c.post("/uploads", files={"file": ("acme.hl7", BATCH, "text/plain")}, headers=h)
+        fid = r.json()["file_id"]  # the test engine is keyless, so this is a plaintext upload
+        keyed = _keyed_store(root)
+        keyed._cipher.set_refusal_hook(  # type: ignore[attr-defined]
+            store_cipher_refusal_forwarder(sink, asyncio.get_running_loop())  # type: ignore[arg-type]
+        )
+        app.state.upload_store = keyed  # the key is now enabled
+
+        r = await c.get(f"/uploads/{fid}/messages", headers=ha)
+        assert r.status_code == 423, r.text
+        await asyncio.sleep(0)  # an off-loop refusal hops onto the loop to alert
+
+    assert sink.reasons, "the by-id read raised no upload-cipher alert"
+    for name, reason in sink.reasons:
+        assert name == UPLOAD_CIPHER_SUBJECT
+        assert "may seal it" in reason and "with the engine stopped" in reason
+        assert "unsealed for good, it can only be deleted" in reason
+        assert "until" not in reason and "acme" not in reason and fid not in reason

@@ -10555,9 +10555,11 @@ def create_managed_app(
             _upload_store: UploadStore | None = getattr(app.state, "upload_store", None)
             if _upload_store is not None:
                 # BACKLOG #1169, owner ruling 2026-09-23: a keyed store refuses a plaintext upload
-                # until `rotate-key` seals it, and a refused file just drops out of the listing. Say
-                # how many are waiting (the count only, never a filename) so the operator knows to
-                # run it. Counting reads a few bytes per file; the engine never seals them here.
+                # until `rotate-key` seals it, where it can (BACKLOG #2322), and a refused file just
+                # drops out of the listing. Say how many are waiting (the count only, never a
+                # filename) so the operator knows to run it. Counting reads more than a marker: some
+                # bodies are read whole, and warn_if_unsealed says which and why (BACKLOG #3183).
+                # The engine never seals them here.
                 await _upload_store.warn_if_unsealed()
 
                 async def _audit_upload_prune(meta: UploadedFileMeta) -> None:

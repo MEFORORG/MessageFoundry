@@ -42,7 +42,7 @@ from collections.abc import Awaitable, Callable, Coroutine, Iterator
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from stat import S_ISREG
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 from messagefoundry.controlchars import strip_control_chars
 from messagefoundry.parsing.peek import HL7PeekError, Peek
@@ -275,10 +275,11 @@ class UploadUnreadableError(UploadError, CipherError):
     """The store cipher refused an uploaded file on a by-id read (BACKLOG #1169).
 
     On a keyed store that is usually a plaintext upload stored before the key was enabled, which a
-    keyed store refuses until ``rotate-key`` seals it (owner ruling 2026-09-23). It can also be a file
-    under a key that is no longer configured. It is a :class:`CipherError` too, so any caller that
-    already catches the cipher's error still does. The API maps it to HTTP 423 without importing the
-    cipher module. The message is the cipher's own, which names only the surface and the fix, or
+    keyed store refuses until ``rotate-key`` seals it, where it can (owner ruling 2026-09-23, BACKLOG
+    #2322). It can also be a file under a key that is no longer configured. It is a
+    :class:`CipherError` too, so any caller that already catches the cipher's error still does. The
+    API maps it to HTTP 423 without importing the cipher module. The message is the cipher's own,
+    which names only the surface and the remedies it offers, or
     :data:`_REFUSED_NOT_UNSEALABLE` from :meth:`UploadStore.delete`, which names neither."""
 
 
@@ -367,6 +368,39 @@ class _UnsealableUpload:
             uploaded_at=self.modified,
             message_count=0,
         )
+
+
+class _Observed(NamedTuple):
+    """What one uploader holds on disk, from :meth:`UploadStore._observed_sync`.
+
+    ``files`` and ``size`` are the whole of it, the uploads ``rotate-key`` cannot seal included.
+    ``unsealable_files`` and ``unsealable_size`` count those again on their own, because the listing
+    never shows them, and a 409 that bills them must say how much of the budget the uploader cannot
+    see (BACKLOG #3183)."""
+
+    files: int
+    size: int
+    unsealable_files: int
+    unsealable_size: int
+
+
+def _unsealable_note(observed: _Observed, *, by_bytes: bool = False) -> str:
+    """The clause a quota refusal adds for the uploads it bills that the listing never shows, or
+    ``""`` when they add nothing to the cap that fired: none at all, or, for the byte cap
+    (``by_bytes``), none holding a byte (BACKLOG #3183). The engine-shard refusal names both caps
+    and cannot tell which one its sibling tipped, so it passes the default and says the clause
+    whenever any is billed.
+
+    Counts only. Never a file id and never a file name: the name comes from a plaintext sidecar
+    nobody can verify, and an operator-chosen name can carry a patient identifier. The refusal is
+    also the ``upload.reject_quota`` audit reason, which is kept."""
+    if not (observed.unsealable_size if by_bytes else observed.unsealable_files):
+        return ""
+    return (
+        "; counted here are uploaded files that cannot be read under the configured store key and "
+        f"are not listed: {observed.unsealable_files}, holding {observed.unsealable_size} bytes. "
+        "The retention prune removes them once they expire"
+    )
 
 
 def sanitize_filename(name: str | None) -> str:
@@ -678,8 +712,8 @@ class UploadStore:
         """True when this surface reads an unmarked file back as plaintext (BACKLOG #1169).
 
         **Owner ruling 2026-09-23: on a keyed store, an unmarked upload is REFUSED until an operator
-        runs ``rotate-key``,** which reseals it. So the refusal applies exactly where that command can
-        reseal, which is an :class:`AesGcmCipher`. There the cipher's own policy decides, and
+        runs ``rotate-key``,** which reseals it where it can (BACKLOG #2322). So the refusal applies
+        exactly where that command can reseal, which is an :class:`AesGcmCipher`. There the cipher's own policy decides, and
         ``[store].allow_unmarked_ciphertext`` restores the passthrough for this surface too.
 
         Every other cipher keeps the passthrough. The identity cipher has no key, so nothing is
@@ -956,29 +990,21 @@ class UploadStore:
             # The scan is uncached, so shards sharing a dir enforce one budget rather than one each.
             # A sibling shard's upload that is reserved but not landed is counted by `in_flight`
             # instead, read after reserving and before this scan (see UploadQuotaError for why).
-            disk_files, disk_bytes = self._observed_sync(uploader_id)
-            refusal = self._on_disk_refusal(
-                uploader=uploader,
-                observed_files=disk_files,
-                observed_bytes=disk_bytes,
-                size=len(data),
-            )
+            disk = self._observed_sync(uploader_id)
+            refusal = self._on_disk_refusal(uploader=uploader, observed=disk, size=len(data))
             if refusal is not None:
                 raise refusal
             # The ledger total includes this upload's own reservation, which `size` already counts,
             # so only the siblings' share is added to the disk figures.
+            with_siblings = disk._replace(
+                files=disk.files + max(0, in_flight[0] - 1),
+                size=disk.size + max(0, in_flight[1] - len(data)),
+            )
             if (
-                self._on_disk_refusal(
-                    uploader=uploader,
-                    observed_files=disk_files + max(0, in_flight[0] - 1),
-                    observed_bytes=disk_bytes + max(0, in_flight[1] - len(data)),
-                    size=len(data),
-                )
+                self._on_disk_refusal(uploader=uploader, observed=with_siblings, size=len(data))
                 is not None
             ):
-                raise self._shard_refusal(
-                    uploader=uploader, observed_files=disk_files, observed_bytes=disk_bytes
-                )
+                raise self._shard_refusal(uploader=uploader, observed=disk)
             meta = UploadedFileMeta(
                 file_id=file_id,
                 filename=display,
@@ -1105,13 +1131,8 @@ class UploadStore:
         blame uploads on another shard that do not exist."""
         if self._ledger is None:
             return False
-        observed_files, observed_bytes = await asyncio.to_thread(self._observed_sync, uploader_id)
-        refusal = self._on_disk_refusal(
-            uploader=uploader,
-            observed_files=observed_files,
-            observed_bytes=observed_bytes,
-            size=size,
-        )
+        observed = await asyncio.to_thread(self._observed_sync, uploader_id)
+        refusal = self._on_disk_refusal(uploader=uploader, observed=observed, size=size)
         if refusal is not None:
             raise refusal
         # A cancellation can arrive after the store committed the reserve but before the call
@@ -1122,8 +1143,8 @@ class UploadStore:
                 uploader_id,
                 files=1,
                 size_bytes=size,
-                max_files=self._max_files_per_user - observed_files,
-                max_total_bytes=self._max_total_bytes_per_user - observed_bytes,
+                max_files=self._max_files_per_user - observed.files,
+                max_total_bytes=self._max_total_bytes_per_user - observed.size,
             )
         )
         try:
@@ -1135,9 +1156,7 @@ class UploadStore:
                 await self._release_across_shards(uploader_id=uploader_id, size=size)
             raise
         if not ok:
-            raise self._shard_refusal(
-                uploader=uploader, observed_files=observed_files, observed_bytes=observed_bytes
-            )
+            raise self._shard_refusal(uploader=uploader, observed=observed)
         return True
 
     @staticmethod
@@ -1249,21 +1268,19 @@ class UploadStore:
 
         fut.add_done_callback(_done)
 
-    def _shard_refusal(
-        self, *, uploader: str, observed_files: int, observed_bytes: int
-    ) -> UploadQuotaError:
+    def _shard_refusal(self, *, uploader: str, observed: _Observed) -> UploadQuotaError:
         """The refusal when what is on disk fits but uploads in flight on other engine shards take
         the rest of the budget. Worded apart from :meth:`_on_disk_refusal` so an operator can tell
         the two causes apart."""
         return UploadQuotaError(
-            f"uploader {uploader!r} has {observed_files} uploaded files holding "
-            f"{observed_bytes} bytes, and another engine shard is mid-upload against the same "
+            f"uploader {uploader!r} has {observed.files} uploaded files holding "
+            f"{observed.size} bytes, and another engine shard is mid-upload against the same "
             f"budget; the limits are {self._max_files_per_user} files / "
-            f"{self._max_total_bytes_per_user} bytes"
+            f"{self._max_total_bytes_per_user} bytes{_unsealable_note(observed)}"
         )
 
     def _on_disk_refusal(
-        self, *, uploader: str, observed_files: int, observed_bytes: int, size: int
+        self, *, uploader: str, observed: _Observed, size: int
     ) -> UploadQuotaError | None:
         """The per-uploader quota verdict against what is ALREADY on disk, or ``None`` if it fits.
 
@@ -1273,16 +1290,16 @@ class UploadStore:
         ownership rule can never disagree about who a file belongs to and a recycled username is
         never billed for files it cannot read. The message names the human username, because an
         operator reading a 409 needs a name, not a uuid."""
-        if observed_files + 1 > self._max_files_per_user:
+        if observed.files + 1 > self._max_files_per_user:
             return UploadQuotaError(
-                f"uploader {uploader!r} has {observed_files} uploaded files; the limit is "
-                f"{self._max_files_per_user}"
+                f"uploader {uploader!r} has {observed.files} uploaded files; the limit is "
+                f"{self._max_files_per_user}{_unsealable_note(observed)}"
             )
-        projected = observed_bytes + size
+        projected = observed.size + size
         if projected > self._max_total_bytes_per_user:
             return UploadQuotaError(
                 f"uploader {uploader!r} would hold {projected} bytes; the limit is "
-                f"{self._max_total_bytes_per_user}"
+                f"{self._max_total_bytes_per_user}{_unsealable_note(observed, by_bytes=True)}"
             )
         return None
 
@@ -1329,16 +1346,16 @@ class UploadStore:
                 self._leave_running(release, what="release", uploader_id=uploader_id, size=size)
             raise
 
-    def _observed_sync(self, uploader_id: str) -> tuple[int, int]:
-        """(file count, total bytes) already ON DISK for ``uploader_id`` — the fleet-visible half of
-        the budget. Sync: the caller runs it off the event loop.
+    def _observed_sync(self, uploader_id: str) -> _Observed:
+        """What is already ON DISK for ``uploader_id`` — the fleet-visible half of the budget. Sync:
+        the caller runs it off the event loop.
 
         An upload ``rotate-key`` cannot seal counts too, at its body's size on disk (BACKLOG #2322).
-        Its owner is unverified, so this errs toward refusing; :class:`_UnsealableUpload` says why."""
-        metas = self._scan_metas_sync()
-        sizes = [m.size for m in metas if m.uploader_id == uploader_id]
-        sizes += [h.size for h in self._scan_unsealable_sync() if h.uploader_id == uploader_id]
-        return len(sizes), sum(sizes)
+        Its owner is unverified, so this errs toward refusing; :class:`_UnsealableUpload` says why.
+        Those are also counted apart, for the refusal to name (BACKLOG #3183)."""
+        sizes = [m.size for m in self._scan_metas_sync() if m.uploader_id == uploader_id]
+        held = [h.size for h in self._scan_unsealable_sync() if h.uploader_id == uploader_id]
+        return _Observed(len(sizes) + len(held), sum(sizes) + sum(held), len(held), sum(held))
 
     async def list_files(self) -> list[UploadedFileMeta]:
         """List all uploaded files (newest first). Undecryptable/foreign sidecars are skipped with a
@@ -1609,7 +1626,13 @@ class UploadStore:
         for each upload with a PLAINTEXT sidecar, a read of its whole body, to tell the two kinds
         apart. That body read is new work at startup, bounded by the plaintext uploads still waiting
         for ``rotate-key``, and the first quota scan or prune after it does not repeat it
-        (``_body_checks``). Runs off the event loop."""
+        (``_body_checks``). Runs off the event loop. **The body read is whole on purpose (BACKLOG
+        #3183).** One byte that is not UTF-8, anywhere in it, makes an upload one ``rotate-key``
+        cannot seal, so a prefix cannot decide it. Each read is bounded by the size an upload can
+        be (:meth:`_lost_body_size`), and the result is cached. The cost is startup time, since
+        ``serve`` awaits this before the API answers, and it lasts only while plaintext uploads
+        wait for ``rotate-key``. Where the store refuses plaintext, the first save's quota scan
+        would otherwise make the same reads under ``_quota_lock``."""
         cipher = self._cipher
         if not isinstance(cipher, AesGcmCipher):  # the same test as _passes_unmarked
             return 0
