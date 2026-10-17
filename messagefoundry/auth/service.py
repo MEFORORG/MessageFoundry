@@ -184,6 +184,21 @@ _FACTOR_CEREMONIES: Final = frozenset(
 #: What ``AuthService._apply_reconcile_revocation`` did with one planned revocation (BACKLOG #3085).
 _RevocationApplied = Literal["skipped", "quiet", "reported"]
 
+#: The revocation reasons that report even when they ended no session (owner ruling 2026-10-17,
+#: BACKLOG #3085): the directory says the account is disabled, or the account is absent from it.
+#: The ruling names these two. ``directory_undetermined`` and ``directory_object_id_missing``
+#: establish neither, so they keep the 2026-10-16 "audit always" rule.
+_ALWAYS_REPORTED_REASONS: Final = frozenset(
+    {
+        reconcile.REVOKE_REASONS[reconcile.ProbeOutcome.DISABLED],
+        reconcile.REVOKE_REASONS[reconcile.ProbeOutcome.ABSENT],
+    }
+)
+
+#: How many of an account's newest ``auth.ad_session_revoked`` rows
+#: ``AuthService._already_revoked_elsewhere`` reads.
+_REVOKED_ROW_PAGE: Final = 20
+
 
 @cache
 def _audit_write_errors() -> tuple[type[Exception], ...]:
@@ -7501,6 +7516,45 @@ class AuthService:
             defects=AUDIT_WRITE_DEFECTS,
         )
 
+    async def _already_revoked_elsewhere(
+        self, revocation: reconcile.SessionRevocation, user: UserRecord | None
+    ) -> bool:
+        """Whether another pass already revoked this account for this reason (owner ruling
+        2026-10-17, BACKLOG #3085).
+
+        The evidence is an ``auth.ad_session_revoked`` row naming the account as actor, with the
+        same ``reason``, written since the account's last full sign-in (``last_login_at``; any age
+        when it never stamped one). A sign-in after that row means the account was let back in, so
+        the earlier revocation no longer covers it. Called before this revocation's own row is
+        written, so it never finds that row.
+
+        Errs toward reporting. A failed read is logged and answers False, so a store fault costs a
+        duplicate alert rather than a missed one. Two reconcilers applying at the same moment can
+        both miss each other's row, and both report. The rows are found by the account's planned
+        username: an account renamed since its earlier revocation is not matched, and reports."""
+        try:
+            rows = await self._store.list_audit(
+                action="auth.ad_session_revoked",
+                actor=revocation.username,
+                since=user.last_login_at if user is not None else None,
+                limit=_REVOKED_ROW_PAGE,
+            )
+        except _audit_write_errors():
+            _log.warning(
+                "directory reconcile: could not read earlier revocations of %s; reporting this one",
+                scrub_log_argument(revocation.username),
+                exc_info=True,
+            )
+            return False
+        for row in rows:
+            try:
+                detail = json.loads(row["detail"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if isinstance(detail, dict) and detail.get("reason") == revocation.reason:
+                return True
+        return False
+
     async def _apply_reconcile_revocation(
         self, revocation: reconcile.SessionRevocation
     ) -> _RevocationApplied:
@@ -7509,11 +7563,16 @@ class AuthService:
         revocation writes no scope (ADR 0198): the next login does.
 
         Returns ``"skipped"`` when it applied nothing, ``"reported"`` when it applied and must
-        alert, and ``"quiet"`` when it applied but ended no session and changed no role. The quiet
-        case is at least what the second of two reconcilers revoking one account sees (BACKLOG
-        #3085). Owner ruling 2026-10-16, "audit always": that revocation still writes its
-        ``auth.ad_session_revoked`` row, with ``sessions: 0``, and sends no notice; the caller
-        raises no alert for it."""
+        alert, and ``"quiet"`` when it applied but ended no session and changed no role, and is not
+        a disabled or absent account's first revocation. The quiet case is at least what the second
+        of two reconcilers revoking one account sees (BACKLOG #3085). Owner ruling 2026-10-16,
+        "audit always": that revocation still writes its ``auth.ad_session_revoked`` row, with
+        ``sessions: 0``, and sends no notice; the caller raises no alert for it.
+
+        Owner ruling 2026-10-17 narrows that. A revocation whose reason is in
+        :data:`_ALWAYS_REPORTED_REASONS` (the account is disabled or absent in the directory)
+        reports even when it ended nothing, as when the user signed out mid-pass. It stays quiet
+        only when :meth:`_already_revoked_elsewhere` finds another pass's revocation of it."""
         user = await self._load_user(revocation.user_id)
         if revocation.reason == reconcile.SCOPE_CHANGED and (
             user is None or user.channel_scope != revocation.scope_from
@@ -7553,6 +7612,17 @@ class AuthService:
                 user, before=user.role_ids, after=revocation.role_ids, via="ad-reconcile"
             )
         revoked = await self._store.revoke_user_sessions(revocation.user_id)
+        # Owner ruling 2026-10-17 narrows "audit always": a disabled or absent account whose
+        # revocation ended nothing still reports, unless another pass already revoked it. Read
+        # BEFORE this revocation's own row is written, or the row would find itself.
+        quiet = (
+            not revoked
+            and not roles_changed
+            and (
+                revocation.reason not in _ALWAYS_REPORTED_REASONS
+                or await self._already_revoked_elsewhere(revocation, user)
+            )
+        )
         # Soft (BACKLOG #3018): the writes above are already applied, so a raise would only cost
         # the notice below, the later accounts and the alerts. See `_audit_reconciler_row`.
         await self._audit_reconciler_row(
@@ -7589,7 +7659,7 @@ class AuthService:
             revocation.username,
             revocation.reason,
         )
-        if not revoked and not roles_changed:
+        if quiet:
             return "quiet"  # audited above, no notice and no alert: see the docstring
         # A directory-pushed disable or demotion is the same event to the user as a local one, so it
         # gets the same out-of-band notice the login-path re-sync sends (best-effort).
