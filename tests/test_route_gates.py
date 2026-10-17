@@ -28,7 +28,7 @@ from fastapi import APIRouter, Depends, FastAPI, Request, WebSocket
 from fastapi.routing import APIWebSocketRoute
 from starlette.middleware import Middleware
 from starlette.responses import PlainTextResponse
-from starlette.routing import Mount, Route
+from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -357,6 +357,40 @@ def test_a_marked_gate_is_read_whatever_its_name() -> None:
     assert row.permissions == (Permission.MESSAGES_VIEW_RAW.value,), row
 
 
+class _CallableGate:
+    """A gate written as a class rather than a ``require*()`` closure."""
+
+    async def __call__(self, request: Request) -> None:
+        return None
+
+
+def _bare_function_gate() -> Callable[[Request], Awaitable[None]]:
+    async def gate(request: Request) -> None:
+        return None
+
+    return gate
+
+
+@pytest.mark.parametrize("behind_a_readable_gate", [False, True], ids=["alone", "second"])
+@pytest.mark.parametrize(
+    "build", [_bare_function_gate, _CallableGate], ids=["function-with-no-closure", "class"]
+)
+def test_a_marked_gate_the_walk_cannot_read_fails_the_walk_rather_than_reading_gated_with_no_gate(
+    build: Callable[[], Callable[..., Any]], behind_a_readable_gate: bool
+) -> None:
+    """Vault BACKLOG #2956 item 3. The walk read a gate's name from a ``require*()`` closure, so a
+    marked gate of any other shape gave ``gate=None`` while the engine's refusal, which reads only the
+    mark, made the row ``kind=gated``. That row also landed in ``ungated_http_rows`` while the engine
+    served it as gated. The walk now refuses such a gate by name, so ``kind=gated`` always carries a
+    gate name and no row leaves the ungated set without someone teaching the walk to read it."""
+    gate = mark_route_gate(build())
+    readable = [Depends(require(Permission.MONITORING_READ))] if behind_a_readable_gate else []
+    app = create_app()
+    app.add_api_route("/planted", _ok, dependencies=[*readable, Depends(gate)])
+    with pytest.raises(ValueError, match="carries the gate mark but is not a closure"):
+        route_gates.route_rows(app)
+
+
 def test_the_walk_descends_into_an_included_router() -> None:
     sub = APIRouter(prefix="/sub")
     sub.add_api_route("/open", _ok)
@@ -493,6 +527,31 @@ def test_a_mount_with_no_routes_stays_one_ungated_row(ui_app: FastAPI) -> None:
     assert rows[(route_gates.MOUNT_METHOD, "/ui/static")].gate is None
 
 
+async def _plain_socket(websocket: WebSocket) -> None:  # pragma: no cover - never connected
+    await websocket.close()
+
+
+def test_a_plain_starlette_websocket_is_labelled_a_socket_and_stays_in_the_ungated_set() -> None:
+    """Vault BACKLOG #2956 item 4. The walk's last arm labelled every route with no methods a mount,
+    so a plain Starlette ``WebSocketRoute`` read as ``MOUNT``. It now has a label of its own. That
+    label is deliberately not ``WS_METHOD``, which the HTTP-only helpers filter out: no dependency and
+    no refusal runs on such a socket, so it must stay in ``ungated_http_rows`` for a consumer's
+    allow-list to catch, as the module docstring's NOTHING FALLS OFF THE END OF THE WALK requires."""
+    app = FastAPI(openapi_url=None)
+    app.routes.append(WebSocketRoute("/plain-ws", _plain_socket))
+    sub = APIRouter()
+    sub.add_websocket_route("/sock", _plain_socket)
+    app.include_router(sub, prefix="/inc")
+    rows = _rows_by_key(app)
+    ungated = {(r.method, r.path) for r in route_gates.ungated_http_rows(app)}
+    for path in ("/plain-ws", "/inc/sock"):
+        assert (route_gates.MOUNT_METHOD, path) not in rows, sorted(rows)
+        row = rows[(route_gates.PLAIN_WS_METHOD, path)]
+        assert (row.kind, row.gate) == (route_gates.KIND_OUTSIDE, None), row
+        assert (route_gates.PLAIN_WS_METHOD, path) in ungated, sorted(ungated)
+    assert not _ws_rows(app)
+
+
 # --- vault BACKLOG #2846: what the refusal makes of each row --------------------------------------------
 # Before #2846 a row carried no kind and no declaration, so a route public by design and one the engine
 # refuses to every caller both read as "no gate". Each test below fails on that walk.
@@ -563,6 +622,8 @@ def test_the_shipped_surface_refuses_nothing_and_every_ungated_row_is_declared_p
         by_kind.setdefault(row.kind, []).append(row)
     assert not by_kind.get(route_gates.KIND_REFUSED), by_kind.get(route_gates.KIND_REFUSED)
     assert len(by_kind[route_gates.KIND_GATED]) > 150, "the walk classified too few rows as gated"
+    # Vault BACKLOG #2956 item 3: a row the refusal reads as gated names the gate it found.
+    assert all(r.gate for r in by_kind[route_gates.KIND_GATED]), by_kind[route_gates.KIND_GATED]
     public = by_kind[route_gates.KIND_PUBLIC]
     assert ("POST", "/auth/login") in {(r.method, r.path) for r in public}
     assert all(r.declaration and r.declaration.strip() for r in public), public

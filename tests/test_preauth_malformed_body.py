@@ -225,7 +225,7 @@ async def _walk(app: FastAPI, *, only: frozenset[tuple[str, str]] | None = None)
         for method in route.methods or ()
     }
     rows = route_gates.route_rows(app)
-    unprobeable = (route_gates.WS_METHOD, route_gates.MOUNT_METHOD)
+    unprobeable = route_gates.NON_HTTP_METHODS
     answers: dict[_Operation, tuple[httpx.Response, ...]] = {}
     # A real peer address: the client-network gate fails closed on a request with none. A
     # handler that raises is recorded as its 500, so the case that reads it can name the route.

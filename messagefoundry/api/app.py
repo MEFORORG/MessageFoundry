@@ -247,6 +247,7 @@ from messagefoundry.api.security import (
     require_step_up_action,
     spend_step_up_action,
     step_up_window_live,
+    undeclared_route_refusal_counts,
     ws_token,
 )
 from messagefoundry.api.svg_sanitize import SvgRejected, may_be_svg, sanitize_if_svg
@@ -3652,6 +3653,8 @@ def create_app(
             client_address_monoculture=bool(
                 getattr(request.app.state, "client_address_monoculture", False)
             ),
+            # Vault BACKLOG #2954: the deny-by-default refusal count (#2604), by path template.
+            undeclared_route_refusals=undeclared_route_refusal_counts(request.app.routes),
             transit_bound_attestation=await _transit_bound_view(
                 engine.store, info.transit_key_name
             ),
