@@ -2596,10 +2596,14 @@ helper both legs call (`_directory_vouches_for_factor`, BACKLOG #3068). That inc
 no directory object id, refused without a lookup as on the code leg, so such an account cannot
 clear the MFA gate by verifying a passkey either. It asks after the second-step lock and the
 `[auth].mfa_verify_min_elapsed_seconds` floor, and only once a ceremony is staged for the session,
-before it takes the challenge. A post with nothing staged, which includes every post from an
-account that holds no passkey, gets the plain failure audited `reason=expired` and causes no
-lookup, so a caller that has proved nothing does not learn what the directory said (BACKLOG
-#3068). After a confirmed lookup
+before it takes the challenge. A post with nothing staged for the session, which includes every
+post from an account that has never staged a ceremony because it holds no passkey, gets the plain
+failure audited `reason=expired` and causes no lookup, so such a caller does not learn what the
+directory said (BACKLOG #3068). **This does not hold for a session that has staged a ceremony.**
+The lookup still runs before the assertion is verified, so such a session can post a response that
+proves nothing and still cost one lookup and read the directory refusal, up to the per-actor
+limiter on `POST /ui/reauth/webauthn`. A ceremony staged before its passkey was deleted stays
+staged until it expires. After a confirmed lookup
 the leg reads the session, the account and its lock again. A refusal checks
 no assertion, leaves the challenge in flight, leaves the sign count alone, and charges nothing to
 the lockout. It is audited as `auth.webauthn_failed` with
@@ -2610,10 +2614,17 @@ account gone after the lookup answers **401**.
 **Both second-factor legs read the session, the account and its lock once more right before they
 write the factor (BACKLOG #3068).** This applies to every account, local ones included. A
 revocation, a disable or a second-step lock that lands while a good code or a good assertion is
-being checked stops the write, so the factor is not marked and no counter is cleared. A session or
-account gone then answers as gone; a lock answers as the leg's locked refusal, audited
-`reason=locked`. On the passkey leg the sign count has already moved by then, because the passkey
-did sign that challenge.
+being checked stops the write, and so, on the code leg, does a TOTP factor turned off meanwhile.
+The factor is then not marked and no counter is cleared. A session or account gone then answers as
+gone: **401** on `POST /auth/mfa-verify` and `POST /ui/reauth/webauthn`, a sign-in redirect on
+`/ui/mfa`, and the same on the code leg when it goes during the directory lookup or the account
+queue. A lock answers as the leg's locked refusal, audited `reason=locked`. By then the proof is
+spent: the code leg has consumed the TOTP step or the single-use recovery code, with no refund, and
+on the passkey leg the sign count has moved, because the passkey did sign that challenge.
+**A window remains, and it is accepted.** The re-read and the factor write are separate awaits, and
+the counter clear that follows the write is unconditional, so a change landing in that last gap is
+not seen. Closing it would take a store write conditional on the state the re-read saw, which no
+leg has. The re-read narrows the window from the whole proof check to that one write.
 
 **Both legs also refuse a present account that lost a role in the directory (BACKLOG #2240).** The
 lookup returns the account's groups, and the engine maps them to roles as the reconciliation pass
@@ -4732,8 +4743,8 @@ engine verified itself, a signed `amr` or `acr` value its claim gate accepted, o
 `auth_time`, and, while the claim gate is on, a configured `amr` or `acr`. A token missing either is
 refused, which grants nothing. The table covers at least these legs. Each cell was read against the
 code at engine commit `3345056505`, and the Where column names the code that does it, except the
-**WebAuthn passkey** cell. That cell was read against engine commit `35f95e3f3a` with the BACKLOG
-#3068 change applied, because its directory sentences describe code merged after `3345056505`
+**WebAuthn passkey** cell. That cell was read against engine commit `f5157b36` (the BACKLOG #3068
+change, on branch `b259-3068`), because its directory sentences describe code merged after `3345056505`
 (BACKLOG #2239).
 
 | Leg | What reaches the engine about strength or recency | What the engine assumes when that says nothing | Where |

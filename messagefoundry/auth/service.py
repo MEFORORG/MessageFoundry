@@ -824,7 +824,9 @@ class Elevation:
       the session was ended because its temporary password lapsed, with the proof checked or not,
       as that ``auth.temp_password_expired`` row records; or (``confirm_mfa_enrollment`` only,
       BACKLOG #2224) the proof was good but turning TOTP on matched no row, so the confirm ended
-      the session it had just rotated, as its ``auth.mfa_enroll_refused`` row records. Fails
+      the session it had just rotated, as its ``auth.mfa_enroll_refused`` row records; or (the TOTP
+      and passkey legs, BACKLOG #3068) the session or its account went while the leg waited on the
+      directory lookup, the account queue or the proof check, with the proof checked or not. Fails
       CLOSED: no token is handed back. Held apart from a wrong proof so a route answers 401 rather than re-prompting on a
       session that no longer exists. The ``auth.reauth`` row's ``session_revoked`` says which.
 
@@ -10337,15 +10339,18 @@ class AuthService:
             return current
         user = current
         async with self._account_credential_lock(user.username):
-            # Read the session, the account and its lock again. For a directory account the lookup
-            # above was a network round trip, and for any account the queue may have been a wait, so
-            # what was read before either may be stale: a session revoked meanwhile would still spend
-            # its code, and a lock set by the attempt ahead in the queue would go unseen.
+            # Read the session, the account and its lock again. The queue may have been a wait, so
+            # what was read before it may be stale: a session revoked meanwhile would still spend
+            # its code, and a lock set by the attempt ahead in the queue would go unseen. A session
+            # or account gone answers ``session_lost``, as the re-reads before and after this one
+            # do (BACKLOG #3068): the token no longer authenticates.
             session = await self._load_session(hash_token(token))
             if session is None or session.revoked_at is not None:
-                return Elevation()
+                return Elevation(session_lost=True)
             user = await self._load_user(session.user_id)
-            if user is None or user.disabled or not user.totp_enabled:
+            if user is None or user.disabled:
+                return Elevation(session_lost=True)
+            if not user.totp_enabled:
                 return Elevation()
             if await self._mfa_lapsed(token, user, client=client, factor_checked=False):
                 return Elevation(session_lost=True)
@@ -10362,6 +10367,9 @@ class AuthService:
                 )
                 if isinstance(fresh, Elevation):
                     return fresh
+                # A self-service disable takes no queue, so the factor this code proved may be gone.
+                if not fresh.totp_enabled:
+                    return Elevation()
                 # The temporary-credential deadline is asked again on that fresh row, since it can
                 # pass during the verify too. This ask guards the writes below; the rotation asks
                 # once more. It awaits only when it ends the session.
@@ -11234,14 +11242,7 @@ class AuthService:
         now = time.time()
         # A locked account is refused BEFORE any verify (verify_mfa parity). ADR 0197: the SECOND-STEP
         # lock, as on verify_mfa; the sign-in lock guards the step this session already passed.
-        if user.second_step_locked(now):
-            await self._audit(
-                "auth.webauthn_failed",
-                actor=user.username,
-                # The shared constant, so the users:manage-only exclusion matches it exactly (#1131).
-                detail=LOCKED_REFUSAL_DETAIL,
-                client=client,
-            )
+        if await self._mfa_lock_refused(user, client=client, event="auth.webauthn_failed"):
             return Elevation()
         # BACKLOG #2301: the login-then-MFA floor, as on verify_mfa. Before the challenge is popped,
         # so a refusal leaves the ceremony in flight rather than spending it.

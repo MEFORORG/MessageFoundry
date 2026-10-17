@@ -28,6 +28,7 @@ from _totp_clock import fresh_totp, pin_totp_clock
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import reconcile, totp
+from messagefoundry.auth.identity import SessionMechanism
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, LdapReferralError
 from messagefoundry.auth.service import DIRECTORY_UNCONFIRMED, AuthService
 from messagefoundry.auth.tokens import hash_token
@@ -436,39 +437,63 @@ async def test_a_lock_set_during_the_lookup_is_honoured(
     assert session is not None and session.reauth_at is None
 
 
-@pytest.mark.parametrize("change", ["lock", "revoke", "disable"])
+@pytest.mark.parametrize("change", ["lock", "revoke", "disable", "factor-off"])
+@pytest.mark.parametrize("account", ["directory", "local"])
 async def test_what_lands_during_the_code_check_stops_the_factor_write(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch, change: str
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, change: str, account: str
 ) -> None:
-    """BACKLOG #3068, item 2. A revocation or a disable needs no account queue to land, and the
-    code check awaits, so the session, the account and its lock are read again right before the
-    factor is written. RED when: a change that lands during a good code's check does not stop the
-    write, which would then mark the factor, stamp the window and clear the lockout counters."""
-    e = await _enrolled_directory_session(store, monkeypatch)
-    real_verify = e.service._verify_second_factor
+    """BACKLOG #3068, item 2. A revocation, a disable or a factor reset needs no account queue to
+    land, and the code check awaits, so the session, the account and its lock are read again right
+    before the factor is written, for every account. RED when: a change that lands during a good
+    code's check does not stop the write, which would then mark the factor, stamp the window and
+    clear the lockout counters."""
+    if account == "directory":
+        e = await _enrolled_directory_session(store, monkeypatch)
+        service, token, user_id, code = e.service, e.token, e.user_id, totp.totp(e.secret, now=_T1)
+    else:
+        service = AuthService(store, _settings())
+        identity, first, _ = await login_admin(service)
+        enroll = await service.begin_mfa_enrollment(identity)
+        confirmed = await service.confirm_mfa_enrollment(
+            identity, fresh_totp(enroll.secret), token=first
+        )
+        assert confirmed.ok and confirmed.token is not None and confirmed.recovery_codes
+        # A fresh session that still owes its factor, proved by a single-use recovery code.
+        token = await service._issue_session(
+            identity.user_id,
+            None,
+            mfa_verified=False,
+            seed_reauth=False,
+            mechanism=SessionMechanism.PASSWORD,
+            idp_auth_time=None,
+        )
+        user_id, code = identity.user_id, confirmed.recovery_codes[0]
+    real_verify = service._verify_second_factor
 
     async def _verify_while_something_lands(*args: Any, **kwargs: Any) -> bool:
         good = await real_verify(*args, **kwargs)
         if change == "lock":
-            await _lock_second_step(store, e.user_id)
+            await _lock_second_step(store, user_id)
         elif change == "revoke":
-            await store.revoke_session(hash_token(e.token))
+            await store.revoke_session(hash_token(token))
+        elif change == "disable":
+            await store.set_user_disabled(user_id, disabled=True)
         else:
-            await store.set_user_disabled(e.user_id, disabled=True)
+            await store.disable_totp(user_id)
         return good
 
-    monkeypatch.setattr(e.service, "_verify_second_factor", _verify_while_something_lands)
+    monkeypatch.setattr(service, "_verify_second_factor", _verify_while_something_lands)
 
-    refused = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
+    refused = await service.verify_mfa(token, code)
 
     assert refused.ok is False
-    assert refused.session_lost is (change != "lock")
+    assert refused.session_lost is (change in ("revoke", "disable"))
     assert refused.locked is (change == "lock")
-    session = await store.get_session(hash_token(e.token))
+    session = await store.get_session(hash_token(token))
     assert session is not None
     assert session.mfa_verified_at is None and session.reauth_at is None
     if change == "lock":
-        user = await store.get_user(e.user_id)
+        user = await store.get_user(user_id)
         assert user is not None and user.second_step_locked_until is not None  # not cleared
 
 

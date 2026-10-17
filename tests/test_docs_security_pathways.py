@@ -552,8 +552,10 @@ def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> N
 
     verify_attrs = _attrs(AuthService.verify_mfa)
     helper_attrs = _attrs(AuthService._directory_vouches_for_factor)
+    reread_attrs = _attrs(AuthService._factor_holder_current)
     assert (
         verify_attrs.count("auth_provider") == 0
+        and reread_attrs.count("auth_provider") == 0
         and "_directory_vouches_for_factor" in verify_attrs
         and helper_attrs.count("auth_provider") == 1
         and "_directory_step_up_refusal" in helper_attrs
@@ -1458,7 +1460,7 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
     code does, then refuses every phrasing that said otherwise:
 
     1. The two second-factor legs read the second-step lock only. ``verify_mfa`` refuses through
-       ``_mfa_lock_refused``; ``finish_webauthn_assertion`` reads ``second_step_locked`` itself.
+       ``_mfa_lock_refused``, and since BACKLOG #3068 so does ``finish_webauthn_assertion``.
     2. The local sign-in refuses on the second-step lock, or on the sign-in lock unless combined.
        A directory sign-in refuses on either lock.
     3. A good code or passkey writes ``record_login_success``, which clears both locks, so the
@@ -1470,7 +1472,9 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
     """
     # 1. The second-factor legs.
     assertion = _service_func("finish_webauthn_assertion")
-    assert "second_step_locked" in _names_read(assertion), (
+    # Since BACKLOG #3068 the passkey leg refuses through the same _mfa_lock_refused as the code leg,
+    # whose own read of the second-step lock is pinned just below.
+    assert _called(assertion, "_mfa_lock_refused"), (
         "finish_webauthn_assertion no longer reads the second-step lock; the lockout paragraph's "
         "table says that lock refuses the assertion leg."
     )
@@ -4402,12 +4406,12 @@ def test_the_passkey_leg_asks_the_directory_and_the_doc_says_so() -> None:
     # Since BACKLOG #3068 the branch is the shared helper's: the leg reads no provider itself.
     provider_reads = sum(
         1
-        for fn in (assertion, helper)
+        for fn in (assertion, helper, _service_func("_factor_holder_current"))
         for n in ast.walk(fn)
         if isinstance(n, ast.Attribute) and n.attr == "auth_provider"
     )
     assert provider_reads == 1, (
-        f"finish_webauthn_assertion and its directory helper read auth_provider {provider_reads} "
+        f"finish_webauthn_assertion and its two helpers read auth_provider {provider_reads} "
         "times; the lockout paragraph says each second-factor leg has ONE provider branch, the "
         "directory check."
     )
