@@ -36,6 +36,12 @@ probe in the pass is judged as usual. Unlike an outage, a referral alerts. A pas
 referrals and failures aborts as ``directory_referral``, which judges no account it asked about
 and alerts. Such a pass, like an outage, still strikes an UNKEYED row (BACKLOG #3170).
 
+A probe fault is not an outage either (BACKLOG #3100). A :attr:`ProbeOutcome.FAULT` account, whose
+probe raised something that is not an LDAP error, is left unjudged like an unreachable one, and
+unlike one it alerts on every pass that probes it. A pass whose only answers are faults and failures,
+at least one a fault, aborts as ``probe_fault``, which judges no account it asked about and alerts.
+It too still strikes an UNKEYED row (BACKLOG #3170).
+
 The pass also re-diffs channel scope (ADR 0198, BACKLOG #1957). It revokes when the directory would
 withdraw or narrow a principal's scope, and it never writes the scope: the next login does, through
 the same :func:`~messagefoundry.auth.channel_scope.decide_ad_channel_scope` this module plans with.
@@ -79,8 +85,8 @@ class ProbeOutcome(Enum):
     #: outcome whatever its account state, because it is not this account's entry.
     ABSENT = "absent"
     #: The directory could not be consulted (``LdapError`` — connectivity/bind/config — other than a
-    #: referral), or the probe raised something else (BACKLOG #2241). Contributes
-    #: nothing: no strike, no revocation, no strike reset.
+    #: referral), or a network-class ``OSError`` escaped the directory layer (BACKLOG #3100).
+    #: Contributes nothing: no strike, no revocation, no strike reset.
     UNAVAILABLE = "unavailable"
     #: The directory answered with a referral, which the engine never follows (``LdapReferralError``,
     #: BACKLOG #2538). Contributes nothing for this account, like :attr:`UNAVAILABLE`: no strike,
@@ -89,6 +95,16 @@ class ProbeOutcome(Enum):
     #: revocation for the referred accounts without a sound. It never stops the other accounts
     #: being judged.
     REFERRED = "referred"
+    #: The probe raised something that is neither an ``LdapError`` nor a network-class ``OSError``
+    #: (:attr:`UNAVAILABLE` takes both): the engine failed to read whatever
+    #: came back, such as a malformed entry or a defect in the directory layer (BACKLOG #2241,
+    #: #3100). It says nothing about the account, so it contributes nothing, like
+    #: :attr:`UNAVAILABLE`: no strike, no revocation, no strike reset, no recorded outcome, and it
+    #: never moves the ADR 0195 hold. Unlike it, it is not an outage and it alerts, because it
+    #: recurs on every pass until the entry or the engine is fixed, and read as unavailable it
+    #: would leave that account unrevoked without a page. The value is the certificate path's
+    #: ``probe_fault`` refusal reason too.
+    FAULT = "probe_fault"
     #: The row carries no ``directory_object_id``, so it was NOT probed (BACKLOG #2434). A name
     #: probe could read another account's entry. No sign-in or step-up admits such a row, so a
     #: session it holds is anomalous. Plans exactly as :attr:`ABSENT` does: it strikes, and revokes
@@ -112,8 +128,10 @@ class Probe:
     outcome: ProbeOutcome
     groups: frozenset[str] = frozenset()
     directory_username: str | None = None
-    #: For :attr:`ProbeOutcome.REFERRED` only: the refusal's text, which names the referred search
-    #: and the referred hosts and nothing else (BACKLOG #2530). The pass logs the first one.
+    #: For :attr:`ProbeOutcome.REFERRED`: the refusal's text, which names the referred search and
+    #: the referred hosts and nothing else (BACKLOG #2530). The pass logs the first one. For
+    #: :attr:`ProbeOutcome.FAULT`: the exception's type name, never its message (BACKLOG #3100).
+    #: None for every other outcome.
     detail: str | None = None
 
 
@@ -156,8 +174,13 @@ HOLD_REASON = "user_account_control_undetermined"
 #: Also the reason slug of the referral's own audit row and alert, on any pass with a referral.
 REFERRAL_ABORT = "directory_referral"
 
+#: The ``aborted`` slug of a pass whose only answers were probe faults and failures, at least one a
+#: fault (BACKLOG #3100). Also the reason slug of the fault's own audit row and alert, on any pass
+#: with a fault. The same string as :attr:`ProbeOutcome.FAULT`'s value.
+PROBE_FAULT_ABORT = ProbeOutcome.FAULT.value
+
 #: The outcomes that judge nothing about the account: no strike, no recorded outcome (rule item 4).
-_UNJUDGED = frozenset({ProbeOutcome.UNAVAILABLE, ProbeOutcome.REFERRED})
+_UNJUDGED = frozenset({ProbeOutcome.UNAVAILABLE, ProbeOutcome.REFERRED, ProbeOutcome.FAULT})
 
 
 @dataclass(frozen=True)
@@ -191,31 +214,37 @@ class ReconcilePlan:
     renames: tuple[UsernameRefresh, ...] = ()
     #: Strikes to record: ``user_id -> consecutive ABSENT, DISABLED, UNDETERMINED or UNKEYED
     #: count``. A PRESENT probe maps to 0 (reset), and so does a HELD one (ADR 0195 rule item 7;
-    #: ``held`` tells the two apart). An UNAVAILABLE or REFERRED probe is absent from this mapping,
+    #: ``held`` tells the two apart). An UNAVAILABLE, REFERRED or FAULT probe is absent from this mapping,
     #: leaving whatever strike the user already carried untouched. Populated even on a breaker
-    #: abort — see :func:`plan_pass`. On an outage or a pass of referrals only it holds the UNKEYED
-    #: rows' strikes alone (BACKLOG #3170), since those were judged without the directory.
+    #: abort — see :func:`plan_pass`. On an outage or a pass of referrals or faults only it holds
+    #: the UNKEYED rows' strikes alone (BACKLOG #3170), since those were judged without the
+    #: directory.
     strikes: Mapping[str, int] = field(default_factory=dict)
     #: Candidates this pass judged, asked or not. Excludes the per-pass budget remainder. An UNKEYED
     #: row counts here, because it can revoke. This is the breaker's denominator (``judged``).
     probed: int = 0
     #: Probes this pass actually sent to the directory: ``probed`` less its UNKEYED rows (BACKLOG
-    #: #2434). An outage and a pass of referrals only are judged over these, and the outage's log
-    #: line and the ``asked`` field of its ``auth.ad_reconcile_skipped`` row count these. So do the
-    #: referral's latched message, the ``asked`` field of its ``auth.ad_reconcile_referred`` row
-    #: and its alert's count (BACKLOG #3170): a referral can only answer a probe that was sent.
+    #: #2434). An outage and a pass of referrals or faults only are judged over these, and the
+    #: outage's log line and the ``asked`` field of its ``auth.ad_reconcile_skipped`` row count
+    #: these. So do the referral's latched message, the ``asked`` field of its
+    #: ``auth.ad_reconcile_referred`` row and its alert's count (BACKLOG #3170): a referral can
+    #: only answer a probe that was sent.
     asked: int = 0
     unavailable: int = 0
     #: ``user_id`` of every probe the directory answered with a referral (BACKLOG #2538). Any one
     #: alerts, and none of them stops the rest of the pass being judged.
     referred: tuple[str, ...] = ()
+    #: ``user_id`` of every probe that raised a fault (:attr:`ProbeOutcome.FAULT`, BACKLOG #3100).
+    #: Any one alerts, and none of them stops the rest of the pass being judged.
+    faulted: tuple[str, ...] = ()
     #: Non-None when the pass ABORTED and must apply nothing: the breaker tripped, every probe the
-    #: pass asked failed (a whole-directory outage), or every probe it asked failed or was referred,
-    #: at least one of them referred. An UNKEYED row was not asked, so it never stops either abort
+    #: pass asked failed (a whole-directory outage), every probe it asked failed or was referred,
+    #: at least one of them referred, or every probe it asked failed or faulted, at least one of
+    #: them a fault (BACKLOG #3100). An UNKEYED row was not asked, so it never stops either abort
     #: (BACKLOG #2434). The value is a closed-set operator-facing slug.
     aborted: str | None = None
     #: Outcomes to record in the caller's per-candidate record (ADR 0195 rule item 4): every probe of
-    #: this pass except an UNAVAILABLE or REFERRED one, which leaves the prior entry in place.
+    #: this pass except an UNAVAILABLE, REFERRED or FAULT one, which leaves the prior entry in place.
     #: Populated on a breaker abort too, like ``strikes``.
     outcomes: Mapping[str, ProbeOutcome] = field(default_factory=dict)
     #: Whether this pass held its UNDETERMINED probes (:func:`hold_engaged`).
@@ -256,12 +285,22 @@ class ReconcilePlan:
         return self.aborted == REFERRAL_ABORT
 
     @property
+    def probe_fault(self) -> bool:
+        """True when the pass aborted because every probe it asked faulted or failed, at least one
+        of them a fault (BACKLOG #3100). It judged nothing, like an outage, but it alerts: the
+        engine could not read what the directory returned, which no later pass fixes on its own.
+        A pass with a referral as well is a referral pass. A pass with a fault beside other answers
+        is NOT this; only ``faulted`` says it saw a fault."""
+        return self.aborted == PROBE_FAULT_ABORT
+
+    @property
     def judged_nothing(self) -> bool:
-        """True when the pass aborted before judging any account: an outage, or a pass of referrals
-        and failures only. Such a pass leaves the hold's state, its message and every clear alone,
-        because it learned nothing about the accounts it asked about. It still strikes an UNKEYED
-        row, which was judged without the directory (BACKLOG #3170)."""
-        return self.directory_outage or self.directory_referral
+        """True when the pass aborted before judging any account: an outage, a pass of referrals
+        and failures only, or one of faults and failures only. Such a pass leaves the hold's state,
+        its message and every clear alone, because it learned nothing about the accounts it asked
+        about. It still strikes an UNKEYED row, which was judged without the directory (BACKLOG
+        #3170)."""
+        return self.directory_outage or self.directory_referral or self.probe_fault
 
     @property
     def judged(self) -> int:
@@ -351,9 +390,10 @@ def select_candidates(
 def _unkeyed_strikes(probes: list[Probe], prior_strikes: Mapping[str, int]) -> dict[str, int]:
     """The strikes of a pass that judged nothing (BACKLOG #3170 item 3).
 
-    An UNKEYED row was judged without the directory, so an outage or a pass of referrals only still
-    strikes it, as any other pass does. Only the strike: its outcome is not recorded, so the hold's
-    record, and so its carry-over, stays as it was, and an aborted pass revokes nothing."""
+    An UNKEYED row was judged without the directory, so an outage or a pass of referrals or faults
+    only (BACKLOG #3100) still strikes it, as any other pass does. Only the strike: its outcome is
+    not recorded, so the hold's record, and so its carry-over, stays as it was, and an aborted pass
+    revokes nothing."""
     return {
         p.user_id: prior_strikes.get(p.user_id, 0) + 1
         for p in probes
@@ -392,22 +432,25 @@ def plan_pass(
     probes = list(probes)
     unavailable = [p for p in probes if p.outcome is ProbeOutcome.UNAVAILABLE]
     referred = [p for p in probes if p.outcome is ProbeOutcome.REFERRED]
+    faulted = [p for p in probes if p.outcome is ProbeOutcome.FAULT]
     # BACKLOG #2434. The caller reads a row it may not ask about as UNKEYED, so that outcome is
     # the one mark of "never asked": it says nothing about whether the directory answered.
     asked = sum(1 for p in probes if p.outcome is not ProbeOutcome.UNKEYED)
 
-    if referred and len(unavailable) + len(referred) == asked:
-        # BACKLOG #2538. Nothing the pass asked was answered, as on an outage, so it judges nothing
-        # and the hold's state carries over. Checked before the outage, so a pass of referrals and
-        # failures is not read as a plain outage, which pages nobody. A user search base in another
-        # domain of the forest refers every probe, and this is the shape it takes.
+    if (referred or faulted) and len(unavailable) + len(referred) + len(faulted) == asked:
+        # BACKLOG #2538, #3100. Nothing the pass asked was answered, as on an outage, so it judges
+        # nothing and the hold's state carries over. Checked before the outage, so a pass of
+        # referrals or faults and failures is not read as a plain outage, which pages nobody. A
+        # user search base in another domain of the forest refers every probe, and an entry or a
+        # defect that raises does so on every pass. A referral wins over a fault: it names the fix.
         return ReconcilePlan(
             strikes=_unkeyed_strikes(probes, prior_strikes),
             probed=len(probes),
             asked=asked,
             unavailable=len(unavailable),
             referred=tuple(p.user_id for p in referred),
-            aborted=REFERRAL_ABORT,
+            faulted=tuple(p.user_id for p in faulted),
+            aborted=REFERRAL_ABORT if referred else PROBE_FAULT_ABORT,
             latched=latched,
         )
 
@@ -428,7 +471,8 @@ def plan_pass(
 
     # ADR 0195 rule items 4 to 6. An UNAVAILABLE probe leaves the prior entry in place, so a
     # directory blip on one held account does not make another look single. A REFERRED probe does
-    # too (BACKLOG #2538): a referral says where to look, not what the account is. Every other probe
+    # too (BACKLOG #2538): a referral says where to look, not what the account is. So does a FAULT
+    # probe (BACKLOG #3100): the engine could not read the answer. Every other probe
     # is judged below as on any pass. A referring group search base refers only the accounts the
     # user search FOUND enabled, so a disabled or absent account's answer still strikes and revokes.
     outcomes = {p.user_id: p.outcome for p in probes if p.outcome not in _UNJUDGED}
@@ -513,6 +557,7 @@ def plan_pass(
         asked=asked,
         unavailable=len(unavailable),
         referred=tuple(p.user_id for p in referred),
+        faulted=tuple(p.user_id for p in faulted),
         outcomes=outcomes,
         hold=hold,
         latched=hold_latches(undetermined=undetermined, latched=latched),

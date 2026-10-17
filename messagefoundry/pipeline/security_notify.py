@@ -86,7 +86,7 @@ _SUBJECTS = {
     FEDERATED_IDENTITY_UNBOUND: "An external sign-in identity was removed from your MessageFoundry account",
     FIRST_ADMINISTRATOR_TAKEOVER: "Your MessageFoundry account was made an Administrator from the host",
     ACCOUNT_DISABLED: "Your MessageFoundry account was disabled",
-    DIRECTORY_SESSIONS_ENDED: "Your MessageFoundry sessions were ended by a directory check",
+    DIRECTORY_SESSIONS_ENDED: "Your MessageFoundry sessions were ended",
     MFA_ENABLED: "Two-factor authentication was enabled on your MessageFoundry account",
     MFA_DISABLED: "Two-factor authentication was disabled on your MessageFoundry account",
     MFA_CREDENTIAL_REMOVED: "A second factor was removed from your MessageFoundry account",
@@ -122,10 +122,15 @@ _DESCRIPTIONS = {
         "no longer works."
     ),
     ACCOUNT_DISABLED: "Your account was disabled by an administrator.",
-    # vault BACKLOG #2140. Says only what the engine did. The probe either could not match the
-    # account or could not read whether it is disabled, so this must not say disabled or deleted.
+    # vault BACKLOG #2140, #3171. One wording for every reason that sends this kind, with no branch on
+    # ``detail["reason"]``. Which reasons those are is decided in
+    # ``AuthService._apply_reconcile_revocation``, and any reason added later falls here too; the
+    # constant's comment in ``auth/notifications.py`` names at least the current ones. For at least
+    # one of them no directory lookup ran, so neither this nor the subject may say one did, or that
+    # the account is disabled or deleted. "Could not confirm" stays true whatever the cause.
     DIRECTORY_SESSIONS_ENDED: (
-        "A check against your organization's directory ended your MessageFoundry sessions."
+        "MessageFoundry ended your sessions. It could not confirm from your organization's "
+        "directory that your account may still sign in."
     ),
     MFA_ENABLED: "A two-factor authenticator (TOTP) was enrolled on your account.",
     MFA_DISABLED: "Two-factor authentication was removed from your account.",

@@ -304,3 +304,23 @@ def test_outside_a_repo_the_json_roster_carries_an_unavailable_receipt(tmp_path:
         f"'nobody is live': stdout={proc.stdout!r} stderr={proc.stderr!r}"
     )
     assert "not inside a git repository" in proc.stderr.lower(), proc.stderr
+
+
+def test_a_scheduled_run_is_flagged_and_a_persons_session_is_not(
+    repo: Path, config_root: Path
+) -> None:
+    write_session(config_root, pid=os.getpid(), cwd=repo, session_id="aaaaaaaa-1111")
+    d = config_root / "projects" / "any"
+    d.mkdir(parents=True)
+    (d / "aaaaaaaa-1111.jsonl").write_text(
+        json.dumps({"type": "queue-operation", "content": '<scheduled-task name="t">'}) + "\n",
+        encoding="utf-8",
+    )
+    rows = run_presence(repo, config_root)
+    assert [r["Scheduled"] for r in rows] == [True]
+
+    (d / "aaaaaaaa-1111.jsonl").write_text(
+        json.dumps({"type": "queue-operation", "content": "hello"}) + "\n", encoding="utf-8"
+    )
+    rows = run_presence(repo, config_root)
+    assert [r["Scheduled"] for r in rows] == [False]

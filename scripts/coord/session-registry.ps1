@@ -250,3 +250,53 @@ function Get-SessionLiveness {
     }
     return $best
 }
+
+# Was this session started by the Desktop app's scheduled-task runner, rather than by a person?
+#
+# THE REGISTRY CANNOT SAY. Measured 2026-10-16: a scheduled run's record reads kind=interactive,
+# entrypoint=claude-desktop and nameSource=user, exactly like a session a person opened, and its name
+# is only the task's title. The TRANSCRIPT can: its first line is the queue entry that started the
+# run, and for a scheduled run that entry's content opens with `<scheduled-task name="...`. A session
+# a person started opens with their own first prompt instead.
+#
+# WHY IT MATTERS: a scheduled run is a peer nobody is in. Announcing to it costs that run a turn per
+# message, and the run's own announcements cost every real peer one.
+#
+# FAILS TOWARD $false. Any miss (no transcript yet, unreadable, unparseable) answers "a person's
+# session", which is what every caller assumed before this existed. Only a positive marker excludes.
+function Test-ScheduledTaskSession {
+    [CmdletBinding()]
+    param(
+        [string]$Root,
+        [string]$SessionId
+    )
+    # The id becomes a file name, so it must be one: no separators, no wildcards.
+    if (-not $Root -or -not $SessionId -or $SessionId -notmatch '^[A-Za-z0-9._-]+$') { return $false }
+    # Search every project directory rather than encoding the cwd. Measured 2026-10-16: one scheduled
+    # run's transcript sat under two project directories, one of which matched no encoding of its cwd.
+    # Walk them explicitly: `Get-ChildItem projects\* -Filter` returned nothing for a transcript that
+    # was there.
+    # Listed once per root per process: presence asks once per session, and the listing does not change
+    # between those calls.
+    if (-not $script:ProjectDirsByRoot) { $script:ProjectDirsByRoot = @{} }
+    if (-not $script:ProjectDirsByRoot.ContainsKey($Root)) {
+        $script:ProjectDirsByRoot[$Root] = @(Get-ChildItem -LiteralPath (Join-Path $Root 'projects') -Directory -EA SilentlyContinue |
+                ForEach-Object { $_.FullName })
+    }
+    $hits = @($script:ProjectDirsByRoot[$Root] |
+        ForEach-Object { Join-Path $_ "$SessionId.jsonl" } |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+    foreach ($f in $hits) {
+        try {
+            $first = Get-Content -LiteralPath $f -TotalCount 1 -EA Stop
+            $rec = $first | ConvertFrom-Json -EA Stop
+            # The queue entry is what was measured. A first `user` record carrying the same prompt is
+            # accepted too, so a runner that skips the queue does not silently turn the flag off.
+            $text = if ($rec.type -eq 'queue-operation') { $rec.content }
+                    elseif ($rec.type -eq 'user' -and $rec.message.content -is [string]) { $rec.message.content }
+                    else { $null }
+            if ($text -is [string] -and $text.StartsWith('<scheduled-task ', 'Ordinal')) { return $true }
+        } catch { continue }
+    }
+    return $false
+}

@@ -727,6 +727,10 @@ _MSSQL_REVOKE_USER_SESSIONS_SQL: Final = (
     "UPDATE sessions SET revoked_at=?, seal='' OUTPUT inserted.token_hash"
     " WHERE user_id=? AND revoked_at IS NULL"
 )
+#: Whether the account holds at least one passkey.
+_MSSQL_WEBAUTHN_ANY_FOR_USER: Final = (
+    "SELECT TOP (1) 1 AS present FROM webauthn_credentials WHERE user_id=?"
+)
 #: store.py's ``_USER_INSERT``, the sealed user record's one INSERT (BACKLOG #2592). Spelled here
 #: rather than imported so this module's own text shows it writes ``users``, whose ``totp_secret``
 #: cell the cipher sweeps must reach (``tests/test_store_cipher_sweep_parity.py`` reads the text).
@@ -13170,9 +13174,7 @@ class SqlServerStore:
 
     async def has_webauthn_credentials(self, user_id: str) -> bool:
         """True when the user has at least one enrolled passkey (the second-factor predicate)."""
-        d = await self._fetchone(
-            "SELECT TOP (1) 1 AS present FROM webauthn_credentials WHERE user_id=?", (user_id,)
-        )
+        d = await self._fetchone(_MSSQL_WEBAUTHN_ANY_FOR_USER, (user_id,))
         return d is not None
 
     async def any_webauthn_credentials(self) -> bool:
@@ -13709,7 +13711,7 @@ class SqlServerStore:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
-                    "SELECT username, oidc_issuer, oidc_subject FROM users"
+                    "SELECT username, oidc_issuer, oidc_subject, totp_enabled, cred_digest FROM users"
                     " WITH (UPDLOCK, ROWLOCK) WHERE id=?",
                     (user_id,),
                 )
@@ -13720,6 +13722,8 @@ class SqlServerStore:
                     await conn.rollback()
                     return None
                 username, issuer, subject = rows[0][0], rows[0][1], rows[0][2]
+                totp_enrolled = bool(rows[0][3])
+                digest_names_passkey = bool(rows[0][4])
                 if (issuer, subject) != (expected_issuer, expected_subject):
                     # Compared under the UPDLOCK above, so no other write to the row can land
                     # between this and the UPDATE. Nothing written; the rollback frees the lock.
@@ -13731,13 +13735,24 @@ class SqlServerStore:
                         sessions_revoked=0,
                         changed=True,
                     )
+                # Vault BACKLOG #2711 step 3. A statement of its own AFTER the UPDLOCK: under RCSI
+                # it reads a fresh statement snapshot, so it sees a passkey whose write (which
+                # re-seals this row) committed while the lock above waited. A passkey counts when
+                # either the table or the sealed digest names one, as the service reads it.
+                await cur.execute(_MSSQL_WEBAUTHN_ANY_FOR_USER, (user_id,))
+                webauthn_enrolled = bool(await cur.fetchall()) or digest_names_passkey
                 if issuer is None and subject is None:
                     # Already unbound: write NOTHING, so a no-op cannot sign the account out. The
                     # rollback releases the UPDLOCK taken above; there is nothing else to undo.
                     # AND, not OR: a half row has something to clear (see FederatedUnbind).
                     await conn.rollback()
                     return FederatedUnbind(
-                        username=username, issuer=None, subject=None, sessions_revoked=0
+                        username=username,
+                        issuer=None,
+                        subject=None,
+                        sessions_revoked=0,
+                        totp_enrolled=totp_enrolled,
+                        webauthn_enrolled=webauthn_enrolled,
                     )
                 await self._write_user(cur, user_id, lambda r: federated_unbind(r, now))
                 await cur.execute(
@@ -13754,6 +13769,8 @@ class SqlServerStore:
             issuer=issuer,
             subject=subject,
             sessions_revoked=int(count) if count is not None else 0,
+            totp_enrolled=totp_enrolled,
+            webauthn_enrolled=webauthn_enrolled,
         )
 
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:

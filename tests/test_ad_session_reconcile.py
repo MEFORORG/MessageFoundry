@@ -576,6 +576,53 @@ def test_a_pass_of_referrals_and_failures_is_a_referral_not_an_outage() -> None:
     assert tripped.aborted == "mass_revoke_breaker" and not tripped.judged_nothing
 
 
+F = reconcile.ProbeOutcome.FAULT
+
+
+def test_a_faulted_probe_is_left_unjudged_and_the_rest_of_the_pass_is_judged() -> None:
+    """BACKLOG #3100 item 1. A probe fault is unjudged like an unreachable probe: no strike, no
+    reset, no recorded outcome, and it never moves the hold. It is counted apart from the
+    unreachable ones, and the account beside it that left the directory is still revoked.
+
+    RED when: a fault is counted as unavailable, or strikes, or is recorded."""
+    probes = [
+        reconcile.Probe("f", "faulted", F, detail="KeyError"),
+        reconcile.Probe("g", "gone", reconcile.ProbeOutcome.ABSENT),
+        reconcile.Probe("ok", "fine", P),
+    ]
+    plan = _plan(probes, prior_strikes={"g": 1, "f": 1}, prior_outcomes={"f": U})
+    assert plan.aborted is None and not plan.judged_nothing and not plan.probe_fault
+    assert [(r.user_id, r.reason) for r in plan.revocations] == [("g", "directory_absent")]
+    assert plan.strikes == {"g": 2, "ok": 0}
+    assert set(plan.outcomes) == {"g", "ok"}
+    assert (plan.faulted, plan.unavailable, plan.judged) == (("f",), 0, 3)
+
+
+def test_a_pass_of_faults_and_failures_is_a_probe_fault_not_an_outage() -> None:
+    """BACKLOG #3100 item 1. When every probe raises, the pass used to read as a directory outage,
+    which is audited as skipped and pages nobody. It aborts as ``probe_fault`` instead: it judges
+    nothing, like an outage, carries the hold's latch, and is not an outage. A referral beside the
+    faults makes it a referral pass, which carries the faults too. Every probe failing is still an
+    outage, the control.
+
+    RED when: an all-fault pass reads as ``directory_unavailable``."""
+    faults = [reconcile.Probe(f"f{i}", f"f{i}", F) for i in range(3)]
+    down = reconcile.Probe("d", "down", reconcile.ProbeOutcome.UNAVAILABLE)
+    for latched in (True, False):
+        plan = _plan(faults, prior_strikes={"f0": 1}, prior_outcomes={"f0": U}, latched=latched)
+        assert plan.aborted == reconcile.PROBE_FAULT_ABORT == "probe_fault"
+        assert plan.probe_fault and plan.judged_nothing and not plan.directory_outage
+        assert plan.revocations == () and plan.strikes == {} and plan.outcomes == {}
+        assert not plan.hold and plan.latched is latched
+        assert (len(plan.faulted), plan.unavailable, plan.asked) == (3, 0, 3)
+    mixed = _plan([down, faults[0]])
+    assert mixed.probe_fault and (mixed.faulted, mixed.unavailable) == (("f0",), 1)
+    referred = _plan([faults[0], reconcile.Probe("r", "referred", R)])
+    assert referred.directory_referral and not referred.probe_fault
+    assert (referred.faulted, referred.referred) == (("f0",), ("r",))
+    assert _plan([down]).directory_outage
+
+
 def test_the_outcome_record_caps_undetermined_entries_last() -> None:
     assert reconcile.outcome_rank(U) > reconcile.outcome_rank(P)
     ledger = {"u1": U, "u2": P}
@@ -625,8 +672,20 @@ def test_an_unkeyed_probe_does_not_hide_an_outage_or_a_referral_only_pass() -> N
             reconcile.Probe("a", "a", reconcile.ProbeOutcome.UNAVAILABLE),
             reconcile.Probe("r", "r", reconcile.ProbeOutcome.REFERRED),
         ],
+        # BACKLOG #3100 shares the referral's early return, so a pass of faults only is one too.
+        [reconcile.Probe("f", "f", reconcile.ProbeOutcome.FAULT)],
+        [
+            reconcile.Probe("a", "a", reconcile.ProbeOutcome.UNAVAILABLE),
+            reconcile.Probe("f", "f", reconcile.ProbeOutcome.FAULT),
+        ],
     ],
-    ids=["outage", "referrals-only", "referrals-and-failures"],
+    ids=[
+        "outage",
+        "referrals-only",
+        "referrals-and-failures",
+        "faults-only",
+        "faults-and-failures",
+    ],
 )
 def test_an_unkeyed_row_is_struck_on_a_pass_that_judged_nothing(
     asked: list[reconcile.Probe],
@@ -637,7 +696,7 @@ def test_an_unkeyed_row_is_struck_on_a_pass_that_judged_nothing(
 
     RED before #3170: both early returns carried no strikes, so such a row went unstruck."""
     unkeyed = reconcile.Probe("k", "k", reconcile.ProbeOutcome.UNKEYED)
-    plan = _plan([*asked, unkeyed], prior_strikes={"k": 1, "a": 1, "r": 1}, latched=True)
+    plan = _plan([*asked, unkeyed], prior_strikes={"k": 1, "a": 1, "r": 1, "f": 1}, latched=True)
     assert plan.judged_nothing
     assert plan.strikes == {"k": 2}
     assert plan.outcomes == {} and plan.latched and not plan.hold
@@ -889,6 +948,8 @@ async def test_a_referring_user_search_base_judges_nothing_and_pages_every_pass(
             assert [r.levelno for r in lines] == [logging.ERROR]
             assert "First referral:" in lines[0].getMessage()
             assert "answered the user search with a referral" in lines[0].getMessage()
+            # BACKLOG #3100 item 5: the base is the fault, so the line names no account.
+            assert "jdoe" not in lines[0].getMessage() and "asmith" not in lines[0].getMessage()
 
         for token in tokens:
             assert token is not None and await service.identity_for_token(token) is not None
@@ -1148,7 +1209,8 @@ async def test_one_principal_that_raises_no_longer_ends_the_pass(
 ) -> None:
     """BACKLOG #2241. A lookup that raises something other than LdapError used to escape the probe
     and end the WHOLE pass, so one such account stopped revocation for every account. It is read as
-    unavailable for that account alone, logged at WARNING by name, and the rest is reconciled.
+    a probe fault for that account alone (BACKLOG #3100), logged at WARNING by name, and the rest
+    is reconciled.
 
     RED when: the KeyError escapes reconcile_directory_sessions."""
     store = await MessageStore.open(":memory:")
@@ -1164,13 +1226,104 @@ async def test_one_principal_that_raises_no_longer_ends_the_pass(
             first = await service.reconcile_directory_sessions()
             second = await service.reconcile_directory_sessions()
 
-        assert first.aborted is None and first.unavailable == 1
+        # A fault, not an outage (BACKLOG #3100): counted apart from the unreachable probes.
+        assert first.aborted is None and first.unavailable == 0 and len(first.faulted) == 1
         assert [r.username for r in second.revocations] == ["asmith"]
         assert await service.identity_for_token(tokens["asmith"] or "") is None
         # Fail open for the account that raised: never struck, never revoked.
         assert await service.identity_for_token(tokens["jdoe"] or "") is not None
         warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert sum("jdoe" in m and "KeyError" in m for m in warned) == 2  # every pass, by name
+    finally:
+        await store.close()
+
+
+async def test_an_os_error_escaping_the_directory_layer_is_still_an_outage() -> None:
+    """BACKLOG #3100, the review's ask. A socket fault ldap.py did not wrap is the directory not
+    being reached. Read as a probe fault, a network blip would page and open an alert that nothing
+    resolves.
+
+    RED when: an OSError maps to FAULT."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap({"jdoe": _principal("jdoe")})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        await _signed_in_ad_user(service, store, "jdoe")
+
+        ldap.broken["jdoe"] = TimeoutError("synthetic: read timed out")
+        plan = await service.reconcile_directory_sessions()
+        assert plan.directory_outage and plan.faulted == () and plan.unavailable == 1
+        assert service.directory_reconcile_fault is None
+    finally:
+        await store.close()
+
+
+def _faulted_rows(audit: list[Any]) -> list[dict[str, Any]]:
+    return [json.loads(a["detail"]) for a in audit if a["action"] == "auth.ad_reconcile_faulted"]
+
+
+async def test_when_every_probe_raises_the_operator_sees_a_probe_fault_not_an_outage(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #3100 items 1 and 3. Every probe raising used to read as a directory outage: a
+    skipped row and a WARNING, paging nobody, while the accounts kept their sessions to the cap.
+    Now every such pass aborts as ``probe_fault``, which judges nothing, and an operator sees one
+    ERROR per pass naming no account, a latched message naming the gap, and a faulted row, and no
+    skipped row. A pass beside a single fault records it too. A clean pass releases the message.
+
+    RED when: the pass reads as ``directory_unavailable``, or nothing pages it."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap({"jdoe": _principal("jdoe"), "asmith": _principal("asmith")})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        tokens = [await _signed_in_ad_user(service, store, u) for u in ("jdoe", "asmith")]
+
+        ldap.broken["jdoe"] = KeyError("userAccountControl")
+        ldap.broken["asmith"] = ValueError("synthetic: malformed objectGUID")
+        for _ in range(2):
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+                plan = await service.reconcile_directory_sessions()
+            assert plan.aborted == "probe_fault" and plan.probe_fault
+            assert not plan.directory_outage and plan.judged_nothing
+            assert len(plan.faulted) == 2 and plan.unavailable == 0 and plan.revocations == ()
+            assert not plan.breaker_clear and not plan.hold_clear and not plan.referral_clear
+            errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+            assert len(errors) == 1 and "directory probe fault" in errors[0]
+            assert "jdoe" not in errors[0] and "asmith" not in errors[0]
+            assert not any("unreachable" in r.getMessage() for r in caplog.records)
+
+        for token in tokens:  # fail open: a fault never revokes
+            assert token is not None and await service.identity_for_token(token) is not None
+        alert = service.directory_reconcile_fault
+        assert alert is not None and "revoked nothing" in alert
+        assert "session_absolute_hours" in alert
+        # The store keeps 200 characters of the alert's reason: the pointer must fit in them.
+        assert "names the account" in alert[:200]
+        audit = await store.list_audit()
+        expected = {
+            "reason": "probe_fault",
+            "faulted": 2,
+            "unavailable": 0,
+            "probed": 2,
+            "aborted": "probe_fault",
+        }
+        assert _faulted_rows(audit) == [expected, expected]
+        assert not any(a["action"] == "auth.ad_reconcile_skipped" for a in audit)
+        assert not any(a["action"] == "auth.ad_reconcile_aborted" for a in audit)
+
+        del ldap.broken["asmith"]  # one account still faults beside a healthy one
+        plan = await service.reconcile_directory_sessions()
+        assert plan.aborted is None and len(plan.faulted) == 1
+        assert service.directory_reconcile_fault is not None
+        assert "judged as usual" in service.directory_reconcile_fault
+
+        del ldap.broken["jdoe"]  # the entry or the engine was fixed
+        plan = await service.reconcile_directory_sessions()
+        assert plan.aborted is None and plan.faulted == ()
+        assert service.directory_reconcile_fault is None
     finally:
         await store.close()
 

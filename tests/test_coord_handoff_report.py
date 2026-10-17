@@ -35,6 +35,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._no_prompt import run_holding_stdin_open
+
 ROOT = Path(__file__).resolve().parents[1]
 COORD = ROOT / "scripts" / "coord"
 LIB = ("handoff.ps1", "box-activity.ps1", "session-registry.ps1", "occupancy.ps1", "mail-key.ps1")
@@ -374,3 +376,31 @@ class TestReportTellsEmptyFromUnlooked:
         """Section 11: prefer "at least" to an enumeration. A closed-set claim here would be false."""
         put(sandbox, "2026-08-13-a.md")
         assert "A FLOOR, not a closed set" in run(sandbox, "-Report").stdout
+
+
+@pytest.mark.parametrize(
+    ("args", "missing"),
+    [
+        (("-Force",), "-Retire"),
+        (("-From", "draft.md"), "-Write"),
+        (("-Write", "a.md"), "-From"),
+    ],
+    ids=["force-only", "from-only", "write-without-from"],
+)
+def test_a_partial_retire_or_write_refuses_instead_of_prompting(
+    sandbox: Path, args: tuple[str, ...], missing: str
+) -> None:
+    """Vault BACKLOG #3627: the ``Retire`` or ``Write`` set bound without its name. Red pre-fix."""
+    target = put(sandbox, "2026-08-13-old-note.md")
+    rc, err = run_holding_stdin_open(
+        [
+            "pwsh", "-NoProfile", "-File", str(sandbox / "scripts" / "coord" / "handoff.ps1"),
+            *args, "-CoordDir", str(sandbox / "coord"), "-ConfigRoot", str(sandbox / "noroot"),
+        ],
+        cwd=sandbox,
+    )  # fmt: skip
+    assert rc != 0, "a partial -Retire or -Write call must be refused, not acted on"
+    assert missing in err, err
+    # Refused means NOTHING moved and NOTHING written.
+    assert [p.name for p in (sandbox / "coord" / "handoffs").iterdir()] == [target.name]
+    assert not list((sandbox / "coord").glob("_retired-*"))
