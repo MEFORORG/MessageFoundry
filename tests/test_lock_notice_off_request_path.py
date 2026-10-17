@@ -14,6 +14,7 @@ Each test that asserts an absence carries a control showing the instrument can s
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import threading
@@ -822,7 +823,7 @@ async def test_a_notice_dropped_on_a_full_queue_does_not_hold_the_next_one_back(
 async def test_the_shipped_notifier_queues_nothing_once_it_has_closed() -> None:
     """Vault BACKLOG #3120: after ``aclose`` nothing drains the queue, so an event ``notify`` put
     there would never be sent. It answers ``False`` instead. The control is the same call on the
-    same notifier before it closed, which answers ``True``. A fresh ``start`` takes events again."""
+    same notifier before it closed, which answers ``True``."""
     relay = _relay()
     relay.start()
     try:
@@ -833,12 +834,70 @@ async def test_the_shipped_notifier_queues_nothing_once_it_has_closed() -> None:
     late = SecurityEvent(ACCOUNT_LOCKED, username="b", email="b@x.test")
     assert await relay.notify(late) is False
     assert relay._queue.qsize() == 0, "the late event was queued where nothing reads it"
+
+
+async def test_a_closed_notifier_refuses_to_start_again() -> None:
+    """Vault BACKLOG #3120, review round two. A close can leave its stop sentinel on the queue, so a
+    drain loop started again could stop on it at once. ``start`` after ``aclose`` therefore raises,
+    and the notifier goes on refusing events. The control is ``start`` on a notifier never closed,
+    which raises nothing."""
+    relay = _relay()
+    relay.start()  # the control
+    await relay.aclose()
+    with pytest.raises(RuntimeError, match="closed"):
+        relay.start()
+    assert relay._task is None, "a drain loop was started on a closed notifier"
+    late = SecurityEvent(ACCOUNT_LOCKED, username="b", email="b@x.test")
+    assert await relay.notify(late) is False
+
+
+async def test_after_a_cut_close_a_notice_reported_queued_is_sent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vault BACKLOG #3120, review round two. The teardown bounds the notifier's close, and a close
+    cut while a send is under way leaves its stop sentinel on the queue. A drain loop started again
+    then read that sentinel and stopped, and ``notify`` answered ``True`` for an event nothing ever
+    sent. Whatever ``start`` does after a cut close, a notice reported queued must be sent.
+
+    The control is the event taken before the close: its send was under way when the close was
+    cut, and once released it goes out and shows in ``sent``."""
+    started, release = threading.Event(), threading.Event()
+    sent: list[list[str]] = []
+
+    def held_send(**kw: Any) -> None:
+        if kw["recipients"] == ["a@x.test"]:
+            started.set()
+            release.wait(_STALL_SECONDS)
+        sent.append(kw["recipients"])
+
+    monkeypatch.setattr("messagefoundry.pipeline.security_notify.send_plain_email", held_send)
+    relay = _relay()
+    # Room behind the stop sentinel, so a full queue cannot be what refuses the late event.
+    relay._queue = asyncio.Queue(maxsize=8)
     relay.start()
+    answered = False
     try:
-        assert await relay.notify(late) is True, "a notifier started again refused an event"
-        relay._queue.get_nowait()
+        assert await relay.notify(SecurityEvent(PASSWORD_CHANGED, username="a", email="a@x.test"))
+        assert await asyncio.to_thread(started.wait, _STALL_SECONDS), "the send never started"
+        with pytest.raises(TimeoutError):  # the teardown's bound, cutting the close
+            await asyncio.wait_for(relay.aclose(), 0.05)
+        assert relay._queue.qsize() == 1, "the cut close left no stop sentinel to test against"
+        with contextlib.suppress(RuntimeError):  # refusing is one way to keep the property below
+            relay.start()
+        late = SecurityEvent(PASSWORD_CHANGED, username="b", email="b@x.test")
+        answered = await relay.notify(late)
+        if answered:
+            await relay.aclose()  # a live drain loop sends what it took before it stops
+            assert ["b@x.test"] in sent, "a notice reported queued after a cut close was never sent"
     finally:
+        release.set()
         await relay.aclose()
+    deadline = time.monotonic() + _STALL_SECONDS
+    while ["a@x.test"] not in sent and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert ["a@x.test"] in sent, "the control's send, under way at the cut, never finished"
+    if not answered:
+        assert ["b@x.test"] not in sent, "the late notice was refused, yet a mail went for it"
 
 
 async def test_the_shipped_notifier_queues_nothing_while_it_closes(

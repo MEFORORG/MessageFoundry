@@ -579,7 +579,7 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         # The queue-full records still being written, held so the loop keeps them alive and so
         # aclose() can wait for them.
         self._recording: set[asyncio.Task[None]] = set()
-        # Set when aclose() begins, cleared only by a fresh start() (vault BACKLOG #3120). An event
+        # Set when aclose() begins, and never cleared: start() refuses (vault BACKLOG #3120). An event
         # queued after that sits behind the stop sentinel, or on a queue nothing reads, and is never
         # sent, so notify() refuses it; the contract on ``SecurityNotifier`` says why.
         self._closing = False
@@ -667,8 +667,12 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         task.add_done_callback(self._recording.discard)
 
     def start(self) -> None:
-        if self._task is None:
-            self._closing = False  # a notifier started again after its close sends again
+        # Never again once closed (vault BACKLOG #3120). A close the teardown cut short leaves its
+        # stop sentinel on the queue, so a drain loop started again would read it and stop, and
+        # notify() would answer True for events nothing sends. The engine builds a new notifier for
+        # each lifespan rather than restart one.
+        if self._closing:
+            raise RuntimeError(f"{type(self).__name__} has been closed and cannot be started again")
         super().start()
 
     async def aclose(self) -> None:
