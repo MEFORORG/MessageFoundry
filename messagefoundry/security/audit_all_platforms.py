@@ -48,16 +48,19 @@ say) fail the audit instead of being skipped.
 WHAT IT REFUSES, exit 2: a lock with no requirement lines at all, so an empty input cannot read as
 a clean audit; and a pip option line (``-r``, ``-c``, ``-e``, an index URL), which a uv export
 never writes and which would resolve against the temporary copy's directory, or escape the strip,
-rather than audit what it names. ``uv export --no-emit-project`` and ``pip-compile
---no-emit-index-url`` write none. It does not judge whether a non-empty lock is complete;
-released-line-audit carries its own floor for that.
+rather than audit what it names (``uv export --no-emit-project`` writes none; a lock tool can
+write at least an index URL, ``--trusted-host`` and ``--find-links`` lines unless told not to); and
+a requirement that continues onto a line other than a hash, option or comment, where a marker
+would stay in place. It does not judge whether a non-empty lock is complete; released-line-audit
+carries its own floor for that.
 
 It reads lines as pip does: a requirement or option is any line that does not continue the one
 before it (a line ending in a backslash continues, unless it is a comment), indented or not. A
-UTF-8 or UTF-16 byte-order mark is honoured, as pip honours it.
+UTF-8, UTF-16 or UTF-32 byte-order mark is honoured, as pip honours it.
 
-Both subprocesses run with ``-P``, so the checked-out tree (the current directory) is not on their
-``sys.path`` and cannot shadow a module the auditor imports.
+Both subprocesses start through ``messagefoundry.childenv.python_module_argv``, so with ``-P``
+(the checked-out tree, the current directory, is not on their ``sys.path`` and cannot shadow a
+module the auditor imports) and the engine's other child-interpreter flags.
 
 WHAT IT DOES NOT HANDLE, stated rather than papered over. If a lock ever pins ONE name at two
 versions under two markers (a resolver fork), the copy carries both and pip-audit refuses it with
@@ -77,6 +80,8 @@ import tempfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+from messagefoundry.childenv import python_module_argv
+
 
 def is_requirement_line(line: str) -> bool:
     """A requirement starts at column 0 and is neither a comment nor a pip option.
@@ -87,32 +92,69 @@ def is_requirement_line(line: str) -> bool:
     return bool(line) and not line[0].isspace() and line[0] not in "#-"
 
 
-def _starts(lines: list[str]) -> list[bool]:
-    """Whether each physical line starts a logical one, as pip joins them.
+def _body(line: str) -> str:
+    """``line`` without its terminator, whichever of those ``str.splitlines`` ends it on."""
+    return line.splitlines()[0] if line else ""
 
-    A line ending in a backslash continues onto the next, unless it is a comment.
+
+def _kinds(lines: list[str]) -> list[str]:
+    """Classify each physical line as pip joins them into logical lines.
+
+    ``requirement`` or ``option`` where a logical line starts; ``continued`` where a requirement
+    goes on to a line that is neither a hash or other option nor a comment, so a marker there would
+    escape the strip; ``other`` for the rest. A line ending in a backslash continues onto the next,
+    unless it is a comment.
     """
-    starts: list[bool] = []
-    continued = False
+    kinds: list[str] = []
+    continued = in_requirement = False
     for line in lines:
-        body = line.rstrip("\r\n")
-        starts.append(not continued)
-        continued = body.endswith("\\") and not body.lstrip().startswith("#")
-    return starts
+        body = _body(line)
+        head = body.lstrip()
+        if not continued:
+            in_requirement = is_requirement_line(head)
+            kind = "requirement" if in_requirement else "option" if head[:1] == "-" else "other"
+        else:
+            kind = "continued" if in_requirement and head[:1] not in ("", "-", "#") else "other"
+        kinds.append(kind)
+        continued = body.endswith("\\") and not head.startswith("#")
+    return kinds
+
+
+def _lines_of(text: str, kind: str) -> list[str]:
+    lines = text.splitlines()
+    return [ln for ln, k in zip(lines, _kinds(lines), strict=True) if k == kind]
+
+
+def requirement_lines(text: str) -> list[str]:
+    """The lines that start a requirement, without their indentation."""
+    return [ln.lstrip() for ln in _lines_of(text, "requirement")]
 
 
 def option_lines(text: str) -> list[str]:
     """The pip option lines (``-r``, ``--index-url``, ...) that start a logical line."""
-    lines = text.splitlines()
-    return [ln for ln, s in zip(lines, _starts(lines), strict=True) if s and ln.lstrip()[:1] == "-"]
+    return _lines_of(text, "option")
+
+
+def continued_requirement_lines(text: str) -> list[str]:
+    """Lines a requirement continues onto that the strip does not rewrite (see :func:`_kinds`)."""
+    return _lines_of(text, "continued")
+
+
+#: Longest first: a UTF-32-LE mark begins with the UTF-16-LE one.
+_BOMS = (
+    (codecs.BOM_UTF32_LE, "utf-32"),
+    (codecs.BOM_UTF32_BE, "utf-32"),
+    (codecs.BOM_UTF16_LE, "utf-16"),
+    (codecs.BOM_UTF16_BE, "utf-16"),
+)
 
 
 def read_lock(path: Path) -> str:
-    """Decode a lock as pip would: UTF-16 behind its byte-order mark, otherwise UTF-8."""
+    """Decode a lock as pip would: by its UTF-32 or UTF-16 byte-order mark, otherwise as UTF-8."""
     raw = path.read_bytes()
-    utf16 = raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE))
+    codec = next((name for bom, name in _BOMS if raw.startswith(bom)), "utf-8-sig")
     # Universal newlines, as Path.read_text gives them.
-    return io.StringIO(raw.decode("utf-16" if utf16 else "utf-8-sig"), newline=None).read()
+    return io.StringIO(raw.decode(codec), newline=None).read()
 
 
 def strip_markers(text: str) -> tuple[str, list[str], int]:
@@ -121,9 +163,9 @@ def strip_markers(text: str) -> tuple[str, list[str], int]:
     stripped: list[str] = []
     requirements = 0
     lines = text.splitlines(keepends=True)
-    for line, starts in zip(lines, _starts(lines), strict=True):
-        body = line.rstrip("\r\n")
-        if starts and is_requirement_line(body.lstrip()):
+    for line, kind in zip(lines, _kinds(lines), strict=True):
+        body = _body(line)
+        if kind == "requirement":
             requirements += 1
             pin, has_marker, marker = body.partition(";")
             if has_marker:
@@ -137,6 +179,8 @@ def strip_markers(text: str) -> tuple[str, list[str], int]:
 
 
 def _run(cmd: list[str]) -> int:
+    # The whole environment on purpose: pip and pip-audit read their index, proxy and certificate
+    # settings from it, and this runs in CI or by hand, never in the service.
     return subprocess.run(cmd, check=False).returncode  # nosec B603 - fixed argv, no shell
 
 
@@ -161,6 +205,14 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
     if options:
         print(f"::error::{args.lock}: pip option lines are not audited: {options}", file=sys.stderr)
         return 2
+    continued = continued_requirement_lines(text)
+    if continued:
+        print(
+            f"::error::{args.lock}: a requirement continues onto a line whose marker would not be "
+            f"removed: {continued}",
+            file=sys.stderr,
+        )
+        return 2
     print(
         f"{args.lock}: {requirements} pinned requirements, {len(stripped)} un-gated from a marker "
         "the host would have evaluated:"
@@ -168,23 +220,14 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
     for entry in stripped:
         print(f"  {entry}")
     sys.stdout.flush()
-    pip_check = [sys.executable, "-P", "-m", "pip", "install", "--dry-run", "--ignore-installed"]
+    pip_check = [*python_module_argv("pip"), "install", "--dry-run", "--ignore-installed"]
     status = run([*pip_check, "--require-hashes", "--quiet", "-r", str(args.lock)])
     if status:
         return status
     with tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP") or None) as tmp:
         copy = Path(tmp) / args.lock.name
         copy.write_text(text, encoding="utf-8")
-        audit = [
-            sys.executable,
-            "-P",
-            "-m",
-            "pip_audit",
-            "-r",
-            str(copy),
-            "--desc",
-            "--disable-pip",
-        ]
+        audit = [*python_module_argv("pip_audit"), "-r", str(copy), "--desc", "--disable-pip"]
         return run([*audit, "--strict", *args.pip_audit_args])
 
 

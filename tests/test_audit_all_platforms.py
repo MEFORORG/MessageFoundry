@@ -17,7 +17,7 @@ import re
 import pytest
 import yaml
 
-from scripts.security.audit_all_platforms import is_requirement_line, main, strip_markers
+from scripts.security.audit_all_platforms import main, requirement_lines, strip_markers
 from tests._workflow_contexts import ROOT, WORKFLOWS, step_script
 
 #: The locks the required audit step reads, in both jobs that carry it.
@@ -41,7 +41,7 @@ _SCRIPT = "scripts/security/audit_all_platforms.py"
 
 def test_the_wrapper_runs_the_packaged_implementation() -> None:
     """One implementation: the workflows' entry point is the module the adopter's job runs."""
-    for imported in (main, strip_markers, is_requirement_line):
+    for imported in (main, strip_markers, requirement_lines):
         assert imported.__module__ == "messagefoundry.security.audit_all_platforms", imported
 
 
@@ -64,7 +64,7 @@ def test_the_windows_only_pins_are_in_the_audited_set() -> None:
 
 def _pins(lock: str) -> set[str]:
     text = (ROOT / lock).read_text(encoding="utf-8")
-    return {ln.split()[0] for ln in text.splitlines() if is_requirement_line(ln)}
+    return {ln.split()[0] for ln in requirement_lines(text)}
 
 
 @pytest.mark.parametrize("lock", _SUBSET_LOCKS)

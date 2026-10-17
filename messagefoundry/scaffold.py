@@ -250,26 +250,23 @@ jobs:
   # disclosed against the version you're pinned to turns YOUR CI red — your remediation clock starts
   # automatically, without waiting to read an advisory email. Remediate by bumping the engine pin in
   # requirements.txt to a release that fixed it; accept a triaged advisory by appending
-  # `--ignore-vuln <ID>` to the audit line that runs (record why, per your own change control).
+  # `--ignore-vuln <ID>` to each audit line that reports it (record why, per your own change control).
   # Declare any third-party package your Routers/Handlers import in requirements.txt too — pip-audit
   # then covers your Handler supply chain alongside the engine (ADR 0144 supply-chain gate; see
   # docs/security/SECURING-HANDLER-CONFIG-IN-CI.md).
   #
   # WINDOWS, the engine's only supported deployment platform: pip-audit silently skips a dependency
-  # whose environment marker does not match the runner. With a hashed requirements.lock the engine's
-  # own auditor also checks the lock's hashes, then audits every pin in it whatever its marker. That
-  # runs engine code, so the job waits on verify-engine as check does, and like check it installs the
-  # engine again from your index. The engine's docs/ADOPTER-CI.md, "Job 3", says more.
+  # whose environment marker does not match the runner. With a hashed requirements.lock the job
+  # installs the lock under --require-hashes and runs the engine's own auditor, which audits every
+  # pin in it whatever its marker. The engine's docs/ADOPTER-CI.md, "Job 3", says more.
   #
   # SEC-021 (CWE-494): pip-audit only catches PUBLISHED advisories — it does NOT vouch for a novel
   # malicious substitute from a compromised/confused index. Without a lock, `pip install -r
   # requirements.txt` resolves the whole transitive closure (fastapi, cryptography, pydantic, …) LIVE
   # and UNHASHED, so the step WARNS and recommends an index pin (--index-url / PIP_CONSTRAINT) against
-  # dependency-confusion. Generate the lock with `uv export` or `pip-compile --generate-hashes` over
-  # YOUR closure (see the README "Transitive supply-chain" section).
+  # dependency-confusion. Generate the lock over YOUR closure (see the README "Transitive
+  # supply-chain" section).
   audit-pin:
-    needs: verify-engine
-    if: ${{ always() && needs.verify-engine.result != 'failure' && needs.verify-engine.result != 'cancelled' }}
     runs-on: windows-latest
     timeout-minutes: 30
     defaults:
@@ -283,17 +280,17 @@ jobs:
       - name: Audit the pinned engine + deps against advisories
         run: |
           if [ -f requirements.lock ]; then
-            # What requirements.txt names, without dependencies, for the engine's auditor. Installed
-            # before pip-audit, so pip-audit's own dependencies win any version they share.
-            python -m pip install --no-deps -r requirements.txt
+            # The engine's auditor, from the lock's hashed pins. Before pip-audit, so pip-audit's own
+            # dependencies win any version they share.
+            python -m pip install --no-deps --require-hashes -r requirements.lock
+            python -m pip install pip-audit
+            pip-audit -r requirements.txt --desc
+            python -P -m messagefoundry.security.audit_all_platforms requirements.lock
           else
             echo "::warning::No requirements.lock — the transitive dependency closure resolves LIVE and UNHASHED at install time."
-            echo "::warning::Pin your index (pip --index-url / PIP_CONSTRAINT) against dependency-confusion, and ship a hash-pinned requirements.lock (uv export / pip-compile --generate-hashes) installed with --require-hashes. See the README."
-          fi
-          python -m pip install pip-audit
-          pip-audit -r requirements.txt --desc
-          if [ -f requirements.lock ]; then
-            python -P -m messagefoundry.security.audit_all_platforms requirements.lock
+            echo "::warning::Pin your index (pip --index-url / PIP_CONSTRAINT) against dependency-confusion, and ship a hash-pinned requirements.lock (uv pip compile --universal --generate-hashes) installed with --require-hashes. See the README."
+            python -m pip install pip-audit
+            pip-audit -r requirements.txt --desc
           fi
 """
 
@@ -385,7 +382,7 @@ A second supply-chain job, **`audit-pin`**, runs `pip-audit` against your pinned
 dependency closure, so a vulnerability **disclosed against the version you're pinned to** turns *your*
 CI red automatically — your remediation clock starts without waiting to read an advisory. Remediate by
 bumping the engine pin in `requirements.txt` to a release that fixed it (accept a triaged advisory by
-appending `--ignore-vuln <ID>` to the audit line that runs, recorded per your own change control).
+appending `--ignore-vuln <ID>` to each audit line that reports it, recorded per your own change control).
 It runs on **Windows**, the engine's only supported deployment platform: `pip-audit` skips a dependency
 whose environment marker does not match the runner, so a Linux runner never audits the engine's
 Windows-only dependencies. With a `requirements.lock` it also runs the engine's own auditor
@@ -410,15 +407,15 @@ hardening steps (recommended for any PHI-handling adopter):
    *your* resolved deps and install with `--require-hashes`:
    ```bash
    # generate (pick one):
-   pip-compile --generate-hashes --no-emit-index-url -o requirements.lock requirements.txt
-   uv export --format requirements-txt --no-emit-project -o requirements.lock
+   uv pip compile --universal --generate-hashes requirements.txt -o requirements.lock
+   pip-compile --generate-hashes --no-emit-index-url --no-emit-trusted-host --no-emit-find-links -o requirements.lock requirements.txt
    # install — fails if ANY requirement is unhashed:
    pip install --require-hashes -r requirements.lock
    ```
    When you commit a `requirements.lock`, the `audit-pin` CI job verifies it installs reproducibly
    under `--require-hashes` on Windows, then audits every pin; without one it **warns** that the
-   closure resolves live and unhashed. `pip-compile` locks only the platform it runs on, so run it on
-   Windows; `uv export` writes every platform's pins.
+   closure resolves live and unhashed. `uv pip compile --universal` writes every platform's pins;
+   `pip-compile` locks only the platform it runs on, so run it on Windows.
 
 ## Environments & posture
 The active environment is **required** and **free-form** — name instances `dev`/`staging`/`test`/`prod`/`poc`/…

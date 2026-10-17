@@ -19,10 +19,13 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.childenv import python_module_argv
 from messagefoundry.security.audit_all_platforms import (
+    continued_requirement_lines,
     main,
     option_lines,
     read_lock,
+    requirement_lines,
     strip_markers,
 )
 from tests._workflow_contexts import ROOT
@@ -99,7 +102,32 @@ def test_option_lines_are_found_indented_and_hash_lines_are_not() -> None:
     assert option_lines(lock) == ["  --index-url https://example.invalid"]
 
 
-@pytest.mark.parametrize("encoding", ["utf-8-sig", "utf-16"])
+def test_a_marker_on_a_continuation_line_is_refused(tmp_path: Path) -> None:
+    """pip joins it into the requirement, and the strip would leave it there, so refuse instead."""
+    lock = "colorama==0.4.6 \\\n    ; sys_platform == 'win32' \\\n    --hash=sha256:aa\n"
+    assert continued_requirement_lines(lock) == ["    ; sys_platform == 'win32' \\"]
+    src = tmp_path / "x.lock"
+    src.write_text(lock, encoding="utf-8")
+    ran, run = _recorder(0)
+    assert main([str(src)], run=run) == 2
+    assert not ran
+
+
+def test_hash_and_comment_continuations_are_not_refused() -> None:
+    assert continued_requirement_lines(LOCK) == []
+    assert requirement_lines(LOCK) == [
+        "colorama==0.4.6 ; sys_platform == 'win32' \\",
+        "idna==3.20 \\",
+        "uvloop==0.23.0 ; platform_python_implementation != 'PyPy' and sys_platform != 'win32' \\",
+    ]
+
+
+def test_any_line_terminator_is_kept_when_a_marker_is_removed() -> None:
+    """str.splitlines ends a line on more than CR and LF, and pip reads the lock the same way."""
+    assert strip_markers("foo==1 ; os_name == 'nt'\x0cbar==2\n")[0] == "foo==1\x0cbar==2\n"
+
+
+@pytest.mark.parametrize("encoding", ["utf-8-sig", "utf-16", "utf-32"])
 def test_a_byte_order_mark_is_read_as_pip_reads_it(encoding: str, tmp_path: Path) -> None:
     lock = tmp_path / "x.lock"
     lock.write_text(LOCK, encoding=encoding)
@@ -140,11 +168,14 @@ def test_the_committed_lock_is_install_checked_then_the_stripped_copy_audited(
     assert main([str(src), "--ignore-vuln", "PYSEC-0"], run=run) == 1
     [(check, checked), (audit, audited)] = seen
     # 1. The hash-checked dry-run install the old pip-audit path did, on the lock AS COMMITTED.
-    assert check[1:5] == ["-P", "-m", "pip", "install"]
+    # Through childenv, so with -P and the engine's other child-interpreter flags.
+    pip = python_module_argv("pip")
+    assert check[: len(pip) + 1] == [*pip, "install"]
     assert {"--dry-run", "--ignore-installed", "--require-hashes"} <= set(check)
     assert checked == LOCK
     # 2. The audit, on the marker-free copy, with pip out of the loop and skips refused.
-    assert audit[1:4] == ["-P", "-m", "pip_audit"]
+    pip_audit = python_module_argv("pip_audit")
+    assert audit[: len(pip_audit)] == pip_audit
     assert {"--disable-pip", "--strict"} <= set(audit)
     assert audit[-2:] == ["--ignore-vuln", "PYSEC-0"]
     assert audited == STRIPPED

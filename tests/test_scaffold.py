@@ -128,12 +128,18 @@ _RELEASE_WORKFLOW = "MEFORORG/MessageFoundry/.github/workflows/release.yml"
 
 
 @pytest.fixture(scope="module")
-def scaffolded_ci(tmp_path_factory: pytest.TempPathFactory) -> tuple[str, Path, dict[str, Any]]:
-    """A bash that can run the generated steps, a scratch root, and the parsed jobs, once per module."""
+def scaffolded_jobs(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, dict[str, Any]]:
+    """A scratch root and the generated workflow's parsed jobs, once per module."""
     root = tmp_path_factory.mktemp("scaffolded-ci")
     scaffold(root / "repo")
     workflow = root / "repo" / ".github" / "workflows" / "check.yml"
-    jobs = yaml.safe_load(workflow.read_text(encoding="utf-8"))["jobs"]
+    return root, yaml.safe_load(workflow.read_text(encoding="utf-8"))["jobs"]
+
+
+@pytest.fixture(scope="module")
+def scaffolded_ci(scaffolded_jobs: tuple[Path, dict[str, Any]]) -> tuple[str, Path, dict[str, Any]]:
+    """The same, with a bash that can run the generated steps, found once per module."""
+    root, jobs = scaffolded_jobs
     return require_bash(root), root, jobs
 
 
@@ -357,19 +363,18 @@ def _run_audit_step(
     return log.read_text(encoding="utf-8").splitlines(), audited, output
 
 
-def test_the_scaffolded_audit_job_runs_on_windows_after_verify(
-    scaffolded_ci: tuple[str, Path, dict[str, Any]],
+def test_the_scaffolded_audit_job_runs_on_windows_on_its_own(
+    scaffolded_jobs: tuple[Path, dict[str, Any]],
 ) -> None:
     """Windows is the only supported deployment platform, and pip-audit evaluates markers on the host.
 
-    The job runs engine code on the lock path, so it is gated exactly as the check job is.
+    It does not wait on verify-engine, so a failed provenance check does not silence the tripwire.
     """
-    jobs = scaffolded_ci[2]
-    audit = jobs["audit-pin"]
+    audit = scaffolded_jobs[1]["audit-pin"]
     assert audit["runs-on"] == "windows-latest"
     assert audit["defaults"] == {"run": {"shell": "bash"}}
-    assert audit["needs"] == "verify-engine"
-    assert audit["if"] == jobs["check"]["if"]
+    assert "needs" not in audit and "if" not in audit
+    assert 0 < audit["timeout-minutes"] < 360
 
 
 def test_the_scaffolded_audit_step_audits_every_pin_of_a_lock(
@@ -379,7 +384,7 @@ def test_the_scaffolded_audit_step_audits_every_pin_of_a_lock(
     Windows-only pin and a Linux-only one alike."""
     calls, audited, output = _run_audit_step(scaffolded_ci, tmp_path, _ADOPTER_LOCK)
     assert calls == [
-        "python -m pip install --no-deps -r requirements.txt",
+        "python -m pip install --no-deps --require-hashes -r requirements.lock",
         "python -m pip install pip-audit",
         "pip-audit -r requirements.txt --desc",
         "python -P -m messagefoundry.security.audit_all_platforms requirements.lock",

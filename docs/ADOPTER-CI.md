@@ -196,30 +196,31 @@ Windows-only dependencies (at least `colorama` and `sspilib`):
 
 - **Always**: `pip-audit -r requirements.txt --desc`, which resolves on Windows the closure your
   deployment installs. Without a lock the job also warns that the closure resolves live and unhashed.
-- **Hashed `requirements.lock` committed, as well**: the job installs what `requirements.txt` names
-  with `--no-deps` and runs the engine's own auditor,
-  `python -P -m messagefoundry.security.audit_all_platforms requirements.lock`. That is the code the
-  engine's own required audit runs, and the module documents what it checks. It dry-run installs the
-  lock with `--require-hashes`, then audits **every pin, whatever its marker**.
+- **Hashed `requirements.lock` committed, as well**: the job installs the lock with `--no-deps
+  --require-hashes`, which brings the engine at the bytes you pinned, and runs the engine's own
+  auditor, `python -P -m messagefoundry.security.audit_all_platforms requirements.lock`. That is the
+  code the engine's own required audit runs, and the module documents what it checks. It dry-run
+  installs the lock with `--require-hashes`, then audits **every pin, whatever its marker**.
   - It needs an engine release that ships the module; 0.5.1 and earlier do not, and the job fails
     rather than fall back to an audit that skips pins.
   - It runs `pip-audit --strict`, so a pin PyPI cannot look up (a private package) fails the job,
     and `--ignore-vuln` does not cover that case.
-  - It refuses a lock with pip option lines. Generate it with `uv export --no-emit-project` or
-    `pip-compile --no-emit-index-url`. `pip-compile` locks only the platform it runs on, so run it on
-    Windows; `uv export` writes every platform's pins.
+  - It refuses a lock with pip option lines, such as an index URL, `--trusted-host` or `--find-links`.
+    `uv pip compile --universal --generate-hashes requirements.txt -o requirements.lock` writes none
+    by default and writes every platform's pins. `pip-compile` needs its `--no-emit-*` flags for each
+    such line, and locks only the platform it runs on, so run it on Windows.
   - A lock that pins one name at two versions under two markers fails: with the markers removed,
     `pip-audit` refuses the duplicate.
-- That path runs engine code, so the job waits on `verify-engine`, as `check` does. Like `check`, it
-  installs the engine again from your index rather than from the file `verify-engine` checked, so
-  the wait does not bind the two.
+- The job does not wait on `verify-engine`, so a failed provenance check does not also silence the
+  tripwire. The engine code it runs comes from your lock's hashes, which bind it to the bytes you
+  locked, not to the wheel `verify-engine` attested.
 
 > `verify-engine` proves *who built* the wheel you pin; `audit-pin` proves *that pin hasn't since gone
 > vulnerable*. Together they cover both halves of the supply-chain question on every PR.
 
 - **Remediate** by bumping the engine pin in `requirements.txt` to a release that fixed it (the engine's
   own fast-response ships fixes promptly — see its `SECURITY.md` dependency-CVE SLA).
-- **Accept a triaged advisory** by appending `--ignore-vuln <ID>` to the audit line that runs (record
+- **Accept a triaged advisory** by appending `--ignore-vuln <ID>` to each audit line that reports it (record
   why, per your own change control) — e.g. a CVE in a path your config never wires.
 
 ---
