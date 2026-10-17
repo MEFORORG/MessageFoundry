@@ -1111,7 +1111,8 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 >
 > The check reads each entry with the same parser as the load, and skips an entry the load
 > refuses. Those forms, a host-bits CIDR such as `10.1.2.3/0` among them, are listed in the
-> `trusted_proxies` row of [CONFIGURATION.md](CONFIGURATION.md).
+> `trusted_proxies` row of [CONFIGURATION.md](CONFIGURATION.md). An IPv4-mapped entry counts as
+> the IPv4 range it names, so `::ffff:0:0/96` gets the whole-family wording.
 - **What you lose:** uvicorn trusts `X-Forwarded-For` from every host an entry covers, so each of those
   hosts can declare its own source address. For a whole family, that is any client. That poisons the
   audit source address, the per-address sign-in limit and the new-client-IP step-up signal. With

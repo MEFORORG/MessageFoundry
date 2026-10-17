@@ -1286,46 +1286,64 @@ _TRUST_ALL_PROXIES_REFUSAL = (
 )
 
 
-_MAPPED_FORM = "an IPv4-mapped IPv6 entry. The engine reports an IPv4 peer in its plain form"
-_ZONED_FORM = (
-    "an IPv6 entry with a zone. The engine reports every peer without one, uvicorn compares a "
-    "host entry's zone, and it ignores a network's, so a zone never narrows the trust"
+_ZONED_HOST = (
+    "an IPv6 entry with a zone. The engine reports every peer without its zone and uvicorn "
+    "compares a host entry's zone, so uvicorn would parse this entry and match no peer, "
+    "collapsing every client source IP to the proxy."
+)
+_ZONED_NETWORK = (
+    "an IPv6 entry with a zone. uvicorn ignores a network's zone, so it would trust this prefix "
+    "on every interface, not only on the one the zone names."
 )
 
+#: The IPv4-mapped block. An entry inside it names IPv4 hosts in their IPv6 spelling (BACKLOG #3042).
+_IPV4_MAPPED = ipaddress.IPv6Network("::ffff:0:0/96")
+_IPV4_MAPPED_BASE = int(_IPV4_MAPPED.network_address)
 
-def _matching_form(parsed: _TrustedProxy) -> tuple[str, _TrustedProxy] | None:
-    """``(why, form)`` for a ``parsed`` entry uvicorn would match no peer with: why it misses, and
-    the form that would match. None when ``parsed`` matches as it stands (BACKLOG #3042).
 
-    At least these forms parse in uvicorn and match no socket peer, or trust wider than written.
-    An IPv4-mapped IPv6 entry: the engine's listener is asyncio's ``create_server``, which sets
-    ``IPV6_V6ONLY`` on an IPv6 socket, so an IPv4 peer is reported in its plain form and never as
-    ``::ffff:a.b.c.d``. And an IPv6 entry with a zone: CPython reports a peer's host without its
-    zone (the zone goes in ``scope_id``, since Python 3.7; the link-local test measures it), and an
+def _matching_form(parsed: _TrustedProxy) -> _TrustedProxy | None:
+    """The form uvicorn would actually match peers with, for a ``parsed`` entry it would read
+    other than as written. None when ``parsed`` matches as it stands (BACKLOG #3042).
+
+    That form is an IPv6 entry with a zone: CPython reports a peer's host without its zone (the
+    zone goes in ``scope_id``, since Python 3.7; the link-local test measures it), and an
     ``IPv6Address`` compares its zone, so the host ``fe80::1%eth0`` never equals the peer
     ``fe80::1``. A network matches by prefix and ignores its zone, so a zoned network trusts the
     prefix on every interface; it is refused too, so that no entry claims a narrowing it lacks.
-    Both checks read the integer, never the address object, whose comparisons include the zone."""
-    if isinstance(parsed, ipaddress.IPv6Address):
-        if parsed.ipv4_mapped is not None:
-            return _MAPPED_FORM, parsed.ipv4_mapped
-        if parsed.scope_id is not None:
-            return _ZONED_FORM, ipaddress.IPv6Address(int(parsed))
-    elif isinstance(parsed, ipaddress.IPv6Network):
-        start = int(parsed.network_address)
-        if start >> 32 == 0xFFFF and parsed.prefixlen >= 96:
-            return _MAPPED_FORM, ipaddress.IPv4Network((start & 0xFFFF_FFFF, parsed.prefixlen - 96))
-        if parsed.network_address.scope_id is not None:
-            return _ZONED_FORM, ipaddress.IPv6Network((start, parsed.prefixlen))
+    The check reads the integer, never the address object, whose comparisons include the zone.
+
+    An IPv4-mapped entry is NOT such a form. uvicorn compares a mapped peer with a mapped entry
+    only, and a dual-stack inner proxy may write a mapped hop into ``X-Forwarded-For``, so
+    :func:`uvicorn_trusted_hosts` hands uvicorn both spellings of every IPv4 entry instead."""
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.scope_id is not None:
+        return ipaddress.IPv6Address(int(parsed))
+    if isinstance(parsed, ipaddress.IPv6Network) and parsed.network_address.scope_id is not None:
+        return ipaddress.IPv6Network((int(parsed.network_address), parsed.prefixlen))
     return None
+
+
+def _ipv4_meaning(
+    network: ipaddress.IPv4Network | ipaddress.IPv6Network,
+) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
+    """``network`` as the IPv4 range it names when it sits inside the mapped block, else itself, so
+    ``::ffff:0:0/96`` counts as the whole IPv4 family it trusts (BACKLOG #3042)."""
+    # The integers, not ``subnet_of``, which compares a zone and would miss a zoned network.
+    if isinstance(network, ipaddress.IPv6Network) and network.prefixlen >= _IPV4_MAPPED.prefixlen:
+        start = int(network.network_address)
+        if start >> 32 == _IPV4_MAPPED_BASE >> 32:
+            return ipaddress.IPv4Network(
+                (start & 0xFFFF_FFFF, network.prefixlen - _IPV4_MAPPED.prefixlen)
+            )
+    return network
 
 
 def _span_wording(network: ipaddress.IPv4Network | ipaddress.IPv6Network) -> str:
     """How a refusal names a range it will not recommend: every host inside a trusted range may set
     its own source address, and a whole family is what the refused ``'*'`` trusts."""
-    if network.prefixlen == 0:
+    meaning = _ipv4_meaning(network)
+    if meaning.prefixlen == 0:
         return (
-            f"It spans '{network}', which would trust every peer of its address family, as the "
+            f"It spans '{network}', which would trust every IPv{meaning.version} peer, as the "
             "refused '*' does."
         )
     return (
@@ -1338,13 +1356,13 @@ def _span_wording(network: ipaddress.IPv4Network | ipaddress.IPv6Network) -> str
 def _as_matched(parsed: _TrustedProxy) -> _TrustedProxy:
     """``parsed`` in the form uvicorn would match a peer with."""
     matching = _matching_form(parsed)
-    return parsed if matching is None else matching[1]
+    return parsed if matching is None else matching
 
 
 def _parse_trusted_proxy(entry: str) -> _TrustedProxy:
     """Read one ``[api].trusted_proxies`` entry the way uvicorn's ``_TrustedHosts`` does (``uvicorn``
-    is pinned exactly in ``pyproject.toml``), and refuse the forms known to load there and match no
-    peer. It is the one reader of the list: the load check, the allow-list pin check and the
+    is pinned exactly in ``pyproject.toml``), and refuse the forms known to load there and match
+    other than as written. It is the one reader of the list: the load check, the allow-list pin check and the
     loosening check all call it, so the three cannot disagree (BACKLOG #3042).
 
     uvicorn parses an entry holding "/" with a STRICT ``ip_network`` and any other with
@@ -1359,21 +1377,16 @@ def _parse_trusted_proxy(entry: str) -> _TrustedProxy:
         parsed = ipaddress.ip_network(entry) if "/" in entry else ipaddress.ip_address(entry)
     except ValueError as exc:
         raise ValueError(_trusted_proxy_refusal(entry, exc)) from exc
-    matching = _matching_form(parsed)
-    if matching is not None:
-        why, form = matching
-        if isinstance(form, ipaddress.IPv4Network | ipaddress.IPv6Network) and (
-            form.num_addresses > 1
-        ):
+    form = _matching_form(parsed)
+    if form is not None:
+        why = _ZONED_NETWORK if isinstance(form, ipaddress.IPv6Network) else _ZONED_HOST
+        if isinstance(form, ipaddress.IPv6Network) and form.num_addresses > 1:
             fix = _span_wording(form)  # a range is named, never recommended
-        elif isinstance(form, ipaddress.IPv4Network | ipaddress.IPv6Network):
+        elif isinstance(form, ipaddress.IPv6Network):
             fix = f"List '{form.network_address}' instead."
         else:
             fix = f"List '{form}' instead."
-        raise ValueError(
-            f"[api].trusted_proxies entry {entry!r} is {why}, so uvicorn would parse this entry "
-            f"and match no peer, collapsing every client source IP to the proxy. {fix}"
-        )
+        raise ValueError(f"[api].trusted_proxies entry {entry!r} is {why} {fix}")
     return parsed
 
 
@@ -1382,9 +1395,9 @@ def _trusted_proxy_refusal(entry: str, exc: ValueError) -> str:
 
     A host-bits CIDR such as ``10.0.0.1/24`` gets its own message naming the single proxy address
     first, then the network it spans (BACKLOG #2488). Neither name is ever a form
-    :func:`_parse_trusted_proxy` refuses: a mapped or zoned spelling is replaced by the one that
-    matches, so ``fe80::1%eth0/64`` names ``fe80::1`` and ``fe80::/64`` (BACKLOG #3042). The network is named, never
-    recommended, because every host inside a trusted range may set its own source address."""
+    :func:`_parse_trusted_proxy` refuses: a zoned spelling is replaced by the one that matches, so
+    ``fe80::1%eth0/64`` names ``fe80::1`` and ``fe80::/64`` (BACKLOG #3042). The network is named,
+    never recommended, because every host inside a trusted range may set its own source address."""
     try:
         network = ipaddress.ip_network(entry, strict=False)
     except ValueError:
@@ -1400,6 +1413,41 @@ def _trusted_proxy_refusal(entry: str, exc: ValueError) -> str:
         "so it would treat this entry as a literal that never matches, collapsing every client "
         f"source IP to the proxy. List the proxy's own address '{host}'. {_span_wording(spanned)}"
     )
+
+
+def _other_spelling(parsed: _TrustedProxy) -> _TrustedProxy | None:
+    """``parsed`` in its other IPv4 spelling: the mapped twin of an IPv4 entry, the plain twin of a
+    mapped one. None for any other entry."""
+    if isinstance(parsed, ipaddress.IPv4Address):
+        return ipaddress.IPv6Address(_IPV4_MAPPED_BASE | int(parsed))
+    if isinstance(parsed, ipaddress.IPv4Network):
+        start = _IPV4_MAPPED_BASE | int(parsed.network_address)
+        return ipaddress.IPv6Network((start, _IPV4_MAPPED.prefixlen + parsed.prefixlen))
+    if isinstance(parsed, ipaddress.IPv6Address):
+        return parsed.ipv4_mapped
+    meaning = _ipv4_meaning(parsed)
+    return meaning if isinstance(meaning, ipaddress.IPv4Network) else None
+
+
+def uvicorn_trusted_hosts(entries: Sequence[str]) -> list[str]:
+    """The ``forwarded_allow_ips`` that ``serve`` hands uvicorn for ``[api].trusted_proxies``
+    ``entries``: each entry as written, then the other IPv4 spelling of each IPv4 or mapped entry
+    that the list does not already hold (BACKLOG #3042).
+
+    uvicorn's ``_TrustedHosts`` compares an ``ip_address`` with each entry and never normalises a
+    mapped one, so ``::ffff:10.0.0.1`` misses the entry ``10.0.0.1`` and the reverse. That check
+    runs on the socket peer and on every ``X-Forwarded-For`` hop, and a dual-stack inner proxy
+    writes its hop mapped. Both spellings name the same hosts, so the second widens nothing. Every
+    entry must already have loaded: one :func:`_parse_trusted_proxy` refuses raises ``ValueError``."""
+    parsed = [_parse_trusted_proxy(entry) for entry in entries]
+    seen = set(parsed)
+    out = list(entries)
+    for item in parsed:
+        twin = _other_spelling(item)
+        if twin is not None and twin not in seen:
+            seen.add(twin)
+            out.append(str(twin))
+    return out
 
 
 def _split_address_list(v: object) -> object:
@@ -7969,12 +8017,19 @@ def _classify_proxy_entries(entries: Sequence[str]) -> tuple[list[str], list[str
             parsed = _parse_trusted_proxy(entry)
         except ValueError:
             continue
-        # A host counts toward its family's collapse as its single-address network.
-        net = ipaddress.ip_network(parsed)
+        # A host counts toward its family's collapse as its single-address network, and a mapped
+        # entry toward IPv4's, so ``::ffff:0:0/96`` is named as the whole family it trusts.
+        net = _ipv4_meaning(ipaddress.ip_network(parsed))
         if isinstance(net, ipaddress.IPv4Network):
             v4.append((entry, net))
         else:
             v6.append((entry, net))
+            if net.prefixlen < _IPV4_MAPPED.prefixlen and int(net.network_address) == (
+                _IPV4_MAPPED_BASE & int(net.netmask)
+            ):
+                # A wider IPv6 range holding the whole mapped block, such as ``::/80``, trusts the
+                # mapped hop of every IPv4 host, so it counts as the whole IPv4 family as well.
+                v4.append((entry, ipaddress.IPv4Network("0.0.0.0/0")))
     whole_family: list[str] = []
     ranges: list[str] = []
     # collapse_addresses takes one family at a time, so each is collapsed on its own.
@@ -7986,7 +8041,9 @@ def _classify_proxy_entries(entries: Sequence[str]) -> tuple[list[str], list[str
     for family, covers_all in families:
         multi = [entry for entry, net in family if net.num_addresses > 1]
         (whole_family if covers_all else ranges).extend(multi)
-    return whole_family, ranges
+    # An entry counted in both families is named once, under the wider wording it earns.
+    whole_family = list(dict.fromkeys(whole_family))
+    return whole_family, [entry for entry in dict.fromkeys(ranges) if entry not in whole_family]
 
 
 def _auth_default(field: str) -> Any:
@@ -9237,9 +9294,10 @@ def security_loosenings(
     # ranges whose union is that) make uvicorn trust X-Forwarded-For from all of them, which is what
     # the refused "*" does. The load still accepts them; naming them is the fix. Read by the load's
     # own parser, _parse_trusted_proxy, which parses as uvicorn's _TrustedHosts does (__main__ hands
-    # it the list verbatim) and refuses at least a host-bits entry such as "10.1.2.3/0" (BACKLOG
-    # #2488) and a mapped or zoned one (#3042), so none reaches this check. Not gated on sign-in: a
-    # forged source address poisons the audit trail either way.
+    # it the list plus each IPv4 entry's other spelling, uvicorn_trusted_hosts) and refuses at least
+    # a host-bits entry such as "10.1.2.3/0" (BACKLOG #2488) and a zoned one (#3042), so none
+    # reaches this check. A mapped entry counts as the IPv4 range it names (#3042). Not gated on
+    # sign-in: a forged source address poisons the audit trail either way.
     # A range short of a whole family is named too, with its own wording: any host inside it may
     # forge X-Forwarded-For, which poisons the same three signals for that range's hosts. Every
     # entry covering more than one address counts, /31 and /127 included; the helper says why.

@@ -1546,11 +1546,33 @@ def test_the_trust_every_peer_check_skips_a_host_bits_entry() -> None:
 
 
 def test_the_trust_every_peer_check_reads_entries_with_the_load_s_own_parser() -> None:
-    """BACKLOG #3042: one parser serves the load, the allow-list pin and this check. A mapped
-    network covering the whole mapped range loads nowhere, so it is skipped here too rather than
-    counted as an IPv6 range."""
-    assert _classify_proxy_entries(["::ffff:0:0/96"]) == ([], [])
-    assert _classify_proxy_entries(["::ffff:0:0/96", "fd00::/8"]) == ([], ["fd00::/8"])
+    """BACKLOG #3042: one parser serves the load, the allow-list pin and this check. A zoned entry
+    loads nowhere, so it is skipped here too."""
+    assert _classify_proxy_entries(["fe80::%eth0/64"]) == ([], [])
+    assert _classify_proxy_entries(["fe80::%eth0/64", "fd00::/8"]) == ([], ["fd00::/8"])
+
+
+def test_a_mapped_entry_counts_as_the_ipv4_range_it_names() -> None:
+    """BACKLOG #3042: a mapped entry loads, and uvicorn is handed both spellings of it, so it trusts
+    the IPv4 hosts it names. ``::ffff:0:0/96`` is the whole IPv4 family, and so is a mapped half
+    beside a plain one; neither may pass as a narrow IPv6 range.
+
+    Mutation: drop ``_ipv4_meaning`` from ``_classify_proxy_entries``. Red: classed as a range."""
+    assert _classify_proxy_entries(["::ffff:0:0/96"]) == (["::ffff:0:0/96"], [])
+    # The upper IPv4 half in its mapped spelling, built so no routable literal sits in the file.
+    halves = ["0.0.0.0/1", str(ipaddress.IPv6Network(((0xFFFF << 32) | (1 << 31), 97)))]
+    assert _classify_proxy_entries(halves) == (halves, [])
+    risk = _proxy_risk("::ffff:0:0/96")
+    assert _WHOLE_FAMILY in risk and _RANGE not in risk
+    # An IPv6 range holding the whole mapped block trusts every IPv4 host's mapped hop, so it is
+    # named once, as the whole family; one beside it is still a range.
+    assert _classify_proxy_entries(["::/80", "fd00::/8"]) == (["::/80"], ["fd00::/8"])
+    assert _classify_proxy_entries(["::fffe:0:0/95"]) == (["::fffe:0:0/95"], [])
+    # Control: a narrow mapped range is a range, and a mapped host is neither.
+    assert _classify_proxy_entries(["::ffff:10.0.0.0/120", "::ffff:10.0.0.1"]) == (
+        [],
+        ["::ffff:10.0.0.0/120"],
+    )
 
 
 def _split(network: str, bits: int) -> list[str]:
