@@ -353,9 +353,15 @@ A write-access push is neither, so auto-merge stays armed. The vault's `main` ne
 the engine, arming while required checks are pending sets a deferred request. That request is not
 yet a queue entry, so the same window opens.
 
-1. Arm only once required checks are green. On the engine, `gh pr merge <N> --match-head-commit
-   <sha>` then enqueues directly, with no deferred window. On the vault, add `--auto` and the
-   merge-method flag, because gh refuses a no-queue merge without one when no terminal is attached.
+1. Arm only once required checks are green. On the engine, run `gh pr merge <N>
+   --match-head-commit <sha>` only once the branch is up to date with `main` AND every check on the
+   head has finished, required or not. **Green required checks are not enough:** on a BEHIND PR,
+   and while a non-required leg was still running, the same command set a deferred auto-merge
+   request instead of a queue entry, which reopens the window (measured twice, Lander comments on
+   engine PR 2232, 2026-10-11). Then read back that the PR has a `mergeQueue` entry and that
+   `autoMergeRequest` is null; a non-null `autoMergeRequest` is the deferred request, so disarm it
+   and wait. On the vault, add `--auto` and the merge-method flag, because gh refuses a no-queue
+   merge without one when no terminal is attached.
 2. Pin the full 40-character SHA of the head you re-read, since gh refuses a short one. If you
    updated the branch, wait for the new head, and confirm it adds only a clean merge of `main`.
    Post the pinned SHA on the PR as a comment. On both paths, gh 2.93.0 sends it as

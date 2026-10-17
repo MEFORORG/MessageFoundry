@@ -24,9 +24,9 @@ CLAUDE.md section 5 governs; the history of both notes is in `docs/METHOD.md`.
   runs the `code-review` skill at `xhigh`. Proof must cover the head you merge (CLAUDE.md section 5).
 - **Arm auto-merge outside two cases** (owner ruling 2026-10-07): a `main` that requires the
   queue, or a repo with no queue. **Or arm without the safeguards** (Manager decision, same day):
-  green checks, `--match-head-commit` on the re-read head, its SHA posted on the PR, and a
-  `headRefOid` check after the merge. A write-access push keeps auto-merge armed, so it can merge
-  unreviewed. The steps are in the CLAUDE.md section 5 note; korus `4c` still binds.
+  every check done green on a current branch, `--match-head-commit` on the re-read head,
+  its SHA posted on the PR, and a `headRefOid` check after the merge. A write-access push keeps
+  it armed, so it can merge unreviewed. Steps: CLAUDE.md section 5 note; korus `4c` still binds.
 - **Decide which of two deliberate changes to an item survives.** That belongs to the authors, and
   korus `4c-quinquies` says the same, so both documents agree here.
 
