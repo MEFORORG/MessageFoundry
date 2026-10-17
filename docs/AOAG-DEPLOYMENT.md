@@ -473,6 +473,9 @@ three consequences for the AG:
 - ODBC Driver 18 validates against the **Windows machine trust store** (`LocalMachine\Root`), and
   there is no CA-file keyword. Import the DB CA on **every engine VM in both DCs**
   ([`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §5, `scripts/service/import-db-ca.ps1`).
+  `[store].ssl_root_cert` is no substitute here: on SQL Server it pins one exact certificate and
+  switches the store to `Encrypt=strict`, so after a failover to a replica that presents a different
+  certificate, every store connection is refused.
 - The engine offers no hostname-override keyword, so the certificate presented after failover must
   be valid for **exactly the listener DNS name** in `[store].server`. Every replica that can host
   the primary, including the DR replica, **must carry the listener DNS name in its certificate
