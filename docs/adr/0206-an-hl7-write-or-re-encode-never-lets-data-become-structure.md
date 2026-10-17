@@ -287,7 +287,9 @@ sources split it. What remains is a Handler that builds one itself, by returning
 messages in one `Send`, or a `Message` parsed from such text. That is structure the Handler author
 wrote, not data becoming structure, so it is outside this decision. The same payload sent unbatched
 over MLLP is one frame holding two messages. Whether a delivery should refuse a payload holding more
-than one `MSH` is left to its own item.
+than one `MSH` is left to its own item. *Decided 2026-10-17 by
+[ADR 0209](0209-mllp-and-tcp-deliveries-refuse-a-payload-holding-more-than-one-msh.md), vault
+BACKLOG #2858.*
 
 ## Acceptance Criteria
 

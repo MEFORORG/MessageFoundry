@@ -454,12 +454,22 @@ from typing import Any
 #: Vault BACKLOG #3192 merged with the #2709 branch, whose digest was 0b41a33c5d9e66b8: the value
 #: below was re-derived with ``--write`` on the merged tree, so it covers every entry above.
 #:
+#: Vault BACKLOG #2709 merged with BACKLOG #3029: each moved the digest on its own (#2709 to
+#: 0b41a33c5d9e66b8, #3029 to b86ce593ab8a43a4 on main). #3029 added no entry here; its move is
+#: ``AuthService.logout`` returning ``LogoutOutcome`` where it returned ``None``. The console
+#: ignores that return value, so no call breaks in either skew direction. The value below was
+#: re-derived with ``--write`` on the merged tree, so it covers both.
+#:
+#: Vault BACKLOG #3192 / #3193 / #3236 merged with the #2709 branch again, after that branch took
+#: main's #3029 (digests 0cd684e3f53d2469 and 344979df3bd2c662). The value below was re-derived
+#: with ``--write`` on the merged tree, so it covers every entry above.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "0cd684e3f53d2469"
+ENGINE_UI_SEAM: str = "71c27581e7c9f921"
 
 
 @dataclass(frozen=True, slots=True)
