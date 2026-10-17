@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import logging
 import random
 import textwrap
 import threading
@@ -862,7 +863,17 @@ async def test_a_stop_before_the_first_message_hands_nothing_over_and_still_prun
     await src._poll_once()
     # _poll_once catches a failed hand-off, logs it and goes on, so a _hand_off that raised once the
     # stop was set would leave the assertions below green. The connector logs no failure this poll.
-    failures = [r.getMessage() for r in caplog.records if r.name == remotefile_log]
+    # A capture that could not see the connector's logger would pass that check on nothing, so a
+    # marker sent through the same logger at the same level must arrive first.
+    marker = "BACKLOG #2967 capture marker"
+    logging.getLogger(remotefile_log).warning(marker)
+    assert len(caplog.records) >= 1
+    assert caplog.records[-1].getMessage() == marker
+    failures = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == remotefile_log and r.getMessage() != marker
+    ]
     assert failures == []
     # a.hl7 was handed over and recorded; b.hl7 met the stop before its first message.
     assert [b.decode("utf-8").split("|")[9] for b in handler.bodies] == ["CTRL1"]
