@@ -21,19 +21,27 @@ fault. An exception the engine raises propagates, whatever its value.
 from __future__ import annotations
 
 import ast
+import contextlib
 import inspect
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from types import SimpleNamespace
 from typing import Any
 
 import ldap3
 import pytest
 from ldap3.core.results import RESULT_CODES, RESULT_SUCCESS
+from ldap3.utils import asn1
 from ldap3.utils.asn1 import decode_sequence
 
+from messagefoundry.api.app import _PROBE_FAULT_ALERT_SOURCE, _REFERRAL_ALERT_SOURCE
 from messagefoundry.auth import ldap as ldap_module
-from messagefoundry.auth.ldap import LdapError, LdapUndecodableError
+from messagefoundry.auth.ldap import AdPrincipal, LdapError, LdapReferralError, LdapUndecodableError
+from messagefoundry.auth.reconcile import PROBE_FAULT_ABORT, REFERRAL_ABORT, ProbeOutcome
+from messagefoundry.auth.service import AuthService
+from messagefoundry.store.store import MessageStore
 from tests._ast_sites import callee_name, parse_source
+from tests.test_ad_user_account_control import _pass
+from tests.test_approval_requester_recheck import _Sink
 from tests.test_ldap_referrals import _BIND_PASSWORD, _BIND_RESPONSE, _SEARCH_DONE, _tlv
 from tests.test_ldap_search_result_codes import (
     _EXTENDED_RESPONSE,
@@ -47,6 +55,7 @@ from tests.test_ldap_search_result_codes import (
     _scripted_dc,
     _service_conn,
 )
+from tests.test_ldap_timeouts import _ad_settings
 
 #: Stands for text the directory sends: it must never reach an error, a log line or an audit row.
 _REFERRED = "ldap://dc9.synthetic-leak-3010.invalid/DC=other"
@@ -68,17 +77,22 @@ def _result(tag: int, code: int, *, matched: bytes | None = None, extra: bytes =
     return _tlv(tag, _tlv(0x0A, _enumerated(code)) + matched_dn + _tlv(0x04, b"") + extra)
 
 
+#: A bind response carrying a referral, which ldap3's decoder cannot read (``KeyError(3)``). It is
+#: refused as a referral, not as an undecodable response (D3b, BACKLOG #3010 and #2538).
+_REFERRAL_BIND = _result(_BIND_RESPONSE, 10, extra=_tlv(0xA3, _tlv(0x04, _REFERRED.encode())))
+
 #: Malformed bind responses: the reply, and what ldap3's decoder raises on it.
 _BAD_BINDS = [
-    pytest.param(
-        _result(_BIND_RESPONSE, 10, extra=_tlv(0xA3, _tlv(0x04, _REFERRED.encode()))),
-        KeyError,
-        id="referral-KeyError-3",
-    ),
     pytest.param(
         _result(_BIND_RESPONSE, RESULT_SUCCESS, extra=_tlv(0x96, b"synthetic")),
         KeyError,
         id="context-tag-22",
+    ),
+    # A universal tag 3 is not the referral field, so it stays undecodable (D3b review round 1).
+    pytest.param(
+        _result(_BIND_RESPONSE, RESULT_SUCCESS, extra=_tlv(0x03, b"\x00")),
+        KeyError,
+        id="universal-tag-3",
     ),
     pytest.param(_result(_BIND_RESPONSE, 4242), KeyError, id="unknown-code-4242"),
     pytest.param(
@@ -203,6 +217,97 @@ def test_a_user_bind_ldap3_cannot_decode_fails_a_present_and_an_absent_account_a
     assert texts[0] == texts[1]
 
 
+# --- a bind response carrying a referral is a referral (D3b) --------------------------------------
+
+
+def _assert_referred_bind(exc: BaseException, operation: str) -> None:
+    """The refusal is a referral naming the operation, with no host: the hosts are in the part
+    ldap3 could not decode, and a value the directory sent never reaches the text."""
+    assert isinstance(exc, LdapReferralError), repr(exc)
+    text = str(exc)
+    assert f"AD answered the {operation} with a referral" in text
+    assert "could not decode" not in text and "result code" not in text
+    assert _REFERRED not in text and "synthetic-leak" not in text, "a referred host leaked"
+    assert isinstance(exc.__cause__, KeyError) and exc.__cause__.args == (3,)
+
+
+def test_a_service_bind_answered_with_a_referral_is_a_referral() -> None:
+    """Before D3b it read as an undecodable response, an outage the reconciler pages nobody for.
+    THE PREMISE first: the bare ldap3 bind raises ``KeyError(3)``. The socket is still closed."""
+    with _scripted_dc(lambda _raw: [], bind_reply=lambda _raw: (_REFERRAL_BIND, b"")) as (
+        dc,
+        authenticator,
+    ):
+        with pytest.raises(KeyError) as bare:
+            _bare_bind(dc.port)
+        assert bare.value.args == (3,)
+        _reading_connection(bare.value).strategy.close()
+        assert dc.ended.wait(_CLOSE_WAIT)
+        dc.ended.clear()
+        with pytest.raises(LdapReferralError) as refused:
+            authenticator.probe_principal("alice")
+        _assert_referred_bind(refused.value, "service-account bind")
+        assert dc.searches == []
+        assert dc.ended.wait(_CLOSE_WAIT), "the referred bind's socket was left open"
+
+
+def test_a_user_bind_answered_with_a_referral_fails_a_present_and_an_absent_account_alike() -> None:
+    """The decoy bind meets the same referral, so the two branches refuse with one text."""
+
+    def bind(raw: bytes) -> _Reply | None:
+        is_user = b"CN=alice" in raw or b"mf-nonexistent-timing-equalizer" in raw
+        return (_REFERRAL_BIND, b"") if is_user else None
+
+    texts = []
+    with _scripted_dc(_alice, bind_reply=bind) as (_dc, authenticator):
+        for username in ("alice", "nobody"):
+            with pytest.raises(LdapReferralError) as refused:
+                authenticator.authenticate(username, "synthetic-user-pw")
+            _assert_referred_bind(refused.value, "user bind")
+            texts.append(str(refused.value))
+    assert texts[0] == texts[1]
+
+
+async def test_the_reconciler_reads_a_referred_service_bind_as_referred() -> None:
+    """So the probe reaches the referral's alert path (BACKLOG #2538), not the outage's."""
+    with _scripted_dc(lambda _raw: [], bind_reply=lambda _raw: (_REFERRAL_BIND, b"")) as (
+        dc,
+        authenticator,
+    ):
+        store = await MessageStore.open(":memory:")
+        try:
+            settings = _ad_settings(
+                ad_server=f"ldap://127.0.0.1:{dc.port}", ad_allow_insecure_ldap=True
+            )
+            service = AuthService(store, settings, ldap=authenticator)
+            user = SimpleNamespace(id="u-1", username="alice", directory_object_id=None)
+            probe = await service._probe_principal(user)  # type: ignore[arg-type]
+        finally:
+            await store.close()
+    assert probe.outcome is ProbeOutcome.REFERRED
+    assert probe.detail is not None and _REFERRED not in probe.detail
+
+
+def test_a_referral_in_a_who_am_i_response_is_still_undecodable() -> None:
+    """THE CONTROL: only a BIND response's referral field is read as a referral. ldap3's decoder
+    raises the same ``KeyError(3)`` on an extended response carrying one, and that stays an
+    undecodable response, because the origin check reads which response was being decoded."""
+    reply = (
+        _result(_EXTENDED_RESPONSE, 10, extra=_tlv(0xA3, _tlv(0x04, _REFERRED.encode()))),
+        b"",
+    )
+    with _scripted_dc(lambda _raw: [_done(RESULT_SUCCESS)], extended_reply=reply) as (
+        _dc,
+        authenticator,
+    ):
+        with _service_conn(authenticator) as conn, pytest.raises(KeyError) as bare:
+            conn.extend.standard.who_am_i()
+        assert bare.value.args == (3,)
+        reading = authenticator.read_bind_account()
+    assert reading.whoami_error is not None
+    assert "Who am I with a response ldap3 could not decode (KeyError)" in reading.whoami_error
+
+
 # --- the nested group search: a malformed paged results control ---------------------------------
 
 _OID = ldap_module._PAGED_RESULTS_OID.encode()
@@ -256,12 +361,146 @@ def test_a_sign_in_probe_whose_group_page_cannot_be_decoded_is_an_outage(
 ) -> None:
     """The reconciler's probe, through the real authenticator: an outage, not an unhandled error."""
 
-    def answer(raw: bytes) -> list[_Reply]:
-        return [_bad_page(control)] if _IN_CHAIN in raw else _alice(raw)
-
-    with _scripted_dc(answer) as (_dc, authenticator), pytest.raises(LdapError) as refused:
+    with _bad_group_page_dc(control) as (_dc, authenticator), pytest.raises(LdapError) as refused:
         authenticator.probe_principal("alice")
     _assert_undecodable(refused.value, "group search", fault)
+
+
+# --- the session reconciler pages on both: vault BACKLOG #3696 item 2 and #3697 step 2 ----------
+
+
+def _bad_bind_dc(reply: bytes) -> Any:
+    """A loopback DC whose every bind, the service account's included, is answered with
+    ``reply``."""
+    return _scripted_dc(lambda _raw: [], bind_reply=lambda _raw: (reply, b""))
+
+
+def _bad_group_page_dc(control: bytes) -> Any:
+    return _scripted_dc(lambda raw: [_bad_page(control)] if _IN_CHAIN in raw else _alice(raw))
+
+
+def _undecodable_reads() -> list[Any]:
+    """Every read the probe makes that ldap3 can fail to decode: the service bind, the user search
+    and a page of the nested group search."""
+    return [
+        *(
+            pytest.param(lambda reply=p.values[0]: _bad_bind_dc(reply), id=f"service-bind-{p.id}")
+            for p in _BAD_BINDS
+        ),
+        pytest.param(lambda: _scripted_dc(lambda _raw: [_done(4242)]), id="user-search-4242"),
+        *(
+            pytest.param(
+                lambda control=p.values[0]: _bad_group_page_dc(control), id=f"group-page-{p.id}"
+            )
+            for p in _BAD_CONTROLS
+        ),
+    ]
+
+
+@contextlib.asynccontextmanager
+async def _reconciler(
+    authenticator: Any, port: int, **over: Any
+) -> AsyncIterator[tuple[AuthService, MessageStore]]:
+    """A real ``AuthService`` over a fresh store, probing through ``authenticator``."""
+    store = await MessageStore.open(":memory:")
+    try:
+        settings = _ad_settings(
+            ad_server=f"ldap://127.0.0.1:{port}", ad_allow_insecure_ldap=True, **over
+        )
+        yield AuthService(store, settings, ldap=authenticator), store
+    finally:
+        await store.close()
+
+
+async def _probe_through_the_reconciler(authenticator: Any, port: int) -> Any:
+    async with _reconciler(authenticator, port) as (service, _store):
+        user = SimpleNamespace(id="u-1", username="alice", directory_object_id=None)
+        return await service._probe_principal(user)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("dc", _undecodable_reads())
+async def test_the_reconciler_reads_every_response_it_cannot_decode_as_a_probe_fault(
+    dc: Callable[[], Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Vault BACKLOG #3696 item 2. On engine ``main`` these faults escaped ldap.py as ldap3's own
+    ``KeyError`` or ``TypeError``, so the probe's broad arm read them as FAULT, which pages.
+    ``LdapUndecodableError`` is an ``LdapError``, so without its own arm it read UNAVAILABLE, an
+    outage, which pages nobody. The WARNING names the account and the type only."""
+    with dc() as (scripted, authenticator), caplog.at_level("WARNING"):
+        probe = await _probe_through_the_reconciler(authenticator, scripted.port)
+    assert probe.outcome is ProbeOutcome.FAULT
+    assert probe.detail == "LdapUndecodableError"
+    warned = [r.getMessage() for r in caplog.records if r.name == "messagefoundry.auth.service"]
+    assert any("directory probe of alice raised LdapUndecodableError" in m for m in warned)
+    assert not any("synthetic" in m or "4242" in m for m in warned), "a directory value leaked"
+
+
+async def _signed_in(service: AuthService, username: str) -> str:
+    """One live directory session, minted through the shared tail of the AD sign-in paths. The
+    principal is synthetic: the subject is the reconciler, not the sign-in."""
+    principal = AdPrincipal(
+        username=username,
+        display_name=username.title(),
+        email=f"{username}@example.com",
+        dn=_USER_DN,
+        groups=frozenset(),
+        directory_object_id="3f2b8c1e-0d4a-4e5b-9c6d-7a8b9c0d1e2f",
+    )
+    login = await service._complete_ad_login(principal, None, mfa_verified=True)
+    assert login.token is not None
+    return login.token
+
+
+@pytest.mark.parametrize(
+    ("reply", "unjudged", "source", "reason", "latch"),
+    [
+        pytest.param(
+            _result(_BIND_RESPONSE, 4242),
+            "faulted",
+            _PROBE_FAULT_ALERT_SOURCE,
+            PROBE_FAULT_ABORT,
+            "directory_reconcile_fault",
+            id="undecodable",
+        ),
+        pytest.param(
+            _REFERRAL_BIND,
+            "referred",
+            _REFERRAL_ALERT_SOURCE,
+            REFERRAL_ABORT,
+            "directory_reconcile_referral",
+            id="referral",
+        ),
+    ],
+)
+async def test_a_pass_whose_service_bind_is_undecodable_or_referred_pages_and_revokes_nothing(
+    reply: bytes, unjudged: str, source: str, reason: str, latch: str
+) -> None:
+    """End to end, through the real authenticator, the real reconcile pass and the alerting the API
+    lifespan task runs. Every probe opens with the service bind, so every probe in the pass meets
+    the same answer. A decode fault pages as a probe fault (#3696 item 2); a referral pages as a
+    referral (#3697 step 2, through the #2538 alert). Neither is an outage, and neither revokes.
+
+    RED when: either reads UNAVAILABLE, which records a skipped pass and pages nobody."""
+    with _bad_bind_dc(reply) as (dc, authenticator):
+        async with _reconciler(authenticator, dc.port, ad_session_recheck_seconds=60) as (
+            service,
+            store,
+        ):
+            await service.initialize()
+            token = await _signed_in(service, "alice")
+            for _ in range(3):  # past ad_session_recheck_strikes: it pages on every pass
+                sink = _Sink()
+                plan = await _pass(service, sink)
+                assert len(getattr(plan, unjudged)) == 1 and plan.unavailable == 0, plan
+                assert not plan.directory_outage and plan.revocations == ()
+                pages = [(e[1], e[2]["reason"]) for e in sink.events]
+                assert pages == [(source, reason)], pages
+            assert await service.identity_for_token(token) is not None, "a session was revoked"
+            latched = getattr(service, latch)
+            assert latched is not None
+            assert _REFERRED not in latched and "synthetic-leak" not in latched
+            skipped = await store.list_audit(action="auth.ad_reconcile_skipped", limit=100)
+            assert list(skipped) == [], "the pass was recorded as an outage"
 
 
 # --- a result code outside ldap3's table ---------------------------------------------------------
@@ -397,6 +636,11 @@ def test_the_ldap3_methods_the_origin_check_names_still_exist() -> None:
     assert readers["ldap3.extend."] == {"decode_response", "populate_result", "set_response"}
     assert {"decode_response", "set_response"} <= set(vars(ExtendedOperation))
     assert "populate_result" in vars(WhoAmI)
+    # What _is_bind_referral reads (D3b): the decoder's locals, and a bind table with no referral.
+    assert {"context_decoders", "ber_class", "ber_type"} <= set(
+        asn1.decode_sequence.__code__.co_varnames
+    )
+    assert ldap_module._REFERRAL_TAG not in asn1.BIND_RESPONSE_CONTEXT
 
 
 def test_an_unbind_error_never_replaces_the_refusal() -> None:

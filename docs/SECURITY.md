@@ -4238,7 +4238,9 @@ revoked. A pass with any referral audits `auth.ad_reconcile_referred` and raises
 acknowledging or suspending one does not silence the other. An `[alerts]` rule keyed on the event
 type alone matches both, and so does a source glob such as `directory-reconciler*`. To mute only
 the referral, a rule names its source exactly. The alert's text names `ad_user_search_base` and
-`ad_group_search_base`. When it resolves itself is stated once, in
+`ad_group_search_base`. A bind answered with a referral, the service account's included, is a
+referral too (BACKLOG #3010). ldap3 cannot decode its hosts, so the alert names none, and its text
+does not name `ad_bind_dn`, the DN that bind used. When it resolves itself is stated once, in
 [CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-two-alerts-resolve-themselves).
 Referred accounts stay in the mass-revoke breaker's count, as unreachable ones do. Left out, a referring group base would
 trip the breaker on any handful of genuine disables. A base in another domain of the forest
@@ -4253,7 +4255,9 @@ role or channel-scope change in the directory does not reach those accounts' ses
 lasts.
 
 A probe that raises something other than an LDAP error, such as a malformed entry the engine cannot
-read, is a probe fault. It fails open for that one account (BACKLOG #2241), and it is not a
+read, is a probe fault. So is a response ldap3 cannot decode, on the service bind, the user search
+or a page of the group search (BACKLOG #3010): the directory answered, so it is not an outage. It
+fails open for that one account (BACKLOG #2241), and it is not a
 directory outage (BACKLOG #3100). Each such probe is logged at WARNING by name, and the rest of the
 estate is still reconciled. A pass with any fault logs one ERROR naming no account and audits
 `auth.ad_reconcile_faulted`. It also raises the `ad_reconcile_aborted` alert with reason

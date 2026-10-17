@@ -141,10 +141,11 @@ class LdapUnansweredError(LdapError):
 class LdapUndecodableError(LdapError):
     """ldap3 could not decode the directory's response to an operation (BACKLOG #3010).
 
-    :func:`_ldap3_call` raises it. A subclass, so every ``except LdapError`` reads it as an outage;
-    its own class keeps a paged search that met one from being abandoned (:func:`_search_paged`). No
-    result code was read, so none is claimed: the text names the type of the exception ldap3 raised,
-    never its text or a value the directory sent.
+    :func:`_ldap3_call` raises it. A subclass, so every ``except LdapError`` catches it. A caller
+    that must tell it from an outage catches it first, as the session reconciler's probe does
+    (``AuthService._probe_principal``). Its own class keeps a paged search that met one from being
+    abandoned (:func:`_search_paged`). No result code was read, so none is claimed: the text names
+    the type of the exception ldap3 raised, never its text or a value the directory sent.
     """
 
 
@@ -771,8 +772,14 @@ def _refuse_referral(conn: Any, operation: str) -> None:
         "the forest; use a base in this domain controller's own domain, or a global catalog, "
         "which carries universal-group membership only (ADR 0180 Amendment F)."
     )
+    raise _referral_error(operation, message)
+
+
+def _referral_error(operation: str, message: str) -> LdapReferralError:
+    """The referral refusal for ``operation``, warned once per operation, whether ldap3 decoded the
+    referral (:func:`_refuse_referral`) or could not (:func:`_referred_bind`)."""
     _warn_once(f"referral: {operation}", "%s Reported once per operation.", message)
-    raise LdapReferralError(message)
+    return LdapReferralError(message)
 
 
 #: What a refused code most likely means, where the code points at the configuration rather than at
@@ -879,7 +886,8 @@ def _search(conn: Any, operation: str, **kwargs: Any) -> None:
 #: What ldap3 raises, other than its own ``LDAPException``, when a response it reads is malformed.
 #: ldap3 2.9.1's default fast decoder indexes the BER it reads without checking it: a context tag a
 #: response may not carry is ``KeyError(tag)`` (``utils/asn1.py``, ``decode_sequence``), so a bind
-#: response carrying a referral raises ``KeyError(3)``; a result code outside its table is
+#: response carrying a referral raises ``KeyError(3)``, which :func:`_ldap3_call` refuses as a
+#: referral (:func:`_is_bind_referral`); a result code outside its table is
 #: ``KeyError(code)`` (``ldap_result_to_dict_fast``, ``operation/bind.py``,
 #: ``operation/extended.py``); a paged results control with no value is ``TypeError`` and one with no
 #: cookie is ``IndexError`` (``strategy/base.py``, ``decode_control_fast``); a bind response whose
@@ -941,12 +949,18 @@ def _ldap3_call(operation: str, *, close: bool = False) -> Iterator[None]:
     operation. A static test pins that. An unbind reads no response, so it runs outside.
 
     BACKLOG #3010. A :data:`_DECODE_FAULTS` exception that ldap3 raised while reading the
-    directory's response becomes :class:`LdapUndecodableError`, which every caller reads as an
-    outage. Unmapped, it would escape every ``except LdapError``, and a sign-in would fail as an
+    directory's response becomes :class:`LdapUndecodableError` (its docstring says who reads it
+    how). Unmapped, it would escape every ``except LdapError``, and a sign-in would fail as an
     unhandled error with no audit row. An exception from anywhere else propagates unchanged, since
     mapped it would hide an engine defect as an outage, which the session reconciler logs only at
     debug level (:func:`_reading_connection` says how the two are told apart). An ``LDAPException``
     passes through untouched, for its own handler.
+
+    **One fault is a referral, not an undecodable response.** ldap3's decoder has no field for the
+    referral a bind response may carry, so it raises ``KeyError(3)`` on one. That becomes
+    :class:`LdapReferralError`, as a referral ldap3 could decode does (:func:`_refuse_referral`),
+    so the session reconciler reads it as referred and alerts (BACKLOG #2538).
+    :func:`_is_bind_referral` says how it is told apart, again by origin.
 
     ``close`` closes the socket the failed read was on, where nothing else will. Only the service
     account's bind passes it: its ``auto_bind`` runs inside ldap3's ``Connection`` constructor, so
@@ -977,7 +991,57 @@ def _ldap3_call(operation: str, *, close: bool = False) -> Iterator[None]:
                 logger.debug(
                     "AD socket close after an undecodable response: %s", _type_name(failed)
                 )
+        if _is_bind_referral(exc):
+            raise _referred_bind(operation) from exc
         raise _undecodable(operation, exc) from exc
+
+
+#: The context tag of the ``referral`` field of an LDAPResult (RFC 4511 section 4.1.9).
+_REFERRAL_TAG = 3
+#: ldap3's number for the context-specific tag class (``utils/asn1.py``, ``CLASSES``).
+_CONTEXT_CLASS = 2
+
+
+def _is_bind_referral(exc: BaseException) -> bool:
+    """Whether ``exc`` is ldap3's decoder meeting the referral field of a bind response.
+
+    Decided by ORIGIN and decoder state, never by the exception's value alone: the innermost frame is
+    ldap3's ``decode_sequence`` reading a bind response's fields (its ``context_decoders`` is
+    ``BIND_RESPONSE_CONTEXT``, which has no entry for the field) at the referral's tag. A
+    ``KeyError(3)`` from anywhere else, such as a stray tag [3] in some other response or engine
+    code, is not this. A test pins the ldap3 names this reads.
+    """
+    # The context-class tag alone: a universal, application or private tag 3 raises KeyError((class,
+    # 3)) from the class table instead, and is a malformed response, not a referral.
+    if not isinstance(exc, KeyError) or exc.args != (_REFERRAL_TAG,):
+        return False
+    from ldap3.utils import asn1  # lazy, like every ldap3 import here
+
+    tb = exc.__traceback__
+    if tb is None:
+        return False
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    frame = tb.tb_frame
+    return (
+        frame.f_globals.get("__name__") == asn1.__name__
+        and frame.f_code.co_name == "decode_sequence"
+        and frame.f_locals.get("context_decoders") is asn1.BIND_RESPONSE_CONTEXT
+        and frame.f_locals.get("ber_class") == _CONTEXT_CLASS
+        and frame.f_locals.get("ber_type") == _REFERRAL_TAG
+    )
+
+
+def _referred_bind(operation: str) -> LdapReferralError:
+    """The refusal for a bind answered with a referral ldap3 could not decode, warned once per
+    operation. The referred hosts were in the part that could not be read, so none is named."""
+    message = (
+        f"AD answered the {operation} with a referral, whose hosts ldap3 cannot decode in a bind "
+        "response; the engine does not follow referrals (BACKLOG #2530, #3010). This usually "
+        "means a configured DN or search base lies in another domain of the forest; use one in "
+        "this domain controller's own domain, or a global catalog."
+    )
+    return _referral_error(operation, message)
 
 
 def _undecodable(operation: str, exc: BaseException) -> LdapUndecodableError:
