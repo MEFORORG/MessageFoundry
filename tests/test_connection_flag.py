@@ -450,22 +450,122 @@ async def test_stop_waits_for_a_write_whose_caller_was_cancelled(tmp_path: Path)
         started.set()
         release.wait(20)
 
+    stopping: asyncio.Future[None] | None = None
+    try:
+        caller = asyncio.ensure_future(
+            eng.write_baseline_config(
+                "connection_flag_set", _write, detail={"probe": True}, actor="tester", client=None
+            )
+        )
+        try:
+            assert await asyncio.to_thread(started.wait, 20)
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+            stopping = asyncio.ensure_future(eng.stop())
+            await asyncio.sleep(0.2)
+        finally:
+            release.set()
+        await stopping
+        assert recorded == ["connection_flag_set"]
+    finally:
+        if stopping is None:
+            await eng.stop()
+
+
+async def test_a_write_queued_when_stop_begins_is_refused_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    """stop() closes the gate before it waits, so a caller still queued for the engine lock is
+    refused once it gets the lock, instead of starting a write the drain never saw and landing it
+    on disk as the store closes."""
+    cfg = _config_dir(tmp_path)
+    eng = await Engine.create(
+        tmp_path / "flag.db",
+        poll_interval=0.02,
+        config_dir=cfg,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    eng.add_registry(load_config(cfg))
+    toml_path = cfg / "connections.toml"
+    before = toml_path.read_bytes()
+    await eng._toml_write_lock.acquire()
     caller = asyncio.ensure_future(
-        eng.write_baseline_config(
-            "connection_flag_set", _write, detail={"probe": True}, actor="tester", client=None
+        eng.set_connection_flag(
+            "OB_TOML", direction="outbound", flagged=True, actor="tester", client=None
         )
     )
     try:
-        assert await asyncio.to_thread(started.wait, 20)
-        caller.cancel()
+        await asyncio.sleep(0.1)
+        assert not caller.done(), "control: the toggle is queued on the held lock"
+        await eng.stop()
+    finally:
+        eng._toml_write_lock.release()
+    with pytest.raises(WiringError, match="stopping"):
+        await caller
+    assert toml_path.read_bytes() == before
+
+
+async def test_a_write_cancelled_before_its_first_step_releases_the_lock(engine: Engine) -> None:
+    """The engine lock is released however the write's task ends. A task cancelled before it ever
+    ran never entered the round-one try/finally, so the lock stayed held and every later toggle
+    queued forever."""
+    caller = asyncio.ensure_future(
+        engine.write_baseline_config(
+            "connection_flag_set", lambda _cfg: None, detail={}, actor="tester", client=None
+        )
+    )
+    # One pass of the loop: the caller takes the free lock and schedules its task, which has not
+    # run yet.
+    await asyncio.sleep(0)
+    (task,) = engine._config_writes
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    assert not engine._toml_write_lock.locked()
+    # And the engine still takes a write.
+    await engine.set_connection_flag(
+        "OB_TOML", direction="outbound", flagged=True, actor="tester", client=None
+    )
+
+
+async def test_a_write_that_fails_after_its_caller_went_is_logged_once(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A write that fails once its caller is gone is logged once, through safe_exc, and not also
+    reported by asyncio as an exception in a shielded future with a raw traceback."""
+    import logging
+    import threading
+
+    started, release = threading.Event(), threading.Event()
+
+    def _write(_cfg: Path) -> None:
+        started.set()
+        release.wait(20)
+        raise WiringError("validate refused the candidate")
+
+    caller = asyncio.ensure_future(
+        engine.write_baseline_config(
+            "connection_flag_set", _write, detail={}, actor="tester", client=None
+        )
+    )
+    with caplog.at_level(logging.WARNING):
+        try:
+            assert await asyncio.to_thread(started.wait, 20)
+            caller.cancel()
+        finally:
+            release.set()
         with pytest.raises(asyncio.CancelledError):
             await caller
-        stopping = asyncio.ensure_future(eng.stop())
-        await asyncio.sleep(0.2)
-    finally:
-        release.set()
-    await stopping
-    assert recorded == ["connection_flag_set"]
+        while engine._config_writes:
+            await asyncio.sleep(0.05)
+        await asyncio.sleep(0.05)
+    messages = [record.getMessage() for record in caplog.records]
+    abandoned = [m for m in messages if m.startswith("config write failed after its caller")]
+    assert len(abandoned) == 1, messages
+    assert "validate refused the candidate" in abandoned[0]
+    assert not [m for m in messages if "shielded future" in m]
+    assert await engine.store.list_audit(action="connection_flag_set") == []
 
 
 async def test_the_toggle_takes_its_digests_under_the_config_edit_lock(
