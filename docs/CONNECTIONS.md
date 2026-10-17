@@ -2463,11 +2463,15 @@ What a site needs to know:
 - If a server answers 2xx while the entry's own `response.status` failed, the message is classified on
   that entry status, like any other HTTP status. An entry status that does not read as an HTTP code is
   logged as a warning, and the 2xx reply counts as delivered.
-- A reply in which a JSON object repeats a key, anywhere in it, is read one way by the engine and maybe
-  another by the server, so the engine does not judge it. The update is a permanent refusal, code
-  `reply-repeats-a-key`, in either capture mode, and it is not sent again. It is not recorded as
-  delivered, even when every reading of the reply is a success, as with a reply over the byte bound
-  below (vault BACKLOG #2812).
+- A reply in which a JSON object repeats a key is read twice, once keeping the first value of each key
+  and once keeping the last (vault BACKLOG #2812). If the two readings agree on the resource type, the
+  entry shape and the entry's `status` text, outcome issue severities and codes, `etag`, `location` and
+  `lastModified` (for a reply with no entry response, on the outcome of the whole body), the reply is
+  judged as above. If they disagree in any of those, the update is a permanent refusal, code
+  `reply-repeats-a-key`, in either capture mode, and it is not sent again. That holds even where both
+  readings would deliver or retry, for example `200 OK` against `201 Created`, an ETag with capture off,
+  or two transient statuses, and for a reply only one of the two reads can parse. It is not recorded as
+  delivered, as with a reply over the byte bound below.
 - A reply body over the byte bound is not kept, so the engine cannot see the entry's status. The
   update is then a permanent refusal, code `reply-too-large`, in either capture mode, and it is not
   sent again. It is not recorded as delivered. See *A 2xx reply over the byte bound* under [REST](#rest--rest).

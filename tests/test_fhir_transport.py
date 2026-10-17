@@ -726,10 +726,11 @@ async def test_too_deep_2xx_reply_captures_as_unparseable() -> None:
         assert isinstance(resp, DeliveryResponse) and resp.outcome == "unparseable"
 
 
-# --- vault BACKLOG #2812: a repeated JSON key is refused on every FhirPeek path ----------------
+# --- vault BACKLOG #2812: an outgoing body that repeats a JSON key is refused; a wrapped update's
+# reply that does is judged only when its two readings agree ---------------------------------------
 
-#: Synthetic. json keeps the last id, so the URL would name the canary while a server keeping the
-#: first key would write first-id.
+#: Synthetic. json keeps the last id, so the engine would gate on the canary (and, in the path
+#: form, put it in the URL) while a server keeping the first key would write first-id.
 _REPEATED_ID = '{"resourceType": "Patient", "id": "first-id", "id": "' + PHI_CANARY + '"}'
 
 
@@ -805,32 +806,51 @@ def _reply_with(response: str, *, meta: str = "{}") -> bytes:
 @pytest.mark.parametrize(
     "reply",
     [
-        # Keeping the last key, as json does, reads the 404 and dead-letters, which the #2180
-        # control did before #2812; refusing the reply must not turn it into a delivery.
+        # Keeping the last key, as json does, reads the 404 and dead-letters; a server keeping
+        # the first meant 200. The readings disagree, so it dead-letters either way round.
         _reply_with('{"status":"200 OK","status":"404 Not Found"}'),
+        # json alone reads 200 here and delivers, while a first-key reader sees the 404.
         _reply_with('{"status": "404 Not Found", "status": "200 OK"}'),
-        # A repeat away from the status still makes the reply read two ways.
+        # A disagreement in a captured entry field alone is enough.
         _reply_with(
-            '{"status": "400 Bad Request"}', meta='{"tag": 1, "tag": "' + PHI_CANARY + '"}'
+            '{"status": "200 OK", "etag": "W/\\"1\\"", "etag": "W/\\"' + PHI_CANARY + '\\""}'
         ),
+        _reply_with('{"status": "200 OK", "location": "Patient/a", "location": "Patient/b"}'),
+        _reply_with(
+            '{"status": "200 OK", "lastModified": "2026-01-01T00:00:00Z", '
+            '"lastModified": "2026-01-02T00:00:00Z"}'
+        ),
+        # The outcome's severity sets the capture outcome.
+        _reply_with(
+            '{"status": "200 OK", "outcome": {"resourceType": "OperationOutcome", "issue": '
+            '[{"severity": "error", "severity": "information"}]}}'
+        ),
+        # A repeated resourceType changes the entry shape the reply is read through.
+        b'{"resourceType": "OperationOutcome", "resourceType": "Bundle", '
+        b'"entry": [{"response": {"status": "404 Not Found"}}]}',
+        # Pinned as the agreement rule reads: the status TEXT must agree, so two successes, or two
+        # transient failures, that differ are refused too.
         _reply_with('{"status": "200 OK", "status": "201 Created"}'),
-        # Not a transaction-response at all: refused the same way, since it too reads two ways.
-        b'{"resourceType": "OperationOutcome", "issue": [{"severity": "information", '
-        b'"severity": "information"}]}',
+        _reply_with('{"status": "503 Service Unavailable", "status": "500 Internal Server Error"}'),
     ],
     ids=[
-        "measured-failure-last",
-        "failure-first",
-        "elsewhere",
-        "both-succeed",
-        "not-a-transaction-response",
+        "measured-200-then-404",
+        "404-then-200",
+        "etag",
+        "location",
+        "last-modified",
+        "outcome-severity",
+        "resource-type",
+        "two-successes",
+        "two-transients",
     ],
 )
-async def test_a_wrapped_update_reply_that_repeats_a_key_is_dead_lettered(
+async def test_a_wrapped_update_reply_whose_readings_disagree_is_dead_lettered(
     reply: bytes, capture: bool
 ) -> None:
-    # Vault BACKLOG #2812: fails closed, like a reply over the byte bound (#2180). It is never
-    # recorded as delivered, whichever order the keys come in.
+    # Vault BACKLOG #2812: the reply is read keeping the first and keeping the last value of each
+    # key. When the two differ in anything the unwrap reads, the update fails closed, like a reply
+    # over the byte bound (#2180), and is never recorded as delivered.
     dest = _dest(interaction="update", capture_response=capture)
     dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
     with pytest.raises(NegativeAckError) as ei:
@@ -838,8 +858,71 @@ async def test_a_wrapped_update_reply_that_repeats_a_key_is_dead_lettered(
     assert ei.value.permanent is True
     assert ei.value.code == "reply-repeats-a-key"
     text = str(ei.value)
-    for word in ("status", "tag", "Not Found", "Bad Request", PHI_CANARY):
+    for word in ("status", "etag", "Not Found", "Patient/", "2026-", PHI_CANARY):
         assert word not in text
+
+
+@pytest.mark.parametrize("capture", [True, False], ids=["capture", "no-capture"])
+@pytest.mark.parametrize(
+    "reply",
+    [
+        # A repeat nothing reads: both readings are a 200.
+        _reply_with('{"status": "200 OK"}', meta='{"tag": 1, "tag": "' + PHI_CANARY + '"}'),
+        _reply_with('{"status": "200 OK", "status": "200 OK"}'),
+        b'{"resourceType": "OperationOutcome", "issue": [{"severity": "information", '
+        b'"severity": "information"}]}',
+    ],
+    ids=["in-meta", "equal-values", "not-a-transaction-response"],
+)
+async def test_a_wrapped_update_reply_whose_readings_agree_is_delivered(
+    reply: bytes, capture: bool
+) -> None:
+    dest = _dest(interaction="update", capture_response=capture)
+    dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
+    resp = await dest.send(UPDATE_1965)
+    if capture:
+        assert isinstance(resp, DeliveryResponse) and resp.outcome == "accepted"
+    else:
+        assert resp is None
+
+
+async def test_a_reply_the_keep_first_read_cannot_take_is_dead_lettered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The hook lowers json's depth limit a little, so a reply in that band parses plain but not
+    # keeping the first key. It can no longer be shown to read one way, so it fails closed. The
+    # trigger is a raised RecursionError, since the real depth is a property of the runner.
+    import messagefoundry.transports.fhir as fhir_module
+
+    def _too_deep(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        raise RecursionError("simulated deep nesting")
+
+    monkeypatch.setattr(fhir_module, "_keep_first_key", _too_deep)
+    dest = _dest(interaction="update")
+    reply = _reply_with('{"status": "404 Not Found"}', meta='{"tag": 1, "tag": 1}')
+    dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(UPDATE_1965)
+    assert ei.value.permanent is True and ei.value.code == "reply-repeats-a-key"
+
+
+@pytest.mark.parametrize(
+    ("reply", "code"),
+    [
+        (_reply_with('{"status": "404 Not Found", "status": "404 Not Found"}'), "404"),
+        (_reply_with('{"status": "400 Bad Request"}', meta='{"tag": 1, "tag": 2}'), "400"),
+    ],
+    ids=["equal-values", "repeat-elsewhere"],
+)
+async def test_a_wrapped_update_reply_whose_readings_agree_on_a_failure_is_classified(
+    reply: bytes, code: str
+) -> None:
+    # Agreement means judged as on main, so an agreed failure dead-letters on its own status.
+    dest = _dest(interaction="update")
+    dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(UPDATE_1965)
+    assert ei.value.code == code
 
 
 @pytest.mark.parametrize("capture", [True, False], ids=["capture", "no-capture"])

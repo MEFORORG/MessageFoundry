@@ -400,11 +400,72 @@ def _screen_bundle(payload: str, interaction: str, screen: _EntryScreen) -> None
 _REPLY_REPEATS_A_KEY_CODE = "reply-repeats-a-key"
 
 
-def _repeats_a_key(body: str) -> bool:
-    """Whether parsing ``body`` stops at a repeated JSON key. Run only after :class:`FhirPeek`
-    refused it, to tell that refusal apart from a body that is not JSON at all."""
-    _, hint = json_loads_or_refusal(body.lstrip(_BOM), object_pairs_hook=refuse_repeated_keys)
-    return hint == RepeatedKeyError.__name__
+def _keep_first_key(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """An ``object_pairs_hook`` that keeps the FIRST of two equal keys, where ``json`` keeps the
+    last: the reading a server that keeps the first would make."""
+    obj: dict[str, Any] = {}
+    for key, value in pairs:
+        obj.setdefault(key, value)
+    return obj
+
+
+def _entry_response(obj: dict[str, Any]) -> dict[str, Any] | None:
+    """The first entry's ``response`` of a ``Bundle`` reply, or None. The one walk both
+    :func:`_unwrap_transaction_reply` and :func:`_reply_reading` take, so they cannot drift."""
+    entries = obj.get("entry") if obj.get("resourceType") == "Bundle" else None
+    first = entries[0] if isinstance(entries, list) and entries else None
+    response = first.get("response") if isinstance(first, dict) else None
+    return response if isinstance(response, dict) else None
+
+
+def _reply_reading(obj: dict[str, Any]) -> tuple[object, ...]:
+    """Everything :func:`_unwrap_transaction_reply` reads from a parsed reply: whether it has an
+    entry response (which the resource type and entry shape decide), then that response's
+    ``status``, its outcome's issue severities and codes, ``etag``, ``location`` and
+    ``lastModified``; for a reply with no entry response, its resource type and the capture
+    outcome of the whole body. Two readings that give equal tuples are judged identically."""
+    response = _entry_response(obj)
+    if response is None:
+        return (obj.get("resourceType"), "no entry response", _capture_outcome_of(obj))
+    outcome = _as_operation_outcome(response.get("outcome"))
+    # Of an outcome, the severities set the capture outcome and the codes the retry decision.
+    issues = (
+        None
+        if outcome is None
+        else (_issue_field(outcome, "severity"), _issue_field(outcome, "code"))
+    )
+    return (
+        "entry response",
+        response.get("status"),
+        issues,
+        *(response.get(field) for field in _ENTRY_RESPONSE_HEADERS.values()),
+    )
+
+
+def _agreed_reading(body: str) -> dict[str, Any] | None:
+    """A reply :class:`FhirPeek` refused, read once keeping the first and once keeping the last
+    value of each repeated key (vault BACKLOG #2812). Returns the reading when both are JSON objects
+    and agree on everything :func:`_reply_reading` names, or ``None`` when the plain read is not a
+    JSON object, which is judged ``unparseable`` as before. Raises the permanent
+    ``reply-repeats-a-key`` refusal when they disagree: the server may have meant either, so, like
+    a reply over the byte bound (#2180), the update fails closed rather than counting as delivered.
+    So does a reply the plain read takes but the keep-first read cannot, such as one nested just
+    past the hook's lower depth limit, since it can no longer be shown to read one way. The refusal
+    names neither a key nor a value."""
+    text = body.lstrip(_BOM)
+    # The plain read first: a body that is not a JSON object stops here, after one more parse.
+    last, hint = json_loads_or_refusal(text)
+    if hint is not None or not isinstance(last, dict):
+        return None
+    first, hint = json_loads_or_refusal(text, object_pairs_hook=_keep_first_key)
+    if hint is not None or _reply_reading(first) != _reply_reading(last):
+        raise NegativeAckError(
+            f"{_REPLY_REPEATS_A_KEY_CODE}, not sent again. A 2xx reply body repeats a JSON key "
+            "and is needed here. Check the partner before a replay (FHIR destination)",
+            code=_REPLY_REPEATS_A_KEY_CODE,
+            permanent=True,
+        )
+    return last
 
 
 def _bundle_refusal(payload: str, interaction: str, screen: _EntryScreen) -> str | None:
@@ -657,9 +718,10 @@ def _unwrap_transaction_reply(
     end in a 412 and a false dead-letter. PHI-safe: only the code is named, never the entry's
     ``status`` text or ``outcome``.
 
-    A reply that repeats a JSON key is a permanent refusal, code ``reply-repeats-a-key``, and is not
-    recorded as delivered (vault BACKLOG #2812). Its entry status could read either way, so, like a
-    reply over the byte bound, it fails closed; the refusal names neither the key nor a value.
+    A reply that repeats a JSON key is read twice, keeping the first and keeping the last value of
+    each key (vault BACKLOG #2812). When the two readings agree on everything this function reads,
+    the reply is judged as any other. When they disagree, it is a permanent refusal, code
+    ``reply-repeats-a-key``, and is not recorded as delivered (see :func:`_agreed_reading`).
 
     The entry's ``etag``/``location``/``lastModified`` describe the updated resource, so a field the
     entry carries suppresses the reply header of the same name, which describes the Bundle, even
@@ -667,27 +729,18 @@ def _unwrap_transaction_reply(
     header value may be, is dropped: it came from a JSON body, which, unlike an HTTP header line,
     bounds neither. The rest are offered to the #154 allow-list."""
     try:
-        peek: FhirPeek | None = FhirPeek.parse(body)
+        obj: dict[str, Any] | None = FhirPeek.parse(body).obj
     except FhirPeekError:
-        peek = None
+        obj = None
     # Judged outside the handler, so nothing rides on the refusal's __context__ (BACKLOG #2048).
-    if peek is None:
-        if _repeats_a_key(body):
-            # Vault BACKLOG #2812: the reply reads two ways, and json alone would take the last.
-            # Like a reply over the byte bound (#2180), it is needed and unreadable, so the update
-            # fails closed rather than counting as delivered.
-            raise NegativeAckError(
-                f"{_REPLY_REPEATS_A_KEY_CODE}, not sent again. A 2xx reply body repeats a JSON key "
-                "and is needed here. Check the partner before a replay (FHIR destination)",
-                code=_REPLY_REPEATS_A_KEY_CODE,
-                permanent=True,
-            )
-        return headers, "unparseable"
-    entries = peek.obj.get("entry") if peek.resource_type == "Bundle" else None
-    first = entries[0] if isinstance(entries, list) and entries else None
-    response = first.get("response") if isinstance(first, dict) else None
-    if not isinstance(response, dict):
-        return headers, _capture_outcome_of(peek.obj)
+    if obj is None:
+        # FhirPeek refuses a repeated key; a reply whose two readings agree is judged as before.
+        obj = _agreed_reading(body)
+        if obj is None:
+            return headers, "unparseable"
+    response = _entry_response(obj)
+    if response is None:
+        return headers, _capture_outcome_of(obj)
     outcome = _as_operation_outcome(response.get("outcome"))
     status = response.get("status")
     m = _ENTRY_STATUS_RE.match(str(status)) if isinstance(status, (str, int, float)) else None

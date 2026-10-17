@@ -63,10 +63,14 @@ class FhirPeek:
         *object*), or if it is FHIR-XML (deferred to a hardened path; JSON-only MVP per ADR 0022).
 
         Also refused: a JSON object that repeats a key, at any depth (vault BACKLOG #2812; see
-        :func:`~messagefoundry.redaction.refuse_repeated_keys`). The body is sent verbatim, so it is
-        refused rather than canonicalised. Only keys equal once JSON-decoded count: a server that
-        folds case, or cuts a key at an escaped NUL, can still read two keys the peek reads as
-        distinct. The refusal names neither the key nor a value."""
+        :func:`~messagefoundry.redaction.refuse_repeated_keys`). A caller gates on the peeked value
+        while the body itself goes on, sent verbatim or read by other code, so it is refused rather
+        than canonicalised. A caller may judge a refused body further on its own terms, as the
+        wrapped-update reply does. Only keys equal once JSON-decoded count, so gaps remain,
+        at least these: a server that folds case, normalises Unicode, or cuts a key at an escaped
+        NUL can still read two keys the peek reads as distinct. The other way, ``bytes`` are decoded
+        with replacement first, so two distinct invalid-UTF-8 keys can collapse into one and be
+        refused. The refusal names neither the key nor a value."""
         if isinstance(raw, (bytes, bytearray)):
             raw = bytes(raw).decode("utf-8", "replace")
         raw = raw.lstrip("﻿")  # tolerate a leading UTF-8 BOM (json.loads would otherwise choke)
