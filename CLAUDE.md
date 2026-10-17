@@ -356,16 +356,17 @@ green. On engine PR 2232 on 2026-10-11 that is what happened twice: the `CI gate
 started at either attempt. That request is not yet a queue entry, so the same window opens.
 
 1. Arm only once every required context in branch protection's live list has a COMPLETED,
-   SUCCESSFUL check run on the head you re-read. Read the list from the API, never from memory or
-   `.github/required-contexts.txt`. On the engine, run `gh pr merge <N> --match-head-commit <sha>`.
-   On the vault, add `--auto` and the merge-method flag, because gh refuses a no-queue merge
-   without one when no terminal is attached. Then, on the engine, read back through GraphQL the
-   PR's `mergeQueueEntry` and `autoMergeRequest`, never `PullRequest.mergeQueue`, which names the
-   target queue whether or not the PR is in it. An entry with a null `autoMergeRequest` is the
-   goal. A non-null `autoMergeRequest` is a deferred request: disarm it, read `autoMergeRequest`
-   back as null, and wait for the missing context. Neither one means nothing is queued: the call
-   was refused or the queue evicted the PR. Read the command's output and the checks again, and
-   re-run only once this step's condition holds.
+   SUCCESSFUL result on the head you re-read, as a check run or a commit status. Read the list from
+   the API, never from memory or `.github/required-contexts.txt`. On the engine, run `gh pr merge
+   <N> --match-head-commit <sha>`. On the vault, add `--auto` and the merge-method flag, because gh
+   refuses a no-queue merge without one when no terminal is attached. Then read back through
+   GraphQL the PR's `merged`, `mergeQueueEntry` and `autoMergeRequest`, never
+   `PullRequest.mergeQueue`, which names the target queue whether or not the PR is in it. Merged,
+   or on the engine an entry with a null `autoMergeRequest`, is the goal. A non-null
+   `autoMergeRequest`, on either repository, is a deferred request: disarm it, read it back as
+   null, and wait for the missing context, or triage it if it went red. None of the three means
+   nothing is queued: the call was refused or the queue evicted the PR. Read the command's output
+   and the checks again, and re-run only once this step's condition holds.
 2. Pin the full 40-character SHA of the head you re-read, since gh refuses a short one. If you
    updated the branch, wait for the new head, and confirm it adds only a clean merge of `main`.
    Post the pinned SHA on the PR as a comment. On both paths, gh 2.93.0 sends it as
