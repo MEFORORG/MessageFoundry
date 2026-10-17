@@ -847,6 +847,11 @@ engine resolves the next trip or hold on its own.
   yourself. The engine resolves a referral on its own only when it clears without a restart, such
   as a directory-side change.
 
+A probe fault opens its own `ad_reconcile_aborted` instance too, with reason `probe_fault` and
+source `directory-reconciler-probe-fault` (BACKLOG #3100). The reconciler raises it on every pass in
+which a probe fails to read an entry. Nothing resolves it automatically. Resolve it by hand once the
+WARNING lines that name each faulting account stop.
+
 A pass judges only accounts that hold a session, and nothing reads an account again once it has
 left. An account leaves at least when it signs out, reaches the session cap, is revoked by the
 reconciler, is disabled locally, or is deleted, and when the hourly session reaper deletes an idle

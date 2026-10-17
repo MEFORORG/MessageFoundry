@@ -4202,10 +4202,18 @@ role or channel-scope change in the directory does not reach those accounts' ses
 lasts.
 
 A probe that raises something other than an LDAP error, such as a malformed entry the engine cannot
-read, fails open for that one account (BACKLOG #2241). It is logged at WARNING by name on every
-pass, and the rest of the estate is still reconciled. **The cost:** while it repeats, that account's
-sessions are never revoked by the reconciler, and no alert is raised. If it hits every probe, the
-pass reads as a directory outage.
+read, is a probe fault. It fails open for that one account (BACKLOG #2241), and it is not a
+directory outage (BACKLOG #3100). Each such probe is logged at WARNING by name, and the rest of the
+estate is still reconciled. A pass with any fault logs one ERROR naming no account and audits
+`auth.ad_reconcile_faulted`. It also raises the `ad_reconcile_aborted` alert with reason
+`probe_fault`, under its own source `directory-reconciler-probe-fault`. If every probe faults or
+fails, the pass judges nothing and revokes nothing, like an outage, but it still pages. A
+connection, timeout or name-lookup error that escapes the directory layer is still read as
+unreachable. **The cost:** while a fault repeats, that account's sessions are never revoked by the
+reconciler, so they run to the absolute cap. That cap is the only bound; the alert makes the gap
+visible and limits nothing. A pass with a fault marks no alert clear. When it resolves is stated once, in
+[CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-two-alerts-resolve-themselves). Step-up
+refuses the account with outcome `probe_fault`.
 
 ### The engine session is independent of the IdP session (ASVS 7.6.1)
 

@@ -20,6 +20,7 @@ import logging
 import math
 import os
 import secrets
+import socket
 import time
 import unicodedata
 import urllib.error
@@ -281,10 +282,11 @@ _CERT_PROBE_MAX_CONCURRENCY = 8
 _CERT_PROBE_SLOT_WAIT_SECONDS = 2.0
 #: The refusal reason when no probe slot freed in time. Not a directory answer.
 CERT_PROBE_SATURATED = "probe_capacity_saturated"
-#: The refusal reason when the certificate path's probe raised past every catch below it: an engine
-#: fault, so it is not a directory outage (BACKLOG #3115). ``_note_cert_probe_fault`` says what it
-#: logs.
-CERT_PROBE_FAULT = "probe_fault"
+#: The refusal reason when the certificate path's probe raised: an engine fault, so it is not a
+#: directory outage (BACKLOG #3115). Either the probe raised past every catch below it, or
+#: ``_probe_principal`` caught the fault and returned :attr:`~reconcile.ProbeOutcome.FAULT`, whose
+#: value this is (BACKLOG #3100). ``_note_cert_probe_fault`` says what it logs.
+CERT_PROBE_FAULT = reconcile.ProbeOutcome.FAULT.value
 #: Refusals that say the directory could not be asked, not what it said about the account. The
 #: certificate path logs these once per outage rather than once per request.
 _CERT_DIRECTORY_OUTAGES = frozenset(
@@ -305,6 +307,14 @@ _CERT_PROBE_FAULT_TRACKED_MAX = 4096
 _PROBE_FAULT_LOG_LEVEL: ContextVar[int] = ContextVar(
     "_PROBE_FAULT_LOG_LEVEL", default=logging.WARNING
 )
+#: The exception type ``_probe_principal`` last read as a fault in this context, so the certificate
+#: path can name it after ``_directory_presence`` reduces the answer to a reason string (BACKLOG
+#: #3100). ``_probe_principal`` sets it on every fault, in whatever context it runs. Only the
+#: certificate path's own probe task reads it, and that task sets it to None before its probe.
+_PROBE_FAULT_KIND: ContextVar[str | None] = ContextVar("_PROBE_FAULT_KIND", default=None)
+#: The errors ``_probe_principal`` reads as an unreachable directory although they are not an
+#: ``LdapError`` (BACKLOG #3100): the network-class ``OSError`` subtypes. At least these.
+_UNREACHED_DIRECTORY = (ConnectionError, TimeoutError, socket.gaierror)
 #: Outcomes the directory itself gave. Any of them ends a logged outage.
 _CERT_DIRECTORY_ANSWERS = frozenset(
     outcome.value
@@ -2593,6 +2603,9 @@ class AuthService:
         #: ``"fresh"``: no pass here saw a referral. ``"referred"``: one did. ``"forfeit"``: see
         #: `_forfeit_clears_on_attrition`. Only `_advance_referral_standing` moves it.
         self._reconcile_referral_standing: _ReferralStanding = "fresh"
+        #: Latched probe fault (BACKLOG #3100): set on a pass in which a probe faulted, and released
+        #: by the next pass that judged something with no fault (`_record_reconcile_fault`).
+        self._reconcile_fault_alert: str | None = None
         #: user_ids a breaker trip has not yet seen read PRESENT on a pass that was not aborted
         #: (BACKLOG #2136). `_mark_reconcile_clears` reports no breaker clear while one is signed in.
         self._reconcile_unconfirmed: set[str] = set()
@@ -6195,6 +6208,12 @@ class AuthService:
         return self._reconcile_referral_alert
 
     @property
+    def directory_reconcile_fault(self) -> str | None:
+        """The standing probe fault's operator message, or ``None`` (BACKLOG #3100). Latches until a
+        pass judges something with no fault (:meth:`_record_reconcile_fault`)."""
+        return self._reconcile_fault_alert
+
+    @property
     def directory_reconcile_hold(self) -> str | None:
         """The engaged undetermined-wave hold's operator message, or ``None`` (ADR 0195). Latches
         while the hold is engaged, so an operator who missed the log line still sees it."""
@@ -6263,33 +6282,55 @@ class AuthService:
             # user per pass; the pass-level summary below reports the count at WARNING.
             _log.debug("directory probe failed for %s: %s", user.username, exc)
             return reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.UNAVAILABLE)
+        except _UNREACHED_DIRECTORY as exc:
+            # BACKLOG #3100. ldap.py wraps the socket faults it knows of as LdapError (BACKLOG
+            # #2566). A connection, timeout or name-lookup error that escapes it is still the
+            # directory not being reached. Read as FAULT, a network blip would page and open an
+            # alert nothing resolves. Any other OSError, such as a missing file, is an engine fault
+            # and falls through to FAULT below. Debug-level, like the outage above.
+            _log.debug("directory probe of %s failed: %s", user.username, type(exc).__name__)
+            return reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.UNAVAILABLE)
         except Exception as exc:
             # BACKLOG #2241. Anything else the directory layer raised: a KeyError or ValueError on a
-            # malformed entry, an OSError, a fault in a test double. Uncaught, it was a 500 from
+            # malformed entry, a fault in a test double. Uncaught, it was a 500 from
             # verify_mfa instead of an audited refusal, and it ended the WHOLE reconcile pass, so one
-            # account that always raised stopped revocation for every account. Read as UNAVAILABLE:
-            # verify_mfa refuses on it (fail closed), and the reconciler skips this one account.
+            # account that always raised stopped revocation for every account.
+            #
+            # THE CATCH STAYS BROAD, AND THE OUTCOME SAYS SO (BACKLOG #3100, a Manager's design
+            # call, not an owner ruling). No named set of exceptions is safe to leave uncaught: any
+            # one that escapes ends the pass for every account again. What changed is the reading.
+            # This is the engine failing to read whatever came back, not the directory failing to
+            # answer, so it is FAULT and not UNAVAILABLE. verify_mfa refuses on it (fail closed),
+            # the certificate path keeps its per-account fault logging, and the reconciler skips
+            # this one account and alerts on every pass that probes it (`_record_reconcile_fault`).
+            # A pass of faults only is no longer read as a directory outage, which pages nobody.
             #
             # NOT LIKE #1639, AND THE COST IS NAMED. An unreadable userAccountControl is an answer
-            # the directory gave, so it strikes as UNDETERMINED. This is the engine failing to read
-            # whatever came back, which says nothing about the account, so it must not strike; and
-            # UNDETERMINED would move the ADR 0195 hold. The price is that an account whose entry
-            # raises every time is never revoked by the reconciler while that lasts. So this logs
-            # at WARNING on every probe, unlike the debug-level outage above: a repeat here is a
-            # standing gap for one named account, not a blip. CancelledError is not an Exception.
-            # The WARNING names the type only: the message can quote a directory value, which
-            # ldap.py never logs. The traceback, with the message, goes to DEBUG for diagnosis.
-            # The certificate path lowers this to DEBUG in its own task's context (BACKLOG #2316):
-            # it probes per request, not per pass, and reports the fault once as an outage.
+            # the directory gave, so it strikes as UNDETERMINED. This says nothing about the
+            # account, so it must not strike; and UNDETERMINED would move the ADR 0195 hold. The
+            # price is that an account whose entry raises every time is never revoked by the
+            # reconciler while that lasts, so its sessions run to the absolute cap, which is the only
+            # bound. The alert makes the gap visible rather than silent; it limits nothing. This
+            # also logs at WARNING on every
+            # probe, by name, so the alert's operator can find the account. CancelledError is not
+            # an Exception. The WARNING names the type only: the message can quote a directory
+            # value, which ldap.py never logs. The traceback, with the message, goes to DEBUG for
+            # diagnosis. The certificate path lowers this to DEBUG in its own task's context
+            # (BACKLOG #2316): it probes per request, not per pass, and logs the fault per account
+            # at most once a minute instead (`_note_cert_probe_fault`).
+            kind = type(exc).__name__
+            _PROBE_FAULT_KIND.set(kind)
             _log.log(
                 _PROBE_FAULT_LOG_LEVEL.get(),
-                "directory probe of %s raised %s; read as unavailable, so this account's "
+                "directory probe of %s raised %s; read as a probe fault, so this account's "
                 "sessions are not revoked and its step-up is refused while this repeats",
                 user.username,
-                type(exc).__name__,
+                kind,
             )
             _log.debug("directory probe of %s raised", user.username, exc_info=True)
-            return reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.UNAVAILABLE)
+            return reconcile.Probe(
+                user.id, user.username, reconcile.ProbeOutcome.FAULT, detail=kind
+            )
         principal = probe.principal
         if principal is None:
             return reconcile.Probe(user.id, user.username, _REFUSED_OUTCOMES[probe.answer])
@@ -6510,11 +6551,13 @@ class AuthService:
             )
         referral = next((p for p in probes if p.outcome is reconcile.ProbeOutcome.REFERRED), None)
         if plan.aborted is not None:
-            if not plan.directory_referral:
+            if not plan.directory_referral and not plan.probe_fault:
                 await self._abort_reconcile_pass(plan)
             if not plan.directory_outage:
-                # A pass of referrals only is recorded as a referral and nothing else (#2538).
+                # A pass of referrals only is recorded as a referral and nothing else (#2538), and
+                # a pass of faults only as a fault and nothing else (#3100).
                 await self._record_reconcile_referral(plan, first=referral)
+                await self._record_reconcile_fault(plan)
             if not plan.judged_nothing:
                 # A held pass writes its own row even when the breaker also aborts it (ADR 0195 rule
                 # item 9). An outage or a pass of referrals only judged nothing, so it leaves the
@@ -6528,8 +6571,7 @@ class AuthService:
         if plan.unavailable:
             _log.warning(
                 "directory reconcile: %d of %d principals asked could not be resolved (directory "
-                "unreachable, or a probe raised, which is warned per account) — those sessions "
-                "were left alone (fail-open)",
+                "unreachable) — those sessions were left alone (fail-open)",
                 plan.unavailable,
                 plan.asked,
             )
@@ -6570,6 +6612,8 @@ class AuthService:
         # BACKLOG #2538. After the revocations, like the hold below: the referred accounts were left
         # unjudged, and every other account's revocation above has already been applied.
         await self._record_reconcile_referral(plan, first=referral)
+        # BACKLOG #3100. After the revocations too, for the same reason as the referral's.
+        await self._record_reconcile_fault(plan)
         # ADR 0195. After the revocations, so a held-row audit write that fails cannot stop a
         # genuine disable or demotion in the same pass from being applied. And that failure is
         # logged rather than raised (BACKLOG #2137), so the pass still returns its plan and the
@@ -6680,7 +6724,9 @@ class AuthService:
         revoked_undetermined = undetermined in (self._reconcile_outcomes.get(u) for u in revoked)
         ids = [uid for uid in users if uid not in revoked]
         outcomes = [self._reconcile_outcomes.get(uid) for uid in ids]
-        covered = bool(ids) and None not in outcomes and not plan.referred
+        # A faulted account, like a referred one, keeps an older answer that may predate the fault
+        # (BACKLOG #3100), so a pass with either marks no clear.
+        covered = bool(ids) and None not in outcomes and not plan.referred and not plan.faulted
         settled = covered and undetermined not in outcomes
         # Called only on a pass that judged something, so a pass of referrals only never gets here.
         referral_clear = (
@@ -7315,12 +7361,14 @@ class AuthService:
             if plan.aborted is not None
             else "Accounts that answered without a referral were judged as usual."
         )
+        if plan.faulted:
+            # BACKLOG #3100. Counted here too, and recorded as a fault of their own.
+            others = f"{len(plan.faulted)} raised a probe fault. {others}"
         if plan.unavailable:
             # A pass of referrals and failures is recorded here and not as an outage, so the
             # failures are counted here, or a near-total outage would read as a search-base fault.
             others = (
-                f"{plan.unavailable} could not be read (the directory was unreachable, or the "
-                f"probe raised). {others}"
+                f"{plan.unavailable} could not be read (the directory was unreachable). {others}"
             )
         self._reconcile_referral_alert = (
             "LDAP referral: check [auth].ad_user_search_base and, for nested groups, "
@@ -7331,13 +7379,14 @@ class AuthService:
             "domain controller's own domain, or a global catalog. The ERROR log line for each such "
             "pass names the first referred search and its hosts."
         )
-        # The username and the refusal's text go to the log only: the refusal names the search
-        # and the referred hosts and nothing else (BACKLOG #2530). One line per pass, not one per
-        # referred account, because a referring base refers every account on every pass.
+        # The refusal's text goes to the log only: it names the search and the referred hosts and
+        # nothing else (BACKLOG #2530), which is what an operator needs to fix the base. One line
+        # per pass, not one per referred account, because a referring base refers every account
+        # on every pass. No username (BACKLOG #3100 item 5): the base is the fault, not the account,
+        # and `_probe_principal` names each referred account at DEBUG.
         _log.error(
-            "directory reconcile: %s First referral: %s: %s",
+            "directory reconcile: %s First referral: %s",
             self._reconcile_referral_alert,
-            first.username if first is not None else "?",
             first.detail if first is not None else "?",
         )
         await self._audit_reconciler_row(
@@ -7353,11 +7402,69 @@ class AuthService:
             ),
         )
 
+    async def _record_reconcile_fault(self, plan: reconcile.ReconcilePlan) -> None:
+        """Latch, log and audit a pass in which a probe faulted (BACKLOG #3100).
+
+        A fault is the engine failing to read what the directory returned for one account, so it
+        leaves that account unjudged (:attr:`~reconcile.ProbeOutcome.FAULT`): no strike and no
+        revocation. While it repeats, the account's sessions run to the absolute cap. This is the
+        bound on that gap: every pass with a fault latches the message, logs it at ERROR, and
+        writes an ``auth.ad_reconcile_faulted`` row, and the lifespan task raises it as
+        ``ad_reconcile_aborted`` with reason ``probe_fault`` under its own source label. Its own
+        audit action and source for the referral's reason: an ``auth.ad_reconcile_skipped`` row
+        reads as benign, and a shared alert instance would let an acknowledged fault silence a
+        later breaker trip or referral. **Nothing resolves that instance automatically**: an
+        operator resolves it once the fault is gone.
+
+        Called on every pass that judged something, and on a pass of referrals or faults only; an
+        outage pass does not call it. A pass with no fault that judged something releases the
+        latched message. The message and the row carry counts and no username; the per-probe
+        WARNING in :meth:`_probe_principal` names each account and the exception type.
+        """
+        if not plan.faulted:
+            if not plan.judged_nothing:
+                self._reconcile_fault_alert = None
+            return
+        others = (
+            "The pass revoked nothing."
+            if plan.aborted is not None
+            else "Accounts that answered were judged as usual."
+        )
+        if plan.unavailable:
+            # Counted here, as the referral's message does: a pass of faults and failures is
+            # recorded as a fault and not as an outage, so the outage would otherwise go unsaid.
+            others = (
+                f"{plan.unavailable} could not be read (the directory was unreachable). {others}"
+            )
+        # The pointer to the account comes first: the store keeps only the first 200 characters
+        # of an alert instance's reason, as `_record_reconcile_referral` says.
+        self._reconcile_fault_alert = (
+            "directory probe fault: the engine log's WARNING for each faulting probe names the "
+            f"account and the exception type. {len(plan.faulted)} of {plan.asked} signed-in "
+            "directory account(s) asked raised an error the engine could not read, and were left "
+            f"unjudged. {others} A faulted account is never revoked while its probe faults, so its "
+            "sessions run to [auth].session_absolute_hours."
+        )
+        _log.error("directory reconcile: %s", self._reconcile_fault_alert)
+        await self._audit_reconciler_row(
+            "auth.ad_reconcile_faulted",
+            detail=_json(
+                {
+                    "reason": reconcile.PROBE_FAULT_ABORT,
+                    "faulted": len(plan.faulted),
+                    "unavailable": plan.unavailable,
+                    "probed": plan.probed,
+                    "aborted": plan.aborted,
+                }
+            ),
+        )
+
     async def _audit_reconciler_row(self, action: str, *, detail: str) -> bool:
         """Write one of the reconcile pass's own rows, and say whether it was written.
 
         BACKLOG #2137. These rows are the held row, the breaker's aborted row, the outage's skipped
-        row, the referral's row (BACKLOG #2538) and the unkeyed-binding report. Each is written
+        row, the referral's row (BACKLOG #2538), the probe fault's row (BACKLOG #3100) and the
+        unkeyed-binding report. Each is written
         after the pass's revocations, or on a pass that applies none. **A failed write here does
         not end the pass.** If it raised, the pass would return no plan, and the lifespan task
         would raise no alert for the revocations already applied, nor for the hold, the breaker or
@@ -8354,8 +8461,9 @@ class AuthService:
     async def _cert_probe(self, user: UserRecord, seq: int) -> reconcile.Probe | str:
         # This task's own context, so the DEBUG level never reaches the reconciler or step-up. A
         # fault on one account's entry would otherwise log a WARNING naming it on every request;
-        # the outage line below reports it once instead.
+        # `_note_cert_probe_fault` reports it at most once a minute instead, naming no account.
         token = _PROBE_FAULT_LOG_LEVEL.set(logging.DEBUG)
+        _PROBE_FAULT_KIND.set(None)
         try:
             answer = await self._directory_presence(user)
         except Exception as exc:
@@ -8366,10 +8474,16 @@ class AuthService:
             _log.debug(
                 "certificate-path directory probe of user id %s raised", user.id, exc_info=True
             )
-            self._note_cert_probe_fault(user.id, seq, exc)
+            self._note_cert_probe_fault(user.id, seq, type(exc).__name__)
             return CERT_PROBE_FAULT
         finally:
             _PROBE_FAULT_LOG_LEVEL.reset(token)
+        if answer == CERT_PROBE_FAULT:
+            # BACKLOG #3100. `_probe_principal` caught the fault and returned FAULT, which
+            # `_directory_presence` hands on as this reason. The same per-account logging as a
+            # raise above, with the type `_probe_principal` recorded in this task's context.
+            self._note_cert_probe_fault(user.id, seq, _PROBE_FAULT_KIND.get())
+            return CERT_PROBE_FAULT
         faulted = self._cert_probe_faulting.get(user.id)
         # Only a probe that started after the latest fault ends it, so a slow answer to a probe
         # issued before the fault cannot.
@@ -8391,7 +8505,7 @@ class AuthService:
             del self._cert_probe_inflight[user_id]
             self._cert_probe_left_at.pop(user_id, None)
 
-    def _note_cert_probe_fault(self, user_id: str, seq: int, exc: Exception) -> None:
+    def _note_cert_probe_fault(self, user_id: str, seq: int, kind: str | None) -> None:
         """Log a certificate-path probe fault (:data:`CERT_PROBE_FAULT`) without one line per
         request: at most one WARNING a minute per account, naming the exception type, and DEBUG
         for the rest.
@@ -8411,8 +8525,10 @@ class AuthService:
         this process sees it, starts afresh (:meth:`_forget_cert_probe_fault`). A fault from a
         probe that predates that move logs at DEBUG and is recorded nowhere. It runs in the probe
         task, so a fault still counts when its caller stopped waiting. The WARNING names no account
-        and never the exception's message, which can quote a directory value."""
-        kind = type(exc).__name__
+        and never the exception's message, which can quote a directory value. ``kind`` is the
+        exception's type name. For a fault :meth:`_probe_principal` caught it comes from
+        ``_PROBE_FAULT_KIND`` (BACKLOG #3100); ``None`` only if that was never set."""
+        kind = kind or "an exception whose type is logged at DEBUG"
         if seq <= self._cert_probe_left_at.get(user_id, 0):
             _log.debug(
                 "certificate-path directory probe of user id %s raised %s after the account left"
@@ -8482,7 +8598,7 @@ class AuthService:
         """Log the certificate path's directory refusals without logging one line per request.
 
         An outage is a refusal that says the directory could not be asked: unreachable, referring,
-        a fault reading the entry, or the probe cap full. It logs one WARNING per outage and, if that
+        or the probe cap full. It logs one WARNING per outage and, if that
         WARNING was logged, one INFO on the next answer the directory actually gave, whatever it
         said about the account. WARNINGs are at least :data:`_CERT_OUTAGE_LOG_INTERVAL_SECONDS`
         apart, so an outage that flaps (a full cap turning over, or one referring account beside a
@@ -10699,7 +10815,7 @@ class AuthService:
         **FAILS CLOSED, UNLIKE THE RECONCILER.** The reconciler REVOKES, so it fails open on an
         unreachable directory and wants two strikes for an ambiguous answer. This GRANTS, so any
         answer short of a present, enabled account refuses: absent, disabled, undetermined,
-        unavailable and referred (BACKLOG #2538) alike. The directory step-up legs already refuse this way: ``_reauth_ad`` on a
+        unavailable, referred (BACKLOG #2538) and probe_fault (BACKLOG #3100) alike. The directory step-up legs already refuse this way: ``_reauth_ad`` on a
         failed bind, and the federated step-up on ``directory_unavailable``. A refusal revokes
         nothing, so the next attempt asks again. An AD row on an engine with no directory
         configured is refused as ``not_configured``, because nothing can confirm it.
