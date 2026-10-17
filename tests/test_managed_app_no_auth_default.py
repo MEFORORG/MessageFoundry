@@ -112,14 +112,9 @@ def test_the_stats_socket_follows_the_same_opt_in(tmp_path: Path) -> None:
 _FACTORY_LOGGER = create_managed_app.__module__
 
 
-def _deny_all_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
-    return [
-        r
-        for r in caplog.records
-        if r.name == _FACTORY_LOGGER
-        and r.levelno == logging.WARNING
-        and AUTH_NOT_CONFIGURED in r.getMessage()
-    ]
+def _factory_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Every WARNING the factory's logger wrote, so a second line worded differently counts too."""
+    return [r for r in caplog.records if r.name == _FACTORY_LOGGER and r.levelno >= logging.WARNING]
 
 
 @pytest.mark.parametrize(
@@ -153,7 +148,9 @@ def test_a_deny_all_build_says_so_once(
         allow_no_auth=allow_no_auth,
         egress_settings=EgressSettings(deny_by_default=False),
     )
-    assert len(_deny_all_warnings(caplog)) == expected
+    warnings = _factory_warnings(caplog)
+    assert len(warnings) == expected
+    assert all(AUTH_NOT_CONFIGURED in r.getMessage() for r in warnings)
 
 
 async def test_enabled_auth_settings_refuse_an_anonymous_call_and_answer_a_signed_in_one(

@@ -9884,9 +9884,9 @@ def create_managed_app(
     ``synchronous``) as a SQLite shortcut. ``config_dir`` loads the code-first Connection/Router/
     Handler graph. ``auth_settings`` attaches an :class:`AuthService` and seeds the built-in roles;
     it creates no account (ADR 0183). With no ``auth_settings`` every protected route is refused
-    (503) unless the caller passes ``allow_no_auth=True``, the same opt-in :func:`create_app` takes,
-    and the build logs one WARNING saying so; beside ``auth_settings`` that opt-in raises
-    ``ValueError``.
+    (503 over HTTP) unless the caller passes ``allow_no_auth=True``, the same opt-in
+    :func:`create_app` takes; a build with neither logs one WARNING. Beside ``auth_settings`` that
+    opt-in raises ``ValueError``.
     The store is opened via the
     backend-agnostic :func:`~messagefoundry.store.open_store`. ``api_listener`` is the engine's own
     ``(host, port)`` (from ``[api]``), reserved so no inbound listener can be wired onto the API's port
@@ -9911,16 +9911,6 @@ def create_managed_app(
         raise ValueError(
             "create_managed_app: allow_no_auth=True was passed beside auth_settings; pass the "
             "opt-in only with no auth_settings, since settings always require sign-in"
-        )
-    elif auth_settings is None and not allow_no_auth:
-        # Vault BACKLOG #2731 item 1: no settings means no service ever attaches, so this fails
-        # closed. Said here and not in create_app, which every managed app calls with auth=None
-        # before the lifespan attaches a service.
-        _log.warning(
-            "create_managed_app: no auth_settings and allow_no_auth is not set, so every protected "
-            "route will answer 503 (%s); pass auth_settings to require sign-in, or "
-            "allow_no_auth=True for the open mode",
-            AUTH_NOT_CONFIGURED,
         )
 
     @asynccontextmanager
@@ -10696,7 +10686,7 @@ def create_managed_app(
 
     # Settings never select the open mode: only the caller's opt-in, checked at the top, does
     # (vault BACKLOG #2611, #2825).
-    return create_app(
+    app = create_app(
         lifespan=lifespan,
         # Build the opt-in uploaded-logs store in the SERVE path too (previously only the direct/test
         # path passed store_settings, so `serve` never wired it): the ASVS 5.2.4 retention runner above
@@ -10723,3 +10713,14 @@ def create_managed_app(
         phi_read_hop_secure=phi_read_hop_secure,
         configured_log_level=configured_log_level,
     )
+    if auth_settings is None and not allow_no_auth:
+        # Vault BACKLOG #2731 item 1: no settings means no service attaches, so this app fails closed.
+        # Said here, once create_app has accepted the build, and not in create_app, which every
+        # managed app calls with auth=None before the lifespan attaches a service.
+        _log.warning(
+            "create_managed_app: built with no auth_settings and without allow_no_auth, so every "
+            "protected route is refused (HTTP routes answer 503, %s). auth_settings attaches "
+            "sign-in; allow_no_auth=True instead serves every route to anonymous callers",
+            AUTH_NOT_CONFIGURED,
+        )
+    return app
