@@ -11031,16 +11031,18 @@ def create_managed_app(
             )
             steps += _app_drain_steps(app, store, auth, owns_auth=True)
             # Vault BACKLOG #2945: a config write whose caller was cancelled still writes its audit
-            # row. Drained here, under the budget, rather than by the fixed wait engine.stop() runs
-            # for a caller with no lifespan; draining closes the engine's gate, so engine.stop()
-            # then does not wait again, and a write still running past this step's bound may lose
-            # its row. The floor is what such a write is guaranteed whatever the steps before took:
-            # a flag toggle's load and build check plus its row. Handed part of its bound, so its
-            # wait ends before the step is cut; the wait never cancels a write.
+            # row. Drained here, under the budget, rather than by the 5 s wait engine.stop() runs
+            # when no drain ran first. Draining closes the engine's gate, and engine.stop() then
+            # gives a write still running only a 1 s late wait, inside its reserve. Handed
+            # _INNER_SHARE of its bound, so its wait ends before the step is cut; the wait never
+            # cancels a write. A small floor, since the gate closes at once and most shutdowns
+            # have no write running. The embedded lifespan (create_app(engine=...)) has no such
+            # step, so its caller's engine.stop() runs the 5 s wait, outside the reserve that
+            # lifespan's budget assumes.
             steps.append(
                 _TeardownStep(
                     "the config-write drain",
-                    1.0,
+                    0.25,
                     lambda b: engine.drain_config_writes(b * _INNER_SHARE),
                 )
             )

@@ -143,8 +143,13 @@ _ALERT_STATE_DRAIN_SECONDS = 5.0
 #: How long stop waits for config writes whose callers were cancelled (vault BACKLOG #2945), so
 #: their audit rows reach the store before it closes. Short, for the same reason as above. Only
 #: when no drain ran first: the managed API lifespan runs one under its shutdown budget (BACKLOG
-#: #3191), and stop then does not wait again, even for a write that drain left running.
+#: #3191), and stop then waits only :data:`_CONFIG_WRITE_LATE_DRAIN_SECONDS`.
 _CONFIG_WRITE_DRAIN_SECONDS = 5.0
+
+#: How long stop waits for a config write the lifespan's drain left running. Within the share of
+#: the shutdown budget the API reserves for stop (``_ENGINE_STOP_RESERVE_SECONDS`` in
+#: ``api/app.py``), and spent only while such a write is still running.
+_CONFIG_WRITE_LATE_DRAIN_SECONDS = 1.0
 
 #: How long a DR release waits for the staged queue to drain before it hands back anyway, leaving
 #: the rest queued (vault BACKLOG #2752). Kept well under the API's 120 s request deadline
@@ -2428,7 +2433,8 @@ class Engine:
         engine itself made. ``tests/test_config_write_census.py`` fails when engine code writes a
         config file any other way, and its census says why each other writer stays outside.
 
-        ``prepare``, when given, runs first, on the event loop and under the engine lock, so a caller
+        ``prepare``, when given, runs on the event loop and under the engine lock, after the
+        stopping and no-config-directory refusals and before ``write``, so a caller
         can snapshot loop-owned state that ``write`` reads from its worker thread as of this write,
         not as of when the caller queued for the lock. A raise there is a refusal, before anything is
         written.
@@ -2608,11 +2614,11 @@ class Engine:
 
         A write whose caller was cancelled is still running, and its row needs the store (vault
         BACKLOG #2945). One still running past ``timeout`` is logged, and its row is lost if the
-        store closes before it lands; nothing waits for it again. The gate closes first, so a caller still queued for the engine lock is
-        refused once it gets the lock rather than starting a write this drain never saw. Waiting
-        never cancels a write: one cut short would leave its file written with no row. Called by
-        the managed API lifespan, under its shutdown budget (BACKLOG #3191), and otherwise by
-        :meth:`stop`."""
+        store closes before it lands. The gate closes first, so a caller still queued for the
+        engine lock is refused once it gets the lock rather than starting a write this drain never
+        saw. Waiting never cancels a write: one cut short would leave its file written with no row.
+        The managed API lifespan calls it under its shutdown budget (BACKLOG #3191), and
+        :meth:`stop` calls it again, so a write that drain left running gets one more short wait."""
         self._config_writes_closed = True
         if not self._config_writes:
             return
@@ -3625,11 +3631,14 @@ class Engine:
             self._warm_pool_task = None
         # A config write whose caller was cancelled is still running, and its row needs the store
         # (vault BACKLOG #2945). Under the managed API lifespan a drain has already run, bounded
-        # by its shutdown budget (BACKLOG #3191), and closed the gate, so a second wait here would
-        # spend time past that budget; a write it left running may lose its row. A caller with no
-        # such lifespan gets the fixed bound.
-        if not self._config_writes_closed:
-            await self.drain_config_writes(_CONFIG_WRITE_DRAIN_SECONDS)
+        # by its shutdown budget (BACKLOG #3191), and closed the gate. A write it left running gets
+        # only the short late wait here, inside this step's reserve; with none running it costs
+        # nothing. A caller whose shutdown ran no drain gets the fixed bound.
+        await self.drain_config_writes(
+            _CONFIG_WRITE_LATE_DRAIN_SECONDS
+            if self._config_writes_closed
+            else _CONFIG_WRITE_DRAIN_SECONDS
+        )
         # Clears raised on the way out are background writes: an unpinned cluster node's intake
         # alerts (BACKLOG #2272) and the coordinator's leadership release. Give them a bounded chance
         # to land before the store closes. Last, so it covers every stop step above.

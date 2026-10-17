@@ -24,6 +24,7 @@ from messagefoundry.api import app as app_module
 from messagefoundry.api import create_app, create_managed_app
 from messagefoundry.api.app import _run_teardown, _TeardownStep
 from messagefoundry.config.settings import ApprovalsSettings, EgressSettings
+from messagefoundry.pipeline import engine as engine_module
 from messagefoundry.pipeline.engine import Engine
 
 _WAIT_S = 10.0
@@ -442,9 +443,11 @@ async def test_the_managed_teardown_drains_config_writes_under_its_budget(
     step = labels.index("the config-write drain")
     assert step < labels.index("engine.stop()")
     # The drain waited for the write before engine.stop() ran, and engine.stop() read the closed
-    # gate and did not drain again.
-    assert [name for name, _ in calls] == ["drain", "write landed", "stop"], calls
+    # gate and drained again with only the late wait, not its own fixed one.
+    assert [name for name, _ in calls] == ["drain", "write landed", "stop", "drain"], calls
     assert calls[0][1] == pytest.approx(bounds[step] * app_module._INNER_SHARE)
+    assert calls[3][1] == engine_module._CONFIG_WRITE_LATE_DRAIN_SECONDS
+    assert engine_module._CONFIG_WRITE_LATE_DRAIN_SECONDS < app_module._ENGINE_STOP_RESERVE_SECONDS
     assert engine._config_writes_closed
 
 
@@ -454,7 +457,7 @@ async def test_the_teardown_is_bounded_when_every_drain_hangs(
     """Every drain before engine.stop() hangs, and the whole teardown still ends within the budget,
     the cut graces and what the real engine.stop() takes. The budget just covers the floors of the
     steps that apply here, as the shipped one covers the managed set's."""
-    budget = 4.5
+    budget = 3.75
     monkeypatch.setattr(app_module, "_SHUTDOWN_BUDGET_SECONDS", budget)
     monkeypatch.setattr(app_module, "_ENGINE_STOP_RESERVE_SECONDS", 0.2)
     app = _managed(tmp_path / "bounded.db")
@@ -479,8 +482,10 @@ async def test_the_teardown_is_bounded_when_every_drain_hangs(
             engine: Engine = app.state.engine
 
             async def _config_drain_hangs(_timeout: float) -> None:
-                # As the real drain does before it waits, so the cut step leaves the gate closed
-                # and engine.stop() does not drain again.
+                # The lifespan's drain hangs. engine.stop()'s late drain, called once the gate is
+                # closed, returns at once, as the real one does with no write running.
+                if engine._config_writes_closed:
+                    return
                 engine._config_writes_closed = True
                 await asyncio.Event().wait()
 

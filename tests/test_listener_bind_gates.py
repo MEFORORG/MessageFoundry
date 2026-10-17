@@ -215,6 +215,7 @@ async def test_a_queued_toggle_checks_the_listening_set_of_its_own_turn(tmp_path
         runner = eng.add_registry(load_config(tmp_path))
         await runner.start()
         assert not runner.inbound_running("IB_TOML")
+        before = (tmp_path / "connections.toml").read_bytes()
         await eng._toml_write_lock.acquire()
         try:
             caller = asyncio.ensure_future(
@@ -232,6 +233,9 @@ async def test_a_queued_toggle_checks_the_listening_set_of_its_own_turn(tmp_path
             with pytest.raises(WiringError, match="HL7 bodies would cross") as refused:
                 await caller
             assert "'IB_TOML' would be bound" in str(refused.value)
+            # Refused before anything landed: no file change, no baseline row.
+            assert (tmp_path / "connections.toml").read_bytes() == before
+            assert await eng.store.list_audit(action="connection_flag_set") == []
         finally:
             runner._sources.pop("IB_TOML")
     finally:
