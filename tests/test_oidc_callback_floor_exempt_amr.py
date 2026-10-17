@@ -265,7 +265,7 @@ async def test_a_refused_exempted_sign_in_against_a_locked_account_keeps_the_hid
 ) -> None:
     """The lock refusal is hidden from readers without users:manage by its exact text, so it takes
     no marker: a marker would make the row visible and show them the lock (owner ruling
-    2026-09-28). Read back through the exclusion the audit routes apply."""
+    2026-09-28). Checked against the exclusion's row set, not through a store read."""
     store = await MessageStore.open(":memory:")
     try:
         service, clock = await _floored(

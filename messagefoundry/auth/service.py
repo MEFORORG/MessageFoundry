@@ -2007,9 +2007,11 @@ def _floor_exempt_marker(floor_exempt_amr: Sequence[str]) -> dict[str, object]:
     apply (BACKLOG #2388).
 
     BACKLOG #3220: the success row carries it, and so does each refusal row written after the
-    exemption applied, except a directory lock refusal (see :meth:`AuthService._refuse_directory_row`),
-    so the review ``docs/SECURITY-LOOSENING.md`` asks for also sees exempted attempts that failed.
-    Other rows the attempt writes, such as role resyncs and session rotation, do not carry it. The values are the CONFIGURED ones the token matched, never the token's own."""
+    exemption applied, except a directory lock refusal (see
+    :meth:`AuthService._refuse_directory_row`). So the review ``docs/SECURITY-LOOSENING.md`` asks
+    for also sees exempted attempts that failed. At least the role-resync and session-rotation rows
+    the attempt writes do not carry it. The values are the CONFIGURED ones the token matched, never
+    the token's own."""
     return {"callback_floor_exempt_amr": list(floor_exempt_amr)} if floor_exempt_amr else {}
 
 
@@ -4577,7 +4579,7 @@ class AuthService:
         signed_in_during_flow = principal_claims.auth_time >= math.floor(flow.issued_at)
         # BACKLOG #2388: an IdP that re-authenticates with no human step (an amr the operator named
         # in oidc_callback_floor_exempt_amr) is exempt. Recorded on the success row, below, and on
-        # every refusal after this point (BACKLOG #3220).
+        # each refusal after this point, a lock refusal excepted (BACKLOG #3220).
         floor_exempt_amr = (
             self._oidc_callback_floor_exemption(principal_claims.amr)
             if signed_in_during_flow and arrived_too_early
@@ -5396,7 +5398,8 @@ class AuthService:
         # BACKLOG #2143: the federated sign-in's verified auth_time, stored on the session. Only the
         # federated caller passes it; a Kerberos session has no IdP clock to compare.
         idp_auth_time: float | None = None,
-        # BACKLOG #3220: extra fields for every refusal row this login writes. The federated caller
+        # BACKLOG #3220: extra fields for the refusal rows this login writes, a lock refusal
+        # excepted (see _refuse_directory_row). The federated caller
         # passes the callback_floor_exempt_amr marker when the floor exemption let it through, so a
         # refused exempted attempt carries it as the success row does. Kerberos passes nothing.
         refusal_extra: Mapping[str, object] | None = None,
