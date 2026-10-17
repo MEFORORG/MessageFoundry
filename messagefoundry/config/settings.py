@@ -1150,7 +1150,8 @@ class StoreSettings(_Section):
                 "[store].ssl_root_cert requires a server-DB backend (postgres or sqlserver); "
                 "SQLite uses no TLS, so pinning a certificate has no effect."
             )
-        if self.ssl_root_cert and self.backend is StoreBackend.SQLSERVER:
+        sends_pin = self.encrypt and not self.trust_server_certificate  # as the store decides
+        if self.ssl_root_cert and self.backend is StoreBackend.SQLSERVER and sends_pin:
             # Vault BACKLOG #2223: on SQL Server the file is an exact-match pin, so a bundle or a CA
             # certificate would refuse every connect. Say so at load, naming the setting. The file
             # holds only a public certificate, and no part of it goes into the message.

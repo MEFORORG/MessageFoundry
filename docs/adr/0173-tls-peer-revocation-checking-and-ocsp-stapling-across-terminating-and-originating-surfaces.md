@@ -1174,9 +1174,9 @@ decisions too:
    It does not change the grade of the SQL Server store row in the table above. That row stays a
    named gap by owner ruling R6.
 4. **The engine checks the pin's validity period itself.** Under strict the driver's own chain,
-   host-name and expiry checks do not apply to a pin match (*documentation*), so the engine refuses a
-   pin that is expired or not yet valid, refuses at load a file that is a bundle or a CA
-   certificate, watches the pin's expiry with its certificate-expiry monitor, and, since the pin is
+   host-name and expiry checks do not apply to a pin match (*documentation*), so the engine refuses,
+   at each store open, a pin that is expired or not yet valid, refuses at load a file that is a
+   bundle or a CA certificate that signs others, watches the pin's expiry with its certificate-expiry monitor, and, since the pin is
    then the connection's only trust anchor, applies the trust-anchor ACL and path checks to it
    (*code*).
 

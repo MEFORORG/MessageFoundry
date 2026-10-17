@@ -231,7 +231,9 @@ def certs_from_settings(settings: ServiceSettings) -> list[MonitoredCert]:
     is what warns before that refusal. A PostgreSQL ``ssl_root_cert`` is a CA bundle the driver
     validates itself, so it is not listed."""
     store, pin = settings.store, settings.store.ssl_root_cert
-    if store.backend is StoreBackend.SQLSERVER and isinstance(pin, str) and pin:
+    # Only where the store sends it: an escaped weakened posture sends no pin.
+    sends_pin = store.encrypt and not store.trust_server_certificate
+    if store.backend is StoreBackend.SQLSERVER and sends_pin and isinstance(pin, str) and pin:
         return [MonitoredCert("store.ssl_root_cert", pin)]
     return []
 

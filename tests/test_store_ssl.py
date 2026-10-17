@@ -21,7 +21,7 @@ from pydantic import ValidationError
 from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, StoreBackend, StoreSettings
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.store.postgres import _build_ssl
-from messagefoundry.store.sqlserver import connection_string
+from messagefoundry.store.sqlserver import check_pinned_certificate, connection_string
 
 
 def _ca_file(tmp_path: object) -> str:
@@ -48,8 +48,10 @@ def _leaf_file(tmp_path: object, name: str = "db-server.pem", *, der: bool = Fal
     return str(p)
 
 
-def _ca_cert_file(tmp_path: object) -> str:
-    """A self-signed CA certificate (basicConstraints CA:TRUE), which a SQL Server pin can never match."""
+def _ca_cert_file(tmp_path: object, *, signs: bool = True, not_after_days: float = 30) -> str:
+    """A self-signed CA:TRUE certificate. With ``signs`` it is an issuer (keyUsage keyCertSign),
+    which a SQL Server pin can never match; without, it is the shape ``openssl req -x509`` gives a
+    server by default, which a server can present."""
     import datetime
 
     from cryptography import x509
@@ -66,9 +68,23 @@ def _ca_cert_file(tmp_path: object) -> str:
         .issuer_name(name)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(minutes=1))
-        .not_valid_after(now + datetime.timedelta(days=30))
+        .not_valid_before(now - datetime.timedelta(days=60))
+        .not_valid_after(now + datetime.timedelta(days=not_after_days))
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=False,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=signs,
+                crl_sign=signs,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
         .sign(key, hashes.SHA256())
     )
     p = tmp_path / "db-ca-cert.pem"  # type: ignore[operator]
@@ -409,7 +425,7 @@ def test_an_expired_pin_is_refused_naming_the_setting_and_not_after(tmp_path: ob
     with pytest.raises(
         ValueError, match=r"\[store\]\.ssl_root_cert .*expired at \d{2} \w{3} \d{4}"
     ) as exc:
-        connection_string(settings, now=time.time() + 60 * _DAY)
+        check_pinned_certificate(settings, now=time.time() + 60 * _DAY)
     assert "BEGIN CERTIFICATE" not in str(exc.value)
 
 
@@ -418,7 +434,7 @@ def test_a_pin_not_yet_valid_is_refused(tmp_path: object) -> None:
 
     settings = _ss(ssl_root_cert=_leaf_file(tmp_path))
     with pytest.raises(ValueError, match=r"\[store\]\.ssl_root_cert .*not valid until .*notAfter"):
-        connection_string(settings, now=time.time() - _DAY)
+        check_pinned_certificate(settings, now=time.time() - _DAY)
 
 
 def test_a_der_pin_is_accepted(tmp_path: object) -> None:
@@ -505,18 +521,16 @@ def _writable_by_others(path: str, monkeypatch: pytest.MonkeyPatch) -> None:
 def test_a_pin_others_can_write_is_refused_while_enforcing(
     tmp_path: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from messagefoundry.auth.trust_anchors import TrustAnchorError
-
     pin = _leaf_file(tmp_path)
     settings = _ss(ssl_root_cert=pin)
     # POSITIVE CONTROL: the same file, owner-written, builds a string under enforce.
-    assert ";ServerCertificate=" in connection_string(settings, posture=HopPosture(enforcing=True))
+    check_pinned_certificate(settings, posture=HopPosture(enforcing=True))
     _writable_by_others(pin, monkeypatch)
-    with pytest.raises(TrustAnchorError, match=r"\[store\]\.ssl_root_cert: the trust anchor"):
-        connection_string(settings, posture=HopPosture(enforcing=True))
+    with pytest.raises(ValueError, match=r"\[store\]\.ssl_root_cert: the trust anchor"):
+        check_pinned_certificate(settings, posture=HopPosture(enforcing=True))
     # No posture counts as enforcing.
-    with pytest.raises(TrustAnchorError):
-        connection_string(settings)
+    with pytest.raises(ValueError, match="the trust anchor"):
+        check_pinned_certificate(settings)
 
 
 def test_a_pin_others_can_write_warns_and_connects_at_warn(
@@ -527,8 +541,7 @@ def test_a_pin_others_can_write_warns_and_connects_at_warn(
     pin = _leaf_file(tmp_path)
     _writable_by_others(pin, monkeypatch)
     with caplog.at_level(logging.WARNING):
-        dsn = connection_string(_ss(ssl_root_cert=pin), posture=HopPosture(enforcing=False))
-    assert ";ServerCertificate=" in dsn
+        check_pinned_certificate(_ss(ssl_root_cert=pin), posture=HopPosture(enforcing=False))
     assert "[store].ssl_root_cert: the trust anchor" in caplog.text
 
 
@@ -540,13 +553,40 @@ def test_a_pin_in_a_folder_others_can_write_is_refused_while_enforcing(tmp_path:
     import os
     import stat
 
-    from messagefoundry.auth.trust_anchors import TrustAnchorError
-
     folder = tmp_path / "open"  # type: ignore[operator]
     folder.mkdir()
     pin = _leaf_file(folder)
     # POSITIVE CONTROL: the folder as created passes.
-    connection_string(_ss(ssl_root_cert=pin), posture=HopPosture(enforcing=True))
+    check_pinned_certificate(_ss(ssl_root_cert=pin), posture=HopPosture(enforcing=True))
     os.chmod(folder, os.stat(folder).st_mode | stat.S_IWOTH)  # world-writable, no sticky bit
-    with pytest.raises(TrustAnchorError, match=r"\[store\]\.ssl_root_cert"):
-        connection_string(_ss(ssl_root_cert=pin), posture=HopPosture(enforcing=True))
+    with pytest.raises(ValueError, match=r"\[store\]\.ssl_root_cert"):
+        check_pinned_certificate(_ss(ssl_root_cert=pin), posture=HopPosture(enforcing=True))
+
+
+def test_a_self_signed_ca_true_server_certificate_is_accepted(tmp_path: object) -> None:
+    """``openssl req -x509`` marks a server's self-signed certificate CA:TRUE by default, with no
+    keyCertSign. A server can present it, so the pin accepts it."""
+    pin = _ca_cert_file(tmp_path, signs=False)
+    assert _ss(ssl_root_cert=pin).ssl_root_cert == pin
+    check_pinned_certificate(_ss(ssl_root_cert=pin))
+
+
+def test_the_escaped_posture_does_not_validate_a_pin_it_never_sends(
+    tmp_path: object, escape_at_warn: None
+) -> None:
+    ca = _ca_cert_file(tmp_path)
+    settings = _ss(ssl_root_cert=ca, trust_server_certificate=True)  # no refusal at load
+    check_pinned_certificate(settings)  # and none at open
+
+
+async def test_store_open_refuses_an_expired_pin_before_any_connect(tmp_path: object) -> None:
+    """The check runs at :meth:`SqlServerStore.open`, ahead of the driver import and every connect,
+    so it holds without a SQL Server or the extra."""
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    pin = _ca_cert_file(tmp_path, signs=False, not_after_days=-1)
+    settings = _ss(ssl_root_cert=pin)
+    with pytest.raises(ValueError, match="expired at"):
+        await SqlServerStore.open(settings)
+    with pytest.raises(ValueError, match="expired at"):
+        await SqlServerStore.provision_schema(settings)

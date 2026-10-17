@@ -6203,8 +6203,8 @@ async def test_server_certificate_pin_is_enforced_under_strict_encryption(tmp_pa
     import aioodbc
     import pyodbc
 
-    from messagefoundry import pki
     from messagefoundry.config.settings import load_settings
+    from messagefoundry.pki import make_self_signed
     from messagefoundry.store.sqlserver import connection_string
 
     base = load_settings(environ=os.environ).store
@@ -6214,7 +6214,7 @@ async def test_server_certificate_pin_is_enforced_under_strict_encryption(tmp_pa
     )
     # A fresh self-signed certificate the server never presents.
     wrong = tmp_path / "not-presented.pem"
-    wrong.write_bytes(pki.make_self_signed("mf-test-not-the-server", [], 30)[0])
+    wrong.write_bytes(make_self_signed("mf-test-not-the-server", [], 30)[0])
 
     def pinned_dsn(pin: Any) -> str:
         # CI trusts the container's self-signed certificate through the escape; the pin replaces that.

@@ -2566,47 +2566,67 @@ def _odbc_brace(value: str) -> str:
     return "{" + value.replace("}", "}}") + "}"
 
 
-def _refuse_an_exposed_pin(path: str, posture: HopPosture | None) -> None:
-    """Apply the trust-anchor ACL and path checks to a ``[store].ssl_root_cert`` pin.
-
-    Vault BACKLOG #2223: under ``Encrypt=strict`` the pinned file is the store connection's sole
-    trust anchor, so whoever can rewrite it, or its folder, can name their own server. It takes the
-    same checks, rules and messages as every other operator trust anchor
-    (:func:`~messagefoundry.auth.trust_anchors.enforce_anchor`): a file or folder a broad principal
-    can write refuses at ``[security].enforcement = enforce`` and warns at ``warn``. No posture
-    counts as enforcing. The driver reads the file by path, so the spec carries
-    ``loads_verified_bytes=False``. Runs where the DSN is built, before any connect."""
-    from messagefoundry.auth.trust_anchors import AnchorSpec, enforce_anchor
-
-    spec = AnchorSpec(
-        "store_sqlserver_pin", "[store].ssl_root_cert", path, loads_verified_bytes=False
-    )
-    enforce_anchor(spec, enforcing=posture is None or posture.enforcing)
+def _pin_path(settings: StoreSettings) -> str | None:
+    """The ``[store].ssl_root_cert`` pin the store sends, or ``None``: it rides only the secure
+    posture, so an escaped weakened one (verify off, or no encryption) sends none."""
+    if settings.trust_server_certificate or not settings.encrypt:
+        return None
+    return settings.ssl_root_cert or None
 
 
-def _refuse_a_pin_outside_its_validity(path: str, now: float) -> None:
-    """Refuse a ``[store].ssl_root_cert`` pin whose certificate is expired or not yet valid.
+def check_pinned_certificate(
+    settings: StoreSettings, *, posture: HopPosture | None = None, now: float | None = None
+) -> None:
+    """Refuse a ``[store].ssl_root_cert`` pin the engine must not send. Raises ``ValueError`` naming
+    the setting. A no-op when the store sends no pin.
 
     Vault BACKLOG #2223: under ``Encrypt=strict`` a pin match stands in for the driver's own chain,
-    host-name and expiry checks, so nothing else would refuse an expired pinned certificate. The
-    engine therefore checks the pinned file's validity period itself. It runs wherever the DSN is
-    built: each pool open and each one-off connect, never per query. A pool opened before
-    ``notAfter`` keeps the DSN it was built with, so the expiry monitor, which watches this file, is
-    what warns ahead of that date. The message names the setting and the dates, never the body."""
+    host-name and expiry checks, and the pinned file is the connection's only trust anchor. So:
+
+    * the file must be one server certificate (:func:`~messagefoundry.pki.read_pinned_server_certificate`);
+    * it takes the trust-anchor ACL and path checks with their own rules and messages
+      (:func:`~messagefoundry.auth.trust_anchors.enforce_anchor`): a file or folder a broad
+      principal can write refuses at ``[security].enforcement = enforce`` and warns at ``warn``,
+      and no posture counts as enforcing. The driver reads the file by path, so the spec carries
+      ``loads_verified_bytes=False``;
+    * it must be inside its validity period at ``now`` (default the wall clock); notAfter itself
+      still counts as valid, as RFC 5280 reads it.
+
+    Blocking: it reads the file and, on Windows, runs ``icacls``. :meth:`SqlServerStore.open` and
+    :meth:`SqlServerStore._one_connection_store` run it off the event loop once per store open,
+    before any connect, never per query. A store opened before notAfter keeps connecting after it,
+    so the certificate-expiry monitor, which watches this file, is what warns ahead of that date."""
+    from messagefoundry.auth.trust_anchors import AnchorSpec, TrustAnchorError, enforce_anchor
     from messagefoundry.pki import read_pinned_server_certificate
     from messagefoundry.redaction import log_timestamp
 
+    path = _pin_path(settings)
+    if path is None:
+        return
     cert = read_pinned_server_certificate(path)
     if isinstance(cert, str):
         raise ValueError(f"[store].ssl_root_cert {path!r} {cert}")
+    spec = AnchorSpec(
+        "store_sqlserver_pin", "[store].ssl_root_cert", path, loads_verified_bytes=False
+    )
+    refusal: str | None = None
+    try:
+        enforce_anchor(spec, enforcing=posture is None or posture.enforcing)
+    except TrustAnchorError as exc:
+        refusal = str(exc)  # the anchor module's own message, which names the setting and the fix
+    except OSError as exc:
+        refusal = f"[store].ssl_root_cert {path!r} could not be read: {exc.strerror or type(exc).__name__}"
+    if refusal is not None:
+        raise ValueError(refusal)
+    moment = time.time() if now is None else now
     not_before, not_after = cert.not_valid_before_utc, cert.not_valid_after_utc
-    if now >= not_after.timestamp():
+    if moment > not_after.timestamp():
         raise ValueError(
             f"[store].ssl_root_cert {path!r}: the pinned certificate expired at "
             f"{log_timestamp(not_after)}. The driver does not check a pin's expiry with "
             "Encrypt=strict, so the engine refuses it. Pin the server's renewed certificate."
         )
-    if now < not_before.timestamp():
+    if moment < not_before.timestamp():
         raise ValueError(
             f"[store].ssl_root_cert {path!r}: the pinned certificate is not valid until "
             f"{log_timestamp(not_before)} (notAfter {log_timestamp(not_after)}). The engine "
@@ -2614,9 +2634,7 @@ def _refuse_a_pin_outside_its_validity(path: str, now: float) -> None:
         )
 
 
-def connection_string(
-    settings: StoreSettings, *, posture: HopPosture | None = None, now: float | None = None
-) -> str:
+def connection_string(settings: StoreSettings, *, posture: HopPosture | None = None) -> str:
     """Build an ODBC connection string for the Microsoft ODBC Driver 18 from store settings.
 
     Free-text values are brace-quoted to prevent connection-string injection (STORE-5), and the
@@ -2630,8 +2648,8 @@ def connection_string(
     embedding, or unit test) leaves the escape unclamped"*; that let a CLI command cross a weakened
     store hop under ``enforce``.
 
-    ``now`` (epoch seconds, default the wall clock) is the instant a ``[store].ssl_root_cert`` pin's
-    validity period is checked against (vault BACKLOG #2223); a test passes it."""
+    It reads no file. The pin's own checks are :func:`check_pinned_certificate`, which the store runs
+    once per open (vault BACKLOG #2223)."""
     if posture is None:
         posture = current_hop_posture()
     # A weakened TLS posture (TrustServerCertificate=yes, or Encrypt=no) is MITM-able, so it REFUSES
@@ -2678,12 +2696,10 @@ def connection_string(
     # measured under #3009). Strict is TDS 8.0, so a server older than SQL Server 2022 refuses the
     # connection; there is no fall back to an unenforced pin. Microsoft documents the exact match as
     # done instead of the expiry, host-name and chain checks, so the engine checks the pinned
-    # certificate's validity period itself, just below. Not a revocation control. Both keywords stay
-    # inside the last-wins tail.
-    pin = None if weakened else settings.ssl_root_cert
+    # certificate itself at store open (check_pinned_certificate). Not a revocation control. Both
+    # keywords stay inside the last-wins tail.
+    pin = _pin_path(settings)
     if pin:
-        _refuse_an_exposed_pin(pin, posture)
-        _refuse_a_pin_outside_its_validity(pin, time.time() if now is None else now)
         parts.append(f"ServerCertificate={_odbc_brace(pin)}")
     encrypt = "strict" if pin else ("yes" if settings.encrypt else "no")
     parts.append(f"Encrypt={encrypt}")
@@ -3549,6 +3565,8 @@ class SqlServerStore:
         # sync-handoff pool) decides as the open did, wherever it is reached from (vault BACKLOG #2354).
         if posture is None:
             posture = current_hop_posture()
+        # Vault BACKLOG #2223: the pin's own checks, once, off the loop, before any connect.
+        await asyncio.to_thread(check_pinned_certificate, settings, posture=posture)
         try:
             import aioodbc  # noqa: F401 - fail on a missing extra before any connect is attempted
         except ImportError as exc:  # pragma: no cover - exercised only without the extra
@@ -4573,6 +4591,8 @@ class SqlServerStore:
 
         The result names the schema the batch landed in and any option still OFF, so the caller can
         report a partial result rather than a success."""
+        # Vault BACKLOG #2223: before the first connect, which the options step makes.
+        await asyncio.to_thread(check_pinned_certificate, settings, posture=posture)
         await cls._ensure_database_options(settings, posture=posture, fail_closed=False)
         async with cls._one_connection_store(settings, posture=posture) as store:
             applied = await store._ensure_schema(provisioning=True)
@@ -4603,6 +4623,8 @@ class SqlServerStore:
         """A one-connection store with the identity cipher, closed on exit: what
         :meth:`provision_schema` and :meth:`probe_privileges` run on instead of :meth:`open`. It hands
         the executor to the store, so :meth:`close` releases it."""
+        # Vault BACKLOG #2223: the pin's own checks, as :meth:`open` runs them.
+        await asyncio.to_thread(check_pinned_certificate, settings, posture=posture)
         pool, executor = await cls._create_pool(settings, posture=posture, maxsize=1)
         store = cls(pool, settings, posture=posture)
         store._pool_executor = executor

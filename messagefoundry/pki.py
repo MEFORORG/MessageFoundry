@@ -55,6 +55,7 @@ __all__ = [
     "cert_to_pem",
     "key_to_pem",
     "load_pinned_server_certificate",
+    "PinRefused",
     "read_pinned_server_certificate",
     "load_pkcs12",
     "make_self_signed",
@@ -701,17 +702,35 @@ def _load_one_certificate(data: bytes) -> x509.Certificate:
     return x509.load_der_x509_certificate(data)
 
 
+class PinRefused(ValueError):
+    """Why a SQL Server pin file can never match the server's certificate. Its text is the engine's
+    own and names no part of the file, unlike a ``ValueError`` from ``cryptography``'s parser."""
+
+
+def _signs_certificates(cert: x509.Certificate) -> bool:
+    """True when the certificate is marked as an issuer: ``keyUsage`` with ``keyCertSign``, or a
+    CA that another CA issued. A self-signed ``CA:TRUE`` certificate with no ``keyCertSign`` is what
+    ``openssl req -x509`` makes by default for a server, and a server can present it, so it is not
+    treated as an issuer here."""
+    try:
+        if cert.extensions.get_extension_for_class(x509.KeyUsage).value.key_cert_sign:
+            return True
+    except x509.ExtensionNotFound:
+        pass
+    return cert.subject != cert.issuer
+
+
 def load_pinned_server_certificate(data: bytes) -> x509.Certificate:
     """The one server certificate a SQL Server ``[store].ssl_root_cert`` pin names, PEM or DER.
 
     The ODBC ``ServerCertificate`` pin is an exact match against the certificate the server presents
-    (vault BACKLOG #2223). A file holding several certificates, or a CA certificate, can never be that
-    certificate, so either is refused here with a reason rather than refused by the driver at every
-    connect. Raises ``ValueError`` naming the problem, never the certificate's contents."""
+    (vault BACKLOG #2223). A file holding several certificates, or a CA certificate that signs
+    others, is refused here with a reason rather than by the driver at every connect. Raises
+    :class:`PinRefused` for those, and ``cryptography``'s own errors for a file that does not parse."""
     if b"-----BEGIN" in data:
         certs = x509.load_pem_x509_certificates(data)  # ValueError when the file holds none
         if len(certs) != 1:
-            raise ValueError(
+            raise PinRefused(
                 f"it holds {len(certs)} certificates; the SQL Server pin must be exactly one, the "
                 "server's own certificate"
             )
@@ -722,10 +741,11 @@ def load_pinned_server_certificate(data: bytes) -> x509.Certificate:
         constraints = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
     except x509.ExtensionNotFound:
         return cert
-    if constraints.ca:
-        raise ValueError(
-            "it is a CA certificate (basicConstraints CA:TRUE); the SQL Server pin is an exact match, "
-            "so name the server's own certificate, or trust the CA through the machine store instead"
+    if constraints.ca and _signs_certificates(cert):
+        raise PinRefused(
+            "it is a CA certificate (basicConstraints CA:TRUE, used to sign certificates); the SQL "
+            "Server pin is an exact match, so name the server's own certificate, or trust the CA "
+            "through the machine store instead"
         )
     return cert
 
@@ -735,20 +755,18 @@ def read_pinned_server_certificate(path: str) -> x509.Certificate | str:
     completes a sentence starting with the setting and the path (vault BACKLOG #2223).
 
     A reason string rather than an exception, so a caller raises its own refusal outside any
-    handler: the phrase is built only from an OS error's ``strerror``, an exception's type name,
-    or the content-free reasons :func:`load_pinned_server_certificate` gives, never the file's
-    bytes. ``cryptography`` raises ``ValueError`` and some non-``ValueError`` types for a bad
-    file; a non-``ValueError`` is named by type alone."""
+    handler. The phrase holds an OS error's ``strerror``, a :class:`PinRefused` reason, or the
+    type name of a parser error, never the parser's text or the file's bytes."""
     reason: str
     try:
         with open(path, "rb") as fh:
             return load_pinned_server_certificate(fh.read())
     except OSError as exc:
         reason = f"could not be read: {exc.strerror or type(exc).__name__}"
-    except ValueError as exc:
+    except PinRefused as exc:
         reason = f"is not a usable SQL Server pin: {exc}"
-    except Exception as exc:  # DuplicateExtension and the like, which are not ValueErrors
-        reason = f"is not a usable SQL Server pin: {type(exc).__name__}"
+    except Exception as exc:  # cryptography's ValueError, DuplicateExtension and the like
+        reason = f"is not a usable SQL Server pin: it is not a certificate ({type(exc).__name__})"
     return reason
 
 
