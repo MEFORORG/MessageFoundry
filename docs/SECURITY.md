@@ -401,6 +401,12 @@ gets you back in. `admin-unlock` clears a local lockout only (vault BACKLOG #271
 - At start, the engine checks for this. When every enabled Administrator needs an outside service,
   it logs a WARNING naming them and writes one `auth.no_local_administrator` audit row. It never
   refuses the start.
+- The `auth.federated_subject_bound`, `auth.federated_subject_rebound` and
+  `auth.federated_subject_unbound` audit rows carry `totp_enrolled` and `webauthn_enrolled`. They
+  say whether the account held each engine factor when the binding changed. A bind first removes
+  any old binding, then writes the new one. The fields are read when the old binding is removed,
+  so a bind or rebind row can miss a factor change made between the two steps. The
+  `bind_federated_subject` docstring says when that can happen.
 - Turning sign-in off is not a way back in. `serve` has no setting that turns it off, and a
   config that still carries the removed switch is refused at load (vault BACKLOG #2719). The
   old loopback mode could not repair an account anyway: with no auth service, creating
@@ -3027,6 +3033,24 @@ alone:
    first address past that, because the check runs on every sensitive request. So a replayed
    token, retrying from one address or alternating between several, is force-stepped-up each time
    but cannot inflate the audit log / notifications (BACKLOG #2159).
+   **That bound is per process, and the owner accepted it as one (vault BACKLOG #2951, owner
+   ruling 2026-10-16, "Accept, doc only").** The record that enforces it is `_new_ip_seen` on
+   `AuthService`. It maps each session's token hash to the addresses already flagged, and it lives
+   in one process's memory. Each process that serves the API keeps its own. So with N such
+   processes over one store, one session can write **N x 9** rows and notices between
+   re-verifications (nine is `_NEW_IP_PER_SESSION_MAX` plus the cap row). A restart empties the record, and each address can be reported again.
+   **N x 9 is not a hard ceiling either.** At least two more paths add rows. A token rotation
+   without a re-verification moves the record only in the rotating process. The other processes
+   start the new token at zero. And past `_NEW_IP_DEDUP_MAX` sessions a process drops
+   its oldest entry, whose addresses can then be reported again.
+   **Each engine shard serves the API.** `messagefoundry supervise` starts one `serve --shard <id>`
+   process per engine shard. `build_shard_specs` in `pipeline/supervisor.py` gives each one its own
+   API port, `base_port + i`. `_serve` in `__main__.py` builds the API app with or without
+   `--shard`. A cluster node is a plain `serve`, so it serves its own API too.
+   The forced step-up never reads the record, so only the rows and notices grow. Every caller of
+   `flag_new_client_ip` shares one record per process. At least these call it: the step-up gates
+   in `api/security.py`, `refuse_from_new_address` there, and the web console's gates in
+   `messagefoundry_webconsole/_auth.py`. So the gates below sit under the same bound.
    **Since vault BACKLOG #2620 the message reads and the paced writes ask too.** Before it, only the
    step-up gates asked. In that shipped code a bearer token replayed from a second address could
    list messages, read a raw body and start or stop connections with no signal, and would have
@@ -4172,10 +4196,18 @@ role or channel-scope change in the directory does not reach those accounts' ses
 lasts.
 
 A probe that raises something other than an LDAP error, such as a malformed entry the engine cannot
-read, fails open for that one account (BACKLOG #2241). It is logged at WARNING by name on every
-pass, and the rest of the estate is still reconciled. **The cost:** while it repeats, that account's
-sessions are never revoked by the reconciler, and no alert is raised. If it hits every probe, the
-pass reads as a directory outage.
+read, is a probe fault. It fails open for that one account (BACKLOG #2241), and it is not a
+directory outage (BACKLOG #3100). Each such probe is logged at WARNING by name, and the rest of the
+estate is still reconciled. A pass with any fault logs one ERROR naming no account and audits
+`auth.ad_reconcile_faulted`. It also raises the `ad_reconcile_aborted` alert with reason
+`probe_fault`, under its own source `directory-reconciler-probe-fault`. If every probe faults or
+fails, the pass judges nothing and revokes nothing, like an outage, but it still pages. A
+connection, timeout or name-lookup error that escapes the directory layer is still read as
+unreachable. **The cost:** while a fault repeats, that account's sessions are never revoked by the
+reconciler, so they run to the absolute cap. That cap is the only bound; the alert makes the gap
+visible and limits nothing. A pass with a fault marks no alert clear. When it resolves is stated once, in
+[CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-two-alerts-resolve-themselves). Step-up
+refuses the account with outcome `probe_fault`.
 
 ### The engine session is independent of the IdP session (ASVS 7.6.1)
 
@@ -4384,9 +4416,14 @@ Users are notified of security-relevant changes to their account through **two**
   alert distribution list). Fired on: account **lockout** and the **first successful login after ≥3
   failed attempts**, or a step-up re-auth that clears such a run (suspicious-login signals, 6.3.5); and **password change**, **email change**, **role
   change**, **account disable**, and a **directory rename** of the username (credential changes,
-  6.3.7). When the directory session reconciler ends an account's sessions because it could not
-  match the account or could not read its `userAccountControl`, it sends `directory_sessions_ended`,
-  not `account_disabled` (vault BACKLOG #2140).
+  6.3.7). When the directory session reconciler ends an account's sessions for a reason other than
+  a read disabled bit, it sends `directory_sessions_ended`, not `account_disabled` (vault BACKLOG
+  #2140). At least `directory_absent`, `directory_undetermined` and `directory_object_id_missing`
+  send it. The comment on `DIRECTORY_SESSIONS_ENDED` in `auth/notifications.py` says what each one
+  means. For at least `directory_object_id_missing` the engine never asks the directory (BACKLOG
+  #2434). So the notice names no directory check. It says only that the engine could not confirm
+  from the directory that the account may still sign in, which is true for each current reason. A
+  new reason must be checked against that wording (vault BACKLOG #3171).
   The rename notice, `username_changed`, names the old and the new name, and is sent only when
   the new name was written (BACKLOG #2017). An **unreplaced temporary password** near its deadline
   (ASVS 6.4.5, BACKLOG #2007) sends two reminders, beside the operator's `initial_credential_expiring`

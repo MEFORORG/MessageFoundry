@@ -46,6 +46,8 @@ from typing import Any
 
 import pytest
 
+from tests._no_prompt import run_holding_stdin_open
+
 _ROOT = Path(__file__).resolve().parents[1]
 _RESCUE = _ROOT / "scripts" / "coord" / "rescue.ps1"
 
@@ -549,3 +551,17 @@ def test_an_annotated_tag_reports_its_COMMIT_not_the_tag_object(tmp_path: Path) 
     assert rows["refs/tags/rescue/annotated"]["commit"] == commit, (
         "reported the tag object instead of the commit"
     )
+
+
+def test_sha_without_anchor_refuses_instead_of_prompting(tmp_path: Path) -> None:
+    """Vault BACKLOG #3627: ``-Sha`` alone binds the ``Anchor`` set without ``-Anchor``. Red pre-fix."""
+    repo = _repo(tmp_path / "r")
+    rc, err = run_holding_stdin_open(
+        ["pwsh", "-NoProfile", "-File", str(repo / "scripts" / "coord" / "rescue.ps1"),
+         "-Sha", "HEAD"],
+        cwd=repo,
+    )  # fmt: skip
+    assert rc != 0, "-Sha without -Anchor must be refused, not anchored"
+    assert "-Anchor" in err, err
+    # Refused means NO rescue ref written.
+    assert _git("for-each-ref", "refs/rescue", "refs/tags/rescue", cwd=repo) == ""
