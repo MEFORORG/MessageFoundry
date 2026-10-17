@@ -1227,6 +1227,11 @@ async def test_a_directory_non_admin_is_sent_to_enrol_not_to_an_unpassable_reaut
         assert got.status_code == 303 and got.headers["location"] == _ENROL_FIRST
         assert posted.status_code == 303 and posted.headers["location"] == _ENROL_FIRST
         assert account.status_code == 200 and "REQUIRES MFA" in account.text
+        # The bounce must lead somewhere: enrolment is step_up=False, so its re-auth renders.
+        async with _client(engine, service) as c:
+            c.cookies.set("mf_session", token)
+            enrol = await c.get("/ui/reauth", params={"next": "/ui/account/mfa/enroll"})
+        assert enrol.status_code == 200 and 'name="password"' in enrol.text
 
 
 async def test_an_exempt_local_non_admin_still_gets_the_reauth_form(engine: Engine) -> None:
@@ -1243,6 +1248,44 @@ async def test_an_exempt_local_non_admin_still_gets_the_reauth_form(engine: Engi
     assert got.status_code == 200 and 'name="password"' in got.text
     assert 'name="code"' not in got.text
     assert account.status_code == 200 and "REQUIRES MFA" not in account.text
+
+
+async def test_a_satisfied_session_on_a_required_account_with_no_factor_is_still_bounced(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the bounce drops the account rule and keys on the session ALONE.
+
+    The inverse of the #3116 split: a session stamped MFA-verified while TOTP was on, whose TOTP was
+    then turned off with the requirement off, is satisfied after the requirement comes on, yet the
+    account rule says it owes a factor it does not hold. It is still sent to enrol, and still told."""
+    _pin_totp_clock(monkeypatch, 1_000_000.0)  # no step boundary between code and check
+    off = await _service(engine, require_mfa=False)
+    user_id = await _add(off, "op", Role.OPERATOR)
+    identity = await off.identity_for_user_id(user_id)
+    assert identity is not None
+    outcome = await off.login("op", PW)
+    assert outcome.ok and outcome.token is not None
+    enrollment = await off.begin_mfa_enrollment(identity)
+    confirmed = await off.confirm_mfa_enrollment(
+        identity, totp.totp(enrollment.secret), token=outcome.token
+    )
+    assert confirmed.ok and confirmed.token is not None
+    await off.disable_mfa(identity)
+    on = await _service(engine, require_mfa=True)
+    assert await on.mfa_satisfied(confirmed.token) is True
+    assert (await on.mfa_status(identity)).required is True
+    async with _client(engine, on) as c:
+        c.cookies.set("mf_session", confirmed.token)
+        got = await c.get("/ui/reauth", params={"next": _STEP_UP_NEXT})
+        posted = await c.post(
+            "/ui/reauth",
+            data={"next": _STEP_UP_NEXT, "password": PW},
+            headers={"origin": "http://t"},
+        )
+        account = await c.get("/ui/account")
+    assert got.status_code == 303 and got.headers["location"] == _ENROL_FIRST
+    assert posted.status_code == 303 and posted.headers["location"] == _ENROL_FIRST
+    assert account.status_code == 200 and "REQUIRES MFA" in account.text
 
 
 # --- a directory the account is not confirmed in (BACKLOG #2023) --------------------------------

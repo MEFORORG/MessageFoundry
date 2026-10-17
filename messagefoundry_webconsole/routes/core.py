@@ -130,15 +130,16 @@ def _directory_unconfirmed(elevation: Elevation) -> bool:
 
 
 def _enrol_before_step_up(satisfied: bool, mfa: MfaStatus, step_up: bool) -> bool:
-    """Whether ``/ui/reauth`` sends this session to enrol instead of rendering its form.
+    """Whether the password ``/ui/reauth`` sends this session to enrol instead of rendering its form.
 
-    True for a full-step-up action on a session that still owes a factor and holds none of EITHER
-    kind (ADR 0068 decision 1(a)): no password can pass that step-up, so the form would loop straight
-    back. Keyed on the SESSION (``satisfied``, from ``mfa_satisfied``), as ``_reauth_idp_page`` is,
-    and NOT on the account rule ``mfa.required``: the directory floor leaves a non-admin directory
-    session unsatisfied that the account rule calls exempt (BACKLOG #3116). Enrolment itself is
-    ``step_up=False``, so it never bounces here."""
-    return step_up and not satisfied and not (mfa.enabled or mfa.webauthn_enrolled)
+    True for a full-step-up action when the account holds no factor of EITHER kind (ADR 0068
+    decision 1(a)) and a factor is owed, by the account rule (``mfa.required``) OR by the session
+    (``satisfied`` is ``mfa_satisfied``): the form could only loop straight back. The session half is
+    BACKLOG #3116. ``AuthService._unverified_session_owes_factor`` says when a session owes a factor
+    the account rule does not. Enrolment itself is ``step_up=False``, so it never bounces here."""
+    if not step_up or mfa.enabled or mfa.webauthn_enrolled:
+        return False
+    return mfa.required or not satisfied
 
 
 #: The message log's received-date bounds, validated by the SAME annotated type the JSON ``/messages``
@@ -1605,8 +1606,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         """/ui/reauth for a session the federated login minted (BACKLOG #296).
 
         Runs BEFORE the password page's enroll-first bounce, because an OIDC session must never see
-        the password page, and one minted with the IdP's MFA claim has met its factor without any
-        engine enrollment. Only a session that has NOT met it is routed:
+        the password page, and because that bounce also keys on the account (``mfa.required``) while
+        an OIDC session minted with the IdP's MFA claim has met its factor without any engine
+        enrollment. Only a session that has NOT met it is routed:
         one owing an ENROLLED engine factor proves it at the MFA gate first (the IdP leg re-proves
         the sign-in, not the engine's factor), and one that owes a factor it has not enrolled goes
         to enroll for a full step-up action, as the password page sends it."""
@@ -1614,9 +1616,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             if mfa.enabled or mfa.webauthn_enrolled:
                 return RedirectResponse("/ui/mfa", status_code=303)
             if step_up:
-                # Keyed on "not satisfied", not on the account rule mfa.required: the directory
-                # floor can leave a session unsatisfied that the account rule calls exempt, and
-                # the step-up gate asks the session.
+                # Keyed on "not satisfied", not on the account rule mfa.required; see
+                # _enrol_before_step_up.
                 return RedirectResponse("/ui/account?m=enroll_first", status_code=303)
         return reauth_idp_response(deps, auth, next_, continues=continues)
 

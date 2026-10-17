@@ -627,10 +627,9 @@ def account_page(
     ``webauthn_notice`` renders the fail-closed copy in place of the Add-a-passkey form (extra
     absent / public_origin unset). ``session_offer`` is the count of the caller's other sessions,
     given only on the one view a factor change earned (BACKLOG #1147); ``None`` or 0 renders none.
-    ``factor_owed`` is whether THIS SESSION still owes a second factor (``not mfa_satisfied``), the
-    test ``/ui/reauth`` uses for its enrol-first bounce. It, not ``mfa.required``, says enrolment is
-    required: the directory floor leaves a non-admin directory session owing a factor that the
-    account rule calls exempt (BACKLOG #3116)."""
+    ``factor_owed`` decides the "REQUIRES MFA" line, read only when TOTP is off: the account rule
+    (``mfa.required``) OR this session (``not mfa_satisfied``) owes a factor. The route computes it
+    because the session half is not in ``mfa`` (BACKLOG #3116)."""
     banner = el("p", error, class_="banner") if error else Markup("")
     note = el("p", notice, class_="muted") if notice else Markup("")
     offer = _session_offer(session_offer or 0)

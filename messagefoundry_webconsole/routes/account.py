@@ -255,9 +255,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 passkeys=passkeys,
                 webauthn_notice=wa_notice,
                 session_offer=session_offer,
-                # Read only where the page uses it, the not-enrolled branch (BACKLOG #3116).
+                # Read only where the page uses it, the no-TOTP branch. The session half is
+                # BACKLOG #3116; _enrol_before_step_up in routes/core.py says why.
                 factor_owed=not mfa.enabled
-                and not await service.mfa_satisfied(session_token(request)),
+                and (mfa.required or not await service.mfa_satisfied(session_token(request))),
             ),
             status_code=status_code,
         )
