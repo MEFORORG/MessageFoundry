@@ -22,6 +22,7 @@ import json
 from typing import Any
 
 from messagefoundry.store.audit_exclusion import AuditExclusion
+from messagefoundry.store.store import audit_active_key_id
 
 _EXCLUDE = AuditExclusion(
     actions=frozenset({"auth.account_locked"}),
@@ -208,7 +209,7 @@ async def check_keyed_audit_evidence(store: Any, tag: str) -> None:
     because a keyless row's hash is one anyone who can write the table can recompute."""
     who = f"e3750-{tag}"
     action = "auth.ad_session_revoked"
-    keyed = bool(store._audit_mac_keys) or store._audit_mac_fn is not None
+    keyed = audit_active_key_id(store._audit_mac_key, store._audit_mac_fn) is not None
     before, _ = await store.audit_anchor()
     assert await store.newest_keyed_audit_row(action, actor=who, after_seq=before) is None
     await store.record_audit(action, actor=who, detail='{"reason": "r"}')

@@ -4107,14 +4107,14 @@ logins would read the same empty groups and withdraw the scope anyway. Revocatio
 raise the `ad_session_revoked` alert, one per revoked principal, once the pass completes. Some
 revocations end no session and change no role. Each still writes its row, with `sessions: 0`
 (BACKLOG #3085, owner ruling 2026-10-16). When the directory says the account is disabled or
-absent, that revocation still alerts and sends its notice, as when the user signed out mid-pass
-(owner ruling 2026-10-17). It is quiet only as a repeat another pass already made (owner ruling
-B258-R7), and only when that pass's row **verifies under the active audit key**
-(`AuthService._already_revoked_elsewhere` states the rule). Anything else alerts: a keyless audit
-chain, a row that fails its MAC or sits under a retired key, or a failed read. So a database writer
-who holds no audit key cannot silence the alert with a forged row (vault BACKLOG #3750 item 33).
-**Residual:** a holder of the active audit key can seal a row that verifies, and so can a writer
-who deletes the newest audit rows within five minutes of a genuine revocation of the same account.
+absent, that revocation still alerts and sends its notice, as when the user signed out mid-pass.
+It is quiet only as a repeat another pass already made (owner ruling B258-R7, 2026-10-17), and,
+under vault BACKLOG #3750 item 33, only when that pass's row **verifies under the active audit
+key** (`AuthService._already_revoked_elsewhere` states the rule). Anything else alerts: a keyless
+audit chain, a row that fails its MAC or sits under a retired key, or a failed read. So a database writer
+who holds no audit key cannot silence the alert with a forged row. That method names the
+residuals, at least a holder of the active audit key and a writer who lowers the watermark close
+to a genuine revocation of the same account. On a keyless audit chain no repeat is quiet.
 Any other revocation that ends nothing and changes no role, such as a scope, role, undetermined or
 unkeyed one, is quiet too. Two reconcilers that both read the old roles, or both read before either
 writes its row, both report. If the first reconciler's pass ended before it alerted, the second's

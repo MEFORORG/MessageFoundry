@@ -6430,7 +6430,8 @@ class AuthService:
             # that today. That predates BACKLOG #2283, and #2283 leaves it open.
             # Before the listing, not after: only a verified revocation row numbered above this
             # can show another pass revoked the account this listing saw signed in (B258-R7). Per
-            # account, so a row from before the account's latest sign-in never counts.
+            # account, so a row committed before this read does not count; the ts bound in
+            # `_already_revoked_elsewhere` covers a watermark a writer lowered.
             watermark = await self._audit_watermark()
             if not await self._store.list_sessions(user.id):
                 continue
@@ -7589,9 +7590,13 @@ class AuthService:
         that fails its MAC, a newest row with another reason or an older ``ts``, unreadable detail,
         or any exception (logged at ERROR) all answer False. So does a race in which both
         reconcilers read before either writes, and a junk row newer than the genuine one.
-        **Residual:** a holder of the active audit key can seal a row that verifies, and so can
-        still silence a repeat alert, as can a writer who deletes the newest rows within
-        :data:`_REVOCATION_EVIDENCE_SKEW_S` of a genuine revocation of the same account."""
+        **Residuals, at least:** a holder of the active audit key can seal a row that verifies.
+        A writer without the key can still lower the watermark, by deleting the newest rows and
+        restoring them after the read, or on SQLite by planting a row whose ``seq`` is text so the
+        anchor falls back to a row count; a genuine row of the same account and reason written
+        within :data:`_REVOCATION_EVIDENCE_SKEW_S` before the read then counts. A genuine row
+        committed after the read for an event before it, such as a slow append by another
+        reconciler, counts too."""
         if watermark is None:
             return False
         store = self._store

@@ -4013,20 +4013,6 @@ async def test_a_second_reconciler_revoking_one_absent_account_audits_zero(
         assert len(alerts) == 1
 
 
-async def test_a_verified_row_from_before_the_listing_does_not_silence_a_keyed_pass(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The watermark is per account, read before the session listing. A row sealed under the key
-    before the pass, such as one from before the account's latest sign-in, verifies but is not a
-    repeat of this revocation, so it alerts."""
-    plan, _rows, notices, alerts = await _absent_pass_with_sessions_gone_first(
-        monkeypatch, other_reconciler_row=False, planted="before_pass", keyed=True
-    )
-    assert [r.reason for r in plan.revocations] == ["directory_absent"]
-    assert notices == [DIRECTORY_SESSIONS_ENDED]
-    assert len(alerts) == 1
-
-
 @pytest.mark.parametrize(
     ("planted", "quiet"),
     [("before_pass", False), ("before_listing", False), ("during_listing", True)],
@@ -4274,6 +4260,14 @@ async def test_the_watermark_fails_toward_reporting(
         monkeypatch.setattr(store, "audit_anchor", empty)
         empty_mark = await service._audit_watermark()
         assert empty_mark is not None and empty_mark.seq == 0
+        # With no watermark a verified repeat reports; with one it is quiet.
+        monkeypatch.undo()
+        user = await _signed_out(store, "jdoe")
+        mark = await service._audit_watermark()
+        revocation = reconcile.SessionRevocation(user.id, user.username, reason="directory_absent")
+        assert await service._apply_reconcile_revocation(revocation, watermark=mark) == "reported"
+        assert await service._apply_reconcile_revocation(revocation, watermark=None) == "reported"
+        assert await service._apply_reconcile_revocation(revocation, watermark=mark) == "quiet"
     finally:
         await store.close()
 
@@ -4374,6 +4368,36 @@ async def test_a_quiet_revocation_whose_row_is_refused_reports_instead(
         )
         assert notifier.sent == []
         assert len(_revoked_rows(await store.list_audit())) == 1  # the control's row only
+    finally:
+        await store.close()
+
+
+async def test_a_verified_repeat_whose_row_is_refused_alerts_without_a_notice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The refused-row rule holds for a verified repeat too (owner ruling B258-R7): quiet when its
+    row is written, and when the store refuses it, an alert with no notice."""
+    store, _, service, _ = await _scoped_service(_GRP_A, keyed=True)
+    try:
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        user = await _signed_out(store, "jdoe")
+        mark = await service._audit_watermark()
+        revocation = reconcile.SessionRevocation(
+            user.id, user.username, reason="directory_disabled"
+        )
+        assert await service._apply_reconcile_revocation(revocation, watermark=mark) == "reported"
+        assert await service._apply_reconcile_revocation(revocation, watermark=mark) == "quiet"
+        real = store.record_audit
+
+        async def refusing(name: str, **kwargs: Any) -> None:
+            if name == "auth.ad_session_revoked":
+                raise sqlite3.OperationalError("synthetic: disk I/O error")
+            await real(name, **kwargs)
+
+        monkeypatch.setattr(store, "record_audit", refusing)
+        assert await service._apply_reconcile_revocation(revocation, watermark=mark) == "reported"
+        assert [e.event_type for e in notifier.sent] == [ACCOUNT_DISABLED]
     finally:
         await store.close()
 

@@ -6105,8 +6105,9 @@ class KeyedAuditEvidenceStore(Protocol):
     ) -> dict[str, Any] | None:
         """The newest ``action`` row by ``actor`` with a sequence number above ``after_seq``, when
         its MAC verifies under the ACTIVE audit key; ``None`` when there is none, it does not
-        verify, it is under a retired key, or the store holds no key. It checks that one row, not the chain: a row that
-        verifies was sealed by a holder of the key, at that sequence number."""
+        verify, it is under a retired key, or the store holds no key. It checks that one row, not
+        the chain: a row that verifies was sealed by a holder of the key, at that sequence
+        number."""
         ...
 
 
