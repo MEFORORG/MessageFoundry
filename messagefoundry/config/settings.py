@@ -3184,9 +3184,13 @@ class AuthSettings(_Section):
     # effective interval instead of a bind storm against the DC.
     ad_session_recheck_max_users: int = 200
     # --- mass-revoke circuit breaker ---
-    # A misconfigured search base, a moved OU, or a service account that lost read rights on the
-    # entries returns "not found" for EVERY user — indistinguishable from "everyone was deleted".
-    # Without a brake the reconciler would sign out the entire estate during exactly the incident when
+    # A search base that names the wrong OU, an OU reorganisation that moves the users out of it, or
+    # a service account that lost read rights on the entries while it can still read the base returns
+    # "not found" for EVERY user — indistinguishable from "everyone was deleted". A base that was
+    # deleted or moved, or that the service account may not read at all, usually ends the search with
+    # a result code instead (noSuchObject, invalidDNSyntax, insufficientAccessRights): a configuration
+    # refusal, which judges no account and pages as `ad_reconcile_aborted` with reason
+    # `directory_misconfigured` rather than reaching this breaker (BACKLOG #3010). Without a brake the reconciler would sign out the entire estate during exactly the incident when
     # operators need the console. A pass that would revoke more than BOTH of these thresholds aborts,
     # revokes nothing, and raises a loud operator-visible alert (log ERROR + an
     # `auth.ad_reconcile_aborted` audit row).

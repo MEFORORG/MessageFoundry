@@ -4261,7 +4261,9 @@ probe is refused, faulted or fails, at least one refused and none referred, the 
 Like the fault's, that alert has no inverse; an operator resolves it. **The cost:** while the
 refusal lasts, the refused accounts' sessions are never revoked by the reconciler, so they run to
 the absolute cap. Other result codes that are not an answer, such as busy or unavailable, are an
-outage. Step-up refuses the account with outcome `misconfigured`.
+outage. The step-up legs that ask the directory before they grant, a second-factor step-up and a
+passkey assertion, refuse the account with outcome `misconfigured`. The password step-up, a live
+re-bind, refuses it as `directory_unavailable`, the reason it gives for any directory error.
 
 ### The engine session is independent of the IdP session (ASVS 7.6.1)
 
