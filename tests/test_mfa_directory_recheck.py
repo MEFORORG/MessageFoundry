@@ -614,18 +614,34 @@ async def test_a_local_account_is_never_probed(store: MessageStore) -> None:
     assert directory.probes == []
 
 
+@pytest.mark.parametrize(
+    ("cause", "outcome"),
+    [
+        ("disabled", "disabled"),
+        ("outage", "unavailable"),
+        ("demotion", "directory_roles_demoted"),
+    ],
+)
 async def test_the_route_says_the_directory_could_not_confirm_the_account(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cause: str, outcome: str
 ) -> None:
-    """The API answers 403, not the wrong-code 401, and names the directory as the reason."""
+    """The API answers 403, not the wrong-code 401, and names the directory as the reason. RED when
+    the text names only a later try, which does not clear a demotion the way docs/SECURITY.md
+    (BACKLOG #2240, #3082) says a new sign-in does. One text covers every cause, so an outage gets
+    both fixes too. It names no group and no role."""
     engine = await Engine.create(
         tmp_path / "mfa_directory.db",
         poll_interval=0.02,
         egress_settings=EgressSettings(deny_by_default=False),
     )
     try:
-        e = await _enrolled_directory_session(engine.store, monkeypatch)
-        e.directory.answer = DirectoryAnswer.DISABLED
+        if cause == "demotion":
+            e = await _mapped_session(engine.store, monkeypatch, _OPERATORS, _VIEWERS)
+            e.directory.principal = replace(_PRINCIPAL, groups=frozenset({_VIEWERS}))
+        else:
+            e = await _enrolled_directory_session(engine.store, monkeypatch)
+            e.directory.answer = DirectoryAnswer.DISABLED
+            e.directory.unreachable = cause == "outage"
         transport = httpx.ASGITransport(
             app=create_app(engine, auth=e.service), client=("127.0.0.1", 123)
         )
@@ -636,7 +652,14 @@ async def test_the_route_says_the_directory_could_not_confirm_the_account(
                 headers={"Authorization": f"Bearer {e.token}"},
             )
         assert r.status_code == 403
-        assert "directory could not confirm this account" in r.json()["detail"]
+        detail = r.json()["detail"]
+        assert "directory could not confirm this account" in detail
+        assert "try again later" in detail and "sign in again" in detail
+        for internal in ("MF-Operators", "MF-Viewers", "operator", "viewer", "demoted", "group"):
+            assert internal not in detail
+        # The cause the test set is the one the engine met: the precise reason is on the audit row.
+        audited = [row["outcome"] for row in await _audited_mfa_failures(engine.store)]
+        assert audited == [outcome]
     finally:
         await engine.stop()
 

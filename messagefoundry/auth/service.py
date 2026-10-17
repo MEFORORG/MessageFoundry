@@ -2438,6 +2438,11 @@ class AuthService:
         admin_loss_alert: Callable[[str, str], None] | None = None,
     ) -> None:
         self._store = store
+        # A copy: the caller's object is also stashed as app.state.auth_settings, and the section
+        # is not frozen, so a write through that stash would otherwise change a live limit with no
+        # audit row (vault BACKLOG #3215). The name is rebound so every object built below, the
+        # directory authenticator and the limiters included, gets the copy too.
+        settings = settings.model_copy(deep=True)
         self._settings = settings
         # BACKLOG #2592: raises the integrity alert when an authority row fails its seal. Injected by
         # the API lifespan (the service never imports the alert sinks). None logs only.
@@ -2878,6 +2883,15 @@ class AuthService:
         ``require_reauth_only_action`` fallback so an org can opt out via
         ``[auth].require_action_step_up = false``."""
         return self._settings.require_action_step_up
+
+    @property
+    def settings(self) -> AuthSettings:
+        """A copy of the ``[auth]`` limits this service enforces. ``GET /security/posture`` reports
+        its loosenings from here, so an embedder that attaches a service with loosened limits sees
+        them named (vault BACKLOG #3215). A deep copy, for the reason the constructor copies its
+        argument: the section is not frozen and holds lists, so a reader that set a field, or
+        appended to a list, on the enforced object would change a live limit with no audit row."""
+        return self._settings.model_copy(deep=True)
 
     @property
     def kerberos_enabled(self) -> bool:
@@ -6942,8 +6956,9 @@ class AuthService:
           referral marks every candidate, so an account that pass itself revokes forfeits too.
 
         At least these take an account out: it signs out or reaches the session cap, the reconciler
-        revokes it, an operator disables it locally, or its row is deleted. The cost is a missed
-        clear when an account leaves for an ordinary reason while the evidence is pending. A trip
+        revokes it, an operator disables it locally, its row is deleted, or the session reaper deletes
+        its idle sessions (an idle row stays a candidate until then, BACKLOG #2283). The cost is a
+        missed clear when an account leaves for an ordinary reason while the evidence is pending. A trip
         or a referral marks every candidate unconfirmed, healthy ones too, so a sign-out during a
         long trip or referral forfeits its clear. This is one process's memory: what leaves across
         a restart is not seen here. The rule in `_mark_reconcile_clears` covers that case, because
@@ -7020,11 +7035,16 @@ class AuthService:
             self._reconcile_hold_standing = "held"
         elif event == "forfeit" and current not in ("settled", "forfeit"):
             self._reconcile_hold_standing = "forfeit"
+            # A fresh process has held nothing: its account left with an undetermined answer that
+            # an earlier run's hold may still cover, so the line must not say this process held
+            # (BACKLOG #3084).
             _log.warning(
                 "directory reconcile: an account whose userAccountControl read undetermined left "
-                "before this process released a hold, so it will not resolve ad_reconcile_held "
-                "itself "
-                "until it restarts; an operator resolves it once the attribute reads clean"
+                "%s, so this process will not resolve ad_reconcile_held itself until it restarts; "
+                "an operator resolves any open instance once the attribute reads clean",
+                "before this process released its hold"
+                if current == "held"
+                else "before any pass here had held, and an earlier run's hold may still cover it",
             )
         elif event == "settled" and current in _HOLD_RELEASABLE:
             self._reconcile_hold_standing = "settled"

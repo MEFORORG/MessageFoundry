@@ -2149,15 +2149,14 @@ Such a refusal may then have no `auth.trust_anchor` row behind it, so the engine
 of it. An inline reload answers **503** for `store_unavailable`; a released one answers 422, as
 every refused release does. The engine log carries the store's error.
 
-**An inline or released reload's `config_reload` row names that reload's own config (vault
-BACKLOG #2257).** It is built from the reload's own result: its directory, connection counts and
-the digest it took before the swap. The row is written after the swap, so a second reload or a
-connection flag toggle can move the engine on first. The row then still names its own config, but
-is marked `superseded` and `baseline_unchecked`, so the next start passes over it and does not
-compare against it. Only a committed reload or a flag toggle that moves the engine's loaded
+**An inline, released or cluster convergence reload's `config_reload` row names that reload's own
+config (vault BACKLOG #2257, #3109).** It is built from the reload's own result: its directory,
+connection counts and the digest it took before the swap. The row is written after the swap, so a
+second reload or a connection flag toggle can move the engine on first. The row then still names
+its own config, but is marked `superseded` and `baseline_unchecked`, so the next start passes over
+it and does not compare against it. Only a committed reload or a flag toggle that moves the engine's loaded
 fingerprint counts. A later reload that fails and rolls back does not mark the row. The check
-runs just before the write, so a change after it is not caught. A cluster convergence reload's
-row is still read from the engine's live state when it is written.
+runs just before the write, so a change after it is not caught.
 
 **A released reload loads only the config its approval named (vault BACKLOG #2596, step 3).** When
 dual control holds a reload, the hold's `params` carry `fingerprint`: the ADR 0041 D1 content
@@ -2666,7 +2665,13 @@ not the permissions they grant. So a move from one role to another refuses, even
 grants more. A lookup whose groups map to no role refuses every directory account that holds a
 role. The refusal writes no roles; the next reconciliation pass, when it runs, or the next sign-in
 re-syncs them. Otherwise it behaves as the refusals above, audited with the outcome
-`directory_roles_demoted`. Channel scope is not compared on these legs.
+`directory_roles_demoted`. Channel scope is not compared on these legs. The caller sees the one
+directory refusal and not its cause, so its words name a later try and a new sign-in both
+(BACKLOG #3082; the text is `_DIRECTORY_UNCONFIRMED_DETAIL` in `api/auth_routes.py`). A later try
+clears an outage. A later try on the same session clears a demotion only if the groups are
+restored in the directory. Once the reconciliation pass re-syncs the roles it also revokes the
+account's sessions, so after a re-sync only a new sign-in clears it. A new sign-in clears it at
+once, because it writes the roles the current groups grant. The words name no group or role.
 
 **The IdP step-up leg makes the same role test (BACKLOG #2154).** `complete_oidc_step_up` already
 looks the account up by its directory object id. It now maps the groups that lookup returns to
@@ -3488,7 +3493,8 @@ listener start, a refusal isolates that one listener and the rest of the graph c
 At build check, the same refusal fails the whole config. That covers `messagefoundry check`, a
 reload or dry-run reload, promote, a connection edit, a connection-flag toggle, a DR activation
 and a cluster follower's convergence reload. A follower whose own settings refuse the graph would
-keep its old graph, log the refusal and retry each interval.
+keep its old graph, log the refusal and retry each interval. It would also write a
+`config_reload_failed` audit row under `system:cluster-convergence` (vault BACKLOG #3109).
 The build check runs the gates only on a listener the engine would bind: deployed and `auto_start`.
 On a running engine it also skips one the DR run-profile parks, and it gates one an operator
 started. It gates an `auto_start` listener outside its schedule window, because the scheduler binds
@@ -5325,7 +5331,7 @@ under `monitoring:diagnose`, and a lock alert there would show lock state to a r
 withholds it from. **Switching the layer off is not yet reported as a posture loosening**:
 `[alerts].security_signals = false`, or a threshold of `0`, is absent from
 `GET /security/posture`. Nor does `posture_loosened` fire on a start whose `config_loaded` row
-records its loosenings as unknown, such as one a cluster convergence reload superseded.
+records its loosenings as unknown, such as one whose config snapshot could not be taken.
 
 **The console exports too, for an auditor with no bearer session (BACKLOG #2446).** `GET
 /audit/export` reads only an `Authorization` bearer, and an account that signs in only through OIDC

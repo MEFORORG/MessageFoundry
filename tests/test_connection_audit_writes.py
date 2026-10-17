@@ -3,11 +3,12 @@
 """Audit writes on the two connection routes that had no success-arm test (BACKLOG #1643).
 
 ``connection_flag_set`` (``POST /connections/{name}/flag``) and ``connection_credential_test``
-(``POST /connections/{name}/test-credential``) each call ``record_audit`` only AFTER their route
-body succeeds, and every pre-existing test of either route stops short of that point -- the flag
-tests drive ``Engine.set_connection_flag`` directly (no API, so no audit), and the credential-test
+(``POST /connections/{name}/test-credential``) each call ``record_audit`` only AFTER their write
+succeeds, and every pre-existing test of either route stopped short of that point -- the flag
+tests drove ``Engine.set_connection_flag`` directly (no API, so then no audit), and the credential-test
 arms in ``tests/test_channel_rbac.py`` all short-circuit at 403 / 400 / 404. So both writes could be
-deleted with the suite staying green.
+deleted with the suite staying green. The flag row is now written by the engine itself (vault
+BACKLOG #2945), and this test still pins the actor the route hands it.
 
 These two tests reach the success arm and assert the row is there under the acting user.
 
@@ -141,10 +142,10 @@ async def test_flag_route_audits_connection_flag_set_under_the_acting_user(
 ) -> None:
     """BACKLOG #1643: a successful flag write leaves a ``connection_flag_set`` row naming the caller.
 
-    RED when the ``connection_flag_set`` ``record_audit`` call in ``api/app.py`` is deleted, or when
-    it stops passing ``actor=identity.username``. Unobservable before this test: every existing flag
-    test calls ``Engine.set_connection_flag`` directly, and the audit write lives in the ROUTE, above
-    the engine method -- so the whole of ``tests/test_connection_flag.py`` stays green without it.
+    RED when the ``record_audit`` call in ``Engine.write_baseline_config`` is deleted, or when the
+    route stops passing ``actor=identity.username`` to ``Engine.set_connection_flag``. The row moved
+    into that engine helper with vault BACKLOG #2945; before that it lived in the ROUTE, where no
+    engine-level flag test could see it go.
 
     The 409 arm below is the negative control: it proves the row is written by the SUCCESS path and
     not unconditionally on entry, which a write hoisted above the ``set_connection_flag`` call would

@@ -823,7 +823,8 @@ while the engine is down. So an operator resolves an alert the last run left ope
 engine resolves the next trip or hold on its own.
 
 - The hold resolves when no answer is undetermined and this pass read `userAccountControl` at
-  least once. An account the pass just revoked still counts as an answer here.
+  least once. An account the pass just revoked still counts as an answer here, but a pass that
+  revokes every signed-in account resolves nothing.
 - An engine can also give up resolving the hold. That happens when an account whose last answer
   was undetermined leaves, unless the engine has released a hold and has not held since. The
   reconciler may revoke it, or its sessions may end some other way. The engine then resolves no
@@ -858,9 +859,12 @@ WARNING lines that name each faulting account stop.
 
 A pass judges only accounts that hold a session, and nothing reads an account again once it has
 left. An account leaves at least when it signs out, reaches the session cap, is revoked by the
-reconciler, is disabled locally, or is deleted. The give-up rules above stop an alert resolving
-on the accounts that remain. The cost is a missed resolve when an account leaves for an ordinary
-reason, such as a sign-out, while the evidence is still pending.
+reconciler, is disabled locally, or is deleted, and when the hourly session reaper deletes an idle
+session. An idle session stays a candidate after `[security].sign_out_after_idle_minutes` until
+the reaper deletes it, which is at least 10 minutes and up to about 70 minutes past that limit. At
+the default settings, idle expiry is the likeliest of these. The give-up rules above stop an alert
+resolving on the accounts that remain. The cost is a missed resolve when an account leaves for an
+ordinary reason, such as a sign-out or an idle session, while the evidence is still pending.
 
 **They never resolve themselves on a `[cluster]` node or in an engine that runs more than one engine
 shard.** Another engine's reconciler may still hold the condition there, so an operator resolves the
@@ -1671,19 +1675,37 @@ started together, can each raise it; the alert list folds them into one instance
   #2257).
 - A reload can swap the graph after a start loads it and before its `config_loaded` row is written;
   on a cluster node, the convergence loop does this. The row still names the graph the start
-  loaded, with its comparison. It is marked `superseded` and `baseline_unchecked`, and its
-  `loosenings` is `null`, since the loosenings reader sees only the reloaded graph. A later start
-  passes over it to the reload's own row.
-- A start that could not take that snapshot still starts, with comparison `no_start_digest`. Its
-  row is degraded with the `start_snapshot` step. Its `dir`, counts and `loosenings` are `null`,
-  and it has no `fingerprint` key at all. A start that could not tell whether a reload swapped its
-  graph names its own graph, degraded with the `start_swap_check` step and `loosenings` `null`. A
-  later start passes over both rows.
+  loaded, with its comparison and its `loosenings`, which are read off that graph (vault BACKLOG
+  #3076). It is marked `superseded` and `baseline_unchecked`. A later start passes over it to the
+  reload's own row.
+- A start that could not take that snapshot still starts, and still compares the digest its load
+  took, so a changed config still raises `config_changed` (vault BACKLOG #3076). Its row is
+  degraded with the `start_snapshot` step and marked `baseline_unchecked`. Its `dir`, counts and
+  `loosenings` are `null`, and it has no `shard` key and no `fingerprint` key at all. A start that
+  could not tell whether a reload swapped its graph names its own graph, degraded with the
+  `start_swap_check` step. A later start passes over both rows. So after a snapshot fault, the
+  next start raises `config_changed` again for the same change, unless a flag toggle or reload row
+  lands in between and becomes the baseline.
 - A convergence reload writes its own `config_reload` row, in the shape an operator reload writes
   (vault BACKLOG #3076). Its actor is `system:cluster-convergence` and its `initiator` is
   `cluster_convergence`. So the store's newest baseline names the graph the node converged on,
   whether the reload lands before or after the start's row. A convergence row that could not take
   a fingerprint is marked `baseline_unchecked`, so a later start passes over it.
+- On a cluster, a reload row carries `config_version`, the shared version the reload applied
+  (vault BACKLOG #3109). An operator reload's row carries the version it bumped the cluster to. A
+  convergence row carries the version the node converged on. An operator reload whose bump failed
+  carries none. A follower's row records the bytes that node loaded, not the operator's digest.
+- A convergence reload that fails writes a `config_reload_failed` row under the same actor, or
+  `config_reload_denied` when its directory is outside the reload roots (vault BACKLOG #3109). The loop retries that version every interval and logs each failure. An
+  engine process writes each distinct row once per version: rows that differ in action, `reason`
+  or `error` are each written once, and a fault that writes the same row as an earlier one writes
+  nothing. A row the audit log refuses is tried again on the next failure. The record is per
+  process, so a node that restarts, or another node, writes its own. The row carries `initiator` and `config_version`, and its `requested` is `null`. Its
+  reason is the one an operator's refused reload records, or `reload_error` with the fault's type
+  name.
+- A convergence row the audit log refuses is logged at ERROR and raises no alert. An operator
+  reload's lost row raises none either, but the operator's answer names an `audit` step. A
+  convergence reload has no answer to name it in.
 - The pass-over looks through the newest 50 config rows at most. If none is usable, the start
   begins a new baseline and says at WARNING that a change made before those rows is not reported.
 

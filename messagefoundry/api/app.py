@@ -422,6 +422,7 @@ from messagefoundry.pipeline.cluster import (
 )
 from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
+from messagefoundry.pipeline.engine import CONFIG_WRITE_ACTIONS
 from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmission
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 from messagefoundry.pipeline.security_signals import (
@@ -1593,6 +1594,7 @@ def _posture_loosenings(
     engine: Engine,
     runner: RegistryRunner | None,
     *,
+    graph: Registry | None = None,
     remote_debug: RemoteDebugPosture,
     startup: StartupPosture,
     service_env: ServiceEnvPosture,
@@ -1603,7 +1605,13 @@ def _posture_loosenings(
     ``GET /security/posture`` and the start's ``config_loaded`` audit row (vault BACKLOG #2597) both
     call this, so the row records the list the route would report. ``runner`` and the three process
     readings (vault BACKLOG #2700 / #2701 / #2595) are passed in rather than read here, so a caller that
-    also reports them elsewhere reads each once."""
+    also reports them elsewhere reads each once.
+
+    The per-connection entries are read off ``graph``, or off ``runner``'s live graph when no
+    ``graph`` is passed. The start passes the graph its snapshot took, so a reload that swaps the
+    graph before its row is written cannot change what the row says the start loaded (vault BACKLOG
+    #3076). The settings-scoped entries are the same for either graph: a reload changes no
+    settings."""
     store = getattr(state, "store_settings", None) or StoreSettings()
     cred_settings = getattr(state, "static_credential_settings", None)
     security = _posture_security(state)
@@ -1612,8 +1620,17 @@ def _posture_loosenings(
     store_privilege = getattr(state, "store_privilege", None)
     gate = getattr(state, "approval_gate", None)
     # [store]/[auth] carry posture switches too (ADR 0148: one posture, loosen only), so the registry
-    # needs them to report a COMPLETE list. Same stash-or-default pattern as `store` above.
-    auth_settings = getattr(state, "auth_settings", None) or AuthSettings()
+    # needs them to report a COMPLETE list. Vault BACKLOG #3215: the [auth] limits are read off the
+    # attached service first, since that is what enforces them. An app built with
+    # create_app(engine, auth=service) stashes no settings, and the defaults read in their place
+    # named none of the embedder's loosened limits. With no service, the same stash-or-default
+    # pattern as `store` above.
+    auth_service: AuthService | None = getattr(state, "auth", None)
+    auth_settings = (
+        auth_service.settings
+        if auth_service is not None
+        else getattr(state, "auth_settings", None) or AuthSettings()
+    )
     # #323 layer 3: [alerts] carries the SMTP-hop deviation (cleartext / verification off). Same
     # stash-or-default pattern — settings-scoped, so this route reports it completely even with no
     # graph loaded, unlike the connection-scoped cleartext_accepted set below.
@@ -1642,16 +1659,17 @@ def _posture_loosenings(
     # registry runner (an embedding, or an app queried before start) cannot see them at all, so it
     # DECLARES that in `loosenings_scope` rather than returning a settings-only subset that reads as
     # the whole posture — the same discipline `messagefoundry security show` follows.
-    if runner is not None:
-        cleartext_hops = [name for name, _ in accepted_cleartext_hops(runner.registry)]
-        expired_hops = [name for name, _ in expiry_relaxed_hops(runner.registry)]
-        hostname_hops = [name for name, _ in hostname_unchecked_hops(runner.registry)]
-        query_hops = [name for name, _ in query_credential_hops(runner.registry)]
-        db_hops = [name for name, _ in unverified_generic_db_hops(runner.registry)]
-        attested_hops = [name for name, _ in attested_secure_hops(runner.registry)]
-        revocation_hops = [name for name, _ in revocation_attested_hops(runner.registry)]
+    registry = graph if graph is not None else (runner.registry if runner is not None else None)
+    if registry is not None:
+        cleartext_hops = [name for name, _ in accepted_cleartext_hops(registry)]
+        expired_hops = [name for name, _ in expiry_relaxed_hops(registry)]
+        hostname_hops = [name for name, _ in hostname_unchecked_hops(registry)]
+        query_hops = [name for name, _ in query_credential_hops(registry)]
+        db_hops = [name for name, _ in unverified_generic_db_hops(registry)]
+        attested_hops = [name for name, _ in attested_secure_hops(registry)]
+        revocation_hops = [name for name, _ in revocation_attested_hops(registry)]
         # Vault BACKLOG #2571. This reader returns plain names already.
-        path_form_hops = path_form_fhir_updates(runner.registry)
+        path_form_hops = path_form_fhir_updates(registry)
     else:
         cleartext_hops, expired_hops, hostname_hops, db_hops = [], [], [], []
         query_hops = []
@@ -1659,7 +1677,7 @@ def _posture_loosenings(
         path_form_hops = []
     loosenings_scope = (
         None
-        if runner is not None
+        if registry is not None
         else (
             "settings only — no connection graph is loaded on this engine, so the per-connection "
             "cleartext_accepted / tls_allow_expired / tls_check_hostname / url_query_credential / "
@@ -1741,13 +1759,21 @@ class _LoadedConfig:
     The start takes one with :meth:`read` right after its first load, and both its comparison and
     its ``config_loaded`` row use that one (vault BACKLOG #2838). A cluster convergence reload can
     swap the graph before the row is written, and a live read at the write would then name the
-    reloaded graph as the one the start loaded. When the start cannot take one, its row uses
-    :data:`_UNKNOWN_LOADED`, which names nothing, rather than a live read."""
+    reloaded graph as the one the start loaded. When the start cannot take one, its row names
+    nothing rather than a live read; see :func:`_record_reload_audit`.
+
+    A reload's row is built from that reload's own outcome with :meth:`of` (vault BACKLOG #2257), a
+    convergence reload's included (vault BACKLOG #3076, #3109). So no row reads the engine's graph,
+    directory or digest at the write. What a row does read at the write includes at least the
+    cluster node id, which is fixed for the life of the process, and, for the ``superseded``
+    checks, which ask about the live state on purpose, the loaded fingerprint's identity (a
+    reload's row) and the live graph's identity (the start's row). The start row also reads the
+    settings the app stashed, for its loosenings; a reload changes none of them."""
 
     directory: str | None
     shard: str | None
-    inbound: int | None
-    outbound: int | None
+    inbound: int
+    outbound: int
     fingerprint: Mapping[str, object] | None
     #: The graph object itself. An applied reload swaps it for a new one before it rebinds the
     #: fingerprint, so comparing it by identity sees a reload still in flight. The start's row uses
@@ -1794,13 +1820,6 @@ class _LoadedConfig:
         swapped it, or is part way through doing so."""
         rr = engine.registry_runner
         return (rr.registry if rr else None) is not self.registry
-
-
-#: The snapshot a start's row names when the start could not take its own (vault BACKLOG #2838):
-#: every field ``None``, so the row claims no directory, count or digest.
-_UNKNOWN_LOADED = _LoadedConfig(
-    directory=None, shard=None, inbound=None, outbound=None, fingerprint=None, registry=None
-)
 
 
 async def _reload_or_record_interruption(
@@ -1868,8 +1887,8 @@ async def _reload_and_record(
         engine,
         actor=actor,
         client=client,
-        failed_steps=[f.step for f in outcome.failures],
-        outcome=outcome,
+        failed_steps=outcome.failed_steps,
+        loaded=outcome,
     )
     return outcome, failures
 
@@ -1878,18 +1897,18 @@ async def _record_reload_audit(
     engine: Engine,
     *,
     actor: str,
+    loaded: _LoadedConfig | ReloadOutcome | None,
     action: Literal["config_reload", "config_loaded"] = "config_reload",
     client: str | None = None,
     failed_steps: Sequence[str] = (),
     extra: Mapping[str, object] | None = None,
-    loaded: _LoadedConfig | None = None,
-    outcome: ReloadOutcome | None = None,
 ) -> list[str]:
     """Write the ``config_reload`` audit row with the ADR 0041 D1 content fingerprint of what loaded.
 
     The start writes its ``config_loaded`` row through here too (vault BACKLOG #2597), passing the
-    action and its ``loosenings`` in ``extra``. Every row names the running directory, its engine
-    shard and cluster node, since each engine-shard process loads the graph.
+    action and its ``loosenings`` in ``extra``. Every row names its cluster node, and the
+    directory and engine shard it loaded, since each engine-shard process loads the graph; a start
+    row with no snapshot names neither (see ``loaded`` below).
 
     Shared by the inline reload endpoint and the dual-control executor so a held-then-approved reload
     records the same fingerprint-bearing row as an ungated one. A cluster convergence reload writes
@@ -1903,12 +1922,16 @@ async def _record_reload_audit(
     written without it.
 
     ``loaded`` is what the row names as loaded: the directory, shard, counts and fingerprint. The
-    start always passes one: the snapshot it took at its first load, or :data:`_UNKNOWN_LOADED`
-    when it could not take one (vault BACKLOG #2838); see :class:`_LoadedConfig`. With neither,
-    the row reads them live, at the write, which the cluster convergence reload still does.
+    start passes the snapshot it took at its first load, or ``None`` when it could not take one
+    (vault BACKLOG #2838); see :class:`_LoadedConfig`. ``None`` names nothing: the directory and
+    counts are ``null``, and the row has no ``shard`` key and no digest keys, since a ``null``
+    engine-shard id would read as a whole-graph start on a ``--shard`` process (vault BACKLOG
+    #3076). No row reads these at the write.
 
-    A reload passes its ``outcome`` instead, and the row names what that reload loaded (vault
-    BACKLOG #2257). The row is written after the swap, and nothing holds the graph still until
+    A reload passes its :class:`~messagefoundry.pipeline.ReloadOutcome`, and the row names what
+    that reload loaded (vault BACKLOG #2257), with the shared cluster ``config_version`` it carries
+    when it has one (vault BACKLOG #3109). An operator reload and a convergence reload both do. The
+    row is written after the swap, and nothing holds the graph still until
     then, so a second reload or a connection flag toggle can move the engine on first. The row then
     still names this reload's config, but marks itself ``superseded`` and
     :data:`_BASELINE_UNCHECKED`, as a superseded start row does: it is no baseline, and the next
@@ -1945,28 +1968,39 @@ async def _record_reload_audit(
     async def write() -> None:
         nonlocal detail
         superseded = False
-        if loaded is not None:
-            state = loaded
-        elif outcome is not None:
-            state = _LoadedConfig.of(outcome)
+        config_version: int | None = None
+        state: _LoadedConfig | None
+        if isinstance(loaded, ReloadOutcome):
+            state = _LoadedConfig.of(loaded)
+            config_version = loaded.config_version
             # Only a COMMITTED reload or a flag toggle rebinds the loaded fingerprint. The graph
             # object is no test: a reload part way through its swap, which then fails and rolls back
             # to this graph, would mark a row that still names the running config.
-            superseded = engine.loaded_config_fingerprint is not outcome.fingerprint
+            superseded = engine.loaded_config_fingerprint is not loaded.fingerprint
         else:
-            state = _LoadedConfig.read(engine)
-        detail = json.dumps(
-            {
+            state = loaded
+        # A start with no snapshot names nothing it loaded, and has no shard key at all.
+        named: dict[str, object] = (
+            {"dir": None, "node": engine.coordinator.node_id, "inbound": None, "outbound": None}
+            if state is None
+            else {
                 "dir": state.directory,
                 "shard": state.shard,
                 "node": engine.coordinator.node_id,
                 "inbound": state.inbound,
                 "outbound": state.outbound,
+            }
+        )
+        digest = (state.fingerprint or {}) if state is not None else {}
+        detail = json.dumps(
+            {
+                **named,
                 "dry_run": False,
+                **({"config_version": config_version} if config_version is not None else {}),
                 **({"degraded": True, "failed_steps": list(failed_steps)} if failed_steps else {}),
                 **(extra or {}),
                 **({"superseded": True, _BASELINE_UNCHECKED: True} if superseded else {}),
-                **(state.fingerprint or {}),
+                **digest,
             }
         )
         await engine.store.record_audit(action, actor=actor, detail=detail, client=client)
@@ -2036,6 +2070,8 @@ async def _audit_refused_reload(
     requested: str | None,
     dry_run: bool,
     client: str | None = None,
+    extra: Mapping[str, object] | None = None,
+    reported: set[str] | None = None,
 ) -> tuple[int, str]:
     """Write the audit row for a reload the engine refused, and return the status and detail to answer.
 
@@ -2059,21 +2095,28 @@ async def _audit_refused_reload(
     vanished or left the reload roots before its release is refused and recorded the way an inline
     one is, rather than escaping the approve route as a 500 (vault BACKLOG #2459). The detail text
     is generic on purpose: the real error is logged here, never returned, so a ``config:deploy``
-    holder cannot probe the filesystem through it. The 404 and 422 WARNINGs log that error redacted,
-    with every line break escaped, and cut only past :data:`_REFUSAL_LOG_LIMIT`, which says why. The
-    403 writes no WARNING.
+    holder cannot probe the filesystem through it. At least the 404, 422 and 503 WARNINGs log that
+    error redacted, with every line break escaped, and cut only past :data:`_REFUSAL_LOG_LIMIT`,
+    which says why. The 403 writes no WARNING.
 
     ``client`` follows :func:`_record_reload_audit`'s rule (ADR 0150): the executor passes none.
+    ``extra`` adds keys to the row's detail; a cluster convergence reload names itself there (vault
+    BACKLOG #3109). ``reported``, when passed, holds :func:`_failure_row_key` of each row already
+    written: a row already in it is not written again, and a row that lands is added. That reload
+    retries every interval, and this keeps it to one row of each kind per version. Its refusal is
+    then logged at DEBUG, not WARNING: the convergence runner already logs each failure at ERROR,
+    and a WARNING per retry would repeat it every interval.
 
     **The row's write never raises.** A refusal changed nothing, so its answer stands whether or
     not the row lands, and a store fault here would otherwise turn it into a raw 500 (vault BACKLOG
     #2255). A failed write is logged at ERROR with the row's detail."""
-    detail: dict[str, object] = {"requested": requested, "dry_run": dry_run}
+    warn = _log.warning if reported is None else _log.debug
+    detail: dict[str, object] = {"requested": requested, "dry_run": dry_run, **(extra or {})}
     if isinstance(exc, ConfigReloadDenied):
         action = "config_reload_denied"
         status, answer = 403, "config directory is not an allowed reload root"
     elif isinstance(exc, FileNotFoundError):
-        _log.warning(
+        warn(
             "config reload failed (missing dir): %s",
             scrub_log_argument(safe_exc(exc, limit=_REFUSAL_LOG_LIMIT)),
         )
@@ -2083,7 +2126,7 @@ async def _audit_refused_reload(
         # A hold that took no digest is told apart, so nobody goes looking for an edit that
         # never happened.
         unbound = exc.approved is None
-        _log.warning(
+        warn(
             "config reload refused: %s",
             "its approval named no config digest"
             if unbound
@@ -2102,12 +2145,12 @@ async def _audit_refused_reload(
         )
     elif isinstance(exc, ConfigDirUnreadable):
         # The engine logged the cause, scrubbed, where it raised this.
-        _log.warning("config reload refused: its config directory could not be resolved or listed")
+        warn("config reload refused: its config directory could not be resolved or listed")
         action, detail["reason"] = "config_reload_failed", "unreadable"
         status, answer = 422, "the engine could not read the config directory; see the engine log"
     elif isinstance(exc, ConfigDigestUnavailable):
         # Not "the config changed": nothing shows it did. The digest's own WARNING names the cause.
-        _log.warning("config reload refused: its config digest could not be taken")
+        warn("config reload refused: its config digest could not be taken")
         action, detail["reason"] = "config_reload_failed", "digest_unavailable"
         detail["approved_fingerprint"] = exc.approved
         detail["current_fingerprint"] = None
@@ -2122,7 +2165,8 @@ async def _audit_refused_reload(
     elif isinstance(exc.__cause__, AnchorStoreUnavailable):
         # BACKLOG #3091: the store refused a trust-anchor check's audit read or write. Nothing is
         # known to be wrong with the anchor or the config, so neither of the reasons below fits.
-        _log.warning(
+        # warn, as every refusal here: a convergence reload's retry logs at DEBUG (vault #3109).
+        warn(
             "config reload failed (store unavailable): %s",
             scrub_log_argument(safe_exc(exc, limit=_REFUSAL_LOG_LIMIT)),
         )
@@ -2131,7 +2175,7 @@ async def _audit_refused_reload(
         answer = "the engine could not reach its store to check a trust anchor; see the engine log"
     else:
         anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
-        _log.warning(
+        warn(
             "config reload %s: %s",
             "refused (trust anchor)" if anchor_refused else "failed (invalid config)",
             scrub_log_argument(safe_exc(exc, limit=_REFUSAL_LOG_LIMIT)),
@@ -2146,14 +2190,79 @@ async def _audit_refused_reload(
     # argument: a caller's chained refusal can still carry the directory into it, and only the
     # handler's ControlCharScrubFilter escapes that. ``defects=()`` keeps the docstring's promise
     # that this write never raises (vault BACKLOG #2260).
-    await write_audit_soft(
+    key = _failure_row_key(action, detail)
+    if reported is not None and key in reported:
+        return status, answer
+    written = await write_audit_soft(
         lambda: engine.store.record_audit(action, actor=actor, detail=row, client=client),
         log=_log,
         message="a refused config reload's %s audit row failed. Lost row: actor=%s detail=%s",
         args=lambda: (action, scrub_log_argument(actor), scrub_log_argument(row)),
         defects=(),
     )
+    if written and reported is not None:
+        reported.add(key)
     return status, answer
+
+
+def _failure_row_key(action: str, detail: Mapping[str, object]) -> str:
+    """What tells one failed-reload row from another, as the row records it: its action, reason
+    and error class. A convergence reload writes each such row once per version (vault BACKLOG
+    #3109), so two faults that write the same row write it once."""
+    return f"{action}:{detail.get('reason')}:{detail.get('error')}"
+
+
+async def _audit_failed_convergence(
+    engine: Engine, exc: Exception, version: int, reported: set[str]
+) -> None:
+    """Write the ``config_reload_failed`` row for a cluster convergence reload that raised, so the
+    attempt is in the audit log and not only in the engine log (vault BACKLOG #3109).
+
+    The row is the one an operator's refused reload writes, as :data:`_CONVERGENCE_ACTOR` with
+    ``initiator`` and the shared ``config_version`` the node could not converge on. ``requested``
+    is ``null``: a convergence reload loads the node's startup directory. A refusal goes through
+    :func:`_audit_refused_reload`, whose status and answer nobody reads here. A fault that is none
+    of :data:`_RELOAD_REFUSALS` has no reason there, so it is recorded with reason
+    ``reload_error`` and its type name, never its text, which the convergence runner logs. Nothing
+    was swapped either way: the reload raises only before its swap commits, and the node keeps its
+    running graph and retries.
+
+    ``reported`` holds :func:`_failure_row_key` of each row already written for this version: a
+    row already in it is not written again, and one that lands is added, so a row the store
+    refused is tried again on the next failure. It never raises: the write goes through
+    :func:`write_audit_soft` with ``defects=()``."""
+    extra = {"initiator": _CONVERGENCE_INITIATOR, "config_version": version}
+    if isinstance(exc, _RELOAD_REFUSALS):
+        await _audit_refused_reload(
+            engine,
+            exc,
+            actor=_CONVERGENCE_ACTOR,
+            requested=None,
+            dry_run=False,
+            extra=extra,
+            reported=reported,
+        )
+        return
+    action = "config_reload_failed"
+    detail = {
+        "requested": None,
+        "dry_run": False,
+        **extra,
+        "reason": "reload_error",
+        "error": type(exc).__name__,
+    }
+    key = _failure_row_key(action, detail)
+    if key in reported:
+        return
+    row = json.dumps(detail)
+    if await write_audit_soft(
+        lambda: engine.store.record_audit(action, actor=_CONVERGENCE_ACTOR, detail=row),
+        log=_log,
+        message="a failed convergence reload's %s audit row failed. Lost row: actor=%s detail=%s",
+        args=lambda: (action, _CONVERGENCE_ACTOR, scrub_log_argument(row)),
+        defects=(),
+    ):
+        reported.add(key)
 
 
 #: The ``audit_write_failed`` alert's key for an inline reload's lost attempt row (vault BACKLOG
@@ -2206,12 +2315,14 @@ async def _audit_reload_attempt(
 
 
 #: The audit actions that record which config bytes a process ran from: a start, an applied reload,
-#: and a flag toggle that rewrote ``connections.toml`` (vault BACKLOG #2597). A dry run's
-#: ``config_reload_check`` is not one: it applied nothing.
+#: and every engine write of a file the config digest covers, such as a flag toggle that rewrote
+#: ``connections.toml`` (vault BACKLOG #2597). The writes come from ``CONFIG_WRITE_ACTIONS``, the
+#: names ``Engine.write_baseline_config`` records under, so a new engine config write needs no edit
+#: here (vault BACKLOG #2945). A dry run's ``config_reload_check`` is not one: it applied nothing.
 _CONFIG_BASELINE_ACTIONS: tuple[str, ...] = (
     "config_loaded",
     "config_reload",
-    "connection_flag_set",
+    *CONFIG_WRITE_ACTIONS,
 )
 
 #: How long the start waits for its baseline read. A slow store costs the comparison, never the start.
@@ -2312,9 +2423,10 @@ async def _compare_start_config(
     over a row whose detail is not a JSON object (at WARNING, since only the engine writes these
     rows) and a row marked :data:`_BASELINE_UNCHECKED`, and falls back to the next older one.
 
-    The caller passes the digest :meth:`Engine.capture_start_provenance` took, not a later read of
-    :attr:`Engine.loaded_config_fingerprint`, so a reload that lands before the row is written
-    cannot change what this start is said to have loaded. Only the ``fingerprint`` key is compared,
+    The caller passes the digest :meth:`Engine.capture_start_provenance` took: off its snapshot,
+    or, when it has none, off :attr:`Engine.loaded_config_fingerprint` read before
+    ``engine.start()`` (vault BACKLOG #3076). Never a read taken once a reload can run, so a reload
+    that lands before the row is written cannot change what this start is said to have loaded. Only the ``fingerprint`` key is compared,
     since ``git_head``, ``dir`` and ``node`` differ between nodes running the same bytes.
 
     Only ``compared`` carries a comparison. ``read_failed`` and ``no_start_digest`` leave the start
@@ -2436,35 +2548,40 @@ async def _record_start_audit(
 
     ``loaded`` is the snapshot the caller took at the first load and compared (vault BACKLOG
     #2838). The row names that, so the digest it records is the one the comparison used. When the
-    caller could not take one, ``loaded`` is ``None``. The row then claims nothing: it carries
-    :data:`_UNKNOWN_LOADED` with no live read, since a reload may already have swapped the graph,
-    and ``loosenings`` ``None`` for the same reason. It is degraded with the ``start_snapshot``
-    step and marked :data:`_BASELINE_UNCHECKED`, whatever ``outcome`` says.
+    caller could not take one, ``loaded`` is ``None``. The row then names nothing it loaded, with
+    no live read, since a reload may already have swapped the graph: no directory, counts,
+    engine-shard id or digest (see :func:`_record_reload_audit`), and ``loosenings`` ``None`` for
+    the same reason. It still records the comparison its caller made. It is
+    degraded with the ``start_snapshot`` step and marked :data:`_BASELINE_UNCHECKED`, whatever
+    ``outcome`` says.
 
     A reload can swap the graph before the row is written: on a clustered node, ``engine.start()``
     runs the convergence loop. The row then still names the start's graph, but it marks itself
     ``superseded`` and :data:`_BASELINE_UNCHECKED`, even when the reload loaded the same bytes.
     Without that, it would be the store's newest baseline while naming a digest no node runs, and
-    the next start on the reloaded bytes would raise a false ``config_changed``. Its
-    ``loosenings`` are ``None``, since the reader sees only the live graph and could not say which
-    of the two they describe. A fault in that swap check marks the row degraded with the
-    ``start_swap_check`` step, unchecked and with ``None`` loosenings, and never ``superseded``."""
-    switches: list[str] | None
-    try:
-        pairs, _scope = _posture_loosenings(
-            app.state,
-            engine,
-            engine.registry_runner,
-            remote_debug=remote_debug_posture(),
-            startup=await asyncio.to_thread(startup_posture),
-            service_env=await asyncio.to_thread(service_env_posture),
-        )
-        switches = [name for name, _risk in pairs]
-    except Exception:  # noqa: BLE001 - a start must not fail on its own audit row (step 5)
-        _log.exception("the start's loosenings list could not be read; config_loaded records None")
-        switches = None
-    # After the loosenings read, so a swap that read could have seen is caught; nothing awaits
-    # between here and the row's detail. A reload that swaps the graph later is not caught.
+    the next start on the reloaded bytes would raise a false ``config_changed``. A fault in that
+    swap check marks the row degraded with the ``start_swap_check`` step and unchecked, and never
+    ``superseded``. Either way its ``loosenings`` stand: they are read off the graph the snapshot
+    took, not the live one, so a swap cannot change them (vault BACKLOG #3076, #3109)."""
+    switches: list[str] | None = None
+    if loaded is not None and loaded.registry is not None:
+        try:
+            pairs, _scope = _posture_loosenings(
+                app.state,
+                engine,
+                None,
+                graph=loaded.registry,
+                remote_debug=remote_debug_posture(),
+                startup=await asyncio.to_thread(startup_posture),
+                service_env=await asyncio.to_thread(service_env_posture),
+            )
+            switches = [name for name, _risk in pairs]
+        except Exception:  # noqa: BLE001 - a start must not fail on its own audit row (step 5)
+            _log.exception(
+                "the start's loosenings list could not be read; config_loaded records None"
+            )
+    # Nothing awaits between here and the row's detail. A reload that swaps the graph later is
+    # not caught.
     superseded = swap_unknown = False
     if loaded is not None:
         try:
@@ -2481,15 +2598,12 @@ async def _record_start_audit(
                 "a config reload applied before the start's config_loaded row was written; the "
                 "row names the graph this start loaded and is marked superseded"
             )
-    # The loosenings describe the live graph, so they stand only when it is the start's.
     untrusted = superseded or swap_unknown or loaded is None
-    if untrusted:
-        switches = None
     await _record_reload_audit(
         engine,
         actor="system",
         action="config_loaded",
-        loaded=loaded if loaded is not None else _UNKNOWN_LOADED,
+        loaded=loaded,
         failed_steps=[
             *(["config_fingerprint"] if fingerprint_failed else []),
             *(["start_snapshot"] if loaded is None else []),
@@ -4576,31 +4690,20 @@ def create_app(
         ):
             await _deny_connection(engine, identity, name, client_ip(request))
         try:
-            fingerprint = await engine.set_connection_flag(
-                name, direction=req.direction, flagged=req.flagged
+            # The engine writes the connection_flag_set row itself, with the config digest it
+            # vouches for after this write (vault BACKLOG #2597, #2945). The next start reads that
+            # row as its baseline.
+            await engine.set_connection_flag(
+                name,
+                direction=req.direction,
+                flagged=req.flagged,
+                actor=identity.username,
+                client=client_ip(request),
             )
         except WiringError as exc:
-            # Not TOML-managed (scope fork) OR a validate-before-persist failure — the edit never landed.
+            # Not TOML-managed (scope fork), a validate-before-persist failure, or a cluster node,
+            # which writes no config file (vault BACKLOG #2933): the edit never landed.
             raise HTTPException(409, str(exc)) from exc
-        # The config digest the engine vouches for after this write (vault BACKLOG #2597): the
-        # directory as written when the toggle was the one change since the load, else the loaded
-        # digest. The next start reads this row as its baseline.
-        await engine.store.record_audit(
-            "connection_flag_set",
-            actor=identity.username,
-            detail=json.dumps(
-                {
-                    "connection": name,
-                    "direction": req.direction,
-                    "flagged": req.flagged,
-                    "node": engine.coordinator.node_id,
-                    **(fingerprint or {}),
-                    # A process whose start never checked its config cannot vouch for it.
-                    **({_BASELINE_UNCHECKED: True} if engine.config_baseline_unchecked else {}),
-                }
-            ),
-            client=client_ip(request),
-        )
         return {"name": name, "direction": req.direction, "flagged": req.flagged}
 
     @app.get("/connections/{name}/metadata", response_model=ConnectionMetadata)
@@ -9772,13 +9875,29 @@ async def _directory_reconciler(
     # just before that pass. None until a read succeeds, and every clear is dropped until then. An
     # instance a pass of this process opened while the read kept failing then counts as inherited:
     # a missed clear, never a false one.
-    inherited: frozenset[int] | None = None if alert_state is not None else frozenset()
+    # A reconciler that may share its store raises no clear at all, so it never reads alert state.
+    reads_alert_state = alert_state is not None and sole_reconciler
+    inherited: frozenset[int] | None = None if reads_alert_state else frozenset()
     while True:
         await asyncio.sleep(interval)
         try:
             if inherited is None and alert_state is not None:
                 found = await _open_reconcile_instances(alert_state)
                 inherited = None if found is None else frozenset(found)
+                if found:
+                    # Once, at the read that fixes the set (BACKLOG #3084): every clear of these
+                    # instances is dropped for this process's life, and without this line only
+                    # docs/CONFIGURATION.md would say so. Keys only; an instance carries no PHI.
+                    # "When this process first read", not "before its first pass": a first read
+                    # that failed lets this process's own early trip or hold land in the set.
+                    _log.warning(
+                        "directory reconcile: %s already open when this process first read alert "
+                        "state, so this process will not resolve %s itself; an operator resolves it",
+                        ", ".join(
+                            f"{event} ({source})" for source, event in sorted(found.values())
+                        ),
+                        "that alert" if len(found) == 1 else "those alerts",
+                    )
             plan = await auth.reconcile_directory_sessions()
             if not sole_reconciler or inherited is None:
                 plan = _without_clears(plan)
@@ -9922,9 +10041,15 @@ _RECONCILE_CLEAR_RESOLVES: Final[Mapping[str, tuple[str, str]]] = {
 }
 
 
+#: The bound on one read of reconcile alert state, in seconds (BACKLOG #3084). A read that runs
+#: past it fails as any other failed read does, so it drops clears. A pass makes at most two such
+#: reads, one before it reconciles and one before it pages, so each waits at most this long.
+_RECONCILE_ALERT_READ_TIMEOUT: Final[float] = 10.0
+
+
 async def _open_reconcile_instances(store: Store) -> dict[int, tuple[str, str]] | None:
     """``id -> (connection, event_type)`` of the open or acknowledged reconcile alert instances, or
-    None when the read failed, which is logged.
+    None when the read failed or ran past :data:`_RECONCILE_ALERT_READ_TIMEOUT`, which is logged.
 
     Catches ``Exception``, on purpose and only around this one read. Its failures are no closed
     family: each backend's driver errors, the engine's own ``RuntimeError``, aiosqlite's
@@ -9932,9 +10057,12 @@ async def _open_reconcile_instances(store: Store) -> dict[int, tuple[str, str]] 
     that escaped would cost the pass's pages, or the whole pass, through the loop's own catch. Any
     failure here only drops a clear, which is a missed clear, never a false one."""
     try:
-        rows = await store.list_active_alert_instances(
-            allowed_channels=sorted({source for source, _ in _RECONCILE_CLEAR_RESOLVES.values()})
-        )
+        async with asyncio.timeout(_RECONCILE_ALERT_READ_TIMEOUT):
+            rows = await store.list_active_alert_instances(
+                allowed_channels=sorted(
+                    {source for source, _ in _RECONCILE_CLEAR_RESOLVES.values()}
+                )
+            )
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -10565,9 +10693,18 @@ def create_managed_app(
         )
 
         # vault BACKLOG #3076: a convergence reload writes the same config_reload row an operator
-        # reload does, so the store's newest baseline names the graph this node now runs.
+        # reload does, so the store's newest baseline names the graph this node now runs. It is
+        # built from the reload's own outcome, as an operator reload's is, so a reload that lands
+        # before the write cannot put its graph under this actor (vault BACKLOG #3109).
+        #
+        # A row the store refuses is logged at ERROR with its detail, and raises no alert (vault
+        # BACKLOG #3109). The inline route's post-swap row raises none either, though it names an
+        # `audit` step in its answer; this reload has no answer to name it in. The next start compares
+        # against the newest row that did land, normally the initiator's, which names the same
+        # bytes where every node shares one config directory. A change goes unreported only if
+        # that row was lost too; otherwise the cost is at most a false config_changed.
         async def _audit_convergence_reload(outcome: ReloadOutcome) -> None:
-            failed = [f.step for f in outcome.failures]
+            failed = outcome.failed_steps
             # A row with no digest would be the newest baseline and leave the next start nothing
             # to compare against. Unlike an operator's row, one lands per follower per cluster
             # reload, so it is marked and a later start passes over it to a digest-bearing row.
@@ -10575,6 +10712,7 @@ def create_managed_app(
             await _record_reload_audit(
                 engine,
                 actor=_CONVERGENCE_ACTOR,
+                loaded=outcome,
                 failed_steps=failed,
                 extra={
                     "initiator": _CONVERGENCE_INITIATOR,
@@ -10582,7 +10720,13 @@ def create_managed_app(
                 },
             )
 
+        async def _audit_convergence_failure(
+            exc: Exception, version: int, reported: set[str]
+        ) -> None:
+            await _audit_failed_convergence(engine, exc, version, reported)
+
         engine.convergence_reload_audit = _audit_convergence_reload
+        engine.convergence_reload_failed = _audit_convergence_failure
         # Bound before the branch so no later read can meet an unbound name (the #1257 lesson below).
         start_fingerprint_failure: str | None = None
         start_outcome: _StartOutcome | None = None
@@ -10611,6 +10755,9 @@ def create_managed_app(
                 # Inside the span too (BACKLOG #1989): a raise from add_registry is past every check
                 # above and before the teardown span below, so nothing else would close the store.
                 engine.add_registry(loaded)
+                # The runner holds the graph now. The lifespan frame lives as long as the process,
+                # so this name would pin the start's graph past every reload (vault BACKLOG #3076).
+                del loaded
                 # Right after the load, so the digest covers the bytes it read, and the provenance
                 # route has a baseline from the start on (vault BACKLOG #2597). Never raises on an
                 # unreadable bundle: it leaves the baseline empty and the start goes on.
@@ -10619,21 +10766,34 @@ def create_managed_app(
                 # convergence reload. The comparison below and the config_loaded row both use it,
                 # so neither can name a graph this start did not load (vault BACKLOG #2838).
                 # Audit only, so it never refuses a start (#2597 step 5): without it the start
-                # checks nothing, as one with no digest does, and its row names no graph.
+                # compares the digest its load took (below), and its row names no graph.
                 try:
                     start_loaded = _LoadedConfig.read(engine)
                 except Exception as exc:  # noqa: BLE001 - see the comment above
                     _log.warning(
-                        "the start could not take its config snapshot (%s); it checks no config "
-                        "change, and its config_loaded row will name no graph",
+                        "the start could not take its config snapshot (%s); it compares the "
+                        "digest its load took, and its config_loaded row names no graph and is "
+                        "no baseline",
                         type(exc).__name__,
                     )
                 # Bounded and never raises: it costs only the comparison (vault BACKLOG #2597,
-                # step 5).
+                # step 5). Without a snapshot it compares the digest the load took, read here and
+                # not later: engine.start() has not run, so no reload can have moved it yet, and a
+                # start on changed bytes still pages through a crash loop (vault BACKLOG #3076).
+                # Its row stays no baseline, since nothing can rule out a swap before the row is
+                # written. So the next start pages again for the same change, unless a flag toggle
+                # or reload row lands in between and becomes the baseline. A repeat page on a
+                # degraded start is the safe side of that trade.
                 start_outcome, start_config = await _compare_start_config(
-                    engine, start_loaded.fingerprint if start_loaded is not None else None
+                    engine,
+                    start_loaded.fingerprint
+                    if start_loaded is not None
+                    else engine.loaded_config_fingerprint,
                 )
                 # This process cannot vouch for a config it never checked: its flag rows say so.
+                # The outcome alone decides it, by design (vault BACKLOG #3076 item 6): a start
+                # row that names no snapshot, or that a reload superseded, is no baseline itself,
+                # but its comparison still ran, and a flag row vouches for no more than that.
                 engine.config_baseline_unchecked = start_outcome in _UNCHECKED_OUTCOMES
                 # Raised here, before engine.start(), so new bytes that make the start itself fail
                 # still page on every attempt of a crash loop. Never raises.
@@ -10815,10 +10975,11 @@ def create_managed_app(
                     _upload_store, audit=_audit_upload_prune
                 )
                 upload_retention_runner.start()
-            # Back the COMPLETE loosening list on GET /security/posture: [auth] carries posture switches
-            # (ad_session_recheck_seconds) that security_loosenings() must see. Without the stash the
-            # route would fall back to AuthSettings() defaults and report a subset. Mirrors
-            # store_settings above.
+            # [auth] carries posture switches (ad_session_recheck_seconds) that security_loosenings()
+            # must see. GET /security/posture reads them off the attached service first (vault
+            # BACKLOG #3215), and this lifespan built that service from these same settings, so
+            # on this path the posture read never reaches this stash. It stays the posture read's
+            # fallback for an app that sets the stash with no service attached.
             if auth_settings is not None:
                 app.state.auth_settings = auth_settings
             # The start's config_loaded row (vault BACKLOG #2597), as early as its readers allow: the
@@ -10836,6 +10997,9 @@ def create_managed_app(
                     comparison=start_config,
                     loaded=start_loaded,
                 )
+                # Its last reader. The snapshot holds the start's graph, and the lifespan frame
+                # lives as long as the process; ``loaded`` was dropped after add_registry.
+                start_loaded = None
             # The auth_settings test adds nothing at runtime; it narrows the type for the reads below.
             if auth is not None and auth_settings is not None:
                 # ADR 0197 Amendment A, AC-A9: name every account still lockable with no way past a
@@ -10980,6 +11144,22 @@ def create_managed_app(
                 )
             )
             steps += _app_drain_steps(app, store, auth, owns_auth=True)
+            # Vault BACKLOG #2945: a config write whose caller was cancelled still writes its audit
+            # row. Drained here, under the budget, rather than by the 5 s wait engine.stop() runs
+            # when no drain ran first. Draining closes the engine's gate, and engine.stop() then
+            # gives a write still running only a 1 s late wait, inside its reserve. Handed
+            # _INNER_SHARE of its bound, so its wait ends before the step is cut; the wait never
+            # cancels a write. A small floor, since the gate closes at once and most shutdowns
+            # have no write running. The embedded lifespan (create_app(engine=...)) has no such
+            # step, so its caller's engine.stop() runs the 5 s wait, outside the reserve that
+            # lifespan's budget assumes.
+            steps.append(
+                _TeardownStep(
+                    "the config-write drain",
+                    0.25,
+                    lambda b: engine.drain_config_writes(b * _INNER_SHARE),
+                )
+            )
             if security_notifier is not None:
                 # It drains queued user emails, and records a notice it could not send in the audit
                 # log, so it closes while the store is open, after the lock notices that hand it

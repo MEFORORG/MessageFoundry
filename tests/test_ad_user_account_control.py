@@ -62,6 +62,7 @@ from messagefoundry.auth.reconcile import (
 from messagefoundry.auth.service import AuthService, _BreakerStanding, _HoldStanding
 from messagefoundry.config.settings import (
     _ALERT_EVENT_TYPES,
+    AlertsSettings,
     AuthSettings,
     EgressSettings,
     SecurityEnforcement,
@@ -1106,16 +1107,22 @@ HELD = ("ad_reconcile_held", "directory-reconciler")
 REFERRAL = ("ad_reconcile_aborted", _REFERRAL_ALERT_SOURCE)
 
 
-async def _left_open_by_an_earlier_run(store: MessageStore) -> None:
+async def _left_open_by_an_earlier_run(
+    store: MessageStore, alerts: frozenset[tuple[str, str]] = frozenset({ABORTED, HELD})
+) -> None:
+    """The breaker's and the hold's instances, or only those in ``alerts``, as an earlier run of
+    the engine left them open."""
     last_run = NotifierAlertSink([], store=store)
-    last_run.ad_reconcile_aborted(
-        "directory-reconciler", reason="mass_revoke_breaker", probed=12, detail="tripped"
-    )
-    last_run.ad_reconcile_held(
-        "directory-reconciler", reason=HOLD_REASON, undetermined=2, detail="held"
-    )
+    if ABORTED in alerts:
+        last_run.ad_reconcile_aborted(
+            "directory-reconciler", reason="mass_revoke_breaker", probed=12, detail="tripped"
+        )
+    if HELD in alerts:
+        last_run.ad_reconcile_held(
+            "directory-reconciler", reason=HOLD_REASON, undetermined=2, detail="held"
+        )
     await _settle(last_run)
-    assert await _open_alerts(store) == {ABORTED, HELD}
+    assert await _open_alerts(store) == alerts
 
 
 async def _alerted_pass(service: AuthService, sink: NotifierAlertSink) -> ReconcilePlan:
@@ -1222,6 +1229,34 @@ async def test_a_trip_does_not_resolve_when_the_reconciler_revokes_the_accounts_
         assert ABORTED in await _open_alerts(store)
 
 
+async def test_a_trip_does_not_resolve_on_the_pass_that_revokes_its_role_changed_accounts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The revocation loop reads the unconfirmed set as it stood BEFORE the pass (BACKLOG #3084).
+    Six of twelve accounts hold roles the directory no longer grants, and the breaker trips. Twelve
+    more users sign in, so the next pass's six role revocations are under the fraction and go
+    through. Those six read PRESENT on that pass, which confirms them, so the set after the pass no
+    longer holds them. They were behind the trip all the same, and their revocation forfeits it.
+
+    RED when the loop reads the set after this pass's PRESENT reads: the revoking pass then clears
+    the trip on the eighteen that remain."""
+    names = [f"ok{i}" for i in range(6)] + [f"demoted{i}" for i in range(6)]
+    later = [f"late{i}" for i in range(12)]
+    async with _signed_in_estate(monkeypatch, names + later) as estate:
+        _directory, service, store, _tokens = estate
+        await _expire(store, later)
+        sink = NotifierAlertSink([], store=store)
+        for name in names[6:]:  # roles the directory no longer grants
+            await store.set_user_roles(await _id(store, name), [Role.VIEWER.value])
+        assert (await _alerted_pass(service, sink)).aborted == "mass_revoke_breaker"
+        await _sign_in(service, later)
+        revoked = await _alerted_pass(service, sink)
+        assert revoked.aborted is None and len(revoked.revocations) == 6
+        assert not revoked.breaker_clear, "the trip resolved on the pass that revoked its accounts"
+        assert not (await _alerted_pass(service, sink)).breaker_clear
+        assert ABORTED in await _open_alerts(store)
+
+
 async def test_a_hold_whose_accounts_leave_on_a_pass_with_nobody_signed_in_still_forfeits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1262,14 +1297,19 @@ async def test_an_account_that_leaves_after_it_was_read_again_does_not_forfeit_t
         assert (await _alerted_pass(service, sink)).breaker_clear
 
 
+@pytest.mark.parametrize("struck_by", ["absent", "disabled"])
 async def test_a_trip_does_not_resolve_when_its_accounts_leave_after_a_read_that_struck_them(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, struck_by: str
 ) -> None:
     """Only a PRESENT read confirms an account a trip left unconfirmed. Ten accounts read absent
     and the breaker trips. A flapping attribute read then holds them, which resets their strikes,
-    and the next pass finds them absent again on strike 1: not aborted, nothing revoked. That read
-    is a strike, not a clean read. Their sessions then end, and the strike ledger forgets them, so
-    the two that remain must not resolve the trip."""
+    and the next pass finds them absent, or present with the disabled bit set, on strike 1: not
+    aborted, nothing revoked. That read is a strike, not a clean read. Their sessions then end, and
+    the strike ledger forgets them, so the two that remain must not resolve the trip.
+
+    The ``disabled`` case is RED when a DISABLED read confirms an account as PRESENT does
+    (BACKLOG #3084): DISABLED is a readable answer, so it releases a hold, but it is no clean read
+    of the account behind a trip."""
     names = ["ok1", "ok2"] + [f"gone{i}" for i in range(10)]
     async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
         sink = NotifierAlertSink([], store=store)
@@ -1282,7 +1322,10 @@ async def test_a_trip_does_not_resolve_when_its_accounts_leave_after_a_read_that
         directory.uac.update(dict.fromkeys(names[2:], ABSENT))  # the attribute will not read
         assert (await _alerted_pass(service, sink)).hold
         for name in names[2:]:
-            directory.delete(name)
+            if struck_by == "absent":
+                directory.delete(name)
+            else:
+                directory.uac[name] = DISABLED
         struck = await _alerted_pass(service, sink)
         assert struck.aborted is None and struck.revocations == () and not struck.breaker_clear
         await _expire(store, names[2:])
@@ -1886,6 +1929,44 @@ async def test_the_hold_standing_never_leaves_a_forfeit(
         await store.close()
 
 
+@pytest.mark.parametrize(
+    ("standing", "start", "says"),
+    [
+        ("breaker", "fresh", "left before a pass read it clean"),
+        ("breaker", "tripped", "left before a pass read it clean"),
+        ("referral", "fresh", "left before a pass read it without one"),
+        ("referral", "referred", "left before a pass read it without one"),
+        ("hold", "fresh", "before any pass here had held, and an earlier run's hold may"),
+        ("hold", "held", "before this process released its hold"),
+    ],
+)
+async def test_each_forfeit_logs_one_warning_that_names_what_happened(
+    caplog: pytest.LogCaptureFixture, standing: str, start: str, says: str
+) -> None:
+    """The three forfeit warnings, each said once on the move into ``"forfeit"`` and never again,
+    since nothing moves out of it (BACKLOG #3084, the review's unpinned log lines). An operator
+    reads this line to know an open instance is now theirs to resolve.
+
+    The hold's line names the state it came from. A fresh process never held, so a line saying it
+    left "before this process released a hold" described a hold that never happened (BACKLOG
+    #3084, item 3)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _fresh_process(store)
+        setattr(service, f"_reconcile_{standing}_standing", start)
+        advance = getattr(service, f"_advance_{standing}_standing")
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            advance("forfeit")
+            advance("forfeit")
+        lines = [r.getMessage() for r in caplog.records if "will not resolve" in r.getMessage()]
+        assert len(lines) == 1, lines
+        assert says in lines[0]
+        if standing == "hold" and start == "fresh":
+            assert "released" not in lines[0]
+    finally:
+        await store.close()
+
+
 async def test_a_pass_that_raises_after_revoking_an_undetermined_account_still_forfeits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1992,13 +2073,30 @@ def test_only_a_process_alone_on_its_store_is_the_sole_reconciler() -> None:
     assert not _is_sole_reconciler(clustered, None, _runner(None))  # a [cluster] node
 
 
+#: An SMTP transport, which wires the notifier; no message is sent by the lifespan tests.
+_SMTP_ALERTS = AlertsSettings(
+    email_smtp_host="smtp.example.invalid",
+    email_from="alerts@example.invalid",
+    email_to=["ops@example.invalid"],
+    security_notifications_required=False,
+)
+
+
+@pytest.mark.parametrize("alerts", [None, _SMTP_ALERTS], ids=["no-alerts", "smtp-alerts"])
 @pytest.mark.parametrize("sole", [False, True], ids=["not-sole", "sole"])
 async def test_the_lifespan_passes_the_sole_reconciler_answer_to_the_reconciler_task(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sole: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sole: bool, alerts: AlertsSettings | None
 ) -> None:
     """The call site in ``create_managed_app``. The test above pins what the answer is; this one
     pins that the lifespan asks for it, with the process's own coordinator, filter and runner, and
-    hands it on. A call site passing ``True`` regardless fails the ``not-sole`` case."""
+    hands it on. A call site passing ``True`` regardless fails the ``not-sole`` case.
+
+    It also pins ``alert_state`` (BACKLOG #3084, item 4). With no ``[alerts]`` transport nothing
+    records an instance, so it is ``None``. With one, the notifier records instances in the
+    engine's store, and the reconciler must read that same store to tell an earlier run's open
+    instance from its own. The ``smtp-alerts`` cases are RED when the call site passes
+    ``alert_state=None`` regardless: a restarted engine whose own pass trips would then resolve
+    the earlier run's row."""
     asked: list[tuple[object, object, object]] = []
     handed: list[bool] = []
     states: list[object] = []
@@ -2027,6 +2125,7 @@ async def test_the_lifespan_passes_the_sole_reconciler_answer_to_the_reconciler_
             enforcement=SecurityEnforcement.WARN, allow_unencrypted_phi=True
         ),
         egress_settings=EgressSettings(deny_by_default=False),
+        alerts_settings=alerts,
     )
     async with app.router.lifespan_context(app):
         for _ in range(200):
@@ -2035,8 +2134,10 @@ async def test_the_lifespan_passes_the_sole_reconciler_answer_to_the_reconciler_
             await asyncio.sleep(0.005)
         engine = app.state.engine
         assert asked == [(engine.coordinator, None, engine.registry_runner)]
+        assert (app.state.notifier is not None) is (alerts is not None)
     assert handed == [sole]
-    assert states == [None]  # no [alerts] notifier, so nothing records an instance to read
+    assert len(states) == 1
+    assert states[0] is (None if alerts is None else engine.store)
 
 
 class _PlanAuth:
@@ -2459,30 +2560,6 @@ async def test_a_process_never_resolves_an_instance_an_earlier_run_left_open() -
         await store.close()
 
 
-async def test_a_failed_alert_state_read_costs_a_clear_and_never_makes_one() -> None:
-    """Until a read of alert state succeeds, the loop cannot tell inherited instances from its
-    own, so every clear is dropped. What is open at the first read that succeeds then counts as
-    inherited, including a trip this process opened meanwhile: a missed clear, never a false
-    one."""
-    store = await MessageStore.open(":memory:")
-    real = store.list_active_alert_instances
-    failures = [sqlite3.OperationalError("synthetic: database is locked")]
-
-    async def failing_once(**kwargs: Any) -> list[Any]:
-        if failures:
-            raise failures.pop()
-        return await real(**kwargs)
-
-    try:
-        store.list_active_alert_instances = failing_once  # type: ignore[method-assign]
-        auth = _ScriptedAuth([_BOTH_CLEAR], {0: partial(_open_both_again, store)})
-        await _run_reconciler(auth, store, NotifierAlertSink([], store=store), passes=4)
-        assert await _open_alerts(store) == {ABORTED, HELD}
-        assert not failures, "the read never failed"
-    finally:
-        await store.close()
-
-
 def test_every_clear_flag_names_the_instance_it_resolves() -> None:
     """``_without_inherited_clears`` drops a flag its map does not name, so a ``*_clear`` flag left
     out of the map is a clear that never fires on an engine with alert state (BACKLOG #2538)."""
@@ -2538,3 +2615,205 @@ async def test_a_process_never_resolves_a_referral_an_earlier_run_left_open() ->
         assert await _open_alerts(store) == set(), "this process's own referral stayed open"
     finally:
         await store.close()
+
+
+def _script_reads(
+    monkeypatch: pytest.MonkeyPatch, store: MessageStore, script: list[str]
+) -> list[str]:
+    """Patch ``list_active_alert_instances`` to answer read ``n`` as ``script[n]`` says, and every
+    read past the script as the last entry: ``real`` reads the store, ``fail`` raises a driver
+    error and ``hang`` never returns. Returns the log of what each read did."""
+    real = store.list_active_alert_instances
+    done: list[str] = []
+
+    async def read(**kwargs: Any) -> list[Any]:
+        how = script[min(len(done), len(script) - 1)]
+        done.append(how)
+        if how == "fail":
+            raise sqlite3.OperationalError("synthetic: database is locked")
+        if how == "hang":
+            await asyncio.Event().wait()
+        return await real(**kwargs)
+
+    monkeypatch.setattr(store, "list_active_alert_instances", read)
+    return done
+
+
+@pytest.mark.parametrize(
+    ("script", "resolves"),
+    [
+        (["real"], True),
+        (["fail", "real"], False),
+        (["hang", "real"], False),
+        (["real", "fail"], False),
+        (["real", "hang"], False),
+        (["real", "fail", "real"], True),
+    ],
+    ids=[
+        "control",
+        "first-read-fails",
+        "first-read-hangs",
+        "later-read-fails",
+        "later-read-hangs",
+        "one-later-read-fails",
+    ],
+)
+async def test_a_pass_whose_alert_read_fails_or_runs_long_drops_its_clears(
+    monkeypatch: pytest.MonkeyPatch, script: list[str], resolves: bool
+) -> None:
+    """BACKLOG #3084, items 2 and 5. Both reads of alert state are bounded, and a pass whose read
+    failed or ran past the bound drops its clears: a missed clear, never a false one. The first
+    read fixes what counts as inherited; the later one is each pass's own, in
+    ``_without_inherited_clears``. The store is empty when the loop starts, so the trip and hold the
+    first pass opens are this process's own, and the control resolves both. Until a first read
+    succeeds the loop cannot tell inherited instances from its own, so what is open at the first
+    read that succeeds counts as inherited, including the trip and hold this process opened
+    meanwhile. One failed later read costs only its own pass's clears: the next pass that reads
+    resolves them (``one-later-read-fails``).
+
+    RED when a failed later read keeps the pass's clears (``later-read-fails``), or when either read
+    has no bound: a hung read then stalls the loop, and the pass count is never reached."""
+    # Short enough that four hung passes finish quickly, long enough that a real :memory: read on a
+    # loaded runner does not time out and turn the control red.
+    monkeypatch.setattr(app_module, "_RECONCILE_ALERT_READ_TIMEOUT", 0.25)
+    store = await MessageStore.open(":memory:")
+    try:
+        done = _script_reads(monkeypatch, store, script)
+        auth = _ScriptedAuth([_BOTH_CLEAR], {0: partial(_open_both_again, store)})
+        await _run_reconciler(auth, store, NotifierAlertSink([], store=store), passes=4)
+        assert done[: len(script)] == script, f"the scripted reads did not all run: {done}"
+        monkeypatch.undo()
+        assert await _open_alerts(store) == (set() if resolves else {ABORTED, HELD})
+    finally:
+        await store.close()
+
+
+async def test_a_reconciler_that_may_share_its_store_never_reads_alert_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reconciler that may share its store raises no clear, so the read that tells inherited
+    instances from its own has no use there. It must not run: each would cost a pass up to the read
+    bound before its revocations, and log an inherited-alert line about clears it never makes
+    (BACKLOG #3084)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        done = _script_reads(monkeypatch, store, ["fail"])
+        auth = _ScriptedAuth([_BOTH_CLEAR], {})
+        task = asyncio.create_task(
+            _directory_reconciler(
+                auth,  # type: ignore[arg-type]
+                0.001,
+                NotifierAlertSink([], store=store),
+                sole_reconciler=False,
+                alert_state=store,
+            )
+        )
+        try:
+            for _ in range(2000):
+                if auth.passes >= 3:
+                    break
+                await asyncio.sleep(0.005)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        assert auth.passes >= 3
+        assert done == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("left_open", [HELD, ABORTED], ids=["hold-inherited", "trip-inherited"])
+async def test_an_inherited_row_keeps_only_its_own_clear_from_resolving(
+    left_open: tuple[str, str],
+) -> None:
+    """BACKLOG #3084, item 5: the hold's clear against an inherited hold row alone. An earlier run
+    left one reconcile alert open, and this process opens the other. A pass the service marks clear
+    for both resolves this process's own row and leaves the inherited one for an operator.
+
+    RED when any inherited row drops every clear, so this process's own row stays open, or when an
+    inherited row is resolved."""
+    store = await MessageStore.open(":memory:")
+    try:
+        await _left_open_by_an_earlier_run(store, frozenset({left_open}))
+        auth = _ScriptedAuth([_BOTH_CLEAR], {0: partial(_open_both_again, store)})
+        await _run_reconciler(auth, store, NotifierAlertSink([], store=store), passes=4)
+        assert await _open_alerts(store) == {left_open}, "own row stayed open, or inherited closed"
+    finally:
+        await store.close()
+
+
+#: The logger the lifespan loop writes through (``_log`` in messagefoundry/api/app.py).
+_RECONCILER_LOGGER = "messagefoundry.api.app"
+
+#: Logged through :data:`_RECONCILER_LOGGER` after the passes, so a capture that sees nothing from
+#: that logger reads as empty rather than as a reconciler that said nothing.
+_CAPTURE_CONTROL = "capture control: the reconciler's logger reaches this capture"
+
+
+async def _reconciler_warnings(caplog: pytest.LogCaptureFixture, *, inherited: bool) -> list[str]:
+    """The WARNING-and-above messages :data:`_RECONCILER_LOGGER` logs over four passes of the
+    lifespan loop on a fresh store, with the earlier run's two alerts left open when ``inherited``,
+    then :data:`_CAPTURE_CONTROL`. Read before the store closes, so nothing it logs lands here."""
+    store = await MessageStore.open(":memory:")
+    try:
+        if inherited:
+            await _left_open_by_an_earlier_run(store)
+        auth = _ScriptedAuth([_BOTH_CLEAR], {})
+        with caplog.at_level(logging.WARNING, logger=_RECONCILER_LOGGER):
+            caplog.clear()
+            await _run_reconciler(auth, store, NotifierAlertSink([], store=store), passes=4)
+            logging.getLogger(_RECONCILER_LOGGER).warning(_CAPTURE_CONTROL)
+            return [
+                r.getMessage()
+                for r in caplog.records
+                if r.name == _RECONCILER_LOGGER and r.levelno >= logging.WARNING
+            ]
+    finally:
+        await store.close()
+
+
+async def test_a_restart_over_open_reconcile_alerts_says_once_that_it_will_not_resolve_them(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #3084, item 1. A restarted engine drops every clear of an instance an earlier run
+    left open. It says so once, at the read that fixes the inherited set, naming each alert by its
+    event type and source, and not again on each pass that drops the clear. The control: an engine
+    that starts over no open alert says nothing at WARNING or above, read from a capture shown to
+    hold the line the test logs through the reconciler's logger, so an empty capture cannot pass."""
+    restarted = await _reconciler_warnings(caplog, inherited=True)
+    lines = [m for m in restarted if "already open" in m]
+    assert len(lines) == 1, lines
+    assert "ad_reconcile_aborted (directory-reconciler)" in lines[0]
+    assert "ad_reconcile_held (directory-reconciler)" in lines[0]
+    assert "will not resolve those alerts itself" in lines[0]
+
+    fresh = await _reconciler_warnings(caplog, inherited=False)
+    assert len(fresh) >= 1, "the capture saw nothing, so its silence proves nothing"
+    said = [m for m in fresh if m != _CAPTURE_CONTROL]
+    assert said == []
+
+
+async def test_a_pass_that_revokes_every_account_is_no_evidence_for_a_clear(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clear rests on an answer for every signed-in account the pass did not just revoke, and it
+    needs at least one such account (``bool(ids)`` in ``_mark_reconcile_clears``; BACKLOG #3084,
+    item 5). Both accounts read undetermined and are held. Both then read with the disabled bit
+    set, and with one strike to revoke, that pass revokes both. Their answers are readable, so no
+    revocation forfeits the hold, but nobody is left signed in for the pass to have read. The hold
+    stays open for an operator, or for a later pass that reads a signed-in account.
+
+    RED when an empty set of remaining accounts counts as covered: every test over it then passes
+    vacuously, and the hold resolves on a pass that left nobody signed in."""
+    names = ["u1", "u2"]
+    async with _signed_in_estate(monkeypatch, names, ad_session_recheck_strikes=1) as estate:
+        directory, service, store, _tokens = estate
+        sink = NotifierAlertSink([], store=store)
+        directory.uac.update(dict.fromkeys(names, ABSENT))
+        assert (await _alerted_pass(service, sink)).hold
+        assert await _open_alerts(store) == {HELD}
+        directory.uac.update(dict.fromkeys(names, DISABLED))
+        every = await _alerted_pass(service, sink)
+        assert every.aborted is None and len(every.revocations) == 2 and every.readable == 2
+        assert not every.hold_clear, "the hold resolved on a pass that left nobody signed in"
+        assert HELD in await _open_alerts(store)

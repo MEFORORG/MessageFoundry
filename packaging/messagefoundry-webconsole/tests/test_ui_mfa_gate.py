@@ -21,6 +21,7 @@ import pytest
 from _ui_clients import SAME_ORIGIN, create_local_user_chosen, held_totp_code
 
 from messagefoundry.api import create_app
+from messagefoundry.api.auth_routes import _DIRECTORY_UNCONFIRMED_DETAIL
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.passwords import hash_password
@@ -28,6 +29,7 @@ from messagefoundry.auth.service import AuthService, Elevation
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry_webconsole.routes.core import _DIRECTORY_UNCONFIRMED_ERROR
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 
@@ -1328,8 +1330,30 @@ async def test_the_gate_says_the_directory_could_not_confirm_the_account(
         _directory_refuses(service, monkeypatch)
         r = await c.post("/ui/mfa", data={"code": "123456"})
         assert r.status_code == 400
-        assert _DIRECTORY_UNCONFIRMED_TEXT in r.text
+        assert _DIRECTORY_UNCONFIRMED_ERROR in r.text
         assert "That code wasn" not in r.text
+
+
+def test_the_directory_refusal_names_both_fixes() -> None:
+    """BACKLOG #3082, the console's half. Which fix clears which cause, an outage or a role lost in
+    the directory (``directory_roles_demoted``), is stated once in docs/SECURITY.md (BACKLOG
+    #2240). The engine hands the console the same
+    ``Elevation(directory_unconfirmed=True)`` for both causes and keeps the cause on the audit row,
+    so this one text is what a demoted operator and an operator meeting an outage both see; the gate
+    test above shows it on the page. The engine's half drives the real refusal for each cause:
+    ``test_the_route_says_the_directory_could_not_confirm_the_account`` in
+    tests/test_mfa_directory_recheck.py.
+
+    It also keeps the console's text in step with the API's 403 detail, which a client of the API
+    shows instead: both name the same fixes, and neither names a group or role.
+
+    RED when either text tells a demoted operator only to try again later."""
+    for text in (_DIRECTORY_UNCONFIRMED_ERROR, _DIRECTORY_UNCONFIRMED_DETAIL):
+        said = text.lower()
+        for fix in ("try again later", "sign out and sign in again", "ask an administrator"):
+            assert fix in said, (fix, text)
+        for internal in ("demoted", "group", "role"):
+            assert internal not in said, (internal, text)
 
 
 async def test_the_reauth_code_leg_says_the_directory_could_not_confirm_the_account(
