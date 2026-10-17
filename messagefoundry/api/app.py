@@ -222,6 +222,7 @@ from messagefoundry.api.paging import page_total
 from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
     AUTH_NOT_CONFIGURED,
+    DIRECTORY_GRANTED_BY,
     AuthenticatedBeforeBodyRoute,
     ExportStopped,
     alert_sink_for,
@@ -278,6 +279,7 @@ from messagefoundry.auth import Identity, Permission, Role
 from messagefoundry.auth.audit_visibility import reads_audit_copies_in_the_log
 from messagefoundry.auth.reconcile import (
     HOLD_REASON,
+    MISCONFIGURED_ABORT,
     PROBE_FAULT_ABORT,
     REFERRAL_ABORT,
     ReconcilePlan,
@@ -407,6 +409,7 @@ from messagefoundry.pipeline.alert_sinks import EmailTransport, notifier_from_se
 from messagefoundry.pipeline.alerts import (
     AlertSink,
     LoggingAlertSink,
+    administrator_granted_alert,
     authority_seal_alert,
     no_enabled_administrator_alert,
     store_cipher_refusal_forwarder,
@@ -9669,13 +9672,16 @@ async def _session_reaper(
     store: Store,
     *,
     idle_seconds: float | None = None,
+    lineage_seconds: float | None = None,
     wall: Callable[[], float] | None = None,
     mono: Callable[[], float] | None = None,
 ) -> None:
     """Drop expired session rows, first ``_SESSION_REAP_FIRST_DELAY`` after start and then every
     ``_SESSION_REAP_INTERVAL``, until the task is cancelled. With ``idle_seconds`` given,
     idle-expired rows go too (BACKLOG #2096); the lifespan passes the idle timeout the validator
-    uses.
+    uses. With ``lineage_seconds`` given, session lineage links older than that go too (vault
+    BACKLOG #3028); the lifespan passes the window the supersession follows them for. Purging as of
+    the earlier instant below only keeps a link longer, never shortens that window.
 
     **The reaper skips a pass when the wall clock has jumped forward (BACKLOG #2283).** The purge
     judges expiry and idleness by the wall clock, and its deletes cannot be undone. Run just after
@@ -9734,7 +9740,9 @@ async def _session_reaper(
             continue
         try:
             await store.purge_expired_sessions(
-                now=now - _SESSION_REAP_STEP_TOLERANCE, idle_seconds=idle_seconds
+                now=now - _SESSION_REAP_STEP_TOLERANCE,
+                idle_seconds=idle_seconds,
+                lineage_seconds=lineage_seconds,
             )
         except asyncio.CancelledError:
             raise
@@ -9799,6 +9807,9 @@ _REFERRAL_ALERT_SOURCE = "directory-reconciler-referral"
 #: The source label of the probe fault's own ``ad_reconcile_aborted`` instance (BACKLOG #3100), apart
 #: from the breaker's and the referral's for the same reasons.
 _PROBE_FAULT_ALERT_SOURCE = "directory-reconciler-probe-fault"
+#: The source label of the configuration refusal's own ``ad_reconcile_aborted`` instance (BACKLOG
+#: #3010), apart from the others for the same reasons.
+_MISCONFIGURED_ALERT_SOURCE = "directory-reconciler-misconfigured"
 
 
 def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSink) -> None:
@@ -9825,8 +9836,22 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     alert with reason ``probe_fault``, under its own source label
     (:data:`_PROBE_FAULT_ALERT_SOURCE`). It has no inverse: an operator resolves it.
 
+    A search the directory refused for its configuration (BACKLOG #3010) is not an outage either: a
+    search base that was deleted or moved, or that the service account may not read, ends every
+    search with noSuchObject, invalidDNSyntax or insufficientAccessRights on every pass. Any pass
+    with such a refusal is ``auth.ad_reconcile_misconfigured`` and becomes one
+    ``ad_reconcile_aborted`` alert with reason ``directory_misconfigured``, under its own source
+    label (:data:`_MISCONFIGURED_ALERT_SOURCE`). Like the fault's, it has no inverse. Before #3010
+    such a base read as "not found" for every account, so it tripped the breaker on an estate
+    large enough; read as an outage, it would page nobody.
+
+    The breaker's alert counts the accounts the pass judged, its denominator. The referral's, the
+    refusal's and the fault's count the probes the pass asked, which leaves out an id-less row
+    (BACKLOG #3170): only a probe that was sent can be referred, refused or raise a fault.
+
     Reads the RETURNED plan, so it sees only a pass that finished. A failed write of the pass's own
-    held, aborted, skipped, referred or unkeyed-binding row no longer ends the pass (BACKLOG #2137):
+    held, aborted, skipped, referred, misconfigured, faulted or unkeyed-binding row no longer ends
+    the pass (BACKLOG #2137):
     the service logs it at ERROR and returns the plan, so these alerts still fire. A pass that raised
     part-way for another reason, such as inside one revocation, has already audited the revocations
     it applied before that point; those rows stand, and no alert is raised for them.
@@ -9844,9 +9869,9 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     ``_mark_reconcile_clears`` states that rule once."""
     if plan.directory_outage:
         return
-    if plan.aborted is not None and not plan.directory_referral and not plan.probe_fault:
-        # A breaker trip. A pass of referrals only is not one: its one alert is the referral's below.
-        # Nor is a pass of faults only (BACKLOG #3100): its one alert is the fault's below.
+    if plan.aborted is not None and not plan.judged_nothing:
+        # A breaker trip. A pass that judged nothing is not one: its alerts are the referral's, the
+        # refusal's or the fault's below (BACKLOG #2538, #3010, #3100), and an outage has none.
         sink.ad_reconcile_aborted(
             "directory-reconciler",
             reason=plan.aborted,
@@ -9861,15 +9886,24 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         sink.ad_reconcile_aborted(
             _REFERRAL_ALERT_SOURCE,
             reason=REFERRAL_ABORT,
-            probed=plan.probed,
+            # The probes ASKED, as the refusal's and the fault's below (BACKLOG #3170).
+            probed=plan.asked,
             detail=auth.directory_reconcile_referral or REFERRAL_ABORT,
         )
+    if plan.misconfigured:
+        # BACKLOG #3010. Beside the referral's, in the same order the service records them.
+        sink.ad_reconcile_aborted(
+            _MISCONFIGURED_ALERT_SOURCE,
+            reason=MISCONFIGURED_ABORT,
+            probed=plan.asked,
+            detail=auth.directory_reconcile_misconfigured or MISCONFIGURED_ABORT,
+        )
     if plan.faulted:
-        # BACKLOG #3100. Beside the referral's, in the same order the service records them.
+        # BACKLOG #3100.
         sink.ad_reconcile_aborted(
             _PROBE_FAULT_ALERT_SOURCE,
             reason=PROBE_FAULT_ABORT,
-            probed=plan.probed,
+            probed=plan.asked,
             detail=auth.directory_reconcile_fault or PROBE_FAULT_ABORT,
         )
     if plan.hold:
@@ -10636,7 +10670,9 @@ def create_managed_app(
                 # This process cannot vouch for a config it never checked: its flag rows say so.
                 engine.config_baseline_unchecked = start_outcome in _UNCHECKED_OUTCOMES
                 # Raised here, before engine.start(), so new bytes that make the start itself fail
-                # still page on every attempt of a crash loop. Never raises.
+                # still page on every attempt of a crash loop. Never raises. Vault BACKLOG #3145
+                # item 1 (a gate-refused restart pages on every attempt) is declined: that is this
+                # contract, pinned by test_the_alert_fires_even_when_the_start_then_fails (#2597).
                 if start_config is not None and start_config.changed:
                     _raise_config_changed(notifier or LoggingAlertSink(), engine, start_config)
             except BaseException:
@@ -10718,6 +10754,11 @@ def create_managed_app(
                     # Vault BACKLOG #3229: a directory role change that leaves no enabled
                     # Administrator is applied, and raises no_enabled_administrator here.
                     admin_loss_alert=no_enabled_administrator_alert(notifier or LoggingAlertSink()),
+                    # Vault BACKLOG #3141: a reconcile pass that newly grants Administrator raises
+                    # administrator_granted here, as a directory sign-in does in its route.
+                    admin_grant_alert=administrator_granted_alert(
+                        notifier or LoggingAlertSink(), granted_by=DIRECTORY_GRANTED_BY
+                    ),
                 )
                 # Started only once the service is built, so a constructor refusal starts no task.
                 if security_notifier is not None:
@@ -10727,7 +10768,10 @@ def create_managed_app(
                 # any connection starts rather than after. Both touch only the store: initialize()
                 # seeds the built-in roles and the gate reads the users. A refusal here also comes
                 # before the start's opt-in audit-chain walk, so that walk cannot alert on such a
-                # start. Everything else that uses the service stays below the start.
+                # start. Vault BACKLOG #3145 item 2 is declined: the walk runs inside engine.start(),
+                # and moving it ahead of this gate reorders the start whose failure paging
+                # test_the_alert_fires_even_when_the_start_then_fails pins (#2597). Everything else
+                # that uses the service stays below the start.
                 await auth.initialize()
                 app.state.auth = auth
                 await _assert_security_notice_is_deliverable(
@@ -10849,9 +10893,12 @@ def create_managed_app(
                 # ADR 0197 Amendment A, Manager decision 2026-09-29: learn at start, not at the first
                 # account creation, that the password policy leaves no credential to issue. It logs
                 # an ERROR and returns, and is guarded like the census: a policy-level fact must
-                # never refuse the start, whatever a later policy clause raises.
+                # never refuse the start, whatever a later policy clause raises. It runs off the loop
+                # (vault BACKLOG #3164): a pathological context-word list makes the generator retry
+                # its policy screens many times, and the engine's listeners and workers already run
+                # on the loop by now.
                 try:
-                    auth.probe_credential_generation()
+                    await asyncio.to_thread(auth.probe_credential_generation)
                 except Exception:  # noqa: BLE001 -- see the comment above
                     _log.exception(
                         "the credential-generation probe could not run; startup continues"
@@ -10900,7 +10947,11 @@ def create_managed_app(
                         auth_settings.oidc_redirect_path,
                     )
                 reaper = asyncio.create_task(
-                    _session_reaper(store, idle_seconds=auth.session_idle_seconds)
+                    _session_reaper(
+                        store,
+                        idle_seconds=auth.session_idle_seconds,
+                        lineage_seconds=auth.supersession_lineage_seconds,
+                    )
                 )
                 if _initial_credential_warn_lead(auth) is not None:
                     # BACKLOG #1141 (ASVS 6.4.5): a nudge for every unclaimed temporary password an

@@ -57,6 +57,10 @@ _CALLS: dict[str, Callable[[Any], Awaitable[Any]]] = {
     "rotate_session": lambda s: s.rotate_session(_HASH, new_token_hash=_OTHER),
     "revoke_session": lambda s: s.revoke_session(_HASH, now=_NOW),
     "supersede_session": lambda s: s.supersede_session(_HASH, now=_NOW),
+    # Vault BACKLOG #3028: nothing is revoked, so the walk reads the lineage once and stops.
+    "supersede_session_lineage": lambda s: s.supersede_session(
+        _HASH, now=_NOW, lineage_since=_NOW - 360
+    ),
     "revoke_user_sessions": lambda s: s.revoke_user_sessions("u", now=_NOW),
     "revoke_user_sessions_except": lambda s: s.revoke_user_sessions(
         "u", except_token_hash=_HASH, now=_NOW
@@ -69,6 +73,9 @@ _CALLS: dict[str, Callable[[Any], Awaitable[Any]]] = {
     ),
     "purge_expired_sessions": lambda s: s.purge_expired_sessions(now=_NOW),
     "purge_expired_sessions_idle": lambda s: s.purge_expired_sessions(now=_NOW, idle_seconds=1800),
+    "purge_expired_sessions_lineage": lambda s: s.purge_expired_sessions(
+        now=_NOW, idle_seconds=1800, lineage_seconds=360
+    ),
 }
 
 
@@ -221,7 +228,14 @@ async def test_sqlserver_rotate_reads_its_output_rowset_not_the_row_count(
     store = _nocount_store(seen, output_rows)
     assert await store.rotate_session(_HASH, new_token_hash=_OTHER) is bool(output_rows)
     # The read comes first (BACKLOG #2592); the rewrite is the statement that reports.
-    assert "OUTPUT inserted.token_hash" in seen[-1][0]
+    assert "OUTPUT inserted.token_hash" in seen[1][0]
+    # The lineage link follows the rewrite only when the rowset says it landed (vault BACKLOG
+    # #3028), so a refused rotation links nothing.
+    links = [sql for sql, _ in seen if sql.startswith("INSERT INTO session_lineage")]
+    assert len(links) == (1 if output_rows else 0)
+    # The generic placeholder test never lands a rotation, so the link's binding is checked here.
+    for sql, params in seen:
+        assert sql.count("?") == len(params), f"{len(params)} parameters for:\n{sql}"
 
 
 @pytest.mark.parametrize("revoked", [0, 3])
@@ -244,9 +258,10 @@ async def test_sqlserver_revoke_user_sessions_counts_its_output_rowset(revoked: 
 
 
 async def test_sqlserver_supersede_returns_the_output_row_by_column_name() -> None:
-    """``supersede_session`` reads its ``OUTPUT inserted.*`` row through ``_execute_output``
-    (BACKLOG #2283), which pairs each value with its column name. Read by position instead, a
-    reordered column list would fill the record from the wrong columns."""
+    """``supersede_session`` reads its ``OUTPUT inserted.*`` row through ``_fetch_dicts``, inside
+    its own transaction (BACKLOG #2283, vault BACKLOG #3028), which pairs each value with its column
+    name. Read by position instead, a reordered column list would fill the record from the wrong
+    columns."""
     columns = (
         "user_id",
         "token_hash",
@@ -330,6 +345,10 @@ class _PgConn:
             return dict(zip(_SESSION_COLUMNS, _LIVE_SESSION, strict=True))
         if sql.startswith("SELECT session_epoch"):
             return {"session_epoch": 0}
+        return None
+
+    async def fetchval(self, sql: str, *args: Any) -> Any:
+        self._seen.append((sql, args))
         return None
 
     def transaction(self) -> Any:

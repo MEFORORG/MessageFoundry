@@ -3211,12 +3211,20 @@ class AuthSettings(_Section):
     # effective interval instead of a bind storm against the DC.
     ad_session_recheck_max_users: int = 200
     # --- mass-revoke circuit breaker ---
-    # A misconfigured search base, a moved OU, or a service account that lost read rights on the
-    # entries returns "not found" for EVERY user — indistinguishable from "everyone was deleted".
-    # Without a brake the reconciler would sign out the entire estate during exactly the incident when
-    # operators need the console. A pass that would revoke more than BOTH of these thresholds aborts,
+    # A search base that names the wrong OU, an OU reorganisation that moves the users out of it, or
+    # a service account that lost read rights on the entries while it can still read the base returns
+    # "not found" for EVERY user — indistinguishable from "everyone was deleted". Without a brake
+    # the reconciler would sign out the entire estate during exactly the incident when operators need
+    # the console. A pass that would revoke more than BOTH of these thresholds aborts,
     # revokes nothing, and raises a loud operator-visible alert (log ERROR + an
     # `auth.ad_reconcile_aborted` audit row).
+    #
+    # A base that was deleted or moved, or that the service account may not read at all, usually ends
+    # the search with a result code instead (noSuchObject, invalidDNSyntax, insufficientAccessRights):
+    # a configuration refusal (BACKLOG #3010). It alerts on its own `ad_reconcile_aborted` source.
+    # The refused account is neither struck nor revoked, but it stays in this breaker's denominator,
+    # the accounts probed (`ReconcilePlan.probed`). When such a pass aborts before the breaker runs
+    # is stated once in docs/SECURITY.md.
     #
     # BOTH must be exceeded to trip, deliberately: the absolute floor stops the breaker firing on a tiny
     # estate where any proportion is meaningless (3 of 3 genuine offboardings is 100 %), and the
@@ -4891,7 +4899,8 @@ _ALERT_EVENT_TYPES = frozenset(
         "approval_too_early",
         # BACKLOG #315: a release by an approver account changed after the request, and an
         # Administrator grant through the console API or, since vault BACKLOG #2610, by a directory
-        # sign-in's role sync (granted_by `<directory>`).
+        # sign-in's role sync, and since vault BACKLOG #3141 by a directory reconcile pass (both
+        # granted_by `<directory>`).
         "approval_approver_provenance",
         "administrator_granted",
         # vault BACKLOG #3229: a directory-driven role change left no enabled Administrator. Keyed

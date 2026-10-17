@@ -101,6 +101,12 @@ this line.**
 
 ### Security
 
+- **A session revoke that ends nothing is audited, with your address.** The revoke button on
+  `/ui/account/sessions` now passes the request's address to the engine, which writes one
+  `auth.session_revoke_missed` row when the id names no session or another account's. The notice
+  is unchanged. `AuthService.revoke_own_session` takes a required keyword `client`; the seam
+  digest records that signature, so it moved, and a console and engine on either side of this
+  change refuse each other at mount. (vault BACKLOG #3260)
 - **The passkey registration finish draws on the per-actor ceremony budget.**
   `POST /ui/account/webauthn/verify` now charges the same budget as `POST /ui/account/mfa/verify`,
   and answers a throttle with a JSON 429 the page can show. No seam change. (BACKLOG #3014)

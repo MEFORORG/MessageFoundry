@@ -30,11 +30,13 @@ from messagefoundry.auth.notifications import ACCOUNT_LOCKED, SecurityEvent
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AlertsSettings, AuthSettings, EgressSettings
 from messagefoundry.keyed_lock import hold_keyed_lock
+from messagefoundry.pipeline.security_notify import SecurityEventNotifier
 from messagefoundry.store import open_store, sqlite_settings
 from messagefoundry.store.store import LockoutIncrement, MessageStore, UserRecord
 from tests._admin_account import ADMIN_USERNAME, create_admin
 
 _LOCK_NOTICE = "auth.lock_notice"
+_LOCK_NOTICE_UNDELIVERED = "auth.lock_notice_undelivered"
 #: Longer than the deferred writes' room in the sign-in pad. A write this slow on the request path
 #: moves the answer to a later slot.
 _SLOW = service_module._FAILURE_BUDGET_SECONDS * service_module._WRITE_ROOM_SHARE * 2.4
@@ -50,8 +52,9 @@ class _FakeNotifier:
     def __init__(self) -> None:
         self.events: list[SecurityEvent] = []
 
-    async def notify(self, event: SecurityEvent) -> None:
+    async def notify(self, event: SecurityEvent) -> bool:
         self.events.append(event)
+        return True
 
     def locks(self) -> list[SecurityEvent]:
         return [e for e in self.events if e.event_type == ACCOUNT_LOCKED]
@@ -77,8 +80,9 @@ async def _harness(
 async def _seed_other_accounts_notices(store: MessageStore, count: int) -> None:
     """``count`` recent ``auth.lock_notice`` rows for OTHER accounts, written straight to the table.
 
-    The throttle walks every recent row of the action to find this account's, since the audit log
-    has no actor index, so these are the rows that make its read slow. Inserted in one statement
+    Before the actor index (vault BACKLOG #3120) the throttle walked every recent row of the
+    action to find this account's, so these were the rows that made its read slow; the test still
+    holds the read at a gate, so it does not depend on the read's speed. Inserted in one statement
     rather than through ``record_audit``, which chains each row and would take minutes. The chain is
     not under test here."""
     db = store._db
@@ -98,6 +102,18 @@ async def _seed_other_accounts_notices(store: MessageStore, count: int) -> None:
         ),
     )
     await db.commit()
+
+
+async def _close(store: MessageStore, service: AuthService) -> None:
+    """Finish the service's background tasks, then close the store (vault BACKLOG #3120).
+
+    Called from each test's ``finally``, so a test that fails before its own drain leaves no
+    notice running on, into a closed store and a later test on the shared loop. Bounded, because a
+    failed test can leave a read held at a gate; a task still running then is cancelled."""
+    try:
+        await service.drain_background(timeout=_STALL_SECONDS)
+    finally:
+        await store.close()
 
 
 def _in_background(service: AuthService) -> bool:
@@ -172,9 +188,10 @@ async def test_the_lock_setting_refusal_stays_in_its_slot_with_a_large_audit_log
     writes its rows in a room of an eighth of a second, and a throttle read slower than that moved
     the answer to the next slot and fired the writes-overrun warning.
 
-    The audit log holds many ``auth.lock_notice`` rows for other accounts, which is what makes the
-    real read slow. The read is also held at a gate until the refusal has answered. So it cannot
-    finish inside the answer, and its walk of those rows cannot compete with the refusal's own
+    The audit log holds many ``auth.lock_notice`` rows for other accounts, which made the real read
+    slow before the actor index (vault BACKLOG #3120). The read is also held at a gate until the
+    refusal has answered. So it cannot finish inside the answer, and its read cannot compete with
+    the refusal's own
     writes. The test also checks which task ran the read, so a read on the request path fails it
     directly. The notice still goes out once the gate opens, and the seeded rows of other accounts
     do not hold this account's mail back."""
@@ -207,7 +224,7 @@ async def test_the_lock_setting_refusal_stays_in_its_slot_with_a_large_audit_log
         rows = await _lock_notice_rows(store, user.username)
         assert [json.loads(r["detail"]) for r in rows] == [{"lock": "sign_in", "mailed": True}]
     finally:
-        await store.close()
+        await _close(store, service)
 
 
 async def test_the_overrun_instrument_fires_for_a_slow_write_still_on_the_path(
@@ -238,7 +255,7 @@ async def test_the_overrun_instrument_fires_for_a_slow_write_still_on_the_path(
         assert _write_overruns(caplog), "the overrun warning did not fire for an on-path write"
         assert refused_by > service_module._FAILURE_BUDGET_SECONDS + 0.05, refused_by
     finally:
-        await store.close()
+        await _close(store, service)
 
 
 # --- the race ---------------------------------------------------------------------------------
@@ -417,7 +434,7 @@ async def test_two_same_kind_locks_at_once_send_one_mail_and_write_one_row(
         assert len(locked) == 2, "each lock still writes its own auth.account_locked row"
         assert service._lock_notice_locks == {}, "the queue table kept an entry nobody holds"
     finally:
-        await store.close()
+        await _close(store, service)
 
 
 async def test_the_race_is_real_without_the_queue(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -436,7 +453,7 @@ async def test_the_race_is_real_without_the_queue(monkeypatch: pytest.MonkeyPatc
         assert len(notifier.locks()) == 2
         assert len(await _lock_notice_rows(store, user.username)) == 2
     finally:
-        await store.close()
+        await _close(store, service)
 
 
 async def _peak_reads_across_accounts(
@@ -507,15 +524,14 @@ async def _peak_reads_across_accounts(
             progress.stalls,
         )
     finally:
-        await store.close()
+        await _close(store, service)
 
 
 async def test_one_throttle_read_runs_at_a_time_across_accounts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Each throttle read walks every recent ``auth.lock_notice`` row, so locks on many accounts at
-    once would fill the store's read pool that sign-ins wait on. The service runs one at a time.
-    Every account still gets its mail."""
+    """Locks on many accounts at once would each take a read from the store's pool that sign-ins
+    wait on, so the service runs one throttle read at a time. Every account still gets its mail."""
     peak, mailed, locked, stalls = await _peak_reads_across_accounts(monkeypatch, slots=None)
     assert stalls == [], stalls
     assert peak == 1, f"{peak} throttle reads ran at once"
@@ -580,7 +596,7 @@ async def test_two_kinds_at_once_are_not_queued_behind_each_other(
         assert peak == 2, "the two kinds' notices queued behind each other"
         assert sorted(e.detail["lock"] for e in notifier.locks()) == ["second_step", "sign_in"]
     finally:
-        await store.close()
+        await _close(store, service)
 
 
 # --- failure and shutdown ---------------------------------------------------------------------
@@ -629,7 +645,7 @@ async def test_a_notice_cancelled_at_shutdown_logs_a_line_that_names_nothing(
         locked = await store.list_audit(actor=user.username, action="auth.account_locked")
         assert len(locked) == 1
     finally:
-        await store.close()
+        await _close(store, service)
 
 
 async def test_a_notice_that_finishes_inside_the_bound_is_not_cancelled(
@@ -651,7 +667,7 @@ async def test_a_notice_that_finishes_inside_the_bound_is_not_cancelled(
         assert len(notifier.locks()) == 1
         assert len(await _lock_notice_rows(store, user.username)) == 1
     finally:
-        await store.close()
+        await _close(store, service)
 
 
 async def test_a_failed_row_write_still_mails_and_logs_the_class_alone(
@@ -680,7 +696,7 @@ async def test_a_failed_row_write_still_mails_and_logs_the_class_alone(
         assert _naming(caplog, user) == [], _naming(caplog, user)
         assert len(notifier.locks()) == 1, "a failed row write dropped the mail"
     finally:
-        await store.close()
+        await _close(store, service)
 
 
 async def test_a_failed_throttle_read_logs_the_class_alone_and_mails(
@@ -708,13 +724,13 @@ async def test_a_failed_throttle_read_logs_the_class_alone_and_mails(
         assert _naming(caplog, user) == [], _naming(caplog, user)
         assert len(notifier.locks()) == 1, "a failed read must fail open and mail"
     finally:
-        await store.close()
+        await _close(store, service)
 
 
 class _RefusingNotifier(_FakeNotifier):
     """A notifier that refuses every hand-off, as a relay whose queue raised would."""
 
-    async def notify(self, event: SecurityEvent) -> None:
+    async def notify(self, event: SecurityEvent) -> bool:
         raise OSError("relay refused the hand-off")
 
 
@@ -731,15 +747,74 @@ async def test_a_refused_hand_off_does_not_hold_the_next_notice_back() -> None:
         assert [json.loads(r["detail"]) for r in rows] == [{"lock": "sign_in", "mailed": False}]
         attempts: list[SecurityEvent] = []
 
-        async def took(event: SecurityEvent) -> None:
+        async def took(event: SecurityEvent) -> bool:
             attempts.append(event)
+            return True
 
         notifier.notify = took  # type: ignore[method-assign]
         await service._record_lock(user, "sign_in", _lock(2), client=None)
         await service.drain_background()
         assert len(attempts) == 1, "the refused notice held the next one back"
     finally:
-        await store.close()
+        await _close(store, service)
+
+
+def _relay(store: MessageStore | None = None) -> SecurityEventNotifier:
+    """The shipped notifier, never started, so nothing is sent, with room for ONE queued event."""
+    relay = SecurityEventNotifier(
+        host="smtp.example.test", port=25, sender="mf@example.test", audit=store
+    )
+    relay._queue = asyncio.Queue(maxsize=1)
+    return relay
+
+
+async def test_the_shipped_notifier_says_whether_it_queued_the_notice() -> None:
+    """Vault BACKLOG #3120, follow-up 2: ``notify`` answers ``True`` only for an event it queued.
+    A full queue and a missing address each drop the event, and each answers ``False``."""
+    relay = _relay()
+    queued = SecurityEvent(ACCOUNT_LOCKED, username="lock-a", email="a@example.test")
+    assert await relay.notify(queued) is True
+    full = SecurityEvent(ACCOUNT_LOCKED, username="lock-b", email="b@example.test")
+    assert await relay.notify(full) is False
+    no_address = SecurityEvent(ACCOUNT_LOCKED, username="lock-c", email=None)
+    assert await relay.notify(no_address) is False
+    assert relay._queue.qsize() == 1, "only the first event may have been queued"
+
+
+async def test_a_notice_dropped_on_a_full_queue_does_not_hold_the_next_one_back() -> None:
+    """Vault BACKLOG #3120, follow-up 2. The shipped notifier's full queue drops a lock notice
+    without a line, and ``notify`` used to return nothing, so the row read ``mailed: true`` and
+    the throttle held the next lock's notice back for a day behind a mail that never left. The row
+    now says ``mailed: false``, and the next lock of the kind is queued once there is room.
+
+    The control is the second lock's own row: with room on the queue it reads ``mailed: true``, so
+    the instrument can see a notice that was taken."""
+    store, service, _fake, user = await _harness()
+    relay = _relay(store)
+    relay._queue.put_nowait(
+        SecurityEvent(ACCOUNT_LOCKED, username="filler", email="f@example.test")
+    )
+    service.attach_security_notifier(relay)
+    try:
+        await service._record_lock(user, "sign_in", _lock(1), client=None)
+        await service.drain_background()
+        rows = await _lock_notice_rows(store, user.username)
+        assert [json.loads(r["detail"]) for r in rows] == [{"lock": "sign_in", "mailed": False}]
+        # BACKLOG #2383: the relay records the drop on its own hidden row too.
+        await asyncio.gather(*relay._recording)
+        dropped = await store.list_audit(actor=user.username, action=_LOCK_NOTICE_UNDELIVERED)
+        assert [json.loads(r["detail"])["reason"] for r in dropped] == ["queue_full"]
+
+        relay._queue.get_nowait()  # room again
+        await service._record_lock(user, "sign_in", _lock(2), client=None)
+        await service.drain_background()
+        rows = await _lock_notice_rows(store, user.username)
+        assert [json.loads(r["detail"])["mailed"] for r in rows] == [True, False], (
+            "the dropped notice held the next one back"
+        )
+        assert relay._queue.qsize() == 1, "the second lock's notice was not queued"
+    finally:
+        await _close(store, service)
 
 
 async def test_after_a_closing_drain_a_notice_runs_inline(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -754,17 +829,17 @@ async def test_after_a_closing_drain_a_notice_runs_inline(monkeypatch: pytest.Mo
         assert len(notifier.locks()) == 1, "the notice did not run inline after the drain"
         assert len(await _lock_notice_rows(store, user.username)) == 1
     finally:
-        await store.close()
+        await _close(store, service)
 
 
 async def test_with_no_notifier_the_row_is_written_inline(monkeypatch: pytest.MonkeyPatch) -> None:
     """With no notifier wired the throttle reads nothing and writes one ``mailed: false`` row, so
     that arm stays on the request path and starts no task."""
     store = await MessageStore.open(":memory:")
+    service = AuthService(
+        store, AuthSettings(lockout_threshold=1, require_mfa=False, notify_security_events=True)
+    )
     try:
-        service = AuthService(
-            store, AuthSettings(lockout_threshold=1, require_mfa=False, notify_security_events=True)
-        )
         admin = await create_admin(service)
         user = await store.get_user(admin.user_id)
         assert user is not None
@@ -773,7 +848,7 @@ async def test_with_no_notifier_the_row_is_written_inline(monkeypatch: pytest.Mo
         rows = await _lock_notice_rows(store, user.username)
         assert [json.loads(r["detail"])["reason"] for r in rows] == ["no_notifier"]
     finally:
-        await store.close()
+        await _close(store, service)
 
 
 # --- the lifespan drains before the store closes ----------------------------------------------
@@ -832,6 +907,7 @@ async def test_the_lifespan_drains_a_pending_notice_before_the_store_closes(
     app = _managed_app(db)
     gate = asyncio.Event()
     pending_at_drain: list[bool] = []
+    auth: AuthService | None = None
     try:
         async with app.router.lifespan_context(app):
             auth = await _lock_in_lifespan(app, monkeypatch, gate=gate)
@@ -839,6 +915,7 @@ async def test_the_lifespan_drains_a_pending_notice_before_the_store_closes(
 
             async def open_gate_then_drain() -> None:
                 # The notice is held until the shutdown drain starts, so it is pending there.
+                assert auth is not None
                 pending_at_drain.append(bool(auth._background_tasks))
                 gate.set()
                 await real_close()
@@ -846,8 +923,9 @@ async def test_the_lifespan_drains_a_pending_notice_before_the_store_closes(
             monkeypatch.setattr(auth, "close_background", open_gate_then_drain)
     finally:
         gate.set()  # never leave a held read behind in the shared loop
-    # Join anything the lifespan left running, so it cannot outlive the test.
-    await auth.drain_background()
+        # Join anything the lifespan left running, so it cannot outlive the test.
+        if auth is not None:
+            await auth.drain_background(timeout=_STALL_SECONDS)
     assert pending_at_drain, "the lifespan never called close_background"
     assert pending_at_drain == [True], "the notice was not pending when the drain started"
     rows = await _rows_after_shutdown(db, _LOCK_NOTICE)
@@ -864,17 +942,21 @@ async def test_the_lifespan_control_loses_the_row_without_the_drain(
     db = tmp_path / "nodrain.db"
     app = _managed_app(db)
     gate = asyncio.Event()
-    async with app.router.lifespan_context(app):
-        auth = await _lock_in_lifespan(app, monkeypatch, gate=gate)
+    auth: AuthService | None = None
+    try:
+        async with app.router.lifespan_context(app):
+            auth = await _lock_in_lifespan(app, monkeypatch, gate=gate)
 
-        async def skipped() -> None:
-            return None
+            async def skipped() -> None:
+                return None
 
-        monkeypatch.setattr(auth, "close_background", skipped)
-    # The store is closed now. Release the held read and finish the orphaned task here, so it
-    # meets the closed store deterministically and does not outlive the test.
-    gate.set()
-    await auth.drain_background()
+            monkeypatch.setattr(auth, "close_background", skipped)
+    finally:
+        # The store is closed now. Release the held read and finish the orphaned task here, so it
+        # meets the closed store deterministically and does not outlive the test.
+        gate.set()
+        if auth is not None:
+            await auth.drain_background(timeout=_STALL_SECONDS)
     assert await _rows_after_shutdown(db, _LOCK_NOTICE) == [], (
         "the row survived with the drain neutralised, so the other test does not measure it"
     )

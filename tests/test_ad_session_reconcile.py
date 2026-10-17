@@ -40,6 +40,7 @@ from messagefoundry.auth.ldap import (
     DirectoryProbe,
     LdapError,
     LdapReferralError,
+    LdapUnansweredError,
 )
 from messagefoundry.auth.notifications import (
     ACCOUNT_DISABLED,
@@ -665,6 +666,119 @@ def test_an_unkeyed_probe_does_not_hide_an_outage_or_a_referral_only_pass() -> N
     assert alone.aborted is None and (alone.probed, alone.asked) == (1, 0)
 
 
+@pytest.mark.parametrize(
+    ("asked", "aborted"),
+    [
+        ([reconcile.Probe("a", "a", reconcile.ProbeOutcome.UNAVAILABLE)], "directory_unavailable"),
+        ([reconcile.Probe("r", "r", reconcile.ProbeOutcome.REFERRED)], reconcile.REFERRAL_ABORT),
+        (
+            [
+                reconcile.Probe("a", "a", reconcile.ProbeOutcome.UNAVAILABLE),
+                reconcile.Probe("r", "r", reconcile.ProbeOutcome.REFERRED),
+            ],
+            reconcile.REFERRAL_ABORT,
+        ),
+        # BACKLOG #3100 shares the referral's early return, so a pass of faults only is one too.
+        ([reconcile.Probe("f", "f", reconcile.ProbeOutcome.FAULT)], reconcile.PROBE_FAULT_ABORT),
+        (
+            [
+                reconcile.Probe("a", "a", reconcile.ProbeOutcome.UNAVAILABLE),
+                reconcile.Probe("f", "f", reconcile.ProbeOutcome.FAULT),
+            ],
+            reconcile.PROBE_FAULT_ABORT,
+        ),
+        # BACKLOG #3010 shares it too: a pass of configuration refusals only.
+        (
+            [reconcile.Probe("m", "m", reconcile.ProbeOutcome.MISCONFIGURED)],
+            reconcile.MISCONFIGURED_ABORT,
+        ),
+    ],
+    ids=[
+        "outage",
+        "referrals-only",
+        "referrals-and-failures",
+        "faults-only",
+        "faults-and-failures",
+        "refusals-only",
+    ],
+)
+def test_an_unkeyed_row_is_struck_on_a_pass_that_judged_nothing(
+    asked: list[reconcile.Probe], aborted: str
+) -> None:
+    """BACKLOG #3170 item 3. An UNKEYED row is judged without the directory, so a pass that learned
+    nothing from it still strikes the row. Only the strike: the asked probes' strikes, the outcome
+    record the hold reads, and the hold's latch all stay as they were. The abort slug is pinned
+    too, so an id-less row cannot hide which kind of pass this was (BACKLOG #2434, #3100).
+
+    RED before #3170: both early returns carried no strikes, so such a row went unstruck."""
+    unkeyed = reconcile.Probe("k", "k", reconcile.ProbeOutcome.UNKEYED)
+    plan = _plan([*asked, unkeyed], prior_strikes={"k": 1, "a": 1, "r": 1, "f": 1}, latched=True)
+    assert plan.aborted == aborted
+    assert plan.judged_nothing
+    assert plan.strikes == {"k": 2}
+    assert plan.outcomes == {} and plan.latched and not plan.hold
+    assert plan.revocations == ()
+    # The control: the same row on an ordinary pass strikes the same way, and revokes there.
+    ordinary = _plan([unkeyed], prior_strikes={"k": 1})
+    assert ordinary.strikes == {"k": 2}
+    assert [r.reason for r in ordinary.revocations] == ["directory_object_id_missing"]
+
+
+def _probes(*pairs: tuple[str, reconcile.ProbeOutcome]) -> list[reconcile.Probe]:
+    return [reconcile.Probe(uid, uid, outcome) for uid, outcome in pairs]
+
+
+_M, _R, _F, _U, _A = (
+    reconcile.ProbeOutcome.MISCONFIGURED,
+    reconcile.ProbeOutcome.REFERRED,
+    reconcile.ProbeOutcome.FAULT,
+    reconcile.ProbeOutcome.UNAVAILABLE,
+    reconcile.ProbeOutcome.ABSENT,
+)
+
+
+@pytest.mark.parametrize(
+    ("pairs", "aborted"),
+    [
+        ((("m", _M),), reconcile.MISCONFIGURED_ABORT),
+        ((("m", _M), ("u", _U)), reconcile.MISCONFIGURED_ABORT),
+        # A referral names the fix most closely, then the refusal; a fault names none.
+        ((("m", _M), ("f", _F)), reconcile.MISCONFIGURED_ABORT),
+        ((("m", _M), ("r", _R)), reconcile.REFERRAL_ABORT),
+        # THE CONTROL: failures alone are an outage, which pages nobody.
+        ((("u", _U), ("v", _U)), "directory_unavailable"),
+    ],
+    ids=["refusals", "refusals-and-failures", "beside-a-fault", "beside-a-referral", "outage"],
+)
+def test_a_pass_of_configuration_refusals_aborts_on_its_own_slug(
+    pairs: tuple[tuple[str, reconcile.ProbeOutcome], ...], aborted: str
+) -> None:
+    """BACKLOG #3010. A deleted or moved search base refuses every probe with noSuchObject. Read as
+    an outage, that pass paged nobody; before #3010 it read as "not found" and struck everyone. It
+    aborts as ``directory_misconfigured``, which judges nothing and alerts, and never revokes.
+
+    RED before D3b: there is no such outcome, and the refusal read as an outage."""
+    plan = _plan(_probes(*pairs), prior_strikes={"m": 1, "u": 1})
+    assert plan.aborted == aborted
+    assert plan.judged_nothing and plan.revocations == () and plan.strikes == {}
+    assert plan.directory_misconfigured is (aborted == reconcile.MISCONFIGURED_ABORT)
+    assert plan.misconfigured == tuple(uid for uid, o in pairs if o is _M)
+
+
+def test_a_configuration_refusal_beside_answers_leaves_only_that_account_unjudged() -> None:
+    """Like a referral or a fault: the refused account keeps its strike and its recorded outcome,
+    and the rest of the pass is judged, revocations included."""
+    plan = _plan(
+        _probes(("m", _M), ("gone", _A)),
+        prior_strikes={"m": 1, "gone": 1},
+        prior_outcomes={"m": reconcile.ProbeOutcome.PRESENT},
+    )
+    assert plan.aborted is None and not plan.judged_nothing
+    assert plan.misconfigured == ("m",)
+    assert "m" not in plan.strikes and "m" not in plan.outcomes
+    assert [r.user_id for r in plan.revocations] == ["gone"]
+
+
 def test_breaker_ceiling_reports_the_larger_of_the_two_thresholds() -> None:
     assert reconcile.breaker_ceiling(probed=10, max_absolute=5, max_fraction=0.34) == 5
     assert reconcile.breaker_ceiling(probed=300, max_absolute=5, max_fraction=0.34) == 102
@@ -923,7 +1037,7 @@ async def test_a_referring_user_search_base_judges_nothing_and_pages_every_pass(
             "reason": "directory_referral",
             "referred": 2,
             "unavailable": 0,
-            "probed": 2,
+            "asked": 2,
             "aborted": "directory_referral",
         }
         assert len(referred) == 3 and all(d == expected for d in referred)
@@ -1312,7 +1426,7 @@ async def test_when_every_probe_raises_the_operator_sees_a_probe_fault_not_an_ou
             "reason": "probe_fault",
             "faulted": 2,
             "unavailable": 0,
-            "probed": 2,
+            "asked": 2,
             "aborted": "probe_fault",
         }
         assert _faulted_rows(audit) == [expected, expected]
@@ -1687,6 +1801,252 @@ async def test_a_referral_does_not_mark_an_id_less_row_it_can_never_confirm() ->
 
         assert plan.referred == (ids["alice"],)
         assert service._reconcile_referred == {ids["alice"], ids["bob"]}
+    finally:
+        await store.close()
+
+
+async def test_a_referral_is_counted_over_the_probes_asked() -> None:
+    """BACKLOG #3170 item 1. An id-less row is never sent to the directory, so no referral could
+    answer it. The referral's row, its latched message and its alert count the probes asked, and
+    the row names the field ``asked``, as the outage's row does (#2434).
+
+    RED before #3170: all three counted ``probed``, which takes in the id-less row."""
+    from messagefoundry.api.app import _alert_reconcile_plan
+    from messagefoundry.pipeline.alerts import LoggingAlertSink
+
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap(
+            {
+                "alice": _principal("alice"),
+                "bob": _principal("bob"),
+                "jdoe": replace(_principal("jdoe"), directory_object_id=None),
+            }
+        )
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for name in ("alice", "bob", "jdoe"):
+            assert await _signed_in_ad_user(service, store, name) is not None
+        ldap.referring.add("alice")
+
+        plan = await service.reconcile_directory_sessions()
+
+        assert (plan.probed, plan.asked, len(plan.referred)) == (3, 2, 1)
+        [row] = _referred_rows(await store.list_audit())
+        assert row["asked"] == 2 and "probed" not in row
+        message = service.directory_reconcile_referral
+        assert message is not None and "1 of 2 signed-in" in message
+
+        counts: list[tuple[str, int]] = []
+
+        class _Sink(LoggingAlertSink):
+            def ad_reconcile_aborted(
+                self, name: str, *, reason: str, probed: int, detail: str
+            ) -> None:
+                counts.append((reason, probed))
+
+        _alert_reconcile_plan(plan, service, _Sink())
+        assert counts == [("directory_referral", 2)]
+        # The breaker's page keeps its judged denominator, which counts the id-less row.
+        counts.clear()
+        tripped = replace(plan, aborted="mass_revoke_breaker")
+        _alert_reconcile_plan(tripped, service, _Sink())
+        assert counts == [("mass_revoke_breaker", 3), ("directory_referral", 2)]
+    finally:
+        await store.close()
+
+
+def _no_such_base() -> LdapUnansweredError:
+    """What ``_search`` raises when the user search base was deleted: engine text, a code and its
+    name, never the directory's diagnostic message."""
+    return LdapUnansweredError(
+        "AD ended the user search with result code 32 (noSuchObject), which is not an answer",
+        code=32,
+        code_name="noSuchObject",
+    )
+
+
+#: The two unjudged outcomes that count over the probes asked besides the referral: what makes
+#: ``alice``'s probe one, its audit action, the row field holding its count, the plan field, the
+#: latched message's property and the alert's reason.
+_COUNTED_OVER_ASKED = [
+    pytest.param(
+        lambda: KeyError("userAccountControl"),
+        "auth.ad_reconcile_faulted",
+        "faulted",
+        "directory_reconcile_fault",
+        reconcile.PROBE_FAULT_ABORT,
+        id="probe-fault",
+    ),
+    pytest.param(
+        _no_such_base,
+        "auth.ad_reconcile_misconfigured",
+        "misconfigured",
+        "directory_reconcile_misconfigured",
+        reconcile.MISCONFIGURED_ABORT,
+        id="configuration-refusal",
+    ),
+]
+
+
+@pytest.mark.parametrize(("raised", "action", "field", "latch", "reason"), _COUNTED_OVER_ASKED)
+async def test_a_fault_or_refusal_is_counted_over_the_probes_asked(
+    raised: Any, action: str, field: str, latch: str, reason: str
+) -> None:
+    """The twin of the referral's test above (BACKLOG #3170, Manager ruling: one event, one count).
+    The fault's row, message and alert count the probes asked, so the id-less row is left out, and
+    the row names the field ``asked``. The configuration refusal (BACKLOG #3010) does the same.
+
+    RED before D3b: the fault's row carried ``probed`` and its alert counted the id-less row."""
+    from messagefoundry.api.app import _alert_reconcile_plan
+    from messagefoundry.pipeline.alerts import LoggingAlertSink
+
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap(
+            {
+                "alice": _principal("alice"),
+                "bob": _principal("bob"),
+                "jdoe": replace(_principal("jdoe"), directory_object_id=None),
+            }
+        )
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for name in ("alice", "bob", "jdoe"):
+            assert await _signed_in_ad_user(service, store, name) is not None
+        ldap.broken["alice"] = raised()
+
+        plan = await service.reconcile_directory_sessions()
+
+        assert (plan.probed, plan.asked, len(getattr(plan, field))) == (3, 2, 1)
+        [row] = [json.loads(a["detail"]) for a in await store.list_audit() if a["action"] == action]
+        assert row["asked"] == 2 and "probed" not in row
+        message = getattr(service, latch)
+        assert message is not None and "1 of 2 signed-in" in message
+
+        counts: list[tuple[str, int]] = []
+
+        class _Sink(LoggingAlertSink):
+            def ad_reconcile_aborted(
+                self, name: str, *, reason: str, probed: int, detail: str
+            ) -> None:
+                counts.append((reason, probed))
+
+        _alert_reconcile_plan(plan, service, _Sink())
+        assert counts == [(reason, 2)]
+        # The breaker's page keeps its judged denominator, which counts the id-less row.
+        counts.clear()
+        _alert_reconcile_plan(replace(plan, aborted="mass_revoke_breaker"), service, _Sink())
+        assert counts == [("mass_revoke_breaker", 3), (reason, 2)]
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(("raised", "action", "field", "latch", "reason"), _COUNTED_OVER_ASKED)
+async def test_a_pass_of_faults_or_refusals_only_strikes_an_id_less_row_and_never_revokes_it(
+    raised: Any, action: str, field: str, latch: str, reason: str
+) -> None:
+    """BACKLOG #3170 item 3 at the service, for a pass that judged nothing the directory answered.
+    The id-less row is struck on every such pass, past the strike threshold, and its session is
+    never revoked: only a pass that is not aborted can revoke it. Then one such pass ends, and the
+    row is revoked on the next clean pass, which proves the strikes were counted."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap(
+            {
+                "alice": _principal("alice"),
+                "jdoe": replace(_principal("jdoe"), directory_object_id=None),
+            }
+        )
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        token = await _signed_in_ad_user(service, store, "jdoe")
+        assert token is not None and await _signed_in_ad_user(service, store, "alice") is not None
+        jdoe = await store.get_user_by_username("jdoe")
+        assert jdoe is not None
+        ldap.broken["alice"] = raised()
+
+        for strike in (1, 2, 3):  # the threshold is 2
+            plan = await service.reconcile_directory_sessions()
+            assert plan.aborted == reason and plan.judged_nothing
+            assert plan.revocations == () and plan.strikes == {jdoe.id: strike}
+            assert await service.identity_for_token(token) is not None, "an aborted pass revoked"
+        audit = await store.list_audit()
+        assert not any(a["action"] == "auth.ad_session_revoked" for a in audit)
+
+        del ldap.broken["alice"]  # THE CONTROL: the first pass that is not aborted revokes it
+        plan = await service.reconcile_directory_sessions()
+        assert [(r.user_id, r.reason) for r in plan.revocations] == [
+            (jdoe.id, "directory_object_id_missing")
+        ]
+    finally:
+        await store.close()
+
+
+async def test_a_deleted_search_base_aborts_alerts_and_never_revokes(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #3010 limb 5. A deleted or moved user search base answers noSuchObject for every
+    account on every pass. Before #3010 it read "not found", struck everyone and tripped the
+    breaker; with #3010 alone it read as an outage, which pages nobody. Now each pass aborts as
+    ``directory_misconfigured``: one ERROR naming the code and no account, a latched message
+    naming the settings, a misconfigured row, and no skipped or aborted row. One refusal beside a
+    healthy account is recorded the same way; a pass with none releases the message.
+
+    RED before D3b: the pass is ``directory_unavailable`` and nothing latches."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap({"jdoe": _principal("jdoe"), "asmith": _principal("asmith")})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        tokens = [await _signed_in_ad_user(service, store, u) for u in ("jdoe", "asmith")]
+        for name in ("jdoe", "asmith"):
+            ldap.broken[name] = _no_such_base()
+
+        for _ in range(3):  # past the strike threshold
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+                plan = await service.reconcile_directory_sessions()
+            assert plan.aborted == reconcile.MISCONFIGURED_ABORT and plan.directory_misconfigured
+            assert not plan.directory_outage and plan.judged_nothing
+            assert len(plan.misconfigured) == 2 and plan.revocations == ()
+            assert not plan.breaker_clear and not plan.hold_clear and not plan.referral_clear
+            errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+            assert len(errors) == 1 and "noSuchObject" in errors[0]
+            assert "jdoe" not in errors[0] and "asmith" not in errors[0]
+        for token in tokens:
+            assert token is not None and await service.identity_for_token(token) is not None
+        message = service.directory_reconcile_misconfigured
+        assert message is not None and "revoked nothing" in message
+        assert "ad_user_search_base" in message[:200]
+        audit = await store.list_audit()
+        rows = [
+            json.loads(a["detail"])
+            for a in audit
+            if a["action"] == "auth.ad_reconcile_misconfigured"
+        ]
+        expected = {
+            "reason": "directory_misconfigured",
+            "misconfigured": 2,
+            "unavailable": 0,
+            "asked": 2,
+            "aborted": "directory_misconfigured",
+        }
+        assert rows == [expected] * 3
+        assert not any(
+            a["action"] in ("auth.ad_reconcile_skipped", "auth.ad_reconcile_aborted") for a in audit
+        )
+
+        del ldap.broken["asmith"]  # one refusal beside a healthy account
+        plan = await service.reconcile_directory_sessions()
+        assert plan.aborted is None and plan.misconfigured != ()
+        assert service.directory_reconcile_misconfigured is not None
+        assert "judged as usual" in service.directory_reconcile_misconfigured
+
+        del ldap.broken["jdoe"]  # the base is restored
+        plan = await service.reconcile_directory_sessions()
+        assert plan.aborted is None and plan.misconfigured == ()
+        assert service.directory_reconcile_misconfigured is None
     finally:
         await store.close()
 
@@ -2095,8 +2455,13 @@ async def _reported(store: MessageStore) -> list[str]:
 
 @pytest.mark.parametrize(
     "refusal",
-    [sqlite3.OperationalError("synthetic: disk I/O error"), CipherError("synthetic: Transit down")],
-    ids=["driver", "transit-mac"],
+    [
+        sqlite3.OperationalError("synthetic: disk I/O error"),
+        CipherError("synthetic: Transit down"),
+        # aiosqlite's closed connection, raised before sqlite3 is reached (BACKLOG #3145 carry-over).
+        ValueError("no active connection"),
+    ],
+    ids=["driver", "transit-mac", "closed-connection"],
 )
 async def test_a_refused_skip_report_logs_once_per_pass_and_tries_the_next_account_next(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, refusal: Exception
@@ -2105,7 +2470,8 @@ async def test_a_refused_skip_report_logs_once_per_pass_and_tries_the_next_accou
     the first failure ended the pass; now the report stops at the first refusal, which also keeps
     a pool that times out each write to one timeout per pass. The
     account it refused goes last next pass, so the next account is tried. Both are reported once the
-    store accepts the write. A Transit outage refuses like a driver error (ADR 0138)."""
+    store accepts the write. A Transit outage refuses like a driver error (ADR 0138), and so does a
+    closed aiosqlite connection."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _two_unkeyed_bindings(store)
@@ -2337,8 +2703,9 @@ class _CapturingNotifier:
     def __init__(self) -> None:
         self.sent: list[Any] = []
 
-    async def notify(self, event: Any) -> None:
+    async def notify(self, event: Any) -> bool:
         self.sent.append(event)
+        return True
 
 
 async def test_a_rename_and_a_role_change_in_one_pass_record_one_consistent_name() -> None:
@@ -3660,8 +4027,8 @@ async def test_a_scope_revocation_sends_no_account_disabled_notice() -> None:
 
 
 #: vault BACKLOG #2140. The notice each revocation reason sends, decided once. ``None`` is no notice.
-#: ACCOUNT_DISABLED says an administrator disabled the account, so only the reason that READ the
-#: disabled bit may send it.
+#: ACCOUNT_DISABLED says the directory reports the account disabled, so only the reason that READ
+#: the disabled bit may send it.
 _NOTICE_FOR_REASON: dict[str, str | None] = {
     "directory_disabled": ACCOUNT_DISABLED,
     "directory_absent": DIRECTORY_SESSIONS_ENDED,
@@ -3701,7 +4068,9 @@ async def test_each_revocation_reason_sends_its_decided_notice(reason: str) -> N
         expected = _NOTICE_FOR_REASON[reason]
         assert [e.event_type for e in notifier.sent] == ([] if expected is None else [expected])
         if expected is not None:
-            assert notifier.sent[0].detail == {"reason": reason}
+            # ``source`` words ROLES_CHANGED and ACCOUNT_DISABLED for the directory (vault
+            # BACKLOG #3121); every reconciler notice carries it.
+            assert notifier.sent[0].detail == {"reason": reason, "source": "directory"}
     finally:
         await store.close()
 

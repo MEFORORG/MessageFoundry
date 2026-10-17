@@ -54,8 +54,9 @@ class _FakeNotifier:
     def __init__(self) -> None:
         self.events: list[SecurityEvent] = []
 
-    async def notify(self, event: SecurityEvent) -> None:
+    async def notify(self, event: SecurityEvent) -> bool:
         self.events.append(event)
+        return True
 
 
 async def _store() -> MessageStore:
@@ -211,11 +212,11 @@ async def test_a_lockout_crossed_on_the_second_factor_is_in_the_users_feed() -> 
 
 async def test_the_lockout_row_is_written_when_a_notifier_is_wired_too() -> None:
     store = await _store()
+    notifier = _FakeNotifier()
+    service = AuthService(
+        store, AuthSettings(lockout_threshold=3, require_mfa=False), security_notifier=notifier
+    )
     try:
-        notifier = _FakeNotifier()
-        service = AuthService(
-            store, AuthSettings(lockout_threshold=3, require_mfa=False), security_notifier=notifier
-        )
         await _local_user(store)
         for _ in range(3):
             await service.login("bob", WRONG_PASSWORD)
@@ -228,4 +229,6 @@ async def test_the_lockout_row_is_written_when_a_notifier_is_wired_too() -> None
         # The count stays in the notice, beside the lock kind and its cycle count (ADR 0197).
         assert notices[0].detail == {"failed_attempts": 3, "lock": "sign_in", "cycle": 1}
     finally:
+        # Again here, so a failure above cannot leave the notice running (vault BACKLOG #3120).
+        await service.drain_background(timeout=20.0)
         await store.close()

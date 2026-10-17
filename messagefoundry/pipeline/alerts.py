@@ -528,12 +528,15 @@ class AlertSink(Protocol):
         ``ad_group_map`` with ``name`` = ``ad-group:<group>`` when a group newly maps to the role.
         A directory sign-in whose role sync newly grants the role (vault BACKLOG #2610) raises it
         with ``name`` = ``user:<username>`` and ``via`` = ``directory_sign_in_negotiate``,
-        ``directory_sign_in_sso`` or ``directory_sign_in_oidc``, naming the route.
+        ``directory_sign_in_sso`` or ``directory_sign_in_oidc``, naming the route. A directory
+        reconcile pass whose role re-diff newly grants it (vault BACKLOG #3141) raises it with
+        ``name`` = ``user:<username>`` and ``via`` = ``directory_reconcile``.
         Both keys are outside the connection-name grammar for the same reason as
         :meth:`approval_approver_provenance`. ``granted_by`` is the acting administrator's username,
-        or ``<directory>`` on a directory sign-in, where no administrator acted.
-        No PHI. Emitted by the API's user-administration and directory sign-in routes, never from
-        ``auth/``."""
+        or ``<directory>`` on a directory sign-in or reconcile pass, where no administrator acted.
+        No PHI. Emitted by the API's user-administration and directory sign-in routes, and for the
+        reconciler through the callable :func:`administrator_granted_alert` builds, which the API
+        lifespan hands to the auth service, so ``auth/`` never imports a sink."""
         ...
 
     def no_enabled_administrator(self, name: str, *, via: str) -> None:
@@ -560,17 +563,23 @@ class AlertSink(Protocol):
         which leaves the referred accounts unjudged and may sit beside revocations the pass applied;
         or one or more probes raised a fault the engine could not read (``probe_fault``, BACKLOG
         #3100, the ``auth.ad_reconcile_faulted`` row), which leaves those accounts unjudged the same
-        way. The type's name predates the second and third cases. Read ``reason`` before naming the
-        cause.
+        way; or the directory refused one or more probes with a result code that points at the
+        configuration, such as a deleted or moved search base (``directory_misconfigured``, BACKLOG
+        #3010, the ``auth.ad_reconcile_misconfigured`` row), which leaves those accounts unjudged the
+        same way. The type's name predates every case but the first. Read ``reason`` before naming
+        the cause.
 
         ``name`` labels the source: ``"directory-reconciler"`` for the breaker,
-        ``"directory-reconciler-referral"`` for a referral, and
-        ``"directory-reconciler-probe-fault"`` for a probe fault, so each is its own instance and
-        throttle. ``reason`` is one of those three closed-set slugs. ``probed`` is how many
-        principals the pass probed. ``detail`` is the operator-facing explanation the auth service
-        latches. No PHI. Emitted by the API-lifespan
-        reconciler task, never from ``auth/``. A whole-directory outage is NOT this event: it is
-        audited as ``auth.ad_reconcile_skipped`` and pages nothing, because the accounts are fine."""
+        ``"directory-reconciler-referral"`` for a referral, ``"directory-reconciler-probe-fault"``
+        for a probe fault, and ``"directory-reconciler-misconfigured"`` for a configuration refusal,
+        so each is its own instance and throttle. ``reason`` is one of those four closed-set slugs.
+        ``probed`` is, for the breaker, how many principals the pass judged, its denominator; for
+        each of the other three, how many probes the pass sent to the directory, which leaves out
+        an id-less row (BACKLOG #3170). ``detail`` is the operator-facing explanation the auth
+        service latches. No PHI. Emitted by the API-lifespan reconciler task, never from ``auth/``.
+        A whole-directory outage is NOT this event: it is audited as ``auth.ad_reconcile_skipped``
+        and pages nothing, because the accounts are fine. A pass where every probe fails and none is
+        referred, refused or faults is such an outage."""
         ...
 
     def ad_reconcile_held(self, name: str, *, reason: str, undetermined: int, detail: str) -> None:
@@ -1128,7 +1137,9 @@ class LoggingAlertSink:
 
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
         log.warning(
-            "ALERT ad_reconcile_aborted: %r left accounts unrevoked in a pass of %d principal(s) "
+            # The count is the candidates the breaker judged, or for every other source the probes
+            # the pass asked (BACKLOG #3170); see AlertSink.ad_reconcile_aborted.
+            "ALERT ad_reconcile_aborted: %r left accounts unrevoked, counting %d principal(s) "
             "(%s): %s",
             name,
             probed,
@@ -1340,6 +1351,23 @@ def no_enabled_administrator_alert(sink: AlertSink) -> Callable[[str, str], None
             sink.no_enabled_administrator(f"user:{username}", via=via)
         except Exception:  # noqa: BLE001 — an alert-sink failure must never break a request
             log.warning("the no_enabled_administrator alert could not be delivered", exc_info=True)
+
+    return _raise
+
+
+def administrator_granted_alert(sink: AlertSink, *, granted_by: str) -> Callable[[str, str], None]:
+    """An alert callable for :class:`~messagefoundry.auth.service.AuthService`: each call, with a
+    username and a ``via``, raises :meth:`AlertSink.administrator_granted` keyed ``user:<username>``
+    and naming ``granted_by`` (vault BACKLOG #3141). The API passes its directory marker, because
+    the service calls this only for a grant the directory made.
+
+    Never raises: an alert failure must not change what a reconcile pass does."""
+
+    def _raise(username: str, via: str) -> None:
+        try:
+            sink.administrator_granted(f"user:{username}", via=via, granted_by=granted_by)
+        except Exception:  # noqa: BLE001 — an alert-sink failure must never break a request
+            log.warning("the administrator_granted alert could not be delivered", exc_info=True)
 
     return _raise
 

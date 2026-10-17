@@ -8613,12 +8613,13 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
             return "no_channel"
         notifier.start()
         try:
-            await notifier.notify(
+            queued = await notifier.notify(
                 SecurityEvent(event_type=MFA_ENABLED, username=user.username, email=address)
             )
         finally:
             await notifier.aclose()
-        return "dispatched"
+        # What the notifier said it took (vault BACKLOG #3120), never a forecast.
+        return "dispatched" if queued else "no_channel"
 
     try:
         report["holder_notice"] = run_guarded(notice())

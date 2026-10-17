@@ -592,8 +592,9 @@ class _CapturingNotifier:
     def __init__(self) -> None:
         self.sent: list[SecurityEvent] = []
 
-    async def notify(self, event: SecurityEvent) -> None:
+    async def notify(self, event: SecurityEvent) -> bool:
         self.sent.append(event)
+        return True
 
 
 async def test_a_login_rename_sends_the_holder_one_username_notice() -> None:
@@ -1148,6 +1149,9 @@ class _RecordingConn:
 
     def __exit__(self, *exc: object) -> None:
         return None
+
+    def unbind(self) -> None:
+        """The lookups release the service connection explicitly (BACKLOG #3010)."""
 
     def search(self, **kwargs: Any) -> None:
         self.searches.append(kwargs)

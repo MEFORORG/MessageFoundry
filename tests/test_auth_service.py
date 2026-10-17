@@ -50,8 +50,9 @@ class _FakeNotifier:
     def __init__(self) -> None:
         self.events: list[SecurityEvent] = []
 
-    async def notify(self, event: SecurityEvent) -> None:
+    async def notify(self, event: SecurityEvent) -> bool:
         self.events.append(event)
+        return True
 
 
 async def _store() -> MessageStore:
@@ -450,9 +451,9 @@ async def _local_user(store: MessageStore, *, email: str = "bob@example.org") ->
 
 async def test_notifier_fires_once_on_account_lockout() -> None:
     store = await _store()
+    notifier = _FakeNotifier()
+    service = AuthService(store, AuthSettings(lockout_threshold=3), security_notifier=notifier)
     try:
-        notifier = _FakeNotifier()
-        service = AuthService(store, AuthSettings(lockout_threshold=3), security_notifier=notifier)
         await _local_user(store)
         for _ in range(3):
             await service.login("bob", "wrong", client="10.0.0.9")
@@ -464,6 +465,8 @@ async def test_notifier_fires_once_on_account_lockout() -> None:
         assert locked[0].email == "bob@example.org"
         assert locked[0].client_ip == "10.0.0.9"
     finally:
+        # Again here, so a failure above cannot leave the notice running (vault BACKLOG #3120).
+        await service.drain_background(timeout=20.0)
         await store.close()
 
 
@@ -601,7 +604,7 @@ async def test_notifier_absent_does_not_break_auth() -> None:
 class _BoomNotifier:
     """A notifier whose notify() always raises — exercises AuthService's best-effort guard."""
 
-    async def notify(self, event: SecurityEvent) -> None:
+    async def notify(self, event: SecurityEvent) -> bool:
         raise RuntimeError("notifier down")
 
 
@@ -631,7 +634,7 @@ async def test_notifier_failure_is_isolated_from_the_auth_op() -> None:
 class _AddressQuotingNotifier:
     """A notifier that raises with the event's address and detail in its message."""
 
-    async def notify(self, event: SecurityEvent) -> None:
+    async def notify(self, event: SecurityEvent) -> bool:
         raise RuntimeError(f"cannot mail {event.email}: {event.detail}")
 
 
@@ -828,6 +831,8 @@ async def test_notifier_fires_on_ad_driven_role_change() -> None:
         assert len(changes) == 2
         assert changes[-1].username == "jdoe" and changes[-1].email == "jdoe@example.org"
         assert changes[-1].detail.get("roles") == ["viewer"]
+        # Worded for the directory, as the reconciler's notice is (vault BACKLOG #3121).
+        assert changes[-1].detail.get("source") == "directory"
     finally:
         await store.close()
 
@@ -945,6 +950,8 @@ async def test_clearing_the_profile_address_leaves_the_account_still_notifiable(
         later = notifier.events[before:]
         assert [e.event_type for e in later] == [ROLES_CHANGED]
         assert later[0].email == "bob@example.org"
+        # An administrator's act keeps the administrator wording (vault BACKLOG #3121).
+        assert "source" not in later[0].detail
     finally:
         await store.close()
 

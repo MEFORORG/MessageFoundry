@@ -182,6 +182,7 @@ from messagefoundry.store.sealed_cache import (
     new_state_cache,
     sealed_reference_set,
 )
+from messagefoundry.store.session_lineage import revoke_through_lineage
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
@@ -729,6 +730,18 @@ _SCHEMA: list[str] = [
     "CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit_log(ts)",
     # recent_audit_of: the start's config baseline read (vault BACKLOG #2597).
     "CREATE INDEX IF NOT EXISTS ix_audit_action ON audit_log(action, id)",
+    # The lock notice's throttle read, one account's rows of one action (vault BACKLOG #3120). Keyed
+    # on a PREFIX of the actor, because `actor` is unbounded TEXT and a btree entry over about 2.7 KB
+    # fails the INSERT: a sign-in can audit a typed username of any length, and an index on the whole
+    # value would turn an overlong one into a failed audit write. `_audit_where` filters on the same
+    # prefix and then on the whole value, so the planner can seek it. 200 characters is at most
+    # 800 bytes.
+    "CREATE INDEX IF NOT EXISTS ix_audit_actor ON audit_log(left(actor, 200), action, id)",
+    # One account's rows of any action, newest first: GET /audit?actor=, its export pages and
+    # /me/security-events (vault BACKLOG #3120). The SQLite `_SCHEMA` says why ix_audit_actor alone
+    # is not enough there. The same actor prefix, for the same reason; `_audit_where` and
+    # `_security_events_where_pg` both filter on it.
+    "CREATE INDEX IF NOT EXISTS ix_audit_actor_id ON audit_log(left(actor, 200), id)",
     # No table beside audit_log says where its keying starts: the process that holds the key decides,
     # and the chain's own row at sequence number 1 (the genesis row) names the first range's key.
     # Per-key AES-GCM invocation bound (ASVS 11.3.4) — see the SQLite `_SCHEMA` for the
@@ -918,6 +931,15 @@ _SCHEMA: list[str] = [
     )""",
     "CREATE INDEX IF NOT EXISTS ix_sessions_user ON sessions(user_id)",
     "CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at)",
+    # Which token hash replaced a retired one (vault BACKLOG #3028, ADR 0210). The SQLite `_SCHEMA`
+    # says who reads it and why it is unsealed. Adding this DDL moves _schema_hash() automatically
+    # -- the ADR 0064 bump.
+    """CREATE TABLE IF NOT EXISTS session_lineage (
+        retired_hash   TEXT PRIMARY KEY,
+        successor_hash TEXT NOT NULL,
+        retired_at     DOUBLE PRECISION NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_session_lineage_retired ON session_lineage(retired_at)",
     # WebAuthn passkeys (WP-14b, ADR 0068 §4). credential_id_hash — sha256 hex of the raw credential
     # id (the sessions.token_hash precedent) — is the parity-safe PK on all 3 backends; sign_count is
     # BIGINT (a WebAuthn uint32 overflows signed INT); label is column-capped so ux_webauthn_label
@@ -1178,6 +1200,15 @@ _PG_SESSION_RESEAL: Final = (
     " client=$6, reauth_at=$7, mfa_verified_at=$8, auth_mechanism=$9, idp_auth_time=$10,"
     " user_epoch=$11, seal=$12 WHERE token_hash=$13 AND seal=$14"
 )
+# Vault BACKLOG #3028: store.py's three session lineage statements respelled for `$n`. store.py says
+# which method runs each, and that no other statement names the table.
+_PG_SESSION_LINEAGE_INSERT: Final = (
+    "INSERT INTO session_lineage (retired_hash, successor_hash, retired_at) VALUES ($1,$2,$3)"
+)
+_PG_SESSION_LINEAGE_SUCCESSOR: Final = (
+    "SELECT successor_hash FROM session_lineage WHERE retired_hash=$1 AND retired_at >= $2"
+)
+_PG_SESSION_LINEAGE_PURGE: Final = "DELETE FROM session_lineage WHERE retired_at < $1"
 #: The whole-account session sweep: revoke and blank the seal (BACKLOG #2592). Each caller raises
 #: the account's session epoch in the same transaction.
 _PG_REVOKE_USER_SESSIONS_SQL: Final = (
@@ -8038,7 +8069,10 @@ class PostgresStore:
         params: list[Any] = []
         if actor is not None:
             params.append(actor)
-            clauses.append(f"actor = ${len(params)}")
+            # The prefix term lets the planner seek ix_audit_actor and ix_audit_actor_id, which are
+            # keyed on that prefix (vault BACKLOG #3120); the whole-value term decides the match.
+            n = len(params)
+            clauses.append(f"left(actor, 200) = left(${n}::text, 200) AND actor = ${n}")
         if action is not None:
             params.append(action)
             clauses.append(f"action = ${len(params)}")
@@ -9763,16 +9797,25 @@ class PostgresStore:
         async with self._timed_acquire(record=False) as conn, conn.transaction():
             await self._write_session(conn, token_hash, stamp)
 
-    async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
+    async def rotate_session(
+        self, token_hash: str, *, new_token_hash: str, now: float | None = None
+    ) -> bool:
         """Re-key a live session in place (ASVS 7.2.4). See :meth:`AuthStore.rotate_session`.
 
         The token hash is sealed, so the re-key goes through :meth:`_write_session` (BACKLOG
-        #2592). The answer is read after the transaction has committed. The borrow is
+        #2592). The lineage link goes in the same transaction, only when the re-key landed (vault
+        BACKLOG #3028), its time read once the re-key has landed, after any wait for the borrow
+        or the row lock. The answer is read after the transaction has committed. The borrow is
         :meth:`_after_commit_txn`'s, for the reason it gives."""
         async with self._after_commit_txn() as conn:
             rotated = await self._write_session(
                 conn, token_hash, lambda s: replace(s, token_hash=new_token_hash)
             )
+            if rotated is not None:
+                retired_at = time.time() if now is None else now
+                await conn.execute(
+                    _PG_SESSION_LINEAGE_INSERT, token_hash, new_token_hash, retired_at
+                )
         return rotated is not None
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None:
@@ -9783,15 +9826,33 @@ class PostgresStore:
             token_hash,
         )
 
-    async def supersede_session(self, token_hash: str, *, now: float) -> SessionRecord | None:
-        """Revoke and return in one statement (BACKLOG #2146). See :meth:`AuthStore.supersede_session`."""
-        d = await self._fetchone(
-            "UPDATE sessions SET revoked_at=$1, seal='' WHERE token_hash=$2 AND revoked_at IS NULL"
-            " RETURNING *",
-            now,
-            token_hash,
-        )
-        return SessionRecord.from_mapping(dict(d)) if d else None
+    async def supersede_session(
+        self, token_hash: str, *, now: float, lineage_since: float | None = None
+    ) -> SessionRecord | None:
+        """Revoke and return, one statement per step, in one transaction (BACKLOG #2146, vault
+        BACKLOG #3028). See :meth:`AuthStore.supersede_session`.
+
+        Each step's ``UPDATE ... RETURNING`` locks the row it ends. Under READ COMMITTED each
+        statement reads what has committed when it starts, so a rotation that commits while the
+        walk runs is seen by the next step's lineage read. The borrow stays bounded, as it was."""
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+
+            async def _revoke(h: str) -> SessionRecord | None:
+                d = await conn.fetchrow(
+                    "UPDATE sessions SET revoked_at=$1, seal='' WHERE token_hash=$2"
+                    " AND revoked_at IS NULL RETURNING *",
+                    now,
+                    h,
+                )
+                return SessionRecord.from_mapping(dict(d)) if d else None
+
+            async def _successor(h: str, since: float) -> str | None:
+                found = await conn.fetchval(_PG_SESSION_LINEAGE_SUCCESSOR, h, since)
+                return None if found is None else str(found)
+
+            return await revoke_through_lineage(
+                token_hash, lineage_since=lineage_since, revoke=_revoke, successor=_successor
+            )
 
     async def revoke_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
@@ -9852,19 +9913,27 @@ class PostgresStore:
         )
 
     async def purge_expired_sessions(
-        self, *, now: float | None = None, idle_seconds: float | None = None
+        self,
+        *,
+        now: float | None = None,
+        idle_seconds: float | None = None,
+        lineage_seconds: float | None = None,
     ) -> int:
         now = time.time() if now is None else now
         # Through `_execute`, the bounded borrow, rather than `self._pool.execute`, which acquires
         # with no timeout (BACKLOG #1052). `_execute` borrows with `record=False`, which keeps this
         # hourly sweep out of the worker acquire-wait curve, and returns the count (BACKLOG #2283).
         if idle_seconds is None:
-            return await self._execute("DELETE FROM sessions WHERE expires_at < $1", now)
-        return await self._execute(
-            "DELETE FROM sessions WHERE expires_at < $1 OR $1 - last_used_at > $2",
-            now,
-            float(idle_seconds),
-        )
+            purged = await self._execute("DELETE FROM sessions WHERE expires_at < $1", now)
+        else:
+            purged = await self._execute(
+                "DELETE FROM sessions WHERE expires_at < $1 OR $1 - last_used_at > $2",
+                now,
+                float(idle_seconds),
+            )
+        if lineage_seconds is not None:
+            await self._execute(_PG_SESSION_LINEAGE_PURGE, now - float(lineage_seconds))
+        return purged
 
     # --- retention / purge + maintenance (PHI.md §8) -------------------------
 
@@ -10459,10 +10528,13 @@ def _pg_cutoff_case(
 def _security_events_where_pg(username: str, until: float | None) -> tuple[str, list[Any]]:
     """The ``$N`` ``WHERE`` text and values for one user's security-event page and its total
     (BACKLOG #2438), shared so the two count one set. The SQLite builder states the rule, including
-    the lower bound at the account's ``created_at`` (BACKLOG #1152)."""
+    the lower bound at the account's ``created_at`` (BACKLOG #1152).
+
+    The actor prefix term lets the planner seek ``ix_audit_actor_id``, which is keyed on that
+    prefix, as ``_audit_where`` does (vault BACKLOG #3120); the whole-value term decides the match."""
     params: list[Any] = [username]
     clause = (
-        " WHERE actor = $1 AND action LIKE 'auth.%'"
+        " WHERE left(actor, 200) = left($1::text, 200) AND actor = $1 AND action LIKE 'auth.%'"
         " AND ts >= (SELECT created_at FROM users WHERE username = $1)"
     )
     if until is not None:

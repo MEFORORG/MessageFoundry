@@ -171,8 +171,9 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
         self._queue: asyncio.Queue[_T | None] = asyncio.Queue(maxsize=max_queue)
         self._task: asyncio.Task[None] | None = None
 
-    def _enqueue(self, item: _T, *, dropped: str | None) -> None:
+    def _enqueue(self, item: _T, *, dropped: str | None) -> bool:
         """Non-blocking enqueue; on a full queue, drop the item with a warning (``dropped`` names it).
+        Returns whether the item was queued.
 
         ``dropped=None`` drops without a line, for an item whose drop must not show in the general
         log (a lock notice, BACKLOG #1131; see ``auth.notifications.LOG_SILENT_EVENT_TYPES``)."""
@@ -181,6 +182,8 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
         except asyncio.QueueFull:
             if dropped is not None:
                 log.warning("%s queue full; dropping %s", type(self).__name__, dropped)
+            return False
+        return True
 
     def start(self) -> None:
         if self._task is None:
@@ -1154,12 +1157,14 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # BACKLOG #315: the Administrator role was granted. `user:<username>` or `ad-group:<group>`
         # stands in for "connection" (the key's grammar is on AlertSink). `granted_by` is the granting
         # administrator's operator account name, or the fixed marker `<directory>` when a directory
-        # sign-in's role sync made the grant (vault BACKLOG #2610). Never message content.
+        # sign-in's role sync or a reconcile pass made the grant (vault BACKLOG #2610, #3141). Never
+        # message content.
         # Vault BACKLOG #3229: every administrator_granted call pops the _last_sent key built from
         # the no_enabled_administrator alert type and the granted target, so a loss after an
         # administrator_granted re-grant is not held back by the earlier loss's cooldown. A
-        # reconciler re-grant calls no administrator_granted, so it pops nothing. The pop builds that key with its own
-        # f-string in `_emit`'s key format; tests/test_directory_last_admin_alert.py pins the match.
+        # reconciler re-grant raises administrator_granted too (vault BACKLOG #3141), so it pops the
+        # key the same way. The pop builds that key with its own f-string in `_emit`'s key format;
+        # tests/test_directory_last_admin_alert.py pins the match.
         # Only a `user:` target can match a loss key, so an `ad-group:` grant pops nothing. _last_sent is
         # per process, so this clears the cooldown in this process only. _occurrences and _suspended
         # are kept. Unlike crl_reload_applied, this resolves no open instance.
@@ -1176,8 +1181,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
         # ADR 0079 mechanism 2: the mass-revoke breaker tripped and the pass applied nothing, or one
-        # or more probes were referred (BACKLOG #2538) or faulted (BACKLOG #3100) and left unjudged;
-        # `reason` tells which. The
+        # or more probes were referred (BACKLOG #2538), refused for the configuration (BACKLOG
+        # #3010) or faulted (BACKLOG #3100) and left unjudged; `reason` tells which. The
         # fixed source label keys the throttle, so a standing misconfiguration that trips every pass
         # pages once per cooldown rather than once per pass. `detail` is the latched operator explanation,
         # and it is what the instance's reason column shows (detail wins over reason there).

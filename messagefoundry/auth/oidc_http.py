@@ -42,6 +42,7 @@ import http.client
 import ssl
 import urllib.request
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from messagefoundry.auth.oidc.jwks import _MAX_JWKS_BYTES
 from messagefoundry.auth.trust_anchors import oidc_anchor_spec, verified_anchor_cadata
@@ -59,7 +60,10 @@ from messagefoundry.transports.bounded_read import (
     reply_framing_fault,
 )
 
-__all__ = ["build_idp_opener", "jwks_fetcher"]
+if TYPE_CHECKING:
+    from messagefoundry.config.settings import AuthSettings
+
+__all__ = ["build_idp_opener", "build_idp_opener_from_settings", "jwks_fetcher"]
 
 #: Wall-clock bound for a single IdP HTTP round trip. Deliberately short: both legs run inside a
 #: browser request, and a hung IdP must degrade the federated login, never pin a worker thread.
@@ -141,6 +145,28 @@ def build_idp_opener(
     narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
     harden_cipher_suites(ctx, connector="OIDC identity provider (token + JWKS)")
     return build_strict_opener(_NoRedirectHandler, urllib.request.HTTPSHandler(context=ctx))
+
+
+def build_idp_opener_from_settings(
+    settings: AuthSettings, *, enforcing: bool, anchor: bool = True
+) -> urllib.request.OpenerDirector:
+    """:func:`build_idp_opener` with its arguments read from ``[auth]``, so the engine and the
+    federation check cannot read the anchor, pin or CRL file differently (vault BACKLOG #3145 item
+    3). Only the argument assembly is shared: each caller keeps its own answer to a failure, a
+    refused start in ``AuthService`` and a check row in ``verify.federation``.
+
+    ``anchor=False`` leaves the anchor and its pin out, for the federation check's revocation row
+    alone. The CRL file is the hop's own knob (BACKLOG #299) and is passed either way.
+
+    The settings preamble the check legs in ``messagefoundry/checks.py`` repeat is not shared here:
+    that refactor is declined, because it would collide with vault BACKLOG #3063 on the same
+    helper."""
+    return build_idp_opener(
+        settings.oidc_tls_ca_cert_file if anchor else None,
+        pin=settings.oidc_tls_ca_cert_pin if anchor else None,
+        enforcing=enforcing,
+        crl_file=settings.oidc_tls_crl_file,
+    )
 
 
 def jwks_fetcher(

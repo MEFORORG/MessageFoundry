@@ -348,7 +348,8 @@ async def test_service_threads_enforcement_dial_and_pin_to_the_oidc_anchor(
         )
         return urllib.request.build_opener()
 
-    monkeypatch.setattr("messagefoundry.auth.service.build_idp_opener", spy)
+    # The helper both build sites share (vault BACKLOG #3145) calls the module-level builder.
+    monkeypatch.setattr("messagefoundry.auth.oidc_http.build_idp_opener", spy)
     # The CRL path must name a real file: [auth].oidc_tls_crl_file refuses a missing one at load
     # (BACKLOG #1997). The spy never reads it, so its content does not matter.
     crl = tmp_path / "idp-crl.pem"
@@ -855,8 +856,9 @@ class _CapturingNotifier:
     def __init__(self) -> None:
         self.events: list[Any] = []
 
-    async def notify(self, event: Any) -> None:
+    async def notify(self, event: Any) -> bool:
         self.events.append(event)
+        return True
 
 
 async def test_the_admin_bind_audits_and_notifies_and_a_login_never_does(

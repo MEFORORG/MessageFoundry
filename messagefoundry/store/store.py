@@ -184,6 +184,7 @@ from messagefoundry.store.sealed_cache import (
     new_state_cache,
     sealed_reference_set,
 )
+from messagefoundry.store.session_lineage import revoke_through_lineage
 from messagefoundry.store.transit_attestation import (
     TRANSIT_BOUND_ATTESTED_ACTION,
     TRANSIT_BOUND_WITHDRAWN_ACTION,
@@ -1278,6 +1279,18 @@ _SESSION_RESEAL: Final = (
     " client=?, reauth_at=?, mfa_verified_at=?, auth_mechanism=?, idp_auth_time=?, user_epoch=?,"
     " seal=? WHERE token_hash=? AND seal=?"
 )
+
+# Vault BACKLOG #3028, ADR 0210: the session lineage's three statements, in `?` form for SQLite and
+# SQL Server; postgres.py respells them for `$n`. The INSERT runs only inside rotate_session's own
+# transaction, the SELECT only inside supersede_session's, and the DELETE only from the session
+# purge. No other statement names the table: a retired hash must authenticate nothing.
+_SESSION_LINEAGE_INSERT: Final = (
+    "INSERT INTO session_lineage (retired_hash, successor_hash, retired_at) VALUES (?,?,?)"
+)
+_SESSION_LINEAGE_SUCCESSOR: Final = (
+    "SELECT successor_hash FROM session_lineage WHERE retired_hash=? AND retired_at >= ?"
+)
+_SESSION_LINEAGE_PURGE: Final = "DELETE FROM session_lineage WHERE retired_at < ?"
 
 
 def session_reseal_params(new: SessionRecord, old: SessionRecord) -> tuple[object, ...]:
@@ -6760,6 +6773,13 @@ CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit_log(ts);
 -- The newest row of a few actions (recent_audit_of): the start's config baseline read, vault BACKLOG
 -- #2597. Without it that read walks the whole chain newest-first until one of the actions turns up.
 CREATE INDEX IF NOT EXISTS ix_audit_action ON audit_log(action, id);
+-- One account's rows of one action, newest first: the lock notice's 24-hour throttle read, vault
+-- BACKLOG #3120. Without it that read walks every recent row of the action, for every account.
+CREATE INDEX IF NOT EXISTS ix_audit_actor ON audit_log(actor, action, id);
+-- One account's rows of any action, newest first: GET /audit?actor=, its export pages and
+-- /me/security-events, vault BACKLOG #3120. ix_audit_actor alone made the planner seek the actor
+-- there and then sort every one of its rows to read the newest few.
+CREATE INDEX IF NOT EXISTS ix_audit_actor_id ON audit_log(actor, id);
 
 -- There is no table beside audit_log that says where its keying starts. Whether a chain is keyed is
 -- decided by the process that holds the key, and the first range's key is named by the chain's own
@@ -6968,6 +6988,17 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS ix_sessions_user    ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at);
 
+-- Which token hash replaced a retired one, written by rotate_session in its own transaction (vault
+-- BACKLOG #3028, ADR 0210). Read by the login supersession ONLY, never by a session read, so a
+-- retired hash authenticates nothing. Not sealed: store/session_lineage.py says why. No FK, and the
+-- session reaper purges rows past the window the supersession follows them for.
+CREATE TABLE IF NOT EXISTS session_lineage (
+    retired_hash   TEXT PRIMARY KEY,           -- the hash the rotation retired
+    successor_hash TEXT NOT NULL,              -- the hash the session carried next
+    retired_at     REAL NOT NULL               -- when the re-key landed, in its transaction (wall clock)
+);
+CREATE INDEX IF NOT EXISTS ix_session_lineage_retired ON session_lineage(retired_at);
+
 CREATE TABLE IF NOT EXISTS webauthn_credentials (
     credential_id_hash TEXT PRIMARY KEY,       -- sha256 hex of the RAW credential id (sessions.token_hash
                                                -- precedent): WebAuthn ids may be up to 1023 raw bytes —
@@ -6996,7 +7027,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_webauthn_label ON webauthn_credentials(user
 -- and client host where a sign-in finished owing nothing more, or a step-up or enrolment passed
 -- (AuthService._mark_login_address_known says when). Keyed on the account id, never the
 -- username, so a re-created namesake inherits nothing. The primary key serves the signal's one read
--- (WHERE user_id), so audit_log, which has no actor index, is never scanned for it. Plaintext like
+-- (WHERE user_id), so audit_log is never read for it. Plaintext like
 -- sessions.client: a network address, not PHI (docs/PHI.md section 2). ON DELETE CASCADE because
 -- the write is best-effort and may race delete_user: a row inserted just before the account's
 -- delete goes with it, and one inserted after fails the key and is dropped by the caller.
@@ -15834,17 +15865,26 @@ class MessageStore:
             await self._write_session(token_hash, stamp)
             await self._commit()
 
-    async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
+    async def rotate_session(
+        self, token_hash: str, *, new_token_hash: str, now: float | None = None
+    ) -> bool:
         """Re-key a live session in place (ASVS 7.2.4). See :meth:`AuthStore.rotate_session`.
 
         ``token_hash`` is the PK, so this is a key update: the row keeps every other column and the
         old hash stops resolving in the same transaction. The token hash is sealed, so the re-key
         re-seals (BACKLOG #2592). Reports whether a row was re-keyed so the caller can fail closed
-        when the session was revoked out from under it."""
+        when the session was revoked out from under it. The lineage link is written in the same
+        transaction, and only when the re-key landed (vault BACKLOG #3028). Its time is read once
+        the re-key has landed, so a wait for the lock cannot age the link before it exists."""
         async with _writer_txn(self._db, self._lock):
             rotated = await self._write_session(
                 token_hash, lambda s: replace(s, token_hash=new_token_hash)
             )
+            if rotated is not None:
+                retired_at = time.time() if now is None else now
+                await self._db.execute(
+                    _SESSION_LINEAGE_INSERT, (token_hash, new_token_hash, retired_at)
+                )
             await self._commit()
         return rotated is not None
 
@@ -15857,28 +15897,41 @@ class MessageStore:
             )
             await self._commit()
 
-    async def supersede_session(self, token_hash: str, *, now: float) -> SessionRecord | None:
-        """Revoke, then read the row back in the SAME transaction (BACKLOG #2146). See
+    async def supersede_session(
+        self, token_hash: str, *, now: float, lineage_since: float | None = None
+    ) -> SessionRecord | None:
+        """Revoke, then read the row back in the SAME transaction (BACKLOG #2146), following the
+        session lineage when ``lineage_since`` is given (vault BACKLOG #3028). See
         :meth:`AuthStore.supersede_session`.
 
-        Two statements here rather than one ``UPDATE ... RETURNING``, because ``RETURNING`` needs
-        SQLite 3.35 and a Linux Python can link an older system library. They are still one unit:
-        the writer lock orders them against every in-process writer, ``rotate_session`` included,
-        and the write lock the ``UPDATE`` takes holds until the commit, so no other process can
-        re-key the row between them."""
-        async with _writer_guard(self._db, self._lock):
+        Two statements per step rather than one ``UPDATE ... RETURNING``, because ``RETURNING``
+        needs SQLite 3.35 and a Linux Python can link an older system library. They are still one
+        unit: the writer lock orders them against every in-process writer, ``rotate_session``
+        included. The first ``UPDATE`` takes SQLite's write lock even when it matches no row, and
+        holds it until the commit, so no other process can re-key a row while the walk runs."""
+
+        async def _revoke(h: str) -> SessionRecord | None:
             cur = await self._db.execute(
                 "UPDATE sessions SET revoked_at=?, seal='' WHERE token_hash=? AND revoked_at IS NULL",
-                (now, token_hash),
+                (now, h),
             )
-            row = None
-            if cur.rowcount:
-                cur = await self._db.execute(
-                    "SELECT * FROM sessions WHERE token_hash=?", (token_hash,)
-                )
-                row = await cur.fetchone()
+            if not cur.rowcount:
+                return None
+            cur = await self._db.execute("SELECT * FROM sessions WHERE token_hash=?", (h,))
+            row = await cur.fetchone()
+            return SessionRecord.from_mapping(dict(row)) if row else None
+
+        async def _successor(h: str, since: float) -> str | None:
+            cur = await self._db.execute(_SESSION_LINEAGE_SUCCESSOR, (h, since))
+            row = await cur.fetchone()
+            return str(row[0]) if row else None
+
+        async with _writer_guard(self._db, self._lock):
+            ended = await revoke_through_lineage(
+                token_hash, lineage_since=lineage_since, revoke=_revoke, successor=_successor
+            )
             await self._commit()
-        return SessionRecord.from_mapping(dict(row)) if row else None
+        return ended
 
     async def revoke_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
@@ -15958,7 +16011,11 @@ class MessageStore:
             return int(cur.rowcount)
 
     async def purge_expired_sessions(
-        self, *, now: float | None = None, idle_seconds: float | None = None
+        self,
+        *,
+        now: float | None = None,
+        idle_seconds: float | None = None,
+        lineage_seconds: float | None = None,
     ) -> int:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
@@ -15969,8 +16026,11 @@ class MessageStore:
                     "DELETE FROM sessions WHERE expires_at < ? OR ? - last_used_at > ?",
                     (now, now, float(idle_seconds)),
                 )
+            purged = cur.rowcount if cur.rowcount is not None else 0
+            if lineage_seconds is not None:
+                await self._db.execute(_SESSION_LINEAGE_PURGE, (now - float(lineage_seconds),))
             await self._commit()
-            return cur.rowcount if cur.rowcount is not None else 0
+            return purged
 
     async def db_status(self) -> DbStatus:
         """Database health snapshot (size, free space, journal mode, row counts).

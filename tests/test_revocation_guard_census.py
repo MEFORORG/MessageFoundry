@@ -69,6 +69,9 @@ _BUILDERS = frozenset(
         "_verifying_context",
         "_build_tls_context",
         "build_idp_opener",
+        # The settings-reading wrapper both IdP opener sites call (vault BACKLOG #3145), so those
+        # two stay the sites and the wrapper hands its opener on, as build_idp_opener does.
+        "build_idp_opener_from_settings",
         "NarrowedTls",
     }
 )

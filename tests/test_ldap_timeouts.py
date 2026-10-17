@@ -378,9 +378,12 @@ def test_no_login_can_be_told_from_another_by_the_directory_work_it_costs() -> N
     # never driven. Only the bind/release pair is pinned here: the construction counts are already
     # owned by test_authenticate_builds_only_finitely_timed_ldap_objects, and a second copy of that
     # number is a second place to update.
+    # Two releases: the user (or decoy) connection, and since BACKLOG #3010 the service-account
+    # connection too, which ldap3's own ``with`` had left open on every branch alike.
     _, _, binds, unbinds = next(iter(measured.values()))
-    assert (binds, unbinds) == (1, 1), (
-        f"expected every branch to issue exactly one bind and release it once; got {measured}"
+    assert (binds, unbinds) == (1, 2), (
+        "expected every branch to issue exactly one bind and release both connections once; got "
+        f"{measured}"
     )
 
 
@@ -670,7 +673,9 @@ def test_a_rejected_password_still_unbinds_the_user_connection(
     assert len(rec.connections) == 2, (
         f"expected a service bind then a user bind; recorded {len(rec.connections)}"
     )
-    assert len(rec.unbinds) == 1, (
+    # The service connection is released too since BACKLOG #3010, so count the user's by its DN.
+    assert rec.unbinds.count("CN=alice,OU=Users,DC=example,DC=com") == 1, (
         "the user connection was NOT unbound on the rejected-password path — the release procedure "
         "documented in docs/CONNECTIONS.md Table B does not run where it matters most (ASVS 13.1.3)"
     )
+    assert len(rec.unbinds) == 2, f"expected the service and user connections; got {rec.unbinds}"

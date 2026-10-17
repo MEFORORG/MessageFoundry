@@ -90,6 +90,8 @@ _TABLES = (
     "reference",
     "reference_version",
     "sessions",
+    "session_lineage",  # vault BACKLOG #3028 (no FK): a link left behind would lead a later test's
+    #                     supersession into a session it never retired
     "webauthn_credentials",  # ADR 0068: FK to users(id) — must clear before users
     "known_login_addresses",  # vault BACKLOG #2145: FK to users(id), cleared before users
     "user_roles",
@@ -5446,11 +5448,19 @@ async def test_cell_tag_contract(store) -> None:
 
 
 async def test_session_supersession_contract(store) -> None:
-    """BACKLOG #2146: supersede_session revokes and returns in one statement, so a rotation after it
-    fails closed. Extra-free shared contract, run here as on SQLite."""
+    """BACKLOG #2146: supersede_session revokes and returns in one transaction, so a rotation after
+    it fails closed. Extra-free shared contract, run here as on SQLite."""
     from tests._session_rotation_contract import assert_session_supersession_contract
 
     await assert_session_supersession_contract(store)
+
+
+async def test_session_lineage_contract(store) -> None:
+    """Vault BACKLOG #3028: a rotation links the hash it retired, the supersession follows the
+    links inside its window, and the purge drops them past it. Extra-free shared contract."""
+    from tests._session_rotation_contract import assert_session_lineage_contract
+
+    await assert_session_lineage_contract(store)
 
 
 async def test_session_cap_contract(store) -> None:

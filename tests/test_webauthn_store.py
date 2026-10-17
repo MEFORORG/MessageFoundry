@@ -112,3 +112,15 @@ async def test_session_supersession_contract_sqlite(tmp_path: Path) -> None:
         await assert_session_supersession_contract(store)
     finally:
         await store.close()
+
+
+async def test_session_lineage_contract_sqlite(tmp_path: Path) -> None:
+    """SQLite leg of the vault BACKLOG #3028 session lineage contract, shared with the live Postgres
+    / SQL Server suites."""
+    store = await MessageStore.open(tmp_path / "lin.db")
+    try:
+        from tests._session_rotation_contract import assert_session_lineage_contract
+
+        await assert_session_lineage_contract(store)
+    finally:
+        await store.close()
