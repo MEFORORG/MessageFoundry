@@ -638,7 +638,7 @@ class TcpSource(SourceConnector):
                 if refusal.kind is not None:
                     await self._emit_event(refusal.kind, peer_host=peer_host, reason=refusal.reason)
                 return  # closed in the outer finally
-            self._admission.admit(peer_host)
+            epoch = self._admission.admit(peer_host)
             try:
                 # Inside the try whose finally releases the slot, so a cancellation delivered at
                 # this await cannot leak a per-host count.
@@ -718,7 +718,7 @@ class TcpSource(SourceConnector):
                 failed = True  # peer reset; nothing to do but drop the connection
                 await self._emit_event("peer_reset", peer_host=peer_host, reason=safe_exc(exc))
             finally:
-                self._admission.release(peer_host)
+                self._admission.release(peer_host, epoch)
         finally:
             self._clients.discard(writer)
             if task is not None:

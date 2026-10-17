@@ -6676,8 +6676,9 @@ CREATE INDEX IF NOT EXISTS ix_resend_message ON resend_log(message_id);
 -- files another system owns can be polled without moving/deleting them and a left file is ingested
 -- ONCE. Shaped like `delivered_keys`/`resend_log`: HASHES + IDS ONLY, no body/PHI, so it is stored in
 -- the clear (NOT part of the `_cipher` seam). `file_key` is a SHA-256 of the file's identity
--- (relative-path+mtime+size local / full-remote-path+size remote — the PATH is folded in, not just the
--- basename, so two same-named files under different subdirs stay distinct and are BOTH ingested) — a
+-- (relative-path+mtime+size local / full-remote-path+size+the listed mtime remote, the mtime only where
+-- the server lists one, BACKLOG #2758 — the PATH is folded in, not just the basename, so two
+-- same-named files under different subdirs stay distinct and are BOTH ingested) — a
 -- DERIVED id, NEVER a cleartext path (a filename/path can embed an MRN) and never logged at INFO+.
 -- `channel_id` is the inbound connection name (config metadata, non-PHI) — scopes the dedup + the
 -- age/count prune per connection. The row is INSERTed AFTER the file's message(s) emit successfully (the
