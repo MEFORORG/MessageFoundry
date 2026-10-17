@@ -536,3 +536,19 @@ async def test_a_discard_cancelled_while_it_waits_for_the_lock_still_removes_the
         f"upload {lost.file_id} has no upload.create audit row and its removal was cancelled"
         in (caplog.text)
     ), caplog.text
+
+
+async def test_a_discard_whose_removal_is_cancelled_does_not_raise_into_its_caller(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Review: the removal's own cancellation surfaced as a CancelledError from a caller nobody
+    cancelled, replacing the error the caller was handling. It is logged by file_id instead."""
+    store = _uploads(tmp_path, None)
+    meta = await store.save(data=b"x\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    async with store._quota_lock:
+        discard = asyncio.create_task(store.discard(meta.file_id))
+        await asyncio.sleep(0.02)  # the removal waits for the lock
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.uploads"):
+            await store.drain_stragglers(timeout=0.0, grace=1.0)
+    await asyncio.wait_for(discard, 10)  # returns rather than raising the removal's cancel
+    assert f"upload {meta.file_id} has no upload.create audit row" in caplog.text, caplog.text
