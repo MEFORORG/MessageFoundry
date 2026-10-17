@@ -10,17 +10,17 @@ as ``ABSENT``, and after the strike threshold it would revoke a present account.
 search would read the same answer as fewer groups. ``_search`` now refuses every code but success
 with :class:`LdapUnansweredError`, which every caller already reads as an outage.
 
-Two follow-ups ride here. The nested group search is paged, so an account in more groups than a
-directory's unpaged cap would not end it with sizeLimitExceeded, and a page that does not end with
-success refuses the whole search. And a result code ldap3 has no name for, which its default fast
-decoder raises ``KeyError`` on from inside ``conn.search``, is mapped to the same refusal.
+A follow-up rides here. The nested group search is paged, so an account in more groups than a
+directory's unpaged cap would not end it with sizeLimitExceeded, a page that does not end with
+success refuses the whole search, and a refused search is abandoned. A response ldap3 cannot decode,
+such as a result code outside its table, is ``tests/test_ldap_decode_boundary.py``'s subject, and
+the loopback server it uses lives here.
 
 Driven at four depths: ``_search`` itself over a bare double; the REAL ``LdapAuthenticator`` over
 the ldap3 doubles of ``tests/test_ad_user_account_control.py`` and ``tests/test_ldap_timeouts.py``;
 the REAL ``AuthService`` reconciler and Kerberos sign-in over those; and a REAL ldap3 stack against
-a loopback server, for the paging control and the unknown code, which no double can reproduce. Each
-refusal has a control on the same doubles: success with no entries still reads absent, and still
-revokes.
+a loopback server, for the paging control, which no double can reproduce. Each refusal has a
+control on the same doubles: success with no entries still reads absent, and still revokes.
 
 **Not exercised:** a real domain controller. The doubles set the result dict the way ldap3 2.9.1's
 synchronous strategy leaves it. Synthetic data only; nothing here touches PHI.
@@ -43,7 +43,6 @@ import pytest
 from ldap3.core.results import (
     RESULT_ADMIN_LIMIT_EXCEEDED,
     RESULT_BUSY,
-    RESULT_CODES,
     RESULT_INSUFFICIENT_ACCESS_RIGHTS,
     RESULT_INVALID_DN_SYNTAX,
     RESULT_NO_SUCH_OBJECT,
@@ -441,16 +440,29 @@ def _replay(conn: Any, page: dict[str, Any], wrap: Callable[[Any], object] = lam
     return bool(result["result"] == RESULT_SUCCESS)
 
 
-class _PagedConn:
-    """A bare double that answers its n-th search with ``pages[n]``, recording each search."""
+_ABANDONED = _page(RESULT_SUCCESS, [], b"")
+"""What a directory answers the RFC 2696 abandon with: success, no entries, an empty cookie."""
 
-    def __init__(self, pages: list[dict[str, Any]]) -> None:
-        self._pages = pages
+
+class _PagedConn:
+    """A bare double that answers its n-th search with ``pages[n]``, recording each search. A search
+    with a page size of zero is the abandon: it is recorded in ``abandons`` instead."""
+
+    def __init__(
+        self, pages: list[dict[str, Any]], abandon_raises: Exception | None = None
+    ) -> None:
+        self._pages, self._abandon_raises = pages, abandon_raises
         self.calls: list[dict[str, Any]] = []
+        self.abandons: list[dict[str, Any]] = []
         self.result: dict[str, Any] | None = None
         self.entries: list[object] = []
 
     def search(self, **kwargs: Any) -> bool:
+        if kwargs.get("paged_size") == 0:
+            self.abandons.append(kwargs)
+            if self._abandon_raises is not None:
+                raise self._abandon_raises
+            return _replay(self, _ABANDONED)
         self.calls.append(kwargs)
         return _replay(self, self._pages[min(len(self.calls), len(self._pages)) - 1])
 
@@ -472,6 +484,7 @@ def test_a_paged_search_reads_every_page_and_sends_each_cookie_back() -> None:
     ]
     assert {call["paged_size"] for call in conn.calls} == {ldap_module._PAGE_SIZE}
     assert all(call["search_base"] == _GROUPS for call in conn.calls)
+    assert conn.abandons == [], "a search that ended is not abandoned"
 
 
 def test_a_directory_that_ignores_the_page_request_is_read_once() -> None:
@@ -481,6 +494,18 @@ def test_a_directory_that_ignores_the_page_request_is_read_once() -> None:
     conn = _PagedConn([_page(RESULT_SUCCESS, [entry], None)])
     assert ldap_module._search_paged(conn, "group search") == [entry]
     assert len(conn.calls) == 1
+    assert conn.abandons == []
+
+
+def _abandoned_with(conn: _PagedConn) -> list[object]:
+    """The cookie each abandon sent, after checking it repeats the paged search's own request."""
+    asked = {k: v for k, v in conn.calls[0].items() if k not in ("paged_size", "paged_cookie")}
+    for abandon in conn.abandons:
+        assert {k: v for k, v in abandon.items() if k != "paged_cookie"} == {
+            **asked,
+            "paged_size": 0,
+        }, "RFC 2696: the abandon is the same search with a page size of zero"
+    return [abandon["paged_cookie"] for abandon in conn.abandons]
 
 
 @pytest.mark.parametrize(
@@ -488,29 +513,76 @@ def test_a_directory_that_ignores_the_page_request_is_read_once() -> None:
     [(RESULT_BUSY, False), (RESULT_SIZE_LIMIT_EXCEEDED, True), (4242, False)],
     ids=["51-busy", "4-sizeLimitExceeded-partial", "4242-unknown"],
 )
+@pytest.mark.parametrize(
+    ("refused_cookie", "abandoned_with"),
+    [(b"synthetic-cookie-2", b"synthetic-cookie-2"), (None, b"synthetic-cookie-1")],
+    ids=["refused-page-has-a-cookie", "refused-page-has-none"],
+)
 def test_a_later_page_that_did_not_end_with_success_refuses_the_whole_search(
-    code: int, partial: bool
+    code: int, partial: bool, refused_cookie: bytes | None, abandoned_with: bytes
 ) -> None:
-    """No silent truncation: the first page's entries are not returned as the whole answer."""
+    """No silent truncation: the first page's entries are not returned as the whole answer. The
+    search is abandoned with the newest cookie the directory sent (review finding 10)."""
     conn = _PagedConn(
         [
             _page(RESULT_SUCCESS, [object()], b"synthetic-cookie-1"),
-            _page(code, [object()] if partial else [], b"synthetic-cookie-2"),
+            _page(code, [object()] if partial else [], refused_cookie),
         ]
     )
     with pytest.raises(LdapUnansweredError, match="group search") as refused:
-        ldap_module._search_paged(conn, "group search")
+        ldap_module._search_paged(conn, "group search", search_base=_GROUPS)
     assert refused.value.code == code
     assert len(conn.calls) == 2
+    assert _abandoned_with(conn) == [abandoned_with]
+
+
+def test_a_refused_first_page_is_not_abandoned() -> None:
+    """The directory sent no cookie, so it holds no paging state to drop."""
+    conn = _PagedConn([_page(RESULT_BUSY, [], None)])
+    with pytest.raises(LdapUnansweredError, match=r"result code 51 \(busy\)"):
+        ldap_module._search_paged(conn, "group search")
+    assert conn.abandons == []
+
+
+def test_a_later_page_answered_with_a_referral_is_refused_and_abandoned() -> None:
+    referred = {**_page(10, [], None), "referrals": ["ldaps://dc9.other.invalid/DC=other"]}
+    conn = _PagedConn([_page(RESULT_SUCCESS, [object()], b"synthetic-cookie-1"), referred])
+    with pytest.raises(LdapReferralError):
+        ldap_module._search_paged(conn, "group search")
+    assert _abandoned_with(conn) == [b"synthetic-cookie-1"]
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        ldap3.core.exceptions.LDAPSocketReceiveError("synthetic"),
+        LdapUnansweredError("synthetic", code=RESULT_BUSY, code_name="busy"),
+    ],
+    ids=["ldap3-error", "refused"],
+)
+def test_an_abandon_that_fails_leaves_the_original_refusal(fault: Exception) -> None:
+    """Best effort: what the abandon answers, or raises, never replaces why the search failed."""
+    conn = _PagedConn(
+        [
+            _page(RESULT_SUCCESS, [object()], b"synthetic-cookie-1"),
+            _page(RESULT_BUSY, [], None),
+        ],
+        abandon_raises=fault,
+    )
+    with pytest.raises(LdapUnansweredError, match=r"result code 51 \(busy\)") as refused:
+        ldap_module._search_paged(conn, "group search")
+    assert refused.value is not fault
+    assert len(conn.abandons) == 1
 
 
 def test_a_directory_that_never_stops_paging_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ldap_module, "_MAX_PAGES", 3)
     conn = _PagedConn([_page(RESULT_SUCCESS, [object()], b"synthetic-again")])
     with pytest.raises(LdapUnansweredError, match="still paging after 3 pages") as refused:
-        ldap_module._search_paged(conn, "group search")
+        ldap_module._search_paged(conn, "group search", search_base=_GROUPS)
     assert len(conn.calls) == 3
     assert (refused.value.code, refused.value.code_name) == (None, "too many pages")
+    assert _abandoned_with(conn) == [b"synthetic-again"]
 
 
 _UNREADABLE_CONTROLS = [
@@ -550,11 +622,17 @@ def test_a_later_page_that_drops_the_paging_control_refuses_the_whole_search(
         ldap_module._search_paged(conn, "group search")
     assert (refused.value.code, refused.value.code_name) == (None, "paging control lost")
     assert len(conn.calls) == 2
+    assert _abandoned_with(conn) == [b"synthetic-cookie-1"]
 
 
-def _paged_groups(monkeypatch: pytest.MonkeyPatch, pages: list[dict[str, Any]]) -> list[object]:
+def _paged_groups(
+    monkeypatch: pytest.MonkeyPatch,
+    pages: list[dict[str, Any]],
+    abandons: list[object] | None = None,
+) -> list[object]:
     """Over the ``_install_fakes`` doubles, answer the n-th group search with ``pages[n]``. Returns
-    the cookies each group search sent."""
+    the cookies each group search sent. An abandon (a page size of zero) is answered with success,
+    and its cookie goes to ``abandons`` instead."""
     base = ldap3.Connection
     sent: list[object] = []
 
@@ -563,6 +641,10 @@ def _paged_groups(monkeypatch: pytest.MonkeyPatch, pages: list[dict[str, Any]]) 
             answered: bool = super().search(**kwargs)
             if not _group_search(kwargs):
                 return answered
+            if kwargs.get("paged_size") == 0:
+                if abandons is not None:
+                    abandons.append(kwargs.get("paged_cookie"))
+                return _replay(self, _ABANDONED)
             sent.append(kwargs.get("paged_cookie"))
             return _replay(self, pages[len(sent) - 1], lambda dn: SimpleNamespace(entry_dn=dn))
 
@@ -598,67 +680,21 @@ def test_a_busy_later_page_refuses_the_sign_in_rather_than_dropping_its_groups(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_fakes(monkeypatch)
+    abandons: list[object] = []
     _paged_groups(
         monkeypatch,
         [
             _page(RESULT_SUCCESS, [_group_dn(1)], b"synthetic-cookie-1"),
             _page(RESULT_BUSY, [], None),
         ],
+        abandons,
     )
     with pytest.raises(LdapUnansweredError, match=r"group search with result code 51 \(busy\)"):
         LdapAuthenticator(_ad_settings()).authenticate("alice", "synthetic-pw")
+    assert abandons == [b"synthetic-cookie-1"]
 
 
-# --- a result code ldap3 has no name for -----------------------------------------------------------
-
-
-def _raising(*args: object) -> Callable[..., bool]:
-    def call(*_a: object, **_kw: object) -> bool:
-        raise KeyError(*args)
-
-    return call
-
-
-def test_a_key_error_naming_an_unknown_code_is_the_same_refusal() -> None:
-    """ldap3's fast decoder raises ``KeyError(code)`` for a code outside ``RESULT_CODES``."""
-    conn = SimpleNamespace(search=_raising(4242), result=None, entries=[])
-    with pytest.raises(LdapUnansweredError, match="an unknown result code") as refused:
-        ldap_module._search(conn, "user search")
-    assert refused.value.code == 4242
-    assert isinstance(refused.value.__cause__, KeyError)
-
-
-def test_a_bind_ending_with_an_unknown_code_is_the_same_refusal() -> None:
-    """The decoder raises the same ``KeyError`` on a bind response, so the wrap every bind runs in
-    maps it too."""
-    with (
-        pytest.raises(LdapUnansweredError, match="bind with result code 4242") as refused,
-        ldap_module._socket_faults_as_ldap_error(),
-    ):
-        _raising(4242)()
-    assert refused.value.code == 4242
-
-
-_OTHER_KEY_ERRORS = pytest.mark.parametrize(
-    "args",
-    [("objectGUID",), (RESULT_BUSY,), (True,), (), (4242, "x")],
-    ids=["a-name", "a-known-code", "a-bool", "no-args", "two-args"],
-)
-
-
-@_OTHER_KEY_ERRORS
-def test_any_other_key_error_is_the_engines_own_and_propagates(args: tuple[object, ...]) -> None:
-    """Mapped, an engine defect would read as an outage, which the reconciler logs at debug."""
-    conn = SimpleNamespace(search=_raising(*args), result=None, entries=[])
-    with pytest.raises(KeyError) as raised:
-        ldap_module._search(conn, "user search")
-    assert not isinstance(raised.value, LdapError)
-    with pytest.raises(KeyError) as raised, ldap_module._socket_faults_as_ldap_error():
-        _raising(*args)()
-    assert not isinstance(raised.value, LdapError)
-
-
-# --- through a real ldap3 stack: the paging control and the unknown code --------------------------
+# --- through a real ldap3 stack: the paging control ----------------------------------------------
 
 _IN_CHAIN = b"1.2.840.113556.1.4.1941"  # the nested group search's matching rule, on the wire
 
@@ -692,16 +728,21 @@ def _entry(dn: str) -> _Reply:
 
 
 class _ScriptedDc:
-    """A loopback LDAP server, after ``tests/test_ldap_referrals.py``'s ``_FakeDc``. Binds end with
-    ``bind_code``, an extended operation such as Who am I with ``extended_code``; each search is
-    answered by ``answer(raw request)``. ``searches`` holds every
-    search request's bytes."""
+    """A loopback LDAP server, after ``tests/test_ldap_referrals.py``'s ``_FakeDc``. A bind is
+    answered by ``bind_reply(raw request)``, or with success where that is absent or returns
+    ``None``; an extended operation such as Who am I ends with ``extended_code``; each search is
+    answered by ``answer(raw request)``. ``searches`` holds every search request's bytes, and
+    ``ended`` is set when a client's socket closes."""
 
     def __init__(
-        self, answer: Callable[[bytes], list[_Reply]], bind_code: int, extended_code: int
+        self,
+        answer: Callable[[bytes], list[_Reply]],
+        extended_code: int,
+        bind_reply: Callable[[bytes], _Reply | None] | None = None,
     ) -> None:
-        self._answer, self._bind_code, self._extended_code = answer, bind_code, extended_code
+        self._answer, self._extended_code, self._bind_reply = answer, extended_code, bind_reply
         self.searches: list[bytes] = []
+        self.ended = threading.Event()
         self._listener = socket.create_server(("127.0.0.1", 0))
         self.port: int = self._listener.getsockname()[1]
         threading.Thread(target=self._accept, daemon=True).start()
@@ -715,23 +756,27 @@ class _ScriptedDc:
             threading.Thread(target=self._session, args=(sock,), daemon=True).start()
 
     def _session(self, sock: socket.socket) -> None:
-        with sock, contextlib.suppress(OSError):
-            sock.settimeout(10)
-            while (message := _read_message(sock)) is not None:
-                raw, body = message
-                message_id = body[: 2 + body[1]]  # the messageID INTEGER, echoed verbatim
-                op = body[2 + body[1]]
-                if op == _BIND_REQUEST:
-                    replies = [_done(self._bind_code, tag=_BIND_RESPONSE)]
-                elif op == _EXTENDED_REQUEST:
-                    replies = [_done(self._extended_code, tag=_EXTENDED_RESPONSE)]
-                elif op == _SEARCH_REQUEST:
-                    self.searches.append(raw)
-                    replies = self._answer(raw)
-                else:  # unbind, or anything this server does not speak
-                    return
-                for reply, controls in replies:
-                    sock.sendall(_tlv(0x30, message_id + reply + controls))
+        try:
+            with sock, contextlib.suppress(OSError):
+                sock.settimeout(10)
+                while (message := _read_message(sock)) is not None:
+                    raw, body = message
+                    message_id = body[: 2 + body[1]]  # the messageID INTEGER, echoed verbatim
+                    op = body[2 + body[1]]
+                    if op == _BIND_REQUEST:
+                        scripted = self._bind_reply(raw) if self._bind_reply else None
+                        replies = [scripted or _done(RESULT_SUCCESS, tag=_BIND_RESPONSE)]
+                    elif op == _EXTENDED_REQUEST:
+                        replies = [_done(self._extended_code, tag=_EXTENDED_RESPONSE)]
+                    elif op == _SEARCH_REQUEST:
+                        self.searches.append(raw)
+                        replies = self._answer(raw)
+                    else:  # unbind, or anything this server does not speak
+                        return
+                    for reply, controls in replies:
+                        sock.sendall(_tlv(0x30, message_id + reply + controls))
+        finally:
+            self.ended.set()
 
     def close(self) -> None:
         # shutdown wakes a blocked accept() on Linux, where close() alone does not.
@@ -744,12 +789,12 @@ class _ScriptedDc:
 def _scripted_dc(
     answer: Callable[[bytes], list[_Reply]],
     *,
-    bind_code: int = RESULT_SUCCESS,
     extended_code: int = RESULT_SUCCESS,
+    bind_reply: Callable[[bytes], _Reply | None] | None = None,
 ) -> Iterator[tuple[_ScriptedDc, LdapAuthenticator]]:
     """A loopback server, and an authenticator pointed at it over plain ``ldap://``: the property
     under test is the decode, not the hop's TLS."""
-    dc = _ScriptedDc(answer, bind_code, extended_code)
+    dc = _ScriptedDc(answer, extended_code, bind_reply)
     try:
         settings = _ad_settings(
             ad_server=f"ldap://127.0.0.1:{dc.port}", ad_allow_insecure_ldap=True
@@ -802,33 +847,9 @@ def test_real_ldap3_refuses_a_group_search_whose_second_page_is_busy() -> None:
         pytest.raises(LdapUnansweredError, match=r"result code 51 \(busy\)"),
     ):
         authenticator._resolve_groups(conn, _USER_DN, [])
-    assert len(dc.searches) == 2
-
-
-@pytest.mark.parametrize("code", [99, 4242], ids=["99", "4242"])
-def test_real_ldap3_raises_key_error_on_an_unknown_code_and_the_engine_maps_it(code: int) -> None:
-    """Measured. THE PREMISE first: a bare ldap3 search, at ldap3's default ``fast_decoder=True``,
-    raises ``KeyError`` from inside ``conn.search``. Then the engine's own search on the same
-    server refuses it as unanswered, so the probe reads as an outage."""
-    assert code not in RESULT_CODES
-    with _scripted_dc(lambda _raw: [_done(code)]) as (_dc, authenticator):
-        with _service_conn(authenticator) as conn, pytest.raises(KeyError):
-            conn.search(search_base="OU=Users,DC=example,DC=com", search_filter="(cn=x)")
-        with pytest.raises(LdapUnansweredError, match="an unknown result code") as refused:
-            authenticator.probe_principal("alice")
-    assert refused.value.code == code
-    assert f"user search with result code {code}" in str(refused.value)
-
-
-def test_real_ldap3_maps_a_bind_that_ends_with_an_unknown_code() -> None:
-    """The service-account bind every probe and sign-in opens with: refused, not a ``KeyError``."""
-    with (
-        _scripted_dc(lambda _raw: [_done(RESULT_SUCCESS)], bind_code=4242) as (dc, authenticator),
-        pytest.raises(LdapUnansweredError, match="bind with result code 4242") as refused,
-    ):
-        authenticator.probe_principal("alice")
-    assert refused.value.code == 4242
-    assert dc.searches == []
+    # The third is the abandon, sent through ldap3 with a page size of zero (RFC 2696).
+    assert len(dc.searches) == 3
+    assert b"synthetic-cookie-1" in dc.searches[2]
 
 
 # --- sign-in: a directory error, not an unknown user ---------------------------------------------
@@ -894,29 +915,3 @@ def test_the_bind_account_read_names_the_code_and_keeps_the_identity(
         assert "distinguished name" not in problem and "may not read" not in problem
     else:
         assert hint in problem
-
-
-def test_a_who_am_i_ending_with_an_unknown_code_is_reported_and_the_group_read_still_runs() -> None:
-    """ldap3's decoder raises the same ``KeyError`` on an extended response. A failed Who am I is
-    not a bind failure, so it is reported in ``whoami_error`` and the group read still runs."""
-    conn = _conn(_result(RESULT_SUCCESS), entries=[])
-    conn.extend = SimpleNamespace(standard=SimpleNamespace(who_am_i=_raising(4242)))
-    conn.unbind = lambda: True
-    authenticator = LdapAuthenticator(_ad_settings())
-    authenticator._service_conn = lambda: conn  # type: ignore[method-assign]
-    reading = authenticator.read_bind_account()
-    assert reading.bound and reading.authzid is None
-    assert reading.whoami_error is not None
-    assert "Who am I with result code 4242 (an unknown result code)" in reading.whoami_error
-    assert reading.problem is not None and "returned no entry" in reading.problem
-
-
-def test_real_ldap3_maps_a_who_am_i_that_ends_with_an_unknown_code() -> None:
-    with _scripted_dc(lambda _raw: [_done(RESULT_SUCCESS)], extended_code=4242) as (
-        dc,
-        authenticator,
-    ):
-        reading = authenticator.read_bind_account()
-    assert reading.bound and reading.authzid is None
-    assert reading.whoami_error is not None and "result code 4242" in reading.whoami_error
-    assert len(dc.searches) == 1, "the group read did not run after the failed Who am I"

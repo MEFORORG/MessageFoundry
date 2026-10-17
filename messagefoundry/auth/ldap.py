@@ -138,6 +138,16 @@ class LdapUnansweredError(LdapError):
         self.code_name = code_name
 
 
+class LdapUndecodableError(LdapError):
+    """ldap3 could not decode the directory's response to an operation (BACKLOG #3010).
+
+    :func:`_ldap3_call` raises it. A subclass, so every ``except LdapError`` reads it as an outage;
+    its own class keeps a paged search that met one from being abandoned (:func:`_search_paged`). No
+    result code was read, so none is claimed: the text names the type of the exception ldap3 raised,
+    never its text or a value the directory sent.
+    """
+
+
 class DirectoryAnswer(Enum):
     """What one password-free lookup of one account established (ADR 0195 rule item 2).
 
@@ -779,9 +789,9 @@ def _refuse_unanswered(conn: Any, operation: str, *, answers: frozenset[int] | N
     unless ``conn``'s last operation ended with a result code in ``answers``, which is success alone
     unless the caller names another set.
 
-    BACKLOG #3010. ldap3 raises no ``LDAPException`` for any of these codes here. (A code outside
-    ldap3's own table raises ``KeyError`` instead, which :func:`_unknown_code_refused` maps to this
-    same refusal.) Every ``Connection`` in this module keeps ldap3's default
+    BACKLOG #3010. ldap3 raises no ``LDAPException`` for any of these codes here. (ldap3's decoder
+    raises ``KeyError`` on a code outside its own table, which :func:`_ldap3_call` refuses as a
+    response it could not decode.) Every ``Connection`` in this module keeps ldap3's default
     ``raise_exceptions=False``, and even under ``True`` ldap3 2.9.1 passes
     sizeLimitExceeded (4) and timeLimitExceeded (3) through (``DO_NOT_RAISE_EXCEPTIONS``). So a
     search the directory did not finish -- busy (51), unavailable (52), unwillingToPerform (53),
@@ -856,40 +866,112 @@ def _unanswered(operation: str, code: int | None) -> LdapUnansweredError:
 def _search(conn: Any, operation: str, **kwargs: Any) -> None:
     """``conn.search(**kwargs)``, refusing a referral result and any other result but success
     (:func:`_refuse_unanswered`). Every search in this module goes through here, so none can read
-    either as "no entries"; a test pins that.
-
-    A result code ldap3 has no name for is the same refusal; :func:`_unknown_code_refused` says
-    why it never reaches :func:`_refuse_unanswered`.
+    either as "no entries"; a test pins that. The search runs inside :func:`_ldap3_call`.
     """
-    with _unknown_code_refused(operation):
+    with _ldap3_call(operation):
         conn.search(**kwargs)
     _refuse_unanswered(conn, operation)
 
 
-@contextlib.contextmanager
-def _unknown_code_refused(operation: str) -> Iterator[None]:
-    """Turn ldap3's ``KeyError`` for a result code it has no name for into the refusal
-    :func:`_refuse_unanswered` raises for any other code that is not an answer.
+#: What ldap3 raises, other than its own ``LDAPException``, when a response it reads is malformed.
+#: ldap3 2.9.1's default fast decoder indexes the BER it reads without checking it: a context tag a
+#: response may not carry is ``KeyError(tag)`` (``utils/asn1.py``, ``decode_sequence``), so a bind
+#: response carrying a referral raises ``KeyError(3)``; a result code outside its table is
+#: ``KeyError(code)`` (``ldap_result_to_dict_fast``, ``operation/bind.py``,
+#: ``operation/extended.py``); a paged results control with no value is ``TypeError`` and one with no
+#: cookie is ``IndexError`` (``strategy/base.py``, ``decode_control_fast``); a bind response whose
+#: matchedDN is not a string is ``AttributeError`` (``decode_response_fast``). At least these; the
+#: decoder trusts every length and tag it reads, so others are reachable.
+_DECODE_FAULTS: tuple[type[Exception], ...] = (LookupError, TypeError, ValueError, AttributeError)
 
-    BACKLOG #3010. ldap3 2.9.1 decodes with its fast decoder by default
-    (``Connection(fast_decoder=True)``), and that decoder looks a bind, search or extended result's
-    code up in ``RESULT_CODES`` (``utils/asn1.py``, ``ldap_result_to_dict_fast``;
-    ``operation/bind.py``; ``operation/extended.py``), so a code outside the table raises
-    ``KeyError(code)`` from inside the ldap3 call. Unmapped, that would escape every
-    ``except LdapError`` and surface as an unhandled error at sign-in. It wraps the search in
-    :func:`_search`, every bind (through :func:`_socket_faults_as_ldap_error`), and the Who am I
-    extended operation. Only a ``KeyError`` whose sole argument is an integer missing from that
-    table is ldap3's; any other is the engine's own defect and propagates.
+#: The ldap3 strategy methods that read and decode a response. A fault raised under one of them was
+#: raised reading what the directory sent, not building what the engine asked for.
+_RESPONSE_READERS = frozenset({"get_response", "_get_response"})
+
+
+def _type_name(exc: BaseException) -> str:
+    """An exception's type, never its text. ``struct.error``'s own name is just "error", so a type
+    from outside builtins carries its module."""
+    kind = type(exc)
+    if kind.__module__ == "builtins":
+        return kind.__qualname__
+    return f"{kind.__module__}.{kind.__qualname__}"
+
+
+def _response_reader(exc: BaseException) -> Any:
+    """The ldap3 strategy that was reading a response when ``exc`` was raised, or ``None`` when
+    ``exc`` was not raised by ldap3 while reading one.
+
+    Decided by ORIGIN, never by the exception's value: the innermost frame belongs to the ldap3
+    package, and an outer frame is one of :data:`_RESPONSE_READERS` in ``ldap3.strategy``. A
+    ``KeyError(3)`` the decoder raises and a ``KeyError(3)`` engine code raises carry the same
+    value, and only the first is the directory's. The second condition keeps out what ldap3 raises
+    while building a request from the engine's own arguments, which is the engine's defect.
     """
-    from ldap3.core.results import RESULT_CODES  # lazy, like every ldap3 import here
+    reader: Any = None
+    module = ""
+    tb = exc.__traceback__
+    while tb is not None:
+        frame = tb.tb_frame
+        module = str(frame.f_globals.get("__name__", ""))
+        if (
+            reader is None
+            and module.startswith("ldap3.strategy.")
+            and frame.f_code.co_name in _RESPONSE_READERS
+        ):
+            reader = frame.f_locals.get("self")
+        tb = tb.tb_next
+    in_ldap3 = module == "ldap3" or module.startswith("ldap3.")
+    return reader if in_ldap3 else None
+
+
+@contextlib.contextmanager
+def _ldap3_call(operation: str, *, close: bool = False) -> Iterator[None]:
+    """The boundary every ldap3 call that reads a response runs inside: each search and each page
+    of one, every bind including the service account's ``auto_bind``, and the Who am I extended
+    operation. A static test pins that. An unbind reads no response, so it runs outside.
+
+    BACKLOG #3010. A :data:`_DECODE_FAULTS` exception that ldap3 raised while reading the
+    directory's response becomes :class:`LdapUndecodableError`, which every caller reads as an
+    outage. Unmapped, it would escape every ``except LdapError``, and a sign-in would fail as an
+    unhandled error with no audit row. An exception from anywhere else propagates unchanged, since
+    mapped it would hide an engine defect as an outage, which the session reconciler logs only at
+    debug level (:func:`_response_reader` says how the two are told apart). An ``LDAPException``
+    passes through untouched, for its own handler.
+
+    ``close`` closes the socket the failed read was on. The service account's ``auto_bind`` needs
+    it: that bind runs inside ldap3's ``Connection`` constructor, so when it raises no caller holds
+    the connection to unbind, and the socket would stay open for as long as the error is kept.
+    """
+    import ldap3
 
     try:
         yield
-    except KeyError as exc:
-        code = exc.args[0] if len(exc.args) == 1 else None
-        if type(code) is not int or code in RESULT_CODES:
+    except ldap3.core.exceptions.LDAPException:
+        raise
+    except _DECODE_FAULTS as exc:
+        reader = _response_reader(exc)
+        if reader is None:
             raise
-        raise _unanswered(operation, code) from exc
+        if close:
+            # BaseStrategy.close shuts the socket without sending anything on a stream that may
+            # be out of step. Best effort: the refusal below is the answer either way.
+            with contextlib.suppress(ldap3.core.exceptions.LDAPException, OSError):
+                reader.close()
+        raise _undecodable(operation, exc) from exc
+
+
+def _undecodable(operation: str, exc: BaseException) -> LdapUndecodableError:
+    """The refusal for ``operation`` whose response ldap3 could not decode, warned once per
+    operation and fault type. The text names the type only: neither a value the directory sent
+    nor ldap3's text, and no result code, since none was read."""
+    fault = _type_name(exc)
+    message = (
+        f"AD answered the {operation} with a response ldap3 could not decode ({fault}); the "
+        "engine reads it as the directory not answering (BACKLOG #3010)."
+    )
+    _warn_once(f"undecodable: {operation}: {fault}", "%s Reported once.", message)
+    return LdapUndecodableError(message)
 
 
 #: The simple paged results control (RFC 2696), which AD and ldap3 both name by this OID.
@@ -933,18 +1015,53 @@ def _search_paged(conn: Any, operation: str, **kwargs: Any) -> list[Any]:
     non-critical, so a directory may ignore it, and that answer either is complete or ends with a
     code :func:`_refuse_unanswered` refuses. **A later page with none is refused**: the directory
     was paging, and a page that does not say whether it is the last cannot be read as the last.
+
+    **A refused search is abandoned** (:func:`_abandon_paging`) once the directory has sent a
+    cookie, so it need not hold the paging state until its own timeout. Not after a response ldap3
+    could not decode: the cookie in it could not be read either.
     """
     entries: list[Any] = []
-    cookie: bytes | None = None
-    for page in range(_MAX_PAGES):
-        _search(conn, operation, paged_size=_PAGE_SIZE, paged_cookie=cookie, **kwargs)
-        entries.extend(conn.entries)
-        cookie = _paged_cookie(conn)
-        if cookie is None and page:
-            raise _paging_refused(operation, "paging control lost", "dropped the paging control")
-        if not cookie:
-            return entries
-    raise _paging_refused(operation, "too many pages", f"was still paging after {_MAX_PAGES} pages")
+    cookie: bytes | None = None  # what the next page is asked with
+    newest: bytes | None = None  # the newest non-empty cookie the directory sent
+    try:
+        for page in range(_MAX_PAGES):
+            _search(conn, operation, paged_size=_PAGE_SIZE, paged_cookie=cookie, **kwargs)
+            entries.extend(conn.entries)
+            cookie = _paged_cookie(conn)
+            if cookie is None and page:
+                raise _paging_refused(
+                    operation, "paging control lost", "dropped the paging control"
+                )
+            if not cookie:
+                return entries
+            newest = cookie
+        raise _paging_refused(
+            operation, "too many pages", f"was still paging after {_MAX_PAGES} pages"
+        )
+    except (LdapUnansweredError, LdapReferralError):
+        # The refusing page was read, so the stream is in step and a cookie in it is readable.
+        _abandon_paging(conn, operation, _paged_cookie(conn) or newest, kwargs)
+        raise
+
+
+def _abandon_paging(
+    conn: Any, operation: str, cookie: bytes | None, kwargs: dict[str, Any]
+) -> None:
+    """Tell the directory to drop a refused paged search's state: the same search again with a page
+    size of zero and ``cookie``, which RFC 2696 section 3 defines as abandoning it. ldap3 sends a
+    zero size as given (``Connection.search`` adds the control for any integer ``paged_size``).
+
+    A finding of BACKLOG #3010's review. ``cookie`` is the newest non-empty one the directory sent;
+    with none, it never held state for this search and nothing is sent. Best effort: the search is
+    refused whatever this answers, so a refusal of the abandon is warned once by :func:`_search` and
+    not raised. It costs one more round trip, which can take up to ``[auth].ad_receive_timeout``.
+    """
+    import ldap3
+
+    if not cookie:
+        return
+    with contextlib.suppress(LdapError, ldap3.core.exceptions.LDAPException):
+        _search(conn, f"{operation} abandon", paged_size=0, paged_cookie=cookie, **kwargs)
 
 
 def _paging_refused(operation: str, case: str, what: str) -> LdapUnansweredError:
@@ -992,9 +1109,8 @@ def _socket_faults_as_ldap_error() -> Iterator[None]:
     of ``tests/test_ldap_referrals.py`` build that connection, so one would fail there first. And
     ``authenticate`` wraps the whole decoy bind, which must neither map nor swallow by itself.
 
-    It also maps a bind that ended with a result code ldap3 has no name for
-    (:func:`_unknown_code_refused`) to the refusal a search gets for one, so it reads as an outage
-    and not as an unhandled error. Any other ``KeyError`` propagates.
+    A response ldap3 could not decode is not a socket fault: each bind also runs inside
+    :func:`_ldap3_call`, nested inside this wrap, which refuses it first.
 
     An ``LDAPException`` passes through untouched, even one that is also an ``OSError``,
     ``TypeError`` or ``ValueError``, so its own handler keeps its own text. The new text is fixed
@@ -1005,20 +1121,12 @@ def _socket_faults_as_ldap_error() -> Iterator[None]:
     import ldap3
 
     try:
-        with _unknown_code_refused("bind"):
-            yield
+        yield
     except ldap3.core.exceptions.LDAPException:
         raise
     except _SOCKET_FAULTS as exc:
-        kind = type(exc)
-        # The type alone, never str(exc). struct.error's own name is just "error", so a type from
-        # outside builtins carries its module.
-        name = (
-            kind.__qualname__
-            if kind.__module__ == "builtins"
-            else f"{kind.__module__}.{kind.__qualname__}"
-        )
-        raise LdapError(f"AD directory call failed: {name}") from exc
+        # The type alone, never str(exc).
+        raise LdapError(f"AD directory call failed: {_type_name(exc)}") from exc
 
 
 class LdapAuthenticator:
@@ -1147,7 +1255,10 @@ class LdapAuthenticator:
         # Server is built outside the wrap to keep engine code out of it. The timeout conversion
         # stays inline, because tests/test_ldap_timeouts.py checks for that call at this site.
         server = self._server()
-        with _socket_faults_as_ldap_error():
+        with (
+            _socket_faults_as_ldap_error(),
+            _ldap3_call("service-account bind", close=True),
+        ):
             return ldap3.Connection(
                 server,
                 user=self._s.ad_bind_dn,
@@ -1176,7 +1287,8 @@ class LdapAuthenticator:
         and ``authenticate`` maps it to :class:`LdapError` exactly as it maps the real bind's. Both
         branches open a socket to the same directory, so such a fault fails them alike; swallowing
         it here alone would answer "wrong password" for an absent account and "directory error" for
-        a present one.
+        a present one. The same holds for a bind response ldap3 could not decode (BACKLOG #3010):
+        both binds refuse it through :func:`_ldap3_call` as the "user bind".
 
         **What #2566 does not settle:** ldap3's OWN socket errors still differ between the branches.
         This method swallows an ``LDAPSocketOpenError`` while the real bind's handler maps it, so a
@@ -1202,7 +1314,10 @@ class LdapAuthenticator:
                 auto_referrals=False,  # BACKLOG #2530: see _refuse_referral
             )
             try:
-                conn.bind()  # result deliberately ignored — this branch always fails the login
+                # Labelled as the real bind is, so an undecodable answer fails both branches with
+                # the same text (_ldap3_call).
+                with _ldap3_call("user bind"):
+                    conn.bind()  # result deliberately ignored — this branch always fails the login
             finally:
                 conn.unbind()
         except ldap3.core.exceptions.LDAPException:
@@ -1516,7 +1631,7 @@ class LdapAuthenticator:
                 try:
                     # BACKLOG #2566: the bind opens the socket, so only the bind is wrapped. The
                     # build above does no I/O, and the release runs on an open socket.
-                    with _socket_faults_as_ldap_error():
+                    with _socket_faults_as_ldap_error(), _ldap3_call("user bind"):
                         bound = user_conn.bind()
                     if not bound:
                         _refuse_referral(user_conn, "user bind")
@@ -1629,12 +1744,13 @@ class LdapAuthenticator:
             # failure, and the group read still runs.
             whoami_error: str | None = None
             try:
-                with _unknown_code_refused("Who am I"):
-                    who = _authzid_text(svc.extend.standard.who_am_i())
+                with _ldap3_call("Who am I"):
+                    answered = svc.extend.standard.who_am_i()
+                who = _authzid_text(answered)
             except (ldap3.core.exceptions.LDAPException, LdapError) as exc:
                 # The type name only, as the group read below does: ldap3's text for an
                 # extended-operation error carries the directory's own diagnostic message. An
-                # LdapError is a result code ldap3 has no name for (BACKLOG #3010), in engine text.
+                # LdapError is a response ldap3 could not decode (BACKLOG #3010), in engine text.
                 why = str(exc) if isinstance(exc, LdapError) else type(exc).__name__
                 who, whoami_error = None, f"Who am I failed: {why}"
             try:
