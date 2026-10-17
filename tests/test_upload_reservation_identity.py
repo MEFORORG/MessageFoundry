@@ -500,3 +500,39 @@ async def test_discard_waits_for_the_quota_lock_before_it_removes_the_pair(
         assert [m.file_id for m in await store.list_files()] == [meta.file_id]
     await asyncio.wait_for(discard, 10)
     assert await store.list_files() == []
+
+
+async def test_a_discard_cancelled_while_it_waits_for_the_lock_still_removes_the_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Review: a cancellation that reached discard while it waited for ``_quota_lock`` ended it
+    there, so a stored file with no upload.create row stayed with no log. The removal now
+    outlives the caller's cancel. Past the caller's bound it goes on held, and if the shutdown
+    drain cancels it before it finishes, an ERROR names the file_id."""
+    monkeypatch.setattr(uploads_mod, "_LEDGER_CANCEL_WAIT_SECONDS", 0.05)
+    store = _uploads(tmp_path, None)
+    kept = await store.save(data=b"x\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    lost = await store.save(data=b"y\n", filename="b.txt", uploader="op", uploader_id="u-op")
+    async with store._quota_lock:
+        discard = asyncio.create_task(store.discard(kept.file_id))
+        await asyncio.sleep(0.02)  # waiting for the lock
+        discard.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(discard, 10)
+        assert store._stragglers, "the removal stopped with its caller"
+    assert await _settled(store), "the removal never finished"
+    assert [m.file_id for m in await store.list_files()] == [lost.file_id]
+
+    # The removal itself cut short, by the shutdown drain while the lock is still held: logged.
+    async with store._quota_lock:
+        discard = asyncio.create_task(store.discard(lost.file_id))
+        await asyncio.sleep(0.02)
+        discard.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(discard, 10)
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.uploads"):
+            await store.drain_stragglers(timeout=0.0, grace=1.0)
+    assert (
+        f"upload {lost.file_id} has no upload.create audit row and its removal was cancelled"
+        in (caplog.text)
+    ), caplog.text

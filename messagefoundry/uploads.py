@@ -1078,9 +1078,19 @@ class UploadStore:
         """Remove a stored pair whose ``upload.create`` row could not be written (vault BACKLOG
         #3178), the way a save cancelled after it landed is removed. It holds ``_quota_lock`` while
         it removes, as that save does, so no other save in this process scans the disk while the
-        pair is still on it and is refused at the quota edge. Cancel-resistant once it holds the
-        lock: the removal finishes before a cancellation propagates. A refused removal is logged,
-        never raised."""
+        pair is still on it and is refused at the quota edge. A refused removal is logged, never
+        raised.
+
+        **The removal outlives a cancellation, the wait for the lock included.** It runs as its own
+        task, held like the other stragglers. A cancelled caller waits up to
+        ``_LEDGER_CANCEL_WAIT_SECONDS`` for it, then propagates while it goes on. If the removal is
+        itself cancelled before it finishes, such as by the shutdown drain, an ERROR names the
+        ``file_id``, so a stored file with no creation row is never left without a record."""
+        removal = asyncio.ensure_future(self._discard_under_lock(file_id))
+        self._hold(removal, functools.partial(_log_discard_unfinished, file_id=file_id))
+        await _wait_to_completion(removal, cancel_bound=_LEDGER_CANCEL_WAIT_SECONDS)
+
+    async def _discard_under_lock(self, file_id: str) -> None:
         async with self._quota_lock:
             await _to_thread_to_completion(self._discard_cancelled_sync, file_id)
 
@@ -2382,6 +2392,24 @@ async def _release_reservation(
             "reclaimed when it goes stale",
             uploader_id,
             exc_info=True,
+        )
+
+
+def _log_discard_unfinished(done: asyncio.Future[Any], file_id: str) -> None:
+    """Name a removal of an unrecorded pair that did not finish (vault BACKLOG #3178). The log
+    names the ``file_id`` only, because the filename can carry PHI."""
+    if done.cancelled():
+        _log.error(
+            "upload %s has no upload.create audit row and its removal was cancelled before it "
+            "finished; the file may still be stored",
+            file_id,
+        )
+    elif (exc := done.exception()) is not None:
+        _log.error(
+            "upload %s has no upload.create audit row and its removal failed; the file may "
+            "still be stored",
+            file_id,
+            exc_info=exc,
         )
 
 
