@@ -231,6 +231,55 @@ Claude Code, and you should read it before you trust it. It is the only tracked 
 None of this is required to contribute. Delete the file locally if you would rather configure your
 own; `git update-index --skip-worktree .claude/settings.json` keeps that local.
 
+## Bumping the engine version
+
+This is the complete list of what an engine version bump edits, and it is kept here only. The
+comments in the harness and toolkit `pyproject.toml` files, ADR 0201 and the pin failures in
+`tests/test_packaging.py` point here. Nothing performs these edits for you, and CI fails a release
+pull request that makes some of them and leaves the rest for later, so make them all in the
+pull request that moves the version.
+
+1. `messagefoundry/__init__.py`: `__version__`. Every other engine pin below is held to it.
+2. `packaging/messagefoundry-harness/pyproject.toml`: the `messagefoundry[harness]==` pin.
+   `tests/test_packaging.py::test_the_harness_pins_the_engine_at_the_version_it_ships_with` is the
+   gate.
+3. `packaging/messagefoundry-toolkit/pyproject.toml`: the `messagefoundry==` pin.
+   `tests/test_packaging.py::test_the_toolkit_pins_the_engine_at_the_version_it_ships_with` is the
+   gate.
+4. The install guides. `tests/test_install_docs_pin_the_current_version.py` holds each of these to
+   `__version__`:
+   - the `$V = "<version>"` line that opens each verify block in `docs/INSTALL-GUIDE.md` and
+     `docs/EARLY-ADOPTER-GUIDE.md`;
+   - every `messagefoundry==<version>` pin, with or without extras, in `docs/INSTALL-GUIDE.md`,
+     `docs/EARLY-ADOPTER-GUIDE.md` and `docs/USER-GUIDE.md`. That includes pins in prose and the
+     `requirements.txt` line in the INSTALL-GUIDE layout diagram;
+   - the phrases *console for engine `<version>`*, *built for engine `<version>`* and
+     *engine `<version>` wheel*. They sit beside the web console pins in `docs/INSTALL-GUIDE.md` and
+     `docs/USER-GUIDE.md`, and they move with the engine.
+
+   The test sweeps all six documents `docs/README.md` lists under *Start here*, so a pin added to
+   any of them is held too. Run it after the bump.
+5. The changelog: `python scripts/release/changelog_fragments.py assemble`, then rename
+   `[Unreleased]` to the version. [changelog.d/README.md](changelog.d/README.md), *At release*,
+   gives the order.
+
+What an engine bump does not move:
+
+- **The `messagefoundry-webconsole==` pins.** The console has its own version line, and the same
+  test holds those pins to `__version__` in `messagefoundry_webconsole/__init__.py`. They move when
+  the console releases, not when the engine does. The *for engine* phrase next to each one still
+  moves, under item 4.
+- **The early-access cautions** in `docs/INSTALL-GUIDE.md` and `docs/EARLY-ADOPTER-GUIDE.md`. They
+  name no version on purpose; keep it that way.
+- Pre-release spelling examples such as `0.5.0rc1` and `v0.5.0-rc1`, and a version named as
+  history, such as *added in engine 0.2.0*.
+
+**Check the UI seam as well.** If `ENGINE_UI_SEAM` has moved since the console last released, the
+published console refuses the new engine, so the release needs a console release beside it
+([docs/WEBCONSOLE-PACKAGE.md](docs/WEBCONSOLE-PACKAGE.md)). That release moves the pairing prose
+in `README.md`, `packaging/messagefoundry-webconsole/README.md` and the *Admin console* section of
+`docs/SERVICE.md`. No test reads those three, so read them by hand.
+
 ## PHI / safety
 
 This engine carries PHI in real deployments. **Never** commit real patient data — tests and

@@ -136,7 +136,7 @@ python -m venv .venv
 pip install "messagefoundry==0.5.1"          # pin the exact version (core runtime only)
 ```
 
-> **CAUTION: early access.** `0.5.0` is an **Early Access** release on public PyPI — feature-complete and
+> **CAUTION: early access.** The current release is an **Early Access** release on public PyPI — feature-complete and
 > test-validated, but the external review + pen test that gate a security-certified **v1.0** land after
 > launch. Earlier releases, back to the `0.1.0rc1` pre-release, remain installable. You can equally
 > install from the engine's **GitHub Release assets** or your organization's **private index**.
