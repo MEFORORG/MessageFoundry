@@ -118,6 +118,7 @@ __all__ = [
     "SandboxPolicy",
     "SandboxSession",
     "SandboxSessionClosed",
+    "SandboxWorkerRefused",
     "GraphShape",
     "graph_shape",
     "graph_differences",
@@ -552,6 +553,21 @@ class SandboxSessionClosed(SandboxError):
     BACKLOG #2772)."""
 
 
+class SandboxWorkerRefused(SandboxError):
+    """A worker was refused because the graph it loaded differs from the one the engine serves.
+
+    ``first`` is True only on the spawn that compared the two graphs. A later dispatch for the same
+    engine graph is refused from the session's cached refusal with ``first`` False, so the runner
+    raises its ``sandbox_worker_refused`` alert once per refusal, not once per message (vault
+    BACKLOG #2724, owner ruling 2026-10-16). ``content_only`` is True when the config modules'
+    bytes are the only difference, so the cause is an edit on disk with no reload."""
+
+    def __init__(self, message: str, *, first: bool, content_only: bool) -> None:
+        super().__init__(message)
+        self.first = first
+        self.content_only = content_only
+
+
 class SandboxSession:
     """A persistent per-inbound sandbox worker (the parent-side handle).
 
@@ -581,8 +597,8 @@ class SandboxSession:
         self._graph = graph
         # The last refusal, and the engine graph it was for. A mismatch cannot clear while that
         # graph is being served, so a later spawn for it is refused at once, without paying for an
-        # interpreter start and a whole config load per message.
-        self._refused: tuple[GraphShape, str] | None = None
+        # interpreter start and a whole config load per message. The flag is ``content_only``.
+        self._refused: tuple[GraphShape, str, bool] | None = None
         # Required, with no default, deliberately: this is what attributes a relayed stderr line to a
         # feed (ADR 0176), and a default would silently reinstate the unattributable relay for every
         # future caller. Parent-side only -- it is not marshalled, on the same rule as ``_env`` below.
@@ -629,7 +645,7 @@ class SandboxSession:
         self._kill(self._proc)
         engine_graph = self._graph() if self._graph is not None else None
         if self._refused is not None and self._refused[0] is engine_graph:
-            raise SandboxError(self._refused[1])
+            raise SandboxWorkerRefused(self._refused[1], first=False, content_only=self._refused[2])
         # A fresh response queue per spawn so a prior (killed) worker's trailing EOF can't leak into
         # this generation's reads.
         self._responses = queue.Queue()
@@ -750,10 +766,11 @@ class SandboxSession:
                 # FAIL CLOSED. A worker that loaded a different graph would answer for this inbound
                 # from that graph, and nothing in its answers would say so.
                 self._kill(proc)
+                content_only = all(d.startswith(_CONTENT_DIFFERS) for d in differing)
                 causes = (
                     "The config files changed on disk since the engine loaded them: reload the "
                     "config."
-                    if differing == [d for d in differing if d.startswith(_CONTENT_DIFFERS)]
+                    if content_only
                     else "Two things cause this. The config files changed on disk since the "
                     "engine loaded them: reload the config. Or config code reads an environment "
                     "variable the worker is not given, because the worker loads the config again "
@@ -764,8 +781,8 @@ class SandboxSession:
                     f"sandbox worker for inbound {self._inbound!r} was refused: the graph it loaded "
                     f"differs from the one the engine is serving. {'. '.join(differing)}. {causes}"
                 )
-                self._refused = (engine_graph, refusal)
-                raise SandboxError(refusal)
+                self._refused = (engine_graph, refusal, content_only)
+                raise SandboxWorkerRefused(refusal, first=True, content_only=content_only)
         self._refused = None
         self._proc = proc
 

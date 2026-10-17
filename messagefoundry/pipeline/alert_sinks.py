@@ -61,6 +61,7 @@ from messagefoundry.pipeline.alerts import (
     crl_reload_refused_detail,
     intake_pause_detail,
     remote_debug_refused_detail,
+    sandbox_worker_refused_detail,
 )
 
 # Not lazy, unlike the two transports imports below: the shared webhook opener is built at import.
@@ -1388,6 +1389,18 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 "count": count,
                 "total": total,
                 "detail": remote_debug_refused_detail(count=count, total=total),
+            }
+        )
+
+    def sandbox_worker_refused(self, name: str, *, content_only: bool) -> None:
+        # vault BACKLOG #2724: a sandbox worker was refused for a graph mismatch. The inbound's own
+        # name is the "connection", so the instance is per inbound and channel scope applies. Fixed
+        # words only: the refusal text stays on the message's last error, never in the alert.
+        self._emit(
+            {
+                "type": "sandbox_worker_refused",
+                "connection": name,
+                "detail": sandbox_worker_refused_detail(content_only=content_only),
             }
         )
 

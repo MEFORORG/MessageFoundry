@@ -181,6 +181,7 @@ from messagefoundry.pipeline.sandbox import (
     SandboxPolicy,
     SandboxSession,
     SandboxSessionClosed,
+    SandboxWorkerRefused,
     graph_shape,
 )
 from messagefoundry.pipeline.saturation import SaturationDetector
@@ -5412,21 +5413,34 @@ class RegistryRunner:
         then). Raising also starts no session for an inbound the reload removed. The caller lets the
         exception past its internal-error policy to the worker's fault arm, which re-pends the row
         (per-lane #1611, pooled ADR 0070 T17), and the next claim reads the registry, the inbound and
-        the session afresh. Either way the message is not dead-lettered for the close."""
+        the session afresh. Either way the message is not dead-lettered for the close.
+
+        A worker refused for a graph mismatch raises the ``sandbox_worker_refused`` alert here, on
+        the loop, before the exception goes on to the internal-error policy unchanged (vault BACKLOG
+        #2724, owner ruling 2026-10-16: alert, keep dead-letter). Only the refusal that compared the
+        graphs raises it; the session's cached refusals for later messages do not."""
         try:
-            return await asyncio.to_thread(
-                fn, registry, *args, sandbox=self._sandbox_for(name), **kwargs
-            )
-        except SandboxSessionClosed:
-            if self._stop.is_set() or self.registry is not registry:
-                raise
-            log.info(
-                "inbound %r: its sandbox worker was recycled mid-dispatch; retrying",
-                name,
-            )
-            return await asyncio.to_thread(
-                fn, registry, *args, sandbox=self._sandbox_for(name), **kwargs
-            )
+            try:
+                return await asyncio.to_thread(
+                    fn, registry, *args, sandbox=self._sandbox_for(name), **kwargs
+                )
+            except SandboxSessionClosed:
+                if self._stop.is_set() or self.registry is not registry:
+                    raise
+                log.info(
+                    "inbound %r: its sandbox worker was recycled mid-dispatch; retrying",
+                    name,
+                )
+                return await asyncio.to_thread(
+                    fn, registry, *args, sandbox=self._sandbox_for(name), **kwargs
+                )
+        except SandboxWorkerRefused as exc:
+            if exc.first:
+                try:
+                    self._alert_sink.sandbox_worker_refused(name, content_only=exc.content_only)
+                except Exception:
+                    log.exception("alert sink raised on sandbox_worker_refused for %r", name)
+            raise
 
     async def stop(
         self,

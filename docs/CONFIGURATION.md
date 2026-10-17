@@ -1224,14 +1224,20 @@ worker ran an edited Router or Handler body nobody had reloaded. What you see wh
 1. The message in hand fails with an error that begins `sandbox worker for inbound '<name>' was
    refused` and names `config module content` with the two digests. It fails at the stage that
    asked for the worker, routing or transform, after the message was acknowledged.
-2. Under the default `[delivery].internal_error = "continue"` the message is dead-lettered with
+2. The engine raises a `sandbox_worker_refused` alert for the inbound, under either
+   `internal_error` setting. Its `connection` is the inbound's name, and its text names the cause
+   and says to reload the config. It carries fixed words only, never the message or the refusal's
+   digests; the message's last error has those.
+3. Under the default `[delivery].internal_error = "continue"` the message is dead-lettered with
    status `ERROR`, the error is its last error, and the log has a `WARNING` naming the inbound and
-   the error type. **No alert fires.** Under `"stop"` the inbound stops, the head message is held,
-   and the `connection_stopped` alert fires.
-3. Every later message on that inbound is refused the same way, without starting another worker,
-   until a reload changes the graph the engine serves. Other inbounds are refused too, as soon as
-   their own workers start.
-4. `GET /config/provenance` reports `drift` as true, because the files on disk no longer match the
+   the error type. Under `"stop"` the inbound stops, the head message is held, and the
+   `connection_stopped` alert fires as well.
+4. Every later message on that inbound is refused the same way, without starting another worker,
+   until a reload changes the graph the engine serves. Those refusals raise no further alert.
+   Other inbounds are refused too, as soon as their own workers start, and each raises its own
+   alert. A reload that does not clear the cause raises the alert again. Nothing resolves it on
+   its own, so resolve it in the alert list once the reload is done.
+5. `GET /config/provenance` reports `drift` as true, because the files on disk no longer match the
    ones the engine loaded.
 
 Reload the config. Putting the file back is not enough for an inbound already refused: the
@@ -1721,7 +1727,7 @@ silences an event you didn't name. Matching is pure config (no code/`eval`).
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `audit_write_failed`, `backup_failed`, `cert_expiry`, `config_changed`, `connection_error`, `connection_stopped`, `crl_reload_refused`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `intake_paused`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_forward_failed`, `log_write_failed`, `message_stall`, `no_enabled_administrator`, `queue_buildup`, `remote_debug_refused`, `saturation`, `secret_rotation`, `storage_threshold`, `store_privilege_warning`, `update_available`, and the six security signals `signin_failure_burst`, `access_denied_burst`, `body_view_burst`, `bulk_export`, `log_level_debug` and `posture_loosened`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
+| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `audit_write_failed`, `backup_failed`, `cert_expiry`, `config_changed`, `connection_error`, `connection_stopped`, `crl_reload_refused`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `intake_paused`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_forward_failed`, `log_write_failed`, `message_stall`, `no_enabled_administrator`, `queue_buildup`, `remote_debug_refused`, `sandbox_worker_refused`, `saturation`, `secret_rotation`, `storage_threshold`, `store_privilege_warning`, `update_available`, and the six security signals `signin_failure_burst`, `access_denied_burst`, `body_view_burst`, `bulk_export`, `log_level_debug` and `posture_loosened`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
 | `connection` | str (glob) | `*` | glob over the connection name (e.g. `OB_*`, `IB_ACME_*`) |
 | `min_depth` | int | _unset_ | `queue_buildup` only — match only when pending depth is at/over this |
 | `min_oldest_seconds` | num | _unset_ | `queue_buildup` only — …or the oldest pending message has waited at least this long |
