@@ -512,7 +512,7 @@ def test_out_keeps_the_access_list_of_a_hardened_target_on_windows(
     assert not list(tmp_path.glob("*.tmp"))
 
 
-def test_out_replaces_a_second_hard_link(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_out_replaces_a_second_hard_link(tmp_path: Path) -> None:
     # Writing in place through a name with a second link would also rewrite the other name.
     other = tmp_path / "elsewhere.json"
     other.write_text("untouched\n", encoding="utf-8")
@@ -535,8 +535,27 @@ def test_out_is_refused_when_the_name_changes_while_it_is_opened_on_windows(
     decoy.write_text("x\n", encoding="utf-8")
     real_lstat = os.lstat
     monkeypatch.setattr(
-        os, "lstat", lambda path, *a, **k: real_lstat(decoy if str(path) == str(out) else path)
+        os,
+        "lstat",
+        lambda path, *a, **k: real_lstat(decoy if str(path) == str(out) else path, *a, **k),
     )
     assert _export_to(tmp_path, out) == 1
     assert "error: could not write the export" in capsys.readouterr().err
+    assert out.read_text(encoding="utf-8") == "untouched\n"
+
+
+@_WINDOWS_ACLS
+def test_out_refuses_a_target_hardened_against_this_account_writing_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A replace could still swap a read-only file out through the folder's grant, trading its list
+    # for the folder's. It is an error instead, and the file is left as it was.
+    scratch = tmp_path / "acl"
+    out = tmp_path / "out.json"
+    out.write_text("untouched\n", encoding="utf-8")
+    _win_run("icacls.exe", str(out), "/inheritance:r", "/grant:r", f"*{_own_sid()}:R")
+    hardened = _sddl_of(out, scratch)
+    assert _export_to(tmp_path, out) == 1
+    assert "error: could not write the export" in capsys.readouterr().err
+    assert _sddl_of(out, scratch) == hardened
     assert out.read_text(encoding="utf-8") == "untouched\n"

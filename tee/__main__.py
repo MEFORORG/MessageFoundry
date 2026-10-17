@@ -500,13 +500,15 @@ def _write_owner_only(path: str, text: str) -> None:
     Windows has no POSIX mode, and the tee imports nothing from ``messagefoundry``, so the engine's
     ``restricted_file`` is out of reach. A NEW file there takes its directory's access list, the
     stance :mod:`tee.store` takes for the capture DB. An existing regular file is instead written in
-    place, as ``write_text`` did before vault BACKLOG #3166, so its access list and owner are kept:
-    a file renamed over it would take the folder's list, and a hardened export or dataset in a
-    looser folder would lose its hardening. The list is kept whatever it holds, so a target looser
-    than its folder stays looser, and a file another account created stays that account's. That
-    write is not atomic, so a failure part way leaves the file truncated or partly written; the
-    command still prints its error line and exits 1. :func:`_write_in_place_on_windows` says which
-    files fall to the replace instead.
+    place, so its access list and owner are kept: a file renamed over it would take the folder's
+    list, and a hardened export or dataset in a looser folder would lose its hardening. (``export``
+    and ``anonymize-captures`` wrote in place through ``write_text`` before vault BACKLOG #3166;
+    ``compare`` had replaced its file since #2792, and on Windows now writes in place too.) The
+    list is kept whatever it holds, so a target looser than its folder stays looser, and a file
+    another account created stays that account's. A target this account may not write is an
+    error, never replaced. The write is not atomic: an OSError part way leaves the file truncated
+    or partly written, and the command prints its error line and exits 1; an interruption leaves
+    it the same way. :func:`_write_in_place_on_windows` says which files fall to the replace.
     """
     if _is_named_stream(path):
         with open(path, "w", encoding="utf-8", newline="\n") as stream:
@@ -532,30 +534,34 @@ def _write_owner_only(path: str, text: str) -> None:
         raise
 
 
+_REPARSE_TAG_NAME_SURROGATE = 0x20000000  # IsReparseTagNameSurrogate: a symlink or mount point
+
+
 def _write_in_place_on_windows(path: str, text: str) -> bool:
     """Write ``text`` into the existing regular file at ``path``, keeping its access list.
 
     ``False``, having written nothing, when ``path`` is missing, is not a regular file, is a link
-    or junction (a name-surrogate reparse point), has a second hard link, or cannot be opened for
-    writing; the caller then replaces it. The file is opened without truncating and checked against
-    the name's ``lstat`` before a byte is written. A name swapped for a link in between is opened
-    through that link, but nothing is written to it: the check raises before the truncate.
+    or junction (a name-surrogate reparse point), or has a second hard link; the caller then
+    replaces it. A file this account may not open for writing raises, so its access list is never
+    traded for the folder's. The file is opened without truncating and checked against the name's
+    ``lstat`` before a byte is written. A name swapped for a link in between is still opened
+    through that link, with whatever an open of its target does (a remote share's sign-in, say),
+    but nothing is written to it: the check raises before the truncate.
     """
-    data = text.encode("utf-8")  # before the open, so a failure here leaves the old file whole
     try:
         named = os.lstat(path)
     except FileNotFoundError:
         return False
-    reparse = getattr(named, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
     # Only a name surrogate points somewhere else. A dedup or compressed file carries another tag
     # and is still the file at this name.
-    surrogate = reparse and getattr(named, "st_reparse_tag", 0) & _REPARSE_TAG_NAME_SURROGATE
+    surrogate = getattr(named, "st_reparse_tag", 0) & _REPARSE_TAG_NAME_SURROGATE
     if not stat.S_ISREG(named.st_mode) or surrogate or named.st_nlink != 1:
         return False
+    data = text.encode("utf-8")  # before the open, so a failure here leaves the old file whole
     try:
         fd = os.open(path, os.O_WRONLY | getattr(os, "O_BINARY", 0))
-    except (FileNotFoundError, PermissionError):
-        return False
+    except FileNotFoundError:
+        return False  # gone since the lstat: nothing to keep, so create it
     try:
         handle = os.fdopen(fd, "wb")
     except BaseException:
@@ -570,9 +576,6 @@ def _write_in_place_on_windows(path: str, text: str) -> bool:
         handle.flush()
         os.fsync(handle.fileno())
     return True
-
-
-_REPARSE_TAG_NAME_SURROGATE = 0x20000000  # IsReparseTagNameSurrogate: a symlink or mount point
 
 
 def _is_named_stream(path: str) -> bool:
