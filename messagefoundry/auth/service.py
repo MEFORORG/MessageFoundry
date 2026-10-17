@@ -13485,14 +13485,12 @@ class AuthService:
         """The throttle's READ: whether a notice of this ``lock`` kind already went out in the window.
 
         Kept apart from the row write, so the background task can send the mail between this read
-        and :meth:`_record_lock_notice` (BACKLOG #2216). Every backend carries an
-        ``ix_audit_actor`` (actor, action, id) index for it, keyed on a prefix of the actor on
-        Postgres (vault BACKLOG #3120). That the read seeks it is measured on SQLite only; on
-        Postgres and SQL Server the planner's choice is not tested. Without it the read walked
-        every recent ``auth.lock_notice`` row of every account. One such read still runs at a time
-        per service (``_lock_notice_read_slots``), so locks on many accounts at once cannot fill the
-        store's read pool, which sign-ins wait on too. The cost is that each notice waits behind the reads queued before it, across every
-        account in this process; ``docs/SECURITY.md`` states it.
+        and :meth:`_record_lock_notice` (BACKLOG #2216). An audit index serves it (vault BACKLOG
+        #3120); ``docs/SECURITY.md`` names it and says on which backends its use is measured. One
+        such read still runs at a time per service (``_lock_notice_read_slots``), so locks on many
+        accounts at once cannot fill the store's read pool, which sign-ins wait on too. The cost is
+        that each notice waits behind the reads queued before it, across every account in this
+        process; ``docs/SECURITY.md`` states it.
 
         A failed read fails OPEN (``False``) and is logged by exception class alone. The line names
         neither the account nor the notice kind (BACKLOG #1131): it runs only when a lock lands,

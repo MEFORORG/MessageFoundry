@@ -8020,8 +8020,8 @@ class PostgresStore:
         params: list[Any] = []
         if actor is not None:
             params.append(actor)
-            # The prefix term lets the planner seek ix_audit_actor, which is keyed on that prefix
-            # (vault BACKLOG #3120); the whole-value term is what decides the match.
+            # The prefix term lets the planner seek ix_audit_actor and ix_audit_actor_id, which are
+            # keyed on that prefix (vault BACKLOG #3120); the whole-value term decides the match.
             n = len(params)
             clauses.append(f"left(actor, 200) = left(${n}::text, 200) AND actor = ${n}")
         if action is not None:

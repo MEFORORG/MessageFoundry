@@ -31,6 +31,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.store import MessageStore
+from messagefoundry.store.audit_exclusion import AuditExclusion
 
 _SQLSERVER_ON = bool(os.getenv("MEFOR_TEST_SQLSERVER"))
 _POSTGRES_ON = bool(os.getenv("MEFOR_TEST_POSTGRES"))
@@ -78,11 +79,13 @@ async def _index_columns(store: Any, name: str) -> list[str]:
     if backend == "postgres":
         # pg_get_indexdef per key position, so an expression key reads as its expression. The
         # store's own schema only, so a same-named index in another schema cannot answer for it.
+        # Compared as a name, not cast to regnamespace, which would case-fold a mixed-case schema.
         rows = await store._fetchall(
             "SELECT pg_get_indexdef(c.oid, k.ord, true) AS col FROM pg_class c"
             " JOIN pg_index i ON i.indexrelid = c.oid"
+            " JOIN pg_namespace n ON n.oid = c.relnamespace"
             " CROSS JOIN LATERAL generate_series(1, i.indnkeyatts::int) AS k(ord)"
-            " WHERE c.relname = $1 AND c.relnamespace = current_schema()::regnamespace"
+            " WHERE c.relname = $1 AND n.nspname = current_schema()"
             " ORDER BY k.ord",
             name,
         )
@@ -127,6 +130,28 @@ async def test_an_overlong_actor_is_still_audited_and_found(store: Any) -> None:
     assert [r["detail"] for r in rows] == ['{"lock": "sign_in"}']
     rows = await store.list_audit(actor=long_actor, since=0.0, limit=50)
     assert [r["detail"] for r in rows] == ['{"lock": "sign_in"}']
+
+
+async def test_security_events_tell_apart_two_names_sharing_the_indexed_prefix(store: Any) -> None:
+    """``/me/security-events`` filters on the Postgres actor prefix too, and only the whole-value
+    term keeps one account from reading another's events when both names share those 200
+    characters. 250 characters fits every backend's username and actor columns. Random names, so a
+    shared server database run twice does not meet the first run's rows."""
+    stem = "".join(hashlib.sha256(os.urandom(16)).hexdigest() for _ in range(4))[:200]
+    mine, theirs = stem + "a" * 50, stem + "b" * 50
+    for n, name in enumerate((mine, theirs)):
+        await store.create_user(
+            user_id=f"u-{stem[:16]}-{n}",
+            username=name,
+            auth_provider="local",
+            password_generated=False,
+            now=1.0,
+        )
+    await store.record_audit("auth.login_success", actor=mine, detail="mine")
+    await store.record_audit("auth.login_success", actor=theirs, detail="theirs")
+    rows = await store.security_events_for_user(mine)
+    assert [r["detail"] for r in rows] == ["mine"]
+    assert await store.count_security_events_for_user(mine) == 1
 
 
 async def _plan(
@@ -187,12 +212,17 @@ async def test_the_throttle_read_seeks_the_actor_index_on_sqlite(
     assert "ix_audit_action" in control, control
 
 
-# Every read filtered by actor without an action equality: the audit page and its total, the export
-# pages (a keyset cursor, or an offset), a time-bounded read, and the self-service security events.
+# At least these reads filter by actor without an action equality: the audit page by offset and its
+# capped total, the export's keyset cursor, a time-bounded read, the page a reader without
+# users:manage gets (an exclusion), and the self-service security events.
+_HIDDEN = AuditExclusion(
+    actions=frozenset({"auth.hidden"}), rows=frozenset({("auth.login_failed", "hidden")})
+)
 _ACTOR_ONLY_READS: dict[str, Callable[[MessageStore], Awaitable[object]]] = {
     "list_audit": lambda s: s.list_audit(actor="owner", limit=50),
     "list_audit_offset": lambda s: s.list_audit(actor="owner", limit=50, offset=500),
     "list_audit_before_id": lambda s: s.list_audit(actor="owner", limit=50, before_id=1000),
+    "list_audit_excluded": lambda s: s.list_audit(actor="owner", limit=50, exclude=_HIDDEN),
     "list_audit_since": lambda s: s.list_audit(actor="owner", since=0.0, until=9e9, limit=50),
     "count_audit_capped": lambda s: s.count_audit(actor="owner", limit=1000),
     "security_events": lambda s: s.security_events_for_user("owner", limit=100, until=9e9),
@@ -204,9 +234,10 @@ async def test_an_actor_only_read_walks_the_actor_in_id_order_on_sqlite(
     read: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """With ``ix_audit_actor`` alone, SQLite sought the actor on it and then sorted all of the
-    actor's rows into a temporary B-tree to read the newest few: about 45 ms for a 300k-row actor
-    against 0.05 ms before it, and an export paging by offset re-sorted every page. ``(actor, id)``
-    hands the rows over already in ``id`` order.
+    actor's rows into a temporary B-tree to read the newest few. Measured with 300k of 600k rows
+    under one actor: a first page took 23 ms against 0.06 ms before that index, and a page at
+    offset 100000 took 233 ms against 8.6 ms. ``(actor, id)`` hands the rows over already in ``id``
+    order: 0.05 ms and 2.9 ms.
 
     An empty database plans like a full one here, because SQLite has no statistics until ANALYZE
     and the store never runs it."""

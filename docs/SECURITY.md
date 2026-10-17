@@ -4984,9 +4984,9 @@ read runs at a time in each API process, across every account**, so locks on man
 cannot fill the store's read pool that sign-ins wait on; each mail then waits behind the reads
 queued before it. Every backend carries an `(actor, action, id)` index for that read, keyed on a
 prefix of the actor on Postgres (vault BACKLOG #3120). A companion `(actor, id)` index, keyed the
-same way, serves the audit reads filtered by actor alone (`GET /audit?actor=`, its export pages,
-`/me/security-events`); without it SQLite sought the actor on the first index and then sorted all
-of its rows. That each read seeks its index is measured on SQLite only; on Postgres and SQL Server
+same way, serves the audit reads filtered by actor without an action equality (`GET
+/audit?actor=`, its export pages, `/me/security-events`); without it SQLite sought the actor on the
+first index and then sorted all of its rows. That each read seeks its index is measured on SQLite only; on Postgres and SQL Server
 the planner's choice is not tested. The residuals are listed below, under *Declined, each with its
 residual*. A sign-in lock
 notice on a TOTP-enrolled local account tells the owner to sign in with the password and the code
