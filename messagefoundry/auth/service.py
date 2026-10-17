@@ -8668,10 +8668,13 @@ class AuthService:
         """End the session ``token`` names, and audit ``auth.logout`` saying whether one ended.
 
         The revoke is :meth:`AuthStore.supersede_session`, which reports whether it matched a row,
-        rather than a blind revoke by hash (BACKLOG #3029). A rotation that re-keyed the session
-        after the route's auth dependency read it leaves the hash naming no session. The row's
-        ``outcome`` is then ``nothing_to_revoke`` rather than a revoke that did not happen. Ending
-        the session under its rotated token is not attempted here; that is BACKLOG #3028."""
+        rather than a blind revoke by hash (BACKLOG #3029). The hash can name no unrevoked session
+        for at least these reasons: a rotation re-keyed the session after the caller read it, a
+        concurrent revoke ended it first, or the token was stale or never valid (``/ui/logout``
+        has no auth dependency). The row's ``outcome`` is then ``nothing_to_revoke`` rather than a
+        revoke that did not happen. ``revoked`` means an unrevoked row was revoked, which may be one
+        already over its idle or absolute limit. Ending the session under a rotated token is not
+        attempted here; that is BACKLOG #3028."""
         if token:
             ended = await self._store.supersede_session(hash_token(token), now=time.time())
             # Emit the documented auth.logout event (SECURITY.md, ASVS 16.3.3) even when nothing
@@ -8765,9 +8768,10 @@ class AuthService:
         if the session doesn't exist or isn't the caller's — so the API answers 404 without revealing
         or letting a user touch another's session. Audited.
 
-        Also ``False``, with no audit row, when a rotation re-keyed the session between the read
-        and the revoke (BACKLOG #3029): the revoke reports whether it matched a row, so neither the
-        return nor the trail claims a revoke that did not happen."""
+        Also ``False``, with no audit row, when the revoke matched no unrevoked row (BACKLOG #3029):
+        at least a rotation that re-keyed the session after the read, which leaves it live under
+        its new id, or a concurrent revoke that ended it first. The revoke reports whether it
+        matched, so neither the return nor the trail claims a revoke that did not happen."""
         session = await self._load_session(session_id)
         if session is None or session.user_id != identity.user_id:
             return False

@@ -337,6 +337,19 @@ async def test_a_rotation_racing_a_self_revoke_is_not_reported_as_a_revoke(
     assert await _superseded(store, "self") == [], "an audit row recorded a revoke that missed"
 
 
+async def test_a_self_revoke_that_lands_returns_true_and_audits_it(store: MessageStore) -> None:
+    # The positive control for the race test above: the same reader sees the row when it is written.
+    service = await _service(store)
+    target = await _token(service)
+    caller = await service.identity_for_token(await _token(service), activity=False)
+    assert caller is not None
+    assert await service.revoke_own_session(caller, hash_token(target), actor="op") is True
+    assert not await _live(service, target)
+    assert await _superseded(store, "self") == [
+        {"scope": "self", "session": hash_token(target)[:12], "actor": "op"}
+    ]
+
+
 async def test_a_failed_sign_in_ends_nothing(store: MessageStore) -> None:
     service = await _service(store)
     prior = await _token(service)
