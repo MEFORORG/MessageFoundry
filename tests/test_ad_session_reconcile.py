@@ -24,7 +24,7 @@ import sqlite3
 import time
 import uuid
 from dataclasses import replace
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from pydantic import ValidationError
@@ -3628,7 +3628,7 @@ async def test_the_pass_judges_the_scope_stored_after_its_probes() -> None:
         apply = service._apply_reconcile_revocation
 
         async def spy(
-            revocation: reconcile.SessionRevocation, *, since: float | None = None
+            revocation: reconcile.SessionRevocation, *, since: float
         ) -> _RevocationApplied:
             planned.append(revocation)
             return await apply(revocation, since=since)
@@ -3652,7 +3652,7 @@ async def test_a_scope_revocation_is_skipped_when_the_scope_moved_before_it_appl
         apply = service._apply_reconcile_revocation
 
         async def login_then_apply(
-            revocation: reconcile.SessionRevocation, *, since: float | None = None
+            revocation: reconcile.SessionRevocation, *, since: float
         ) -> _RevocationApplied:
             await store.set_user_channel_scope(
                 revocation.user_id, json.dumps(["IB_B"]), source=SCOPE_SOURCE_AD
@@ -3744,7 +3744,9 @@ async def test_each_revocation_reason_sends_its_decided_notice(reason: str) -> N
         if reason == reconcile.SCOPE_CHANGED:
             extra.update(scope_changed=True, scope_from=user.channel_scope, scope_to=None)
         revocation = reconcile.SessionRevocation(user.id, user.username, reason=reason, **extra)
-        assert await service._apply_reconcile_revocation(revocation) == "reported"
+        assert (
+            await service._apply_reconcile_revocation(revocation, since=time.time()) == "reported"
+        )
         expected = _NOTICE_FOR_REASON[reason]
         assert [e.event_type for e in notifier.sent] == ([] if expected is None else [expected])
         if expected is not None:
@@ -3765,7 +3767,9 @@ async def test_an_undecided_whole_account_reason_falls_to_the_neutral_notice() -
         revocation = reconcile.SessionRevocation(
             user.id, user.username, reason="directory_synthetic_new_reason"
         )
-        assert await service._apply_reconcile_revocation(revocation) == "reported"
+        assert (
+            await service._apply_reconcile_revocation(revocation, since=time.time()) == "reported"
+        )
         assert [e.event_type for e in notifier.sent] == [DIRECTORY_SESSIONS_ENDED]
     finally:
         await store.close()
@@ -3973,14 +3977,18 @@ def _revoked_rows(rows: list[Any]) -> list[dict[str, Any]]:
 
 
 async def _absent_pass_with_sessions_gone_first(
-    monkeypatch: pytest.MonkeyPatch, *, other_reconciler_row: bool
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    other_reconciler_row: bool,
+    planted: Literal["before_pass", "during_listing"] | None = None,
 ) -> tuple[reconcile.ReconcilePlan, list[dict[str, Any]], list[str], list[Any]]:
     """Run one pass over ``jdoe``, now absent, whose sessions end between the plan and the apply.
 
     With ``other_reconciler_row`` the sessions are ended by a second reconciler, which writes its
     own ``auth.ad_session_revoked`` row first. Without it the user signed out mid-pass, and no
-    other pass revoked anything. Returns the plan, the revoked rows, the notices and the
-    ``ad_session_revoked`` alerts."""
+    other pass revoked anything. ``planted`` writes one more matching row: a minute before the pass
+    starts, or while the pass lists the account's sessions. Returns the plan, the revoked rows, the
+    notices and the ``ad_session_revoked`` alerts."""
     store = await MessageStore.open(":memory:")
     try:
         ldap = _FakeLdap({"jdoe": _principal("jdoe")})
@@ -4004,6 +4012,24 @@ async def _absent_pass_with_sessions_gone_first(
             return await real_revoke(user_id)
 
         monkeypatch.setattr(store, "revoke_user_sessions", sessions_gone_first)
+        absent_row = json.dumps({"reason": "directory_absent", "sessions": 1})
+        if planted == "before_pass":
+            await store.record_audit(
+                "auth.ad_session_revoked", actor="jdoe", detail=absent_row, now=time.time() - 60
+            )
+        elif planted == "during_listing":
+            real_list = store.list_sessions
+            written: list[bool] = []
+
+            async def row_while_listing(user_id: str, **kwargs: Any) -> list[Any]:
+                if not written:
+                    written.append(True)
+                    await store.record_audit(
+                        "auth.ad_session_revoked", actor="jdoe", detail=absent_row
+                    )
+                return await real_list(user_id, **kwargs)
+
+            monkeypatch.setattr(store, "list_sessions", row_while_listing)
         ldap.present.clear()
         plan = await service.reconcile_directory_sessions()
         assert plan.aborted is None
@@ -4050,6 +4076,35 @@ async def test_an_absent_account_that_signs_out_mid_pass_still_alerts_and_is_tol
     assert len(alerts) == 1
 
 
+async def test_a_pass_reports_over_a_matching_row_from_before_it_started(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Owner ruling 2026-10-17, through the whole pass. A matching row written before the pass
+    started is not evidence that another pass revoked the account, so the revocation reports."""
+    plan, rows, notices, alerts = await _absent_pass_with_sessions_gone_first(
+        monkeypatch, other_reconciler_row=False, planted="before_pass"
+    )
+    assert [r.reason for r in plan.revocations] == ["directory_absent"]
+    assert [r["sessions"] for r in rows] == [0, 1]
+    assert notices == [DIRECTORY_SESSIONS_ENDED]
+    assert len(alerts) == 1
+
+
+async def test_a_pass_is_quiet_over_a_matching_row_written_while_it_listed_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The window opens before the session listing. A matching row written while the pass lists
+    the account's sessions counts, so the revocation is quiet. This fails if the pass reads its
+    start time after the listing."""
+    plan, rows, notices, alerts = await _absent_pass_with_sessions_gone_first(
+        monkeypatch, other_reconciler_row=False, planted="during_listing"
+    )
+    assert plan.revocations == ()
+    assert [r["sessions"] for r in rows] == [0, 1]
+    assert notices == []
+    assert alerts == []
+
+
 async def _signed_out(store: MessageStore, username: str) -> UserRecord:
     user = await store.get_user_by_username(username)
     assert user is not None
@@ -4068,7 +4123,9 @@ async def test_a_disabled_account_that_signs_out_mid_pass_still_alerts_and_is_to
         revocation = reconcile.SessionRevocation(
             user.id, user.username, reason="directory_disabled"
         )
-        assert await service._apply_reconcile_revocation(revocation) == "reported"
+        assert (
+            await service._apply_reconcile_revocation(revocation, since=time.time()) == "reported"
+        )
         assert [e.event_type for e in notifier.sent] == [ACCOUNT_DISABLED]
         assert [r["sessions"] for r in _revoked_rows(await store.list_audit())] == [0]
     finally:
@@ -4106,7 +4163,9 @@ async def test_a_revocation_row_from_before_the_pass_started_does_not_silence_it
         revocation = reconcile.SessionRevocation(
             user.id, user.username, reason="directory_disabled"
         )
-        assert await service._apply_reconcile_revocation(revocation) == "reported"
+        assert (
+            await service._apply_reconcile_revocation(revocation, since=time.time()) == "reported"
+        )
         later = time.time() + 60
         assert await service._apply_reconcile_revocation(revocation, since=later) == "reported"
         assert [e.event_type for e in notifier.sent] == [ACCOUNT_DISABLED, ACCOUNT_DISABLED]
@@ -4114,9 +4173,15 @@ async def test_a_revocation_row_from_before_the_pass_started_does_not_silence_it
         await store.close()
 
 
-async def test_an_earlier_revocation_for_another_reason_does_not_silence_it() -> None:
+@pytest.mark.parametrize(
+    ("earlier_reason", "expected"),
+    [("roles_changed", "reported"), ("directory_disabled", "quiet")],
+)
+async def test_an_earlier_revocation_for_another_reason_does_not_silence_it(
+    earlier_reason: str, expected: str
+) -> None:
     """The earlier row must carry the same reason: a role revocation earlier in the window does not
-    make a later disable quiet."""
+    make a later disable quiet. The control: the same row with the same reason does."""
     store, _, service, _ = await _scoped_service(_GRP_A)
     try:
         notifier = _CapturingNotifier()
@@ -4126,13 +4191,15 @@ async def test_an_earlier_revocation_for_another_reason_does_not_silence_it() ->
         await service._audit(
             "auth.ad_session_revoked",
             actor="jdoe",
-            detail=json.dumps({"reason": "roles_changed", "sessions": 1}),
+            detail=json.dumps({"reason": earlier_reason, "sessions": 1}),
         )
         revocation = reconcile.SessionRevocation(
             user.id, user.username, reason="directory_disabled"
         )
-        assert await service._apply_reconcile_revocation(revocation, since=since) == "reported"
-        assert [e.event_type for e in notifier.sent] == [ACCOUNT_DISABLED]
+        assert await service._apply_reconcile_revocation(revocation, since=since) == expected
+        assert [e.event_type for e in notifier.sent] == (
+            [ACCOUNT_DISABLED] if expected == "reported" else []
+        )
     finally:
         await store.close()
 
@@ -4158,26 +4225,76 @@ async def test_a_failed_read_of_earlier_revocations_reports(
         with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
             assert await service._apply_reconcile_revocation(revocation, since=since) == "reported"
         assert len(notifier.sent) == 2
-        assert any("could not read earlier revocations" in r.getMessage() for r in caplog.records)
+        assert any(
+            r.levelno == logging.ERROR and "could not read earlier revocations" in r.getMessage()
+            for r in caplog.records
+        )
     finally:
         await store.close()
 
 
-async def test_a_defect_reading_earlier_revocations_raises(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("defect", ["NotImplementedError", "KeyError", "TypeError"])
+async def test_a_defect_reading_earlier_revocations_still_writes_the_row_and_reports(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, defect: str
 ) -> None:
-    """A defect in the read is raised, not passed over as a refusal (AUDIT_WRITE_DEFECTS)."""
+    """A defect in the evidence read is not raised. The caller has not yet written this
+    revocation's row, so a raise would lose it, end the pass, and leave the account, with no
+    session left, unrevisited. It fails toward reporting: the row is written, the revocation
+    reports, and the read is logged at ERROR with the exception's type. ``KeyError`` and
+    ``TypeError`` are store shape defects, a row with no ``detail`` and a row that cannot be
+    indexed by name. Neither may pass as an unreadable row."""
+    store, _, service, _ = await _scoped_service(_GRP_A)
+    try:
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        user = await _signed_out(store, "jdoe")
+        revocation = reconcile.SessionRevocation(user.id, user.username, reason="directory_absent")
+        real_list = store.list_audit
+
+        async def broken(**kwargs: Any) -> list[Any]:
+            if kwargs.get("action") == "auth.ad_session_revoked" and "since" in kwargs:
+                if defect == "KeyError":
+                    return [{"id": 7}]  # no "detail" column
+                if defect == "TypeError":
+                    return [("positional",)]  # a row that cannot be indexed by name
+                raise NotImplementedError("synthetic: backend bug")
+            return await real_list(**kwargs)
+
+        monkeypatch.setattr(store, "list_audit", broken)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            outcome = await service._apply_reconcile_revocation(revocation, since=time.time())
+        assert outcome == "reported"
+        assert [e.event_type for e in notifier.sent] == [DIRECTORY_SESSIONS_ENDED]
+        assert [r["sessions"] for r in _revoked_rows(await real_list())] == [0]
+        assert any(
+            r.levelno == logging.ERROR
+            and "could not read earlier revocations" in r.getMessage()
+            and defect in r.getMessage()
+            for r in caplog.records
+        )
+        assert not any("is unreadable" in r.getMessage() for r in caplog.records)
+    finally:
+        await store.close()
+
+
+async def test_an_unreadable_earlier_row_is_passed_over_and_named(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A row whose detail is not JSON is passed over, and the WARNING names the row id and the
+    parse error, so it can be found."""
     store, _, service, _ = await _scoped_service(_GRP_A)
     try:
         user = await _signed_out(store, "jdoe")
+        since = time.time()
+        await service._audit("auth.ad_session_revoked", actor="jdoe", detail="{not json")
+        (bad,) = await store.list_audit(action="auth.ad_session_revoked")
         revocation = reconcile.SessionRevocation(user.id, user.username, reason="directory_absent")
-
-        async def broken(**_: object) -> list[Any]:
-            raise NotImplementedError("synthetic: backend bug")
-
-        monkeypatch.setattr(store, "list_audit", broken)
-        with pytest.raises(NotImplementedError):
-            await service._apply_reconcile_revocation(revocation, since=time.time())
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            assert await service._apply_reconcile_revocation(revocation, since=since) == "reported"
+        warnings = [r.getMessage() for r in caplog.records if "is unreadable" in r.getMessage()]
+        assert len(warnings) == 1
+        assert f"row {bad['id']} " in warnings[0]
+        assert "JSONDecodeError" in warnings[0]
     finally:
         await store.close()
 
@@ -4193,7 +4310,7 @@ async def test_an_undetermined_revocation_that_ends_nothing_stays_quiet() -> Non
         revocation = reconcile.SessionRevocation(
             user.id, user.username, reason="directory_undetermined"
         )
-        assert await service._apply_reconcile_revocation(revocation) == "quiet"
+        assert await service._apply_reconcile_revocation(revocation, since=time.time()) == "quiet"
         assert notifier.sent == []
     finally:
         await store.close()
@@ -4212,8 +4329,10 @@ async def test_a_role_revocation_another_reconciler_applied_first_is_quiet() -> 
         revocation = reconcile.SessionRevocation(
             user.id, user.username, reason="roles_changed", role_ids=target
         )
-        assert await service._apply_reconcile_revocation(revocation) == "reported"
-        assert await service._apply_reconcile_revocation(revocation) == "quiet"
+        assert (
+            await service._apply_reconcile_revocation(revocation, since=time.time()) == "reported"
+        )
+        assert await service._apply_reconcile_revocation(revocation, since=time.time()) == "quiet"
         assert [e.event_type for e in notifier.sent] == [ROLES_CHANGED]
         assert len(_revoked_rows(await store.list_audit())) == 2
     finally:
@@ -4234,7 +4353,9 @@ async def test_a_role_change_that_ends_no_session_still_reports() -> None:
         revocation = reconcile.SessionRevocation(
             user.id, user.username, reason="roles_changed", role_ids=target
         )
-        assert await service._apply_reconcile_revocation(revocation) == "reported"
+        assert (
+            await service._apply_reconcile_revocation(revocation, since=time.time()) == "reported"
+        )
         assert [e.event_type for e in notifier.sent] == [ROLES_CHANGED]
         assert [r["sessions"] for r in _revoked_rows(await store.list_audit())] == [0]
     finally:

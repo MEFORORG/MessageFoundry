@@ -202,6 +202,14 @@ _ALWAYS_REPORTED_REASONS: Final = frozenset(
 _REVOKED_ROW_PAGE: Final = 20
 
 
+def _audit_row_id(row: Any) -> object:
+    """An audit row's ``id`` for a log line, or ``None`` when the row has none."""
+    try:
+        return row["id"]
+    except (KeyError, IndexError):
+        return None
+
+
 @cache
 def _audit_write_errors() -> tuple[type[Exception], ...]:
     """What a refused audit write raises, at least on the store backends and key modes named here
@@ -6406,8 +6414,8 @@ class AuthService:
             return reconcile.ReconcilePlan()
         settings = self._settings
         # Read before any session listing (owner ruling 2026-10-17, BACKLOG #3085): only another
-        # pass's revocation row written after this moment can show it already revoked an account
-        # this pass saw signed in. See `_already_revoked_elsewhere`.
+        # pass's revocation row written at or after this moment can show it already revoked an
+        # account this pass saw signed in. See `_already_revoked_elsewhere`.
         pass_started = time.time()
 
         # Candidates: AD-provider users that are not already locally disabled AND still hold at least
@@ -7531,26 +7539,29 @@ class AuthService:
         )
 
     async def _already_revoked_elsewhere(
-        self, revocation: reconcile.SessionRevocation, *, since: float | None
+        self, revocation: reconcile.SessionRevocation, *, since: float
     ) -> bool:
         """Whether another pass already revoked this account for this reason (owner ruling
         2026-10-17, BACKLOG #3085).
 
         This is the one statement of the rule. The evidence is an ``auth.ad_session_revoked`` row
-        whose actor is the account's planned username, with the same ``reason``, written at or after
-        ``since``. The reconciler passes the moment its pass started, before it listed any session.
-        So only a revocation written while this pass ran counts: an older row, a deleted
-        namesake's, or one from before a later sign-in never does. With no ``since`` nothing counts.
-        Read before this revocation's own row is written, so it never finds that row.
+        whose actor is the account's planned username, with the same ``reason``, and a ``ts`` at or
+        after ``since``. The reconciler passes the moment its pass started, before it listed any
+        session. So only a revocation written at or after this pass started counts. An older row,
+        such as a deleted namesake's or one from before a later sign-in, does not. Read before this
+        revocation's own row is written, so it does not find that row.
+
+        **Clock skew.** ``since`` is this host's clock and a row's ``ts`` is the writer's, so skew
+        between two engines on one store moves the window by that skew. This is the one place that
+        caveat is stated; the docs point here.
 
         It errs toward reporting. Two reconcilers that both read before either writes both report.
-        A store refusal of a type :func:`_audit_write_errors` names is logged and answers False,
-        so it costs a duplicate alert rather than a missed one; a defect
-        (:data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS`) still raises. An unreadable row is
-        logged and passed over. ``since`` is this host's clock and a row's ``ts`` is the writer's,
-        so clock skew between two engines moves the window by that skew."""
-        if since is None:
-            return False
+        Any exception while reading the evidence, a store refusal or a defect alike, is logged at
+        ERROR with its type and answers False. It is not raised: the caller has not yet written this
+        revocation's own row, so a raise would end the pass and lose that row and the earlier
+        alerts, and an account left with no session is not revisited by a later pass. A fault
+        therefore costs a duplicate alert rather than a missed one. A row whose ``detail`` is not
+        readable JSON is logged at WARNING and passed over."""
         try:
             rows = await self._store.list_audit(
                 action="auth.ad_session_revoked",
@@ -7558,47 +7569,54 @@ class AuthService:
                 since=since,
                 limit=_REVOKED_ROW_PAGE,
             )
-        except AUDIT_WRITE_DEFECTS:
-            raise
-        except _audit_write_errors():
-            _log.warning(
-                "directory reconcile: could not read earlier revocations of %s; reporting this one",
+            for row in rows:
+                # Outside the inner try: a row that cannot be indexed is a store shape defect, not
+                # an unreadable row, so it takes the ERROR path below.
+                raw = row["detail"]
+                try:
+                    detail = json.loads(raw or "{}")
+                except (TypeError, ValueError) as exc:
+                    _log.warning(
+                        "directory reconcile: auth.ad_session_revoked row %s for %s is unreadable "
+                        "(%s); passed over",
+                        _audit_row_id(row),
+                        scrub_log_argument(revocation.username),
+                        scrub_log_argument(f"{type(exc).__name__}: {exc}"),
+                    )
+                    continue
+                if isinstance(detail, dict) and detail.get("reason") == revocation.reason:
+                    return True
+        except Exception as exc:  # any class: fail toward reporting, see the docstring
+            _log.error(
+                "directory reconcile: could not read earlier revocations of %s (%s); "
+                "reporting this one",
                 scrub_log_argument(revocation.username),
+                type(exc).__name__,
                 exc_info=True,
             )
             return False
-        for row in rows:
-            try:
-                detail = json.loads(row["detail"] or "{}")
-            except (TypeError, ValueError, KeyError, IndexError):
-                _log.warning(
-                    "directory reconcile: an auth.ad_session_revoked row for %s is unreadable; "
-                    "passed over",
-                    scrub_log_argument(revocation.username),
-                )
-                continue
-            if isinstance(detail, dict) and detail.get("reason") == revocation.reason:
-                return True
         return False
 
     async def _apply_reconcile_revocation(
-        self, revocation: reconcile.SessionRevocation, *, since: float | None = None
+        self, revocation: reconcile.SessionRevocation, *, since: float
     ) -> _RevocationApplied:
         """Apply one planned revocation: persist a role re-diff (when that is why), drop the user's
         live sessions, audit, and notify the affected user out-of-band (ASVS 6.3.7). A scope
         revocation writes no scope (ADR 0198): the next login does.
 
         Returns ``"skipped"`` when it applied nothing, ``"reported"`` when it applied and must
-        alert, and ``"quiet"`` when it applied but ended no session and changed no role, and is not
-        a disabled or absent account's first revocation. The quiet case is at least what the second
-        of two reconcilers revoking one account sees (BACKLOG #3085). Owner ruling 2026-10-16,
-        "audit always": that revocation still writes its ``auth.ad_session_revoked`` row, with
-        ``sessions: 0``, and sends no notice; the caller raises no alert for it.
+        alert, and ``"quiet"`` when it applied but must not alert. A quiet revocation ended no
+        session and changed no role, and either its reason is not in
+        :data:`_ALWAYS_REPORTED_REASONS` or :meth:`_already_revoked_elsewhere` finds another pass
+        revoked the account at or after ``since``, the moment this pass started (BACKLOG #3085,
+        owner rulings 2026-10-16 and 2026-10-17). The quiet case is at least what the second of two
+        reconcilers revoking one account sees. A quiet revocation still writes its
+        ``auth.ad_session_revoked`` row, with ``sessions: 0`` ("audit always"), and sends no
+        notice; the caller raises no alert for it.
 
-        Owner ruling 2026-10-17 narrows that. A revocation whose reason is in
-        :data:`_ALWAYS_REPORTED_REASONS` reports even when it ended nothing, as when the user signed
-        out mid-pass. It stays quiet only when :meth:`_already_revoked_elsewhere` finds another
-        pass's revocation of it written since ``since``, the moment the pass started."""
+        So a disabled or absent account whose revocation ended nothing still reports, as when the
+        user signed out mid-pass, unless another pass already revoked it. The rule, and its
+        clock-skew caveat, are stated once, in :meth:`_already_revoked_elsewhere`."""
         user = await self._load_user(revocation.user_id)
         if revocation.reason == reconcile.SCOPE_CHANGED and (
             user is None or user.channel_scope != revocation.scope_from
@@ -7610,7 +7628,7 @@ class AuthService:
             # delta stands whatever happened to the scope.
             _log.debug(
                 "directory reconcile: scope revocation for %s skipped; the stored scope changed",
-                revocation.username,
+                scrub_log_argument(revocation.username),
             )
             return "skipped"
         # No role write for an account that is gone or fails its seal (BACKLOG #2592): the store would
@@ -7682,7 +7700,7 @@ class AuthService:
         _log.info(
             "directory reconcile: revoked %d session(s) for %s (%s)",
             revoked,
-            revocation.username,
+            scrub_log_argument(revocation.username),
             revocation.reason,
         )
         if quiet:
