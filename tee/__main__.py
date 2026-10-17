@@ -394,7 +394,11 @@ async def _export(args: argparse.Namespace) -> int:
         await store.close()
     text = json.dumps(data, indent=2)
     if args.out:
-        Path(args.out).write_text(text + "\n", encoding="utf-8")
+        try:
+            _write_owner_only(args.out, text + "\n")
+        except OSError as exc:
+            print(f"error: could not write the export to {args.out}: {exc}", file=sys.stderr)
+            return 1
         print(f"wrote {len(data['rows'])} row(s) to {args.out}", file=sys.stderr)
     else:
         print(text)
@@ -473,9 +477,14 @@ async def _load_captures(db: str, since: float | None) -> list[CorepointOutput]:
 def _write_owner_only(path: str, text: str) -> None:
     """Write ``text`` to ``path`` so that, on POSIX, only its owner can read it (vault BACKLOG #2792).
 
-    A ``compare --show-diffs`` report holds field values from both engines. ``write_text`` would
-    create it at the process umask, world-readable under 022, beside a capture DB that
-    :mod:`tee.store` keeps at 0600.
+    Every ``--out`` the tee writes goes through here (vault BACKLOG #3166). A ``compare
+    --show-diffs`` report holds field values from both engines; an ``anonymize-captures`` dataset
+    holds surrogates and every value a rule kept; an ``export`` carries control ids, message types
+    and NAK details from the capture DB. ``write_text`` would create any of them at the process
+    umask, world-readable under 022, beside a capture DB that :mod:`tee.store` keeps at 0600.
+
+    Newlines are written as LF on every platform. The text layer's default would write CRLF on
+    Windows, and the dataset is JSONL that the harness corpus reads back line by line.
 
     The report is written to a NEW file that ``mkstemp`` creates exclusively at 0600 in the same
     directory, flushed to disk, then renamed over ``path``. A regular file already at ``path``, or a
@@ -492,14 +501,14 @@ def _write_owner_only(path: str, text: str) -> None:
     stance :mod:`tee.store` takes for the capture DB.
     """
     if _is_named_stream(path):
-        with open(path, "w", encoding="utf-8") as stream:
+        with open(path, "w", encoding="utf-8", newline="\n") as stream:
             stream.write(text)
         return
     target = Path(path)
     fd, temp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
     try:
         try:
-            handle = os.fdopen(fd, "w", encoding="utf-8")
+            handle = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
         except BaseException:
             os.close(fd)  # nothing owns the descriptor yet, and Windows cannot unlink an open file
             raise
@@ -709,7 +718,11 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    Path(args.out).write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    try:
+        _write_owner_only(args.out, "\n".join(lines) + "\n")
+    except OSError as exc:
+        print(f"error: could not write the dataset to {args.out}: {exc}", file=sys.stderr)
+        return 1
     print(f"wrote {len(lines)} de-identified message(s) to {args.out}", file=sys.stderr)
     return 0
 
