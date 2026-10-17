@@ -31,8 +31,10 @@ from typing import Any
 
 import httpx
 import pytest
+from fastapi import WebSocket
 
 from messagefoundry.api.app import create_app
+from messagefoundry.api.security import authorizes_in_body
 from scripts.security import dast_target as dast_target_module
 from scripts.security import route_gates
 from scripts.security.dast_auth_sweep import (
@@ -44,6 +46,7 @@ from scripts.security.dast_auth_sweep import (
     load_policy,
     main,
     ungated_not_declared_public,
+    websocket_rows_not_declared,
     write_probe_outcome,
 )
 from scripts.security.dast_target import (
@@ -232,6 +235,12 @@ def test_ungated_routes_are_exactly_the_documented_anonymous_set(
     assert receipt["websocket_rows"], (
         "the receipt no longer reports the WebSocket row it excluded from HTTP probing"
     )
+    # Vault BACKLOG #2955: each WebSocket row carries its kind, and none is refused or unexplained.
+    assert all("kind" in r and "declaration" in r for r in receipt["websocket_rows"]), receipt[
+        "websocket_rows"
+    ]
+    undeclared_ws = websocket_rows_not_declared(receipt)
+    assert not undeclared_ws, f"WebSocket rows refused or with no reason: {undeclared_ws}"
 
 
 # =====================================================================================================
@@ -974,6 +983,107 @@ def test_an_allow_listed_route_that_is_not_declared_public_reds_the_run(
     code, errors = evaluate({**clean, "ungated_routes": [changed, *rows[1:]]}, policy)
     assert code == 1, errors
     assert any("not declared public" in line and changed["path"] in line for line in errors), errors
+
+
+def _ws_row(**fields: Any) -> dict[str, Any]:
+    return {"method": route_gates.WS_METHOD, "path": "/ws/planted", **fields}
+
+
+_REASON = "synthetic reason"
+
+
+@pytest.mark.parametrize(
+    ("row", "reds"),
+    [
+        pytest.param(_ws_row(kind=route_gates.KIND_REFUSED, declaration=None), True, id="refused"),
+        pytest.param(
+            _ws_row(kind=route_gates.KIND_OUTSIDE, declaration=None), True, id="outside-no-reason"
+        ),
+        pytest.param(
+            _ws_row(kind=route_gates.KIND_PUBLIC, declaration=None), True, id="public-no-reason"
+        ),
+        pytest.param(_ws_row(kind=None, declaration=_REASON), True, id="no-kind"),
+        # The shape the receipt wrote before #2955: method and path only.
+        pytest.param(_ws_row(), True, id="older-receipt"),
+        pytest.param(_ws_row(kind=route_gates.KIND_GATED, declaration=None), False, id="gated"),
+        pytest.param(
+            _ws_row(kind=route_gates.KIND_IN_BODY, declaration=_REASON), False, id="in-body"
+        ),
+        pytest.param(
+            _ws_row(kind=route_gates.KIND_PUBLIC, declaration=_REASON), False, id="public"
+        ),
+        pytest.param(
+            _ws_row(kind=route_gates.KIND_OUTSIDE, declaration=_REASON),
+            False,
+            id="outside-with-reason",
+        ),
+    ],
+)
+def test_a_websocket_row_the_engine_refuses_reds_the_run(row: dict[str, Any], reds: bool) -> None:
+    """Vault BACKLOG #2955. The sweep cannot probe a WebSocket over HTTP, so a socket the engine
+    refuses to every caller, a dead route, passed unreported: the kind check read HTTP rows only.
+    ``evaluate()`` now reads each WebSocket row's kind and reason too. Each red case passed
+    ``evaluate()`` before #2955."""
+    policy = _policy()
+    clean: dict[str, Any] = {
+        "gated_http_rows": 99,
+        "route_rows_examined": 105,
+        "negative_probes": 198,
+        "reached": 46,
+        "bfla_probes": 19,
+        "write_reached": 61,
+        "write_bfla_probes": 43,
+        "unreached_unexplained": 0,
+        "ungated_routes": _declared_public(policy),
+        "findings": [],
+    }
+    assert evaluate(clean, policy) == (0, [])
+    code, errors = evaluate({**clean, "websocket_rows": [row]}, policy)
+    if reds:
+        assert code == 1, errors
+        assert any("WebSocket" in line and "/ws/planted" in line for line in errors), errors
+    else:
+        assert (code, errors) == (0, [])
+
+
+async def _planted_undeclared(websocket: WebSocket) -> None:
+    """A WebSocket endpoint with no gate and no declaration, so the engine refuses it."""
+    await websocket.close()
+
+
+@authorizes_in_body("synthetic reason: the planted control socket")
+async def _planted_in_body(websocket: WebSocket) -> None:
+    """The control: the same socket, declared as authorizing in its own body."""
+    await websocket.close()
+
+
+def test_a_planted_undeclared_websocket_route_reds_the_sweep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #2955, end to end. A WebSocket route with no gate and no declaration, planted on
+    the sweep's own target app, reds the real sweep. A control socket planted beside it, declared as
+    authorizing in its body, is not listed, so the red comes from the declaration and not from the
+    planting. This sweep exited 0 before #2955."""
+    import scripts.security.dast_auth_sweep as sweep
+
+    real = dast_target
+
+    @asynccontextmanager
+    async def _target(**kwargs: Any) -> AsyncIterator[Any]:
+        async with real(**kwargs) as target:
+            target.app.add_api_websocket_route("/ws/planted", _planted_undeclared)
+            target.app.add_api_websocket_route("/ws/planted-control", _planted_in_body)
+            yield target
+
+    monkeypatch.setattr(sweep, "dast_target", _target)
+    receipt_path = tmp_path / "receipt.json"
+    code = main(["--policy", str(_POLICY), "--receipt", str(receipt_path)])
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    kinds = {r["path"]: r["kind"] for r in receipt["websocket_rows"]}
+    assert kinds.get("/ws/planted") == route_gates.KIND_REFUSED, kinds
+    assert kinds.get("/ws/planted-control") == route_gates.KIND_IN_BODY, kinds
+    assert websocket_rows_not_declared(receipt) == ["WS /ws/planted (refused)"]
+    assert code == 1, f"a sweep with a refused WebSocket route exited {code}"
 
 
 # =====================================================================================================
