@@ -450,6 +450,8 @@ def test_a_blank_configured_value_matches_no_blank_amr() -> None:
     service._settings = AuthSettings.model_construct(oidc_callback_floor_exempt_amr=["", " "])
     values = service._oidc_callback_floor_exempt_values()
     assert service._oidc_callback_floor_exemption(values, ("", " ")) == ()
+    # A set that skipped the filter: the helper refuses its blanks itself.
+    assert service._oidc_callback_floor_exemption(frozenset({"", " "}), ("", " ")) == ()
     service._settings = AuthSettings.model_construct(oidc_callback_floor_exempt_amr=[EXEMPT])
     values = service._oidc_callback_floor_exempt_values()
     assert service._oidc_callback_floor_exemption(values, ("pwd", EXEMPT)) == (EXEMPT,)

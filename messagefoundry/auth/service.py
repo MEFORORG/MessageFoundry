@@ -752,7 +752,7 @@ _STEP_UP_ERRORS: Final[Mapping[str, str]] = MappingProxyType(
         # the second-step floors). So does the engine's own client credential refused with a 401,
         # an operator fault. Its audit row carries the status, which is where the operator tells
         # the two apart (BACKLOG #1948, #3221). IDP_ANSWER_UNUSABLE can be an operator fault too,
-        # so its text no longer says a later try will help.
+        # so its text sends a repeat to an administrator rather than saying "try again later".
         IDP_ANSWER_UNUSABLE: (
             "The identity provider could not complete the confirmation. Try again. If it repeats,"
             " ask an administrator."
@@ -2916,8 +2916,8 @@ class AuthService:
         failed login and cleared by the next code exchange that yields a verified token, on either
         leg, whether or not a later check then refuses the attempt (BACKLOG #3221). *No login path
         gates on it* — the start leg always attempts. That is what satisfies AC-8's "SHALL recover
-        without an engine restart"; a copy of the Kerberos latch would leave one IdP blip disabling federated login
-        until a restart, which is exactly what AC-8 forbids. It exists to drive the login-page link
+        without an engine restart"; a copy of the Kerberos latch would leave one IdP blip disabling
+        federated login until a restart, which is exactly what AC-8 forbids. It exists to drive the login-page link
         and ``/auth/providers``, nothing more. Do not "fix" the asymmetry with the Kerberos twin.
 
         "A failed login" means a TRANSPORT failure and nothing else (BACKLOG #1948): see
@@ -4899,8 +4899,8 @@ class AuthService:
     ) -> tuple[str, ...]:
         """The ``exempt_values`` a signature-verified ``amr`` carries, sorted (BACKLOG #2388). Empty
         means the callback floor applies. The caller passes in what
-        :meth:`_oidc_callback_floor_exempt_values` returned, so a step-up callback builds it once
-        (BACKLOG #3221); the set is filtered again here, so any other set is safe too.
+        :meth:`_oidc_callback_floor_exempt_values` returned, which a step-up callback reads once
+        (BACKLOG #3221). The set is filtered again here, so a set built any other way is safe too.
 
         It returns configured values only, never the token's own, so the result is a closed set
         an audit row may carry. A blank or non-string value matches nothing, whoever built the
