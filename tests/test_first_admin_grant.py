@@ -398,7 +398,8 @@ async def test_an_unknown_grant_outcome_that_wrote_the_role_advises_the_totp_res
     assert "holds the Administrator role" in message
     assert "an Administrator may now exist under this name" in message
     assert "showed no recovery codes" in message
-    assert "run `messagefoundry admin-reset-totp --username 'site-admin'`" in message
+    assert "`messagefoundry admin-reset-totp`" in message
+    assert "the same --db and --service-config as this run" in message
     assert "keep any authenticator entry" not in message
     [line] = _error_lines(caplog)
     assert "'site-admin'" in line and "object" in line
@@ -426,12 +427,50 @@ async def test_an_unknown_grant_outcome_that_wrote_no_role_advises_a_re_run(
     ):
         await _provision(service, "site-admin")
     message = str(refused.value)
-    assert "holds no Administrator role" in message
-    assert "remove any authenticator entry it showed, then run the command again" in message
+    assert "That account holds no role" in message
+    assert "remove any authenticator entry this run showed, then run the command again" in message
     assert "admin-reset-totp" not in message
     assert len(_error_lines(caplog)) == 1
     assert await _provisioned_rows(store) == []
     assert await enabled_admins(store) == set()
+
+
+async def test_an_unknown_grant_outcome_revokes_even_when_the_re_read_raises(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The refusal's re-read of the row runs AFTER the repair branch's second revoke and the ERROR
+    line, so a read that raises can skip neither: a session the earlier holder minted before the
+    password write would otherwise survive a role the store may have written."""
+    await _roleless_row(store, "site-admin")
+    service = AuthService(store, AuthSettings())
+    await service.initialize()
+    role_writer = _out_of_contract_grant(store, writes_role=True)
+
+    async def read_fails(*_a: Any, **_k: Any) -> None:
+        raise sqlite3.OperationalError("synthetic read fault")
+
+    async def grant_then_break_the_read(*a: Any, **k: Any) -> object:
+        outcome = await role_writer(*a, **k)
+        monkeypatch.setattr(store, "get_user_by_username", read_fails)
+        return outcome
+
+    monkeypatch.setattr(store, "grant_first_admin_unless_admin_exists", grant_then_break_the_read)
+    revokes: list[str] = []
+    original_revoke = store.revoke_user_sessions
+
+    async def counted_revoke(user_id: str) -> int:
+        revokes.append(user_id)
+        return await original_revoke(user_id)
+
+    monkeypatch.setattr(store, "revoke_user_sessions", counted_revoke)
+    with (
+        caplog.at_level("ERROR", logger="messagefoundry.auth.service"),
+        pytest.raises(sqlite3.OperationalError, match="synthetic read fault"),
+    ):
+        await _provision(service, "site-admin")
+    assert revokes == ["halfwritten", "halfwritten"]
+    assert len(_error_lines(caplog)) == 1
+    assert await _provisioned_rows(store) == []
 
 
 # --- the #3025 fold-in: no Administrator over another run's credential -----------------------------

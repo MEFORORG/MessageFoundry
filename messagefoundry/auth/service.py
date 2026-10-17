@@ -3329,7 +3329,9 @@ class AuthService:
         # granted first, a crash would leave an Administrator with no credential and a store this
         # command then refuses. Its account therefore holds no role, and nothing it wrote is undone:
         # a compare-free undo of the password could erase the winner's on a row both runs wrote.
-        grant = await self._store.grant_first_admin_unless_admin_exists(
+        # Typed ``object``, not ``AdminGrant``: narrowed by the three checks below, the enum would
+        # make mypy read the fail-closed block as unreachable and stop checking it.
+        grant: object = await self._store.grant_first_admin_unless_admin_exists(
             user_id,
             admin_role_id=Role.ADMINISTRATOR.value,
             expected_password_hash=password_hash,
@@ -3355,38 +3357,21 @@ class AuthService:
             # provisioned row is written. No audit row records this refusal, so the ERROR line is
             # its only trace and is written FIRST, before any later await can raise past it. The
             # outcome is logged as a member's name or a type name, never a repr, because an
-            # out-of-contract value could carry what the grant was handed.
+            # out-of-contract value could carry what the grant was handed. The name is scrubbed
+            # over its repr, so it reads as ``%r`` wrote it (see ``scrub_log_argument``).
             _log.error(
-                "first-admin grant for %r returned unexpected outcome %s; refused",
-                scrub_log_argument(username),
+                "first-admin grant for %s returned unexpected outcome %s; refused",
+                scrub_log_argument(repr(username)),
                 grant.name if isinstance(grant, AdminGrant) else type(grant).__name__,
             )
-            # Such a store MAY still have written the role, so the row is read again here and the
-            # advice matches what it holds. A re-run of a row that holds the role refuses it, and a
-            # re-run of a roleless one takes the repair branch, which clears the authenticator
-            # this run enrolled, so "keep the entry and re-run" is right for neither.
-            roles = await self._store.get_user_role_ids(user_id)
             if repaired:
-                # The repair branch's second revoke, as on success below; harmless with no role.
+                # The repair branch's second revoke, as on success below, and ahead of the read
+                # below so a read that raises cannot skip it. Harmless if no role was written.
                 await self._store.revoke_user_sessions(user_id)
-            if Role.ADMINISTRATOR.value in roles:
-                reset = (
-                    "to replace its authenticator seed and get recovery codes, run `messagefoundry "
-                    f"admin-reset-totp --username {username!r}`"
-                    if totp_secret is not None
-                    else "it enrolled no authenticator"
-                )
-                raise FirstAdministratorRefused(
-                    "the role grant returned an unexpected outcome, and the account named "
-                    f"{username!r} holds the Administrator role, so an Administrator may now exist "
-                    f"under this name; this run showed no recovery codes, and {reset}"
-                )
             raise FirstAdministratorRefused(
-                "the role grant returned an unexpected outcome, and the account named "
-                f"{username!r} holds no Administrator role, so this run granted none and showed "
-                "no recovery codes; remove any authenticator entry it showed"
-                # A row holding some other role is one a re-run refuses, so it is not advised.
-                + ("" if roles else ", then run the command again")
+                await self._unexpected_grant_refusal(
+                    username, user_id, enrolled=totp_secret is not None
+                )
             )
         if repaired:
             # AGAIN, after the role (ADR 0197 Amendment A, AC-A5). The earlier holder's password
@@ -3417,6 +3402,60 @@ class AuthService:
             repaired=repaired,
             holder_notice=holder_notice,
             recovery_codes=plain_codes,
+        )
+
+    async def _unexpected_grant_refusal(
+        self, username: str, user_id: str, *, enrolled: bool
+    ) -> str:
+        """The operator-facing text for a first-admin grant that answered out of contract (#3078).
+
+        Such a store MAY still have written a role, so the row is read again, through the same
+        seal-checked loader a re-run uses, and the advice matches what it holds. The read runs
+        after the grant's transaction, so it can also see another run's work; the text says
+        "may" for that reason. "Keep the entry and re-run" is wrong in at least two states: a re-run
+        refuses a row that holds the Administrator role, and on a roleless row it clears the
+        authenticator this run enrolled.
+        """
+        prefix = (
+            "the role grant returned an unexpected outcome, so this run showed no recovery codes "
+            f"for the account named {username!r}"
+        )
+        again = (
+            "If the command is refused the same way again, the store has a fault this command "
+            "cannot repair"
+        )
+        lookup = await self._lookup_by_username(username)
+        row = lookup.user
+        if row is None or row.id != user_id:
+            return f"{prefix}, and could not read what that account holds now. {again}"
+        if Role.ADMINISTRATOR.value in row.role_ids:
+            if not enrolled:
+                return (
+                    f"{prefix}. That account holds the Administrator role, so an Administrator may "
+                    "now exist under this name; this run enrolled no authenticator"
+                )
+            return (
+                f"{prefix}. That account holds the Administrator role, so an Administrator may now "
+                "exist under this name. If no other provision-admin run used this name, replace "
+                "its authenticator seed and get recovery codes with `messagefoundry "
+                "admin-reset-totp`, naming that account and giving the same --db and "
+                "--service-config as this run"
+            )
+        if await self.has_enabled_administrator():
+            return (
+                f"{prefix}. That account holds no Administrator role, and another enabled "
+                "Administrator now exists; remove any authenticator entry this run showed. If "
+                "nobody needs that account, delete it from the web console"
+            )
+        if row.role_ids:
+            return (
+                f"{prefix}. That account holds a role other than Administrator, so the command "
+                "refuses it; remove any authenticator entry this run showed, and run the command "
+                "again with another username"
+            )
+        return (
+            f"{prefix}. That account holds no role; remove any authenticator entry this run "
+            f"showed, then run the command again. {again}"
         )
 
     async def _existing_row_refusal(
