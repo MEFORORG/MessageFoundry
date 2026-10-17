@@ -973,7 +973,8 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   method stays floored. Each exempted pass records the matched values as `callback_floor_exempt_amr`,
   under `evidence` on a sign-in's `auth.login_success` row and at the top of a step-up's `auth.reauth` row.
   A pass the exemption let through that is then refused carries the field at the top of its refusal
-  row too (BACKLOG #3220), so review those rows, failed attempts included. Load refuses a value `oidc_mfa_amr_values` also accepts while the claim gate is
+  row too, except a lock refusal, whose row keeps the exact text that hides it (BACKLOG #3220).
+  Review those rows, failed attempts included. Load refuses a value `oidc_mfa_amr_values` also accepts while the claim gate is
   on, since that value would exempt every token the gate admits by it.
 - **Reversible:** yes, immediately — empty the list (or delete the line) and restart.
 

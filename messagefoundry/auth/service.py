@@ -47,6 +47,7 @@ from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 from messagefoundry.auth import channel_scope, oidc, reconcile, totp, webauthn
 from messagefoundry.auth.audit_visibility import (
     ACCOUNT_LOCKED_ACTION,
+    DIRECTORY_LOCKED_REFUSAL_DETAIL,
     LOCK_NOTICE_ACTION,
     LOCKED_REFUSAL_DETAIL,
     LOGIN_LOCKED_ACTION,
@@ -2005,9 +2006,10 @@ def _floor_exempt_marker(floor_exempt_amr: Sequence[str]) -> dict[str, object]:
     """The audit fields for an OIDC callback the floor exemption let through, empty when it did not
     apply (BACKLOG #2388).
 
-    BACKLOG #3220: every row the attempt writes after the exemption applied carries it, refusals
-    included, so the review ``docs/SECURITY-LOOSENING.md`` asks for also sees exempted attempts
-    that failed. The values are the CONFIGURED ones the token matched, never the token's own."""
+    BACKLOG #3220: the success row carries it, and so does each refusal row written after the
+    exemption applied, except a directory lock refusal (see :meth:`AuthService._refuse_directory_row`),
+    so the review ``docs/SECURITY-LOOSENING.md`` asks for also sees exempted attempts that failed.
+    Other rows the attempt writes, such as role resyncs and session rotation, do not carry it. The values are the CONFIGURED ones the token matched, never the token's own."""
     return {"callback_floor_exempt_amr": list(floor_exempt_amr)} if floor_exempt_amr else {}
 
 
@@ -5335,14 +5337,15 @@ class AuthService:
         ``error`` is the generic string on purpose: an unauthenticated caller learns that the attempt
         failed and nothing about whether the account exists, is disabled, or is locked.
 
-        ``extra`` adds fields to the audit row only, as on :meth:`_directory_reject_audit`.
+        ``extra`` adds fields to the audit row only, as on :meth:`_directory_reject_audit`, with one
+        exception: a lock refusal takes none. Readers without ``users:manage`` are kept from that
+        row by its exact text, ``DIRECTORY_LOCKED_REFUSAL_DETAIL`` (owner ruling 2026-09-28), so
+        any extra field would show them the lock (BACKLOG #3220).
         """
-        await self._audit(
-            "auth.login_failed",
-            actor=username,
-            detail=_json({**(extra or {}), "provider": "ad", "reason": reason}),
-            client=client,
-        )
+        detail = _json({"provider": "ad", "reason": reason})
+        if extra and detail != DIRECTORY_LOCKED_REFUSAL_DETAIL:
+            detail = _json({**extra, "provider": "ad", "reason": reason})
+        await self._audit("auth.login_failed", actor=username, detail=detail, client=client)
         return LoginOutcome(ok=False, error="invalid credentials", reason=reason)
 
     async def _directory_reject_audit(

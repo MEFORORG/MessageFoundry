@@ -20,6 +20,10 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from messagefoundry.auth import oidc
+from messagefoundry.auth.audit_visibility import (
+    DIRECTORY_LOCKED_REFUSAL_DETAIL,
+    HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE,
+)
 from messagefoundry.auth.service import TOO_EARLY, AuthService
 from messagefoundry.config.settings import AuthSettings, _auth_limit_loosenings
 from messagefoundry.store.store import MessageStore
@@ -80,13 +84,14 @@ async def _sign_in_too_early(
     amr: tuple[str, ...],
     *,
     elapsed: float = FLOOR - 0.001,
+    auth_time_offset: float = 0.5,
 ) -> Any:
     """A sign-in whose person signed in at the IdP during the flow, returning ``elapsed`` seconds
     after the start: inside the floor unless a test says otherwise."""
     flow_id, url = await service.begin_oidc_login(client="127.0.0.1", public_origin=ORIGIN)
     state = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))["state"]
     issued_at = _staged(service, flow_id).issued_at
-    service._exchange_and_validate = lambda *_a, **_k: _verified(amr, issued_at + 0.5)  # type: ignore[method-assign]
+    service._exchange_and_validate = lambda *_a, **_k: _verified(amr, issued_at + auth_time_offset)  # type: ignore[method-assign]
     clock[0] += elapsed
     return await service.complete_oidc_login(
         flow_id=flow_id, state=state, code=AUTH_CODE, client="127.0.0.1", public_origin=ORIGIN
@@ -251,6 +256,55 @@ async def test_a_refused_sign_in_carries_the_marker_only_when_the_exemption_appl
             assert detail["callback_floor_exempt_amr"] == [EXEMPT]
         else:
             assert "callback_floor_exempt_amr" not in detail
+    finally:
+        await store.close()
+
+
+async def test_a_refused_exempted_sign_in_against_a_locked_account_keeps_the_hidden_lock_text(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lock refusal is hidden from readers without users:manage by its exact text, so it takes
+    no marker: a marker would make the row visible and show them the lock (owner ruling
+    2026-09-28). Read back through the exclusion the audit routes apply."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, clock = await _floored(
+            store, rsa_key, monkeypatch, oidc_callback_floor_exempt_amr=[EXEMPT]
+        )
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        await store.record_login_failure(user.id, failed_attempts=5, locked_until=time.time() + 600)
+        out = await _sign_in_too_early(service, clock, ("mfa", EXEMPT))
+        assert not out.ok and out.reason == "locked", out
+        [row] = [
+            r
+            for r in await _audit_rows(store, "auth.login_failed")
+            if json.loads(str(r["detail"])).get("reason") == "locked"
+        ]
+        assert row["detail"] == DIRECTORY_LOCKED_REFUSAL_DETAIL
+        assert (
+            "auth.login_failed",
+            row["detail"],
+        ) in HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE.rows
+    finally:
+        await store.close()
+
+
+async def test_a_too_early_single_sign_on_callback_is_not_marked_when_refused(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the other condition: an IdP answering from a sign-on made before the flow
+    is not floored, so a refusal of it carries no marker even with an exempt amr."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, clock = await _floored(
+            store, rsa_key, monkeypatch, oidc_callback_floor_exempt_amr=[EXEMPT]
+        )
+        await _refuse_sign_in(service, store, "disabled")
+        out = await _sign_in_too_early(service, clock, ("mfa", EXEMPT), auth_time_offset=-60.0)
+        assert not out.ok and out.reason == "disabled", out
+        detail = await _refusal_detail(store, "auth.login_failed", "disabled")
+        assert "callback_floor_exempt_amr" not in detail
     finally:
         await store.close()
 
