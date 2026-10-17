@@ -23,7 +23,8 @@ The text is every such string that holds a space or spells the variable, so a ba
 ``""`` default of ``os.environ.get`` is not a message. That text must name the posture, and a
 phrase that wraps or is split across ``+`` still counts.
 
-**What the prose scans see** (vault BACKLOG #3099, #3753). Every docstring in the packages, one
+**What the prose scans see** (vault BACKLOG #3099, #3753). Every docstring in the packages (not a
+``#:`` attribute comment), one
 paragraph at a time: a paragraph that spells the variable must name the posture, so a mention
 cannot ride on the posture in another paragraph. Two mentions inside one paragraph are judged
 together. Comments in ``_COMMENT_FILES``: own-line comments on consecutive
@@ -47,7 +48,8 @@ imported under another name; a message with no space that only interpolates the 
 as ``f"{INSECURE_TLS_ESCAPE_ENV}=1:refused"``; a call lent through ``+``, as in
 ``(_("set %s") + "...") % NAME``; a method called on the template, as in
 ``"set %s".strip() % NAME``; the variable handed through a nested call, as in
-``"set %s" % str(NAME)``; a comment outside the pinned files; and prose that
+``"set %s" % str(NAME)``; a comment outside ``_COMMENT_FILES``, including a ``#:`` attribute
+doc; and prose that
 says "the dev escape" without the variable. A lent call that spells the variable itself is counted
 twice, once on its own and once in the call around it. A ``.format`` call is also judged on its
 own, by its arguments and without its template, so a spaced argument beside the variable is

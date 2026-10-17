@@ -16,12 +16,12 @@ Standard library only (``urllib.request``) — no new dependency (ADR 0003). Red
 (a 3xx could divert PHI to an unintended host) and the scheme is constrained to http/https, mirroring
 the alert-webhook hardening (ASVS 15.3.2 / 1.3.6); the `[egress].allowed_http` allowlist is the
 fail-closed host gate (enforced by the runner at load/reload/start). Per-connection
-``verify_tls=False`` on an ``https`` URL is decided by :func:`refuse_verify_off`, whose docstring
-is the source of record for the rule. The dev escape ``MEFOR_ALLOW_INSECURE_TLS`` can turn that
-refusal into a loud warning only on an instance at ``[security].enforcement = warn``; under
-``enforce``, the default, or with no posture known, it changes nothing. It never lifts the
-refusal of a hop that sends a credential the refusal can see; the section of
-docs/SECURITY-LOOSENING.md that :func:`refuse_verify_off` links names what it cannot see.
+``verify_tls=False`` on an ``https`` URL may be refused at construction; :func:`refuse_verify_off`
+says when, and its docstring is the source of record for the rule, including the hops it allows
+and the credentialed hops nothing lifts. Where the dev escape ``MEFOR_ALLOW_INSECURE_TLS`` reaches
+such a refusal, it turns it into a loud warning only on an instance at
+``[security].enforcement = warn``; under ``enforce``, the default, or with no posture known, it
+changes nothing.
 
 There is **no REST source yet** — a non-HL7 source needs the payload-agnostic ingress decided in
 ADR 0003 (its own follow-up ADR). This is the first non-HL7 connector.

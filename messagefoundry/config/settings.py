@@ -439,7 +439,8 @@ class _Section(_InputHidingModel):
         return data
 
 
-#: Env var that explicitly permits MITM-able TLS overrides for a trusted-network dev/test bind.
+#: Env var that explicitly permits MITM-able TLS overrides for a trusted-network dev/test bind,
+#: honoured only on an instance at ``[security].enforcement = warn``.
 INSECURE_TLS_ESCAPE_ENV = "MEFOR_ALLOW_INSECURE_TLS"
 
 
@@ -565,9 +566,8 @@ def insecure_config_source_escape_permitted(environ: Mapping[str, str] | None = 
     one is refused, and the refusal names the variable. It used to be honoured at any dial, so one
     variable in the service environment would have turned off the check that keeps writable Python
     from running as the service account, and nothing would have reported it. The insecure-TLS escape
-    ``MEFOR_ALLOW_INSECURE_TLS`` is clamped the same way, honoured only on an instance at
-    ``[security].enforcement = warn`` (:func:`weakened_tls_escape_permitted`), but it reads that dial
-    from the instance's posture, not from the environment.
+    ``MEFOR_ALLOW_INSECURE_TLS`` has its own clamp, honoured only on an instance at
+    ``[security].enforcement = warn`` (:func:`weakened_tls_escape_permitted`).
 
     **Why the dial is read from the environment and not from loaded settings.** The check runs inside
     ``load_config``, in every process that executes config: ``serve``, a reload, the sandbox worker's
