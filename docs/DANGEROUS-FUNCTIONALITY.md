@@ -1001,8 +1001,10 @@ store's cluster records too. Run the harness only where those variables name a t
 **A run-time function swap.** This class is the harness's own. `provision-admin` reads the new
 password from a terminal and takes it no other way. A test rig has no terminal. So
 `load/rigadmin.py` imports the engine's command module and replaces its `_read_new_password`
-function with one that returns a password the rig holds. It then calls the shipped command's
-`main`. The rest of `provision-admin` runs as shipped.
+function with one that returns a password the rig holds. It also wraps the command's
+`_build_provision_auth_service`, so the service it builds refuses any store that holds an enabled
+Administrator (vault BACKLOG #2711). That only narrows the command. It then calls the shipped
+command's `main`. The rest of `provision-admin` runs as shipped.
 
 What holds it:
 
@@ -1013,12 +1015,11 @@ What holds it:
   it out of its own environment before any engine code runs.
 - The shipped command refuses a store that already has an enabled local Administrator with a
   usable password, and the swap does not change that. Since vault BACKLOG #2711, a directory or
-  federated Administrator does not block it.
+  federated Administrator does not block the shipped command. The rig adds a check of its own: it
+  refuses a store that holds an enabled Administrator of any kind.
 
-What it means: take a store where no enabled local Administrator has a usable password. Whoever
-can run the harness with access to that store can create one with no terminal and no
-authenticator app. That includes a store whose Administrators all sign in through the directory,
-even while they can still sign in (vault BACKLOG #2711). The swap passes
+What it means: on a store with no enabled Administrator, whoever can run the harness with access
+to that store can create one with no terminal and no authenticator app. The swap passes
 `--no-totp`, and sets `MEFOR_SECURITY_REQUIRE_MFA=false` in that process.
 
 **Parsing.** Section 7's six patterns, run over the harness, find these modules:

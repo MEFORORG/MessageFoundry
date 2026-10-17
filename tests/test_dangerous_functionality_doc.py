@@ -1636,8 +1636,13 @@ _CONFIG_LOADERS = frozenset({"load_config"})
 #: the dotted name assigned. Section 11's swap paragraph names each module and each attribute.
 _REVIEWED_HARNESS_SWAPS: dict[str, tuple[str, ...]] = {
     # ``_provision_here`` replaces the terminal read of the shipped ``provision-admin`` command with
-    # a password the rig holds, in a process started for that one job.
-    "load/rigadmin.py": ("messagefoundry.__main__._read_new_password",),
+    # a password the rig holds, in a process started for that one job. ``_keep_the_narrow_rule``
+    # wraps the command's auth-service builder so it also refuses a store holding a directory
+    # Administrator (vault BACKLOG #2711); it only narrows the command.
+    "load/rigadmin.py": (
+        "messagefoundry.__main__._read_new_password",
+        "messagefoundry.__main__._build_provision_auth_service",
+    ),
 }
 
 
