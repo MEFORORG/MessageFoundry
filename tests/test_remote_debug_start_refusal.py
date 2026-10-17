@@ -89,7 +89,7 @@ def test_the_refusal_follows_the_interpreter_reading_only() -> None:
 def test_the_refusal_names_the_launch_that_fixes_it_and_the_acceptance() -> None:
     refused = remote_debug_refusal(_ON)
     assert refused is not None
-    assert "python -X disable-remote-debug -m messagefoundry" in refused
+    assert "python -P -X disable-remote-debug -m messagefoundry" in refused
     assert "PYTHON_DISABLE_REMOTE_DEBUG=1" in refused
     assert f"{REMOTE_DEBUG_ACCEPTANCE} = true" in refused
     assert REMOTE_DEBUG_ACCEPTANCE.removeprefix("[security].") in SecuritySettings.model_fields
@@ -271,7 +271,7 @@ def test_a_real_start_with_the_interface_on_refuses(tmp_path: Path) -> None:
 def test_a_real_start_with_disable_remote_debug_gets_past_this_gate(tmp_path: Path) -> None:
     """The control for the arm above: the launch the refusal names. It stops at a later gate, the
     missing store key, which shows it ran on past this one."""
-    proc = _real_serve(tmp_path, "-X", "disable-remote-debug")
+    proc = _real_serve(tmp_path, "-P", "-X", "disable-remote-debug")  # as the refusal names
     assert _REFUSAL not in proc.stderr
     assert proc.returncode == 2, proc.stderr[-2000:]
     assert "no MEFOR_STORE_ENCRYPTION_KEY" in proc.stderr, proc.stderr[-2000:]

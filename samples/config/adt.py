@@ -6,7 +6,7 @@ Connection names follow the project convention ``[TYPE]_[PARTNER]_[MESSAGE]`` (s
 docs/CONNECTIONS.md): ``IB_Test_ADT`` is an inbound MLLP listener; ``FILE-OUT_Test_ADT`` is an
 outbound file writer. Run it with::
 
-    python -X disable-remote-debug -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev
+    python -P -X disable-remote-debug -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev
 
 Pass ``--env dev`` for local work: the active environment is **required** (no default) and selects
 which ``environments/<env>.toml`` resolves any ``env()`` value lookups (this sample uses none, so it

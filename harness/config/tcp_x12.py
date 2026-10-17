@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Raw-TCP and X12 graph the harness drives (vault BACKLOG #2674). Loaded with every other
-top-level module here by ``python -X disable-remote-debug -m messagefoundry serve --config harness/config``.
+top-level module here by ``python -P -X disable-remote-debug -m messagefoundry serve --config harness/config``.
 
 Ports are read with the engine's own ``env()``, each under ``harness_<endpoint key>`` with the same
 default as its entry in ``harness/endpoints/tcp.py`` or ``harness/endpoints/x12.py`` (2580 to 2583),

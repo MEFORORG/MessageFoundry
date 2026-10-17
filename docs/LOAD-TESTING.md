@@ -63,7 +63,7 @@ python -m harness.load.rigadmin provision --db ./load.db
 
 # 2) Serve the load config (its own ports, separate from harness/config). Tune via env (below).
 MEFOR_LOAD_FANOUT=20 MEFOR_LOAD_TRANSFORM=edit MEFOR_LOAD_SINK_PORT=2700 \
-  python -X disable-remote-debug -m messagefoundry serve --config harness/config/load --db ./load.db --env dev
+  python -P -X disable-remote-debug -m messagefoundry serve --config harness/config/load --db ./load.db --env dev
 
 # 3) Drive it, signed in. `run` signs in and appends --token=<session> to the command after `--`.
 #    --sink-port must match MEFOR_LOAD_SINK_PORT above.
@@ -232,11 +232,11 @@ the engine was served with. Run the same profile against each backend (swap `--d
 
 ```bash
 # SQLite (single-writer WAL ceiling — the baseline to beat)
-python -X disable-remote-debug -m messagefoundry serve --config harness/config/load --db ./load.db --env dev
+python -P -X disable-remote-debug -m messagefoundry serve --config harness/config/load --db ./load.db --env dev
 python -m harness --load fanout-baseline --engine ... --db-backend sqlite --report-json out/load/sqlite.json
 
 # Postgres (server-DB backend — full staged-pipeline parity)
-python -X disable-remote-debug -m messagefoundry serve --config harness/config/load --db "postgresql://..."
+python -P -X disable-remote-debug -m messagefoundry serve --config harness/config/load --db "postgresql://..."
 python -m harness --load fanout-baseline --engine ... --db-backend postgres \
   --baseline out/load/sqlite.json --report-json out/load/postgres.json
 ```

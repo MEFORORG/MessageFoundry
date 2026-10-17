@@ -7,7 +7,7 @@ DEV, a specific NIC in PROD), set by the operator, not here. The outbound peer d
 environment, so it's authored with ``env()`` and resolved from ``environments/<env>.toml`` (DEV vs
 PROD). Run it against the dev values with::
 
-    python -X disable-remote-debug -m messagefoundry serve --config samples/config --env dev --db ./messagefoundry.db
+    python -P -X disable-remote-debug -m messagefoundry serve --config samples/config --env dev --db ./messagefoundry.db
 """
 
 from messagefoundry import MLLP, Send, env, handler, inbound, outbound, router

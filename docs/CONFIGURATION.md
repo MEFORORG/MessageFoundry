@@ -472,7 +472,7 @@ cross-cutting selector **`[ai].environment`** — a **free-form name** (ADR 0017
   [environments]
   base_dir = "C:/srv/acme-config"   # the config-repo root; environments/<env>.toml live under it
   ```
-  or per run: `python -X disable-remote-debug -m messagefoundry serve --config config --env prod --project-root C:/srv/acme-config`
+  or per run: `python -P -X disable-remote-debug -m messagefoundry serve --config config --env prod --project-root C:/srv/acme-config`
   (the flag overrides `[environments].base_dir`; precedence is CLI > env > file > default, like every
   service setting). The startup log prints the **resolved** `environments/<env>.toml` path so you can
   confirm where values are read from. Running from the repo root keeps working unchanged (the empty
@@ -2733,7 +2733,7 @@ step-by-step is in OFF-LOOPBACK-DEPLOYMENT.md
 ## Example
 
 A **complete, startable** `messagefoundry.toml` for a loopback PHI instance on a SQL Server store,
-run as `python -X disable-remote-debug -m messagefoundry serve --config <dir> --env prod` (the active environment is required and has
+run as `python -P -X disable-remote-debug -m messagefoundry serve --config <dir> --env prod` (the active environment is required and has
 no default; `--env` is the CLI layer over `[ai].environment`, which is why it is not in the file).
 
 **Two of these blocks exist only because a shipped serve gate refuses without them** — they are not

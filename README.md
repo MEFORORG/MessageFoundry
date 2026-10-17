@@ -100,7 +100,7 @@ pip install "messagefoundry==<version>"   # pin the exact engine version (core r
 messagefoundry init ./my-config-repo      # scaffold a standalone config repo
 cd ./my-config-repo
 messagefoundry provision-admin --username <name> --email <address>   # the first administrator
-python -X disable-remote-debug -m messagefoundry serve --config config --env dev
+python -P -X disable-remote-debug -m messagefoundry serve --config config --env dev
 ```
 
 The engine creates no account on its own, so nobody can manage a new instance until `provision-admin`
@@ -193,7 +193,7 @@ covers the key.
 
 ```bash
 python -m messagefoundry provision-admin --username <name> --email <address> --db messagefoundry.db
-python -X disable-remote-debug -m messagefoundry serve --config samples/config --db messagefoundry.db --env dev
+python -P -X disable-remote-debug -m messagefoundry serve --config samples/config --db messagefoundry.db --env dev
 # API on https://127.0.0.1:8765 — GET /connections, /messages, /stats, WS /ws/stats
 ```
 

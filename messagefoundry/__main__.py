@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Command-line entrypoint for the MessageFoundry engine + IDE tooling.
 
-    python -X disable-remote-debug -m messagefoundry serve --config ./samples/config --db ./messagefoundry.db  # engine + API
+    python -P -X disable-remote-debug -m messagefoundry serve --config ./samples/config --db ./messagefoundry.db  # engine + API
     messagefoundry validate  --config ./samples/config --json                     # report problems
     messagefoundry graph     --config ./samples/config --json                     # the wired graph
     messagefoundry dryrun    --config ./samples/config --messages ./msgs --json   # run, don't send
@@ -5734,7 +5734,7 @@ def _init(args: argparse.Namespace) -> int:
     print("\nNext steps:")
     print("  pip install -r requirements.txt        # the pinned engine (a read-only dependency)")
     print("  messagefoundry check --config config --messages messages/sets")
-    print("  python -X disable-remote-debug -m messagefoundry serve --config config --env dev")
+    print("  python -P -X disable-remote-debug -m messagefoundry serve --config config --env dev")
     return 0
 
 

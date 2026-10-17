@@ -22,7 +22,7 @@ message (required by the at-least-once re-run invariant; see CLAUDE.md §2).
 
 Run::
 
-    python -X disable-remote-debug -m messagefoundry serve --config samples/consistency --db ./mf.db --env dev
+    python -P -X disable-remote-debug -m messagefoundry serve --config samples/consistency --db ./mf.db --env dev
 """
 
 from messagefoundry import MLLP, File, Send, handler, inbound, outbound, router

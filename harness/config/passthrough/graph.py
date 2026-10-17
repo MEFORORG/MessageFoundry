@@ -13,7 +13,7 @@ Synthetic + generic; reuses the load graph's ``_shape`` for the entry port and s
 ``MEFOR_LOAD_ADT_PORT`` / ``MEFOR_LOAD_SINK_PORT`` behave as in ``harness/config/load``. Serve it::
 
     MEFOR_LOAD_ADT_PORT=2600 MEFOR_LOAD_SINK_PORT=2700 \
-      python -X disable-remote-debug -m messagefoundry serve --config harness/config/passthrough --db ./pt.db
+      python -P -X disable-remote-debug -m messagefoundry serve --config harness/config/passthrough --db ./pt.db
 """
 
 from __future__ import annotations

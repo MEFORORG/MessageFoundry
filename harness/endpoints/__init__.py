@@ -9,7 +9,7 @@ what stops a graph and its scenarios drifting apart.
 Each value resolves in this order: an explicit override (a scenario run's ``--endpoint KEY=VALUE``,
 or a test's own mapping), then the environment variable ``MEFOR_VALUE_HARNESS_<KEY>``, then the default.
 The defaults are the fixed ports and directories the harness has always documented, so
-``python -X disable-remote-debug -m messagefoundry serve --config harness/config`` behaves as before. Tests set the
+``python -P -X disable-remote-debug -m messagefoundry serve --config harness/config`` behaves as before. Tests set the
 environment variables to ephemeral ports and temporary directories, so the REAL graph runs under
 test rather than a copy of it.
 

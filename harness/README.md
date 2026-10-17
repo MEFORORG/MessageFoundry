@@ -61,7 +61,7 @@ That test reads imports and attribute uses of `frame`; it does not see a frame a
 and delivery path (see its docstring). Serve it, then drive it from the tabs above:
 
 ```powershell
-python -X disable-remote-debug -m messagefoundry serve --config harness/config --db ./messagefoundry.db --env dev
+python -P -X disable-remote-debug -m messagefoundry serve --config harness/config --db ./messagefoundry.db --env dev
 ```
 
 | Send (Send/Compose tab → 127.0.0.1:2575) | Disposition (Monitor tab) |
@@ -170,7 +170,7 @@ then run a profile:
 
 ```powershell
 $env:MEFOR_LOAD_FANOUT=20; $env:MEFOR_LOAD_TRANSFORM="edit"; $env:MEFOR_LOAD_SINK_PORT=2700
-python -X disable-remote-debug -m messagefoundry serve --config harness/config/load --db ./load.db   # swap --db for backends
+python -P -X disable-remote-debug -m messagefoundry serve --config harness/config/load --db ./load.db   # swap --db for backends
 python -m harness --load fanout-baseline --engine URL --token T --report-json out/load/run.json
 ```
 
@@ -222,7 +222,7 @@ each a well-formed ACK or NAK, followed by a clean close; and that no API call a
 each holds.
 
 ```powershell
-python -X disable-remote-debug -m messagefoundry serve --config harness/config --db ./fuzz.db
+python -P -X disable-remote-debug -m messagefoundry serve --config harness/config --db ./fuzz.db
 python -m harness --fuzz --engine URL --cacert PEM --token T --fuzz-seed 7 --fuzz-iterations 100000 --fuzz-seconds 300
 python -m harness --fuzz-replay <path printed by the failure> --engine URL --cacert PEM --token T
 ```
@@ -352,7 +352,7 @@ export MEFOR_VALUE_HARNESS_DATABASE_SERVER=127.0.0.1 MEFOR_VALUE_HARNESS_DATABAS
 export MEFOR_VALUE_HARNESS_DATABASE_NAME=... MEFOR_VALUE_HARNESS_DATABASE_USERNAME=...
 export MEFOR_VALUE_HARNESS_DATABASE_PASSWORD=...
 export MEFOR_EGRESS_ALLOWED_DB=127.0.0.1
-python -X disable-remote-debug -m messagefoundry serve --config harness/config/database --db ./harness-db.db --env dev
+python -P -X disable-remote-debug -m messagefoundry serve --config harness/config/database --db ./harness-db.db --env dev
 python -m harness --scenario database_roundtrip --engine URL --token T
 ```
 
@@ -421,7 +421,7 @@ not load it:
 
 ```powershell
 $env:MEFOR_VALUE_REMOTEFILE_HARNESS_PASSWORD = "<any throwaway value>"
-python -X disable-remote-debug -m messagefoundry serve --config harness/config/remotefile --env dev
+python -P -X disable-remote-debug -m messagefoundry serve --config harness/config/remotefile --env dev
 python -m harness --scenario remotefile_write_out --engine URL --token T
 ```
 

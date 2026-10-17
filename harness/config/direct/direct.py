@@ -10,7 +10,7 @@ build until certificates exist for the run, and a top-level graph that could not
 subdirectory stays out of ``serve --config harness/config``. ``tests/test_harness_email.py`` mints
 synthetic trust material, serves this directory, and asserts what the sink received::
 
-    python -X disable-remote-debug -m messagefoundry serve --config harness/config/direct --env dev --db ./direct.db
+    python -P -X disable-remote-debug -m messagefoundry serve --config harness/config/direct --env dev --db ./direct.db
 
 with these engine environment values set (``MEFOR_VALUE_<KEY>``): ``direct_signing_cert`` /
 ``direct_signing_key`` (the sender's S/MIME pair), ``direct_recipient_cert`` (the partner's RSA

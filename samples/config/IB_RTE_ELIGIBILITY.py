@@ -16,7 +16,7 @@ machinery wired onto the X12 capture path.
 
 Peers are environment-specific → ``env()`` (resolved from ``environments/<env>.toml``).
 
-    python -X disable-remote-debug -m messagefoundry serve --config samples/config --env dev --db ./messagefoundry.db
+    python -P -X disable-remote-debug -m messagefoundry serve --config samples/config --env dev --db ./messagefoundry.db
 """
 
 from messagefoundry import (

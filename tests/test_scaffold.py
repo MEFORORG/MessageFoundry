@@ -339,11 +339,11 @@ def test_every_serve_start_init_names_disables_remote_debugging(
     ]
     assert len(starts) >= 3  # the printed next step, the README launch and its commented form
     for line in starts:
-        assert "python -X disable-remote-debug -m messagefoundry serve" in line, line
+        assert "python -P -X disable-remote-debug -m messagefoundry serve" in line, line
     refusal = remote_debug_refusal(
         RemoteDebugPosture(interpreter_enabled=True, guard_installed=True)
     )
-    assert refusal is not None and "python -X disable-remote-debug -m messagefoundry" in refusal
+    assert refusal is not None and "python -P -X disable-remote-debug -m messagefoundry" in refusal
 
 
 # --- BACKLOG #1318: what `init` writes, the loader must accept ---------------------------------

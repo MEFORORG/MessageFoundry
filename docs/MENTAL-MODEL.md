@@ -345,7 +345,7 @@ Keep the message store on a fast *local* disk, not a network share — the stage
 
 - **Install:** the supported production artifact is the signed, version-pinned PyPI wheel (pip install "messagefoundry==0.5.0"); then messagefoundry init scaffolds your own config repo (ADR 0017). Extras are opt-in: \[postgres\], \[sqlserver\], \[harness\] (the PySide6 test harness), \[sftp\], \[fhir\], \[dicom\], \[x12\], \[xml\], \[webauthn\], \[vault\], \[otel\]. The `/ui` web console installs alongside as the separate `messagefoundry-webconsole` distribution, published to PyPI on its own `webconsole-v*` cadence.
 
-- **Run headless:** python -X disable-remote-debug -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev — API on https://127.0.0.1:8765 (GET /connections, /messages, /stats, WS /ws/stats).
+- **Run headless:** python -P -X disable-remote-debug -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev — API on https://127.0.0.1:8765 (GET /connections, /messages, /stats, WS /ws/stats).
 
 - **Windows service:** the engine runs as a Windows service via NSSM (scripts/service/, docs/SERVICE.md).
 
@@ -376,7 +376,7 @@ The engine doesn’t care which — it only reads the --config directory on disk
 
 ```bash
 git clone https://your-git-host/acme/mefor-config.git          # your config repo — any git host
-python -X disable-remote-debug -m messagefoundry serve --config ./mefor-config/config --env prod # the engine just reads the files
+python -P -X disable-remote-debug -m messagefoundry serve --config ./mefor-config/config --env prod # the engine just reads the files
 ```
 
 >
@@ -450,7 +450,7 @@ inbound("IB_ACME_ADT", MLLP(port=2600), router="acme_adt_router", shard="a")
 ```
 
 ```bash
-python -X disable-remote-debug -m messagefoundry supervise --config ./config --base-port 8765   # one subprocess per shard id
+python -P -X disable-remote-debug -m messagefoundry supervise --config ./config --base-port 8765   # one subprocess per shard id
 ```
 
 **What’s measured, and what isn’t.** On a consumer 8-core test box, supervise scaled roughly linearly — 1 → 2 → 4 shards at ~50 → 88.7 → 165.5 msg/s aggregate, about η ≈ 0.85 of a core per added shard. The portable result is that **speedup shape**, not the absolute rate: multiply η by *your* measured single-shard rate. Two honest caveats — that run used the since-deprecated per-shard SQLite store, and N shards actively sharing one server DB, while built and invariant-tested, is **not yet certified as a supported production topology** (it awaits a clean multi-engine no-loss bench). Until it is, size production multi-engine deployments as active-passive (§14). Detail: docs/SYSTEM-REQUIREMENTS.md and docs/benchmarks/TUNING-BASELINE.md.

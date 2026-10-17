@@ -14,7 +14,7 @@ pure function the ``--estate`` driver imports — so the served fan-out and the 
 rate calibration derive from ONE definition. Serve it on its own::
 
     MEFOR_ESTATE_COUNT=1500 MEFOR_ESTATE_SIMPLE_FRACTION=0.72 MEFOR_ESTATE_HUB_FANOUT=3 \
-      python -X disable-remote-debug -m messagefoundry serve --config harness/config/estate --db ./estate.db
+      python -P -X disable-remote-debug -m messagefoundry serve --config harness/config/estate --db ./estate.db
 
 Every value here is synthetic and generic — no real partner, site, host, or volume. See
 ``docs/LOAD-TESTING.md``.

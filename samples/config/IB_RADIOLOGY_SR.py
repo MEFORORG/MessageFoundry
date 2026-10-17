@@ -15,7 +15,7 @@ SCP binds ``[inbound].bind_host`` (a non-loopback bind requires ``tls=true`` or
 ``serve --allow-insecure-bind``); ``ae_title``/``calling_ae_allowlist`` gate which peers may associate.
 
     pip install 'messagefoundry[dicom]'   # pydicom + pynetdicom (the codec + the SCP both need it)
-    python -X disable-remote-debug -m messagefoundry serve --config samples/config --env dev --db ./messagefoundry.db
+    python -P -X disable-remote-debug -m messagefoundry serve --config samples/config --env dev --db ./messagefoundry.db
 
 Generate a synthetic, PHI-free SR to send with ``samples/dicom/generate_sr_sample.py``.
 """
