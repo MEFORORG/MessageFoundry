@@ -55,9 +55,10 @@ only the host can. On a host that does not provide it:
   verdict your deployment warrants is yours to determine; nothing here should pre-fill it.)*
 - an **exposed** PHI instance **warns at every start** until the decision is recorded —
   `[security].memory_encryption_operator_declared = true` is the operator's declaration that the host
-  provides it. The engine **starts either way**: this is a host property, not a config error, and one no
-  operator can satisfy on Windows, so refusing by default would break deployments over something they
-  cannot change. An estate that has standardized on confidential-computing hosts can make the missing
+  provides it. The engine **starts either way**: this is a host property, not a config error, and a
+  Windows engine VM gets it only as an Azure or Azure Local confidential VM (table below, verified
+  2026-07-22), so refusing by default would stop a Windows engine on Windows Server Hyper-V over
+  something its operator cannot change. An estate that has standardized on confidential-computing hosts can make the missing
   declaration fatal with `[security].require_memory_encryption_declaration = true` (default `false`).
   Loopback and synthetic instances are **silent — but not exempt.** The warning is keyed on exposure to
   keep startup output off deployments nobody is watching, **not because the risk differs**: hardware
@@ -81,8 +82,8 @@ limitation travels with any copy of the posture body. The engine measures and re
 determines the verdict.
 
 **Availability on today's on-premises platforms (verified 2026-07-22).** For a **Windows** engine host —
-the only supported v1 platform — this requirement is presently **unmeetable on-premises**, and the
-blocker is the hypervisor, not the CPU:
+the only supported v1 platform — this requirement is presently **unmeetable on Windows Server Hyper-V**;
+ESXi 9.0 does not list Windows as a supported SEV-SNP guest. The blocker is the hypervisor, not the CPU:
 
 | Platform | Confidential guest for a **Windows** engine VM |
 |---|---|
@@ -91,9 +92,9 @@ blocker is the hypervisor, not the CPU:
 | **Azure / Azure Local confidential VMs** | ✅ SEV-SNP and TDX with Windows Server guests (a Microsoft paravisor supplies what a Windows guest needs). |
 | **Linux guests on KVM / AWS / GCP / ESXi 9** | ✅ Where the host is SEV-SNP/TDX-capable and the guest is launched confidential. Linux is [not supported for v1](#linux-is-not-a-supported-v1-deployment-target). |
 
-So a Windows on-prem deployment is honestly capped at **Partial** today, and the Linux row does not
-apply to v1. For a v1 deployment, the only row this table marks as a route is the Azure / Azure
-Local confidential-VM row. Plan hardware refresh accordingly —
+The Linux row does not apply to v1, so for a v1 deployment the only row this table marks as a route is
+Azure / Azure Local. What verdict a Windows engine VM on the other rows warrants is yours to determine
+(see the 2026-08-02 correction above). For an Azure Local route, plan hardware refresh accordingly —
 SEV-SNP needs EPYC 7003+ and TDX needs 5th Gen Xeon Scalable+, which is newer than much of a typical
 5–7-year hospital server refresh cycle.
 
@@ -310,6 +311,12 @@ multi-engine deployments as **active-passive** (one active writer per store) for
 | **Standard single-node** | ~30–70 msg/s | ~1.0–2.2 M/day | 1 process, single node | SQLite, or PostgreSQL / SQL Server | 4 cores / 8 GB |
 | **High single-node** | ~70–100 msg/s | ~2.2–3.2 M/day | 1 process, tuned (lean transforms; low fan-out; the default `pooled` claim mode; finite-retry on hot lanes), many connections / lanes draining concurrently via `SKIP LOCKED` | Server DB on its **own** host (PostgreSQL / SQL Server) | 4–8 cores / 16 GB + a DB host sized to the commit load |
 | **Multi-process (engine shards)** | ~165 msg/s measured at 4 engine shards **on per-shard SQLite — a topology that is not supported above one shard** (see the Store cell). The **supported** shared-server-DB shape has never been measured at this rate; a 4-shard soak at fan-out 8 on one shared SQL Server store sustained **~10 msg/s ingress**. The portable result is the **~0.85 per-shard efficiency**, not the absolute rate: ≈ *N* × your measured single-shard rate × 0.85 | ~5.3 M/day **for the unsupported per-shard-SQLite run only** — not a figure any deployable shape has demonstrated | *N* `messagefoundry supervise` engine-shard processes, partitioned by inbound connection — **not yet certified as a production topology** (see above) | **PostgreSQL / SQL Server** — required above one shard, so all engine shards share **one unified store** | 8+ cores / 32 GB + a dedicated DB host sized to the commit load |
+
+> **Platform of the source runs.** The Pilot and Standard rows come from the reference config in
+> [TUNING-BASELINE.md](benchmarks/TUNING-BASELINE.md), measured on a GitHub-hosted `ubuntu-latest` runner.
+> Linux is [not supported for v1](#linux-is-not-a-supported-v1-deployment-target). That file's Windows
+> Server 2025 sharding run also measured one process on SQLite at ~50 msg/s, inside the Standard band.
+> The High single-node and engine-shard rows had a Windows engine host.
 
 **Reading the tiers — and checking the arithmetic**
 

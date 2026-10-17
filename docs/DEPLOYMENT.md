@@ -277,9 +277,9 @@ was retired in [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-i
 > **Not supported for v1.** The image runs Linux
 > ([why](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target)).
 
-The **headless engine** ships as an OCI image (ADR 0017 "container fast-follow") — a complement to the
-Windows-service/NSSM path ([`SERVICE.md`](SERVICE.md)), not a replacement. A container is just another
-way to bind off-loopback, so it inherits the controls above unchanged. The operator console is the
+The **headless engine** builds as an OCI image (ADR 0017 "container fast-follow"), a development and CI
+artifact; deploy v1 as a Windows service ([`SERVICE.md`](SERVICE.md)). In a container the code applies
+the controls above unchanged. The operator console is the
 **browser web console the engine serves in-process at `/ui`** (ADR 0065), but its optional
 `messagefoundry-webconsole` wheel is **not in the image** — neither hash-locked profile installs it, so a
 stock container soft-degrades to a **JSON-API-only serve** (with a warning) until you add the wheel to a
@@ -287,7 +287,7 @@ derived image. Full build/run/ops guide:
 [`../docker/README.md`](../docker/README.md); the scoping analysis is in
 [`CONTAINER-EXPOSURE-EVALUATION.md`](CONTAINER-EXPOSURE-EVALUATION.md).
 
-Container-specific essentials (all detailed in [`../docker/README.md`](../docker/README.md)):
+Container-specific essentials, for that unsupported image (all detailed in [`../docker/README.md`](../docker/README.md)):
 
 - **Two variants:** slim default (core + SQLite) and `-sqlserver` (adds the OS-level MS ODBC Driver 18
   for the SQL Server store / `db_lookup`). Non-root uid 10001; read-only root fs; per-profile hash-locked deps.
