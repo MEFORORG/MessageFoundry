@@ -1978,17 +1978,28 @@ async def test_a_reload_row_that_fails_after_a_drain_cancel_is_logged(
 
 
 class _HeldAudit(_SlowAudit):
-    """An audit log whose write holds until ``release`` is set, then fails, as one would on the
-    store engine.stop() closes."""
+    """An audit log whose write holds until ``release`` is set. It then fails, as one would on the
+    store engine.stop() closes, or, with ``lands``, records the row."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, lands: bool = False) -> None:
         super().__init__()
         self.release = asyncio.Event()
+        self._lands = lands
 
     async def record_audit(self, action: str, **_kw: Any) -> None:
         self.entered.set()
         await self.release.wait()
-        raise sqlite3.ProgrammingError("PROBE: the store is closed")
+        if not self._lands:
+            raise sqlite3.ProgrammingError("PROBE: the store is closed")
+        self.rows.append(action)
+
+
+async def _settle_unlanded() -> None:
+    """Let the row writes a test left running end, so none outlives the test."""
+    from messagefoundry.api.app import _UNLANDED_ROW_WRITES
+
+    if _UNLANDED_ROW_WRITES:
+        await asyncio.wait(set(_UNLANDED_ROW_WRITES), timeout=1.0)
 
 
 @pytest.mark.parametrize("writer", ["refusal", "reload"])
@@ -1996,33 +2007,87 @@ async def test_a_row_wait_ends_inside_the_grace_the_drain_has_left(
     writer: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #3157 against #3191: the drain's grace is a share of the shutdown budget, and can be
-    shorter than the row wait's cap. The wait is cut to what the grace has left, so the reload's
-    task ends while the drain still waits for it, and the row it could not land is logged at
-    ERROR rather than holding the shutdown."""
+    shorter than the row wait. The wait is cut to what the grace has left, so the reload's task
+    ends while the drain still waits for it, and the row it could not land is logged at ERROR
+    rather than holding the shutdown."""
     from messagefoundry.api.outlive import OutlivingOperations
 
     store = _HeldAudit()
     op, action = _slow_writer(writer, store)
     outliving = OutlivingOperations()
     caller = asyncio.create_task(outliving.run(op, "config reload"))
-    await asyncio.wait_for(store.entered.wait(), 5.0)
-    with caplog.at_level(logging.ERROR):
-        loop = asyncio.get_running_loop()
-        began = loop.time()
-        assert await outliving.drain(timeout=0.0, grace=0.3) == ["config reload"]
-        assert loop.time() - began < 0.3 + 0.2
-        assert outliving.inflight == []
-        assert not [r for r in caplog.records if "finished rolling back" in r.getMessage()]
-        with pytest.raises(asyncio.CancelledError):
-            await caller
-        store.release.set()  # the write left running now meets the closed store
-        for _ in range(50):
-            await asyncio.sleep(0.01)
-            if any("after its operation was cancelled" in r.getMessage() for r in caplog.records):
-                break
+    try:
+        await asyncio.wait_for(store.entered.wait(), 5.0)
+        with caplog.at_level(logging.ERROR):
+            assert await outliving.drain(timeout=0.0, grace=0.3) == ["config reload"]
+            # The pin: the drain saw the reload end inside its grace, with nothing left rolling back.
+            assert outliving.inflight == []
+            assert not [r for r in caplog.records if "finished rolling back" in r.getMessage()]
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+            store.release.set()  # the write left running now meets the closed store
+            await _settle_unlanded()
+    finally:
+        store.release.set()
+        await _settle_unlanded()
     [lost] = [r for r in caplog.records if "after its operation was cancelled" in r.getMessage()]
     assert f"Lost row: action={action} actor=alice" in lost.getMessage()
-    assert store.rows == []
+
+
+async def test_a_drained_row_wait_is_not_cut_to_the_undrained_cap() -> None:
+    """Under a drain the grace bounds the wait, so a row slower than the undrained cap, but inside
+    the grace, still lands."""
+    from messagefoundry.api.app import _ROW_CANCEL_WAIT_SECONDS
+    from messagefoundry.api.outlive import OutlivingOperations
+
+    store = _HeldAudit(lands=True)
+    op, action = _slow_writer("reload", store)
+    outliving = OutlivingOperations()
+    caller = asyncio.create_task(outliving.run(op, "config reload"))
+    loop = asyncio.get_running_loop()
+    try:
+        await asyncio.wait_for(store.entered.wait(), 5.0)
+        loop.call_later(_ROW_CANCEL_WAIT_SECONDS + 0.3, store.release.set)
+        await outliving.drain(timeout=0.0, grace=_ROW_CANCEL_WAIT_SECONDS + 0.8)
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        # Landed before the reload ended, so before a real shutdown would go on to close the store.
+        assert store.rows == [action]
+    finally:
+        store.release.set()
+        await _settle_unlanded()
+
+
+async def test_the_grace_reaches_only_the_operations_the_drain_cancelled() -> None:
+    """The grace is keyed by the drained operation's own task. A task it spawned, and a later
+    operation on the same holder cancelled by anything but a drain, read None, not a stale grace."""
+    from messagefoundry.api.outlive import OutlivingOperations, cancel_grace_left
+
+    seen: dict[str, float | None] = {}
+    children: list[asyncio.Task[None]] = []
+
+    async def _waits(name: str, *, spawn: bool = False) -> None:
+        if spawn:
+            children.append(asyncio.create_task(_waits("child")))
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            seen[name] = cancel_grace_left()
+            raise
+
+    outliving = OutlivingOperations()
+    first = asyncio.create_task(outliving.run(_waits("first", spawn=True), "first"))
+    await asyncio.sleep(0.01)
+    assert await outliving.drain(timeout=0.0, grace=1.0) == ["first"]
+    second = asyncio.create_task(outliving.run(_waits("second"), "second"))
+    await asyncio.sleep(0.01)
+    for task in (*children, *outliving._inflight):
+        task.cancel()
+    await asyncio.gather(first, second, *children, return_exceptions=True)
+    await asyncio.sleep(0)
+    left = seen["first"]
+    assert left is not None and 0 < left <= 1.0
+    assert seen["child"] is None and seen["second"] is None
 
 
 async def test_a_row_wait_with_no_grace_left_does_not_wait() -> None:
@@ -2038,25 +2103,22 @@ async def test_a_row_wait_with_no_grace_left_does_not_wait() -> None:
 
     write = asyncio.ensure_future(asyncio.sleep(10))
     waiter = asyncio.ensure_future(_wait_to_completion(write, cancel_bound=_left))
-    await asyncio.sleep(0)
-    assert reads == []  # not read before the cancel
-    waiter.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(waiter, 1.0)
-    assert reads == [0.0] and not write.done()
-    write.cancel()
+    try:
+        await asyncio.sleep(0)
+        assert reads == []  # not read before the cancel
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(waiter, 1.0)
+        assert reads == [0.0] and not write.done()
+    finally:
+        write.cancel()
+        await asyncio.gather(write, return_exceptions=True)
 
 
-def test_the_row_wait_cap_fits_inside_the_shutdown_budget() -> None:
+def test_the_undrained_row_wait_fits_inside_the_engine_stop_reserve() -> None:
     """Nothing hands engine.stop() a remaining time, so the cap alone bounds a cancelled convergence
-    reload's row wait there. It stays below the smallest grace _app_drain_steps hands the drain,
-    at the long-operations step's floor, and well inside engine.stop()'s reserve (BACKLOG #3191)."""
+    reload's row wait there, and it must leave most of the reserve to the rest of the stop
+    (BACKLOG #3191)."""
     from messagefoundry.api import app as app_module
-    from messagefoundry.api.outlive import DRAIN_TIMEOUT_SECONDS
 
-    fake = cast(Any, SimpleNamespace(state=SimpleNamespace(outliving_operations=None)))
-    [step] = app_module._app_drain_steps(fake, None, None, owns_auth=False)
-    share = step.floor * app_module._INNER_SHARE
-    smallest_grace = share - min(DRAIN_TIMEOUT_SECONDS, share / 4)
-    assert smallest_grace > app_module._ROW_CANCEL_WAIT_SECONDS
     assert app_module._ROW_CANCEL_WAIT_SECONDS <= app_module._ENGINE_STOP_RESERVE_SECONDS / 3

@@ -1793,14 +1793,17 @@ async def _reload_and_record(
     return outcome, failures
 
 
-#: The most a cancel waits for a reload's audit row to land (:func:`_write_through_cancel`). A
-#: store write may have no bound of its own, so a hung write must not hold the shutdown. Under a
-#: shutdown drain the wait is also cut to what is left of the drain's grace (cancel_grace_left).
-#: Nothing hands engine.stop() a remaining time, and it awaits a cancelled convergence reload with
-#: no bound, so this cap is what holds that wait inside the shutdown budget (BACKLOG #3191): below
-#: the smallest grace _app_drain_steps hands the drain (1.2 s, at the step's 2.0 s floor), and a
-#: third of _ENGINE_STOP_RESERVE_SECONDS. tests/test_dual_control_reload.py pins both.
+#: How long a cancel no shutdown drain sent waits for a reload's audit row to land
+#: (:func:`_write_through_cancel`). A store write may have no bound of its own, so a hung write must
+#: not hold the shutdown. A drain's cancel waits for what its grace has left instead
+#: (:func:`_row_cancel_wait`). This is the bound for the rest, at least the convergence reload
+#: engine.stop() cancels and awaits with no bound: nothing hands engine.stop() a remaining time, so
+#: this cap is what keeps that wait well inside _ENGINE_STOP_RESERVE_SECONDS (BACKLOG #3191).
+#: tests/test_dual_control_reload.py pins it there.
 _ROW_CANCEL_WAIT_SECONDS: Final = 1.0
+#: The part of a drain's remaining grace a row wait leaves for the reload's task to unwind, so the
+#: drain sees the task end rather than timing out beside it.
+_ROW_UNWIND_MARGIN_SECONDS: Final = 0.1
 
 #: Row writes still running after the cancel bound. The event loop keeps only a weak reference to a
 #: task, so this set keeps each alive until it ends and its outcome is logged.
@@ -1816,11 +1819,11 @@ async def _write_through_cancel(
     cancel can land while the reload's own outcome row is being written. Cancelling that write
     would lose the row with no ERROR line, since a cancel is no ``Exception``. So the write runs as
     its own task, and a cancel waits for it to land, through the uploads module's
-    ``_wait_to_completion``, for up to :data:`_ROW_CANCEL_WAIT_SECONDS`, and under a shutdown drain
-    for no longer than the drain's grace has left (:func:`_row_cancel_wait`, BACKLOG #3191). With
-    none left it does not wait. Past the bound the cancel goes on, so the
-    reload's task ends while the drain still waits for it, and the write is left to finish on its
-    own. A write that then meets the store engine.stop() closes is logged as below.
+    ``_wait_to_completion``, for as long as :func:`_row_cancel_wait` allows: under a shutdown
+    drain, a little less than the drain's grace has left (BACKLOG #3191), and none when none is
+    left; otherwise :data:`_ROW_CANCEL_WAIT_SECONDS`. Past the bound the cancel goes on, so a
+    drained reload's task ends while the drain still waits for it, and the write is left to finish
+    on its own. A write that then meets the store engine.stop() closes is logged as below.
 
     Not :meth:`ApprovalGate._shielded`'s shape, which re-raises at once and leaves the gate's own
     drain to wait for the write. Nothing would drain this one once the reload's task has ended. A
@@ -1851,13 +1854,12 @@ async def _write_through_cancel(
 
 
 def _row_cancel_wait() -> float:
-    """The wait :func:`_write_through_cancel` gives a row once its cancel lands: the cap, or less
-    when a shutdown drain's grace has less left. :data:`_CUT_GRACE_SECONDS` of that grace is kept
-    back for the reload's task to unwind, so the drain sees it end rather than timing out with it."""
+    """The wait :func:`_write_through_cancel` gives a row once its cancel lands. Under a drain that
+    cancelled this reload, what the drain's grace has left, less
+    :data:`_ROW_UNWIND_MARGIN_SECONDS`; that grace is already a bounded share of the shutdown
+    budget, so no cap is added. For any other cancel, :data:`_ROW_CANCEL_WAIT_SECONDS`."""
     left = cancel_grace_left()
-    if left is None:
-        return _ROW_CANCEL_WAIT_SECONDS
-    return min(_ROW_CANCEL_WAIT_SECONDS, left - _CUT_GRACE_SECONDS)
+    return _ROW_CANCEL_WAIT_SECONDS if left is None else left - _ROW_UNWIND_MARGIN_SECONDS
 
 
 def _log_unlanded_row(task: asyncio.Future[Any], lost: Callable[[], str]) -> None:
