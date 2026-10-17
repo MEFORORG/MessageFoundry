@@ -528,37 +528,54 @@ async def run_sweep(policy: dict[str, Any], *, canary: str | None = None) -> dic
 def _row_record(row: route_gates.RouteRow) -> dict[str, Any]:
     """A route row as the receipt carries it. ``kind`` and ``declaration`` tell a route public by
     design from one the engine refuses to every caller, which the method and path alone cannot
-    (vault BACKLOG #2846, and #2955 for WebSocket rows)."""
+    (vault BACKLOG #2846, and #2955 for WebSocket rows). ``gates`` is what the walk found the
+    operation runs; for a WebSocket that authorizes in its body it is the only evidence it does."""
     return {
         "method": row.method,
         "path": row.path,
         "kind": row.kind,
         "declaration": row.declaration,
+        "gates": list(row.gates),
     }
 
 
-#: What a WebSocket row may be and pass (vault BACKLOG #2955): gated outright; marked
-#: ``public_route`` or ``authorizes_in_body``, or outside the engine's refusal, only with a reason.
-#: Outside the refusal, the reason is all that says the socket authorizes at all.
+#: What a WebSocket row may be and pass (vault BACKLOG #2955). Gated outright passes. Marked
+#: ``public_route`` passes with its reason. Marked ``authorizes_in_body``, or outside the engine's
+#: refusal, passes only with a reason AND a gate the walk found in its body: the engine accepts any
+#: declaration on a socket, and outside the refusal nothing reads it, so the reason alone would
+#: vouch for a socket that authorizes nobody.
 _WS_PASSES: Final = frozenset({route_gates.KIND_GATED})
 _WS_NEEDS_REASON: Final = frozenset(
     {route_gates.KIND_PUBLIC, route_gates.KIND_IN_BODY, route_gates.KIND_OUTSIDE}
 )
+_WS_NEEDS_GATE: Final = frozenset({route_gates.KIND_IN_BODY, route_gates.KIND_OUTSIDE})
 _HTTP_NEEDS_REASON: Final = frozenset({route_gates.KIND_PUBLIC})
 
 
 def _rows_not_declared(
-    rows: list[dict[str, Any]], *, passes: frozenset[str], needs_reason: frozenset[str]
+    rows: list[dict[str, Any]],
+    *,
+    passes: frozenset[str],
+    needs_reason: frozenset[str],
+    needs_gate: frozenset[str] = frozenset(),
 ) -> list[str]:
-    """Each row whose kind is not in ``passes``, and not in ``needs_reason`` with a declaration.
+    """Each row whose kind is not in ``passes``, and not in ``needs_reason`` with a declaration
+    (and, for a kind in ``needs_gate``, at least one gate).
 
     A row with no kind is listed too, so an older receipt cannot pass by omission."""
     found: list[str] = []
     for row in rows:
         kind = row.get("kind") or "no kind"
-        if kind in passes or (kind in needs_reason and row.get("declaration")):
+        if kind in passes:
             continue
-        state = f"{kind}, no reason" if kind in needs_reason else kind
+        if kind not in needs_reason:
+            state = kind
+        elif not row.get("declaration"):
+            state = f"{kind}, no reason"
+        elif kind in needs_gate and not row.get("gates"):
+            state = f"{kind}, no gate found"
+        else:
+            continue
         found.append(f"{str(row['method']).upper()} {row['path']} ({state})")
     return sorted(found)
 
@@ -574,13 +591,16 @@ def ungated_not_declared_public(receipt: dict[str, Any]) -> list[str]:
 
 
 def websocket_rows_not_declared(receipt: dict[str, Any]) -> list[str]:
-    """Each WebSocket row in ``receipt`` that the engine refuses, or that has no declared reason.
+    """Each WebSocket row in ``receipt`` that the engine refuses, or that is not shown to authorize.
 
     A WebSocket cannot be probed with an HTTP request, so its kind is the only check the sweep makes
     of it (vault BACKLOG #2955). A refused row is one the engine closes to every caller, a dead
     route."""
     return _rows_not_declared(
-        receipt.get("websocket_rows", []), passes=_WS_PASSES, needs_reason=_WS_NEEDS_REASON
+        receipt.get("websocket_rows", []),
+        passes=_WS_PASSES,
+        needs_reason=_WS_NEEDS_REASON,
+        needs_gate=_WS_NEEDS_GATE,
     )
 
 
@@ -651,7 +671,7 @@ def evaluate(receipt: dict[str, Any], policy: dict[str, Any]) -> tuple[int, list
     undeclared_ws = websocket_rows_not_declared(receipt)
     if undeclared_ws:
         errors.append(
-            f"WebSocket route(s) refused by the engine or with no declared reason: {undeclared_ws}. "
+            f"WebSocket route(s) refused by the engine or not shown to authorize: {undeclared_ws}. "
             "The sweep cannot probe a WebSocket, so its kind is the only check made of it."
         )
 
@@ -784,7 +804,7 @@ def receipt_lines(receipt: dict[str, Any], policy: dict[str, Any], verdict: str)
         f"declared public with a reason -- "
         f"{len(ungated_rows) - len(not_public)}/{len(ungated_rows)} ungated routes"
         + (f"; NOT: {not_public}" if not_public else ""),
-        f"WebSocket rows gated or declared with a reason -- "
+        f"WebSocket rows gated, declared public with a reason, or shown to authorize in the body -- "
         f"{len(ws) - len(ws_undeclared)}/{len(ws)}"
         + (f"; NOT: {ws_undeclared}" if ws_undeclared else ""),
         f"negative probes -- {receipt.get('negative_probes')} requests "

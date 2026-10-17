@@ -34,7 +34,8 @@ import pytest
 from fastapi import WebSocket
 
 from messagefoundry.api.app import create_app
-from messagefoundry.api.security import authorizes_in_body
+from messagefoundry.api.security import authorize_ws, authorizes_in_body
+from messagefoundry.auth.permissions import Permission
 from scripts.security import dast_target as dast_target_module
 from scripts.security import route_gates
 from scripts.security.dast_auth_sweep import (
@@ -45,6 +46,7 @@ from scripts.security.dast_auth_sweep import (
     is_refused,
     load_policy,
     main,
+    receipt_lines,
     ungated_not_declared_public,
     websocket_rows_not_declared,
     write_probe_outcome,
@@ -69,10 +71,13 @@ def _policy() -> dict[str, Any]:
     return load_policy(_POLICY)
 
 
+_REASON = "synthetic reason"
+
+
 def _declared_public(policy: dict[str, Any]) -> list[dict[str, Any]]:
     """The allow-list as a clean receipt reports it: each route declared public, with a reason."""
     return [
-        {**entry, "kind": route_gates.KIND_PUBLIC, "declaration": "synthetic reason"}
+        {**entry, "kind": route_gates.KIND_PUBLIC, "declaration": _REASON}
         for entry in policy["anonymous_allowlist"]
     ]
 
@@ -989,7 +994,7 @@ def _ws_row(**fields: Any) -> dict[str, Any]:
     return {"method": route_gates.WS_METHOD, "path": "/ws/planted", **fields}
 
 
-_REASON = "synthetic reason"
+_GATES = ["authorize_ws"]
 
 
 @pytest.mark.parametrize(
@@ -1002,18 +1007,30 @@ _REASON = "synthetic reason"
         pytest.param(
             _ws_row(kind=route_gates.KIND_PUBLIC, declaration=None), True, id="public-no-reason"
         ),
-        pytest.param(_ws_row(kind=None, declaration=_REASON), True, id="no-kind"),
+        pytest.param(
+            _ws_row(kind=route_gates.KIND_IN_BODY, declaration=_REASON, gates=[]),
+            True,
+            id="in-body-no-gate",
+        ),
+        pytest.param(
+            _ws_row(kind=route_gates.KIND_OUTSIDE, declaration=_REASON, gates=[]),
+            True,
+            id="outside-no-gate",
+        ),
+        pytest.param(_ws_row(kind=None, declaration=_REASON, gates=_GATES), True, id="no-kind"),
         # The shape the receipt wrote before #2955: method and path only.
         pytest.param(_ws_row(), True, id="older-receipt"),
         pytest.param(_ws_row(kind=route_gates.KIND_GATED, declaration=None), False, id="gated"),
         pytest.param(
-            _ws_row(kind=route_gates.KIND_IN_BODY, declaration=_REASON), False, id="in-body"
+            _ws_row(kind=route_gates.KIND_IN_BODY, declaration=_REASON, gates=_GATES),
+            False,
+            id="in-body",
         ),
         pytest.param(
             _ws_row(kind=route_gates.KIND_PUBLIC, declaration=_REASON), False, id="public"
         ),
         pytest.param(
-            _ws_row(kind=route_gates.KIND_OUTSIDE, declaration=_REASON),
+            _ws_row(kind=route_gates.KIND_OUTSIDE, declaration=_REASON, gates=_GATES),
             False,
             id="outside-with-reason",
         ),
@@ -1038,12 +1055,16 @@ def test_a_websocket_row_the_engine_refuses_reds_the_run(row: dict[str, Any], re
         "findings": [],
     }
     assert evaluate(clean, policy) == (0, [])
-    code, errors = evaluate({**clean, "websocket_rows": [row]}, policy)
+    receipt = {**clean, "websocket_rows": [row]}
+    code, errors = evaluate(receipt, policy)
+    (summary,) = [line for line in receipt_lines(receipt, policy, "") if "WebSocket rows" in line]
     if reds:
         assert code == 1, errors
         assert any("WebSocket" in line and "/ws/planted" in line for line in errors), errors
+        assert " -- 0/1; NOT: ['WS /ws/planted (" in summary, summary
     else:
         assert (code, errors) == (0, [])
+        assert summary.endswith(" -- 1/1"), summary
 
 
 async def _planted_undeclared(websocket: WebSocket) -> None:
@@ -1053,12 +1074,14 @@ async def _planted_undeclared(websocket: WebSocket) -> None:
 
 @authorizes_in_body("synthetic reason: the planted control socket")
 async def _planted_in_body(websocket: WebSocket) -> None:
-    """The control: the same socket, declared as authorizing in its own body."""
+    """The control: a socket declared as authorizing in its own body, which it does."""
+    if await authorize_ws(websocket, Permission.MONITORING_READ) is None:
+        return
     await websocket.close()
 
 
 def test_a_planted_undeclared_websocket_route_reds_the_sweep(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Vault BACKLOG #2955, end to end. A WebSocket route with no gate and no declaration, planted on
     the sweep's own target app, reds the real sweep. A control socket planted beside it, declared as
@@ -1084,6 +1107,10 @@ def test_a_planted_undeclared_websocket_route_reds_the_sweep(
     assert kinds.get("/ws/planted-control") == route_gates.KIND_IN_BODY, kinds
     assert websocket_rows_not_declared(receipt) == ["WS /ws/planted (refused)"]
     assert code == 1, f"a sweep with a refused WebSocket route exited {code}"
+    # The red must be the WebSocket check's own, not some other finding that happens to fail the run.
+    out = capsys.readouterr()
+    assert "WebSocket route(s) refused" in out.out + out.err, out
+    assert "WS /ws/planted (refused)" in out.out + out.err, out
 
 
 # =====================================================================================================
