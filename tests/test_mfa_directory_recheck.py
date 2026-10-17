@@ -28,13 +28,7 @@ from _totp_clock import fresh_totp, pin_totp_clock
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import reconcile, totp
-from messagefoundry.auth.ldap import (
-    AdPrincipal,
-    DirectoryAnswer,
-    DirectoryProbe,
-    LdapError,
-    LdapReferralError,
-)
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, LdapReferralError
 from messagefoundry.auth.service import DIRECTORY_UNCONFIRMED, AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
@@ -42,6 +36,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store.base import Store
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import login_admin
+from tests._fake_directory import FakeDirectory as _Directory
 
 _T0 = 1_700_000_000.0
 _T1 = _T0 + totp.DEFAULT_PERIOD
@@ -54,28 +49,6 @@ _PRINCIPAL = AdPrincipal(
     groups=frozenset(),
     directory_object_id="6f1d3c52-0e0b-4a57-9d52-1c2a3b4c5d6e",
 )
-
-
-class _Directory:
-    """A directory whose answer the test sets. ``unreachable`` raises the connectivity signal."""
-
-    def __init__(self, principal: AdPrincipal) -> None:
-        self.principal = principal
-        self.answer = DirectoryAnswer.FOUND
-        self.unreachable = False
-        #: Raised by the lookup when set: a referral (BACKLOG #2538) or a non-LDAP fault (#2241).
-        self.raises: Exception | None = None
-        self.probes: list[tuple[str, str | None]] = []
-
-    def probe_principal(self, username: str, *, object_id: str | None = None) -> DirectoryProbe:
-        self.probes.append((username, object_id))
-        if self.unreachable:
-            raise LdapError("synthetic: LDAP socket closed")
-        if self.raises is not None:
-            raise self.raises
-        if self.answer is DirectoryAnswer.FOUND:
-            return DirectoryProbe(DirectoryAnswer.FOUND, self.principal)
-        return DirectoryProbe(self.answer)
 
 
 @dataclass
@@ -461,6 +434,42 @@ async def test_a_lock_set_during_the_lookup_is_honoured(
     assert refused.locked is True and refused.ok is False
     session = await store.get_session(hash_token(e.token))
     assert session is not None and session.reauth_at is None
+
+
+@pytest.mark.parametrize("change", ["lock", "revoke", "disable"])
+async def test_what_lands_during_the_code_check_stops_the_factor_write(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """BACKLOG #3068, item 2. A revocation or a disable needs no account queue to land, and the
+    code check awaits, so the session, the account and its lock are read again right before the
+    factor is written. RED when: a change that lands during a good code's check does not stop the
+    write, which would then mark the factor, stamp the window and clear the lockout counters."""
+    e = await _enrolled_directory_session(store, monkeypatch)
+    real_verify = e.service._verify_second_factor
+
+    async def _verify_while_something_lands(*args: Any, **kwargs: Any) -> bool:
+        good = await real_verify(*args, **kwargs)
+        if change == "lock":
+            await _lock_second_step(store, e.user_id)
+        elif change == "revoke":
+            await store.revoke_session(hash_token(e.token))
+        else:
+            await store.set_user_disabled(e.user_id, disabled=True)
+        return good
+
+    monkeypatch.setattr(e.service, "_verify_second_factor", _verify_while_something_lands)
+
+    refused = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
+
+    assert refused.ok is False
+    assert refused.session_lost is (change != "lock")
+    assert refused.locked is (change == "lock")
+    session = await store.get_session(hash_token(e.token))
+    assert session is not None
+    assert session.mfa_verified_at is None and session.reauth_at is None
+    if change == "lock":
+        user = await store.get_user(e.user_id)
+        assert user is not None and user.second_step_locked_until is not None  # not cleared
 
 
 async def _more_sessions(e: _Enrolled, count: int) -> list[str]:

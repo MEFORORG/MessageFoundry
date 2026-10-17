@@ -10324,22 +10324,18 @@ class AuthService:
             session, user, arrived_at, event="auth.mfa_failed", client=client
         ):
             return Elevation()
-        if user.auth_provider == AuthProvider.AD.value:
-            # BACKLOG #2023: a good code below can renew the step-up window (on any session but an
-            # OIDC one, BACKLOG #2142) or meet a pending factor, so a DIRECTORY account must
-            # still be in the directory before the code is even checked. Asked first, so a refusal
-            # spends no TOTP step or recovery code and charges nothing to the lockout: the caller
-            # did not guess wrong, the directory could not vouch for the account. This branch only
-            # ADDS a refusal; a confirmed directory account meets the same lock and lockout feed.
-            refusal = await self._directory_step_up_refusal(user)
-            if refusal is not None:
-                await self._audit(
-                    "auth.mfa_failed",
-                    actor=user.username,
-                    detail=_json({"reason": DIRECTORY_UNCONFIRMED, "outcome": refusal}),
-                    client=client,
-                )
-                return Elevation(directory_unconfirmed=True)
+        # BACKLOG #2023: a good code below can renew the step-up window (on any session but an OIDC
+        # one, BACKLOG #2142) or meet a pending factor, so a DIRECTORY account must still be in the
+        # directory before the code is even checked. Asked first, so a refusal spends no TOTP step
+        # or recovery code and charges nothing to the lockout: the caller did not guess wrong, the
+        # directory could not vouch for the account. This only ADDS a refusal; a confirmed
+        # directory account meets the same lock and lockout feed. A local account is not asked.
+        current = await self._directory_vouches_for_factor(
+            token, user, event="auth.mfa_failed", client=client, report_lock=True
+        )
+        if isinstance(current, Elevation):
+            return current
+        user = current
         async with self._account_credential_lock(user.username):
             # Read the session, the account and its lock again. For a directory account the lookup
             # above was a network round trip, and for any account the queue may have been a wait, so
@@ -10357,17 +10353,22 @@ class AuthService:
                 return Elevation(locked=True)
             now = time.time()
             if await self._verify_second_factor(user, code, client=client, arrived=arrived):
-                # Asked again after the verify, on the stored row read afresh: a recovery-code walk
-                # is argon2 work off the loop, and the deadline can pass during it. This ask guards
-                # the writes below; the rotation asks once more. Only a must-change account has a
-                # deadline to pass, so no other account pays the read. A row gone meanwhile fails
-                # closed.
-                if user.must_change_password:
-                    fresh = await self._load_user(user.id)
-                    if fresh is None or await self._mfa_lapsed(
-                        token, fresh, client=client, factor_checked=True
-                    ):
-                        return Elevation(session_lost=True)
+                # BACKLOG #3068: the verify awaited (a recovery-code walk is argon2 work off the
+                # loop), and a revocation or a disable needs no queue to land. So the session, the
+                # account and its lock are read again right before the factor is written. Fails
+                # closed on a row gone meanwhile.
+                fresh = await self._factor_holder_current(
+                    token, event="auth.mfa_failed", client=client, report_lock=True
+                )
+                if isinstance(fresh, Elevation):
+                    return fresh
+                # The temporary-credential deadline is asked again on that fresh row, since it can
+                # pass during the verify too. This ask guards the writes below; the rotation asks
+                # once more. It awaits only when it ends the session.
+                if fresh.must_change_password and await self._mfa_lapsed(
+                    token, fresh, client=client, factor_checked=True
+                ):
+                    return Elevation(session_lost=True)
                 # ORDER-CRITICAL: this whole write group lands against the OLD hash, and only then
                 # does the session rotate. Moving any of them after the rotation writes NOTHING and
                 # reports success — every session stamp UPDATE is rowcount-blind. The group is not
@@ -10552,8 +10553,11 @@ class AuthService:
         )
         return True
 
-    async def _mfa_lock_refused(self, user: UserRecord, *, client: str | None) -> bool:
-        """Whether :meth:`verify_mfa` must refuse ``user`` as locked, auditing the refusal if so.
+    async def _mfa_lock_refused(
+        self, user: UserRecord, *, client: str | None, event: str = "auth.mfa_failed"
+    ) -> bool:
+        """Whether :meth:`verify_mfa` must refuse ``user`` as locked, auditing the refusal as
+        ``event`` if so. :meth:`_factor_holder_current` passes the passkey leg's event too.
 
         Per-account lockout covers the SECOND factor too: a run of wrong codes locks the account, so
         MFA guessing isn't bounded only by the shared per-IP login limiter (which IP-rotation can
@@ -10563,7 +10567,7 @@ class AuthService:
         if not user.second_step_locked(time.time()):
             return False
         await self._audit(
-            "auth.mfa_failed",
+            event,
             actor=user.username,
             # The shared constant, so the users:manage-only exclusion matches it exactly (#1131).
             detail=LOCKED_REFUSAL_DETAIL,
@@ -10571,11 +10575,84 @@ class AuthService:
         )
         return True
 
+    async def _directory_vouches_for_factor(
+        self,
+        token: str,
+        user: VerifiedUser,
+        *,
+        event: str,
+        client: str | None,
+        report_lock: bool,
+    ) -> Elevation | VerifiedUser:
+        """The directory check a leg runs before it marks a DIRECTORY account's factor met, with
+        the re-read that must follow the lookup. Returns the refusal to hand back, or the account
+        to carry on with: ``user`` itself for a local account, which is never asked and costs no
+        read, or the row read afresh after a confirmed lookup.
+
+        The one copy of a block :meth:`verify_mfa` (BACKLOG #2023) and
+        :meth:`finish_webauthn_assertion` (BACKLOG #2239) each used to spell out (BACKLOG #3068).
+        For an AD row it asks :meth:`_directory_step_up_refusal`. A refusal is audited as ``event``
+        with ``reason=directory_unconfirmed`` and the lookup's outcome, and returns
+        ``directory_unconfirmed``: nothing was checked or charged, and the token still
+        authenticates. A confirmed lookup was a network round trip, so the session, the account
+        and its second-step lock are then read again through :meth:`_factor_holder_current`.
+
+        **Calling it from another leg (BACKLOG #3061 names the two enrolment legs).** Pass the
+        caller's session ``token`` and the account it loaded through :meth:`_load_user`; no session
+        object is needed, because the re-read loads it from the token. That suits
+        :meth:`confirm_mfa_enrollment`, which holds an identity and a token but no session. Pass
+        the leg's own failure ``event`` (``auth.mfa_failed`` on the TOTP legs,
+        ``auth.webauthn_failed`` on the passkey legs). ``report_lock`` sets ``locked`` on a lock
+        refusal, which only :meth:`verify_mfa` reports. Call it before anything the refusal must
+        not spend (a challenge, a TOTP step, a stored credential), and after the cheap local
+        refusals, so a caller already refused costs no lookup. Note that the re-read refuses a
+        second-step-locked account, and that a caller's own detail fields, such as
+        ``phase=enroll``, are not added to the refusal row."""
+        if user.auth_provider != AuthProvider.AD.value:
+            return user
+        refusal = await self._directory_step_up_refusal(user)
+        if refusal is not None:
+            await self._audit(
+                event,
+                actor=user.username,
+                detail=_json({"reason": DIRECTORY_UNCONFIRMED, "outcome": refusal}),
+                client=client,
+            )
+            return Elevation(directory_unconfirmed=True)
+        return await self._factor_holder_current(
+            token, event=event, client=client, report_lock=report_lock
+        )
+
+    async def _factor_holder_current(
+        self, token: str, *, event: str, client: str | None, report_lock: bool
+    ) -> Elevation | VerifiedUser:
+        """Read the session, its account and the second-step lock again, and return the account,
+        or the refusal when any of them no longer allows the factor to be marked.
+
+        For a check that must land just before a factor is written, after awaits in which a
+        revocation, a disable or a lock could have landed (BACKLOG #3068).
+        :meth:`_directory_vouches_for_factor` runs it after a confirmed lookup, and both second-
+        factor legs run it again right before ``mark_session_mfa_verified``. A session revoked or
+        gone, or an account disabled or gone, returns ``session_lost``: the token no longer
+        authenticates, so the caller must not report a wrong proof. A live second-step lock is
+        audited as ``event`` with the shared locked detail, and returns a wrong-proof refusal,
+        with ``locked`` set when ``report_lock`` is."""
+        session = await self._load_session(hash_token(token))
+        if session is None or session.revoked_at is not None:
+            return Elevation(session_lost=True)
+        user = await self._load_user(session.user_id)
+        if user is None or user.disabled:
+            return Elevation(session_lost=True)
+        if await self._mfa_lock_refused(user, client=client, event=event):
+            return Elevation(locked=report_lock)
+        return user
+
     async def _directory_step_up_refusal(self, user: UserRecord) -> str | None:
         """Why the directory cannot vouch for directory account ``user`` before :meth:`verify_mfa`
         renews its step-up window (BACKLOG #2023) or :meth:`finish_webauthn_assertion` marks its
-        factor met (BACKLOG #2239), or ``None`` when it can. Called only for an AD row; a local
-        account is never asked.
+        factor met (BACKLOG #2239), or ``None`` when it can. Both reach it through
+        :meth:`_directory_vouches_for_factor`, which calls it only for an AD row; a local account is
+        never asked.
 
         Without this, an account disabled in the directory kept renewing its window with a good code
         until the reconciliation pass revoked its sessions. The engine row's ``disabled`` flag is
@@ -11141,8 +11218,11 @@ class AuthService:
         direction and the divergence does not cover it — see the call site.
 
         **A directory account must be confirmed by the directory first** (BACKLOG #2239), through
-        the same :meth:`_directory_step_up_refusal` :meth:`verify_mfa` asks. A refusal returns
-        ``directory_unconfirmed`` and spends neither the challenge nor the sign count."""
+        the same :meth:`_directory_vouches_for_factor` :meth:`verify_mfa` calls. A refusal returns
+        ``directory_unconfirmed`` and spends neither the challenge nor the sign count. The lookup
+        runs only once a ceremony is staged for the session, so a post with nothing staged gets the
+        plain ``expired`` refusal and costs no lookup (BACKLOG #3068). The session, the account and
+        the lock are read once more right before the factor is written."""
         if not token:
             return Elevation()
         session = await self._load_session(hash_token(token))
@@ -11169,51 +11249,32 @@ class AuthService:
             session, user, now, event="auth.webauthn_failed", client=client
         ):
             return Elevation()
-        if user.auth_provider == AuthProvider.AD.value:
-            # BACKLOG #2239: a good assertion below marks the factor met, so a DIRECTORY account
-            # must still be in the directory first, as verify_mfa asks (#2023). Without this an
-            # account disabled in the directory would clear the MFA gate with its passkey until the
-            # reconciler revoked it. Asked before the challenge is popped and before the sign count
-            # moves, so a refusal leaves the ceremony in flight and charges nothing; assertion
-            # failures feed no lockout here anyway (ADR 0068).
-            refusal = await self._directory_step_up_refusal(user)
-            if refusal is not None:
-                await self._audit(
-                    "auth.webauthn_failed",
-                    actor=user.username,
-                    detail=_json({"reason": DIRECTORY_UNCONFIRMED, "outcome": refusal}),
-                    client=client,
-                )
-                return Elevation(directory_unconfirmed=True)
-            # The lookup was a network round trip, so read the session, the account and its lock
-            # again, as verify_mfa does. A revocation, a disable or a second-step lock that landed
-            # meanwhile must stop this assertion before it marks the factor or clears the counters.
-            # A session or account gone meanwhile is ``session_lost``: the token no longer
-            # authenticates, so the caller must not report a wrong passkey.
-            session = await self._load_session(hash_token(token))
-            if session is None or session.revoked_at is not None:
-                return Elevation(session_lost=True)
-            user = await self._load_user(session.user_id)
-            if user is None or user.disabled:
-                return Elevation(session_lost=True)
-            now = time.time()
-            if user.second_step_locked(now):
-                await self._audit(
-                    "auth.webauthn_failed",
-                    actor=user.username,
-                    detail=LOCKED_REFUSAL_DETAIL,
-                    client=client,
-                )
-                return Elevation()
-        pending = self._webauthn_challenges.pop((hash_token(token), "assert"))
+        challenge_key = (hash_token(token), "assert")
+        # BACKLOG #3068: the directory lookup below costs a network round trip and its answer is
+        # a fact about the account, so a caller that has staged no ceremony, which includes every
+        # account holding no passkey, must not reach it. PEEKED, never popped: a refusal below must
+        # leave a staged ceremony in flight. The miss is answered as the pop below answers it.
+        staged = self._webauthn_challenges.peek(challenge_key)
+        if staged is None or staged.user_id != user.id:
+            return await self._assertion_expired(user, client)
+        # BACKLOG #2239: a good assertion below marks the factor met, so a DIRECTORY account must
+        # still be in the directory first, as verify_mfa asks (#2023). Without this an account
+        # disabled in the directory would clear the MFA gate with its passkey until the reconciler
+        # revoked it. Asked before the challenge is popped and before the sign count moves, so a
+        # refusal leaves the ceremony in flight and charges nothing; assertion failures feed no
+        # lockout here anyway (ADR 0068). A local account is not asked.
+        current = await self._directory_vouches_for_factor(
+            token, user, event="auth.webauthn_failed", client=client, report_lock=False
+        )
+        if isinstance(current, Elevation):
+            return current
+        user = current
+        now = time.time()
+        # Popped, not reused from the peek: the ceremony may have expired, or been replaced,
+        # during the lookup.
+        pending = self._webauthn_challenges.pop(challenge_key)
         if pending is None or pending.user_id != user.id:
-            await self._audit(
-                "auth.webauthn_failed",
-                actor=user.username,
-                detail=_json({"reason": "expired"}),
-                client=client,
-            )
-            return Elevation()
+            return await self._assertion_expired(user, client)
         try:
             raw_id = webauthn.credential_id_from_response(response_json)
         except webauthn.WebAuthnVerificationError:
@@ -11288,6 +11349,16 @@ class AuthService:
                 client=client,
             )
             return Elevation()
+        # BACKLOG #3068: the passkey read and the sign-count write awaited since the session, the
+        # account and its lock were last read, so a revocation, a disable or a lock that landed in
+        # between must stop the factor write, as on verify_mfa. The sign count has already moved,
+        # which is right: this passkey did sign this challenge.
+        fresh = await self._factor_holder_current(
+            token, event="auth.webauthn_failed", client=client, report_lock=False
+        )
+        if isinstance(fresh, Elevation):
+            return fresh
+        user = fresh
         # BACKLOG #2298: the passkey leg of /ui/mfa, asked as verify_mfa asks after a good code, so
         # an assertion that straddles the deadline marks nothing and clears no counter.
         if user.must_change_password and await self._mfa_lapsed(
@@ -11317,6 +11388,18 @@ class AuthService:
             # vault BACKLOG #2145, as in verify_mfa.
             await self._mark_login_address_known(user.id, client)
         return elevation
+
+    async def _assertion_expired(self, user: UserRecord, client: str | None) -> Elevation:
+        """The refusal :meth:`finish_webauthn_assertion` gives when no ceremony of this account's
+        is staged for the session, audited ``reason=expired``. One spelling for the peek before the
+        directory lookup and the pop after it, so the two cannot be told apart (BACKLOG #3068)."""
+        await self._audit(
+            "auth.webauthn_failed",
+            actor=user.username,
+            detail=_json({"reason": "expired"}),
+            client=client,
+        )
+        return Elevation()
 
     async def delete_webauthn_credential(
         self, identity: Identity, credential_id_hash: str, *, client: str | None = None

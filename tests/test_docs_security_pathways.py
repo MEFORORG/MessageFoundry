@@ -543,13 +543,20 @@ def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> N
     rest on (a directory account's wrong code feeds the lockout, and its lock is checked before the
     lookup) is pinned in ``tests/test_mfa_directory_recheck.py``, not by this AST read.
     """
-    verify_attrs = [
-        n.attr
-        for n in ast.walk(ast.parse(textwrap.dedent(inspect.getsource(AuthService.verify_mfa))))
-        if isinstance(n, ast.Attribute)
-    ]
+
+    # Since BACKLOG #3068 the one provider branch lives in the shared helper both second-factor legs
+    # call, so verify_mfa reads no provider itself and the helper reads it exactly once.
+    def _attrs(func: object) -> list[str]:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(func)))  # type: ignore[arg-type]
+        return [n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)]
+
+    verify_attrs = _attrs(AuthService.verify_mfa)
+    helper_attrs = _attrs(AuthService._directory_vouches_for_factor)
     assert (
-        verify_attrs.count("auth_provider") == 1 and "_directory_step_up_refusal" in verify_attrs
+        verify_attrs.count("auth_provider") == 0
+        and "_directory_vouches_for_factor" in verify_attrs
+        and helper_attrs.count("auth_provider") == 1
+        and "_directory_step_up_refusal" in helper_attrs
     ), (
         "verify_mfa grew a provider branch beyond the BACKLOG #2023 directory check; re-derive the "
         "pathway rows, which say a directory account's TOTP leg feeds and meets the lockout."
@@ -1153,7 +1160,9 @@ def test_the_fifth_sweep_carries_the_idp_step_up_leg_into_every_pathway_claim() 
        (BACKLOG #2023), so a code does not renew a disabled directory account's window, and a
        step-up is not the only live directory check.
     """
-    assert _called(_service_func("verify_mfa"), "_directory_step_up_refusal"), (
+    assert _called(_service_func("verify_mfa"), "_directory_vouches_for_factor") and _called(
+        _service_func("_directory_vouches_for_factor"), "_directory_step_up_refusal"
+    ), (
         "verify_mfa no longer asks the directory before a code renews the window; the identity-"
         "provider row and the reconciliation section say it does (BACKLOG #2023)."
     )
@@ -4383,16 +4392,24 @@ def test_the_passkey_leg_asks_the_directory_and_the_doc_says_so() -> None:
     behaviour (refused before the challenge is taken, nothing charged) is pinned in
     ``tests/test_passkey_directory_recheck.py``, not by this AST read."""
     assertion = _service_func("finish_webauthn_assertion")
-    assert _called(assertion, "_directory_step_up_refusal"), (
+    helper = _service_func("_directory_vouches_for_factor")
+    assert _called(assertion, "_directory_vouches_for_factor") and _called(
+        helper, "_directory_step_up_refusal"
+    ), (
         "finish_webauthn_assertion no longer asks the directory; the step-up section and the "
         "passkey row say it does (BACKLOG #2239)."
     )
+    # Since BACKLOG #3068 the branch is the shared helper's: the leg reads no provider itself.
     provider_reads = sum(
-        1 for n in ast.walk(assertion) if isinstance(n, ast.Attribute) and n.attr == "auth_provider"
+        1
+        for fn in (assertion, helper)
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Attribute) and n.attr == "auth_provider"
     )
     assert provider_reads == 1, (
-        f"finish_webauthn_assertion reads auth_provider {provider_reads} times; the lockout "
-        "paragraph says each second-factor leg has ONE provider branch, the directory check."
+        f"finish_webauthn_assertion and its directory helper read auth_provider {provider_reads} "
+        "times; the lockout paragraph says each second-factor leg has ONE provider branch, the "
+        "directory check."
     )
     text = " ".join(_doc_text().split())
     assert "the passkey leg does not ask the directory" not in text, (

@@ -16,8 +16,10 @@ data here is synthetic.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
+from typing import Any
 
 import pytest
 
@@ -26,12 +28,8 @@ pytest.importorskip("webauthn")
 from webauthn.helpers import base64url_to_bytes  # noqa: E402
 
 from messagefoundry.auth import reconcile  # noqa: E402
-from messagefoundry.auth.ldap import (  # noqa: E402
-    AdPrincipal,
-    DirectoryAnswer,
-    DirectoryProbe,
-    LdapError,
-)
+from messagefoundry.auth.identity import SessionMechanism  # noqa: E402
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer  # noqa: E402
 from messagefoundry.auth.service import (  # noqa: E402
     DIRECTORY_OBJECT_ID_MISSING,
     DIRECTORY_ROLES_DEMOTED,
@@ -43,6 +41,7 @@ from messagefoundry.auth.tokens import hash_token  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
 from messagefoundry.store.store import MessageStore, UserRecord  # noqa: E402
 from tests._admin_account import ADMIN_USERNAME, login_admin  # noqa: E402
+from tests._fake_directory import FakeDirectory as _Directory  # noqa: E402
 from tests._soft_webauthn import SoftAuthenticator  # noqa: E402
 
 _RP, _ORIGIN = "t", "http://t"
@@ -55,24 +54,6 @@ _PRINCIPAL = AdPrincipal(
     groups=frozenset(),
     directory_object_id="3b9e7a10-5c2d-4f8e-a1b6-0d4c8e2f7a91",
 )
-
-
-class _Directory:
-    """A directory whose answer the test sets. ``unreachable`` raises the connectivity signal."""
-
-    def __init__(self, principal: AdPrincipal) -> None:
-        self.principal = principal
-        self.answer = DirectoryAnswer.FOUND
-        self.unreachable = False
-        self.probes: list[tuple[str, str | None]] = []
-
-    def probe_principal(self, username: str, *, object_id: str | None = None) -> DirectoryProbe:
-        self.probes.append((username, object_id))
-        if self.unreachable:
-            raise LdapError("synthetic: LDAP socket closed")
-        if self.answer is DirectoryAnswer.FOUND:
-            return DirectoryProbe(DirectoryAnswer.FOUND, self.principal)
-        return DirectoryProbe(self.answer)
 
 
 def _settings() -> AuthSettings:
@@ -97,6 +78,7 @@ class _Pending:
     token: str  # a session that still owes its passkey
     user_id: str
     response: str  # an assertion answering the session's staged challenge
+    key: SoftAuthenticator  # the account's one passkey
 
 
 async def _register_passkey(
@@ -148,7 +130,7 @@ async def _directory_session_owing_a_passkey(
     assert await service.mfa_satisfied(second.token) is False
     response = await _staged_assertion(service, second.token, key)
     directory.probes.clear()
-    return _Pending(service, store, directory, second.token, second.identity.user_id, response)
+    return _Pending(service, store, directory, second.token, second.identity.user_id, response, key)
 
 
 async def _finish(p: _Pending) -> Elevation:
@@ -385,6 +367,9 @@ async def test_what_lands_during_the_lookup_is_honoured(
     if change == "lock":
         user = await store.get_user(p.user_id)
         assert user is not None and user.second_step_locked_until is not None
+        # BACKLOG #3068, item 3: the re-check's refusal writes its own audit row. The lock landed
+        # after the first check, so only the re-check can have written it.
+        assert {"reason": "locked"} in await _audited_assertion_failures(store)
 
 
 async def test_a_local_account_is_never_probed(store: MessageStore) -> None:
@@ -404,3 +389,140 @@ async def test_a_local_account_is_never_probed(store: MessageStore) -> None:
 
     assert verified.ok is True
     assert directory.probes == []
+
+
+# --- BACKLOG #3068: the follow-ups from engine PR 2055's review ------------------------------------
+
+
+async def _directory_session_with_no_passkey(store: MessageStore) -> _Pending:
+    """A directory account that holds no passkey, signed in, so nothing can be staged for it."""
+    directory = _Directory(_PRINCIPAL)
+    service = AuthService(store, _settings(), ldap=directory)  # type: ignore[arg-type]
+    await service.initialize()
+    out = await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=False)
+    assert out.token is not None and out.identity is not None
+    assert await service.begin_webauthn_assertion(out.token, rp_id=_RP) is None  # nothing staged
+    key = SoftAuthenticator(rp_id=_RP, origin=_ORIGIN)
+    return _Pending(service, store, directory, out.token, out.identity.user_id, "{}", key)
+
+
+@pytest.mark.parametrize("caller", ["nothing-staged", "no-passkey"])
+async def test_a_post_with_nothing_staged_costs_no_directory_lookup(
+    store: MessageStore, caller: str
+) -> None:
+    """Item 1. A directory session with no ceremony staged has proved nothing, so its post must not
+    reach the directory or learn its answer: it gets the plain ``expired`` refusal the pop gives.
+    RED when: the lookup runs before the staged ceremony is checked (the directory, set to refuse,
+    is then probed and the answer reads ``directory_unconfirmed``)."""
+    if caller == "nothing-staged":
+        p = await _directory_session_owing_a_passkey(store)
+        assert p.service._webauthn_challenges.pop((hash_token(p.token), "assert")) is not None
+    else:
+        p = await _directory_session_with_no_passkey(store)
+    p.directory.answer = DirectoryAnswer.DISABLED
+
+    refused = await _finish(p)
+
+    assert refused == Elevation()  # the plain failure, nothing about the directory
+    assert p.directory.probes == []
+    failures = await _audited_assertion_failures(store)
+    assert {"reason": "expired"} in failures
+    assert not any(d.get("reason") == DIRECTORY_UNCONFIRMED for d in failures)
+
+
+async def test_a_staged_ceremony_is_peeked_not_taken_before_the_lookup(
+    store: MessageStore,
+) -> None:
+    """Item 1, the other half. RED when: the check before the lookup pops the staged ceremony, so
+    the assertion it refused cannot verify once the directory answers."""
+    p = await _directory_session_owing_a_passkey(store)
+    p.directory.answer = DirectoryAnswer.DISABLED
+    assert (await _finish(p)).directory_unconfirmed is True
+    assert p.service._webauthn_challenges.peek((hash_token(p.token), "assert")) is not None
+
+    p.directory.answer = DirectoryAnswer.FOUND
+    assert (await _finish(p)).ok is True
+
+
+async def test_an_oidc_minted_session_is_checked_too(store: MessageStore) -> None:
+    """Item 3. The check keys on the ACCOUNT's provider, not on how the session was minted, so a
+    session the federated sign-in minted is asked as a Kerberos one is. RED when: the check is
+    skipped for an ``oidc`` session."""
+    p = await _directory_session_owing_a_passkey(store)
+    oidc = await p.service._issue_session(
+        p.user_id,
+        None,
+        mfa_verified=False,
+        seed_reauth=False,
+        mechanism=SessionMechanism.OIDC,
+        idp_auth_time=time.time(),
+    )
+    response = await _staged_assertion(p.service, oidc, p.key)
+    p.directory.answer = DirectoryAnswer.DISABLED
+
+    refused = await p.service.finish_webauthn_assertion(oidc, response, rp_id=_RP, origin=_ORIGIN)
+
+    assert refused.directory_unconfirmed is True
+    assert p.directory.probes == [("kpark", _PRINCIPAL.directory_object_id)]
+    session = await store.get_session(hash_token(oidc))
+    assert session is not None and session.mfa_verified_at is None
+
+
+async def test_the_lookup_comes_after_the_too_early_floor(store: MessageStore) -> None:
+    """Item 3. The login-then-MFA floor (BACKLOG #2301) is a local check, so a passkey that arrives
+    too soon is refused before the directory is asked. RED when: the lookup moves ahead of it."""
+    p = await _directory_session_owing_a_passkey(store)
+    p.service._settings = p.service._settings.model_copy(
+        update={"mfa_verify_min_elapsed_seconds": 3600}
+    )
+    p.directory.answer = DirectoryAnswer.DISABLED
+
+    refused = await _finish(p)
+
+    assert refused == Elevation()
+    assert p.directory.probes == []
+
+
+@pytest.mark.parametrize("change", ["lock", "revoke", "disable"])
+@pytest.mark.parametrize("account", ["directory", "local"])
+async def test_what_lands_before_the_factor_write_is_honoured(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, change: str, account: str
+) -> None:
+    """Item 2. The passkey read and the sign-count write await after the session, the account and
+    its lock were last read. RED when: a lock, a revocation or a disable that lands there does not
+    stop the factor write, which would then mark the factor and clear both lockout counters."""
+    if account == "directory":
+        p = await _directory_session_owing_a_passkey(store)
+        service, token, response, user_id = p.service, p.token, p.response, p.user_id
+    else:
+        service = AuthService(store, _settings())
+        identity, first, password = await login_admin(service)
+        key = SoftAuthenticator(rp_id=_RP, origin=_ORIGIN)
+        await _register_passkey(service, identity, first, key)
+        out = await service.login(ADMIN_USERNAME, password)
+        assert out.ok and out.token is not None
+        token, user_id = out.token, identity.user_id
+        response = await _staged_assertion(service, token, key)
+    real_update = store.update_webauthn_sign_count
+
+    async def _update_while_something_lands(*args: Any, **kwargs: Any) -> bool:
+        if change == "lock":
+            await _lock_second_step(store, user_id)
+        elif change == "revoke":
+            await store.revoke_session(hash_token(token))
+        else:
+            await store.set_user_disabled(user_id, disabled=True)
+        return await real_update(*args, **kwargs)
+
+    monkeypatch.setattr(store, "update_webauthn_sign_count", _update_while_something_lands)
+
+    refused = await service.finish_webauthn_assertion(token, response, rp_id=_RP, origin=_ORIGIN)
+
+    assert refused.ok is False
+    assert refused.session_lost is (change != "lock")
+    session = await store.get_session(hash_token(token))
+    assert session is not None and session.mfa_verified_at is None
+    if change == "lock":
+        user = await store.get_user(user_id)
+        assert user is not None and user.second_step_locked_until is not None  # not cleared
+        assert {"reason": "locked"} in await _audited_assertion_failures(store)
