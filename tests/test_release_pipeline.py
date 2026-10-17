@@ -902,6 +902,13 @@ def test_the_console_version_check_reads_the_console_tag_not_the_engine_tag() ->
     )
 
 
+def _upload_step(job: dict, packages_dir: str) -> dict:
+    """The one PyPI upload step in ``job`` that publishes ``packages_dir``."""
+    found = [s for s in job["steps"] if (s.get("with") or {}).get("packages-dir") == packages_dir]
+    assert len(found) == 1, f"expected one upload of {packages_dir}, found {len(found)}"
+    return found[0]
+
+
 def test_the_console_publish_uses_trusted_publishing_and_is_tag_gated() -> None:
     """Same bar as the engine and harness: OIDC, never an API token, and never on a branch push.
 
@@ -3479,7 +3486,8 @@ def test_every_job_that_can_publish_waits_on_the_provenance_gate() -> None:
 # An immutable release refuses any asset change once it is published. So the engine's release is a
 # draft until every job that attaches an asset has run, and then one job publishes it. The console's
 # release is a draft created by one call that carries its one asset, and its own job publishes it
-# once the wheel is on PyPI (vault BACKLOG #2975). A re-run never uploads to a published
+# once its upload job has succeeded, which with PUBLISH_WEBCONSOLE unset uploads nothing (vault
+# BACKLOG #2975). A re-run never uploads to a published
 # release. The structural tests hold the shape; the executed tests run each step against a stand-in
 # `gh` that records what it was asked to do.
 
@@ -3553,7 +3561,7 @@ def test_only_the_publish_job_takes_a_release_out_of_draft_and_it_runs_last() ->
     )
 
 
-def test_the_console_release_is_a_draft_until_its_wheel_is_on_pypi() -> None:
+def test_the_console_release_is_a_draft_until_its_upload_job_succeeds() -> None:
     """The console release used to be published by the call that made it, before the `pypi`
     approval was asked for, so a refused approval left a public release naming a version PyPI
     lacked (vault BACKLOG #2975). Now it is a draft, published by a job that waits on the upload.
@@ -3724,15 +3732,9 @@ def test_the_publish_step_publishes_a_draft_and_leaves_a_published_release_alone
     assert not _uploads(calls), calls
 
 
-def _upload_step(job: dict, packages_dir: str) -> dict:
-    """The one PyPI upload step in ``job`` that publishes ``packages_dir``."""
-    found = [s for s in job["steps"] if (s.get("with") or {}).get("packages-dir") == packages_dir]
-    assert len(found) == 1, f"expected one upload of {packages_dir}, found {len(found)}"
-    return found[0]
-
-
-#: Each draft publisher, the job whose gated upload it waits on, that upload's `packages-dir`, and
-#: the repository variable that gates it (vault BACKLOG #2975).
+#: Each draft publisher, the job whose gated upload it waits on, that upload's `packages-dir`, the
+#: repository variable that gates it, the distribution, and the build job that reads the variable
+#: first (vault BACKLOG #2975).
 _DRAFT_PUBLISHERS = [
     (
         _PUBLISH_JOB,
@@ -3803,10 +3805,10 @@ def test_a_draft_publisher_reads_the_variable_again_and_the_upload_outcome(
         ("true", "skipped", False),
         ("true", "", False),
         ("true", "success", True),
-        ("", "skipped", True),
+        # `${{ vars.X == 'true' }}` renders 'true' or 'false', so 'false' is the unset case.
         ("false", "skipped", True),
     ],
-    ids=["set-upload-skipped", "set-no-outcome", "set-uploaded", "unset", "false"],
+    ids=["set-upload-skipped", "set-no-outcome", "set-uploaded", "unset"],
 )
 def test_a_draft_publisher_refuses_while_the_variable_is_set_and_the_upload_did_not_run(
     tmp_path: Path, prefix: str, gate: str, outcome: str, ok: bool
@@ -3828,7 +3830,7 @@ def test_a_draft_publisher_refuses_while_the_variable_is_set_and_the_upload_did_
     assert (rc == 0) is ok, f"exit {rc}:\n{out}\ncalls: {calls}"
     assert len(published) == (1 if ok else 0), f"gh calls: {calls}"
     if not ok:
-        assert "PUBLISH_X is 'true'" in out and "Re-run the build-x job" in out, out
+        assert "PUBLISH_X is 'true'" in out and "re-run the build-x job" in out, out
     rc, out, calls = _run_release_step(tmp_path / "published", prefix, "published", extra_env=env)
     assert rc == 0, f"a published release failed the job:\n{out}"
     assert not any("--draft=false" in c for c in calls), calls
@@ -3998,13 +4000,15 @@ def test_every_engine_tag_upload_runs_under_one_approval_before_the_release_is_p
         if "!startsWith(github.ref_name,'webconsole-')" in _despace(str(job.get("if") or ""))
     }
     assert engine_tag == {"publish-pypi"}, sorted(engine_tag)
-    # The gate is read outside the environment and handed in, so an environment copy of the
-    # variable cannot skip the step in a job that still succeeds (vault BACKLOG #2975).
+    # The gate is read outside the environment and handed in, so an environment copy cannot turn
+    # the upload on; one that skips it is refused by the draft publisher (vault BACKLOG #2975).
     harness_if = str(_upload_step(jobs["publish-pypi"], "harness-dist/").get("if"))
     assert "needs.release-harness.outputs.publish-harness" in harness_if, harness_if
     assert jobs["release-harness"]["outputs"]["publish-harness"] == "${{ vars.PUBLISH_HARNESS }}"
     gated = sorted(
-        key for key in _upstream(_PUBLISH_JOB) if "vars." in str(jobs[key].get("if") or "")
+        key
+        for key in _upstream(_PUBLISH_JOB) | {_PUBLISH_JOB}
+        if "vars." in str(jobs[key].get("if") or "")
     )
     assert not gated, (
         f"job(s) {gated} upstream of {_PUBLISH_JOB} are gated on a variable; unset, they skip it"
@@ -4023,7 +4027,9 @@ def test_an_unset_publish_webconsole_still_publishes_the_console_release() -> No
     """
     jobs = _jobs()
     gated = sorted(
-        key for key in _upstream(_CONSOLE_PUBLISH_JOB) if "vars." in str(jobs[key].get("if") or "")
+        key
+        for key in _upstream(_CONSOLE_PUBLISH_JOB) | {_CONSOLE_PUBLISH_JOB}
+        if "vars." in str(jobs[key].get("if") or "")
     )
     assert not gated, (
         f"job(s) {gated} upstream of {_CONSOLE_PUBLISH_JOB} are gated on a variable; unset, "

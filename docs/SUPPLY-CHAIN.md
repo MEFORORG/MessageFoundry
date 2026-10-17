@@ -63,7 +63,7 @@ flowchart TB
   TAGW(["Console tag webconsole-vX.Y.Z pushed"]):::ext
   WEB["release-webconsole job<br/>build wheel, member gate, smoke test, engine floor gate"]:::build
   PUBWEB["publish-pypi-webconsole job, environment pypi<br/>check the digests, publish the console wheel"]:::build
-  WEBPUB["publish-github-release-webconsole job<br/>publish the console draft once the wheel is on PyPI"]:::build
+  WEBPUB["publish-github-release-webconsole job<br/>publish the console draft once the upload job has succeeded"]:::build
 
   GH(["GitHub release assets"]):::ext
   PYPI(["PyPI<br/>Trusted Publishing by OIDC, PEP 740 attestations"]):::ext
@@ -155,8 +155,8 @@ Facts the labels leave out:
   release is still published, as the engine's is with `PUBLISH_HARNESS` unset. With either variable
   set, its draft publisher reads it again when it runs and refuses to publish the release while
   that run skipped the upload. A re-run that reused an earlier reading of the variable can still
-  skip the upload, and on an engine tag the toolkit and engine are on PyPI by then; the release
-  stays a draft until the build job is re-run.
+  skip the upload, and on an engine tag the toolkit and engine are on PyPI by then. The release
+  stays a draft until the build job is re-run, or the variable is unset and the publisher re-run.
 - **The provenance gate.** The tagged commit must be on `main`, and each required check's latest
   run on it must have passed. A red run after the merge blocks the tag even if the merge-queue run
   passed. To clear it, re-run the failed job on that commit, then re-run the release. A check

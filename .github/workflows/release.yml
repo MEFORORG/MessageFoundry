@@ -12,7 +12,8 @@
 #                 to a published release, which is what lets the owner turn on immutable releases
 #                 (vault BACKLOG #2631, limb 6). A console release is a draft made by one call that
 #                 carries its one asset, and `publish-github-release-webconsole` publishes it once
-#                 `publish-pypi-webconsole` has uploaded the wheel (vault BACKLOG #2975).
+#                 `publish-pypi-webconsole` has succeeded: with PUBLISH_WEBCONSOLE set, once the
+#                 wheel is uploaded; unset, with no upload (vault BACKLOG #2975).
 # Dry-run:        run this workflow manually (workflow_dispatch) — it builds + SBOMs + signs and uploads
 #                 the artifacts for inspection. It does NOT create a GitHub release, does NOT publish
 #                 to PyPI and does NOT write an SLSA attestation, so the dry-run validates
@@ -73,10 +74,10 @@
 # upload on, and the fresh read keeps an unset made after the build job ran from being ignored by
 # a re-run. The job that takes the release out of draft, outside the environment, reads it again,
 # compared as Actions compares (ignoring case), and refuses while it is 'true' and the upload did
-# not run. That last read covers a variable set after the build job read it, whether by a re-run of
-# failed jobs reusing the build job's output or while the upload waited for its approval; re-running
-# the build job, which re-runs the jobs after it, reads it afresh. Unset, the upload step is
-# skipped and the release still goes public.
+# not run. That last read covers at least a variable set after the build job read it, whether by
+# a re-run of failed jobs reusing the build job's output or while the upload waited for its
+# approval, and an environment copy that differs; re-running the build job, which re-runs the jobs
+# after it, reads it afresh. Unset, the upload step is skipped and the release still goes public.
 #
 # THE HAND-OVER. Each build job records the digests once its last gate has passed, and its last
 # step uploads the files. Neither step has an `if:`, so any earlier failure skips both. In `release`
@@ -1844,7 +1845,7 @@ jobs:
           if [ "$is_draft" = "true" ]; then
             # The variable is read again here, when this job runs; the header says why (vault BACKLOG #2975).
             if [ "$PUBLISH_GATE" = "true" ] && [ "$UPLOAD_OUTCOME" != "success" ]; then
-              echo "::error::$GATE_NAME is 'true', but this run did not upload $DISTRIBUTION (outcome '$UPLOAD_OUTCOME'): $BUILD_JOB read the variable before it was set, and a re-run of failed jobs reuses that reading. Re-run the $BUILD_JOB job, which re-runs the jobs after it, or unset the variable. The release stays a draft."
+              echo "::error::$GATE_NAME is 'true', but this run did not upload $DISTRIBUTION (outcome '$UPLOAD_OUTCOME'). Either it was set after $BUILD_JOB read it (a re-run of failed jobs reuses that reading, as does a set made while the upload waited for its approval): re-run the $BUILD_JOB job, which re-runs the jobs after it. Or the pypi environment holds its own copy of $GATE_NAME: remove it. Or unset $GATE_NAME. The release stays a draft."
               exit 1
             fi
             gh release edit "$tag" --draft=false
@@ -2261,7 +2262,7 @@ jobs:
           if [ "$is_draft" = "true" ]; then
             # The variable is read again here, when this job runs; the header says why (vault BACKLOG #2975).
             if [ "$PUBLISH_GATE" = "true" ] && [ "$UPLOAD_OUTCOME" != "success" ]; then
-              echo "::error::$GATE_NAME is 'true', but this run did not upload $DISTRIBUTION (outcome '$UPLOAD_OUTCOME'): $BUILD_JOB read the variable before it was set, and a re-run of failed jobs reuses that reading. Re-run the $BUILD_JOB job, which re-runs the jobs after it, or unset the variable. The release stays a draft."
+              echo "::error::$GATE_NAME is 'true', but this run did not upload $DISTRIBUTION (outcome '$UPLOAD_OUTCOME'). Either it was set after $BUILD_JOB read it (a re-run of failed jobs reuses that reading, as does a set made while the upload waited for its approval): re-run the $BUILD_JOB job, which re-runs the jobs after it. Or the pypi environment holds its own copy of $GATE_NAME: remove it. Or unset $GATE_NAME. The release stays a draft."
               exit 1
             fi
             gh release edit "$tag" --draft=false
