@@ -275,6 +275,7 @@ from messagefoundry.store.store import (
     owned_lane_scope,
     passkey_digest,
     password_change,
+    read_newest_keyed_audit_row,
     read_transit_bound_attestation_rows,
     reauth_stamp,
     recovery_code_spend,
@@ -299,6 +300,7 @@ from messagefoundry.store.store import (
     session_insert_params,
     session_reseal_params,
     session_seal_ok,
+    settle_newest_keyed_audit_row,
     settle_transit_bound_attestation,
     should_record_event,
     tee_audits,
@@ -11950,6 +11952,25 @@ class SqlServerStore:
         return str(row["salt"])
 
     # --- vault_transit AES-GCM bound attestation (BACKLOG #2337) -------------
+
+    async def newest_keyed_audit_row(
+        self, action: str, *, actor: str, after_seq: int
+    ) -> dict[str, Any] | None:
+        """See the SQLite twin. Each read is its own pooled statement; a row that changes between
+        them fails its MAC check, which gives no evidence."""
+
+        async def fetch(sql: str, params: tuple[object, ...]) -> Mapping[str, Any] | None:
+            return await self._fetchone(sql, params)
+
+        check = await read_newest_keyed_audit_row(
+            fetch,
+            action=action,
+            actor=actor,
+            after_seq=after_seq,
+            mac_keys=self._audit_mac_keys,
+            mac_fn=self._audit_mac_fn,
+        )
+        return await settle_newest_keyed_audit_row(check)
 
     async def get_transit_bound_attestation(self) -> TransitBoundAttestation | None:
         """See the SQLite twin. Each read here is its own pooled statement, not one snapshot, so an

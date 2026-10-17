@@ -6073,10 +6073,12 @@ async def test_audit_events_and_security_events_page_by_offset_mssql(store) -> N
     from tests._audit_event_paging_contract import (
         check_audit_paging,
         check_connection_event_paging,
+        check_keyed_audit_evidence,
         check_security_events_paging,
     )
 
     await check_audit_paging(store, "mssql")
+    await check_keyed_audit_evidence(store, "mssql")
     await check_security_events_paging(store, "mssql")
     await check_connection_event_paging(store, "mssql")
 

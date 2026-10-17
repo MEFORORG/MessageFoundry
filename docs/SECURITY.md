@@ -4108,15 +4108,20 @@ raise the `ad_session_revoked` alert, one per revoked principal, once the pass c
 revocations end no session and change no role. Each still writes its row, with `sessions: 0`
 (BACKLOG #3085, owner ruling 2026-10-16). When the directory says the account is disabled or
 absent, that revocation still alerts and sends its notice, as when the user signed out mid-pass
-(owner ruling 2026-10-17). That holds even when another reconciler revoked the account first,
-because no audit row decides whether a revocation alerts: a row this pass did not write could be
-forged to silence it (vault BACKLOG #3750 item 33). Two reconcilers revoking one disabled or
-absent account therefore both alert. Any other revocation that ends nothing and changes no role,
-such as a scope, role, undetermined or unkeyed one, is quiet, with no alert and no notice. So
-when two reconcilers on one store make one of those in turn, the second only audits. If both read
-the old roles, both still report. If the first reconciler's pass ended before it alerted, the
-second's quiet revocation means that account pages nobody. A quiet revocation whose own row is
-refused alerts instead, with no notice. `AuthService._apply_reconcile_revocation` states the rule.
+(owner ruling 2026-10-17). It is quiet only as a repeat: when another pass already revoked
+the account (owner ruling B258-R7), shown by an `auth.ad_session_revoked` row for the same
+username and reason, numbered after this pass began to list the account's sessions, whose MAC
+**verifies under the audit key**. A row that fails its MAC, a keyless audit chain, or a failed
+read gives no evidence, so the revocation alerts. A writer of the database who holds no audit key
+therefore cannot silence the alert with a forged row (vault BACKLOG #3750 item 33). That is the
+Lander's concern there, met by verifying the evidence rather than, as its wording asked, by
+trusting no row this pass did not write. **Residual:** a holder of the audit key can seal a row
+that verifies, and so can still silence a repeat alert. `AuthService._already_revoked_elsewhere`
+states the rule. Any other revocation that ends nothing and changes no role, such as a scope,
+role, undetermined or unkeyed one, is quiet too. If both reconcilers read the old roles, or both
+read before either writes its row, both still report. If the first reconciler's pass ended before
+it alerted, the second's quiet revocation means that account pages nobody. A quiet revocation
+whose own row is refused alerts instead, with no notice.
 
 A pass that fails part-way keeps the audit rows for what it already revoked, but raises no alert for
 them. A refused audit write does not end the pass (BACKLOG #3018). That holds for the store errors

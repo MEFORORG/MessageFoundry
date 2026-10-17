@@ -282,6 +282,7 @@ from messagefoundry.store.store import (
     owned_lane_scope,
     passkey_digest,
     password_change,
+    read_newest_keyed_audit_row,
     read_transit_bound_attestation_rows,
     reauth_stamp,
     recovery_code_spend,
@@ -306,6 +307,7 @@ from messagefoundry.store.store import (
     session_insert_params,
     session_reseal_params,
     session_seal_ok,
+    settle_newest_keyed_audit_row,
     settle_transit_bound_attestation,
     should_record_event,
     tee_audits,
@@ -8369,6 +8371,32 @@ class PostgresStore:
         return str(row["salt"])
 
     # --- vault_transit AES-GCM bound attestation (BACKLOG #2337) -------------
+
+    async def newest_keyed_audit_row(
+        self, action: str, *, actor: str, after_seq: int
+    ) -> dict[str, Any] | None:
+        """See the SQLite twin. Its reads share one borrow and one read-only REPEATABLE READ
+        snapshot; the MAC runs after both are released."""
+        async with (
+            self._timed_acquire(record=False) as conn,
+            conn.transaction(isolation="repeatable_read", readonly=True),
+        ):
+
+            async def fetch(sql: str, params: tuple[object, ...]) -> Mapping[str, Any] | None:
+                parts = sql.split("?")
+                numbered = parts[0] + "".join(f"${i}{part}" for i, part in enumerate(parts[1:], 1))
+                row: Mapping[str, Any] | None = await conn.fetchrow(numbered, *params)
+                return row
+
+            check = await read_newest_keyed_audit_row(
+                fetch,
+                action=action,
+                actor=actor,
+                after_seq=after_seq,
+                mac_keys=self._audit_mac_keys,
+                mac_fn=self._audit_mac_fn,
+            )
+        return await settle_newest_keyed_audit_row(check)
 
     async def get_transit_bound_attestation(self) -> TransitBoundAttestation | None:
         """See the SQLite twin. The shared reader's ``?`` placeholders become ``$n`` here, and

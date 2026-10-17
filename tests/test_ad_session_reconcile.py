@@ -49,12 +49,13 @@ from messagefoundry.auth.notifications import (
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import AuthService, DirectoryObjectIdMissing, _RevocationApplied
 from messagefoundry.config.settings import AuthSettings
-from messagefoundry.store.crypto import CipherError
+from messagefoundry.store.crypto import CipherError, generate_key, make_cipher
 from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
     MessageStore,
     UserRecord,
+    audit_row_hash,
 )
 from tests._admin_account import create_local_user_chosen
 from tests.test_approval_requester_recheck import _Sink
@@ -3090,13 +3091,19 @@ async def _scope_of(store: MessageStore, username: str) -> tuple[str | None, str
 
 
 async def _scoped_service(
-    *groups: str, names: tuple[str, ...] = ("jdoe",)
+    *groups: str, names: tuple[str, ...] = ("jdoe",), keyed: bool = False
 ) -> tuple[MessageStore, _FakeLdap, AuthService, dict[str, str]]:
     """A service whose accounts signed in holding ``groups``, under a map giving grp-a IB_A and
     IB_B, grp-b IB_B, and grp-all every channel. The map is written through the STORE, not the
     service: the service's map edit revokes every session, and these tests model a change made in
-    the directory."""
-    store = await MessageStore.open(":memory:")
+    the directory. ``keyed`` opens an encrypted store whose audit chain is HMAC-keyed."""
+    if keyed:
+        cipher = make_cipher(generate_key())
+        store = await MessageStore.open(
+            ":memory:", cipher=cipher, audit_mac_key=cipher.audit_mac_key()
+        )
+    else:
+        store = await MessageStore.open(":memory:")
     await store.set_ad_group_scope_map(
         [(_GRP_A, "IB_A"), (_GRP_A, "IB_B"), (_GRP_B, "IB_B"), (_GRP_ALL, "*")]
     )
@@ -3537,9 +3544,11 @@ async def test_the_pass_judges_the_scope_stored_after_its_probes() -> None:
         planned: list[reconcile.SessionRevocation] = []
         apply = service._apply_reconcile_revocation
 
-        async def spy(revocation: reconcile.SessionRevocation) -> _RevocationApplied:
+        async def spy(
+            revocation: reconcile.SessionRevocation, *, after_seq: int | None
+        ) -> _RevocationApplied:
             planned.append(revocation)
-            return await apply(revocation)
+            return await apply(revocation, after_seq=after_seq)
 
         service._apply_reconcile_revocation = spy  # type: ignore[method-assign]
         plan = await service.reconcile_directory_sessions()
@@ -3559,11 +3568,13 @@ async def test_a_scope_revocation_is_skipped_when_the_scope_moved_before_it_appl
         ldap.present["jdoe"] = _principal("jdoe", _GRP_B)
         apply = service._apply_reconcile_revocation
 
-        async def login_then_apply(revocation: reconcile.SessionRevocation) -> _RevocationApplied:
+        async def login_then_apply(
+            revocation: reconcile.SessionRevocation, *, after_seq: int | None
+        ) -> _RevocationApplied:
             await store.set_user_channel_scope(
                 revocation.user_id, json.dumps(["IB_B"]), source=SCOPE_SOURCE_AD
             )
-            return await apply(revocation)
+            return await apply(revocation, after_seq=after_seq)
 
         service._apply_reconcile_revocation = login_then_apply  # type: ignore[method-assign]
         plan = await service.reconcile_directory_sessions()
@@ -3650,7 +3661,12 @@ async def test_each_revocation_reason_sends_its_decided_notice(reason: str) -> N
         if reason == reconcile.SCOPE_CHANGED:
             extra.update(scope_changed=True, scope_from=user.channel_scope, scope_to=None)
         revocation = reconcile.SessionRevocation(user.id, user.username, reason=reason, **extra)
-        assert await service._apply_reconcile_revocation(revocation) == "reported"
+        assert (
+            await service._apply_reconcile_revocation(
+                revocation, after_seq=await service._audit_watermark()
+            )
+            == "reported"
+        )
         expected = _NOTICE_FOR_REASON[reason]
         assert [e.event_type for e in notifier.sent] == ([] if expected is None else [expected])
         if expected is not None:
@@ -3671,7 +3687,12 @@ async def test_an_undecided_whole_account_reason_falls_to_the_neutral_notice() -
         revocation = reconcile.SessionRevocation(
             user.id, user.username, reason="directory_synthetic_new_reason"
         )
-        assert await service._apply_reconcile_revocation(revocation) == "reported"
+        assert (
+            await service._apply_reconcile_revocation(
+                revocation, after_seq=await service._audit_watermark()
+            )
+            == "reported"
+        )
         assert [e.event_type for e in notifier.sent] == [DIRECTORY_SESSIONS_ENDED]
     finally:
         await store.close()
@@ -3886,15 +3907,23 @@ async def _absent_pass_with_sessions_gone_first(
     *,
     other_reconciler_row: bool,
     planted: _Planted | None = None,
+    keyed: bool = False,
 ) -> tuple[reconcile.ReconcilePlan, list[dict[str, Any]], list[str], list[Any]]:
     """Run one pass over ``jdoe``, now absent, whose sessions end between the plan and the apply.
 
     With ``other_reconciler_row`` the sessions are ended by a second reconciler, which writes its
     own ``auth.ad_session_revoked`` row first. Without it the user signed out mid-pass.
     ``planted`` writes one more matching row straight into the store: before the pass starts, or
-    while it lists the account's sessions. Returns the plan, the revoked rows, the notices and the
-    ``ad_session_revoked`` alerts."""
-    store = await MessageStore.open(":memory:")
+    while it lists the account's sessions. ``keyed`` opens a store whose audit chain is
+    HMAC-keyed. Returns the plan, the revoked rows, the notices and the ``ad_session_revoked``
+    alerts."""
+    if keyed:
+        cipher = make_cipher(generate_key())
+        store = await MessageStore.open(
+            ":memory:", cipher=cipher, audit_mac_key=cipher.audit_mac_key()
+        )
+    else:
+        store = await MessageStore.open(":memory:")
     try:
         ldap = _FakeLdap({"jdoe": _principal("jdoe")})
         settings = _ad_settings(ad_session_recheck_strikes=1)
@@ -3948,18 +3977,37 @@ async def _absent_pass_with_sessions_gone_first(
         await store.close()
 
 
-async def test_a_second_reconciler_revoking_one_absent_account_audits_zero_and_still_alerts(
+@pytest.mark.parametrize("keyed", [True, False])
+async def test_a_second_reconciler_revoking_one_absent_account_audits_zero(
+    monkeypatch: pytest.MonkeyPatch, keyed: bool
+) -> None:
+    """BACKLOG #3085 item 2, owner ruling B258-R7 and vault BACKLOG #3750 item 33, through the
+    whole pass. Another reconciler ends the account's sessions, and writes its row, between this
+    pass's plan and its apply. This pass still writes its ``auth.ad_session_revoked`` row, with
+    ``sessions: 0``. On a keyed chain the other row verifies, so this repeat is quiet: no alert
+    and no notice. On a keyless chain no row is evidence, so it alerts and notifies."""
+    plan, rows, notices, alerts = await _absent_pass_with_sessions_gone_first(
+        monkeypatch, other_reconciler_row=True, keyed=keyed
+    )
+    assert [r["sessions"] for r in rows] == [0, 1], "the revocation wrote no row"
+    if keyed:
+        assert plan.revocations == () and notices == [] and alerts == []
+    else:
+        assert [r.reason for r in plan.revocations] == ["directory_absent"]
+        assert notices == [DIRECTORY_SESSIONS_ENDED]
+        assert len(alerts) == 1
+
+
+async def test_a_verified_row_from_before_the_listing_does_not_silence_a_keyed_pass(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BACKLOG #3085 item 2 and vault BACKLOG #3750 item 33. Another reconciler ends the account's
-    sessions, and writes its row, between this pass's plan and its apply. This pass still writes
-    its ``auth.ad_session_revoked`` row, with ``sessions: 0``, and still alerts and sends its
-    notice."""
-    plan, rows, notices, alerts = await _absent_pass_with_sessions_gone_first(
-        monkeypatch, other_reconciler_row=True
+    """The watermark is per account, read before the session listing. A row sealed under the key
+    before the pass, such as one from before the account's latest sign-in, verifies but is not a
+    repeat of this revocation, so it alerts."""
+    plan, _rows, notices, alerts = await _absent_pass_with_sessions_gone_first(
+        monkeypatch, other_reconciler_row=False, planted="before_pass", keyed=True
     )
     assert [r.reason for r in plan.revocations] == ["directory_absent"]
-    assert [r["sessions"] for r in rows] == [0, 1], "the revocation wrote no row"
     assert notices == [DIRECTORY_SESSIONS_ENDED]
     assert len(alerts) == 1
 
@@ -4014,7 +4062,12 @@ async def test_a_disabled_account_that_signs_out_mid_pass_still_alerts_and_is_to
         revocation = reconcile.SessionRevocation(
             user.id, user.username, reason="directory_disabled"
         )
-        assert await service._apply_reconcile_revocation(revocation) == "reported"
+        assert (
+            await service._apply_reconcile_revocation(
+                revocation, after_seq=await service._audit_watermark()
+            )
+            == "reported"
+        )
         assert [e.event_type for e in notifier.sent] == [ACCOUNT_DISABLED]
         assert [r["sessions"] for r in _revoked_rows(await store.list_audit())] == [0]
     finally:
@@ -4022,20 +4075,103 @@ async def test_a_disabled_account_that_signs_out_mid_pass_still_alerts_and_is_to
 
 
 @pytest.mark.parametrize("reason", ["directory_disabled", "directory_absent"])
-async def test_a_repeat_revocation_of_a_disabled_or_absent_account_still_reports(
-    reason: str,
-) -> None:
-    """Vault BACKLOG #3750 item 33. The second apply ends nothing, and still reports."""
+async def test_a_repeat_revocation_on_an_unkeyed_chain_still_reports(reason: str) -> None:
+    """Vault BACKLOG #3750 item 33. On a keyless audit chain anyone who can write the table can
+    recompute a row's hash, so no row there is evidence: a repeat revocation of a disabled or
+    absent account reports, though the first apply's row sits above the watermark."""
     store, _, service, _ = await _scoped_service(_GRP_A)
     try:
         notifier = _CapturingNotifier()
         service._security_notifier = notifier
         user = await _signed_out(store, "jdoe")
+        watermark = await service._audit_watermark()
         revocation = reconcile.SessionRevocation(user.id, user.username, reason=reason)
-        assert await service._apply_reconcile_revocation(revocation) == "reported"
-        assert await service._apply_reconcile_revocation(revocation) == "reported"
+        for _ in range(2):
+            assert (
+                await service._apply_reconcile_revocation(revocation, after_seq=watermark)
+                == "reported"
+            )
         assert len(notifier.sent) == 2
         assert len(_revoked_rows(await store.list_audit())) == 2
+    finally:
+        await store.close()
+
+
+async def _forge_revocation_row(store: MessageStore, reason: str) -> None:
+    """Insert an ``auth.ad_session_revoked`` row straight into the table, at the next sequence
+    number, as a writer of the database who holds no audit key could: its hash is the keyless
+    SHA-256 a forger can compute, not the chain's HMAC."""
+    seq, head = await store.audit_anchor()
+    detail = json.dumps({"reason": reason, "sessions": 1})
+    now = time.time()
+    forged = audit_row_hash(
+        head,
+        seq=seq + 1,
+        ts=now,
+        actor="jdoe",
+        action="auth.ad_session_revoked",
+        channel_id=None,
+        detail=detail,
+        client=None,
+    )
+    await store._db.execute(
+        "INSERT INTO audit_log (seq, ts, actor, action, channel_id, detail, client, row_hash)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (seq + 1, now, "jdoe", "auth.ad_session_revoked", None, detail, None, forged),
+    )
+    await store._db.commit()
+
+
+@pytest.mark.parametrize("reason", ["directory_disabled", "directory_absent"])
+async def test_a_forged_revocation_row_does_not_silence_a_repeat_on_a_keyed_chain(
+    reason: str,
+) -> None:
+    """Vault BACKLOG #3750 item 33. On a keyed chain a row inserted by a database writer who holds
+    no audit key fails its MAC, so it is not evidence that another pass revoked the account: the
+    revocation reports and the user is told."""
+    store, _, service, _ = await _scoped_service(_GRP_A, keyed=True)
+    try:
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        user = await _signed_out(store, "jdoe")
+        watermark = await service._audit_watermark()
+        await _forge_revocation_row(store, reason)
+        revocation = reconcile.SessionRevocation(user.id, user.username, reason=reason)
+        assert (
+            await service._apply_reconcile_revocation(revocation, after_seq=watermark) == "reported"
+        ), "a forged row silenced the alert"
+        assert len(notifier.sent) == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("reason", ["directory_disabled", "directory_absent"])
+async def test_a_verified_repeat_revocation_on_a_keyed_chain_is_quiet(reason: str) -> None:
+    """Owner ruling B258-R7: only a repeat revocation another pass already made stays quiet. The
+    first apply's row is sealed under the audit key above the watermark, so the second apply finds
+    it verified, writes its own row and is quiet."""
+    store, _, service, _ = await _scoped_service(_GRP_A, keyed=True)
+    try:
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        user = await _signed_out(store, "jdoe")
+        watermark = await service._audit_watermark()
+        revocation = reconcile.SessionRevocation(user.id, user.username, reason=reason)
+        assert (
+            await service._apply_reconcile_revocation(revocation, after_seq=watermark) == "reported"
+        )
+        assert await service._apply_reconcile_revocation(revocation, after_seq=watermark) == "quiet"
+        assert len(notifier.sent) == 1
+        assert len(_revoked_rows(await store.list_audit())) == 2
+        # The controls: a verified row at or below the watermark, and a newest row with another
+        # reason, do not count.
+        later = await service._audit_watermark()
+        assert await service._apply_reconcile_revocation(revocation, after_seq=later) == "reported"
+        newest = await service._audit_watermark()
+        await store.record_audit("auth.ad_session_revoked", actor="jdoe", detail='{"reason": "x"}')
+        assert await service._apply_reconcile_revocation(revocation, after_seq=newest) == "reported"
+        assert len(notifier.sent) == 3
+        assert (await store.verify_audit_chain())[0]
     finally:
         await store.close()
 
@@ -4051,7 +4187,12 @@ async def test_an_undetermined_revocation_that_ends_nothing_stays_quiet() -> Non
         revocation = reconcile.SessionRevocation(
             user.id, user.username, reason="directory_undetermined"
         )
-        assert await service._apply_reconcile_revocation(revocation) == "quiet"
+        assert (
+            await service._apply_reconcile_revocation(
+                revocation, after_seq=await service._audit_watermark()
+            )
+            == "quiet"
+        )
         assert notifier.sent == []
     finally:
         await store.close()
@@ -4072,7 +4213,12 @@ async def test_a_quiet_revocation_whose_row_is_refused_reports_instead(
         revocation = reconcile.SessionRevocation(
             user.id, user.username, reason="directory_undetermined"
         )
-        assert await service._apply_reconcile_revocation(revocation) == "quiet"
+        assert (
+            await service._apply_reconcile_revocation(
+                revocation, after_seq=await service._audit_watermark()
+            )
+            == "quiet"
+        )
         real = store.record_audit
 
         async def refusing(name: str, **kwargs: Any) -> None:
@@ -4081,7 +4227,12 @@ async def test_a_quiet_revocation_whose_row_is_refused_reports_instead(
             await real(name, **kwargs)
 
         monkeypatch.setattr(store, "record_audit", refusing)
-        assert await service._apply_reconcile_revocation(revocation) == "reported"
+        assert (
+            await service._apply_reconcile_revocation(
+                revocation, after_seq=await service._audit_watermark()
+            )
+            == "reported"
+        )
         assert notifier.sent == []
         assert len(_revoked_rows(await store.list_audit())) == 1  # the control's row only
     finally:
@@ -4101,8 +4252,18 @@ async def test_a_role_revocation_another_reconciler_applied_first_is_quiet() -> 
         revocation = reconcile.SessionRevocation(
             user.id, user.username, reason="roles_changed", role_ids=target
         )
-        assert await service._apply_reconcile_revocation(revocation) == "reported"
-        assert await service._apply_reconcile_revocation(revocation) == "quiet"
+        assert (
+            await service._apply_reconcile_revocation(
+                revocation, after_seq=await service._audit_watermark()
+            )
+            == "reported"
+        )
+        assert (
+            await service._apply_reconcile_revocation(
+                revocation, after_seq=await service._audit_watermark()
+            )
+            == "quiet"
+        )
         assert [e.event_type for e in notifier.sent] == [ROLES_CHANGED]
         assert len(_revoked_rows(await store.list_audit())) == 2
     finally:
@@ -4123,7 +4284,12 @@ async def test_a_role_change_that_ends_no_session_still_reports() -> None:
         revocation = reconcile.SessionRevocation(
             user.id, user.username, reason="roles_changed", role_ids=target
         )
-        assert await service._apply_reconcile_revocation(revocation) == "reported"
+        assert (
+            await service._apply_reconcile_revocation(
+                revocation, after_seq=await service._audit_watermark()
+            )
+            == "reported"
+        )
         assert [e.event_type for e in notifier.sent] == [ROLES_CHANGED]
         assert [r["sessions"] for r in _revoked_rows(await store.list_audit())] == [0]
     finally:
