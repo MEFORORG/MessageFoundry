@@ -2680,6 +2680,61 @@ async def test_a_begin_inside_the_confirm_window_cannot_choose_the_enabled_secre
         await store.close()
 
 
+async def test_a_lost_enable_write_ends_the_session_and_confirms_after_a_fresh_sign_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: a ``write_lost`` refusal hands the session back, records another reason, or leaves
+    no way to confirm afterwards (BACKLOG #3025).
+
+    The enable is made to match no row while the row still holds the verified secret with TOTP
+    off, which is the ``write_lost`` shape. The refused confirm must end the session. The same
+    step's code is spent, so after a fresh sign-in it is refused as a wrong code, and a code from
+    a later step confirms the same staged secret."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
+        identity, token, password = await login_admin(service)
+        staged = await service.begin_mfa_enrollment(identity)
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+
+        real_enable = store.enable_totp
+
+        async def enable_loses(*args: Any, **kwargs: Any) -> bool:
+            return False
+
+        monkeypatch.setattr(store, "enable_totp", enable_loses)
+        refused = await service.confirm_mfa_enrollment(
+            identity, totp.totp(staged.secret, now=t0), token=token
+        )
+        assert refused.ok is False and refused.session_lost is True
+        assert refused.recovery_codes == ()
+        assert await store.list_sessions(identity.user_id) == []
+        rows = await store.list_audit(
+            actor=ADMIN_USERNAME, action="auth.mfa_enroll_refused", limit=10
+        )
+        assert len(rows) == 1 and '"reason": "write_lost"' in str(rows[0]["detail"])
+
+        monkeypatch.setattr(store, "enable_totp", real_enable)
+        again = await service.login(ADMIN_USERNAME, password)
+        assert again.token is not None
+        replay = await service.confirm_mfa_enrollment(
+            identity, totp.totp(staged.secret, now=t0), token=again.token
+        )
+        assert replay.ok is False and replay.session_lost is False, (
+            "the spent step's code was accepted, or answered as a lost session"
+        )
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        confirmed = await service.confirm_mfa_enrollment(
+            identity, totp.totp(staged.secret, now=t1), token=again.token
+        )
+        assert confirmed.ok
+        assert (await service.mfa_status(identity)).enabled is True
+    finally:
+        await store.close()
+
+
 async def test_an_unrelated_write_inside_the_confirm_window_still_confirms(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
