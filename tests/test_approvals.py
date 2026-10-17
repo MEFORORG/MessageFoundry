@@ -470,9 +470,10 @@ async def test_a_released_purge_whose_audit_row_fails_cancels_nothing(
 async def test_a_released_purge_with_no_requester_is_refused_before_it_cancels(
     engine: Engine, tmp_path: Path
 ) -> None:
-    """Vault BACKLOG #3217: a held purge whose params carry no requester fails closed. It used to
-    run and write a connection_purge row naming no actor (found in code review). The raise is an
-    ApprovalError, so the gate's compensation records 'failed' and the route answers 409."""
+    """Vault BACKLOG #3217: the purge executor itself refuses params that carry no requester, so it
+    never writes a connection_purge row naming no actor. The gate refuses such a hold before its
+    claim (the test below), so this refusal is reached only if the purge is registered without
+    ``requires_requester``; its raise would then be compensated to 'failed'."""
     service = await _service(engine)
     mid = await _quiesced_outbound_with_a_pending_row(engine, tmp_path)
     app = create_app(engine, auth=service, approvals=ON)
@@ -513,11 +514,32 @@ async def test_a_held_purge_with_no_requester_is_predicted_blocked_and_refused_a
         assert entry["release_blocked"] == "params_no_requester"
         refused = await c.post(f"/approvals/{approval_id}/approve", headers=admin)
     assert refused.status_code == 409
+    assert "record no requester" in refused.json()["detail"]
     row = await engine.store.get_pending_approval(approval_id)
     assert row is not None and str(row["status"]) == "pending"
+    [audit] = await engine.store.list_audit(action="approval.params_no_requester")
+    assert str(audit["actor"]) == "approver"
     assert await engine.store.list_audit(action="approval.release_attempted") == []
     assert await engine.store.list_audit(action="connection_purge") == []
     assert {r["status"] for r in await engine.store.outbox_for(mid)} == {OutboxStatus.PENDING.value}
+
+
+async def test_the_executors_that_need_the_requester_are_registered_as_needing_it(
+    engine: Engine,
+) -> None:
+    """The purge and the reload refuse params naming no requester, so the gate must predict it for
+    both. The replay writes its row with a NULL actor instead (the test further below), so it is not
+    flagged, and the reload's own refusal backs the flag up as the purge's does."""
+    service = await _service(engine)
+    app = create_app(engine, auth=service, approvals=ON)
+    ops = app.state.approval_gate._ops
+    flagged = {key for key, op in ops.items() if op.requires_requester}
+    assert flagged == {"connection_purge", "config_reload"}
+    for params in ({"config_dir": None}, {"config_dir": None, "requester": ""}):
+        with pytest.raises(ApprovalError) as info:
+            await ops["config_reload"].execute(params)
+        assert info.value.status == 409
+    assert await engine.store.list_audit(action="config_reload") == []
 
 
 def test_settings_validator_rejects_unknown_operation() -> None:

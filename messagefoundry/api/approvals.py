@@ -105,11 +105,22 @@ RESOLVE_OUTCOMES: Mapping[str, str] = {
 }
 
 
-#: How long :meth:`ApprovalGate.drain` waits for outcome writes still running at shutdown. It shares
-#: NSSM's 15 s graceful-stop window (AppStopMethodConsole in scripts/service/install-service.ps1)
-#: with the upload runner's 5 s stop, which runs first, and engine.stop() still has to run after it.
-#: One outcome write is a status update and an audit row, so a few seconds is ample.
+#: How long :meth:`ApprovalGate.drain` waits for the gate's writes still running at shutdown, at
+#: least the outcome writes and the request writes (vault BACKLOG #3193). It shares NSSM's 15 s
+#: graceful-stop window (AppStopMethodConsole in scripts/service/install-service.ps1) with the
+#: upload runner's 5 s stop, which runs first, and engine.stop() still has to run after it. Each
+#: write is a status change or a new row with its audit row, plus at most a read-back, so a few
+#: seconds is ample.
 DRAIN_TIMEOUT_SECONDS = 3.0
+
+
+def named_requester(params: Mapping[str, Any]) -> str | None:
+    """The requester's name a hold's params carry, or ``None`` when it is missing or not a non-empty
+    string (vault BACKLOG #3217). One test for the executors that need the name and for the queue's
+    ``params_no_requester`` prediction, so the two cannot drift."""
+    requester = params.get("requester")
+    return requester if isinstance(requester, str) and requester else None
+
 
 #: The claim owner of an engine that is neither an engine shard nor a cluster node (BACKLOG #1562).
 #: Fixed, so a plain ``serve`` recognises its own claims after a restart. Two such engines over one
@@ -313,7 +324,8 @@ class ApprovalGate:
         # release (fail closed) rather than executing on authority it could not check.
         self._resolve_identity = resolve_identity
         self._alert_sink: AlertSink = alert_sink if alert_sink is not None else LoggingAlertSink()
-        # Outcome writes started by _shielded, mapped to their approval id. Held here because a
+        # Writes started by _shielded, at least the outcome and request writes (vault BACKLOG
+        # #3193), mapped to their approval id. Held here because a
         # caller that was cancelled no longer holds one, and the event loop keeps only a weak
         # reference to a running task. Per gate rather than per module (BACKLOG #2087), so drain()
         # sees only this gate's writes and no set outlives the loop its tasks ran on.
@@ -355,7 +367,9 @@ class ApprovalGate:
         return self._claim_owner_value
 
     async def drain(self, timeout: float = DRAIN_TIMEOUT_SECONDS) -> list[str]:
-        """Wait up to ``timeout`` seconds for outcome writes still running (BACKLOG #2087).
+        """Wait up to ``timeout`` seconds for the gate's writes still running (BACKLOG #2087): every
+        write :meth:`_shielded` started, at least the outcome writes and the request writes (vault
+        BACKLOG #3193).
 
         The managed lifespan calls this before ``engine.stop()`` closes the store. A write whose
         caller was cancelled, such as by a request timeout, then lands instead of meeting a closed
@@ -841,8 +855,7 @@ class ApprovalGate:
             return "params_unreadable"
         # The executor's own test, read here so the refusal comes before the claim (vault BACKLOG
         # #3217): past the claim it was compensated to 'failed' while the queue offered Approve.
-        requester = params.get("requester")
-        if op.requires_requester and not (isinstance(requester, str) and requester):
+        if op.requires_requester and named_requester(params) is None:
             return "params_no_requester"
         return None
 

@@ -74,6 +74,7 @@ from messagefoundry.api.approvals import (
     ApprovalError,
     ApprovalGate,
     IdentityResolver,
+    named_requester,
 )
 from messagefoundry.api.auth_routes import add_auth_routes
 from messagefoundry.api.client_networks import ClientNetworkMiddleware
@@ -1277,8 +1278,8 @@ def _app_drain_steps(
        cancelled save left running, the releases they start, and the save-time sweeps that write
        ``upload.prune`` rows. After the long-operations drain, so a pair removed because its
        ``upload.create`` row failed there (vault BACKLOG #3178) is held as a straggler by then.
-    3. Approval writes still running (BACKLOG #2087): the outcome writes, and the request writes
-       whose caller was cancelled (vault BACKLOG #3193), which would otherwise meet a closed store.
+    3. Every approval write the gate still has running (BACKLOG #2087), at least the outcome writes
+       and the request writes (vault BACKLOG #3193), which would otherwise meet a closed store.
     4. Lock notices (BACKLOG #2216), which read and write the audit log and hand their mail to the
        security notifier, so they drain before that notifier stops.
     5. The open summary-access windows (M-5, BACKLOG #1640). Every clean restart otherwise dropped
@@ -1445,12 +1446,12 @@ def _build_approval_gate(
         # Vault BACKLOG #3217: the connection_purge row is attributed to the REQUESTER, so a hold
         # whose params carry none is refused before anything runs, rather than released as a
         # destructive purge whose row names no actor. The gate refuses such a hold before its claim
-        # (requires_requester below, release_blocked 'params_no_requester'), so this test is the
-        # backstop for a caller that runs the executor some other way; its raise would reach the
-        # gate's compensation as 'failed'. Every hold the route files carries the key
+        # (requires_requester below, release_blocked 'params_no_requester', the same test), so
+        # this one is reached only if that registration flag is dropped; its raise would then reach
+        # the gate's compensation as 'failed'. Every hold the route files carries the key
         # (_purge_hold_params), so this is a guard, not a migration path.
-        requester = p.get("requester")
-        if not isinstance(requester, str) or not requester:
+        requester = named_requester(p)
+        if requester is None:
             raise ApprovalError(
                 409,
                 "this purge request records no requester, so its connection_purge row could not "
@@ -1491,9 +1492,17 @@ def _build_approval_gate(
         # refusal, below). The same fingerprint-bearing config_reload audit row is written so the
         # released reload is bound to the bytes that actually loaded (defeating attribution-laundering).
         config_dir = p.get("config_dir")
-        # Read BEFORE the reload (BACKLOG #1940): a KeyError raised after the swap would reach the
-        # gate's compensation and record a reload that ran as 'failed'.
-        actor = str(p["requester"])
+        # Read BEFORE the reload (BACKLOG #1940): a raise after the swap would reach the gate's
+        # compensation and record a reload that ran as 'failed'. The gate refuses a hold naming no
+        # requester before its claim (requires_requester below), so this refusal, as the purge's,
+        # is reached only if that flag is dropped; it keeps a row naming no actor from being written.
+        actor = named_requester(p)
+        if actor is None:
+            raise ApprovalError(
+                409,
+                "this reload request records no requester, so its config_reload row could not "
+                "name who ran it; it was not run",
+            )
         # Vault BACKLOG #2596, step 3: the release loads only the bytes the approval named. A hold
         # whose params carry no digest (none is filed that way now) binds to None, which matches
         # nothing, so it is refused as a mismatch once its directory resolves. On a store that holds
@@ -1578,6 +1587,7 @@ def _build_approval_gate(
         "Reload the live config graph (config:deploy)",
         _config_reload,
         permission=Permission.CONFIG_DEPLOY,
+        requires_requester=True,
     )
     return gate
 

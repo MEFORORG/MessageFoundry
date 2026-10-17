@@ -109,7 +109,7 @@ this line.**
   administrator to reset it. No seam change. (vault BACKLOG #2298)
 - **The Approvals page no longer offers Approve on a request the engine always refuses.** It reads
   the engine's new `release_blocked` reason, so a request that predates requester-id attribution,
-  or whose operation is no longer registered, or a purge whose parameters name no requester, gets
+  or whose operation is no longer registered, or a purge or reload whose parameters name no requester, gets
   only the reject and a note saying why, as an ungated or unreadable one already did. Each note
   names the button beside it, Withdraw or Reject. Seam change: `PendingApprovalInfo` gained
   `release_blocked`. (vault BACKLOG #3192)

@@ -2112,11 +2112,9 @@ two cannot disagree. `PendingApprovalInfo` in `messagefoundry/api/models.py` lis
 what `null` does not promise. The console's Approvals page keys on it, and offers a blocked request
 only Reject, or Withdraw on the requester's own row, with a note saying why. A release
 refused for unreadable parameters writes an `approval.params_unreadable` row against the
-approver, which carries no parameters. A held purge whose parameters name no requester is marked
-`params_no_requester` and refused before the claim, so it stays pending for a reject and writes an
-`approval.params_no_requester` row against the approver; the purge executor's own refusal of it
-(vault BACKLOG #3217) is then a backstop. A refusal for a request with no requester id, or for an
-operation no longer registered, still writes no row.
+approver, which carries no parameters, and one refused as `params_no_requester` writes an
+`approval.params_no_requester` row against the approver. A refusal for a request with no requester
+id, or for an operation no longer registered, still writes no row.
 
 **Each state change and its audit row are one write (vault BACKLOG #2255).** The store
 moves the request and appends its audit row in one transaction, so the two commit or roll back

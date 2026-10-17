@@ -554,7 +554,8 @@ class PendingApprovalInfo(BaseModel):
     order it raises them: ``no_requester_id`` (the row predates requester-id attribution),
     ``operation_unavailable`` (no such operation is registered), ``not_gated`` (as ``gated`` above),
     ``params_unreadable``, and ``params_no_requester`` (the operation's executor needs the
-    requester's name and the parameters carry none, such as a purge's; vault BACKLOG #3217). ``None`` does not promise a release. At least the self-approval
+    requester's name and the parameters carry none, as a purge's and a reload's do; vault BACKLOG
+    #3217). ``None`` does not promise a release. At least the self-approval
     refusal, the expiry, the dwell floor, the requester's standing, the row's seal and the
     operation's own refusals, such as a held reload with no config digest, are met only at
     release. It lets a page offer only the reject. It is ``None`` on an ``interrupted`` row."""

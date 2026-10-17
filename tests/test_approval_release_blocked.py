@@ -171,3 +171,34 @@ async def test_a_no_requester_refusal_writes_its_audit_row(store: MessageStore) 
     detail = json.loads(str(row["detail"]))
     assert detail == {"approval_id": approval_id, "operation": _REPLAY, "requester": "maker"}
     assert await store.list_audit(action="approval.release_attempted") == []
+
+
+async def test_a_lost_no_requester_row_still_answers_409_and_pages(store: MessageStore) -> None:
+    approval_id = await _row(store, params="{}")
+    sink = _Sink()
+    gate = _gate(_Faulty(store, audit_fails=("approval.params_no_requester",)), [], sink)
+    with pytest.raises(ApprovalError) as caught:
+        await gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)
+    assert caught.value.status == 409
+    assert sink.lost == [(f"approval:{approval_id}", "approval.params_no_requester")]
+
+
+async def test_an_operation_not_needing_the_requester_releases_without_one(
+    store: MessageStore,
+) -> None:
+    """The negative control: the default, ``requires_requester=False``, leaves params naming no
+    requester releasable, as the real replay is."""
+    settings = ApprovalsSettings(enabled=True, operations=[_REPLAY], min_dwell_seconds=0.0)
+    gate = ApprovalGate(_StandingStore(store), settings, resolve_identity=_resolve)
+    runs: list[str] = []
+
+    async def _execute(_p: Mapping[str, Any]) -> dict[str, Any]:
+        runs.append("ran")
+        return {"requeued": 0}
+
+    gate.register(_REPLAY, "op", _execute, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await _row(store, params="{}")
+    [entry] = await gate.list_pending()
+    assert entry["release_blocked"] is None
+    await gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)
+    assert runs == ["ran"]

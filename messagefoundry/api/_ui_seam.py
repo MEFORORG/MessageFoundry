@@ -465,7 +465,7 @@ from typing import Any
 #: with ``--write`` on the merged tree, so it covers every entry above.
 #:
 #: Vault BACKLOG #3192 review repair: ``ReleaseBlocked`` gained ``params_no_requester``, a held
-#: purge whose params name no requester, which the gate now refuses before its claim (vault BACKLOG
+#: purge or reload whose params name no requester, which the gate now refuses before its claim (vault BACKLOG
 #: #3217). The Approvals page keys a note on every value, so an older console on this engine is
 #: refused at mount rather than meeting a value it has no note for. Re-derived with ``--write``
 #: from 71c27581e7c9f921.
