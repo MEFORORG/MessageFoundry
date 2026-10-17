@@ -43,12 +43,14 @@ guards set no executor, so they run on the shared loop.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import functools
 import inspect
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import fastapi
@@ -72,6 +74,7 @@ from messagefoundry.pipeline.connscale_shim import InstrumentedThreadPoolExecuto
 from messagefoundry.store.store import MessageStore
 from messagefoundry_webconsole._service import _service as console_service
 from scripts.security import route_gates
+from tests._ast_sites import call_sites, find_funcs, parse_source
 
 _POOL = 4
 # The baseline's budget. A verify with no free thread cannot finish at any budget, so the value only
@@ -286,9 +289,9 @@ def test_no_route_declares_a_sync_dependency() -> None:
     :func:`bearer_token_dependency` wraps ``bearer_token``. A helper that does block goes in
     :data:`_SYNC_ACCEPTED` with its reason.
 
-    WHAT IT DOES NOT COVER, at least: a sync iterator handed to ``StreamingResponse`` and a sync
-    background task, which Starlette also steps through on a worker thread. The walk reads what is
-    declared, not what an endpoint body does.
+    WHAT IT DOES NOT COVER, at least: a sync background task, which Starlette also runs on a worker
+    thread. The walk reads what is declared, not what an endpoint body does. A sync iterator handed
+    to ``StreamingResponse`` is :func:`test_no_streaming_response_is_handed_a_sync_body`'s.
     """
     found = _walk_app(route_gates.full_surface_app())
     # Coverage beside the verdict: one sentinel per surface the full app adds, so a registrar that
@@ -384,3 +387,156 @@ def test_a_renamed_fastapi_helper_fails_the_guard_by_name(
         _fastapi_awaits(_planted_async_dependency)
     assert f"fastapi.dependencies.models.{helper}" in str(caught.value)
     assert f"FastAPI {fastapi.__version__}" in str(caught.value)
+
+
+#: The packages that build responses. ``harness`` and ``tee`` serve no HTTP.
+_STREAMING_PACKAGES = ("messagefoundry", "messagefoundry_webconsole", "messagefoundry_toolkit")
+
+#: ``StreamingResponse`` bodies the guard accepts, as ``path:line`` to the reason. Empty today. A
+#: body that really blocks, such as a file read, needs a thread, so it belongs here with its reason.
+_STREAMING_ACCEPTED: dict[str, str] = {}
+
+
+def _is_async_generator(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Whether ``func`` is an ``async def`` that itself yields. A ``yield`` inside a nested
+    function, lambda or class belongs to that scope, and ``route_gates._own_nodes`` does not enter
+    one."""
+    return isinstance(func, ast.AsyncFunctionDef) and any(
+        isinstance(node, ast.Yield | ast.YieldFrom) for node in route_gates._own_nodes(func)
+    )
+
+
+def _names_streaming_response(expr: ast.expr) -> bool:
+    """``StreamingResponse`` or ``<anything>.StreamingResponse``, the shapes ``callee_name`` reads."""
+    return (isinstance(expr, ast.Name) and expr.id == "StreamingResponse") or (
+        isinstance(expr, ast.Attribute) and expr.attr == "StreamingResponse"
+    )
+
+
+def _sync_streaming_bodies(source: str, where: str) -> dict[str, str]:
+    """Every ``StreamingResponse`` body in ``source`` that cannot be shown to be async, as
+    ``where:line`` to what was found.
+
+    Starlette steps a body that is not an ``AsyncIterable`` through ``iterate_in_threadpool``, one
+    worker-thread hop per chunk (``starlette.responses.StreamingResponse.__init__``). The one shape
+    this reads as async is a call to a function whose every definition in the module is an
+    ``async def`` that yields. Anything else it sees is named, including a body it cannot resolve:
+    a list, a name bound earlier, a sync generator, a call through an attribute. An aliased import
+    and a subclass are named too, because either would hide a call from the walk.
+
+    It reads names, not bindings, so at least these pass unseen: ``StreamingResponse`` bound to
+    another name by assignment and called through it, a body function rebound by assignment beside
+    an ``async def`` of the same name, and a decorator that turns an async generator into a sync
+    iterator.
+    """
+    tree = parse_source(source)
+    found: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom | ast.Import):
+            for alias in node.names:
+                if alias.name.rpartition(".")[2] == "StreamingResponse" and alias.asname:
+                    found[f"{where}:{node.lineno}"] = f"imported as {alias.asname}"
+        elif isinstance(node, ast.ClassDef) and any(map(_names_streaming_response, node.bases)):
+            found[f"{where}:{node.lineno}"] = f"class {node.name} subclasses StreamingResponse"
+    for call in call_sites(tree, "StreamingResponse"):
+        at = f"{where}:{call.lineno}"
+        content = call.args[0] if call.args else None
+        for keyword in call.keywords:
+            if keyword.arg == "content":
+                content = keyword.value
+        if content is None:
+            found[at] = "no body argument"
+            continue
+        body = ast.unparse(content)
+        if not (isinstance(content, ast.Call) and isinstance(content.func, ast.Name)):
+            found[at] = f"body {body} is not a call to a named function"
+            continue
+        candidates = find_funcs(tree, content.func.id)
+        if not candidates:
+            found[at] = f"body {body} calls a function not defined in this module"
+        elif not all(_is_async_generator(d) for d in candidates):
+            found[at] = f"body {body} calls a function that is not an async generator"
+    return found
+
+
+def test_no_streaming_response_is_handed_a_sync_body() -> None:
+    """THE GUARD BACKLOG #2918 asks for (ASVS 15.4.4). Starlette steps a sync body through a worker
+    thread once per chunk, so a large export would share the pool every sync dependency above is
+    kept out of. No ``StreamingResponse`` in the product packages is handed a body the guard cannot
+    show is an async generator. A new one fails here, named by file and line.
+
+    The fix is an ``async def`` generator, as ``_iter_csv`` in ``export_audit`` and
+    ``_iter_ndjson`` in the message export are. A body that really blocks goes in
+    :data:`_STREAMING_ACCEPTED` with its reason.
+
+    A file whose text never spells ``StreamingResponse`` is not parsed: every shape the classifier
+    names (a call, an aliased import, a subclass) spells it, and parsing the whole tree cost about
+    8 s a run."""
+    root = Path(__file__).resolve().parents[1]
+    calls = 0
+    found: dict[str, str] = {}
+    for package in _STREAMING_PACKAGES:
+        for path in sorted((root / package).rglob("*.py")):
+            source = path.read_text(encoding="utf-8")
+            if "StreamingResponse" not in source:
+                continue
+            calls += len(call_sites(parse_source(source), "StreamingResponse"))
+            found.update(_sync_streaming_bodies(source, path.relative_to(root).as_posix()))
+    # Coverage beside the verdict: the audit export and the message export each make one call, and
+    # this counts calls in code, not mentions, so a walk that stops finding them cannot pass.
+    assert calls >= 2, calls
+    assert {at: why for at, why in found.items() if at not in _STREAMING_ACCEPTED} == {}
+
+
+_PLANTED_STREAMING = """
+from fastapi.responses import StreamingResponse
+from fastapi import responses
+from starlette.responses import StreamingResponse as Aliased  # named
+
+async def good():
+    yield "a"
+
+def sync_gen():
+    yield "a"
+
+async def no_yield():
+    def nested():
+        yield "the nested def's, not this one's"
+    return nested()
+
+async def twice():
+    yield "a"
+
+def twice():
+    yield "a"
+
+class Mine(StreamingResponse):  # named
+    pass
+
+def route(rows):
+    StreamingResponse(good())
+    StreamingResponse(content=good())
+    StreamingResponse(sync_gen())  # named
+    responses.StreamingResponse(sync_gen())  # named
+    StreamingResponse(no_yield())  # named
+    StreamingResponse(twice())  # named
+    StreamingResponse(iter(rows))  # named
+    StreamingResponse(rows)  # named
+    StreamingResponse(elsewhere())  # named
+    StreamingResponse(media_type="text/csv")  # named
+"""
+
+
+def test_the_streaming_guard_names_what_was_planted() -> None:
+    """THE CONTROL for :func:`test_no_streaming_response_is_handed_a_sync_body`. One sync or
+    unresolvable body is planted on each branch of the classifier, each line marked ``# named``,
+    beside two async bodies, one positional and one by keyword. The guard names exactly the marked
+    lines."""
+    lines = _PLANTED_STREAMING.splitlines()
+    marked = {f"planted.py:{n}" for n, line in enumerate(lines, 1) if line.endswith("# named")}
+    found = _sync_streaming_bodies(_PLANTED_STREAMING, "planted.py")
+    assert set(found) == marked, found
+    assert len(marked) == 10
+    reasons = sorted(found.values())
+    assert sum("not an async generator" in why for why in reasons) == 4, reasons
+    assert sum("not defined in this module" in why for why in reasons) == 2, reasons

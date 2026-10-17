@@ -110,9 +110,11 @@ _CSP_REPORT_SUMMARY_MAX = 5
 #: What the MFA gate and the re-auth form say when ``verify_mfa``, ``reauth`` or
 #: ``finish_webauthn_assertion`` refused a directory account the directory did not confirm (BACKLOG
 #: #2023, #2027, #2239). The code, password or passkey was never checked, so "invalid code",
-#: "incorrect password" or "passkey verification failed" would be false.
+#: "incorrect password" or "passkey verification failed" would be false. It names both fixes, a
+#: later try and a new sign-in, as the API's ``_DIRECTORY_UNCONFIRMED_DETAIL`` does (BACKLOG #3082).
 _DIRECTORY_UNCONFIRMED_ERROR = (
-    "The directory could not confirm your account. Try again later, or ask an administrator."
+    "The directory could not confirm your account. Try again later. If it is still refused,"
+    " sign out and sign in again, or ask an administrator."
 )
 
 

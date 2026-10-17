@@ -6712,8 +6712,9 @@ class AuthService:
           referral marks every candidate, so an account that pass itself revokes forfeits too.
 
         At least these take an account out: it signs out or reaches the session cap, the reconciler
-        revokes it, an operator disables it locally, or its row is deleted. The cost is a missed
-        clear when an account leaves for an ordinary reason while the evidence is pending. A trip
+        revokes it, an operator disables it locally, its row is deleted, or the session reaper deletes
+        its idle sessions (an idle row stays a candidate until then, BACKLOG #2283). The cost is a
+        missed clear when an account leaves for an ordinary reason while the evidence is pending. A trip
         or a referral marks every candidate unconfirmed, healthy ones too, so a sign-out during a
         long trip or referral forfeits its clear. This is one process's memory: what leaves across
         a restart is not seen here. The rule in `_mark_reconcile_clears` covers that case, because
@@ -6790,11 +6791,16 @@ class AuthService:
             self._reconcile_hold_standing = "held"
         elif event == "forfeit" and current not in ("settled", "forfeit"):
             self._reconcile_hold_standing = "forfeit"
+            # A fresh process has held nothing: its account left with an undetermined answer that
+            # an earlier run's hold may still cover, so the line must not say this process held
+            # (BACKLOG #3084).
             _log.warning(
                 "directory reconcile: an account whose userAccountControl read undetermined left "
-                "before this process released a hold, so it will not resolve ad_reconcile_held "
-                "itself "
-                "until it restarts; an operator resolves it once the attribute reads clean"
+                "%s, so this process will not resolve ad_reconcile_held itself until it restarts; "
+                "an operator resolves any open instance once the attribute reads clean",
+                "before this process released its hold"
+                if current == "held"
+                else "before any pass here had held, and an earlier run's hold may still cover it",
             )
         elif event == "settled" and current in _HOLD_RELEASABLE:
             self._reconcile_hold_standing = "settled"

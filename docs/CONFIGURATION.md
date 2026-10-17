@@ -818,7 +818,8 @@ while the engine is down. So an operator resolves an alert the last run left ope
 engine resolves the next trip or hold on its own.
 
 - The hold resolves when no answer is undetermined and this pass read `userAccountControl` at
-  least once. An account the pass just revoked still counts as an answer here.
+  least once. An account the pass just revoked still counts as an answer here, but a pass that
+  revokes every signed-in account resolves nothing.
 - An engine can also give up resolving the hold. That happens when an account whose last answer
   was undetermined leaves, unless the engine has released a hold and has not held since. The
   reconciler may revoke it, or its sessions may end some other way. The engine then resolves no
@@ -848,9 +849,12 @@ engine resolves the next trip or hold on its own.
 
 A pass judges only accounts that hold a session, and nothing reads an account again once it has
 left. An account leaves at least when it signs out, reaches the session cap, is revoked by the
-reconciler, is disabled locally, or is deleted. The give-up rules above stop an alert resolving
-on the accounts that remain. The cost is a missed resolve when an account leaves for an ordinary
-reason, such as a sign-out, while the evidence is still pending.
+reconciler, is disabled locally, or is deleted, and when the hourly session reaper deletes an idle
+session. An idle session stays a candidate after `[security].sign_out_after_idle_minutes` until
+the reaper deletes it, which is at least 10 minutes and up to about 70 minutes past that limit. At
+the default settings, idle expiry is the likeliest of these. The give-up rules above stop an alert
+resolving on the accounts that remain. The cost is a missed resolve when an account leaves for an
+ordinary reason, such as a sign-out or an idle session, while the evidence is still pending.
 
 **They never resolve themselves on a `[cluster]` node or in an engine that runs more than one engine
 shard.** Another engine's reconciler may still hold the condition there, so an operator resolves the
