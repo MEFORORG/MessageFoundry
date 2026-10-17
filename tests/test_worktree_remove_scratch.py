@@ -46,7 +46,7 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -1032,7 +1032,7 @@ def test_a_delete_that_stops_part_way_lists_exactly_what_remains(rig: Rig) -> No
         assert r.code == 3, r.out
         b = r.block(victim)
         assert b.verdict.startswith(f"PARTIAL {victim}: the delete stopped part-way"), r.out
-        assert "2 entries remain" in b.verdict, r.out
+        assert "which holds 2 entries" in b.verdict, r.out
         assert "partial=1" in r.summary and "deleted=0" in r.summary, r.out
         left = list(rig.root.iterdir())
         assert len(left) == 1 and re.fullmatch(r"victim\.removing-[0-9a-f]{8}", left[0].name), left
@@ -1055,7 +1055,7 @@ def test_a_delete_that_stops_part_way_lists_exactly_what_remains(rig: Rig) -> No
 
 # --- a check or a delete that throws -------------------------------------------------------------
 #
-# Nothing in the script throws on demand, so these three tests plant one line in a COPY of it. The
+# Nothing in the script throws on demand, so the tests below plant one line in a COPY of it. The
 # copy lives in a throwaway repository under tmp_path, because the script lists the worktrees of the
 # repository it sits in. The real script is never written to.
 
@@ -1068,6 +1068,16 @@ _DELETE_ENTRY = (
 
 def _planted_copy(base: Path, anchor: str, planted: str) -> Path:
     """A copy of the script with ``planted`` as a new line directly under the line ``anchor``."""
+
+    def plant(text: str) -> str:
+        assert text.count(anchor) == 1, f"the anchor line matched {text.count(anchor)} times"
+        return text.replace(anchor, f"{anchor}\n{planted}")
+
+    return _edited_copy(base, plant)
+
+
+def _edited_copy(base: Path, edit: Callable[[str], str]) -> Path:
+    """A copy of the script, in a repository of its own, with ``edit`` applied to its text."""
     repo = base / "copy"
     for rel in (
         "scripts/worktree/remove-scratch.ps1",
@@ -1086,9 +1096,7 @@ def _planted_copy(base: Path, anchor: str, planted: str) -> Path:
     ):
         subprocess.run(["git", *args], check=True, capture_output=True, text=True)
     script = repo / "scripts" / "worktree" / "remove-scratch.ps1"
-    text = script.read_text(encoding="utf-8")
-    assert text.count(anchor) == 1, f"the anchor line matched {text.count(anchor)} times"
-    script.write_text(text.replace(anchor, f"{anchor}\n{planted}"), encoding="utf-8")
+    script.write_text(edit(script.read_text(encoding="utf-8")), encoding="utf-8")
     return script
 
 
@@ -1130,7 +1138,7 @@ def test_a_delete_that_throws_after_the_rename_still_says_where_the_tree_went(ri
     assert len(left) == 1 and re.fullmatch(r"boom\.removing-[0-9a-f]{8}", left[0].name), left
     tomb = left[0]
     assert b.verdict.startswith(f"PARTIAL {boom}: the delete stopped part-way"), r.out
-    assert f"renamed to '{tomb}' and 3 entries remain" in b.verdict, r.out
+    assert f"renamed to '{tomb}', which holds 3 entries" in b.verdict, r.out
     assert "failed: the delete threw: planted delete failure" in b.extra, r.out
     remains = sorted(line[len("remains: ") :] for line in b.extra if line.startswith("remains: "))
     assert remains == [str(tomb / "a.txt"), str(tomb / "sub"), str(tomb / "sub" / "b.bin")], r.out
@@ -1157,3 +1165,113 @@ def test_a_delete_that_records_a_failure_is_never_reported_as_deleted(rig: Rig) 
     assert "failed: planted failure note" in b.extra, r.out
     assert "deleted=0" in r.summary and "partial=1" in r.summary, r.out
     assert list(rig.root.iterdir()) == []
+    # BACKLOG #2963 (j): the renamed folder is gone, so nothing remains. Listing it anyway once
+    # counted its own could-not-list line as "1 entry remains".
+    assert "which is gone, but 1 failure(s) were recorded on the way" in b.verdict, r.out
+    assert not [line for line in b.extra if line.startswith("remains: ")], r.out
+
+
+def _ps_quoted(value: object) -> str:
+    """``value`` as a single-quoted PowerShell literal, so an apostrophe in a path cannot break it."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+_FULL_LISTING = re.compile(r"\[IO\.DirectoryInfo\]::new\((\$\w+)\)\.GetFileSystemInfos\(\)")
+
+
+def test_no_folder_above_a_target_is_listed_in_full(rig: Rig) -> None:
+    """BACKLOG #2963 (h). The git walk up to the temp root once listed every folder on the way in
+    full, and the temp root, which every target shares, can hold thousands of entries. It now looks
+    up the four names it needs, so no folder above a target is listed in full at all.
+
+    Every full listing the script writes as ``[IO.DirectoryInfo]::new($x).GetFileSystemInfos()`` is
+    routed through a planted function that logs the folder. A listing spelled another way would not
+    be seen. The targets' own trees are listed that way too, which shows the log works."""
+    rig.caller()
+    targets = [rig.tree(rig.root / "shared" / name) for name in ("one", "two", "three")]
+    log = rig.base / "listed.log"
+    logger = (
+        "function Get-LoggedListing([string]$Dir) {\n"
+        f"    Add-Content -LiteralPath {_ps_quoted(log)} -Value $Dir\n"
+        "    return [IO.DirectoryInfo]::new($Dir).GetFileSystemInfos()\n"
+        "}\n"
+    )
+
+    def route_listings(text: str) -> str:
+        routed, n = _FULL_LISTING.subn(r"(Get-LoggedListing \1)", text)
+        assert n > 0, "no full listing was found to route"
+        return routed.replace("function Get-Remains(", logger + "function Get-Remains(", 1)
+
+    script = _edited_copy(rig.base, route_listings)
+
+    r = rig.run(*targets, delete=False, script=script)
+
+    assert r.code == 0, r.out
+    for t in targets:
+        assert r.block(t).receipt["git"].startswith("PASS"), r.out
+    listed = [Path(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert set(targets) <= set(listed), listed
+    above = {parent for t in targets for parent in t.parents}
+    assert not [p for p in listed if p in above], listed
+
+
+def test_a_checkout_made_above_a_later_target_mid_run_refuses_it(rig: Rig) -> None:
+    """BACKLOG #2963 (h). A -Delete run can take minutes. A git checkout that appears above a later
+    target while the run goes on must still refuse that target, so no answer about a folder above a
+    target is kept from one target to the next.
+
+    A planted line makes a .git folder above both targets as soon as the first one is decided."""
+    rig.caller()
+    first = rig.tree(rig.root / "shared" / "one")
+    second = rig.tree(rig.root / "shared" / "two")
+    shared = rig.root / "shared"
+    script = _planted_copy(
+        rig.base,
+        "    Write-Host $verdict",
+        f"    if ($raw -eq {_ps_quoted(first)}) "
+        f"{{ [void][IO.Directory]::CreateDirectory({_ps_quoted(shared / '.git')}) }}",
+    )
+
+    r = rig.run(first, second, delete=False, script=script)
+
+    assert (shared / ".git").is_dir(), r.out
+    assert r.block(first).verdict.startswith("WOULD DELETE"), r.out
+    r.refused(second, "git", f"the target sits inside the git checkout at '{shared}'")
+    assert r.code == 1, r.out
+
+
+def test_the_walk_up_reaches_past_the_given_temp_root_to_the_real_one(rig: Rig) -> None:
+    """The walk climbs to the real temp root, not to -TempRoot. A checkout above -TempRoot, still
+    under the real temp root, refuses a target below it."""
+    rig.caller()
+    target = rig.tree(rig.root / "below")
+    (rig.base / ".git").mkdir()
+
+    r = rig.run(target, delete=False)
+
+    r.refused(target, "git", f"the target sits inside the git checkout at '{rig.base}'")
+
+
+@pytest.mark.parametrize("which", ["write time", "creation time"])
+def test_a_zeroed_stamp_is_unreadable_not_ancient(rig: Rig, which: str) -> None:
+    """BACKLOG #2963 (i). FILETIME 0 reads as the year 1601, which once counted as very old.
+
+    ``SetFileTime`` treats a FILETIME of 0 as "leave this time alone", so the rig plants the smallest
+    stamp it can set, one tick after 1601-01-01. The script reads it exactly as it would a zero."""
+    rig.caller()
+    victim = rig.tree(rig.root / "victim")
+    control = rig.tree(rig.root / "control")
+    marked = victim / "sub" / "b.bin"
+    old = time.time() - 36000
+    if which == "write time":
+        _stamp(marked, old, written_ticks=1)
+    else:
+        _stamp(marked, old, created_ticks=1)
+
+    r = rig.run(victim, control)
+
+    assert r.code == 1, r.out
+    b = r.refused(victim, "idle", "could not be read, so the tree cannot be shown idle")
+    assert f"'{marked}'" in b.receipt["idle"], r.out
+    r.deleted(control)
+    assert _snapshot(victim) == ["a.txt [5]", "sub", "sub\\b.bin [7]"]

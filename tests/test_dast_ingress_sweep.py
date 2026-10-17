@@ -359,6 +359,8 @@ def test_an_unknown_profile_fails_closed() -> None:
 
 def test_a_known_defect_never_silences_liveness_time_or_log() -> None:
     # Judged on the canary path only because it needs no floors; the split happens first either way.
+    # No engine defect is open (the last, BACKLOG #2875, is fixed), so the policy names a stand-in.
+    policy = dict(_policy(), known_defects={"stand-in-defect": "A defect this test pretends to."})
     receipt: dict[str, Any] = {
         "canary": "no-reply",
         "findings": [
@@ -367,12 +369,12 @@ def test_a_known_defect_never_silences_liveness_time_or_log() -> None:
                 "plane": "mllp",
                 "case": "c",
                 "detail": "x",
-                "known_defect": "alphanumeric-field-separator",
+                "known_defect": "stand-in-defect",
             }
             for d in ("reply", "liveness", "time", "log_body")
         ],
     }
-    evaluate(receipt, _policy())
+    evaluate(receipt, policy)
     tolerated = {f["detector"] for f in receipt["known_defect_findings"]}
     assert tolerated == {"reply"}
 
@@ -537,7 +539,8 @@ def test_each_known_defect_discriminator_matches_its_catalogue_case() -> None:
     """A tolerance keyed on a condition no catalogue case carries would tolerate nothing, and one keyed
     on a condition EVERY case carries would tolerate everything."""
     cases = {c.name: c for c in catalogue("ZZTESTSENTINEL", _CAP) if c.plane == "mllp"}
-    anchors = {"alphanumeric-field-separator": "letter-field-separator"}
+    # Empty since BACKLOG #2875 fixed the last open defect; an entry names its anchor case here.
+    anchors: dict[str, str] = {}
     assert set(anchors) == set(KNOWN_DEFECT_DISCRIMINATORS) == set(_policy()["known_defects"])
     for defect, case_name in anchors.items():
         hit = KNOWN_DEFECT_DISCRIMINATORS[defect]
@@ -573,13 +576,9 @@ async def test_a_blank_segment_that_fails_utf8_decode_gets_the_runners_own_nak()
     assert not result.findings, result.findings
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "ENGINE DEFECT: a message whose MSH-1 is a letter or digit is accepted, and the ACK echoes "
-        "that separator, so MSA-1 (itself letters) cannot be read back by the sender."
-    ),
-)
+# Defect 2, an alphanumeric MSH-1 echoed into an ACK that could not be read back, is FIXED by
+# BACKLOG #2875. Its strict xfail became this plain test and its policy entry came out, so the run
+# no longer tolerates a reply finding on such a frame.
 @_LIVE
 async def test_an_alphanumeric_field_separator_gets_a_readable_reply() -> None:
     result = await _run_alone(_case("mllp", "letter-field-separator"), _budget())
