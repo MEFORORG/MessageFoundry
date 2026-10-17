@@ -4205,7 +4205,7 @@ def create_app(
         want_out = role in (None, "destination")
         if rr is not None and want_in and name in rr.registry.inbound:
             await _control_guard(engine, identity, name, client)
-            anchor_refused = False
+            refused: str | None = None
             try:
                 # An operator door, so it overrides a passive DR standby (vault BACKLOG #3140).
                 if action == "start":
@@ -4223,12 +4223,24 @@ def create_app(
                 # vault BACKLOG #2371: an Ftp poller's CA was refused. The runner recorded it failed
                 # and logged why. Raised below, outside this handler, so the refusal, which names
                 # the CA's path and SHA-256, is not left on the 409's __context__.
-                anchor_refused = True
-            if anchor_refused:
+                refused = _ANCHOR_REFUSED_DETAIL
+            except WiringError as exc:
+                # BACKLOG #3063 item 4: a start gate refused the listener, most often an exposure
+                # gate an auto_start = false listener first meets here. It escaped as a 500 with no
+                # audit row. The full refusal goes to the operator log; the answer names only the
+                # listener, because other start gates' text can name paths and sibling bindings.
+                _log.warning(
+                    "operator %s of inbound connection %r refused: %s",
+                    action,
+                    name,
+                    scrub_log_argument(safe_exc(exc, limit=_REFUSAL_LOG_LIMIT)),
+                )
+                refused = f"inbound connection {name!r}: {action} refused; see the server log"
+            if refused is not None:
                 await _record_control_audit(
                     engine, identity, name, action, role="source", running=False, client=client
                 )
-                raise HTTPException(409, _ANCHOR_REFUSED_DETAIL)
+                raise HTTPException(409, refused)
             running = rr.inbound_running(name)
             await _record_control_audit(
                 engine, identity, name, action, role="source", running=running, client=client
