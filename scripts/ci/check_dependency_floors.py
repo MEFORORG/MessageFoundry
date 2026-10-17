@@ -28,42 +28,46 @@ from importlib import metadata
 from pathlib import Path
 
 from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 from packaging.version import Version
 
 _ROOT = Path(__file__).resolve().parents[2]
 
 
-#: Specifier operators whose version is a lower bound. ``==X.*``, ``>X`` and ``===`` name no
-#: installable lowest release, so a dependency written only with those reads as having no floor.
+#: Specifier operators whose version is a lower bound. ``==X.*`` and ``>X`` name no installable
+#: lowest release. ``===`` does name one, but by string equality, so its operand need not parse as
+#: a version to compare against. A dependency written only with those reads as having no floor.
 _FLOOR_OPERATORS = frozenset({">=", "~=", "=="})
 
 
 def declared_floors(pyproject: Path) -> dict[str, Version | None]:
     """``{canonical name: floor}`` for each runtime dependency whose marker applies here. The floor
-    is ``None`` when no specifier gives one, or its own specifier excludes it (``>=1.0,!=1.0``), so
-    :func:`check` can refuse rather than skip it. Two lines for one name combine, as a resolver
-    combines them."""
+    is ``None`` when no specifier gives one, or the specifiers exclude it (``>=1.0,!=1.0``), so
+    :func:`check` can refuse rather than skip it. Two lines for one name combine into one specifier
+    set before the floor is read, as a resolver combines them: a bare line adds no bound, and an
+    exclusion on one line applies to the floor another line declares."""
     project = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]
-    floors: dict[str, Version | None] = {}
+    specifiers: dict[str, SpecifierSet] = {}
     for line in project.get("dependencies", []):
         requirement = Requirement(line)
         if requirement.marker is not None and not requirement.marker.evaluate():
             continue
-        bounds = [
-            Version(s.version)
-            for s in requirement.specifier
-            if s.operator in _FLOOR_OPERATORS and not s.version.endswith(".*")
-        ]
-        floor = max(bounds) if bounds else None
-        if floor is not None and not requirement.specifier.contains(floor, prereleases=True):
-            floor = None
         name = canonicalize_name(requirement.name)
-        if name in floors:
-            known = floors[name]
-            floor = None if known is None or floor is None else max(known, floor)
-        floors[name] = floor
-    return floors
+        specifiers[name] = specifiers.get(name, SpecifierSet()) & requirement.specifier
+    return {name: _floor(specifier) for name, specifier in specifiers.items()}
+
+
+def _floor(specifier: SpecifierSet) -> Version | None:
+    bounds = [
+        Version(s.version)
+        for s in specifier
+        if s.operator in _FLOOR_OPERATORS and not s.version.endswith(".*")
+    ]
+    floor = max(bounds) if bounds else None
+    if floor is not None and not specifier.contains(floor, prereleases=True):
+        return None
+    return floor
 
 
 def _installed(name: str) -> Version | None:
