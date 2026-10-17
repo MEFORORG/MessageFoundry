@@ -2325,14 +2325,16 @@ class Engine:
         try:
             outcome = await self.reload_detail(propagate=False)
         except Exception as exc:
-            first = version != self._convergence_failure_reported
-            self._convergence_failure_reported = version
-            if first and self.convergence_reload_failed is not None:
+            hook = self.convergence_reload_failed
+            if hook is not None and version != self._convergence_failure_reported:
+                self._convergence_failure_reported = version
                 try:
-                    await self.convergence_reload_failed(exc, version)
+                    await hook(exc, version)
                 except Exception:  # noqa: BLE001 - the reload's own fault is the one to raise
                     log.exception("cluster: a convergence reload failed, and so did its audit")
             raise
+        # A version that failed and then converged is reported again if it ever fails again.
+        self._convergence_failure_reported = None
         outcome = replace(outcome, config_version=version)
         if self.convergence_reload_audit is None:
             return

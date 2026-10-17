@@ -1571,8 +1571,9 @@ async def _record_reload_audit(
     """Write the ``config_reload`` audit row with the ADR 0041 D1 content fingerprint of what loaded.
 
     The start writes its ``config_loaded`` row through here too (vault BACKLOG #2597), passing the
-    action and its ``loosenings`` in ``extra``. Every row names the running directory, its engine
-    shard and cluster node, since each engine-shard process loads the graph.
+    action and its ``loosenings`` in ``extra``. Every row names its cluster node, and the
+    directory and engine shard it loaded, since each engine-shard process loads the graph; a start
+    row with no snapshot names neither (see ``loaded`` below).
 
     Shared by the inline reload endpoint and the dual-control executor so a held-then-approved reload
     records the same fingerprint-bearing row as an ungated one. A cluster convergence reload writes
@@ -1643,21 +1644,28 @@ async def _record_reload_audit(
             superseded = engine.loaded_config_fingerprint is not loaded.fingerprint
         else:
             state = loaded
-        where: dict[str, object] = (
-            {"dir": None} if state is None else {"dir": state.directory, "shard": state.shard}
+        # A start with no snapshot names nothing it loaded, and has no shard key at all.
+        named: dict[str, object] = (
+            {"dir": None, "node": engine.coordinator.node_id, "inbound": None, "outbound": None}
+            if state is None
+            else {
+                "dir": state.directory,
+                "shard": state.shard,
+                "node": engine.coordinator.node_id,
+                "inbound": state.inbound,
+                "outbound": state.outbound,
+            }
         )
+        digest = (state.fingerprint or {}) if state is not None else {}
         detail = json.dumps(
             {
-                **where,
-                "node": engine.coordinator.node_id,
-                "inbound": state.inbound if state is not None else None,
-                "outbound": state.outbound if state is not None else None,
+                **named,
                 "dry_run": False,
                 **({"config_version": config_version} if config_version is not None else {}),
                 **({"degraded": True, "failed_steps": list(failed_steps)} if failed_steps else {}),
                 **(extra or {}),
                 **({"superseded": True, _BASELINE_UNCHECKED: True} if superseded else {}),
-                **((state.fingerprint or {}) if state is not None else {}),
+                **digest,
             }
         )
         await engine.store.record_audit(action, actor=actor, detail=detail, client=client)
@@ -1755,9 +1763,7 @@ async def _audit_refused_reload(
 
     ``client`` follows :func:`_record_reload_audit`'s rule (ADR 0150): the executor passes none.
     ``extra`` adds keys to the row's detail; a cluster convergence reload names itself there (vault
-    BACKLOG #3109). That reload may also pass a fault outside :data:`_RELOAD_REFUSALS`, which writes
-    ``config_reload_failed`` with reason ``reload_error`` and the fault's type name, never its
-    text, and answers 500; see :func:`_audit_failed_convergence`.
+    BACKLOG #3109).
 
     **The row's write never raises.** A refusal changed nothing, so its answer stands whether or
     not the row lands, and a store fault here would otherwise turn it into a raw 500 (vault BACKLOG
@@ -1813,7 +1819,7 @@ async def _audit_refused_reload(
             else "the engine could not read the config to check it against this request's "
             "approval; see the engine log"
         )
-    elif isinstance(exc, WiringError):
+    else:
         anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
         _log.warning(
             "config reload %s: %s",
@@ -1823,13 +1829,6 @@ async def _audit_refused_reload(
         action = "config_reload_failed"
         detail["reason"] = "trust_anchor" if anchor_refused else "invalid_config"
         status, answer = 422, "invalid configuration"
-    else:
-        # None of _RELOAD_REFUSALS, so only a convergence reload passes one (vault BACKLOG #3109);
-        # the routes let such a fault answer 500. The type name only: no reason names it, and its
-        # text is the convergence runner's to log.
-        action = "config_reload_failed"
-        detail["reason"], detail["error"] = "reload_error", type(exc).__name__
-        status, answer = 500, "the config reload failed; see the engine log"
     row = json.dumps(detail)
     # The exc above and this row carry the caller's requested directory, so their arguments are
     # scrubbed for CodeQL py/log-injection; scrub_log_argument says why. ``json.dumps`` already
@@ -1853,17 +1852,38 @@ async def _audit_failed_convergence(engine: Engine, exc: Exception, version: int
 
     The row is the one an operator's refused reload writes, as :data:`_CONVERGENCE_ACTOR` with
     ``initiator`` and the shared ``config_version`` the node could not converge on. ``requested``
-    is ``null``: a convergence reload loads the node's startup directory. A fault that is none of
-    :data:`_RELOAD_REFUSALS` is recorded with reason ``reload_error`` and its type name. Nothing
+    is ``null``: a convergence reload loads the node's startup directory. A refusal goes through
+    :func:`_audit_refused_reload`, whose status and answer nobody reads here. A fault that is none
+    of :data:`_RELOAD_REFUSALS` has no reason there, so it is recorded with reason
+    ``reload_error`` and its type name, never its text, which the convergence runner logs. Nothing
     was swapped either way: the reload raises only before its swap commits, and the node keeps its
-    running graph and retries. Like the refusal row's, the write never raises."""
-    await _audit_refused_reload(
-        engine,
-        exc,
-        actor=_CONVERGENCE_ACTOR,
-        requested=None,
-        dry_run=False,
-        extra={"initiator": _CONVERGENCE_INITIATOR, "config_version": version},
+    running graph and retries.
+
+    It never raises: the write goes through :func:`write_audit_soft` with ``defects=()``."""
+    extra = {"initiator": _CONVERGENCE_INITIATOR, "config_version": version}
+    if isinstance(exc, _RELOAD_REFUSALS):
+        await _audit_refused_reload(
+            engine, exc, actor=_CONVERGENCE_ACTOR, requested=None, dry_run=False, extra=extra
+        )
+        return
+    row = json.dumps(
+        {
+            "requested": None,
+            "dry_run": False,
+            **extra,
+            "reason": "reload_error",
+            "error": type(exc).__name__,
+        }
+    )
+    await write_audit_soft(
+        lambda: engine.store.record_audit(
+            "config_reload_failed", actor=_CONVERGENCE_ACTOR, detail=row
+        ),
+        log=_log,
+        # The refused-reload line's shape, so one search finds both lost rows.
+        message="a refused config reload's %s audit row failed. Lost row: actor=%s detail=%s",
+        args=lambda: ("config_reload_failed", _CONVERGENCE_ACTOR, scrub_log_argument(row)),
+        defects=(),
     )
 
 
@@ -2023,9 +2043,10 @@ async def _compare_start_config(
     over a row whose detail is not a JSON object (at WARNING, since only the engine writes these
     rows) and a row marked :data:`_BASELINE_UNCHECKED`, and falls back to the next older one.
 
-    The caller passes the digest :meth:`Engine.capture_start_provenance` took, not a later read of
-    :attr:`Engine.loaded_config_fingerprint`, so a reload that lands before the row is written
-    cannot change what this start is said to have loaded. Only the ``fingerprint`` key is compared,
+    The caller passes the digest :meth:`Engine.capture_start_provenance` took: off its snapshot,
+    or, when it has none, off :attr:`Engine.loaded_config_fingerprint` read before
+    ``engine.start()`` (vault BACKLOG #3076). Never a read taken once a reload can run, so a reload
+    that lands before the row is written cannot change what this start is said to have loaded. Only the ``fingerprint`` key is compared,
     since ``git_head``, ``dir`` and ``node`` differ between nodes running the same bytes.
 
     Only ``compared`` carries a comparison. ``read_failed`` and ``no_start_digest`` leave the start
@@ -5626,7 +5647,7 @@ def create_app(
             # BACKLOG #1111 -- without this the route answers a degraded apply as clean success.
             if req.dry_run:
                 outcome = await engine.reload_detail(req.config_dir, dry_run=True, propagate=False)
-                failures = outcome.failed_steps
+                failures = [f.step for f in outcome.failures]
             else:
                 # vault BACKLOG #2254: only an ungated reload gets here, with no approval row first.
                 await _audit_reload_attempt(
@@ -10265,8 +10286,9 @@ def create_managed_app(
         # built from the reload's own outcome, as an operator reload's is, so a reload that lands
         # before the write cannot put its graph under this actor (vault BACKLOG #3109).
         #
-        # A row the store refuses is logged at ERROR with its detail, and raises no alert, as the
-        # inline route's post-swap row is (vault BACKLOG #3109). The next start then compares
+        # A row the store refuses is logged at ERROR with its detail, and raises no alert (vault
+        # BACKLOG #3109). The inline route's post-swap row raises none either, though it names an
+        # `audit` step in its answer; this reload has no answer to name it in. The next start compares
         # against the newest row that did land, normally the initiator's, which names the same
         # bytes where every node shares one config directory. A change goes unreported only if
         # that row was lost too; otherwise the cost is at most a false config_changed.
@@ -10328,19 +10350,23 @@ def create_managed_app(
                 # convergence reload. The comparison below and the config_loaded row both use it,
                 # so neither can name a graph this start did not load (vault BACKLOG #2838).
                 # Audit only, so it never refuses a start (#2597 step 5): without it the start
-                # checks nothing, as one with no digest does, and its row names no graph.
+                # compares the digest its load took (below), and its row names no graph.
                 try:
                     start_loaded = _LoadedConfig.read(engine)
                 except Exception as exc:  # noqa: BLE001 - see the comment above
                     _log.warning(
-                        "the start could not take its config snapshot (%s); it checks no config "
-                        "change, and its config_loaded row will name no graph",
+                        "the start could not take its config snapshot (%s); it compares the "
+                        "digest its load took, and its config_loaded row names no graph and is "
+                        "no baseline",
                         type(exc).__name__,
                     )
                 # Bounded and never raises: it costs only the comparison (vault BACKLOG #2597,
                 # step 5). Without a snapshot it compares the digest the load took, read here and
                 # not later: engine.start() has not run, so no reload can have moved it yet, and a
                 # start on changed bytes still pages through a crash loop (vault BACKLOG #3076).
+                # Its row stays no baseline, since nothing can rule out a swap before the row is
+                # written, so the next start pages again for the same change. A repeat page on
+                # a degraded start is the safe side of that trade.
                 start_outcome, start_config = await _compare_start_config(
                     engine,
                     start_loaded.fingerprint
@@ -10553,6 +10579,9 @@ def create_managed_app(
                     comparison=start_config,
                     loaded=start_loaded,
                 )
+                # Its last reader: the lifespan frame lives as long as the process, and the
+                # snapshot would hold the start's graph past every reload.
+                start_loaded = None
             # The auth_settings test adds nothing at runtime; it narrows the type for the reads below.
             if auth is not None and auth_settings is not None:
                 # ADR 0197 Amendment A, AC-A9: name every account still lockable with no way past a

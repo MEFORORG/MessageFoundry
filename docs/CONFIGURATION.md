@@ -1633,23 +1633,25 @@ started together, can each raise it; the alert list folds them into one instance
   degraded with the `start_snapshot` step and marked `baseline_unchecked`. Its `dir`, counts and
   `loosenings` are `null`, and it has no `shard` key and no `fingerprint` key at all. A start that
   could not tell whether a reload swapped its graph names its own graph, degraded with the
-  `start_swap_check` step. A later start passes over both rows.
+  `start_swap_check` step. A later start passes over both rows. So after a snapshot fault, the
+  next start raises `config_changed` again for the same change.
 - A convergence reload writes its own `config_reload` row, in the shape an operator reload writes
   (vault BACKLOG #3076). Its actor is `system:cluster-convergence` and its `initiator` is
   `cluster_convergence`. So the store's newest baseline names the graph the node converged on,
   whether the reload lands before or after the start's row. A convergence row that could not take
   a fingerprint is marked `baseline_unchecked`, so a later start passes over it.
-- A reload row on a cluster carries `config_version`, the shared version the reload applied: the
-  one an operator reload bumped the cluster to, or the one a convergence reload converged on (vault
-  BACKLOG #3109). So a follower's row names the operator reload it followed, whose row carries the
-  same number and the operator's name. A follower's row records the bytes that node loaded, not the
-  operator's digest.
-- A convergence reload that fails writes a `config_reload_failed` row under the same actor, with
-  `initiator`, `config_version` and `requested` `null`, once per version: the loop retries that
-  version every interval and logs each failure (vault BACKLOG #3109). The reason is the one an
-  operator's refused reload records, or `reload_error` with the fault's type name. A convergence
-  row the audit log refuses is logged at ERROR and raises no alert, as an operator reload's own
-  row is.
+- On a cluster, a reload row carries `config_version`, the shared version the reload applied
+  (vault BACKLOG #3109). An operator reload's row carries the version it bumped the cluster to. A
+  convergence row carries the version the node converged on. An operator reload whose bump failed
+  carries none. A follower's row records the bytes that node loaded, not the operator's digest.
+- A convergence reload that fails writes one `config_reload_failed` row per version, under the
+  same actor (vault BACKLOG #3109). The loop retries that version every interval and logs each
+  failure. The row carries `initiator` and `config_version`, and its `requested` is `null`. Its
+  reason is the one an operator's refused reload records, or `reload_error` with the fault's type
+  name.
+- A convergence row the audit log refuses is logged at ERROR and raises no alert. An operator
+  reload's lost row raises none either, but the operator's answer names an `audit` step. A
+  convergence reload has no answer to name it in.
 - The pass-over looks through the newest 50 config rows at most. If none is usable, the start
   begins a new baseline and says at WARNING that a change made before those rows is not reported.
 

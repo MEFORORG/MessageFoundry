@@ -671,6 +671,7 @@ async def test_the_reload_route_row_still_names_the_reloaded_graph(
     row = json.loads(rows[0]["detail"])
     assert list(row)[:6] == ["dir", "shard", "node", "inbound", "outbound", "dry_run"]
     assert (row["dir"], row["shard"], row["node"], row["dry_run"]) == (str(live), None, node, False)
+    assert row["dir"] == str(cfg.resolve()), "control: the directory the route was given"
     assert row["fingerprint"] == config_fingerprint(cfg) != start_digest
     assert (row["inbound"], row["outbound"]) == (2, 2)
     assert "superseded" not in row and "baseline_unchecked" not in row

@@ -2777,10 +2777,11 @@ class AuthService:
 
     @property
     def settings(self) -> AuthSettings:
-        """The ``[auth]`` limits this service enforces. ``GET /security/posture`` reports its
-        loosenings from here, so an embedder that attaches a service with loosened limits sees them
-        named (vault BACKLOG #3215). Read it; never mutate it."""
-        return self._settings
+        """A copy of the ``[auth]`` limits this service enforces. ``GET /security/posture`` reports
+        its loosenings from here, so an embedder that attaches a service with loosened limits sees
+        them named (vault BACKLOG #3215). A copy, because the section is not frozen: a reader that
+        set a field on the enforced object would change a live limit with no audit row."""
+        return self._settings.model_copy()
 
     @property
     def kerberos_enabled(self) -> bool:

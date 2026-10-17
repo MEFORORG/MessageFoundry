@@ -1259,12 +1259,20 @@ async def test_a_convergence_reload_hands_its_hooks_the_version_it_converged_on(
         await eng._converge_reload(4)
         assert applied == [4] and failed == []
         assert coord.bumps == 0, "control: a convergence reload still bumps nothing"
+        good = (cfgdir / "c.py").read_text(encoding="utf-8")
         (cfgdir / "c.py").write_text("this is not python (", encoding="utf-8")
         for version in (5, 5, 6):  # a retry of 5, as the runner's next tick makes, then 6
             with pytest.raises(WiringError):
                 await eng._converge_reload(version)
         assert applied == [4]
         assert failed == [(WiringError, 5), (WiringError, 6)], "once per version, not per tick"
+        # A version that converges clears the mark, so its next failure is reported again.
+        (cfgdir / "c.py").write_text(good, encoding="utf-8")
+        await eng._converge_reload(6)
+        (cfgdir / "c.py").write_text("this is not python (", encoding="utf-8")
+        with pytest.raises(WiringError):
+            await eng._converge_reload(6)
+        assert applied == [4, 6] and failed[-1] == (WiringError, 6) and len(failed) == 3
     finally:
         await eng.stop()
 
