@@ -5062,6 +5062,15 @@ jobs:
             exit 1
           fi
           echo "the engine's uid cannot create a file in $site"
+          # The config directory too (vault BACKLOG #3106 item 3): the engine executes every *.py
+          # there, and the image keeps /config root-owned so its own uid cannot add one. The same
+          # write control above, in a writable place, is what makes this refusal mean something. The
+          # container runs without --read-only, so the refusal comes from ownership, not the mount.
+          if docker exec mefor touch /config/planted-by-smoke.py; then
+            echo "FAIL: the engine's uid created a file in /config"
+            exit 1
+          fi
+          echo "the engine's uid cannot create a file in /config"
 
       - name: Verify graceful shutdown (tini -> SIGTERM -> engine.stop drains)
         run: |
