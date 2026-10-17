@@ -350,6 +350,21 @@ _RESET_LANE_CHUNK = 500
 # but not yet inside the gate) the close can still queue behind a call, and this bound caps that wait.
 _DIRTY_CLOSE_TIMEOUT = 5.0
 
+# BACKLOG #3023: how many `[store].acquire_timeout`s a session write that follows a committed auth
+# change may wait for a pooled connection (SqlServerStore._acquire_after_commit). Longer than an
+# ordinary borrow, because nothing retries that write and failing it after the change committed
+# leaves the change half done; still finite, because an unbounded pool wait is the defect
+# acquire_timeout exists to remove (BACKLOG #1052). 2 gives 60 s at the 30 s default: long enough
+# to ride out a burst that saturates the pool, and at most half of the API's request deadline
+# (DEFAULT_REQUEST_TIMEOUT_SECONDS), so at the defaults the borrow itself gives up, as a
+# StoreAcquireTimeout the rotation's fail-closed branch catches, before the deadline cancels it; a
+# cancellation skips that branch. The margin covers the borrow only. The branch then makes ordinary
+# borrows of its own (two revokes and an audit row), so on a pool that stays wedged they can be
+# refused, or the deadline can still cancel the request before the branch answers. The test pins
+# the margin. A fixed multiple rather than a new setting, so the one knob an operator tunes moves
+# both limits together.
+_AFTER_COMMIT_ACQUIRE_FACTOR = 2
+
 
 def _drain_detached_close(fut: asyncio.Future[None]) -> None:
     """Retrieve a detached raw close's outcome, so asyncio never logs it as never-retrieved.
@@ -4776,36 +4791,40 @@ class SqlServerStore:
         ADR 0159 ordering in :meth:`_borrow` is preserved exactly — the quarantine still runs BEFORE
         the release, which is what makes a poisoned connection unlendable.
 
-        **One exception to the bound, on purpose:** :meth:`_acquire_after_commit` (BACKLOG #3023)."""
+        **One borrow has a longer bound, on purpose:** :meth:`_acquire_after_commit` (BACKLOG
+        #3023)."""
         return self._borrow(self._settings.acquire_timeout)
 
     def _acquire_after_commit(self) -> AbstractAsyncContextManager[Any]:
-        """:meth:`_acquire` with NO acquire limit, for a session write that FOLLOWS a write its caller
-        has already committed (BACKLOG #3023). Everything else :meth:`_acquire` does is kept: the
-        call gate, the command timeout, the ADR 0159 quarantine before the release, and the
+        """:meth:`_acquire` with a LONGER acquire limit, for a session write that FOLLOWS a write its
+        caller has already committed (BACKLOG #3023): ``_AFTER_COMMIT_ACQUIRE_FACTOR`` times
+        ``[store].acquire_timeout``, whose comment says why that multiple. Everything else :meth:`_acquire` does is
+        kept: the call gate, the command timeout, the ADR 0159 quarantine before the release, and the
         acquire-wait histogram.
 
         ``rotate_session`` and ``revoke_user_sessions`` finish what an auth change started: a reset
         password, a disabled account, a changed role, a completed factor ceremony. By the time they
-        run, that change is committed. Under ``[store].acquire_timeout`` a saturated pool would make
-        them raise after it, and nothing retries them: a reset password would leave every other
-        session live with no audit row, and a factor ceremony would leave the old token elevated and
-        unrotated. Waiting for a connection finishes the write once the pool frees. This is the
-        Postgres store's ``_after_commit_txn`` choice (BACKLOG #2283), brought to SQL Server.
+        run, that change is committed, and nothing retries them, so a pool shortage at the ordinary
+        limit would fail them after it. The longer limit lets a shortage that clears within it pass.
+        It is still a limit, so the wait is always bounded: at it the borrow raises
+        ``StoreAcquireTimeout`` like any other, and a refused rotation then fails closed in
+        ``AuthService._rotate_session_hash``. The Postgres store's ``_after_commit_txn`` (BACKLOG
+        #2283) waits without a limit; this one does not.
 
-        Waiting finishes the write only for a pool shortage. ``[store].command_timeout`` still bounds
-        the statement, and a lost connection still fails it. The same callers make other bounded
-        writes after their change commits, such as stamps and audit rows, and those can still fail at
-        the limit. Callers with no earlier write, such as "sign out everywhere else", wait the same
-        way, as on Postgres. The wait holds whatever lock its caller holds, such as a ceremony's
-        per-account lock, until the pool frees. ``tests/test_store_pool_acquire_timeout.py`` pins
-        which methods reach this borrow."""
-        return self._borrow(None)
+        The limit is derived from ``acquire_timeout``, never from ``command_timeout``, so a
+        ``command_timeout`` of 0, which lifts the statement limit on every store call, leaves this
+        wait bounded, as long as ``acquire_timeout`` is, which its validator requires to be > 0.
+        The same callers make other bounded writes after their change commits,
+        such as stamps and audit rows, and those can still fail at the ordinary limit. Callers with
+        no earlier write, such as "sign out everywhere else", wait the same way. The wait holds
+        whatever lock its caller holds, such as a ceremony's per-account lock, for up to the longer
+        limit, and a rotation's fail-closed revokes run under that lock after it. ``tests/test_store_pool_acquire_timeout.py`` pins which methods reach this borrow."""
+        return self._borrow(self._settings.acquire_timeout * _AFTER_COMMIT_ACQUIRE_FACTOR)
 
     @asynccontextmanager
-    async def _borrow(self, timeout: float | None) -> AsyncIterator[Any]:
+    async def _borrow(self, timeout: float) -> AsyncIterator[Any]:
         """The body of :meth:`_acquire` and :meth:`_acquire_after_commit`, and the sole place this
-        store borrows from its pool. ``timeout`` is the acquire limit; ``None`` waits without one."""
+        store borrows from its pool. ``timeout`` is the acquire limit, never ``None``."""
         t0 = perf_counter()
         conn = await acquire_pooled(self._pool, timeout=timeout, backend="sqlserver")
         self._acquire_wait.record((perf_counter() - t0) * 1000.0)

@@ -7750,12 +7750,12 @@ class AuthService:
         its new hash, since a re-key whose commit landed before the error reached us has already
         moved the row. Then :class:`_RotationStoreError` is raised for :meth:`_elevated_hash` to
         audit and answer as ``session_lost``. If a revoke is refused too, the session stays live
-        until it lapses; the error records which. On SQL Server and Postgres the re-key waits out a
-        pool shortage rather than raising, so what reaches this branch there is a statement or
-        connection failure, or a refused read before the re-key.
+        until it lapses; the error records which. On Postgres the re-key waits out a pool shortage
+        rather than raising. On SQL Server it waits up to a longer, still finite limit, and a
+        ``StoreAcquireTimeout`` at that limit reaches this branch like any other refusal.
 
         A cancellation is not an ``Exception``, so it skips this branch and propagates with the old
-        hash unrotated and unrevoked. The unbounded re-key makes that wait longer than it was."""
+        hash unrotated and unrevoked. The longer post-commit wait widens the window for one."""
         try:
             session = await self._load_session(old_hash)
         except _session_write_errors() as exc:
@@ -7792,7 +7792,7 @@ class AuthService:
         error classes only, never a hash.
 
         Each revoke is the ordinary, bounded ``revoke_session``. It has other callers that do not
-        follow a committed write, so it is not moved onto a store's unbounded post-commit borrow
+        follow a committed write, so it is not moved onto a store's longer post-commit borrow
         here, and at the acquire limit it can be refused while the pool is still short."""
         refused: list[str] = []
         for token_hash in (old_hash, new_hash):

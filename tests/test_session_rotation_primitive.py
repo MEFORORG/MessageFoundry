@@ -24,6 +24,7 @@ Each test names the mutation that must turn it RED.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -322,6 +323,51 @@ async def test_a_refused_read_before_the_rotation_fails_closed_too(
 
     assert elevation.session_lost is True and elevation.token is None
     assert await service.identity_for_token(token) is None
+    assert await _rotation_failures(service) == [
+        {"ceremony": "mfa_verify", "reason": "store_error", "revokes_landed": True}
+    ]
+
+
+async def test_a_hung_sqlserver_post_commit_borrow_fails_the_rotation_closed_within_its_bound(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3023, PR 2350 repair. RED when: the SQL Server post-commit borrow waits without a
+    limit (the elevation then hangs until the outer ``wait_for`` fails the test), or its
+    ``StoreAcquireTimeout`` no longer reaches the fail-closed branch.
+
+    The real ``SqlServerStore.rotate_session``, on a pool whose acquire never returns, stands in for
+    the SQLite store's: the rotation must give up at the longer limit and be answered as a lost
+    session, with the old token revoked and the refusal audited."""
+    from messagefoundry.config.settings import StoreSettings
+    from messagefoundry.store.pool_metrics import AcquireWaitHistogram
+    from messagefoundry.store.sqlserver import _AFTER_COMMIT_ACQUIRE_FACTOR, SqlServerStore
+
+    class HangingPool:
+        async def acquire(self) -> None:
+            await asyncio.Event().wait()
+
+        async def release(self, conn: object) -> None:
+            return None
+
+    acquire_timeout = 0.05
+    hung = SqlServerStore.__new__(SqlServerStore)
+    hung._pool = HangingPool()
+    hung._settings = StoreSettings(acquire_timeout=acquire_timeout)
+    hung._acquire_wait = AcquireWaitHistogram()
+
+    service, token = await _service_and_token(engine)
+    monkeypatch.setattr(service.store, "rotate_session", hung.rotate_session)
+    bound = acquire_timeout * _AFTER_COMMIT_ACQUIRE_FACTOR
+
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    elevation = await asyncio.wait_for(
+        service._elevated(token, ceremony="mfa_verify", actor="rot"), timeout=bound + 5
+    )
+    assert loop.time() - t0 >= bound * 0.9, "the rotation gave up before its longer limit"
+
+    assert elevation.session_lost is True and elevation.token is None
+    assert await service.identity_for_token(token) is None, "the unrotated token still resolves"
     assert await _rotation_failures(service) == [
         {"ceremony": "mfa_verify", "reason": "store_error", "revokes_landed": True}
     ]

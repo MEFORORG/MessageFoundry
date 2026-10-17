@@ -3745,16 +3745,11 @@ def _salvage_late_borrow(pool: Any, backend: str, borrow: asyncio.Future[Any]) -
 _LATE_RELEASES: set[asyncio.Future[None]] = set()
 
 
-async def acquire_pooled(pool: Any, *, timeout: float | None, backend: str) -> Any:
+async def acquire_pooled(pool: Any, *, timeout: float, backend: str) -> Any:
     """Borrow a pooled connection within ``timeout`` seconds, or raise :class:`StoreAcquireTimeout`.
 
-    ``timeout=None`` waits without a limit and never raises :class:`StoreAcquireTimeout`, for a
-    borrow that must not fail at the limit (BACKLOG #3023). It keeps the salvage on cancellation
-    described below.
-
-    The chokepoint both server backends' bounded borrows go through, so there is one place that
-    decides what happens at the limit and the two cannot drift. Postgres's unbounded post-commit
-    borrow does not come through here; SQL Server's does, with ``timeout=None``. The caller releases the
+    The single bounded chokepoint both server backends' ``_acquire`` helpers go through, so there is
+    one place that decides what happens at the limit and the two cannot drift. The caller releases the
     connection exactly as it did when it used ``async with pool.acquire()``: both drivers' acquire
     context managers do nothing on exit but ``await pool.release(conn)`` (aioodbc 0.5.0
     ``utils.py:86-103``, asyncpg 0.31.0 ``pool.py:1059-1068``), so an explicit release is equivalent.
@@ -3768,12 +3763,8 @@ async def acquire_pooled(pool: Any, *, timeout: float | None, backend: str) -> A
     shutdown mid-borrow would strand a slot the pool never recovers."""
     borrow: asyncio.Future[Any] = asyncio.ensure_future(_as_awaitable(pool.acquire()))
     try:
-        if timeout is None:
-            return await asyncio.shield(borrow)
         return await asyncio.wait_for(asyncio.shield(borrow), timeout)
     except TimeoutError as exc:
-        if timeout is None:  # the driver's own error: there is no limit to have reached
-            raise
         borrow.cancel()
         borrow.add_done_callback(partial(_salvage_late_borrow, pool, backend))
         raise StoreAcquireTimeout(
