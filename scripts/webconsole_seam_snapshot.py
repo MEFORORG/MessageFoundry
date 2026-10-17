@@ -35,8 +35,8 @@ The snapshot captures:
      field-name-only snapshot stayed byte-identical;
   6. what the console installs on the app, its route gates above all, read from a live mount
      (BACKLOG #2709; ``console_route_gates`` says what it covers and misses). This is the one
-     section read from the imported console rather than from its source, so it refuses to run on a
-     console imported from any tree but this repository's.
+     section read from the imported console rather than from its source, so it imports this
+     repository's console by path, whatever copy the process already holds (``repo_console``).
 
 Usage:
   ``python scripts/webconsole_seam_snapshot.py``           print the snapshot
@@ -59,16 +59,18 @@ redirect for anyone not on 5.1 -- the failure it was warning against.
 from __future__ import annotations
 
 import ast
+import contextlib
 import dataclasses
 import enum
 import hashlib
+import importlib.machinery
 import importlib.util
 import inspect
 import re
 import sys
 import textwrap
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -242,6 +244,92 @@ def _auth_service_symbol(obj: Any) -> str:
 #: separate constant on purpose: a test points ``_CONSOLE_DIR`` at a copy of the source, which the
 #: import cannot follow.
 _CONSOLE_PACKAGE_DIR = _REPO_ROOT / "messagefoundry_webconsole"
+_CONSOLE_PACKAGE = "messagefoundry_webconsole"
+
+#: This repository's console modules, kept while another tree's copy holds ``sys.modules``, so a
+#: second call reuses them and a test can patch the copy the table reads.
+_REPO_CONSOLE_MODULES: dict[str, types.ModuleType] = {}
+
+
+def _console_entries() -> dict[str, types.ModuleType]:
+    prefix = f"{_CONSOLE_PACKAGE}."
+    return {
+        name: module
+        for name, module in sys.modules.items()
+        if name == _CONSOLE_PACKAGE or name.startswith(prefix)
+    }
+
+
+def _package_dir(module: types.ModuleType) -> Path:
+    return Path(module.__file__ or "").resolve().parent
+
+
+@contextlib.contextmanager
+def repo_console() -> Iterator[types.ModuleType]:
+    """This repository's console package, imported from its source whatever ``sys.path`` offers.
+
+    An installed console is a COPY. Hatchling copies a ``force-include`` tree into site-packages even
+    for an editable install, and CI installs the console that way, so a process that imported the
+    console before this script did holds that copy. Mounting it would describe a console other than
+    the source the other sections read. So when ``sys.modules`` holds a console from another tree,
+    this moves that copy aside for the duration, imports the console from this repository by path,
+    and puts the copy back afterwards. The repository's modules are kept for the next call.
+
+    It refuses, rather than falls back, when this repository has no console to import."""
+    current = sys.modules.get(_CONSOLE_PACKAGE)
+    want = _CONSOLE_PACKAGE_DIR.resolve()
+    if current is not None and _package_dir(current) == want:
+        yield current
+        return
+    displaced = _console_entries()
+    for name in displaced:
+        del sys.modules[name]
+    kept = _REPO_CONSOLE_MODULES.get(_CONSOLE_PACKAGE)
+    if kept is not None and _package_dir(kept) == want:
+        sys.modules.update(_REPO_CONSOLE_MODULES)
+    imported = False
+    try:
+        console = sys.modules.get(_CONSOLE_PACKAGE) or _import_repo_console()
+        if _package_dir(console) != want:
+            raise RuntimeError(
+                f"the route-gate table imported the web console from {_package_dir(console)}, "
+                f"not from {_CONSOLE_PACKAGE_DIR}, so it would describe a different console than "
+                "the one the other sections read"
+            )
+        imported = True
+        yield console
+    finally:
+        ours = _console_entries()
+        if not displaced:
+            # Nothing was moved aside, so this repository's console stays the process's console.
+            # A failed import leaves nothing worth keeping.
+            if not imported:
+                for name in ours:
+                    del sys.modules[name]
+        else:
+            if imported:
+                _REPO_CONSOLE_MODULES.update(ours)
+            for name in ours:
+                del sys.modules[name]
+            sys.modules.update(displaced)
+
+
+def _import_repo_console() -> types.ModuleType:
+    """Import the console package from ``_CONSOLE_PACKAGE_DIR`` alone, never from ``sys.path``.
+
+    Its submodules then resolve through the package's own ``__path__``, which is this tree."""
+    spec = importlib.machinery.PathFinder.find_spec(
+        _CONSOLE_PACKAGE, [str(_CONSOLE_PACKAGE_DIR.parent)]
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(
+            f"the route-gate table found no web console at {_CONSOLE_PACKAGE_DIR}, and it reads "
+            "only this repository's console"
+        )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_CONSOLE_PACKAGE] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _stub(label: str, *, takes_arguments: bool) -> Callable[..., Any]:
@@ -428,19 +516,14 @@ def console_route_gates() -> list[tuple[str, str]]:
     authorizer, such as the CSP; a route registered only when a ``UiDeps`` field that is not a
     ``bool`` is set, or when a ``bool`` one is off.
     """
+    with repo_console() as console:
+        return _route_gate_rows(console)
+
+
+def _route_gate_rows(console: types.ModuleType) -> list[tuple[str, str]]:
     from fastapi import FastAPI
     from fastapi.routing import APIRoute, APIWebSocketRoute
     from starlette.routing import Mount
-
-    import messagefoundry_webconsole as console
-
-    loaded_from = Path(console.__file__).resolve().parent
-    if loaded_from != _CONSOLE_PACKAGE_DIR.resolve():
-        raise RuntimeError(
-            f"the route-gate table imported the web console from {loaded_from}, not from "
-            f"{_CONSOLE_PACKAGE_DIR}, so it would describe a different console than the one the "
-            "other sections read. Import this script before anything imports the console."
-        )
 
     known: dict[int, str] = {}
 
