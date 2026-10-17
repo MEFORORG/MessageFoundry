@@ -49,7 +49,7 @@ _IEA_SEGMENT = re.compile(rb"[ \t\r\n\x0b\x0c]*IEA")
 #: to hold a listener's frame deadline off: past it they are inter-interchange noise like any byte.
 #: The same rule as ``messagefoundry.framing.FrameDecoder``'s, kept local so this pure parsing module
 #: imports nothing from the transport layer.
-_FRAME_TAIL_BYTES = frozenset(b"\r\n")
+_FRAME_TAIL_BYTES = b"\r\n"
 _FRAME_TAIL_MAX = 2
 
 
@@ -132,10 +132,9 @@ class X12FrameReader:
         :attr:`trailer_only` is decided here, eagerly, so it never describes an earlier read; the
         reassembly itself still runs lazily as the generator is iterated.
         """
-        owed = _leading_line_ends(data, self._tail_left)
-        self.trailer_only = 0 < owed == len(data)
+        self.trailer_only = bool(data) and _only_line_ends(data, self._tail_left)
         # Any other byte ends the allowance: what follows it is not the interchange's ending.
-        self._tail_left = self._tail_left - owed if self.trailer_only else 0
+        self._tail_left = self._tail_left - len(data) if self.trailer_only else 0
         return self._frames(data)
 
     def _frames(self, data: bytes) -> Iterator[bytes]:
@@ -194,8 +193,8 @@ class X12FrameReader:
                 self._seg_start = self._scan = 0
                 # What the read held past the terminator: line ends alone are owed to this
                 # interchange, so the allowance left is what they have not used yet.
-                owed = _leading_line_ends(buf, _FRAME_TAIL_MAX)
-                self._tail_left = _FRAME_TAIL_MAX - owed if owed == len(buf) else 0
+                tail = _only_line_ends(buf, _FRAME_TAIL_MAX)
+                self._tail_left = _FRAME_TAIL_MAX - len(buf) if tail else 0
                 return frame
             self._seg_start = self._scan = idx + len(terminator)
 
@@ -210,7 +209,6 @@ class X12FrameReader:
     def _clear(self) -> None:
         self._buf.clear()
         self._seg_start = self._scan = 0
-        self._tail_left = 0
 
     def _check_cap(self) -> None:
         # Called from every path that returns with the interchange still open. Only one of those can
@@ -225,12 +223,10 @@ class X12FrameReader:
             )
 
 
-def _leading_line_ends(data: bytes | bytearray, limit: int) -> int:
-    """How many of the first ``limit`` bytes of ``data`` are line ends, up to the first that is not."""
-    count, size = 0, min(limit, len(data))
-    while count < size and data[count] in _FRAME_TAIL_BYTES:
-        count += 1
-    return count
+def _only_line_ends(data: bytes | bytearray, limit: int) -> bool:
+    """Whether ``data`` is at most ``limit`` bytes, every one a line end. The length is checked
+    first, so a large buffer is never copied by the strip."""
+    return len(data) <= limit and not data.strip(_FRAME_TAIL_BYTES)
 
 
 def check_integrity(raw: str) -> list[str]:
