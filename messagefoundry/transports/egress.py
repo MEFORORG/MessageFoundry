@@ -325,11 +325,14 @@ def warn_url_query_credentials(label: str, settings: Mapping[str, Any]) -> None:
     Called from :func:`check_egress_allowed`, the one function every outbound build path runs (at
     least check, start, operator start and test), and from :func:`check_fhir_lookup_allowed`, its
     FhirLookup twin. Both run on env-resolved settings, so this sees a URL that ``env()`` supplied.
-    A reload's rebuilds in ``RegistryRunner._reconcile_outbounds`` and its FhirLookup executor
-    rebuild skip it, because its build check already warned; :func:`check_egress_allowed` says how.
-    Some builds in a reload still warn a second time, at least the start in
-    ``Engine.reload_detail`` when no runner is up yet, and ``RegistryRunner._reconcile_schedulers`` resuming a calendar-parked
-    lane with no connector, which builds through ``_start_outbound_unsafe`` with the default flag.
+    A reload's rebuilds in ``RegistryRunner._reconcile_outbounds``, and its FhirLookup executor
+    rebuild, skip it because its build check already warned; :func:`check_egress_allowed` says how.
+    At least one reload still warns a second time: when the engine has no runner object yet,
+    ``Engine.reload_detail`` runs a build check and then ``RegistryRunner.start``, whose builds pass
+    no flag. ``RegistryRunner._reconcile_schedulers`` also builds with the default flag, through
+    ``_start_outbound_unsafe``, but only a lane with no connector, and a reading of
+    ``_reconcile_outbounds`` finds it has built one by then for every lane the reconcile resumes.
+    No test measures either case. ``docs/SECURITY-LOOSENING.md`` states this for operators.
     ``config.wiring.query_credential_hops`` is the graph-side reader for ``check`` and the posture
     registry, and walks the same two tables."""
     url = settings.get("url")

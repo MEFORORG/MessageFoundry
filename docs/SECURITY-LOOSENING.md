@@ -1527,17 +1527,18 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **Compensating controls:** keep the URL itself in `env()` so the credential is not in the config
   file, and treat the partner's and the proxy's access logs as holding a secret.
 - **It is never silent:** a WARNING naming the connection and the parameter names, never a value.
-  It fires at least once on each build check, which at least `messagefoundry check`, a dry run and a
-  reload run, and on each build at a start, an operator start or a connection test. A reload's
-  rebuild of an outbound or of the `FhirLookup` executor skips it, because that reload's build check
-  has already logged it, so a reload still logs it. Some builds in a reload log it a second time,
-  at least these two: the start in the engine's reload when no runner is up yet, which builds after
-  the build check, and a reload's scheduler reconcile, when it resumes a calendar-parked lane that
-  has no connector. There is also a
-  `url-query-credential` line in `messagefoundry check`, and a
+  It is logged for each connection a build check builds, and at least `messagefoundry check`, a dry
+  run and a reload run one. It is also logged when a connector is built with no build check before
+  it, at least at a start, an operator start and a connection test. A reload's rebuild of an
+  outbound, or of the `FhirLookup` executor, skips it, because that reload's build check has
+  already logged it, so a reload still logs it. At least one reload logs it a second time: the one
+  that finds the engine with no runner yet builds through a start after its build check. The
+  scheduler reconcile in a reload also builds without skipping it, but only a lane with no
+  connector, and a reading of the code finds the reload has built one by then; no test measures
+  either case. There is also a `url-query-credential` line in `messagefoundry check`, and a
   `url_query_credential` entry in `security_loosenings()`, and so in `GET /security/posture` on a
   running engine. All three walk outbound connections and `FhirLookup` connections, whose names are
-  prefixed `fhir_lookup:`. The construction WARNING reads the resolved URL. The `check` line and the registry
+  prefixed `fhir_lookup:`. The WARNING reads the resolved URL. The `check` line and the registry
   read a literal `url` only, so a URL supplied by `env()` is in the WARNING alone.
 - **What it cannot do:** it is a guess from names. It misses a credential under a name it does not
   know, and it will name a parameter that only looks like one, such as `page_token`. OIDC's
