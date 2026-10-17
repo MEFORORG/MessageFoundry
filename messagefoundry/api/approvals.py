@@ -264,6 +264,9 @@ class _Operation:
     permission: Permission
     #: Optional scope predicate over the captured params, re-checked at release beside ``permission``.
     in_scope: ScopeCheck | None = None
+    #: The executor refuses params whose ``requester`` is not a non-empty string (vault BACKLOG
+    #: #3217), so :meth:`ApprovalGate._release_blocked` predicts that refusal before the claim.
+    requires_requester: bool = False
 
 
 class ApprovalError(Exception):
@@ -501,11 +504,20 @@ class ApprovalGate:
         *,
         permission: Permission,
         in_scope: ScopeCheck | None = None,
+        requires_requester: bool = False,
     ) -> None:
         """Register an approvable operation. ``permission`` is REQUIRED, so no operation can become
-        approvable without naming the authority its requester must still hold at release."""
+        approvable without naming the authority its requester must still hold at release.
+        ``requires_requester`` declares that ``execute`` refuses params whose ``requester`` is not a
+        non-empty string, so the gate refuses such a request before it claims it and the queue
+        marks it ``params_no_requester``."""
         self._ops[key] = _Operation(
-            key=key, label=label, execute=execute, permission=permission, in_scope=in_scope
+            key=key,
+            label=label,
+            execute=execute,
+            permission=permission,
+            in_scope=in_scope,
+            requires_requester=requires_requester,
         )
 
     @property
@@ -820,12 +832,18 @@ class ApprovalGate:
         what each value means and what ``None`` does not promise."""
         if not r.requester_user_id:
             return "no_requester_id"
-        if r.operation not in self._ops:
+        op = self._ops.get(r.operation)
+        if op is None:
             return "operation_unavailable"
         if not self.gates(r.operation):
             return "not_gated"
         if params is None:
             return "params_unreadable"
+        # The executor's own test, read here so the refusal comes before the claim (vault BACKLOG
+        # #3217): past the claim it was compensated to 'failed' while the queue offered Approve.
+        requester = params.get("requester")
+        if op.requires_requester and not (isinstance(requester, str) and requester):
+            return "params_no_requester"
         return None
 
     def _queue_entry(self, r: ApprovalRow, caller_user_id: str | None) -> dict[str, Any]:
@@ -884,7 +902,8 @@ class ApprovalGate:
 
         **The writes on this path answer a mapped status in a store outage (vault BACKLOG #2255).** A
         refusal's own audit row (at least ``approval.too_early``, ``approval.stale_requester``,
-        ``approval.no_longer_gated`` and ``approval.params_unreadable``) that fails to write is
+        ``approval.no_longer_gated``, ``approval.params_unreadable`` and
+        ``approval.params_no_requester``) that fails to write is
         logged and the refusal still answers 409, since it runs nothing. A release whose approver account changed after the request
         writes ``approval.approver_provenance``. That row is soft too, and pages if it fails. It is
         written whether the operation succeeded, failed or was cut off. Many failed writes on this path also page
@@ -946,6 +965,25 @@ class ApprovalGate:
                 context="the release was refused",
             )
             raise ApprovalError(409, "request parameters are unreadable; reject it instead")
+        if blocked == "params_no_requester":
+            # The executor would refuse it after the claim, compensated to 'failed' (vault BACKLOG
+            # #3217). Refused here instead, so it stays pending for a reject, as the queue
+            # predicts. Audited, and soft, like the unreadable-params refusal above.
+            await self._record_audit_soft(
+                approval_id,
+                "approval.params_no_requester",
+                actor=approver,
+                detail=json.dumps(
+                    {"approval_id": approval_id, "operation": operation, "requester": row.requester}
+                ),
+                client=client,  # ADR 0150: the approver's address, matching this row's actor
+                context="the release was refused",
+            )
+            raise ApprovalError(
+                409,
+                "this request's parameters record no requester, so the operation could not name "
+                "who ran it; reject it and request the operation again",
+            )
         op = self._ops.get(operation)
         if blocked is not None or not requester_user_id or op is None or params is None:
             # Unreachable while every reason has its arm above. Fail closed if one is added

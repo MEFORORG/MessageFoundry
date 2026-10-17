@@ -2112,7 +2112,10 @@ two cannot disagree. `PendingApprovalInfo` in `messagefoundry/api/models.py` lis
 what `null` does not promise. The console's Approvals page keys on it, and offers a blocked request
 only Reject, or Withdraw on the requester's own row, with a note saying why. A release
 refused for unreadable parameters writes an `approval.params_unreadable` row against the
-approver, which carries no parameters. A refusal for a request with no requester id, or for an
+approver, which carries no parameters. A held purge whose parameters name no requester is marked
+`params_no_requester` and refused before the claim, so it stays pending for a reject and writes an
+`approval.params_no_requester` row against the approver; the purge executor's own refusal of it
+(vault BACKLOG #3217) is then a backstop. A refusal for a request with no requester id, or for an
 operation no longer registered, still writes no row.
 
 **Each state change and its audit row are one write (vault BACKLOG #2255).** The store
@@ -2252,7 +2255,7 @@ is running or owned by another engine shard cancels nothing and writes no `conne
 **An audit or store outage that refuses writes answers a mapped status on at least these approval
 paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own audit row fails still
 answers **409**: that is at least `approval.too_early`, `approval.stale_requester`,
-`approval.no_longer_gated` and `approval.params_unreadable`. A claim, a rejection or a resolution that the store cannot write with
+`approval.no_longer_gated`, `approval.params_unreadable` and `approval.params_no_requester`. A claim, a rejection or a resolution that the store cannot write with
 its audit row answers **503**. The request does not move, except where a COMMIT lands despite the
 error, as stated above.
 

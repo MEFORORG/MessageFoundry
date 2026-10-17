@@ -522,7 +522,11 @@ class PendingApprovalResponse(BaseModel):
 #: Why the gate refuses a pending request's approve whoever approves it (vault BACKLOG #3192).
 #: ``PendingApprovalInfo`` says what each value means.
 ReleaseBlocked = Literal[
-    "no_requester_id", "operation_unavailable", "not_gated", "params_unreadable"
+    "no_requester_id",
+    "operation_unavailable",
+    "not_gated",
+    "params_unreadable",
+    "params_no_requester",
 ]
 
 
@@ -548,8 +552,9 @@ class PendingApprovalInfo(BaseModel):
     ``release_blocked`` names why the engine refuses a ``pending`` request's approve whoever the
     approver is, or is ``None`` (vault BACKLOG #3192). Each value is a 409 the gate raises, in the
     order it raises them: ``no_requester_id`` (the row predates requester-id attribution),
-    ``operation_unavailable`` (no such operation is registered), ``not_gated`` (as ``gated`` above)
-    and ``params_unreadable``. ``None`` does not promise a release. At least the self-approval
+    ``operation_unavailable`` (no such operation is registered), ``not_gated`` (as ``gated`` above),
+    ``params_unreadable``, and ``params_no_requester`` (the operation's executor needs the
+    requester's name and the parameters carry none, such as a purge's; vault BACKLOG #3217). ``None`` does not promise a release. At least the self-approval
     refusal, the expiry, the dwell floor, the requester's standing, the row's seal and the
     operation's own refusals, such as a held reload with no config digest, are met only at
     release. It lets a page offer only the reject. It is ``None`` on an ``interrupted`` row."""

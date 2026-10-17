@@ -11,6 +11,11 @@ real refusal.
 The unreadable-params refusal also wrote no audit row, unlike the gate's other refusals. It now
 writes ``approval.params_unreadable``, soft like them.
 
+A held purge whose params name no requester was refused by its executor only after the claim
+(vault BACKLOG #3217), so the queue offered Approve and the release ended ``failed``. An operation
+registered with ``requires_requester`` is now marked ``params_no_requester`` and refused before the
+claim, audited as ``approval.params_no_requester``.
+
 The gate runs over a real SQLite store. The odd rows are written through the store directly,
 because no request through ``guard`` can produce them.
 """
@@ -55,16 +60,23 @@ def _gate(store: Any, runs: list[str], sink: _Sink | None = None) -> ApprovalGat
         runs.append("ran")
         return {"requeued": 0}
 
+    # The replay stands in for an executor that needs the requester's name, as the real purge does
+    # (vault BACKLOG #3217); only the replay is both registered and gated here.
     for key in (_REPLAY, _PURGE):
-        gate.register(key, "op", _execute, permission=Permission.MESSAGES_REPLAY)
+        gate.register(
+            key, "op", _execute, permission=Permission.MESSAGES_REPLAY, requires_requester=True
+        )
     return gate
+
+
+_NAMED = json.dumps({"requester": "maker"})
 
 
 async def _row(
     store: MessageStore,
     *,
     operation: str = _REPLAY,
-    params: str = "{}",
+    params: str = _NAMED,
     requester_user_id: str = _REQUESTER_ID,
 ) -> str:
     approval_id = uuid4().hex
@@ -87,6 +99,8 @@ async def _rows(store: MessageStore) -> dict[str, ReleaseBlocked | None]:
         await _row(store, operation=_RELOAD): "operation_unavailable",
         await _row(store, operation=_PURGE): "not_gated",
         await _row(store, params="[1]"): "params_unreadable",
+        await _row(store, params="{}"): "params_no_requester",
+        await _row(store, params=json.dumps({"requester": ""})): "params_no_requester",
         await _row(store): None,
     }
 
@@ -140,3 +154,20 @@ async def test_a_lost_unreadable_params_row_still_answers_409_and_pages(
         await gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)
     assert caught.value.status == 409
     assert sink.lost == [(f"approval:{approval_id}", "approval.params_unreadable")]
+
+
+async def test_a_no_requester_refusal_writes_its_audit_row(store: MessageStore) -> None:
+    """Vault BACKLOG #3217 met at the gate: refused before the claim, so nothing ran and nothing
+    was claimed, and the refusal is audited against the approver."""
+    approval_id = await _row(store, params="{}")
+    runs: list[str] = []
+    with pytest.raises(ApprovalError) as caught:
+        await _gate(store, runs).approve(
+            approval_id, approver="checker", approver_user_id=_APPROVER_ID
+        )
+    assert caught.value.status == 409 and runs == []
+    [row] = await store.list_audit(action="approval.params_no_requester")
+    assert str(row["actor"]) == "checker"
+    detail = json.loads(str(row["detail"]))
+    assert detail == {"approval_id": approval_id, "operation": _REPLAY, "requester": "maker"}
+    assert await store.list_audit(action="approval.release_attempted") == []

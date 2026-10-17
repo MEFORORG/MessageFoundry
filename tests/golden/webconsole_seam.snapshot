@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-71c27581e7c9f921
+6d7dcabe1103f08d
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -321,7 +321,7 @@ messagefoundry.config.ai_policy.SecurityEnforcement: ENFORCE, WARN
 messagefoundry.api.auth_models.ChannelScope.expected_source: ad, manual
 messagefoundry.api.models.ApprovalResolveRequest.outcome: effects_applied, effects_not_applied
 messagefoundry.api.models.ConnectionFlagRequest.direction: inbound, outbound
-messagefoundry.api.models.PendingApprovalInfo.release_blocked: no_requester_id, not_gated, operation_unavailable, params_unreadable
+messagefoundry.api.models.PendingApprovalInfo.release_blocked: no_requester_id, not_gated, operation_unavailable, params_no_requester, params_unreadable
 messagefoundry.api.models.PendingApprovalInfo.status: interrupted, pending
 messagefoundry.api.models.SearchPresetCriteria.target: both, raw, summary
 messagefoundry.api.models.StatsResetTarget.role: destination, source

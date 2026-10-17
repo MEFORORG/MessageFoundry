@@ -464,12 +464,18 @@ from typing import Any
 #: main's #3029 (digests 0cd684e3f53d2469 and 344979df3bd2c662). The value below was re-derived
 #: with ``--write`` on the merged tree, so it covers every entry above.
 #:
+#: Vault BACKLOG #3192 review repair: ``ReleaseBlocked`` gained ``params_no_requester``, a held
+#: purge whose params name no requester, which the gate now refuses before its claim (vault BACKLOG
+#: #3217). The Approvals page keys a note on every value, so an older console on this engine is
+#: refused at mount rather than meeting a value it has no note for. Re-derived with ``--write``
+#: from 71c27581e7c9f921.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "71c27581e7c9f921"
+ENGINE_UI_SEAM: str = "6d7dcabe1103f08d"
 
 
 @dataclass(frozen=True, slots=True)

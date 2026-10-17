@@ -1277,7 +1277,8 @@ def _app_drain_steps(
        cancelled save left running, the releases they start, and the save-time sweeps that write
        ``upload.prune`` rows. After the long-operations drain, so a pair removed because its
        ``upload.create`` row failed there (vault BACKLOG #3178) is held as a straggler by then.
-    3. Approval outcome writes (BACKLOG #2087), which would otherwise meet a closed store.
+    3. Approval writes still running (BACKLOG #2087): the outcome writes, and the request writes
+       whose caller was cancelled (vault BACKLOG #3193), which would otherwise meet a closed store.
     4. Lock notices (BACKLOG #2216), which read and write the audit log and hand their mail to the
        security notifier, so they drain before that notifier stops.
     5. The open summary-access windows (M-5, BACKLOG #1640). Every clean restart otherwise dropped
@@ -1318,7 +1319,9 @@ def _app_drain_steps(
     if gate is not None:
         steps.append(
             _TeardownStep(
-                "the approval outcome-write drain", 0.5, lambda b: gate.drain(b * _INNER_SHARE)
+                "the approval request- and outcome-write drain",
+                0.5,
+                lambda b: gate.drain(b * _INNER_SHARE),
             )
         )
     if auth is not None and owns_auth:
@@ -1441,9 +1444,11 @@ def _build_approval_gate(
         #
         # Vault BACKLOG #3217: the connection_purge row is attributed to the REQUESTER, so a hold
         # whose params carry none is refused before anything runs, rather than released as a
-        # destructive purge whose row names no actor. The raise reaches the gate's compensation,
-        # which records the release as 'failed', and the route answers 409. Every hold the route
-        # files carries the key (_purge_hold_params), so this is a guard, not a migration path.
+        # destructive purge whose row names no actor. The gate refuses such a hold before its claim
+        # (requires_requester below, release_blocked 'params_no_requester'), so this test is the
+        # backstop for a caller that runs the executor some other way; its raise would reach the
+        # gate's compensation as 'failed'. Every hold the route files carries the key
+        # (_purge_hold_params), so this is a guard, not a migration path.
         requester = p.get("requester")
         if not isinstance(requester, str) or not requester:
             raise ApprovalError(
@@ -1566,6 +1571,7 @@ def _build_approval_gate(
         _purge,
         permission=Permission.MESSAGES_PURGE,
         in_scope=lambda identity, _p: _purge_in_scope(identity),
+        requires_requester=True,
     )
     gate.register(
         "config_reload",

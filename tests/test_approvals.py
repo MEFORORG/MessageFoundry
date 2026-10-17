@@ -485,6 +485,41 @@ async def test_a_released_purge_with_no_requester_is_refused_before_it_cancels(
     assert {r["status"] for r in await engine.store.outbox_for(mid)} == {OutboxStatus.PENDING.value}
 
 
+async def test_a_held_purge_with_no_requester_is_predicted_blocked_and_refused_at_approve(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """Vault BACKLOG #3217 met by the queue: the executor's refusal above came after the claim, so
+    the queue showed ``release_blocked: null`` and offered Approve, and the release ended 'failed'.
+    The gate now predicts it as ``params_no_requester`` and refuses it before the claim, so the
+    request stays pending for a reject and nothing is cancelled."""
+    service = await _service(engine)
+    op_id = await _add(service, "op", Role.OPERATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    mid = await _quiesced_outbound_with_a_pending_row(engine, tmp_path)
+    approval_id = "feedfacefeedfacefeedfacefeedface"
+    await engine.store.create_pending_approval(
+        approval_id=approval_id,
+        operation="connection_purge",
+        params=json.dumps({"name": "OB", "scope": "top"}),
+        requester="op",
+        requester_user_id=op_id,
+        requested_at=time.time(),
+        expires_at=None,
+    )
+    async with _client(engine, service, ON) as c:
+        admin = await _token(c, "approver")
+        listed = await c.get("/approvals", headers=admin)
+        [entry] = [a for a in listed.json()["approvals"] if a["id"] == approval_id]
+        assert entry["release_blocked"] == "params_no_requester"
+        refused = await c.post(f"/approvals/{approval_id}/approve", headers=admin)
+    assert refused.status_code == 409
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None and str(row["status"]) == "pending"
+    assert await engine.store.list_audit(action="approval.release_attempted") == []
+    assert await engine.store.list_audit(action="connection_purge") == []
+    assert {r["status"] for r in await engine.store.outbox_for(mid)} == {OutboxStatus.PENDING.value}
+
+
 def test_settings_validator_rejects_unknown_operation() -> None:
     with pytest.raises(ValueError, match="unknown operation"):
         ApprovalsSettings(operations=["not_a_real_op"])
