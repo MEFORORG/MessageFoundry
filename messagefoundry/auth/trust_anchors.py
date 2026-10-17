@@ -138,6 +138,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
 from messagefoundry.auth.anchor_path import (
     LINK,
     ChainFinding,
@@ -148,7 +149,7 @@ from messagefoundry.childenv import system_tool_environment
 from messagefoundry.config.models import bool_setting
 from messagefoundry.connection_names import fhir_lookup_record_name, inbound_record_name
 from messagefoundry.credential import constant_time_equal
-from messagefoundry.redaction import codec_safe_str
+from messagefoundry.redaction import codec_safe_str, safe_exc
 from messagefoundry.service_status import _system_exe
 
 if TYPE_CHECKING:
@@ -181,7 +182,21 @@ class TrustAnchorError(Exception):
     mismatch, a file that holds no loadable PEM block, or, under ``[security].enforcement = enforce``,
     an ACL or path that lets another principal replace it or that could not be read. Raised at
     construction and at reload so the engine refuses a tampered/exposed anchor rather than silently
-    trusting it."""
+    trusting it.
+
+    ``unaudited`` is True when the preflight refused the anchor while the store refused one of its
+    ``auth.trust_anchor`` rows (BACKLOG #3091), so the refusal may have no row behind it."""
+
+    unaudited: bool = False
+
+
+class AnchorStoreUnavailable(Exception):
+    """The store refused an audit read or write that a trust-anchor check needs (BACKLOG #3091).
+
+    It is **not** a :class:`TrustAnchorError`. It is raised only for an anchor that passed its
+    checks, or for the advisory ``restart_required`` row after every anchor passed, so a reload it
+    stops audits ``reason="store_unavailable"``, not ``trust_anchor``. Its ``__cause__``
+    is the backend's own exception; this is the one class a caller can catch."""
 
 
 @dataclass(frozen=True)
@@ -246,11 +261,19 @@ _PEM_END = b"-----END "
 _PEM_TRUSTED = b"-----BEGIN TRUSTED CERTIFICATE-----"
 #: The RFC 1421 headers of an encrypted PEM block, lower-cased (BACKLOG #2270, :func:`anchor_cadata`).
 _PEM_ENCRYPTION_HEADERS = ("proc-type:", "dek-info:")
+#: What :func:`has_encryption_header` matches, in the words :func:`anchor_cadata`'s refusal uses
+#: (BACKLOG #3105). It names no block on purpose: the check models none. ``strict_requests`` keeps
+#: an identical literal, since its marked refusals may interpolate only that module's own
+#: literals; ``tests/test_trust_anchors.py`` compares the two exactly.
+_ENCRYPTION_HEADER_SCOPE = (
+    "names an encryption header (Proc-Type or DEK-Info) somewhere after the first -----BEGIN in "
+    "its PEM text, even outside a block, as in a comment"
+)
 #: The source-location tail CPython appends to an ``ssl.SSLError`` message, dropped from a refusal.
 _SSL_WHERE = re.compile(r"\s*\(_ssl\.c:\d+\)$")
 
 
-def _has_encryption_header(text: str) -> bool:
+def has_encryption_header(text: str) -> bool:
     """Whether an RFC 1421 encryption header name appears anywhere after the first ``-----BEGIN ``
     in ``text``, the exact text the TLS load is handed (BACKLOG #2270).
 
@@ -307,7 +330,8 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     certificate and no CRL, so that file still passes. The throwaway context is discarded. It checks
     that the text loads, not that a certificate in it is a CA; a leaf still loads here.
 
-    **An encryption header inside a block refuses, before that load** (BACKLOG #2270). A
+    **An encryption header name after the first BEGIN refuses, before that load** (BACKLOG
+    #2270), whether or not it sits inside a block. A
     ``Proc-Type: 4,ENCRYPTED`` header sends OpenSSL to its password callback, and ``cadata=`` sets
     none, so OpenSSL falls back to its default one, which reads the terminal. The POSIX terminal run
     was done later, off-version (BACKLOG #3090, 2026-10-12): on CPython 3.12.3 / OpenSSL 3.0.13 on
@@ -321,10 +345,13 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     once with ``PEM lib``. So a start or a reload could hang on this file. A CA certificate never
     carries an RFC 1421 encryption header, so ``Proc-Type:`` and ``DEK-Info:`` both refuse, in any
     case, anywhere after the first BEGIN of the text the load would get, and OpenSSL is never
-    handed that text (:func:`_has_encryption_header`). That is wider than the hang: an encrypted
-    private-key block beside a certificate loads through ``cadata=``, and refuses here, because a
-    trust anchor has no use for a key, and so does the header name in a comment between two
-    blocks. The same header in a comment above the first block still passes."""
+    handed that text (:func:`has_encryption_header`). That is wider than the hang: a private-key
+    block encrypted in that legacy header format beside a certificate loads through ``cadata=``,
+    and refuses here, and so does the header name in a comment between two blocks or after the
+    last one. A PKCS#8 ``ENCRYPTED PRIVATE KEY`` block has no such header and is not refused. The
+    same header in a comment above the first block still passes, unless a ``-----BEGIN `` comes
+    anywhere before it, on its own line or an earlier one. The check reads the text the load would get, so a comment line that is not
+    ASCII, dropped above, is not checked."""
     kept: list[bytes] = []
 
     inside = False
@@ -360,13 +387,14 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
             f"{spec.setting}: the trust anchor {spec.path!r} has a non-ASCII byte inside a PEM "
             "block, so it is not a readable certificate"
         ) from exc
-    if _has_encryption_header(text):
+    if has_encryption_header(text):
         raise TrustAnchorError(
-            f"{spec.setting}: the trust anchor {spec.path!r} holds a PEM block with an encryption "
-            "header (Proc-Type or DEK-Info), such as an encrypted certificate or private key. A "
-            "trust anchor needs only plain CERTIFICATE blocks, and loading an encrypted one can make "
-            "the TLS library wait for a password. Remove the encrypted block, or export the CA "
-            "certificate as a plain CERTIFICATE block"
+            f"{spec.setting}: the trust anchor {spec.path!r} {_ENCRYPTION_HEADER_SCOPE}. An "
+            "encrypted certificate carries one, as does a private key encrypted in the legacy PEM "
+            "format. A trust anchor needs only plain "
+            "CERTIFICATE blocks, and loading an encrypted one can make the TLS library wait for a "
+            "password. Remove the encrypted block and any comment that names one of those headers, "
+            "or export the CA certificate as a plain CERTIFICATE block"
         )
     try:
         ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=text)
@@ -1279,12 +1307,15 @@ def inbound_ca_cadata(name: str, settings: Mapping[str, Any], *, enforcing: bool
         raise _unreadable_anchor(spec, exc) from exc
 
 
-def _unreadable_anchor(spec: AnchorSpec, exc: OSError) -> TrustAnchorError:
+def _unreadable_anchor(spec: AnchorSpec, exc: OSError | ValueError) -> TrustAnchorError:
     """The refusal for an anchor file that cannot be read. It names the setting, and so the
-    connection, which the bare ``OSError`` does not. The caller raises it ``from exc``."""
-    return TrustAnchorError(
-        f"{spec.setting}: could not read the trust anchor {spec.path!r}: {exc.strerror or exc}"
-    )
+    connection, which the bare ``OSError`` does not. The caller raises it ``from exc``.
+
+    A ``ValueError`` is a path the OS cannot take, such as one with a NUL in it or one that is not
+    UTF-8. :func:`codec_safe_str` renders it, so a codec error's own text names the byte and not
+    the input (vault BACKLOG #3295)."""
+    why = exc.strerror if isinstance(exc, OSError) and exc.strerror else codec_safe_str(exc)
+    return TrustAnchorError(f"{spec.setting}: could not read the trust anchor {spec.path!r}: {why}")
 
 
 def connection_anchor_specs(
@@ -1479,6 +1510,17 @@ _FINGERPRINT_PAGE = 200
 _FINGERPRINT_PAGES = 50
 
 
+#: What a store call raises that is a defect in the caller or the backend, not a refusal by the
+#: store. They pass through unwrapped, so a bug never reads as a store outage with retry advice.
+#: :data:`AUDIT_WRITE_DEFECTS` says why its three are here; a wrong argument or a missing
+#: attribute is a defect too.
+_STORE_CALL_DEFECTS: tuple[type[Exception], ...] = (
+    *AUDIT_WRITE_DEFECTS,
+    TypeError,
+    AttributeError,
+)
+
+
 async def _last_fingerprint(store: Store, label: str) -> str | None:
     """The most-recently audited fingerprint for ``label``, or ``None`` if this anchor has never been
     observed. Reads the ``auth.trust_anchor`` audit rows (most-recent-first), a page at a time, and
@@ -1486,7 +1528,12 @@ async def _last_fingerprint(store: Store, label: str) -> str | None:
     before, inclusively, so a row at that instant is read twice and never skipped."""
     until: float | None = None
     for _page in range(_FINGERPRINT_PAGES):
-        rows = await store.list_audit(action=AUDIT_ACTION, limit=_FINGERPRINT_PAGE, until=until)
+        try:
+            rows = await store.list_audit(action=AUDIT_ACTION, limit=_FINGERPRINT_PAGE, until=until)
+        except _STORE_CALL_DEFECTS:
+            raise
+        except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
+            raise _store_unavailable(label, "read", exc) from exc
         for row in rows:
             detail_raw = row["detail"]
             if not detail_raw:
@@ -1508,8 +1555,92 @@ async def _last_fingerprint(store: Store, label: str) -> str | None:
 
 
 async def _record(store: Store, spec: AnchorSpec, event: str, **extra: object) -> None:
-    detail = {"label": spec.label, "setting": spec.setting, "event": event, **extra}
-    await store.record_audit(AUDIT_ACTION, actor=None, detail=json.dumps(detail))
+    detail = json.dumps({"label": spec.label, "setting": spec.setting, "event": event, **extra})
+    try:
+        await store.record_audit(AUDIT_ACTION, actor=None, detail=detail)
+    except _STORE_CALL_DEFECTS:
+        raise
+    except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
+        raise _store_unavailable(spec.label, "write", exc) from exc
+
+
+def _store_unavailable(label: str, what: str, exc: Exception) -> AnchorStoreUnavailable:
+    """The fault for a store call the check of ``label`` needed. Its text names the backend's
+    exception type only, and the backend's own text is logged here through :func:`safe_exc`, for
+    the operator the 503 sends to the log. The caller raises it ``from exc``, which keeps the
+    store's own exception as its cause."""
+    log.warning("trust anchor %r: the store refused its audit %s: %s", label, what, safe_exc(exc))
+    return AnchorStoreUnavailable(
+        f"the store refused the trust-anchor audit {what} for {label!r} ({type(exc).__name__}), "
+        "so the check could not be recorded"
+    )
+
+
+async def _audit_verdict(
+    store: Store,
+    spec: AnchorSpec,
+    verdict: AnchorVerdict,
+    *,
+    enforcing: bool,
+    pin_escapes: bool,
+    shape_error: TrustAnchorError | None,
+) -> None:
+    """The audit rows :func:`_preflight_one` writes for ``verdict``, before it enforces.
+
+    Each store call is tried on its own, so a failed read or row does not stop the violation
+    rows after it. The first :class:`AnchorStoreUnavailable` is raised once all were tried."""
+    faults: list[AnchorStoreUnavailable] = []
+
+    async def record(event: str, **extra: object) -> None:
+        try:
+            await _record(store, spec, event, **extra)
+        except AnchorStoreUnavailable as exc:
+            faults.append(exc)
+
+    try:
+        previous = await _last_fingerprint(store, spec.label)
+    except AnchorStoreUnavailable as exc:
+        faults.append(exc)  # no baseline to compare with, so no observed/changed row
+    else:
+        if previous is None:
+            await record("observed", fingerprint=verdict.fingerprint)
+        elif previous != verdict.fingerprint:
+            await record("changed", fingerprint=verdict.fingerprint, previous=previous)
+    if verdict.pin_ok is False:
+        await record("pin_mismatch", fingerprint=verdict.fingerprint)
+    if verdict.acl_ok is False:
+        await record("acl_insecure", fingerprint=verdict.fingerprint, enforcing=enforcing)
+    elif verdict.acl_ok is None:
+        # BACKLOG #1142. This branch used to write no row at all, so an operator following the
+        # runbook's "alert on auth.trust_anchor" instruction saw nothing on the one branch where the
+        # engine cannot vouch for the anchor, a detective control blind on its own subject. Since
+        # slice 3 it also refuses at enforce unless a matching pin lets it through, and `pinned`
+        # says which of the two this row saw. A dialling CA's pin never lets it through (module
+        # item 9), so its row reads False even beside a matching pin (vault BACKLOG #2371).
+        await record(
+            "acl_indeterminate",
+            fingerprint=verdict.fingerprint,
+            enforcing=enforcing,
+            pinned=pin_escapes,
+        )
+    if verdict.path_ok is not True:
+        # Each row names every object that failed, with the principal and the right, or the cause.
+        insecure = verdict.path_ok is False
+        extra: dict[str, object] = {} if insecure else {"pinned": pin_escapes}
+        await record(
+            "path_insecure" if insecure else "path_indeterminate",
+            fingerprint=verdict.fingerprint,
+            enforcing=enforcing,
+            components=[
+                {"path": f.path, "kind": f.kind, "reason": f.reason}
+                for f in _findings(verdict, insecure=insecure)
+            ],
+            **extra,
+        )
+    if shape_error is not None:
+        await record("pem_refused", fingerprint=verdict.fingerprint)
+    if faults:
+        raise faults[0]
 
 
 async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> str:
@@ -1531,63 +1662,50 @@ async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> 
 
     An anchor whose consumer reads ``cafile=`` (``loads_verified_bytes`` False, the outbound CAs,
     vault BACKLOG #2371) skips the shape check. ``cafile=`` loads a ``TRUSTED CERTIFICATE`` block,
-    for one, so refusing it here would refuse what the build accepts."""
-    verdict = await asyncio.to_thread(evaluate_anchor, spec)
+    for one, so refusing it here would refuse what the build accepts.
+
+    **Only the file read and the PEM load become an anchor refusal** (BACKLOG #3091). An
+    ``OSError`` or a ``ValueError`` from them, such as a missing file or a NUL in the path, is raised as a
+    :class:`TrustAnchorError` that names the setting (:func:`_unreadable_anchor`). A store call that
+    fails raises :class:`AnchorStoreUnavailable` instead, so a store fault no longer reads as a
+    refused anchor. An anchor the verdict refuses is still refused as one when a store call fails,
+    since the verdict is reached first."""
     shape_error: TrustAnchorError | None = None
-    if verdict.pin_ok is not False and spec.loads_verified_bytes:
-        try:
-            await asyncio.to_thread(anchor_cadata, verdict.data, spec)
-        except TrustAnchorError as exc:
-            shape_error = exc
+    try:
+        verdict = await asyncio.to_thread(evaluate_anchor, spec)
+        if verdict.pin_ok is not False and spec.loads_verified_bytes:
+            try:
+                await asyncio.to_thread(anchor_cadata, verdict.data, spec)
+            except TrustAnchorError as exc:
+                shape_error = exc
+    except (OSError, ValueError) as exc:
+        raise _unreadable_anchor(spec, exc) from exc
     # The item 6 escape, the one `_enforce_verdict` grants: a matching pin over the bytes loaded.
     pin_escapes = verdict.pin_ok is True and spec.loads_verified_bytes
-    previous = await _last_fingerprint(store, spec.label)
-    if previous is None:
-        await _record(store, spec, "observed", fingerprint=verdict.fingerprint)
-    elif previous != verdict.fingerprint:
-        await _record(store, spec, "changed", fingerprint=verdict.fingerprint, previous=previous)
-    if verdict.pin_ok is False:
-        await _record(store, spec, "pin_mismatch", fingerprint=verdict.fingerprint)
-    if verdict.acl_ok is False:
-        await _record(
-            store, spec, "acl_insecure", fingerprint=verdict.fingerprint, enforcing=enforcing
-        )
-    elif verdict.acl_ok is None:
-        # BACKLOG #1142. This branch used to write no row at all, so an operator following the
-        # runbook's "alert on auth.trust_anchor" instruction saw nothing on the one branch where the
-        # engine cannot vouch for the anchor, a detective control blind on its own subject. Since
-        # slice 3 it also refuses at enforce unless a matching pin lets it through, and `pinned`
-        # says which of the two this row saw. A dialling CA's pin never lets it through (module
-        # item 9), so its row reads False even beside a matching pin (vault BACKLOG #2371).
-        await _record(
+    store_fault: AnchorStoreUnavailable | None = None
+    try:
+        await _audit_verdict(
             store,
             spec,
-            "acl_indeterminate",
-            fingerprint=verdict.fingerprint,
+            verdict,
             enforcing=enforcing,
-            pinned=pin_escapes,
+            pin_escapes=pin_escapes,
+            shape_error=shape_error,
         )
-    if verdict.path_ok is not True:
-        # Each row names every object that failed, with the principal and the right, or the cause.
-        insecure = verdict.path_ok is False
-        extra: dict[str, object] = {} if insecure else {"pinned": pin_escapes}
-        await _record(
-            store,
-            spec,
-            "path_insecure" if insecure else "path_indeterminate",
-            fingerprint=verdict.fingerprint,
-            enforcing=enforcing,
-            components=[
-                {"path": f.path, "kind": f.kind, "reason": f.reason}
-                for f in _findings(verdict, insecure=insecure)
-            ],
-            **extra,
-        )
-    if shape_error is not None:
-        await _record(store, spec, "pem_refused", fingerprint=verdict.fingerprint)
-    _enforce_verdict(spec, verdict, enforcing=enforcing)
-    if shape_error is not None:
-        raise shape_error
+    except AnchorStoreUnavailable as exc:
+        # The verdict was reached before any store call. An anchor it refuses is refused as one
+        # even when its audit row failed, so a substituted anchor never reads as a store outage.
+        # Only an anchor that passes raises the store fault.
+        store_fault = exc
+    try:
+        _enforce_verdict(spec, verdict, enforcing=enforcing)
+        if shape_error is not None:
+            raise shape_error
+    except TrustAnchorError as refusal:
+        refusal.unaudited = store_fault is not None
+        raise
+    if store_fault is not None:
+        raise store_fault
     return verdict.fingerprint
 
 
@@ -1603,25 +1721,41 @@ async def run_anchor_preflight(
     anchor another principal can replace or whose ACL or path could not be read, unless module item
     6's pin escape applies) it raises :class:`TrustAnchorError` after auditing it, so the caller refuses to start / refuses
     the reload. Otherwise it returns each anchor's fingerprint, keyed by its label."""
-    return {spec.label: await _preflight_one(store, spec, enforcing=enforcing) for spec in specs}
+    seen: dict[str, str] = {}
+    store_fault: AnchorStoreUnavailable | None = None
+    for spec in specs:
+        try:
+            seen[spec.label] = await _preflight_one(store, spec, enforcing=enforcing)
+        except AnchorStoreUnavailable as exc:
+            # Go on: a later anchor the checks refuse must be refused as one (BACKLOG #3091).
+            store_fault = store_fault or exc
+    if store_fault is not None:
+        raise store_fault
+    return seen
 
 
 async def _report_restart_required(
     specs: Sequence[AnchorSpec], store: Store, *, seen: Mapping[str, str]
-) -> None:
+) -> tuple[str, ...]:
     """Log and audit each settings anchor whose bytes on disk differ from the bytes its consumer
-    loaded (:func:`loaded_fingerprint`). An anchor no consumer loaded is skipped: a restart would
-    apply nothing there. The dialling settings CAs of module item 10 are always skipped, since
-    their hops load by path and record no fingerprint.
+    loaded (:func:`loaded_fingerprint`), and return those anchors' setting names, in spec order
+    and once each, for the reload's response (BACKLOG #3015). An anchor no consumer loaded is
+    skipped: a restart would apply nothing there. The dialling settings CAs of module item 10 are
+    always skipped, since their hops load by path and record no fingerprint.
+
+    A name is returned whether or not its audit row was written: the row is advisory, and the
+    restart is needed either way.
 
     The compare is never against the audit chain. The last audited fingerprint moves to the new
     bytes at the first reload that sees them, while the consumers still trust the old bytes. A
     compare with it would go quiet from the second reload on (BACKLOG #2185)."""
+    changed: dict[str, None] = {}  # ordered and once each
     for spec in specs:
         in_use = loaded_fingerprint(spec)
         now = seen[spec.label]
         if in_use is None or in_use == now:
             continue
+        changed[spec.setting] = None
         log.warning(
             "%s: the trust anchor %r changed on disk since the engine loaded it (sha256 %s, was "
             "%s). This reload checked the new file but does not apply it. The engine keeps "
@@ -1631,12 +1765,18 @@ async def _report_restart_required(
             now,
             in_use,
         )
-        await _record(store, spec, "restart_required", fingerprint=now, in_use=in_use)
+        try:
+            await _record(store, spec, "restart_required", fingerprint=now, in_use=in_use)
+        except AnchorStoreUnavailable:
+            # Advisory: the anchors passed, so a lost row does not refuse the reload. The WARNING
+            # above and _store_unavailable's both reached the log (BACKLOG #3091).
+            continue
+    return tuple(changed)
 
 
 def make_settings_anchor_preflight(
     specs: Sequence[AnchorSpec], store: Store, *, enforcing: bool
-) -> Callable[[], Awaitable[None]] | None:
+) -> Callable[[], Awaitable[tuple[str, ...]]] | None:
     """The engine's ``settings_preflight`` for ``serve``: :func:`run_anchor_preflight` over the
     settings anchors (:func:`collect_anchor_specs`), run by the engine on EVERY real reload. That is
     the direct ``/config/reload`` route, a held reload a second approver releases, a cluster
@@ -1647,57 +1787,65 @@ def make_settings_anchor_preflight(
     row. A refusal is re-raised as ``WiringError`` caused by a :class:`TrustAnchorError`, so the reload
     route answers 422 and audits ``reason="trust_anchor"``, as it did when it ran this itself. An
     unreadable anchor (``OSError``, or ``ValueError`` from a NUL in its path) counts as a refused
-    anchor, as it did there.
+    anchor, as it did there, and its text names the setting (BACKLOG #3105, item 6). A store that
+    refuses the audit read or write is not a refused anchor (BACKLOG #3091): it is re-raised as
+    ``WiringError`` caused by :class:`AnchorStoreUnavailable` (:func:`anchor_store_refusal`), which
+    the route audits as ``reason="store_unavailable"``.
 
     **A reload that passes does not apply a changed anchor** (BACKLOG #2185). No reload rebuilds the
     consumers that loaded these files, so each keeps the bytes it read at start. When this
     preflight passes, it warns and audits ``restart_required`` for each anchor whose bytes on disk
-    differ from its consumer's (:func:`loaded_fingerprint`). That repeats on every reload until a
-    restart. The specs are frozen here, pins included, so a reload re-reads the paths and pins the
-    engine started with. The report skips the dialling settings CAs of module item 10."""
+    differ from its consumer's (:func:`loaded_fingerprint`), and returns those anchors' setting
+    names, which the reload's response reports as ``restart_required`` (BACKLOG #3015). That
+    repeats on every reload until a restart. The specs are frozen here, pins included, so a
+    reload re-reads the paths and pins the engine started with. The report skips the dialling
+    settings CAs of module item 10."""
     if not specs:
         return None
     from messagefoundry.config.wiring import WiringError
 
     frozen = tuple(specs)
 
-    async def preflight() -> None:
+    async def preflight() -> tuple[str, ...]:
         try:
+            # An unreadable anchor arrives as a TrustAnchorError naming its setting (_preflight_one).
             seen = await run_anchor_preflight(frozen, store, enforcing=enforcing)
+            return await _report_restart_required(frozen, store, seen=seen)
         except TrustAnchorError as exc:
             raise WiringError(f"a settings trust anchor was refused: {exc}") from exc
-        except (OSError, ValueError) as exc:
-            # An unreadable anchor is a refused anchor, as it was when the reload route ran this.
-            # codec_safe_str: a file that is not UTF-8 arrives here as a ValueError too, and its
-            # own text names the byte (vault BACKLOG #3295).
-            unreadable = TrustAnchorError(
-                f"a trust anchor could not be read: {codec_safe_str(exc)}"
-            )
-            unreadable.__cause__ = exc
-            raise WiringError(f"a settings trust anchor was refused: {unreadable}") from unreadable
-        await _report_restart_required(frozen, store, seen=seen)
+        except AnchorStoreUnavailable as exc:
+            raise anchor_store_refusal(exc) from exc
 
     return preflight
 
 
-async def _preflight_connection(store: Store, spec: AnchorSpec, *, enforcing: bool) -> None:
-    """:func:`_preflight_one` for a connection's CA, with an unreadable file refused by name."""
-    try:
-        await _preflight_one(store, spec, enforcing=enforcing)
-    except OSError as exc:
-        raise _unreadable_anchor(spec, exc) from exc
+def anchor_store_refusal(exc: AnchorStoreUnavailable) -> WiringError:
+    """A trust-anchor check the store stopped, as the ``WiringError`` a reload refuses with
+    (BACKLOG #3091). Its cause is ``exc``, so the reload routes audit
+    ``reason="store_unavailable"`` rather than ``trust_anchor``. Raise it ``from exc``. The
+    settings preflight calls it; the connection checks reach it through
+    :func:`refused_connection_anchor`."""
+    from messagefoundry.config.wiring import WiringError
+
+    error = WiringError(f"a trust anchor could not be checked: {exc}")
+    error.__cause__ = exc
+    return error
 
 
 def refused_connection_anchor(exc: Exception) -> WiringError:
     """A connection CA refusal as the ``WiringError`` a reload answers with 422 (BACKLOG #2183).
 
     Its cause is always a :class:`TrustAnchorError`, so the reload routes audit
-    ``reason="trust_anchor"``. Any other exception, such as an ``OSError`` or a ``ValueError`` for a
-    blank ``tls_ca_pin`` or an ``env()`` path with a NUL in it, is wrapped in one first, keeping its
-    text. Raise it ``from`` its own ``__cause__``, which keeps that chain. Shared by the registry preflight and the
-    runner's reload check of the lane CAs (vault BACKLOG #2371)."""
+    ``reason="trust_anchor"``. Any other exception, such as a ``ValueError`` for a blank
+    ``tls_ca_pin``, is wrapped in one first, keeping its text. The one exception is
+    :class:`AnchorStoreUnavailable`, which is not a refusal: it is answered by
+    :func:`anchor_store_refusal`, so the routes audit ``reason="store_unavailable"`` (BACKLOG
+    #3091). Raise it ``from`` its own ``__cause__``, which keeps that chain. Shared by the registry
+    preflight and the runner's reload check of the lane CAs (vault BACKLOG #2371)."""
     from messagefoundry.config.wiring import WiringError
 
+    if isinstance(exc, AnchorStoreUnavailable):
+        return anchor_store_refusal(exc)
     refused = exc if isinstance(exc, TrustAnchorError) else TrustAnchorError(str(exc))
     if refused is not exc:
         refused.__cause__ = exc
@@ -1723,9 +1871,16 @@ def make_registry_anchor_preflight(store: Store, *, enforcing: bool) -> Registry
     ) -> None:
         try:
             # Inside the try: a blank tls_ca_pin raises ValueError while the specs are collected.
+            # An unreadable CA arrives as a TrustAnchorError naming its setting (_preflight_one).
+            store_fault: AnchorStoreUnavailable | None = None
             for spec in registry_anchor_specs(registry, env_values, lanes=lanes):
-                await _preflight_connection(store, spec, enforcing=enforcing)
-        except (TrustAnchorError, OSError, ValueError) as exc:
+                try:
+                    await _preflight_one(store, spec, enforcing=enforcing)
+                except AnchorStoreUnavailable as fault:
+                    store_fault = store_fault or fault  # go on, as run_anchor_preflight does
+            if store_fault is not None:
+                raise store_fault
+        except (TrustAnchorError, AnchorStoreUnavailable, ValueError) as exc:
             error = refused_connection_anchor(exc)
             raise error from error.__cause__
 
@@ -1754,7 +1909,9 @@ def make_lane_anchor_check(store: Store, *, enforcing: bool) -> LaneAnchorCheck:
 
     It raises :class:`TrustAnchorError` for a refused or unreadable file, and ``ValueError`` for a
     blank or unread ``tls_ca_pin``. Each names the connection. A lane with no CA it reads is a
-    no-op: no store call, no audit row.
+    no-op: no store call, no audit row. A store that refuses the audit read or write raises
+    :class:`AnchorStoreUnavailable`, which is not a refusal and is not remembered below, so the
+    next check reads the file again (BACKLOG #3091).
 
     **A repeat of the last refusal writes no rows.** A scheduled poller retries its bind at every
     window tick, and each audited refusal would add rows. Enough of them would push a quiet
@@ -1781,9 +1938,10 @@ def make_lane_anchor_check(store: Store, *, enforcing: bool) -> LaneAnchorCheck:
             refused[spec.label] = prior
             raise TrustAnchorError(prior[1])
         try:
-            await _preflight_connection(store, spec, enforcing=enforcing)
+            await _preflight_one(store, spec, enforcing=enforcing)
         except TrustAnchorError as exc:
-            refused[spec.label] = (now, str(exc))
+            if not exc.unaudited:  # else re-check, so a recovered store gets the rows
+                refused[spec.label] = (now, str(exc))
             raise
 
     return check

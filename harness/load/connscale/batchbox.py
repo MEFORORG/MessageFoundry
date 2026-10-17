@@ -71,6 +71,52 @@ _STOP_GRACE = 5.0
 _DEFAULT_SINK_PROCS = 6  # the >= 5-6 sink-PROCESS attribution gate
 
 
+# The engine's shipped ``[auth]`` defaults the rig compares against, copied rather than imported,
+# because tests/test_dependency_boundaries.py bans a direct ``messagefoundry.config`` import here
+# without an allow-list entry. (That rule is static: this module still loads engine config
+# transitively, through runner.py.) tests/test_bench_batch_two_box.py pins each copy to the
+# ``AuthSettings`` field default, so a moved engine default fails CI there. A rig run from a checkout
+# whose engine default moved ahead of these copies would compare against the stale copy.
+SHIPPED_MAX_SESSIONS_PER_USER = 5
+SHIPPED_LOGIN_RATE_LIMIT_PER_IP = 10
+SHIPPED_LOGIN_RATE_LIMIT_GLOBAL = 60
+
+#: The ``[auth]`` limits a fleet of rig sign-ins from one address meets, as
+#: ``(env name, shipped default)``.
+_RIG_SIGN_IN_LIMITS = (
+    ("MEFOR_AUTH_MAX_SESSIONS_PER_USER", SHIPPED_MAX_SESSIONS_PER_USER),
+    ("MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP", SHIPPED_LOGIN_RATE_LIMIT_PER_IP),
+    ("MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL", SHIPPED_LOGIN_RATE_LIMIT_GLOBAL),
+)
+
+
+def rig_sign_in_env(procs: int) -> dict[str, str]:
+    """The ``[auth]`` env a cell's engine needs so ``procs`` driver processes can all sign in.
+
+    Each of the driver's ``procs`` ``connscale-remote`` processes signs in for itself as the one rig
+    Administrator, from the one load-gen box address. At least these engine limits meet that fleet:
+
+    * the per-user session cap (``SHIPPED_MAX_SESSIONS_PER_USER``): past it a login ends the
+      user's oldest session, so one process past the cap would end the first one's, which would
+      sign in again and end the next;
+    * the per-address sign-in limit (``SHIPPED_LOGIN_RATE_LIMIT_PER_IP`` attempts per window,
+      successes counted too): every process signs in at the start of the cell, inside one window,
+      so one process past that limit would be refused with HTTP 429 (BACKLOG #2795);
+    * the all-clients sign-in limit (``SHIPPED_LOGIN_RATE_LIMIT_GLOBAL`` per window), met the same
+      way by one process past it.
+
+    Each is raised to the fleet, doubled for a process that signs in again, plus two, and only when
+    that size passes the shipped default, so a small fleet never runs below a stock engine whose
+    defaults match the copies above. The
+    per-address value also sets the engine's per-user credential-ceremony limit and its
+    repeated-credential audit limit, and the all-clients value that audit limit's global ceiling, so
+    those are raised with them. Each process signing in for itself keeps the rig's sessions apart;
+    one session handed to every process would need none of this, and is not what the rig does.
+    """
+    size = 2 * procs + 2
+    return {name: str(size) for name, shipped in _RIG_SIGN_IN_LIMITS if size > shipped}
+
+
 # --- the matrix cell ---------------------------------------------------------
 
 
@@ -572,13 +618,12 @@ async def run_batch_engine(
             install_executor_shim=False,
             db_path=None,  # batch is SQL-Server-scoped: the store comes from MEFOR_STORE_*
         )
-        # RIGS SIGN IN, AND THIS RIG'S DRIVE IS SPLIT OVER PROCESSES. Each of the driver's `procs`
-        # connscale-remote processes holds its own session as the one rig Administrator. The engine
-        # keeps five sessions for a user by default and ends the oldest past that, so a sixth
-        # process would end the first one's session, which would sign in again and end the next.
-        # So the cap is sized to the fleet this cell advertises, doubled for a process that signs
-        # in again. setdefault, so an operator's own value stands.
-        node_env.setdefault("MEFOR_AUTH_MAX_SESSIONS_PER_USER", str(2 * procs + 2))
+        # RIGS SIGN IN, AND THIS RIG'S DRIVE IS SPLIT OVER PROCESSES: the session cap and the
+        # sign-in rate limits are sized to the fleet this cell advertises (rig_sign_in_env says why).
+        # setdefault, so a value the operator's environment already sets stands. A value set only in
+        # a messagefoundry.toml in cwd does not: the engine ranks env above the file.
+        for key, value in rig_sign_in_env(procs).items():
+            node_env.setdefault(key, value)
         node = EngineNode(
             f"batch-{cell.cell_id}", api_port, env=node_env, config_dir=_CONFIG_DIR, cwd=cwd
         )

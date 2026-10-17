@@ -26,6 +26,8 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline import Engine
 from tests._admin_account import create_local_user_chosen
+from tests._operator_audit_atomic_contract import failing_append
+from tests._store_audit import ALERT_AUDIT
 
 PW = "Sup3rSecret!!"
 
@@ -176,7 +178,7 @@ async def test_alerts_active_reflects_open_count(
         for x in (await engine.store.list_active_alert_instances(allowed_channels=None))
         if x.event_type == "queue_buildup"
     ]
-    await engine.store.ack_alert_instance(acked.id, actor="op")
+    await engine.store.ack_alert_instance(acked.id, actor="op", audit=ALERT_AUDIT)
     rows = (await noauth_client.get("/connections")).json()
     src = next(r for r in rows if r["channel_id"] == "IB_A" and r["role"] == "source")
     assert src["alerts_active"] == 1  # acknowledged dropped the badge
@@ -317,3 +319,42 @@ async def test_alerts_ack_resolve_out_of_scope_refused_no_mutation(engine: Engin
         assert (await c.post(f"/alerts/{in_scope.id}/ack", headers=h)).status_code == 200
     ack_rows = [r for r in await engine.store.list_audit(limit=100) if r["action"] == "alert_ack"]
     assert len(ack_rows) == 1
+
+
+# --- vault BACKLOG #3217: the row commits with the change -------------------
+
+
+@pytest.mark.parametrize(
+    ("action", "path", "body"),
+    [
+        ("alert_ack", "ack", None),
+        ("alert_resolve", "resolve", None),
+        ("alert_suspend", "suspend", {"minutes": 30}),
+        ("alert_resume", "resume", None),
+    ],
+)
+async def test_an_alert_mutation_whose_audit_row_fails_changes_nothing(
+    engine: Engine, action: str, path: str, body: dict[str, int] | None
+) -> None:
+    """Before #3217 each route committed the change, then wrote its row in a second transaction,
+    so a failed append kept the change with no row saying who made it. Now the append fails inside
+    the change's own transaction: the route answers 500 and the instance is as it was."""
+    await engine.store.upsert_alert_instance(
+        event_type="connection_error", connection="OB_X", severity="critical", now=100.0
+    )
+    (inst,) = await engine.store.list_active_alert_instances(allowed_channels=None)
+    if path == "resume":  # something to resume
+        await engine.store.suspend_alert_instance(inst.id, until=9e9, audit=ALERT_AUDIT)
+    before = await engine.store.get_alert_instance(inst.id, allowed_channels=None)
+    app = create_app(engine, allow_no_auth=True)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        with failing_append(engine.store, action):
+            r = await c.post(f"/alerts/{inst.id}/{path}", json=body)
+        assert r.status_code == 500
+        assert await engine.store.get_alert_instance(inst.id, allowed_channels=None) == before
+        assert await engine.store.list_audit(action=action) == []
+        # CONTROL: the same request with a healthy append changes the instance and writes the row.
+        assert (await c.post(f"/alerts/{inst.id}/{path}", json=body)).status_code == 200
+    assert await engine.store.get_alert_instance(inst.id, allowed_channels=None) != before
+    assert len(await engine.store.list_audit(action=action)) == 1
