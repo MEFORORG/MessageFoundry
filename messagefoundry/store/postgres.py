@@ -371,6 +371,13 @@ _LOCK_CLASS_OUTBOUND_LANE = 4
 _LOCK_CLASS_ADMIN_GUARD = 5
 _AUDIT_LOCK = "mefor_audit_chain"
 _ADMIN_GUARD_LOCK = "mefor_last_admin"
+#: The ``$n`` twin of the SQLite store's ``_SQL_ADMIN_GUARD_HOLDERS`` (BACKLOG #2592), read by
+#: ``remove_unless_last_admin`` and the first-administrator grant (BACKLOG #3078).
+_PG_SQL_ADMIN_GUARD_HOLDERS: Final = (
+    "SELECT u.id, CASE WHEN u.id = $1 THEN 1 ELSE 0 END AS is_target"
+    " FROM users u JOIN user_roles r ON r.user_id = u.id"
+    " WHERE r.role_id = $2 AND NOT u.disabled"
+)
 
 
 def _audit_write_probe(table: str, privilege: str) -> str:
@@ -9169,11 +9176,8 @@ class PostgresStore:
             if change.takes_role(admin_role_id, role_ids):
                 # Only a change that can empty the set queues on the lock.
                 await self._advisory_lock(conn, _LOCK_CLASS_ADMIN_GUARD, _ADMIN_GUARD_LOCK)
-                # The ``$n`` twin of the SQLite store's _SQL_ADMIN_GUARD_HOLDERS (BACKLOG #2592).
                 rows = await conn.fetch(
-                    "SELECT u.id, CASE WHEN u.id = $1 THEN 1 ELSE 0 END AS is_target"
-                    " FROM users u JOIN user_roles r ON r.user_id = u.id"
-                    " WHERE r.role_id = $2 AND NOT u.disabled",
+                    _PG_SQL_ADMIN_GUARD_HOLDERS,
                     user_id,
                     admin_role_id,
                 )
@@ -9224,9 +9228,7 @@ class PostgresStore:
         async with self._timed_acquire() as conn, conn.transaction():
             await self._advisory_lock(conn, _LOCK_CLASS_ADMIN_GUARD, _ADMIN_GUARD_LOCK)
             rows = await conn.fetch(
-                "SELECT u.id, CASE WHEN u.id = $1 THEN 1 ELSE 0 END AS is_target"
-                " FROM users u JOIN user_roles r ON r.user_id = u.id"
-                " WHERE r.role_id = $2 AND NOT u.disabled",
+                _PG_SQL_ADMIN_GUARD_HOLDERS,
                 user_id,
                 admin_role_id,
             )

@@ -18,11 +18,11 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from messagefoundry.auth.permissions import Role
 from messagefoundry.store.store import AdminGrant
+from tests._last_admin_store_contract import ADMIN, VIEWER, enabled_admins
 
-ADMIN = Role.ADMINISTRATOR.value
-VIEWER = Role.VIEWER.value
+__all__ = ["enabled_admins"]
+
 TOTP_SECRET = "JBSWY3DPEHPK3PXP"
 
 
@@ -59,14 +59,6 @@ async def provisioned_row(store: Any, user_id: str, *, totp: bool) -> str | None
     assert cell is not None
     assert await store.enable_totp(user_id, recovery_code_hashes=[], expected_secret_cell=cell)
     return str(cell)
-
-
-async def enabled_admins(store: Any) -> set[str]:
-    found: set[str] = set()
-    for user in await store.list_users():
-        if not user.disabled and ADMIN in await store.get_user_role_ids(user.id):
-            found.add(user.id)
-    return found
 
 
 async def grant(store: Any, user_id: str, cell: str | None, **overrides: Any) -> AdminGrant:

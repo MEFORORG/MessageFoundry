@@ -30,7 +30,6 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import AuthService, FirstAdministratorRefused
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store import store as store_module
@@ -40,6 +39,7 @@ from tests._first_admin_grant_store_contract import (
     assert_concurrent_grants_leave_one,
     assert_first_admin_grant_contract,
     enabled_admins,
+    grant,
     provisioned_row,
     seed_roles,
 )
@@ -94,12 +94,7 @@ async def test_a_busy_grant_runs_again_rather_than_answering(
         return await real(user_id, change)
 
     monkeypatch.setattr(store, "_write_user", busy_once)
-    result = await store.grant_first_admin_unless_admin_exists(
-        "a",
-        admin_role_id=Role.ADMINISTRATOR.value,
-        expected_password_hash="synthetic-hash-a",
-        expected_totp_secret_cell=None,
-    )
+    result = await grant(store, "a", None)
     assert result is AdminGrant.GRANTED
     assert calls == 2
     assert await enabled_admins(store) == {"a"}
@@ -120,12 +115,7 @@ async def test_a_busy_that_outlasts_the_bound_is_raised_not_read_as_a_refusal(
 
     monkeypatch.setattr(store, "_write_user", always_busy)
     with pytest.raises(sqlite3.OperationalError):
-        await store.grant_first_admin_unless_admin_exists(
-            "a",
-            admin_role_id=Role.ADMINISTRATOR.value,
-            expected_password_hash="synthetic-hash-a",
-            expected_totp_secret_cell=None,
-        )
+        await grant(store, "a", None)
     assert calls == store_module._ADMIN_GRANT_BUSY_ATTEMPTS
     monkeypatch.undo()
     assert await enabled_admins(store) == set()
@@ -145,29 +135,24 @@ async def test_an_error_that_is_not_busy_is_raised_at_once(
 
     monkeypatch.setattr(store, "_write_user", broken)
     with pytest.raises(sqlite3.OperationalError, match="disk I/O"):
-        await store.grant_first_admin_unless_admin_exists(
-            "a",
-            admin_role_id=Role.ADMINISTRATOR.value,
-            expected_password_hash="synthetic-hash-a",
-            expected_totp_secret_cell=None,
-        )
+        await grant(store, "a", None)
     assert calls == 1
 
 
 # --- the provisioning race -------------------------------------------------------------------------
 
 
-async def _unguarded_grant(store: MessageStore) -> Callable[..., Awaitable[AdminGrant]]:
+def _unguarded_grant(store: MessageStore) -> Callable[..., Awaitable[AdminGrant]]:
     """The check-then-write this item removes: the role written with no re-check. The mutation
     control patches it back in."""
 
-    async def grant(
+    async def unguarded(
         user_id: str, *, admin_role_id: str, assigned_by: str | None = None, **_: Any
     ) -> AdminGrant:
         await store.set_user_roles(user_id, [admin_role_id], assigned_by=assigned_by)
         return AdminGrant.GRANTED
 
-    return grant
+    return unguarded
 
 
 def _hold_both_after_the_read(services: list[AuthService], monkeypatch: pytest.MonkeyPatch) -> None:
@@ -324,9 +309,7 @@ async def test_mutation_control_an_unguarded_grant_lets_both_runs_through(
         services = [AuthService(store, AuthSettings()) for _ in range(2)]
         for service in services:
             await service.initialize()
-        monkeypatch.setattr(
-            store, "grant_first_admin_unless_admin_exists", await _unguarded_grant(store)
-        )
+        monkeypatch.setattr(store, "grant_first_admin_unless_admin_exists", _unguarded_grant(store))
         _hold_both_after_the_read(services, monkeypatch)
         outcomes = await asyncio.gather(
             _provision(services[0], "site-admin-one"),
