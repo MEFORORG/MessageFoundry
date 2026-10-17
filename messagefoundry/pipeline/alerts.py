@@ -37,6 +37,7 @@ __all__ = [
     "crl_reload_refused_detail",
     "intake_pause_detail",
     "remote_debug_refused_detail",
+    "sandbox_worker_refused_detail",
 ]
 
 log = logging.getLogger(__name__)
@@ -146,6 +147,28 @@ def remote_debug_refused_detail(*, count: int, total: int) -> str:
         f"refused {count} script(s) another process injected through the interpreter's remote "
         f"debugging ({total} since this process started). None ran. WARNING lines in the engine "
         "log may name the files."
+    )
+
+
+def sandbox_worker_refused_detail(*, content_only: bool) -> str:
+    """The one-line description of a ``sandbox_worker_refused`` alert both sinks show (vault
+    BACKLOG #2724). Fixed words that name the cause and the remedy: never a message body, and not
+    the refusal itself, which the runner logs whole in a WARNING line. The alert instance's reason
+    column keeps only about the first 200 characters, so the cause and the remedy lead."""
+    if content_only:
+        cause = (
+            "A config file changed on disk since the engine loaded it, with no reload. Reload the "
+            "config."
+        )
+    else:
+        cause = (
+            "Most often a config file changed on disk with no reload: reload the config. Or config "
+            "reads a variable the worker lacks: add it to [sandbox].pass_environment and restart."
+        )
+    return (
+        f"{cause} Until then every message on this inbound fails at routing or transform: "
+        'dead-lettered as ERROR under internal_error = "continue", or the inbound stops under '
+        '"stop". A WARNING line in the engine log names what differs.'
     )
 
 
@@ -792,6 +815,23 @@ class AlertSink(Protocol):
         durable record."""
         ...
 
+    # --- vault BACKLOG #2724: a sandbox worker refused for a graph mismatch -------------------
+
+    def sandbox_worker_refused(self, name: str, *, content_only: bool) -> None:
+        """A ``[sandbox].mode = "subprocess"`` worker for inbound ``name`` was refused, because the
+        graph it loaded differs from the one the engine serves (vault BACKLOG #2724, owner ruling
+        2026-10-16: alert, keep dead-letter). ``content_only`` is True when only the config
+        modules' bytes differ: a config file was edited on disk with no reload.
+
+        Raised once per refusal, on the event loop, by the runner: not again for each later
+        message the session refuses from its cached refusal, and not for a refusal computed
+        against a graph a reload has since replaced. A reload makes fresh sessions, so a refusal
+        that outlives the reload raises again. A sink that raises here is logged, not retried. ``name`` is the inbound connection's name.
+        Fixed words only, built by :func:`sandbox_worker_refused_detail`: no message content, no
+        PHI. Not in the control-action set: a restart reloads nothing, so it cannot clear this.
+        Nothing resolves it automatically; an operator resolves the instance after the reload."""
+        ...
+
 
 class LoggingAlertSink:
     """Default :class:`AlertSink`: log each event at ``WARNING``. No PHI — only the connection name
@@ -1249,6 +1289,13 @@ class LoggingAlertSink:
             "ALERT remote_debug_refused: %r %s",
             name,
             remote_debug_refused_detail(count=count, total=total),
+        )
+
+    def sandbox_worker_refused(self, name: str, *, content_only: bool) -> None:
+        log.warning(
+            "ALERT sandbox_worker_refused: inbound %r: %s",
+            name,
+            sandbox_worker_refused_detail(content_only=content_only),
         )
 
 

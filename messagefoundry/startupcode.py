@@ -39,10 +39,11 @@ expected on any install, and a file somebody dropped beside them is not. A ``sit
 BASE interpreter's standard library directory is expected too: some operating-system builds ship
 one, and whoever can write that directory can replace the standard library itself.
 
-**The children's import path is searched too.** The engine hands its Python children the absolute
-entries of ``PYTHONPATH`` (``messagefoundry/childenv.py``), and they are not isolated. So a
-``sitecustomize`` there runs in the sandbox worker and in each engine shard even when the engine
-itself ignores the variable. Those entries are searched beside the engine's own import path.
+**The children's import path is the engine's own.** A Python child of the engine repeats the
+engine's isolation (``messagefoundry/childenv.py``, vault BACKLOG #2701): an isolated engine's
+children are isolated, and an engine that reads ``PYTHONPATH`` has the entries it hands a child on
+its own import path already. So searching the engine's import path covers the sandbox worker's
+and each engine shard's.
 
 **What this is not.** Start-up code runs first. A planted ``.pth`` line runs before any engine
 code, with the engine's rights, and could change what this module reads or skip it. The baseline
@@ -59,8 +60,6 @@ what stops a plant, which is why the third reading exists.
   and nothing for a third-party package.
 * The module a packaging tool's ``.pth`` imports (:data:`_PACKAGING_TOOL_PTH`): only the ``.pth``
   line is compared.
-* A child's user site directory. Outside a virtual environment a child that is not isolated has
-  one, and an isolated engine does not look there.
 * An import-path entry that is an archive. Only directories are checked for write access.
 
 No engine state. The standard library, ``messagefoundry.controlchars`` and, when a file needs a
@@ -72,6 +71,7 @@ from __future__ import annotations
 import ctypes
 import importlib.machinery
 import locale
+import logging
 import os
 import site
 import stat
@@ -96,6 +96,8 @@ __all__ = [
     "startup_posture",
     "startup_refusal",
 ]
+
+log = logging.getLogger(__name__)
 
 #: The interpreter options each shipped service launch passes, ahead of ``-m messagefoundry``.
 #: ``-I`` is isolated mode. ``-X disable-remote-debug`` turns off the remote-debugging interface
@@ -167,9 +169,6 @@ class InterpreterLaunch:
     #: The names from :data:`_CODE_PATH_VARIABLES` that are set to something. Names only, never
     #: values.
     code_path_variables: tuple[str, ...] = ()
-    #: The ones among them a Python child of the engine is handed with something in it. That
-    #: leaves out a ``PYTHONPATH`` with no absolute entry, which the child builders drop.
-    reaching_children: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,13 +228,6 @@ def _unique(paths: list[str]) -> list[str]:
     return out
 
 
-def _inherited_pythonpath() -> list[str]:
-    """The ``PYTHONPATH`` entries the engine hands a Python child: the absolute ones.
-    ``messagefoundry/childenv.py`` drops the rest."""
-    entries = os.environ.get("PYTHONPATH", "").split(os.pathsep)
-    return [entry for entry in entries if os.path.isabs(entry)]
-
-
 def _interpreter_launch() -> InterpreterLaunch:
     """The launch flags of THIS process. It says nothing about any other process."""
     flags = sys.flags
@@ -246,9 +238,6 @@ def _interpreter_launch() -> InterpreterLaunch:
         ignore_environment=bool(flags.ignore_environment),
         no_user_site=bool(flags.no_user_site),
         code_path_variables=present,
-        reaching_children=tuple(
-            name for name in present if name != "PYTHONPATH" or _inherited_pythonpath()
-        ),
     )
 
 
@@ -262,12 +251,10 @@ def _site_dirs() -> list[Path]:
 
 
 def _search_path() -> list[str]:
-    """The import path a customize module is looked for on: this process's, then the absolute
-    ``PYTHONPATH`` entries the engine hands its Python children. A process that reads the
-    variable has them on its own path already. An entry that is not text is left out, as the
-    import system leaves it out."""
-    own = [entry or os.curdir for entry in sys.path if isinstance(entry, str)]
-    return _unique(own + _inherited_pythonpath())
+    """The import path a customize module is looked for on: this process's, which is also its
+    Python children's, as the module docstring says. An entry that is not text is left out, as
+    the import system leaves it out."""
+    return _unique([entry or os.curdir for entry in sys.path if isinstance(entry, str)])
 
 
 def _is_hidden(path: Path) -> bool:
@@ -296,7 +283,14 @@ def _executable_lines(path: Path) -> list[str] | None:
         if path.stat().st_size > _PTH_READ_LIMIT:
             return None
         raw = path.read_bytes()
-    except OSError:
+    except OSError as exc:
+        # The caller lists the file and judges it by its RECORD row alone, so say why it was not
+        # read: a row can match a file whose lines this reading never saw.
+        log.warning(
+            "start-up code inventory: could not read %s: %s",
+            scrub_log_argument(str(path)),
+            scrub_log_argument(str(exc)),
+        )
         return None
     try:
         text = raw.decode("utf-8-sig")
@@ -335,7 +329,14 @@ def _made_by_a_packaging_tool() -> bool:
 def _pth_items(directory: Path) -> list[StartupCodeItem]:
     try:
         names = sorted(name for name in os.listdir(directory) if name.endswith(".pth"))
-    except OSError:
+    except OSError as exc:
+        # No item comes back, which reads the same as a directory with no .pth file, so the
+        # failure is said here or nowhere.
+        log.warning(
+            "start-up code inventory: could not list %s, so its .pth files were not read: %s",
+            scrub_log_argument(str(directory)),
+            scrub_log_argument(str(exc)),
+        )
         return []
     items: list[StartupCodeItem] = []
     for name in names:
@@ -594,21 +595,10 @@ def startup_loosenings(posture: StartupPosture) -> list[tuple[str, str]]:
             (
                 "interpreter_not_isolated",
                 "the engine's interpreter was not started in isolated mode (-I). "
-                f"{reads} {path} The shipped service launches pass -I. An engine shard that "
-                "`supervise` starts is not isolated: the supervisor starts it with -P and hands "
-                "it the variables. Start the engine as "
+                f"{reads} {path} The shipped service launches pass -I. The Python children "
+                "it starts, the sandbox worker and each engine shard under `supervise`, repeat "
+                "its isolation, so they are not isolated either. Start the engine as "
                 f"`python {' '.join(ISOLATED_LAUNCH_OPTIONS)} -m messagefoundry serve ...`",
-            )
-        )
-    if launch.ignore_environment and launch.reaching_children:
-        out.append(
-            (
-                "python_variables_reach_children",
-                f"{'/'.join(launch.reaching_children)} is set in the engine's environment. The "
-                "engine ignores it, but the "
-                "Python children it starts (the sandbox worker, and each engine shard under "
-                "`supervise`) are not isolated and would import from where it points. Remove it "
-                "from the service's environment",
             )
         )
     if posture.unexpected:
