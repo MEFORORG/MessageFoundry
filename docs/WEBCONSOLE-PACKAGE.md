@@ -370,10 +370,11 @@ Option B decouples **development, test, and release**. It does **not** buy deplo
   client-asset CSP change ships package-only.
 - Console-internal changes — presentation, client JS, `app.js` CSP tweaks — ship as a
   **package-only** release. Since BACKLOG #2709 at least these do not: a change that adds a console
-  route or changes a route's gate, and an edit to a console function a gate reaches, such as an
-  `_auth` helper it calls, or to a middleware argument or the WebSocket authorizer. The seam digest
-  records each of those, so the change moves the seam and needs an engine that ships the new
-  value. That is the point: a console released from a tree
+  route or changes a route's gate, and an edit to a console function a gate reaches by plain
+  name, such as an `_auth` helper it calls, or to a middleware argument or the WebSocket
+  authorizer. The seam digest records each of those, so the change moves the seam and needs an
+  engine that ships the new value. A helper reached another way, such as through a module
+  attribute, is not recorded, so an edit to it does not move the seam. That is the point: a console released from a tree
   whose route gates differ in what the digest records pins a different digest, and is refused at
   mount. Section 3 says where the list of what it records, and misses, is kept.
 

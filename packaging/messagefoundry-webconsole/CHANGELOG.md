@@ -86,8 +86,8 @@ this line.**
   records what this console installs: each route's top-level dependencies, gates included, with
   their own source and captured settings, and its mounts, middleware and WebSocket authorizer
   (vault `BACKLOG #2709`). No console route changed, but the supported digest moved. A console
-  release that adds a route, changes a route's gate, or edits a console helper a gate calls now
-  moves the seam too, so it needs an
+  release that adds a route, changes a route's gate, or edits a console helper a gate calls by
+  plain name now moves the seam too, so it needs an
   engine that ships the new value. The released 0.4.0, whose DR routes sit on the session alone,
   passed the handshake of engines from PR 1910 up to engine PR 1940, whose unrelated seam move
   refuses it; this change guards the next gate change that moves nothing else.

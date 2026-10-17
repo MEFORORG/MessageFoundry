@@ -245,6 +245,7 @@ def _auth_service_symbol(obj: Any) -> str:
 #: import cannot follow.
 _CONSOLE_PACKAGE_DIR = _REPO_ROOT / "messagefoundry_webconsole"
 _CONSOLE_PACKAGE = "messagefoundry_webconsole"
+_ENGINE_PACKAGE = "messagefoundry"
 
 #: The ``engine_seam`` the route-gate table mounts the console under. Not a digest, so it can never
 #: equal the seam the table feeds; the console is told to accept it for the mount alone.
@@ -312,6 +313,8 @@ def repo_console() -> Iterator[types.ModuleType]:
                     del sys.modules[name]
         else:
             if imported:
+                # Replaced, not merged, so no submodule of an earlier tree outlives its package.
+                _REPO_CONSOLE_MODULES.clear()
                 _REPO_CONSOLE_MODULES.update(ours)
             for name in ours:
                 del sys.modules[name]
@@ -367,16 +370,27 @@ def _normalized_source(fn: Any) -> str:
     source rather than bytecode, which changes with the Python version. A lambda's source is the
     physical line holding it, which may not parse alone; that falls back to the stripped text.
 
-    Read from the function a decorator wrapped, as ``inspect.getsource`` does. Cached by the
-    IDENTITY of that function's code object, never by equality: equal code objects can belong to
-    different functions, since equality ignores the file name and annotations, and every
-    ``functools.wraps`` wrapper of one decorator shares one code object. Every route's gate built
-    by one factory shares that factory's code object, which is what the cache saves."""
-    target = inspect.unwrap(fn)
-    code = target.__code__
+    A ``functools.wraps`` wrapper contributes its own body and the body of every function under it
+    (``_layers``), so a check added to or dropped from either moves the digest. Each body is read
+    from its code object, which ``inspect.getsource`` does not unwrap, and cached by the IDENTITY
+    of that code object, never by equality: equal code objects can belong to different functions,
+    since equality ignores the file name and annotations. Every route's gate built by one factory
+    shares that factory's code object, which is what the cache saves."""
+    return "\n".join(_code_source(layer.__code__) for layer in _layers(fn))
+
+
+def _layers(fn: Any) -> list[Any]:
+    """``fn``, then each function a ``functools.wraps`` chain under it wraps, outermost first."""
+    chain = [fn]
+    while inspect.isfunction(getattr(chain[-1], "__wrapped__", None)):
+        chain.append(chain[-1].__wrapped__)
+    return chain
+
+
+def _code_source(code: types.CodeType) -> str:
     cached = _NORMALIZED_SOURCE.get(id(code))
     if cached is None or cached[0] is not code:
-        cached = _NORMALIZED_SOURCE[id(code)] = (code, _normalize(target))
+        cached = _NORMALIZED_SOURCE[id(code)] = (code, _normalize(code))
     return cached[1]
 
 
@@ -384,8 +398,8 @@ def _normalized_source(fn: Any) -> str:
 _NORMALIZED_SOURCE: dict[int, tuple[types.CodeType, str]] = {}
 
 
-def _normalize(fn: Any) -> str:
-    source = textwrap.dedent(inspect.getsource(fn))
+def _normalize(code: types.CodeType) -> str:
+    source = textwrap.dedent(inspect.getsource(code))
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -424,20 +438,25 @@ def _console_helpers(fn: Any, found: dict[str, Any]) -> None:
     rather than captures, so the gate's own source does not carry them. A console function is
     followed, and its source hashed. An engine function is recorded by its qualified name only,
     as ``None``: its body is the engine's to version, but which engine function a console name is
-    bound to is the console's choice, so a rebinding moves the digest."""
-    target = inspect.unwrap(fn)
-    for name in sorted(_code_names(target.__code__)):
-        value = target.__globals__.get(name)
-        if not inspect.isfunction(value):
-            continue
-        key = _qualified(value)
-        if key in found:
-            continue
-        if value.__module__.partition(".")[0] != _CONSOLE_PACKAGE:
-            found[key] = None
-            continue
-        found[key] = value
-        _console_helpers(value, found)
+    bound to is the console's choice, so a rebinding moves the digest. A function from any other
+    package, the standard library or a dependency, is skipped: its qualified name can differ by
+    platform (``ntpath`` against ``posixpath``) or by dependency release, and the engine pins
+    neither. Every layer of a ``functools.wraps`` chain is read, so a helper the wrapper calls is
+    collected as well as the wrapped function's."""
+    for layer in _layers(fn):
+        for name in sorted(_code_names(layer.__code__)):
+            value = layer.__globals__.get(name)
+            if not inspect.isfunction(value):
+                continue
+            key = _qualified(value)
+            if key in found:
+                continue
+            package = value.__module__.partition(".")[0]
+            if package == _ENGINE_PACKAGE:
+                found[key] = None
+            elif package == _CONSOLE_PACKAGE:
+                found[key] = value
+                _console_helpers(value, found)
 
 
 def _render_value(owner: str, var: str, value: Any, known: dict[int, str], seen: set[int]) -> str:
@@ -531,8 +550,9 @@ def console_route_gates() -> list[tuple[str, str]]:
     It covers at least these, and misses at least these. Covered: each route's path, method and
     order; each top-level dependency's name, normalized source, defaults and captured values,
     recursively through captured functions; the source of each console function it, or a console
-    function it reaches, calls through a plain global name, at any nesting depth; the qualified
-    name of each engine function reached the same way; each mount's application class; each
+    function it reaches, calls through a plain global name, at any nesting depth and in every
+    layer of a ``functools.wraps`` chain; the qualified name of each engine function reached the
+    same way; each mount's application class; each
     middleware class with its arguments; each ``app.state`` slot named for an authorizer, rendered
     the same way, and the type of every other hook. Missed: an engine function's body, which the
     engine versions; module-level data a gate reads, such as a constant or a registry; a method of
@@ -581,9 +601,10 @@ def _route_gate_rows(console: Any) -> list[tuple[str, str]]:
     known[id(deps)] = "deps"
     app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
     # Mounted under a fixed sentinel the console is told to accept for the duration, never under
-    # its own pin, so the table cannot depend on the seam it feeds.
+    # its own pin, so the table cannot depend on the seam it feeds. Added to the pin rather than
+    # replacing it, so the console still accepts its own seam meanwhile.
     pinned = console.SUPPORTED_ENGINE_SEAMS
-    console.SUPPORTED_ENGINE_SEAMS = frozenset({_MOUNT_SEAM})
+    console.SUPPORTED_ENGINE_SEAMS = pinned | {_MOUNT_SEAM}
     try:
         console.mount_ui(app, deps)
     finally:
