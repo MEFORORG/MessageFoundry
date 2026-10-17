@@ -13739,8 +13739,8 @@ class AuthService:
         :meth:`_record_suspicious_login` for the two 6.3.5 events.
 
         Returns ``True`` only when the notifier took the event without raising (BACKLOG #2019) and
-        said it took it: the shipped notifier answers ``False`` for an event it dropped for want of
-        an address or of room on its queue (vault BACKLOG #3120). So a caller that audits the outcome
+        said it took it: the shipped notifier answers ``False`` for an event it dropped, for the
+        reasons the ``SecurityNotifier`` contract lists (vault BACKLOG #3120). So a caller that audits the outcome
         can record what happened. That is a hand-off, not a delivery: a send that fails later, on
         the notifier's own task, is not reported back. Most callers ignore it.
 

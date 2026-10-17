@@ -127,10 +127,11 @@ SUSPICIOUS_LOGIN_FAILURE_THRESHOLD = 3
 #: one, so a line per undelivered lock notice told that reader which candidate was right.
 #:
 #: Only ``ACCOUNT_LOCKED`` carries that bit. Every other kind is sent on an authenticated action, a
-#: completed sign-in, or a clock, so it keeps its per-event line (BACKLOG #1139). A lock notice with
-#: no relay, no address or no room on the notifier's queue is still recorded where only an
-#: administrator reads it, as ``mailed: false`` on the ``auth.lock_notice`` row (vault BACKLOG #3120
-#: for the full queue). A full queue or a failed send is also recorded on its own
+#: completed sign-in, or a clock, so it keeps its per-event line (BACKLOG #1139). A lock notice the
+#: notifier did not take, for at least no relay, no address, no room on its queue or a notifier
+#: closing at shutdown, is still recorded where only an administrator reads it, as
+#: ``mailed: false`` on the ``auth.lock_notice`` row (vault BACKLOG #3120 for the last two). A full
+#: queue, a closing notifier or a failed send is also recorded on its own
 #: ``auth.lock_notice_undelivered`` row (BACKLOG #2383). A failed send happens after the
 #: ``auth.lock_notice`` row is written at the hand-off, so that row still reads ``mailed: true``; the
 #: residual is stated in ``docs/SECURITY.md``. An instance with no relay at all is reported at startup by

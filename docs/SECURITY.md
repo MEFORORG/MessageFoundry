@@ -5444,7 +5444,7 @@ and header are that route's.
   relay (`mailed: false`, `reason: no_notifier`) and no address (`mailed: false`) are on the
   `auth.lock_notice` row. A full queue and a failed send are on an `auth.lock_notice_undelivered`
   row (BACKLOG #2383), and a full queue also reads `mailed: false` on the `auth.lock_notice` row
-  (vault BACKLOG #3120). A relay that is down still shows, on every other notice kind. An instance with no relay at all is reported at
+  (vault BACKLOG #3120). So does a notice the relay refused because it had begun to close. A relay that is down still shows, on every other notice kind. An instance with no relay at all is reported at
   startup by the serve gate, except under `[security].enforcement = "warn"` with
   `[alerts].security_notifications_required = false`. Every other notice kind keeps its per-event
   line (BACKLOG #1139); none of them fires on a refused sign-in. The list is
@@ -5496,22 +5496,25 @@ stays broken, or recovers and breaks again, is reported only by that first line.
 **A notice the relay loses is audited (BACKLOG #2383).** The `auth.lock_notice` row is written
 when the notice is handed to the relay. It reads `mailed: true` only when the relay queued the
 notice: one its full queue dropped, or one it refused because it had begun to close, reads
-`mailed: false`, so the next lock of the kind mails again (vault BACKLOG #3120). When the relay's queue is full, or the
-send fails, the engine writes one more row, with the notice's recipient as the actor. A lock
+`mailed: false`, so the next lock of the kind mails again (vault BACKLOG #3120). When the relay's queue is full, the relay refuses the notice because it has
+begun to close, or the send fails, the engine writes one more row, with the notice's recipient as
+the actor. A lock
 notice writes `auth.lock_notice_undelivered`, hidden as above. Every other notice kind writes
 `auth.security_notice_undelivered`, which every `audit:read` reader sees. The detail names the
-notice kind and the `reason`, `queue_full` or `send_failed`. An issuer's reminder also names the
+notice kind and the `reason`, `queue_full`, `closing` or `send_failed`. An issuer's reminder also names the
 holder. The row never carries the address, the rest of the notice's detail, or the error. The
 source of record is `SecurityEventNotifier._record_undelivered` in
 `messagefoundry/pipeline/security_notify.py`. **Still open, at least:**
 
 - At shutdown the notifier closes while the store is still open (BACKLOG #3191), so a send that
-  fails in its final drain is recorded. That close is one bounded step of the shutdown, and a
-  notice still queued when the step is cut is neither sent nor recorded. A lock notice among them
-  keeps its `auth.lock_notice` row reading `mailed: true`.
-- A notice that reaches the notifier once it has begun to close is refused, and the notifier
-  writes no undelivered row for it. A lock notice's `auth.lock_notice` row reads `mailed: false`
-  instead.
+  fails in its final drain is recorded. That close is one bounded step of the shutdown. When the
+  step is cut, a notice still queued is neither sent nor recorded, and a send already under way
+  may still go out or fail unrecorded. A lock notice among them keeps its `auth.lock_notice` row
+  reading `mailed: true`, so the throttle holds back that account's next lock notice of the kind
+  for the rest of its 24 hours.
+- A notice that reaches the notifier once it has begun to close is refused and recorded with
+  `reason: closing`. The close waits only for records started before it finishes. One started
+  later can meet the closed store, and is then lost like any failed record write.
 - An offline command such as `provision-admin` wires no audit writer, so it records nothing.
 - Under a long overload only 64 queue-full records are written at a time, and drops past that are
   not recorded.

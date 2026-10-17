@@ -822,15 +822,23 @@ async def test_a_notice_dropped_on_a_full_queue_does_not_hold_the_next_one_back(
 async def test_the_shipped_notifier_queues_nothing_once_it_has_closed() -> None:
     """Vault BACKLOG #3120: after ``aclose`` nothing drains the queue, so an event ``notify`` put
     there would never be sent. It answers ``False`` instead. The control is the same call on the
-    same notifier before it closed, which answers ``True``."""
+    same notifier before it closed, which answers ``True``. A fresh ``start`` takes events again."""
     relay = _relay()
     relay.start()
-    assert await relay.notify(SecurityEvent(ACCOUNT_LOCKED, username="a", email="a@x.test"))
-    relay._queue.get_nowait()  # never sent: the drain loop has not run yet
-    await relay.aclose()
+    try:
+        assert await relay.notify(SecurityEvent(ACCOUNT_LOCKED, username="a", email="a@x.test"))
+        relay._queue.get_nowait()  # never sent: the drain loop has not run yet
+    finally:
+        await relay.aclose()
     late = SecurityEvent(ACCOUNT_LOCKED, username="b", email="b@x.test")
     assert await relay.notify(late) is False
     assert relay._queue.qsize() == 0, "the late event was queued where nothing reads it"
+    relay.start()
+    try:
+        assert await relay.notify(late) is True, "a notifier started again refused an event"
+        relay._queue.get_nowait()
+    finally:
+        await relay.aclose()
 
 
 async def test_the_shipped_notifier_queues_nothing_while_it_closes(
@@ -852,30 +860,43 @@ async def test_the_shipped_notifier_queues_nothing_while_it_closes(
     # Room behind the stop sentinel, so a full queue cannot be what refuses the late event.
     relay._queue = asyncio.Queue(maxsize=8)
     relay.start()
-    assert await relay.notify(SecurityEvent(PASSWORD_CHANGED, username="a", email="a@x.test"))
-    assert await asyncio.to_thread(started.wait, _STALL_SECONDS), "the first send never started"
-    closing = asyncio.create_task(relay.aclose())
+    closing: asyncio.Task[None] | None = None
     try:
+        assert await relay.notify(SecurityEvent(PASSWORD_CHANGED, username="a", email="a@x.test"))
+        assert await asyncio.to_thread(started.wait, _STALL_SECONDS), "the send never started"
+        closing = asyncio.create_task(relay.aclose())
         await asyncio.sleep(0)  # aclose has begun and is waiting on the drain
         late = SecurityEvent(PASSWORD_CHANGED, username="b", email="b@x.test")
         assert await relay.notify(late) is False
     finally:
         release.set()
-        await closing
+        await (closing if closing is not None else relay.aclose())
     assert sent == [["a@x.test"]], "the event taken before the close was not sent"
 
 
-async def test_a_lock_notice_raised_after_the_relay_closed_records_mailed_false() -> None:
+async def test_a_lock_notice_raised_after_the_relay_closed_records_mailed_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Vault BACKLOG #3120. At shutdown the teardown can cut the lock-notice drain before it cancels
     a pending notice, which then runs on and reaches the security notifier after that has closed.
     The notifier used to take it and answer ``True``, so the row read ``mailed: true`` for a mail
     that is never sent, and the throttle held the account's next notice of the kind back for a day.
-    The row now reads ``mailed: false``, so that next lock mails again.
+    The row now reads ``mailed: false``, so that next lock mails again, and the relay records the
+    drop with ``reason: closing``.
 
-    The control is a second account's lock, before the close, whose row reads ``mailed: true``."""
+    The relay is started and its drain loop runs, as at a real shutdown. The control is a second
+    account's lock before the close, whose notice is sent and whose row reads ``mailed: true``."""
+    sent: list[list[str]] = []
+    monkeypatch.setattr(
+        "messagefoundry.pipeline.security_notify.send_plain_email",
+        lambda **kw: sent.append(kw["recipients"]),
+    )
     store, service, _fake, user = await _harness()
-    relay = _relay(store)
+    relay = SecurityEventNotifier(
+        host="smtp.example.test", port=25, sender="mf@example.test", audit=store
+    )
     service.attach_security_notifier(relay)
+    relay.start()
     try:
         other_id = uuid4().hex
         await store.create_user(
@@ -891,15 +912,20 @@ async def test_a_lock_notice_raised_after_the_relay_closed_records_mailed_false(
         await service.drain_background()
         before = await _lock_notice_rows(store, other_user.username)
         assert [json.loads(r["detail"])["mailed"] for r in before] == [True]
-        relay._queue.get_nowait()  # room again, so only the close can refuse the next one
 
         await relay.aclose()
+        assert sent == [["other@example.org"]], "the control's notice was not sent"
         await service._record_lock(user, "sign_in", _lock(1), client=None)
         await service.drain_background()
         rows = await _lock_notice_rows(store, user.username)
         assert [json.loads(r["detail"]) for r in rows] == [{"lock": "sign_in", "mailed": False}]
         assert relay._queue.qsize() == 0, "the late notice was queued where nothing reads it"
+        await asyncio.gather(*relay._recording)
+        dropped = await store.list_audit(actor=user.username, action=_LOCK_NOTICE_UNDELIVERED)
+        assert [json.loads(r["detail"])["reason"] for r in dropped] == ["closing"]
+        assert sent == [["other@example.org"]], "a mail went out after the close"
     finally:
+        await relay.aclose()
         await _close(store, service)
 
 
