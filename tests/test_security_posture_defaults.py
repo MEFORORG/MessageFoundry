@@ -1552,6 +1552,9 @@ def test_the_trust_every_peer_check_reads_entries_with_the_load_s_own_parser() -
     assert _classify_proxy_entries(["fe80::%eth0/64", "fd00::/8"]) == ([], ["fd00::/8"])
 
 
+_MAPPED_BLOCK = ipaddress.ip_network("::ffff:0:0/96")
+
+
 def test_a_mapped_entry_counts_as_the_ipv4_range_it_names() -> None:
     """BACKLOG #3042: a mapped entry loads, and uvicorn is handed both spellings of it, so it trusts
     the IPv4 hosts it names. ``::ffff:0:0/96`` is the whole IPv4 family, and so is a mapped half
@@ -1568,6 +1571,10 @@ def test_a_mapped_entry_counts_as_the_ipv4_range_it_names() -> None:
     # named once, as the whole family; one beside it is still a range.
     assert _classify_proxy_entries(["::/80", "fd00::/8"]) == (["::/80"], ["fd00::/8"])
     assert _classify_proxy_entries(["::fffe:0:0/95"]) == (["::fffe:0:0/95"], [])
+    # The IPv6 rest of ::/0 beside the mapped block still covers every IPv6 address.
+    rest = [str(n) for n in ipaddress.ip_network("::/0").address_exclude(_MAPPED_BLOCK)]
+    whole, ranges = _classify_proxy_entries([*rest, str(_MAPPED_BLOCK)])
+    assert ranges == [] and len(whole) == len(rest) + 1
     # Control: a narrow mapped range is a range, and a mapped host is neither.
     assert _classify_proxy_entries(["::ffff:10.0.0.0/120", "::ffff:10.0.0.1"]) == (
         [],

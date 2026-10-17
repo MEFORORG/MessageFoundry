@@ -4,8 +4,9 @@
   uvicorn ignores a network's zone, so a zoned network is refused too. uvicorn compares a mapped
   `X-Forwarded-For` hop such as `::ffff:10.0.0.1` only with a mapped entry, so behind a dual-stack
   proxy that writes mapped hops the entry `10.0.0.1` would have resolved the client to that hop
-  rather than to the real client. The engine now hands uvicorn each IPv4 entry in both its plain
-  and IPv4-mapped spellings; the `trusted_proxies` row of `docs/CONFIGURATION.md` says how.
+  rather than to the real client. The engine now hands uvicorn each IPv4 entry, and each mapped
+  entry, in both its plain and IPv4-mapped spellings, so `::ffff:0:0/96` also trusts every plain
+  IPv4 peer; the `trusted_proxies` row of `docs/CONFIGURATION.md` says how.
   `MEFOR_API_TRUSTED_PROXIES`
   and `MEFOR_API_WS_ALLOWED_ORIGINS` now split on `,` on every platform, as
   `MEFOR_SECURITY_ALLOWED_CLIENT_NETWORKS` does. They split on the path separator before, `:` on

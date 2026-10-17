@@ -1327,24 +1327,30 @@ def _ipv4_meaning(
 ) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
     """``network`` as the IPv4 range it names when it sits inside the mapped block, else itself, so
     ``::ffff:0:0/96`` counts as the whole IPv4 family it trusts (BACKLOG #3042)."""
-    # The integers, not ``subnet_of``, which compares a zone and would miss a zoned network.
-    if isinstance(network, ipaddress.IPv6Network) and network.prefixlen >= _IPV4_MAPPED.prefixlen:
-        start = int(network.network_address)
-        if start >> 32 == _IPV4_MAPPED_BASE >> 32:
-            return ipaddress.IPv4Network(
-                (start & 0xFFFF_FFFF, network.prefixlen - _IPV4_MAPPED.prefixlen)
-            )
+    # Every caller passes a zoneless network: a zoned entry is refused, or stripped of its zone.
+    if isinstance(network, ipaddress.IPv6Network) and network.subnet_of(_IPV4_MAPPED):
+        return ipaddress.IPv4Network(
+            (int(network.network_address) & 0xFFFF_FFFF, network.prefixlen - _IPV4_MAPPED.prefixlen)
+        )
     return network
+
+
+def _trusts_every_ipv4_host(network: ipaddress.IPv4Network | ipaddress.IPv6Network) -> bool:
+    """Whether ``network`` trusts every IPv4 host in some spelling: ``0.0.0.0/0``, or an IPv6 range
+    holding the whole mapped block, such as ``::ffff:0:0/96``, ``::/80`` or ``::/0``, which trusts
+    the mapped hop of every IPv4 host (BACKLOG #3042)."""
+    if isinstance(network, ipaddress.IPv4Network):
+        return network.prefixlen == 0
+    return _IPV4_MAPPED.subnet_of(network)
 
 
 def _span_wording(network: ipaddress.IPv4Network | ipaddress.IPv6Network) -> str:
     """How a refusal names a range it will not recommend: every host inside a trusted range may set
     its own source address, and a whole family is what the refused ``'*'`` trusts."""
-    meaning = _ipv4_meaning(network)
-    if meaning.prefixlen == 0:
+    if network.prefixlen == 0 or _trusts_every_ipv4_host(network):
+        family = "IPv6" if network.prefixlen == 0 and network.version == 6 else "IPv4"
         return (
-            f"It spans '{network}', which would trust every IPv{meaning.version} peer, as the "
-            "refused '*' does."
+            f"It spans '{network}', which would trust every {family} peer, as the refused '*' does."
         )
     return (
         f"It spans the network '{network}'. Trust that range only if every host in it is a "
@@ -1362,8 +1368,9 @@ def _as_matched(parsed: _TrustedProxy) -> _TrustedProxy:
 def _parse_trusted_proxy(entry: str) -> _TrustedProxy:
     """Read one ``[api].trusted_proxies`` entry the way uvicorn's ``_TrustedHosts`` does (``uvicorn``
     is pinned exactly in ``pyproject.toml``), and refuse the forms known to load there and match
-    other than as written. It is the one reader of the list: the load check, the allow-list pin check and the
-    loosening check all call it, so the three cannot disagree (BACKLOG #3042).
+    other than as written. It is the one reader of the list: at least the load check, the
+    allow-list pin check, the loosening check and :func:`uvicorn_trusted_hosts` call it, so they
+    cannot disagree (BACKLOG #3042).
 
     uvicorn parses an entry holding "/" with a STRICT ``ip_network`` and any other with
     ``ip_address``. Whatever fails either becomes a literal that matches no peer, which would
@@ -1437,8 +1444,11 @@ def uvicorn_trusted_hosts(entries: Sequence[str]) -> list[str]:
     uvicorn's ``_TrustedHosts`` compares an ``ip_address`` with each entry and never normalises a
     mapped one, so ``::ffff:10.0.0.1`` misses the entry ``10.0.0.1`` and the reverse. That check
     runs on the socket peer and on every ``X-Forwarded-For`` hop, and a dual-stack inner proxy
-    writes its hop mapped. Both spellings name the same hosts, so the second widens nothing. Every
-    entry must already have loaded: one :func:`_parse_trusted_proxy` refuses raises ``ValueError``."""
+    writes its hop mapped. Both spellings name the same hosts, so the second trusts no host the
+    first did not name; it does trust that host in its other spelling, so a mapped entry's plain
+    twin also trusts it as a plain IPv4 socket peer, and ``::ffff:0:0/96`` gains ``0.0.0.0/0``.
+    Every entry must already have loaded: one :func:`_parse_trusted_proxy` refuses raises
+    ``ValueError``."""
     parsed = [_parse_trusted_proxy(entry) for entry in entries]
     seen = set(parsed)
     out = list(entries)
@@ -8019,14 +8029,16 @@ def _classify_proxy_entries(entries: Sequence[str]) -> tuple[list[str], list[str
             continue
         # A host counts toward its family's collapse as its single-address network, and a mapped
         # entry toward IPv4's, so ``::ffff:0:0/96`` is named as the whole family it trusts.
-        net = _ipv4_meaning(ipaddress.ip_network(parsed))
+        # A mapped entry also stays in IPv6's collapse, since uvicorn holds it as an IPv6 network.
+        net = ipaddress.ip_network(parsed)
+        meaning = _ipv4_meaning(net)
         if isinstance(net, ipaddress.IPv4Network):
             v4.append((entry, net))
         else:
             v6.append((entry, net))
-            if net.prefixlen < _IPV4_MAPPED.prefixlen and int(net.network_address) == (
-                _IPV4_MAPPED_BASE & int(net.netmask)
-            ):
+            if isinstance(meaning, ipaddress.IPv4Network):
+                v4.append((entry, meaning))
+            elif _trusts_every_ipv4_host(net):
                 # A wider IPv6 range holding the whole mapped block, such as ``::/80``, trusts the
                 # mapped hop of every IPv4 host, so it counts as the whole IPv4 family as well.
                 v4.append((entry, ipaddress.IPv4Network("0.0.0.0/0")))

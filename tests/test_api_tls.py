@@ -891,6 +891,8 @@ def test_trusted_proxies_accepts_the_neighbouring_forms_that_match(entry: str, p
     ("entry", "address", "spans"),
     [
         ("fe80::1%eth0/64", "fe80::1", "It spans the network 'fe80::/64'"),
+        ("::1/80", "::1", "It spans '::/80', which would trust every IPv4 peer"),
+        ("::1/0", "::1", "It spans '::/0', which would trust every IPv6 peer"),
         ("::ffff:10.0.0.1/120", "::ffff:10.0.0.1", "It spans the network '::ffff:10.0.0.0/120'"),
         (
             "::ffff:10.0.0.1/96",
