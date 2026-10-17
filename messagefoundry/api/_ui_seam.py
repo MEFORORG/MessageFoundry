@@ -438,12 +438,18 @@ from typing import Any
 #: is no longer recorded, since a standard-library name can differ by platform. The digest moved
 #: from the merged value 6d97ea22c90b73a4.
 #:
+#: Vault BACKLOG #2709 merged with BACKLOG #3029: each moved the digest on its own (#2709 to
+#: 0b41a33c5d9e66b8, #3029 to b86ce593ab8a43a4 on main). #3029 added no entry here; its move is
+#: ``AuthService.logout`` returning ``LogoutOutcome`` where it returned ``None``. The console
+#: ignores that return value, so no call breaks in either skew direction. The value below was
+#: re-derived with ``--write`` on the merged tree, so it covers both.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "0b41a33c5d9e66b8"
+ENGINE_UI_SEAM: str = "344979df3bd2c662"
 
 
 @dataclass(frozen=True, slots=True)
