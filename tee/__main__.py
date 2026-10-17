@@ -487,9 +487,10 @@ def _write_owner_only(path: str, text: str) -> None:
     Windows, and the dataset is JSONL that the harness corpus reads back line by line.
 
     The report is written to a NEW file that ``mkstemp`` creates exclusively at 0600 in the same
-    directory, flushed to disk, then renamed over ``path``. A regular file already at ``path``, or a
-    link, is replaced rather than written into, so neither its owner nor its mode carries over, and
-    a reader holding the old file open keeps the old contents. A failed write leaves no temp file.
+    directory, flushed to disk, then renamed over ``path``. On POSIX a regular file already at
+    ``path``, or a link, is replaced rather than written into, so neither its owner nor its mode
+    carries over, and a reader holding the old file open keeps the old contents. A failed write
+    leaves no temp file. Windows writes an existing regular file in place instead; see below.
 
     One exception: a stream the caller named on purpose, such as ``/dev/stdout`` or a shell's
     ``>(...)``, is written through, since replacing it would break it and nothing is created there.
@@ -497,12 +498,19 @@ def _write_owner_only(path: str, text: str) -> None:
     file falls to the replace.
 
     Windows has no POSIX mode, and the tee imports nothing from ``messagefoundry``, so the engine's
-    ``restricted_file`` is out of reach: there the file takes its directory's access list, the
-    stance :mod:`tee.store` takes for the capture DB.
+    ``restricted_file`` is out of reach. A NEW file there takes its directory's access list, the
+    stance :mod:`tee.store` takes for the capture DB. An existing regular file is instead written in
+    place, so an access list an operator set on it is kept: a file renamed over it would take the
+    folder's list, and a hardened export or dataset in a looser folder would lose its hardening.
+    That write is not atomic, so a failure part way leaves the file truncated or partly written;
+    the command still prints its error line and exits 1. :func:`_write_in_place_on_windows` says
+    which files fall to the replace instead.
     """
     if _is_named_stream(path):
         with open(path, "w", encoding="utf-8", newline="\n") as stream:
             stream.write(text)
+        return
+    if os.name == "nt" and _write_in_place_on_windows(path, text):
         return
     target = Path(path)
     fd, temp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
@@ -520,6 +528,33 @@ def _write_owner_only(path: str, text: str) -> None:
     except BaseException:
         Path(temp).unlink(missing_ok=True)
         raise
+
+
+def _write_in_place_on_windows(path: str, text: str) -> bool:
+    """Write ``text`` into the existing regular file at ``path``, keeping its access list.
+
+    ``False``, having written nothing, when ``path`` is missing, is not a regular file, is a reparse
+    point (a symlink or a junction), or has a second hard link; the caller then replaces it. The
+    file is opened without truncating and checked against the name's ``lstat`` before a byte is
+    written, so a name swapped for a link in between is refused rather than followed.
+    """
+    try:
+        named = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    reparse = getattr(named, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    if not stat.S_ISREG(named.st_mode) or reparse or named.st_nlink != 1:
+        return False
+    fd = os.open(path, os.O_WRONLY | getattr(os, "O_BINARY", 0))
+    with os.fdopen(fd, "wb") as handle:
+        opened = os.fstat(handle.fileno())
+        if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino) or opened.st_nlink != 1:
+            raise OSError(f"{path} changed while it was being opened; nothing was written")
+        handle.truncate(0)
+        handle.write(text.encode("utf-8"))
+        handle.flush()
+        os.fsync(handle.fileno())
+    return True
 
 
 def _is_named_stream(path: str) -> bool:

@@ -7,9 +7,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import functools
 import json
 import os
 import stat
+import subprocess
 import sys
 import time
 from collections.abc import Iterator
@@ -450,3 +452,73 @@ def test_out_that_cannot_be_written_is_an_error_line(
     assert _write_out(command, tmp_path, monkeypatch, out) == 1
     assert f"error: could not write the {what}" in capsys.readouterr().err
     assert not out.parent.exists()
+
+
+# --- a hardened --out target keeps its access list on Windows (vault BACKLOG #3166) ---------------
+
+_WINDOWS_ACLS = pytest.mark.skipif(sys.platform != "win32", reason="Windows access lists")
+
+
+def _win_run(exe: str, *args: str) -> str:
+    """Run a System32 tool by its pinned path, never a search-path lookup (BACKLOG #1680)."""
+    from messagefoundry.service_status import _system_exe
+
+    done = subprocess.run(
+        [_system_exe(exe), *args], capture_output=True, text=True, check=True, encoding="mbcs"
+    )
+    return done.stdout
+
+
+@functools.cache
+def _own_sid() -> str:
+    line = _win_run("whoami.exe", "/user", "/fo", "csv", "/nh").strip()
+    return line.rsplit(",", 1)[1].strip().strip('"')
+
+
+def _sddl_of(path: Path, scratch: Path) -> str:
+    """The DACL of ``path`` as SDDL, read by ``icacls /save``, which does not depend on the
+    display language the way icacls's printed listing does."""
+    scratch.mkdir(exist_ok=True)
+    saved = scratch / f"acl-{path.name}.txt"
+    _win_run("icacls.exe", str(path), "/save", str(saved))
+    text = saved.read_bytes().decode("utf-16-le").lstrip("\ufeff")
+    return [line for line in text.splitlines() if line.strip()][1]
+
+
+@_WINDOWS_ACLS
+@pytest.mark.parametrize("command", _OUT_COMMANDS)
+def test_out_keeps_the_access_list_of_a_hardened_target_on_windows(
+    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A file renamed over the target would take the folder's inherited access list, so an export
+    # or dataset an operator had hardened would lose that hardening in a looser folder.
+    scratch = tmp_path / "acl"
+    out = tmp_path / "out.json"
+    out.write_text("stale\n", encoding="utf-8")
+    _win_run("icacls.exe", str(out), "/inheritance:r", "/grant:r", f"*{_own_sid()}:F")
+    hardened = _sddl_of(out, scratch)
+    sibling = tmp_path / "fresh.json"
+    sibling.write_text("x\n", encoding="utf-8")
+    # Control: the hardening really differs from what a new file in this folder gets.
+    assert hardened != _sddl_of(sibling, scratch)
+    assert _write_out(command, tmp_path, monkeypatch, out) == 0
+    assert _sddl_of(out, scratch) == hardened
+    data = out.read_bytes()
+    assert b"stale" not in data
+    assert data.endswith(b"}\n")
+    assert b"\r\n" not in data
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+@_WINDOWS_ACLS
+def test_out_replaces_a_second_hard_link_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Writing in place through a name with a second link would also rewrite the other name.
+    other = tmp_path / "elsewhere.json"
+    other.write_text("untouched\n", encoding="utf-8")
+    out = tmp_path / "out.json"
+    os.link(other, out)
+    assert _export_to(tmp_path, out) == 0
+    assert other.read_text(encoding="utf-8") == "untouched\n"
+    assert b"untouched" not in out.read_bytes()
