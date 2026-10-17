@@ -435,7 +435,7 @@ async def test_an_enrolment_on_a_session_that_owes_no_factor_is_not_floored(
         await store.close()
 
 
-async def test_a_passkey_registration_just_inside_the_floor_is_refused_and_keeps_its_ceremony(
+async def test_a_pending_sessions_passkey_registration_is_refused_for_its_factor_not_its_timing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pytest.importorskip("webauthn")
@@ -444,9 +444,10 @@ async def test_a_passkey_registration_just_inside_the_floor_is_refused_and_keeps
     from tests._soft_webauthn import SoftAuthenticator
 
     rp, origin = "t", "http://t"
-    # An account with TOTP, signed in again, so its session OWES the factor. The service floor is
-    # tested on this state directly; the routes refuse to begin a registration here until the TOTP
-    # is proven, so the directory test below is the case a route can reach.
+    # An account with TOTP, signed in again, so its session OWES the factor. The routes refuse to
+    # begin a registration here until the TOTP is proven, and the finish refuses it too (BACKLOG
+    # #3014), BEFORE the floor: inside the floor it answers as it would outside it, so the answer
+    # does not tell the caller which side it is on. The directory test below is the floor's case.
     store, service, token, _code, minted = await _pending_totp_session(monkeypatch)
     try:
         pending = await store.get_session(hash_token(token))
@@ -463,27 +464,18 @@ async def test_a_passkey_registration_just_inside_the_floor_is_refused_and_keeps
             base64url_to_bytes(options["challenge"]), transports=["usb"]
         )
 
-        now = [minted + MFA_FLOOR - 0.001]
-        _fake_service_wall_clock(monkeypatch, now)
-        early = await service.finish_webauthn_registration(
-            identity, response, label="key", token=token, rp_id=rp, origin=origin
-        )
+        _fake_service_wall_clock(monkeypatch, [minted + MFA_FLOOR - 0.001])
+        with pytest.raises(ValueError, match="already has a second factor"):
+            await service.finish_webauthn_registration(
+                identity, response, label="key", token=token, rp_id=rp, origin=origin
+            )
 
-        assert early == Elevation()
         assert not await service.mfa_satisfied(token)
-        failed = await _audit_rows(store, "auth.webauthn_failed")
-        assert _reasons(failed) == [TOO_EARLY] and _phases(failed) == ["enroll"]
+        assert await _audit_rows(store, "auth.webauthn_failed") == []  # no too_early row
+        assert len(await _audit_rows(store, "auth.mfa_denied")) == 1
         assert await store.list_webauthn_credentials(identity.user_id) == []
         user = await store.get_user(identity.user_id)
         assert user is not None and user.second_step_failed_attempts == 0, "it charged the lockout"
-
-        # CONTROL: the refusal left the ceremony in flight, so the SAME response is served now.
-        now[0] = minted + MFA_FLOOR + 0.001
-        served = await service.finish_webauthn_registration(
-            identity, response, label="key", token=token, rp_id=rp, origin=origin
-        )
-        assert served.ok and served.token is not None
-        assert await service.mfa_satisfied(served.token)
     finally:
         await store.close()
 
