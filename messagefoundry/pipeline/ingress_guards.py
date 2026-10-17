@@ -66,6 +66,7 @@ from messagefoundry.parsing.peek import (
     enforce_size_limits,
 )
 from messagefoundry.parsing.sniff import _content_matches_declared, text_sniff_head
+from messagefoundry.parsing.split import _holds_more_than_one_message
 from messagefoundry.parsing.validate import validate
 from messagefoundry.redaction import safe_exc
 
@@ -411,24 +412,6 @@ class IngressMultipleMessagesRejected(IngressBodyRejected):
 
     def __init__(self) -> None:
         super().__init__(MULTIPLE_MESSAGES_REJECTED_REASON)
-
-
-#: The first character the parser keeps: it strips the whitespace around a body before it reads it.
-_FIRST_KEPT = re.compile(r"\S")
-
-
-def _holds_more_than_one_message(text: str) -> bool:
-    """Whether ``text`` holds more than one ``MSH`` segment, by the parser's own reading: it strips
-    the whitespace around the body, then treats every line whose first three characters are ``MSH``
-    as a header. C-level scans and no copy. The boundary is the one ``split_batch`` splits on
-    (``_MSH_BOUNDARY`` in ``parsing/split.py``), so a File source hands this guard one message at a
-    time; keep the two in step."""
-    first = _FIRST_KEPT.search(text)
-    if first is None:
-        return False
-    start = first.start()
-    later = text.count("\rMSH", start)
-    return later > 1 or (later == 1 and text.startswith("MSH", start))
 
 
 def decode_body(raw: str | bytes, ic: InboundConnection, *, encoding: str) -> str:
