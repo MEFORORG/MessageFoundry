@@ -120,7 +120,9 @@ _LEDGER_STRAGGLER_MAX_SECONDS = 60.0
 
 # How long :meth:`UploadStore.drain_stragglers` waits at shutdown for the calls and save-time sweeps
 # a cancelled save left running, then how long it waits for the ones it cancels (vault BACKLOG
-# #3180). Both are short: they share NSSM's 15 s graceful-stop window with the other drains.
+# #3180). Both are short, and together they stay inside the retention runner's 5 s stop
+# (``_DEFAULT_STOP_TIMEOUT_SECONDS``), which the managed lifespan runs beside this drain, so the drain
+# adds nothing to NSSM's 15 s graceful-stop window. A test pins that they fit.
 _STRAGGLER_DRAIN_SECONDS = 2.0
 _STRAGGLER_CANCEL_GRACE_SECONDS = 1.0
 
@@ -625,8 +627,9 @@ class UploadStore:
         # cancelled upload stopped waiting for (#2261), held until they finish: the loop holds a
         # Task only weakly. See _hold.
         self._stragglers: set[asyncio.Future[Any]] = set()
-        # Set by drain_stragglers, so a ledger call it cancels spawns no late release (#3180).
-        self._draining = False
+        # The tasks drain_stragglers cancelled and that have not ended yet. A reserve among them
+        # spawns no late release (#3180): the store is about to close.
+        self._drain_cancelled: set[asyncio.Future[Any]] = set()
         # Live saves' reservation heartbeats (BACKLOG #2648), held for the same reason. Each ends
         # once its save sets the stop Event. See _start_heartbeat.
         self._heartbeats: set[asyncio.Future[None]] = set()
@@ -1108,8 +1111,9 @@ class UploadStore:
         in-process check raises, so the API's 409 + ``upload.reject_quota`` audit is unchanged; the
         message differs on purpose, so an operator can tell the two causes apart. A ledger error is
         NOT swallowed: the store being unreachable fails the upload closed. It may have committed
-        before it raised, so a release of the reservation by its id is started before the error
-        propagates (vault BACKLOG #3180). Nothing waits for it.
+        before it raised, so the reservation is released by its id, and that release is awaited
+        before the error propagates, for at most ``_LEDGER_CANCEL_WAIT_SECONDS`` (vault BACKLOG
+        #3180).
 
         **This is not the quota decision (BACKLOG #1941).** ``save`` makes that after reserving, from
         a read of the ledger plus a fresh disk scan; :class:`UploadQuotaError` says why the order
@@ -1162,10 +1166,14 @@ class UploadStore:
             raise
         except Exception:
             # Its outcome is unknown, and a release by id pays back exactly what it took, if
-            # anything. Started, not awaited: a failing store would otherwise make this error path
-            # wait out a second store call while every queued save waits on _quota_lock, and an
-            # unpaid slot only makes the quota stricter until it goes stale.
-            self._release_later(reservation, uploader_id)
+            # anything. Awaited, under _quota_lock, before the error propagates: a release that was
+            # only started let an immediate retry in this process reserve while its own orphan row
+            # was still counted, and be refused at the quota edge as "another engine shard". The
+            # wait is bounded, so a stalled store cannot hold the lock and every queued save. The
+            # release never raises a ledger error, so the reserve's error is what propagates.
+            release = self._release_later(reservation, uploader_id)
+            if release is not None:
+                await asyncio.wait((release,), timeout=_LEDGER_CANCEL_WAIT_SECONDS)
             raise
         if not ok:
             raise self._shard_refusal(
@@ -1255,31 +1263,34 @@ class UploadStore:
             if what != "reserve":
                 _log_release_cancelled(done, uploader_id)
             elif self._reserve_may_hold_a_slot(done, uploader_id):
-                self._release_later(reservation, uploader_id)
+                if done not in self._drain_cancelled:
+                    self._release_later(reservation, uploader_id)
+                else:
+                    # The drain cancelled it because the store is about to close, so nothing new
+                    # starts against it; the slot is reclaimed once it goes stale.
+                    _log.warning(
+                        "shutdown: a slot the cross-shard upload reserve for %s may have taken is "
+                        "not released; it is reclaimed once it goes stale",
+                        uploader_id,
+                    )
 
         self._hold(fut, _done, cap=_LEDGER_STRAGGLER_MAX_SECONDS)
 
-    def _release_later(self, reservation: str, uploader_id: str) -> None:
-        """Start a release of ``reservation`` that nobody waits for, held for at most
-        ``_LEDGER_STRAGGLER_MAX_SECONDS`` (vault BACKLOG #3180). The held task is the store call
-        itself, so the cap or the shutdown drain cancels the call, not a wrapper that would absorb
-        the cancellation. While the store is draining it starts nothing: the store is about to
-        close, and the slot is reclaimed once it goes stale."""
+    def _release_later(self, reservation: str, uploader_id: str) -> asyncio.Future[None] | None:
+        """Start a release of ``reservation``, held for at most ``_LEDGER_STRAGGLER_MAX_SECONDS``
+        (vault BACKLOG #3180), and return it, or ``None`` with no ledger. The held task is the
+        store call itself, so the cap or the shutdown drain cancels the call, not a wrapper that
+        would absorb the cancellation. A caller may wait on it; nothing has to."""
         ledger = self._ledger
         if ledger is None:
-            return
-        if self._draining:
-            _log.warning(
-                "shutdown: a slot the cross-shard upload reserve for %s may have taken is not "
-                "released; it is reclaimed once it goes stale",
-                uploader_id,
-            )
-            return
+            return None
+        release = asyncio.ensure_future(_release_reservation(ledger, reservation, uploader_id))
         self._hold(
-            asyncio.ensure_future(_release_reservation(ledger, reservation, uploader_id)),
+            release,
             functools.partial(_log_release_cancelled, uploader_id=uploader_id),
             cap=_LEDGER_STRAGGLER_MAX_SECONDS,
         )
+        return release
 
     def _hold(
         self,
@@ -1314,38 +1325,40 @@ class UploadStore:
         #3180): the ledger calls, the late releases they spawn, and the save-time sweeps. The
         lifespan calls it before ``engine.stop()``.
 
-        It waits up to ``timeout``, then cancels what is left, live saves' heartbeats included, and
-        waits up to ``grace`` for those to end. A reserve it cancels spawns no release, so nothing
-        new starts against a store about to close; a slot it may have taken goes stale. A sweep it
+        It waits up to ``timeout``. A reserve that finishes inside that wait still starts its
+        release, and the wait covers that release too. Then it cancels what is left, live saves'
+        heartbeats included, and waits up to ``grace`` for those to end. A reserve it cancelled
+        spawns no release when it ends, however long past ``grace`` that is, so nothing new starts
+        against a store about to close; a slot it may have taken goes stale. Only those reserves
+        are refused, so a lifespan that runs again on this store releases normally. A sweep it
         cancels logs each file it removed with no row, as a shutdown cancel always has."""
-        self._draining = True
-        try:
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + timeout
-            while self._stragglers and (remaining := deadline - loop.time()) > 0:
-                await asyncio.wait(set(self._stragglers), timeout=remaining)
-            left = set(self._stragglers) | set(self._heartbeats)
-            if not left:
-                return
-            if self._stragglers:
-                _log.warning(
-                    "shutdown: cancelling %d upload ledger call(s) or save-time sweep(s) still "
-                    "running after %gs",
-                    len(self._stragglers),
-                    timeout,
-                )
-            for task in left:
-                task.cancel()
-            _done, stuck = await asyncio.wait(left, timeout=grace)
-            if stuck:
-                _log.error(
-                    "shutdown: %d cancelled upload task(s) had not finished after %gs",
-                    len(stuck),
-                    grace,
-                )
-        finally:
-            # An app whose lifespan runs again on this store releases normally again.
-            self._draining = False
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while self._stragglers and (remaining := deadline - loop.time()) > 0:
+            await asyncio.wait(set(self._stragglers), timeout=remaining)
+        left = set(self._stragglers) | set(self._heartbeats)
+        if not left:
+            return
+        if self._stragglers:
+            _log.warning(
+                "shutdown: cancelling %d upload ledger call(s) or save-time sweep(s) still "
+                "running after %gs",
+                len(self._stragglers),
+                timeout,
+            )
+        # Each discard is registered after the task's own callbacks, so a reserve's done callback
+        # still finds it here and starts no release.
+        for task in left:
+            self._drain_cancelled.add(task)
+            task.add_done_callback(self._drain_cancelled.discard)
+            task.cancel()
+        _done, stuck = await asyncio.wait(left, timeout=grace)
+        if stuck:
+            _log.error(
+                "shutdown: %d cancelled upload task(s) had not finished after %gs",
+                len(stuck),
+                grace,
+            )
 
     def _shard_refusal(
         self, *, uploader: str, observed_files: int, observed_bytes: int

@@ -58,6 +58,26 @@ async def _settled(store: UploadStore, seconds: float = 10.0) -> bool:
     return False
 
 
+class _PassThrough:
+    """The real SQLite ledger, call for call. A test subclasses it and overrides the one call it
+    changes."""
+
+    def __init__(self, store: MessageStore) -> None:
+        self.store = store
+
+    async def reserve_upload_quota(self, *args: Any, **kwargs: Any) -> bool:
+        return await self.store.reserve_upload_quota(*args, **kwargs)
+
+    async def release_upload_quota(self, reservation_id: str) -> None:
+        await self.store.release_upload_quota(reservation_id)
+
+    async def touch_upload_quota(self, reservation_id: str) -> None:
+        await self.store.touch_upload_quota(reservation_id)
+
+    async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
+        return await self.store.upload_quota_in_flight(uploader_id)
+
+
 async def test_a_reserve_that_raises_after_its_commit_is_released_by_its_id(
     tmp_path: Path, ledger_db: MessageStore
 ) -> None:
@@ -65,24 +85,15 @@ async def test_a_reserve_that_raises_after_its_commit_is_released_by_its_id(
     paid back by its id first. Red before #3180: the release could only subtract counts, which
     might have been a sibling's, so nothing was paid back and ``(1, 2)`` stayed in flight."""
 
-    class _CommitThenFail:
+    class _CommitThenFail(_PassThrough):
         async def reserve_upload_quota(self, *args: Any, **kwargs: Any) -> bool:
-            await ledger_db.reserve_upload_quota(*args, **kwargs)
+            await self.store.reserve_upload_quota(*args, **kwargs)
             raise ConnectionError("lost after the commit")
 
-        async def release_upload_quota(self, reservation_id: str) -> None:
-            await ledger_db.release_upload_quota(reservation_id)
-
-        async def touch_upload_quota(self, reservation_id: str) -> None:
-            await ledger_db.touch_upload_quota(reservation_id)
-
-        async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
-            return await ledger_db.upload_quota_in_flight(uploader_id)
-
-    store = _uploads(tmp_path, _CommitThenFail())
+    store = _uploads(tmp_path, _CommitThenFail(ledger_db))
     with pytest.raises(ConnectionError):
         await store.save(data=b"x\n", filename="a.txt", uploader="op", uploader_id="u-op")
-    assert await _settled(store), "the release by id never finished"
+    assert not store._stragglers, "the release by id was not awaited"
     assert await ledger_db.upload_quota_in_flight("u-op") == (0, 0)
     assert not (tmp_path / "uploads").exists() or not list((tmp_path / "uploads").iterdir())
 
@@ -92,7 +103,9 @@ async def test_a_late_release_is_cancelled_at_its_cap_rather_than_absorbed(
 ) -> None:
     """The cap must reach the store call itself. A held wrapper that waited on the call absorbed
     the cancellation for ``_LEDGER_CANCEL_WAIT_SECONDS`` and then held the call again under a fresh
-    cap (found in code review), so a stalled release outlived its cap several times over."""
+    cap (found in code review), so a stalled release outlived its cap several times over. The save
+    waits for the release only up to ``_LEDGER_CANCEL_WAIT_SECONDS``, then fails as it would."""
+    monkeypatch.setattr(uploads_mod, "_LEDGER_CANCEL_WAIT_SECONDS", 0.05)
     monkeypatch.setattr(uploads_mod, "_LEDGER_STRAGGLER_MAX_SECONDS", 0.2)
 
     class _ReserveFailsReleaseStalls:
@@ -261,3 +274,168 @@ async def test_the_managed_teardown_drains_the_upload_stragglers_before_the_engi
         if real_stop and "stop" not in calls:
             await real_stop[0]()
     assert calls == ["uploads", "stop"]
+
+
+async def test_a_retry_right_after_a_failed_reserve_is_not_refused_for_its_own_orphan(
+    tmp_path: Path, ledger_db: MessageStore
+) -> None:
+    """The release after a reserve that raised is awaited before the error propagates. Red when
+    it was only started: an immediate retry in the same process reserved while the first save's
+    orphan row was still counted, and was refused at the quota edge as another engine shard's
+    upload."""
+    calls = {"reserve": 0}
+
+    class _FirstReserveCommitsThenFails(_PassThrough):
+        async def reserve_upload_quota(self, *args: Any, **kwargs: Any) -> bool:
+            calls["reserve"] += 1
+            applied = await self.store.reserve_upload_quota(*args, **kwargs)
+            if calls["reserve"] == 1:
+                raise ConnectionError("lost after the commit")
+            return applied
+
+        async def release_upload_quota(self, reservation_id: str) -> None:
+            await asyncio.sleep(0.05)  # a release slower than the retry's reserve
+            await self.store.release_upload_quota(reservation_id)
+
+    store = _uploads(tmp_path, _FirstReserveCommitsThenFails(ledger_db), max_files=1)
+    with pytest.raises(ConnectionError):
+        await store.save(data=b"x\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    meta = await store.save(data=b"y\n", filename="b.txt", uploader="op", uploader_id="u-op")
+    assert meta.filename == "b.txt"
+    assert await ledger_db.upload_quota_in_flight("u-op") == (0, 0)
+
+
+async def test_a_reserve_that_finishes_inside_the_drain_still_pays_its_slot_back(
+    tmp_path: Path, ledger_db: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review round two: the drain refused every late release from its first line, so a reserve
+    that finished while the drain was still waiting for it kept its slot until it went stale. Only
+    what the drain cancels is refused a release now."""
+    monkeypatch.setattr(uploads_mod, "_LEDGER_CANCEL_WAIT_SECONDS", 0.05)
+    ledger = _GatedLedger(ledger_db, hold="reserve")
+    store = _uploads(tmp_path, ledger)
+    save = asyncio.create_task(
+        store.save(data=b"x\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    )
+    await asyncio.wait_for(ledger.at_gate.wait(), 10)
+    save.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(save, 10)
+    assert await ledger_db.upload_quota_in_flight("u-op") == (1, 2)  # the control
+    drain = asyncio.create_task(store.drain_stragglers(timeout=10.0, grace=1.0))
+    await asyncio.sleep(0.05)  # the drain is waiting on the stalled reserve
+    ledger.gate.set()
+    await asyncio.wait_for(drain, 10)
+    assert not store._stragglers
+    assert await ledger_db.upload_quota_in_flight("u-op") == (0, 0)
+    assert not store._drain_cancelled
+
+
+async def test_a_straggler_that_ends_after_the_drain_returned_starts_no_release(
+    tmp_path: Path, ledger_db: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review round two: the drain cleared its flag as it returned, so a reserve that outlived the
+    grace and ended later started a release against a store being closed. A reserve the drain
+    cancelled is now refused its release whenever it ends, and then forgotten."""
+    monkeypatch.setattr(uploads_mod, "_LEDGER_CANCEL_WAIT_SECONDS", 0.05)
+    at_gate, finish = asyncio.Event(), asyncio.Event()
+    released: list[str] = []
+
+    class _ReserveOutlivesItsCancel(_PassThrough):
+        async def reserve_upload_quota(self, *args: Any, **kwargs: Any) -> bool:
+            applied = await self.store.reserve_upload_quota(*args, **kwargs)
+            at_gate.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await finish.wait()  # a driver still unwinding past the drain's grace
+                raise
+            return applied
+
+        async def release_upload_quota(self, reservation_id: str) -> None:
+            released.append(reservation_id)
+            await self.store.release_upload_quota(reservation_id)
+
+    store = _uploads(tmp_path, _ReserveOutlivesItsCancel(ledger_db))
+    save = asyncio.create_task(
+        store.save(data=b"x\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    )
+    await asyncio.wait_for(at_gate.wait(), 10)
+    save.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(save, 10)
+    await store.drain_stragglers(timeout=0.05, grace=0.05)
+    assert store._stragglers, "the control: the reserve outlived the grace"
+    finish.set()
+    assert await _settled(store), "the reserve never ended"
+    await asyncio.sleep(0)
+    assert released == [], "a release started after the drain returned"
+    assert await ledger_db.upload_quota_in_flight("u-op") == (1, 2)
+    assert not store._drain_cancelled, "the drain still holds a task that ended"
+
+
+def test_the_straggler_drain_fits_inside_the_retention_runner_stop() -> None:
+    """The managed lifespan runs the two side by side, so the drain adds nothing to NSSM's 15 s
+    graceful-stop window only while its two bounds fit inside the runner's (review round two)."""
+    assert (
+        uploads_mod._STRAGGLER_DRAIN_SECONDS + uploads_mod._STRAGGLER_CANCEL_GRACE_SECONDS
+        <= uploads_mod._DEFAULT_STOP_TIMEOUT_SECONDS
+    )
+
+
+async def test_the_managed_teardown_drains_beside_the_retention_runner_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run in turn, the drain's bounds added to the runner's in the shutdown budget. The fake stop
+    waits for the drain to begin, so a sequential teardown would time out here."""
+    from messagefoundry.api import create_managed_app
+
+    drain_started = asyncio.Event()
+    calls: list[str] = []
+
+    async def _stop(self: Any) -> None:
+        calls.append("runner")
+        await asyncio.wait_for(drain_started.wait(), 5)
+
+    monkeypatch.setattr(uploads_mod.UploadRetentionRunner, "stop", _stop)
+    app = create_managed_app(
+        store_settings=StoreSettings(
+            path=str(tmp_path / "managed.db"),
+            uploads_dir=str(tmp_path / "uploads"),
+            max_upload_bytes=4096,
+        ),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    async with app.router.lifespan_context(app):
+
+        async def _drain(*_args: Any, **_kwargs: Any) -> None:
+            drain_started.set()
+            calls.append("uploads")
+
+        app.state.upload_store.drain_stragglers = _drain
+    assert sorted(calls) == ["runner", "uploads"]
+
+
+async def test_the_old_per_uploader_ledger_table_is_dropped_at_open(tmp_path: Path) -> None:
+    """The ``upload_quota`` table the reservations replaced is dropped, not left beside them."""
+    import sqlite3
+
+    db = tmp_path / "legacy.db"
+    await (await MessageStore.open(db)).close()
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "CREATE TABLE upload_quota (uploader_id TEXT PRIMARY KEY, inflight_files INTEGER,"
+            " inflight_bytes INTEGER, since REAL)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    await (await MessageStore.open(db)).close()
+    conn = sqlite3.connect(db)
+    try:
+        names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        conn.close()
+    assert "upload_reservation" in names
+    assert "upload_quota" not in names

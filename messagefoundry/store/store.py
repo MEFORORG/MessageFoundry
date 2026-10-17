@@ -6821,6 +6821,8 @@ CREATE TABLE IF NOT EXISTS transit_bound_attestation (
 -- heartbeat (BACKLOG #2648). A reservation idle that long is a leak, from a killed process or a
 -- release that never landed, and the uploader's next reserve deletes it. No PHI: two ids, a size
 -- and a timestamp.
+-- The table this one replaced held one row per uploader (vault BACKLOG #3180). Nothing reads it.
+DROP TABLE IF EXISTS upload_quota;
 CREATE TABLE IF NOT EXISTS upload_reservation (
     reservation_id TEXT PRIMARY KEY,
     uploader_id    TEXT NOT NULL,

@@ -1124,6 +1124,19 @@ async def _drain_upload_stragglers(app: FastAPI) -> None:
         _log.exception("uploads: the shutdown drain failed; continuing the teardown")
 
 
+async def _stop_upload_background(app: FastAPI, runner: UploadRetentionRunner | None) -> None:
+    """Stop the upload retention runner and drain the upload stragglers side by side (vault
+    BACKLOG #3180). The two are independent, and run in turn their bounds added the drain's 3 s
+    to NSSM's 15 s graceful-stop window; side by side they take the runner's 5 s. Neither raises
+    into the teardown, and the drain is awaited even if the runner's stop is cut short."""
+    drain = asyncio.ensure_future(_drain_upload_stragglers(app))
+    try:
+        if runner is not None:
+            await runner.stop()
+    finally:
+        await drain
+
+
 @asynccontextmanager
 async def _embedded_approvals_lifespan(app: FastAPI) -> AsyncIterator[None]:
     """The lifespan :func:`create_app` gives an app built around a caller's engine.
@@ -10673,9 +10686,7 @@ def create_managed_app(
             for task in background:
                 task.cancel()
             try:
-                if upload_retention_runner is not None:
-                    await upload_retention_runner.stop()
-                await _drain_upload_stragglers(app)
+                await _stop_upload_background(app, upload_retention_runner)
                 # gather(return_exceptions): absorbs both our cancellation AND any exception a
                 # previously-died task stored, so it can't skip the steps below (review M-33).
                 await asyncio.gather(*background, return_exceptions=True)

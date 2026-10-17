@@ -929,6 +929,13 @@ def _rcsi_remedy(database: str | None) -> str:
     )
 
 
+def _upload_quota_lock(uploader_id: str) -> str:
+    """The applock the reserve and the release of one uploader's reservations both take (vault
+    BACKLOG #3180). One spelling, because the release's lock order holds only while the names
+    match."""
+    return f"mefor:upload_quota:{uploader_id}"
+
+
 def _applock_timeout_ms(command_timeout: int) -> int:
     """``@LockTimeout`` (ms) for :data:`_SQL_APPLOCK`: ``command_timeout*1000`` when set, else ``-1``
     (wait forever, the pyodbc query timeout backstops). ``0`` -> ``-1`` is why the SYNC handoff pool
@@ -2136,6 +2143,9 @@ _SCHEMA: list[str] = [
     # backends a real sharded deployment runs (`require_unified_store` makes a server DB mandatory
     # past one shard). No PHI (two ids, a size and a timestamp). BIN2 collation matches the other
     # id-keyed tables.
+    # The table this one replaced held one row per uploader (vault BACKLOG #3180). Nothing reads
+    # it. In _SCHEMA, so the drop moves _schema_hash() and a provisioning run carries it too.
+    """IF OBJECT_ID('upload_quota','U') IS NOT NULL DROP TABLE upload_quota""",
     """IF OBJECT_ID('upload_reservation','U') IS NULL CREATE TABLE upload_reservation (
         reservation_id NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL PRIMARY KEY,
         uploader_id NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
@@ -12131,7 +12141,7 @@ class SqlServerStore:
                         (uploader_id,),
                     )
                     await cur.fetchall()
-                    await self._applock(cur, f"mefor:upload_quota:{uploader_id}")
+                    await self._applock(cur, _upload_quota_lock(uploader_id))
                     await cur.execute(
                         "DELETE FROM upload_reservation WHERE uploader_id = ? AND since <= ?",
                         (uploader_id, stale),
@@ -12166,10 +12176,38 @@ class SqlServerStore:
         return row is not None
 
     async def release_upload_quota(self, reservation_id: str) -> None:
-        """See :meth:`messagefoundry.store.base.Store.release_upload_quota`."""
-        await self._execute(
-            "DELETE FROM upload_reservation WHERE reservation_id = ?", (reservation_id,)
-        )
+        """See :meth:`messagefoundry.store.base.Store.release_upload_quota`.
+
+        **It takes the uploader's applock before it deletes, as the reserve does (vault BACKLOG
+        #3180).** A bare delete by the key locked the clustered row and then the uploader index
+        entry. The reserve's stale delete reaches the same row through the uploader index, so it
+        locks the index entry first and then the clustered row. A release racing the reserve that
+        sweeps its own stale row could therefore deadlock it. Under the applock the two cannot
+        hold row locks at once, since each takes the applock before any row lock.
+
+        The uploader is read first under ``READCOMMITTEDLOCK``, which waits out a reserve still
+        committing this row rather than reading past it under RCSI, and holds its shared lock only
+        for the read. Nothing to release commits the empty transaction and returns."""
+        async with self._acquire() as conn:
+            try:
+                async with self._cursor(conn) as cur:
+                    await cur.execute(
+                        "SELECT uploader_id FROM upload_reservation WITH (READCOMMITTEDLOCK)"
+                        " WHERE reservation_id = ?",
+                        (reservation_id,),
+                    )
+                    row = await cur.fetchone()
+                    if row is not None:
+                        await self._applock(cur, _upload_quota_lock(str(row[0])))
+                        await cur.execute(
+                            "DELETE FROM upload_reservation WHERE reservation_id = ?",
+                            (reservation_id,),
+                        )
+                    await self._commit(conn)
+            except Exception:
+                # The transaction may hold the applock; after the cursor closes, as the reserve.
+                await self._rollback_or_discard(conn)
+                raise
 
     async def touch_upload_quota(self, reservation_id: str) -> None:
         """See :meth:`messagefoundry.store.base.Store.touch_upload_quota`."""
