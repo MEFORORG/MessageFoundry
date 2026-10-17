@@ -343,7 +343,12 @@ async def test_an_unknown_grant_outcome_is_refused_and_shows_no_recovery_codes(
         pytest.raises(FirstAdministratorRefused, match="unexpected outcome"),
     ):
         await _provision(service, "site-admin")
-    assert any(r.levelname == "ERROR" for r in caplog.records)
+    assert any(
+        r.levelname == "ERROR"
+        and r.name == "messagefoundry.auth.service"
+        and "unexpected outcome" in r.getMessage()
+        for r in caplog.records
+    )
     assert await _provisioned_rows(store) == []
     assert await enabled_admins(store) == set()
 

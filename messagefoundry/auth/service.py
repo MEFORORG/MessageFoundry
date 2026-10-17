@@ -3265,8 +3265,9 @@ class AuthService:
         # was never told. An earlier slot would tell them of a takeover that a later refusal leaves
         # unfinished. A refusal above, on the repair branch, has still cleared their factors and
         # sessions and tells nobody; that predates #2915 and is shipped open.
-        # BACKLOG #3078 adds ONE refusal after this slot: the guarded grant below, which a race can
-        # refuse. On the repair branch that refusal leaves the notice sent and the address replaced,
+        # BACKLOG #3078 adds at least two refusals after this slot: the guarded grant below, which a
+        # race can refuse, and its fail-closed refusal of an unexpected outcome. On the repair
+        # branch either refusal leaves the notice sent and the address replaced,
         # as the crash #2915 names does, and a re-run then reads the operator's address as the
         # earlier holder's. It is shipped open: the grant has to stay last (see there).
         # Two at-least-once costs remain, and no state records a sent notice. A crash between this
@@ -3339,17 +3340,25 @@ class AuthService:
         if grant is not AdminGrant.GRANTED:
             # Fail closed: only GRANTED is success. Any other value -- an outcome added later, or a
             # store answering out of contract -- is refused, so no recovery codes are shown and no
-            # provisioned row claims an Administrator this run cannot confirm.
+            # provisioned row is written. Such a store MAY still have written the role, so this is
+            # not the roleless end state the two refusals above leave: the repair branch's second
+            # revoke runs first (it is harmless with no role), and the advice is to keep the
+            # authenticator entry, since it may be the only factor of an Administrator. A re-run
+            # reports which state the store is in. No audit row records this refusal; the ERROR
+            # line is its only trace. The logged outcome is its type name, never its repr, because
+            # an out-of-contract value could carry what the grant was handed.
+            if repaired:
+                await self._store.revoke_user_sessions(user_id)
             _log.error(
-                "first-administrator grant for %r returned an unexpected outcome %r; refused",
-                username,
-                grant,
+                "first-administrator grant for %s returned an unexpected outcome of type %s; refused",
+                scrub_log_argument(username),
+                type(grant).__name__,
             )
             raise FirstAdministratorRefused(
                 "the role grant returned an unexpected outcome, so this run cannot confirm that "
-                f"the account named {username!r} holds the Administrator role and reports no "
-                "success; remove any authenticator entry it showed, and check that account's "
-                "roles in the web console before running the command again"
+                f"the account named {username!r} holds the Administrator role and shows no "
+                "recovery codes; keep any authenticator entry it showed, and run the command "
+                "again: it completes the account, or reports that an Administrator already exists"
             )
         if repaired:
             # AGAIN, after the role (ADR 0197 Amendment A, AC-A5). The earlier holder's password
