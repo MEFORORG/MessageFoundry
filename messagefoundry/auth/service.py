@@ -144,6 +144,7 @@ from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
     AdMap,
+    AdminGrant,
     AdminRemoval,
     AuditAppend,
     ChannelScopeSource,
@@ -3142,13 +3143,16 @@ class AuthService:
                 "that authenticator code was already used on this account; no password was set. "
                 "Wait for the next code and run the command again"
             )
+        # BACKLOG #3078: kept, because the grant below is bound to the credentials this run wrote.
+        password_hash = await self._argon2(hash_password, password)
         await self._store.set_password(
             user_id,
-            password_hash=await self._argon2(hash_password, password),
+            password_hash=password_hash,
             must_change_password=False,
             password_generated=False,
         )
         plain_codes: tuple[str, ...] = ()
+        staged_cell: str | None = None
         if totp_secret is not None and matched_step is not None:
             # Enrolled BEFORE the role, which stays last, so every interruption still leaves a
             # roleless row a re-run completes -- and the repair branch above clears a half-enrolled
@@ -3229,7 +3233,37 @@ class AuthService:
             # seeded the same value; on a REPAIRED row an earlier run created the account, so this
             # write is the only one that carries it.
             await self._store.set_user_notify_email(user_id, email=notify_email)
-        await self._store.set_user_roles(user_id, [Role.ADMINISTRATOR.value], assigned_by=actor)
+        # BACKLOG #3078: the refusal at the top is a read, and the account writes came in later
+        # awaits, so two runs with different usernames could each pass it and each grant. The grant
+        # re-checks under the last-administrator guard's lock, in the transaction that writes it,
+        # so the run whose grant commits second is refused. It is also bound to the password and the
+        # TOTP cell this run wrote: two runs on ONE row can interleave so that one run's password
+        # sits beside the other's TOTP, and then neither run is granted. A loser was refused after
+        # its credential writes rather than before them, because the role stays last (ADR 0183):
+        # granted first, a crash would leave an Administrator with no credential and a store this
+        # command then refuses. Its account therefore holds no role, and nothing it wrote is undone:
+        # a compare-free undo of the password could erase the winner's on a row both runs wrote.
+        grant = await self._store.grant_first_admin_unless_admin_exists(
+            user_id,
+            admin_role_id=Role.ADMINISTRATOR.value,
+            expected_password_hash=password_hash,
+            expected_totp_secret_cell=staged_cell,
+            assigned_by=actor,
+        )
+        if grant is AdminGrant.ADMIN_EXISTS:
+            raise FirstAdministratorRefused(
+                "another enabled Administrator was created while this command ran, so this run "
+                f"granted no role, and the account named {username!r} holds none; remove the "
+                "authenticator entry it showed, and delete that account from the web console if "
+                "nobody needs it"
+            )
+        if grant is AdminGrant.ACCOUNT_CHANGED:
+            raise FirstAdministratorRefused(
+                "the account's password, authenticator or enabled state was changed while this "
+                "command ran, so this run granted no role; remove the authenticator entry it "
+                "showed. If another "
+                "provision-admin run is in progress, let it finish. Then run the command again"
+            )
         if repaired:
             # AGAIN, after the role (ADR 0197 Amendment A, AC-A5). The earlier holder's password
             # still worked until ``set_password`` above, so a sign-in in that window minted a session
