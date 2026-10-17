@@ -868,7 +868,7 @@ def _search(conn: Any, operation: str, **kwargs: Any) -> None:
     (:func:`_refuse_unanswered`). Every search in this module goes through here, so none can read
     either as "no entries"; a test pins that. The search runs inside :func:`_ldap3_call`.
     """
-    with _ldap3_call(operation, close=True):
+    with _ldap3_call(operation):
         conn.search(**kwargs)
     _refuse_unanswered(conn, operation)
 
@@ -945,11 +945,12 @@ def _ldap3_call(operation: str, *, close: bool = False) -> Iterator[None]:
     debug level (:func:`_reading_connection` says how the two are told apart). An ``LDAPException``
     passes through untouched, for its own handler.
 
-    ``close`` closes the socket the failed read was on, where nothing else will. The service
-    account's ``auto_bind`` runs inside ldap3's ``Connection`` constructor, so when it raises no
-    caller holds the connection to unbind. A search's caller abandons the connection on any error,
-    and the stream may be out of step after a fault partway through a response; the service
-    connection is never unbound, so its socket would stay open for as long as the error is kept.
+    ``close`` closes the socket the failed read was on, where nothing else will. Only the service
+    account's bind passes it: its ``auto_bind`` runs inside ldap3's ``Connection`` constructor, so
+    when it raises no caller holds the connection to unbind. A search does not. Its caller holds
+    the connection in a ``with`` block, and ldap3 2.9.1's ``Connection.__exit__`` reopens a
+    connection that was open on entry and is closed on exit, so a close there would cost one more
+    connect and close nothing (measured, BACKLOG #3010).
     """
     import ldap3
 
@@ -1030,8 +1031,7 @@ def _search_paged(conn: Any, operation: str, **kwargs: Any) -> list[Any]:
 
     **A refused search is abandoned** (:func:`_abandon_paging`) once the directory has sent a
     cookie, so it need not hold the paging state until its own timeout. Not after a response ldap3
-    could not decode: the stream may be out of step after one, so nothing more is sent on it, and
-    :func:`_search` closes the socket instead, which drops the paging state with the connection.
+    could not decode: the stream may be out of step after one, so nothing more is sent on it.
     """
     entries: list[Any] = []
     cookie: bytes | None = None  # what the next page is asked with
