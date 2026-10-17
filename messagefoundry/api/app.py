@@ -9481,8 +9481,8 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     new. **The one statement of why each condition has its own source** (BACKLOG #3100 item 13):
     its own source gives it its own instance, throttle and detail, so acknowledging or suspending a
     standing referral or fault must not silence a later breaker trip, and one detail cannot hide
-    another. An ``[alerts]`` rule keyed on the event type alone still matches all of them; only a
-    rule naming the exact source keeps them apart.
+    another. An ``[alerts]`` rule keyed on the event type alone still matches all of them; a rule
+    whose source pattern matches one label and not the others keeps them apart.
 
     A probe fault (BACKLOG #3100) is not an outage either: the engine could not read what the
     directory returned for an account, and that account is left unrevoked while it lasts. Any pass

@@ -1699,7 +1699,21 @@ async def test_a_pass_with_a_referral_or_fault_beside_clean_answers_marks_no_cle
     either clear, however clean the rest reads.
 
     RED when: a pass with a referral or a fault beside other answers marks a clear."""
-    assert await _marked(plan, {"a": PRESENT, "b": PRESENT, "c": PRESENT}) == (False, False)
+    record = {"a": PRESENT, "b": PRESENT, "c": PRESENT}
+    assert await _marked(plan, record) == (False, False)
+    # The referral's own clear, on a process whose pass saw a referral and whose marked accounts
+    # have all read PRESENT since: only the referral or the fault in this pass stops it.
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _fresh_process(store)
+        service._reconcile_referral_standing = "referred"
+        service._reconcile_referred = set()
+        service._reconcile_outcomes = dict(record)
+        users = cast(Mapping[str, UserRecord], dict.fromkeys(record))
+        assert not service._mark_reconcile_clears(plan, users).referral_clear
+        assert service._mark_reconcile_clears(_CLEAN_TWO, users).referral_clear  # the control
+    finally:
+        await store.close()
 
 
 async def test_an_estate_that_reads_only_undetermined_is_no_breaker_clear() -> None:
@@ -1792,17 +1806,23 @@ _BREAKER_MOVES = [
 
 @pytest.mark.parametrize(("start", "event", "end"), _BREAKER_MOVES)
 async def test_the_breaker_standing_never_leaves_a_forfeit(
-    start: _BreakerStanding, event: _BreakerStanding, end: _BreakerStanding
+    start: _BreakerStanding,
+    event: _BreakerStanding,
+    end: _BreakerStanding,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A forfeit is never left, not even by a later trip. A new trip lands on the instance the
     forfeit kept open, and the account the forfeit gave up on is still unread, so resolving it
-    would rest on the rest of the estate again."""
+    would rest on the rest of the estate again. It warns once, on the move into a forfeit."""
     store = await MessageStore.open(":memory:")
     try:
         service = _fresh_process(store)
         service._reconcile_breaker_standing = start
-        service._advance_breaker_standing(event)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            service._advance_breaker_standing(event)
         assert service._reconcile_breaker_standing == end
+        warned = [r for r in caplog.records if "last breaker trip left" in r.getMessage()]
+        assert len(warned) == (1 if start != "forfeit" and end == "forfeit" else 0)
     finally:
         await store.close()
 

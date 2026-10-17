@@ -91,8 +91,9 @@ class ProbeOutcome(Enum):
     #: no revocation, no strike reset, no recorded outcome. Unlike it, a referral alerts, because it
     #: is a configuration error that recurs on every pass: read as unavailable, it would stop
     #: revocation for the referred accounts without a sound. It never stops the other accounts
-    #: being judged. It read no ``userAccountControl``, so it is not a readable answer for the
-    #: hold's ``r`` either (BACKLOG #3100 item 9).
+    #: being judged. It is not counted as a readable answer for the hold's ``r``, although a
+    #: referral on the group search came after the user search read ``userAccountControl``
+    #: (BACKLOG #3100 item 9, left open).
     REFERRED = "referred"
     #: The probe raised something that is neither an ``LdapError`` nor a network-class ``OSError``
     #: (:attr:`UNAVAILABLE` takes both): the engine failed to read whatever

@@ -577,9 +577,11 @@ def test_a_pass_of_referrals_and_failures_is_a_referral_not_an_outage() -> None:
 
 
 def test_a_referred_probe_is_not_a_readable_answer_for_the_hold() -> None:
-    """BACKLOG #3100 items 6 and 9. A referral read no ``userAccountControl``, so a lone
-    undetermined account beside only referrals has nothing readable beside it and is held, not
-    struck. The control: a PRESENT answer beside it is readable, so the lone account strikes.
+    """BACKLOG #3100 item 6. Today's rule, pinned so it cannot move unseen: a REFERRED probe is not
+    counted readable, so a lone undetermined account beside only referrals is held, not struck.
+    The control: a PRESENT answer beside it is readable, so the lone account strikes. A referral on
+    the group search came after the user search read ``userAccountControl``, so whether such a
+    referral should count is open under item 9; changing it changes this test on purpose.
 
     RED when: REFERRED counts toward the hold's ``r``."""
     lone = reconcile.Probe("u", "u", U)
@@ -1121,6 +1123,8 @@ async def test_revoking_an_account_signed_in_at_a_referral_forfeits_the_clear_on
         service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
         await service.initialize()
         tokens = {n: await _signed_in_ad_user(service, store, n) for n in ("jdoe", "asmith")}
+        assert tokens["asmith"] is not None
+        assert await service.identity_for_token(tokens["asmith"]) is not None
 
         ldap.referring = {"jdoe"}
         del ldap.present["asmith"]
@@ -1130,7 +1134,7 @@ async def test_revoking_an_account_signed_in_at_a_referral_forfeits_the_clear_on
         ldap.referring.clear()
         plan = await service.reconcile_directory_sessions()
         assert [r.username for r in plan.revocations] == ["asmith"]
-        assert await service.identity_for_token(tokens["asmith"] or "") is None
+        assert await service.identity_for_token(tokens["asmith"]) is None
         assert not plan.referral_clear
         assert service.directory_reconcile_referral is not None
     finally:
