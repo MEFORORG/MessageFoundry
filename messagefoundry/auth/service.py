@@ -11080,9 +11080,10 @@ class AuthService:
         try:
             await self._store.add_webauthn_credential(cred)
         except Exception as exc:
-            # The concurrent duplicate-label race (ADR 0068 §4): each backend raises its own
-            # integrity class (sqlite3.IntegrityError / asyncpg UniqueViolationError / pyodbc
-            # IntegrityError) — rendered as the same legible error as a pre-checked duplicate.
+            # A concurrent enrolment raced this one past the pre-checks above (ADR 0068 §4): each
+            # backend raises its own integrity class (sqlite3.IntegrityError / asyncpg
+            # UniqueViolationError / pyodbc IntegrityError) for at least the user foreign key, the
+            # credential-id primary key and the (user_id, label) index. Each is told apart below.
             if not _is_integrity_refusal(exc):
                 raise
             # BACKLOG #1807: the same classes carry the user_id foreign-key refusal, raised when the

@@ -22,6 +22,7 @@ import secrets
 from collections.abc import Awaitable
 from typing import Any
 
+from messagefoundry.auth.service import _is_integrity_refusal
 from messagefoundry.store.store import WebAuthnCredential
 
 #: A base64url credential id at WebAuthn's maximum raw size (1023 bytes -> ~1364 chars) — the
@@ -58,13 +59,14 @@ def _cred(
 
 
 async def _assert_integrity_refused(write: Awaitable[object], what: str) -> None:
-    """``write`` fails with the backend's native integrity class: sqlite3.IntegrityError, an
-    asyncpg IntegrityConstraintViolationError subclass, or pyodbc.IntegrityError."""
+    """``write`` fails with a refusal the service recognises as an integrity refusal: the one
+    predicate it uses, so this contract pins exactly what finish_webauthn_registration relies on."""
     try:
         await write
     except Exception as exc:  # noqa: BLE001 - each backend raises its own integrity class
-        names = "".join(t.__name__ for t in type(exc).__mro__)
-        assert "Integrity" in names, f"{what} raised {type(exc).__name__}, not an integrity error"
+        assert _is_integrity_refusal(exc), (
+            f"{what} raised {type(exc).__name__}, not an integrity refusal"
+        )
     else:
         raise AssertionError(f"{what} was accepted")
 
