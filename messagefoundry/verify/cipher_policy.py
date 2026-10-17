@@ -54,15 +54,24 @@ _LEGACY_VERSIONS: tuple[str, ...] = ("TLS 1.0", "TLS 1.1")
 #: Section 5.4's check 1 pattern for an AEAD suite name in SChannel's naming.
 _SCHANNEL_AEAD = re.compile("GCM|CCM|CHACHA20_POLY1305")
 
-#: Exit status of the Windows probe on a host without the ``Get-TlsCipherSuite`` cmdlet. Without
-#: the guard, PowerShell exits 1 there, which it also does for a cmdlet that ran and failed.
+#: Exit status of the Windows probe on a host without the system TLS module or its
+#: ``Get-TlsCipherSuite`` cmdlet. Without the guard, PowerShell exits 1 there, which it also does
+#: for a cmdlet that ran and failed.
 _NO_CMDLET_EXIT = 64
 #: The warning and verbose streams are silenced first: Windows PowerShell 5.1 writes their lines to
 #: a redirected stdout, where they would fail the suite-name check and make the reading an ERROR.
+#: The cmdlet is then taken from the TLS module under ``$PSHOME``, imported by that path, and run
+#: as that module's exported command object, never looked up by name. So a script on ``PATH`` or
+#: a module in the account's own Documents folder that defines a ``Get-TlsCipherSuite`` cannot
+#: answer instead. ``$PSHOME`` is the folder of the pinned ``powershell.exe``. This does not guard
+#: against a change to that system folder, which takes an administrator.
 _SUITES_COMMAND = (
     "$WarningPreference = 'SilentlyContinue'; $VerbosePreference = 'SilentlyContinue'; "
-    "if (Get-Command Get-TlsCipherSuite -ErrorAction SilentlyContinue) "
-    f"{{ (Get-TlsCipherSuite).Name }} else {{ exit {_NO_CMDLET_EXIT} }}"
+    "$m = Import-Module -Name (Join-Path $PSHOME 'Modules\\TLS') -PassThru "
+    "-ErrorAction SilentlyContinue; "
+    "if ($m -and $m.ExportedCommands.ContainsKey('Get-TlsCipherSuite')) "
+    "{ (& $m.ExportedCommands['Get-TlsCipherSuite']).Name } "
+    f"else {{ exit {_NO_CMDLET_EXIT} }}"
 )
 #: The shape of an SChannel suite name. ``SSL_`` is there so an older host's SSL 2 suite is
 #: counted, and fails. Any other line is not a reading this check understands, so it is an ERROR
@@ -75,6 +84,8 @@ _OPENSSL_CNF = Path("/etc/ssl/openssl.cnf")
 #: Python interpreter's own variables; ``openssl`` is not Python, so it reads none of the latter.
 _OPENSSL_ENV = ("OPENSSL_CONF", "OPENSSL_CONF_INCLUDE", "OPENSSL_MODULES", "OPENSSL_ENGINES")
 _POLICY_KEYS = {key.lower(): key for key in ("CipherString", "Ciphersuites", "MinProtocol")}
+#: The policy lines the verdict rests on. ``Ciphersuites`` is read for the evidence only.
+_JUDGED_KEYS = frozenset({"CipherString", "MinProtocol"})
 _SECTION_HEADER = re.compile(r"^\s*\[\s*([^\]]*?)\s*\]")
 _ASSIGNMENT = re.compile(r"^\s*([^\s=#]+)\s*=(.*)$")
 #: ``.include path``, ``.include = path`` and the ``.pragma`` forms.
@@ -164,7 +175,7 @@ def _windows_enabled_suites() -> list[str]:
             creationflags=_NO_WINDOW,
         )
     if proc.returncode == _NO_CMDLET_EXIT:
-        raise ProbeUnavailable("Get-TlsCipherSuite not found")
+        raise ProbeUnavailable("Get-TlsCipherSuite not found in the system TLS module")
     lines = _stdout_lines("powershell.exe", proc)
     for line in lines:
         if not _SCHANNEL_SUITE_NAME.fullmatch(line):
@@ -284,10 +295,10 @@ def _config_sections(text: str) -> dict[str, list[tuple[str, str]]]:
     """Each section's ``name = value`` lines, in file order. Lines above the first header are in
     ``default``, which is where OpenSSL files them.
 
-    An ``.include``, a ``.pragma`` or a line continued with a backslash raises
-    :class:`ProbeUnavailable`, wherever it is in the file: each can add to, or change how OpenSSL
-    reads, the section this check reads, so a reading taken without it could PASS on lines OpenSSL
-    does not apply."""
+    An ``.include``, a ``.pragma``, a line continued with a backslash or a ``section::name``
+    assignment raises :class:`ProbeUnavailable`, wherever it is in the file: each can add to, or
+    change how OpenSSL reads, the section this check reads, so a reading taken without it could
+    PASS on lines OpenSSL does not apply. These are the constructs known here, not all of them."""
     sections: dict[str, list[tuple[str, str]]] = {"default": []}
     current = sections["default"]
     for line in text.splitlines():
@@ -298,6 +309,8 @@ def _config_sections(text: str) -> dict[str, list[tuple[str, str]]]:
         if header := _SECTION_HEADER.match(line):
             current = sections.setdefault(header[1], [])
         elif assignment := _ASSIGNMENT.match(line):
+            if "::" in assignment[1]:
+                raise _not_followed("a section::name assignment")
             current.append((assignment[1], _config_value(assignment[2])))
     return sections
 
@@ -324,20 +337,23 @@ def _openssl_policy_lines() -> tuple[Path, str | None, list[tuple[str, str]]]:
     the ``openssl`` probe above loaded. Returns the file, the system-default section, and that
     section's policy lines; no section means the file sets no system-default policy. OpenSSL
     matches a file-form command name without case, so this does too. A file using what this
-    check does not follow raises :class:`ProbeUnavailable` naming the file."""
+    check does not follow raises :class:`ProbeUnavailable` naming the file, and so does an
+    ``OPENSSL_CONF`` that is set but empty, because which file ``openssl`` read is then not known.
+    A leading byte-order mark is dropped, as OpenSSL drops it."""
     named = os.environ.get("OPENSSL_CONF")
+    if named == "":
+        raise ProbeUnavailable("OPENSSL_CONF is set but empty, so the file openssl read is unknown")
     path = Path(named) if named else _OPENSSL_CNF
-    text = path.read_text(encoding="utf-8", errors="replace")
+    text = path.read_text(encoding="utf-8-sig", errors="replace")
     try:
         sections = _config_sections(text)
         section = _system_default_section(sections)
         if section is None:
             return path, None, []
-        settings = [
-            (policy_key, _expanded_nowhere(value))
-            for key, value in sections.get(section, [])
-            if (policy_key := _POLICY_KEYS.get(key.lower()))
-        ]
+        settings: list[tuple[str, str]] = []
+        for name, value in sections.get(section, []):
+            if key := _POLICY_KEYS.get(name.lower()):
+                settings.append((key, _expanded_nowhere(value) if key in _JUDGED_KEYS else value))
     except ProbeUnavailable as exc:
         raise ProbeUnavailable(f"{path} {exc}") from exc
     return path, section, settings

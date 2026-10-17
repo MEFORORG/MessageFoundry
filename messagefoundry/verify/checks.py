@@ -126,15 +126,18 @@ def check_sqlserver_odbc_driver() -> CheckResult:
 def check_host_cipher_policy() -> CheckResult:
     """DEPLOY-SERVER-DB.md section 5.4: the host TLS policy every ODBC Driver 18 hop takes.
 
-    Reported where an ODBC hop could run, which is wherever pyodbc imports: the SQL Server store, the
-    DATABASE connector, ``db_lookup`` and ``DatabaseRef`` all reach the driver through it. Without
-    it no such hop exists here, so the row SKIPs rather than failing a host that needs no policy."""
+    Reported wherever pyodbc is installed, found on the import path without being imported: the SQL
+    Server store, the DATABASE connector, ``db_lookup`` and ``DatabaseRef`` all reach the driver
+    through it. Without it no such hop exists here, so the row SKIPs. With it, the row reads the
+    policy whether or not this host's configuration uses an ODBC hop, because this check is handed
+    no engine configuration; a host that installed pyodbc and uses no hop still reads FAIL on a stock
+    policy, and DEPLOY-SERVER-DB.md section 5.4 says so."""
     if not _can_import("pyodbc"):
         return CheckResult(
             cipher_policy.RID,
             cipher_policy.TITLE,
             Status.SKIP,
-            "pyodbc does not import in this Python, so no ODBC hop runs from it; run verify "
+            "pyodbc is not installed in this Python, so no ODBC hop runs from it; run verify "
             "from the engine's own environment to read the policy",
         )
     return cipher_policy.read_host_cipher_policy()

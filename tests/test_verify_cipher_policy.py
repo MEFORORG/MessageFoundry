@@ -193,6 +193,17 @@ def test_suite_names_are_read_one_per_line(monkeypatch: pytest.MonkeyPatch) -> N
     assert calls[0][-1] == cipher_policy._SUITES_COMMAND
 
 
+def test_the_command_runs_the_system_tls_modules_own_cmdlet() -> None:
+    """A ``Get-TlsCipherSuite`` on ``PATH`` or in the account's Documents modules must not answer:
+    the module is imported by its ``$PSHOME`` path and its exported command object is run, so the
+    name is never looked up through command discovery."""
+    command = cipher_policy._SUITES_COMMAND
+    assert "Import-Module -Name (Join-Path $PSHOME 'Modules\\TLS') -PassThru" in command
+    assert "(& $m.ExportedCommands['Get-TlsCipherSuite']).Name" in command
+    # Every mention of the name is inside a lookup on the imported module, never a bare call.
+    assert command.count("Get-TlsCipherSuite") == command.count("ExportedCommands")
+
+
 @pytest.mark.parametrize("odd", ["WARNING: module loaded late", "AVERTISSEMENT : x", "TLS AES"])
 def test_a_line_that_is_not_a_suite_name_is_an_error(
     monkeypatch: pytest.MonkeyPatch, odd: str
@@ -219,8 +230,9 @@ def test_a_cmdlet_that_ran_and_failed_is_an_error(monkeypatch: pytest.MonkeyPatc
 
 @pytest.mark.skipif(sys.platform != "win32", reason="runs the real Windows PowerShell")
 def test_the_powershell_command_runs_on_this_host() -> None:
-    """The guarded command parses and prints suite names on a host with stock suites, so the
-    stubs above match a real start: the cmdlet guard did not fire and the names kept their shape."""
+    """The guarded command parses and prints suite names on a host with stock suites, with the
+    probe's own environment, so the stubs above match a real start: the module imported by its
+    path, the cmdlet guard did not fire, and every line kept the suite-name shape."""
     assert cipher_policy._windows_enabled_suites()
 
 
@@ -412,6 +424,11 @@ _HEALTHY_SECTION = "[system_default_sect]\nCipherString = ECDHE+AESGCM\nMinProto
         (_CHAIN + _HEALTHY_SECTION + "Options = A,\\\n  B\n", "a line continued"),
         (_CHAIN + _HEALTHY_SECTION + "MinProtocol = $floor\n", "$ variable expansion"),
         (_CHAIN.replace("ssl_sect\n[", "$name\n[") + _HEALTHY_SECTION, "$ variable expansion"),
+        (
+            _CHAIN + _HEALTHY_SECTION + "[other]\nsystem_default_sect::MinProtocol = TLSv1\n",
+            "section::name",
+        ),
+        ("﻿.include /etc/ssl/more.cnf\n" + _CHAIN + _HEALTHY_SECTION, ".include"),
     ],
 )
 def test_a_file_using_what_the_check_does_not_follow_is_manual(
@@ -431,6 +448,27 @@ def test_a_dollar_outside_the_read_lines_is_not_refused(
     """The stock Ubuntu file uses ``$dir`` in its CA sections, which the TLS policy never reads."""
     text = "HOME = .\n" + _CHAIN + _HEALTHY_SECTION + "[CA_default]\ncerts = $dir/certs\n"
     assert _read_cnf(monkeypatch, tmp_path / "openssl.cnf", text)[1] == "system_default_sect"
+    # Ciphersuites is evidence only, so a $ there does not stop the verdict.
+    r = _linux_from_file(monkeypatch, tmp_path / "b.cnf", text + "Ciphersuites = $tls13\n")
+    assert r.status is Status.PASS, r.detail
+
+
+def test_a_byte_order_mark_is_dropped_as_openssl_drops_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A BOM before ``openssl_conf`` must not break the chain into a false FAIL."""
+    text = "﻿" + _CHAIN + _HEALTHY_SECTION
+    assert _read_cnf(monkeypatch, tmp_path / "openssl.cnf", text)[1] == "system_default_sect"
+
+
+def test_an_empty_openssl_conf_is_manual(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``openssl`` gets the empty name, so the file it read is not known; the system file is not
+    read in its place."""
+    monkeypatch.setenv("OPENSSL_CONF", "")
+    monkeypatch.setattr(cipher_policy, "_openssl_suites", lambda: _SSL_AEAD)
+    r = cipher_policy.read_host_cipher_policy("linux")
+    assert r.status is Status.MANUAL, r.detail
+    assert "OPENSSL_CONF is set but empty" in r.detail
 
 
 def test_a_quoted_min_protocol_passes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -564,9 +602,14 @@ def _reaches_the_probe(tree: ast.AST, package: str) -> bool:
 
 def test_only_the_verify_command_reaches_the_policy() -> None:
     """Report only: owner ruling R3 declined a startup check. Outside ``verify/``, the only import
-    of a module that runs the probe is in the ``verify`` subcommand's own handler.
+    of a module whose functions run the probe is in the ``verify`` subcommand's own handler.
 
-    It does not see a module name built at run time, a module reached through an attribute of one
+    That is not "the probe module is never loaded elsewhere". ``messagefoundry/verify/__init__.py``
+    imports the runner, so importing any ``messagefoundry.verify`` submodule, as the ``check``
+    gate's federation import does, loads ``cipher_policy`` too. Loading it runs no probe, and a
+    call through the loaded package by attribute is outside what this test sees.
+
+    Nor does it see a module name built at run time, a module reached through an attribute of one
     already imported, or a plugin entry point. A file whose text never says ``verify`` is skipped,
     since every import the detector sees names it."""
     root = Path(cipher_policy.__file__).resolve().parents[2]
