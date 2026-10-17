@@ -868,7 +868,8 @@ async def test_create_user_route_refuses_a_site_context_word(engine: Engine) -> 
 
 async def test_create_user_with_a_repeated_role_grants_it_once(engine: Engine) -> None:
     # BACKLOG #2733: a repeated role once failed the user_roles primary key after the account row
-    # had committed. The store now writes one grant, and the reply and audit name the role once.
+    # had committed. The store now writes one grant, and the request model names the role once,
+    # so the reply and both audit rows do too.
     settings = AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
     service = await _service(engine, settings)
     await _add(service, "root", Role.ADMINISTRATOR)
@@ -878,15 +879,24 @@ async def test_create_user_with_a_repeated_role_grants_it_once(engine: Engine) -
         created = await c.post("/users", headers=h, json=body)
         assert created.status_code == 201, created.text
         assert created.json()["roles"] == ["viewer"]
-    user = await service.store.get_user_by_username("twice")
-    assert user is not None
-    assert await service.store.get_user_role_ids(user.id) == ["viewer"]
-    details = [
-        json.loads(dict(a)["detail"])
-        for a in await engine.store.list_audit(limit=50)
-        if dict(a)["action"] == "user.created" and dict(a)["actor"] == "root"
+        uid = created.json()["id"]
+        # The role change takes the same list type, so it names a repeated role once too.
+        changed = await c.put(
+            f"/users/{uid}/roles", headers=h, json={"roles": ["operator", "operator"]}
+        )
+        assert changed.status_code == 200, changed.text
+    assert await service.store.get_user_role_ids(uid) == ["operator"]
+    audit = [dict(a) for a in await engine.store.list_audit(limit=50)]
+    created_details = [
+        json.loads(a["detail"])
+        for a in audit
+        if a["action"] == "user.created" and a["actor"] == "root"
     ]
-    assert details == [{"username": "twice", "roles": ["viewer"]}]
+    assert created_details == [{"username": "twice", "roles": ["viewer"]}]
+    changed_details = [
+        json.loads(a["detail"]) for a in audit if a["action"] == "user.roles_changed"
+    ]
+    assert changed_details == [{"user_id": uid, "roles": ["operator"]}]
 
 
 async def test_a_reset_the_generator_cannot_satisfy_names_the_setting(
