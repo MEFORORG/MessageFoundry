@@ -287,34 +287,39 @@ class EngineNode:
         exited, because what the root started can outlive it."""
         self._end_tree()
         if self._proc is not None and self._proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
+            # Windows refuses TerminateProcess on a root the job is already ending: PermissionError.
+            with contextlib.suppress(ProcessLookupError, PermissionError):
                 self._proc.kill()
 
     async def stop(self) -> None:
         """Graceful shutdown for cleanup (SIGTERM → uvicorn lifespan stop → the node expires its lease);
         escalates to SIGKILL if it doesn't exit, then closes the log file."""
         proc = self._proc
-        if proc is not None and proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=10.0)
-            except TimeoutError:
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-                with contextlib.suppress(Exception):
-                    await proc.wait()
-        # Whatever the root left behind goes with the job, whichever branch above ran.
-        self._end_tree()
-        with contextlib.suppress(Exception):
-            self._log.close()
-        # The startup-failure tail is captured into the FailoverError before teardown, so the log file is
-        # no longer needed once the node is stopped — unlink it rather than leak one per node per run.
-        # Bench keep-logs mode (MEFOR_BENCH_KEEP_NODE_LOGS) deliberately preserves it for post-run
-        # phase-timing extraction.
-        if not self._keep_log:
-            with contextlib.suppress(OSError):
-                Path(self._log.name).unlink()
+        try:
+            if proc is not None and proc.returncode is None:
+                # PermissionError as in kill(): a root already exiting refuses the signal on Windows.
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=10.0)
+                except TimeoutError:
+                    with contextlib.suppress(ProcessLookupError, PermissionError):
+                        proc.kill()
+                    with contextlib.suppress(Exception):
+                        await proc.wait()
+        finally:
+            # Whatever the root left behind goes with the job, even if the wait above raised or was
+            # cancelled.
+            self._end_tree()
+            with contextlib.suppress(Exception):
+                self._log.close()
+            # The startup-failure tail is captured into the FailoverError before teardown, so the log
+            # file is no longer needed once the node is stopped — unlink it rather than leak one per
+            # node per run. Bench keep-logs mode (MEFOR_BENCH_KEEP_NODE_LOGS) deliberately preserves
+            # it for post-run phase-timing extraction.
+            if not self._keep_log:
+                with contextlib.suppress(OSError):
+                    Path(self._log.name).unlink()
 
     def log_tail(self, limit: int = 4000) -> str:
         """The end of this node's captured stdout/stderr — for diagnosing a failed start in CI.
