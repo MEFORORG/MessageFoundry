@@ -74,10 +74,10 @@ def _live(tmp_path: Path) -> Path:
 def _refuse_open(
     monkeypatch: pytest.MonkeyPatch, refusal: OSError, when: Callable[[Path], bool]
 ) -> None:
-    def fake_open(path: Any, flags: int, mode: int = 0o777, **kwargs: Any) -> int:
+    def fake_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
         if when(Path(path)):
             raise refusal
-        return _real_open(path, flags, mode, **kwargs)
+        return _real_open(path, flags, *args, **kwargs)
 
     monkeypatch.setattr(os, "open", fake_open)
 
