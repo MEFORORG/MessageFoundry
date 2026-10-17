@@ -355,5 +355,5 @@ async def test_a_cancel_at_the_idp_returns_to_the_step_up_page(
         )
         assert r.status_code == 403
         assert 'action="/ui/reauth/oidc"' in r.text
-        assert "did not complete the sign-in" in r.text
+        assert "did not complete the confirmation" in r.text  # BACKLOG #3221: a step-up word
         assert await service.identity_for_token(token) is not None
