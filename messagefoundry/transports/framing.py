@@ -27,9 +27,11 @@ from messagefoundry.framing import (
     FramePayloadError,
     codec_for,
 )
+from messagefoundry.parsing.split import _sends_more_than_one_message
 from messagefoundry.transports.base import NegativeAckError, encode_wire_body
 
 __all__ = [
+    "MULTIPLE_MESSAGES_CODE",
     "FrameError",
     "FrameByteFault",
     "FramePayloadError",
@@ -47,6 +49,10 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+#: The :class:`NegativeAckError` code of an MLLP or TCP delivery refused for holding more than one
+#: ``MSH`` segment (ADR 0209).
+MULTIPLE_MESSAGES_CODE = "multiple-messages"
+
 
 def frame_for_delivery(codec: FrameCodec, payload: str, encoding: str, *, transport: str) -> bytes:
     """Frame one outbound ``payload`` for the wire, or refuse it permanently (ADR 0205 rule 1).
@@ -61,15 +67,21 @@ def frame_for_delivery(codec: FrameCodec, payload: str, encoding: str, *, transp
     byte and its position, never the content. The encode goes through :func:`encode_wire_body`, so a
     payload the charset cannot hold is the same content-free permanent failure other destinations
     raise. Call this once per send, before any dial, so a refused payload opens no connection and
-    never discards a healthy persistent one."""
+    never discards a healthy persistent one. :func:`check_frame_bytes` also refuses a payload
+    holding more than one message (ADR 0209)."""
     return codec.frame(check_frame_bytes(codec, payload, encoding, transport=transport))
 
 
 def check_frame_bytes(codec: FrameCodec, payload: str, encoding: str, *, transport: str) -> bytes:
-    """Rule 1's check alone: encode ``payload`` and refuse it as :func:`frame_for_delivery` does,
-    returning the encoded body unframed. The delivery stage calls it, through a destination's
+    """The delivery checks without the frame: refuse ``payload`` as :func:`frame_for_delivery`
+    does, or return it encoded and unframed. The delivery stage calls it, through a destination's
     ``check_frame``, where no single-payload send runs: on each member of an MLLP batch, and on a
-    shadow (simulate) outbound, so both record the disposition a live send would."""
+    shadow (simulate) outbound, so both record the disposition a live send would.
+
+    It refuses, in order, at least: a payload holding more than one message
+    (:func:`_refuse_more_than_one_message`, ADR 0209), one the charset cannot encode
+    (:func:`encode_wire_body`), and ADR 0205 rule 1 on the encoded bytes."""
+    _refuse_more_than_one_message(payload, transport)
     body = encode_wire_body(payload, encoding, transport=transport)
     # The judgement and its wording are the leaf's (FrameCodec.find_frame_byte), shared with the test
     # harness; what is engine-only is the permanent delivery failure it becomes here.
@@ -77,6 +89,21 @@ def check_frame_bytes(codec: FrameCodec, payload: str, encoding: str, *, transpo
     if fault is not None:
         raise NegativeAckError(fault.describe(transport), code="framing", permanent=True)
     return body
+
+
+def _refuse_more_than_one_message(payload: str, transport: str) -> None:
+    """Refuse an ``MSH``-led ``payload`` that holds a second ``MSH`` line (ADR 0209): one frame is
+    one message to the receiver. It sits under :func:`check_frame_bytes`, so it reaches at least a
+    live send, a batch member and a shadow outbound. A payload not led
+    by ``MSH`` is never read, so a relayed X12 interchange and the ``BHS`` envelope a batching
+    outbound sends (ADR 0082) pass. The text names the rule, never the content."""
+    if _sends_more_than_one_message(payload):
+        raise NegativeAckError(
+            f"{transport}: payload holds more than one MSH segment, and one frame carries one "
+            "message (ADR 0209)",
+            code=MULTIPLE_MESSAGES_CODE,
+            permanent=True,
+        )
 
 
 def frame_reply(codec: FrameCodec, reply: str, encoding: str) -> bytes:

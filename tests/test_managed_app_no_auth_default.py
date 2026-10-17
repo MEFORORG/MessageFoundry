@@ -9,16 +9,17 @@ same route, so a 503 is a reading of the gate and never of an app that failed to
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from pathlib import Path
 
 import httpx
 import pytest
 from fastapi import FastAPI
-from starlette.testclient import TestClient
-from starlette.websockets import WebSocketDisconnect
+from starlette.testclient import TestClient, WebSocketDenialResponse
 
 from messagefoundry.api import create_app, create_managed_app
+from messagefoundry.api.security import AUTH_NOT_CONFIGURED
 from messagefoundry.auth import Role
 from messagefoundry.config.settings import AuthSettings, EgressSettings, ServiceSettings
 from messagefoundry.pipeline import Engine
@@ -85,12 +86,17 @@ def test_the_stats_socket_follows_the_same_opt_in(tmp_path: Path) -> None:
         poll_interval=0.05,
         egress_settings=EgressSettings(deny_by_default=False),
     )
+    # The refusal is the handshake's HTTP answer, sent before accept (refuse_websocket), so the test
+    # client raises the denial itself; a bare WebSocketDisconnect would also pass a socket that
+    # accepted and then dropped (vault BACKLOG #2731 item 6).
     with (
         TestClient(refused) as tc,
-        pytest.raises(WebSocketDisconnect),
-        tc.websocket_connect("/ws/stats") as ws,
+        pytest.raises(WebSocketDenialResponse) as denied,
+        tc.websocket_connect("/ws/stats"),
     ):
-        ws.receive_json()
+        pass
+    assert denied.value.status_code == 403
+    assert denied.value.json() == {"detail": "not authenticated or not permitted"}
 
     opened = create_managed_app(
         db_path=tmp_path / "ws-open.db",
@@ -100,6 +106,51 @@ def test_the_stats_socket_follows_the_same_opt_in(tmp_path: Path) -> None:
     )
     with TestClient(opened) as tc, tc.websocket_connect("/ws/stats") as ws:
         assert "outbox_by_status" in ws.receive_json(), "control: the opt-in opens the socket"
+
+
+#: The factory's own logger, read off the function so a module move cannot leave the filter empty.
+_FACTORY_LOGGER = create_managed_app.__module__
+
+
+def _factory_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Every WARNING the factory's logger wrote, so a second line worded differently counts too."""
+    return [r for r in caplog.records if r.name == _FACTORY_LOGGER and r.levelno >= logging.WARNING]
+
+
+@pytest.mark.parametrize(
+    ("auth_settings", "allow_no_auth", "expected"),
+    [
+        pytest.param(None, False, 1, id="nothing-passed"),
+        pytest.param(None, True, 0, id="opted-in"),
+        pytest.param(
+            AuthSettings(require_mfa=False, notify_security_events=False),
+            False,
+            0,
+            id="auth-settings",
+        ),
+    ],
+)
+def test_a_deny_all_build_says_so_once(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    auth_settings: AuthSettings | None,
+    allow_no_auth: bool,
+    expected: int,
+) -> None:
+    """Vault BACKLOG #2731 item 1: the deny-all default fails closed, and the build logs one WARNING
+    naming it. The opt-in and enabled settings are the controls: neither denies everything, and
+    neither warns. The factory is called and not started, so the line is the build's own."""
+    caplog.set_level(logging.WARNING, logger=_FACTORY_LOGGER)
+    create_managed_app(
+        db_path=tmp_path / "warn.db",
+        poll_interval=0.05,
+        auth_settings=auth_settings,
+        allow_no_auth=allow_no_auth,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    warnings = _factory_warnings(caplog)
+    assert len(warnings) == expected
+    assert all(AUTH_NOT_CONFIGURED in r.getMessage() for r in warnings)
 
 
 async def test_enabled_auth_settings_refuse_an_anonymous_call_and_answer_a_signed_in_one(

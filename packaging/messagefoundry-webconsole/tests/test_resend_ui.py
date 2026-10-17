@@ -9,7 +9,7 @@ are only observable through a mounted app.
 
 NOT the edit-and-resubmit editor (ADR 0090 section 9, BACKLOG #153), which is a different endpoint
 with different permissions and ships an EDITED body; and not the uploaded-logs resend (ADR 0134),
-which injects into an INBOUND. Both live in test_webui.py / test_uploaded_logs_ui.py.
+which injects into an INBOUND. Both live in test_webui_edit.py / test_uploaded_logs_ui.py.
 """
 
 from __future__ import annotations

@@ -215,6 +215,47 @@ def test_codec_validates_bytes_and_distinct_delimiters() -> None:
         codec_for(None)  # neither preset nor bytes
 
 
+@pytest.mark.parametrize("role", ["start", "end"])
+def test_codec_refuses_a_space_start_or_end_byte(role: str) -> None:
+    # BACKLOG #2900. The refusal names the setting, directly, through the settings and at build.
+    def frame_bytes(byte: int) -> dict[str, int]:
+        return {"start": 0x02, "end": 0x03, role: byte}
+
+    with pytest.raises(ValueError, match=f"frame {role} must not be 0x20"):
+        FrameCodec(**frame_bytes(0x20))
+    with pytest.raises(
+        ValueError, match=f"TCP framing misconfigured: frame {role} must not be 0x20"
+    ):
+        tcp_mod._codec_from_settings(dict(frame_bytes(0x20)))
+    with pytest.raises(ValueError, match=f"frame {role} must not be 0x20"):
+        _source(framing=None, **frame_bytes(0x20))
+    with pytest.raises(ValueError, match=f"frame {role} must not be 0x20"):
+        _dest(9, framing=None, **frame_bytes(0x20))
+    # Control: the byte after the space still builds, directly, through the settings and at build.
+    built = FrameCodec(**frame_bytes(0x21))
+    assert getattr(built, role) == 0x21
+    assert tcp_mod._codec_from_settings(dict(frame_bytes(0x21))) == built
+    assert _source(framing=None, **frame_bytes(0x21)).codec == built
+    assert _dest(9, framing=None, **frame_bytes(0x21)).codec == built
+
+
+def test_codec_allows_a_space_trailer() -> None:
+    # The trailer is not a frame byte to a decoder, so a space trailer is not refused.
+    codec = FrameCodec(start=0x02, end=0x03, trailer=0x20)
+    assert codec.frame_neutralised("A\x02B\x03C") == b"\x02A B C\x03 "
+    assert tcp_mod._codec_from_settings({"start": 2, "end": 3, "trailer": 0x20}) == codec
+
+
+@pytest.mark.parametrize("trailer", [None, 0x20])
+def test_a_neutralised_reply_decodes_as_one_frame(trailer: int | None) -> None:
+    # The property behind the 0x20 refusal, for a codec that may be built: a reply holding both
+    # frame bytes still decodes as exactly one payload with no frame left open.
+    codec = FrameCodec(start=0x21, end=0x03, trailer=trailer)
+    decoder = codec.decoder()
+    assert list(decoder.feed(codec.frame_neutralised("A!B\x03C"))) == [b"A B C"]
+    assert not decoder.in_frame
+
+
 # --- MLLP unchanged after refactor onto the shared codec ---------------------
 
 

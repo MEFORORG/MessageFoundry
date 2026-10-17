@@ -36,8 +36,9 @@ the store, so one sign-in covers every node that shares a store, however many no
 matters because the engine caps the sessions one user may hold (five by default) and ends the
 oldest past that: a session per node would end the first ones on a large fleet. A node on a
 different store refuses the session, and :func:`renew_session` signs in again there. A drive split
-over several harness PROCESSES holds one session in each, so the rig that splits its drive that way
-sizes the cap on the engine it starts (``connscale/batchbox.py``).
+over several harness PROCESSES holds one session in each and makes one sign-in from each, so the
+rig that splits its drive that way sizes the cap and the sign-in rate limits on the engine it starts
+(``connscale/batchbox.py``, ``rig_sign_in_env``).
 """
 
 from __future__ import annotations
@@ -500,6 +501,18 @@ def sign_in(base_url: str, admin: RigAdmin | None = None, *, cacert: str | None 
         cacert=cacert,
         body={"username": admin.username, "password": admin.password},
     )
+    if status == 429:
+        # The sign-in rate limit, not the credential (BACKLOG #2795): the stale-Administrator advice
+        # below would send an operator after the wrong cause. Every attempt counts, successes too,
+        # so a fleet of rig processes signing in from one address can meet the per-address limit.
+        # A refused attempt does not count, which is why waiting out the window clears it.
+        raise RigSignInRefused(
+            "the engine rate-limited the rig Administrator's sign-in (HTTP 429): too many sign-in "
+            "attempts inside its window, which clears once the window passes. A rig of many "
+            "processes signing in from one address needs the engine's "
+            "MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP, and past the all-clients limit "
+            "MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL, sized to its sign-ins."
+        )
     if status != 200:
         raise RigSignInRefused(
             f"the engine refused the rig Administrator's sign-in (HTTP {status}). If this store "

@@ -19,7 +19,7 @@ this module exists to keep in one place.
 from __future__ import annotations
 
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from urllib.parse import quote, urlencode
 
@@ -271,3 +271,27 @@ def _seg(value: object) -> str:
     by READING each one, never by a blanket builder.
     """
     return quote(str(value), safe="")
+
+
+def _reload_shortfall(
+    *, degraded: bool, failures: Sequence[str], restart_required: Sequence[str] | None
+) -> list[str]:
+    """The sentences for a reload that is live but not finished, or an empty list for a clean one.
+
+    One copy for both pages that report a reload: the inline result and a released hold's
+    approval page, so dual control is never the quieter path (BACKLOG #1111, #3015). It names a
+    follow-on step that failed (``degraded``) and each settings trust anchor that takes a restart
+    (``restart_required``; ``None``, a dry run that did not check, says nothing)."""
+    sentences: list[str] = []
+    if degraded:
+        sentences.append(
+            f"The reload applied, and at least one follow-on step failed: {', '.join(failures)}. "
+            "The new graph is live; finish those steps by hand."
+        )
+    if restart_required:
+        sentences.append(
+            "Restart the engine to apply a changed trust anchor. This reload checked the new file "
+            "but does not load it, so the engine still trusts the old CA for: "
+            f"{', '.join(restart_required)}."
+        )
+    return sentences

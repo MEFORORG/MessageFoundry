@@ -215,7 +215,7 @@ It must send `notify_email`. CLAUDE.md section 0: zero deployments, so no shim.
   notice. -> `tests/test_admin_notify_email_update.py::test_an_unrelated_save_does_not_move_the_notification_address`,
   `::test_an_unrelated_save_does_not_fill_a_blank_notification_address`,
   `::test_patch_without_the_field_leaves_the_notification_address`, and
-  `packaging/messagefoundry-webconsole/tests/test_webui.py::test_an_unrelated_console_save_leaves_the_notification_address`
+  `packaging/messagefoundry-webconsole/tests/test_webui_users.py::test_an_unrelated_console_save_leaves_the_notification_address`
 - **AC-10** -- WHEN an administrator names a new `notify_email`, THE SYSTEM SHALL move it, write
   `user.notify_email_changed`, and notify the previous address, or the new one when there was none.
   -> `tests/test_admin_notify_email_update.py::test_an_explicit_change_moves_the_address_and_tells_the_old_one`,
