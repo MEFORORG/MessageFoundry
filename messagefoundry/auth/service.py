@@ -7480,7 +7480,9 @@ class AuthService:
         also skip every account after this one. So a store refusal is logged at ERROR, naming the
         action and the actor, and the pass goes on. The log line is then the only record of that
         row: nothing retries it. A revocation or rename it records has already committed, and any
-        notice or alert it was due still goes.
+        notice it was due still goes. Its alert still goes too, unless a later write in the same
+        pass also fails and ends the pass: the earlier account then has neither its row nor its
+        alert.
 
         A defect is raised, not passed over (:data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS`).
         """
