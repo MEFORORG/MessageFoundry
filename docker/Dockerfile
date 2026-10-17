@@ -92,10 +92,11 @@ RUN apt-get update \
 RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin mefor \
  && mkdir -p /var/lib/mefor /config \
  && chown -R 10001:10001 /var/lib/mefor
-# PYTHONUNBUFFERED and PYTHONDONTWRITEBYTECODE are for the Python CHILDREN the engine starts (an
-# engine shard under `supervise`, the sandbox worker). The engine itself is started in isolated
-# mode by the ENTRYPOINT below, which ignores every PYTHON* variable, so it gets the same two
-# behaviours from -u and -B there.
+# The engine is started in isolated mode by the ENTRYPOINT below, which ignores every PYTHON*
+# variable, so it gets unbuffered output and no bytecode from -u and -B there. Its Python children
+# (an engine shard under `supervise`, the sandbox worker) repeat -I and -B, and take -u because
+# PYTHONUNBUFFERED is set here (messagefoundry/childenv.py). PYTHONDONTWRITEBYTECODE reaches no
+# process that reads it; it stays for a shell started in the image.
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

@@ -2192,12 +2192,12 @@ class MLLPSource(SourceConnector):
             # at the next promotion) may not run its `finally` before the restart, so a count it
             # holds would survive into the restarted listener, and `release`'s own docstring names
             # what that costs: a per-host count left behind by a missed release locks that peer
-            # out. The limit, stated so it is not over-read: a straggler that releases AFTER the
-            # restart has re-admitted its host decrements the new count, so the per-host cap can
-            # undercount by one per such straggler while that host's newer connections stay open.
-            # Tying a release to the run
-            # that admitted it would close that, and is a separate change. `active` keeps its
-            # existing behaviour: the global cap that predates this row reads it.
+            # out. A straggler that releases AFTER the restart has re-admitted its host carries the
+            # epoch of the run that admitted it, and `reset` advances the epoch, so that release
+            # leaves the restarted listener's per-host count alone rather than undercounting it
+            # (vault BACKLOG #2939). `active` still drops on it: that socket was open until then,
+            # and the global cap that predates this row reads it. What the epoch leaves open while
+            # a straggler is still live is stated once, in `ListenerAdmission.release`.
             self._admission.reset()
         # Now that no client handlers are in flight, this should complete promptly — but on the Windows
         # ProactorEventLoop a still-pending overlapped accept/read can make wait_closed() never return,
@@ -2374,7 +2374,7 @@ class MLLPSource(SourceConnector):
                 if refusal.kind is not None:
                     await self._emit_event(refusal.kind, peer_host=peer_host, reason=refusal.reason)
                 return  # refused (closed in the outer finally)
-            self._admission.admit(peer_host)
+            epoch = self._admission.admit(peer_host)
             # The `established` emit sits INSIDE the try whose finally releases the slot. It is
             # fail-soft against `Exception` but not against `CancelledError`, and stop() cancels
             # straggling client tasks — so a cancellation delivered here used to escape past
@@ -2500,7 +2500,7 @@ class MLLPSource(SourceConnector):
                 failed = True  # peer reset; nothing to do but drop the connection
                 await self._emit_event("peer_reset", peer_host=peer_host, reason=safe_exc(exc))
             finally:
-                self._admission.release(peer_host)
+                self._admission.release(peer_host, epoch)
         finally:
             self._clients.discard(writer)
             if task is not None:

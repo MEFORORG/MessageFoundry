@@ -144,7 +144,9 @@ transport = "mllp"
   of the wrong kind — `port = "2576"`, `persistent = "yes"` — is refused at load naming the setting and
   the type it wanted. A quoted TOML value is always a string, so write the number or `true`/`false`
   without quotes. An `env()` reference is also accepted, but give it a `cast` for a non-string setting:
-  an environment value arrives as text and an **uncast** ref hands the connector that text. An inline
+  an environment value arrives as text and an **uncast** ref hands the connector that text. A
+  boolean setting is mostly the exception: it is read strictly whatever the cast (vault BACKLOG
+  #3234; [CONFIGURATION.md](CONFIGURATION.md) gives the spellings and the settings it misses). An inline
   `default =` is held to the setting's type here, because a default is **not** converted by `cast`.
   The one exception is `cast = "bool"`, which reads a default's spelling as it reads the value's.
   **A numeric cap reads the text `"0"` exactly as it reads the number `0`** (BACKLOG #1872): where a
@@ -482,7 +484,7 @@ the bytes.
 | `host` | out | — (required) | the downstream peer to dial. **Inbound takes no host** (wiring error) — listeners bind the service-level `[inbound].bind_host`. |
 | `port` | both | — (required) | bind/connect port |
 | `framing` | both | `"stx_etx"` | framing **preset**: `"stx_etx"` (`0x02`/`0x03`, no trailer) or `"vt_fs"`/`"mllp"` (`0x0B`/`0x1C`/`0x0D`). Pass `framing=None` to use explicit bytes instead. |
-| `start` / `end` / `trailer` | both | — | explicit delimiter **byte ints** (use with `framing=None`; `trailer` optional). Specifying these *and* a preset is a config error. |
+| `start` / `end` / `trailer` | both | — | explicit delimiter **byte ints** (use with `framing=None`; `trailer` optional). Specifying these *and* a preset is a config error. `start` and `end` must differ, and neither may be `0x20` (a space); the connection is refused when it is built. A `0x20` `trailer` is allowed. Why: `FrameCodec` in [`messagefoundry/framing.py`](../messagefoundry/framing.py). |
 | `encoding` | both | `utf-8` | charset used to encode/decode the framed payload |
 | `max_connections` | in | `256` | cap on concurrent client connections (flood guard). `None`/`0` = unlimited. |
 | `receive_timeout` | in | `60.0` | close a client idle this many seconds (slowloris). `None`/`0` = no timeout. |
@@ -653,7 +655,7 @@ routes a `Message`; `json`/`xml`/`text`/`fhir` route a `RawMessage` the Handler 
 | `max_connections` | `256` | cap on concurrent clients (connection-flood guard). `None`/`0` = unlimited. |
 | `receive_timeout` | `60.0` | bound the **whole-request** read — request line + headers + body (slowloris guard); over budget answers a synchronous `408`. `None`/`0` = no timeout. |
 | `max_connections_per_host` | **off** | cap on concurrent connections from **one peer address**, answered `503` with an `at_capacity` event whose reason reads `max_connections_per_host` (vault BACKLOG #2606). **Ships off, unlike MLLP/TCP/X12**: this connector answers one request per connection, so behind a reverse proxy every partner arrives from one address and any cap would be the listener's whole capacity. Set one only where the listener sees real client addresses. |
-| `max_body_bytes` | `16 MiB` | the MLLP frame cap's HTTP twin — an over-declared `Content-Length` is refused `413` **before a body byte is read** (OOM guard). `None`/`0` = unlimited. |
+| `max_body_bytes` | `16 MiB` | the MLLP frame cap's HTTP twin — an over-declared `Content-Length` is refused `413` **before a body byte is read** (OOM guard). `None`/`0` = unlimited, and the connection logs a `WARNING` naming the setting each time it is built (BACKLOG #2749). |
 | `max_header_bytes` | `64 KiB` | cap the request line + headers (header-flood guard). This one cap can't be switched off: unset or `None` takes the 64 KiB default, and `0` (or `"0"`) is refused at load rather than silently becoming the default (BACKLOG #1872). |
 | `max_messages_per_second` | **off** | sustained message-rate ceiling for the **whole listener** (ASVS 2.4.1 / 15.2.2, BACKLOG #1114 — the MLLP pacer, ported). Over budget the connector **waits before reading the request**, so the partner is back-pressured and then served in full — **nothing is dropped, refused or answered differently**, and the wait sits outside `receive_timeout` so a paced partner is never handed a `408` for a delay the engine imposed. **Listener-wide, not per-connection**, unlike MLLP/TCP/X12: this connector answers one request per connection, so a per-connection bucket would be charged once and thrown away, bounding nothing. A `GET`/`HEAD` probe waits behind an outstanding debt but **charges nothing**, and neither does a request refused before its body reaches the engine. Only a body the engine reads and records spends budget, including one it then refuses with a `422`, so a peer that submits nothing cannot starve one that does. Unset = no bound, deliberately: a guessed rate throttles real traffic, so the number has to come from your own feed profile. |
 | `message_burst` | = the rate | tokens the bucket holds, i.e. how large a burst passes unpaced before the sustained rate applies. Only meaningful with `max_messages_per_second` set. Floor of 1 so the listener can always make progress. |
@@ -779,11 +781,11 @@ def route(msg):
 | `directory` | both | — (required) | folder to poll / write into |
 | `pattern` | in | `*.hl7` | filename glob to pick up |
 | `poll_seconds` | in | `1.0` | poll interval, a finite number of seconds above zero; anything else is refused at build, including at least zero, a negative value, NaN, infinity and text that is not a number (BACKLOG #2774). It is also the **settle window**: a file is read only once its size and modification time are unchanged since the last poll that saw it (BACKLOG #1811), so every file waits at least one poll. The settle gate is always on and has no setting, but a very small `poll_seconds` narrows its window to almost nothing. |
-| `min_age_seconds` | in | `0` | skip files modified within this window. This is an extra wait on top of the settle gate, not the gate itself; set it for a partner that pauses between writes for longer than `poll_seconds`. |
+| `min_age_seconds` | in | `0` | skip files modified within this window. This is an extra wait on top of the settle gate, not the gate itself; set it for a partner that pauses between writes for longer than `poll_seconds`. A negative value is refused at build (BACKLOG #3151). |
 | `after_read` | in | `move` | `move` (→ `.processed`), `delete`, or `leave` (process **in place** — never move/delete the source file, for a read-only share / a directory another system owns; a hashed dedup ledger ensures a left file is ingested **once**, #142) |
 | `sort` | in | `name` | process order: `name` or `mtime` |
 | `recursive` | in | `false` | also scan subdirectories |
-| `max_file_bytes` | in | `16 MiB` | route files larger than this to the error dir instead of reading them into memory (OOM guard). `None`/`0` = unlimited. |
+| `max_file_bytes` | in | `16 MiB` | route files larger than this to the error dir instead of reading them into memory (OOM guard). `None`/`0` = unlimited, and the connection logs a `WARNING` naming the setting each time it is built (BACKLOG #2749). |
 | `poll_max_files` | in | `500` | most files one scan will take. The rest stay in the drop directory and the next scan takes them — a **deferral, not a drop**: nothing is quarantined, errored, or left unaccounted for. See [*Per-tick poll ceilings*](#per-tick-poll-ceilings) for the number and when to raise it. `None`/`0` = unlimited. |
 | `validate_directory` | both | `false` | validate the directory **at startup** (#114): a missing/unusable dir reports the connection **`failed`** (ADR 0031) instead of the default deferral to run time. **No mkdir** — a merely-missing dir fails. **In:** a `leave` source validates read-only (a read-only share passes); `move`/`delete` also require write. **Out:** the target must already exist and accept a write, and is then **never created** — not at start, not on write (a delivery into a vanished dir fails retryably instead), and not by `POST /connections/{name}/test`. Left off (the default) the outbound target is still created on first write, but the creation is now logged as a `WARNING`. |
 | `processed_subdir` / `error_subdir` | in | `.processed` / `.error` | where read/failed files go |
@@ -1055,7 +1057,7 @@ its own policy block below):
   charged on the handle the read opens, not on an earlier `stat()`: an oversize file is rejected by
   its handle's size **before** it is read into memory, and the read itself stops at the cap plus one
   byte, so a file that grows after it was listed is refused too (OOM / DoS guard, BACKLOG #2507).
-  `None`/`0` disables it.
+  `None`/`0` disables it, and the connection then logs a `WARNING` each time it is built (BACKLOG #2749).
 - **Links are refused at listing, read and move time.** The listing looks at each name without
   following a link there. A drop is read only if the opened handle is a regular file at the listed
   name inside the watch directory, reached through no symbolic link or junction: POSIX opens each path
@@ -1312,7 +1314,7 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `poll_seconds` | in | `5.0` | poll interval, a finite number of seconds above zero; anything else is refused at build, including at least zero, a negative value, NaN, infinity and text that is not a number (BACKLOG #2774). It is also the **settle window**: a file is read only once it lists at the same size, and the same modification time where the server lists one, as at the last poll that saw it (BACKLOG #2071, #2758), so every file waits at least one poll. The gate is always on and has no setting. On a server that lists no modification time (at least FTP without `MLSD`, an `MLSD` server without `modify`, and an SFTP server that omits the times) it reads the listed size alone, so there it cannot see a same-size rewrite, nor anything on a server that lists every file at size 0. |
 | `min_age_seconds` | in | `0.0` | **accepted but not honoured on a remote source today** — the connector never reads it. Only `File(...)` implements it; the settle gate on `poll_seconds` above, and the partner's own write-then-rename, are what guard against partial reads here. |
 | `after_read` | in | `move` | `move` (→ `processed_subdir`), `delete`, or `leave` (process **in place**, #142 — a durable dedup ledger keyed on a hash of the **full remote path** + size + the listed modification time where the server gives one ensures a left file is ingested once; see *Process-in-place* for what a server that lists no modification time misses) |
-| `max_file_bytes` | in | `16 MiB` | **charged twice, and the second charge is the one that binds.** Before the retrieve, against the size the **server reported** in its own directory listing — an over-size entry is moved to `error_subdir` without being read. Then **during** the retrieve, against the **bytes actually read**: the download streams in 1 MiB chunks and is cut off at the first byte past the budget, so a share that lists a small file and then delivers an arbitrarily large body is refused mid-transfer rather than buffered whole (BACKLOG #1191). Either refusal quarantines the file to `error_subdir` and logs it — never a silent drop, and never left in place to be re-pulled every poll. `None`/`0` = unlimited, in both charges. |
+| `max_file_bytes` | in | `16 MiB` | **charged twice, and the second charge is the one that binds.** Before the retrieve, against the size the **server reported** in its own directory listing — an over-size entry is moved to `error_subdir` without being read. Then **during** the retrieve, against the **bytes actually read**: the download streams in 1 MiB chunks and is cut off at the first byte past the budget, so a share that lists a small file and then delivers an arbitrarily large body is refused mid-transfer rather than buffered whole (BACKLOG #1191). Either refusal quarantines the file to `error_subdir` and logs it — never a silent drop, and never left in place to be re-pulled every poll. `None`/`0` = unlimited, in both charges, and the connection logs a `WARNING` naming the setting each time it is built (BACKLOG #2749). |
 | `poll_max_files` | in | `500` | most files one poll will take. The rest stay on the share and the next poll takes them — a **deferral, not a drop**. Identical in shape and reasoning to the `File(...)` row; see [*Per-tick poll ceilings*](#per-tick-poll-ceilings). `None`/`0` = unlimited. |
 | `validate_directory` | both | `false` | validate `remote_dir` **at startup** (#114): unreachable/unusable reports the connection **`failed`** (ADR 0031) instead of deferring to run time. The probe is a **listing** — it never creates. **Out:** the upload dir is then never `ensure_dir`ed either, on send or by `POST /connections/{name}/test`. Instead every send first **lists** `remote_dir`, so the account needs list permission there even with `overwrite = true`, at one extra round trip per delivery. An upload into a vanished dir then fails **retryably** rather than dead-lettering on the partner's permanent no-such-dir; a credential refusal on that listing stops the lane. Left off (the default) the upload dir is still created on first send, but the creation is now logged as a `WARNING`. |
 | `processed_subdir` / `error_subdir` | in | `.processed` / `.error` | where read / failed files go |
@@ -3581,9 +3583,9 @@ Facts that are easy to get wrong, stated plainly first:
     Noise in the same read as a completed frame starts nothing. A sender that holds
     a quiet socket open with them is closed at `max_frame_seconds`, even where `receive_timeout` is
     longer or off.
-  * On X12 the frame is the interchange, from its `ISA` to its `IEA`. X12 has no line-end allowance
-    yet, so a newline after the `IEA` that arrives in a read of its own starts the clock. That is a
-    known gap, not the intended rule.
+  * On X12 the frame is the interchange, from its `ISA` to the terminator of its `IEA` segment. Up
+    to two bytes directly after that terminator belong to the interchange when each is CR or LF, so
+    a newline after the `IEA` starts nothing, however late it arrives (vault BACKLOG #2938).
   * Time the engine withholds, for pacing or an intake pause, is not counted.
 
   Vault BACKLOG #2847 moved MLLP onto this rule. Its clock used to start only at a start byte.

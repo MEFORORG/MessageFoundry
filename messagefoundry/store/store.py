@@ -85,6 +85,7 @@ from uuid import uuid4
 
 import aiosqlite
 
+from messagefoundry.childenv import system_tool_environment
 from messagefoundry.config.models import RetryPolicy
 
 # The captured-reply record lives in the (store-free) config layer so a sandbox worker child — which
@@ -5193,6 +5194,7 @@ def _secure_file(path: Path) -> None:
             result = subprocess.run(  # nosec B603 B607
                 [_system_exe("icacls.exe"), str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
                 check=False,
+                env=system_tool_environment(),  # the platform's start-up names only (#2716)
                 capture_output=True,
                 text=True,
                 # icacls echoes the path in the OEM code page. Neither the cp1252 locale default nor
@@ -5230,6 +5232,7 @@ def _grant_read(path: Path, principal: str) -> None:
         result = subprocess.run(  # nosec B603 B607
             [_system_exe("icacls.exe"), str(path), "/grant", f"{principal}:(R)"],
             check=False,
+            env=system_tool_environment(),  # the platform's start-up names only (#2716)
             capture_output=True,
             text=True,
             encoding="oem",  # icacls's piped output; see _secure_file for why "replace"
@@ -6660,8 +6663,9 @@ CREATE INDEX IF NOT EXISTS ix_resend_message ON resend_log(message_id);
 -- files another system owns can be polled without moving/deleting them and a left file is ingested
 -- ONCE. Shaped like `delivered_keys`/`resend_log`: HASHES + IDS ONLY, no body/PHI, so it is stored in
 -- the clear (NOT part of the `_cipher` seam). `file_key` is a SHA-256 of the file's identity
--- (relative-path+mtime+size local / full-remote-path+size remote — the PATH is folded in, not just the
--- basename, so two same-named files under different subdirs stay distinct and are BOTH ingested) — a
+-- (relative-path+mtime+size local / full-remote-path+size+the listed mtime remote, the mtime only where
+-- the server lists one, BACKLOG #2758 — the PATH is folded in, not just the basename, so two
+-- same-named files under different subdirs stay distinct and are BOTH ingested) — a
 -- DERIVED id, NEVER a cleartext path (a filename/path can embed an MRN) and never logged at INFO+.
 -- `channel_id` is the inbound connection name (config metadata, non-PHI) — scopes the dedup + the
 -- age/count prune per connection. The row is INSERTed AFTER the file's message(s) emit successfully (the

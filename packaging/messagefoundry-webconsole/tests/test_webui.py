@@ -3214,6 +3214,25 @@ async def test_config_reload_registered_in_stepup_allowlist(engine: Engine) -> N
     assert not is_safe_ui_action("/ui/config/reload?dir=/etc")  # query rejected (no path injection)
 
 
+def test_the_reload_result_page_says_what_the_reload_left_undone() -> None:
+    """BACKLOG #3015: the page shows a degraded step and a changed trust anchor that takes a
+    restart. Before it, both reached only the JSON answer. The control is a clean reload."""
+    from messagefoundry.api.models import ReloadResult
+    from messagefoundry_webconsole import pages
+
+    def render(**fields: object) -> str:
+        counts = {"inbound": 1, "outbound": 1, "routers": 1, "handlers": 1, "running": True}
+        return str(pages.reload_result(ReloadResult.model_validate({**counts, **fields})))
+
+    clean = render(restart_required=[])
+    assert "Restart the engine" not in clean and "follow-on step failed" not in clean
+    restart = render(restart_required=["[auth].ad_tls_ca_cert_file"])
+    assert "Restart the engine" in restart and "[auth].ad_tls_ca_cert_file" in restart
+    degraded = render(degraded=True, failures=["reference_sync"])
+    assert "follow-on step failed: reference_sync" in degraded
+    assert "Restart the engine" not in render(restart_required=None)  # a dry run did not check
+
+
 async def test_write_action_method_matches_its_continuation(engine: Engine) -> None:
     # R1 (refined for L0c): the re-auth continuation branches on a registered action's flags, so the HTTP
     # method serving each action MUST match its continuation style, or the branch is a hazard:
@@ -4844,6 +4863,17 @@ async def test_builtin_role_edit_is_404(engine: Engine) -> None:
         assert (await c.get("/ui/roles/administrator/edit")).status_code == 404
 
 
+async def test_ad_group_inputs_show_an_example_dn(engine: Engine) -> None:
+    """BACKLOG #3222: both maps take a full DN only, so every group input says what one looks
+    like. Three blank rows per map, and no stored rows yet."""
+    service = await _service(engine)
+    async with _boss_client(engine, service) as c:
+        r = await c.get("/ui/ad-groups")
+        assert r.status_code == 200
+        hint = 'placeholder="CN=MF-Admins,OU=Groups,DC=example,DC=com"'
+        assert r.text.count(hint) == r.text.count('name="ad_group"') == 6
+
+
 async def test_ad_group_maps_roundtrip(engine: Engine) -> None:
     service = await _service(engine)
     async with _boss_client(engine, service) as c:
@@ -4877,7 +4907,12 @@ async def test_ad_group_maps_roundtrip(engine: Engine) -> None:
             value = "administrator" if partner == "role" else "*"
             r = await _post_pairs(c, path, [("ad_group", "MEFOR-Ops"), (partner, value)])
             assert r.status_code == 400 and "full distinguished name" in r.text
+            # A no-break space at the end is refused too, not trimmed (BACKLOG #3222).
+            nbsp = "CN=MEFOR-Ops,OU=Groups,DC=example,DC=invalid\u00a0"
+            r = await _post_pairs(c, path, [("ad_group", nbsp), (partner, value)])
+            assert r.status_code == 400 and "does not print" in r.text
         assert len(await service.store.list_ad_group_role_map()) == 1
+        assert await service.store.list_ad_group_scope_map() == []
         # Scope map round-trip.
         r = await _post_pairs(
             c,
@@ -6136,8 +6171,8 @@ def _data_attr(text: str, attr: str) -> dict:
     return json.loads(_html.unescape(m.group(1)))
 
 
-async def _browser_enroll(c: httpx.AsyncClient, *, label: str) -> object:
-    """Run the full browser registration ceremony; returns the enrolled soft authenticator."""
+async def _browser_stage(c: httpx.AsyncClient) -> tuple[object, dict]:
+    """Stage a browser registration ceremony; returns the soft authenticator and its attestation."""
     from _soft_webauthn import SoftAuthenticator
     from webauthn.helpers import base64url_to_bytes
 
@@ -6148,7 +6183,12 @@ async def _browser_enroll(c: httpx.AsyncClient, *, label: str) -> object:
     assert r.status_code == 200, r.text
     options = _data_attr(r.text, "data-mf-webauthn-create")
     auth = SoftAuthenticator(rp_id="t", origin="http://t")
-    resp = json.loads(auth.create_response(base64url_to_bytes(options["challenge"])))
+    return auth, json.loads(auth.create_response(base64url_to_bytes(options["challenge"])))
+
+
+async def _browser_enroll(c: httpx.AsyncClient, *, label: str) -> object:
+    """Run the full browser registration ceremony; returns the enrolled soft authenticator."""
+    auth, resp = await _browser_stage(c)
     r = await c.post(
         "/ui/account/webauthn/verify", json={"label": label, "response": resp}, headers=_SFS
     )
@@ -6285,6 +6325,33 @@ async def test_webauthn_json_endpoints_reject_bearer_without_cookie(engine: Engi
         assert r.status_code == 401
         r = await c.post("/ui/account/webauthn/verify", json={"response": {}}, headers=headers)
         assert r.status_code == 303  # require_ui-family: no cookie -> login redirect
+
+
+async def test_webauthn_verify_draws_on_the_ceremony_budget(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #3014: the passkey finish draws on the per-actor ceremony budget, as mfa/verify does.
+    # RED when: a denied budget still reaches the service, or answers with a body the page's fetch
+    # cannot read. The throttle comes before the service, so the ceremony survives it.
+    pytest.importorskip("webauthn")
+    service = await _service(engine)
+    async with _boss_client(engine, service) as c:
+        _auth, resp = await _browser_stage(c)
+        real = service.allow_reauth_attempt
+        monkeypatch.setattr(service, "allow_reauth_attempt", lambda _actor: False)
+        r = await c.post(
+            "/ui/account/webauthn/verify", json={"label": "k", "response": resp}, headers=_SFS
+        )
+        body = r.json()
+        assert r.status_code == 429 and body["ok"] is False and body["error"]
+        uid = await _uid(service, "boss")
+        assert await service.store.list_webauthn_credentials(uid) == []
+
+        monkeypatch.setattr(service, "allow_reauth_attempt", real)
+        r = await c.post(
+            "/ui/account/webauthn/verify", json={"label": "k", "response": resp}, headers=_SFS
+        )
+        assert r.status_code == 200 and r.json()["ok"] is True, r.text
 
 
 async def test_webauthn_cross_site_posts_rejected(engine: Engine) -> None:
