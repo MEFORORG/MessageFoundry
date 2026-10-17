@@ -981,8 +981,14 @@ IMPORT_ONLY: dict[str, str] = {
 #: to perform. Rationale for a file's crypto lives on its INVENTORY row above; rows for files the
 #: import arm never saw carry their own.
 OPERATION_INVENTORY: dict[str, frozenset[str]] = {
+    # Vault BACKLOG #2796: a rig account with an authenticator key signs in with a TOTP code the
+    # engine's own messagefoundry.auth.totp computes (HMAC-SHA-256), imported where it is used.
     "harness/load/rigadmin.py": frozenset(
-        {"csprng:secrets.token_hex", "tls_context:ssl.create_default_context"}
+        {
+            "csprng:secrets.token_hex",
+            "mac:via messagefoundry.auth.totp",
+            "tls_context:ssl.create_default_context",
+        }
     ),
     "harness/load/tlsmat.py": frozenset(
         {
@@ -1758,11 +1764,13 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         }
     ),
     # enginepoll.py also signs its clients in as the rig Administrator (vault BACKLOG #2719),
-    # which reaches that module's password draw and its verifying TLS context.
+    # which reaches that module's password draw, its verifying TLS context, and the TOTP code a
+    # rig account with an authenticator key signs in with (vault BACKLOG #2796).
     "harness/load/enginepoll.py": frozenset(
         {
             "csprng:via harness.load.rigadmin",
             "key_cert:via harness.load.tlsmat",
+            "mac:via harness.load.rigadmin",
             "sign_verify:via harness.load.tlsmat",
             "tls_context:via harness.load.rigadmin",
         }
