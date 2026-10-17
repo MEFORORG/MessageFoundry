@@ -514,9 +514,14 @@ def test_postgres_borrows_outside_the_bounded_helper_are_pinned() -> None:
     # Store 33 -> 32 on 2026-10-14, a drop: BACKLOG #2592 moved `decide_pending_approval`'s audit-free
     # UPDATE, which borrowed with `self._pool.execute`, into a transaction on the bounded
     # `_timed_acquire`, so the move reads the row and checks its seal before it writes.
-    assert (len(store_sites), len(cluster_sites)) == (32, 0), (
-        "the measured population of pool borrows OUTSIDE the bounded helper moved from 32 (store)"
-        " + 0 (cluster), measured 2026-10-14. Re-read the CONNECTIONS.md scope note before changing"
+    # Store 32 -> 28 on 2026-10-16, a drop: vault BACKLOG #3217 moved the four operator alert
+    # mutations (ack, resolve, suspend, resume), which borrowed with `self._pool.execute`, into
+    # `_alert_write`, a transaction on the bounded `_timed_acquire`, so each commits its audit row
+    # with its change. The CONNECTIONS.md note still says "at least", so this drop also leaves it
+    # true as written.
+    assert (len(store_sites), len(cluster_sites)) == (28, 0), (
+        "the measured population of pool borrows OUTSIDE the bounded helper moved from 28 (store)"
+        " + 0 (cluster), measured 2026-10-16. Re-read the CONNECTIONS.md scope note before changing"
         " this number. Sites scanned:\n" + "\n".join(store_sites + cluster_sites)
     )
 

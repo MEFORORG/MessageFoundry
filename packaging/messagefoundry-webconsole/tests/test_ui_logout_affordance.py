@@ -22,6 +22,7 @@ Three layers, because pinning the five fixed pages cannot catch a SIXTH bare pag
 from __future__ import annotations
 
 import ast
+import json
 from pathlib import Path
 
 import httpx
@@ -207,3 +208,9 @@ async def test_must_change_session_can_see_and_use_sign_out(engine: Engine) -> N
         assert out.status_code == 303
         # the session is really gone: the change-password page now bounces to login
         assert (await c.get("/ui/account/password")).status_code in (302, 303, 401)
+    # BACKLOG #3029: the route passes no actor, so the auth.logout row names the owner of the
+    # session it ended rather than carrying a NULL actor.
+    rows = await engine.store.list_audit(action="auth.logout")
+    assert [(r["actor"], json.loads(str(r["detail"]))["outcome"]) for r in rows] == [
+        ("rotate", "revoked")
+    ]

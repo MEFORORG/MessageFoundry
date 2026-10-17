@@ -444,31 +444,38 @@ INSECURE_TLS_ESCAPE_ENV = "MEFOR_ALLOW_INSECURE_TLS"
 
 
 def insecure_tls_allowed() -> bool:
-    """Whether the explicit dev escape to permit insecure TLS overrides is set (ASVS 12.3.2).
+    """Whether the dev escape for insecure TLS overrides is SET to a true value (ASVS 12.3.2).
 
-    Certificate-validation overrides (``trust_server_certificate=true`` for SQL Server, for one) are
-    MITM-able, so they now **refuse** at startup unless ``MEFOR_ALLOW_INSECURE_TLS`` is truthy. This means a production deployment can't silently disable
-    server-cert validation; an operator must opt in loudly for a trusted-network dev/test bind."""
+    Set is not honoured. Certificate-validation overrides (``trust_server_certificate=true`` for
+    SQL Server, for one) are MITM-able, so the escape lets one through only when
+    ``MEFOR_ALLOW_INSECURE_TLS`` is set on an instance at ``[security].enforcement = warn``. The
+    cells ask :func:`weakened_tls_escape_permitted` or :func:`hop_insecure_escape_downgrades`, which
+    add that condition. Under ``enforce``, the default, or where the code knows no posture, the
+    escape changes nothing. Some connections have a per-hop way across that needs neither the escape
+    nor the dial, such as ``tls_hop_attested``. Some credential hops refuse even at ``warn``;
+    docs/SECURITY-LOOSENING.md, *No escape sends a credential to an unverified peer*, names them
+    and the ones that still cross."""
     return os.environ.get(INSECURE_TLS_ESCAPE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def hop_insecure_escape_downgrades(*, enforcing: bool) -> bool:
-    """Whether ``MEFOR_ALLOW_INSECURE_TLS`` may downgrade an insecure-hop REFUSE→WARN here (#200).
+    """Whether ``MEFOR_ALLOW_INSECURE_TLS`` may downgrade an insecure-hop REFUSE→WARN here (#200):
+    only on an instance at ``[security].enforcement = warn``.
 
     The **clamp** on the blunt global escape for the posture-keyed hop refusal (ADR 0092, decision 2):
     the escape may only relax a hop REFUSE to WARN when the security dial is **not enforcing**. Under
     ENFORCE it is **inert** — it can NEVER satisfy an enforcing hop (a deliberate behaviour change from
     the pre-#200 global escape, which silenced the refusal in every environment).
 
-    **Scope after ADR 0153 (decision 5): the TRANSPORT cells no longer consult this at all.** The
-    cleartext-hop authority lost its ``audited_opt_out`` parameter, so the variable cannot influence a
-    connection's cleartext-hop decision; the per-connection ``cleartext_accepted`` declaration replaced
-    it there. This clamp survives for the two **non-connection** cells that still key on the escape and
-    have nowhere to carry a per-hop declaration — the ``[logging]`` forwarder
-    (:func:`forward_hop_disposition`) and the API PHI-read serve hop
-    (:func:`~messagefoundry.config.tls_policy.phi_read_hop_disposition`) — plus the verify-off cells via
-    :func:`weakened_tls_escape_permitted`. On a connection, ``tls_hop_attested`` (ALLOW) or
-    ``cleartext_accepted`` (WARN + audit) is now the only way across an enforcing hop."""
+    **Scope after ADR 0153 (decision 5).** The cleartext-hop authority
+    (:func:`~messagefoundry.config.tls_policy.insecure_hop_disposition`) lost its
+    ``audited_opt_out`` parameter, so the variable no longer reaches a hop that authority decides as
+    cleartext; the per-connection ``cleartext_accepted`` declaration replaced it there. This clamp
+    is still called by at least the ``[logging]`` forwarder (:func:`forward_hop_disposition`), the
+    API PHI-read serve hop, and the HTTP family's ``verify_tls=false`` cell
+    (``transports.rest._shipped_strict_disposition``). :func:`weakened_tls_escape_permitted` applies
+    the same clamp to at least the other verify-off cells and the Direct and Email cleartext SMTP
+    hops."""
     return insecure_tls_allowed() and not enforcing
 
 
@@ -933,14 +940,17 @@ class StoreSettings(_Section):
     schema_management: SchemaManagement | None = None
     encrypt: bool = True
     trust_server_certificate: bool = False
-    # Optional certificate file to verify the DB server certificate against a PRIVATE / self-signed CA (the
-    # common hospital-estate posture) WITHOUT installing it box-globally into the OS trust store. Honored by
-    # BOTH server-DB backends (#45), on the SECURE posture only (encrypt=true, trust_server_certificate=false)
-    # — it NEVER disables verification:
+    # Optional certificate file to verify the DB server WITHOUT installing anything box-globally into the OS
+    # trust store (the common hospital-estate posture is a PRIVATE / self-signed CA). Honored by BOTH
+    # server-DB backends (#45), on the SECURE posture only (encrypt=true, trust_server_certificate=false),
+    # and never applied on a weakened one. The two backends read it differently:
     #   * POSTGRES — asyncpg takes an SSLContext, so this loads ssl.create_default_context(cafile=...), a
     #     CA-bundle pin (chain + hostname still verified).
-    #   * SQL SERVER — the ODBC Driver 18.1+ `ServerCertificate` keyword pins the server's certificate by
-    #     file (a leaf/exact-cert match, brace-quoted STORE-5-safe); requires ODBC Driver 18.1 or newer.
+    #   * SQL SERVER — the ODBC Driver 18.1+ `ServerCertificate` keyword pins the server's OWN certificate
+    #     by file (an exact-cert match, brace-quoted STORE-5-safe), so a CA file matches nothing. It goes
+    #     out with `Encrypt=strict`: on the Driver 18.7 build tested, the pin was enforced with strict and
+    #     not with `Encrypt=yes` (vault BACKLOG #2223). Strict is TDS 8.0, so it needs SQL Server 2022 or
+    #     later, the supported floor; an older server refuses the connection. Not a revocation control.
     # REJECTED for SQLite (no TLS at all). A path, not a secret — it may live in the config file /
     # connections.toml. Empty = use the system trust store (the secure default). Existence is checked at load
     # (a missing file fails loud here, not confusingly at connect).
@@ -1139,13 +1149,24 @@ class StoreSettings(_Section):
     def _ssl_root_cert_backend(self) -> StoreSettings:
         """``ssl_root_cert`` pins the DB server certificate for verification (#45). Both server-DB
         backends honor it — Postgres as an asyncpg SSLContext CA-bundle, SQL Server via the ODBC Driver
-        18.1+ ``ServerCertificate`` keyword — but SQLite uses no TLS, so setting it there is a silent
-        no-op: fail loud instead of leaving the operator thinking a private CA is pinned."""
+        18.1+ ``ServerCertificate`` keyword under ``Encrypt=strict`` — but SQLite uses no TLS, so
+        setting it there is a silent no-op: fail loud instead of leaving the operator thinking a
+        private CA is pinned."""
         if self.ssl_root_cert and self.backend is StoreBackend.SQLITE:
             raise ValueError(
                 "[store].ssl_root_cert requires a server-DB backend (postgres or sqlserver); "
                 "SQLite uses no TLS, so pinning a certificate has no effect."
             )
+        sends_pin = self.encrypt and not self.trust_server_certificate  # as the store decides
+        if self.ssl_root_cert and self.backend is StoreBackend.SQLSERVER and sends_pin:
+            # Vault BACKLOG #2223: on SQL Server the file is an exact-match pin, so a bundle or a CA
+            # certificate would refuse every connect. Say so at load, naming the setting. The file
+            # holds only a public certificate, and no part of it goes into the message.
+            from messagefoundry.pki import read_pinned_server_certificate
+
+            problem = read_pinned_server_certificate(self.ssl_root_cert)
+            if isinstance(problem, str):
+                raise ValueError(f"[store].ssl_root_cert {self.ssl_root_cert!r} {problem}")
         return self
 
     @field_validator("ssl_crl_file")
