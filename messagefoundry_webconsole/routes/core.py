@@ -1872,7 +1872,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 await auth.verify_mfa(token, code, client=client) if code else Elevation()
             )
             if code_elevation.session_lost:
-                return login_redirect_response()  # session ended under a correct code
+                # The session ended during the ceremony, whether or not the code was checked yet
+                # (BACKLOG #3068).
+                return login_redirect_response()
             if code_elevation.token is not None:
                 rekey_continuations(token, code_elevation.token)
                 token = code_elevation.token  # rotation 1 of 2

@@ -2599,7 +2599,9 @@ clear the MFA gate by verifying a passkey either. It asks after the second-step 
 before it takes the challenge. A post with nothing staged for the session, which includes every
 post from an account that has never staged a ceremony because it holds no passkey, gets the plain
 failure audited `reason=expired` and causes no lookup, so such a caller does not learn what the
-directory said (BACKLOG #3068). **This does not hold for a session that has staged a ceremony.**
+directory said on this leg (BACKLOG #3068). The code leg does not gate this way: it asks the
+directory before it checks any code, so a session that has proved nothing can still read the
+directory refusal there, up to the route's rate limiter. **This does not hold for a session that has staged a ceremony.**
 The lookup still runs before the assertion is verified, so such a session can post a response that
 proves nothing and still cost one lookup and read the directory refusal, up to the per-actor
 limiter on `POST /ui/reauth/webauthn`. A ceremony staged before its passkey was deleted stays
@@ -2614,17 +2616,23 @@ account gone after the lookup answers **401**.
 **Both second-factor legs read the session, the account and its lock once more right before they
 write the factor (BACKLOG #3068).** This applies to every account, local ones included. A
 revocation, a disable or a second-step lock that lands while a good code or a good assertion is
-being checked stops the write, and so, on the code leg, does a TOTP factor turned off meanwhile.
-The factor is then not marked and no counter is cleared. A session or account gone then answers as
-gone: **401** on `POST /auth/mfa-verify` and `POST /ui/reauth/webauthn`, a sign-in redirect on
-`/ui/mfa`, and the same on the code leg when it goes during the directory lookup or the account
-queue. A lock answers as the leg's locked refusal, audited `reason=locked`. By then the proof is
+being checked stops the write, and so does the proved factor itself going meanwhile: a TOTP
+factor turned off, or the passkey that signed deleted. The factor is then not marked and no
+counter is cleared, and because the proof is already spent the refusal is audited, with
+`reason=session_lost` or `reason=factor_removed`. A session or account gone answers as gone on at
+least these surfaces: **401** on `POST /auth/mfa-verify` and `POST /ui/reauth/webauthn`, and a
+sign-in redirect on `/ui/mfa` and the `/ui/reauth` code leg. On the code leg it answers the same
+when it goes during the directory lookup or the account queue. A lock answers as the leg's locked refusal, audited `reason=locked`. By then the proof is
 spent: the code leg has consumed the TOTP step or the single-use recovery code, with no refund, and
 on the passkey leg the sign count has moved, because the passkey did sign that challenge.
-**A window remains, and it is accepted.** The re-read and the factor write are separate awaits, and
-the counter clear that follows the write is unconditional, so a change landing in that last gap is
-not seen. Closing it would take a store write conditional on the state the re-read saw, which no
-leg has. The re-read narrows the window from the whole proof check to that one write.
+**A window remains, and it is accepted.** It runs from the re-read through the factor stamp (and
+on the code leg the window stamp) to `record_login_success`, which clears both lockout counters
+unconditionally. A change landing there is not seen: for example, a run of wrong codes on another
+session of the same account can set the second-step lock there, and the passkey leg, which takes
+no account queue, would then clear it. The re-read does not check the session's expiry either;
+the rotation that follows refuses an expired session, but only after the counters are cleared.
+Closing the window would take store writes conditional on the state the re-read saw, which no leg
+has. The re-read narrows it from the whole proof check to those writes.
 
 **Both legs also refuse a present account that lost a role in the directory (BACKLOG #2240).** The
 lookup returns the account's groups, and the engine maps them to roles as the reconciliation pass

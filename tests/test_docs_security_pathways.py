@@ -1488,7 +1488,13 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
         "TOTP/recovery leg."
     )
     verify = _service_func("verify_mfa")
-    for fn, label in ((lock_refused, "_mfa_lock_refused"), (verify, "verify_mfa")):
+    # The two BACKLOG #3068 helpers hold lock logic for both second-factor legs, so they are read too.
+    for fn, label in (
+        (lock_refused, "_mfa_lock_refused"),
+        (verify, "verify_mfa"),
+        (_service_func("_factor_holder_current"), "_factor_holder_current"),
+        (_service_func("_directory_vouches_for_factor"), "_directory_vouches_for_factor"),
+    ):
         assert not _names_read(fn) & _SIGN_IN_LOCK_READS, (
             f"{label} now reads {sorted(_names_read(fn) & _SIGN_IN_LOCK_READS)}; the doc says the "
             "sign-in lock does not refuse the TOTP/recovery leg."

@@ -483,14 +483,15 @@ async def test_the_lookup_comes_after_the_too_early_floor(store: MessageStore) -
     assert p.directory.probes == []
 
 
-@pytest.mark.parametrize("change", ["lock", "revoke", "disable"])
+@pytest.mark.parametrize("change", ["lock", "revoke", "disable", "passkey-deleted"])
 @pytest.mark.parametrize("account", ["directory", "local"])
 async def test_what_lands_before_the_factor_write_is_honoured(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, change: str, account: str
 ) -> None:
     """Item 2. The passkey read and the sign-count write await after the session, the account and
-    its lock were last read. RED when: a lock, a revocation or a disable that lands there does not
-    stop the factor write, which would then mark the factor and clear both lockout counters."""
+    its lock were last read. RED when: a lock, a revocation, a disable or a delete of the passkey
+    that signed lands there and does not stop the factor write, which would then mark the factor
+    and clear both lockout counters, or when the refusal of a spent proof writes no audit row."""
     if account == "directory":
         p = await _directory_session_owing_a_passkey(store)
         service, token, response, user_id = p.service, p.token, p.response, p.user_id
@@ -510,8 +511,14 @@ async def test_what_lands_before_the_factor_write_is_honoured(
             await _lock_second_step(store, user_id)
         elif change == "revoke":
             await store.revoke_session(hash_token(token))
-        else:
+        elif change == "disable":
             await store.set_user_disabled(user_id, disabled=True)
+        else:
+            # After the write: a delete before it already fails the sign-count compare-and-set.
+            moved = await real_update(*args, **kwargs)
+            (held,) = await store.list_webauthn_credentials(user_id)
+            assert await store.delete_webauthn_credential(user_id, held.credential_id_hash)
+            return moved
         return await real_update(*args, **kwargs)
 
     monkeypatch.setattr(store, "update_webauthn_sign_count", _update_while_something_lands)
@@ -519,10 +526,11 @@ async def test_what_lands_before_the_factor_write_is_honoured(
     refused = await service.finish_webauthn_assertion(token, response, rp_id=_RP, origin=_ORIGIN)
 
     assert refused.ok is False
-    assert refused.session_lost is (change != "lock")
+    assert refused.session_lost is (change in ("revoke", "disable"))
     session = await store.get_session(hash_token(token))
     assert session is not None and session.mfa_verified_at is None
+    reason = {"lock": "locked", "passkey-deleted": "factor_removed"}.get(change, "session_lost")
+    assert {"reason": reason} in await _audited_assertion_failures(store)
     if change == "lock":
         user = await store.get_user(user_id)
         assert user is not None and user.second_step_locked_until is not None  # not cleared
-        assert {"reason": "locked"} in await _audited_assertion_failures(store)

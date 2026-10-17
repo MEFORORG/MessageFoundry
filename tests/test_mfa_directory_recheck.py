@@ -489,6 +489,8 @@ async def test_what_lands_during_the_code_check_stops_the_factor_write(
     assert refused.ok is False
     assert refused.session_lost is (change in ("revoke", "disable"))
     assert refused.locked is (change == "lock")
+    reason = {"lock": "locked", "factor-off": "factor_removed"}.get(change, "session_lost")
+    assert {"reason": reason} in await _audited_mfa_failures(store)
     session = await store.get_session(hash_token(token))
     assert session is not None
     assert session.mfa_verified_at is None and session.reauth_at is None

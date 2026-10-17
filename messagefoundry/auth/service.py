@@ -10363,12 +10363,23 @@ class AuthService:
                 # account and its lock are read again right before the factor is written. Fails
                 # closed on a row gone meanwhile.
                 fresh = await self._factor_holder_current(
-                    token, event="auth.mfa_failed", client=client, report_lock=True
+                    token,
+                    actor=user.username,
+                    event="auth.mfa_failed",
+                    client=client,
+                    report_lock=True,
                 )
                 if isinstance(fresh, Elevation):
                     return fresh
                 # A self-service disable takes no queue, so the factor this code proved may be gone.
+                # The code is spent by now, so the refusal is audited with its reason.
                 if not fresh.totp_enabled:
+                    await self._audit(
+                        "auth.mfa_failed",
+                        actor=fresh.username,
+                        detail=_json({"reason": "factor_removed"}),
+                        client=client,
+                    )
                     return Elevation()
                 # The temporary-credential deadline is asked again on that fresh row, since it can
                 # pass during the verify too. This ask guards the writes below; the rotation asks
@@ -10628,11 +10639,11 @@ class AuthService:
             )
             return Elevation(directory_unconfirmed=True)
         return await self._factor_holder_current(
-            token, event=event, client=client, report_lock=report_lock
+            token, actor=user.username, event=event, client=client, report_lock=report_lock
         )
 
     async def _factor_holder_current(
-        self, token: str, *, event: str, client: str | None, report_lock: bool
+        self, token: str, *, actor: str, event: str, client: str | None, report_lock: bool
     ) -> Elevation | VerifiedUser:
         """Read the session, its account and the second-step lock again, and return the account,
         or the refusal when any of them no longer allows the factor to be marked.
@@ -10642,14 +10653,22 @@ class AuthService:
         :meth:`_directory_vouches_for_factor` runs it after a confirmed lookup, and both second-
         factor legs run it again right before ``mark_session_mfa_verified``. A session revoked or
         gone, or an account disabled or gone, returns ``session_lost``: the token no longer
-        authenticates, so the caller must not report a wrong proof. A live second-step lock is
-        audited as ``event`` with the shared locked detail, and returns a wrong-proof refusal,
-        with ``locked`` set when ``report_lock`` is."""
+        authenticates, so the caller must not report a wrong proof. It is audited as ``event``
+        with ``reason=session_lost``, filed under ``actor`` (the account name the caller last
+        read), because the proof may already be spent. A live second-step lock is audited as
+        ``event`` with the shared locked detail, and returns a wrong-proof refusal, with
+        ``locked`` set when ``report_lock`` is. Only revocation is asked of the session, not its
+        expiry; the rotation that follows a factor write refuses an expired one."""
         session = await self._load_session(hash_token(token))
-        if session is None or session.revoked_at is not None:
-            return Elevation(session_lost=True)
-        user = await self._load_user(session.user_id)
+        user = (
+            None
+            if session is None or session.revoked_at is not None
+            else (await self._load_user(session.user_id))
+        )
         if user is None or user.disabled:
+            await self._audit(
+                event, actor=actor, detail=_json({"reason": "session_lost"}), client=client
+            )
             return Elevation(session_lost=True)
         if await self._mfa_lock_refused(user, client=client, event=event):
             return Elevation(locked=report_lock)
@@ -11355,11 +11374,31 @@ class AuthService:
         # between must stop the factor write, as on verify_mfa. The sign count has already moved,
         # which is right: this passkey did sign this challenge.
         fresh = await self._factor_holder_current(
-            token, event="auth.webauthn_failed", client=client, report_lock=False
+            token,
+            actor=user.username,
+            event="auth.webauthn_failed",
+            client=client,
+            report_lock=False,
         )
         if isinstance(fresh, Elevation):
             return fresh
         user = fresh
+        # The code leg's TOTP-off check, for a passkey: a self-service delete takes no queue, so the
+        # passkey that signed may be gone. Asked of the set its seal covers (BACKLOG #2592).
+        still_held = await self._verified_passkeys(user)
+        # Every credential compared, each in constant time (ASVS 11.2.4, as the delete path does).
+        matches = [
+            constant_time_equal(c.credential_id_hash, cred.credential_id_hash)
+            for c in still_held or ()
+        ]
+        if not any(matches):
+            await self._audit(
+                "auth.webauthn_failed",
+                actor=user.username,
+                detail=_json({"reason": "factor_removed"}),
+                client=client,
+            )
+            return Elevation()
         # BACKLOG #2298: the passkey leg of /ui/mfa, asked as verify_mfa asks after a good code, so
         # an assertion that straddles the deadline marks nothing and clears no counter.
         if user.must_change_password and await self._mfa_lapsed(
