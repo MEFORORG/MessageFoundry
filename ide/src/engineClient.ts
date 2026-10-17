@@ -227,7 +227,7 @@ function networkError(err: NodeJS.ErrnoException, baseUrl: string): NetworkError
   }
   if (err.code === "ECONNREFUSED" || err.code === "ECONNRESET" || err.code === "ENOTFOUND") {
     return new NetworkError(
-      `engine not reachable at ${baseUrl} — start it (on this machine: the status pill, or \`${serveCommandLine("<configDir>")}\`).`,
+      `engine not reachable at ${baseUrl} — if it runs on this machine, start it (the status pill, or \`${serveCommandLine("<configDir>")}\`).`,
       err.code,
     );
   }

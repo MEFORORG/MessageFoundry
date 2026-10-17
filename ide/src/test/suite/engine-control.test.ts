@@ -69,11 +69,18 @@ suite("engine control — the serve invocation is the ADR-blessed command, RUN n
 
   test("the preflight, provision-admin and serve take the same interpreter options", () => {
     // -P keeps the working directory off the import path, so all three import the same engine.
-    const serve = buildServeInvocation({ python: "python", configDir: "c" }).args.slice(0, 3);
-    assert.deepStrictEqual(serve, [...INTERPRETER_OPTIONS]);
-    assert.deepStrictEqual(preflightArgs().slice(0, 3), serve);
-    assert.deepStrictEqual(buildProvisionInvocation({ python: "p", username: "a", email: "a@b.test" }).args.slice(0, 3), serve);
-    assert.deepStrictEqual(buildAdminProbeInvocation({ python: "p" }).args.slice(0, 3), serve);
+    const n = INTERPRETER_OPTIONS.length;
+    const serve = buildServeInvocation({ python: "python", configDir: "c" }).args.slice(0, n);
+    assert.deepStrictEqual(serve, ["-P", "-X", "disable-remote-debug"]);
+    const provision = buildProvisionInvocation({ python: "p", username: "a", email: "a@b.test" });
+    for (const args of [
+      preflightArgs(),
+      provision.args,
+      buildHeldInvocation(provision).args,
+      buildAdminProbeInvocation({ python: "p" }).args,
+    ]) {
+      assert.deepStrictEqual(args.slice(0, n), serve);
+    }
   });
 
   test("the copied start command is the Start argv as one line", () => {
@@ -83,6 +90,8 @@ suite("engine control — the serve invocation is the ADR-blessed command, RUN n
       serveCommandLine("samples/config"),
       "python -P -X disable-remote-debug -m messagefoundry serve --config samples/config",
     );
+    // A path with a space stays one argument when the line is pasted.
+    assert.ok(serveCommandLine("my configs/prod").endsWith('--config "my configs/prod"'));
   });
 });
 
@@ -303,7 +312,7 @@ suite("engine control — the provision-admin invocations carry no credential (W
     const inner = buildProvisionInvocation({ python: "py", username: "alice", email: "alice@example.test" });
     const held = buildHeldInvocation(inner);
     assert.strictEqual(held.command, "py");
-    assert.deepStrictEqual(held.args, ["-c", HOLD_OPEN_SCRIPT, ...inner.args]);
+    assert.deepStrictEqual(held.args, [...INTERPRETER_OPTIONS, "-c", HOLD_OPEN_SCRIPT, ...inner.args]);
     // It re-runs the SAME interpreter with the argv after -c, waits for Enter, and keeps the exit code.
     assert.ok(HOLD_OPEN_SCRIPT.includes("subprocess.call([sys.executable, *sys.argv[1:]])"));
     assert.ok(HOLD_OPEN_SCRIPT.includes("input(") && HOLD_OPEN_SCRIPT.includes("sys.exit(rc)"));

@@ -1863,9 +1863,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `supervise` also write a WARNING-level log line that begins `AUDIT:`, as the gate runs.
   `serve` writes it again once logging reaches its handlers; `supervise` writes it again only
   where a log forwarder is installed, for the off-box copy. The acceptance has no audit row
-  or alert of its own: `serve` records it the way it records every loosening, in the
-  start's `config_loaded` audit row and in `GET /security/posture`, and `supervise` leaves
-  only the log lines. The `remote_debug_enabled` entry still reports the interface itself.
+  or alert of its own. `serve` also names it the way it names every loosening, in the
+  loosenings list of the start's `config_loaded` audit row, except where that row records no
+  list (a degraded or superseded start). `supervise` leaves only the log lines. The `remote_debug_enabled` entry still reports the interface itself.
 - **What it does not do:** it does not turn the hook off, and under `enforcement = warn` it has
   nothing to lift.
 - **How to turn it off:** remove it, and start the interpreter with `-X disable-remote-debug`.

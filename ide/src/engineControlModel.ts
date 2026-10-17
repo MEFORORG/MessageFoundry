@@ -16,9 +16,11 @@
  *  `ModuleNotFoundError: No module named 'pydantic'` a hand-run `python -m messagefoundry serve` produces. */
 export const PREFLIGHT_IMPORT = "messagefoundry.config.models";
 
-/** The interpreter options every engine command the IDE starts takes. `-P` keeps the working
- *  directory off the import path, so the preflight, provision-admin and serve import the same
- *  engine; `-X disable-remote-debug` is what serve's enforce refusal names (vault BACKLOG #2700). */
+/** The interpreter options the pill's engine lifecycle takes: the preflight, provision-admin (and
+ *  its held wrapper) and serve. `-P` keeps the working directory off the import path, so all of
+ *  them import the same engine; `-X disable-remote-debug` is what serve's enforce refusal names
+ *  (vault BACKLOG #2700). The CLI bridge in cli.ts (validate, graph and the rest) does not take
+ *  them yet. */
 export const INTERPRETER_OPTIONS: readonly string[] = ["-P", "-X", "disable-remote-debug"];
 
 /** The argv for the preflight import check (`python <these>`). */
@@ -50,10 +52,12 @@ export function buildServeInvocation(opts: {
   };
 }
 
-/** The pill's Start command as one line, for the clipboard and for hints: the same argv as
- *  {@link buildServeInvocation}, with `python` for the interpreter. */
+/** The pill's Start command as one line, for the clipboard and for hints: the argv of
+ *  {@link buildServeInvocation}, with `python` for the interpreter, and an element holding
+ *  whitespace double-quoted so a pasted path with a space stays one argument. */
 export function serveCommandLine(configDir: string): string {
-  return ["python", ...buildServeInvocation({ python: "python", configDir }).args].join(" ");
+  const args = buildServeInvocation({ python: "python", configDir }).args;
+  return ["python", ...args.map((a) => (/\s/.test(a) ? `"${a}"` : a))].join(" ");
 }
 
 /** The outcome of the interpreter preflight, each with a DIFFERENT remedy. */
@@ -208,7 +212,9 @@ export function buildHeldInvocation(inv: { command: string; args: string[] }): {
   command: string;
   args: string[];
 } {
-  return { command: inv.command, args: ["-c", HOLD_OPEN_SCRIPT, ...inv.args] };
+  // The wrapper takes the options too: it runs in the workspace, where -P keeps a stray module
+  // there from replacing the subprocess module the wrapper imports.
+  return { command: inv.command, args: [...INTERPRETER_OPTIONS, "-c", HOLD_OPEN_SCRIPT, ...inv.args] };
 }
 
 /** What the shell captured from running the probe with no terminal. */

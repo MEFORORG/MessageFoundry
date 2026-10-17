@@ -354,13 +354,20 @@ def _real_serve(tmp_path: Path, *options: str) -> subprocess.CompletedProcess[st
     )
 
 
-@_needs_install
-def test_a_real_start_with_the_interface_on_refuses(tmp_path: Path) -> None:
-    # Decided from a child started as _real_serve starts one, not from this process: a parent run
-    # with PYTHON_DISABLE_REMOTE_DEBUG=1 or -X disable-remote-debug has the interface off itself,
-    # and the child, started without either, would still have it on.
+_PROBE = (
+    "import sys, messagefoundry; print(sys.is_remote_debug_enabled()); "
+    "print(messagefoundry.__file__)"
+)
+
+
+def _child_interface_on(tmp_path: Path) -> bool:
+    """Whether a child started as :func:`_real_serve` starts one has the interface on. Read from
+    the child, not this process: a parent run with PYTHON_DISABLE_REMOTE_DEBUG=1 or -X
+    disable-remote-debug has it off itself, and the child, started without either, has it on.
+    Skips where the child would import an engine other than this checkout's, since neither arm
+    would then test the code under review."""
     probe = subprocess.run(
-        [sys.executable, "-c", "import sys; print(sys.is_remote_debug_enabled())"],
+        [sys.executable, "-P", "-c", _PROBE],
         cwd=tmp_path,
         env=_child_env(),
         capture_output=True,
@@ -368,7 +375,17 @@ def test_a_real_start_with_the_interface_on_refuses(tmp_path: Path) -> None:
         timeout=10,
         check=True,
     )
-    if probe.stdout.strip() != "True":
+    enabled, package = probe.stdout.strip().splitlines()[-2:]
+    assert enabled in {"True", "False"}, probe.stdout
+    here = Path(cli.__file__).resolve().parent
+    if Path(package).resolve().parent != here:
+        pytest.skip(f"SKIP (nothing run): the installed engine is {package}, not this checkout")
+    return enabled == "True"
+
+
+@_needs_install
+def test_a_real_start_with_the_interface_on_refuses(tmp_path: Path) -> None:
+    if not _child_interface_on(tmp_path):
         pytest.skip("SKIP (nothing run): this interpreter build has remote debugging off")
     proc = _real_serve(tmp_path)
     assert proc.returncode == 2, proc.stderr[-2000:]
@@ -379,6 +396,7 @@ def test_a_real_start_with_the_interface_on_refuses(tmp_path: Path) -> None:
 def test_a_real_start_with_disable_remote_debug_gets_past_this_gate(tmp_path: Path) -> None:
     """The control for the arm above: the launch the refusal names. It stops at a later gate, the
     missing store key, which shows it ran on past this one."""
+    _child_interface_on(tmp_path)  # for its skip: the child must import this checkout
     proc = _real_serve(tmp_path, "-P", "-X", "disable-remote-debug")  # as the refusal names
     assert _REFUSAL not in proc.stderr
     assert proc.returncode == 2, proc.stderr[-2000:]
