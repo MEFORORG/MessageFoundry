@@ -667,8 +667,9 @@ def test_trusted_proxies_accepts_valid_addresses_and_networks(entries: list[str]
         ("10.0.0.1/24", "10.0.0.1", "10.0.0.0/24"),
         ("10.1.2.3/0", "10.1.2.3", "0.0.0.0/0"),
         ("fd00::1/64", "fd00::1", "fd00::/64"),
-        # A zone survives into the suggested address: uvicorn compares a scoped peer with its zone.
-        ("fe80::1%eth0/64", "fe80::1%eth0", "fe80::/64"),
+        # The zone is dropped from the suggested address: a peer is reported without one, and a
+        # zoned host entry would never equal it (BACKLOG #3042).
+        ("fe80::1%eth0/64", "fe80::1", "fe80::/64"),
     ],
 )
 def test_trusted_proxies_refuses_a_host_bits_cidr(entry: str, address: str, network: str) -> None:
@@ -706,6 +707,166 @@ def test_trusted_proxies_refuses_a_host_bits_cidr(entry: str, address: str, netw
         assert "Trust that range only if every host in it is a proxy" in message
     # Both names load.
     ApiSettings(trusted_proxies=[network], tls_terminated_upstream=True)
+    ApiSettings(trusted_proxies=[address], tls_terminated_upstream=True)
+
+
+def _link_local_peer() -> tuple[str, int]:
+    """The host string and scope id CPython reports for a peer on a link-local socket, measured by
+    connecting to one. Skips where the host has no link-local address to bind."""
+    import socket
+
+    try:
+        infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET6)
+    except OSError:
+        pytest.skip("no IPv6 address to resolve")
+    link_local = [info[4] for info in infos if info[4][0].lower().startswith("fe80")]
+    if not link_local:
+        pytest.skip("no link-local IPv6 address on this host")
+    host, _, _, scope = link_local[0][:4]
+    try:
+        with socket.socket(socket.AF_INET6) as server, socket.socket(socket.AF_INET6) as client:
+            server.bind((host, 0, 0, scope))
+            server.listen()
+            client.connect(server.getsockname())
+            conn, peer = server.accept()
+            conn.close()
+    except OSError as exc:
+        pytest.skip(f"cannot connect over link-local: {exc}")
+    return peer[0], scope
+
+
+def test_a_link_local_peer_is_reported_without_its_zone() -> None:
+    """BACKLOG #3042's premise for refusing a zoned host entry, measured rather than assumed: CPython
+    reports a link-local peer's host WITHOUT its zone (the zone is the tuple's scope id), which is
+    the string uvicorn's ``get_remote_addr`` hands ``_TrustedHosts``. So the zoneless entry matches
+    and the zoned one never does."""
+    from uvicorn.middleware.proxy_headers import _TrustedHosts
+
+    host, scope = _link_local_peer()
+    assert "%" not in host
+    assert host in _TrustedHosts([host])
+    assert host not in _TrustedHosts([f"{host}%{scope}"])
+    ApiSettings(trusted_proxies=[host], tls_terminated_upstream=True)
+    with pytest.raises(ValidationError, match="is an IPv6 entry with a zone"):
+        ApiSettings(trusted_proxies=[f"{host}%{scope}"], tls_terminated_upstream=True)
+
+
+@pytest.mark.parametrize(
+    ("entry", "peer", "fix", "form"),
+    [
+        ("::ffff:10.0.0.1", "10.0.0.1", "10.0.0.1", "an IPv4-mapped IPv6 entry"),
+        ("fe80::1%eth0", "fe80::1", "fe80::1", "an IPv6 entry with a zone"),
+        ("fd00::1%eth0", "fd00::1", "fd00::1", "an IPv6 entry with a zone"),
+        ("::ffff:10.0.0.1/128", "10.0.0.1", "10.0.0.1", "an IPv4-mapped IPv6 entry"),
+    ],
+)
+def test_trusted_proxies_refuses_a_host_form_uvicorn_parses_and_never_matches(
+    entry: str, peer: str, fix: str, form: str
+) -> None:
+    """BACKLOG #3042: an IPv4-mapped host and a zoned IPv6 host both parse in uvicorn and then
+    match no peer. The engine's listener reports an IPv4 peer in its plain form (asyncio sets
+    ``IPV6_V6ONLY``), and every peer without a zone, which ``IPv6Address`` compares (measured in
+    the test above). Each would collapse every client to the proxy address on a first deployment,
+    so the load refuses it and names the form that matches.
+
+    Mutation: return None from ``_matching_form``. Red: DID NOT RAISE."""
+    from uvicorn.middleware.proxy_headers import _TrustedHosts
+
+    # The premise, read from uvicorn itself: the entry misses the peer, the named fix matches it.
+    assert peer not in _TrustedHosts([entry])
+    assert peer in _TrustedHosts([fix])
+
+    with pytest.raises(ValidationError) as exc:
+        ApiSettings(trusted_proxies=["10.0.0.7", entry], tls_terminated_upstream=True)
+    message = str(exc.value)
+    assert f"[api].trusted_proxies entry {entry!r} is {form}" in message
+    assert f"List {fix!r} instead" in message
+    ApiSettings(trusted_proxies=[fix], tls_terminated_upstream=True)
+
+
+def test_trusted_proxies_refuses_a_mapped_network_and_names_its_range_without_recommending_it() -> (
+    None
+):
+    """BACKLOG #3042: a mapped network misses every plain IPv4 peer, as a mapped host does. Its
+    IPv4 form is a range, so it is named with the range caution, never offered as the fix."""
+    from uvicorn.middleware.proxy_headers import _TrustedHosts
+
+    assert "10.0.0.5" not in _TrustedHosts(["::ffff:10.0.0.0/120"])
+    assert "10.0.0.5" in _TrustedHosts(["10.0.0.0/24"])
+    with pytest.raises(ValidationError) as exc:
+        ApiSettings(trusted_proxies=["::ffff:10.0.0.0/120"], tls_terminated_upstream=True)
+    message = str(exc.value)
+    assert "is an IPv4-mapped IPv6 entry" in message
+    assert "It spans the network '10.0.0.0/24'. Trust that range only if" in message
+    assert "instead" not in message
+
+
+@pytest.mark.parametrize(
+    ("entry", "other_link_peer", "spans"),
+    [
+        ("fe80::%eth0/64", "fe80::1", "It spans the network 'fe80::/64'"),
+        ("fe80::1%eth0/128", "fe80::1", "List 'fe80::1' instead"),
+        # A zone on the mapped boundary used to slip past ``subnet_of``, which compares zones.
+        ("::ffff:0:0%eth0/96", "::ffff:10.0.0.1", "It spans '0.0.0.0/0'"),
+    ],
+)
+def test_trusted_proxies_refuses_a_zoned_network_whose_zone_uvicorn_ignores(
+    entry: str, other_link_peer: str, spans: str
+) -> None:
+    """BACKLOG #3042: uvicorn matches a network by prefix and ignores its zone, so a zoned network
+    trusts the prefix on every interface while claiming one. The load refuses the zone and names
+    the zoneless network without recommending it.
+
+    Mutation: delete the zoned-network arm of ``_matching_form``. Red: DID NOT RAISE."""
+    from uvicorn.middleware.proxy_headers import _TrustedHosts
+
+    assert other_link_peer in _TrustedHosts([entry])  # the zone narrowed nothing
+    with pytest.raises(ValidationError) as exc:
+        ApiSettings(trusted_proxies=[entry], tls_terminated_upstream=True)
+    message = str(exc.value)
+    assert f"[api].trusted_proxies entry {entry!r} is an" in message
+    assert spans in message
+
+
+@pytest.mark.parametrize(
+    ("entry", "peer"),
+    [
+        ("fe80::1", "fe80::1"),  # the zoneless host is the form a link-local peer is reported in
+        ("fe80::/64", "fe80::1"),  # a network matches by prefix
+        ("::fffe:0:0/95", "::fffe:0:1"),  # wider than the mapped range, so it matches other peers
+    ],
+)
+def test_trusted_proxies_accepts_the_neighbouring_forms_that_match(entry: str, peer: str) -> None:
+    """The positive control for the refusals above: each neighbouring form loads, and uvicorn
+    matches a peer with it."""
+    from uvicorn.middleware.proxy_headers import _TrustedHosts
+
+    assert peer in _TrustedHosts([entry])
+    api = ApiSettings(trusted_proxies=[entry], tls_terminated_upstream=True)
+    assert api.trusted_proxies == [entry]
+
+
+@pytest.mark.parametrize(
+    ("entry", "address", "spans"),
+    [
+        ("fe80::1%eth0/64", "fe80::1", "It spans the network 'fe80::/64'"),
+        ("::ffff:10.0.0.1/120", "10.0.0.1", "It spans the network '10.0.0.0/24'"),
+        ("::ffff:10.0.0.1/96", "10.0.0.1", "It spans '0.0.0.0/0', which would trust every peer"),
+    ],
+)
+def test_the_host_bits_refusal_never_suggests_a_refused_form(
+    entry: str, address: str, spans: str
+) -> None:
+    """BACKLOG #3042: the host-bits message named the host part as written, so for these entries it
+    suggested a zoned host or a mapped one, which the load now refuses. It names the form that
+    matches, and a mapped range spanning the whole family gets the whole-family wording.
+
+    Mutation: name ``entry.partition('/')[0]`` again. Red: the address assertion."""
+    with pytest.raises(ValidationError) as exc:
+        ApiSettings(trusted_proxies=[entry], tls_terminated_upstream=True)
+    message = str(exc.value)
+    assert f"List the proxy's own address {address!r}" in message
+    assert spans in message
     ApiSettings(trusted_proxies=[address], tls_terminated_upstream=True)
 
 

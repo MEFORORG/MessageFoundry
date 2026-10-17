@@ -1545,6 +1545,14 @@ def test_the_trust_every_peer_check_skips_a_host_bits_entry() -> None:
     assert _classify_proxy_entries(["10.1.2.3/0", "0.0.0.0/0"]) == (["0.0.0.0/0"], [])
 
 
+def test_the_trust_every_peer_check_reads_entries_with_the_load_s_own_parser() -> None:
+    """BACKLOG #3042: one parser serves the load, the allow-list pin and this check. A mapped
+    network covering the whole mapped range loads nowhere, so it is skipped here too rather than
+    counted as an IPv6 range."""
+    assert _classify_proxy_entries(["::ffff:0:0/96"]) == ([], [])
+    assert _classify_proxy_entries(["::ffff:0:0/96", "fd00::/8"]) == ([], ["fd00::/8"])
+
+
 def _split(network: str, bits: int) -> list[str]:
     """``network`` cut into 2**bits equal ranges. Built rather than written out, so the file carries
     no routable address literal for the forbidden-content scan to stop on."""
