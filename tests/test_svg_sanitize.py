@@ -735,7 +735,7 @@ _DICOM_SHAPED = (
 
 def _starts_as_markup(data: bytes) -> bool:
     """Whether the first byte past leading noise is ``<``, as the sanitizer reads it."""
-    return svg_sanitize._plain_head(data) is None
+    return svg_sanitize._plain_head(data, svg_sanitize._FIRST_CONTENT_BYTE_RE.search(data)) is None
 
 
 #: A large binary: several MiB of PDF-shaped bytes, with a stray ``svg`` start tag well past the
@@ -830,7 +830,7 @@ def test_a_gzip_tag_scan_reads_the_head_from_the_first_content_byte(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The gzip head scan covers :data:`_HEAD_BYTES` from the first byte past leading noise,
-    so leading whitespace does not shorten it: the head pass reads on to twice the head, and never
+    so leading whitespace does not shorten it: the head pass reads on to exactly a full head past the noise, and never
     to the bound (BACKLOG #1129). A tag that ends inside that window is refused, and one just past
     it is served, which is the recorded trade (BACKLOG #3257). A tag the window's end cuts is judged
     on what the window holds: ``<svg`` is refused as if the tag went on, ``<sv`` is past the head.
@@ -846,11 +846,11 @@ def test_a_gzip_tag_scan_reads_the_head_from_the_first_content_byte(
     inside = at_the_end(b"<svg onload=", b"x>")
     with pytest.raises(SvgRejected, match="svg start tag"):
         sanitize_if_svg("application/gzip", inside)
-    assert calls == [(False, 1024), (False, 2048)]
+    assert calls == [(False, 1024), (False, 900 + 1024)]
     calls.clear()
     outside = _gz(lead + b"A" * 1024 + b"<svg onload=x>" + b"A" * 4096)
     assert sanitize_if_svg("application/gzip", outside) is outside
-    assert calls == [(False, 1024), (False, 2048)]
+    assert calls == [(False, 1024), (False, 900 + 1024)]
     with pytest.raises(SvgRejected, match="svg start tag"):
         sanitize_if_svg("application/gzip", at_the_end(b"<svg", b"z/>"))
     cut = at_the_end(b"<sv", b"g onload=x>")
@@ -898,7 +898,8 @@ def _random_bodies() -> list[bytes]:
 @pytest.mark.parametrize("data", _random_bodies(), ids=lambda data: f"{len(data)}-bytes")
 def test_a_pre_check_false_never_hides_a_refusal(data: bytes) -> None:
     """``may_be_svg`` lets the route skip the sanitizer, so its ``False`` must mean the sanitizer
-    would serve the body unchanged under any label, and a refusal must always follow a ``True``."""
+    would serve the body unchanged under any label: every refusal comes with a ``True``. A ``True``
+    need not mean a refusal; gzip, markup and long leading noise all go to the sanitizer."""
     for label in ("image/svg+xml", "application/pdf", None):
         try:
             served = sanitize_if_svg(label, data)
@@ -949,8 +950,26 @@ def test_the_pre_check_misses_no_markup_and_clears_binaries(data: bytes, expecte
         assert sanitize_if_svg("image/svg+xml", data) is data
 
 
-def test_the_pre_check_reads_past_any_amount_of_leading_whitespace() -> None:
-    assert may_be_svg(b" " * (70 * 1024) + b"<svg/>")
+def test_markup_past_a_long_run_of_leading_whitespace_reaches_the_sanitizer() -> None:
+    """The pre-check stops reading noise after a head and sends the body on, where the sanitizer
+    reads past any amount of it and still finds the SVG."""
+    data = b" " * (70 * 1024) + b'<svg xmlns="http://www.w3.org/2000/svg" onload="x"/>'
+    assert may_be_svg(data)
+    out = sanitize_if_svg(None, data)
+    assert out is not data and b"onload" not in out
+
+
+def test_the_head_re_read_stops_at_a_full_head_past_the_noise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gzip whose leading noise shortened the head is read on to exactly a full head past the
+    noise, so damage past what the tag scan needs is not reached, as it is not for the same body
+    with no noise. The bound is shrunk so the bodies stay small."""
+    monkeypatch.setattr(svg_sanitize, "_HEAD_BYTES", 1024)
+    damaged_second_member = _flip(_gz(b"B" * 4096), 12)
+    for lead in (b"", b"\n", b"\n\n", b" " * 600):
+        body = _gz(lead + b"%PDF-1.4 " + b"A" * 1100) + damaged_second_member
+        assert sanitize_if_svg("application/pdf", body) is body
 
 
 def test_the_pre_check_leaves_noise_past_a_head_to_the_thread() -> None:

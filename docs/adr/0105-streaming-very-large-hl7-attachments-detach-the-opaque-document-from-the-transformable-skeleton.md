@@ -582,8 +582,9 @@ and bytes that were not markup were served with no scan at all. So leading text 
 run it. The scan reads only that 64 KiB head, the same span a gzip body's scan reads (step 3 of
 the correction below), so a large binary is never copied whole and the chance that its bytes spell
 a tag does not grow with its size. The download's pre-check reads the same head, so a PDF, an
-image or a DICOM file with no tag there never reaches the thread pool. The scan looks for the tag
-only, never the SVG namespace name, so a PDF or a DICOM file that names the namespace is still
+image or a DICOM file with no tag there stays off the thread pool unless its leading noise runs
+past a head. The scan looks for the tag only, never the SVG namespace name, so a PDF or a DICOM
+file that names the namespace is still
 served. It also reads the tag spelled through an ISO-2022-JP escape sequence, which decodes to
 nothing; unlike markup, such a body is not refused for the escape byte alone, since most binaries
 hold it. What the scan does not reach, past the head included, rests on the inert-type allow-list:
@@ -641,8 +642,9 @@ refused. The size bound caps the memory one download can take, and at most two d
 once, because the work runs on the thread pool the pipeline's workers share. These are the only
 cases where the route refuses a linked attachment it can decode. *Amended 2026-10-16 (BACKLOG
 #3257):* that sentence no longer holds. The 2026-10-07 correction below added refusals, and a body
-that is not markup is now refused when it holds an `svg` start tag; "What this leaves open" under
-that correction lists at least the documents with no SVG in them that these refuse.
+that is not markup is now refused when the head past its leading noise holds an `svg` start tag;
+"What this leaves open" under that correction lists at least the documents with no SVG in them
+that these refuse.
 `_safe_attachment_content_type` still decides only the declared type.
 
 **Audited.** When the served bytes are a sanitized copy, the `attachment_download` audit row carries
@@ -698,8 +700,9 @@ real detach and the download, and fails against the sanitizer this correction re
 3. The first 64 KiB is inflated first. If its first byte past leading whitespace, NUL and
    byte-order-mark bytes is not `<`, the body is not markup. It is refused when the 64 KiB from that
    byte on hold an `svg` start tag, and otherwise served as stored without reading the rest. Where
-   the leading noise took part of the first 64 KiB, the head is read on to 128 KiB, so a full 64 KiB
-   past the noise is scanned, and damage that read reaches is refused as in step 2. The scan also
+   the leading noise took part of the first 64 KiB, the head is read on to exactly 64 KiB past the
+   noise, so a full 64 KiB past it is scanned, and damage that read reaches is refused as in step 2.
+   The scan also
    reads the tag spelled through an ISO-2022-JP escape sequence. Damage past the bytes read is not
    seen, and nor is a tag past the head. That rests on the inert-type allow-list, as it does for
    plain bytes, whose scan reads the same 64 KiB past the noise and needs no second read, since all

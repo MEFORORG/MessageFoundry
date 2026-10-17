@@ -26,7 +26,7 @@ the code meets them.
   past their leading noise scanned for an ``svg`` start tag, plain or inflated, and are refused when
   one is found (BACKLOG #3257). Only the tag counts, so a PDF or a DICOM file that names the SVG
   namespace is still served. :func:`may_be_svg` reads the same head, so a binary with no tag in it
-  never leaves the caller's thread.
+  stays on the caller's thread unless its leading noise runs past a head.
 - A gzip body, which is what an SVGZ file is, is inflated under the same size bound and vetted like
   plain bytes. A sanitized SVG inside is served gzipped again (BACKLOG #2391).
 - Trial passes that keep no output check the gzip's size bound, its member cap and its soundness
@@ -419,6 +419,8 @@ def _head_is_tagged(head: bytes) -> bool:
     here only the tag spelled through an escape sequence counts: the scan reads the bytes with the
     sequences removed, as a browser decoding the body in that encoding would. Removing them breaks
     no tag the raw bytes hold, since no byte of a tag's name or of the byte after it is ``ESC``."""
+    if b"<" not in head:
+        return False  # every tag starts with one, so the copies below are skipped
     if _ESC in head:
         head = _ISO2022_ESCAPE_RE.sub(b"", head)
     return _has_svg_tag(head)
@@ -430,12 +432,11 @@ def _refuse_if_tagged(head: bytes) -> None:
         raise SvgRejected("document that is not markup carries an svg start tag")
 
 
-def _plain_head(body: bytes) -> bytes | None:
-    """``None`` when the plain ``body`` is markup, else its head: the :data:`_HEAD_BYTES` from the
-    first byte past leading noise, or nothing when it is noise to its end. The span is the one
-    :class:`_FirstContentWatch` keeps for a gzip body, so the tag scan reads the same bytes plain or
-    inflated (BACKLOG #3257). The search is linear in the leading noise, not in the body."""
-    first = _FIRST_CONTENT_BYTE_RE.search(body)
+def _plain_head(body: bytes, first: re.Match[bytes] | None) -> bytes | None:
+    """``None`` when the plain ``body`` is markup, else its head: the :data:`_HEAD_BYTES` from
+    ``first``, the first byte past leading noise, or nothing when it is noise to its end. The span
+    is the one :class:`_FirstContentWatch` keeps for a gzip body, so the tag scan reads the same
+    bytes plain or inflated (BACKLOG #3257)."""
     if first is None:
         return b""
     if first.group() == b"<":
@@ -452,10 +453,12 @@ class _FirstContentWatch:
     :meth:`next_member` gives it a fresh decompressor for each member, since a reader joins the
     members into one document."""
 
-    __slots__ = ("first", "head", "inner")
+    __slots__ = ("first", "first_at", "head", "inner", "seen")
 
     def __init__(self) -> None:
         self.first: bytes | None = None
+        self.first_at = 0
+        self.seen = 0
         self.head = bytearray()
         self.next_member()
 
@@ -467,8 +470,11 @@ class _FirstContentWatch:
         if self.first is None:
             match = _FIRST_CONTENT_BYTE_RE.search(piece)
             if match is None:
+                self.seen += len(piece)
                 return piece
             self.first, start = match.group(), match.start()
+            self.first_at = self.seen + start
+        self.seen += len(piece)
         # Markup is vetted whole, so only a document that is not markup needs its head.
         room = _HEAD_BYTES - len(self.head)
         if room > 0 and self.first != b"<":
@@ -500,12 +506,14 @@ class _Gunzipped:
 
     ``output`` is the document, and is empty unless the walk kept its output and the body inflated
     whole. ``whole`` is false only when the output passed the walk's limit. ``first`` is the first
-    byte past leading noise among the bytes inflated, or ``None`` when there was none. ``head`` is
-    the first :data:`_HEAD_BYTES` inflated from that byte on, whatever ``output`` holds."""
+    byte past leading noise among the bytes inflated, or ``None`` when there was none, and
+    ``first_at`` its offset in the output. ``head`` is the first :data:`_HEAD_BYTES` inflated from
+    that byte on when it is not ``<``, whatever ``output`` holds."""
 
     output: bytes
     whole: bool
     first: bytes | None
+    first_at: int
     head: bytes
 
     @property
@@ -544,7 +552,7 @@ def _gunzip_bounded(body: bytes, limit: int, *, keep_output: bool) -> _Gunzipped
                 exact_ceiling=True,
             )
         except InflateCeilingExceeded:
-            return _Gunzipped(b"", False, watch.first, bytes(watch.head))
+            return _Gunzipped(b"", False, watch.first, watch.first_at, bytes(watch.head))
         except zlib.error:
             # The refusal is raised after the except ends, so the zlib error stays off its chain,
             # as in sanitize_svg (BACKLOG #1796).
@@ -559,7 +567,7 @@ def _gunzip_bounded(body: bytes, limit: int, *, keep_output: bool) -> _Gunzipped
         produced += result.produced
         position += result.end
         if _NOT_NUL_RE.search(view, position) is None:
-            return _Gunzipped(b"".join(parts), True, watch.first, bytes(watch.head))
+            return _Gunzipped(b"".join(parts), True, watch.first, watch.first_at, bytes(watch.head))
         if bytes(view[position : position + 2]) != _GZIP_MAGIC:
             raise SvgRejected("gzip body has bytes after its last member")
     raise SvgRejected(f"gzip body has more than {_MAX_GZIP_MEMBERS} members")
@@ -572,7 +580,7 @@ def _vet_markup(label: str | None, body: bytes) -> bytes:
     head is read, the same span past leading noise a gzip body's tag scan reads, so the chance that
     a binary's bytes spell a tag does not grow with its size, and a large one is never copied whole.
     A tag past the head rests on the route's content-type allow-list, as it does for gzip."""
-    head = _plain_head(body)
+    head = _plain_head(body, _FIRST_CONTENT_BYTE_RE.search(body))
     if head is not None:
         _refuse_if_tagged(head)
         return body
@@ -599,9 +607,9 @@ def _vet_gzip(label: str | None, body: bytes) -> bytes:
     ``<``. It is then cleared unless the first :data:`_HEAD_BYTES` from that byte on hold an
     ``svg`` start tag, which refuses it: the same head a plain body's scan reads (BACKLOG #3257).
     Leading noise does not shorten that head: a walk that stopped before it held a full head past
-    the noise reads on, and one the bound stopped first is refused. A plain body needs no second
-    read, since all its bytes are at hand. A body that inflates to nothing
-    but whitespace within the bound has not shown that byte, so it is treated as markup: a reader
+    the noise reads on to exactly that head, and one the bound stopped first is refused. A plain
+    body needs no second read, since all its bytes are at hand. A body that inflates to nothing but
+    whitespace within the bound has not shown that byte, so it is treated as markup: a reader
     that inflates the rest may find an SVG there. A gzip that is not sound is refused by
     :func:`_gunzip_bounded` before anything is judged.
 
@@ -619,9 +627,9 @@ def _vet_gzip(label: str | None, body: bytes) -> bytes:
     head = _gunzip_bounded(body, _HEAD_BYTES, keep_output=False)
     if head.first not in (None, b"<"):
         if head.head_short:
-            # Leading noise took part of the head. The noise is no longer than the head, so twice
-            # the head holds a full one past it.
-            head = _gunzip_bounded(body, 2 * _HEAD_BYTES, keep_output=False)
+            # Leading noise took part of the head, so read on to exactly a full head past it, and
+            # no further: damage past the bytes the scan needs is not this pass's business.
+            head = _gunzip_bounded(body, head.first_at + _HEAD_BYTES, keep_output=False)
         _refuse_gzip_if_tagged(head)
         return body
     # A body that inflated whole within the head needs no second trial pass.
@@ -781,16 +789,18 @@ def may_be_svg(body: bytes) -> bool:
     reader inflates it first, for markup, and for bytes that are not markup but whose head holds an
     ``svg`` start tag, which :func:`sanitize_if_svg` refuses (BACKLOG #3257). It takes the same head
     as that refusal, through the same functions, so the two cannot disagree. A PDF, an image or a
-    DICOM file with no tag in its head is cleared here and never takes the hop.
+    DICOM file with no tag in its head is cleared here and does not take the hop, unless its
+    leading noise runs past a head.
 
     The caller runs this on the event loop, so it reads at most a head's worth of leading noise,
-    then one head: a copy of at most :data:`_HEAD_BYTES` and one scan of it. A body whose noise runs
-    past that is left to :func:`sanitize_if_svg`, which judges it the same way off the loop."""
+    then one head: a copy of at most :data:`_HEAD_BYTES`, scanned only when it holds a ``<``. A body
+    whose noise runs past that is left to :func:`sanitize_if_svg`, which judges it off the loop."""
     if body.startswith(_GZIP_MAGIC):
         return True
-    if _FIRST_CONTENT_BYTE_RE.search(body, 0, _HEAD_BYTES) is None:
+    first = _FIRST_CONTENT_BYTE_RE.search(body, 0, _HEAD_BYTES)
+    if first is None:
         return len(body) > _HEAD_BYTES
-    head = _plain_head(body)
+    head = _plain_head(body, first)
     return head is None or _head_is_tagged(head)
 
 
