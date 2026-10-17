@@ -1860,17 +1860,21 @@ async def test_an_unreadable_trust_anchor_refusal_names_no_byte(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The arm catches (OSError, ValueError), so the scan does not see it: the read is in a callee.
-    async def unreadable(*args: object, **kwargs: object) -> None:
+    # Since BACKLOG #3091 that arm is in _preflight_one, around the file read alone, and its text
+    # names the setting (BACKLOG #3105, item 6). The read fails before any store call.
+    def unreadable(*args: object, **kwargs: object) -> None:
         raise _decode_error()
 
-    monkeypatch.setattr(trust_anchors, "run_anchor_preflight", unreadable)
-    spec: Any = object()
+    monkeypatch.setattr(trust_anchors, "evaluate_anchor", unreadable)
+    spec = trust_anchors.AnchorSpec("ad", "[auth].ad_tls_ca_cert_file", "ca.pem", None)
     store: Any = None
     preflight = trust_anchors.make_settings_anchor_preflight([spec], store, enforcing=True)
     assert preflight is not None
     with pytest.raises(WiringError) as caught:
         await preflight()
-    assert str(caught.value).startswith("a settings trust anchor was refused: a trust anchor could")
+    assert str(caught.value).startswith(
+        "a settings trust anchor was refused: [auth].ad_tls_ca_cert_file: could not read"
+    )
     _assert_decode_safe(str(caught.value))
 
 
