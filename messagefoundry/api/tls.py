@@ -139,24 +139,23 @@ class ApiHandshakeRecord:
     """
 
     def __init__(self, ctx: ssl.SSLContext) -> None:
-        self.failures = HandshakeFailures(self._emit)
+        # A plain emitter, so a line is logged at once and never waits on a task that uvicorn's
+        # closing loop could cancel before it ran.
+        self.failures = HandshakeFailures(_log_api_handshake_failures)
         watch_loop_handshakes(ctx, self._note)
 
     def _note(self, cause: str) -> None:
         self.failures.note_soon(None, cause)
-
-    async def _emit(self, peer_host: str | None, reason: str) -> None:
-        _log_api_handshake_failures(reason)
 
     def close(self) -> None:
         """Disarm the trailing line and log what it still held. Needs no running loop."""
         self.failures.cancel()
         held = self.failures.take_held()
         if held is not None:
-            _log_api_handshake_failures(held[1])
+            _log_api_handshake_failures(*held)
 
 
-def _log_api_handshake_failures(reason: str) -> None:
+def _log_api_handshake_failures(_peer_host: str | None, reason: str) -> None:
     log.warning("TLS handshake failed on the API listener: %s", reason)
 
 

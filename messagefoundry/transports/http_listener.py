@@ -838,11 +838,14 @@ class HttpSource(SourceConnector):
             self._clients.clear()
             self._client_tasks.clear()
             # Report the handshake failures a trailing event still held (vault BACKLOG #3302).
-            await self._tls_failures.flush()
+            # Not once a restart has begun, whose failures are its own to report.
+            if self._admission.stopping:
+                await self._tls_failures.flush()
         finally:
             # Even when this stop() is cancelled: a task cancelled past its grace never released.
             self._admission.reset()
-            self._tls_failures.cancel()
+            if self._admission.stopping:
+                self._tls_failures.cancel()
         # Bound wait_closed() so a Windows ProactorEventLoop overlapped-op wedge can't hang teardown on
         # the suite's shared session loop (#55, mirrors MLLPSource.stop()). The listener is closed and
         # every client task is resolved, so a wait_closed() past the grace is an OS wedge — abandoning it

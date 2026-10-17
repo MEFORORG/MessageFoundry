@@ -91,14 +91,16 @@ def handshake_cause(exc: BaseException) -> str:
 class HandshakeFailures:
     """One listener's failed-handshake counter and its throttled report.
 
-    ``emit(peer_host, reason)`` sends one report. A report for one failure names its peer; a report
-    for several names none, since they may come from many peers. The reason is a count and a
-    cause from :func:`handshake_cause`, never the peer's bytes.
+    ``emit(peer_host, reason)`` sends one report: a coroutine function for a connection event, or a
+    plain function for a log line, which then runs at once rather than on a task a closing loop
+    could cancel. A report for one failure names its peer; a report for several names none, since
+    they may come from many peers. The reason is a count and a cause from :func:`handshake_cause`,
+    never the peer's bytes.
     """
 
     def __init__(
         self,
-        emit: Callable[[str | None, str], Coroutine[Any, Any, None]],
+        emit: Callable[[str | None, str], Coroutine[Any, Any, None] | None],
         *,
         window: float = EVENT_SECONDS,
     ) -> None:
@@ -115,16 +117,21 @@ class HandshakeFailures:
         self._tasks: set[asyncio.Task[None]] = set()
 
     def _count(self, peer_host: str | None, cause: str) -> bool:
-        """Count one failure; True when a report is due now, else arm the trailing timer."""
+        """Count one failure; True when a report is due now, else arm the trailing timer.
+
+        A report due now also carries whatever a trailing timer held, so that timer is disarmed
+        here. Left armed, it could fire a second report inside the new window, since asyncio runs
+        a due I/O callback before a due timer in the same loop iteration."""
         self.count += 1
         self._last = (peer_host, cause)
         now = time.monotonic()
         last = self._reported_at
         if last is None or now - last >= self._window:
+            self.cancel()
             return True
         if self._timer is None:
             self._timer = asyncio.get_running_loop().call_later(
-                last + self._window - now, self._report_soon
+                last + self._window - now, self._on_timer
             )
         return False
 
@@ -154,22 +161,30 @@ class HandshakeFailures:
         if self._count(peer_host, cause):
             self._report_soon()
 
+    def _on_timer(self) -> None:
+        """The trailing report's timer."""
+        self._timer = None
+        self._report_soon()
+
     def _report_soon(self) -> None:
         # Taken here, not in the task, so the window starts now: a second failure in the same loop
         # turn is held for the trailing report, as under `note`, rather than reported twice.
-        self._timer = None
         held = self.take_held()
         if held is None:
             return
-        task = asyncio.get_running_loop().create_task(self._emit(*held))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        sent = self._emit(*held)
+        if sent is not None:
+            task = asyncio.get_running_loop().create_task(sent)
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
 
     async def report(self) -> None:
         """Send one report for the failures not yet reported, if there are any."""
         held = self.take_held()
         if held is not None:
-            await self._emit(*held)
+            sent = self._emit(*held)
+            if sent is not None:
+                await sent
 
     def cancel(self) -> None:
         """Disarm the trailing timer. What it held stays held, for :meth:`flush` or :meth:`take_held`."""

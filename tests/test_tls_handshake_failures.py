@@ -191,6 +191,33 @@ async def test_note_soon_throttles_as_note_does() -> None:
     assert len(sent) == 2  # nothing more was held, so nothing more is sent
 
 
+async def test_a_report_due_now_disarms_the_trailing_timer() -> None:
+    """A failure that arrives once the window has passed, before the trailing timer has fired (an
+    I/O callback runs before a due timer in one loop iteration), reports everything held. The old
+    timer must not fire a second report inside the new window, and cancel() must reach the next."""
+    sent: list[tuple[str | None, str]] = []
+
+    async def emit(peer_host: str | None, reason: str) -> None:
+        sent.append((peer_host, reason))
+
+    failures = HandshakeFailures(emit, window=0.3)
+    failures.note_soon(None, "SSLError")
+    failures.note_soon(None, "SSLError")  # held: arms the trailing timer
+    stale = failures._timer
+    assert stale is not None
+    assert failures._reported_at is not None
+    failures._reported_at -= 1.0  # the window has passed, and the timer has not run yet
+    failures.note_soon(None, "SSLError")
+    assert stale.cancelled()
+    await _until(lambda: len(sent) == 2, "the due report was not sent")
+    assert sent[1] == (None, "2 failed handshake(s) since the last event; last cause SSLError")
+    failures.note_soon(None, "SSLError")  # inside the new window: a new timer
+    assert failures._timer is not None
+    failures.cancel()
+    await asyncio.sleep(0.5)
+    assert len(sent) == 2  # neither timer fired
+
+
 # --- the HTTP intake listener -----------------------------------------------------------------
 
 
@@ -374,6 +401,8 @@ def test_serve_records_a_failed_api_handshake(
             server.close()
             await server.wait_closed()
 
+    level_before = tls_log.level
+
     def fake_run(*_args: Any, **kwargs: Any) -> None:
         tls_log.addHandler(collect)
         tls_log.setLevel(logging.WARNING)
@@ -388,7 +417,7 @@ def test_serve_records_a_failed_api_handshake(
         after_close = _api_records(collect.records)
     finally:
         tls_log.removeHandler(collect)
-        tls_log.setLevel(logging.NOTSET)
+        tls_log.setLevel(level_before)
 
     assert during["control_ok"] is True
     assert during["after_control"] == []  # the control: a completed handshake logs nothing

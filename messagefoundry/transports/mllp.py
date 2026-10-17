@@ -2151,10 +2151,14 @@ class MLLPSource(SourceConnector):
             self._client_tasks.clear()
             # Vault BACKLOG #2613: report the handshake failures a trailing event still held, once
             # no handshake can add to them. `_emit_event` is fail-soft, so this cannot fail stop().
-            await self._tls_failures.flush()
+            # Not once a restart has begun (an abandoned stop() resuming late), whose failures are
+            # its own to report.
+            if self._stopping:
+                await self._tls_failures.flush()
         finally:
             # Again here, so a stop() cancelled above leaves no timer to fire after it.
-            self._tls_failures.cancel()
+            if self._stopping:
+                self._tls_failures.cancel()
             # Clear the per-host tables with them, in a `finally` so a stop() cancelled or failing
             # anywhere above still clears them (vault BACKLOG #2847), as the raw-TCP, X12 and HTTP
             # listeners already did. A client task the runner ABANDONS when a stop() overruns
