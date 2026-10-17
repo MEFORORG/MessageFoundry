@@ -53,8 +53,9 @@ REFUSALS = pytest.mark.parametrize(
     [
         lambda: PermissionError(errno.EACCES, "Permission denied"),
         lambda: OSError(errno.EROFS, "Read-only file system"),
+        lambda: PermissionError(errno.EPERM, "Operation not permitted"),
     ],
-    ids=["root-owned", "read-only"],
+    ids=["root-owned", "read-only", "not-permitted"],
 )
 
 _real_open = os.open
@@ -176,8 +177,9 @@ def test_a_candidate_it_cannot_write_is_a_wiring_error_and_cleaned_up(
 def test_an_error_from_the_replace_is_never_converted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Only the steps before the replace are known not to have written anything; from the replace
-    # onward the editor cannot say the file was not changed, so the error propagates as it is.
+    # The conversion is kept to the steps before the replace, where the write lands. A failed
+    # rename itself leaves the live file as it was, but it still propagates as it is; widening the
+    # conversion to it is a separate decision.
     _live(tmp_path)
     refusal = PermissionError(errno.EACCES, "Permission denied")
 
@@ -228,5 +230,5 @@ def test_the_message_names_the_step_the_file_system_refused(
     refusal = PermissionError(errno.EACCES, "Permission denied")
     _refuse_open(monkeypatch, refusal, lambda p: p.name == atomic_edit.LOCK_FILE_NAME)
 
-    with pytest.raises(WiringError, match=r"create its edit lock \.mefor-edit\.lock"):
+    with pytest.raises(WiringError, match=r"create or open its edit lock \.mefor-edit\.lock"):
         connections_edit.upsert_connection(tmp_path, ENTRY, validate=_noop)

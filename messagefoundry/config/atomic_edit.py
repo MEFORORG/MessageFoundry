@@ -166,18 +166,15 @@ def edit_lock(
     flags = os.O_RDONLY | os.O_CREAT | _O_BINARY
     flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        fd = os.open(lock_path, flags, 0o600)
+        with _refused_as(path, refused_error, f"create or open its edit lock {lock_path.name}"):
+            fd = os.open(lock_path, flags, 0o600)
     except OSError as exc:
-        if exc.errno == errno.ELOOP:
-            # In the editor's own refusal type, so its callers catch it as they catch a busy lock.
-            raise busy_error(
-                f"{lock_path} is a link; an edit of {path} will not lock through it -- remove it"
-            ) from exc
-        if refused_error is not None and exc.errno in _REFUSED:
-            raise refused_error(
-                _refusal(path, exc, f"create its edit lock {lock_path.name}")
-            ) from exc
-        raise
+        if exc.errno != errno.ELOOP:
+            raise
+        # In the editor's own refusal type, so its callers catch it as they catch a busy lock.
+        raise busy_error(
+            f"{lock_path} is a link; an edit of {path} will not lock through it -- remove it"
+        ) from exc
     try:
         locked = _acquire(fd, lock_path, path, busy_error, timeout)
         held.add(key)
@@ -266,9 +263,10 @@ def _refusal(path: Path, exc: OSError, step: str) -> str:
     code = errno.errorcode.get(exc.errno, "") if exc.errno is not None else ""
     reason = (exc.strerror or type(exc).__name__) + (f" ({code})" if code else "")
     return (
-        f"{path.name} was not changed: the file system would not let the engine {step}: "
+        f"{path.name} was not changed: the file system would not let this account {step}: "
         f"{reason}. Its directory is read-only or another account owns it, as a root-owned or "
-        "read-only config directory is; change the file in the config source instead"
+        "read-only config directory is, or another account owns the file named; change the file "
+        "where this account can write it, or as the account that owns it"
     )
 
 

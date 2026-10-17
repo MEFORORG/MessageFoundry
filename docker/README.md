@@ -106,10 +106,10 @@ as an unprivileged uid and is refused; leave the files owned by your own user th
 root inside.
 
 **What a root-owned config gives up.** The engine's own editors that write into the config
-directory (the web console's connection toggle, and the connection and code-set editors on the command line) cannot
-write a root-owned one, just as they cannot write a read-only mount. The toggle answers 409, naming
-`connections.toml` and the file system's refusal, and leaves the file unchanged; change the flag in
-the config source and rebuild or remount instead.
+directory (at least the web console's connection toggle, and the connection, code-set and `impact`
+rename editors on the command line) cannot write a root-owned one, just as they cannot write a
+read-only mount. The toggle answers 409, naming `connections.toml` and the file system's refusal,
+and leaves the file unchanged; change the flag in the config source and rebuild or remount instead.
 
 **Pass `--read-only` on a plain `docker run`.** [`compose.yaml`](compose.yaml) and both Kubernetes
 manifests set a read-only root file system; a bare `docker run` does not. The engine writes only

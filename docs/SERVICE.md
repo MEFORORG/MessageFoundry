@@ -688,9 +688,9 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
       own account that is not group- or world-writable, such as the engine's data directory.
       Nothing here detects either. An account that can write the directory a link points into can
       replace the file the check passed. Before you deploy, run `namei -l <config dir>` to list
-      every directory on the path. It does not look inside the directory, so also run `ls -l` on
-      the config directory and its `codesets` folder, and run `namei -l` on every file there that
-      is a link. Each directory those commands list must be owned by root, or by the engine's own
+      every directory on the path. It does not look inside the directory, so also run `ls -lR` on
+      the config directory, which lists at least its `codesets` and `environments` folders, and
+      run `namei -l` on every file there that is a link. Each directory those commands list must be owned by root, or by the engine's own
       account for the config directory itself, with no group or other write bit. The shipped
       image's `/config` sits directly under `/`, which is root-owned.
   - **The cache folder is checked because it runs.** Python's source loader runs a matching
