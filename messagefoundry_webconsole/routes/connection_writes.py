@@ -54,11 +54,8 @@ _log = logging.getLogger(__name__)
 _NOT_A_CONNECTION_NAME = "not applied: not a valid connection name"
 
 
-async def _refused_name(
-    core: Any, engine: Any, identity: Identity, request: Request, name: str
-) -> bool:
-    """Whether a bulk selection's ``name`` fails the connection-name rule, auditing a scoped
-    actor's attempt on the way.
+async def _audit_refused_name(core: Any, engine: Any, identity: Identity, request: Request) -> None:
+    """Audit a channel-scoped actor's bulk selection that failed the connection-name rule.
 
     A channel-scoped actor's attempt on a name it may not reach is a security event. MEASURED when
     the refusal was unconditional and wrote nothing: a well-formed out-of-scope name wrote one
@@ -68,12 +65,16 @@ async def _refused_name(
 
     The row carries no channel (BACKLOG #3031). The name is caller-chosen text that failed the rule,
     bounded only by the request body, and ``audit_log.channel_id`` would otherwise hold it whole. The
-    actor and the host still identify the attempt, as on the purge confirm page's refusal."""
-    if refuse(CONNECTION_RULE, name) is None:
-        return False
-    if identity.allowed_channels is not None:
+    actor and the host still identify the attempt, as on the purge confirm page's refusal.
+
+    A failed write is logged and the batch goes on, as it does for a failed target, so the
+    operator still sees which targets were applied."""
+    if identity.allowed_channels is None:
+        return
+    try:
         await core.audit_channel_denied(engine, identity, None, client_ip(request))
-    return True
+    except Exception:  # noqa: BLE001 - capture-and-continue; one bad selection never aborts the batch
+        _log.exception("could not audit a channel-scoped actor's malformed bulk selection")
 
 
 # The per-name queue purge POST (`/ui/connections/{name}/purge/{scope}`) is deliberately NOT a
@@ -145,8 +146,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # bad selection must not abort the rest. After the dedupe, so a selection repeated N
             # times is still one row whether it is valid or not.
             # The rule's own sentence is discarded here on purpose -- see _NOT_A_CONNECTION_NAME.
-            # A channel-scoped actor's refusal is still audited; _refused_name says how and why.
-            if await _refused_name(core, engine, identity, request, name):
+            # A channel-scoped actor's refusal is still audited; _audit_refused_name says why.
+            if refuse(CONNECTION_RULE, name) is not None:
+                await _audit_refused_name(core, engine, identity, request)
                 outcomes.append((None, _NOT_A_CONNECTION_NAME))
                 continue
             try:
@@ -290,7 +292,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # BACKLOG #1740, same shape as ui_bulk_control above. It also stops an unvetted body
             # value reaching the result table, which the raw append below used to put there.
             # Same shape and the same channel-scope audit as ui_bulk_control above.
-            if await _refused_name(core, engine, identity, request, value):
+            if refuse(CONNECTION_RULE, value) is not None:
+                await _audit_refused_name(core, engine, identity, request)
                 outcomes.append((None, _NOT_A_CONNECTION_NAME))
                 continue
             try:

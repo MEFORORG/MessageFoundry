@@ -14,7 +14,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import httpx
@@ -7881,6 +7881,39 @@ async def test_bulk_routes_audit_a_scoped_malformed_name_without_writing_it(
     rows = await engine.store.list_audit(limit=100, action="auth.channel_denied")
     assert [(row["actor"], row["channel_id"]) for row in rows] == [("op", None)]
     assert all("xxxxx" not in str(dict(row)) for row in rows)
+
+
+async def test_a_failed_malformed_name_audit_does_not_abort_the_batch(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3031: the malformed-name denial is written outside the per-target capture, so a
+    failed write must still leave the batch to run and render its result table."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await service.set_channel_scope(await _uid(service, "op"), ["in1"], actor="admin")
+    await _start_two_out(engine, tmp_path)
+    real = engine.store.record_audit
+
+    async def failing(action: str, *args: Any, **kwargs: Any) -> Any:
+        if action == "auth.channel_denied":
+            raise RuntimeError("synthetic audit failure")
+        return await real(action, *args, **kwargs)
+
+    monkeypatch.setattr(engine.store, "record_audit", failing)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await _post_pairs(
+            c,
+            "/ui/connections/bulk-control",
+            [
+                ("action", "stop"),
+                ("sel", _rowkey("source", "bad name")),
+                ("sel", _rowkey("source", "in1")),
+            ],
+        )
+    assert r.status_code == 200, r.text
+    assert "not applied: not a valid connection name" in r.text
+    assert "applied (running=False)" in r.text
 
 
 async def test_bulk_control_bad_action_404(engine: Engine) -> None:

@@ -1291,13 +1291,16 @@ def _posture_visible(
     :func:`~messagefoundry.connection_names.inbound_record_name` spells them."""
     if identity.allowed_channels is None:
         return None
-    inbound = runner.registry.inbound if runner is not None else {}
 
     def shown(record: str) -> bool:
         if record.startswith(SETTINGS_PREFIX):
             return True
         name = inbound_name_of(record)
-        return name is not None and name in inbound and identity.can_access_channel(name)
+        if name is None or runner is None or not identity.can_access_channel(name):
+            return False
+        # Read at each call, not once: a reload swaps runner.registry, and the readers this
+        # filters read the graph at their own call, after the route's awaits.
+        return name in runner.registry.inbound
 
     return shown
 
@@ -3535,13 +3538,15 @@ def create_app(
         ``cleartext_accepted`` declarations) is read off THIS process's registry, which in a sharded
         deployment is the shard-filtered graph — so each shard reports its own declared set, not the
         estate's. ``messagefoundry check`` reads the whole config dir and is the estate-wide surface.
-        ``loosenings_scope`` is non-``None`` when this engine has no loaded graph at all.
+        ``loosenings_scope`` is non-``None`` when this engine has no loaded graph at all, and for a
+        channel-scoped reader.
 
         **Channel scope (BACKLOG #3189).** A channel-scoped reader is shown a per-connection entry
-        only for an inbound in its own scope that the graph holds: in ``loosenings``, in
-        ``static_credential_hops``, in ``security``'s static-credential opt-outs, and in the audit
-        row. ``loosenings_scope`` and ``static_credential_hops_scope`` then say the reading is
-        narrowed. Everything else here names no connection and is shown whole."""
+        only for an inbound in its own scope that the graph holds, in at least ``loosenings``,
+        ``static_credential_hops``, ``security``'s static-credential opt-outs and the audit row.
+        ``loosenings_scope`` and ``static_credential_hops_scope`` then say the reading is narrowed.
+        The rest is shown whole, and some of it is operator free text, such as an alert rule's id or
+        an attestation reason, which may name a connection."""
         # The live cipher posture (on/off + key fingerprint only). cipher_info() is the public Store
         # accessor — the route never touches engine.store._cipher.
         info = engine.store.cipher_info()
@@ -3629,8 +3634,9 @@ def create_app(
         else:
             static_hops_scope = STATIC_CREDENTIAL_HOPS_COMPLETE
         if visible is not None:
-            # Read, then withheld from this reader (BACKLOG #3189), so it is not an unread half.
-            static_hops_scope += "; " + POSTURE_NARROWED_TO_SCOPE
+            # Read, then withheld from this reader (BACKLOG #3189), so it is not an unread half. It
+            # leads, so a reading never starts with "complete" for a reader shown less than all.
+            static_hops_scope = POSTURE_NARROWED_TO_SCOPE + "; " + static_hops_scope
         store_privilege_view = (
             StorePrivilegeView(status=STORE_PRIVILEGE_NOT_PROBED)
             if store_privilege is None

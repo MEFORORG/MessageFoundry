@@ -1539,9 +1539,9 @@ STATIC_CREDENTIAL_HOPS_COMPLETE = (
 )
 #: The same field's prefix when a half could not be read; the route appends which half and why.
 STATIC_CREDENTIAL_HOPS_PARTIAL = "partial, not read: "
-#: ``SecurityPosture.loosenings_scope`` for a channel-scoped reader (BACKLOG #3189), and the half
-#: ``static_credential_hops_scope`` names for one. Such a reader is shown a per-connection entry only
-#: for an inbound in its own scope that the running graph holds.
+#: ``SecurityPosture.loosenings_scope`` for a channel-scoped reader (BACKLOG #3189), and the lead of
+#: ``static_credential_hops_scope`` for one. Such a reader is shown a per-connection entry only for an
+#: inbound in its own scope that the running graph holds.
 POSTURE_NARROWED_TO_SCOPE = (
     "narrowed to your channel scope: a per-connection entry is listed only for an inbound in "
     "your scope, so one on any other connection is NOT included"
@@ -1621,7 +1621,8 @@ class SecurityPosture(BaseModel):
     # This is the INVENTORY, reported whether or not the opt-in refusal
     # ([security].require_nonstatic_credentials, echoed in `security` above) is on. The scope is always
     # a sentence and never absent: it says both halves were read, or names the half this engine could
-    # not see (no loaded graph, or no resolved service configuration). Its default says the inventory
+    # not see (no loaded graph, or no resolved service configuration). For a channel-scoped reader it
+    # starts with POSTURE_NARROWED_TO_SCOPE (BACKLOG #3189). Its default says the inventory
     # was not read at all, so a posture built without it can never pass for a clean, complete list.
     static_credential_hops: list[StaticCredentialHopView] = Field(default_factory=list)
     static_credential_hops_scope: str = STATIC_CREDENTIAL_HOPS_NOT_READ
