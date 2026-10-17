@@ -29,7 +29,8 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore, UserRecord
 from tests._admin_account import login_admin
-from tests.test_mfa_directory_recheck import _OPERATORS, _PRINCIPAL, _VIEWERS, _Directory, _settings
+from tests._fake_directory import FakeDirectory
+from tests.test_mfa_directory_recheck import _OPERATORS, _PRINCIPAL, _VIEWERS, _settings
 
 _SERVICE_LOGGER = "messagefoundry.auth.service"
 _OUTAGE_LINE = "mTLS certificate identities for directory accounts"
@@ -44,14 +45,14 @@ async def store() -> AsyncIterator[MessageStore]:
 
 async def _directory_account(
     store: MessageStore, *groups: str, role_map: list[tuple[str, str]] | None = None
-) -> tuple[AuthService, _Directory, str]:
+) -> tuple[AuthService, FakeDirectory, str]:
     """A directory account whose roles a sign-in wrote from ``groups`` under the synthetic map.
 
     The sign-in is only how the row is born. The certificate path holds no session."""
     await AuthService(store, _settings()).initialize()  # the map's role ids need the seeded roles
     await store.set_ad_group_role_map(role_map or [(_OPERATORS, "operator"), (_VIEWERS, "viewer")])
     principal = replace(_PRINCIPAL, groups=frozenset(groups))
-    directory = _Directory(principal)
+    directory = FakeDirectory(principal)
     service = AuthService(store, _settings(), ldap=directory)  # type: ignore[arg-type]
     await service.initialize()
     login = await service._complete_ad_login(principal, None, mfa_verified=False)
@@ -185,7 +186,7 @@ async def test_an_account_removed_from_every_mapped_group_is_refused(
 
 async def test_a_local_account_is_never_probed(store: MessageStore) -> None:
     """The control: a local row behaves exactly as before, and the directory sees no call."""
-    directory = _Directory(_PRINCIPAL)
+    directory = FakeDirectory(_PRINCIPAL)
     service = AuthService(store, _settings(), ldap=directory)  # type: ignore[arg-type]
     identity, _token, _ = await login_admin(service)
 
