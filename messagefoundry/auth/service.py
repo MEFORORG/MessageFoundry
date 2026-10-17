@@ -6867,7 +6867,12 @@ class AuthService:
             # ``old_username`` (BACKLOG #2291). The reconciler captured that at plan time, and a
             # sign-in may have renamed the row since, so it can name an account that no longer
             # exists. The audit actor and the warning both use the name an operator would find.
-            # On the reconciler's path the two names now agree (BACKLOG #3069, the skip below).
+            # On the reconciler's path the two names now agree, because the BACKLOG #3069 skip below
+            # returns first. On the LOGIN path they can still differ, when a pass wrote between the
+            # sign-in's read and this one. So each ``_refuse`` call passes the name the row held,
+            # never ``old_username``: passing that would bring back the #2291 defect on the login
+            # path, an audit row naming an account that no longer exists. ``row_gone`` is the one
+            # exception, since no row is left to hold a name.
             await self._audit(
                 "auth.ad_username_refresh_conflict",
                 actor=holds,
@@ -6917,9 +6922,9 @@ class AuthService:
         # read.
         #
         # A row that already carries the new name has nothing to change, so it gets no second audit
-        # row and no second notice. On the reconciler's path, a row that carries neither name was
-        # renamed by someone else since the plan, so the plan is stale and is skipped (BACKLOG
-        # #3069). The notice and every refusal name what the row held.
+        # row and no second notice. The reconciler's rule for a row that carries neither name is
+        # stated once, at the BACKLOG #3069 skip below. The notice and every refusal name what the
+        # row held.
         # The write below compares on this name (BACKLOG #2290), so a refresh that read it just
         # before another refresh of this row wrote cannot write as well. And each refusal after
         # this read audits under this name (BACKLOG #2291), so the read comes BEFORE the ``held``
@@ -6955,20 +6960,24 @@ class AuthService:
             # name (read when the pass listed its accounts) nor its new one, so another writer,
             # most likely a sign-in, renamed it since. The compare-and-set below compares on the
             # name just read, so it would match and could write an older name over a newer one.
-            # Skip, and let the next pass plan from a fresh read. Nothing was attempted, so no audit
-            # row, no conflict and no notice; INFO says why.
+            # Skip, and leave the name to a later read of the directory. Nothing was attempted, so
+            # no audit row, no conflict and no notice; INFO says why.
             #
             # A HEURISTIC ON NAMES, NOT AN ORDERING OF DIRECTORY READS. Nothing here knows which
             # directory read is newer, so at least these residuals stand:
             #   - the sign-in may have written before this pass's probe, so the skipped plan can
-            #     hold the NEWER name; the label then lags until the next pass or sign-in;
+            #     hold the NEWER name; the label then lags until a later read, below;
             #   - a directory that renamed the account away and back (jdoe -> jdoe-married -> jdoe)
             #     leaves the row on the plan's old name, so the plan writes and notifies;
             #   - the login (``from_plan`` False) writes whatever it carries, so a sign-in whose
             #     bind ran before a pass that probed and wrote a newer name can still write the
             #     older one. It is exempt because its name came from a bind made moments before,
             #     and skipping it would as often keep an older name a pass wrote.
-            # Each converges on the next sign-in or pass, which copies the directory's name down.
+            # Each converges when a later read copies the directory's name down: the account's next
+            # sign-in, or a pass that probes it. That need not be the next pass, because a pass
+            # probes the least-recently-probed accounts first, at most
+            # ``ad_session_recheck_max_users`` of them (``reconcile.select_candidates``), so the
+            # label can lag several passes.
             #
             # AFTER the already-applied check, because a row that holds the new name is the no-op
             # above, not a skip. BEFORE the ``held`` pre-check, because a stale plan is not a
@@ -6977,8 +6986,8 @@ class AuthService:
             _log.info(
                 "AD account %s was renamed by another writer after this reconciler pass read it, "
                 "so its planned rename to %s was skipped (the row now holds %s); nothing was "
-                "written, audited or sent, and the next pass plans from a fresh read "
-                "(BACKLOG #3069)",
+                "written, audited or sent, and the name is copied down when a later pass probes "
+                "the account or it signs in again (BACKLOG #3069)",
                 user_id,
                 scrub_log_argument(new_username),
                 scrub_log_argument(before.username),
@@ -10222,7 +10231,9 @@ class AuthService:
                 reason = "secret_replaced"
             else:
                 # The row still holds the verified cell with TOTP off, so the write lost to some
-                # other concurrent write to the row; a retry confirms.
+                # other concurrent write to the row. A plain retry gets a 401, because the session
+                # was revoked above and this code's step is consumed; the user signs in again and
+                # confirms with a code from a later step.
                 reason = "write_lost"
             await self._audit(
                 "auth.mfa_enroll_refused",
