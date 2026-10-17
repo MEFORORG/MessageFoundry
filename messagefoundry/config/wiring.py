@@ -36,12 +36,14 @@ import importlib.machinery
 import importlib.util
 import inspect
 import ipaddress
+import linecache
 import logging
 import math
 import os
 import re
 import sys
 import threading
+import traceback
 import urllib.parse
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -8749,6 +8751,96 @@ def untrusted_install_paths() -> list[str]:
     return reasons
 
 
+def _raised_by_the_engine(exc: BaseException) -> bool:
+    """Whether the innermost frame of ``exc``'s traceback is this package's own code, judged by the
+    frame's module name, as ``__main__._is_engine_refusal`` judges it. A config module and its
+    helpers run as ``mefor_config_*``, never under ``messagefoundry``."""
+    tb = exc.__traceback__
+    if tb is None:
+        return False
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    name = tb.tb_frame.f_globals.get("__name__", "")
+    return isinstance(name, str) and name.split(".")[0] == "messagefoundry"
+
+
+#: Exceptions whose ``name`` attribute is usually an identifier from the SOURCE -- a module, a
+#: variable, an attribute. It is kept only where it also appears in the source line it was raised
+#: from: ``getattr(obj, value)`` or ``import_module(value)`` put a RUNTIME value in ``name``, which
+#: the line does not spell, so such a name is withheld with the rest.
+_NAMED_EXCEPTIONS: Final = (ImportError, NameError, AttributeError)
+
+#: How the loader names a config file's module (:func:`_config_module_name`): the prefix, then the
+#: stem, then ``_`` and 12 hex digits. An ImportError naming a helper carries this mangled name.
+_CONFIG_MODULE_PREFIX: Final = "mefor_config_"
+_CONFIG_MODULE_SUFFIX_LEN: Final = 13
+
+
+def _module_failure(path: Path, exc: BaseException) -> str:
+    """The loader's diagnostic for author code that failed: the exception TYPE, the config-directory
+    file and line it was raised from, and for an import or name error the identifier, but never the
+    exception's text (vault BACKLOG #3249).
+
+    The text is author code's, or a library's quoting author data, and can carry any value the module
+    held -- an inline credential, a row it read. It reached ``messagefoundry validate`` and ``check``
+    output (so CI logs), the reload WARNING and the ``POST /connections/{name}/flag`` 409, and a
+    credential scrub only replaces a LABELLED value, so it is a backstop, not a boundary.
+
+    The file is the deepest frame in the config directory, so a failing helper is named rather than
+    the config module's import of it. A file name and a line number are layout, not data."""
+    config_dir = path.resolve().parent
+    located: tuple[str, int] | None = None
+    filename = getattr(exc, "filename", None) if isinstance(exc, SyntaxError) else None
+    lineno = getattr(exc, "lineno", None)
+    if isinstance(filename, str) and isinstance(lineno, int) and _in_dir(filename, config_dir):
+        located = (filename, lineno)
+    else:
+        for frame, frame_line in traceback.walk_tb(exc.__traceback__):
+            if _in_dir(frame.f_code.co_filename, config_dir):
+                located = (frame.f_code.co_filename, frame_line)
+    where = names = ""
+    if located is not None:
+        source_file, line = located
+        if Path(source_file).name != path.name:
+            where = f" in {Path(source_file).name}"
+        where += f" at line {line}"
+        if isinstance(exc, _NAMED_EXCEPTIONS):
+            # `from x import y` puts the module in `name` and the symbol in `name_from`.
+            spelled = linecache.getline(source_file, line)
+            idents = [
+                ident
+                for ident in map(_source_name, (exc.name, getattr(exc, "name_from", None)))
+                if ident is not None and ident in spelled
+            ]
+            names = (" naming " + ", ".join(repr(ident) for ident in idents)) if idents else ""
+    return (
+        f"error loading config module {path.name}: {type(exc).__name__}{where}{names} "
+        "(its message is withheld: it can carry a value the module held)"
+    )
+
+
+def _source_name(name: object) -> str | None:
+    """``name`` as an author would have written it, or ``None`` when it is not a dotted identifier:
+    a helper's mangled module name is given back as its stem."""
+    if not isinstance(name, str) or not all(part.isidentifier() for part in name.split(".")):
+        return None
+    if name.startswith(_CONFIG_MODULE_PREFIX) and len(name) > (
+        len(_CONFIG_MODULE_PREFIX) + _CONFIG_MODULE_SUFFIX_LEN
+    ):
+        return name[len(_CONFIG_MODULE_PREFIX) : -_CONFIG_MODULE_SUFFIX_LEN]
+    return name
+
+
+def _in_dir(filename: str, directory: Path) -> bool:
+    """Whether ``filename`` sits directly in ``directory`` -- config modules and their helpers are
+    siblings -- compared resolved, so a config directory given as a relative path still matches the
+    absolute path the import machinery records."""
+    try:
+        return Path(filename).resolve().parent == directory
+    except (OSError, ValueError):
+        return False
+
+
 def _exec_module(path: Path, helpers: _HelperImporter) -> None:
     # Register the module in sys.modules under its path-derived name so intra-config imports and
     # anything relying on sys.modules[__name__] resolve correctly; remove it again on failure.
@@ -8758,20 +8850,39 @@ def _exec_module(path: Path, helpers: _HelperImporter) -> None:
         raise WiringError(f"cannot load config module: {path}")
     module = helpers.new_module(spec)
     helpers.register(mod_name, module)
+    withheld: WiringError | None = None
+    cause: ImportError | None = None
     try:
         spec.loader.exec_module(module)
         # The helpers its function bodies import, loaded now that it has run (vault BACKLOG #2783).
         helpers.preload(path)
-    except WiringError:
-        helpers.unregister(mod_name, module)
-        raise
     except Exception as exc:
         helpers.unregister(mod_name, module)
-        raise WiringError(f"error loading config module {path.name}: {exc}") from exc
+        # An import or name error is judged by its identifier, not its frame: a failed import ends
+        # in this package's own helper finder whoever wrote the import.
+        if _raised_by_the_engine(exc) and not isinstance(exc, _NAMED_EXCEPTIONS):
+            # The engine's own wording -- a factory or registry refusal naming a connection or a
+            # setting -- which is the diagnostic an author needs, so it keeps its text, as before.
+            # That relies on engine raise sites not quoting a value. At least a few wrap another
+            # exception's text (`f"{where}: {exc}"`), and an engine call such as int() on an
+            # author value can quote it; nothing scrubs those here.
+            if isinstance(exc, WiringError):
+                raise
+            raise WiringError(f"error loading config module {path.name}: {exc}") from exc
+        withheld = WiringError(_module_failure(path, exc))
+        # An import failure keeps a textless stand-in of its type as the cause, because the
+        # engine-shard preflight (_config_preflight) reads the cause's type for its helper advice.
+        if isinstance(exc, ImportError):
+            kind = ModuleNotFoundError if isinstance(exc, ModuleNotFoundError) else ImportError
+            cause = kind(name=exc.name)
     finally:
         # Whatever this module queued -- a failure part-way included -- is never drained by the next
         # module, whose diagnostic would then name the wrong file.
         helpers.drop_pending()
+    if withheld is not None:
+        # Raised AFTER the handler, so the original is neither __cause__ nor __context__: a rendered
+        # traceback, a structured log or a crash reporter would print it again from either.
+        raise withheld from cause
 
 
 def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list[Diagnostic]:
@@ -8813,6 +8924,9 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
             try:
                 _exec_module(path, helpers)
             except WiringError as exc:
+                # Not scrubbed: `_module_failure` withholds a module's own text (vault BACKLOG
+                # #3249), and the scrub would mangle the engine's own fix advice, which spells
+                # `credential_password=env(...)`.
                 diagnostics.append(Diagnostic(message=str(exc), file=str(path)))
                 declaring_source_failed = True
     # Merge connections.toml best-effort too (ADR 0007), so the editor sees TOML problems alongside the
