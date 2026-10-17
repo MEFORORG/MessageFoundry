@@ -54,6 +54,7 @@ from messagefoundry.uploads import (
     UploadQuotaError,
     UploadStore,
     UploadUnreadableError,
+    _UnsealableUpload,
 )
 
 _ADT = "MSH|^~\\&|A|B|C|D|202601011200||ADT^A01|MSGID1|P|2.5\rPID|1||MRN123^^^HOSP||DOE^JOHN\r"
@@ -483,6 +484,40 @@ async def test_a_delete_told_the_sidecar_was_refused_still_classifies_it(tmp_pat
 
 
 @_BREAKS
+async def test_a_delete_told_the_sidecar_was_refused_removes_an_unsealable_upload(
+    tmp_path: Path, break_body: Callable[[Path], None]
+) -> None:
+    """BACKLOG #3240, the positive arm the store test lacked: with ``sidecar_refused`` the
+    never-sealable kind is removed, both files, and reported with blank owner fields."""
+    root = tmp_path / "uploads"
+    fid = await _unsealable_upload(root, break_body)
+    store = UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20)
+    meta = await store.delete(fid, sidecar_refused=True)
+    assert (meta.file_id, meta.uploader_id, meta.filename) == (fid, "", "")
+    assert _files(root) == []
+
+
+@pytest.mark.parametrize("sidecar_refused", [False, True], ids=["read-here", "read-by-caller"])
+async def test_a_sidecar_gone_before_it_is_classed_answers_not_found(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sidecar_refused: bool
+) -> None:
+    """BACKLOG #3240. A sidecar that vanished between the refused read and the class check, as when
+    a prune removes it, answered 423 (refused) where an absent sidecar answers 404."""
+    root = tmp_path / "uploads"
+    fid = await _plaintext_upload(root)
+    store = UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20)
+    real = store._unsealable_sync
+
+    def _gone_first(file_id: str, sidecar: Path) -> object:
+        sidecar.unlink()
+        return real(file_id, sidecar)
+
+    monkeypatch.setattr(store, "_unsealable_sync", _gone_first)
+    with pytest.raises(UploadNotFoundError):
+        await store.delete(fid, sidecar_refused=sidecar_refused)
+
+
+@_BREAKS
 async def test_an_unsealable_upload_counts_toward_the_quota_and_is_never_listed(
     tmp_path: Path, break_body: Callable[[Path], None], caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -574,7 +609,8 @@ async def test_a_body_the_engine_could_not_have_written_is_never_read(tmp_path: 
     fid = await _plaintext_upload(root)
     (root / f"{fid}.blob").write_bytes(b"\xff" * (3 * 1024 + 4096))
     store = UploadStore(root, _keyed(generate_key()), max_bytes=1024)
-    assert store._scan_unsealable_sync() == []
+    held: list[_UnsealableUpload] = []
+    assert store._scan_metas_sync(held) == [] and held == []
     assert (await store.prune_expired(now=10**12)).pruned == []
     assert (root / f"{fid}.blob").exists()
 

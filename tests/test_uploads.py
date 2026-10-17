@@ -30,7 +30,6 @@ from messagefoundry.uploads import (
     UploadRetentionRunner,
     UploadStore,
     UploadTooLargeError,
-    _SweepTally,
     sanitize_filename,
     validate_upload_content,
 )
@@ -349,8 +348,8 @@ async def test_concurrent_uploads_cannot_double_book_the_quota(
 
     real_scan = store._scan_metas_sync
 
-    def _slow_scan() -> list[UploadedFileMeta]:
-        out = real_scan()
+    def _slow_scan(held: list[Any] | None = None) -> list[UploadedFileMeta]:
+        out = real_scan(held)
         time.sleep(0.05)  # widen the window so an unlocked check-then-write WOULD lose the race
         return out
 
@@ -549,16 +548,112 @@ async def test_a_sweep_stuck_past_the_stop_bound_is_cancelled_and_logged(
     """BACKLOG #2065, the bound. A sweep stuck inside one filesystem call cannot be stopped, so
     ``stop()`` waits only ``stop_timeout_seconds`` and then names the audit gap at ERROR rather than
     holding shutdown open forever or returning in silence. The sweep is parked on its SECOND pair,
-    past that pair's abort check, so two pairs go with no audit row and the ERROR counts both."""
+    past that pair's abort check. The first pair's row was written before the second pair was
+    touched (BACKLOG #3184), so only the pair in progress is named. Before #3184 the rows waited
+    for the whole pass, and the ERROR counted both."""
     store = _quota_store(tmp_path, retention_days=30)
     for i in range(2):
         await store.save(
             data=f"aging {i}\n".encode(), filename=f"f{i}.txt", uploader="op", uploader_id="u-op"
         )
-    record = await _stop_stuck_runner(store, *_pause_sweep_at_pair(store, 2), caplog)
+    audited: list[str] = []
+    record = await _stop_stuck_runner(
+        store, *_pause_sweep_at_pair(store, 2), caplog, audit=_audited_to(audited)
+    )
     assert record.levelno == logging.ERROR, record.getMessage()
     assert "did not finish within 0.05s of shutdown" in record.getMessage()
-    assert "2 file(s) it removed, or was removing, may have no" in record.getMessage()
+    assert "1 file(s) it removed, or was removing, may have no" in record.getMessage()
+    [named] = record.getMessage().rsplit(": ", 1)[1].split(", ")
+    assert len(audited) == 1 and audited[0] != named
+
+
+async def test_a_timed_out_stop_keeps_the_row_of_every_pair_already_removed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3184 item 3. The sweep audited only after its whole pass, so a stop that timed out
+    mid-pass lost the row of every pair it had removed. Parked on its THIRD pair, the sweep has
+    removed two, and both rows are written: only the pair in progress is unaudited. Red before the
+    fix: no row at all, and the ERROR named all three."""
+    store = _quota_store(tmp_path, retention_days=30)
+    for i in range(4):
+        await store.save(
+            data=f"aging {i}\n".encode(), filename=f"f{i}.txt", uploader="op", uploader_id="u-op"
+        )
+    audited: list[str] = []
+    record = await _stop_stuck_runner(
+        store, *_pause_sweep_at_pair(store, 3), caplog, audit=_audited_to(audited)
+    )
+    assert record.levelno == logging.ERROR, record.getMessage()
+    assert "1 file(s) it removed, or was removing, may have no" in record.getMessage()
+    [named] = record.getMessage().rsplit(": ", 1)[1].split(", ")
+    assert len(audited) == 2 and named not in audited
+    # The parked thread finishes the pair it is on once released; the fourth pair is never touched.
+    for _ in range(200):
+        if len(await store.list_files()) == 1:
+            break
+        await asyncio.sleep(0.01)
+    assert len(await store.list_files()) == 1
+
+
+async def test_a_quota_check_walks_the_uploads_directory_once(tmp_path: Path) -> None:
+    """BACKLOG #3184 item 1. The quota scan walked the directory twice, once to decrypt the sidecars
+    and again to find an upload ``rotate-key`` cannot seal. It is one walk now, and it still finds
+    that kind: a plaintext sidecar over a missing body, on a store that refuses plaintext."""
+    root = tmp_path / "uploads"
+    plain = await UploadStore(root, make_cipher(None), max_bytes=4096).save(
+        data=b"legacy\n", filename="a.txt", uploader="op", uploader_id="u-op"
+    )
+    (root / f"{plain.file_id}.blob").unlink()
+    store = _quota_store(tmp_path)
+    await store.save(data=b"sealed\n", filename="b.txt", uploader="op", uploader_id="u-op")
+    real_iter = store._iter_sidecars
+    walks = 0
+
+    def _counting_iter() -> Any:
+        nonlocal walks
+        walks += 1
+        return real_iter()
+
+    store._iter_sidecars = _counting_iter  # type: ignore[method-assign]
+    assert store._observed_sync("u-op") == (2, len(b"sealed\n"))
+    assert walks == 1
+
+
+async def test_a_save_wakes_the_running_retention_runner(tmp_path: Path) -> None:
+    """BACKLOG #3184 item 4. ``wake_retention`` reports whether a runner is running and starts its
+    next sweep at once, rather than at the end of the interval. A stopped runner unbinds, so a
+    save then sweeps for itself."""
+    store = _quota_store(tmp_path, retention_days=30)
+    assert store.wake_retention() is False
+    audited: list[str] = []
+    now = [time.time()]
+    runner = UploadRetentionRunner(
+        store, audit=_audited_to(audited), clock=lambda: now[0], interval_seconds=3600
+    )
+    runner.start()
+    try:
+        meta = await store.save(
+            data=b"aging\n", filename="a.txt", uploader="op", uploader_id="u-op"
+        )
+        now[0] += 31 * 86_400  # the next sweep finds the file expired
+        assert store.wake_retention() is True
+        for _ in range(500):
+            if audited:
+                break
+            await asyncio.sleep(0.01)
+        assert audited == [meta.file_id], "the wake did not start a sweep inside the interval"
+    finally:
+        await runner.stop()
+    assert store.wake_retention() is False
+
+    # A loop that ended without stop() is not reported as running, so a save sweeps for itself.
+    runner.start()
+    assert runner._task is not None
+    runner._task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await runner._task
+    assert store.wake_retention() is False
+    await runner.stop()
 
 
 async def test_a_stuck_sweep_that_deleted_nothing_logs_no_audit_gap(
@@ -566,41 +661,39 @@ async def test_a_stuck_sweep_that_deleted_nothing_logs_no_audit_gap(
 ) -> None:
     """BACKLOG #2264 item 1. ``stop()`` logged its possible-audit-gap ERROR even when the sweep had
     deleted nothing. Parked in its sidecar scan, the sweep has deleted nothing, and once released
-    it sees the abort and deletes nothing more, so no row is lost: a WARNING, not an ERROR."""
+    it deletes nothing more, so no row is lost: a WARNING, not an ERROR. Since BACKLOG #3184 each
+    pair is its own worker-thread call, so the cancelled sweep never reaches the pair at all."""
     store = _quota_store(tmp_path, retention_days=30)
     meta = await store.save(data=b"aging\n", filename="a.txt", uploader="op", uploader_id="u-op")
-    paused, release, decided = threading.Event(), threading.Event(), threading.Event()
+    paused, release, scanned = threading.Event(), threading.Event(), threading.Event()
     real_scan = store._scan_metas_sync
-    real_begin = _SweepTally.begin
-    began: list[bool] = []
 
-    def _stuck_scan() -> list[UploadedFileMeta]:
+    def _stuck_scan(held: list[Any] | None = None) -> list[UploadedFileMeta]:
         paused.set()
         release.wait(timeout=10)
-        return real_scan()
-
-    def _begin(tally: _SweepTally, m: UploadedFileMeta, abort: threading.Event) -> bool:
-        began.append(real_begin(tally, m, abort))
-        decided.set()
-        return began[-1]
+        try:
+            return real_scan(held)
+        finally:
+            scanned.set()
 
     monkeypatch.setattr(store, "_scan_metas_sync", _stuck_scan)
-    monkeypatch.setattr(_SweepTally, "begin", _begin)
     record = await _stop_stuck_runner(store, paused, release, caplog)
     assert record.levelno == logging.WARNING, record.getMessage()
     assert "no upload.prune row is lost" in record.getMessage()
-    # Nothing joins a cancelled to_thread job, so wait for the released thread's decision on the
-    # pair. The abort was set before the release, so it declines, and the pair stays whole.
-    assert await asyncio.to_thread(decided.wait, 10), "the released sweep never reached the pair"
-    assert began == [False]
+    # Nothing joins a cancelled to_thread job, so wait for the released scan to end. The sweep was
+    # cancelled during it, and the pair stays whole. That the abort check stops a pass before its
+    # next pair is pinned by test_stopping_the_runner_mid_sweep_audits_every_file_it_deleted.
+    assert await asyncio.to_thread(scanned.wait, 10), "the released scan never ended"
     assert [m.file_id for m in await store.list_files()] == [meta.file_id]
 
 
 async def test_a_sweep_stuck_in_its_audit_writes_names_each_unaudited_file(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BACKLOG #2264, code review. The sweep removed three pairs and its audit write hangs on the
-    second, so two rows are missing. The ERROR names exactly those two files, by ``file_id``."""
+    """BACKLOG #2264, code review. The audit write hangs on the second removed pair, so its row is
+    missing. The ERROR names exactly that file, by ``file_id``. Since BACKLOG #3184 each row is
+    written before the next pair is touched, so the third pair is never removed: before it, the
+    sweep removed all three first and the ERROR named two."""
     store = _quota_store(tmp_path, retention_days=30)
     for i in range(3):
         await store.save(
@@ -617,10 +710,11 @@ async def test_a_sweep_stuck_in_its_audit_writes_names_each_unaudited_file(
 
     record = await _stop_stuck_runner(store, paused, threading.Event(), caplog, audit=_audit)
     assert record.levelno == logging.ERROR, record.getMessage()
-    assert "2 file(s) it removed, or was removing, may have no" in record.getMessage()
-    assert await store.list_files() == []
+    assert "1 file(s) it removed, or was removing, may have no" in record.getMessage()
     named = set(record.getMessage().rsplit(": ", 1)[1].split(", "))
-    assert len(written) == 1 and written[0] not in named and len(named) == 2
+    remaining = [m.file_id for m in await store.list_files()]
+    assert len(written) == 1 and written[0] not in named and len(named) == 1
+    assert len(remaining) == 1 and not named & set(remaining), "the stop did not end the pass"
 
 
 async def test_a_refused_unlink_is_not_counted_as_an_audit_gap(
@@ -696,7 +790,7 @@ async def test_a_pair_another_pass_already_removed_is_not_reported_twice(tmp_pat
     await store.save(data=b"aging\n", filename="a.txt", uploader="op", uploader_id="u-op")
     seen = store._scan_metas_sync()
     first = await store.prune_expired(now=time.time() + 31 * 86_400)
-    store._scan_metas_sync = lambda: seen  # type: ignore[method-assign]
+    store._scan_metas_sync = lambda held=None: seen  # type: ignore[method-assign]
     second = await store.prune_expired(now=time.time() + 31 * 86_400)
 
     assert len(first.pruned) == 1
@@ -1399,10 +1493,11 @@ async def test_a_write_stuck_past_the_bound_is_left_to_finish(
 async def test_a_save_time_sweep_shutdown_cancels_names_each_unaudited_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BACKLOG #2264, code review. The save-time sweep removed three pairs and its audit write
-    hangs on the second. Its request is cancelled, the bound passes, and shutdown then cancels
-    the held sweep. The ERROR names exactly the two files with no row, as the runner's stop does,
-    rather than a bare "may have" that also fires for a sweep that removed nothing."""
+    """BACKLOG #2264, code review. The save-time sweep's audit write hangs on the second pair it
+    removed. Its request is cancelled, the bound passes, and shutdown then cancels the held sweep.
+    The ERROR names exactly the file with no row, as the runner's stop does, rather than a bare
+    "may have" that also fires for a sweep that removed nothing. Since BACKLOG #3184 each row is
+    written before the next pair is touched, so the third pair is never removed."""
     monkeypatch.setattr("messagefoundry.uploads._LEDGER_CANCEL_WAIT_SECONDS", 0.05)
     store = _quota_store(tmp_path, retention_days=30)
     ids = await _save_aged(store, tmp_path / "uploads", 3)
@@ -1429,9 +1524,11 @@ async def test_a_save_time_sweep_shutdown_cancels_names_each_unaudited_file(
     [record] = [r for r in caplog.records if "upload.prune" in r.getMessage()]
     assert record.levelno == logging.ERROR, record.getMessage()
     assert record.getMessage().startswith("the save-time upload prune was cancelled")
-    assert "2 file(s) it removed, or was removing, may have no" in record.getMessage()
+    assert "1 file(s) it removed, or was removing, may have no" in record.getMessage()
     named = set(record.getMessage().rsplit(": ", 1)[1].split(", "))
-    assert named == ids - set(written) and len(written) == 1
+    remaining = {m.file_id for m in await store.list_files()}
+    assert len(written) == 1 and len(named) == 1 and len(remaining) == 1
+    assert named | remaining == ids - set(written)
 
 
 async def test_an_orphan_sweep_failure_keeps_the_pruned_pairs_reported(tmp_path: Path) -> None:
