@@ -8994,7 +8994,9 @@ async def test_a_cookie_replayed_from_a_second_address_is_sent_to_reauth(engine:
         assert (await b.get(f"/ui/messages/{mid}")).status_code == 200
     seen = [
         json.loads(str(dict(a)["detail"]))["path"]
-        for a in await engine.store.list_audit(action="auth.admin_action_new_ip", limit=100)
+        for a in await engine.store.list_audit(
+            action="auth.new_address_reverify_required", limit=100
+        )
     ]
     assert seen == [f"/ui/messages/{mid}"]  # one row: a first sighting, then deduped
 
@@ -9132,6 +9134,105 @@ def test_a_new_address_continuation_never_drops_a_query_or_overflows() -> None:
     assert _new_address_continuation(req("POST", "/ui/messages"), landing=land) == land
 
 
+def test_a_new_address_continuation_keeps_the_path_encoded() -> None:
+    """RED when: the continuation is built from the decoded path, so an encoded ``?`` inside a
+    segment comes back from the re-auth as a query (vault BACKLOG #3052 item 8). Also RED when an
+    encoded ``/`` or ``..`` passes as one segment of a registered page: decoded, it names another
+    page, so those fall back to the landing."""
+    from starlette.requests import Request
+
+    from messagefoundry_webconsole._auth import _new_address_continuation, is_unlock_action
+
+    def req(path: str, raw: str, query: str = "") -> Request:
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": path,
+            "raw_path": raw.encode(),
+            "query_string": query.encode(),
+            "headers": [],
+        }
+        return Request(scope)
+
+    land = "/ui/account"
+    encoded = req("/ui/messages/a?b", "/ui/messages/a%3Fb")
+    assert _new_address_continuation(encoded, landing=land) == "/ui/messages/a%3Fb"
+    with_query = req("/ui/messages/a?b", "/ui/messages/a%3Fb", "x=1")
+    assert _new_address_continuation(with_query, landing=land) == "/ui/messages/a%3Fb?x=1"
+    # A query with a byte outside ASCII falls back to the landing (review round 2): the redirect
+    # quotes the target as UTF-8, so the raw byte would come back as different bytes. The same
+    # query sent percent-encoded is ASCII, and comes back unchanged.
+    for raw_query in (b"x=\xe9", "x=é".encode()):
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/ui/messages/ab",
+            "raw_path": b"/ui/messages/ab",
+            "query_string": raw_query,
+            "headers": [],
+        }
+        assert _new_address_continuation(Request(scope), landing=land) == land, raw_query
+    encoded_query = req("/ui/messages/ab", "/ui/messages/ab", "x=%C3%A9")
+    assert _new_address_continuation(encoded_query, landing=land) == "/ui/messages/ab?x=%C3%A9"
+    # The control: a plain segment still comes back to itself.
+    assert _new_address_continuation(req("/ui/messages/ab", "/ui/messages/ab"), landing=land) == (
+        "/ui/messages/ab"
+    )
+    # An encoded "#" stays in its id too, and so does an encoded "?" on a page whose pattern
+    # takes no query (review round 1: a decoded-path recheck refused both).
+    hashed = req("/ui/messages/a#b", "/ui/messages/a%23b")
+    assert _new_address_continuation(hashed, landing=land) == "/ui/messages/a%23b"
+    user_page = "/ui/users/a%3Fb"
+    assert is_unlock_action(user_page) and not is_unlock_action(user_page + "?x=1")
+    assert _new_address_continuation(req("/ui/users/a?b", user_page), landing=land) == user_page
+    # A path the browser would rewrite before following the 303 falls back to the landing.
+    for decoded, raw in (
+        ("/ui/messages/a/b", "/ui/messages/a%2Fb"),
+        ("/ui/messages/a?/raw", "/ui/messages/a%3F%2Fraw"),
+        ("/ui/messages/..", "/ui/messages/%2e%2e"),
+        ("/ui/messages/.", "/ui/messages/%2E"),
+        ("/ui/messages/a\\b", "/ui/messages/a%5Cb"),
+        ("/ui/messages/a\\b", "/ui/messages/a\\b"),
+        ("/ui/messages/.", "/ui/messages/."),
+    ):
+        assert _new_address_continuation(req(decoded, raw), landing=land) == land, raw
+    # No raw path from the server: the decoded "?" is re-encoded, never read as a query.
+    bare = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/ui/messages/a?b",
+            "query_string": b"x=1",
+            "headers": [],
+        }
+    )
+    assert _new_address_continuation(bare, landing=land) == "/ui/messages/a%3Fb?x=1"
+
+
+async def test_an_encoded_question_mark_survives_the_new_address_reauth(engine: Engine) -> None:
+    """RED when: a PHI page whose id carries an encoded ``?`` is refused for a new address with a
+    continuation that splits the id at it (vault BACKLOG #3052 item 8). The whole round trip: the
+    refusal's ``next``, and the re-auth's 303 back to the page as the browser sent it."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    page = "/ui/messages/a%3Fb"
+    same = {"Sec-Fetch-Site": "same-origin"}
+    async with _client_from(engine, service, "10.0.0.1") as a:
+        await _cookie_login(a, "op")
+        tok = a.cookies.get("mf_session")
+        assert tok is not None
+    async with _client_from(engine, service, "10.9.9.9") as b:
+        b.cookies.set("mf_session", tok)
+        r = await b.get(page)
+        assert (r.status_code, r.headers.get("location")) == (
+            303,
+            "/ui/reauth?next=" + quote(page, safe="/"),
+        )
+        assert (await b.get("/ui/reauth", params={"next": page})).status_code == 200
+        done = await b.post("/ui/reauth", data={"next": page, "password": PW}, headers=same)
+        assert (done.status_code, done.headers["location"]) == (303, page)
+
+
 async def test_the_continuation_cap_is_the_reauth_pages_own(engine: Engine) -> None:
     """RED when: ``_REAUTH_NEXT_MAX`` and ``GET /ui/reauth``'s own cap on ``next`` drift apart
     (vault BACKLOG #3052 item 18). The unit test above reads the constant, so a refused PHI read
@@ -9153,7 +9254,7 @@ async def test_the_continuation_cap_is_the_reauth_pages_own(engine: Engine) -> N
 async def test_a_cross_site_write_from_a_new_address_writes_no_row(engine: Engine) -> None:
     """RED when: ``require_ui`` asks the new-address question before its same-origin check (vault
     BACKLOG #3052 item 11). In that order a cross-site page holding a replayed cookie would make
-    the engine write ``auth.admin_action_new_ip`` and send the notice before the write is refused.
+    the engine write ``auth.new_address_reverify_required`` and send the notice before the write is refused.
 
     The write carries no ``Sec-Fetch-Site`` and a foreign ``Origin``, as an older browser's would:
     the fetch-metadata middleware lets an absent header through, so the refusal under test is
@@ -9170,10 +9271,16 @@ async def test_a_cross_site_write_from_a_new_address_writes_no_row(engine: Engin
         r = await b.post("/ui/statistics/reset", headers={"Origin": "https://attacker.example"})
         # require_ui's own refusal, by its detail, so an earlier gate cannot pass this vacuously.
         assert (r.status_code, r.json().get("detail")) == (403, "cross-origin request rejected")
-        assert await engine.store.list_audit(action="auth.admin_action_new_ip", limit=10) == []
+        assert (
+            await engine.store.list_audit(action="auth.new_address_reverify_required", limit=10)
+            == []
+        )
         r = await b.post("/ui/statistics/reset", headers={"Sec-Fetch-Site": "same-origin"})
         assert (r.status_code, r.headers["location"]) == (303, "/ui/reauth?next=/ui")
-    assert len(await engine.store.list_audit(action="auth.admin_action_new_ip", limit=10)) == 1
+    assert (
+        len(await engine.store.list_audit(action="auth.new_address_reverify_required", limit=10))
+        == 1
+    )
 
 
 async def test_a_refused_write_without_monitoring_read_lands_on_the_account_page(

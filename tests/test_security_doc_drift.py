@@ -509,7 +509,7 @@ _CONTEXTUAL_TOKENS = frozenset(
         "X-Step-Up-Required",
         "X-MFA-Required",
         "X-Step-Up-Action",
-        "auth.admin_action_new_ip",
+        "auth.new_address_reverify_required",
         # BACKLOG #288: the first-seen sign-in address signal and its fail-open record
         "auth.login_new_ip",
         "auth.login_address_unevaluated",
