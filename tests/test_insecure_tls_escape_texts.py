@@ -60,6 +60,7 @@ must find, so a scanner that silently matches nothing cannot pass by finding not
 from __future__ import annotations
 
 import ast
+import functools
 import io
 import re
 import tokenize
@@ -119,7 +120,7 @@ _DOCSTRING_FILES = frozenset(
     }
 )
 #: The posture as source spells it, wrapped or not, so the planted control can strike it out.
-_POSTURE_IN_SOURCE = re.compile(r"\[security\]\.enforcement\s+=\s+warn")
+_POSTURE_IN_SOURCE = re.compile(r"\s+".join(map(re.escape, _POSTURE.split())))
 #: Files whose comments are held to it. The authoring factories live here, and their parameter
 #: comments reach an operator as help text.
 _COMMENT_FILES = ("messagefoundry/config/wiring.py",)
@@ -220,34 +221,25 @@ def escape_texts_without_posture(source: str) -> tuple[list[int], int]:
     return unposted, seen
 
 
-def _docstring_without_posture(node: _DOCUMENTED) -> tuple[list[int], int]:
-    """:func:`docstrings_without_posture` for ``node``'s own docstring alone."""
-    unposted: list[int] = []
-    seen = 0
-    text = ast.get_docstring(node, clean=False)
-    if text is None:
-        return unposted, seen
-    line = node.body[0].lineno
-    for chunk in _PARAGRAPH_BREAK.split(text):
-        at = chunk.find(INSECURE_TLS_ESCAPE_ENV)
-        if at >= 0:
-            seen += 1
-            if _POSTURE not in _squash(chunk):
-                unposted.append(line + chunk.count("\n", 0, at))
-        line += chunk.count("\n")
-    return unposted, seen
-
-
 def docstrings_without_posture(source: str) -> tuple[list[int], int]:
     """Lines of docstring paragraphs that name the escape but not the posture, and how many
     paragraphs named the escape at all. The line is where the paragraph first spells the variable."""
     unposted: list[int] = []
     seen = 0
     for node in ast.walk(parse_source(source)):
-        if isinstance(node, _DOCUMENTED):
-            lines, count = _docstring_without_posture(node)
-            unposted.extend(lines)
-            seen += count
+        if not isinstance(node, _DOCUMENTED):
+            continue
+        text = ast.get_docstring(node, clean=False)
+        if text is None:
+            continue
+        line = node.body[0].lineno
+        for chunk in _PARAGRAPH_BREAK.split(text):
+            at = chunk.find(INSECURE_TLS_ESCAPE_ENV)
+            if at >= 0:
+                seen += 1
+                if _POSTURE not in _squash(chunk):
+                    unposted.append(line + chunk.count("\n", 0, at))
+            line += chunk.count("\n")
     return sorted(unposted), seen
 
 
@@ -436,16 +428,24 @@ def test_the_prose_scans_pass_a_text_that_names_the_posture() -> None:
     assert comments_without_posture(_PROSE_THAT_NAMES_THE_POSTURE) == ([], 3)
 
 
+@functools.cache
+def _package_sources() -> tuple[tuple[str, str], ...]:
+    """Each package file that spells the variable or names ``INSECURE_TLS_ESCAPE_ENV``, as its
+    repo-relative path and its source. Read once for every walk in this module."""
+    roots = [_REPO / name for name in _PACKAGES]
+    assert all(root.is_dir() for root in roots), roots
+    sources: list[tuple[str, str]] = []
+    for path in sorted(p for root in roots for p in root.rglob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        if _NAME in source or INSECURE_TLS_ESCAPE_ENV in source:
+            sources.append((path.relative_to(_REPO).as_posix(), source))
+    return tuple(sources)
+
+
 def test_every_runtime_text_naming_the_escape_names_the_posture() -> None:
     failures: list[str] = []
     found: set[str] = set()
-    roots = [_REPO / name for name in _PACKAGES]
-    assert all(root.is_dir() for root in roots), roots
-    for path in sorted(p for root in roots for p in root.rglob("*.py")):
-        source = path.read_text(encoding="utf-8")
-        if _NAME not in source and INSECURE_TLS_ESCAPE_ENV not in source:
-            continue
-        rel = path.relative_to(_REPO).as_posix()
+    for rel, source in _package_sources():
         unposted, seen = escape_texts_without_posture(source)
         if seen:
             found.add(rel)
@@ -460,15 +460,6 @@ def test_every_runtime_text_naming_the_escape_names_the_posture() -> None:
 
 def _text(rel: str) -> str:
     return (_REPO / rel).read_text(encoding="utf-8")
-
-
-def _docstring_scans() -> Iterator[tuple[str, tuple[list[int], int]]]:
-    """Each package file whose source spells the variable, with its docstring scan."""
-    for root in (_REPO / name for name in _PACKAGES):
-        for path in sorted(root.rglob("*.py")):
-            source = path.read_text(encoding="utf-8")
-            if INSECURE_TLS_ESCAPE_ENV in source:
-                yield path.relative_to(_REPO).as_posix(), docstrings_without_posture(source)
 
 
 def test_the_docstring_walk_flags_a_pinned_file_whose_posture_is_struck_out() -> None:
@@ -488,7 +479,8 @@ def test_the_docstring_walk_flags_a_pinned_file_whose_posture_is_struck_out() ->
 def test_every_authoring_text_naming_the_escape_names_the_posture() -> None:
     failures: list[str] = []
     found: set[str] = set()
-    for rel, (unposted, seen) in _docstring_scans():
+    for rel, source in _package_sources():
+        unposted, seen = docstrings_without_posture(source)
         if seen:
             found.add(rel)
         failures.extend(f"{rel}:{line} (docstring)" for line in unposted)
