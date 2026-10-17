@@ -299,16 +299,52 @@ async def test_a_session_live_when_the_revoke_began_is_audited_though_it_lapsed_
 async def test_a_logout_records_whether_it_ended_a_session(store: MessageStore) -> None:
     # BACKLOG #3029: the auth.logout row says what happened, and a logout of a token that names no
     # unrevoked session (a replay of a dead token) still writes its row.
+    # The return value is the same outcome the row records, in both cases.
     service = await _service(store)
     token = await _token(service)
-    await service.logout(token, actor="op")
-    await service.logout(token, actor="op")
+    first = await service.logout(token, actor="op")
+    replay = await service.logout(token, actor="op")
     assert not await _live(service, token)
-    outcomes = [
-        json.loads(str(row["detail"] or "{}")).get("outcome")
+    assert [first, replay] == ["revoked", "nothing_to_revoke"]
+    assert await _logouts(store) == [
+        {"outcome": "nothing_to_revoke", "actor": "op"},
+        {"outcome": "revoked", "actor": "op"},
+    ], "newest first: the replay, then the logout"
+
+
+async def _logouts(store: MessageStore) -> list[dict[str, object]]:
+    """Each ``auth.logout`` row, newest first, as its ``outcome`` plus the row's ``actor``."""
+    return [
+        {"outcome": json.loads(str(row["detail"] or "{}")).get("outcome"), "actor": row["actor"]}
         for row in await store.list_audit(action="auth.logout")
     ]
-    assert outcomes == ["nothing_to_revoke", "revoked"], "newest first: the replay, then the logout"
+
+
+async def test_a_logout_with_no_actor_names_the_owner_of_the_session_it_ended(
+    store: MessageStore,
+) -> None:
+    # BACKLOG #3029: /ui/logout has no auth dependency, so it passes no actor. The row used to carry
+    # a NULL actor even when a session ended; it now names that session's owner. A token naming no
+    # session has no owner, so its row keeps a NULL actor. "other" signs out, so the row cannot be
+    # matching a default of "op".
+    service = await _service(store)
+    token = await _token(service, "other")
+    first = await service.logout(token)
+    replay = await service.logout(token)
+    assert [first, replay] == ["revoked", "nothing_to_revoke"]
+    assert await _logouts(store) == [
+        {"outcome": "nothing_to_revoke", "actor": None},
+        {"outcome": "revoked", "actor": "other"},
+    ]
+
+
+async def test_a_logout_with_no_token_returns_nothing_to_revoke_and_writes_no_row(
+    store: MessageStore,
+) -> None:
+    service = await _service(store)
+    assert await service.logout(None) == "nothing_to_revoke"
+    assert await service.logout("") == "nothing_to_revoke"
+    assert await _logouts(store) == []
 
 
 async def test_a_rotation_racing_a_self_revoke_is_not_reported_as_a_revoke(
