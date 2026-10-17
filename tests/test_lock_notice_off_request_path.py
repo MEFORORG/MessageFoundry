@@ -16,17 +16,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
+from uuid import uuid4
 
 import pytest
 
 from messagefoundry.api import create_managed_app
 from messagefoundry.auth import service as service_module
-from messagefoundry.auth.notifications import ACCOUNT_LOCKED, SecurityEvent
+from messagefoundry.auth.notifications import ACCOUNT_LOCKED, PASSWORD_CHANGED, SecurityEvent
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AlertsSettings, AuthSettings, EgressSettings
 from messagefoundry.keyed_lock import hold_keyed_lock
@@ -813,6 +815,90 @@ async def test_a_notice_dropped_on_a_full_queue_does_not_hold_the_next_one_back(
             "the dropped notice held the next one back"
         )
         assert relay._queue.qsize() == 1, "the second lock's notice was not queued"
+    finally:
+        await _close(store, service)
+
+
+async def test_the_shipped_notifier_queues_nothing_once_it_has_closed() -> None:
+    """Vault BACKLOG #3120: after ``aclose`` nothing drains the queue, so an event ``notify`` put
+    there would never be sent. It answers ``False`` instead. The control is the same call on the
+    same notifier before it closed, which answers ``True``."""
+    relay = _relay()
+    relay.start()
+    assert await relay.notify(SecurityEvent(ACCOUNT_LOCKED, username="a", email="a@x.test"))
+    relay._queue.get_nowait()  # never sent: the drain loop has not run yet
+    await relay.aclose()
+    late = SecurityEvent(ACCOUNT_LOCKED, username="b", email="b@x.test")
+    assert await relay.notify(late) is False
+    assert relay._queue.qsize() == 0, "the late event was queued where nothing reads it"
+
+
+async def test_the_shipped_notifier_queues_nothing_while_it_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vault BACKLOG #3120: once ``aclose`` has begun, an event queued behind its stop sentinel is
+    never drained, so ``notify`` answers ``False`` from the start of the close, not its end. The
+    close is held on a send in flight, and the control is that held event, which is sent."""
+    started, release = threading.Event(), threading.Event()
+    sent: list[list[str]] = []
+
+    def held_send(**kw: Any) -> None:
+        started.set()
+        release.wait(_STALL_SECONDS)
+        sent.append(kw["recipients"])
+
+    monkeypatch.setattr("messagefoundry.pipeline.security_notify.send_plain_email", held_send)
+    relay = _relay()
+    # Room behind the stop sentinel, so a full queue cannot be what refuses the late event.
+    relay._queue = asyncio.Queue(maxsize=8)
+    relay.start()
+    assert await relay.notify(SecurityEvent(PASSWORD_CHANGED, username="a", email="a@x.test"))
+    assert await asyncio.to_thread(started.wait, _STALL_SECONDS), "the first send never started"
+    closing = asyncio.create_task(relay.aclose())
+    try:
+        await asyncio.sleep(0)  # aclose has begun and is waiting on the drain
+        late = SecurityEvent(PASSWORD_CHANGED, username="b", email="b@x.test")
+        assert await relay.notify(late) is False
+    finally:
+        release.set()
+        await closing
+    assert sent == [["a@x.test"]], "the event taken before the close was not sent"
+
+
+async def test_a_lock_notice_raised_after_the_relay_closed_records_mailed_false() -> None:
+    """Vault BACKLOG #3120. At shutdown the teardown can cut the lock-notice drain before it cancels
+    a pending notice, which then runs on and reaches the security notifier after that has closed.
+    The notifier used to take it and answer ``True``, so the row read ``mailed: true`` for a mail
+    that is never sent, and the throttle held the account's next notice of the kind back for a day.
+    The row now reads ``mailed: false``, so that next lock mails again.
+
+    The control is a second account's lock, before the close, whose row reads ``mailed: true``."""
+    store, service, _fake, user = await _harness()
+    relay = _relay(store)
+    service.attach_security_notifier(relay)
+    try:
+        other_id = uuid4().hex
+        await store.create_user(
+            user_id=other_id,
+            username="other-holder",
+            auth_provider="local",
+            password_generated=False,
+        )
+        await store.set_user_notify_email(other_id, email="other@example.org")
+        other_user = await store.get_user(other_id)
+        assert other_user is not None
+        await service._record_lock(other_user, "sign_in", _lock(1), client=None)
+        await service.drain_background()
+        before = await _lock_notice_rows(store, other_user.username)
+        assert [json.loads(r["detail"])["mailed"] for r in before] == [True]
+        relay._queue.get_nowait()  # room again, so only the close can refuse the next one
+
+        await relay.aclose()
+        await service._record_lock(user, "sign_in", _lock(1), client=None)
+        await service.drain_background()
+        rows = await _lock_notice_rows(store, user.username)
+        assert [json.loads(r["detail"]) for r in rows] == [{"lock": "sign_in", "mailed": False}]
+        assert relay._queue.qsize() == 0, "the late notice was queued where nothing reads it"
     finally:
         await _close(store, service)
 

@@ -13709,7 +13709,8 @@ class AuthService:
 
         ``mailed`` is true only when the account had an address AND the notifier took the event
         (``handed``, BACKLOG #2019). A refused hand-off, or one the notifier dropped on a full
-        queue (vault BACKLOG #3120), then writes ``mailed: false``, which holds back no later
+        queue or refused once it had begun to close at shutdown (vault BACKLOG #3120), then writes
+        ``mailed: false``, which holds back no later
         mailable notice, so the next lock mails again rather than staying quiet for a day.
 
         **A send that fails after the hand-off still leaves ``mailed: true``.** It fails on the

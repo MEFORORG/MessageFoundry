@@ -5495,8 +5495,8 @@ stays broken, or recovers and breaks again, is reported only by that first line.
 
 **A notice the relay loses is audited (BACKLOG #2383).** The `auth.lock_notice` row is written
 when the notice is handed to the relay. It reads `mailed: true` only when the relay queued the
-notice: one its full queue dropped reads `mailed: false`, so the next lock of the kind mails again
-(vault BACKLOG #3120). When the relay's queue is full, or the
+notice: one its full queue dropped, or one it refused because it had begun to close, reads
+`mailed: false`, so the next lock of the kind mails again (vault BACKLOG #3120). When the relay's queue is full, or the
 send fails, the engine writes one more row, with the notice's recipient as the actor. A lock
 notice writes `auth.lock_notice_undelivered`, hidden as above. Every other notice kind writes
 `auth.security_notice_undelivered`, which every `audit:read` reader sees. The detail names the
@@ -5505,8 +5505,13 @@ holder. The row never carries the address, the rest of the notice's detail, or t
 source of record is `SecurityEventNotifier._record_undelivered` in
 `messagefoundry/pipeline/security_notify.py`. **Still open, at least:**
 
-- At shutdown the notifier drains its queue after the store has closed, so a send that fails then
-  is not recorded.
+- At shutdown the notifier closes while the store is still open (BACKLOG #3191), so a send that
+  fails in its final drain is recorded. That close is one bounded step of the shutdown, and a
+  notice still queued when the step is cut is neither sent nor recorded. A lock notice among them
+  keeps its `auth.lock_notice` row reading `mailed: true`.
+- A notice that reaches the notifier once it has begun to close is refused, and the notifier
+  writes no undelivered row for it. A lock notice's `auth.lock_notice` row reads `mailed: false`
+  instead.
 - An offline command such as `provision-admin` wires no audit writer, so it records nothing.
 - Under a long overload only 64 queue-full records are written at a time, and drops past that are
   not recorded.
@@ -5521,10 +5526,12 @@ source of record is `SecurityEventNotifier._record_undelivered` in
 engine waits at most two seconds for pending notices, then cancels any still pending, each with one
 line. A cancelled notice may be neither mailed nor recorded. The API lifespan's shutdown budget
 (BACKLOG #3191) can cut that wait short before it cancels anything, whenever the lock-notice step's
-bound falls below those two seconds. A pending notice is then not cancelled and runs on. If it
-reaches the security notifier after that notifier has closed, the notifier still takes it and
-reports it queued, so its `auth.lock_notice` row says `mailed: true` for a mail that is never sent,
-and the throttle holds back that account's next notice of that kind for 24 hours. A failed `auth.lock_notice` row write also changes: it used to fail
+bound falls below those two seconds. A pending notice is then not cancelled and runs on. One that
+reaches the security notifier before that notifier begins to close is queued and drained like any
+other. One that reaches it later is refused, since nothing would send it (vault BACKLOG #3120), so
+no mail goes and its `auth.lock_notice` row says `mailed: false`, which holds back no later notice.
+If the store has closed by then, that row write fails and is logged, which costs at most a
+duplicate mail at the next lock. A failed `auth.lock_notice` row write also changes: it used to fail
 the request, and now it is logged instead. The mail goes before its row, so that failure costs at
 most a duplicate mail at the next lock. Each such line names no account and no lock. It still tells
 a `logs:view` reader when some notice failed.

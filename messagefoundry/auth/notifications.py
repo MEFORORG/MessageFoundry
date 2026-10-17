@@ -236,7 +236,9 @@ class SecurityNotifier(Protocol):
     must not raise into the auth path (the caller still guards it).
 
     ``notify`` returns whether it took the event for sending: ``False`` when it dropped the event
-    on the spot, for example for want of an address or room on its queue (vault BACKLOG #3120).
+    on the spot, for example for want of an address or room on its queue, or because it is closing
+    or closed and would never send it (vault BACKLOG #3120). An implementation that can be closed
+    answers ``False`` from the start of its close.
     ``True`` is a hand-off, never a delivery receipt: a send that fails later is not reported back.
     The ``auth.lock_notice`` row's ``mailed`` field is recorded from this, so a notice dropped here
     does not hold the next lock's notice back for a day."""

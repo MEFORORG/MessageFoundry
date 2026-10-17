@@ -1257,7 +1257,9 @@ def _app_drain_steps(
     if auth is not None and owns_auth:
         # close_background is the shutdown call the service names, with its own bound (its drain
         # and cancel grace, in auth/service.py). Only a bound below that cuts it before it cancels
-        # its notices itself; a notice cut that way meets the closed store and logs its own failure.
+        # its notices itself. A notice cut that way runs on: the security notifier queues it if it
+        # arrives before that notifier begins to close, and refuses it after, so its row reads
+        # mailed: false, or meets the closed store and logs its own failure (vault BACKLOG #3120).
         steps.append(
             _TeardownStep("the lock-notice drain", 1.0, lambda _b: auth.close_background())
         )
