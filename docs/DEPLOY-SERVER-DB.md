@@ -37,10 +37,10 @@ Configure `[store]` in the service settings (full reference: [`CONFIGURATION.md`
   `trust_server_certificate = false`). **Postgres:** a **CA-bundle** PEM (chain + hostname still checked) —
   the make-before-break-friendly path. **SQL Server:** the ODBC Driver **18.1+** `ServerCertificate`
   keyword, which pins the **leaf** cert (an exact-cert match — see the leaf-pin rotation caveat in §5.3).
-  The engine sends it with `Encrypt=strict`, because Driver 18 enforced the pin with strict
-  encryption and did not enforce it with `Encrypt=yes`. Strict encryption is TDS 8.0, so it needs SQL Server 2022 or later; an older server
-  refuses the connection. For CA-chain rotation the machine-store import (§5.2) stays the lighter-touch SQL Server option. Rejected
-  for SQLite; a missing file fails loud at load.
+  The engine sends it with `Encrypt=strict`, so it needs SQL Server 2022 or later; why, and what else
+  it needs, is in the `ssl_root_cert` row of [`CONFIGURATION.md`](CONFIGURATION.md). For CA-chain
+  rotation the machine-store import (§5.2) stays the lighter-touch SQL Server option. Rejected for
+  SQLite; a missing file fails loud at load.
 - `[store].pool_size` — see *Pool sizing* below.
 
 > _Filled by staging:_ a minimal `[store]` block for each backend (Postgres DSN; SQL Server ODBC).
@@ -560,7 +560,8 @@ connection fails validation** (NIST SP 800-52r2: rotate certificates before expi
 chains to the already-trusted CA. Just roll it before expiry. **Caveat — leaf pinning:** if you pinned
 the *leaf* instead of the CA (PostgreSQL `ssl_root_cert` pointed at the server cert itself; or SQL
 Server ODBC 18.1+ `ServerCertificate=<file>` leaf-pin), a leaf rotation **breaks validation** until you
-update the pin in lockstep. On PostgreSQL, pin the **CA**, not the leaf, to keep rotations
+update the pin in lockstep. On SQL Server that is a window in which every new store connection
+is refused. On PostgreSQL, pin the **CA**, not the leaf, to keep rotations
 make-before-break. The SQL Server pin is an exact match, so a CA file there matches nothing; on SQL
 Server, use the machine-store CA import (§5.2) for make-before-break rotation.
 

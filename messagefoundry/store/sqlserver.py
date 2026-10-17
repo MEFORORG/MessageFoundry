@@ -2587,9 +2587,8 @@ def connection_string(settings: StoreSettings, *, posture: HopPosture | None = N
     # escape through the ONE clamp (weakened_tls_escape_permitted) so the escape can NEVER relax a
     # production-PHI store hop (previously the escape crossed prod, violating decision 2). It stays a
     # STRICT verify-off cell (no gradient warn-and-cross) and keeps NO second escape.
-    if (
-        settings.trust_server_certificate or not settings.encrypt
-    ) and not weakened_tls_escape_permitted(posture):
+    weakened = settings.trust_server_certificate or not settings.encrypt
+    if weakened and not weakened_tls_escape_permitted(posture):
         raise ValueError(
             "SQL Server TLS is weakened (trust_server_certificate=true or encrypt=false), which is "
             f"MITM-able. Use a trusted server certificate, or set {INSECURE_TLS_ESCAPE_ENV}=1 on an "
@@ -2621,15 +2620,13 @@ def connection_string(settings: StoreSettings, *, posture: HopPosture | None = N
     # Pin the DB server's certificate by file WITHOUT a machine-wide trust import (#45), via the ODBC
     # Driver 18.1+ `ServerCertificate` keyword — only on the SECURE posture (encrypt on, verify on; the
     # weakened branch above already refused/escaped). Brace-quoted (STORE-5). The pin goes out with
-    # Encrypt=strict: Driver 18 enforced it with strict and did NOT with Encrypt=yes, where a pin of the
-    # wrong certificate still connected (vault BACKLOG #2223, measured under #3009). Strict is TDS 8.0,
-    # so a server older than SQL Server 2022 refuses the connection; there is no fall back to an
-    # unenforced pin. Not a revocation control. Both keywords stay inside the last-wins tail.
-    pin = (
-        settings.ssl_root_cert
-        if settings.encrypt and not settings.trust_server_certificate
-        else None
-    )
+    # Encrypt=strict: on the Driver 18.7 build tested on Windows, the pin was enforced with strict and
+    # NOT with Encrypt=yes, where a pin of the wrong certificate still connected (vault BACKLOG #2223,
+    # measured under #3009). Strict is TDS 8.0, so a server older than SQL Server 2022 refuses the
+    # connection; there is no fall back to an unenforced pin. Microsoft documents the exact match as
+    # done instead of the expiry, host-name and chain checks, and nothing here watches the pinned
+    # file's expiry. Not a revocation control. Both keywords stay inside the last-wins tail.
+    pin = None if weakened else settings.ssl_root_cert
     if pin:
         parts.append(f"ServerCertificate={_odbc_brace(pin)}")
     encrypt = "strict" if pin else ("yes" if settings.encrypt else "no")

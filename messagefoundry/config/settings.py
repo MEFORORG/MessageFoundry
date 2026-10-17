@@ -933,18 +933,17 @@ class StoreSettings(_Section):
     schema_management: SchemaManagement | None = None
     encrypt: bool = True
     trust_server_certificate: bool = False
-    # Optional certificate file to verify the DB server certificate against a PRIVATE / self-signed CA (the
-    # common hospital-estate posture) WITHOUT installing it box-globally into the OS trust store. Honored by
-    # BOTH server-DB backends (#45), on the SECURE posture only (encrypt=true, trust_server_certificate=false)
-    # — it NEVER disables verification:
+    # Optional certificate file to verify the DB server WITHOUT installing anything box-globally into the OS
+    # trust store (the common hospital-estate posture is a PRIVATE / self-signed CA). Honored by BOTH
+    # server-DB backends (#45), on the SECURE posture only (encrypt=true, trust_server_certificate=false),
+    # and never applied on a weakened one. The two backends read it differently:
     #   * POSTGRES — asyncpg takes an SSLContext, so this loads ssl.create_default_context(cafile=...), a
     #     CA-bundle pin (chain + hostname still verified).
-    #   * SQL SERVER — the ODBC Driver 18.1+ `ServerCertificate` keyword pins the server's certificate by
-    #     file (a leaf/exact-cert match, brace-quoted STORE-5-safe); requires ODBC Driver 18.1 or newer.
-    #     It goes out with `Encrypt=strict`: Driver 18 enforced the pin with strict and did not with
-    #     `Encrypt=yes` (vault BACKLOG #2223). Strict is TDS 8.0, so it needs SQL Server 2022 or later,
-    #     the supported floor; an older server refuses the connection. The match is exact, so a CA file
-    #     does not match (pin the server's own certificate), and it is not a revocation control.
+    #   * SQL SERVER — the ODBC Driver 18.1+ `ServerCertificate` keyword pins the server's OWN certificate
+    #     by file (an exact-cert match, brace-quoted STORE-5-safe), so a CA file matches nothing. It goes
+    #     out with `Encrypt=strict`: on the Driver 18.7 build tested, the pin was enforced with strict and
+    #     not with `Encrypt=yes` (vault BACKLOG #2223). Strict is TDS 8.0, so it needs SQL Server 2022 or
+    #     later, the supported floor; an older server refuses the connection. Not a revocation control.
     # REJECTED for SQLite (no TLS at all). A path, not a secret — it may live in the config file /
     # connections.toml. Empty = use the system trust store (the secure default). Existence is checked at load
     # (a missing file fails loud here, not confusingly at connect).

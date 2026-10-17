@@ -6175,7 +6175,7 @@ def _presented_certificate_pem(host: str, port: int) -> str:
     ctx.verify_mode = ssl.CERT_NONE
     ctx.set_alpn_protocols(["tds/8.0"])
     with (
-        socket.create_connection((host, port), timeout=10) as raw,
+        socket.create_connection((host, port), timeout=5) as raw,
         ctx.wrap_socket(raw, server_hostname=host) as tls,
     ):
         der = tls.getpeercert(binary_form=True)
@@ -6186,14 +6186,18 @@ def _presented_certificate_pem(host: str, port: int) -> str:
 async def test_server_certificate_pin_is_enforced_under_strict_encryption(tmp_path: Any) -> None:
     """The store's pinned string, ``ServerCertificate`` with ``Encrypt=strict``, connects with the
     certificate the server presents and is refused with any other. Vault BACKLOG #3009 measured on
-    Windows that Driver 18 enforced the pin with strict and not with ``Encrypt=yes``; this is the
+    Windows that Driver 18.7 enforced the pin with strict and not with ``Encrypt=yes``; this is the
     Linux driver's reading, closing step 1 of #2223.
 
     POSITIVE CONTROL: the right pin connects through the same builder, so the wrong pin's refusal is
-    the pin's doing and not a strict handshake this server cannot make.
+    the pin's doing and not a strict handshake this server cannot make. The two strings differ only
+    in the pinned file.
 
-    MEASUREMENT, not asserted: the same wrong pin beside ``Encrypt=yes``, the string the store sent
-    before #2223. Grep the CI warnings summary for ``BACKLOG-2223-PIN``."""
+    MEASUREMENT, not asserted: the same two pins beside ``Encrypt=yes``, the string the store sent
+    before #2223. The CI container's certificate is self-signed and not in the runner's trust store,
+    so ``yes_right`` is the control for ``yes_wrong``: if ``yes_right`` is REFUSED, the chain check
+    refused both and ``yes_wrong`` says nothing about the pin. Grep the CI warnings summary for
+    ``BACKLOG-2223-PIN``; a refusal carries the driver's message."""
     import warnings
 
     import aioodbc
@@ -6208,9 +6212,8 @@ async def test_server_certificate_pin_is_enforced_under_strict_encryption(tmp_pa
     right.write_text(
         await asyncio.to_thread(_presented_certificate_pem, base.server or "localhost", base.port)
     )
-    wrong = (
-        tmp_path / "not-presented.pem"
-    )  # a fresh self-signed certificate the server never presents
+    # A fresh self-signed certificate the server never presents.
+    wrong = tmp_path / "not-presented.pem"
     wrong.write_bytes(pki.make_self_signed("mf-test-not-the-server", [], 30)[0])
 
     def pinned_dsn(pin: Any) -> str:
@@ -6220,10 +6223,12 @@ async def test_server_certificate_pin_is_enforced_under_strict_encryption(tmp_pa
         )
 
     async def outcome(dsn: str) -> str:
+        # A short login timeout, so a stalled handshake reports here and not at the test watchdog.
         try:
-            conn = await aioodbc.connect(dsn=dsn, autocommit=True, timeout=base.connect_timeout)
+            conn = await aioodbc.connect(dsn=dsn, autocommit=True, timeout=10)
         except pyodbc.Error as exc:
-            return f"REFUSED ({exc.args[0] if exc.args else type(exc).__name__})"
+            # pyodbc puts the SQLSTATE in args[0] and the driver's message in args[1].
+            return f"REFUSED ({exc.args[-1] if exc.args else type(exc).__name__})"
         try:
             cur = await conn.cursor()
             await cur.execute("SELECT 1")
@@ -6235,13 +6240,14 @@ async def test_server_certificate_pin_is_enforced_under_strict_encryption(tmp_pa
 
     right_dsn, wrong_dsn = pinned_dsn(right), pinned_dsn(wrong)
     assert "Encrypt=strict;" in right_dsn and "Encrypt=strict;" in wrong_dsn
-    right_result = await outcome(right_dsn)
-    wrong_result = await outcome(wrong_dsn)
-    yes_result = await outcome(wrong_dsn.replace("Encrypt=strict;", "Encrypt=yes;"))
+    results = {
+        "strict_right": await outcome(right_dsn),
+        "strict_wrong": await outcome(wrong_dsn),
+        "yes_right": await outcome(right_dsn.replace("Encrypt=strict;", "Encrypt=yes;")),
+        "yes_wrong": await outcome(wrong_dsn.replace("Encrypt=strict;", "Encrypt=yes;")),
+    }
     warnings.warn(
-        f"BACKLOG-2223-PIN strict_right={right_result} strict_wrong={wrong_result}"
-        f" yes_wrong={yes_result}",
-        stacklevel=1,
+        "BACKLOG-2223-PIN " + " ".join(f"{k}={v}" for k, v in results.items()), stacklevel=1
     )
-    assert right_result == "CONNECTED", "the right pin was refused: the control did not connect"
-    assert wrong_result.startswith("REFUSED"), "a pin naming another certificate still connected"
+    assert results["strict_right"] == "CONNECTED", "the right pin was refused: the control failed"
+    assert results["strict_wrong"].startswith("REFUSED"), "a pin of another certificate connected"

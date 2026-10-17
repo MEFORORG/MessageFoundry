@@ -17,7 +17,7 @@ import ssl
 import pytest
 from pydantic import ValidationError
 
-from messagefoundry.config.settings import StoreBackend, StoreSettings
+from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, StoreBackend, StoreSettings
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.store.postgres import _build_ssl
 from messagefoundry.store.sqlserver import connection_string
@@ -275,7 +275,7 @@ async def test_pool_connect_hook_is_absent_on_the_weakened_escapes(
 # --- SQL Server (the #45 slice) ----------------------------------------------
 
 
-def test_connection_string_pins_with_strict_encryption(tmp_path: object) -> None:
+def test_connection_string_emits_server_certificate_on_secure_posture(tmp_path: object) -> None:
     """The pin travels with ``Encrypt=strict``: Driver 18 enforced ``ServerCertificate`` with strict
     and did not with ``Encrypt=yes``, where a pin naming the wrong certificate still connected (vault
     BACKLOG #2223; measured under #3009)."""
@@ -310,7 +310,7 @@ def test_connection_string_pin_does_not_lift_the_weakened_refusal(
     tmp_path: object, monkeypatch: pytest.MonkeyPatch, overrides: dict[str, object]
 ) -> None:
     """A pin is no way around the weakened-TLS refusal: with no escape the string is still refused."""
-    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    monkeypatch.delenv(INSECURE_TLS_ESCAPE_ENV, raising=False)
     with pytest.raises(ValueError, match="SQL Server TLS is weakened"):
         connection_string(_ss(ssl_root_cert=_ca_file(tmp_path), **overrides))
 

@@ -1170,9 +1170,9 @@ decisions too:
 2. **The escaped dev posture is unchanged.** Where `trust_server_certificate` or `encrypt = false`
    is escaped, the string carries no pin and no `strict`, so strict cannot quietly turn
    verification back on.
-3. **The pin is an exact match, and the engine does not count it as a revocation control.** It does
-   not change the grade of
-   the SQL Server store row in the table above. That row stays a named gap by owner ruling R6.
+3. **The pin is an exact match, and the engine does not count it as a revocation control.**
+   It does not change the grade of the SQL Server store row in the table above. That row stays a
+   named gap by owner ruling R6.
 
 The paragraph above is kept as written. Its first sentence, *"`connection_string` emits
 `ServerCertificate=` beside `Encrypt=yes`, never `Encrypt=strict`"*, describes the code before this
