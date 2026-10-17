@@ -191,6 +191,9 @@ this line.**
   change: the console imports `alert_directory_administrator_granted` from `api.security`. (vault
   BACKLOG #2610)
 
+- **A domain entry with a leading dot matches nothing.** The interstitial check stripped the
+  dot, so `.hospital.example` from a caller other than settings covered the domain. Settings refuse
+  such an entry at load, so the strip only ever widened a match. No seam change. (BACKLOG #3075)
 - **An IPv4 entry in `organization_domains` or `external_link_allowlist` matches only that
   address.** The interstitial check matched every entry on a label boundary. So a host that merely
   ended in a listed address would have counted as covered. The engine still accepts a canonical

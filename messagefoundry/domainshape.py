@@ -18,7 +18,7 @@ from __future__ import annotations
 import ipaddress
 import string
 
-__all__ = ["domain_shape_problem", "is_canonical_ipv4"]
+__all__ = ["MAX_MAIL_ADDRESS", "MAX_MAIL_DOMAIN", "domain_shape_problem", "is_canonical_ipv4"]
 
 #: The characters a hostname-shaped domain may hold, in either case.
 _DOMAIN_TEXT = frozenset(string.ascii_letters + string.digits + "-.")
@@ -26,6 +26,12 @@ _DOMAIN_TEXT = frozenset(string.ascii_letters + string.digits + "-.")
 _MAX_LABEL = 63
 #: The RFC 1035 limit on a whole domain, written without a final dot.
 _MAX_DOMAIN = 253
+#: The RFC 5321 limit on a whole mail address. Here, not in ``transports/email.py``, so the
+#: recipient domain list in ``config/`` derives its cap from the same number (BACKLOG #3075).
+MAX_MAIL_ADDRESS = 254
+#: The longest domain an address can carry: the address limit less a one-character local
+#: part and the ``@``. Tighter than :data:`_MAX_DOMAIN`, so it binds wherever mail goes.
+MAX_MAIL_DOMAIN = MAX_MAIL_ADDRESS - len("a@")
 
 
 def domain_shape_problem(domain: str) -> str | None:
@@ -66,7 +72,9 @@ def is_canonical_ipv4(text: str) -> bool:
 
     The one form besides a domain that ``[security].organization_domains`` and
     ``external_link_allowlist`` accept, and that the console matches exactly rather than on a
-    label boundary. A short, octal or hexadecimal form is not canonical."""
+    label boundary. A short, octal or hexadecimal form is not canonical. Settings also refuse a
+    canonical address that is not one host's, such as ``0.0.0.0`` (``config/settings.py``,
+    ``_not_a_host_address``)."""
     try:
         return str(ipaddress.IPv4Address(text)) == text
     except ValueError:

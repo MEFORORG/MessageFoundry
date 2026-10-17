@@ -29,7 +29,11 @@ from fastapi import FastAPI
 import messagefoundry.api.app as app_module
 import messagefoundry.config.fingerprint as fp_mod
 from messagefoundry.api import create_managed_app
-from messagefoundry.config.fingerprint import FINGERPRINT_SCHEME, config_fingerprint
+from messagefoundry.config.fingerprint import (
+    FINGERPRINT_SCHEME,
+    UNREADABLE_FILES_KEY,
+    config_fingerprint,
+)
 from messagefoundry.config.settings import (
     _ALERT_CONTROL_EVENT_TYPES,
     _ALERT_EVENT_TYPES,
@@ -38,12 +42,13 @@ from messagefoundry.config.settings import (
 from messagefoundry.config.wiring import load_config
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
-from messagefoundry.pipeline.alerts import LoggingAlertSink
+from messagefoundry.pipeline.alerts import LoggingAlertSink, config_changed_detail
 from messagefoundry.store.store import MessageStore
 from tests.test_alert_sinks import _drain as _drain_transports
 from tests.test_alert_sinks import _RecordingTransport
 from tests.test_alert_state import _drain as _drain_state
 from tests.test_alert_state import _RecordingStore
+from tests.test_config_fingerprint import _unreadable
 from tests.test_reload_dir_only_moves_on_apply import _write_valid_config
 
 _ACTIONS = ("config_loaded", "config_reload", "connection_flag_set")
@@ -985,8 +990,8 @@ async def test_the_notifier_pages_config_changed_with_labels_only() -> None:
     (event,) = transport.events
     assert event["type"] == "config_changed" and event["connection"] == "config:aaaaaaaaaaaa"
     assert event["detail"] == (
-        "this process started with config aaaaaaaaaaaa; the store's baseline is config "
-        "bbbbbbbbbbbb (node host:2:y, action config_reload, time 2026-10-04T00:00:00+00:00)"
+        "baseline 2026-10-04T00:00:00+00:00 on node host:2:y (config_reload): started on config "
+        "aaaaaaaaaaaa, baseline config bbbbbbbbbbbb"
     )
     assert (event["fingerprint"], event["previous_fingerprint"]) == ("a" * 64, "b" * 64)
     assert set(event) <= {
@@ -1004,3 +1009,206 @@ async def test_the_notifier_pages_config_changed_with_labels_only() -> None:
         "ts",
         "severity",
     }
+
+
+# --- vault BACKLOG #2944, items 4 to 6 -----------------------------------------------------------
+
+
+async def test_a_start_whose_digest_left_out_a_file_raises_no_alert_and_is_passed_over(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """Item 4: a file an antivirus lock held at one start and not at the next gave two digests for
+    the same bytes, and the start raised config_changed for no change."""
+    await _start(tmp_path, cfg)
+    with monkeypatch.context() as m:
+        _unreadable(m, "cfg.py")
+        partial = await _start(tmp_path, cfg)
+    assert alerts == []
+    assert partial[-1][UNREADABLE_FILES_KEY] == ["cfg.py"]
+    assert partial[-1]["comparison"] == "partial_start_digest"
+    assert partial[-1]["baseline_unchecked"] is True
+    # The next start, with the file readable again, passes over the partial row.
+    rows = await _start(tmp_path, cfg)
+    assert alerts == []
+    assert rows[-1]["comparison"] == "compared" and rows[-1]["changed"] is False
+    # Control: a real change is still reported against the same baseline.
+    _edit(cfg)
+    await _start(tmp_path, cfg)
+    assert len(alerts) == 1
+
+
+async def test_a_partial_baseline_raises_no_alert(
+    tmp_path: Path, cfg: Path, alerts: list[dict[str, Any]]
+) -> None:
+    """Item 4, the row side: a reload whose digest left out a file is no record of the bundle."""
+    await _start(tmp_path, cfg)
+    store = await MessageStore.open(tmp_path / "start.db")
+    try:
+        await store.record_audit(
+            "config_reload",
+            actor="alice",
+            detail=json.dumps(
+                {
+                    "fingerprint": "f" * 64,
+                    "scheme": FINGERPRINT_SCHEME,
+                    UNREADABLE_FILES_KEY: ["codesets/x.csv"],
+                }
+            ),
+        )
+    finally:
+        await store.close()
+    rows = await _start(tmp_path, cfg)
+    assert alerts == []
+    assert rows[-1]["comparison"] == "degraded_baseline"
+
+
+async def test_an_edit_during_the_start_load_leaves_the_start_unchecked(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """Item 5: an edit between the load and the start's digest was recorded as loaded. Here the
+    start loads edited bytes and the edit is reverted before the digest, so without the check the
+    row named the baseline's bytes and no start ever reported the change this one ran."""
+    before = config_fingerprint(cfg)
+    await _start(tmp_path, cfg)
+    original = (cfg / "cfg.py").read_bytes()
+    _edit(cfg)
+
+    def _load_then_revert(*args: Any, **kwargs: Any) -> Any:
+        registry = load_config(*args, **kwargs)
+        (cfg / "cfg.py").write_bytes(original)
+        return registry
+
+    with monkeypatch.context() as m:
+        m.setattr(app_module, "load_config", _load_then_revert)
+        app = _app(tmp_path, cfg)
+        async with app.router.lifespan_context(app):
+            engine: Engine = app.state.engine
+            provenance_after = engine.loaded_config_fingerprint
+            rows = await _start_rows(engine)
+    assert config_fingerprint(cfg) == before, "control: the digest after the load matches"
+    assert alerts == []
+    assert rows[-1]["comparison"] == "changed_during_load"
+    assert rows[-1]["baseline_unchecked"] is True
+    assert provenance_after is None, "the digest may name bytes the process never loaded"
+    # The next start passes over that row to the checked one.
+    _edit(cfg)
+    rows = await _start(tmp_path, cfg)
+    assert len(alerts) == 1 and alerts[0]["previous_fingerprint"] == before
+    assert rows[-1]["comparison"] == "compared"
+
+
+#: A node id on a host whose name is the longest DNS allows: ``host:pid:tag``.
+_LONG_NODE = f"{'h' * 253}:4194304:abcdef12"
+
+
+def _long_node_detail() -> str:
+    return config_changed_detail(
+        fingerprint="a" * 64,
+        previous_fingerprint="b" * 64,
+        baseline_action="connection_flag_set",
+        baseline_node=_LONG_NODE,
+        baseline_at="2026-10-04T00:00:00+00:00",
+    )
+
+
+def test_the_detail_leads_with_the_baseline_time_and_node_and_fits_the_reason_column() -> None:
+    """Item 6: the reason column keeps about 200 characters, and a long host name pushed the
+    baseline time and node past it."""
+    detail = _long_node_detail()
+    assert len(detail) <= 200
+    assert detail.startswith("baseline 2026-10-04T00:00:00+00:00 on node hhh")
+    assert ":4194304:abcdef12 (connection_flag_set)" in detail
+    assert detail.endswith("baseline config bbbbbbbbbbbb")
+
+
+async def check_config_changed_reason_survives_a_long_node(store: Any) -> None:
+    """Store the ``config_changed`` detail at the longest node id and read it back uncut. Shared
+    with the SQL Server and PostgreSQL store suites (vault BACKLOG #2944, item 6).
+
+    The store's redaction replaces the ISO date as date-shaped text, on every backend and at every
+    node length, so the stored reason is the redacted line. The event carries ``baseline_at``
+    whole. What this pins is the cut: nothing past the node is lost."""
+    detail = _long_node_detail()
+    expected = detail.replace("2026-10-04T00:00:00+00:00", "[redacted]")
+    await store.upsert_alert_instance(
+        event_type="config_changed",
+        connection="config:aaaaaaaaaaaa",
+        severity="warning",
+        reason=detail,
+        now=100.0,
+    )
+    (row,) = [
+        a
+        for a in await store.list_active_alert_instances(allowed_channels=None)
+        if a.event_type == "config_changed"
+    ]
+    assert row.reason == expected
+
+
+async def test_the_config_changed_reason_survives_a_long_node_sqlite(tmp_path: Path) -> None:
+    store = await MessageStore.open(tmp_path / "s.db")
+    try:
+        await check_config_changed_reason_survives_a_long_node(store)
+    finally:
+        await store.close()
+
+
+async def test_two_digests_that_left_out_the_same_file_are_compared(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """Item 4, review round 1: a file that stays unreadable must not turn the check off. Digests
+    that left out the same files cover the same files, so they compare like for like."""
+    (cfg / "_locked.py").write_text("LOCKED = 1\n", encoding="utf-8")
+    with monkeypatch.context() as m:
+        _unreadable(m, "_locked.py")
+        first = await _start(tmp_path, cfg)
+        assert first[-1]["comparison"] == "no_baseline"
+        rows = await _start(tmp_path, cfg)
+        assert alerts == []
+        assert rows[-1]["comparison"] == "compared" and rows[-1]["changed"] is False
+        _edit(cfg)
+        rows = await _start(tmp_path, cfg)
+    assert len(alerts) == 1, "an edit to a file both digests cover is reported"
+    assert rows[-1]["comparison"] == "compared" and rows[-1]["changed"] is True
+
+
+async def test_a_convergence_row_with_a_partial_digest_is_passed_over(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """Review round 1: a partial convergence digest is no baseline for a start that reads the whole
+    directory, so it is marked unchecked like one with no digest."""
+    before = config_fingerprint(cfg)
+    await _start(tmp_path, cfg)
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        with monkeypatch.context() as m:
+            _unreadable(m, "cfg.py")
+            await engine._converge_reload()
+        reload_rows = await engine.store.list_audit(action="config_reload")
+    row = json.loads(reload_rows[0]["detail"])
+    assert row[UNREADABLE_FILES_KEY] == ["cfg.py"] and row["baseline_unchecked"] is True
+    _edit(cfg)
+    rows = await _start(tmp_path, cfg)
+    assert rows[-1]["comparison"] == "compared"
+    assert len(alerts) == 1 and alerts[0]["previous_fingerprint"] == before
+
+
+async def test_a_failed_digest_before_the_load_never_blocks_the_start(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    await _start(tmp_path, cfg)
+    real = Engine.fingerprint_bundle
+    calls: list[Path] = []
+
+    async def _first_raises(self: Engine, path: Path) -> Any:
+        calls.append(path)
+        if len(calls) == 1:
+            raise RuntimeError("synthetic")
+        return await real(self, path)
+
+    with monkeypatch.context() as m:
+        m.setattr(Engine, "fingerprint_bundle", _first_raises)
+        rows = await _start(tmp_path, cfg)  # asserts the graph is serving
+    assert rows[-1]["comparison"] == "changed_during_load"
+    assert alerts == []
