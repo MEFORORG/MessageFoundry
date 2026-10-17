@@ -90,7 +90,8 @@ class SlidingWindowRateLimiter:
     def _has_room(self, key: str, now: float) -> bool:
         """Prune to ``now`` and report whether an attempt for ``key`` would fit.
 
-        Prunes the global window and ``key``'s bucket, and drops a few aged buckets of other keys.
+        Prunes the global window (when the global gate is on) and ``key``'s bucket, and drops a few
+        aged buckets of other keys.
         Shared by :meth:`allow` and :meth:`would_allow` rather than duplicated into each, because a
         caller that consults one and charges the other must never see them disagree.
 

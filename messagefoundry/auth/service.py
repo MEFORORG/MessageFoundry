@@ -321,23 +321,34 @@ _UNREACHED_DIRECTORY = (ConnectionError, TimeoutError, socket.gaierror)
 #: which pages. Read by name, because the values differ by platform and a platform may lack one.
 #: On Windows these names carry the Winsock values (``ENETUNREACH`` is ``WSAENETUNREACH``).
 _UNREACHED_ERRNOS: Final[frozenset[int]] = frozenset(
-    getattr(errno, name)
-    for name in ("ENETUNREACH", "EHOSTUNREACH", "ENETDOWN", "EHOSTDOWN", "ENETRESET")
-    if hasattr(errno, name)
+    code
+    for code in (
+        getattr(errno, name, None)
+        for name in ("ENETUNREACH", "EHOSTUNREACH", "ENETDOWN", "EHOSTDOWN", "ENETRESET")
+    )
+    if code is not None
 )
-#: The Win32 codes for the same failures. An error raised from Win32 rather than Winsock carries
-#: one in ``winerror`` and only ``EINVAL`` in ``errno``. ERROR_NETWORK_UNREACHABLE and
-#: ERROR_HOST_UNREACHABLE.
-_UNREACHED_WINERRORS: Final = frozenset({1231, 1232})
+#: The Win32 codes for these failures and for the ones the type test reads. An error raised from
+#: Win32 rather than Winsock carries one in ``winerror`` and only ``EINVAL`` in ``errno``. They are
+#: ERROR_CONNECTION_REFUSED, ERROR_NETWORK_UNREACHABLE, ERROR_HOST_UNREACHABLE,
+#: ERROR_PORT_UNREACHABLE and ERROR_CONNECTION_ABORTED. At least these.
+_UNREACHED_WINERRORS: Final = frozenset({1225, 1231, 1232, 1234, 1236})
 
 
 def _unreached_directory(exc: Exception) -> bool:
-    """Whether ``exc`` means the directory was not reached, rather than an engine fault."""
-    if isinstance(exc, _UNREACHED_DIRECTORY):
-        return True
+    """Whether ``exc`` means the directory was not reached, rather than an engine fault.
+
+    Never raises: it runs inside the probe's broad handler, and an escape there would end the pass.
+    An ``errno`` or ``winerror`` that is not an int, which ``OSError`` allows, reads as no match.
+    """
     if not isinstance(exc, OSError):
         return False
-    return exc.errno in _UNREACHED_ERRNOS or getattr(exc, "winerror", None) in _UNREACHED_WINERRORS
+    if isinstance(exc, _UNREACHED_DIRECTORY):
+        return True
+    winerror = getattr(exc, "winerror", None)
+    return (isinstance(exc.errno, int) and exc.errno in _UNREACHED_ERRNOS) or (
+        isinstance(winerror, int) and winerror in _UNREACHED_WINERRORS
+    )
 
 
 #: Outcomes the directory itself gave. Any of them ends a logged outage.
@@ -6300,8 +6311,14 @@ class AuthService:
                 # escapes it is still the directory not being reached. Read as FAULT, a network
                 # blip would page and open an alert nothing resolves. Any other OSError, such as a
                 # missing file, is an engine fault and reads as FAULT below. Debug-level, like the
-                # outage above.
-                _log.debug("directory probe of %s failed: %s", user.username, type(exc).__name__)
+                # outage above. The codes say which failure it was; the message is not logged.
+                _log.debug(
+                    "directory probe of %s failed: %s errno=%s winerror=%s",
+                    user.username,
+                    type(exc).__name__,
+                    getattr(exc, "errno", None),
+                    getattr(exc, "winerror", None),
+                )
                 return reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.UNAVAILABLE)
             # BACKLOG #2241. Anything else the directory layer raised: a KeyError or ValueError on a
             # malformed entry, a fault in a test double. Uncaught, it was a 500 from

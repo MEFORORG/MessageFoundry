@@ -22,7 +22,6 @@ import errno
 import json
 import logging
 import sqlite3
-import sys
 import time
 import uuid
 from collections.abc import Callable
@@ -1204,9 +1203,17 @@ _NETWORK_ERRNOS = [
 ]
 
 
-def _os_error(code: int, winerror: int | None = None) -> Callable[[], Exception]:
+def _os_error(code: object) -> Callable[[], Exception]:
     # Built inside the test, so a raised instance does not outlive it holding the service.
-    return lambda: OSError(code, "synthetic: directory probe", None, winerror)
+    return lambda: OSError(code, "synthetic: directory probe")
+
+
+class _Win32Error(OSError):
+    """A Win32-raised OSError on every platform: errno EINVAL, the cause in ``winerror``."""
+
+    def __init__(self, winerror: object) -> None:
+        super().__init__(errno.EINVAL, "synthetic: directory probe")
+        self.winerror = winerror
 
 
 @pytest.mark.parametrize(
@@ -1217,15 +1224,16 @@ def _os_error(code: int, winerror: int | None = None) -> Callable[[], Exception]
         # unreachable network as a probe fault, which would page (BACKLOG #3100 follow-up).
         *[pytest.param(_os_error(getattr(errno, n)), True, id=n) for n in _NETWORK_ERRNOS],
         # Raised from Win32 rather than Winsock: errno is only EINVAL, winerror names the cause.
-        pytest.param(
-            _os_error(errno.EINVAL, 1231),
-            True,
-            id="ERROR_NETWORK_UNREACHABLE",
-            marks=pytest.mark.skipif(sys.platform != "win32", reason="winerror is Windows-only"),
-        ),
+        *[
+            pytest.param(lambda w=w: _Win32Error(w), True, id=f"winerror-{w}")
+            for w in (1225, 1231, 1232, 1234, 1236)
+        ],
         # The control: the set is narrow. A missing file is the engine failing, not the
-        # directory, so it still reads as FAULT and still pages.
+        # directory, so it still reads as FAULT and still pages. So does an unhashable errno or
+        # winerror, rather than the classifier raising and ending the pass.
         pytest.param(_os_error(errno.ENOENT), False, id="ENOENT"),
+        pytest.param(_os_error([errno.ENETUNREACH]), False, id="unhashable-errno"),
+        pytest.param(lambda: _Win32Error([1231]), False, id="unhashable-winerror"),
     ],
 )
 async def test_an_os_error_escaping_the_directory_layer_reads_by_its_cause(
