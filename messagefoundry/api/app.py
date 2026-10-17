@@ -1230,12 +1230,9 @@ def _app_drain_steps(
 
     async def _outliving(bound: float) -> None:
         # At most a quarter of it waiting: the grace after is what lets a cancelled operation's
-        # rollback arm record 'interrupted' before the store closes. That grace is shorter than
-        # CANCEL_GRACE_SECONDS, and shorter than the DR hook reap inside it, with the managed
-        # lifespan's full set of steps: under 3 s when the steps before this one are quick. The
-        # budget cannot hold the reap, since the NSSM window leaves it no room (see
-        # _SHUTDOWN_BUDGET_SECONDS). So at least a cancelled DR takeover whose killed hook takes
-        # most of its reap can still be rolling back when the store closes, and the drain logs it.
+        # rollback arm record 'interrupted' before the store closes. With the managed lifespan's
+        # full set of steps that grace is below the DR hook reap, and the NSSM window leaves the
+        # budget no room to hold it. CANCEL_GRACE_SECONDS (api/outlive.py) states what that costs.
         wait = min(OUTLIVING_DRAIN_SECONDS, bound * _INNER_SHARE / 4)
         await outliving.drain(wait, grace=min(CANCEL_GRACE_SECONDS, bound * _INNER_SHARE - wait))
 
@@ -10824,8 +10821,9 @@ def create_managed_app(
             steps: list[_TeardownStep] = []
             if upload_retention_runner is not None:
                 # Handed part of its bound, so the runner's own wait ends, names any unaudited
-                # file and cancels the sweep before the teardown cuts it. That bound is about 2 s
-                # with every step present, so the runner's own 5 s wait never runs in full here.
+                # file and cancels the sweep before the teardown cuts it. With the managed set of
+                # steps that bound is below the runner's own default wait, which then never runs
+                # in full here.
                 steps.append(
                     _TeardownStep(
                         "the upload retention runner's stop",

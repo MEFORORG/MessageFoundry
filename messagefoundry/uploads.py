@@ -822,16 +822,17 @@ class UploadStore:
         residual for all of that. The residual is named in ``docs/PHI.md`` §3: a refused upload is
         outside retention and the quota until ``rotate-key`` seals it, and ``serve`` logs the count
         at startup so the operator knows to run it. One kind ``rotate-key`` can never seal is
-        brought back through ``held`` instead, without trusting its sidecar. At least a blank or
-        non-UTF-8 sidecar is still left out.
+        brought back through ``held`` instead, without trusting its sidecar. At least a blank
+        sidecar, or one that is not UTF-8 within the part :meth:`_unsealable_sync` reads, is still
+        left out.
 
         **``held`` is for the quota and the prune only (BACKLOG #2322, #3184).** When it is a list
         and the cipher refuses plaintext, each refused sidecar that is an upload ``rotate-key``
         cannot seal is appended to it, from this same directory walk, so a quota check walks the
         directory once rather than twice. Nothing that lists or serves an upload passes it, so the
-        strict read is not loosened. Only a sidecar the cipher refused, or one that could not be
-        read whole, is classed; the second covers a plaintext sidecar that is not UTF-8 only past
-        the head :meth:`_unsealable_sync` reads. A sidecar the cipher decrypted is sealed, and
+        strict read is not loosened. Only a sidecar the cipher refused, or one that is not UTF-8
+        as a whole, is classed; the second covers a plaintext sidecar that is not UTF-8 only past
+        the part :meth:`_unsealable_sync` reads. A sidecar the cipher decrypted is sealed, and
         :meth:`_unsealable_sync` would decline it anyway. The class is keyed by the PATH id, never
         by the id in a sidecar's JSON.
 
@@ -845,7 +846,7 @@ class UploadStore:
         for fid, entry in self._iter_sidecars():
             if sink is not None:
                 bodies.add(f"{fid}{_BLOB_SUFFIX}")
-            unread = False
+            classify = False
             try:
                 out.append(self._decrypt_meta(entry.read_text(encoding="utf-8"), fid))
             except CipherError as exc:
@@ -853,21 +854,22 @@ class UploadStore:
                 # another cell, or the refusal of an unmarked (legacy, planted or downgraded)
                 # sidecar. Named on its own so these can be told apart from a damaged file.
                 _log.warning("uploaded-file sidecar %s: cipher declined it: %s", fid, exc)
-                unread = True
+                classify = True
             except (OSError, UnicodeDecodeError) as exc:
                 # The bytes never reached the cipher — unreadable file, or not valid UTF-8.
                 _log.warning(
                     "uploaded-file sidecar %s: unreadable on disk: %s", fid, codec_safe_str(exc)
                 )
-                # Classed too: a plaintext sidecar that is not UTF-8 only past the head the class
-                # check reads is still one rotate-key can never seal.
-                unread = True
+                # A decode error is classed too: a plaintext sidecar that is not UTF-8 only past
+                # the part the class check reads is still one rotate-key can never seal. An
+                # OSError is not, so a stalled read is not paid twice under _quota_lock.
+                classify = isinstance(exc, UnicodeDecodeError)
             except (ValueError, TypeError, KeyError) as exc:
                 # Decrypted, but the JSON is malformed or a field will not coerce. Type only.
                 _log.warning(
                     "uploaded-file sidecar %s: malformed metadata (%s)", fid, type(exc).__name__
                 )
-            if unread and sink is not None:
+            if classify and sink is not None:
                 lost = self._unsealable_sync(fid, entry)
                 if lost is not None:
                     sink.append(lost)

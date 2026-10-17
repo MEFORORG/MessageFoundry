@@ -525,8 +525,9 @@ async def _stop_stuck_runner(
     stop_timeout_seconds: float = 0.05,
     timeout: float | None = None,
 ) -> logging.LogRecord:
-    """Start a runner over ``store``, wait for its sweep to park on ``paused``, stop it with a
-    0.05 s bound, release the sweep, and return the one record ``stop()`` logged about it."""
+    """Start a runner over ``store``, wait for its sweep to park on ``paused``, stop it, release the
+    sweep, and return the one record ``stop()`` logged about it. The runner's own bound is
+    ``stop_timeout_seconds``, and ``timeout`` is the caller's, passed to ``stop()``."""
     runner = UploadRetentionRunner(
         store,
         audit=audit or _audited_to([]),
