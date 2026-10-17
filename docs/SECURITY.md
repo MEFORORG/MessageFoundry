@@ -2103,6 +2103,17 @@ refusal or cancellation whose own row then fails, and an unexpected fault in the
 alone. The 503 has the same two lost-COMMIT exceptions as the gate's, listed above, where the
 attempt row may have committed after all.
 
+**A reload's `config_reload_failed` row names why in `reason`.** At least these values are
+written: `trust_anchor`, `invalid_config`, `not_found`, `unreadable`, `digest_mismatch`,
+`no_approved_digest`, `digest_unavailable` and `store_unavailable`. A trust-anchor check that the
+store stops, by refusing the `auth.trust_anchor` audit read or write it needs, is
+`store_unavailable` (BACKLOG #3091). The checks of the file run before any store call, so this
+reason is written only for an anchor that passed them. An anchor they refuse is still
+`trust_anchor` when its audit row then fails, and so is an anchor file that cannot be read.
+Such a refusal may then have no `auth.trust_anchor` row behind it, so the engine log is the record
+of it. An inline reload answers **503** for `store_unavailable`; a released one answers 422, as
+every refused release does. The engine log carries the store's error.
+
 **An inline or released reload's `config_reload` row names that reload's own config (vault
 BACKLOG #2257).** It is built from the reload's own result: its directory, connection counts and
 the digest it took before the swap. The row is written after the swap, so a second reload or a

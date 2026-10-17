@@ -1479,8 +1479,14 @@ def _pinned_ad_anchor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[
 
 
 async def _anchored_engine(
-    tmp_path: Path, spec: AnchorSpec, *, with_config_dir: bool = True
+    tmp_path: Path,
+    spec: AnchorSpec,
+    *,
+    with_config_dir: bool = True,
+    preflight_store: Any = None,
 ) -> tuple[Any, Path]:
+    """``preflight_store`` is the store the settings preflight audits through; the engine's own
+    store when it is None."""
     from messagefoundry.pipeline import Engine
 
     cfg = tmp_path / "cfg"
@@ -1489,7 +1495,9 @@ async def _anchored_engine(
     engine = Engine(
         store,
         config_dir=cfg if with_config_dir else None,
-        settings_preflight=ta.make_settings_anchor_preflight([spec], store, enforcing=True),
+        settings_preflight=ta.make_settings_anchor_preflight(
+            [spec], store if preflight_store is None else preflight_store, enforcing=True
+        ),
         egress_settings=EgressSettings(deny_by_default=False),
     )
     return engine, cfg
@@ -2464,3 +2472,245 @@ async def test_a_refused_dialling_settings_ca_refuses_the_start(
     with pytest.raises(TrustAnchorError, match=r"\[alerts\]\.email_tls_ca_file"):
         async with app.router.lifespan_context(app):
             pass
+
+
+# --- BACKLOG #3091: a store fault inside a trust-anchor check is not a refused anchor --------------
+#
+# Each of the three checks that go through _preflight_one meets a store whose audit read, or
+# separately its audit write, raises an OSError: the settings preflight, the registry preflight and
+# the per-lane check. Before the fix each turned that OSError into a TrustAnchorError, so a reload
+# audited reason="trust_anchor" and the lane check remembered the store fault as the CA's refusal.
+
+
+class _FaultyAuditStore:
+    """Just the two audit calls the preflight makes, either of which can be told to fail."""
+
+    def __init__(self, fail: str | None) -> None:
+        self.fail = fail
+        self.writes: list[str] = []
+
+    async def list_audit(self, **_kw: object) -> list[dict[str, Any]]:
+        if self.fail == "list_audit":
+            raise OSError(5, "Input/output error")
+        return []
+
+    async def record_audit(self, action: str, *, actor: str | None, detail: str) -> None:
+        if self.fail == "record_audit":
+            raise OSError(5, "Input/output error")
+        self.writes.append(detail)
+
+
+_AUDIT_FAULTS = pytest.mark.parametrize("fail", ["list_audit", "record_audit"])
+
+
+def _no_anchor_refusal_in(exc: BaseException) -> None:
+    """Nothing on the explicit cause chain is an anchor refusal, and the store's OSError is its root."""
+    from messagefoundry.api.app import _caused_by_trust_anchor
+
+    assert not _caused_by_trust_anchor(exc)
+    root = exc
+    while root.__cause__ is not None:
+        root = root.__cause__
+    assert type(root) is OSError, root
+
+
+def _judged_clean(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+
+
+@_AUDIT_FAULTS
+async def test_a_store_fault_in_the_settings_preflight_is_not_an_anchor_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail: str
+) -> None:
+    from messagefoundry.config.wiring import WiringError
+
+    _judged_clean(monkeypatch)
+    spec = AnchorSpec("ad", "[auth].ad_tls_ca_cert_file", str(_pem(tmp_path)), None)
+    preflight = ta.make_settings_anchor_preflight([spec], _FaultyAuditStore(fail), enforcing=True)  # type: ignore[arg-type]
+    assert preflight is not None
+    with pytest.raises(WiringError, match="a trust anchor could not be checked") as err:
+        await preflight()
+    assert isinstance(err.value.__cause__, ta.AnchorStoreUnavailable)
+    _no_anchor_refusal_in(err.value)
+    # The control: the same anchor over a store that works passes.
+    working = _FaultyAuditStore(None)
+    ok = ta.make_settings_anchor_preflight([spec], working, enforcing=True)  # type: ignore[arg-type]
+    assert ok is not None
+    await ok()
+    assert working.writes
+
+
+@_AUDIT_FAULTS
+async def test_a_store_fault_in_the_registry_preflight_is_not_an_anchor_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail: str
+) -> None:
+    from messagefoundry.config.wiring import WiringError, load_config
+
+    _judged_clean(monkeypatch)
+    cfg = tmp_path / "cfg"
+    _one_listener_graph(cfg, _pem(tmp_path, _block(b"ca")))
+    preflight = ta.make_registry_anchor_preflight(_FaultyAuditStore(fail), enforcing=True)  # type: ignore[arg-type]
+    with pytest.raises(WiringError, match="a trust anchor could not be checked") as err:
+        await preflight(load_config(cfg), {})
+    assert isinstance(err.value.__cause__, ta.AnchorStoreUnavailable)
+    _no_anchor_refusal_in(err.value)
+    await ta.make_registry_anchor_preflight(_FaultyAuditStore(None), enforcing=True)(  # type: ignore[arg-type]
+        load_config(cfg), {}
+    )
+
+
+@_AUDIT_FAULTS
+async def test_a_store_fault_in_the_lane_check_is_not_remembered_as_a_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail: str
+) -> None:
+    """Red under: the store's OSError cached in refused[...] as the CA's refusal, so the next check
+    re-raised it as a TrustAnchorError without asking the store again."""
+    _judged_clean(monkeypatch)
+    store = _FaultyAuditStore(fail)
+    check = ta.make_lane_anchor_check(store, enforcing=True)  # type: ignore[arg-type]
+    settings = {"tls_ca_file": str(_pem(tmp_path))}
+    with pytest.raises(ta.AnchorStoreUnavailable) as err:
+        await check("outbound", "OUT", settings)
+    _no_anchor_refusal_in(err.value)
+    store.fail = None  # the store recovers; the file never changed
+    await check("outbound", "OUT", settings)
+    assert store.writes
+
+
+async def test_an_unreadable_settings_anchor_names_its_setting(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """BACKLOG #3105, item 6: the settings preflight's refusal of a file it cannot read names the
+    setting, as the connection checks' refusal names the connection, and stays an anchor refusal."""
+    from messagefoundry.config.wiring import WiringError
+
+    gone = AnchorSpec("ad", "[auth].ad_tls_ca_cert_file", str(tmp_path / "gone.pem"), None)
+    nul = AnchorSpec("oidc", "[auth].oidc_tls_ca_cert_file", "bad\x00path.pem", None)
+    for spec, cause in ((gone, FileNotFoundError), (nul, ValueError)):
+        preflight = ta.make_settings_anchor_preflight([spec], store, enforcing=True)
+        assert preflight is not None
+        with pytest.raises(
+            WiringError, match=re.escape(f"refused: {spec.setting}: could not read")
+        ) as err:
+            await preflight()
+        assert isinstance(err.value.__cause__, TrustAnchorError)
+        assert isinstance(err.value.__cause__.__cause__, cause)
+
+
+async def test_the_reload_route_audits_a_store_fault_in_an_anchor_check_as_store_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The direct /config/reload route answers 503 and writes reason="store_unavailable". The
+    preflight's store is the faulty one; the route's own audit rows land in a working store."""
+    import httpx
+
+    from messagefoundry.api import create_app
+
+    _judged_clean(monkeypatch)
+    spec = AnchorSpec("ad", "[auth].ad_tls_ca_cert_file", str(_pem(tmp_path)), None)
+    engine, cfg = await _anchored_engine(
+        tmp_path, spec, preflight_store=_FaultyAuditStore("list_audit")
+    )
+    store = engine.store
+    try:
+        transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            r = await client.post("/config/reload", json={"config_dir": str(cfg)})
+        assert r.status_code == 503, r.text
+        rows = await store.list_audit(action="config_reload_failed", limit=10)
+        assert [json.loads(row["detail"])["reason"] for row in rows] == ["store_unavailable"]
+    finally:
+        await engine.stop()
+
+
+@_AUDIT_FAULTS
+async def test_a_refused_anchor_is_still_a_refusal_when_its_audit_row_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail: str
+) -> None:
+    """The verdict is reached before any store call, so a substituted anchor (a pin mismatch here)
+    whose audit read or write then fails is audited as trust_anchor, never as a store outage."""
+    from messagefoundry.config.wiring import WiringError
+
+    _judged_clean(monkeypatch)
+    spec = AnchorSpec("ad", "[auth].ad_tls_ca_cert_file", str(_pem(tmp_path)), "00" * 32)
+    preflight = ta.make_settings_anchor_preflight([spec], _FaultyAuditStore(fail), enforcing=True)  # type: ignore[arg-type]
+    assert preflight is not None
+    with pytest.raises(WiringError, match="a settings trust anchor was refused") as err:
+        await preflight()
+    assert isinstance(err.value.__cause__, TrustAnchorError)
+
+
+async def test_a_store_fault_fails_a_lane_without_marking_its_ca_refused(tmp_path: Path) -> None:
+    """An operator start of a lane whose CA check the store stopped reads failed, through the
+    TrustAnchorError the control route answers, but the lane is not marked refused, and the fixed
+    line says the file could not be checked rather than that it was refused."""
+    from messagefoundry.config.wiring import Registry
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+
+    async def stopped(_direction: str, _name: str, _settings: Any) -> None:
+        raise ta.AnchorStoreUnavailable("the store refused the trust-anchor audit read")
+
+    store = await MessageStore.open(tmp_path / "r.db")
+    try:
+        runner = RegistryRunner(
+            Registry(),
+            store,
+            egress=EgressSettings(deny_by_default=False),
+            lane_anchor_check=stopped,
+        )
+        with pytest.raises(TrustAnchorError, match="its tls_ca_file could not be checked") as err:
+            await runner._check_lane_anchor("outbound", "OUT", {}, fails_lane=True)
+        assert isinstance(err.value.__cause__, ta.AnchorStoreUnavailable)
+        assert ("outbound", "OUT") not in runner._anchor_refused
+        # A reload's pre-check (fails_lane=False) lets the store fault through for the reload to
+        # answer as store_unavailable.
+        with pytest.raises(ta.AnchorStoreUnavailable):
+            await runner._check_lane_anchor("outbound", "OUT", {}, fails_lane=False)
+    finally:
+        await store.close()
+
+
+async def test_a_lane_refusal_whose_audit_failed_is_checked_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refusal made while the store refused its rows is not remembered, so once the store is back
+    the next check writes the pin_mismatch row rather than raising from memory with no row."""
+    _judged_clean(monkeypatch)
+    store = _FaultyAuditStore("record_audit")
+    check = ta.make_lane_anchor_check(store, enforcing=True)  # type: ignore[arg-type]
+    settings = {"tls_ca_file": str(_pem(tmp_path)), "tls_ca_pin": "00" * 32}
+    with pytest.raises(TrustAnchorError, match="does not match") as err:
+        await check("outbound", "OUT", settings)
+    assert err.value.unaudited
+    store.fail = None
+    with pytest.raises(TrustAnchorError, match="does not match") as again:
+        await check("outbound", "OUT", settings)
+    assert not again.value.unaudited
+    assert any(json.loads(d)["event"] == "pin_mismatch" for d in store.writes)
+
+
+async def test_a_store_fault_on_an_earlier_anchor_does_not_hide_a_later_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two settings anchors: the first passes its checks, the second is pinned to other bytes. A
+    store that refuses every audit read must not stop the preflight at the first, or the substituted
+    second would read as a store outage."""
+    from messagefoundry.config.wiring import WiringError
+
+    _judged_clean(monkeypatch)
+    good = tmp_path / "good"
+    bad = tmp_path / "bad"
+    good.mkdir()
+    bad.mkdir()
+    specs = [
+        AnchorSpec("oidc", "[auth].oidc_tls_ca_cert_file", str(_pem(good)), None),
+        AnchorSpec("ad", "[auth].ad_tls_ca_cert_file", str(_pem(bad)), "00" * 32),
+    ]
+    faulty: Any = _FaultyAuditStore("list_audit")
+    preflight = ta.make_settings_anchor_preflight(specs, faulty, enforcing=True)
+    assert preflight is not None
+    with pytest.raises(WiringError, match="a settings trust anchor was refused") as err:
+        await preflight()
+    assert isinstance(err.value.__cause__, TrustAnchorError)
+    assert "[auth].ad_tls_ca_cert_file" in str(err.value)
