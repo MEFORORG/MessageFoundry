@@ -1129,9 +1129,9 @@ async def test_failed_handshakes_are_counted_and_their_events_throttled(
     source, _cert_path = _tls_source(tmp_path)
     events = _Events()
     source.on_connection_event = events
-    await source._note_tls_failure("10.0.0.9", "SSLError")
-    await source._note_tls_failure("10.0.0.8", "SSLError")
-    await source._note_tls_failure("10.0.0.7", "ConnectionAbortedError")
+    await source._tls_failures.note("10.0.0.9", "SSLError")
+    await source._tls_failures.note("10.0.0.8", "SSLError")
+    await source._tls_failures.note("10.0.0.7", "ConnectionAbortedError")
     # The control: three failures inside one window are one event so far, and the count is exact.
     assert source.tls_handshake_failures == 3
     assert events.seen == [
@@ -1161,13 +1161,13 @@ async def test_stop_reports_the_handshake_failures_still_held(
     await source.start(_ack)
     try:
         for _ in range(4):
-            await source._note_tls_failure("10.0.0.9", "SSLError")
+            await source._tls_failures.note("10.0.0.9", "SSLError")
         assert len(events.seen) == 1
     finally:
         await asyncio.wait_for(source.stop(), timeout=10.0)
     held = events.seen[1][2]
     assert held is not None and held.startswith("3 failed handshake(s)")
-    assert source._tls_flush is None
+    assert source._tls_failures._timer is None
 
 
 async def test_a_peer_dropping_as_its_handshake_completes_is_closed_quietly(

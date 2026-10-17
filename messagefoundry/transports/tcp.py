@@ -4,7 +4,9 @@
 
 Built to relay **X12 (and other non-HL7) feeds over custom-framed TCP** opaquely: the payload
 is carried as bytes and never parsed (no ISA/GS/ST inspection, no 997/TA1 acks — those are a
-documented follow-up). Whether a received body is routed as a structured HL7
+documented follow-up). A delivery still refuses, at least, a payload holding its codec's frame
+bytes (ADR 0205) and an ``MSH``-led payload holding a second ``MSH`` (ADR 0209). Whether a
+received body is routed as a structured HL7
 :class:`~messagefoundry.parsing.message.Message` or a
 :class:`~messagefoundry.parsing.message.RawMessage` is decided by the **inbound's
 ``content_type``** (set ``x12`` for these feeds), not by this connector (ADR 0004).
@@ -219,9 +221,9 @@ class TcpDestination(DestinationConnector):
         self._hop_guard.enforce_construction()
 
     def check_frame(self, payload: str, *, rewrite: bool = True) -> None:
-        """ADR 0205 rule 1 on ``payload`` without sending it, as :meth:`MLLPDestination.check_frame`
-        does, for a shadow outbound where :meth:`send` does not run. TCP has no delimiter rewrite,
-        so ``rewrite`` changes nothing."""
+        """ADR 0205 rule 1 and ADR 0209 on ``payload`` without sending it, as
+        :meth:`MLLPDestination.check_frame` does, for a shadow outbound where :meth:`send` does not
+        run. TCP has no delimiter rewrite, so ``rewrite`` changes nothing."""
         check_frame_bytes(self.codec, payload, self.encoding, transport="TCP")
 
     async def test_connection(self) -> None:
@@ -638,7 +640,7 @@ class TcpSource(SourceConnector):
                 if refusal.kind is not None:
                     await self._emit_event(refusal.kind, peer_host=peer_host, reason=refusal.reason)
                 return  # closed in the outer finally
-            self._admission.admit(peer_host)
+            epoch = self._admission.admit(peer_host)
             try:
                 # Inside the try whose finally releases the slot, so a cancellation delivered at
                 # this await cannot leak a per-host count.
@@ -718,7 +720,7 @@ class TcpSource(SourceConnector):
                 failed = True  # peer reset; nothing to do but drop the connection
                 await self._emit_event("peer_reset", peer_host=peer_host, reason=safe_exc(exc))
             finally:
-                self._admission.release(peer_host)
+                self._admission.release(peer_host, epoch)
         finally:
             self._clients.discard(writer)
             if task is not None:

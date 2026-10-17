@@ -539,9 +539,13 @@ def test_a_release_that_did_no_work_says_so() -> None:
     skipped = _page({"cancelled": 0, "skipped": "outbound running"})
     assert "The operation skipped its work: outbound running." in skipped
     degraded = _page({"inbound": 1, "outbound": 1, "degraded": True, "failures": ["audit"]})
-    assert "at least one follow-on step failed" in degraded
+    assert "at least one follow-on step failed: audit." in degraded
+    # BACKLOG #3015: a released reload says a changed anchor takes a restart, as the inline does.
+    restart = _page({"inbound": 1, "restart_required": ["[auth].ad_tls_ca_cert_file"]})
+    assert "Restart the engine" in restart and "[auth].ad_tls_ca_cert_file" in restart
     clean = _page({"requeued": 2})
     assert "skipped its work" not in clean and "follow-on step failed" not in clean
+    assert "Restart the engine" not in _page({"inbound": 1, "restart_required": []})
 
 
 def test_a_bulk_purge_with_a_held_destination_links_to_approvals() -> None:
