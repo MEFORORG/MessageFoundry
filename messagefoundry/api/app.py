@@ -9473,9 +9473,8 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     ``ad_reconcile_held`` alert, on every pass while it holds, including one the breaker also aborts
     (ADR 0195). Each applied revocation is ``auth.ad_session_revoked`` and becomes one
     ``ad_session_revoked`` alert, except a quiet one, which the service leaves off the returned
-    plan. A quiet revocation ended no session and changed no role, and, for a disabled or absent
-    account, repeats another pass's revocation of it (BACKLOG #3085, owner rulings 2026-10-16 and
-    2026-10-17; ``AuthService._apply_reconcile_revocation``). A whole-directory outage aborts too,
+    plan (BACKLOG #3085; ``AuthService._apply_reconcile_revocation`` says which are quiet). A
+    whole-directory outage aborts too,
     but it is audited as ``auth.ad_reconcile_skipped`` and pages nothing: the accounts are fine, the
     directory is not, and the pass is fail-open.
 

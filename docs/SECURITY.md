@@ -4109,16 +4109,17 @@ revocations end no session and change no role. Each still writes its row, with `
 (BACKLOG #3085, owner ruling 2026-10-16). When the directory says the account is disabled or
 absent, that revocation still alerts and sends its notice, as when the user signed out mid-pass
 (owner ruling 2026-10-17). It is quiet, with no alert and no notice, only when another pass already
-revoked the account. The evidence is an earlier `auth.ad_session_revoked` row for the account with
-the same reason, since its last sign-in. Any other revocation that ends nothing is quiet too. So
+revoked the account. The evidence is an `auth.ad_session_revoked` row with the same username and
+reason, written after this pass started. An older row never counts. The rule is stated in full in
+`AuthService._already_revoked_elsewhere`. Any other revocation that ends nothing is quiet too. So
 when two reconcilers on one store revoke one account in turn, the second only audits. If both read
 the old roles, or both apply before either writes its row, both still report. If the first
 reconciler's pass ended before it alerted, the second's quiet revocation means that account pages
 nobody.
 
 A pass that fails part-way keeps the audit rows for what it already revoked, but raises no alert for
-them. A refused audit write does not end the pass (BACKLOG #3018), when the store reports it as one
-of the errors the reconciler treats as a refusal; any other error still ends it. The reconciler logs
+them. A refused audit write does not end the pass (BACKLOG #3018). That holds for the store errors
+the reconciler treats as a refusal. Any other error still ends the pass. The reconciler logs
 a refused row at ERROR, naming the action and the account. That line is the only record of the row,
 and nothing writes it later. Any notice the account was due still goes. Its alert still goes too,
 unless something later in the same pass raises and ends it. Then that account has neither its row
