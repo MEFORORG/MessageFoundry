@@ -1972,10 +1972,16 @@ def test_a_blank_pin_without_mtls_fails_its_own_lane_not_the_graph() -> None:
 _CONTROL_PATH = "C:/anchors/evil\nFORGED: line\x1b[31m.pem"
 
 
+def _no_raw_control(text: str | None) -> None:
+    """Neither control byte of the hostile paths below reaches ``text`` raw."""
+    assert text is not None
+    assert "\x1b" not in text and "\nFORGED" not in text, text
+
+
 def _quoted(text: str) -> None:
     """``text`` names the control-character path only in its escaped form."""
     assert repr(_CONTROL_PATH) in text, text
-    assert "\x1b" not in text and "\nFORGED" not in text, text
+    _no_raw_control(text)
 
 
 @pytest.mark.parametrize(
@@ -2050,14 +2056,14 @@ def test_a_chain_walk_reason_quotes_the_path() -> None:
 
     _chain, cause = ap.windows_chain("C:\\evil\nFORGED line\x1b[31m.pem", "C:\\", unreadable)
     assert cause is not None and repr("C:\\evil\nFORGED line\x1b[31m.pem") in cause
-    assert "\x1b" not in cause and "\nFORGED" not in cause
+    _no_raw_control(cause)
 
     def a_file(_p: str) -> tuple[str, str | None]:
         return ap.FILE, None
 
     _chain, cause = ap.windows_chain("C:\\evil\nFORGED\x1b\\ca.pem", "C:\\", a_file)
     assert cause is not None and cause.endswith("is not a directory")
-    assert "\x1b" not in cause and "\nFORGED" not in cause
+    _no_raw_control(cause)
 
 
 async def test_the_restart_required_log_quotes_the_path(
@@ -2102,11 +2108,25 @@ def _byte_order_mark_before_the_block() -> bytes:
 
 
 def _encrypted_key_beside_the_certificate() -> bytes:
-    """Manager decision: a key block refuses too, though cadata= loads the certificate beside it.
-    A trust anchor has no use for a key, and the header is refused in a block of any label."""
+    """Manager decision: a key block with a legacy encryption header refuses too, though cadata=
+    loads the certificate beside it, since the header is refused in a block of any label. A PKCS#8
+    ENCRYPTED PRIVATE KEY block, or a plain key block, has no such header and is not refused."""
     label = b"RSA PRIVATE" + b" KEY"  # split, so the secret scanner does not read a real key
     key = b"-----BEGIN " + label + b"-----\n" + _ENCRYPTED + b"AAAA\n-----END " + label + b"-----\n"
     return _real_ca("crl-test-ca")[0] + key
+
+
+def _encrypted_block_then_a_plain_one() -> bytes:
+    """BACKLOG #3105: red under a header search from the last BEGIN, as the last block is plain."""
+    return _with_headers(_ENCRYPTED) + _real_ca("second-ca")[0]
+
+
+def _mid_line_begin_with_headers_then_a_plain_block() -> bytes:
+    """BACKLOG #3105: red under a search from the last BEGIN, and under one that counts a BEGIN only
+    at a line start. The BEGIN that carries the headers sits after 254 bytes of one line, where
+    OpenSSL reads it (as in :func:`_begin_past_a_long_line`), so the only BEGIN at a line start,
+    and the last one, is the plain block's after it."""
+    return b"#" * 254 + _with_headers(_ENCRYPTED) + _real_ca("second-ca")[0]
 
 
 class _NoTlsLoad:
@@ -2136,15 +2156,38 @@ class _NoTlsLoad:
         ),
         pytest.param(_byte_order_mark_before_the_block, id="byte-order mark"),
         pytest.param(_encrypted_key_beside_the_certificate, id="encrypted key block"),
+        pytest.param(_encrypted_block_then_a_plain_one, id="header block, then a plain block"),
+        pytest.param(
+            _mid_line_begin_with_headers_then_a_plain_block,
+            id="BEGIN after 254 bytes with headers, then a plain block",
+        ),
+        # The check errs wide on purpose (has_encryption_header's docstring), so these refuse
+        # though no block carries a header, and the refusal text says so (BACKLOG #3105).
+        pytest.param(
+            lambda: _real_ca("crl-test-ca")[0] + b"Proc-Type: noted\n" + _real_ca("second-ca")[0],
+            id="comment between blocks",
+        ),
+        pytest.param(
+            lambda: _real_ca("crl-test-ca")[0] + b"# DEK-Info: noted\n", id="after the last END"
+        ),
+        pytest.param(
+            lambda: (
+                b"# paste the -----BEGIN block below, no Proc-Type: line\n"
+                + _real_ca("crl-test-ca")[0]
+            ),
+            id="comment above the first block that holds a BEGIN",
+        ),
     ],
 )
 def test_an_encrypted_pem_block_refuses_before_the_tls_load(
     monkeypatch: pytest.MonkeyPatch, shape: Any
 ) -> None:
+    """Every shape is refused before the load, with the text naming the check's real scope."""
     spec = AnchorSpec("api_client", "[api].tls_client_ca_file", "ca.pem", None)
     monkeypatch.setattr(ta, "ssl", _NoTlsLoad)
-    with pytest.raises(TrustAnchorError, match="holds a PEM block with an encryption header"):
+    with pytest.raises(TrustAnchorError) as err:
         ta.anchor_cadata(shape(), spec)
+    assert ta._ENCRYPTION_HEADER_SCOPE in str(err.value)
 
 
 def test_an_encryption_header_outside_a_block_still_passes() -> None:
@@ -2171,6 +2214,144 @@ async def test_the_preflight_refuses_an_encrypted_anchor_as_the_consumer_does(
     assert str(central.value) == str(consumer.value)
     assert "encryption header" in str(central.value)
     assert "pem_refused" in {r["event"] for r in await _rows(store, "api_client")}
+
+
+# --- BACKLOG #3105: the repr sites engine PR 2063 left without a test -----------------------------
+#
+# The icacls call and the POSIX stat are stood in, but each runs only on its own platform: patching
+# os.name would hand pytest the wrong pathlib flavour (see the note above the DACL pin test). The
+# chain walks take their host reads as arguments and run everywhere.
+
+
+def test_the_encryption_header_refusal_quotes_the_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    spec = AnchorSpec("api_client", "[api].tls_client_ca_file", _CONTROL_PATH, None)
+    monkeypatch.setattr(ta, "ssl", _NoTlsLoad)
+    with pytest.raises(TrustAnchorError, match="encryption header") as err:
+        ta.anchor_cadata(_with_headers(_ENCRYPTED), spec)
+    _quoted(str(err.value))
+
+
+def test_the_vault_hop_states_the_same_scope() -> None:
+    """strict_requests keeps its own copy of the scope sentence (its marked refusals may use only
+    its own literals), so the two are compared exactly here. Read from the source, so this runs on
+    a leg without the [vault] extra."""
+    import ast
+
+    import messagefoundry.transports as transports
+
+    source = (Path(transports.__file__).parent / "strict_requests.py").read_text(encoding="utf-8")
+    (value,) = [
+        stmt.value.value
+        for stmt in ast.parse(source).body
+        if isinstance(stmt, ast.Assign)
+        and any(isinstance(n, ast.Name) and n.id == "_ENCRYPTED_CA_TEXT" for n in stmt.targets)
+        and isinstance(stmt.value, ast.Constant)
+    ]
+    assert value == ta._ENCRYPTION_HEADER_SCOPE
+
+
+def _ran(returncode: int, stdout: str | None, stderr: str = "") -> Any:
+    return subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+
+def _icacls_fails() -> Any:
+    raise OSError(2, "icacls could not be started")
+
+
+@pytest.mark.parametrize(
+    "ran",
+    [
+        pytest.param(_icacls_fails, id="icacls could not run"),
+        pytest.param(lambda: _ran(0, None), id="no readable output"),
+        pytest.param(
+            lambda: _ran(5, "", f"{_CONTROL_PATH}: Access is denied."), id="exit non-zero"
+        ),
+        pytest.param(lambda: _ran(0, "this is not icacls output\n"), id="no readable ACE"),
+    ],
+)
+@_windows_only
+def test_each_icacls_log_branch_quotes_the_path(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, ran: Any
+) -> None:
+    """The non-zero exit is the control: a real icacls already reached it."""
+    monkeypatch.setattr(subprocess, "run", lambda *_a, **_k: ran())
+    with caplog.at_level("WARNING", logger=ta.log.name):
+        assert dacl_is_owner_only(_CONTROL_PATH) is None
+    (record,) = [r for r in caplog.records if r.name == ta.log.name]
+    _quoted(record.getMessage())
+
+
+@_posix_only
+def test_the_posix_stat_log_quotes_the_path(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    class _Unstatable:
+        def __init__(self, _name: str) -> None:
+            pass
+
+        def stat(self) -> Any:
+            raise OSError(13, "denied")
+
+    monkeypatch.setattr(ta, "Path", _Unstatable)
+    with caplog.at_level("WARNING", logger=ta.log.name):
+        assert dacl_is_owner_only(_CONTROL_PATH) is None
+    (record,) = [r for r in caplog.records if r.name == ta.log.name]
+    _quoted(record.getMessage())
+
+
+def test_the_volume_cause_quotes_the_root() -> None:
+    from messagefoundry.auth import anchor_path as ap
+
+    root = "\x1b:\\"
+    _chain, cause = ap.windows_chain(
+        "\x1b:\\anchors\\ca.pem",
+        "C:\\",
+        lambda _p: (ap.DIRECTORY, None),
+        volume_cause=lambda _root: "it is a FAT volume",
+    )
+    assert cause == f"{root!r}: it is a FAT volume"
+    _no_raw_control(cause)
+
+
+def test_a_link_to_a_path_the_check_does_not_read_quotes_the_link() -> None:
+    from messagefoundry.auth import anchor_path as ap
+
+    def probe(p: str) -> tuple[str, str | None]:
+        return (ap.LINK, "") if "FORGED" in p else (ap.DIRECTORY, None)
+
+    _chain, cause = ap.windows_chain("C:\\evil\nFORGED\x1b[31m\\ca.pem", "C:\\", probe)
+    assert cause is not None and cause.startswith("the link ")
+    assert repr("C:\\evil\nFORGED\x1b[31m") in cause
+    _no_raw_control(cause)
+
+
+def test_the_posix_sticky_link_reason_quotes_the_folder() -> None:
+    """A link owned by another uid in a sticky, world-writable folder whose name holds a newline
+    and an escape byte. The reason names that folder, and the path a finding carries is quoted
+    later, by the message that prints it."""
+    from messagefoundry.auth import anchor_path as ap
+
+    folder = "/tmp\nFORGED\x1b[31m"
+    stats = {
+        "/": ap.PosixStat(0, 0o040755),
+        folder: ap.PosixStat(0, 0o041777),
+        folder + "/ca.pem": ap.PosixStat(1234, 0o120777),
+    }
+
+    def unreadable_link(_p: str) -> str:
+        raise OSError(13, "denied")
+
+    verdict = ap.posix_path_verdict(
+        folder + "/ca.pem",
+        cwd="/",
+        euid=1000,
+        lstat_fn=lambda p: stats[p],
+        readlink_fn=unreadable_link,
+        fstype_fn=lambda _p: ("/", "ext4"),
+    )
+    (reason,) = [f.reason for f in verdict.findings if f.kind == ap.LINK and f.insecure]
+    assert repr(folder) in reason, reason
+    _no_raw_control(reason)
 
 
 # --- BACKLOG #2183: an unreadable inbound CA audits as trust_anchor, as a settings anchor does ------
