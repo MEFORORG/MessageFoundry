@@ -309,9 +309,12 @@ environment, less any empty or relative `PYTHONPATH` entry. Autostart starts the
 process with the same interpreter options plus `-E`, under the plain `pythonw.exe`. It goes through
 the script only from a checkout. Windows hands that process the user's environment unfiltered.
 `-E` makes the interpreter ignore its `PYTHON*` variables, so no `PYTHONPATH` entry reaches that
-process's import path (vault BACKLOG #2852). The relaunch it starts does read the user's
-`PYTHONPATH`, as above. A tray started by hand gets none of the options. Section 3, under
-*Autostart starts the tray with the interpreter options; a tray started by hand does not*, says what that means for its import path. The other
+process's import path (vault BACKLOG #2852). The relaunch it starts repeats that `-E`, and the `-s`
+the login command adds where `PYTHONNOUSERSITE` is set, as every Python child repeats its parent's
+isolation (vault BACKLOG #2701). A tray started by hand gets none of the options, and its relaunch
+reads the user's `PYTHONPATH`. Section 3, under
+*Autostart starts the tray with the interpreter options; a tray started by hand does not*, says what that means for its import path. The `icacls.exe` and `sc.exe` starts get
+the platform's start-up names and nothing else, from the same module (vault BACKLOG #2716). The other
 starts in the table hand over the whole environment. One of them leaves two names out: when the
 tray starts VS Code, it drops the two variables VS Code's own launcher manages. `tests/test_child_process_environment.py`
 lists each of those with its reason, and fails a new start whose environment does not come from
@@ -394,8 +397,8 @@ pure-Python equivalent:
 - Diagnostics: `crashdump.py`
 - Start-up code check: `startupcode.py`, which on Windows opens each directory the interpreter
   reads start-up code from with `kernel32`'s `CreateFileW`, asking only for the right to add a
-  file or a folder. Those are the site directories and every directory on the import path, the
-  engine's own and the absolute `PYTHONPATH` entries it hands its Python children. Windows runs
+  file or a folder. Those are the site directories and every directory on the engine's import
+  path, which its Python children share. Windows runs
   its own access check against the engine's token, so the engine learns whether its account
   could plant start-up code there. Nothing is created or changed. POSIX needs no `ctypes` for
   this; it asks `os.access` (vault BACKLOG #2701)

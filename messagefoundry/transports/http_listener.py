@@ -775,6 +775,15 @@ class HttpSource(SourceConnector):
         # connections and bound the wait (mirrors MLLPSource, review H-2 / #55).
         self._clients: set[asyncio.StreamWriter] = set()
         self._client_tasks: set[asyncio.Task[None]] = set()
+        if self.max_body_bytes is None:
+            # Turning the body cap off is documented, so it is allowed, but never silent (BACKLOG
+            # #2749, as FileSource does for its caps). Logged after every check in this constructor,
+            # so a source it refuses has not logged it. The line names the setting, never its value.
+            logger.warning(
+                "HTTP source %s: max_body_bytes is off, so a request body of any declared size is "
+                "read whole; set a positive value to bound it",
+                config.name or f"{self.host}:{self.port}",
+            )
 
     async def start(
         self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None
@@ -1078,7 +1087,7 @@ class HttpSource(SourceConnector):
                     ),
                 )
                 return  # pre-ingress refusal — nothing accepted, so nothing to count
-            self._admission.admit(peer_host)
+            epoch = self._admission.admit(peer_host)
             established = True  # set with the admit, so the finally below always releases it
             await self._emit_event("established", peer_host=peer_host)
             failed = await self._serve_one(reader, writer, peer_host=peer_host)
@@ -1094,7 +1103,7 @@ class HttpSource(SourceConnector):
             await self._write_safely(writer, build_response(500, '{"error":"internal error"}'))
         finally:
             if established:
-                self._admission.release(peer_host)
+                self._admission.release(peer_host, epoch)
             self._clients.discard(writer)
             if task is not None:
                 self._client_tasks.discard(task)

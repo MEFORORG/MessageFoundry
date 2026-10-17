@@ -47,7 +47,8 @@ rather than buffered whole. That matters here more than on any other intake: thi
 the body *before* an ingress row exists, so no admission bound further down the pipeline can see it.
 The refusal is a content refusal, not a transient one — the file is quarantined to ``error_subdir``
 and logged, exactly as an over-listed-size or content-sniff reject is. ``max_file_bytes=0`` disables
-both charges (unbounded), which is the operator's explicit choice.
+both charges (unbounded), which is the operator's explicit choice, and the source logs a WARNING
+saying so each time it is built (BACKLOG #2749).
 
 **Idempotency.** Delivery is at-least-once (an upload may re-send) and a poll may re-emit a file that
 was handled but not yet marked, so downstream consumers **must** tolerate duplicates.
@@ -2453,6 +2454,15 @@ class RemoteFileSource(SourceConnector):
         self._other_form_warned_at: float | None = None
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        if self._max_file_bytes is None:
+            # Turning the cap off is documented, so it is allowed, but never silent (BACKLOG #2749,
+            # as FileSource does for its caps). Logged after every check in this constructor, so a
+            # source it refuses has not logged it. The line names the setting, never its value.
+            logger.warning(
+                "REMOTEFILE source %s: max_file_bytes is off, so a retrieve is read whole with no "
+                "byte ceiling; set a positive value to bound it",
+                self._connection or _where(self._host, self._remote_dir),
+            )
 
     async def start(
         self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None

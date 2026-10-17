@@ -13,6 +13,7 @@ from __future__ import annotations
 from messagefoundry.api.models import RELOAD_REFUSED_CHANNEL_SCOPED, ConfigProvenance, ReloadResult
 
 from .._html import Markup, el, page, register_nav, rows_table, text
+from ._common import _reload_shortfall
 from .approvals import approvals_link
 
 __all__ = ["config_page", "reload_pending", "reload_result"]
@@ -98,7 +99,13 @@ def config_page(prov: ConfigProvenance | None = None) -> Markup:
 
 
 def reload_result(result: ReloadResult) -> Markup:
-    """The outcome of a successful config reload — the element counts of the now-live graph."""
+    """The outcome of a successful config reload: the element counts of the now-live graph, and a
+    banner for each thing the reload left undone (:func:`._common._reload_shortfall`)."""
+    shortfall = _reload_shortfall(
+        degraded=result.degraded,
+        failures=result.failures,
+        restart_required=result.restart_required,
+    )
     tbl = rows_table(
         ["Element", "Count"],
         [
@@ -111,6 +118,7 @@ def reload_result(result: ReloadResult) -> Markup:
     body = el(
         "div",
         el("h1", "Configuration reloaded"),
+        *(el("p", sentence, class_="banner") for sentence in shortfall),
         el("p", "The code-first graph is now live.", class_="muted"),
         tbl,
         el("p", el("a", "← Configuration", href="/ui/config")),

@@ -414,12 +414,20 @@ def _canonical_group_dns(groups: list[str]) -> list[str]:
     what it returns, in the same order. A short name used to match a same-named group in any unit,
     so it is refused rather than stored. The canonical form is the one ``_resolve_groups`` gives a
     member's groups, so a key matches however it escapes a value (:func:`canonical_group_dn`). The
-    store still strips and folds case, which changes nothing in that form. A blank key stays blank,
-    and the store drops it as it always has. A canonical key longer than
-    :data:`_STORED_GROUP_MAX` is refused too."""
+    store still strips and folds case, which changes nothing in that form. A key that is blank
+    once a space, a tab and a line break are trimmed stays blank, and the store drops it as it always has. A
+    canonical key longer than :data:`_STORED_GROUP_MAX` is refused too."""
     # Outer white space is trimmed first: a pasted key often carries a line break, and the last
-    # RDN of a group DN is a domain component, which holds none.
-    keys = [g.strip() for g in groups]
+    # RDN of a group DN is a domain component, which holds none. Only a space, a tab and a line
+    # break are trimmed (BACKLOG #3222). A key that still starts or ends with a character that
+    # does not print, such as a no-break space or a zero-width space, is refused with its own
+    # reason: trimming it guessed, and keeping a trailing one stored a key that matches no group.
+    keys = [g.strip(" \t\r\n") for g in groups]
+    _refuse_group_keys(
+        sorted({k for k in keys if k and not (k[0].isprintable() and k[-1].isprintable())}),
+        "AD group starts or ends with white space other than a space, a tab or a line break, or "
+        "with another character that does not print",
+    )
     canonical = [canonical_group_dn(k) if k else "" for k in keys]
     pairs = list(zip(keys, canonical, strict=True))
     _refuse_group_keys(
@@ -436,13 +444,16 @@ def _canonical_group_dns(groups: list[str]) -> list[str]:
 
 
 def _refuse_group_keys(bad: list[str], reason: str) -> None:
-    """Raise the 400 naming the first :data:`_GROUPS_NAMED` of ``bad``, if there are any."""
+    """Raise the 400 naming the first :data:`_GROUPS_NAMED` of ``bad``, if there are any.
+
+    A key holding a character that does not print is named in its ``ascii()`` form, so a no-break
+    space cannot pass for a plain one in the message (BACKLOG #3222)."""
     if bad:
         more = len(bad) - _GROUPS_NAMED
+        named = [k if k.isprintable() else ascii(k) for k in bad[:_GROUPS_NAMED]]
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            f"{reason}; refused: {', '.join(bad[:_GROUPS_NAMED])}"
-            + (f" and {more} more" if more > 0 else ""),
+            f"{reason}; refused: {', '.join(named)}" + (f" and {more} more" if more > 0 else ""),
         )
 
 

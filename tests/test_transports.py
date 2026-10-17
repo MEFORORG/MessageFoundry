@@ -1749,11 +1749,11 @@ def test_file_source_member_cap_refuses_zero_and_bad_values(bad: object) -> None
         FileSource(Source(type=ConnectorType.FILE, settings=settings))
 
 
-def _decompressed_cap_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+def _cap_off_warnings(caplog: pytest.LogCaptureFixture, knob: str) -> list[logging.LogRecord]:
     return [
         r
         for r in caplog.records
-        if r.levelno == logging.WARNING and "max_decompressed_bytes is off" in r.getMessage()
+        if r.levelno == logging.WARNING and f"{knob} is off" in r.getMessage()
     ]
 
 
@@ -1766,7 +1766,7 @@ def test_file_source_warns_once_when_the_decompressed_byte_cap_is_off(
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.file"):
         src = FileSource(Source(type=ConnectorType.FILE, name="IB_DEMO_ADT", settings=settings))
     assert src.max_decompressed_bytes is None
-    [record] = _decompressed_cap_warnings(caplog)
+    [record] = _cap_off_warnings(caplog, "max_decompressed_bytes")
     assert "IB_DEMO_ADT" in record.getMessage()
 
 
@@ -1784,7 +1784,66 @@ def test_file_source_does_not_warn_while_the_decompressed_byte_cap_holds(
     # Without decompress the cap is never read, so turning it off changes nothing to warn about.
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.file"):
         FileSource(Source(type=ConnectorType.FILE, settings={"directory": "x", **settings}))
-    assert _decompressed_cap_warnings(caplog) == []
+    assert _cap_off_warnings(caplog, "max_decompressed_bytes") == []
+
+
+@pytest.mark.parametrize("off", [0, None, "0"], ids=["zero", "none", "zero-text"])
+def test_file_source_warns_once_when_max_file_bytes_is_off(
+    off: object, caplog: pytest.LogCaptureFixture
+) -> None:  # #2749
+    # Off is documented and allowed, but never silent. The line names the connection and the setting.
+    # Red mutation: drop the warning from FileSource.__init__. No record is found.
+    settings = {"directory": "x", "max_file_bytes": off}
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.file"):
+        src = FileSource(Source(type=ConnectorType.FILE, name="IB_DEMO_ADT", settings=settings))
+    assert src.max_file_bytes is None
+    [record] = _cap_off_warnings(caplog, "max_file_bytes")
+    assert "IB_DEMO_ADT" in record.getMessage()
+
+
+async def test_file_source_default_max_file_bytes_warns_nothing_and_still_refuses_oversize(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:  # #2749
+    # The control for the warning above: the shipped default says nothing, and a drop one byte past it
+    # is still quarantined unread.
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    (inbox / ".error").mkdir()  # start() would make it; _scan_once is driven directly here
+    with (inbox / "big.hl7").open("wb") as fh:
+        fh.truncate(DEFAULT_MAX_FILE_BYTES + 1)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.file"):
+        src = _file_source_for(inbox)
+    assert _cap_off_warnings(caplog, "max_file_bytes") == []
+    received: list[bytes] = []
+
+    async def handler(raw: bytes) -> None:
+        received.append(raw)
+
+    src._handler = handler
+    await src._scan_once()  # the settle poll (BACKLOG #1811): records the stat, reads nothing
+    await src._scan_once()
+    assert received == []
+    assert (inbox / ".error" / "big.hl7").exists()
+
+
+@pytest.mark.parametrize("bad", [-1, -0.5, "-1", "-0.5"])
+def test_file_source_refuses_a_negative_min_age_seconds(bad: object) -> None:  # #3151
+    # Red mutation: drop the negative check from FileSource.__init__. Every case builds.
+    settings = {"directory": "x", "min_age_seconds": bad}
+    refusal = (
+        "file source min_age_seconds must be a number of seconds, zero or more (value withheld)"
+    )
+    with pytest.raises(ValueError, match=f"^{re.escape(refusal)}$"):
+        FileSource(Source(type=ConnectorType.FILE, settings=settings))
+
+
+@pytest.mark.parametrize("ok", ["unset", 0, 0.0, "0", "-0", 2.5, "3600"])
+def test_file_source_accepts_zero_or_a_positive_min_age_seconds(ok: object) -> None:  # #3151
+    # The control for the refusal above: unset (the shipped default of zero), a zero in any exact
+    # spelling, a negative zero, and a positive value all build.
+    settings = {"directory": "x"} if ok == "unset" else {"directory": "x", "min_age_seconds": ok}
+    src = FileSource(Source(type=ConnectorType.FILE, settings=settings))
+    assert src.min_age_seconds == (0.0 if ok == "unset" else float(str(ok)))
 
 
 async def test_file_source_quarantines_corrupt_archive(tmp_path: Path) -> None:

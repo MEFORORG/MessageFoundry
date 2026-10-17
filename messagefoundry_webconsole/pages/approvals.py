@@ -43,7 +43,7 @@ from messagefoundry.api.models import (
 )
 
 from .._html import Markup, el, page, register_nav, rows_table
-from ._common import _seg
+from ._common import _reload_shortfall, _seg
 from .monitoring import _post_button, _ts
 
 __all__ = [
@@ -328,21 +328,24 @@ def approvals_page(listing: ApprovalList, *, notice: str = "") -> Markup:
 def _shortfall(result: dict[str, object]) -> str | None:
     """The sentence for a release whose operation returned without doing all of its work, or None.
 
-    Two shapes are known: a purge that skips (``skipped``, for example an outbound still running)
-    and a reload that swapped the graph with a follow-on step failed (``degraded``). The request is
-    closed either way, so the page says what to do rather than reporting a plain success."""
+    At least these shapes are known: a purge that skips (``skipped``, for example an outbound still
+    running), and a reload that swapped the graph with a follow-on step failed (``degraded``) or
+    with a changed trust anchor that takes a restart (``restart_required``, BACKLOG #3015). The
+    request is closed either way, so the page says what to do rather than reporting a plain
+    success."""
     skipped = result.get("skipped")
     if skipped:
         return (
             f"The operation skipped its work: {skipped}. Nothing was changed, and this request is "
             "closed. Clear the cause, then request the operation again."
         )
-    if result.get("degraded"):
-        return (
-            f"The reload applied, and at least one follow-on step failed: {result.get('failures')}. "
-            "The new graph is live; finish those steps by hand."
-        )
-    return None
+    failures, restart = result.get("failures"), result.get("restart_required")
+    sentences = _reload_shortfall(
+        degraded=bool(result.get("degraded")),
+        failures=[str(f) for f in failures] if isinstance(failures, list) else [],
+        restart_required=[str(s) for s in restart] if isinstance(restart, list) else None,
+    )
+    return " ".join(sentences) or None
 
 
 def approval_approved(result: ApprovalDecisionResult) -> Markup:
