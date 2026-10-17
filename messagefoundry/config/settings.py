@@ -3342,7 +3342,7 @@ class AuthSettings(_Section):
     # with no non-blank required value is refused at load (BACKLOG #2032), and so is setting it
     # while oidc_require_mfa_claim is off (BACKLOG #2325). A whitespace-only value loads as None.
     oidc_acr_values: str | None = None
-    oidc_prompt: str | None = None  # requested `prompt` authorize param
+    oidc_prompt: str | None = None  # requested `prompt` authorize param; blank loads as None
     oidc_jwks_ttl_seconds: int = 3600
     oidc_jwks_min_refetch_seconds: int = 300  # the amplification bound
     oidc_flow_ttl_seconds: int = 300  # single-use flow window; validator-capped 30..1800
@@ -3611,12 +3611,12 @@ class AuthSettings(_Section):
         # lists compared with a token claim; a non-string item is left for the type check to refuse.
         return _normalise_claim_value_list(v)
 
-    @field_validator("oidc_acr_values")
+    @field_validator("oidc_acr_values", "oidc_prompt")
     @classmethod
-    def _normalise_oidc_acr_values(cls, v: str | None) -> str | None:
-        # BACKLOG #2325: the request is space-separated (OIDC Core, the authentication request). A whitespace-only
-        # value names no class, so it becomes None and the authorization request carries no
-        # acr_values at all, rather than the raw blanks it used to send.
+    def _normalise_space_separated_request(cls, v: str | None) -> str | None:
+        # BACKLOG #2325, and #3221 for prompt: both requests are space-separated (OIDC Core, the
+        # authentication request). A whitespace-only value names nothing, so it becomes None and the
+        # authorization request does not carry it, rather than the raw blanks it used to send.
         if v is None:
             return None
         return " ".join(v.split()) or None
