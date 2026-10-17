@@ -2591,16 +2591,29 @@ and `/ui/mfa` and `/ui/reauth` say the same. A local account is never looked up.
 **The passkey leg asks the same question before it checks an assertion (BACKLOG #2239).** A passkey
 opens no window, but it does mark the factor met. So without the check, an account disabled in the
 directory would clear the MFA gate with its passkey until the reconciliation pass revoked it.
-`finish_webauthn_assertion` uses the same lookup and refuses the same answers. It asks after the
-second-step lock and the `[auth].mfa_verify_min_elapsed_seconds` floor, and before it takes the
-challenge. That includes a row with no directory object id, refused without a lookup as on the code
-leg, so such an account cannot clear the MFA gate by verifying a passkey either. After a confirmed lookup
+`finish_webauthn_assertion` uses the same lookup and refuses the same answers, through the one
+helper both legs call (`_directory_vouches_for_factor`, BACKLOG #3068). That includes a row with
+no directory object id, refused without a lookup as on the code leg, so such an account cannot
+clear the MFA gate by verifying a passkey either. It asks after the second-step lock and the
+`[auth].mfa_verify_min_elapsed_seconds` floor, and only once a ceremony is staged for the session,
+before it takes the challenge. A post with nothing staged, which includes every post from an
+account that holds no passkey, gets the plain failure audited `reason=expired` and causes no
+lookup, so a caller that has proved nothing does not learn what the directory said (BACKLOG
+#3068). After a confirmed lookup
 the leg reads the session, the account and its lock again. A refusal checks
 no assertion, leaves the challenge in flight, leaves the sign count alone, and charges nothing to
 the lockout. It is audited as `auth.webauthn_failed` with
 `reason=directory_unconfirmed` and the lookup's outcome. For that refusal
 `POST /ui/reauth/webauthn` answers **400** with the same words the other legs use. A session or
 account gone after the lookup answers **401**.
+
+**Both second-factor legs read the session, the account and its lock once more right before they
+write the factor (BACKLOG #3068).** This applies to every account, local ones included. A
+revocation, a disable or a second-step lock that lands while a good code or a good assertion is
+being checked stops the write, so the factor is not marked and no counter is cleared. A session or
+account gone then answers as gone; a lock answers as the leg's locked refusal, audited
+`reason=locked`. On the passkey leg the sign count has already moved by then, because the passkey
+did sign that challenge.
 
 **Both legs also refuse a present account that lost a role in the directory (BACKLOG #2240).** The
 lookup returns the account's groups, and the engine maps them to roles as the reconciliation pass
@@ -4718,13 +4731,16 @@ Only a check the engine runs can raise that. It may be, at least, a password or 
 engine verified itself, a signed `amr` or `acr` value its claim gate accepted, or a step-up it ran. OIDC requires two values: an
 `auth_time`, and, while the claim gate is on, a configured `amr` or `acr`. A token missing either is
 refused, which grants nothing. The table covers at least these legs. Each cell was read against the
-code at engine commit `3345056505`, and the Where column names the code that does it.
+code at engine commit `3345056505`, and the Where column names the code that does it, except the
+**WebAuthn passkey** cell. That cell was read against engine commit `35f95e3f3a` with the BACKLOG
+#3068 change applied, because its directory sentences describe code merged after `3345056505`
+(BACKLOG #2239).
 
 | Leg | What reaches the engine about strength or recency | What the engine assumes when that says nothing | Where |
 |---|---|---|---|
 | **Local password** | No outside provider. The engine checks the password itself, so it knows what it checked | Mints the session MFA-verified only when the sign-in owes no second factor, or when a combined sign-in proved a TOTP code in the same request. Otherwise the session is MFA-pending. At sign-in, the step-up window opens only in two cases. One is a sign-in that owes no factor and is not from a first-seen address. The other is a combined sign-in | `AuthService._login_local`: `mfa_verified=not mfa_required` and its `seed_reauth` expression |
 | **Engine TOTP or recovery code** | No outside provider. The engine checks the code itself | A good code marks the session's second factor and stamps the step-up window. Since BACKLOG #2142 it stamps no window on an `oidc` session, whose window opens only at the IdP. A directory account gets there only after the directory confirms the account (BACKLOG #2023) | `AuthService.verify_mfa` |
-| **WebAuthn passkey** | The authenticator's user-verification flag | Not relied on. The engine asks for `user_verification=preferred` and verifies without requiring the flag, so a passkey counts as one possession factor and never more. No sign-in accepts a passkey alone, so it is always the second factor. It marks the second factor and stamps no step-up window. For a directory account, the engine asks the directory before it verifies a passkey (BACKLOG #2239; see [step-up](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)). Registering a passkey also marks the factor, and the engine does not ask the directory there; the step-up window gates that route | `auth/webauthn.py` `verify_assertion`; `AuthService.finish_webauthn_assertion` |
+| **WebAuthn passkey** | The authenticator's user-verification flag | Not relied on. The engine asks for `user_verification=preferred` and verifies without requiring the flag, so a passkey counts as one possession factor and never more. No sign-in accepts a passkey alone, so it is always the second factor. It marks the second factor and stamps no step-up window. For a directory account, the engine asks the directory before it verifies a passkey (BACKLOG #2239); [step-up](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753) states when and what it refuses. Registering a passkey also marks the factor, and the engine does not ask the directory there; the step-up window gates that route | `auth/webauthn.py` `verify_assertion`; `AuthService.finish_webauthn_assertion` |
 | **Kerberos / SPNEGO** | A service ticket. It carries no factor-strength or sign-in-time value that `pyspnego` surfaces | One factor and no recent sign-in. The session is minted `mfa_verified=False`, with no step-up window. While `[security].require_mfa` is on (the default), such a directory session owes an engine factor whatever `require_mfa_scope` says | `AuthService._authenticate_kerberos`; `AuthService._complete_ad_login`, where `seed_reauth=False` is a constant; `AuthService._unverified_session_owes_factor` |
 | **AD bind, step-up only** | Whether the bind as the user succeeded. Nothing about the directory's own MFA | Not a sign-in since BACKLOG #1137. It re-proves the password behind a Kerberos session and stamps the step-up window. It grants no second factor: `reauth` stamps the window and never marks the factor. The directory's MFA is not delegated (BACKLOG #1144) | `AuthService.reauth` |
 | **OIDC sign-in, recency** | `auth_time` in the signed `id_token`. The engine asks for it by sending `max_age` on every authorization request | Refused, with no time assumed. A missing `auth_time` fails as `auth_time_missing`, and one older than `[auth].oidc_max_age_seconds` as `auth_time_stale`. An accepted session also ends at `auth_time + oidc_max_age_seconds` when that is sooner than its other caps | `_check_auth_time` in `auth/oidc/claims.py`; `AuthService._authenticate_oidc` |
