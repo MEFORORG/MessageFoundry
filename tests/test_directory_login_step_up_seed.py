@@ -9,7 +9,8 @@ whole ``step_up_max_age_seconds`` window with no directory interaction. One path
 
 Now ``_complete_ad_login`` passes ``seed_reauth=False`` itself, and no directory entry point takes
 the argument. Each test names the change that turns it RED. The console half of the pair lives in
-``packaging/messagefoundry-webconsole/tests/test_webui.py``, ``test_sso_session_not_reauth_seeded``.
+``packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py``,
+``test_sso_session_not_reauth_seeded``.
 """
 
 from __future__ import annotations
