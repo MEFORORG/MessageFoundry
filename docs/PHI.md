@@ -584,7 +584,9 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    bound to its path, so trusting it would let a planted one name another upload for the prune to
    delete, lift a quota with a negative size, or fail every save. `rotate-key` stamps the key's rotation date only when the key
    actually changed, so running it with the same key to seal uploads does not reset the key-age
-   clock.
+   clock. It also writes no stamp, and exits non-zero, when it skipped an upload or its audit-chain
+   step did not complete (BACKLOG #3181). The next `serve` start stamps a changed key all the same,
+   so a stamp does not prove that a rotation completed.
    **At least one kind of refused upload is never sealed, so it is kept inside retention another way
    (BACKLOG #2322).** It is a plaintext sidecar over a body that is missing or is not text. Sealing it would list an
    upload with no usable body, and would seal a planted lone sidecar too, so `rotate-key` leaves it
@@ -647,8 +649,8 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`). **Rotation** = set the new active key, keep the prior key in
    `…_RETIRED`, run **`messagefoundry rotate-key`** (offline) to re-encrypt every value under the new
    key, then drop the retired key. `rotate-key` also opens a new range of the audit chain under the new
-   key and verifies the chain first; do not drop the retired key until it has printed its audit line
-   without an error ([ADR 0193](adr/0193-audit-chain-key-ranges-survive-a-store-key-rotation.md),
+   key and verifies the chain first; do not drop the retired key until it exits 0 and prints its audit
+   line as `OK:` ([ADR 0193](adr/0193-audit-chain-key-ranges-survive-a-store-key-rotation.md),
    BACKLOG #1904). Keep the retired key through the engine's first start after the rotation too. The
    secret-rotation watcher keys its fingerprints off the store key, and that start re-keys them. With
    the retired key in hand, a secret changed in the same window still reads as rotated. Without it,
