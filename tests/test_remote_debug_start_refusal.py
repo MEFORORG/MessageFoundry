@@ -16,7 +16,9 @@ import logging
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 
@@ -28,6 +30,7 @@ from messagefoundry.remotedebug import (
     remote_debug_refusal,
 )
 from messagefoundry.startupcode import InterpreterLaunch, StartupPosture
+from tests.test_isolated_launch import _needs_install
 
 # The suite stands this gate down for every other test (tests/conftest.py); these test it.
 pytestmark = pytest.mark.usefixtures("remote_debug_start_gate")
@@ -161,6 +164,49 @@ def test_the_acceptance_writes_an_audit_line_only_where_it_lifts_a_refusal(
     assert all(REMOTE_DEBUG_ACCEPTANCE in line for line in lines)
 
 
+class _PastTheReLog(Exception):
+    """Raised by the first call a start makes after the remote-debugging AUDIT re-log."""
+
+
+def _stop_past_the_re_log(*args: object, **kwargs: object) -> NoReturn:
+    raise _PastTheReLog
+
+
+def _stand_down_the_gates_before_logging(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The store-key and forwarder gates that would stop a test start before logging."""
+    monkeypatch.setattr(cli, "_store_key_file_gate", lambda settings, **kw: True)
+    monkeypatch.setattr(cli, "_forwarder_posture_refused", lambda settings, **kw: False)
+
+
+def test_serve_logs_the_audit_line_again_once_logging_reaches_its_handlers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The first AUDIT line is written before ``configure_logging`` installs the operator's
+    handlers and forwarder, so ``serve`` writes it again after ``_start_logging``. The gates in
+    between are stood down and the start is stopped by the first call after the re-log."""
+    marker = "TEST MARKER: logging has reached its handlers"
+
+    def started(*args: object, **kwargs: object) -> None:
+        logging.getLogger(cli.__name__).warning(marker)
+
+    _stand_down_the_gates_before_logging(monkeypatch)
+    monkeypatch.setattr(cli, "_store_key_configured", lambda settings: True)
+    monkeypatch.setattr(cli, "_start_logging", started)
+    monkeypatch.setattr("messagefoundry.config.settings.unread_env_warnings", _stop_past_the_re_log)
+    with caplog.at_level(logging.WARNING, logger=cli.__name__):
+        # main's last-resort handler turns the stop into a non-zero exit.
+        assert _serve(tmp_path, monkeypatch, _ON, accept=True) != 0
+    assert any("_PastTheReLog" in r.getMessage() for r in caplog.records), (
+        "the start stopped before the re-log, so this arm proves nothing"
+    )
+    messages = [r.getMessage() for r in caplog.records if r.name == cli.__name__]
+    audits = _audit_lines(caplog, "start")
+    assert len(audits) == 2, messages
+    # One as the gate ran, and one after the handlers exist.
+    started_at = messages.index(marker)
+    assert audits[0] in messages[:started_at] and audits[0] in messages[started_at + 1 :], messages
+
+
 def test_the_acceptance_is_named_as_a_loosening() -> None:
     from tests.test_security_posture_defaults import _names
 
@@ -238,20 +284,51 @@ def test_supervise_writes_the_audit_line_where_the_acceptance_lifts_its_refusal(
     assert len(lines) == 1 and REMOTE_DEBUG_ACCEPTANCE in lines[0], lines
 
 
+def test_supervise_logs_the_audit_line_again_for_the_forwarder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """With a forwarder installed, ``supervise`` writes the AUDIT line once more so the off-box
+    copy has it. The gates in between are stood down; the renewal after the re-log stops it."""
+
+    def started(*args: object, configure: Callable[[None], object], **kwargs: object) -> None:
+        # _supervise below stubs configure_logging out; a forwarder that installs is this arm.
+        monkeypatch.setattr(cli, "configure_logging", lambda *a, **k: True)
+        configure(None)
+
+    _stand_down_the_gates_before_logging(monkeypatch)
+    monkeypatch.setattr(cli, "_keyless_store_gate", lambda settings: None)
+    monkeypatch.setattr(cli, "_start_logging", started)
+    monkeypatch.setattr(cli, "_renew_api_tls_before_spawning", _stop_past_the_re_log)
+    with caplog.at_level(logging.WARNING, logger=cli.__name__), pytest.raises(_PastTheReLog):
+        _supervise(tmp_path, monkeypatch, _ON, accept=True)
+    lines = _audit_lines(caplog, "start the fleet")
+    relogged = "(Logged again for the off-box forwarder.)"
+    assert len(lines) == 2 and not lines[0].endswith(relogged) and lines[1].endswith(relogged), (
+        lines
+    )
+
+
 # --- a real interpreter, started both ways ---------------------------------------------------------
 
 
-def _real_serve(tmp_path: Path, *options: str) -> subprocess.CompletedProcess[str]:
-    env = {
+def _child_env() -> dict[str, str]:
+    """The parent's environment less what would decide the reading or the import for the child:
+    the engine's own variables, the variable that turns the interface off, and PYTHONPATH, so the
+    installed package answers and not a path the parent happened to carry."""
+    return {
         k: v
         for k, v in os.environ.items()
-        if not k.startswith("MEFOR_") and k != "PYTHON_DISABLE_REMOTE_DEBUG"
+        if not k.upper().startswith("MEFOR_")
+        and k.upper() not in {"PYTHON_DISABLE_REMOTE_DEBUG", "PYTHONPATH"}
     }
+
+
+def _real_serve(tmp_path: Path, *options: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, *options, "-m", "messagefoundry", "serve"]
         + ["--config", str(_SAMPLES_CONFIG), "--env", "dev"],
         cwd=tmp_path,
-        env=env,
+        env=_child_env(),
         capture_output=True,
         text=True,
         timeout=50,  # under the suite's 60 s pytest-timeout
@@ -259,15 +336,28 @@ def _real_serve(tmp_path: Path, *options: str) -> subprocess.CompletedProcess[st
     )
 
 
-@pytest.mark.skipif(
-    not sys.is_remote_debug_enabled(), reason="this interpreter has remote debugging off"
-)
+@_needs_install
 def test_a_real_start_with_the_interface_on_refuses(tmp_path: Path) -> None:
+    # Decided from a child started as _real_serve starts one, not from this process: a parent run
+    # with PYTHON_DISABLE_REMOTE_DEBUG=1 or -X disable-remote-debug has the interface off itself,
+    # and the child, started without either, would still have it on.
+    probe = subprocess.run(
+        [sys.executable, "-c", "import sys; print(sys.is_remote_debug_enabled())"],
+        cwd=tmp_path,
+        env=_child_env(),
+        capture_output=True,
+        text=True,
+        timeout=50,
+        check=True,
+    )
+    if probe.stdout.strip() != "True":
+        pytest.skip("SKIP (nothing run): this interpreter build has remote debugging off")
     proc = _real_serve(tmp_path)
     assert proc.returncode == 2, proc.stderr[-2000:]
     assert _REFUSAL in proc.stderr
 
 
+@_needs_install
 def test_a_real_start_with_disable_remote_debug_gets_past_this_gate(tmp_path: Path) -> None:
     """The control for the arm above: the launch the refusal names. It stops at a later gate, the
     missing store key, which shows it ran on past this one."""
