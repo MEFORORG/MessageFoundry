@@ -6984,7 +6984,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_webauthn_label ON webauthn_credentials(user
 -- and client host where a sign-in finished owing nothing more, or a step-up or enrolment passed
 -- (AuthService._mark_login_address_known says when). Keyed on the account id, never the
 -- username, so a re-created namesake inherits nothing. The primary key serves the signal's one read
--- (WHERE user_id), so audit_log, which has no actor index, is never scanned for it. Plaintext like
+-- (WHERE user_id), so audit_log is never read for it. Plaintext like
 -- sessions.client: a network address, not PHI (docs/PHI.md section 2). ON DELETE CASCADE because
 -- the write is best-effort and may race delete_user: a row inserted just before the account's
 -- delete goes with it, and one inserted after fails the key and is dropped by the caller.

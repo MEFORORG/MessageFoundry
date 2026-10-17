@@ -721,8 +721,13 @@ _SCHEMA: list[str] = [
     "CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit_log(ts)",
     # recent_audit_of: the start's config baseline read (vault BACKLOG #2597).
     "CREATE INDEX IF NOT EXISTS ix_audit_action ON audit_log(action, id)",
-    # The lock notice's throttle read, one account's rows of one action (vault BACKLOG #3120).
-    "CREATE INDEX IF NOT EXISTS ix_audit_actor ON audit_log(actor, action, id)",
+    # The lock notice's throttle read, one account's rows of one action (vault BACKLOG #3120). Keyed
+    # on a PREFIX of the actor, because `actor` is unbounded TEXT and a btree entry over about 2.7 KB
+    # fails the INSERT: a sign-in can audit a typed username of any length, and an index on the whole
+    # value would turn an overlong one into a failed audit write. `_audit_where` filters on the same
+    # prefix and then on the whole value, so the planner can seek it. 200 characters is at most
+    # 800 bytes.
+    "CREATE INDEX IF NOT EXISTS ix_audit_actor ON audit_log(left(actor, 200), action, id)",
     # No table beside audit_log says where its keying starts: the process that holds the key decides,
     # and the chain's own row at sequence number 1 (the genesis row) names the first range's key.
     # Per-key AES-GCM invocation bound (ASVS 11.3.4) — see the SQLite `_SCHEMA` for the
@@ -8010,7 +8015,10 @@ class PostgresStore:
         params: list[Any] = []
         if actor is not None:
             params.append(actor)
-            clauses.append(f"actor = ${len(params)}")
+            # The prefix term lets the planner seek ix_audit_actor, which is keyed on that prefix
+            # (vault BACKLOG #3120); the whole-value term is what decides the match.
+            n = len(params)
+            clauses.append(f"left(actor, 200) = left(${n}::text, 200) AND actor = ${n}")
         if action is not None:
             params.append(action)
             clauses.append(f"action = ${len(params)}")

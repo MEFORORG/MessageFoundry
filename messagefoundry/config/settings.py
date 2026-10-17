@@ -3190,8 +3190,9 @@ class AuthSettings(_Section):
     # deleted or moved, or that the service account may not read at all, usually ends the search with
     # a result code instead (noSuchObject, invalidDNSyntax, insufficientAccessRights): a configuration
     # refusal, which judges no account and pages as `ad_reconcile_aborted` with reason
-    # `directory_misconfigured` rather than reaching this breaker (BACKLOG #3010). Without a brake the reconciler would sign out the entire estate during exactly the incident when
-    # operators need the console. A pass that would revoke more than BOTH of these thresholds aborts,
+    # `directory_misconfigured` rather than reaching this breaker (BACKLOG #3010). Without a brake
+    # the reconciler would sign out the entire estate during exactly the incident when operators need
+    # the console. A pass that would revoke more than BOTH of these thresholds aborts,
     # revokes nothing, and raises a loud operator-visible alert (log ERROR + an
     # `auth.ad_reconcile_aborted` audit row).
     #

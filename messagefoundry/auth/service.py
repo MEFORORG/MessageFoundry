@@ -2033,13 +2033,16 @@ _LOCK_NOTICE_WINDOW_SECONDS: Final = 24 * 3600.0
 #:
 #: The budget is NSSM's 15 s graceful-stop window (``AppStopMethodConsole`` in
 #: ``scripts/service/install-service.ps1``), not any one drain's constant (vault BACKLOG #3120). The
-#: lifespan teardown in ``api/app.py`` spends it in order, after uvicorn's own connection drain:
-#: the upload runner's stop (``uploads._DEFAULT_STOP_TIMEOUT_SECONDS``, 5 s), the long-operation
-#: drain (``api/outlive.py``, 0.5 s plus ``CANCEL_GRACE_SECONDS``, 6 s), the approval gate's drain
-#: (``api/approvals.DRAIN_TIMEOUT_SECONDS``, 3 s), then this one (2.0 s plus 0.5 s), and
-#: ``engine.stop()`` after them all. Those bounds add up to 17 s, past the window, so the
-#: teardown fits it only while they are not all busy at once; uvicorn's drain has no bound at all.
-#: A change to any of them is read against that sum.
+#: lifespan teardown in ``api/app.py`` spends it, after uvicorn's own connection drain, on at least
+#: these drains with a named bound, in order: the upload runner's stop
+#: (``uploads._DEFAULT_STOP_TIMEOUT_SECONDS``, 5 s), the long-operation drain (``api/outlive.py``,
+#: 0.5 s plus ``CANCEL_GRACE_SECONDS``, 6 s), the approval gate's drain
+#: (``api/approvals.DRAIN_TIMEOUT_SECONDS``, 3 s), then this one (2.0 s plus 0.5 s). Those alone add
+#: up to 17 s, past the window when all are busy at once. The rest of the teardown has no shared
+#: bound: uvicorn's drain, the summary-access flush, ``engine.stop()``, and the security notifier's
+#: and alert notifier's ``aclose()``, each of which drains its queue at the SMTP or transport
+#: timeout per item. So nothing here makes the teardown fit the window; a change to any bound is
+#: read against this list.
 _BACKGROUND_DRAIN_SECONDS: Final = 2.0
 _BACKGROUND_CANCEL_GRACE_SECONDS: Final = 0.5
 

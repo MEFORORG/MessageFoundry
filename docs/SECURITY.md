@@ -4261,9 +4261,10 @@ probe is refused, faulted or fails, at least one refused and none referred, the 
 Like the fault's, that alert has no inverse; an operator resolves it. **The cost:** while the
 refusal lasts, the refused accounts' sessions are never revoked by the reconciler, so they run to
 the absolute cap. Other result codes that are not an answer, such as busy or unavailable, are an
-outage. The step-up legs that ask the directory before they grant, a second-factor step-up and a
-passkey assertion, refuse the account with outcome `misconfigured`. The password step-up, a live
-re-bind, refuses it as `directory_unavailable`, the reason it gives for any directory error.
+outage. A second-factor step-up and a passkey assertion, which probe the directory before they
+grant, refuse the account with outcome `misconfigured`. At least two other step-up legs refuse it
+as `directory_unavailable`, the reason each gives for any directory error: the password step-up, a
+live re-bind, and the federated step-up's directory lookup.
 
 ### The engine session is independent of the IdP session (ASVS 7.6.1)
 
@@ -4981,8 +4982,9 @@ not push a refused sign-in past its padded slot. The task is queued per account 
 one API process. Two locks of one kind landing together there would send one mail. **One throttle
 read runs at a time in each API process, across every account**, so locks on many accounts at once
 cannot fill the store's read pool that sign-ins wait on; each mail then waits behind the reads
-queued before it. The read seeks the account's own rows on an `(actor, action, id)` index, on every
-backend (vault BACKLOG #3120). The residuals are listed below, under *Declined, each with its
+queued before it. Every backend carries an `(actor, action, id)` index for that read, keyed on a
+prefix of the actor on Postgres (vault BACKLOG #3120). That the read seeks it is measured on SQLite
+only; on Postgres and SQL Server the planner's choice is not tested. The residuals are listed below, under *Declined, each with its
 residual*. A sign-in lock
 notice on a TOTP-enrolled local account tells the owner to sign in with the password and the code
 together; a second-step notice says which factor was right and, **if the
@@ -5353,7 +5355,8 @@ and header are that route's.
   An administrator can still read each case in the audit trail, with the gaps listed below. No
   relay (`mailed: false`, `reason: no_notifier`) and no address (`mailed: false`) are on the
   `auth.lock_notice` row. A full queue and a failed send are on an `auth.lock_notice_undelivered`
-  row (BACKLOG #2383). A relay that is down still shows, on every other notice kind. An instance with no relay at all is reported at
+  row (BACKLOG #2383), and a full queue also reads `mailed: false` on the `auth.lock_notice` row
+  (vault BACKLOG #3120). A relay that is down still shows, on every other notice kind. An instance with no relay at all is reported at
   startup by the serve gate, except under `[security].enforcement = "warn"` with
   `[alerts].security_notifications_required = false`. Every other notice kind keeps its per-event
   line (BACKLOG #1139); none of them fires on a refused sign-in. The list is

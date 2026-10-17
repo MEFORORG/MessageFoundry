@@ -5,7 +5,9 @@
 The lock notice's 24-hour throttle reads one account's ``auth.lock_notice`` rows through
 ``list_audit(actor=, action=, since=, limit=50)``. With only ``ix_audit_ts`` and
 ``ix_audit_action`` that read walked every recent row of the action, for every account.
-``ix_audit_actor`` lets it seek the account's own rows, newest first.
+``ix_audit_actor`` lets it seek the account's own rows, newest first. On Postgres it keys a prefix
+of the actor, which is unbounded TEXT there. Only the SQLite plan is measured here; on the server
+backends this file checks that the index exists, not that the planner picks it.
 
 Backend-parametrized like ``test_fifo_index_migration``: the SQLite case runs everywhere; the SQL
 Server and Postgres cases run only when their ``MEFOR_TEST_*`` env is set, which the hosted service-
@@ -15,6 +17,7 @@ container legs do.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
@@ -68,15 +71,15 @@ async def _index_columns(store: Any, name: str) -> list[str]:
             cur = await db.execute(f"PRAGMA index_info({name})")
             return [r[2] for r in sorted(await cur.fetchall(), key=lambda r: r[0])]
     if backend == "postgres":
+        # pg_get_indexdef per key position, so an expression key reads as its expression.
         rows = await store._fetchall(
-            "SELECT a.attname FROM pg_index i"
-            " JOIN pg_class c ON c.oid = i.indexrelid"
-            " JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true"
-            " JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum"
+            "SELECT pg_get_indexdef(c.oid, k.ord, true) AS col FROM pg_class c"
+            " JOIN pg_index i ON i.indexrelid = c.oid"
+            " CROSS JOIN LATERAL generate_series(1, i.indnkeyatts::int) AS k(ord)"
             " WHERE c.relname = $1 ORDER BY k.ord",
             name,
         )
-        return [r["attname"] for r in rows]
+        return [str(r["col"]).replace('"', "").replace(" ", "") for r in rows]
     rows = await store._fetchall(  # sqlserver
         "SELECT c.name FROM sys.indexes i"
         " JOIN sys.index_columns ic ON ic.object_id=i.object_id AND ic.index_id=i.index_id"
@@ -89,10 +92,30 @@ async def _index_columns(store: Any, name: str) -> list[str]:
 
 
 async def test_the_actor_index_exists_on_every_backend(store: Any) -> None:
-    assert await _index_columns(store, "ix_audit_actor") == ["actor", "action", "id"]
+    # Postgres keys a prefix of the unbounded TEXT actor; see the next test.
+    actor = "left(actor,200)" if store._test_backend == "postgres" else "actor"
+    assert await _index_columns(store, "ix_audit_actor") == [actor, "action", "id"]
     # The control: the same probe reads the index that was already there, so an empty list above
     # would be the index missing, not the probe failing.
     assert await _index_columns(store, "ix_audit_action") == ["action", "id"]
+
+
+async def test_an_overlong_actor_is_still_audited_and_found(store: Any) -> None:
+    """A btree entry over about 2.7 KB fails its INSERT on Postgres, and ``actor`` is unbounded
+    there. An index on the whole value would turn an overlong typed username into a failed audit
+    write. The Postgres index keys a prefix, and ``list_audit`` still matches the whole value.
+
+    SQL Server is left out: its ``actor`` column is NVARCHAR(256), which refuses such a row at the
+    column whatever the index, so the case is not this change's to pin there."""
+    if store._test_backend == "sqlserver":
+        pytest.skip("SQL Server's actor column is NVARCHAR(256)")
+    # Random hex, which pglz cannot shrink, so compressing the index entry cannot rescue it.
+    long_actor = "".join(hashlib.sha256(str(i).encode()).hexdigest() for i in range(125))  # 8000
+    near = long_actor[:200] + "-another"  # same prefix, another actor
+    await store.record_audit(_LOCK_NOTICE, actor=long_actor, detail='{"lock": "sign_in"}')
+    await store.record_audit(_LOCK_NOTICE, actor=near, detail='{"lock": "second_step"}')
+    rows = await store.list_audit(actor=long_actor, action=_LOCK_NOTICE, since=0.0, limit=50)
+    assert [r["detail"] for r in rows] == ['{"lock": "sign_in"}']
 
 
 async def test_the_throttle_read_seeks_the_actor_index_on_sqlite(
@@ -101,7 +124,8 @@ async def test_the_throttle_read_seeks_the_actor_index_on_sqlite(
     """The plan of the statement ``list_audit`` runs for the throttle names ``ix_audit_actor``.
 
     The statement and its parameters are captured off the read connection as ``list_audit``
-    really runs them, not rebuilt here, so the test cannot drift from the method. The control is
+    really runs them, not rebuilt here, so the SQL cannot drift from the method. The filters are
+    the ones ``AuthService._lock_notice_held_back`` passes today, written out here. The control is
     an action-only read, whose plan names ``ix_audit_action``, so the instrument is known to report
     the index it uses."""
     store = await MessageStore.open(tmp_path / "plan.db")

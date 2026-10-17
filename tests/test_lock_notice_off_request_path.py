@@ -530,9 +530,8 @@ async def _peak_reads_across_accounts(
 async def test_one_throttle_read_runs_at_a_time_across_accounts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Each throttle read walks every recent ``auth.lock_notice`` row, so locks on many accounts at
-    once would fill the store's read pool that sign-ins wait on. The service runs one at a time.
-    Every account still gets its mail."""
+    """Locks on many accounts at once would each take a read from the store's pool that sign-ins
+    wait on, so the service runs one throttle read at a time. Every account still gets its mail."""
     peak, mailed, locked, stalls = await _peak_reads_across_accounts(monkeypatch, slots=None)
     assert stalls == [], stalls
     assert peak == 1, f"{peak} throttle reads ran at once"
