@@ -433,6 +433,11 @@ async def test_whole_frames_with_quiet_gaps_longer_than_the_deadline_are_not_cut
         ("tcp", b"\r", False),
         ("mllp", b"Z", True),  # CONTROL: any other byte after a completed frame starts the clock
         ("mllp", b"\r\n\r", True),  # CONTROL: line ends past the two-byte allowance are noise
+        # vault BACKLOG #2938: the newline after an X12 IEA terminator takes the same allowance.
+        ("x12", b"\r\n", False),
+        ("x12", b"\n", False),  # the CR arrived with the IEA, so the LF is the second byte
+        ("x12", b"Z", True),  # CONTROL: a byte that is not a line end starts the clock
+        ("x12", b"\r\n\r", True),  # CONTROL: three line ends are past the allowance
     ],
 )
 async def test_line_end_bytes_ending_a_frame_do_not_start_the_frame_deadline(
@@ -452,7 +457,8 @@ async def test_line_end_bytes_ending_a_frame_do_not_start_the_frame_deadline(
     framing = {"framing": "mllp"} if kind == "tcp" else {}
     source = _build(kind, max_frame_seconds=0.3, receive_timeout=5.0, **framing)
     source.on_connection_event = events
-    whole = _whole_frame("mllp")
+    # X12's frame is the interchange through its IEA terminator; the CR here is its first line end.
+    whole = _whole_frame("x12") + b"\r" if kind == "x12" else _whole_frame("mllp")
     # The `\n` row sends the CR with the frame, so the LF is the second line-end byte.
     first = whole if after == b"\n" else whole[:-1]
 
@@ -597,26 +603,80 @@ def test_the_refusal_log_defaults_match_the_dicom_server() -> None:
 # --- Stopping, and the slot accounting -------------------------------------------------------------
 
 
+class _PeerWriter:
+    """The one writer method admission reads, for a peer at ``192.0.2.7``."""
+
+    def get_extra_info(self, name: str, default: object = None) -> object:
+        return ("192.0.2.7", 4000) if name == "peername" else default
+
+
 def test_admission_refuses_while_stopping_and_releases_what_it_admits() -> None:
     gate = ListenerAdmission(
         transport="TCP", max_connections=2, max_connections_per_host=1, source_ip_allowlist=None
     )
-
-    class _W:
-        def get_extra_info(self, name: str, default: object = None) -> object:
-            return ("192.0.2.7", 4000) if name == "peername" else default
-
-    w: Any = _W()
+    w: Any = _PeerWriter()
     assert gate.check(w, "192.0.2.7") is None
-    gate.admit("192.0.2.7")
+    epoch = gate.admit("192.0.2.7")
     refusal = gate.check(w, "192.0.2.7")
     assert refusal is not None and refusal.reason == "max_connections_per_host"
-    gate.release("192.0.2.7")
+    gate.release("192.0.2.7", epoch)
     assert gate.active == 0 and gate.per_host == {}
     assert gate.host_capacity_warned == set()
     gate.stopping = True
     refusal = gate.check(w, "192.0.2.8")
     assert refusal is not None and refusal.kind is None, "a stop refusal emits no event"
+
+
+def test_a_release_from_before_a_restart_leaves_the_restarted_count_alone() -> None:
+    """vault BACKLOG #2939: a connection that outlives its listener's stop() and releases after the
+    restart has re-admitted its host must not take a slot from the new count. Without the epoch, the
+    straggler's release would drop the host to one below the cap and let a third connection in."""
+    host = "192.0.2.7"
+    w: Any = _PeerWriter()
+    gate = ListenerAdmission(
+        transport="TCP", max_connections=10, max_connections_per_host=2, source_ip_allowlist=None
+    )
+    straggler = gate.admit(host)
+    gate.stopping = True  # stop() begins; the straggler's task outlives it
+    gate.reset()
+    gate.stopping = False  # the same instance restarts
+    assert gate.check(w, host) is None
+    current = gate.admit(host)
+    assert gate.check(w, host) is None
+    gate.admit(host)
+    refused = gate.check(w, host)
+    assert refused is not None and refused.reason == "max_connections_per_host"
+    assert host in gate.host_capacity_warned
+    gate.release(host, straggler)
+    assert gate.per_host == {host: 2}, "a pre-restart release took a slot from the restarted run"
+    refused = gate.check(w, host)
+    assert refused is not None and refused.reason == "max_connections_per_host"
+    assert host in gate.host_capacity_warned, "the warned set belongs to the restarted run too"
+    # `active` counts sockets, and the straggler's was open until now, whichever run admitted it.
+    assert gate.active == 2
+    # CONTROL: a release from the current run still gives its slot back.
+    gate.release(host, current)
+    assert gate.per_host == {host: 1}
+    assert gate.check(w, host) is None
+
+
+def test_a_release_still_counts_when_a_late_stop_skipped_the_reset() -> None:
+    """The epoch advances only when reset() really clears the tables. A stop() that finishes after
+    the restart skips its reset, so the tables still hold the earlier connection's slot, and its
+    release must give that slot back, or the host would stay one short of its cap for good."""
+    host = "192.0.2.7"
+    gate = ListenerAdmission(
+        transport="TCP", max_connections=None, max_connections_per_host=2, source_ip_allowlist=None
+    )
+    earlier = gate.admit(host)
+    gate.stopping = True
+    gate.stopping = False  # restarted before the stop() reached its reset
+    gate.reset()  # the late stop(): a no-op now
+    gate.admit(host)
+    assert gate.per_host == {host: 2}
+    gate.release(host, earlier)
+    assert gate.per_host == {host: 1}
+    assert gate.active == 1
 
 
 @pytest.mark.parametrize("kind", ["tcp", "x12", "http"])
@@ -701,6 +761,54 @@ async def test_a_stop_cut_short_in_its_wait_still_clears_the_per_host_count(
     finally:
         release.set()
         if writer is not None:
+            await _close(writer)
+        await asyncio.wait_for(source.stop(), timeout=10.0)
+
+
+@pytest.mark.parametrize("kind", ["mllp", "tcp", "x12"])
+async def test_a_straggler_releasing_after_a_restart_leaves_the_new_per_host_count(
+    kind: str,
+) -> None:
+    """vault BACKLOG #2939, end to end through the listener's own admit and release. A client held
+    in its handler outlives a stop() cut short; the same instance restarts and admits the host
+    again; then the straggler releases. The restarted run's count must still hold its connection.
+    This pins the MLLP, raw-TCP and X12 listeners passing on the epoch their admit returned. The
+    HTTP listener's handler has another shape and is not driven here."""
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(raw: bytes) -> str:
+        entered.set()
+        await release.wait()
+        return build_ack(raw, code="AA")
+
+    source = _build(kind)
+    await source.start(handler)
+    gate = source._admission  # type: ignore[attr-defined]
+    writers: list[asyncio.StreamWriter] = []
+    try:
+        _reader, old = await asyncio.open_connection("127.0.0.1", source.sockport)  # type: ignore[attr-defined]
+        writers.append(old)
+        old.write(_whole_frame(kind, HL7))
+        await old.drain()
+        await asyncio.wait_for(entered.wait(), 3.0)
+        stopping = asyncio.ensure_future(source.stop())
+        await asyncio.sleep(0.1)  # inside the client-task grace wait
+        stopping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stopping
+        assert gate.per_host == {}  # the reset ran; the straggler is still in its handler
+        await source.start(handler)  # the same instance restarts
+        _reader, new = await asyncio.open_connection("127.0.0.1", source.sockport)  # type: ignore[attr-defined]
+        writers.append(new)
+        assert await _until(lambda: gate.per_host == {"127.0.0.1": 1})
+        assert gate.active == 2
+        release.set()
+        assert await _until(lambda: gate.active == 1), "the straggler never released"
+        assert gate.per_host == {"127.0.0.1": 1}, "the straggler took the restarted run's slot"
+    finally:
+        release.set()
+        for writer in writers:
             await _close(writer)
         await asyncio.wait_for(source.stop(), timeout=10.0)
 

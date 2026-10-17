@@ -413,3 +413,41 @@ the lane, and only because the proxy handler screened a challenge that was not i
 
 Tests: `tests/test_digest_refusal_classification.py`, the section headed BACKLOG #2989, and
 `tests/test_over_cap_2xx_reply_is_sent_once.py`, the section at its end.
+
+#### B.1, 2026-10-17: a FHIR update reply that repeats a JSON key and reads two ways (vault BACKLOG #2812, batch 265)
+
+> **Recorded 2026-10-17 by a Builder seat for batch 265.** It describes the code in the pull
+> request for vault BACKLOG #2812, not the #2989 work above. This entry is the one statement of the
+> rule; other documents link here.
+
+A FHIR `update` or `if-match` goes out as a one-entry `transaction`, and the engine reads the
+entry's status in the 2xx reply to judge it. `json` keeps the last of two equal keys and a server
+may mean the first, so a reply that repeats a key is read twice, keeping the first value of each
+key and keeping the last. When both readings reach the same judgment (delivered with one capture
+outcome, retried, or dead-lettered with one code) and agree on the values a delivery takes (the
+resource type, whether there is an entry response, and the entry's `etag`, `location` and
+`lastModified`), the reply is judged as any other. So `200 OK` against `201 Created` is delivered,
+and two statuses that both classify as transient are retried. When the readings differ in any of
+those, in either capture mode, or the keep-first read cannot parse a body the plain read takes,
+the delivery is a permanent refusal, code `reply-repeats-a-key`, not sent again and not recorded
+as delivered, as a reply the engine needs and cannot read is above. The same refusal applies when
+a key occurs three or more times in one object, at any depth, and some occurrence equals neither
+its first nor its last value, because the two readings alone would never see it (so
+`200 OK`, `404 Not Found`, `200 OK` dead-letters, as does such a repeat inside `meta`).
+
+It fails closed only on disagreement because a reply that reads one way under both rules carries
+no ambiguity to resolve, and refusing it would dead-letter an update that applied, which a replay
+of an `if-match` update turns into a 412. On `main` before this, `404 Not Found` then `200 OK` was
+delivered on the last key.
+
+**Provenance: decided 2026-10-17 under the owner's standing driver rule, by the Lander's send-back
+of engine PR 2356, and narrowed by the batch 265 Manager to compare judgments rather than status
+text. The owner has not ruled on it and may overturn it.**
+
+Costs, at least these. A reply nested in the narrow band between the hook's depth limit and plain
+`json`'s is refused with this code although it may repeat no key, and its text then says it does.
+An ETag that differs with capture off refuses, though nothing reads it in that mode.
+
+It is raised in `transports/fhir.py` (`_agreed_reading`, comparing `_reply_reading`), not by
+`read_2xx_reply_text`. Tests: `tests/test_fhir_transport.py`, the section headed vault BACKLOG
+#2812.

@@ -16,6 +16,7 @@ a test that measures input validation and one that measures an RBAC denial.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -201,3 +202,16 @@ def held_totp_code(secret: str) -> Iterator[str]:
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(totp, "time", SimpleNamespace(time=lambda: instant))
         yield totp.totp(secret, now=instant)
+
+
+def hold_auth_wall_clock(monkeypatch: pytest.MonkeyPatch, now: list[float]) -> None:
+    """Hold the auth service's and the store's ``time.time()`` at ``now[0]``; ``monotonic()``
+    stays real.
+
+    Both, because the store stamps a session's mint and the service reads the login-to-MFA floor
+    against it (BACKLOG #3194). One held clock makes the elapsed time the test's own choice however
+    slow the runner is. Move ``now[0]`` only forward: a clock behind a session's own stamps ends
+    the session."""
+    held = SimpleNamespace(time=lambda: now[0], monotonic=time.monotonic)
+    monkeypatch.setattr("messagefoundry.auth.service.time", held)
+    monkeypatch.setattr("messagefoundry.store.store.time", held)

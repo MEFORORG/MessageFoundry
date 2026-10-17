@@ -43,6 +43,7 @@ from pathlib import Path
 import pytest
 
 from tests._no_prompt import run_holding_stdin_open
+from tests.test_worktree_remove_path import copy_real_scripts, settle_worktrees
 
 _REPO = Path(__file__).resolve().parents[1]
 SCRIPT = _REPO / "scripts" / "worktree" / "remove.ps1"
@@ -134,6 +135,10 @@ def run(
     """Drive the real script. ``repo_root`` defaults to the fixture primary and is NEVER omitted
     unless a test is deliberately exercising the ``$PSScriptRoot`` default against a copied script.
     """
+    # Both removal routes refuse a tree written to inside its quiet period (vault BACKLOG #2988), and
+    # every fixture tree is seconds old. The quiet period itself is driven in
+    # tests/test_worktree_remove_in_use.py.
+    settle_worktrees(fx.primary)
     argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script or SCRIPT)]
     root = fx.primary if repo_root is None else repo_root
     if root != "":
@@ -293,9 +298,8 @@ def test_the_script_location_default_still_anchors_when_no_root_is_passed(fx: Fi
     pointing the real script at this checkout.
     """
     wt = fx.add("bydefault")
+    copy_real_scripts(fx.primary)
     copied = fx.primary / "scripts" / "worktree" / "remove.ps1"
-    copied.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(SCRIPT, copied)
 
     proc = run(fx, "-Name", "bydefault", script=copied, repo_root="")
 
@@ -347,16 +351,17 @@ def test_a_git_status_that_FAILS_refuses_instead_of_reading_as_clean(fx: Fixture
     assert (wt / "seed.txt").read_text(encoding="utf-8") == "an edit nobody committed\n"
 
 
-# --- BACKLOG #1295: claims held by a removed worktree --------------------------
+# --- claims and the removed worktree: refused before, never released after --------------------
 #
-# `claim.ps1 -Release` is WORKTREE-SCOPED, so a claim outliving its holder can never be released
-# normally and reads as actively-being-built forever. Measured 2026-08-19: 19 of 28 live claims were
-# already orphaned this way, and this script -- the sanctioned removal path -- had no claim handling,
-# so it was a source of them.
+# BACKLOG #1295 made this route DELETE the claim files a removed tree held, because `claim.ps1
+# -Release` is worktree-scoped and a claim outliving its holder reads as in flight forever. That
+# release left no line in the claims .history file (#1068), and it fired while the work could
+# still be running (vault BACKLOG #2988). So -Name now refuses a claimed tree, as -Path does, and
+# the release goes through claim.ps1, which records it.
 #
-# THE FALSE POSITIVE IS THE ONE TO FEAR, not the missed release. Handing a LIVE worktree's key to
-# another session invites the duplicate build the registry exists to stop, which is strictly worse
-# than the orphan. That is why two of the tests below assert a claim SURVIVES.
+# THE FALSE POSITIVE IS STILL THE ONE TO FEAR. A claim held by a DIFFERENT, living worktree must
+# neither block the removal nor be touched, and a claim whose path merely prefixes the target is a
+# different worktree's.
 
 
 def _claims_dir(fx: Fixture) -> Path:
@@ -375,33 +380,35 @@ def _write_claim(fx: Fixture, key: str, worktree: Path | str) -> Path:
     return f
 
 
-def test_a_claim_held_by_the_removed_worktree_is_released(fx: Fixture) -> None:
+def test_a_claim_held_by_the_target_refuses_and_is_not_released(fx: Fixture) -> None:
     wt = fx.add("alpha")
     claim = _write_claim(fx, "9001", wt)
-    assert claim.exists(), (
-        "POSITIVE CONTROL: the claim must exist before removal, or this proves nothing"
-    )
 
-    proc = run(fx, "-Name", "alpha")
+    proc = run(fx, "-Name", "alpha", "-Force")
+
+    assert proc.returncode != 0
+    assert "still holds 1 work claim(s): 9001" in proc.stdout, proc.stdout + proc.stderr
+    assert claim.exists(), "a claim was released with no .history line"
+    assert fx.is_registered(wt)
+    history = _claims_dir(fx) / ".history"
+    assert not history.exists(), "this script wrote to the release ledger; only claim.ps1 may"
+
+    # Control: released first, the same call removes the tree.
+    claim.unlink()
+    proc = run(fx, "-Name", "alpha", "-Force")
     assert proc.returncode == 0, proc.stderr
-    assert not claim.exists(), (
-        "the claim outlived its holder and can now never be released normally"
-    )
-    assert "9001" in proc.stdout, (
-        "the release happened silently; an operator cannot audit what they cannot see"
-    )
+    assert not wt.exists()
 
 
 def test_a_claim_held_by_a_DIFFERENT_worktree_survives(fx: Fixture) -> None:
-    """THE FALSE-POSITIVE GUARD, and it matters more than the release itself."""
+    """THE FALSE-POSITIVE GUARD: it neither blocks the removal nor is released by it."""
     wt = fx.add("alpha")
     other = fx.add("beta")
-    mine = _write_claim(fx, "9002", wt)
     theirs = _write_claim(fx, "9003", other)
 
     proc = run(fx, "-Name", "alpha")
     assert proc.returncode == 0, proc.stderr
-    assert not mine.exists(), "the removed worktree's own claim was not released"
+    assert not wt.exists()
     assert theirs.exists(), (
         "a claim belonging to a LIVING worktree was released. That hands its key to another session "
         "and invites the duplicate build the registry exists to stop -- worse than the orphan."
@@ -409,41 +416,38 @@ def test_a_claim_held_by_a_DIFFERENT_worktree_survives(fx: Fixture) -> None:
 
 
 def test_a_claim_whose_path_merely_PREFIXES_the_removed_one_survives(fx: Fixture) -> None:
-    """`repo-alpha` is a string prefix of `repo-alpha-two`. A StartsWith match would release both.
-
-    This is the exact shape the matching rule forbids -- full normalised path, no prefix, no leaf.
-    """
+    """`repo-alpha` is a string prefix of `repo-alpha-two`. A StartsWith match would refuse on, or
+    release, the other tree's claim. Full normalised path, no prefix, no leaf."""
     wt = fx.add("alpha")
     nested = fx.add("alpha-two")
-    exact = _write_claim(fx, "9004", wt)
     victim = _write_claim(fx, "9005", nested)
+    # CONTROL that the match is live at all: the same spelling of THIS tree refuses.
+    exact = _write_claim(fx, "9004", wt)
+    assert run(fx, "-Name", "alpha").returncode != 0
+    exact.unlink()
 
     proc = run(fx, "-Name", "alpha")
     assert proc.returncode == 0, proc.stderr
-    # CONTROL: without this the test passes when the sweep does nothing at all.
-    assert not exact.exists(), "the sweep did not run, so the prefix result below proves nothing"
+    assert not wt.exists()
     assert victim.exists(), "a prefix match released a different worktree's claim"
 
 
-def test_an_unreadable_claim_is_left_in_place_and_reported(fx: Fixture) -> None:
-    """UNREADABLE IS NOT ABSENT. A file that will not parse might name this worktree, so it is
-    reported rather than deleted on a guess -- and rather than silently skipped, which would make a
-    stranded claim look like a clean sweep."""
-    fx.add("alpha")
+def test_an_unreadable_claim_refuses_and_is_left_in_place(fx: Fixture) -> None:
+    """UNREADABLE IS NOT ABSENT. A file that will not parse might name this worktree, so the removal
+    refuses, and the file is not deleted on a guess."""
+    wt = fx.add("alpha")
     bad = _claims_dir(fx) / "9006.json"
     bad.write_text("{not json", encoding="utf-8")
 
     proc = run(fx, "-Name", "alpha")
-    assert proc.returncode == 0, proc.stderr
+    assert proc.returncode != 0
+    assert "9006.json does not parse" in proc.stdout, proc.stdout + proc.stderr
     assert bad.exists(), "an unparseable claim was deleted on a guess"
-    combined = proc.stdout + proc.stderr
-    assert "9006" in combined, (
-        "the unreadable claim was skipped silently, which reads as a clean sweep"
-    )
+    assert fx.is_registered(wt)
 
 
 def test_removal_still_succeeds_with_no_claims_directory(fx: Fixture) -> None:
-    """The sweep must not turn a working removal into a failure on a repo that has never claimed."""
+    """The check must not turn a working removal into a failure on a repo that has never claimed."""
     fx.add("alpha")
     proc = run(fx, "-Name", "alpha")
     assert proc.returncode == 0, proc.stderr

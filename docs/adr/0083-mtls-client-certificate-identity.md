@@ -203,14 +203,15 @@ or group removal never reached the certificate path at all.
 - **A cap and a bounded wait.** At most 8 certificate-path probes run at once. A request that gets no
   slot within 2 seconds is refused. A slot is held until the probe's worker thread ends, even when
   the request was cancelled, so the threads cannot outnumber the cap.
-- **Refusals do not log one line per request.** An outage (unreachable, referring, a fault reading
-  the entry, or a full cap) logs one WARNING and one INFO when it ends, naming no account, and at
+- **Refusals do not log one line per request.** An outage (unreachable, referring, or a full cap)
+  logs one WARNING and one INFO when it ends, naming no account, and at
   most one WARNING a minute while it flaps. An outage that starts within a minute of the last
   WARNING logs its own on its first refusal after that minute, so a long one is never silent. A
   change of reason during a logged outage logs one INFO, at most once a minute. A configuration
   refusal (no directory wired, no `directory_object_id`) logs one WARNING per reason per process.
-  `probe_fault` is an engine fault raised past the directory layer's own catch, so it is not a
-  directory outage (BACKLOG #3115). When an account's probe starts to fault, it logs one WARNING
+  `probe_fault` is an engine fault, so it is not a directory outage (BACKLOG #3115). It is either
+  raised past the directory layer's own catch, or caught there and returned as a fault (BACKLOG
+  #3100). When an account's probe starts to fault, it logs one WARNING
   that names the exception type. One account's WARNINGs are at least a minute apart, and other
   faults log at DEBUG. A fault a minute or more after the account's last WARNING warns again, a
   repeat included. So a fault that persists warns about once a minute, while one that starts and
@@ -219,7 +220,9 @@ or group removal never reached the certificate path at all.
   state changes only the DEBUG wording. An account can leave the probe set (disabled, deleted, no
   longer a directory account) or re-enter it. When this process sees that, the account starts
   afresh and its next fault warns at once, even inside the minute. A fault from a probe that
-  read the account before the move logs at DEBUG only. A fault the directory layer raises still reads as `unavailable`.
+  read the account before the move logs at DEBUG only. A fault the auth service's probe catches
+  and returns as a fault takes the same per-account rules, and its WARNING names the type too
+  (BACKLOG #3100).
 - **The answer vouches for one account.** The row read after the probe must still carry the
   `directory_object_id` and provider the probe asked about, or the request is refused.
 

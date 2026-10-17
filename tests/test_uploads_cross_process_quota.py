@@ -38,6 +38,7 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -78,8 +79,8 @@ def _shard_result(
             )
             real_scan = uploads._scan_metas_sync
 
-            def _slow_scan() -> list[UploadedFileMeta]:
-                out = real_scan()
+            def _slow_scan(held: list[Any] | None = None) -> list[UploadedFileMeta]:
+                out = real_scan(held)
                 time.sleep(_SCAN_OVERLAP_SECONDS)  # widen the scan -> write window
                 return out
 
@@ -199,7 +200,7 @@ def test_the_reservation_is_released_so_the_next_upload_is_not_locked_out(tmp_pa
             # And the ledger itself is back at zero in-flight: a reserve with a headroom of exactly
             # one succeeds, which it could not if either completed save had left a slot outstanding.
             assert await store.reserve_upload_quota(
-                "u-alice", files=1, size_bytes=1, max_files=1, max_total_bytes=1
+                "u-alice", "probe", size_bytes=1, max_files=1, max_total_bytes=1
             ), "a completed upload left its reservation outstanding"
         finally:
             await store.close()
@@ -209,24 +210,24 @@ def test_the_reservation_is_released_so_the_next_upload_is_not_locked_out(tmp_pa
 
 def test_a_leaked_reservation_is_reclaimed_once_it_goes_stale(tmp_path: Path) -> None:
     """A process killed between reserve and release leaks its reservation. It must not consume the
-    uploader's budget forever: a row with no activity for longer than ``stale_after`` is reset on
-    the next reserve."""
+    uploader's budget forever: a reservation with no activity for longer than ``stale_after`` is
+    deleted on the next reserve."""
 
     async def _run() -> None:
         store = await MessageStore.open(tmp_path / "engine.db")
         try:
             # Simulate the crash: reserve, never release.
             assert await store.reserve_upload_quota(
-                "u-alice", files=1, size_bytes=10, max_files=1, max_total_bytes=100
+                "u-alice", "leaked", size_bytes=10, max_files=1, max_total_bytes=100
             )
             # A live reservation blocks the next one (this is the control that the leak is real).
             assert not await store.reserve_upload_quota(
-                "u-alice", files=1, size_bytes=10, max_files=1, max_total_bytes=100
+                "u-alice", "second", size_bytes=10, max_files=1, max_total_bytes=100
             )
             # Once stale, the same call succeeds — the leak self-heals.
             assert await store.reserve_upload_quota(
                 "u-alice",
-                files=1,
+                "third",
                 size_bytes=10,
                 max_files=1,
                 max_total_bytes=100,
@@ -292,7 +293,12 @@ def test_a_slow_save_keeps_its_slot_past_the_staleness_window(
         async with _a_save_held_mid_write(tmp_path) as (store, uploads, save):
             await asyncio.sleep(0.6)
             applied = await store.reserve_upload_quota(
-                "u-alice", files=1, size_bytes=5, max_files=1, max_total_bytes=4096, stale_after=0.3
+                "u-alice",
+                "sibling",
+                size_bytes=5,
+                max_files=1,
+                max_total_bytes=4096,
+                stale_after=0.3,
             )
         assert isinstance(save.result(), UploadedFileMeta)
         assert not uploads._heartbeats, "the heartbeat outlived its save"
@@ -324,30 +330,129 @@ def test_the_heartbeat_stops_at_its_lifetime_cap(
         asyncio.run(_run())
 
 
+class _StuckTouchLedger:
+    """A ledger whose reserve and release answer at once and whose touch never returns: a store
+    that stalls on exactly the statement the heartbeat sends."""
+
+    def __init__(self) -> None:
+        self.touches = 0
+        self.cut_off = 0
+
+    async def reserve_upload_quota(
+        self,
+        uploader_id: str,
+        reservation_id: str,
+        *,
+        size_bytes: int,
+        max_files: int,
+        max_total_bytes: int,
+        stale_after: float = 0.0,
+    ) -> bool:
+        return True
+
+    async def release_upload_quota(self, reservation_id: str) -> None:
+        return None
+
+    async def touch_upload_quota(self, reservation_id: str) -> None:
+        self.touches += 1
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cut_off += 1
+            raise
+
+    async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
+        return (1, 5)
+
+
+def test_a_stuck_heartbeat_touch_no_longer_holds_the_heartbeat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3256 item 3. The heartbeat awaited its touch with no time bound, so one touch stuck
+    on the store held the heartbeat, and its lifetime cap, for as long as the store stalled. The
+    wait is bounded now and the heartbeat leaves the touch running, never cancels it, and never
+    doubles it. Red before the fix: the heartbeat never reached its cap. The held touch is then
+    capped like every other straggler (vault BACKLOG #3180), so a stalled store does not collect
+    one per save."""
+    monkeypatch.setattr(uploads_mod, "_RESERVATION_HEARTBEAT_SECONDS", 0.02)
+    monkeypatch.setattr(uploads_mod, "_RESERVATION_TOUCH_WAIT_SECONDS", 0.01)
+    monkeypatch.setattr(uploads_mod, "_LEDGER_STRAGGLER_MAX_SECONDS", 1.0)
+    monkeypatch.setattr(uploads_mod, "_RESERVATION_HEARTBEAT_MAX_SECONDS", 0.3)
+    ledger = _StuckTouchLedger()
+
+    async def _run() -> None:
+        uploads = UploadStore(
+            tmp_path / "uploads", make_cipher(generate_key()), max_bytes=4096, store=ledger
+        )
+        entered, gate = threading.Event(), threading.Event()
+        real_encrypt = uploads._encrypt_blob
+
+        def _held(data: bytes, file_id: str) -> str:
+            entered.set()
+            gate.wait(timeout=30)
+            return real_encrypt(data, file_id)
+
+        uploads._encrypt_blob = _held  # type: ignore[method-assign]
+        save = asyncio.ensure_future(
+            uploads.save(data=b"slow\n", filename="a.txt", uploader="alice", uploader_id="u-alice")
+        )
+        try:
+            assert await asyncio.to_thread(entered.wait, 30), "the save never reached its write"
+            for _ in range(250):
+                if "no longer refreshed" in caplog.text:
+                    break
+                await asyncio.sleep(0.02)
+            assert "no longer refreshed" in caplog.text, "a stuck touch held the heartbeat"
+            await asyncio.sleep(0.05)  # the task leaves the set on its done callback
+            assert not uploads._heartbeats
+            # The stuck touch was left running, held, and never doubled or cancelled by the
+            # heartbeat.
+            assert (ledger.touches, ledger.cut_off) == (1, 0)
+            assert uploads._stragglers, "the stuck touch was dropped instead of held"
+            # Then the straggler cap cancels it and the set empties.
+            for _ in range(250):
+                if ledger.cut_off and not uploads._stragglers:
+                    break
+                await asyncio.sleep(0.02)
+            assert (ledger.touches, ledger.cut_off) == (1, 1), "the held touch was never capped"
+            assert not uploads._stragglers
+        finally:
+            gate.set()
+            await asyncio.gather(save, return_exceptions=True)
+            for held in set(uploads._stragglers):
+                held.cancel()  # stands in for asyncio.run's shutdown, which would cancel it
+
+    with caplog.at_level("WARNING", logger=uploads_mod._log.name):
+        asyncio.run(_run())
+    assert "did not finish within" in caplog.text
+
+
 def test_a_lagging_clock_never_moves_the_row_backwards(tmp_path: Path) -> None:
     """BACKLOG #2648. ``since`` is stamped from each writer's own clock. A shard whose clock lags
-    must not age a row a sibling keeps fresh, or the sibling's next reserve reclaims live slots.
-    The row is stamped an hour ahead to stand in for the sibling; a reserve, a release and a touch
-    from this host must all leave that stamp where it is."""
+    must not age a reservation a faster host stamped, or a sibling's next reserve reclaims a live
+    slot. The reservation is stamped an hour ahead to stand in for that host; a touch from this
+    host, and a reserve and a release of another reservation, must all leave that stamp where it
+    is (vault BACKLOG #3180: only its own touch could move it)."""
 
     async def _run() -> None:
         store = await MessageStore.open(tmp_path / "engine.db")
         try:
             assert await store.reserve_upload_quota(
-                "u-alice", files=1, size_bytes=10, max_files=5, max_total_bytes=100
+                "u-alice", "ahead", size_bytes=10, max_files=5, max_total_bytes=100
             )
             ahead = time.time() + 3600.0
             await store._db.execute(
-                "UPDATE upload_quota SET since = ? WHERE uploader_id = ?", (ahead, "u-alice")
+                "UPDATE upload_reservation SET since = ? WHERE reservation_id = ?",
+                (ahead, "ahead"),
             )
             await store._db.commit()
             assert await store.reserve_upload_quota(
-                "u-alice", files=1, size_bytes=10, max_files=5, max_total_bytes=100
+                "u-alice", "other", size_bytes=10, max_files=5, max_total_bytes=100
             )
-            await store.reserve_upload_quota("u-alice", files=-1, size_bytes=-10)
-            await store.reserve_upload_quota("u-alice", files=0, size_bytes=0)
+            await store.release_upload_quota("other")
+            await store.touch_upload_quota("ahead")
             cur = await store._db.execute(
-                "SELECT since FROM upload_quota WHERE uploader_id = ?", ("u-alice",)
+                "SELECT since FROM upload_reservation WHERE reservation_id = ?", ("ahead",)
             )
             row = await cur.fetchone()
             assert row is not None and float(row[0]) == ahead
