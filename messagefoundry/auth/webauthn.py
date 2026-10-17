@@ -296,7 +296,7 @@ class ChallengeCache:
     one; entries expire after ``ttl_seconds`` (``time.monotonic()`` — wall-clock steps can't widen
     the window); a user at their pending cap evicts **their own oldest** entry (self-harm only —
     one principal can never deny another's ceremonies); the global safety bound refuses new
-    ceremonies with a cause-naming error.
+    ceremonies with a cause-naming error. :meth:`pop` consumes an entry and :meth:`peek` does not.
     """
 
     def __init__(

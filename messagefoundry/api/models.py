@@ -1500,7 +1500,7 @@ class InterpreterView(BaseModel):
     code_path_variables: list[str] = Field(default_factory=list)
     startup_code: list[StartupCodeItemView] = Field(default_factory=list)
     #: The directories start-up code is read from: the site directories and every directory on
-    #: the import path, the engine's own and the one it hands its Python children.
+    #: the engine's import path, which its Python children share (they repeat its isolation).
     startup_dirs: list[str] = Field(default_factory=list)
     #: The ones the engine's own account can add a file to. Empty is the safe reading only while
     #: ``startup_dirs`` is not empty and ``unchecked_startup_dirs`` is.

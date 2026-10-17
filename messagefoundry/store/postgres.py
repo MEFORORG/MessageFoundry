@@ -333,6 +333,10 @@ log = logging.getLogger(__name__)
 _FIFO_HEADS_LANE_CHUNK = 500
 # ADR 0066 §3.1: release_claimed id-chunk bound (ids per UPDATE statement).
 _RELEASE_CHUNK = 500
+# BACKLOG #3256: the database server's clock as epoch seconds, the unit `upload_quota.since` holds.
+# statement_timestamp() is one value for the whole statement, so every reference agrees. The cluster
+# lease reads clock_timestamp() inline (pipeline/cluster.py), which moves within a statement.
+_PG_EPOCH_NOW = "EXTRACT(EPOCH FROM statement_timestamp())::double precision"
 # BACKLOG #1169: rows per batch for the `attachment_chunk` at-rest migration. Every OTHER cipher pass
 # batches 500 because its rows are kilobyte-shaped; one attachment_chunk row is a whole
 # DETACH_CHUNK_BYTES (1 MiB) slice, ~1.33 MiB once base64+GCM sealed. 16 keeps a batch near 21 MiB,
@@ -1172,6 +1176,8 @@ _PG_SESSION_RESEAL: Final = (
 _PG_REVOKE_USER_SESSIONS_SQL: Final = (
     "UPDATE sessions SET revoked_at=$1, seal='' WHERE user_id=$2 AND revoked_at IS NULL"
 )
+#: Whether the account holds at least one passkey.
+_PG_WEBAUTHN_ANY_FOR_USER: Final = "SELECT 1 FROM webauthn_credentials WHERE user_id=$1 LIMIT 1"
 
 # The `$n` twins of store.py's sealed user-record statements (BACKLOG #2592), used only by
 # `create_user`, `_write_user` and the passkey writer; store.py states the contract.
@@ -8479,46 +8485,48 @@ class PostgresStore:
 
         One statement carries the budget predicate into the ``DO UPDATE``, so no other connection can
         land between the read and the write. ``RETURNING`` (absent on a refusal) discriminates applied
-        from refused."""
-        now = time.time()
+        from refused.
+
+        "Now" is the database server's clock, ``_PG_EPOCH_NOW`` (BACKLOG #3256;
+        ``uploads.UploadQuotaError`` says why)."""
         if files <= 0:
             # RELEASE — unconditional, clamped at zero (a double release cannot mint budget).
             await self._execute(
                 "UPDATE upload_quota SET"
                 " inflight_files = GREATEST(0, inflight_files + $2),"
                 " inflight_bytes = GREATEST(0, inflight_bytes + $3),"
-                " since = GREATEST(since, $4)"  # never backwards (BACKLOG #2648)
+                f" since = GREATEST(since, {_PG_EPOCH_NOW})"  # never backwards (BACKLOG #2648)
                 " WHERE uploader_id = $1",
                 uploader_id,
                 int(files),
                 int(size_bytes),
-                now,
             )
             return True
         if files > max_files or size_bytes > max_total_bytes:
             # Fail closed before touching the row: the insert branch applies unconditionally.
             return False
-        stale = now - max(0.0, stale_after)
+        stale = f"({_PG_EPOCH_NOW} - $4)"
         row = await self._fetchone(
             "INSERT INTO upload_quota (uploader_id, inflight_files, inflight_bytes, since)"
-            " VALUES ($1,$2,$3,$4)"
+            f" VALUES ($1,$2,$3,{_PG_EPOCH_NOW})"
             " ON CONFLICT (uploader_id) DO UPDATE SET"
             " inflight_files ="
-            " CASE WHEN upload_quota.since <= $5 THEN 0 ELSE upload_quota.inflight_files END + $2,"
+            f" CASE WHEN upload_quota.since <= {stale} THEN 0"
+            " ELSE upload_quota.inflight_files END + $2,"
             " inflight_bytes ="
-            " CASE WHEN upload_quota.since <= $5 THEN 0 ELSE upload_quota.inflight_bytes END + $3,"
+            f" CASE WHEN upload_quota.since <= {stale} THEN 0"
+            " ELSE upload_quota.inflight_bytes END + $3,"
             # Every applied reserve refreshes it, never backwards (BACKLOG #2648).
-            " since = GREATEST(upload_quota.since, $4)"
-            " WHERE (CASE WHEN upload_quota.since <= $5 THEN 0"
-            " ELSE upload_quota.inflight_files END) + $2 <= $6"
-            " AND (CASE WHEN upload_quota.since <= $5 THEN 0"
-            " ELSE upload_quota.inflight_bytes END) + $3 <= $7"
+            f" since = GREATEST(upload_quota.since, {_PG_EPOCH_NOW})"
+            f" WHERE (CASE WHEN upload_quota.since <= {stale} THEN 0"
+            " ELSE upload_quota.inflight_files END) + $2 <= $5"
+            f" AND (CASE WHEN upload_quota.since <= {stale} THEN 0"
+            " ELSE upload_quota.inflight_bytes END) + $3 <= $6"
             " RETURNING 1 AS applied",
             uploader_id,
             int(files),
             int(size_bytes),
-            now,
-            stale,
+            float(max(0.0, stale_after)),
             int(max_files),
             int(max_total_bytes),
         )
@@ -9053,9 +9061,7 @@ class PostgresStore:
 
     async def has_webauthn_credentials(self, user_id: str) -> bool:
         """True when the user has at least one enrolled passkey (the second-factor predicate)."""
-        d = await self._fetchone(
-            "SELECT 1 FROM webauthn_credentials WHERE user_id=$1 LIMIT 1", user_id
-        )
+        d = await self._fetchone(_PG_WEBAUTHN_ANY_FOR_USER, user_id)
         return d is not None
 
     async def any_webauthn_credentials(self) -> bool:
@@ -9437,7 +9443,8 @@ class PostgresStore:
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
-                "SELECT username, oidc_issuer, oidc_subject FROM users WHERE id=$1 FOR UPDATE",
+                "SELECT username, oidc_issuer, oidc_subject, totp_enabled, cred_digest FROM users"
+                " WHERE id=$1 FOR UPDATE",
                 user_id,
             )
             if row is None:
@@ -9452,11 +9459,24 @@ class PostgresStore:
                     sessions_revoked=0,
                     changed=True,
                 )
+            # Vault BACKLOG #2711 step 3. A statement of its own AFTER the row lock: under READ
+            # COMMITTED it takes a fresh snapshot, so it sees a passkey whose write (which re-seals
+            # this row) committed while the lock above waited. A passkey counts when either the
+            # table or the sealed digest names one, as the service's own predicate reads it.
+            totp_enrolled = bool(row["totp_enabled"])
+            webauthn_enrolled = await conn.fetchval(
+                _PG_WEBAUTHN_ANY_FOR_USER, user_id
+            ) is not None or bool(row["cred_digest"])
             if issuer is None and subject is None:
                 # Already unbound: write NOTHING, so a no-op cannot sign the account out. AND, not
                 # OR: a half row has something to clear (see FederatedUnbind).
                 return FederatedUnbind(
-                    username=row["username"], issuer=None, subject=None, sessions_revoked=0
+                    username=row["username"],
+                    issuer=None,
+                    subject=None,
+                    sessions_revoked=0,
+                    totp_enrolled=totp_enrolled,
+                    webauthn_enrolled=webauthn_enrolled,
                 )
             await self._write_user(conn, user_id, lambda r: federated_unbind(r, now))
             result = await conn.execute(_PG_REVOKE_USER_SESSIONS_SQL, now, user_id)
@@ -9465,6 +9485,8 @@ class PostgresStore:
                 issuer=issuer,
                 subject=subject,
                 sessions_revoked=_rowcount(result),
+                totp_enrolled=totp_enrolled,
+                webauthn_enrolled=webauthn_enrolled,
             )
 
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
