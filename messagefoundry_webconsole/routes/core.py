@@ -56,6 +56,7 @@ from .. import pages
 from .._auth import (
     CLEAR_SITE_DATA_HEADER,
     CLEAR_SITE_DATA_VALUE,
+    ENROL_FIRST_PAGE,
     WEBAUTHN_EXTRA_MISSING_NOTICE,
     WEBAUTHN_RP_CHANGED_NOTICE,
     WEBAUTHN_RP_MISSING_NOTICE,
@@ -126,6 +127,18 @@ def _directory_unconfirmed(elevation: Elevation) -> bool:
     guard. The ``allow_reauth_attempt`` precedent in ``_auth.py`` is the same.
     """
     return bool(getattr(elevation, "directory_unconfirmed", False))
+
+
+def _enrol_before_step_up(satisfied: bool, mfa: MfaStatus, step_up: bool) -> bool:
+    """Whether ``/ui/reauth`` sends this session to enrol instead of rendering its form.
+
+    True for a full-step-up action on a session that still owes a factor and holds none of EITHER
+    kind (ADR 0068 decision 1(a)): no password can pass that step-up, so the form would loop straight
+    back. Keyed on the SESSION (``satisfied``, from ``mfa_satisfied``), as ``_reauth_idp_page`` is,
+    and NOT on the account rule ``mfa.required``: the directory floor leaves a non-admin directory
+    session unsatisfied that the account rule calls exempt (BACKLOG #3116). Enrolment itself is
+    ``step_up=False``, so it never bounces here."""
+    return step_up and not satisfied and not (mfa.enabled or mfa.webauthn_enrolled)
 
 
 #: The message log's received-date bounds, validated by the SAME annotated type the JSON ``/messages``
@@ -1591,9 +1604,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> Response:
         """/ui/reauth for a session the federated login minted (BACKLOG #296).
 
-        Runs BEFORE the password page's enroll-first bounce, because that bounce keys on the account
-        (``mfa.required``, nothing enrolled) and an OIDC session minted with the IdP's MFA claim has
-        met its factor without any engine enrollment. Only a session that has NOT met it is routed:
+        Runs BEFORE the password page's enroll-first bounce, because an OIDC session must never see
+        the password page, and one minted with the IdP's MFA claim has met its factor without any
+        engine enrollment. Only a session that has NOT met it is routed:
         one owing an ENROLLED engine factor proves it at the MFA gate first (the IdP leg re-proves
         the sign-in, not the engine's factor), and one that owes a factor it has not enrolled goes
         to enroll for a full step-up action, as the password page sends it."""
@@ -1752,18 +1765,14 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # mechanism, not the account: a Kerberos session keeps the password form below.
             # Ahead of the enroll-first bounce; _reauth_idp_page says why.
             return await _reauth_idp_page(auth, token, mfa, next_, action.step_up, continues)
-        if mfa.required and not (mfa.enabled or mfa.webauthn_enrolled) and action.step_up:
-            # A full-step-up action a required-but-UNENROLLED session (no factor of EITHER
-            # kind — ADR 0068 decision 1(a)) can NEVER satisfy — send it to enroll instead
-            # of a password form that would loop straight back. Enrollment itself is
-            # step_up=False (below).
-            return RedirectResponse("/ui/account?m=enroll_first", status_code=303)
+        satisfied = await auth.mfa_satisfied(token)
+        if _enrol_before_step_up(satisfied, mfa, action.step_up):
+            return RedirectResponse(ENROL_FIRST_PAGE, status_code=303)
         # The rendering splits BY FACTOR (decision 1(b)): the TOTP code field renders iff
         # TOTP is enrolled (a required-but-unenrolled account can never produce a code —
         # demanding one would deadlock, L4b); the passkey hook renders iff WebAuthn is
         # enrolled — a WebAuthn-only user sees password + passkey, never an unanswerable
         # code field; a both-enrolled user sees both, either satisfies.
-        satisfied = await auth.mfa_satisfied(token)
         mfa_needed = not satisfied and mfa.enabled
         wa_options, wa_notice = await _reauth_webauthn_state(request, auth, token, mfa, satisfied)
         return HTMLResponse(
@@ -1805,14 +1814,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         mfa = await auth.mfa_status(identity)
         # continues_after_reauth is asked of `token` at each use, not once here: the code leg below
         # rotates it and re-keys the issued continuation onto the new token.
-        if mfa.required and not (mfa.enabled or mfa.webauthn_enrolled) and action.step_up:
-            # See ui_reauth_form: a full-step-up action this session can never satisfy (no
-            # factor of EITHER kind — ADR 0068 decision 1(a)) — send it to enroll rather
-            # than loop. Checked BEFORE the rate limiter so a correct password isn't burned
-            # into a 429 (the review's silent-loop finding; the ordering pin covers the
-            # generalized condition too).
-            return RedirectResponse("/ui/account?m=enroll_first", status_code=303)
         satisfied = await auth.mfa_satisfied(token)
+        if _enrol_before_step_up(satisfied, mfa, action.step_up):
+            # Checked BEFORE the rate limiter so a correct password isn't burned into a 429 (the
+            # review's silent-loop finding; the ordering pin covers the generalized condition too).
+            return RedirectResponse(ENROL_FIRST_PAGE, status_code=303)
         if not satisfied and not mfa.enabled and mfa.webauthn_enrolled:
             # ADR 0068 decision 1(d): a WebAuthn-ONLY user's password form can never satisfy
             # MFA by itself — the passkey leg (POST /ui/reauth/webauthn) must run first.

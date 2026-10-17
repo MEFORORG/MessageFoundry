@@ -255,6 +255,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 passkeys=passkeys,
                 webauthn_notice=wa_notice,
                 session_offer=session_offer,
+                # Read only where the page uses it, the not-enrolled branch (BACKLOG #3116).
+                factor_owed=not mfa.enabled
+                and not await service.mfa_satisfied(session_token(request)),
             ),
             status_code=status_code,
         )
