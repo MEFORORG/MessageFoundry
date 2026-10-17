@@ -2529,7 +2529,7 @@ def _serve(args: argparse.Namespace) -> int:
     )
     from messagefoundry.crashdump import suppress_crash_dumps
     from messagefoundry.keywrap import KeyWrapRefused
-    from messagefoundry.pipeline.cert_expiry import crls_from_settings
+    from messagefoundry.pipeline.cert_expiry import certs_from_settings, crls_from_settings
     from messagefoundry.store.crypto import memory_locking_available
 
     # ADR 0152 Phase 0 — in-USE PHI hygiene, applied before anything can put PHI in this address
@@ -4590,7 +4590,9 @@ def _serve(args: argparse.Namespace) -> int:
         api_tls_client_cert_files=settings.api.tls_client_cert_files,
         # BACKLOG #299: the settings-level CRL files ([tls], [logging] forward, [auth] OIDC, [store],
         # [api] client), so a CRL going stale on an OUTBOUND hop alerts before it fails a handshake.
-        settings_crls=crls_from_settings(settings),
+        # Vault BACKLOG #2223: plus the SQL Server store pin, whose expiry the driver does not check
+        # under Encrypt=strict.
+        settings_crls=[*crls_from_settings(settings), *certs_from_settings(settings)],
         # Reserve the engine's own API listener so no inbound can be wired onto it (it would collide
         # with uvicorn at bind); surfaced as a clear PortConflictError at check/start instead.
         api_listener=(settings.api.host, settings.api.port),
@@ -5927,6 +5929,7 @@ def _cert_inventory(args: argparse.Namespace) -> int:
     from messagefoundry.pipeline.cert_expiry import (
         MonitoredCert,
         certs_from_registry,
+        certs_from_settings,
         crls_from_settings,
     )
 
@@ -5972,6 +5975,8 @@ def _cert_inventory(args: argparse.Namespace) -> int:
         client_certs = settings.api.tls_client_cert_files
         # BACKLOG #299: the same settings-level CRL files the engine's expiry monitor watches.
         settings_crls = crls_from_settings(settings)
+        # Vault BACKLOG #2223: and the SQL Server store pin, which the monitor watches too.
+        settings_crls.extend(certs_from_settings(settings))
 
     reg = None
     if args.config:

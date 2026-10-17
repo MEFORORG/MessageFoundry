@@ -6158,3 +6158,104 @@ async def test_transit_bound_attestation_roundtrip_ss(store) -> None:
     from tests.test_transit_bound_attestation_server_backends import attestation_roundtrip
 
     await attestation_roundtrip(store)
+
+
+# --- vault BACKLOG #2223: the ServerCertificate pin is enforced under Encrypt=strict (gated) -------
+
+
+def _presented_certificate_pem(host: str, port: int) -> str:
+    """The certificate the server presents on a TDS 8.0 handshake, which opens with TLS on the
+    listener port. Read with verification off on purpose: this is the instrument that learns which
+    certificate to pin, and the pinned connect below is what verifies it."""
+    import socket
+    import ssl
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.set_alpn_protocols(["tds/8.0"])
+    with (
+        socket.create_connection((host, port), timeout=5) as raw,
+        ctx.wrap_socket(raw, server_hostname=host) as tls,
+    ):
+        der = tls.getpeercert(binary_form=True)
+    assert der, "the server presented no certificate"
+    return ssl.DER_cert_to_PEM_cert(der)
+
+
+@pytest.mark.skipif(
+    os.getenv("MEFOR_TEST_SQLSERVER_STRICT") != "1",
+    reason="set MEFOR_TEST_SQLSERVER_STRICT=1 only where the SQL Server is configured for TDS 8.0 "
+    "strict encryption; the default CI containers are not, so the TLS-first read is cut",
+)
+async def test_server_certificate_pin_is_enforced_under_strict_encryption(tmp_path: Any) -> None:
+    """The store's pinned string, ``ServerCertificate`` with ``Encrypt=strict``, connects with the
+    certificate the server presents and is refused with any other. Vault BACKLOG #3009 measured on
+    Windows that Driver 18.7 enforced the pin with strict and not with ``Encrypt=yes``, and that
+    measurement is the evidence the store change rests on. This would be the Linux driver's reading,
+    toward closing step 1 of #2223, on a server configured for strict encryption.
+
+    POSITIVE CONTROL: the right pin connects through the same builder, so the wrong pin's refusal is
+    the pin's doing and not a strict handshake this server cannot make. The two strings differ only
+    in the pinned file.
+
+    MEASUREMENT, not asserted: the same two pins beside ``Encrypt=yes``, the string the store sent
+    before #2223. The CI container's certificate is self-signed and not in the runner's trust store,
+    so ``yes_right`` is the control for ``yes_wrong``: if ``yes_right`` is REFUSED, the chain check
+    refused both and ``yes_wrong`` says nothing about the pin. The test is skipped in CI unless
+    ``MEFOR_TEST_SQLSERVER_STRICT=1`` is set on a strict-configured server; where it runs, its
+    ``BACKLOG-2223-PIN`` warning line carries each outcome, and a refusal carries the driver's message."""
+    import warnings
+
+    import aioodbc
+    import pyodbc
+
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.pki import make_self_signed
+    from messagefoundry.store.sqlserver import connection_string
+
+    base = load_settings(environ=os.environ).store
+    right = tmp_path / "presented.pem"
+    right.write_text(
+        await asyncio.to_thread(_presented_certificate_pem, base.server or "localhost", base.port)
+    )
+    # A fresh self-signed certificate the server never presents.
+    wrong = tmp_path / "not-presented.pem"
+    wrong.write_bytes(make_self_signed("mf-test-not-the-server", [], 30)[0])
+
+    def pinned_dsn(pin: Any) -> str:
+        # CI trusts the container's self-signed certificate through the escape; the pin replaces that.
+        return connection_string(
+            base.model_copy(update={"trust_server_certificate": False, "ssl_root_cert": str(pin)})
+        )
+
+    async def outcome(dsn: str) -> str:
+        # A short login timeout, so a stalled handshake reports here and not at the test watchdog.
+        try:
+            conn = await aioodbc.connect(dsn=dsn, autocommit=True, timeout=10)
+        except pyodbc.Error as exc:
+            # pyodbc puts the SQLSTATE in args[0] and the driver's message in args[1].
+            return f"REFUSED ({exc.args[-1] if exc.args else type(exc).__name__})"
+        try:
+            cur = await conn.cursor()
+            await cur.execute("SELECT 1")
+            row = await cur.fetchone()
+        finally:
+            await conn.close()
+        assert row is not None and row[0] == 1
+        return "CONNECTED"
+
+    right_dsn, wrong_dsn = pinned_dsn(right), pinned_dsn(wrong)
+    assert "Encrypt=strict;" in right_dsn and "Encrypt=strict;" in wrong_dsn
+    results = {
+        "strict_right": await outcome(right_dsn),
+        "strict_wrong": await outcome(wrong_dsn),
+        "yes_right": await outcome(right_dsn.replace("Encrypt=strict;", "Encrypt=yes;")),
+        "yes_wrong": await outcome(wrong_dsn.replace("Encrypt=strict;", "Encrypt=yes;")),
+    }
+    warnings.warn(
+        "BACKLOG-2223-PIN " + " ".join(f"{k}={v}" for k, v in results.items()), stacklevel=1
+    )
+    assert results["strict_right"] == "CONNECTED", "the right pin was refused: the control failed"
+    assert results["strict_wrong"].startswith("REFUSED"), "a pin of another certificate connected"
