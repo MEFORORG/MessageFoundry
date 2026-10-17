@@ -73,7 +73,7 @@ import re
 import traceback
 import weakref
 from abc import ABCMeta
-from collections import ChainMap, OrderedDict, UserDict, defaultdict, deque
+from collections import ChainMap, Counter, OrderedDict, UserDict, defaultdict, deque
 from collections.abc import Callable, MappingView
 from datetime import UTC, datetime
 from functools import lru_cache
@@ -1747,8 +1747,37 @@ def redact(text: str) -> str:
     call can scrub what the first kept, but only while the key is still there. A run that took a
     key glued to its token left that value in view on the second call, where the stages alone scrub
     it: measured at 1 text in 200,000 on a fuzz, at every head of the pull request before this rule,
-    and 0 in 600,000 with it. That zero is a measurement, not a proof for the first-stage labels."""
-    out = _redact_stages(text)
+    and 0 in 600,000 with it. That zero is a measurement, not a proof for the first-stage labels.
+
+    **A PHI label glued to a field run keeps its place, and the answer is checked against the one
+    that took it (BACKLOG #3318).** :func:`_glued_label_replacement` says what it keeps. Where it kept
+    a label, this function also computes the answer without it, and returns that one instead unless
+    both of these hold. First, no credential shape is in the input or in either answer
+    (:func:`_holds_a_credential_shape`): the credential filters run after this module, and a kept label
+    can take theirs into its own value. Second, the answer keeps no word that the answer without it
+    scrubbed, beyond the words of the labels it kept (:func:`_keeps_no_new_word`). So on one call, a
+    word this redactor printed was printed before #3318 too, by construction. A second call over the
+    first one's output is not covered by that check, and is measured instead."""
+    if not text.isprintable() or _holds_a_credential_shape(text):
+        return _redact_text(text, None)
+    labels: list[str] = []
+    out = _redact_text(text, labels)
+    if not labels:
+        return out
+    plain = _redact_text(text, None)
+    if (
+        _holds_a_credential_shape(plain)
+        or _holds_a_credential_shape(out)
+        or not _keeps_no_new_word(out, plain, labels)
+    ):
+        return plain
+    return out
+
+
+def _redact_text(text: str, labels: list[str] | None) -> str:
+    """:func:`redact` with the glued-label rule on (``labels`` a list, which collects every label it
+    kept) or off (``None``, the redactor before BACKLOG #3318)."""
+    out = _redact_stages(text, labels)
     if "%" not in out or _ENCODED_SEPARATOR.search(out) is None:
         return out
     if _HL7_ENCODED_FIELD_RUN.search(out) is None:
@@ -1764,16 +1793,16 @@ def redact(text: str) -> str:
         or _CREDENTIAL_AHEAD.search(out) is not None
     ):
         return out
-    return _redact_stages(_HL7_ENCODED_FIELD_RUN.sub(_REDACTED, out))
+    return _redact_stages(_field_run_sub(_HL7_ENCODED_FIELD_RUN, out, labels), labels)
 
 
-def _redact_stages(text: str) -> str:
+def _redact_stages(text: str, labels: list[str] | None = None) -> str:
     """The two stages of :func:`redact`: the #1711 passes to their fixed point, then the widened ones
     when :func:`_needs_widened_stage` says a widened rule could match."""
-    first = _redact_rounds(text, widened=False)
+    first = _redact_rounds(text, widened=False, labels=labels)
     if not _needs_widened_stage(first):
         return first
-    return _redact_rounds(first, widened=True)
+    return _redact_rounds(first, widened=True, labels=labels)
 
 
 #: A JSON key the widened stage reads differently: ``name``/``address`` (the shape rule) and a group
@@ -1814,17 +1843,17 @@ def _needs_widened_stage(text: str) -> bool:
     return "mrn" in text.lower() and _MRN_LABELLED.search(text) is not None
 
 
-def _redact_rounds(text: str, *, widened: bool) -> str:
+def _redact_rounds(text: str, *, widened: bool, labels: list[str] | None = None) -> str:
     """One stage of :func:`redact`: the flat and structured passes, repeated to a fixed point."""
     credentials = not widened
     for _ in range(_STRUCTURED_ROUNDS):
         if not text:
             return text
-        flat = _redact_flat(text, widened=widened, credentials=credentials)
+        flat = _redact_flat(text, widened=widened, credentials=credentials, labels=labels)
         text = _redact_structured(flat, widened=widened)
         if text == flat:
             return text
-    return _redact_flat(text, widened=widened, credentials=credentials)
+    return _redact_flat(text, widened=widened, credentials=credentials, labels=labels)
 
 
 #: The most rounds one stage of :func:`redact` takes. A call runs two stages, and runs both again when
@@ -1836,7 +1865,151 @@ def _redact_rounds(text: str, *, widened: bool) -> str:
 _STRUCTURED_ROUNDS = 8
 
 
-def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
+# --- a PHI label glued to a field run (BACKLOG #3318) ----------------------------------------------
+#
+# A field run takes its whole whitespace-free token. When a PHI label is glued into that token --
+# compact JSON ``..&c=2","name":"Zqxdoe Vandtjane"``, XML ``<PID.8>A^B^C</PID.8><name>Zqxdoe ..``,
+# a query ``?a=1&b=2&mrn= 88123456``, ``A^B^C,PatientName: Zqxdoe`` -- the run took the label, and the
+# part of its value past the token's end was left for no pass to read. The rule here keeps the LAST
+# such label in the token, with the quote or element end that opens its value, and scrubs the rest of
+# the token as before. The label's own pass then reads the value as it would with a space before it.
+#
+# **Only where the value runs past the token.** A value the token closes (a string whose closing
+# quote, or an element whose end tag, is in it), an MRN with its number in the token, or a DICOM value
+# ended by ``;`` there, is scrubbed with the token as it always was, so a kept quote cannot end a
+# later value early. A bare JSON value glued to its key (``"name":Zqxdoe``) is not kept either: the
+# placeholder after the key reads as an array, so keeping the key would not scrub the rest. That is
+# a residual, as is a name run whose first word is glued into the token.
+#
+# :func:`redact` checks every answer this rule changed against the answer without it.
+
+#: Where a label could be glued: a cheap screen, so text with none of these pays a C-speed search
+#: and keeps the C-speed placeholder substitution.
+_GLUE_SCREEN = re.compile(
+    r"""["']\s*+:|<[A-Za-z_]|Patient|MedicalRecordLocator|ResponsiblePerson|(?i:mrn)|\(0010,"""
+)
+#: The label half of :data:`_MRN_LABELLED`, group 1 of it, with no value required after it.
+_MRN_LABEL = re.compile(
+    r"""(?<![A-Za-z0-9])((?i:MRN)\b['"]?[ \t]*+(?:[:#=][ \t]*+){0,2}\[?[ \t]*+['"]?)"""
+)
+#: A group 0010 DICOM tag, the one kind :data:`_DICOM_TAG` reads that a label pass scrubs after.
+_PATIENT_DICOM_TAG = re.compile(r"\(0010, ?[0-9A-Fa-f]{4}\)")
+#: How far past a token a label's match may run: the whitespace before a colon or an ``=``. A label
+#: with more than this before its separator is not kept, which is the old answer.
+_LABEL_REACH = 16
+#: The quotes that can open a value.
+_QUOTES = "\"'"
+
+
+#: The label passes a glued label is read for, each with its kind for :func:`_label_to_keep`.
+_GLUED_LABEL_PASSES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("json", _JSON_PHI_KEY),
+    ("xml", _XML_PHI_ELEMENT),
+    ("dicom", _DICOM_PHI_LABEL),
+    ("mrn", _MRN_LABEL),
+    ("tag", _PATIENT_DICOM_TAG),
+)
+
+
+def _last_glued_label(token: re.Match[str]) -> tuple[str, re.Match[str]] | None:
+    """``(kind, match)`` for the label that starts last inside the field run ``token``, or ``None``."""
+    text = token.string
+    start, end = token.span()
+    reach = min(len(text), end + _LABEL_REACH)
+    best: tuple[str, re.Match[str]] | None = None
+    for kind, pattern in _GLUED_LABEL_PASSES:
+        for found in pattern.finditer(text, start, reach):
+            if found.start() >= end:
+                break
+            if best is None or found.start() > best[1].start():
+                best = (kind, found)
+    return best
+
+
+def _label_to_keep(kind: str, label: str, rest: str) -> str | None:
+    """What of the token to keep from the label on: the label and the opener of a value that runs
+    past the token, or ``None`` where the value ends inside it. ``rest`` is the token after the
+    label."""
+    if kind == "json":
+        opened = len(rest) - len(rest.lstrip("[{("))
+        if opened == len(rest):
+            return label + rest
+        quote = rest[opened]
+        if quote not in _QUOTES or quote in rest[opened + 1 :]:
+            return None
+        return label + rest[: opened + 1]
+    if kind == "dicom":
+        if rest[:1] and rest[0] in _QUOTES:
+            return None if rest[0] in rest[1:] else label + rest[0]
+        return None if ";" in rest else label
+    if kind == "xml":
+        if not rest:
+            return label
+        return label + ">" if rest[0] == ">" and "</" not in rest else None
+    if kind == "mrn":
+        return None if rest else label
+    return label  # a group 0010 tag: its value runs to the end of the line
+
+
+def _glued_label_replacement(token: re.Match[str], labels: list[str]) -> str:
+    """The field run ``token`` scrubbed, keeping a glued PHI label whose value runs past it. Every
+    label kept is appended to ``labels``."""
+    found = _last_glued_label(token)
+    if found is None:
+        return _REDACTED
+    kind, label = found
+    start, end = token.span()
+    head = token.string[label.start() : min(label.end(), end)]
+    keep = _label_to_keep(kind, head, token.string[label.end() : end])
+    if keep is None:
+        return _REDACTED
+    labels.append(keep)
+    before = _REDACTED if label.start() > start else ""
+    after = _REDACTED if label.start() + len(keep) < end else ""
+    return f"{before}{keep}{after}"
+
+
+def _field_run_sub(pattern: re.Pattern[str], text: str, labels: list[str] | None) -> str:
+    """``pattern``'s field runs in ``text`` scrubbed, with the glued-label rule when ``labels`` is a
+    list."""
+    if labels is None or _GLUE_SCREEN.search(text) is None:
+        return pattern.sub(_REDACTED, text)
+    return pattern.sub(lambda token: _glued_label_replacement(token, labels), text)
+
+
+#: A percent escape, read as a word boundary when screening for a credential label
+#: (``secretscrub`` starts a label after one, and :data:`_CREDENTIAL_AHEAD` does not).
+_PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
+
+
+def _holds_a_credential_shape(text: str) -> bool:
+    """Whether a credential filter after this module could read ``text``: :data:`_CREDENTIAL_AHEAD`,
+    also after a percent escape, or the credential backstop's opener."""
+    if _USERINFO_OPENER in text or _CREDENTIAL_AHEAD.search(text) is not None:
+        return True
+    return "%" in text and _CREDENTIAL_AHEAD.search(_PERCENT_ESCAPE.sub(" ", text)) is not None
+
+
+#: A word an answer keeps, for :func:`_keeps_no_new_word`.
+_KEPT_WORD = re.compile(r"\w+")
+
+
+def _kept_words(text: str) -> Counter[str]:
+    return Counter(_KEPT_WORD.findall(text.replace(_REDACTED, " ")))
+
+
+def _keeps_no_new_word(out: str, plain: str, labels: list[str]) -> bool:
+    """Whether ``out`` keeps no word, counted with repeats, that ``plain`` does not, apart from the
+    words of the ``labels`` the glued-label rule kept."""
+    allowed = _kept_words(plain)
+    for label in labels:
+        allowed.update(_KEPT_WORD.findall(label))
+    return not _kept_words(out) - allowed
+
+
+def _redact_flat(
+    text: str, *, widened: bool, credentials: bool, labels: list[str] | None = None
+) -> str:
     """Every pass but the structured ones: the credential backstop, the HL7 shapes, a labelled MRN
     (``widened`` only), dates and names. One stage of :func:`redact` is this plus
     :func:`_redact_structured`, repeated to a fixed point.
@@ -1857,11 +2030,19 @@ def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
     **What is not re-checked, stated because the reason above is easy to over-read.** A credential
     span that only a WIDENED scrub completes (one that removes an escaped line break inside a ``name``
     string, joining an opener's line to its ``@``) is not re-checked: #1711 did not catch that
-    either."""
+    either.
+
+    ``labels`` turns on the glued-label rule of BACKLOG #3318 for the default delimiters
+    (:func:`_field_run_sub`). A message that declares others takes the rule off for the whole text,
+    because a kept label can hold a declared delimiter."""
     if credentials:
         text = _INVALID_URL_USERINFO.sub(lambda m: f"{m.group(1)}{_REDACTED}@", text)
+    declared = _sniff_delimiters(text)
+    custom = not declared <= _DEFAULT_DELIMITERS
+    if custom:
+        labels = None
     scrubbed = _HL7_SEGMENT.sub(lambda m: f"{m.group(1)}|{_REDACTED}", text)
-    scrubbed = _HL7_FIELD_RUN.sub(_REDACTED, scrubbed)
+    scrubbed = _field_run_sub(_HL7_FIELD_RUN, scrubbed, labels)
     # BACKLOG #1572. The passes above assume `| ^ ~ &`; MSH DECLARES the real set per message, so a
     # feed using `*` and `$` kept its identifiers. Sniff, and run a separator-aware pass only when the
     # declared set reaches outside the defaults — widening the hardcoded class instead would have been
@@ -1869,9 +2050,8 @@ def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
     # of ordinary operational text, which is most of what the support bundle and the forwarded log
     # stream carry. Sniffing `text` and not `scrubbed` is load-bearing: on a custom FIELD separator with
     # default encoding characters, `_HL7_FIELD_RUN` has already eaten the MSH line (and the delimiter
-    # declaration with it) by this point.
-    declared = _sniff_delimiters(text)
-    if not declared <= _DEFAULT_DELIMITERS:
+    # declaration with it) by this point, which is why `declared` is read above.
+    if custom:
         segment, field_run = _delimiter_patterns(declared | _DEFAULT_DELIMITERS)
         scrubbed = segment.sub(lambda m: f"{m.group(1)}{m.group(2)}{_REDACTED}", scrubbed)
         scrubbed = field_run.sub(_REDACTED, scrubbed)
