@@ -55,6 +55,10 @@
       (b) The Kind -ne 'interactive' filter is currently UNEXERCISED. Measured 2026-08-01: all registry
           records on this host read kind=interactive, entrypoint=claude-desktop, including a
           workflow-driven session. Do not read it as protection it has never provided.
+      (c) Scheduled-task runs are recognised by presence's Scheduled flag, which reads the first line
+          of each peer's transcript (Test-ScheduledTaskSession in session-registry.ps1). If the Desktop
+          app changes how it starts a scheduled run, the flag reads false and they are announced to
+          again, as before the flag existed.
 
     NO SHIPPED CALLER REACHES THE OUTSIDE-A-REPO PATH. The shim scripts/coord/install-coordination.ps1
     writes is gated on the same git probe this hook would use and invokes it with no arguments, so
@@ -658,7 +662,11 @@ try {
         $me = @($peers | Where-Object { $_.SessionId -and ($_.SessionId -ieq $selfId) })
         $me = if ($me.Count -gt 0) { $me[0] } else { $null }
 
-        if (-not $SelfTest -and $me -and $me.Kind -and $me.Kind -ne 'interactive') {
+        # A SCHEDULED-TASK RUN STANDS DOWN TOO. The Kind test never fires for one; presence's Scheduled
+        # flag does, and session-registry.ps1's Test-ScheduledTaskSession says why. Measured 2026-10-16:
+        # a 15-minute scheduled run announced itself, and was announced to, on every prompt.
+        $meScheduled = ($me -and $me.Scheduled -eq $true)
+        if (-not $SelfTest -and $me -and (($me.Kind -and $me.Kind -ne 'interactive') -or $meScheduled)) {
             # NOT terminal. Writing 'announced' here would permanently silence a session on the strength
             # of a filter measured to be currently unexercised, and a wrong filter would then produce
             # evidence identical to a right one. DO NOT invert this to fail closed when $me is null:
@@ -669,12 +677,16 @@ try {
             $upd | Add-Member -NotePropertyName checks -NotePropertyValue ([int]$upd.checks + 1) -Force
             $upd | Add-Member -NotePropertyName lastCheck -NotePropertyValue (Get-Date).ToString('o') -Force
             try { $upd | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $marker -Encoding ascii } catch { }
-            Write-Receipt 'UNATTENDED' @{ peers = $peers.Count; checks = [int]$upd.checks; note = "kind=$($me.Kind)" }
+            $why = if ($meScheduled) { 'scheduled task' } else { "kind=$($me.Kind)" }
+            Write-Receipt 'UNATTENDED' @{ peers = $peers.Count; checks = [int]$upd.checks; note = $why }
             exit 0
         }
 
-        # BOTH self-identification nets.
-        $others = @($peers | Where-Object { (-not $_.IsSelf) -and -not ($_.SessionId -ieq $selfId) })
+        # BOTH self-identification nets. A scheduled-task peer is DROPPED, not listed as unreachable:
+        # an unreachable peer is mailed, and nobody in a scheduled run is there to read it.
+        $notSelf = @($peers | Where-Object { (-not $_.IsSelf) -and -not ($_.SessionId -ieq $selfId) })
+        $others = @($notSelf | Where-Object { -not ($_.Scheduled -eq $true) })
+        $schedDropped = $notSelf.Count - $others.Count
 
         # THIS SESSION'S LOGIN IS A FACT, LOOKED UP, NOT INFERRED FROM THE ROSTER.
         #
@@ -922,6 +934,8 @@ try {
                 }
             }
         }
+        # Dropped scheduled peers are a decision too. A mail problem outranks this in the 80-char note.
+        if ($schedDropped -gt 0 -and -not $mailNote) { $mailNote = "scheduled-task peers dropped: $schedDropped" }
         $upd | Add-Member -NotePropertyName mailed -NotePropertyValue @($mailKnown) -Force
         $upd | Add-Member -NotePropertyName mailSent -NotePropertyValue ([int]$upd.mailSent + $mailSentNow) -Force
 

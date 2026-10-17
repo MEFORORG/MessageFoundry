@@ -124,6 +124,15 @@ REMOTE = {
     "Worktree": "cron-wt",
     "Cwd": "D:\\t\\cron-wt",
 }
+# The registry reads kind=interactive for a scheduled run; only presence's Scheduled flag tells.
+SCHEDULED = {
+    **PEER,
+    "Scheduled": True,
+    "SessionId": "dddddddd-1111-1111-1111-111111111111",
+    "Short": "dddddddd",
+    "Worktree": "primary",
+    "Cwd": "D:\\t\\primary-sched",
+}
 
 
 def _git_init(repo: Path) -> None:
@@ -596,6 +605,51 @@ def test_an_unattended_peer_is_listed_but_not_targeted(repo: Path, tmp_path: Pat
     p = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, PEER, REMOTE])
     skip = peer_lines(p.stdout, "SKIP")
     assert any(REMOTE["Worktree"] in ln and "unattended" in ln for ln in skip)
+
+
+def test_a_scheduled_task_peer_is_dropped_not_targeted_or_mailed(
+    repo: Path, tmp_path: Path
+) -> None:
+    """Nobody is in a scheduled run, so it is neither messaged nor mailed, nor even listed.
+
+    The mailed half uses a run on ANOTHER login: without the flag that peer is mailed, so the
+    assertion would fail on the old code rather than pass vacuously."""
+    sd = tmp_path / "state"
+    stub, log = mail_stub(tmp_path)
+    sched_acct = {**SCHEDULED, "Login": "acct-1"}
+    p = run(
+        repo,
+        tmp_path=tmp_path,
+        state_dir=sd,
+        rows=[SELF_ROW, PEER, SCHEDULED, sched_acct],
+        extra=("-MailScript", str(stub)),
+    )
+    assert "1 other session" in p.stdout
+    assert SCHEDULED["Cwd"] not in p.stdout
+    assert any(PEER["Cwd"] in ln for ln in p.stdout.splitlines())
+    assert sends(log) == [], f"a scheduled run was mailed: {sends(log)!r}"
+
+
+def test_only_a_scheduled_task_peer_means_silence_with_a_receipt(
+    repo: Path, tmp_path: Path
+) -> None:
+    sd = tmp_path / "state"
+    p = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, SCHEDULED])
+    assert p.stdout.strip() == ""
+    assert "NO_PEERS" in outcomes(sd)
+    assert any("scheduled-task peers dropped: 1" in r for r in receipts(sd))
+
+
+def test_a_scheduled_task_session_stands_down_rather_than_announcing(
+    repo: Path, tmp_path: Path
+) -> None:
+    sd = tmp_path / "state"
+    p = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[{**SELF_ROW, "Scheduled": True}, PEER])
+    assert p.stdout.strip() == ""
+    assert "UNATTENDED" in outcomes(sd)
+    assert any("scheduled task" in r for r in receipts(sd))
+    # Not terminal: the same rule as the Kind stand-down.
+    assert marker_obj(sd)["state"] == "pending"
 
 
 def test_only_unreachable_peers_means_silence(repo: Path, tmp_path: Path) -> None:
