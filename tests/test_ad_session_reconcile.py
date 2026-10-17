@@ -1683,6 +1683,57 @@ async def test_a_breaker_trip_does_not_mark_an_id_less_row_or_forfeit_its_clear(
         await store.close()
 
 
+async def test_a_forfeited_breaker_logs_a_trip_of_id_less_rows_once_not_per_pass(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #3083 beside #2434. A trip leaves an id-less row unmarked, so a trip of id-less rows
+    alone marks nothing. It is still one trip: a process that has given up resolving the breaker
+    says once that it will not resolve it, not on every pass the trip stands.
+
+    RED when: whether a trip is open is read off the marks, which an id-less trip never sets."""
+    names = [f"user{i:02d}" for i in range(12)]
+    legacy = [f"legacy{i:02d}" for i in range(12)]
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap(
+            {
+                **{n: _principal(n) for n in names},
+                **{n: replace(_principal(n), directory_object_id=None) for n in legacy},
+            }
+        )
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for name in names:
+            assert await _signed_in_ad_user(service, store, name) is not None
+        for name in names:
+            del ldap.present[name]  # a wrong search base: nobody is found
+        assert (await service.reconcile_directory_sessions()).aborted is None  # strike 1
+        assert (await service.reconcile_directory_sessions()).aborted == "mass_revoke_breaker"
+        for name in names:
+            user = await store.get_user_by_username(name)
+            assert user is not None
+            await store.revoke_user_sessions(user.id)
+        assert (await service.reconcile_directory_sessions()).probed == 0
+        assert service._reconcile_breaker_standing == "forfeit"
+
+        for name in legacy:
+            assert await _signed_in_ad_user(service, store, name) is not None
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            assert (await service.reconcile_directory_sessions()).aborted is None  # strike 1
+            for _ in range(3):  # the new trip, then later passes of the same trip
+                plan = await service.reconcile_directory_sessions()
+                assert plan.aborted == "mass_revoke_breaker"
+                assert service._reconcile_unconfirmed == set()  # nothing was marked
+        said = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "the breaker tripped after" in r.getMessage()
+        ]
+        assert len(said) == 1
+    finally:
+        await store.close()
+
+
 async def test_an_outage_beside_an_id_less_row_counts_only_the_probes_asked(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
