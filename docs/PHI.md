@@ -2082,7 +2082,12 @@ Properties of the anonymizer:
 - **Deterministic, salted keying.** A real value maps to a surrogate under a **secret, per-dataset
   salt**: the same real value yields the same surrogate **within a dataset** (referential integrity
   preserved), **different datasets use different salts** (no cross-dataset linkage), and the salt is
-  secret (re-identification-resistant).
+  secret (re-identification-resistant). Generate the salt with `secrets.token_urlsafe(24)`. The
+  keyer refuses a salt that looks degenerate, and that screen also refuses a small share of
+  genuinely random salts drawn from a narrow alphabet, such as decimal digits. That is an accepted
+  cost. If one is refused, replace it with a salt from that tool, not another draw from the same
+  alphabet. The rates and the stated bound are in the docstring of `_estimated_entropy_bits` in
+  [`keying.py`](../messagefoundry/anon/keying.py) (vault BACKLOG #3359).
 - **Width/shape-preserving surrogates** — a surrogate keeps the original's width/shape so the
   scrubbed dataset stays structurally realistic.
 - **Field-anchored site-code scrub** — the site-code scrub is anchored to the field, not matched by

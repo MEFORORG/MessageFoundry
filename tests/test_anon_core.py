@@ -8,6 +8,8 @@ seam's plumbing; engine/tee whole-message equality stays in ``test_anon_parity.p
 from __future__ import annotations
 
 import functools
+import math
+import random
 import secrets
 import string
 from collections.abc import Callable, Iterator
@@ -131,9 +133,12 @@ def test_keyer_accepts_real_high_entropy_salts_including_one_with_repeats() -> N
     )
     for salt in (
         _REAL_RANDOM_SALT_WITH_REPEATS,
-        secrets.token_hex(8),  # 16 characters -- exactly at MIN_SALT_LEN, no length headroom
-        secrets.token_urlsafe(24),
-        secrets.token_hex(32),
+        # FIXED draws, not fresh ones: a control that can fail at random is not a control, and a
+        # fresh 16-character hex draw is refused now and then (BACKLOG #3359; the rate is in the
+        # estimator's docstring).
+        "f93e8522e800a6f1",  # secrets.token_hex(8): 16 characters, exactly at MIN_SALT_LEN
+        "oaBlx5VtWT4i_Sl2FfajqZcqhvFiVeGZ",  # secrets.token_urlsafe(24)
+        "c75ea23aa891e361a23926b2bbdcd10c76cad07eb0f7a0de1d934b8ba51936e4",  # secrets.token_hex(32)
     ):
         assert Keyer(salt).seed("mrn", "12345") > 0  # constructs and keys, no raise
 
@@ -166,7 +171,8 @@ def test_keyer_rejects_an_oversized_salt_at_construction_not_at_first_message() 
     with pytest.raises(ValueError, match="at most"):
         Keyer(oversized)
     # ...and a salt exactly AT the ceiling still works -- the bound must not be off by one.
-    at_ceiling = secrets.token_hex(MAX_SALT_BYTES // 2)
+    # A FIXED secrets.token_hex(32) draw, like the positive controls above (BACKLOG #3359).
+    at_ceiling = "c75ea23aa891e361a23926b2bbdcd10c76cad07eb0f7a0de1d934b8ba51936e4"
     assert len(at_ceiling.encode("utf-8")) == MAX_SALT_BYTES
     assert Keyer(at_ceiling).seed("mrn", "12345") > 0
 
@@ -795,23 +801,136 @@ def test_length_does_not_rescue_a_repeating_pattern(salt: str, label: str) -> No
 def test_real_generated_salts_are_still_accepted() -> None:
     """THE CONTROL THAT MATTERS. A floor that refuses everything would pass every rejection test
     above while making the anonymizer unusable, which is worse than the defect it fixes. Decimal is
-    the narrowest alphabet a real generator would produce, so it is the binding case."""
+    the narrowest alphabet a real generator would produce, so it is the binding case.
+
+    Each salt is a FIXED draw from the generator its comment names, not a fresh one. This test drew
+    fresh salts until BACKLOG #3359, and failed a required CI leg whenever a 16-digit draw landed in
+    the share the screen refuses. The rate itself is pinned by the seeded sweep below."""
     for salt in (
-        secrets.token_urlsafe(24),
-        secrets.token_hex(8),
-        secrets.token_hex(16),
-        "".join(secrets.choice(string.digits) for _ in range(MIN_SALT_LEN)),
+        "oaBlx5VtWT4i_Sl2FfajqZcqhvFiVeGZ",  # secrets.token_urlsafe(24), the recommended generator
+        "006392195aac21a4",  # secrets.token_hex(8)
+        "b3601e0acceec7205183707ba608c1ed",  # secrets.token_hex(16)
+        "9800610913639340",  # 16 x secrets.choice(string.digits)
     ):
         Keyer(salt)  # must not raise
+
+
+#: Draws per alphabet in the seeded sweep: enough to see the decimal refusals, under a second to run.
+_SWEEP_DRAWS = 20_000
+
+#: The stated bound on refusing a genuinely random decimal salt, under 1 in 1,000. The source of
+#: record for the bound and the exact rates is the docstring of ``_estimated_entropy_bits``.
+_MAX_DECIMAL_REFUSALS = _SWEEP_DRAWS // 1_000
+
+
+def _seeded_salts(alphabet: str, length: int, *, seed: int) -> list[str]:
+    """Salts drawn uniformly from ``alphabet`` by a SEEDED generator, so the sweep is the same on
+    every run. Only ``Random.random()`` is used: the random module guarantees its output for a given
+    seed across Python versions, and does not guarantee ``choice`` or ``randbytes``."""
+    rng = random.Random(seed)
+    return [
+        "".join(alphabet[int(rng.random() * len(alphabet))] for _ in range(length))
+        for _ in range(_SWEEP_DRAWS)
+    ]
+
+
+def _refusals(salts: list[str]) -> int:
+    refused = 0
+    for salt in salts:
+        try:
+            Keyer(salt)
+        except ValueError:
+            refused += 1
+    return refused
+
+
+def test_seeded_sweep_holds_the_refusal_bound_for_random_decimal_salts() -> None:
+    """The screen refuses a small share of genuinely random 16-digit salts, BY DESIGN (BACKLOG
+    #3359): the estimator reads the characters a draw happens to repeat, not the generator. This
+    sweep holds that cost under the stated bound. It must also see at least one refusal: a sweep
+    that never fires would pass just as well against an estimator that could not refuse anything."""
+    refused = _refusals(_seeded_salts(string.digits, MIN_SALT_LEN, seed=3359))
+    assert 0 < refused < _MAX_DECIMAL_REFUSALS, refused
+
+
+def _partitions(n: int, parts: int, largest: int) -> Iterator[tuple[int, ...]]:
+    """Every way to split ``n`` characters into at most ``parts`` symbol counts, largest first."""
+    if n == 0:
+        yield ()
+        return
+    if parts == 0:
+        return
+    for first in range(min(n, largest), 0, -1):
+        for rest in _partitions(n - first, parts - 1, first):
+            yield (first, *rest)
+
+
+def _exact_refusal_rate(alphabet: str, length: int) -> float:
+    """The EXACT probability that ``Keyer`` refuses a uniform random salt of ``length`` characters
+    from ``alphabet``. Both floors depend only on the multiset of character counts, so one string
+    per multiset, run through ``Keyer`` itself, decides every string with those counts, and each
+    multiset is weighted by how many strings share it."""
+    size = len(alphabet)
+    refused = 0
+    for counts in _partitions(length, size, length):
+        salt = "".join(symbol * count for symbol, count in zip(alphabet, counts, strict=False))
+        try:
+            Keyer(salt)
+            continue
+        except ValueError:
+            pass
+        arrangements = math.factorial(length)
+        for count in counts:
+            arrangements //= math.factorial(count)
+        symbol_choices = math.perm(size, len(counts))
+        for count in set(counts):
+            symbol_choices //= math.factorial(counts.count(count))
+        refused += arrangements * symbol_choices
+    return refused / size**length
+
+
+@pytest.mark.parametrize(
+    "alphabet,length,rate",
+    [
+        (string.digits, MIN_SALT_LEN, 2.76e-4),  # the two floors are the same inequality here
+        (string.digits, MIN_SALT_LEN + 1, 1.50e-4),  # the per-character floor binds from here up
+        (string.digits, 20, 1.38e-5),
+        ("0123456789abcdef", MIN_SALT_LEN, 2.51e-6),  # secrets.token_hex(8)
+    ],
+)
+def test_exact_refusal_rates_match_the_estimator_docstring(
+    alphabet: str, length: int, rate: float
+) -> None:
+    """PIN the rates the docstring of ``_estimated_entropy_bits`` states, so a change to either
+    floor or to the estimator has to face them. The 17-digit case also fails if the per-character
+    floor is removed: the total floor alone refuses about a fifth as many."""
+    assert _exact_refusal_rate(alphabet, length) == pytest.approx(rate, rel=0.01)
+
+
+def test_seeded_sweep_never_refuses_the_recommended_generator() -> None:
+    """Both entropy refusals tell an operator to run ``secrets.token_urlsafe(24)``, which emits 32
+    characters of the 64-symbol URL-safe alphabet. This sweep models that SHAPE with seeded draws;
+    it does not call the generator. A salt of that shape must never be refused, and with a wide
+    margin rather than by luck, so the lowest estimate is held at three times the floor. Clearing
+    that margin also clears the per-character floor (96 bits over 32 characters is 3 per
+    character)."""
+    urlsafe = string.ascii_letters + string.digits + "-_"
+    assert len(urlsafe) == 64
+    salts = _seeded_salts(urlsafe, 32, seed=3359)
+    assert _refusals(salts) == 0  # refusal is Keyer's, so Keyer is what the sweep asks
+    assert min(map(_estimated_entropy_bits, salts)) > 3 * MIN_SALT_ENTROPY_BITS
 
 
 def test_the_two_floors_are_independent() -> None:
     """Neither floor substitutes for the other, so both must be able to fire alone. A single
     repeated character fails the TOTAL (0 bits); a two-symbol pattern long enough to clear the
-    total fails the RATE. If one message could serve both, one floor would be redundant."""
-    with pytest.raises(ValueError, match="too predictable"):
+    total fails the RATE. If one message could serve both, one floor would be redundant. Each
+    message must also name the generator the sweep above holds at zero refusals, and send a
+    refused random salt to it rather than to another draw from the same alphabet."""
+    generator = r"[\s\S]*secrets\.token_urlsafe\(24\)[\s\S]*not another draw from the same alphabet"
+    with pytest.raises(ValueError, match="too predictable" + generator):
         Keyer("a" * MIN_SALT_LEN)
-    with pytest.raises(ValueError, match="too few distinct characters"):
+    with pytest.raises(ValueError, match="too few distinct characters" + generator):
         Keyer("ab" * MIN_SALT_LEN)
 
 
