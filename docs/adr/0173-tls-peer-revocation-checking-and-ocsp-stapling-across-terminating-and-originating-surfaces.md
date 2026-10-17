@@ -1180,6 +1180,10 @@ decisions too:
    then the connection's only trust anchor, applies the trust-anchor ACL and path checks to it
    (*code*).
 
+The live Linux test of the pin, `test_server_certificate_pin_is_enforced_under_strict_encryption`,
+runs only with `MEFOR_TEST_SQLSERVER_STRICT=1` on a strict-configured server. No CI job sets it, so
+it is skipped in CI and the Linux reading is not yet taken.
+
 The paragraph above is kept as written. Its first sentence, *"`connection_string` emits
 `ServerCertificate=` beside `Encrypt=yes`, never `Encrypt=strict`"*, describes the code before this
 amendment.

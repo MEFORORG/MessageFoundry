@@ -6185,7 +6185,7 @@ def _presented_certificate_pem(host: str, port: int) -> str:
 
 
 @pytest.mark.skipif(
-    not os.getenv("MEFOR_TEST_SQLSERVER_STRICT"),
+    os.getenv("MEFOR_TEST_SQLSERVER_STRICT") != "1",
     reason="set MEFOR_TEST_SQLSERVER_STRICT=1 only where the SQL Server is configured for TDS 8.0 "
     "strict encryption; the default CI containers are not, so the TLS-first read is cut",
 )
@@ -6203,8 +6203,9 @@ async def test_server_certificate_pin_is_enforced_under_strict_encryption(tmp_pa
     MEASUREMENT, not asserted: the same two pins beside ``Encrypt=yes``, the string the store sent
     before #2223. The CI container's certificate is self-signed and not in the runner's trust store,
     so ``yes_right`` is the control for ``yes_wrong``: if ``yes_right`` is REFUSED, the chain check
-    refused both and ``yes_wrong`` says nothing about the pin. Grep the CI warnings summary for
-    ``BACKLOG-2223-PIN``; a refusal carries the driver's message."""
+    refused both and ``yes_wrong`` says nothing about the pin. The test is skipped in CI unless
+    ``MEFOR_TEST_SQLSERVER_STRICT=1`` is set on a strict-configured server; where it runs, its
+    ``BACKLOG-2223-PIN`` warning line carries each outcome, and a refusal carries the driver's message."""
     import warnings
 
     import aioodbc
