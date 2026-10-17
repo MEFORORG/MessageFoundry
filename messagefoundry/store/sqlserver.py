@@ -2414,6 +2414,15 @@ _SCHEMA: list[str] = [
         CREATE INDEX ix_webauthn_credentials_user ON webauthn_credentials(user_id)""",
     """IF INDEXPROPERTY(OBJECT_ID('webauthn_credentials'),'ux_webauthn_label','IndexID') IS NULL
         CREATE UNIQUE INDEX ux_webauthn_label ON webauthn_credentials(user_id, label)""",
+    # BACKLOG #2733: the user foreign key SQLite and Postgres already declare, so a passkey can
+    # never be written for an account that does not exist. No cascade, as on those two: at least
+    # delete_user and remove_unless_last_admin clear the account's passkeys first, through
+    # _delete_user_rows, and a delete that skipped it would be refused here. WITH NOCHECK so a
+    # store already holding an orphaned passkey row still opens; the key refuses every later one.
+    # ix_webauthn_credentials_user above serves the key's check on a user delete.
+    """IF OBJECT_ID('fk_webauthn_credentials_user','F') IS NULL
+        ALTER TABLE webauthn_credentials WITH NOCHECK
+            ADD CONSTRAINT fk_webauthn_credentials_user FOREIGN KEY (user_id) REFERENCES users(id)""",
     # The first-seen sign-in address baseline (BACKLOG #288, vault BACKLOG #2145) -- mirrors the SQLite
     # `known_login_addresses` table (store/store.py), whose comment gives the reasons, the cascade's
     # among them. The primary key serves the signal's one read. `address` is BIN2 so key equality is
@@ -13176,11 +13185,12 @@ class SqlServerStore:
 
     async def add_webauthn_credential(self, cred: WebAuthnCredential) -> None:
         """Persist one enrolled passkey. Public keys are plaintext by design (COSE verification
-        material, not a secret — excluded from cipher + rekey). A duplicate ``(user_id, label)``
-        raises pyodbc's IntegrityError via ``ux_webauthn_label`` — the caller renders it as the
-        same "label already in use" error as its pre-check (the concurrent-enroll race, ADR 0068
-        §4). The account is re-sealed over its new passkey digest in the same transaction (BACKLOG
-        #2592)."""
+        material, not a secret — excluded from cipher + rekey). pyodbc's IntegrityError is raised
+        for at least a duplicate ``(user_id, label)`` (``ux_webauthn_label``), a credential id
+        already held (the primary key) and an account that does not exist
+        (``fk_webauthn_credentials_user``, BACKLOG #2733); the caller tells them apart by
+        re-reading, as ``AuthService.finish_webauthn_registration`` says. The account is re-sealed
+        over its new passkey digest in the same transaction (BACKLOG #2592)."""
         await self._write_passkeys_txn(
             cred.user_id, _WEBAUTHN_INSERT, webauthn_insert_params(cred), counted=False
         )
@@ -13413,6 +13423,11 @@ class SqlServerStore:
     @staticmethod
     async def _delete_user_rows(cur: Any, user_id: str) -> None:
         """Delete the account and every row keyed to it, inside the caller's transaction."""
+        # BACKLOG #2733: hold the account row first, as every passkey write does
+        # (_read_user_record). Otherwise an enrolment committing between the passkey delete and the
+        # users delete below would fail fk_webauthn_credentials_user and the whole delete with it.
+        await cur.execute("SELECT id FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?", (user_id,))
+        await cur.fetchall()
         await cur.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
         await cur.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
         await cur.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))

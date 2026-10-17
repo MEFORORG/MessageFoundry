@@ -11243,9 +11243,11 @@ class AuthService:
         try:
             await self._store.add_webauthn_credential(cred)
         except Exception as exc:
-            # The concurrent duplicate-label race (ADR 0068 §4): each backend raises its own
-            # integrity class (sqlite3.IntegrityError / asyncpg UniqueViolationError / pyodbc
-            # IntegrityError) — rendered as the same legible error as a pre-checked duplicate.
+            # A concurrent enrolment raced this one past the pre-checks above (ADR 0068 §4): each
+            # backend raises its own integrity class (sqlite3.IntegrityError, asyncpg
+            # UniqueViolationError or ForeignKeyViolationError, pyodbc IntegrityError) for at least
+            # the user foreign key, the credential-id primary key and the (user_id, label) index.
+            # The first two are told apart below; anything else is answered as the label clash.
             if not _is_integrity_refusal(exc):
                 raise
             # BACKLOG #1807: the same classes carry the user_id foreign-key refusal, raised when the
@@ -11253,6 +11255,11 @@ class AuthService:
             # driver's message: that text can echo the operator-chosen label.
             if await self._load_user(user.id) is None:
                 raise ValueError("no such user") from exc
+            # BACKLOG #2733: the credential-id primary key fires too, when the same authenticator
+            # enrols concurrently (on this account or another). Told apart the same way: a row now
+            # holding this credential id is that refusal, whatever label it carries.
+            if await self._store.get_webauthn_credential(credential_id_hash) is not None:
+                raise ValueError("this passkey is already enrolled") from exc
             raise ValueError("label already in use") from exc
         # Parity with confirm_mfa_enrollment: the enrolling session is now MFA-verified (it just
         # proved possession of the freshly-bound authenticator). Stamped against the OLD hash, then
