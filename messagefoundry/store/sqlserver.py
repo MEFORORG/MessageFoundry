@@ -161,12 +161,16 @@ from messagefoundry.store.sealed_cache import (
     new_state_cache,
     sealed_reference_set,
 )
+from messagefoundry.store.session_lineage import revoke_through_lineage
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
     _SESSION_CAP_ORDER_SQL,
     _SESSION_CAP_RANK_NOT_AHEAD_SQL,
     _SESSION_INSERT,
+    _SESSION_LINEAGE_INSERT,
+    _SESSION_LINEAGE_PURGE,
+    _SESSION_LINEAGE_SUCCESSOR,
     _SESSION_LIVE_SQL,
     _SESSION_NOT_AHEAD_SQL,
     _SQL_ADMIN_GUARD_HOLDERS,
@@ -2404,6 +2408,14 @@ _SCHEMA: list[str] = [
         CREATE INDEX ix_sessions_user ON sessions(user_id)""",
     """IF INDEXPROPERTY(OBJECT_ID('sessions'),'ix_sessions_expires','IndexID') IS NULL
         CREATE INDEX ix_sessions_expires ON sessions(expires_at)""",
+    # Which token hash replaced a retired one (vault BACKLOG #3028, ADR 0210). The SQLite `_SCHEMA`
+    # says who reads it and why it is unsealed. Both hashes are 64-character hex digests, the
+    # sessions.token_hash width. Adding this DDL moves _schema_hash() -- the ADR 0064 bump.
+    """IF OBJECT_ID('session_lineage','U') IS NULL CREATE TABLE session_lineage (
+        retired_hash NVARCHAR(64) NOT NULL PRIMARY KEY,
+        successor_hash NVARCHAR(64) NOT NULL, retired_at FLOAT NOT NULL)""",
+    """IF INDEXPROPERTY(OBJECT_ID('session_lineage'),'ix_session_lineage_retired','IndexID') IS NULL
+        CREATE INDEX ix_session_lineage_retired ON session_lineage(retired_at)""",
     # WebAuthn passkeys (WP-14b, ADR 0068 §4). credential_id_hash — sha256 hex of the RAW credential
     # id (the sessions.token_hash precedent) — is the PK: raw WebAuthn ids may be up to 1023 bytes,
     # unboundable as an index key here (NVARCHAR(MAX) can't be a PK/index key), so the fixed-width
@@ -14000,12 +14012,19 @@ class SqlServerStore:
         return updated if written else None
 
     async def _write_session_txn(
-        self, token_hash: str, change: Callable[[SessionRecord], SessionRecord]
+        self,
+        token_hash: str,
+        change: Callable[[SessionRecord], SessionRecord],
+        *,
+        landed: Callable[[Any], Awaitable[None]] | None = None,
     ) -> SessionRecord | None:
-        """:meth:`_write_session` in a transaction of its own, committed before it returns."""
+        """:meth:`_write_session` in a transaction of its own, committed before it returns.
+        ``landed`` runs on the same cursor, in the same transaction, only when the write landed."""
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 updated = await self._write_session(cur, token_hash, change)
+                if updated is not None and landed is not None:
+                    await landed(cur)
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
@@ -14061,15 +14080,23 @@ class SqlServerStore:
     async def mark_session_mfa_verified(self, token_hash: str, *, now: float | None = None) -> None:
         await self._write_session_txn(token_hash, mfa_stamp(time.time() if now is None else now))
 
-    async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
+    async def rotate_session(
+        self, token_hash: str, *, new_token_hash: str, now: float | None = None
+    ) -> bool:
         """Re-key a live session in place (ASVS 7.2.4). See :meth:`AuthStore.rotate_session`.
 
         The token hash is sealed, so the re-key goes through :meth:`_write_session` (BACKLOG
         #2592), whose write reads an ``OUTPUT`` rowset and never ``cursor.rowcount`` (BACKLOG
         #2283). ``token_hash`` is ``NVARCHAR(64)`` and a hex digest is exactly 64 chars, so the
-        clustered-PK row move is width-safe."""
+        clustered-PK row move is width-safe. The lineage link goes in the same transaction, only
+        when the re-key landed (vault BACKLOG #3028)."""
+        now = time.time() if now is None else now
+
+        async def _link(cur: Any) -> None:
+            await cur.execute(_SESSION_LINEAGE_INSERT, (token_hash, new_token_hash, now))
+
         rotated = await self._write_session_txn(
-            token_hash, lambda s: replace(s, token_hash=new_token_hash)
+            token_hash, lambda s: replace(s, token_hash=new_token_hash), landed=_link
         )
         return rotated is not None
 
@@ -14080,17 +14107,41 @@ class SqlServerStore:
             (now, token_hash),
         )
 
-    async def supersede_session(self, token_hash: str, *, now: float) -> SessionRecord | None:
-        """Revoke and return in one statement (BACKLOG #2146). See :meth:`AuthStore.supersede_session`.
+    async def supersede_session(
+        self, token_hash: str, *, now: float, lineage_since: float | None = None
+    ) -> SessionRecord | None:
+        """Revoke and return, one statement per step, in one transaction (BACKLOG #2146, vault
+        BACKLOG #3028). See :meth:`AuthStore.supersede_session`.
 
-        Through ``_execute_output`` rather than ``_fetchone``, which commits as a READ, while this is
-        a durable write (BACKLOG #2283)."""
-        rows = await self._execute_output(
-            "UPDATE sessions SET revoked_at=?, seal='' OUTPUT inserted.*"
-            " WHERE token_hash=? AND revoked_at IS NULL",
-            (now, token_hash),
-        )
-        return SessionRecord.from_mapping(rows[0]) if rows else None
+        Each step's ``UPDATE ... OUTPUT`` takes the row's lock, and its rowset says what it ended,
+        which a session-wide ``SET NOCOUNT ON`` cannot hide (BACKLOG #2283). Each statement reads
+        what has committed when it runs, so a rotation that commits while the walk runs is seen by
+        the next step's lineage read. Committed as a durable write, never as a READ."""
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+
+            async def _revoke(h: str) -> SessionRecord | None:
+                await cur.execute(
+                    "UPDATE sessions SET revoked_at=?, seal='' OUTPUT inserted.*"
+                    " WHERE token_hash=? AND revoked_at IS NULL",
+                    (now, h),
+                )
+                rows = await self._fetch_dicts(cur)
+                return SessionRecord.from_mapping(rows[0]) if rows else None
+
+            async def _successor(h: str, since: float) -> str | None:
+                await cur.execute(_SESSION_LINEAGE_SUCCESSOR, (h, since))
+                rows = await cur.fetchall()
+                return str(rows[0][0]) if rows else None
+
+            try:
+                ended = await revoke_through_lineage(
+                    token_hash, lineage_since=lineage_since, revoke=_revoke, successor=_successor
+                )
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return ended
 
     async def revoke_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
@@ -14164,7 +14215,11 @@ class SqlServerStore:
         return len(rows)
 
     async def purge_expired_sessions(
-        self, *, now: float | None = None, idle_seconds: float | None = None
+        self,
+        *,
+        now: float | None = None,
+        idle_seconds: float | None = None,
+        lineage_seconds: float | None = None,
     ) -> int:
         now = time.time() if now is None else now
         if idle_seconds is None:
@@ -14178,7 +14233,12 @@ class SqlServerStore:
         # `revoke_user_sessions` this keeps the driver's count, which a session-wide SET NOCOUNT ON
         # can turn to -1: the reaper ignores it and decides nothing on it, and an OUTPUT rowset
         # would carry every purged row back each pass for a number nobody acts on.
-        return await self._execute(sql, params)
+        purged = await self._execute(sql, params)
+        if lineage_seconds is not None:
+            # Its own statement and transaction, as on Postgres: a link is table hygiene, and the
+            # supersession stops following one at its window whether or not this has run.
+            await self._execute(_SESSION_LINEAGE_PURGE, (now - float(lineage_seconds),))
+        return purged
 
     async def stats(self) -> dict[str, int]:
         rows = await self._fetchall(

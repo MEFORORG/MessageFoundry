@@ -9336,13 +9336,16 @@ async def _session_reaper(
     store: Store,
     *,
     idle_seconds: float | None = None,
+    lineage_seconds: float | None = None,
     wall: Callable[[], float] | None = None,
     mono: Callable[[], float] | None = None,
 ) -> None:
     """Drop expired session rows, first ``_SESSION_REAP_FIRST_DELAY`` after start and then every
     ``_SESSION_REAP_INTERVAL``, until the task is cancelled. With ``idle_seconds`` given,
     idle-expired rows go too (BACKLOG #2096); the lifespan passes the idle timeout the validator
-    uses.
+    uses. With ``lineage_seconds`` given, session lineage links older than that go too (vault
+    BACKLOG #3028); the lifespan passes the window the supersession follows them for. Purging as of
+    the earlier instant below only keeps a link longer, never shortens that window.
 
     **The reaper skips a pass when the wall clock has jumped forward (BACKLOG #2283).** The purge
     judges expiry and idleness by the wall clock, and its deletes cannot be undone. Run just after
@@ -9401,7 +9404,9 @@ async def _session_reaper(
             continue
         try:
             await store.purge_expired_sessions(
-                now=now - _SESSION_REAP_STEP_TOLERANCE, idle_seconds=idle_seconds
+                now=now - _SESSION_REAP_STEP_TOLERANCE,
+                idle_seconds=idle_seconds,
+                lineage_seconds=lineage_seconds,
             )
         except asyncio.CancelledError:
             raise
@@ -10605,7 +10610,11 @@ def create_managed_app(
                         auth_settings.oidc_redirect_path,
                     )
                 reaper = asyncio.create_task(
-                    _session_reaper(store, idle_seconds=auth.session_idle_seconds)
+                    _session_reaper(
+                        store,
+                        idle_seconds=auth.session_idle_seconds,
+                        lineage_seconds=auth.supersession_lineage_seconds,
+                    )
                 )
                 if _initial_credential_warn_lead(auth) is not None:
                     # BACKLOG #1141 (ASVS 6.4.5): a nudge for every unclaimed temporary password an

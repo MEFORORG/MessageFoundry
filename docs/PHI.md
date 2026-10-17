@@ -991,7 +991,9 @@ on the store-file ACL plus the volume/whole-DB layer for the rest.
 - `audit_log`, `delivered_keys`, `resend_log` — **keep-forever by design**; `[retention].audit_days` is
   **reserved and not enforced**.
 - `sessions` — expired rows are deleted by `purge_expired_sessions`, driven from the auth layer (idle
-  30 min / absolute 12 h), not by the RetentionRunner.
+  30 min / absolute 12 h), not by the RetentionRunner. The same pass deletes `session_lineage` links
+  (two token hashes and a time, vault BACKLOG #3028) once they are past the window the sign-in
+  supersession follows them for.
 - `processed_files` — an age/count prune driven from the wiring runner, also outside the RetentionRunner.
 - `state.namespace` / `state.key` — removed with their value on `[retention].state_max_age_days`.
 - `reference.*` — **no purge path**; replaced only by the next sync's build-new-then-flip.

@@ -207,7 +207,8 @@ async def test_a_rotation_racing_the_supersession_cannot_keep_the_session_live(
     # FIRST store call that names the presented hash, whichever call that is, so it measures the
     # gap rather than one method name. Once that call has run, the session must end: the rotation
     # fails closed, or its new token does not validate. A rotation that commits BEFORE that call is
-    # the stated limit, pinned in tests/_session_rotation_contract.py. If a later change reads the
+    # followed through the session lineage (vault BACKLOG #3028), which
+    # tests/test_session_supersession_lineage.py pins. If a later change reads the
     # presented hash earlier in the sign-in, this fires there, and that read must not decide the
     # revoke, or the gap is back.
     service = await _service(store)
@@ -258,11 +259,13 @@ async def test_a_touch_just_before_the_revoke_still_audits_a_live_session(
         reads[0] += 1
         return base + reads[0] * 0.001
 
-    async def _touched_first(token_hash: str, *, now: float) -> object:
+    async def _touched_first(
+        token_hash: str, *, now: float, lineage_since: float | None = None
+    ) -> object:
         touched = time.time()
         assert touched > now, "the stepping clock did not separate the touch from the revoke stamp"
         await store.touch_session(token_hash, now=touched)
-        return await real_supersede(token_hash, now=now)
+        return await real_supersede(token_hash, now=now, lineage_since=lineage_since)
 
     monkeypatch.setattr(store, "supersede_session", _touched_first)
     monkeypatch.setattr(time, "time", _stepping)

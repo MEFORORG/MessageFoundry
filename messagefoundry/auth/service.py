@@ -183,6 +183,14 @@ _FACTOR_CEREMONIES: Final = frozenset(
     {"mfa_enroll_confirm", "mfa_verify", "webauthn_enroll", "webauthn_assert"}
 )
 
+#: Vault BACKLOG #3028: what :attr:`AuthService.supersession_lineage_seconds` adds to the flow TTL
+#: for the sign-in's own work after its last wait. At the federated callback that is the code
+#: exchange and a JWKS refresh, each a blocking call under a 10-second socket timeout; on the
+#: password and directory legs it is the whole request, whose LDAP calls each sit under
+#: ``ad_connect_timeout`` and ``ad_receive_timeout`` (10 seconds by default). A sign-in that runs
+#: past the window is a stated limit in docs/SECURITY.md.
+_LINEAGE_SIGN_IN_SLACK_SECONDS: Final = 60.0
+
 
 @cache
 def _audit_write_errors() -> tuple[type[Exception], ...]:
@@ -4310,6 +4318,21 @@ class AuthService:
     def oidc_flow_ttl_seconds(self) -> int:
         """The staged-flow lifetime, so the browser cookie's max-age matches the server-side TTL."""
         return self._settings.oidc_flow_ttl_seconds
+
+    @property
+    def supersession_lineage_seconds(self) -> float:
+        """How long a retired session hash still leads a sign-in's supersession to the session it
+        became (vault BACKLOG #3028, ADR 0210), in seconds. The session reaper purges links older
+        than this.
+
+        It must outlast the longest sign-in a rotation can race, because the presented hash is read
+        at the START of the sign-in and the supersession runs at its end. The longest is the
+        federated leg: its start leg stages the hash, and the callback can come back as late as
+        ``oidc_flow_ttl_seconds`` after. :data:`_LINEAGE_SIGN_IN_SLACK_SECONDS` covers the
+        callback's own work after that, and every other leg is one request inside it. A longer
+        window only lengthens the time a stale copy of a token can END its successor; it never
+        lets one authenticate."""
+        return float(self._settings.oidc_flow_ttl_seconds) + _LINEAGE_SIGN_IN_SLACK_SECONDS
 
     def _oidc_redirect_uri(self, public_origin: str) -> str:
         return public_origin.rstrip("/") + self._settings.oidc_redirect_path
@@ -8875,18 +8898,27 @@ class AuthService:
         session that was still LIVE gets an audit row, so the trail does
         not record the ending of something that had already ended.
 
-        **The read and the revoke are one atomic store operation (BACKLOG #2146).** Why that closes
-        the race with a concurrent rotation is :meth:`AuthStore.supersede_session`'s to say. It holds
+        **The read and the revoke are one store transaction (BACKLOG #2146).** Why that closes the
+        race with a concurrent rotation is :meth:`AuthStore.supersede_session`'s to say. It holds
         across engine processes too, because engine shards serve the API from one shared store.
 
-        **A rotation that committed BEFORE that operation is a stated limit, not a race this
-        closes.** The presented hash then names no session, so this ends nothing, and the session
-        lives on under its new token. docs/SECURITY.md (ASVS 7.2.4, the supersession paragraphs)
-        states how wide that window is.
+        **A rotation that committed BEFORE that transaction is followed (vault BACKLOG #3028, ADR
+        0210).** An elevation in another tab can finish while this sign-in is in flight, and on the
+        federated leg the presented hash was read at the start leg, before the identity provider's
+        round trip. The presented hash then names no session. The store follows the lineage links
+        each rotation wrote to the session's live end and revokes that, in the same transaction.
+        Only links retired within :attr:`supersession_lineage_seconds` of now are followed, so this
+        is the one place a retired hash leads anywhere, and it leads only to an end. An elevation
+        that finished longer ago than that, such as one a second holder of the token completed
+        earlier, is not followed; docs/SECURITY.md (ASVS 7.2.4, the supersession paragraphs) states
+        that bound. The audit row names the session that ended and, when a link was followed, the
+        hash that was presented.
         Returns True when it audited.
         """
         before = time.time()
-        prior = await self._store.supersede_session(prior_hash, now=before)
+        prior = await self._store.supersede_session(
+            prior_hash, now=before, lineage_since=before - self.supersession_lineage_seconds
+        )
         if prior is None:
             return False
         after = time.time()
@@ -8900,10 +8932,13 @@ class AuthService:
         if not prior.is_live(now=moment, idle_seconds=self.session_idle_seconds):
             return False
         owner = await self._load_user(prior.user_id)
+        detail = {"scope": "superseded", "session": prior.token_hash[:12]}
+        if not constant_time_equal(prior.token_hash, prior_hash):  # ASVS 11.2.4, as elsewhere
+            detail["presented"] = prior_hash[:12]
         await self._audit(
             "auth.session_revoked",
             actor=owner.username if owner is not None else None,
-            detail=_json({"scope": "superseded", "session": prior_hash[:12]}),
+            detail=_json(detail),
             client=client,
         )
         return True

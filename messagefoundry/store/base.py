@@ -2771,7 +2771,9 @@ class AuthStore(Protocol):
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None: ...
 
-    async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
+    async def rotate_session(
+        self, token_hash: str, *, new_token_hash: str, now: float | None = None
+    ) -> bool:
         """Re-key a live session to ``new_token_hash``, in place (ASVS 7.2.4).
 
         A pure re-key: every other column — ``user_id``, ``created_at``, ``expires_at``, ``client``,
@@ -2791,6 +2793,12 @@ class AuthStore(Protocol):
         that report what they changed: every other one is deliberately blind (a write against a dead
         hash is a silent no-op), but a caller rotating a session is about to hand the new token to a user,
         so it must be able to fail closed if the session died underneath it.
+
+        **A re-key that lands also records a lineage link, in the SAME transaction** (vault BACKLOG
+        #3028, ADR 0210): ``token_hash`` retired at ``now``, replaced by ``new_token_hash``. The
+        session row itself carries nothing of its old hash, so the old hash still resolves to
+        nothing. The link's one reader is :meth:`supersede_session`; ``store/session_lineage.py``
+        says why it is unsealed. A re-key that did not land writes no link.
         """
         ...
 
@@ -2820,21 +2828,33 @@ class AuthStore(Protocol):
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None: ...
 
-    async def supersede_session(self, token_hash: str, *, now: float) -> SessionRecord | None:
-        """Revoke the unrevoked session ``token_hash`` names, and return its row as revoked.
+    async def supersede_session(
+        self, token_hash: str, *, now: float, lineage_since: float | None = None
+    ) -> SessionRecord | None:
+        """Revoke the unrevoked session ``token_hash`` names, or the one it became, and return its
+        row as revoked.
 
-        Returns ``None`` when no unrevoked row has that hash, so nothing was written. A row that is
-        expired or idle is still revoked and returned. Its other columns are as the revoke found
-        them, so the caller can judge whether the session was live, and ``revoked_at`` is ``now``.
+        Returns ``None`` when nothing was revoked. A row that is expired or idle is still revoked
+        and returned. Its other columns are as the revoke found them, so the caller can judge
+        whether the session was live, and ``revoked_at`` is ``now``. Its ``token_hash`` is the hash
+        the session ended under, which differs from ``token_hash`` when a link was followed.
 
-        **ONE atomic operation, so it cannot interleave with :meth:`rotate_session` (BACKLOG
-        #2146).** It is one statement on Postgres and SQL Server, and one transaction on SQLite. The
-        login supersession used to read the row and then revoke it by hash, and a rotation that
-        re-keyed the row between the two left the revoke matching nothing, so the session lived on
-        under its new hash. Here the store orders the two writes on the row. If this one runs first,
-        the row is revoked and the rotation's ``revoked_at IS NULL`` guard refuses it, so the
-        rotation fails closed. If the rotation committed first, the hash names no row and this
-        returns ``None``.
+        **ONE store transaction, so it cannot interleave with :meth:`rotate_session` (BACKLOG
+        #2146).** The login supersession used to read the row and then revoke it by hash, and a
+        rotation that re-keyed the row between the two left the revoke matching nothing. Here the
+        store orders the two writes on the row. If this one runs first, the row is revoked and the
+        rotation's ``revoked_at IS NULL`` guard refuses it, so the rotation fails closed.
+
+        **A rotation that committed FIRST is followed, when ``lineage_since`` is given (vault
+        BACKLOG #3028, ADR 0210).** The presented hash then names no row, so the revoke steps along
+        the links :meth:`rotate_session` wrote, over as many rotations as there were, and ends the
+        live end, all inside this one transaction. A link retired before ``lineage_since`` is not
+        followed, so a retired hash leads anywhere only for a bounded time; the caller chooses the
+        bound, because the store reads no settings. A rotation that commits during the walk costs
+        the walk one more step, never the revoke: ``store/session_lineage.py`` says why. With
+        ``lineage_since`` left ``None`` no link is followed, and a rotation that committed first
+        leaves this returning ``None``, as before. The lineage lookup lives here and nowhere else:
+        no session READ follows a link, so a retired hash authenticates nothing.
         """
         ...
 
@@ -2900,11 +2920,19 @@ class AuthStore(Protocol):
         ...
 
     async def purge_expired_sessions(
-        self, *, now: float | None = None, idle_seconds: float | None = None
+        self,
+        *,
+        now: float | None = None,
+        idle_seconds: float | None = None,
+        lineage_seconds: float | None = None,
     ) -> int:
         """Delete session rows past their absolute expiry, revoked or not, and return the count.
         With ``idle_seconds`` given, rows idle for longer are deleted too (BACKLOG #2096): the
         validator refuses them on presentation, so keeping them only grows the table.
+
+        With ``lineage_seconds`` given, session lineage links retired more than that long before
+        ``now`` are deleted too (vault BACKLOG #3028). The supersession no longer follows them, so
+        keeping them only grows the table. They are not counted in the return.
 
         The idle variant scans the table, because its ``OR`` reaches past the expiry index, and that
         stands on purpose (BACKLOG #2283). The scan runs once per reaper pass over a table the
