@@ -634,33 +634,36 @@ step that follows the first faster than a person can:
 
 | Pair | Floor | Default | Refused with |
 |---|---|---|---|
-| Sign-in, then a TOTP or recovery code, or a passkey, on the MFA-pending session, including an enrolment that would satisfy it: `POST /me/mfa/confirm` or a passkey registration (BACKLOG #2389) | `[auth].mfa_verify_min_elapsed_seconds`, from the session's mint | 1 s | the leg's ordinary failure, at least: `401 invalid code` on `POST /auth/mfa-verify`, `400 invalid code` on `POST /me/mfa/confirm`, the console's gate page with `400` and "That code wasn't accepted" on `POST /ui/mfa`, the console's `Invalid code.` page on its TOTP confirm, and `400 passkey verification failed` on the console's passkey assertion (`POST /ui/reauth/webauthn`) and its passkey registration; audited `auth.mfa_failed` or `auth.webauthn_failed` with `reason=too_early`, and `phase=enroll` on an enrolment |
+| Sign-in, then a TOTP or recovery code, or a passkey, on the MFA-pending session, including an enrolment that would satisfy it: `POST /me/mfa/confirm` or a passkey registration (BACKLOG #2389) | `[auth].mfa_verify_min_elapsed_seconds`, from the session's mint | 1 s | the leg's ordinary failure, at least: `401 invalid code` on `POST /auth/mfa-verify`, `400 invalid code` on `POST /me/mfa/confirm`, the console's gate page with `400` and "That code wasn't accepted" on `POST /ui/mfa`, the re-authentication page with `Invalid code.` on `POST /ui/reauth` with a code, the console's `Invalid code.` page on its TOTP confirm, and `400 passkey verification failed` on the console's passkey assertion (`POST /ui/reauth/webauthn`) and its passkey registration; audited `auth.mfa_failed` or `auth.webauthn_failed` with `reason=too_early`, and `phase=enroll` on an enrolment |
 | A federated start, then its callback: the step-up always, the sign-in only when `auth_time` falls inside the flow. A callback whose verified `amr` names a value in `oidc_callback_floor_exempt_amr` is exempt (BACKLOG #2388) | `[auth].oidc_callback_min_elapsed_seconds`, from the flow's start on the flow cache's clock | 1 s | `federated sign-in failed`, audited `auth.login_failed`, or the generic step-up refusal, audited `auth.reauth`; both with `reason=too_early` |
 
-Neither response says anything about timing. A caller that does not know whether its proof is good
-cannot tell the refusal from a wrong code or a failed IdP proof by the answer. A caller that does
-know, such as a script holding the TOTP secret or the authenticator, learns from its first refused
-proof that the floor fired. The floors hide nothing from that caller; they only make it wait. The
-MFA floor charges no lockout and spends no code or passkey challenge, so the person simply submits
+Neither response says anything about timing. On most legs a wrong code gets the same answer either
+side of the floor, so a caller that does not know whether its proof is good cannot tell the refusal
+from a wrong code or a failed IdP proof. The exceptions are listed below. A caller that does know,
+such as a script holding the TOTP secret or the authenticator, learns from its first refused proof
+that the floor fired. The floors hide nothing from that caller; they only make it wait. The MFA
+floor charges no lockout and spends no code or passkey challenge, so the person simply submits
 again. That also means a resubmission can show the floor fired, on the verify legs and on both
 enrolment legs: the same code or passkey response then succeeds, where a wrong one never would.
 This is kept on purpose: spending the code or challenge would make the person start the ceremony
-again after a refusal that was not their error (BACKLOG #3194 declined that change). The floor tests
-pin the current behaviour. At least two more answers differ either side of the floor:
+again after a refusal that was not their error (BACKLOG #3194 declined that change). At least these
+answers also differ either side of the floor, whatever the proof:
 
-- A passkey registration whose credential is already enrolled, or whose label is already in use,
-  is refused inside the floor as a failed verification, and past it as `this passkey is already
-  enrolled` or `label already in use`. Those checks run after the attestation is verified, so a
-  response that fails verification learns nothing about which credentials exist. Registration
-  asks for no attestation, so a verified response proves only that the caller answered this
-  session's challenge, and the check protects little. Running the floor after those checks instead
-  would remove this tell. That is a change to `finish_webauthn_registration` that BACKLOG #3194
-  left open.
-- A TOTP enrolment confirm on an account whose TOTP is already on is refused inside the floor as a
-  wrong code. Past it, a good code ends the session (`auth.mfa_enroll_refused`,
-  `reason=already_enabled`). `confirm_mfa_enrollment` runs the floor before that check, which
-  `begin_mfa_enrollment` already makes. Moving the check ahead of the floor is a change BACKLOG
-  #3194 left open.
+- A pending directory session whose account the directory does not confirm. `verify_mfa` and
+  `finish_webauthn_assertion` run the floor before the directory lookup, so any code or assertion
+  gets the leg's ordinary failure inside the floor and the directory refusal past it (see *The
+  passkey leg asks the same question before it checks an assertion*, below).
+- A passkey registration whose credential is already enrolled, on this or another account, is
+  refused inside the floor as a failed verification, and past it as `this passkey is already
+  enrolled`. `label already in use` differs the same way, but the console lets a pending session
+  begin only a first passkey, so only two finishes racing on one account can reach it. Both checks run after the
+  attestation is verified, so a response that fails verification learns nothing about which
+  credentials exist. Registration asks for no attestation, so a verified response proves only that
+  the caller answered this session's challenge, and the order protects little. Removing the tell
+  would mean verifying the response and checking for a duplicate against the peeked challenge, then
+  running the floor, and only then consuming the challenge, so a floor refusal still leaves the
+  ceremony in flight. That is a change to `finish_webauthn_registration` that BACKLOG #3194 left
+  open.
 
 The floor
 applies only while the session still owes its factor. A step-up code on a satisfied session is not
@@ -702,9 +705,10 @@ below that, at 1 s, because M is an average and some people are faster. The comm
   then wait out only what is left of it. The floor does not time the step between start and
   confirm, where a person scans the code and types it. On the TOTP leg, timing that step
   would need the enrolment's begin time stored beside its staged secret, which is schema work, so
-  BACKLOG #3194 declined it and this stays a gap. A passkey ceremony's start is already held in
-  memory with its challenge, so that leg would need only a service change, which BACKLOG #3194
-  also left open.
+  BACKLOG #3194 declined it and this stays a gap. A passkey ceremony is held in memory and
+  carries only its deadline, on the cache's monotonic clock, so timing that leg would mean
+  deriving the start from the deadline or storing it with the ceremony. That needs no schema
+  change, and BACKLOG #3194 left it open.
 - An IdP that re-authenticates with no human step, such as integrated Windows sign-in, answers a
   step-up faster than the floor on every try. The step-up is then refused each time. At such a site,
   list the `amr` values that method sends in `oidc_callback_floor_exempt_amr` (BACKLOG #2388),

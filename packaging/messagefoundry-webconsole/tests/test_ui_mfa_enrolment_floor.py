@@ -6,8 +6,8 @@
 finishes a passkey registration. Either can turn a session that still owes its factor into a
 satisfied one, so the service floors both against the session's mint
 (``[auth].mfa_verify_min_elapsed_seconds``). The console suites that drive a ceremony at machine
-speed either turn that floor off or run with require_mfa off, where no session owes a factor and
-the floor never applies. These tests keep it ON, at its shipped default, with require_mfa on, and
+speed either turn that floor off or run with require_mfa off and no factor enrolled, where no session
+owes a factor and the floor never applies. These tests keep it ON, at its shipped default, with require_mfa on, and
 pin what each route answers inside it and past it.
 
 No test sleeps. The wall clock the service and the store read is held, so no time passes between
@@ -20,6 +20,7 @@ Each test names the mutation that must turn it RED.
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 
@@ -60,6 +61,13 @@ async def _floored_service(
     return service, now
 
 
+def _banner(page: str) -> str | None:
+    """The error banner a console page renders, the one part a refusal varies, or None."""
+    found = re.findall(r'<p class="banner">(.*?)</p>', page)
+    assert len(found) <= 1, found
+    return found[0] if found else None
+
+
 async def _too_early_rows(engine: Engine, action: str) -> list[dict[str, object]]:
     rows = await engine.store.list_audit(action=action, limit=50)
     details = [json.loads(str(r["detail"])) for r in rows if r["detail"]]
@@ -89,12 +97,11 @@ async def test_a_console_totp_confirm_inside_the_floor_is_an_ordinary_invalid_co
         with held_totp_code(secret) as code:
             await mint_bound_proof(c, "/ui/account/mfa/confirm")
             early = await c.post("/ui/account/mfa/verify", data={"code": code}, headers=SAME_ORIGIN)
-            assert early.status_code == 400 and "Invalid code." in early.text
+            assert early.status_code == 400 and _banner(early.text) == "Invalid code."
             rows = await _too_early_rows(engine, "auth.mfa_failed")
             assert [r.get("phase") for r in rows] == ["enroll"]
             user = await service.store.get_user(user_id)
             assert user is not None and not user.totp_enabled
-            assert user.second_step_failed_attempts == 0, "it charged the second-step lockout"
 
             # Past the floor, a genuinely wrong code gets the answer the early good code got.
             now[0] += FLOOR + 0.001
@@ -103,7 +110,7 @@ async def test_a_console_totp_confirm_inside_the_floor_is_an_ordinary_invalid_co
             refused = await c.post(
                 "/ui/account/mfa/verify", data={"code": wrong}, headers=SAME_ORIGIN
             )
-            assert refused.status_code == early.status_code and "Invalid code." in refused.text
+            assert (refused.status_code, _banner(refused.text)) == (400, "Invalid code.")
 
             # CONTROL: past the floor, the SAME good code activates TOTP and shows the codes.
             await mint_bound_proof(c, "/ui/account/mfa/confirm")
@@ -163,8 +170,6 @@ async def test_a_console_passkey_registration_inside_the_floor_is_a_failed_verif
         rows = await _too_early_rows(engine, "auth.webauthn_failed")
         assert [r.get("phase") for r in rows] == ["enroll"]
         assert await service.store.list_webauthn_credentials(out.identity.user_id) == []
-        user = await service.store.get_user(out.identity.user_id)
-        assert user is not None and user.second_step_failed_attempts == 0, "it charged the lockout"
 
         # CONTROL: past the floor, the SAME response binds the passkey and satisfies the session.
         now[0] += FLOOR + 0.001

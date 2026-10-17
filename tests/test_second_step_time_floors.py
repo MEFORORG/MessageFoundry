@@ -388,21 +388,23 @@ async def test_a_totp_confirm_with_nothing_staged_answers_the_same_inside_and_pa
 
 
 def test_a_challenge_peek_reads_without_consuming_and_hides_an_expired_one() -> None:
-    # RED when: ChallengeCache.peek consumes the entry, or returns one past its deadline (BACKLOG
-    # #3194). finish_webauthn_registration peeks before the floor, so a consuming peek would spend
+    # RED when: ChallengeCache.peek consumes or re-stages the entry, or returns one past its
+    # deadline (BACKLOG #3194). finish_webauthn_registration peeks before the floor, so a consuming peek would spend
     # the ceremony on a floor refusal, and a stale one would let an expired ceremony reach the floor.
     clock = [100.0]
     cache = webauthn.ChallengeCache(ttl_seconds=10.0, clock=lambda: clock[0])
     key = ("token-hash", "register")
     assert cache.peek(key) is None
     cache.put(key, "user-1", b"challenge")
+    clock[0] += 5.0  # a peek later in the ceremony must not move its deadline
     first = cache.peek(key)
     assert first is not None and first.user_id == "user-1" and first.challenge == b"challenge"
-    assert cache.peek(key) == first, "a peek consumed the ceremony"
+    assert first.deadline == 110.0, "a peek re-staged the ceremony and extended its deadline"
+    assert cache.peek(key) is first, "a peek consumed the ceremony"
     assert cache.pop(key) == first  # CONTROL: pop still consumes it
     assert cache.peek(key) is None and cache.pop(key) is None
 
-    cache.put(key, "user-1", b"challenge")
+    cache.put(key, "user-1", b"challenge")  # deadline 115.0
     clock[0] += 10.0  # at the deadline, which pop already treats as expired
     assert cache.peek(key) is None
     assert cache.pop(key) is None
