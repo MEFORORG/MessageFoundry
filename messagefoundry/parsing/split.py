@@ -42,6 +42,53 @@ __all__ = [
 # segment id is always exactly three chars, so only an ``MSH`` segment starts with the literal "MSH".
 _MSH_BOUNDARY = re.compile(r"(?=\rMSH)")
 
+#: The first character the parser keeps: it strips the whitespace around a body before it reads it.
+_FIRST_KEPT = re.compile(r"\S")
+
+
+def _holds_more_than_one_message(text: str) -> bool:
+    """Whether normalized (``\\r``-delimited) ``text`` holds more than one ``MSH`` segment, by the
+    parser's own reading: it strips the whitespace around the body, then treats every line whose
+    first three characters are ``MSH`` as a header. C-level scans and no copy. The ingress guard's
+    reading (ADR 0206 rule 5). The boundary is the one :func:`split_batch` splits on
+    (``_MSH_BOUNDARY``), so a File source hands that guard one message at a time; keep the two in
+    step, and :func:`_sends_more_than_one_message` with them."""
+    first = _FIRST_KEPT.search(text)
+    if first is None:
+        return False
+    start = first.start()
+    later = text.count("\rMSH", start)
+    return later > 1 or (later == 1 and text.startswith("MSH", start))
+
+
+#: The byte order mark, U+FEFF, named rather than written so the source stays ASCII.
+_BOM = "\N{ZERO WIDTH NO-BREAK SPACE}"
+
+#: ``MSH`` after whitespace and any byte order mark. Wider than the parser's ``_LEADS_WITH_MSH`` by
+#: the mark alone, which :func:`split_batch` reads past too: a receiver that drops the mark reads
+#: the messages behind it.
+_LEADS_WITH_MSH_PAST_BOM = re.compile(r"[\s" + _BOM + r"]*MSH")
+
+#: A later ``MSH`` line that a byte order mark leads, as two texts read without stripping their
+#: marks would join. Searched only when the payload holds a mark, so a clean payload never pays it.
+_LATER_MSH_PAST_BOM = re.compile(r"[\r\n]" + _BOM + r"+MSH")
+
+
+def _sends_more_than_one_message(payload: str) -> bool:
+    """Whether an outbound ``payload`` opens with ``MSH``, past whitespace and a byte order mark,
+    and holds another line that starts with ``MSH``, or with marks and then ``MSH`` (ADR 0209). The
+    payload is not normalized, so a line break is a CR or an LF, and on an ``MSH``-led payload with
+    no mark the answer is :func:`_holds_more_than_one_message`'s on the normalized text. A payload
+    not led by ``MSH`` answers False. Each search stops at its first hit and copies nothing."""
+    lead = _LEADS_WITH_MSH_PAST_BOM.match(payload)
+    if lead is None:
+        return False
+    start = lead.end()
+    if payload.find("\rMSH", start) >= 0 or payload.find("\nMSH", start) >= 0:
+        return True
+    return _BOM in payload and _LATER_MSH_PAST_BOM.search(payload, start) is not None
+
+
 #: A UTF-8 byte order mark after the leading whitespace the content sniff tolerates. A match, not a
 #: strip, so a file led by whitespace is not copied whole to look at its first bytes. In a bytes
 #: pattern ``\s`` is exactly the bytes of ``sniff._LEADING_WS``; a test pins the two.

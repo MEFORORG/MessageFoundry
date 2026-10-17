@@ -31,7 +31,11 @@ from typing import Any
 
 from messagefoundry.parsing.fhir._deps import load_fhirpathpy
 from messagefoundry.parsing.fhir.errors import FhirPeekError
-from messagefoundry.redaction import json_loads_or_refusal
+from messagefoundry.redaction import (
+    RepeatedKeyError,
+    json_loads_or_refusal,
+    refuse_repeated_keys,
+)
 
 __all__ = ["FhirPeek"]
 
@@ -56,7 +60,17 @@ class FhirPeek:
         """Peek the FHIR resource in ``raw``.
 
         Raises :class:`FhirPeekError` if the body is not parseable FHIR JSON (not JSON, or not a resource
-        *object*), or if it is FHIR-XML (deferred to a hardened path; JSON-only MVP per ADR 0022)."""
+        *object*), or if it is FHIR-XML (deferred to a hardened path; JSON-only MVP per ADR 0022).
+
+        Also refused: a JSON object that repeats a key, at any depth (vault BACKLOG #2812; see
+        :func:`~messagefoundry.redaction.refuse_repeated_keys`). A caller gates on the peeked value
+        while the body itself goes on, sent verbatim or read by other code, so it is refused rather
+        than canonicalised. A caller may judge a refused body further on its own terms, as the
+        wrapped-update reply does. Only keys equal once JSON-decoded count, so gaps remain,
+        at least these: a server that folds case, normalises Unicode, or cuts a key at an escaped
+        NUL can still read two keys the peek reads as distinct. The other way, ``bytes`` are decoded
+        with replacement first, so two distinct invalid-UTF-8 keys can collapse into one and be
+        refused. The refusal names neither the key nor a value."""
         if isinstance(raw, (bytes, bytearray)):
             raw = bytes(raw).decode("utf-8", "replace")
         raw = raw.lstrip("﻿")  # tolerate a leading UTF-8 BOM (json.loads would otherwise choke)
@@ -67,7 +81,9 @@ class FhirPeek:
             )
         # PHI rule: name the failure, never echo the body. No handler here, so the decode error
         # (which holds the body) is on neither chain (BACKLOG #2048).
-        parsed, refusal = json_loads_or_refusal(raw)
+        parsed, refusal = json_loads_or_refusal(raw, object_pairs_hook=refuse_repeated_keys)
+        if refusal == RepeatedKeyError.__name__:
+            raise FhirPeekError("a JSON object in the FHIR body repeats a key")
         if refusal is not None:
             raise FhirPeekError(f"body is not parseable JSON for FHIR ({refusal})")
         if not isinstance(parsed, dict):

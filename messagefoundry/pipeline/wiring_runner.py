@@ -41,6 +41,7 @@ from typing import Any, Literal, NamedTuple, Protocol, cast
 
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.auth.trust_anchors import (
+    AnchorStoreUnavailable,
     LaneAnchorCheck,
     TrustAnchorError,
     refused_connection_anchor,
@@ -3721,6 +3722,20 @@ class RegistryRunner:
                 "server log and the auth.trust_anchor audit rows say why"
             )
             raise TrustAnchorError(f"{direction} connection '{name}': its {tail}") from exc
+        except AnchorStoreUnavailable as exc:
+            # BACKLOG #3091: the store stopped the check; the file is not known to be bad. A
+            # failing lane still fails with a fixed line, so an operator start reads `failed` and
+            # the control route answers it, but nothing is marked refused, and the next start
+            # checks the file again.
+            if not fails_lane:
+                raise
+            # No WARNING here: the check logged the store's error once, and a scheduled poller
+            # retries at every in-window tick.
+            raise TrustAnchorError(
+                f"{direction} connection '{name}': its tls_ca_file could not be checked, because "
+                "the store refused the trust-anchor audit. Start the connection once the store is "
+                "back; the server log says why"
+            ) from exc
         if fails_lane:
             self._anchor_refused.pop((direction, name), None)
 
@@ -3895,13 +3910,22 @@ class RegistryRunner:
         if self._lane_anchor_check is None:
             return []
         passed: list[tuple[Direction, str]] = []
+        store_fault: AnchorStoreUnavailable | None = None
         for direction, name, settings in self._reload_anchor_lanes(old, new, old_inbound_names):
             try:
                 await self._check_lane_anchor(direction, name, settings, fails_lane=False)
+            except AnchorStoreUnavailable as exc:
+                # Not a refused CA. Go on, so a later lane's refused CA refuses as one; the store
+                # fault refuses the reload only if none does (BACKLOG #3091).
+                store_fault = store_fault or exc
+                continue
             except (TrustAnchorError, ValueError) as exc:
                 error = refused_connection_anchor(exc)
                 raise error from error.__cause__
             passed.append((direction, name))
+        if store_fault is not None:
+            error = refused_connection_anchor(store_fault)
+            raise error from error.__cause__
         return passed
 
     async def _ensure_destination_built(self, name: str) -> None:
