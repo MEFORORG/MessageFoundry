@@ -375,11 +375,13 @@ def test_the_scaffolded_audit_job_runs_on_windows_after_verify(
 def test_the_scaffolded_audit_step_audits_every_pin_of_a_lock(
     scaffolded_ci: tuple[str, Path, dict[str, Any]], tmp_path: Path
 ) -> None:
-    """With a lock, the engine's auditor un-gates a Windows-only pin and a Linux-only one alike."""
+    """With a lock, requirements.txt is still audited, and the engine's auditor un-gates a
+    Windows-only pin and a Linux-only one alike."""
     calls, audited, output = _run_audit_step(scaffolded_ci, tmp_path, _ADOPTER_LOCK)
     assert calls == [
-        "python -m pip install pip-audit",
         "python -m pip install --no-deps -r requirements.txt",
+        "python -m pip install pip-audit",
+        "pip-audit -r requirements.txt --desc",
         "python -P -m messagefoundry.security.audit_all_platforms requirements.lock",
     ]
     text = audited.read_text(encoding="utf-8")

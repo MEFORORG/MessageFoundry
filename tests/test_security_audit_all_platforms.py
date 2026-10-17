@@ -19,7 +19,12 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.security.audit_all_platforms import main, strip_markers
+from messagefoundry.security.audit_all_platforms import (
+    main,
+    option_lines,
+    read_lock,
+    strip_markers,
+)
 from tests._workflow_contexts import ROOT
 
 LOCK = """\
@@ -78,6 +83,35 @@ def test_a_last_line_without_continuation_or_newline() -> None:
 def test_crlf_line_endings_are_kept() -> None:
     text = strip_markers("colorama==0.4.6 ; os_name == 'nt' \\\r\n    --hash=sha256:aa\r\n")[0]
     assert text == "colorama==0.4.6 \\\r\n    --hash=sha256:aa\r\n"
+
+
+def test_an_indented_requirement_is_read_as_pip_reads_it() -> None:
+    """pip strips indentation, so an indented line that continues nothing is still a requirement."""
+    text, stripped, requirements = strip_markers(
+        "  sspilib==0.6.0 ; sys_platform == 'win32' \\\n    --hash=sha256:aa\n    # via pyspnego\n"
+    )
+    assert text == "  sspilib==0.6.0 \\\n    --hash=sha256:aa\n    # via pyspnego\n"
+    assert (stripped, requirements) == (["sspilib==0.6.0 ; sys_platform == 'win32'"], 1)
+
+
+def test_option_lines_are_found_indented_and_hash_lines_are_not() -> None:
+    lock = "idna==3.20 \\\n    --hash=sha256:cc\n  --index-url https://example.invalid\n"
+    assert option_lines(lock) == ["  --index-url https://example.invalid"]
+
+
+@pytest.mark.parametrize("encoding", ["utf-8-sig", "utf-16"])
+def test_a_byte_order_mark_is_read_as_pip_reads_it(encoding: str, tmp_path: Path) -> None:
+    lock = tmp_path / "x.lock"
+    lock.write_text(LOCK, encoding=encoding)
+    assert read_lock(lock) == LOCK
+
+
+def test_a_lock_that_is_only_a_byte_order_mark_and_a_header_is_refused(tmp_path: Path) -> None:
+    src = tmp_path / "x.lock"
+    src.write_text("# only a header\n", encoding="utf-8-sig")
+    ran, run = _recorder(0)
+    assert main([str(src)], run=run) == 2
+    assert not ran
 
 
 def test_an_empty_lock_is_refused_without_running_the_audit(

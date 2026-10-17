@@ -257,9 +257,9 @@ jobs:
   #
   # WINDOWS, the engine's only supported deployment platform: pip-audit silently skips a dependency
   # whose environment marker does not match the runner. With a hashed requirements.lock the engine's
-  # own auditor checks the hashes, then audits every pin whatever its marker (strict: a pin PyPI cannot
-  # look up fails), so this job waits on verify-engine like check. The engine's docs/ADOPTER-CI.md,
-  # "Job 3", says more.
+  # own auditor also checks the lock's hashes, then audits every pin in it whatever its marker. That
+  # runs engine code, so the job waits on verify-engine as check does, and like check it installs the
+  # engine again from your index. The engine's docs/ADOPTER-CI.md, "Job 3", says more.
   #
   # SEC-021 (CWE-494): pip-audit only catches PUBLISHED advisories — it does NOT vouch for a novel
   # malicious substitute from a compromised/confused index. Without a lock, `pip install -r
@@ -271,6 +271,7 @@ jobs:
     needs: verify-engine
     if: ${{ always() && needs.verify-engine.result != 'failure' && needs.verify-engine.result != 'cancelled' }}
     runs-on: windows-latest
+    timeout-minutes: 30
     defaults:
       run:
         shell: bash
@@ -281,15 +282,18 @@ jobs:
           python-version: "3.14"
       - name: Audit the pinned engine + deps against advisories
         run: |
-          python -m pip install pip-audit
           if [ -f requirements.lock ]; then
-            # --no-deps installs only what requirements.txt names, which brings the engine's auditor.
+            # What requirements.txt names, without dependencies, for the engine's auditor. Installed
+            # before pip-audit, so pip-audit's own dependencies win any version they share.
             python -m pip install --no-deps -r requirements.txt
-            python -P -m messagefoundry.security.audit_all_platforms requirements.lock
           else
             echo "::warning::No requirements.lock — the transitive dependency closure resolves LIVE and UNHASHED at install time."
             echo "::warning::Pin your index (pip --index-url / PIP_CONSTRAINT) against dependency-confusion, and ship a hash-pinned requirements.lock (uv export / pip-compile --generate-hashes) installed with --require-hashes. See the README."
-            pip-audit -r requirements.txt --desc
+          fi
+          python -m pip install pip-audit
+          pip-audit -r requirements.txt --desc
+          if [ -f requirements.lock ]; then
+            python -P -m messagefoundry.security.audit_all_platforms requirements.lock
           fi
 """
 
@@ -384,9 +388,9 @@ bumping the engine pin in `requirements.txt` to a release that fixed it (accept 
 appending `--ignore-vuln <ID>` to the audit line that runs, recorded per your own change control).
 It runs on **Windows**, the engine's only supported deployment platform: `pip-audit` skips a dependency
 whose environment marker does not match the runner, so a Linux runner never audits the engine's
-Windows-only dependencies. With a `requirements.lock` it runs the engine's own auditor
+Windows-only dependencies. With a `requirements.lock` it also runs the engine's own auditor
 (`python -P -m messagefoundry.security.audit_all_platforms requirements.lock`), which audits every pin
-in the lock whatever its marker.
+in the lock whatever its marker; the engine's `docs/ADOPTER-CI.md` lists what it refuses.
 
 ## Transitive supply-chain (your deps, not the engine)
 `gh attestation verify` authenticates the **engine wheel** only; `pip install -r requirements.txt`
@@ -406,8 +410,8 @@ hardening steps (recommended for any PHI-handling adopter):
    *your* resolved deps and install with `--require-hashes`:
    ```bash
    # generate (pick one):
-   pip-compile --generate-hashes -o requirements.lock requirements.txt
-   uv export --format requirements-txt > requirements.lock
+   pip-compile --generate-hashes --no-emit-index-url -o requirements.lock requirements.txt
+   uv export --format requirements-txt --no-emit-project -o requirements.lock
    # install — fails if ANY requirement is unhashed:
    pip install --require-hashes -r requirements.lock
    ```

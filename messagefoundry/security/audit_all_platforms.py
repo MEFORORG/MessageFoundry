@@ -46,10 +46,15 @@ that lacks a hash. ``--strict`` makes a pin pip-audit could not look up (a relea
 say) fail the audit instead of being skipped.
 
 WHAT IT REFUSES, exit 2: a lock with no requirement lines at all, so an empty input cannot read as
-a clean audit; and a pip option line at column 0 (``-r``, ``-c``, ``-e``, an index URL), which a uv
-export never writes and which would resolve against the temporary copy's directory, or escape the
-strip, rather than audit what it names. It does not judge whether a non-empty lock is complete;
+a clean audit; and a pip option line (``-r``, ``-c``, ``-e``, an index URL), which a uv export
+never writes and which would resolve against the temporary copy's directory, or escape the strip,
+rather than audit what it names. ``uv export --no-emit-project`` and ``pip-compile
+--no-emit-index-url`` write none. It does not judge whether a non-empty lock is complete;
 released-line-audit carries its own floor for that.
+
+It reads lines as pip does: a requirement or option is any line that does not continue the one
+before it (a line ending in a backslash continues, unless it is a comment), indented or not. A
+UTF-8 or UTF-16 byte-order mark is honoured, as pip honours it.
 
 Both subprocesses run with ``-P``, so the checked-out tree (the current directory) is not on their
 ``sys.path`` and cannot shadow a module the auditor imports.
@@ -63,6 +68,8 @@ audit, and silently auditing one of them would recreate the gap above. No lock h
 from __future__ import annotations
 
 import argparse
+import codecs
+import io
 import os
 import subprocess
 import sys
@@ -74,10 +81,38 @@ from pathlib import Path
 def is_requirement_line(line: str) -> bool:
     """A requirement starts at column 0 and is neither a comment nor a pip option.
 
-    The ``--hash`` and ``# via`` lines a uv export writes under each requirement are indented, so
-    they fall outside this and are copied through untouched.
+    Applied to a line that starts a logical line, with its indentation removed: the ``--hash``
+    lines a uv export writes under each requirement continue it, so they are never asked.
     """
     return bool(line) and not line[0].isspace() and line[0] not in "#-"
+
+
+def _starts(lines: list[str]) -> list[bool]:
+    """Whether each physical line starts a logical one, as pip joins them.
+
+    A line ending in a backslash continues onto the next, unless it is a comment.
+    """
+    starts: list[bool] = []
+    continued = False
+    for line in lines:
+        body = line.rstrip("\r\n")
+        starts.append(not continued)
+        continued = body.endswith("\\") and not body.lstrip().startswith("#")
+    return starts
+
+
+def option_lines(text: str) -> list[str]:
+    """The pip option lines (``-r``, ``--index-url``, ...) that start a logical line."""
+    lines = text.splitlines()
+    return [ln for ln, s in zip(lines, _starts(lines), strict=True) if s and ln.lstrip()[:1] == "-"]
+
+
+def read_lock(path: Path) -> str:
+    """Decode a lock as pip would: UTF-16 behind its byte-order mark, otherwise UTF-8."""
+    raw = path.read_bytes()
+    utf16 = raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE))
+    # Universal newlines, as Path.read_text gives them.
+    return io.StringIO(raw.decode("utf-16" if utf16 else "utf-8-sig"), newline=None).read()
 
 
 def strip_markers(text: str) -> tuple[str, list[str], int]:
@@ -85,16 +120,17 @@ def strip_markers(text: str) -> tuple[str, list[str], int]:
     out: list[str] = []
     stripped: list[str] = []
     requirements = 0
-    for line in text.splitlines(keepends=True):
+    lines = text.splitlines(keepends=True)
+    for line, starts in zip(lines, _starts(lines), strict=True):
         body = line.rstrip("\r\n")
-        if is_requirement_line(body):
+        if starts and is_requirement_line(body.lstrip()):
             requirements += 1
             pin, has_marker, marker = body.partition(";")
             if has_marker:
                 continued = body.endswith("\\")
                 pin = pin.rstrip()
                 marker = marker.strip().removesuffix("\\").rstrip()
-                stripped.append(f"{pin} ; {marker}")
+                stripped.append(f"{pin.lstrip()} ; {marker}")
                 line = pin + (" \\" if continued else "") + line[len(body) :]
         out.append(line)
     return "".join(out), stripped, requirements
@@ -114,14 +150,14 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
     )
     args = parser.parse_args(argv)
 
-    text, stripped, requirements = strip_markers(args.lock.read_text(encoding="utf-8"))
+    text, stripped, requirements = strip_markers(read_lock(args.lock))
     if requirements == 0:
         print(
             f"::error::{args.lock}: no requirement lines -- refusing an empty audit",
             file=sys.stderr,
         )
         return 2
-    options = [ln for ln in text.splitlines() if ln.startswith("-")]
+    options = option_lines(text)
     if options:
         print(f"::error::{args.lock}: pip option lines are not audited: {options}", file=sys.stderr)
         return 2

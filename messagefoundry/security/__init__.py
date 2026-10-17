@@ -2,10 +2,13 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Security assets shipped in the wheel (ADR 0144 Increment 3).
 
-Currently the opt-in Semgrep taint rules for operator-authored Router/Handler config. Semgrep is
-**not** a MessageFoundry dependency and does not run inside ``messagefoundry check`` — it is an opt-in
-CI leg an operator wires over their own config repo. See
-``docs/security/SECURING-HANDLER-CONFIG-IN-CI.md``.
+The opt-in Semgrep taint rules for operator-authored Router/Handler config. Semgrep is **not** a
+MessageFoundry dependency and does not run inside ``messagefoundry check`` — it is an opt-in CI leg
+an operator wires over their own config repo. See ``docs/security/SECURING-HANDLER-CONFIG-IN-CI.md``.
+
+And :mod:`messagefoundry.security.audit_all_platforms`, the dependency auditor that audits every pin
+of a hashed lock whatever its environment marker. The engine's own CI and the ``audit-pin`` job
+``messagefoundry init`` generates both run it.
 """
 
 from __future__ import annotations
