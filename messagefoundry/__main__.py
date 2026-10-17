@@ -3089,6 +3089,11 @@ def _serve(args: argparse.Namespace) -> int:
     # "a non-loopback bind REFUSES to serve until a real certificate is configured." So this gate
     # keeps keying on tls_enabled (an OPERATOR certificate) rather than on the minted pair, and the
     # messages say why.
+    from messagefoundry.config.settings import uvicorn_trusted_hosts
+
+    # What uvicorn's forwarded_allow_ips is handed, computed here so a refused entry stops serve
+    # before any startup side effect. The log below names the CONFIGURED list instead.
+    forwarded_allow_ips = uvicorn_trusted_hosts(settings.api.trusted_proxies)
     if not settings.api.is_loopback:
         if settings.api.tls_enabled:
             # WP-13a: TLS terminates in-process, so tokens + PHI are encrypted on the wire and HSTS
@@ -3101,7 +3106,7 @@ def _serve(args: argparse.Namespace) -> int:
             # declared proxies (the validator guarantees trusted_proxies is set here).
             logging.getLogger(__name__).info(
                 "API on non-loopback host %r behind a TLS-terminating proxy; trusting forwarded "
-                "headers from %s.",
+                "headers from %s (each IPv4 address an entry names is trusted plain and ::ffff:-mapped).",
                 settings.api.host,
                 settings.api.trusted_proxies,
             )
@@ -4234,19 +4239,20 @@ def _serve(args: argparse.Namespace) -> int:
     # operator to DECLARE it ([security].memory_encryption_operator_declared).
     #
     # WARN BY DEFAULT; REFUSE ONLY ON AN OPT-IN. This is the load-bearing scoping decision and it is
-    # not a softening — it is the only shape that does not hard-stop deployments that boot today:
+    # not a softening — it is the only shape that does not refuse an engine over a host property:
     #   * every instance carries patient data (BACKLOG #1279, after ADR 0148 GIVEN 1 made every
     #     built-in environment name derive PHI), so an exposed dev/test instance that declared
     #     nothing at all is in scope and nothing can declare it out;
     #   * "exposed" includes the loopback-behind-proxy topology OFF-LOOPBACK-DEPLOYMENT.md actually
     #     RECOMMENDS (it declares tls_terminated_upstream), which the Posture-B gate 400 lines above
     #     deliberately spares from its own refusal for exactly this reason;
-    #   * on Windows — the primary deployment platform — the read-out is ALWAYS null, so no host can
-    #     ever clear such a gate by being correctly configured.
-    # A default refusal would therefore stop a working dev/staging/prod service from booting on
-    # upgrade over a platform property nobody can satisfy on Windows. That is the outcome ADR 0151
-    # avoided by scoping its companion refusal to its own opt-in ("only fire on the opt-in, so it
-    # cannot break an existing deployment"). Same rule here: the warning is the default; the refusal
+    #   * on Windows — the primary deployment platform — the read-out reports nothing, so the
+    #     engine can never see the property there, and many Windows hosts cannot provide it (which
+    #     can: ADR 0152, Amendment 2026-10-17).
+    # A default refusal would therefore leave an operator on such a host two choices: do not start,
+    # or declare a property the host does not have. ADR 0151 scoped its companion refusal to its own
+    # opt-in ("only fire on the opt-in, so it cannot break an existing deployment"), and the same
+    # rule applies here: the warning is the default; the refusal
     # requires [security].require_memory_encryption_declaration = true, which nothing has set. The
     # ADR 0148 refuse/warn dial then applies on top of the opt-in, as it does everywhere else.
     #
@@ -4632,9 +4638,10 @@ def _serve(args: argparse.Namespace) -> int:
         # #200 (ADR 0002): mTLS client-cert → principal allow-list, consumed by
         # security.resolve_client_cert_identity (deny-by-default; empty = cert-identity off).
         tls_client_cert_identities=settings.api.tls_client_cert_identities,
-        # The SAME list that becomes uvicorn's forwarded_allow_ips below. The client-network gate does
-        # NOT key its decision on this — it reads the scope address uvicorn already resolved — it is
-        # passed only so the address-monoculture tripwire knows whether a proxy was declared.
+        # The CONFIGURED list, not uvicorn's forwarded_allow_ips (uvicorn_trusted_hosts says what
+        # that adds). The client-network gate does NOT key its decision on
+        # this — it reads the scope address uvicorn already resolved — it is passed only so the
+        # address-monoculture tripwire knows whether a proxy was declared.
         trusted_proxies=settings.api.trusted_proxies,
         log_dir=settings.logging.log_dir,  # GET /status app-log disk metering (#50)
         # BACKLOG #171 (ADR 0130): the startup [logging].level baseline a restart returns to, reported by
@@ -4657,10 +4664,11 @@ def _serve(args: argparse.Namespace) -> int:
     # so everything shares one format/stream (and one log file under NSSM).
     # WP-15: trust X-Forwarded-For/-Proto ONLY from the declared reverse proxies, so the audit /
     # rate-limit source IP is the real client (not the proxy). Empty list = trust nothing (the secure
-    # default — the direct TCP peer is used), overriding uvicorn's loopback default.
+    # default — the direct TCP peer is used), overriding uvicorn's loopback default. The list is
+    # uvicorn_trusted_hosts' (BACKLOG #3042).
     run_kwargs: dict[str, Any] = {
         "log_config": None,
-        "forwarded_allow_ips": settings.api.trusted_proxies,
+        "forwarded_allow_ips": forwarded_allow_ips,
         # WP-L3-07 (ASVS 13.4.6): drop the `Server: uvicorn` banner so a response doesn't advertise the
         # server implementation/version to an unauthenticated caller.
         "server_header": False,
@@ -4668,8 +4676,9 @@ def _serve(args: argparse.Namespace) -> int:
         "ws": floored_ws,
         "timeout_graceful_shutdown": _UVICORN_DRAIN_SECONDS,  # BACKLOG #3256; see the constant
     }
-    from messagefoundry.api.tls import build_api_ssl_context
+    from messagefoundry.api.tls import ApiHandshakeRecord, build_api_ssl_context
 
+    api_handshakes: ApiHandshakeRecord | None = None
     if _material is not None:
         _cert, _key = _material
         # _key is None when the operator embedded the private key in the cert PEM (tls_key_file is
@@ -4690,6 +4699,8 @@ def _serve(args: argparse.Namespace) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         run_kwargs["ssl_context_factory"] = lambda config, default_factory: ctx
+        # Vault BACKLOG #3302: the loop runs every API handshake, so a failed one left no record.
+        api_handshakes = ApiHandshakeRecord(ctx)
         # ADR 0083 activation: only when in-process mTLS (client CA) AND a cert-identity map are BOTH
         # configured, swap in the scope-populating HTTP protocol so a verified peer cert reaches
         # resolve_client_cert_identity. Gated on both so a mutual-auth-only bind (console mTLS, no map)
@@ -4717,6 +4728,9 @@ def _serve(args: argparse.Namespace) -> int:
     except Exception as exc:  # last-resort: log an abnormal server exit PHI-redacted, then re-raise
         logging.getLogger(__name__).critical("server exited abnormally: %s", safe_exc(exc))
         raise
+    finally:
+        if api_handshakes is not None:
+            api_handshakes.close()
     return 0
 
 

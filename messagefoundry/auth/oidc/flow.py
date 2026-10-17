@@ -327,7 +327,10 @@ def build_authorization_url(
     """
     if max_age <= 0:
         raise ValueError("max_age must be a positive number of seconds")
-    if step_up and prompt:
+    # BACKLOG #2325 and #3221: a whitespace-only acr_values or prompt names nothing, so it is not
+    # sent. Settings load already turns one into None; this covers any other caller.
+    requested_prompt = _space_separated(prompt)
+    if step_up and requested_prompt:
         raise ValueError("a step-up request sends prompt=login; do not pass another prompt")
     params: dict[str, str] = {
         "response_type": "code",
@@ -341,20 +344,24 @@ def build_authorization_url(
         "code_challenge_method": "S256",
         "max_age": "0" if step_up else str(max_age),
     }
-    # BACKLOG #2325: a whitespace-only request names no class, so it is not sent. Settings load
-    # already turns one into None; this covers any other caller.
-    requested_acr = " ".join((acr_values or "").split())
+    requested_acr = _space_separated(acr_values)
     if requested_acr:
         params["acr_values"] = requested_acr
     if step_up:
         params["prompt"] = "login"
-    elif prompt:
-        params["prompt"] = prompt
+    elif requested_prompt:
+        params["prompt"] = requested_prompt
     # urlsplit is the repo's ONE URL parser (enforced by tests/test_security_static.py), so a value
     # validated at config load cannot be re-read differently at use — the classic parser-confusion
     # gap. config/settings.py validates this endpoint with urlsplit too.
     sep = "&" if urllib.parse.urlsplit(authorization_endpoint).query else "?"
     return f"{authorization_endpoint}{sep}{urllib.parse.urlencode(params)}"
+
+
+def _space_separated(value: str | None) -> str:
+    """A space-separated authorization-request value with its whitespace collapsed, empty when it
+    names nothing."""
+    return " ".join((value or "").split())
 
 
 def exchange_code(

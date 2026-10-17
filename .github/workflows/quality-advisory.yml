@@ -484,7 +484,8 @@ jobs:
     # job above that is about 7.0 minutes against 6.5, so under a minute per run. The hash needs
     # no new dependency, no committed durations file to go stale, and no edit when a test file is
     # added. Those weights are relative, from one Windows box, not this runner's absolute times.
-    # The largest file, test_webui.py, is 5 percent of the total, so no single file sets a floor.
+    # The largest file then, test_webui.py, was 5 percent of the total, so no single file sets a
+    # floor. BACKLOG #2509 has since split it into nine files.
     #
     # 30 MINUTES IS ABOUT 4x A SHARD'S EXPECTED RUN. Re-measure from the first green run of this
     # matrix; the per-shard pytest time is the number to watch, not the combine job's.

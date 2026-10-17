@@ -248,7 +248,7 @@ factor at all still enrols its first one from a password-only session.
   AND its account already holds a second factor of either kind, WHEN it reaches a factor-binding
   lane on either surface, THE SYSTEM SHALL refuse until the EXISTING factor is proven.
   → `tests/test_mfa_access_gate.py::test_the_existing_factor_is_required_whatever_the_step_up_knob_says`,
-  `packaging/messagefoundry-webconsole/tests/test_webui.py::test_ui_factor_bind_needs_the_existing_factor_whatever_the_knob_says`
+  `packaging/messagefoundry-webconsole/tests/test_webui_account.py::test_ui_factor_bind_needs_the_existing_factor_whatever_the_knob_says`
 
 ## Amendment (2026-09-27, BACKLOG #1975): the Decision section no longer grades ASVS 7.5.3
 

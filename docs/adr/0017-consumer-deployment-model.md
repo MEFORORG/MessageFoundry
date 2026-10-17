@@ -275,3 +275,15 @@ operators who want hard enforcement opt in via `[integrity].fail_closed_on_drift
 **What this does not change.** The accepted three-tier ownership model, the same-commit-everywhere promotion
 model (Decision 4), the env-name decoupling Blockers, and the AGPL/licensing posture (Decision 6) are all
 unchanged. This amendment narrows **only** the install/boundary-enforcement surface of Decision 5.
+
+## Amendment (2026-10-16) -- the container image is not a supported v1 deployment path
+
+> Append-only. It records an owner ruling and does not change the Status line above.
+
+The owner's 2026-10-16 v1 platform
+[ruling](../SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target) narrows Ratified
+Decision 7 (container image): the supported v1 install is the non-editable wheel run as a Windows
+service ([SERVICE.md](../SERVICE.md)). The container image, the Minor row of "Engine work required"
+that names it, is built and stays in [`docker/`](../../docker/README.md) as a development and CI
+artifact. The three-tier ownership model, the promotion model and the other ratified decisions are
+unchanged.

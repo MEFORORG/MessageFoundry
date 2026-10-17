@@ -435,7 +435,7 @@ The tests named below are written with the build; none exists yet.
   credential row. The test must fail on the code before this build. A test that drives the route
   past the write floor instead passes on today's code, so it does not meet this criterion. The
   discriminating form already exists in `test_l4b_rate_limit_paths`
-  (`packaging/messagefoundry-webconsole/tests/test_webui.py`): it re-proves first, then replaces
+  (`packaging/messagefoundry-webconsole/tests/test_webui_account.py`): it re-proves first, then replaces
   `service.allow_reauth_attempt` with a deny and leaves the write floor alone.
   → a web console test under `packaging/messagefoundry-webconsole/tests/`
 - **AC-15** -- WHEN an account holding an outstanding code is disabled, THE SYSTEM SHALL clear the
