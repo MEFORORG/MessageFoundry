@@ -2620,15 +2620,15 @@ being checked stops the write, and so does the proved factor itself going meanwh
 factor turned off (`reason=factor_removed`), or turned off and enrolled again with a new secret
 (`reason=factor_replaced`, read from the enrolment stamp and the opened secret, neither of which a
 store-key rotation changes), or the passkey that signed deleted (`reason=factor_removed`). An
-administrator's TOTP replace or MFA reset revokes the account's sessions, so once its revocation
-has landed it answers as a lost session; a re-read that falls between its factor write and its
-revocation reads as the factor gone. The factor is then not marked and no counter is cleared, and
-because the proof is already spent the refusal is audited, with at least the reasons named here.
-The passkey leg re-reads whether or not its sign-count compare-and-set succeeded, and asks whether
-the passkey is still held before it reads a miss as a clone, so a passkey deleted before its sign
-count is written is refused `reason=factor_removed`, not audited as a suspected clone. A miss on a
-session or account gone, or on a lock, answers as those do, so it writes no clone row. A passkey
-set that fails its seal is refused `reason=factor_unverified`. A session or account gone answers
+administrator's TOTP replace swaps the secret and revokes the account's sessions in one
+transaction, so a re-read answers it as a lost session. An MFA reset removes the factors and then
+revokes the sessions in separate writes, so a re-read that falls between them reads as the factor
+gone. The factor is then not marked and no counter is cleared, and because the proof is already
+spent the refusal is audited, with at least the reasons named here. A factor that can no longer be
+read, a TOTP secret that does not open or a passkey set that fails its seal, is refused
+`reason=factor_unverified`. The passkey leg re-reads whether or not its sign-count
+compare-and-set succeeded; what a miss means is in the passkey section's sign-count sentence.
+A session or account gone answers
 as gone on at least these surfaces: **401** on `POST /auth/mfa-verify` and
 `POST /ui/reauth/webauthn`, and a sign-in redirect on `/ui/mfa` and the `/ui/reauth` code leg.
 On the code leg it answers the same when it goes during the directory lookup or the account
@@ -2905,10 +2905,14 @@ COSE **public keys are stored plaintext by design** (verification material, not 
 outside the store cipher, documented in the crypto inventory); the authenticator **sign counter is
 updated via a strict compare-and-set** — a regression or a concurrent same-counter assertion is treated
 as a **clone signal** (rejected + audited `auth.webauthn_clone_suspected`; a permanent counter of 0 is
-normal for synced passkeys). A compare-and-set that misses because the passkey was deleted after it
-was read is no clone signal: it is refused as `auth.webauthn_failed` with `reason=factor_removed`
-(BACKLOG #3068). A miss on a session or account gone, or a second-step lock, answers as those do,
-before the clone question is asked. Assertion failures are audited but deliberately do **not** feed the
+normal for synced passkeys). A compare-and-set that misses because the passkey, or its account,
+was deleted after it was read is no clone signal: the passkey is confirmed gone, so the miss is
+refused as `auth.webauthn_failed` with `reason=factor_removed`, or `reason=session_lost` for the
+account (BACKLOG #3068). Every other miss writes the clone row, asked before the session, the
+account and the lock are read again, so a holder who ends their own session, or a disable or a lock
+landing meanwhile, cannot suppress it; the refusal then carries that change's own reason too. A
+passkey set that fails its seal is not confirmed gone, so its miss writes the clone row as well.
+Assertion failures are audited but deliberately do **not** feed the
 account lockout (signatures aren't guessable secrets). While `[auth].login_rate_limit_enabled` is on, abuse is bounded instead by the **per-actor
 credential-ceremony limiter** — the sole route that finishes an assertion, `POST /ui/reauth/webauthn`,
 charges `allow_reauth_attempt`, not the sign-in window — plus cookie-holder-only reachability. With it
