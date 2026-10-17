@@ -12,7 +12,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from messagefoundry.auth.service import _LOGIN_ADDRESS_FOREVER, _LOGIN_ADDRESS_RESET_MARKER
+# The values AuthService's reset clear passes (vault BACKLOG #2946), written out so this store
+# contract stays free of the auth service; tests/test_login_new_ip.py pins that they match.
+_FOREVER = 1e18
+_RESET_MARKER = "cleared by reset"
 
 
 async def _account(store: Any, user_id: str, username: str) -> None:
@@ -72,17 +75,15 @@ async def _assert_login_address_contract(store: Any) -> None:
     await store.forget_login_addresses("ka-u2", before=7000.0)
 
     # The clear an administrator's reset runs (vault BACKLOG #2946): every backend binds the finite
-    # ``_LOGIN_ADDRESS_FOREVER`` and deletes every row, then keeps the epoch-stamped marker out of
-    # a lookback read and in an any-age one.
+    # bound (SQL Server's FLOAT holds no infinity) and deletes every row, then keeps the
+    # epoch-stamped marker out of a lookback read and in an any-age one.
     await store.remember_login_address("ka-u2", "192.0.2.1", now=9000.0)
-    await store.forget_login_addresses("ka-u2", before=_LOGIN_ADDRESS_FOREVER)
+    await store.forget_login_addresses("ka-u2", before=_FOREVER)
     assert await store.list_known_login_addresses("ka-u2", since=0.0) == []
-    await store.remember_login_address("ka-u2", _LOGIN_ADDRESS_RESET_MARKER, now=0.0)
+    await store.remember_login_address("ka-u2", _RESET_MARKER, now=0.0)
     assert await store.list_known_login_addresses("ka-u2", since=1.0) == []
-    assert await store.list_known_login_addresses("ka-u2", since=0.0) == [
-        _LOGIN_ADDRESS_RESET_MARKER
-    ]
-    await store.forget_login_addresses("ka-u2", before=_LOGIN_ADDRESS_FOREVER)
+    assert await store.list_known_login_addresses("ka-u2", since=0.0) == [_RESET_MARKER]
+    await store.forget_login_addresses("ka-u2", before=_FOREVER)
 
     # Deleting the account deletes its rows; a re-created namesake under a new id inherits none.
     await store.delete_user("ka-u1")

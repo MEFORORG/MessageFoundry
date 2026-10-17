@@ -1275,10 +1275,37 @@ async def test_a_failed_clear_logs_and_does_not_refuse_the_reset(
         assert issued is not None and issued.password
         assert any(
             r.levelno == logging.ERROR
-            and "could not clear the known sign-in addresses" in r.getMessage()
+            and "could not clear the known sign-in addresses of oper" in r.getMessage()
             for r in caplog.records
         )
         action = "auth.password_reset" if reset == "admin_reset_password" else "auth.mfa_reset"
         assert len(await store.list_audit(action=action)) == 1
+        # The record is as the failure left it: unchanged when the delete failed, emptied with no
+        # marker when the marker write failed.
+        monkeypatch.undo()
+        left = await store.list_known_login_addresses(uid, since=0.0)
+        assert left == (["10.1.1.1"] if method == "forget_login_addresses" else [])
+    finally:
+        await store.close()
+
+
+def test_the_store_contract_uses_the_service_reset_values() -> None:
+    from tests import _login_address_store_contract as contract
+
+    assert contract._FOREVER == service_module._LOGIN_ADDRESS_FOREVER
+    assert contract._RESET_MARKER == service_module._LOGIN_ADDRESS_RESET_MARKER
+
+
+async def test_a_client_naming_the_marker_is_never_written() -> None:
+    """A forwarded header can carry any text; a client equal to the marker is not recorded, so the
+    marker never enters the lookback (vault BACKLOG #2946)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, _FakeNotifier())
+        uid = await _operator(service)
+        marker = service_module._LOGIN_ADDRESS_RESET_MARKER
+        await service.admin_reset_password(uid, actor="boss")
+        await service._mark_login_address_known(uid, marker)
+        assert await store.list_known_login_addresses(uid, since=1.0) == []
     finally:
         await store.close()

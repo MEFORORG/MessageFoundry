@@ -997,11 +997,13 @@ on the store-file ACL plus the volume/whole-DB layer for the rest.
 - `reference.*` — **no purge path**; replaced only by the next sync's build-new-then-flip.
 - `queue` metadata columns — removed with their row; `messages.control_id` / `message_type` are kept for
   the life of the metadata row, and so are `messages.origin` / `origin_actor`.
-- `known_login_addresses` — each write to an account's record (a finished sign-in, a step-up or
-  a factor enrolment) is followed by a prune of that account's rows older than the sign-in
-  signal's 90-day lookback, and `delete_user` deletes them all; an account with no write keeps
-  its stale rows until its next one or its deletion. An administrator's password or MFA reset
-  deletes every row too, and leaves one marker row holding no address (vault BACKLOG #2946).
+- `known_login_addresses` — each address write to an account's record (a finished sign-in, a
+  step-up or a factor enrolment) is followed by a prune of that account's rows older than the
+  sign-in signal's 90-day lookback, and `delete_user` deletes them all; an account with no write
+  keeps its stale rows until its next one or its deletion. An administrator's password or MFA
+  reset deletes every row too, then writes one marker row holding no address, with no prune after
+  it; the marker stays until the account's next address write or its deletion (vault BACKLOG
+  #2946).
 - `connection_event.peer_host` — removed with its row on
   `[retention].connection_event_retention_hours`.
 - `attachment` header + `message_attachment` linkage — the join rows are `DELETE`d and the header's

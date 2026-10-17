@@ -340,8 +340,8 @@ _LOGIN_NEW_IP_NOTICE_SECONDS = 900.0
 # The one row an administrator's password or MFA reset leaves in the account's known-address record
 # (vault BACKLOG #2946). It is the baseline for an account that has never stamped ``last_login_at``,
 # so the next sign-in after the reset is judged NEW rather than failed open as no-baseline. It is
-# never a match: it is stamped at the epoch, outside every lookback, and the next real write's prune
-# usually removes it. A space keeps it apart from any address an ASGI server reports.
+# never a match: it is stamped at the epoch, outside every lookback, ``_mark_login_address_known``
+# never writes a client whose text equals it, and the next real write's prune usually removes it.
 _LOGIN_ADDRESS_RESET_MARKER = "cleared by reset"
 # Larger than any ``last_seen`` the record can hold, so a prune with it deletes every row. Finite,
 # because SQL Server's FLOAT cannot hold an infinity.
@@ -9614,7 +9614,12 @@ class AuthService:
             return
         try:
             key = _host_key(client)
-            if len(key.encode("utf-16-le")) // 2 > _LOGIN_ADDRESS_KEY_MAX:
+            # A client text equal to the reset marker (a forged forwarded header can carry any
+            # text) is not written, or the upsert would move the marker into the lookback.
+            if (
+                key == _LOGIN_ADDRESS_RESET_MARKER
+                or len(key.encode("utf-16-le")) // 2 > _LOGIN_ADDRESS_KEY_MAX
+            ):
                 return
             if step_up:
                 user = await self._load_user(user_id)
@@ -9643,7 +9648,7 @@ class AuthService:
                 "could not prune old known sign-in addresses; the address itself was recorded"
             )
 
-    async def _clear_login_addresses(self, user_id: str) -> None:
+    async def _clear_login_addresses(self, user_id: str, *, username: str) -> None:
         """Empty the account's known-address record after an administrator's password or MFA reset
         (vault BACKLOG #2946, owner ruling 2026-10-16), so an address learned before the reset, by
         the holder or by whoever the reset shuts out, reads NEW at the next sign-in. Revoking every
@@ -9657,10 +9662,11 @@ class AuthService:
         it. Every reset leaves it, an account that never signed in included, as the ruling asks.
 
         Best-effort and never raising, for the reason :meth:`_mark_login_address_known` gives: the
-        reset has committed, and its reply carries the one-time credential. A failure is logged at
-        ERROR, and the reset stands with the record as the failure left it: unchanged, or emptied
-        with no marker. The two calls are separate transactions, so a sign-in finishing while the
-        reset runs can also write its address back after the delete."""
+        reset's credential write has committed, and its reply carries the one-time credential. A
+        failure is logged at ERROR with the username, and the reset stands with the record as the
+        failure left it: unchanged, or emptied with no marker. The two calls are separate
+        transactions, so any record write still in flight for the account, from a sign-in, a
+        step-up, a factor proof or an enrolment, can land after the delete."""
         try:
             await self._store.forget_login_addresses(user_id, before=_LOGIN_ADDRESS_FOREVER)
             # Stamped at the epoch, so the lookback read never returns it and only the any-age
@@ -9668,8 +9674,10 @@ class AuthService:
             await self._store.remember_login_address(user_id, _LOGIN_ADDRESS_RESET_MARKER, now=0.0)
         except Exception:
             _log.exception(
-                "could not clear the known sign-in addresses after a reset; the reset stands, and "
-                "the next sign-in may read an address seen before it as known, or find no baseline"
+                "could not clear the known sign-in addresses of %s after a reset; the reset stands, "
+                "and the next sign-in may read an address seen before it as known, or find no "
+                "baseline",
+                username,
             )
 
     def _login_new_ip_notice_due(self, user_id: str, client: str | None) -> bool:
@@ -10848,7 +10856,10 @@ class AuthService:
         before the holder signs in to enrol again. **The credential is written FIRST**, before TOTP
         and the passkeys are cleared, so a crash between the writes leaves a generated credential
         with factors, never a chosen password without them. A directory account has no engine
-        password and gets ``None``."""
+        password and gets ``None``.
+
+        It also clears the account's known sign-in addresses, local or directory (vault BACKLOG
+        #2946; see :meth:`_clear_login_addresses`)."""
         user = await self._load_user(user_id)
         if user is None:
             raise ValueError("no such user")
@@ -10887,6 +10898,9 @@ class AuthService:
                 ),
             )
         await self._store.revoke_user_sessions(user_id)
+        # Straight after the revoke, before the audit row, so a raise from the audit or a notice
+        # cannot skip it. It never raises itself.
+        await self._clear_login_addresses(user_id, username=user.username)
         await self._audit(
             "auth.mfa_reset",
             actor=actor,
@@ -10915,9 +10929,6 @@ class AuthService:
                     else {"expires_at": issued.expires_at}
                 ),
             )
-        # Last, after the audit row and the notices, as the #2964 record work runs: it is
-        # best-effort, and a slow store must not hold them back.
-        await self._clear_login_addresses(user_id)
         return issued
 
     async def mfa_status(self, identity: Identity) -> MfaStatus:
@@ -11906,6 +11917,9 @@ class AuthService:
         mechanism, and this return value is the only thing that reaches the issuing administrator.
         ``expires_at`` is read back from the STORED ``password_changed_at`` the write above just
         stamped rather than from a fresh clock, so the surfaced instant is the one the login gate will actually refuse on.
+
+        It also clears the account's known sign-in addresses (vault BACKLOG #2946; see
+        :meth:`_clear_login_addresses`).
         """
         user = await self._load_user(user_id)
         if user is None:
@@ -11922,6 +11936,7 @@ class AuthService:
             password_generated=True,
         )
         await self._store.revoke_user_sessions(user_id)  # invalidate any live sessions on reset
+        await self._clear_login_addresses(user_id, username=user.username)  # as in admin_reset_mfa
         await self._audit(
             "auth.password_reset",
             actor=actor,
@@ -11941,7 +11956,6 @@ class AuthService:
             email=user.notify_email,
             detail=None if expires_at is None or user.disabled else {"expires_at": expires_at},
         )
-        await self._clear_login_addresses(user_id)  # last, as in admin_reset_mfa
         return IssuedCredential(password=temp, expires_at=expires_at)
 
     async def remind_expiring_initial_credential(
