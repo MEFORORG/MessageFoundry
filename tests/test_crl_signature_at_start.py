@@ -615,6 +615,36 @@ def test_a_crl_under_the_listed_cas_name_in_other_ascii_case_is_judged_by_that_c
     assert verdict is not None and verdict[1] is True  # the reload's BAD_SIGNATURE case
 
 
+def test_an_akid_issuer_name_in_other_ascii_case_still_fits_the_ca(twins: _Twins) -> None:
+    """The second name test inside "fits": a CRL's authority key identifier may carry the CA's
+    issuer name and serial too, and OpenSSL compares that name by the same canonical form. So
+    the engine folds ASCII case there as well, and a badly signed CRL of that kind is proven
+    bad. Control: OpenSSL fits that CA and fails the handshake on the signature."""
+    new_ca = x509.load_pem_x509_certificate(twins.new_ca.read_bytes())
+    akid = x509.AuthorityKeyIdentifier(
+        x509.SubjectKeyIdentifier.from_public_key(twins.new_key.public_key()).digest,
+        [x509.DirectoryName(_NAME_IN_OTHER_CASE)],
+        new_ca.serial_number,
+    )
+    pem = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(_NAME)
+        .last_update(_NOW - _DAY)
+        .next_update(_NOW + 30 * _DAY)
+        .add_extension(x509.CRLNumber(1), False)
+        .add_extension(akid, False)
+        .sign(twins.stranger, hashes.SHA256())
+        .public_bytes(_PEM)
+    )
+    twins.crl.write_bytes(pem)
+
+    assert [s.state for s in judge_crl_signatures(pem, _ders(twins.new_ca))] == ["bad"]
+    with pytest.raises(ssl.SSLError, match="CRL signature failure"):
+        _handshake(_raw_hop(twins.new_ca, twins.crl), twins.server(sends_renewed=False))
+    with pytest.raises(ValueError, match="does not verify the CRL's signature"):
+        twins.hop("new")
+
+
 #: Names OpenSSL does NOT take for the twins' ``mefor-2905-twin-ca``. One differs in a letter. The
 #: other is the twins' name made of non-ASCII letters, Cyrillic look-alikes in capitals: RFC 5280
 #: would fold their case, but OpenSSL folds ASCII alone, and so does the engine.

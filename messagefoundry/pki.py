@@ -473,13 +473,18 @@ def _issuer_name_key(name: x509.Name) -> _NameKey:
     name matching folds case beyond ASCII and maps characters (LDAP StringPrep). OpenSSL does
     neither, and a match looser than OpenSSL's would refuse a start for a CRL OpenSSL never
     judges that CA's peers by. So a letter outside ASCII is compared exactly, as OpenSSL compares
-    it. Two things this keeps from ``cryptography``: the string type of a value does not count,
-    which OpenSSL also ignores, and attributes in one RDN are compared as a multiset. **OpenSSL is
-    looser in at least one more way:** it also drops leading and trailing white space in a value,
-    measured on OpenSSL 3.5.7, and by its source collapses a run of it to one space. This does
-    not, so a CA whose name differs only there still reads ``unlisted``, the warning arm, while
-    OpenSSL judges its peers by the CRL. Folding that too would close the same gap for spacing;
-    it is left open on purpose, as a change of its own."""
+    it. Attributes in one RDN are compared as a multiset, as both do.
+
+    **Where this still differs from OpenSSL, at least.** OpenSSL is looser about white space: it
+    drops it around a value, measured on OpenSSL 3.5.7, and by its source collapses a run of it
+    to one space. This does not, so a CA whose name differs only there reads ``unlisted``, the
+    warning arm, while OpenSSL judges its peers by the CRL. Folding that too would close the same
+    gap for spacing; it is left open on purpose, as a change of its own. This is looser about
+    string type: ``cryptography`` ignores it, while OpenSSL ignores it only for the text types
+    (UTF8String, PrintableString, T61String, IA5String, VisibleString, BMPString,
+    UniversalString), by its source. So a value in another type, such as a NumericString, can
+    match here where OpenSSL sees another name, and a start can refuse a CRL OpenSSL would not
+    judge that CA's peers by. That fails closed, at a start, and names the file."""
     return tuple(tuple(sorted(map(_attribute_key, rdn))) for rdn in name.rdns)
 
 
@@ -596,7 +601,9 @@ def _akid_fit(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool
         for name in akid.authority_cert_issuer or ()
         if isinstance(name, x509.DirectoryName)
     ]
-    return names_key if not names or ca.issuer in names else None
+    # By the name test the issuer match uses, for OpenSSL compares this name the same way.
+    fits = not names or _issuer_name_key(ca.issuer) in {_issuer_name_key(n) for n in names}
+    return names_key if fits else None
 
 
 def _verifies(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool | None:

@@ -1859,10 +1859,12 @@ three cases warn:
   CRL's authority key identifier, where it carries one. This is the usual case when the peer
   sends the intermediate CA that issued the CRL. A CA in a CA directory reads the same way until a
   handshake first uses it. So does a listed CA whose name differs from the CRL's issuer name only
-  in white space around a value. OpenSSL was measured to treat those two names as one, so it
-  still judges peers by that CRL, and a badly signed CRL of that kind starts with the WARNING and
-  then fails its handshake with `CRL signature failure`. A name that differs in a letter outside
-  ASCII, case included, is another name to OpenSSL too.
+  in white space, at least: around a value, which was measured, and in a run of spaces inside one,
+  by OpenSSL's source. OpenSSL treats those two names as one, so it still judges peers by that
+  CRL, and a badly signed CRL of that kind starts with the WARNING and then fails its handshake
+  with `CRL signature failure`. A name that differs in a letter outside ASCII, case included, is
+  another name to OpenSSL too. The name a CRL's authority key identifier may carry for the CA's
+  issuer is compared the same way as the issuer name.
 - A listed CA has the CRL's issuer name and does not verify it, but the CRL names no key. A CA that
   renewed its key can read this way while handshakes still pass. That was measured for one chain
   shape, where the peer sends the renewed CA certified by the old key.
