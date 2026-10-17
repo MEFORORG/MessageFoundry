@@ -100,8 +100,13 @@ def test_every_pin_names_the_shipped_version(
     assert set(found) == {expected}, f"{doc}: pins {found}, the tree ships {expected}"
 
 
+#: Swept beside the sequenced documents: the console pairing install lines a bump moves (vault
+#: BACKLOG #2732; release PR 1895 left both at the previous engine).
+_ALSO_SWEPT = ("README.md", "packaging/messagefoundry-webconsole/README.md")
+
+
 def test_the_sequenced_documents_pin_only_the_shipped_versions() -> None:
-    """Every pin in all six sequenced documents, not only the lines the cases above name.
+    """Every pin in the six sequenced documents and the two READMEs, not only the lines named above.
 
     The armed cases above prove each pattern still fits its guide. This sweep carries no such arm
     per document, because SYSTEM-REQUIREMENTS, DEPLOYMENT and VERIFY pin nothing today; it is
@@ -109,7 +114,7 @@ def test_the_sequenced_documents_pin_only_the_shipped_versions() -> None:
     """
     stale: dict[str, list[str]] = {}
     matched = 0
-    for rel in sequenced_documents():
+    for rel in [*sequenced_documents(), *_ALSO_SWEPT]:
         text = (_ROOT / rel).read_text(encoding="utf-8")
         matched += sum(len(pattern.findall(text)) for _, pattern, _ in _PINS)
         if bad := _stale_pins(text):
@@ -187,18 +192,23 @@ _BUMP_NOT_MOVED = "\nWhat an engine bump does not move:"
 _BUMP_TOKEN_SEP = re.compile(r"[\s`*()\[\],;:]+")
 
 
-@functools.cache
-def _bump_edits() -> list[str]:
-    """The tokens of CONTRIBUTING.md's list of a bump's edits, from its heading to *does not move*.
+def _tokens(text: str) -> frozenset[str]:
+    return frozenset(_BUMP_TOKEN_SEP.split(text))
 
-    The *does not move* paragraph names files too, and a file named only there is not on the list,
-    so a reworded marker fails here rather than widening the list to that paragraph.
+
+@functools.cache
+def _bump_edits() -> frozenset[str]:
+    """The tokens of CONTRIBUTING.md's numbered bump items, from item 1 to *does not move*.
+
+    The intro and the *does not move* paragraph name files too, and a file named only there is not
+    an edit, so a reworded marker fails here rather than widening the span.
     """
     text = _CONTRIBUTING.read_text(encoding="utf-8")
     assert _BUMP_HEADING in text.splitlines(), f"CONTRIBUTING.md has no {_BUMP_HEADING!r} heading"
     body = text.split(f"\n{_BUMP_HEADING}\n", 1)[1].split("\n## ", 1)[0]
+    assert "\n1. " in body, "the bump list has no item 1"
     assert _BUMP_NOT_MOVED in body, f"the bump list lost its {_BUMP_NOT_MOVED.strip()!r} marker"
-    return _BUMP_TOKEN_SEP.split(body.split(_BUMP_NOT_MOVED, 1)[0])
+    return _tokens(body.split("\n1. ", 1)[1].split(_BUMP_NOT_MOVED, 1)[0])
 
 
 @pytest.mark.parametrize(
@@ -226,3 +236,17 @@ def test_the_bump_list_names_every_file_a_version_bump_moves(path: str) -> None:
     """
     assert (_ROOT / path).is_file(), f"{path} no longer exists; re-derive the bump list"
     assert path in _bump_edits(), f"CONTRIBUTING.md, *Bumping the engine version*, omits `{path}`"
+
+
+@pytest.mark.parametrize(
+    ("text", "path"),
+    [
+        ("`packaging/messagefoundry-webconsole/README.md`", "README.md"),
+        ("[changelog.d/README.md](changelog.d/README.md)", "README.md"),
+        ("`docs/SERVICE.md.bak`", "docs/SERVICE.md"),
+    ],
+)
+def test_a_path_inside_a_longer_one_is_not_named(text: str, path: str) -> None:
+    """NEGATIVE CONTROL: the whole-token match the guard above relies on."""
+    assert path not in _tokens(text)
+    assert path in _tokens(f"{text} and `{path}`")

@@ -237,8 +237,9 @@ This is the one list of what an engine version bump edits, and it is kept here o
 at least these edits; if a bump needs one it does not name, add it here. The comments in the
 harness and toolkit `pyproject.toml` files, ADR 0201, `.github/workflows/release.yml` and the pin
 failures in `tests/test_packaging.py` point here. Nothing performs these edits for you. CI fails a
-release pull request that leaves a test-held pin behind (items 2 to 4), but not one that skips
-item 5, so make them all in the pull request that moves the version.
+release pull request that leaves a test-held pin behind (items 2 to 4 and the README pins of item
+5), but not one that skips the rest of item 5, so make them all in the pull request that moves the
+version.
 
 1. `messagefoundry/__init__.py`: `__version__`. Every other engine pin below must match it.
 2. `packaging/messagefoundry-harness/pyproject.toml`: the `messagefoundry[harness]==` pin.
@@ -254,16 +255,18 @@ item 5, so make them all in the pull request that moves the version.
    - every `messagefoundry==<version>` pin, with or without extras, in `docs/INSTALL-GUIDE.md`,
      `docs/EARLY-ADOPTER-GUIDE.md` and `docs/USER-GUIDE.md`. That includes pins in prose and the
      `requirements.txt` line in the INSTALL-GUIDE layout diagram;
-   - the phrases *console for engine `<version>`*, *built for engine `<version>`* and
-     *engine `<version>` wheel*. They sit beside the web console pins in `docs/INSTALL-GUIDE.md` and
-     `docs/USER-GUIDE.md`, and they move with the engine.
+   - the phrases *console for engine `<version>`* and *built for engine `<version>`*, which sit
+     beside the web console pins in `docs/INSTALL-GUIDE.md` and `docs/USER-GUIDE.md`, and any
+     *engine `<version>` wheel* phrase. They move with the engine.
 
-   The test sweeps all six documents `docs/README.md` lists under *Start here*, so a pin added to
-   any of them is held too. Run it after the bump.
-5. The console pairing prose: the engine pin in the pairing install line of `README.md` and of
-   `packaging/messagefoundry-webconsole/README.md`, the engine versions that prose names as
-   sharing the console's seam, and the engine version in the *Admin console* section of
-   `docs/SERVICE.md`. No test holds these versions, so edit them by hand.
+   The test sweeps all six documents `docs/README.md` lists under *Start here*, so an engine pin,
+   console pin or *for engine* phrase added to any of them is held too. A `$V` line is held only in
+   the two guides named above. Run the test after the bump.
+5. The console pairing prose. **Check the UI seam first** (below): if it moved, this item follows
+   the console release instead. Move the engine pin in the pairing install line of `README.md`
+   and of `packaging/messagefoundry-webconsole/README.md`; the same test sweeps both files. Move
+   by hand the engine versions that prose names as sharing the console's seam, and the engine
+   version in the *Admin console* section of `docs/SERVICE.md`. No test holds those.
 6. `CHANGELOG.md`: run `python scripts/release/changelog_fragments.py assemble`, then rename
    `[Unreleased]` to the version and add a fresh, empty `[Unreleased]` above it.
    [changelog.d/README.md](changelog.d/README.md), *At release*, gives the order.
@@ -271,16 +274,19 @@ item 5, so make them all in the pull request that moves the version.
 What an engine bump does not move:
 
 - **The `messagefoundry-webconsole==` pins.** The console has its own version line, and the same
-  test holds those pins to `__version__` in `messagefoundry_webconsole/__init__.py`. They move when
-  the console releases, not when the engine does. The *for engine* phrase next to each one still
-  moves, under item 4.
+  test holds the pins in the documents it sweeps to `__version__` in
+  `messagefoundry_webconsole/__init__.py`. They move when the console releases, not when the engine
+  does. A *for engine* phrase next to one still moves, under item 4.
 - **The early-access cautions** in `docs/INSTALL-GUIDE.md` and `docs/EARLY-ADOPTER-GUIDE.md`. They
   name no version on purpose; keep it that way.
 - Pre-release spelling examples such as `0.5.0rc1` and `v0.5.0-rc1`, and a version named as
   history, such as *added in engine 0.2.0*.
 
-**Check the UI seam as well.** If `ENGINE_UI_SEAM` has moved since the console last released, the
-published console refuses the new engine, so the release needs a console release beside it
+**Check the UI seam.** Compare `ENGINE_UI_SEAM` in `messagefoundry/api/_ui_seam.py` with
+`SUPPORTED_ENGINE_SEAMS` in `git show webconsole-v<last>:messagefoundry_webconsole/__init__.py`,
+the last console tag. The in-tree console moves with the engine seam, so comparing against it
+always reads unchanged. If the seam has moved, the published console refuses the new engine, so the
+release needs a console release beside it
 ([docs/WEBCONSOLE-PACKAGE.md](docs/WEBCONSOLE-PACKAGE.md)). That release also moves the console
 version in the three files of item 5.
 

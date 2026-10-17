@@ -671,7 +671,7 @@ def test_the_harness_pins_the_engine_at_the_version_it_ships_with() -> None:
         f"the harness must pin the engine at the version it ships with (BACKLOG #1585).\n"
         f"  {root.relative_to(_REPO).as_posix()} says: {shipped}\n"
         f"  {_HARNESS_PYPROJECT.relative_to(_REPO).as_posix()} pins: {pinned}\n"
-        f"A VERSION BUMP MOVES THIS PIN WITH THE OTHERS; {_BUMP_LIST} has the full list. "
+        f"A VERSION BUMP MOVES THIS PIN WITH THE OTHERS; {_BUMP_LIST} lists the others. "
         f"PEP 621 `dependencies` is static and nothing in this repository generates it, so set "
         f"that table to `messagefoundry[harness]=={shipped}` in the same commit that moves "
         f"__version__."
@@ -948,7 +948,7 @@ def test_the_toolkit_pins_the_engine_at_the_version_it_ships_with() -> None:
         f"the toolkit must pin the engine at the version it ships with (ADR 0201 AC-7).\n"
         f"  {root.relative_to(_REPO).as_posix()} says: {shipped}\n"
         f"  {_TOOLKIT_PYPROJECT.relative_to(_REPO).as_posix()} pins: {_engine_pin(deps)}\n"
-        f"A VERSION BUMP MOVES THIS PIN WITH THE OTHERS; {_BUMP_LIST} has the full list."
+        f"A VERSION BUMP MOVES THIS PIN WITH THE OTHERS; {_BUMP_LIST} lists the others."
     )
     engine = _engine_requirement(deps)
     assert engine is not None and not engine.extras, (

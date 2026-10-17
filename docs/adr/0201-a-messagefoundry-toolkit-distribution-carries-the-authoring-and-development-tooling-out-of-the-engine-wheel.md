@@ -222,7 +222,7 @@ A version bump then touches three files: `messagefoundry/__init__.py`, the harne
 toolkit pin. `tests/test_packaging.py::test_the_harness_pins_the_engine_at_the_version_it_ships_with`
 gains a toolkit twin.
 
-**Amended (vault BACKLOG #2732).** Three files was an undercount. The install guides pin the version
+**Amended 2026-10-16 (vault BACKLOG #2732).** Three files was an undercount. The install guides pin the version
 too, and a test holds them to it, so release pull request 1895 went red on them. The one list of
 the edits is in [CONTRIBUTING.md, *Bumping the engine version*](../../CONTRIBUTING.md#bumping-the-engine-version),
 and only there.
