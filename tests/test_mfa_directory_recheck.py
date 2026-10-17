@@ -584,6 +584,46 @@ async def test_a_rename_during_the_code_check_is_audited_under_the_new_name(
     assert [r["actor"] for r in rows] == ["jdoe-renamed"]
 
 
+async def test_a_secret_that_does_not_open_for_the_check_is_refused_and_spends_nothing(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3068, review of the merged head. A TOTP cell that does not open before the code is
+    checked is refused ``factor_unverified``, never raised, and the check stops at its TOTP
+    decrypt, so a recovery code sent with it is not spent. RED when: verify_mfa raises
+    ``CipherError``, or the refused recovery code no longer verifies once the cell opens again."""
+    service = AuthService(store, _settings())
+    identity, first, _ = await login_admin(service)
+    enroll = await service.begin_mfa_enrollment(identity)
+    confirmed = await service.confirm_mfa_enrollment(
+        identity, fresh_totp(enroll.secret), token=first
+    )
+    assert confirmed.ok and confirmed.recovery_codes
+    token = await service._issue_session(
+        identity.user_id,
+        None,
+        mfa_verified=False,
+        seed_reauth=False,
+        mechanism=SessionMechanism.PASSWORD,
+        idp_auth_time=None,
+    )
+    real_open = store.open_totp_secret
+    state = {"broken": True}
+
+    def _sometimes_refuses(*args: Any) -> str | None:
+        if state["broken"]:
+            raise CipherError("synthetic: the cell does not open")
+        return real_open(*args)
+
+    monkeypatch.setattr(store, "open_totp_secret", _sometimes_refuses)
+
+    refused = await service.verify_mfa(token, confirmed.recovery_codes[0])
+
+    assert refused.ok is False and not refused.session_lost and not refused.locked
+    assert {"reason": "factor_unverified"} in await _audited_mfa_failures(store)
+    state["broken"] = False  # the control: the same recovery code still verifies
+    assert (await service.verify_mfa(token, confirmed.recovery_codes[0])).ok
+
+
 async def _more_sessions(e: _Enrolled, count: int) -> list[str]:
     """``count`` further sessions on the enrolled directory account, each still owing its factor."""
     tokens = []

@@ -2665,7 +2665,9 @@ revokes the sessions in separate writes, so a re-read that falls between them re
 gone. The factor is then not marked and no counter is cleared, and because the proof is already
 spent the refusal is audited, with at least the reasons named here. A factor that cannot be read
 at the re-read is refused `reason=factor_unverified`. That covers a TOTP secret that does not open
-once the code has been checked, which is also logged, and a passkey set that fails its seal. The passkey leg re-reads whether or not its
+once the code has been checked, which is also logged, and a passkey set that fails its seal. A
+TOTP secret that does not open for the check itself is refused the same way, before any code is
+read, so no recovery code is spent and nothing is charged. The passkey leg re-reads whether or not its
 sign-count compare-and-set succeeded. What a miss means is stated once, under
 [WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068).
 A session or account gone answers

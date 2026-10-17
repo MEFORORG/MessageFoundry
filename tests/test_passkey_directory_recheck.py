@@ -697,6 +697,42 @@ async def test_a_sign_count_miss_is_a_clone_signal_unless_the_passkey_is_gone(ch
         await store.close()
 
 
+async def test_a_sign_count_miss_keeps_its_clone_signal_when_the_holder_question_raises() -> None:
+    """BACKLOG #3068, review of the merged head. The passkey question after a miss is two to four
+    store reads, and a store error in any of them must not drop the clone row (ADR 0068 decision
+    4). RED when: the error propagates with no ``auth.webauthn_clone_suspected`` row written."""
+    store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
+    try:
+        service, token, response, user_id = await _local_assertion(store)
+        real_update = store.update_webauthn_sign_count
+
+        async def _store_error(*_args: Any) -> list[object]:
+            raise RuntimeError("synthetic: the store read failed")
+
+        async def _miss(*args: Any, **kwargs: Any) -> bool:
+            (held,) = await store.list_webauthn_credentials(user_id)
+            assert await real_update(
+                held.credential_id_hash,
+                expected=held.sign_count,
+                new=held.sign_count + 100,
+                used_at=0.0,
+            )
+            # Every read of the set from here on fails, which is the holder question's first read.
+            store.list_webauthn_credentials = _store_error  # type: ignore[method-assign,assignment]
+            return await real_update(*args, **kwargs)
+
+        store.update_webauthn_sign_count = _miss  # type: ignore[method-assign]
+
+        with pytest.raises(RuntimeError, match="synthetic"):
+            await service.finish_webauthn_assertion(token, response, rp_id=_RP, origin=_ORIGIN)
+
+        assert len(await store.list_audit(action="auth.webauthn_clone_suspected")) == 1
+        session = await store.get_session(hash_token(token))
+        assert session is not None and session.mfa_verified_at is None
+    finally:
+        await store.close()
+
+
 async def test_a_passkey_set_failing_its_seal_after_the_write_is_unverified() -> None:
     """BACKLOG #3068, the ``factor_unverified`` branch on its own. A set that fails its seal once the
     sign count has moved says nothing about the passkey, so the factor write is refused as

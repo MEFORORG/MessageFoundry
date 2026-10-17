@@ -10877,7 +10877,23 @@ class AuthService:
             # compared too, so two enrolments sharing a stamp still differ. Neither moves under a
             # store-key rotation, which re-encrypts the cell, so a rotation refuses nothing.
             verified_enrolment = self._totp_enrolment(user)
-            if await self._verify_second_factor(user, code, client=client, arrived=arrived):
+            try:
+                proved = await self._verify_second_factor(
+                    user, code, client=client, arrived=arrived
+                )
+            except CipherError:
+                # The cell did not open for the check either (logged just above). The check raises
+                # at its TOTP decrypt, before any recovery code is read, so nothing is spent and
+                # nothing is charged. Refused with the reason the after-side gives, rather than
+                # raised past the "never raises" contract.
+                await self._audit(
+                    "auth.mfa_failed",
+                    actor=user.username,
+                    detail=_json({"reason": "factor_unverified"}),
+                    client=client,
+                )
+                return Elevation()
+            if proved:
                 # BACKLOG #3068: the verify awaited (a recovery-code walk is argon2 work off the
                 # loop), and a revocation or a disable needs no queue to land. So the session, the
                 # account and its lock are read again right before the factor is written. Fails
@@ -11837,6 +11853,10 @@ class AuthService:
         # leave a staged ceremony in flight. The miss is answered as the pop below answers it.
         staged = self._webauthn_challenges.peek(challenge_key)
         if staged is None or staged.user_id != user.id:
+            if staged is not None:
+                # Another account's entry under this token is dead, so it is ended here as the pop
+                # below and the registration leg end one.
+                self._webauthn_challenges.pop(challenge_key)
             return await self._assertion_refused(user, client, "expired")
         # BACKLOG #2239: a good assertion below marks the factor met, so a DIRECTORY account must
         # still be in the directory first, as verify_mfa asks (#2023). Without this an account
@@ -11859,13 +11879,7 @@ class AuthService:
         try:
             raw_id = webauthn.credential_id_from_response(response_json)
         except webauthn.WebAuthnVerificationError:
-            await self._audit(
-                "auth.webauthn_failed",
-                actor=user.username,
-                detail=_json({"reason": "malformed"}),
-                client=client,
-            )
-            return Elevation()
+            return await self._assertion_refused(user, client, "malformed")
         # The account's passkeys, checked against the digest its seal covers (BACKLOG #2592): a
         # passkey row the store did not write fails the whole set, so none of them signs in.
         held = await self._verified_passkeys(user)
@@ -11874,13 +11888,7 @@ class AuthService:
         if cred is None or cred.user_id != user.id or cred.rp_id != rp_id:
             # Unknown credential, another user's, or minted under a different origin — same
             # refusal either way (no oracle distinguishing the three).
-            await self._audit(
-                "auth.webauthn_failed",
-                actor=user.username,
-                detail=_json({"reason": "unknown_credential"}),
-                client=client,
-            )
-            return Elevation()
+            return await self._assertion_refused(user, client, "unknown_credential")
         try:
             new_count = webauthn.verify_assertion(
                 response_json=response_json,
@@ -11930,17 +11938,20 @@ class AuthService:
             # (BACKLOG #3068). Asked BEFORE the holder re-read below, and answered whatever that
             # re-read finds, so ending one's own session, a disable or a lock landing mid-flight
             # cannot suppress the signal. A set whose seal fails proves nothing either way, so it
-            # keeps the signal.
-            standing = await self._passkey_held(user, cred)
-            if standing in ("held", "unverified"):
-                # Written now, under the name loaded before the write, so an exception in the
-                # re-read below cannot drop the signal.
-                await self._audit(
-                    "auth.webauthn_clone_suspected",
-                    actor=user.username,
-                    detail=_json({"label": cred.label}),
-                    client=client,
-                )
+            # keeps the signal, and so does a question that raises: the row is written on the way
+            # out, so a store error in the reads cannot drop it.
+            try:
+                standing = await self._passkey_held(user, cred)
+            finally:
+                if standing in (None, "held", "unverified"):
+                    # Written now, under the name loaded before the write, so an exception in the
+                    # re-read below cannot drop the signal either.
+                    await self._audit(
+                        "auth.webauthn_clone_suspected",
+                        actor=user.username,
+                        detail=_json({"label": cred.label}),
+                        client=client,
+                    )
         # BACKLOG #3068: the passkey read and the sign-count write awaited since the session, the
         # account and its lock were last read, so a revocation, a disable or a lock that landed in
         # between must stop the factor write, as on verify_mfa. Asked on both paths, so each
