@@ -7,7 +7,7 @@
 ``RequiredPrivileges`` list. Both are settings on the registration. Neither one proves what token
 the running engine holds, and a smoke leg that never looks is green whether the token is restricted
 or not. This script is the instrument that looks. ``windows-service-smoke`` in
-``.github/workflows/ci.yml`` runs it in two ways:
+``.github/workflows/ci.yml`` runs it in these modes:
 
 ``check-read --service-sid S --privilege P --control-pid C --pid N``
     Run by the leg, elevated. Opens each process and prints its token as JSON: the user, the
@@ -33,7 +33,7 @@ or not. This script is the instrument that looks. ``windows-service-smoke`` in
     write-restricted. The control is the leg's own elevated shell, which holds more privileges.
 
 Reading and judging are kept apart. :func:`read_token` and the ``inside`` mode only report.
-:func:`token_problems` and :func:`inside_problems` hold the whole rule for what passes, as plain
+:func:`token_problems`, :func:`privilege_problems` and :func:`inside_problems` hold the whole rule for what passes, as plain
 functions over the reports, so the tests can hand them a token that must fail.
 
 Windows only. ``tests/test_service_token_hardening.py`` starts a child process under a
@@ -569,7 +569,7 @@ def privilege_problems(
 
     Three things, each on its own. The user is the account: a privilege list survives a change of
     account. It holds exactly ``privileges``, held but switched off counting as held. And it is NOT
-    write-restricted, because the installer writes SID type none for such an account; a restricted
+    restricted at all, no restricting SID and not write-restricted, because the installer writes SID type none for such an account; a restricted
     token here would mean the registration and the installer's own account of it disagree.
     """
     if token.get("error"):
@@ -582,7 +582,13 @@ def privilege_problems(
             f"it holds {', '.join(token['privileges']) or 'no privilege'}, "
             f"not exactly {', '.join(sorted(privileges))}"
         )
-    if token["write_restricted"]:
+    if token["restricting_sids"]:
+        # Write-restricted or fully restricted, either way not what SID type none gives.
+        problems.append(
+            f"its restricting list holds {', '.join(token['restricting_sids'])}, but the "
+            "installer sets SID type none for this account"
+        )
+    elif token["write_restricted"]:
         problems.append(
             "it is write-restricted, but the installer sets SID type none for this account"
         )

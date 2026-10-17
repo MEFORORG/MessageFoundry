@@ -3919,19 +3919,22 @@ jobs:
         # install->serve->MLLP path is validated on the version we ship, on each Server SKU. This job
         # is push/dispatch-only, so the Windows minutes cost no PR time.
         #
-        # vault BACKLOG #2702: two more legs install the service under an account other than its own
-        # virtual account, the two the installer warns it gives SID type none: LocalSystem
-        # (-AllowLocalSystem), and a local user with a password (-ServiceAccount), created on the
-        # runner for this run. Each must start, take a message and run with exactly the privilege
-        # list the installer writes. One Server SKU each, so they add two legs and not four.
-        # A gMSA gets NO leg, and that is a refusal, not a gap someone forgot: it needs an Active
-        # Directory domain the runner is joined to, and no hosted runner has one. docs/SERVICE.md
-        # "Restrict the service token" says so.
+        # vault BACKLOG #2702: account legs install the service under an account other than its own
+        # virtual account, which the installer gives SID type none. Each must start, take a message
+        # and run with exactly the privilege list the installer writes. One Server SKU each.
+        # - localsystem (-AllowLocalSystem) runs.
+        # - localuser (-ServiceAccount, a local user created on the runner) is WIRED BUT NOT LISTED.
+        #   Read from the code, it cannot pass yet: the store's hardened-directory rule
+        #   (_hardening_refusal in messagefoundry/store/store.py) accepts only a per-service virtual
+        #   account, so the rig's provision-first order would leave the store files to the
+        #   operator alone and lock the service out. Add the row below once that rule accepts the
+        #   installer's named account:
+        #     - { os: windows-2025, python-version: "3.14", account: localuser }
+        # - A gMSA gets no leg. docs/SERVICE.md "Restrict the service token" says why.
         include:
           - { os: windows-2022, python-version: "3.14" }
           - { os: windows-2025, python-version: "3.14" }
           - { os: windows-2025, python-version: "3.14", account: localsystem }
-          - { os: windows-2025, python-version: "3.14", account: localuser }
     defaults:
       run:
         shell: pwsh
@@ -4092,8 +4095,8 @@ jobs:
           SMOKE_LOCAL_USER_PASSWORD: ${{ steps.svc.outputs.password }}
         run: |
           # vault BACKLOG #2702: the account this leg runs the service as. $account is what the
-          # installer is handed; $grantee is the name the grants below write for it. LocalSystem
-          # gets no named grant: SYSTEM is in every access list this job writes.
+          # installer is handed; $grantee is the name the grants below write for it, SYSTEM's SID
+          # for LocalSystem. The installer itself writes no named grant for LocalSystem.
           $account = @{}
           $grantee = "NT SERVICE\MessageFoundry"
           if ($env:SMOKE_ACCOUNT -eq "localsystem") {
@@ -4726,7 +4729,7 @@ jobs:
       # same one-entry RequiredPrivileges list as the virtual account, and SID type none, with a
       # warning. The health and message steps above show the engine still starts and takes a
       # message under that list. This step shows the list took: it reads the registration, then the
-      # token of every process under the running service through service_token_probe.py
+      # token of the service's root process and of the engine's processes under it, through service_token_probe.py
       # check-privileges, whose control is this shell. It does not put the probe in the engine's
       # place: with SID type none there is no write restriction for it to show.
       #

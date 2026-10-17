@@ -423,14 +423,17 @@ account and LocalSystem, and prints a warning that says so. It writes `none` on 
 re-install that changes the account never keeps a restricted SID from the account before, and a
 SID type you set by hand with `sc.exe sidtype` is replaced.
 
-The `windows-service-smoke` CI leg has two account legs for this, on Windows Server 2025. One installs
-with `-AllowLocalSystem`. The other creates a local user on the runner and installs with
-`-ServiceAccount` and its password. Each checks that the engine starts, takes a message over MLLP, and
-runs with SID type `none` and only `SeChangeNotifyPrivilege` in every service process. Their first
-run is in the merge queue, so until a run has passed, treat a start under those accounts as
-unmeasured. **A gMSA has no leg.** It needs an Active Directory domain that the runner has joined,
-and no hosted runner has one. Before you rely on a gMSA install, start the service once, then read
-its token, for example with `scripts/ci/service_token_probe.py check-privileges`.
+The `windows-service-smoke` CI leg has an account leg for `-AllowLocalSystem`, on Windows Server
+2025. It checks that the engine starts, takes a message over MLLP, and that the service's root
+process and the engine's processes run with SID type `none` and only `SeChangeNotifyPrivilege`.
+Read the leg's latest run for the result.
+
+**No leg runs a named account yet, a local user or a gMSA.** A local-user leg is wired in `ci.yml`
+and left out of the matrix. Read from the code, a SQLite store in the data directory would lock
+such a service out when the operator provisions the first Administrator before the first start.
+The store shares its files between the service and the operator only when the data directory
+grants a per-service virtual account, `NT SERVICE\<name>`. A gMSA could not have a leg in any case:
+it needs an Active Directory domain that the runner has joined, and no hosted runner has one.
 
 **`-SkipRestrictedServiceSid` opts out** for the default account. Use it only when the engine must
 write somewhere you cannot grant to `NT SERVICE\<ServiceName>`. The engine can then write wherever

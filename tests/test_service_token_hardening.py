@@ -777,7 +777,7 @@ def test_the_token_step_reconfigures_only_a_stopped_service() -> None:
     )
 
 
-def test_the_account_legs_run_under_localsystem_and_a_local_user() -> None:
+def test_the_account_legs_run_localsystem_and_wire_a_local_user() -> None:
     """Vault BACKLOG #2702: the installer gives LocalSystem and any -ServiceAccount SID type none
     and the privilege list. Two legs install under those accounts. This checks the wiring; the
     legs' own result is the reading, and a pull_request event skips the job."""
@@ -785,7 +785,9 @@ def test_the_account_legs_run_under_localsystem_and_a_local_user() -> None:
 
     job = jobs_of("ci.yml")["windows-service-smoke"]
     accounts = [leg.get("account") for leg in job["strategy"]["matrix"]["include"]]
-    assert accounts.count(None) == 2 and {"localsystem", "localuser"} <= set(accounts), accounts
+    # localuser is wired and left out of the matrix until the store shares its files with a named
+    # account; the comment above the matrix says why. Listing it then is the one-line change.
+    assert accounts.count(None) == 2 and "localsystem" in accounts, accounts
     assert job["env"]["SMOKE_ACCOUNT"] == "${{ matrix.account || 'virtual' }}"
     steps = {str(s.get("name")): s for s in job["steps"]}
 
@@ -821,7 +823,12 @@ def test_the_account_legs_run_under_localsystem_and_a_local_user() -> None:
 
 
 def _privilege_token(**changes: Any) -> dict[str, Any]:
-    token = {"user": "S-1-5-18", "privileges": [_PRIVILEGE], "write_restricted": False}
+    token = {
+        "user": "S-1-5-18",
+        "privileges": [_PRIVILEGE],
+        "restricting_sids": [],
+        "write_restricted": False,
+    }
     return {**token, **changes}
 
 
@@ -832,6 +839,8 @@ def _privilege_token(**changes: Any) -> dict[str, Any]:
         ({"privileges": [_PRIVILEGE, "SeImpersonatePrivilege"]}, "not exactly"),
         ({"privileges": []}, "no privilege"),
         ({"write_restricted": True}, "SID type none"),
+        # A FULLY restricted token: restricting SIDs and no write-restricted flag.
+        ({"restricting_sids": ["S-1-1-0"]}, "restricting list holds S-1-1-0"),
         ({"error": "OpenProcess(4) failed"}, "could not be read"),
     ],
 )
@@ -881,6 +890,8 @@ def test_a_failed_credential_call_names_where_it_failed(
             pass
 
     monkeypatch.setattr(wincred, "CredentialContext", Failing)
+    # The function puts the repository root on sys.path itself; keep that inside this test.
+    monkeypatch.setattr(sys, "path", list(sys.path))
     probe = _probe()
     result = probe.try_alternate_credential(Path("granted"), Path("denied"))
     assert result["ok"] is False and stage in result["stage"], result
