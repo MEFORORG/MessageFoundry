@@ -3720,9 +3720,9 @@ class AuthSettings(_Section):
     @field_validator("ad_session_revoke_max_fraction")
     @classmethod
     def _check_ad_revoke_fraction(cls, value: float) -> float:
-        # A 0.0 fraction can never be exceeded by a non-negative count in the AND-form trip test.
-        # 1.0 cannot be exceeded either; `_refuse_a_breaker_that_cannot_trip` refuses it while the
-        # reconciler can run (BACKLOG #3085).
+        # A 0.0 fraction would make the breaker absolute-only: any revocation exceeds it. A 1.0
+        # fraction is the opposite, never exceeded, so it disables the whole breaker;
+        # `_refuse_a_breaker_that_cannot_trip` refuses that while the reconciler can run (#3085).
         if not 0.0 < value <= 1.0:
             raise ValueError("ad_session_revoke_max_fraction must be > 0.0 and <= 1.0")
         return value
@@ -3814,17 +3814,22 @@ class AuthSettings(_Section):
         """
         if not (self.ad_enabled and self.ad_session_recheck_seconds > 0):
             return self
+        problems: list[str] = []
         if self.ad_session_revoke_max_fraction >= 1.0:
-            raise ValueError(
-                "ad_session_revoke_max_fraction must be below 1.0 while the directory reconciler "
-                "runs: a pass never revokes more accounts than it judged, so at 1.0 the mass-revoke "
-                "breaker can never trip"
+            problems.append(
+                "ad_session_revoke_max_fraction must be below 1.0 (a pass never revokes more "
+                "accounts than it judged)"
             )
         if self.ad_session_recheck_max_users <= self.ad_session_revoke_max:
+            problems.append(
+                "ad_session_recheck_max_users must be greater than ad_session_revoke_max (a pass "
+                "judges at most ad_session_recheck_max_users accounts)"
+            )
+        if problems:
             raise ValueError(
-                "ad_session_recheck_max_users must be greater than ad_session_revoke_max while the "
-                "directory reconciler runs: a pass judges at most ad_session_recheck_max_users "
-                "accounts, so a budget at or below the cap means the mass-revoke breaker can never trip"
+                "while the directory reconciler runs, "
+                + "; and ".join(problems)
+                + ", or the mass-revoke breaker can never trip"
             )
         return self
 

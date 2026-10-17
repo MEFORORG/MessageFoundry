@@ -140,6 +140,17 @@ _AUTH_CASES: dict[str, tuple[dict[str, Any], dict[str, Any], str]] = {
         {},
         "ad_session_recheck_seconds requires ad_enabled",
     ),
+    # _refuse_a_breaker_that_cannot_trip (BACKLOG #3085)
+    "breaker_fraction_one": (
+        _auth(ad_session_revoke_max_fraction=1.0),
+        {},
+        "the mass-revoke breaker can never trip",
+    ),
+    "breaker_budget_at_cap": (
+        _auth(ad_session_recheck_max_users=5),
+        {},
+        "the mass-revoke breaker can never trip",
+    ),
     # _require_oidc_fields, in the order it refuses
     "oidc_without_ad": (
         _auth(ad_enabled=False, ad_server=_DROP),

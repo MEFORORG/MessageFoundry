@@ -293,8 +293,12 @@ _BUDGET_OF_TWO = _budget(2)
             {"ad_session_recheck_max_users": 3, "ad_session_revoke_max": 10},
             "must be greater than ad_session_revoke_max",
         ),
+        (
+            {"ad_session_revoke_max_fraction": 1.0, "ad_session_recheck_max_users": 5},
+            "below 1.0 .*; and ad_session_recheck_max_users must be greater",
+        ),
     ],
-    ids=["fraction-1.0", "budget-equals-cap", "budget-below-cap"],
+    ids=["fraction-1.0", "budget-equals-cap", "budget-below-cap", "both-in-one-message"],
 )
 def test_a_breaker_that_cannot_trip_is_refused_at_load(
     override: dict[str, Any], message: str
@@ -324,7 +328,8 @@ def test_the_breaker_settings_check_waits_for_a_reconciler_that_can_run(
 
 
 def test_the_shipped_breaker_defaults_pass_with_the_reconciler_on() -> None:
-    """The control: the defaults (200, 5, 0.34) and the smallest legal budget above a cap load."""
+    """The control: the defaults (200, 5, 0.34) load and can trip, and a budget one above its cap
+    and a fraction just below 1.0 both load."""
     defaults = _settings()
     assert breaker_tripped(
         revoke_count=defaults.ad_session_recheck_max_users,
