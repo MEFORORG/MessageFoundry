@@ -3044,9 +3044,9 @@ async def test_config_convergence_runner_reloads_from_real_db(store) -> None:
     applied = {"v": 0}
     reloads: list[int] = []
 
-    async def reload() -> None:
+    async def reload(version: int) -> None:
         # Convergence re-reads THIS node's own config dir; here we record the version B converged to.
-        reloads.append(b.config_version_cached())
+        reloads.append(version)
 
     runner = ConfigConvergenceRunner(
         b,

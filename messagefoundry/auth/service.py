@@ -2378,6 +2378,11 @@ class AuthService:
         admin_loss_alert: Callable[[str, str], None] | None = None,
     ) -> None:
         self._store = store
+        # A copy: the caller's object is also stashed as app.state.auth_settings, and the section
+        # is not frozen, so a write through that stash would otherwise change a live limit with no
+        # audit row (vault BACKLOG #3215). The name is rebound so every object built below, the
+        # directory authenticator and the limiters included, gets the copy too.
+        settings = settings.model_copy(deep=True)
         self._settings = settings
         # BACKLOG #2592: raises the integrity alert when an authority row fails its seal. Injected by
         # the API lifespan (the service never imports the alert sinks). None logs only.
@@ -2815,6 +2820,15 @@ class AuthService:
         ``require_reauth_only_action`` fallback so an org can opt out via
         ``[auth].require_action_step_up = false``."""
         return self._settings.require_action_step_up
+
+    @property
+    def settings(self) -> AuthSettings:
+        """A copy of the ``[auth]`` limits this service enforces. ``GET /security/posture`` reports
+        its loosenings from here, so an embedder that attaches a service with loosened limits sees
+        them named (vault BACKLOG #3215). A deep copy, for the reason the constructor copies its
+        argument: the section is not frozen and holds lists, so a reader that set a field, or
+        appended to a list, on the enforced object would change a live limit with no audit row."""
+        return self._settings.model_copy(deep=True)
 
     @property
     def kerberos_enabled(self) -> bool:

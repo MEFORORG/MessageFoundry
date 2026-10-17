@@ -23,7 +23,7 @@ from types import SimpleNamespace
 import pytest
 
 from messagefoundry.config.settings import ClusterSettings, EgressSettings, ReferenceSettings
-from messagefoundry.config.wiring import FileRef, ReferenceSpec, Registry, load_config
+from messagefoundry.config.wiring import FileRef, ReferenceSpec, Registry, WiringError, load_config
 from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.cluster import (
     ClusterCoordinator,
@@ -38,7 +38,7 @@ from messagefoundry.pipeline.cluster import (
     members_from_node_rows,
 )
 from messagefoundry.pipeline.config_convergence import ConfigConvergenceRunner
-from messagefoundry.pipeline.engine import Engine
+from messagefoundry.pipeline.engine import Engine, ReloadOutcome
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
 from messagefoundry.pipeline.state_convergence import StateConvergenceRunner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
@@ -1023,8 +1023,8 @@ async def test_config_convergence_reloads_when_version_advances() -> None:
     applied = {"v": 0}
     reloads: list[int] = []
 
-    async def fake_reload() -> None:
-        reloads.append(coord.config_version_cached())
+    async def fake_reload(version: int) -> None:
+        reloads.append(version)
 
     runner = ConfigConvergenceRunner(
         coord,  # type: ignore[arg-type]
@@ -1036,6 +1036,7 @@ async def test_config_convergence_reloads_when_version_advances() -> None:
     assert await runner.converge_once() is False  # version unchanged (0 == 0) → no reload
     coord._cached = 3  # a sibling operator reload bumped the shared token
     assert await runner.converge_once() is True  # behind → reload + advance applied to 3
+    # The reload is told the version it converges on, for its audit row (vault BACKLOG #3109).
     assert reloads == [3] and applied["v"] == 3
     assert await runner.converge_once() is False  # caught up → no second reload
     assert reloads == [3]
@@ -1049,7 +1050,7 @@ async def test_config_convergence_initiator_does_not_re_reload() -> None:
     applied = {"v": 5}  # ...and advanced its own applied version to match
     reloads: list[int] = []
 
-    async def fake_reload() -> None:
+    async def fake_reload(_version: int) -> None:
         reloads.append(1)
 
     runner = ConfigConvergenceRunner(
@@ -1070,7 +1071,7 @@ async def test_config_convergence_bad_reload_does_not_advance_or_kill_loop() -> 
     coord._cached = 2
     applied = {"v": 0}
 
-    async def bad_reload() -> None:
+    async def bad_reload(_version: int) -> None:
         raise RuntimeError("bad local config")
 
     runner = ConfigConvergenceRunner(
@@ -1189,9 +1190,13 @@ async def test_engine_operator_reload_propagate_bumps_and_advances_applied(tmp_p
     eng.add_registry(load_config(cfgdir))
     await eng.start()
     try:
-        await eng.reload(propagate=True)  # the startup --config dir; the operator-initiated arm
+        # The startup --config dir; the operator-initiated arm.
+        outcome = await eng.reload_detail(propagate=True)
         assert coord.bumps == 1  # bumped exactly once on the operator reload
         assert eng._applied_config_version == 1  # advanced to the bumped value (no self re-reload)
+        # The outcome names the version, so the operator's row and every follower's row carry the
+        # same number (vault BACKLOG #3109).
+        assert outcome.config_version == 1
     finally:
         await eng.stop()
 
@@ -1213,8 +1218,72 @@ async def test_engine_convergence_reload_does_not_propagate(tmp_path: Path) -> N
     eng.add_registry(load_config(cfgdir))
     await eng.start()
     try:
-        await eng.reload(propagate=False)  # the convergence arm — must not bump
+        outcome = await eng.reload_detail(propagate=False)  # the convergence arm — must not bump
         assert coord.bumps == 0  # convergence reload never bumps
+        assert outcome.config_version is None  # _converge_reload names the version it converged on
+    finally:
+        await eng.stop()
+
+
+async def test_a_convergence_reload_hands_its_hooks_the_version_it_converged_on(
+    tmp_path: Path,
+) -> None:
+    """vault BACKLOG #3109: ``_converge_reload`` hands the audit hook its outcome carrying the
+    shared version it converged on. A reload that raises hands the failure hook the fault, that
+    version and the set of rows already written for it, and is re-raised, so the runner still
+    retries it. The set lives as long as the version keeps failing: a retry gets the same set, and
+    a new version or a convergence starts an empty one. The API's writer uses it to write each
+    distinct row once (tests/test_start_config_change_alert.py)."""
+    coord = _BumpRecordingCoordinator()
+    cfgdir = tmp_path / "cfg"
+    _minimal_config(cfgdir, tmp_path)
+    eng = await Engine.create(
+        tmp_path / "hooks.db",
+        poll_interval=0.05,
+        config_dir=cfgdir,
+        coordinator=coord,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    eng.add_registry(load_config(cfgdir))
+    await eng.start()
+    applied: list[int | None] = []
+    calls: list[tuple[type[Exception], int, frozenset[str]]] = []
+    sets: list[set[str]] = []
+
+    async def _audit(outcome: ReloadOutcome) -> None:
+        applied.append(outcome.config_version)
+
+    async def _failed(exc: Exception, version: int, reported: set[str]) -> None:
+        calls.append((type(exc), version, frozenset(reported)))
+        sets.append(reported)
+        reported.add(type(exc).__name__)  # what the API's writer does once a row lands
+
+    eng.convergence_reload_audit = _audit
+    eng.convergence_reload_failed = _failed
+    try:
+        await eng._converge_reload(4)
+        assert applied == [4] and calls == []
+        assert coord.bumps == 0, "control: a convergence reload still bumps nothing"
+        good = (cfgdir / "c.py").read_text(encoding="utf-8")
+        (cfgdir / "c.py").write_text("this is not python (", encoding="utf-8")
+        for version in (5, 5, 6):  # a retry of 5, as the runner's next tick makes, then 6
+            with pytest.raises(WiringError):
+                await eng._converge_reload(version)
+        assert applied == [4]
+        assert calls == [
+            (WiringError, 5, frozenset()),
+            (WiringError, 5, frozenset({"WiringError"})),  # the retry sees the row written
+            (WiringError, 6, frozenset()),  # a new version starts empty
+        ]
+        assert sets[0] is sets[1] and sets[2] is not sets[1]
+        # A version that converges drops its set, so a later failure of it starts empty.
+        (cfgdir / "c.py").write_text(good, encoding="utf-8")
+        await eng._converge_reload(6)
+        (cfgdir / "c.py").write_text("this is not python (", encoding="utf-8")
+        with pytest.raises(WiringError):
+            await eng._converge_reload(6)
+        assert applied == [4, 6] and calls[-1] == (WiringError, 6, frozenset())
+        assert sets[-1] is not sets[2]
     finally:
         await eng.stop()
 
