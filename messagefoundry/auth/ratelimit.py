@@ -35,7 +35,8 @@ class SlidingWindowRateLimiter:
     The cap bounds the work spent on other keys' buckets, so no call walks the table. The login
     path is unauthenticated, and one call that dropped a million aged buckets would stall the
     event loop. It does not bound the prune of the global window or of the caller's own bucket.
-    A limiter with no per-key gate (falsy ``per_key`` and no gap) keeps no buckets at all.
+    A limiter with no per-key gate (falsy ``per_key`` and no gap) keeps no buckets at all, and one
+    with no global gate (falsy ``glob``) keeps no global window.
 
     ``min_interval_seconds`` adds a GAP floor beside the count (BACKLOG #2301, ASVS 2.4.2): a hit
     for a key is refused while that key's last allowed hit is younger than this. A count alone
@@ -115,7 +116,8 @@ class SlidingWindowRateLimiter:
         now = time.monotonic()
         if not self._has_room(key, now):
             return False  # a rejected attempt does not count toward the window
-        self._global_hits.append(now)
+        if self._global:  # with the global gate off nothing reads the window, so keep none
+            self._global_hits.append(now)
         if self._keeps_buckets:
             bucket = self._hits.get(key)
             if bucket is None:

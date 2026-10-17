@@ -401,6 +401,29 @@ def test_limiter_table_stays_bounded_under_a_stream_of_new_keys(
     assert gap_only.allow("a")
 
 
+def test_limiter_with_no_global_gate_keeps_no_global_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #2714 follow-up. With the global gate off, nothing reads the global window, so an
+    # admitted call must not add to it; it used to hold every call of the last window.
+    # RED when: a call admitted with ``glob=0`` lands in ``_global_hits``.
+    clock = [1000.0]
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    per_key_only = SlidingWindowRateLimiter(per_key=5, glob=0, window_seconds=60.0)
+    for n in range(500):
+        assert per_key_only.allow(f"peer-{n}")
+    assert not per_key_only._global_hits
+    # The control: with the gate on, the window still counts and still refuses.
+    global_on = SlidingWindowRateLimiter(per_key=0, glob=3, window_seconds=60.0)
+    for n in range(3):
+        assert global_on.allow(f"peer-{n}")
+    assert len(global_on._global_hits) == 3
+    assert not global_on.allow("peer-x")
+    assert global_on.retry_after("peer-x") == 60.0
+
+
 async def test_admin_write_retry_after_is_whole_seconds_rounded_up_and_at_least_one(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
