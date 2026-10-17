@@ -1592,20 +1592,25 @@ async def _write_through_cancel(
     from messagefoundry.uploads import _wait_to_completion
 
     task = asyncio.ensure_future(write)
+    write_cancelled = False
     try:
         await _wait_to_completion(task, cancel_bound=_ROW_CANCEL_WAIT_SECONDS)
     except asyncio.CancelledError:
         current = asyncio.current_task()
-        if task.cancelled() and (current is None or current.cancelling() == 0):
-            # Nobody cancelled the caller: the write itself was cancelled, as by a store that
-            # closed under it. That is a failed write for the caller's fail-soft handler to log,
-            # not a cancellation to pass on.
-            raise RuntimeError("the audit row's write was cancelled") from None
-        if not task.done():
-            _UNLANDED_ROW_WRITES.add(task)
-            task.add_done_callback(_UNLANDED_ROW_WRITES.discard)
-        task.add_done_callback(lambda done: _log_unlanded_row(done, lost))
-        raise
+        if not (task.cancelled() and (current is None or current.cancelling() == 0)):
+            if not task.done():
+                _UNLANDED_ROW_WRITES.add(task)
+                task.add_done_callback(_UNLANDED_ROW_WRITES.discard)
+            task.add_done_callback(lambda done: _log_unlanded_row(done, lost))
+            raise
+        # Nobody cancelled the caller: the write itself was cancelled, as by a store that closed
+        # under it. That is a failed write for the caller's fail-soft handler to log, not a
+        # cancellation to pass on.
+        write_cancelled = True
+    if write_cancelled:
+        # Raised after the handler, so the caught cancellation rides neither __cause__ nor
+        # __context__.
+        raise RuntimeError("the audit row's write was cancelled")
 
 
 def _log_unlanded_row(task: asyncio.Future[Any], lost: Callable[[], str]) -> None:
