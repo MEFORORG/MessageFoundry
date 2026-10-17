@@ -361,6 +361,7 @@ async def test_the_retention_runner_s_stop_waits_less_than_its_step_s_bound(
     """The runner's own stop wait is longer than its teardown step's bound. The lifespan hands it a
     share of that bound, so its wait ends, and it cancels its own sweep, before the step is cut."""
     pytest.importorskip("psutil")
+    from messagefoundry import uploads as uploads_module
     from messagefoundry.config.settings import StoreSettings
     from messagefoundry.uploads import UploadRetentionRunner
 
@@ -389,6 +390,8 @@ async def test_the_retention_runner_s_stop_waits_less_than_its_step_s_bound(
     assert timeout is not None
     assert timeout == pytest.approx(bounds[0] * app_module._INNER_SHARE)
     assert timeout < bounds[0]
+    # The premise: even with fewer steps than serve runs, the share is the shorter of the two waits.
+    assert timeout < uploads_module._DEFAULT_STOP_TIMEOUT_SECONDS
 
 
 async def test_the_teardown_is_bounded_when_every_drain_hangs(
