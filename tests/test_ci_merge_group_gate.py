@@ -59,7 +59,8 @@ _SOURCE_REPO = "MEFORORG/MessageFoundry"
 #: * `code` is belt-and-braces. `test` and `webconsole` name merge_group in their own STEP `if:`.
 #: * `docker`, `ide`, `tooling` and `packaging` DO decide their jobs -- docker-smoke, ide, tooling
 #:   and packaging-build are each gated on an output of this step AND name merge_group nowhere, so
-#:   false here is that job OFF in the queue. `_DECIDED_BY_THE_ARM_ALONE` below pins that set.
+#:   false here is that job OFF in the queue. So does `serverdb` for postgres-store-windows, per the
+#:   first bullet. `_DECIDED_BY_THE_ARM_ALONE` below pins all five.
 #:
 #: Asserting the outputs without that context would teach a reader the opposite of what the workflow
 #: does. The same partition is stated at the arm in ci.yml; the two move together.

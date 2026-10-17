@@ -20,7 +20,8 @@ on:
   schedule:
     # Nightly (03:17 UTC — off the top-of-hour rush) run of the HEAVY POST-MERGE legs: the load
     # smokes (load-test, load-test-sqlserver x2 majors), the server-DB suites (sqlserver-store x2
-    # majors, postgres-store), windows-service-smoke (x2 SKUs, 2x-billed) and docker-smoke. These
+    # majors, postgres-store; its advisory Windows twin postgres-store-windows, x2 SKUs, was
+    # never per-push), windows-service-smoke (x2 SKUs, 2x-billed) and docker-smoke. These
     # all used to run on EVERY push to main (~16 auto-merges/day re-validating content whose PR run
     # had just passed); the nightly cadence + the PR path-gates (`changes`) keep the same coverage
     # at a fraction of the runs. `gh workflow run ci.yml --ref main` (workflow_dispatch) still runs
@@ -3581,10 +3582,10 @@ jobs:
   # and disabled, PGBIN set, superuser `postgres` with password `root`. Neither is the 16 the ubuntu
   # leg pins, and the image is not pinned: the first step prints the exact version it got.
   #
-  # NOT REQUIRED AND NOT IN `ci-gate`'s `needs`; docs/CI.md, "The `CI gate` roll-up", says why.
-  # NOT ON merge_group either: a non-required leg in the queue can stop nothing, and it would take
-  # Windows runner concurrency from the required Windows `test` legs.
-  # tests/test_ci_postgres_windows_leg.py pins all of this and pins the test files to the ubuntu job.
+  # NOT REQUIRED, NOT IN `ci-gate`'s `needs`, AND NOT IN THE MERGE QUEUE; docs/CI.md, "The `CI
+  # gate` roll-up", says why. tests/test_ci_postgres_windows_leg.py pins the test files and their
+  # env to the ubuntu job's. `--timeout=120` is the `test` matrix's Windows per-test value; the
+  # ubuntu job inherits pyproject's 60.
   #
   # Fork guard as on windows-service-smoke: 2x-billed Windows minutes are free here (public) and
   # billed to a fork's owner.
@@ -3646,7 +3647,7 @@ jobs:
           python-version: "3.14"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -3656,14 +3657,14 @@ jobs:
         run: uv pip install --system --constraint constraints.lock -e ".[dev,postgres]"
 
       - name: Run the Postgres store suite (against the real DB)
-        run: pytest tests/test_postgres_store.py tests/test_adr0157_postgres_fence.py -v
+        run: pytest --timeout=120 tests/test_postgres_store.py tests/test_adr0157_postgres_fence.py -v
 
       - name: Run the failover-LOAD test (two nodes, kill the primary mid-load, against the real DB)
-        run: pytest tests/test_load_failover_postgres.py -v
+        run: pytest --timeout=120 tests/test_load_failover_postgres.py -v
 
       - name: Run the throughput-lever backend invariants on real Postgres
         run: >-
-          pytest -v
+          pytest -v --timeout=120
           tests/test_inline_fast_path.py
           tests/test_batch_claim_fifo.py
           tests/test_batch_claim_worker.py
@@ -3680,27 +3681,27 @@ jobs:
         env:
           # Why 4, and not smaller: the ubuntu job's step of the same name.
           MEFOR_STORE_POOL_SIZE: "4"
-        run: pytest tests/test_connscale_postgres.py -v
+        run: pytest --timeout=120 tests/test_connscale_postgres.py -v
 
       - name: Run the RTE capture / re-ingress loop on real Postgres (ADR 0013/0016)
-        run: pytest -v tests/test_x12_rte.py
+        run: pytest -v --timeout=120 tests/test_x12_rte.py
 
       - name: Run the failover + engine-shard recovery suites on real Postgres
         run: >-
-          pytest -v
+          pytest -v --timeout=120
           tests/test_cluster_failover_postgres.py
           tests/test_shard_recovery_postgres.py
 
       - name: Run the DR seed-gate + backup suites on real Postgres
         run: >-
-          pytest -v
+          pytest -v --timeout=120
           tests/test_dr_server_seed_gate_postgres.py
           tests/test_backup_runner_server_db_postgres.py
           tests/test_dr7_server_config_only_backup_postgres.py
 
       - name: Run the store-principal privilege preflight on real Postgres
         run: >-
-          pytest -v
+          pytest -v --timeout=120
           tests/test_store_privilege_preflight.py
           tests/test_store_privilege_schema_split.py
 

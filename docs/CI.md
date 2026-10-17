@@ -335,24 +335,28 @@ would be exactly the thing it exists to prevent.
 `cancelled` leg. A **`skipped`** leg counts as a **pass** — that is what lets a path-gated leg stay off
 an unrelated PR without turning the gate red.
 
-**One path-gated leg is deliberately outside the roll-up.** `postgres store (windows-2022)` and
-`postgres store (windows-2025)` (job `postgres-store-windows` in `ci.yml`) run the same Postgres
+**The Windows Postgres leg is deliberately outside the roll-up.** `postgres store (windows-2022)`
+and `postgres store (windows-2025)` (job `postgres-store-windows` in `ci.yml`) run the same Postgres
 store test files as `postgres store`, on hosted Windows, the only supported v1 deployment platform.
-They use the PostgreSQL that the runner image preinstalls: 14 on windows-2022 and 17 on
-windows-2025 at the time of writing, against 16 on the ubuntu leg. They run on a pull request that
-touches the server-DB paths, nightly and on dispatch, on this repository only, and not in the merge
-queue. **They are not required, and `CI gate` does not `need` them, so a red there blocks no
-merge.** That is deliberate: the leg is new, runs on an unpinned runner image, and has no run
-history to judge a red against, so it reports and is read rather than gating. In the queue it could
-stop nothing and would take Windows runners from the required `test` legs, so it does not run
-there. A red one still turns the workflow run red, so a red nightly opens the usual
-`nightly-notice.yml` issue. `tests/test_ci_postgres_windows_leg.py` pins all of this and keeps the
-leg's test files and their env equal to the ubuntu leg's. Making the leg blocking is a decision
-that moves that test.
+They use the PostgreSQL the runner image preinstalls; the job header in `ci.yml` names the majors,
+which differ from the ubuntu leg's. They run on a pull request that touches the server-DB paths,
+nightly and on dispatch, on this repository only. **They are not required, and `CI gate` does not
+`need` them, so a red there blocks no merge.** That is deliberate: the leg is new, runs on an
+unpinned runner image, and has no run history to judge a red against, so it is read rather than
+gated on. It stays out of the merge queue because there it could stop nothing and would take
+Windows runners from the required `test` legs. Its `if:` does not name `merge_group`; it is kept
+out because `changes` emits `serverdb=false` on a queue entry, so a change that makes that filter
+real in the queue would let it in. A red one still turns the workflow run red, so a red nightly
+opens the usual `nightly-notice.yml` issue and a red PR run gets `failure-signal.yml`'s `ci-red`
+label, as `ide build` and `docker image smoke` already do. `tests/test_ci_postgres_windows_leg.py`
+keeps the leg's test files and their env equal to the ubuntu leg's and checks that it is not
+required or rolled up. Making the leg blocking is a decision that moves that test.
 
-There is no SQL Server leg on hosted Windows. The runner images ship no SQL Server instance, and
-the only engine on them, the LocalDB runtime that comes with Visual Studio, cannot be reached by
-the store's `SERVER=host,port` connection string. A self-hosted SQL Server runner is deferred.
+There is no SQL Server leg on hosted Windows. The runner images ship no SQL Server instance. The
+only engine on them, the LocalDB runtime that comes with Visual Studio, has no TCP listener, so the
+store's `SERVER=host,port` connection string cannot reach it. Installing SQL Server during the job
+would need a large download that is not pinned. `.github/workflows/selfhosted-win2025-sql.yml` is
+the Windows SQL Server leg; its self-hosted runner is deferred, so it does not run.
 
 > ### The required-but-absent trap
 > A **required** status check that never reports **blocks every PR forever**. So before you stop a job

@@ -71,8 +71,9 @@ def test_the_windows_leg_runs_the_ubuntu_legs_files_under_the_same_env() -> None
 def test_the_windows_leg_runs_on_the_ubuntu_legs_triggers_minus_the_queue() -> None:
     """The PR path gate, schedule and dispatch, on this repository only; NOT merge_group.
 
-    A non-required leg in the merge queue can stop nothing, and it would compete for Windows runner
-    concurrency with the required Windows `test` legs.
+    docs/CI.md says why. Note what this does NOT prove: the `if:` does not name merge_group, so the
+    leg stays out of the queue only because `changes` emits `serverdb=false` there, which
+    tests/test_ci_merge_group_gate.py pins.
     """
     linux_if = str(_ci_jobs()[_LINUX]["if"]).strip()
     queue_arm = " || github.event_name == 'merge_group'"
@@ -87,7 +88,32 @@ def test_the_windows_leg_runs_on_hosted_windows_with_a_job_timeout() -> None:
     assert job["strategy"]["matrix"]["os"] == ["windows-2022", "windows-2025"]
     # GitHub's default is six hours, on 2x-billed runners.
     timeout = job.get("timeout-minutes")
-    assert isinstance(timeout, int) and 0 < timeout < 360
+    assert type(timeout) is int and 0 < timeout < 360, f"not a real job cap: {timeout!r}"
+
+
+def test_the_windows_leg_runs_every_step_and_can_go_red() -> None:
+    """Ways to run less, or never go red, that the file and env pin above cannot see."""
+    job = _ci_jobs()[_WINDOWS]
+    assert "continue-on-error" not in job
+    for step in job["steps"]:
+        assert "continue-on-error" not in step, step.get("name")
+        run = str(step.get("run", ""))
+        if "pytest" not in run:
+            continue
+        assert "if" not in step, f"a pytest step is conditional: {step.get('name')}"
+        for narrowing in (" -k ", "--deselect", "::", "|| true", "--lf", "-x "):
+            assert narrowing not in f" {run} ", f"{step.get('name')} narrows with {narrowing!r}"
+
+
+def test_the_windows_leg_uses_the_ubuntu_legs_action_pins() -> None:
+    """Same action at the same SHA, so an action bump cannot be the difference between the legs."""
+
+    def pins(job: dict[str, Any]) -> dict[str, str]:
+        return {str(s["uses"]).split("@")[0]: str(s["uses"]) for s in job["steps"] if "uses" in s}
+
+    linux, windows = pins(_ci_jobs()[_LINUX]), pins(_ci_jobs()[_WINDOWS])
+    assert linux, "control: the ubuntu job parsed to no `uses:` steps"
+    assert windows == linux
 
 
 def test_the_windows_leg_is_not_rolled_up_by_ci_gate() -> None:
