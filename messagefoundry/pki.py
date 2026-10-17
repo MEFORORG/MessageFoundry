@@ -54,6 +54,8 @@ __all__ = [
     "ca_chain_to_pem",
     "cert_to_pem",
     "key_to_pem",
+    "load_pinned_server_certificate",
+    "read_pinned_server_certificate",
     "load_pkcs12",
     "make_self_signed",
     "read_cert_facts",
@@ -691,6 +693,65 @@ def _crl_blocks(pem: bytes) -> Iterator[bytes]:
         start = pem.find(_CRL_BEGIN, start + len(_CRL_BEGIN))
 
 
+def _load_one_certificate(data: bytes) -> x509.Certificate:
+    """The certificate in ``data``, PEM or DER. A PEM file is read for its first certificate block,
+    as ``load_pem_x509_certificate`` does. Raises ``ValueError`` when ``data`` holds none."""
+    if b"-----BEGIN" in data:
+        return x509.load_pem_x509_certificate(data)
+    return x509.load_der_x509_certificate(data)
+
+
+def load_pinned_server_certificate(data: bytes) -> x509.Certificate:
+    """The one server certificate a SQL Server ``[store].ssl_root_cert`` pin names, PEM or DER.
+
+    The ODBC ``ServerCertificate`` pin is an exact match against the certificate the server presents
+    (vault BACKLOG #2223). A file holding several certificates, or a CA certificate, can never be that
+    certificate, so either is refused here with a reason rather than refused by the driver at every
+    connect. Raises ``ValueError`` naming the problem, never the certificate's contents."""
+    if b"-----BEGIN" in data:
+        certs = x509.load_pem_x509_certificates(data)  # ValueError when the file holds none
+        if len(certs) != 1:
+            raise ValueError(
+                f"it holds {len(certs)} certificates; the SQL Server pin must be exactly one, the "
+                "server's own certificate"
+            )
+        cert = certs[0]
+    else:
+        cert = x509.load_der_x509_certificate(data)
+    try:
+        constraints = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
+    except x509.ExtensionNotFound:
+        return cert
+    if constraints.ca:
+        raise ValueError(
+            "it is a CA certificate (basicConstraints CA:TRUE); the SQL Server pin is an exact match, "
+            "so name the server's own certificate, or trust the CA through the machine store instead"
+        )
+    return cert
+
+
+def read_pinned_server_certificate(path: str) -> x509.Certificate | str:
+    """The certificate a SQL Server pin file names, or why it is not usable, as a phrase that
+    completes a sentence starting with the setting and the path (vault BACKLOG #2223).
+
+    A reason string rather than an exception, so a caller raises its own refusal outside any
+    handler: the phrase is built only from an OS error's ``strerror``, an exception's type name,
+    or the content-free reasons :func:`load_pinned_server_certificate` gives, never the file's
+    bytes. ``cryptography`` raises ``ValueError`` and some non-``ValueError`` types for a bad
+    file; a non-``ValueError`` is named by type alone."""
+    reason: str
+    try:
+        with open(path, "rb") as fh:
+            return load_pinned_server_certificate(fh.read())
+    except OSError as exc:
+        reason = f"could not be read: {exc.strerror or type(exc).__name__}"
+    except ValueError as exc:
+        reason = f"is not a usable SQL Server pin: {exc}"
+    except Exception as exc:  # DuplicateExtension and the like, which are not ValueErrors
+        reason = f"is not a usable SQL Server pin: {type(exc).__name__}"
+    return reason
+
+
 def read_cert_facts(pem: bytes, *, now: float) -> CertFacts:
     """Parse a PEM certificate into its public inventory facts, evaluated at ``now`` (epoch seconds).
 
@@ -704,8 +765,10 @@ def read_cert_facts(pem: bytes, *, now: float) -> CertFacts:
     a malformed Name or a duplicate/unsupported extension — where ``cryptography`` raises
     ``DuplicateExtension``/``UnsupportedGeneralNameType``, which subclass ``Exception``, **not**
     ``ValueError`` — must not sink a cert whose ``notAfter`` parsed fine. Otherwise ``cert inventory``
-    would crash on such a cert and the expiry monitor would silently DROP a cert it used to watch."""
-    cert = x509.load_pem_x509_certificate(pem)
+    would crash on such a cert and the expiry monitor would silently DROP a cert it used to watch.
+
+    A DER file is read too, because the SQL Server store pin may be one (vault BACKLOG #2223)."""
+    cert = _load_one_certificate(pem)
     not_after = cert.not_valid_after_utc  # tz-aware UTC (cryptography >= 42)
     days_remaining = _days_until(not_after, now)
     try:

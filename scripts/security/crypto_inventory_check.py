@@ -1354,6 +1354,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "key_cert:cryptography.x509.Name.from_rfc4514_string",
             "key_cert:cryptography.x509.load_der_x509_certificate",
             "key_cert:cryptography.x509.load_pem_x509_certificate",
+            # Vault BACKLOG #2223: load_pinned_server_certificate counts the certificates in a SQL
+            # Server pin file, so a bundle is refused at load. Public certificates only.
+            "key_cert:cryptography.x509.load_pem_x509_certificates",
             "key_cert:cryptography.x509.load_pem_x509_crl",
             "key_cert:cryptography.x509.random_serial_number",
             "key_cert:via messagefoundry.keywrap",
@@ -1486,6 +1489,14 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:hashlib.sha256",
             "hash:via messagefoundry.store.store",
             "kdf:via messagefoundry.store.crypto",
+            # Vault BACKLOG #2223: connection_string parses the [store].ssl_root_cert pin (public
+            # certificate only) through pki.load_pinned_server_certificate to refuse one outside its
+            # validity period, since Encrypt=strict leaves that check to the engine.
+            "key_cert:via messagefoundry.pki",
+            # Vault BACKLOG #2223: the same pin takes the trust-anchor preflight (enforce_anchor), which
+            # fingerprints the public file (SHA-256). No pin is configured for it, so no compare runs.
+            "compare:via messagefoundry.auth.trust_anchors",
+            "hash:via messagefoundry.auth.trust_anchors",
             "mac:via messagefoundry.store.store",
             # BACKLOG #2592: the session write helper checks a row's seal before it re-seals it.
             "sign_verify:via messagefoundry.store.store",

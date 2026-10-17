@@ -1161,7 +1161,7 @@ does apply the pin, the exact match replaces the standard checks, the trust chai
 tested, the `ServerCertificate` pin was enforced with `Encrypt=strict` and was not enforced with
 `Encrypt=yes`; no other `Encrypt` value was tested. Microsoft's page, quoted above, documents the
 keyword for strict encryption (*documentation*). The decision rests on a private test record, vault
-BACKLOG #3009, and its contents are not repeated here. Three consequences follow, and they are
+BACKLOG #3009, and its contents are not repeated here. Four consequences follow, and they are
 decisions too:
 
 1. **No silent fall back.** Strict encryption is TDS 8.0, which SQL Server 2022 and later speak, and
@@ -1173,6 +1173,12 @@ decisions too:
 3. **The pin is an exact match, and the engine does not count it as a revocation control.**
    It does not change the grade of the SQL Server store row in the table above. That row stays a
    named gap by owner ruling R6.
+4. **The engine checks the pin's validity period itself.** Under strict the driver's own chain,
+   host-name and expiry checks do not apply to a pin match (*documentation*), so the engine refuses a
+   pin that is expired or not yet valid, refuses at load a file that is a bundle or a CA
+   certificate, watches the pin's expiry with its certificate-expiry monitor, and, since the pin is
+   then the connection's only trust anchor, applies the trust-anchor ACL and path checks to it
+   (*code*).
 
 The paragraph above is kept as written. Its first sentence, *"`connection_string` emits
 `ServerCertificate=` beside `Encrypt=yes`, never `Encrypt=strict`"*, describes the code before this

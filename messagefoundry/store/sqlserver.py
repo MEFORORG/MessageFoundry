@@ -2566,7 +2566,57 @@ def _odbc_brace(value: str) -> str:
     return "{" + value.replace("}", "}}") + "}"
 
 
-def connection_string(settings: StoreSettings, *, posture: HopPosture | None = None) -> str:
+def _refuse_an_exposed_pin(path: str, posture: HopPosture | None) -> None:
+    """Apply the trust-anchor ACL and path checks to a ``[store].ssl_root_cert`` pin.
+
+    Vault BACKLOG #2223: under ``Encrypt=strict`` the pinned file is the store connection's sole
+    trust anchor, so whoever can rewrite it, or its folder, can name their own server. It takes the
+    same checks, rules and messages as every other operator trust anchor
+    (:func:`~messagefoundry.auth.trust_anchors.enforce_anchor`): a file or folder a broad principal
+    can write refuses at ``[security].enforcement = enforce`` and warns at ``warn``. No posture
+    counts as enforcing. The driver reads the file by path, so the spec carries
+    ``loads_verified_bytes=False``. Runs where the DSN is built, before any connect."""
+    from messagefoundry.auth.trust_anchors import AnchorSpec, enforce_anchor
+
+    spec = AnchorSpec(
+        "store_sqlserver_pin", "[store].ssl_root_cert", path, loads_verified_bytes=False
+    )
+    enforce_anchor(spec, enforcing=posture is None or posture.enforcing)
+
+
+def _refuse_a_pin_outside_its_validity(path: str, now: float) -> None:
+    """Refuse a ``[store].ssl_root_cert`` pin whose certificate is expired or not yet valid.
+
+    Vault BACKLOG #2223: under ``Encrypt=strict`` a pin match stands in for the driver's own chain,
+    host-name and expiry checks, so nothing else would refuse an expired pinned certificate. The
+    engine therefore checks the pinned file's validity period itself. It runs wherever the DSN is
+    built: each pool open and each one-off connect, never per query. A pool opened before
+    ``notAfter`` keeps the DSN it was built with, so the expiry monitor, which watches this file, is
+    what warns ahead of that date. The message names the setting and the dates, never the body."""
+    from messagefoundry.pki import read_pinned_server_certificate
+    from messagefoundry.redaction import log_timestamp
+
+    cert = read_pinned_server_certificate(path)
+    if isinstance(cert, str):
+        raise ValueError(f"[store].ssl_root_cert {path!r} {cert}")
+    not_before, not_after = cert.not_valid_before_utc, cert.not_valid_after_utc
+    if now >= not_after.timestamp():
+        raise ValueError(
+            f"[store].ssl_root_cert {path!r}: the pinned certificate expired at "
+            f"{log_timestamp(not_after)}. The driver does not check a pin's expiry with "
+            "Encrypt=strict, so the engine refuses it. Pin the server's renewed certificate."
+        )
+    if now < not_before.timestamp():
+        raise ValueError(
+            f"[store].ssl_root_cert {path!r}: the pinned certificate is not valid until "
+            f"{log_timestamp(not_before)} (notAfter {log_timestamp(not_after)}). The engine "
+            "refuses a pin outside its validity period."
+        )
+
+
+def connection_string(
+    settings: StoreSettings, *, posture: HopPosture | None = None, now: float | None = None
+) -> str:
     """Build an ODBC connection string for the Microsoft ODBC Driver 18 from store settings.
 
     Free-text values are brace-quoted to prevent connection-string injection (STORE-5), and the
@@ -2578,7 +2628,10 @@ def connection_string(settings: StoreSettings, *, posture: HopPosture | None = N
     serve/engine caller). ``None`` reads the ambient posture, and with none the escape is NOT
     permitted (vault BACKLOG #2354). CORRECTED: this read *"``None`` (a backup/restore utility,
     embedding, or unit test) leaves the escape unclamped"*; that let a CLI command cross a weakened
-    store hop under ``enforce``."""
+    store hop under ``enforce``.
+
+    ``now`` (epoch seconds, default the wall clock) is the instant a ``[store].ssl_root_cert`` pin's
+    validity period is checked against (vault BACKLOG #2223); a test passes it."""
     if posture is None:
         posture = current_hop_posture()
     # A weakened TLS posture (TrustServerCertificate=yes, or Encrypt=no) is MITM-able, so it REFUSES
@@ -2624,10 +2677,13 @@ def connection_string(settings: StoreSettings, *, posture: HopPosture | None = N
     # NOT with Encrypt=yes, where a pin of the wrong certificate still connected (vault BACKLOG #2223,
     # measured under #3009). Strict is TDS 8.0, so a server older than SQL Server 2022 refuses the
     # connection; there is no fall back to an unenforced pin. Microsoft documents the exact match as
-    # done instead of the expiry, host-name and chain checks, and nothing here watches the pinned
-    # file's expiry. Not a revocation control. Both keywords stay inside the last-wins tail.
+    # done instead of the expiry, host-name and chain checks, so the engine checks the pinned
+    # certificate's validity period itself, just below. Not a revocation control. Both keywords stay
+    # inside the last-wins tail.
     pin = None if weakened else settings.ssl_root_cert
     if pin:
+        _refuse_an_exposed_pin(pin, posture)
+        _refuse_a_pin_outside_its_validity(pin, time.time() if now is None else now)
         parts.append(f"ServerCertificate={_odbc_brace(pin)}")
     encrypt = "strict" if pin else ("yes" if settings.encrypt else "no")
     parts.append(f"Encrypt={encrypt}")

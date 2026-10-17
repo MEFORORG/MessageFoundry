@@ -13,6 +13,7 @@ Pure unit tests (no DB, no asyncpg / aioodbc required) — always run in CI. The
 from __future__ import annotations
 
 import ssl
+import sys
 
 import pytest
 from pydantic import ValidationError
@@ -27,6 +28,51 @@ def _ca_file(tmp_path: object) -> str:
     """A real (empty) file to satisfy the load-time existence validator; contents are never read here."""
     p = tmp_path / "db-ca.pem"  # type: ignore[operator]
     p.write_text("-----BEGIN CERTIFICATE-----\n")
+    return str(p)
+
+
+def _leaf_file(tmp_path: object, name: str = "db-server.pem", *, der: bool = False) -> str:
+    """A real server certificate (basicConstraints CA:FALSE), valid from a minute ago for 30 days:
+    what a SQL Server pin names (vault BACKLOG #2223). ``der`` writes it DER-encoded."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+
+    from messagefoundry import pki
+
+    pem = pki.make_self_signed("db.example", [], 30)[0]
+    p = tmp_path / name  # type: ignore[operator]
+    if der:
+        p.write_bytes(x509.load_pem_x509_certificate(pem).public_bytes(serialization.Encoding.DER))
+    else:
+        p.write_bytes(pem)
+    return str(p)
+
+
+def _ca_cert_file(tmp_path: object) -> str:
+    """A self-signed CA certificate (basicConstraints CA:TRUE), which a SQL Server pin can never match."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mf-test-db-ca")])
+    now = datetime.datetime.now(datetime.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=1))
+        .not_valid_after(now + datetime.timedelta(days=30))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    p = tmp_path / "db-ca-cert.pem"  # type: ignore[operator]
+    p.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
     return str(p)
 
 
@@ -279,11 +325,11 @@ def test_connection_string_emits_server_certificate_on_secure_posture(tmp_path: 
     """The pin travels with ``Encrypt=strict``: Driver 18 enforced ``ServerCertificate`` with strict
     and did not with ``Encrypt=yes``, where a pin naming the wrong certificate still connected (vault
     BACKLOG #2223; measured under #3009)."""
-    ca = _ca_file(tmp_path)
-    dsn = connection_string(_ss(ssl_root_cert=ca))
+    pin = _leaf_file(tmp_path)
+    dsn = connection_string(_ss(ssl_root_cert=pin))
     # The ODBC Driver 18.1+ ServerCertificate keyword pins the cert by file, brace-quoted (STORE-5).
     # Match the standalone keyword (a leading ';') so it isn't confused with TrustServerCertificate.
-    assert f";ServerCertificate={{{ca}}}" in dsn
+    assert f";ServerCertificate={{{pin}}}" in dsn
     # The TLS keywords stay the last-wins tail, and Encrypt=yes appears nowhere in the string.
     assert dsn.rstrip(";").endswith("Encrypt=strict;TrustServerCertificate=no")
     assert "Encrypt=yes" not in dsn
@@ -312,7 +358,7 @@ def test_connection_string_pin_does_not_lift_the_weakened_refusal(
     """A pin is no way around the weakened-TLS refusal: with no escape the string is still refused."""
     monkeypatch.delenv(INSECURE_TLS_ESCAPE_ENV, raising=False)
     with pytest.raises(ValueError, match="SQL Server TLS is weakened"):
-        connection_string(_ss(ssl_root_cert=_ca_file(tmp_path), **overrides))
+        connection_string(_ss(ssl_root_cert=_leaf_file(tmp_path), **overrides))
 
 
 @pytest.mark.parametrize(
@@ -332,7 +378,7 @@ def test_connection_string_escaped_posture_sends_no_pin_and_no_strict(
     """On an escaped dev posture the pin is dropped and strict is not sent. Microsoft documents that
     strict ignores ``TrustServerCertificate``, so sending it would quietly re-enable verification the
     operator switched off, and plaintext cannot be strict at all."""
-    dsn = connection_string(_ss(ssl_root_cert=_ca_file(tmp_path), **overrides))
+    dsn = connection_string(_ss(ssl_root_cert=_leaf_file(tmp_path), **overrides))
     assert ";ServerCertificate=" not in dsn
     assert "Encrypt=strict" not in dsn
     assert dsn.rstrip(";").endswith(tail)
@@ -340,10 +386,71 @@ def test_connection_string_escaped_posture_sends_no_pin_and_no_strict(
 
 def test_connection_string_server_certificate_brace_neutralizes_injection(tmp_path: object) -> None:
     # A cracked path with a stray brace can't inject extra keywords (the inner } is doubled).
-    d = tmp_path / "ca}x.pem"  # type: ignore[operator]
-    d.write_text("x")
-    dsn = connection_string(_ss(ssl_root_cert=str(d)))
+    dsn = connection_string(_ss(ssl_root_cert=_leaf_file(tmp_path, "ca}x.pem")))
     assert "ca}}x.pem}" in dsn
+
+
+# --- vault BACKLOG #2223: the engine checks the SQL Server pin itself --------------------------
+#
+# Under Encrypt=strict a pin match stands in for the driver's own chain, host-name and expiry checks,
+# so the engine refuses a pin outside its validity period, and refuses at load a file that can never
+# match the server's certificate.
+
+_DAY = 86_400.0
+
+
+def test_an_expired_pin_is_refused_naming_the_setting_and_not_after(tmp_path: object) -> None:
+    import time
+
+    pin = _leaf_file(tmp_path)
+    settings = _ss(ssl_root_cert=pin)
+    # POSITIVE CONTROL: the same pin, checked now, builds a string.
+    assert ";ServerCertificate=" in connection_string(settings)
+    with pytest.raises(
+        ValueError, match=r"\[store\]\.ssl_root_cert .*expired at \d{2} \w{3} \d{4}"
+    ) as exc:
+        connection_string(settings, now=time.time() + 60 * _DAY)
+    assert "BEGIN CERTIFICATE" not in str(exc.value)
+
+
+def test_a_pin_not_yet_valid_is_refused(tmp_path: object) -> None:
+    import time
+
+    settings = _ss(ssl_root_cert=_leaf_file(tmp_path))
+    with pytest.raises(ValueError, match=r"\[store\]\.ssl_root_cert .*not valid until .*notAfter"):
+        connection_string(settings, now=time.time() - _DAY)
+
+
+def test_a_der_pin_is_accepted(tmp_path: object) -> None:
+    pin = _leaf_file(tmp_path, "db-server.cer", der=True)
+    assert f";ServerCertificate={{{pin}}}" in connection_string(_ss(ssl_root_cert=pin))
+
+
+def test_a_ca_certificate_is_refused_as_a_sqlserver_pin_at_load(tmp_path: object) -> None:
+    ca = _ca_cert_file(tmp_path)
+    with pytest.raises(ValidationError, match=r"ssl_root_cert .*CA certificate"):
+        _ss(ssl_root_cert=ca)
+    # The same file stays a valid PostgreSQL CA bundle: the refusal is SQL Server's alone.
+    assert _pg(ssl_root_cert=ca).ssl_root_cert == ca
+
+
+def test_a_two_certificate_bundle_is_refused_as_a_sqlserver_pin_at_load(tmp_path: object) -> None:
+    from messagefoundry import pki
+
+    bundle = tmp_path / "two.pem"  # type: ignore[operator]
+    bundle.write_bytes(
+        pki.make_self_signed("db1.example", [], 30)[0]
+        + pki.make_self_signed("db2.example", [], 30)[0]
+    )
+    with pytest.raises(ValidationError, match="holds 2 certificates"):
+        _ss(ssl_root_cert=str(bundle))
+
+
+def test_a_file_that_is_not_a_certificate_is_refused_as_a_sqlserver_pin_at_load(
+    tmp_path: object,
+) -> None:
+    with pytest.raises(ValidationError, match="not a usable SQL Server pin"):
+        _ss(ssl_root_cert=_ca_file(tmp_path))
 
 
 # --- backend / existence gating ----------------------------------------------
@@ -355,8 +462,8 @@ def test_ssl_root_cert_accepted_for_postgres(tmp_path: object) -> None:
 
 
 def test_ssl_root_cert_accepted_for_sqlserver(tmp_path: object) -> None:
-    ca = _ca_file(tmp_path)
-    assert _ss(ssl_root_cert=ca).ssl_root_cert == ca
+    pin = _leaf_file(tmp_path)
+    assert _ss(ssl_root_cert=pin).ssl_root_cert == pin
 
 
 def test_ssl_root_cert_rejected_for_sqlite(tmp_path: object) -> None:
@@ -376,3 +483,70 @@ def test_ssl_root_cert_missing_file_rejected() -> None:
             username="mefor",
             ssl_root_cert="/no/such/db-ca.pem",
         )
+
+
+# --- vault BACKLOG #2223: the pin is a trust anchor, so it takes the anchor ACL and path checks ---
+
+
+def _writable_by_others(path: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ``path`` writable by a broad principal. POSIX sets the real bit, so the Linux leg runs
+    the real DACL check; Windows answers the check's own question, as tests/test_trust_anchors.py does."""
+    import os
+    import stat
+
+    if sys.platform == "win32":
+        from messagefoundry.auth import trust_anchors
+
+        monkeypatch.setattr(trust_anchors, "dacl_is_owner_only", lambda _p: False)
+    else:
+        os.chmod(path, os.stat(path).st_mode | stat.S_IWOTH)
+
+
+def test_a_pin_others_can_write_is_refused_while_enforcing(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from messagefoundry.auth.trust_anchors import TrustAnchorError
+
+    pin = _leaf_file(tmp_path)
+    settings = _ss(ssl_root_cert=pin)
+    # POSITIVE CONTROL: the same file, owner-written, builds a string under enforce.
+    assert ";ServerCertificate=" in connection_string(settings, posture=HopPosture(enforcing=True))
+    _writable_by_others(pin, monkeypatch)
+    with pytest.raises(TrustAnchorError, match=r"\[store\]\.ssl_root_cert: the trust anchor"):
+        connection_string(settings, posture=HopPosture(enforcing=True))
+    # No posture counts as enforcing.
+    with pytest.raises(TrustAnchorError):
+        connection_string(settings)
+
+
+def test_a_pin_others_can_write_warns_and_connects_at_warn(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    pin = _leaf_file(tmp_path)
+    _writable_by_others(pin, monkeypatch)
+    with caplog.at_level(logging.WARNING):
+        dsn = connection_string(_ss(ssl_root_cert=pin), posture=HopPosture(enforcing=False))
+    assert ";ServerCertificate=" in dsn
+    assert "[store].ssl_root_cert: the trust anchor" in caplog.text
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="conftest answers the path check on win32, because %TEMP%'s own DACL refuses it",
+)
+def test_a_pin_in_a_folder_others_can_write_is_refused_while_enforcing(tmp_path: object) -> None:
+    import os
+    import stat
+
+    from messagefoundry.auth.trust_anchors import TrustAnchorError
+
+    folder = tmp_path / "open"  # type: ignore[operator]
+    folder.mkdir()
+    pin = _leaf_file(folder)
+    # POSITIVE CONTROL: the folder as created passes.
+    connection_string(_ss(ssl_root_cert=pin), posture=HopPosture(enforcing=True))
+    os.chmod(folder, os.stat(folder).st_mode | stat.S_IWOTH)  # world-writable, no sticky bit
+    with pytest.raises(TrustAnchorError, match=r"\[store\]\.ssl_root_cert"):
+        connection_string(_ss(ssl_root_cert=pin), posture=HopPosture(enforcing=True))

@@ -1150,6 +1150,15 @@ class StoreSettings(_Section):
                 "[store].ssl_root_cert requires a server-DB backend (postgres or sqlserver); "
                 "SQLite uses no TLS, so pinning a certificate has no effect."
             )
+        if self.ssl_root_cert and self.backend is StoreBackend.SQLSERVER:
+            # Vault BACKLOG #2223: on SQL Server the file is an exact-match pin, so a bundle or a CA
+            # certificate would refuse every connect. Say so at load, naming the setting. The file
+            # holds only a public certificate, and no part of it goes into the message.
+            from messagefoundry.pki import read_pinned_server_certificate
+
+            problem = read_pinned_server_certificate(self.ssl_root_cert)
+            if isinstance(problem, str):
+                raise ValueError(f"[store].ssl_root_cert {self.ssl_root_cert!r} {problem}")
         return self
 
     @field_validator("ssl_crl_file")
