@@ -6171,6 +6171,7 @@ def _presented_certificate_pem(host: str, port: int) -> str:
     import ssl
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     ctx.set_alpn_protocols(["tds/8.0"])
@@ -6183,11 +6184,17 @@ def _presented_certificate_pem(host: str, port: int) -> str:
     return ssl.DER_cert_to_PEM_cert(der)
 
 
+@pytest.mark.skipif(
+    not os.getenv("MEFOR_TEST_SQLSERVER_STRICT"),
+    reason="set MEFOR_TEST_SQLSERVER_STRICT=1 only where the SQL Server is configured for TDS 8.0 "
+    "strict encryption; the default CI containers are not, so the TLS-first read is cut",
+)
 async def test_server_certificate_pin_is_enforced_under_strict_encryption(tmp_path: Any) -> None:
     """The store's pinned string, ``ServerCertificate`` with ``Encrypt=strict``, connects with the
     certificate the server presents and is refused with any other. Vault BACKLOG #3009 measured on
-    Windows that Driver 18.7 enforced the pin with strict and not with ``Encrypt=yes``; this is the
-    Linux driver's reading, closing step 1 of #2223.
+    Windows that Driver 18.7 enforced the pin with strict and not with ``Encrypt=yes``, and that
+    measurement is the evidence the store change rests on. This would be the Linux driver's reading,
+    toward closing step 1 of #2223, on a server configured for strict encryption.
 
     POSITIVE CONTROL: the right pin connects through the same builder, so the wrong pin's refusal is
     the pin's doing and not a strict handshake this server cannot make. The two strings differ only
