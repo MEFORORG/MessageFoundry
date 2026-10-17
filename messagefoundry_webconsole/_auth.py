@@ -16,7 +16,7 @@ import os
 import re
 import time
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from urllib.parse import quote, urlsplit
 
@@ -252,6 +252,9 @@ _CROSS_ORIGIN_FETCH = frozenset({"cross-site", "same-site"})
 #: The ``Sec-Fetch-Site`` values a /ui WRITE is accepted with (:func:`assert_same_origin`): the
 #: browser calls the request same-origin, or user-initiated (``none``). A GET is not held to this.
 _SAME_ORIGIN_FETCH = frozenset({"same-origin", "none"})
+#: The refusal for a request whose ``Sec-Fetch-Site`` lines disagree. Shared with
+#: :class:`._security.UiFetchMetadataMiddleware`, which gives the same answer to the same request.
+_CONFLICTING_FETCH_SITE = "conflicting Sec-Fetch-Site lines rejected"
 
 
 #: ASVS 14.3.1 — the header emitted on every response that ENDS a session's browser-visible life.
@@ -651,6 +654,32 @@ def _origin_matches(app_state: object, origin: str, host: str | None) -> bool:
     return host is not None and urlsplit(origin).netloc.lower() == host.lower()
 
 
+def _fetch_site_lines_disagree(values: Sequence[str]) -> bool:
+    """Whether a request's ``Sec-Fetch-Site`` lines carry more than one value.
+
+    The one statement of "disagree", used by :func:`_sec_fetch_site` and by
+    :class:`._security.UiFetchMetadataMiddleware`, so the two cannot drift apart on it. Values are
+    compared exactly as received: no trimming, no case folding, and a comma-joined value folded
+    into one line by an intermediary is one value, judged by the rules for any other value.
+    """
+    return len(set(values)) > 1
+
+
+def _sec_fetch_site(request: Request) -> str | None:
+    """The request's one ``Sec-Fetch-Site`` value, or ``None`` when it carries no such line.
+
+    A browser sets this header once. Lines that all carry one value are that value. Lines that
+    carry DIFFERENT values are refused with a 403 rather than judged on one of them, because
+    ``headers.get`` reads the first line and :class:`._security.UiFetchMetadataMiddleware` walks
+    them all, so judging one line let the two checks rule on different values of one request. The
+    middleware refuses the same requests, so the two now agree on every request either one sees.
+    """
+    values = request.headers.getlist("sec-fetch-site")
+    if _fetch_site_lines_disagree(values):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, _CONFLICTING_FETCH_SITE)
+    return values[0] if values else None
+
+
 def assert_not_cross_site(request: Request) -> None:
     """Reject a request the BROWSER ITSELF labels cross-site — the ``Sec-Fetch-Site`` half of
     :func:`assert_same_origin`, and nothing else (ASVS 3.5.1).
@@ -665,8 +694,10 @@ def assert_not_cross_site(request: Request) -> None:
     canary's). So the check keeps exactly the property that matters for such a sink — a report a
     FOREIGN site's CSP aimed at us is refused instead of amplifying our log — and lets conforming
     same-origin and agent-initiated delivery through.
+
+    Lines that disagree are refused too, by :func:`_sec_fetch_site`.
     """
-    if request.headers.get("sec-fetch-site") in _CROSS_ORIGIN_FETCH:
+    if _sec_fetch_site(request) in _CROSS_ORIGIN_FETCH:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "cross-site request rejected")
 
 
@@ -692,21 +723,24 @@ def assert_same_origin(request: Request) -> None:
     **THE RULE, stated once.** This table is the one statement of what the check does with the
     method and ONE line of each header. Other documents say the one fact they need and point here.
     ``test_ui_origin_guard.py`` reads the table out of this docstring and drives the function over
-    every row, on the Host-fallback posture; a change to the table or to these branches that
-    leaves the other behind fails there.
+    every row, on the ``Host``-fallback posture only (no public origin, no proxy). A change to the
+    table or to these branches that leaves the other behind fails there for that posture.
 
     What the table does not state, so it is not read as covering it:
 
     * "matches" means :func:`_origin_matches` accepts the ``Origin``. What that function compares
       is its own subject (a configured public origin, the ``Host`` fallback, the proxied-loopback
       refusal) and is not restated or re-tested by the table.
-    * A repeated ``Sec-Fetch-Site`` line: this function reads the first, and
-      :class:`._security.UiFetchMetadataMiddleware` keeps the last.
+    * More than one ``Sec-Fetch-Site`` line. Lines that all carry one value are that value. Lines
+      that carry different values are refused with a 403 on every method, by
+      :func:`_sec_fetch_site`, and :class:`._security.UiFetchMetadataMiddleware` refuses the same
+      requests. ``test_ui_origin_guard.py`` drives both.
     * Values are compared as this function receives them. "any other value" is any non-empty value
       outside the four named, so another letter case or padding is another value HERE; an HTTP
       server may trim padding before the request arrives.
 
-    A refusal is a 403. "write" is any method but GET, to match ``require_ui``.
+    A refusal is a 403. "write" is any method but GET, to match ``require_ui``, so ``HEAD`` and
+    ``OPTIONS`` are writes here and get the write rows.
 
     ======  =======================  ===============  =======
     Method  Sec-Fetch-Site           Origin           Verdict
@@ -743,11 +777,15 @@ def assert_same_origin(request: Request) -> None:
     """
     # "GET" and nothing wider, to match require_ui's own definition of a write.
     write = request.method != "GET"
-    site = request.headers.get("sec-fetch-site")
-    # On a write an EMPTY Sec-Fetch-Site names no provenance, so it is absence, as an empty Origin
-    # is below. On a GET any present line settles it, which is the pre-#1116 rule unchanged.
-    if site if write else site is not None:
-        assert_not_cross_site(request)
+    site = _sec_fetch_site(request)
+    # Whether the Sec-Fetch-Site line decides the request, so Origin is never read. On a write an
+    # EMPTY line names no provenance, so it is absence, as an empty Origin is below. On a GET any
+    # present line decides, empty included: the pre-#1116 rule, unchanged.
+    settled_by_site = bool(site) if write else site is not None
+    if settled_by_site:
+        # assert_not_cross_site's test, on the value already read.
+        if site in _CROSS_ORIGIN_FETCH:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "cross-site request rejected")
         # An ALLOW set on a write, not only the two refused values above. The Fetch Metadata
         # values are four exact lowercase tokens; anything else (an unknown token, another case,
         # padding) is not a browser naming this request same-origin, so it fails closed.
