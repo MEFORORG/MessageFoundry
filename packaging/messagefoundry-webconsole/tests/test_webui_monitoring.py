@@ -775,6 +775,25 @@ async def test_config_reload_registered_in_stepup_allowlist(engine: Engine) -> N
     assert not is_safe_ui_action("/ui/config/reload?dir=/etc")  # query rejected (no path injection)
 
 
+def test_the_reload_result_page_says_what_the_reload_left_undone() -> None:
+    """BACKLOG #3015: the page shows a degraded step and a changed trust anchor that takes a
+    restart. Before it, both reached only the JSON answer. The control is a clean reload."""
+    from messagefoundry.api.models import ReloadResult
+    from messagefoundry_webconsole import pages
+
+    def render(**fields: object) -> str:
+        counts = {"inbound": 1, "outbound": 1, "routers": 1, "handlers": 1, "running": True}
+        return str(pages.reload_result(ReloadResult.model_validate({**counts, **fields})))
+
+    clean = render(restart_required=[])
+    assert "Restart the engine" not in clean and "follow-on step failed" not in clean
+    restart = render(restart_required=["[auth].ad_tls_ca_cert_file"])
+    assert "Restart the engine" in restart and "[auth].ad_tls_ca_cert_file" in restart
+    degraded = render(degraded=True, failures=["reference_sync"])
+    assert "follow-on step failed: reference_sync" in degraded
+    assert "Restart the engine" not in render(restart_required=None)  # a dry run did not check
+
+
 async def test_write_action_method_matches_its_continuation(engine: Engine) -> None:
     # R1 (refined for L0c): the re-auth continuation branches on a registered action's flags, so the HTTP
     # method serving each action MUST match its continuation style, or the branch is a hazard:
