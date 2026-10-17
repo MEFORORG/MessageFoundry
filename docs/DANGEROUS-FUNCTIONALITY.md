@@ -259,7 +259,7 @@ debugging on, because a launcher passes no interpreter option.
 | `auth/trust_anchors.py` | `icacls.exe`, read-only | Checking a trust anchor file's permissions | argument list |
 | `store/store.py` | `icacls.exe` | Setting owner-only permissions on store files, which hold no key | argument list |
 | `checks.py` | `ruff` and `mypy`, found on `PATH` | `messagefoundry check`, when they are installed | argument list |
-| `verify/cipher_policy.py` | `powershell.exe` running `Get-TlsCipherSuite` on Windows; `openssl ciphers`, found on `PATH`, on Linux | `messagefoundry verify`, in its host section, which runs by default, when `pyodbc` imports | argument list |
+| `verify/cipher_policy.py` | `powershell.exe` running `Get-TlsCipherSuite` from the system TLS module on Windows; `openssl ciphers`, found on `PATH`, on Linux | `messagefoundry verify`, in its host section, which runs by default, when `pyodbc` is installed | argument list |
 | `tray/actions.py` | VS Code, the default browser, the default viewer | Tray menu actions | argument list, browser, os.startfile |
 | `tray/app.py` | The default editor | Opening `tray.toml` from the tray | os.startfile |
 | `tray/branding.py` | The tray again, under its branded launcher | Tray startup | argument list |

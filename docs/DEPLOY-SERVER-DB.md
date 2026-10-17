@@ -776,19 +776,27 @@ too. That variable replaces the system file for the driver (measured, last table
 
 `messagefoundry verify` runs the checks of this step as one row of its host section, `host.ciphers`
 ([`testing/VERIFY.md`](testing/VERIFY.md)). The host section runs by default, and
-`--section host` runs it alone. It changes no TLS or registry setting and no file of the engine's.
-Windows PowerShell, which it starts on Windows, may write its own per-account files, such as its
-module analysis cache, as any PowerShell start can. It is not part of `messagefoundry serve`, so it
-never refuses or delays an engine start. Run it as the account the engine runs as, with the same
-environment, after the reboot on Windows.
+`--section host` runs it alone. It changes no TLS or registry setting and no file of the engine's;
+what the programs it starts may still write is listed once, in
+[`testing/VERIFY.md`](testing/VERIFY.md), *What writes, and what does not*. It is not part of
+`messagefoundry serve`, so it never refuses or delays an engine start. Run it as the account the
+engine runs as, with the same environment, after the reboot on Windows.
+
+**It runs whenever `pyodbc` is installed in the Python that runs `verify`**, found on the import
+path without being imported. It does not read the engine's configuration, so it runs on a host
+whose store and connections use no ODBC Driver 18 hop too. On such a host a stock policy still
+reads FAIL, and `verify` exits 1. Read that FAIL as not applying to a host with no such hop.
 
 It runs the commands of this step. It differs from them in at least the ways named here:
 
-- Windows: `(Get-TlsCipherSuite).Name` through Windows PowerShell at its `System32` path, with the
-  name filter of check 1 applied in Python, and the two `Enabled` values of check 2 read from the
-  registry. It silences PowerShell's warning and verbose streams. Any other output line that is not
-  shaped like a suite name makes the row ERROR, so such a line is neither counted as a suite nor
-  dropped. **It also reads one thing the manual checks do not.** Where Group Policy sets **SSL Cipher Suite Order**, it reads that list from the registry value the
+- Windows: `Get-TlsCipherSuite` through Windows PowerShell at its `System32` path, with the name
+  filter of check 1 applied in Python, and the two `Enabled` values of check 2 read from the
+  registry. It imports the system TLS module by its path under the Windows PowerShell folder and
+  runs that module's own `Get-TlsCipherSuite`, so a script on the `PATH` or a module in the
+  account's Documents folder with the same name cannot answer instead. It silences PowerShell's
+  warning and verbose streams. Any other output line that is not shaped like a suite name makes the
+  row ERROR, so such a line is neither counted as a suite nor dropped. **It also reads one thing the
+  manual checks do not.** Where Group Policy sets **SSL Cipher Suite Order**, it reads that list from the registry value the
   policy writes, and applies the same filter to it. Which of the two lists SChannel uses when they
   differ is **unmeasured**, so a suite that is not AEAD in either list is a FAIL. **So a host
   configured only through Group Policy may read FAIL** while its policy list is AEAD-only, if the
@@ -803,11 +811,13 @@ It runs the commands of this step. It differs from them in at least the ways nam
   `openssl_conf` in the top of the file, then that section's `ssl_conf`, then that section's
   `system_default`, which is `[system_default_sect]` on the stock Ubuntu file measured above. A file
   where that chain leads nowhere sets no policy, and reads FAIL. It matches the three names without
-  regard to case, as OpenSSL does. It accepts an indented line, removes quotes around a value, and
-  drops a `#` comment outside quotes. It does not follow an `.include` or `.pragma` line, a line
-  that ends in a backslash, or a `$name` value. A file with an `.include`, a `.pragma` or such a
-  line anywhere, or with `$` in a value the row reads, reads MANUAL, so the row never passes on
-  lines OpenSSL may not apply. RHEL-family hosts, which set the policy through
+  regard to case, as OpenSSL does. It accepts an indented line, removes quotes around a value,
+  drops a `#` comment outside quotes, and drops a leading byte-order mark. It does not follow at
+  least these: an `.include` or `.pragma` line, a line that ends in a backslash, a
+  `section::name` assignment, or a `$name` value. A file with any of the first four anywhere, or
+  with `$` in a `CipherString` or `MinProtocol` value or in the section chain, reads MANUAL. So does
+  an `OPENSSL_CONF` that is set but empty. A PASS still rests on this reading matching OpenSSL's
+  for every construct the file uses. RHEL-family hosts, which set the policy through
   `update-crypto-policies` and an included file, are outside what this row was written and
   measured for. On a stock one, expect MANUAL: its file pulls the policy in through `.include`, and
   it is not at `/etc/ssl/openssl.cnf`. That is **unmeasured**.
@@ -817,16 +827,17 @@ It runs the commands of this step. It differs from them in at least the ways nam
 | PASS | The control is above 0 and every enabled suite is AEAD. On Windows, both `Enabled` values read `0`, and every suite in a Group Policy suite order is AEAD. On Linux, the system-default section holds one `CipherString` line and its last `MinProtocol` is `TLSv1.2` or `TLSv1.3`. |
 | FAIL | Any of those does not hold. The row names the suites that are not AEAD. An `Enabled` value that is not set fails too, as on the stock host measured above. |
 | ERROR | A reading was attempted and gave no usable answer. At least these: a command ran and failed or timed out; PowerShell printed a line that is not a suite name; a suite list, enabled or Group Policy, read empty; a registry value could not be read or held the wrong type; the OpenSSL file could not be read. An empty list is a control of 0, so it never reads as healthy. |
-| MANUAL | The row cannot take the reading here. At least these: no Windows PowerShell, no `Get-TlsCipherSuite` cmdlet in it, no `openssl`, no OpenSSL file at the path read, or an OpenSSL file that uses what the row does not follow (above). Run the commands above by hand. |
-| SKIP | `pyodbc` does not import, so no ODBC Driver 18 hop can run in this environment. Or the host is neither Windows nor Linux. |
+| MANUAL | The row cannot take the reading here. At least these: no Windows PowerShell, no system TLS module or `Get-TlsCipherSuite` cmdlet in it, no `openssl`, no OpenSSL file at the path read, an empty `OPENSSL_CONF`, or an OpenSSL file that uses what the row does not follow (above). Run the commands above by hand. |
+| SKIP | `pyodbc` is not installed in the Python that runs `verify`, so no ODBC Driver 18 hop can run from it. Or the host is neither Windows nor Linux. |
 
 When readings disagree, the row takes the worst: FAIL, then ERROR, then MANUAL, then PASS. So a
-broken reading never hides a finding. A FAIL makes `verify` exit 1, like any other FAIL row. Apart
+broken reading never hides a finding. A FAIL or an ERROR makes `verify` exit 1, like any other FAIL
+or ERROR row. Apart
 from the differences above, it reads what the commands above read, so the limits listed under each
 platform hold for it too.
 
 **Measured** on 2026-10-17, on a stock Windows 11 host with no policy set, calling the row's reading
-directly because that host has no `pyodbc`: 18 of 28 suites not AEAD and both `Enabled` values unset,
+directly because that host has no `pyodbc`, with the TLS module imported by its path as above: 18 of 28 suites not AEAD and both `Enabled` values unset,
 so FAIL. The manual Windows checks on the same host printed `28`, 18 names, and nothing. Its healthy
 reading is **unmeasured** on a real host; the tests cover it with the probes stubbed. The Linux branch
 is **unmeasured** on Linux.
