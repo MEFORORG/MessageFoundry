@@ -2347,7 +2347,10 @@ class AuthService:
         admin_loss_alert: Callable[[str, str], None] | None = None,
     ) -> None:
         self._store = store
-        self._settings = settings
+        # A copy: the caller's object is also stashed as app.state.auth_settings, and the section
+        # is not frozen, so a write through that stash would otherwise change a live limit with no
+        # audit row (vault BACKLOG #3215).
+        self._settings = settings.model_copy(deep=True)
         # BACKLOG #2592: raises the integrity alert when an authority row fails its seal. Injected by
         # the API lifespan (the service never imports the alert sinks). None logs only.
         self._integrity_alert = integrity_alert
@@ -2779,9 +2782,9 @@ class AuthService:
     def settings(self) -> AuthSettings:
         """A copy of the ``[auth]`` limits this service enforces. ``GET /security/posture`` reports
         its loosenings from here, so an embedder that attaches a service with loosened limits sees
-        them named (vault BACKLOG #3215). A deep copy, because the section is not frozen and holds
-        lists: a reader that set a field, or appended to a list, on the enforced object would
-        change a live limit with no audit row."""
+        them named (vault BACKLOG #3215). A deep copy, for the reason the constructor copies its
+        argument: the section is not frozen and holds lists, so a reader that set a field, or
+        appended to a list, on the enforced object would change a live limit with no audit row."""
         return self._settings.model_copy(deep=True)
 
     @property

@@ -3287,12 +3287,15 @@ async def test_an_embedders_attached_service_supplies_the_auth_limits(
 async def test_the_settings_an_auth_service_hands_out_are_a_deep_copy(engine: Engine) -> None:
     """Vault BACKLOG #3215, review finding 7: ``AuthService.settings`` is read by the posture route,
     and the section is not frozen. Setting a field, or appending to a list field, on what it
-    returns must leave the limits the service enforces unchanged. A shallow copy shared the lists."""
-    service = AuthService(engine.store, AuthSettings())
-    handed = service.settings
+    returns must leave the limits the service enforces unchanged. A shallow copy shared the lists.
+    The same holds for the object passed to the constructor, which the managed lifespan also
+    stashes as ``app.state.auth_settings``: the service keeps its own copy."""
+    given = AuthSettings()
+    service = AuthService(engine.store, given)
     before = list(service.settings.oidc_signing_algorithms)
-    handed.oidc_signing_algorithms.append("HS256")
-    handed.totp_skew_steps = 2
-    assert service.settings.oidc_signing_algorithms == before
-    assert service.settings.totp_skew_steps == 0
-    assert handed.oidc_signing_algorithms == [*before, "HS256"], "control: the copy did change"
+    for target in (service.settings, given):
+        target.oidc_signing_algorithms.append("HS256")
+        target.totp_skew_steps = 2
+        assert target.oidc_signing_algorithms == [*before, "HS256"], "control: it did change"
+        assert service.settings.oidc_signing_algorithms == before
+        assert service.settings.totp_skew_steps == 0

@@ -3407,7 +3407,8 @@ listener start, a refusal isolates that one listener and the rest of the graph c
 At build check, the same refusal fails the whole config. That covers `messagefoundry check`, a
 reload or dry-run reload, promote, a connection edit, a connection-flag toggle, a DR activation
 and a cluster follower's convergence reload. A follower whose own settings refuse the graph would
-keep its old graph, log the refusal and retry each interval.
+keep its old graph, log the refusal and retry each interval. It would also write a
+`config_reload_failed` audit row under `system:cluster-convergence` (vault BACKLOG #3109).
 The build check runs the gates only on a listener the engine would bind: deployed and `auto_start`.
 On a running engine it also skips one the DR run-profile parks, and it gates one an operator
 started. It gates a listener outside its schedule window, because the scheduler binds it when the

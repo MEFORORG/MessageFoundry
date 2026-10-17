@@ -1158,3 +1158,52 @@ async def test_a_failed_convergence_row_the_store_refused_is_written_on_the_next
     assert refused == ["config_reload_failed"], "control: the first write was refused"
     assert len(failed) == 1, "written on the second pass, and not again on the third"
     assert json.loads(failed[0]["detail"])["config_version"] == 2
+
+
+async def test_alternating_faults_on_one_version_write_one_row_each_and_then_nothing(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """vault BACKLOG #3109: the runner retries a failing version every tick, and the fault can
+    alternate, as on a flaky share. Each distinct row is written once for the version and then
+    never again, however the faults interleave. Keyed on the last fault alone, A, B, A, B wrote a
+    row on every tick."""
+
+    async def _boom(self: Engine, *a: Any, **kw: Any) -> Any:
+        raise RuntimeError("synthetic: a fault that is no reload refusal")
+
+    real = Engine.reload_detail
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        (cfg / "cfg.py").write_text("this is not python (", encoding="utf-8")
+        for tick in range(6):  # invalid config, engine fault, invalid config, ...
+            with monkeypatch.context() as patch:
+                patch.setattr(Engine, "reload_detail", _boom if tick % 2 else real)
+                with pytest.raises(WiringError if tick % 2 == 0 else RuntimeError):
+                    await engine._converge_reload(2)
+        failed = await engine.store.list_audit(action="config_reload_failed")
+    reasons = sorted(json.loads(r["detail"])["reason"] for r in failed)
+    assert reasons == ["invalid_config", "reload_error"], "one row each, then nothing"
+
+
+async def test_two_causes_that_write_the_same_row_write_it_once(
+    tmp_path: Path, cfg: Path, alerts: list[dict[str, Any]]
+) -> None:
+    """vault BACKLOG #3109: two different bad configs fail the same version with different causes,
+    a syntax error and then a name nobody defined. Both write the same row, reason
+    ``invalid_config``, so it is written once. Keyed on the cause, each wrote a row that could
+    not be told from the other."""
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        causes: list[type[BaseException] | None] = []
+        for body in ("this is not python (", "name_nobody_defined\n"):
+            (cfg / "cfg.py").write_text(body, encoding="utf-8")
+            with pytest.raises(WiringError) as raised:
+                await engine._converge_reload(2)
+            cause = raised.value.__cause__
+            causes.append(type(cause) if cause is not None else None)
+        assert causes[0] is not causes[1], f"control: the two faults differ in cause ({causes})"
+        failed = await engine.store.list_audit(action="config_reload_failed")
+    assert len(failed) == 1
+    assert json.loads(failed[0]["detail"])["reason"] == "invalid_config"

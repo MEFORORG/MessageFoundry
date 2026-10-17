@@ -1226,12 +1226,14 @@ async def test_engine_convergence_reload_does_not_propagate(tmp_path: Path) -> N
 
 
 async def test_a_convergence_reload_hands_its_hooks_the_version_it_converged_on(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     """vault BACKLOG #3109: ``_converge_reload`` hands the audit hook its outcome carrying the
-    shared version it converged on. A reload that raises hands the failure hook the fault and that
-    version, and is re-raised, so the runner still retries it. The hook is called until its row for
-    a version lands, not on every retry; a row the store refused is tried again on the next pass."""
+    shared version it converged on. A reload that raises hands the failure hook the fault, that
+    version and the set of rows already written for it, and is re-raised, so the runner still
+    retries it. The set lives as long as the version keeps failing: a retry gets the same set, and
+    a new version or a convergence starts an empty one. The API's writer uses it to write each
+    distinct row once (tests/test_start_config_change_alert.py)."""
     coord = _BumpRecordingCoordinator()
     cfgdir = tmp_path / "cfg"
     _minimal_config(cfgdir, tmp_path)
@@ -1245,23 +1247,22 @@ async def test_a_convergence_reload_hands_its_hooks_the_version_it_converged_on(
     eng.add_registry(load_config(cfgdir))
     await eng.start()
     applied: list[int | None] = []
-    failed: list[tuple[type[Exception], int]] = []
-    refuse_next_row = [False]
+    calls: list[tuple[type[Exception], int, frozenset[str]]] = []
+    sets: list[set[str]] = []
 
     async def _audit(outcome: ReloadOutcome) -> None:
         applied.append(outcome.config_version)
 
-    async def _failed(exc: Exception, version: int) -> bool:
-        failed.append((type(exc), version))
-        landed = not refuse_next_row[0]
-        refuse_next_row[0] = False
-        return landed
+    async def _failed(exc: Exception, version: int, reported: set[str]) -> None:
+        calls.append((type(exc), version, frozenset(reported)))
+        sets.append(reported)
+        reported.add(type(exc).__name__)  # what the API's writer does once a row lands
 
     eng.convergence_reload_audit = _audit
     eng.convergence_reload_failed = _failed
     try:
         await eng._converge_reload(4)
-        assert applied == [4] and failed == []
+        assert applied == [4] and calls == []
         assert coord.bumps == 0, "control: a convergence reload still bumps nothing"
         good = (cfgdir / "c.py").read_text(encoding="utf-8")
         (cfgdir / "c.py").write_text("this is not python (", encoding="utf-8")
@@ -1269,35 +1270,20 @@ async def test_a_convergence_reload_hands_its_hooks_the_version_it_converged_on(
             with pytest.raises(WiringError):
                 await eng._converge_reload(version)
         assert applied == [4]
-        assert failed == [(WiringError, 5), (WiringError, 6)], "once per version, not per tick"
-        # A version that converges clears the mark, so its next failure is reported again.
+        assert calls == [
+            (WiringError, 5, frozenset()),
+            (WiringError, 5, frozenset({"WiringError"})),  # the retry sees the row written
+            (WiringError, 6, frozenset()),  # a new version starts empty
+        ]
+        assert sets[0] is sets[1] and sets[2] is not sets[1]
+        # A version that converges drops its set, so a later failure of it starts empty.
         (cfgdir / "c.py").write_text(good, encoding="utf-8")
         await eng._converge_reload(6)
         (cfgdir / "c.py").write_text("this is not python (", encoding="utf-8")
         with pytest.raises(WiringError):
             await eng._converge_reload(6)
-        assert applied == [4, 6] and failed[-1] == (WiringError, 6) and len(failed) == 3
-        # A row the store refuses leaves the version unreported, so the next pass tries again,
-        # and a row that lands stops the retries.
-        refuse_next_row[0] = True
-        for _ in range(3):
-            with pytest.raises(WiringError):
-                await eng._converge_reload(7)
-        assert failed[3:] == [(WiringError, 7), (WiringError, 7)], "lost once, then written"
-
-        # A different kind of fault for the same version gets its own row: a trust-anchor
-        # refusal is a WiringError too, told apart by its cause.
-        causes: list[BaseException | None] = [None, None, OSError("synthetic anchor fault")]
-
-        async def _refuse(*_a: object, **_kw: object) -> ReloadOutcome:
-            cause = causes.pop(0)
-            raise WiringError("synthetic refusal") from cause
-
-        monkeypatch.setattr(eng, "reload_detail", _refuse)
-        for _ in range(3):
-            with pytest.raises(WiringError):
-                await eng._converge_reload(8)
-        assert failed[5:] == [(WiringError, 8), (WiringError, 8)], "one row per kind of fault"
+        assert applied == [4, 6] and calls[-1] == (WiringError, 6, frozenset())
+        assert sets[-1] is not sets[2]
     finally:
         await eng.stop()
 

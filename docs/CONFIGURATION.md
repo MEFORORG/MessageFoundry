@@ -1646,9 +1646,11 @@ started together, can each raise it; the alert list folds them into one instance
   convergence row carries the version the node converged on. An operator reload whose bump failed
   carries none. A follower's row records the bytes that node loaded, not the operator's digest.
 - A convergence reload that fails writes a `config_reload_failed` row under the same actor
-  (vault BACKLOG #3109). The loop retries that version every interval and logs each failure. Each
-  engine process writes at most one row per version and kind of fault, once the audit log accepts
-  it, so a node that restarts, or another node, writes its own. The row carries `initiator` and `config_version`, and its `requested` is `null`. Its
+  (vault BACKLOG #3109). The loop retries that version every interval and logs each failure. An
+  engine process writes each distinct row once per version: rows that differ in action, `reason`
+  or `error` are each written once, and a fault that writes the same row as an earlier one writes
+  nothing. A row the audit log refuses is tried again on the next failure. The record is per
+  process, so a node that restarts, or another node, writes its own. The row carries `initiator` and `config_version`, and its `requested` is `null`. Its
   reason is the one an operator's refused reload records, or `reload_error` with the fault's type
   name.
 - A convergence row the audit log refuses is logged at ERROR and raises no alert. An operator

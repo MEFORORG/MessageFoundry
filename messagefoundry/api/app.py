@@ -1738,7 +1738,7 @@ async def _audit_refused_reload(
     dry_run: bool,
     client: str | None = None,
     extra: Mapping[str, object] | None = None,
-    wrote: Callable[[bool], None] | None = None,
+    reported: set[str] | None = None,
 ) -> tuple[int, str]:
     """Write the audit row for a reload the engine refused, and return the status and detail to answer.
 
@@ -1766,8 +1766,9 @@ async def _audit_refused_reload(
 
     ``client`` follows :func:`_record_reload_audit`'s rule (ADR 0150): the executor passes none.
     ``extra`` adds keys to the row's detail; a cluster convergence reload names itself there (vault
-    BACKLOG #3109). ``wrote``, when passed, is told whether the row landed; that reload uses it to
-    retry a row the store refused.
+    BACKLOG #3109). ``reported``, when passed, holds :func:`_failure_row_key` of each row already
+    written: a row already in it is not written again, and a row that lands is added. That reload
+    retries every interval, and this keeps it to one row of each kind per version.
 
     **The row's write never raises.** A refusal changed nothing, so its answer stands whether or
     not the row lands, and a store fault here would otherwise turn it into a raw 500 (vault BACKLOG
@@ -1840,6 +1841,9 @@ async def _audit_refused_reload(
     # argument: a caller's chained refusal can still carry the directory into it, and only the
     # handler's ControlCharScrubFilter escapes that. ``defects=()`` keeps the docstring's promise
     # that this write never raises (vault BACKLOG #2260).
+    key = _failure_row_key(action, detail)
+    if reported is not None and key in reported:
+        return status, answer
     written = await write_audit_soft(
         lambda: engine.store.record_audit(action, actor=actor, detail=row, client=client),
         log=_log,
@@ -1847,12 +1851,21 @@ async def _audit_refused_reload(
         args=lambda: (action, scrub_log_argument(actor), scrub_log_argument(row)),
         defects=(),
     )
-    if wrote is not None:
-        wrote(written)
+    if written and reported is not None:
+        reported.add(key)
     return status, answer
 
 
-async def _audit_failed_convergence(engine: Engine, exc: Exception, version: int) -> bool:
+def _failure_row_key(action: str, detail: Mapping[str, object]) -> str:
+    """What tells one failed-reload row from another, as the row records it: its action, reason
+    and error class. A convergence reload writes each such row once per version (vault BACKLOG
+    #3109), so two faults that write the same row write it once."""
+    return f"{action}:{detail.get('reason')}:{detail.get('error')}"
+
+
+async def _audit_failed_convergence(
+    engine: Engine, exc: Exception, version: int, reported: set[str]
+) -> None:
     """Write the ``config_reload_failed`` row for a cluster convergence reload that raised, so the
     attempt is in the audit log and not only in the engine log (vault BACKLOG #3109).
 
@@ -1865,12 +1878,12 @@ async def _audit_failed_convergence(engine: Engine, exc: Exception, version: int
     was swapped either way: the reload raises only before its swap commits, and the node keeps its
     running graph and retries.
 
-    It returns whether the row landed, so the engine can try again on the next failure of the
-    same version rather than lose it. It never raises: the write goes through
+    ``reported`` holds :func:`_failure_row_key` of each row already written for this version: a
+    row already in it is not written again, and one that lands is added, so a row the store
+    refused is tried again on the next failure. It never raises: the write goes through
     :func:`write_audit_soft` with ``defects=()``."""
     extra = {"initiator": _CONVERGENCE_INITIATOR, "config_version": version}
     if isinstance(exc, _RELOAD_REFUSALS):
-        landed: list[bool] = []
         await _audit_refused_reload(
             engine,
             exc,
@@ -1878,28 +1891,29 @@ async def _audit_failed_convergence(engine: Engine, exc: Exception, version: int
             requested=None,
             dry_run=False,
             extra=extra,
-            wrote=landed.append,
+            reported=reported,
         )
-        return landed == [True]
-    row = json.dumps(
-        {
-            "requested": None,
-            "dry_run": False,
-            **extra,
-            "reason": "reload_error",
-            "error": type(exc).__name__,
-        }
-    )
-    return await write_audit_soft(
-        lambda: engine.store.record_audit(
-            "config_reload_failed", actor=_CONVERGENCE_ACTOR, detail=row
-        ),
+        return
+    action = "config_reload_failed"
+    detail = {
+        "requested": None,
+        "dry_run": False,
+        **extra,
+        "reason": "reload_error",
+        "error": type(exc).__name__,
+    }
+    key = _failure_row_key(action, detail)
+    if key in reported:
+        return
+    row = json.dumps(detail)
+    if await write_audit_soft(
+        lambda: engine.store.record_audit(action, actor=_CONVERGENCE_ACTOR, detail=row),
         log=_log,
-        # The refused-reload line's shape, so one search finds both lost rows.
-        message="a refused config reload's %s audit row failed. Lost row: actor=%s detail=%s",
-        args=lambda: ("config_reload_failed", _CONVERGENCE_ACTOR, scrub_log_argument(row)),
+        message="a failed convergence reload's %s audit row failed. Lost row: actor=%s detail=%s",
+        args=lambda: (action, _CONVERGENCE_ACTOR, scrub_log_argument(row)),
         defects=(),
-    )
+    ):
+        reported.add(key)
 
 
 #: The ``audit_write_failed`` alert's key for an inline reload's lost attempt row (vault BACKLOG
@@ -10325,8 +10339,10 @@ def create_managed_app(
                 },
             )
 
-        async def _audit_convergence_failure(exc: Exception, version: int) -> bool:
-            return await _audit_failed_convergence(engine, exc, version)
+        async def _audit_convergence_failure(
+            exc: Exception, version: int, reported: set[str]
+        ) -> None:
+            await _audit_failed_convergence(engine, exc, version, reported)
 
         engine.convergence_reload_audit = _audit_convergence_reload
         engine.convergence_reload_failed = _audit_convergence_failure
