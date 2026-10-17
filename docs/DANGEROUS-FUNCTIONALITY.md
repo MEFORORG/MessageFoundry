@@ -1011,11 +1011,14 @@ What holds it:
 - No engine module imports the harness, so no shipped command gains a password path.
 - The password comes from the `MEFOR_RIG_ADMIN_PASSWORD` environment variable. The process takes
   it out of its own environment before any engine code runs.
-- The shipped command refuses a store that already has an enabled Administrator, and the swap
-  does not change that.
+- The shipped command refuses a store that already has an enabled local Administrator with a
+  usable password, and the swap does not change that. Since vault BACKLOG #2711, a directory or
+  federated Administrator does not block it.
 
-What it means: on a store with no enabled Administrator, whoever can run the harness with access
-to that store can create one with no terminal and no authenticator app. The swap passes
+What it means: take a store where no enabled local Administrator has a usable password. Whoever
+can run the harness with access to that store can create one with no terminal and no
+authenticator app. That includes a store whose Administrators all sign in through the directory,
+even while they can still sign in (vault BACKLOG #2711). The swap passes
 `--no-totp`, and sets `MEFOR_SECURITY_REQUIRE_MFA=false` in that process.
 
 **Parsing.** Section 7's six patterns, run over the harness, find these modules:

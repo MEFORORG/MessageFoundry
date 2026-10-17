@@ -2479,6 +2479,15 @@ _UNSEALED_NAME_REFUSAL: Final = (
     "the account named {username!r} fails its integrity seal, so it is refused and cannot be"
     " repaired -- provision under a different username"
 )
+#: ``provision-admin``'s refusal while a local Administrator can sign in with its password (vault
+#: BACKLOG #2711 step 1). Keep the words "already has an enabled Administrator": at least the VS
+#: Code extension (``ide/src/engineControlModel.ts``), the load rig (``harness/load/rigadmin.py``)
+#: and ``scripts/service/measure-store-access.ps1`` key on them.
+_ADMINISTRATOR_EXISTS_REFUSAL: Final = (
+    "this store already has an enabled Administrator that signs in with a local password, so there"
+    " is nothing to provision -- create further accounts from the web console, and use"
+    " `admin-unlock` if that administrator is locked out"
+)
 
 
 def _lookup_keys(user: UserRecord) -> tuple[str | None, ...]:
@@ -3104,13 +3113,53 @@ class AuthService:
         return False
 
     async def has_enabled_administrator(self) -> bool:
-        """True iff some enabled account holds Administrator.
+        """True iff some enabled account holds Administrator, whichever kind.
 
-        The provisioning refusal below asks this, and so does ``provision-admin`` before it prompts.
-        (Further open-coded copies of that enumeration exist -- see :meth:`has_notifiable_admin` --
-        and unifying them is its own item, not this one.)
+        The directory-demotion alert asks this. The provisioning refusal does not since vault BACKLOG
+        #2711 step 1; it asks :meth:`has_self_sufficient_administrator`. (Further open-coded copies
+        of that enumeration exist -- see :meth:`has_notifiable_admin` -- and unifying them is its
+        own item, not this one.)
         """
         return await self._other_enabled_admin_exists()
+
+    def _signs_in_without_an_outside_service(self, user: VerifiedUser, now: float) -> bool:
+        """True iff ``user`` is a local account holding a password the login gate would still
+        accept: not a must-change credential past its deadline (:meth:`_credential_lapsed`). A
+        directory account needs the directory (a federated binding is only ever on one), and a
+        local row with no hash, or an expired temporary one, cannot sign in at all. Enabled and the
+        role are the caller's to check."""
+        if user.auth_provider != AuthProvider.LOCAL.value or user.password_hash is None:
+            return False
+        return not self._credential_lapsed(user, now)
+
+    async def _administrator_standing(self) -> tuple[bool, tuple[str, ...]]:
+        """Whether some enabled Administrator signs in without an outside service, and every
+        enabled Administrator's username, sorted.
+
+        THE ONE COMPUTATION behind both the ``provision-admin`` refusal and the start notice of
+        vault BACKLOG #2711 (owner ruling B258-R4, ADR 0183 Amendment E), so the command cannot
+        refuse a site the notice says it would rescue, or the reverse."""
+        now = time.time()
+        usable = False
+        names: list[str] = []
+        for user in await self._load_users():
+            if user.disabled or Role.ADMINISTRATOR.value not in user.role_ids:
+                continue
+            usable = usable or self._signs_in_without_an_outside_service(user, now)
+            names.append(user.username)
+        return usable, tuple(sorted(names))
+
+    async def has_self_sufficient_administrator(self) -> bool:
+        """True iff some enabled Administrator is a local account with a usable password, so it can
+        sign in with no directory or identity provider up.
+
+        ``provision-admin`` refuses exactly while this holds (vault BACKLOG #2711 step 1, ADR 0183
+        Amendment E). Before that, it refused while any enabled Administrator existed, so a site
+        whose every Administrator needed an outside service had no host command to get back in
+        while that service was down. :meth:`administrators_needing_an_outside_service` names
+        accounts exactly when this is false and an enabled Administrator exists."""
+        usable, _names = await self._administrator_standing()
+        return usable
 
     async def provision_first_administrator(
         self,
@@ -3165,6 +3214,16 @@ class AuthService:
         wider than an emptiness guard by design: it makes this a standing recovery path whenever
         every administrator is lost, which overlaps BACKLOG #1236's subject on the same host boundary.
 
+        **SINCE VAULT BACKLOG #2711 STEP 1 IT ASKS FOR A SELF-SUFFICIENT ONE** (owner ruling B258-R4,
+        ADR 0183 Amendment E): an enabled LOCAL Administrator with a usable password, by
+        :meth:`has_self_sufficient_administrator`, the same computation the start notice reads. A
+        directory or federated Administrator no longer blocks it, so a site whose every
+        Administrator needs an outside service can make a local one at the host while that service
+        is down. The check is still a separate read before the writes, so two runs with different
+        usernames can both pass it (vault BACKLOG #3078, not fixed here). The widening adds no step
+        to that window; it only lets the check pass on more stores, those with directory
+        Administrators.
+
         **THE CREDENTIAL IS CLAIMED AT BIRTH, so there is no half-claimed state to restart into.**
         The password is typed by the operator at a TTY and reaches no file, no argv and no log, so
         "the holder set their own credential" is already true and ``users.password_claimed_at`` is
@@ -3181,8 +3240,13 @@ class AuthService:
         refused the SECOND state, leaving a row this command could never complete -- a stranded
         install, which is exactly the risk the design exists to avoid. Roleless
         is also what makes the takeover safe rather than merely convenient: the account holds no
-        permission to inherit, and this branch is reachable only when the store has no enabled
-        administrator at all, which is already the state an operator needs recovering from. Safe is
+        permission to inherit, and before #2711 step 1 this branch was reachable only when the store
+        had no enabled administrator at all, which is already the state an operator needs
+        recovering from. **Since step 1 that premise is narrower.** The branch is reachable whenever
+        no enabled local Administrator has a usable password. On a directory-run site it can then
+        take over a roleless local account while the directory Administrators still sign in. The
+        host gate is unchanged, and the audit row's ``administrators_at_check`` names who held the
+        role. A tighter rule for that case is not built here. Safe is
         not silent, though: a roleless account can still be somebody's, so a repair tells the
         address it held before (BACKLOG #2019). And a row that holds an address is completed only
         when ``notify_email`` is given (BACKLOG #2288), so the sole Administrator's notices never
@@ -3207,12 +3271,9 @@ class AuthService:
                 raise FirstAdministratorRefused(
                     f"the notification address was refused: {exc}"
                 ) from exc
-        if await self.has_enabled_administrator():
-            raise FirstAdministratorRefused(
-                "this store already has an enabled Administrator, so there is nothing to provision "
-                "-- create further accounts from the web console, and use `admin-unlock` if the "
-                "administrator is locked out"
-            )
+        usable, standing_admins = await self._administrator_standing()
+        if usable:
+            raise FirstAdministratorRefused(_ADMINISTRATOR_EXISTS_REFUSAL)
         violations = self._policy.violations(password, username=username)
         if violations:
             raise FirstAdministratorRefused("; ".join(violations))
@@ -3402,6 +3463,11 @@ class AuthService:
                     # The earlier address itself is not recorded here; the notice went to it.
                     "notify_email_moved": moved,
                     "totp_enrolled": totp_secret is not None,
+                    # Vault BACKLOG #2711 step 1: every enabled Administrator when this run checked.
+                    # None of them could sign in with a local password; most are directory
+                    # accounts. Empty on a first install; non-empty means this one was added beside
+                    # them.
+                    "administrators_at_check": list(standing_admins),
                 }
             ),
         )
@@ -3456,7 +3522,8 @@ class AuthService:
 
     async def provision_refusal(self, username: str, *, notify_email: str | None) -> str | None:
         """What ``provision_first_administrator`` would refuse ``username`` for, asked BEFORE any
-        prompt (ADR 0197 Amendment A): an enabled Administrator exists, or the named row is one this
+        prompt (ADR 0197 Amendment A): an enabled local Administrator with a usable password exists
+        (:meth:`has_self_sufficient_administrator`, vault BACKLOG #2711), or the named row is one this
         command will not complete. ``provision-admin`` asks it first, so an operator is never shown
         an authenticator key for an account the store then refuses. The service still refuses on its
         own; this is the courtesy, that is the control. ``notify_email`` is the ``--email`` value,
@@ -3468,12 +3535,8 @@ class AuthService:
                 notify_email = _require_single_mailbox(notify_email)
             except InvalidNotifyEmail as exc:
                 return f"the notification address was refused: {exc}"
-        if await self.has_enabled_administrator():
-            return (
-                "this store already has an enabled Administrator, so there is nothing to provision "
-                "-- create further accounts from the web console, and use `admin-unlock` if the "
-                "administrator is locked out"
-            )
+        if await self.has_self_sufficient_administrator():
+            return _ADMINISTRATOR_EXISTS_REFUSAL
         lookup = await self._lookup_by_username(name)
         existing = lookup.user
         if existing is None:
@@ -10750,30 +10813,17 @@ class AuthService:
 
     async def administrators_needing_an_outside_service(self) -> tuple[str, ...]:
         """The enabled Administrators, by username, when NONE of them can sign in without an outside
-        identity service; empty otherwise (vault BACKLOG #2711, step 2).
+        identity service (:meth:`_signs_in_without_an_outside_service`); empty otherwise (vault
+        BACKLOG #2711, step 2). Empty too when there is no enabled Administrator at all: the
+        first-run notices of ADR 0183 cover that case.
 
-        An Administrator counts as self-sufficient when it is a local account holding a password the
-        login gate would still accept: not a must-change credential past its
-        :meth:`initial_credential_deadline`. A directory account needs the directory (a federated
-        binding is only ever on one), and a local row with no password hash, or an expired
-        temporary one, cannot sign in at all. ``provision-admin`` refuses while any enabled
-        Administrator exists, whichever kind, so such a site has no host command to get back in
-        while the outside service is down. Empty too when there is no enabled Administrator at all:
-        the first-run notices of ADR 0183 cover that case."""
-        now = time.time()
-        admins: list[str] = []
-        for user in await self._load_users():
-            if user.disabled:
-                continue
-            if Role.ADMINISTRATOR.value not in user.role_ids:
-                continue
-            if user.auth_provider == AuthProvider.LOCAL.value and user.password_hash is not None:
-                deadline = self.initial_credential_deadline(user.password_changed_at)
-                expired = user.must_change_password and deadline is not None and now > deadline
-                if not expired:
-                    return ()
-            admins.append(user.username)
-        return tuple(sorted(admins))
+        It reads :meth:`_administrator_standing`, as the ``provision-admin`` refusal does, so
+        whenever this names anyone, these accounts do not block ``provision-admin`` (step 1, ADR
+        0183 Amendment E). Under the same settings, that is: the command reads its own
+        ``--service-config``, and it can still refuse for reasons this never checks, such as the
+        password policy or a missing authenticator under ``require_mfa``."""
+        usable, names = await self._administrator_standing()
+        return () if usable else names
 
     async def report_administrators_needing_an_outside_service(self) -> tuple[str, ...]:
         """Run :meth:`administrators_needing_an_outside_service` at startup: WARN and write one audit
@@ -10786,9 +10836,10 @@ class AuthService:
             "no enabled Administrator can sign in without an outside identity service (the "
             "directory or a federated identity provider); each is a directory account or a local "
             "one with no usable password: %s. If that service is down, no Administrator can sign "
-            "in to manage this engine, and `messagefoundry provision-admin` will not create a local "
-            "Administrator while these accounts exist. Create a local Administrator now, before "
-            "an outage (docs/SECURITY.md, 'Keep a local Administrator').",
+            "in to manage this engine. Create a local Administrator now, before an outage, from "
+            "the web console. During an outage, `messagefoundry provision-admin`, run at the host "
+            "with the engine stopped, is not blocked by these accounts "
+            "(docs/SECURITY.md, 'Keep a local Administrator').",
             ", ".join(names),
         )
         await self._audit(

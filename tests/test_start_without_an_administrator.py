@@ -139,8 +139,8 @@ def test_an_administrator_with_no_address_is_pointed_at_the_offline_setter(
 ) -> None:
     """AC-16: the address half of the gate names ``admin-set-notify-email``, and it works.
 
-    ``provision-admin`` cannot help here, because an enabled Administrator exists, so naming it
-    would send the operator to a command that refuses. It cannot leave this state either, since
+    ``provision-admin`` cannot help here, because an enabled local Administrator with a
+    password exists, so naming it would send the operator to a command that refuses. It cannot leave this state either, since
     BACKLOG #1138 made ``--email`` required, so the Administrator is written through the service.
     """
     monkeypatch.chdir(tmp_path)
