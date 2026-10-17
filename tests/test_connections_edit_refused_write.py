@@ -47,11 +47,12 @@ ENTRY: dict[str, Any] = {
     "settings": {"host": "127.0.0.1", "port": 2700},
 }
 
+# Factories, not instances: a shared instance would carry each run's traceback into the next.
 REFUSALS = pytest.mark.parametrize(
-    "refusal",
+    "make_refusal",
     [
-        PermissionError(errno.EACCES, "Permission denied"),
-        OSError(errno.EROFS, "Read-only file system"),
+        lambda: PermissionError(errno.EACCES, "Permission denied"),
+        lambda: OSError(errno.EROFS, "Read-only file system"),
     ],
     ids=["root-owned", "read-only"],
 )
@@ -103,8 +104,9 @@ def _leftovers(directory: Path) -> list[str]:
 
 @REFUSALS
 def test_a_lock_file_it_cannot_create_is_a_wiring_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal: OSError
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_refusal: Callable[[], OSError]
 ) -> None:
+    refusal = make_refusal()
     path = _live(tmp_path)
     before = path.read_bytes()
     _refuse_open(monkeypatch, refusal, lambda p: p.name == atomic_edit.LOCK_FILE_NAME)
@@ -118,8 +120,9 @@ def test_a_lock_file_it_cannot_create_is_a_wiring_error(
 
 @REFUSALS
 def test_the_engines_own_lock_refuses_the_same_way(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal: OSError
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_refusal: Callable[[], OSError]
 ) -> None:
+    refusal = make_refusal()
     # The flag toggle takes `locked` around its read-modify-write before the upsert takes it again.
     _live(tmp_path)
     _refuse_open(monkeypatch, refusal, lambda p: p.name == atomic_edit.LOCK_FILE_NAME)
@@ -132,8 +135,9 @@ def test_the_engines_own_lock_refuses_the_same_way(
 
 @REFUSALS
 def test_a_candidate_directory_it_cannot_create_is_a_wiring_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal: OSError
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_refusal: Callable[[], OSError]
 ) -> None:
+    refusal = make_refusal()
     path = _live(tmp_path)
     before = path.read_bytes()
     validated: list[Path] = []
@@ -150,8 +154,9 @@ def test_a_candidate_directory_it_cannot_create_is_a_wiring_error(
 
 @REFUSALS
 def test_a_candidate_it_cannot_write_is_a_wiring_error_and_cleaned_up(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal: OSError
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_refusal: Callable[[], OSError]
 ) -> None:
+    refusal = make_refusal()
     path = _live(tmp_path)
     before = path.read_bytes()
     _refuse_open(
@@ -199,3 +204,29 @@ def test_an_editor_that_does_not_opt_in_still_raises_the_os_error(
         security_edit.set_security(path, {"require_mfa": False}, validate=_noop)
 
     assert caught.value is refusal
+
+
+@pytest.mark.parametrize("code", [errno.ENOSPC, errno.ENOENT], ids=["disk-full", "missing"])
+def test_an_error_that_is_not_a_refusal_keeps_its_own_type(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    # A full disk or a missing directory is not a permission problem, so it is not reported as one.
+    _live(tmp_path)
+    refusal = OSError(code, os.strerror(code))
+    _refuse_open(monkeypatch, refusal, lambda p: p.name == atomic_edit.LOCK_FILE_NAME)
+
+    with pytest.raises(OSError) as caught:
+        connections_edit.upsert_connection(tmp_path, ENTRY, validate=_noop)
+
+    assert caught.value is refusal
+
+
+def test_the_message_names_the_step_the_file_system_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _live(tmp_path)
+    refusal = PermissionError(errno.EACCES, "Permission denied")
+    _refuse_open(monkeypatch, refusal, lambda p: p.name == atomic_edit.LOCK_FILE_NAME)
+
+    with pytest.raises(WiringError, match=r"create its edit lock \.mefor-edit\.lock"):
+        connections_edit.upsert_connection(tmp_path, ENTRY, validate=_noop)
