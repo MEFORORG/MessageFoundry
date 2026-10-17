@@ -1135,9 +1135,14 @@ async def test_the_status_and_last_factor_guards_skip_the_directory_floor_the_ga
     await _add_passkey(service, "adadmin")
     with pytest.raises(ValueError, match="enroll another factor first"):
         await service.delete_webauthn_credential(admin, "adadmin-passkey-hash")
-    # Enrol TOTP, then drop the passkey, so TOTP is the last factor; disabling it must refuse.
+    # Drop the passkey, then enrol TOTP, so TOTP is the last factor; disabling it must refuse. The
+    # passkey goes through the store because the guard above refuses it, and it goes BEFORE the
+    # enrolment because confirm_mfa_enrollment refuses a pending session on an account that already
+    # holds a factor (BACKLOG #3061), as the confirm route's gate does.
+    admin_row = await service.store.get_user_by_username("adadmin")
+    assert admin_row is not None
+    assert await service.store.delete_webauthn_credential(admin_row.id, "adadmin-passkey-hash")
     await enrol_totp(admin, admin_login.token)
-    assert await service.delete_webauthn_credential(admin, "adadmin-passkey-hash") is True
     with pytest.raises(ValueError, match="enroll another factor first"):
         await service.disable_mfa(admin)
 

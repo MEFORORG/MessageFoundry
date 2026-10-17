@@ -10660,7 +10660,14 @@ class AuthService:
         step, mints no recovery codes, and leaves MFA off with the staged secret in place. Since the
         re-read after the lookup refuses a second-step lock, a locked directory account cannot enrol
         either; a local account is not lock-checked here. The code is judged as of the request's
-        arrival, so a slow lookup cannot push a good code out of its step."""
+        arrival, so a slow lookup cannot push a good code out of its step.
+
+        **The factor-binding rule is asked again after the lookup** (BACKLOG #3061), as
+        :meth:`finish_webauthn_registration` asks it. A pending session on an account that gained a
+        factor since the route's gate asked, for example a passkey bound on another session during
+        the lookup, raises :class:`ValueError` (audited ``auth.mfa_denied``) before the code is
+        checked, so no step is spent, no recovery codes are minted and MFA stays off. A session
+        revoked before that ask returns ``session_lost``."""
         arrived_at = time.time()  # the floor's clock, read before any await
         # The TOTP clock at arrival: the directory lookup below can cross a step boundary, so the
         # code is judged as of now, as verify_mfa judges it (BACKLOG #1943, #3061).
@@ -10691,6 +10698,14 @@ class AuthService:
         if isinstance(current, Elevation):
             return current
         user = current
+        # The #3014 factor-binding rule, asked again after the awaits above (BACKLOG #3061; see the
+        # docstring). Mirrors finish_webauthn_registration's second ask, session guard first for the
+        # reason given there; read-then-act as there.
+        if await self._load_session(hash_token(token)) is None:
+            return Elevation(session_lost=True)
+        if await self._factor_binding_is_blocked(token, STEP_UP_ACTION_MFA_CONFIRM):
+            await self.audit_mfa_denied(identity, "confirm_mfa_enrollment", client=client)
+            raise ValueError(self._TOTP_FACTOR_PRESENT)
         # Verify the enrollment proof under the SAME configured clock-skew window as a login (BACKLOG
         # #187): default 0 = strict current-step only. Enrolling under the same window a login uses
         # avoids the trap of a skewed-clock authenticator that confirms enrollment yet then fails every
@@ -11653,6 +11668,12 @@ class AuthService:
         "this account already has a second factor; verify it first, then start adding the passkey "
         "again from the account page"
     )
+    #: The same refusal on a TOTP confirm, when a factor was bound during its directory lookup
+    #: (BACKLOG #3061). The staged secret is kept, so it points at the confirm, not a new begin.
+    _TOTP_FACTOR_PRESENT = (
+        "this account already has a second factor; verify it first, then confirm the "
+        "authenticator app again from the account page"
+    )
 
     async def begin_webauthn_registration(
         self, identity: Identity, *, token: str, rp_id: str, rp_name: str
@@ -11779,7 +11800,9 @@ class AuthService:
         # network round trip, and a TOTP confirmed on another session meanwhile would otherwise let
         # this passkey bind and promote a session that never proved that factor. Refused exactly
         # as the check above refuses, and with the same dead-session guard in front, since the
-        # check fails closed on a session revoked meanwhile (a local account's floor re-reads none).
+        # check fails closed on a session revoked meanwhile. A directory account's lookup re-reads
+        # the session and answers a revoked one lost first; a local account is never looked up, and
+        # the floor, which reads the session only when it is above 0, does not refuse a revoked one.
         if await self._load_session(hash_token(token)) is None:
             self._webauthn_challenges.pop((hash_token(token), "register"))
             return Elevation(session_lost=True)
