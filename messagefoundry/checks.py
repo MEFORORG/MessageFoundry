@@ -2333,6 +2333,12 @@ def _check_build(
             detail=f"environment values or [tls] trust anchors did not load: {exc}",
         )
 
+    # The residual: stamp THIS instance's derived posture so the posture-keyed insecure-hop refusal
+    # (ADR 0092) decides at commit/CI exactly as serve/reload do — a prod-PHI cleartext hop raises
+    # here rather than shipping and only refusing at serve. Derived here, not in _build, so the
+    # posture census (tests/test_vault_posture_census.py) finds the read where it has always been.
+    posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
+
     def _build(*, allow_insecure_bind: bool) -> None:
         build_check_registry(
             registry,
@@ -2340,10 +2346,7 @@ def _check_build(
             env_values=env_values,
             egress=settings.egress,
             reserved_bindings=((API_LISTENER_LABEL, settings.api.host, settings.api.port),),
-            # The residual: stamp THIS instance's derived posture so the posture-keyed insecure-hop
-            # refusal (ADR 0092) decides at commit/CI exactly as serve/reload do — a prod-PHI cleartext
-            # hop raises here rather than shipping and only refusing at serve.
-            posture=hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement),
+            posture=posture,
             trust_anchor_policy=trust_anchor_policy,
             # ADR 0154 D4: the EFFECTIVE ordering / max_attempts refusals need the resolved
             # [delivery] defaults. Without them that arm is skipped rather than guessed, and the
