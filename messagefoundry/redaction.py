@@ -73,6 +73,7 @@ import re
 import traceback
 import weakref
 from abc import ABCMeta
+from bisect import bisect_left
 from collections import ChainMap, Counter, OrderedDict, UserDict, defaultdict, deque
 from collections.abc import Callable, MappingView
 from datetime import UTC, datetime
@@ -1752,13 +1753,23 @@ def redact(text: str) -> str:
     **A PHI label glued to a field run keeps its place, and the answer is checked against the one
     that took it (BACKLOG #3318).** :func:`_glued_label_replacement` says what it keeps. Where it kept
     a label, this function also computes the answer without it, and returns that one instead unless
-    both of these hold. First, no credential shape is in the input or in either answer
-    (:func:`_holds_a_credential_shape`): the credential filters run after this module, and a kept label
-    can take theirs into its own value. Second, the answer keeps no word that the answer without it
-    scrubbed, beyond the words of the labels it kept (:func:`_keeps_no_new_word`). So on one call, a
-    word this redactor printed was printed before #3318 too, by construction. A second call over the
-    first one's output is not covered by that check, and is measured instead."""
-    if not text.isprintable() or _holds_a_credential_shape(text):
+    all three of these hold. First, the input is printable: ``ControlCharScrubFilter`` writes a line
+    break as visible text, so a second handler reads two lines as one, and a kept quote there closed
+    an earlier value that the line end had closed on the first call. The price is large and stated: a
+    traceback is many lines, so the rule never applies to one. Second, no credential shape is in the
+    input or in either answer (:func:`_holds_a_credential_shape`): the credential filters run after
+    this module, and a kept label can take theirs into its own value. That screen also matches
+    ordinary words such as ``state=`` or ``session:``, and the rule is off on such a text. Third, the
+    answer keeps no word that the answer without it scrubbed, beyond the vocabulary words of the
+    labels it kept (:func:`_keeps_no_new_word`). So on one call, a word this redactor printed was
+    printed before #3318 too, by construction. A second call over the first one's output is not
+    covered by that check, and is measured instead; it can scrub more than the first, as other
+    exceptions :func:`safe_text` names can.
+
+    The rule is dropped silently where those checks refuse it, at least: a text the widened stage
+    reads only because of a kept label, which then keeps an encoded run the answer without the rule
+    scrubs; and an unclosed XML element after the token, which its pass reads as prose."""
+    if not text.isprintable():
         return _redact_text(text, None)
     labels: list[str] = []
     out = _redact_text(text, labels)
@@ -1766,7 +1777,8 @@ def redact(text: str) -> str:
         return out
     plain = _redact_text(text, None)
     if (
-        _holds_a_credential_shape(plain)
+        _holds_a_credential_shape(text)
+        or _holds_a_credential_shape(plain)
         or _holds_a_credential_shape(out)
         or not _keeps_no_new_word(out, plain, labels)
     ):
@@ -1874,10 +1886,13 @@ _STRUCTURED_ROUNDS = 8
 # such label in the token, with the quote or element end that opens its value, and scrubs the rest of
 # the token as before. The label's own pass then reads the value as it would with a space before it.
 #
-# **Only where the value runs past the token.** A value the token closes (a string whose closing
+# **Only where the value can run past the token.** A value the token closes (a string whose closing
 # quote, or an element whose end tag, is in it), an MRN with its number in the token, or a DICOM value
 # ended by ``;`` there, is scrubbed with the token as it always was, so a kept quote cannot end a
-# later value early. A bare JSON value glued to its key (``"name":Zqxdoe``) is not kept either: the
+# later value early. An unquoted DICOM value and a group 0010 tag's value run to the end of the line,
+# so their label is kept even when the token holds all of the value, and the prose after it on the
+# line is scrubbed with it: over-redaction, in the safe direction. An XML label with a namespace
+# prefix is not kept, since the prefix is free text. A bare JSON value glued to its key (``"name":Zqxdoe``) is not kept either: the
 # placeholder after the key reads as an array, so keeping the key would not scrub the rest. That is
 # a residual, as is a name run whose first word is glued into the token.
 #
@@ -1911,19 +1926,30 @@ _GLUED_LABEL_PASSES: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
-def _last_glued_label(token: re.Match[str]) -> tuple[str, re.Match[str]] | None:
-    """``(kind, match)`` for the label that starts last inside the field run ``token``, or ``None``."""
-    text = token.string
-    start, end = token.span()
-    reach = min(len(text), end + _LABEL_REACH)
-    best: tuple[str, re.Match[str]] | None = None
-    for kind, pattern in _GLUED_LABEL_PASSES:
-        for found in pattern.finditer(text, start, reach):
-            if found.start() >= end:
-                break
-            if best is None or found.start() > best[1].start():
-                best = (kind, found)
-    return best
+class _GluedLabels:
+    """Every label :data:`_GLUED_LABEL_PASSES` finds in one text, by start, so each field-run token
+    is answered by a bisection rather than by scans of its own."""
+
+    def __init__(self, text: str) -> None:
+        found = sorted(
+            (
+                (match.start(), kind, match)
+                for kind, pattern in _GLUED_LABEL_PASSES
+                for match in pattern.finditer(text)
+            ),
+            key=lambda entry: entry[0],
+        )
+        self.starts = [entry[0] for entry in found]
+        self._found = [(entry[1], entry[2]) for entry in found]
+
+    def last_in(self, start: int, end: int) -> tuple[str, re.Match[str]] | None:
+        """``(kind, match)`` for the label that starts last in ``[start, end)``, or ``None``. A match
+        that runs more than :data:`_LABEL_REACH` past ``end`` is not one."""
+        index = bisect_left(self.starts, end) - 1
+        if index < 0 or self.starts[index] < start:
+            return None
+        kind, match = self._found[index]
+        return None if match.end() > end + _LABEL_REACH else (kind, match)
 
 
 def _label_to_keep(kind: str, label: str, rest: str) -> str | None:
@@ -1943,6 +1969,8 @@ def _label_to_keep(kind: str, label: str, rest: str) -> str | None:
             return None if rest[0] in rest[1:] else label + rest[0]
         return None if ";" in rest else label
     if kind == "xml":
+        if ":" in label:
+            return None
         if not rest:
             return label
         return label + ">" if rest[0] == ">" and "</" not in rest else None
@@ -1951,14 +1979,14 @@ def _label_to_keep(kind: str, label: str, rest: str) -> str | None:
     return label  # a group 0010 tag: its value runs to the end of the line
 
 
-def _glued_label_replacement(token: re.Match[str], labels: list[str]) -> str:
+def _glued_label_replacement(token: re.Match[str], glued: _GluedLabels, labels: list[str]) -> str:
     """The field run ``token`` scrubbed, keeping a glued PHI label whose value runs past it. Every
     label kept is appended to ``labels``."""
-    found = _last_glued_label(token)
+    start, end = token.span()
+    found = glued.last_in(start, end)
     if found is None:
         return _REDACTED
     kind, label = found
-    start, end = token.span()
     head = token.string[label.start() : min(label.end(), end)]
     keep = _label_to_keep(kind, head, token.string[label.end() : end])
     if keep is None:
@@ -1974,7 +2002,10 @@ def _field_run_sub(pattern: re.Pattern[str], text: str, labels: list[str] | None
     list."""
     if labels is None or _GLUE_SCREEN.search(text) is None:
         return pattern.sub(_REDACTED, text)
-    return pattern.sub(lambda token: _glued_label_replacement(token, labels), text)
+    glued = _GluedLabels(text)
+    if not glued.starts:
+        return pattern.sub(_REDACTED, text)
+    return pattern.sub(lambda token: _glued_label_replacement(token, glued, labels), text)
 
 
 #: A percent escape, read as a word boundary when screening for a credential label
@@ -2000,7 +2031,8 @@ def _kept_words(text: str) -> Counter[str]:
 
 def _keeps_no_new_word(out: str, plain: str, labels: list[str]) -> bool:
     """Whether ``out`` keeps no word, counted with repeats, that ``plain`` does not, apart from the
-    words of the ``labels`` the glued-label rule kept."""
+    words of the ``labels`` the glued-label rule kept. Those are vocabulary: an XML label with a
+    namespace prefix, the one kind that could carry free text, is never kept."""
     allowed = _kept_words(plain)
     for label in labels:
         allowed.update(_KEPT_WORD.findall(label))
@@ -2033,8 +2065,9 @@ def _redact_flat(
     either.
 
     ``labels`` turns on the glued-label rule of BACKLOG #3318 for the default delimiters
-    (:func:`_field_run_sub`). A message that declares others takes the rule off for the whole text,
-    because a kept label can hold a declared delimiter."""
+    (:func:`_field_run_sub`). A pass over a text whose MSH declares others takes the rule off for
+    that pass, because a kept label can hold a declared delimiter. A later round that no longer sees
+    the declaration (an earlier round scrubbed the MSH line) runs no separator-aware pass either."""
     if credentials:
         text = _INVALID_URL_USERINFO.sub(lambda m: f"{m.group(1)}{_REDACTED}@", text)
     declared = _sniff_delimiters(text)

@@ -182,6 +182,29 @@ def test_a_text_with_a_line_break_gets_the_answer_without_the_rule() -> None:
     assert not _paths_keeping(text, "99887766", paths=("two handlers",))
 
 
+def test_an_xml_label_with_a_namespace_prefix_is_not_kept() -> None:
+    """The prefix is free text, so keeping it could print a word the run hid. Found by code review:
+    the word check allowed every word of a kept label, the prefix's too."""
+    text = "x|y|z<Qnsprefix:name>Vandtjane Smith</name>"
+    assert redact(text) == redaction._redact_text(text, None)
+    assert "Qnsprefix" not in redact(text)
+
+
+def test_the_mrn_label_is_the_label_half_of_the_mrn_pass() -> None:
+    """``_MRN_LABEL`` is group 1 of ``_MRN_LABELLED``, spelled again so it needs no value. Pinned so
+    the two cannot drift apart."""
+    assert redaction._MRN_LABELLED.pattern.startswith(redaction._MRN_LABEL.pattern)
+
+
+@pytest.mark.parametrize(
+    "tag", ["(0010,0010)", "(0010, 1040)", "(0010,00ff)", "(0008,0060)", "(0010,ZZZZ)"]
+)
+def test_the_patient_tag_is_the_dicom_tag_in_group_0010(tag: str) -> None:
+    whole = redaction._DICOM_TAG.fullmatch(tag)
+    expected = whole is not None and whole.group(1) == "0010"
+    assert (redaction._PATIENT_DICOM_TAG.fullmatch(tag) is not None) is expected
+
+
 # --- A small grammar sweep: no route prints a value the redactor before the rule hid ------------
 
 _RUNS = ("A^B^C", "x|y|z", "https://h.example/p?a=1&b=2&c=3")
