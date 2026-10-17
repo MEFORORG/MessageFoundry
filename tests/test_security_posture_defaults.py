@@ -3299,3 +3299,15 @@ async def test_the_settings_an_auth_service_hands_out_are_a_deep_copy(engine: En
         assert target.oidc_signing_algorithms == [*before, "HS256"], "control: it did change"
         assert service.settings.oidc_signing_algorithms == before
         assert service.settings.totp_skew_steps == 0
+
+
+async def test_an_auth_service_builds_its_directory_bind_from_its_own_copy(engine: Engine) -> None:
+    """Vault BACKLOG #3215: the copy the service takes at construction also feeds what it builds,
+    the directory authenticator included. Built from the caller's object, a write through the
+    stash the managed lifespan keeps would still reach the live AD bind."""
+    given = _ad()
+    service = AuthService(engine.store, given)
+    ldap = service._ldap
+    assert ldap is not None, "control: AD settings build a directory authenticator"
+    given.ad_server = "ldaps://elsewhere.test.invalid"
+    assert ldap._s.ad_server == "ldaps://dc.test.invalid"

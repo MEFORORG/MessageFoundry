@@ -2349,8 +2349,10 @@ class AuthService:
         self._store = store
         # A copy: the caller's object is also stashed as app.state.auth_settings, and the section
         # is not frozen, so a write through that stash would otherwise change a live limit with no
-        # audit row (vault BACKLOG #3215).
-        self._settings = settings.model_copy(deep=True)
+        # audit row (vault BACKLOG #3215). The name is rebound so every object built below, the
+        # directory authenticator and the limiters included, gets the copy too.
+        settings = settings.model_copy(deep=True)
+        self._settings = settings
         # BACKLOG #2592: raises the integrity alert when an authority row fails its seal. Injected by
         # the API lifespan (the service never imports the alert sinks). None logs only.
         self._integrity_alert = integrity_alert

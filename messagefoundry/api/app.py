@@ -1768,17 +1768,20 @@ async def _audit_refused_reload(
     ``extra`` adds keys to the row's detail; a cluster convergence reload names itself there (vault
     BACKLOG #3109). ``reported``, when passed, holds :func:`_failure_row_key` of each row already
     written: a row already in it is not written again, and a row that lands is added. That reload
-    retries every interval, and this keeps it to one row of each kind per version.
+    retries every interval, and this keeps it to one row of each kind per version. Its refusal is
+    then logged at DEBUG, not WARNING: the convergence runner already logs each failure at ERROR,
+    and a WARNING per retry would repeat it every interval.
 
     **The row's write never raises.** A refusal changed nothing, so its answer stands whether or
     not the row lands, and a store fault here would otherwise turn it into a raw 500 (vault BACKLOG
     #2255). A failed write is logged at ERROR with the row's detail."""
+    warn = _log.warning if reported is None else _log.debug
     detail: dict[str, object] = {"requested": requested, "dry_run": dry_run, **(extra or {})}
     if isinstance(exc, ConfigReloadDenied):
         action = "config_reload_denied"
         status, answer = 403, "config directory is not an allowed reload root"
     elif isinstance(exc, FileNotFoundError):
-        _log.warning(
+        warn(
             "config reload failed (missing dir): %s",
             scrub_log_argument(safe_exc(exc, limit=_REFUSAL_LOG_LIMIT)),
         )
@@ -1788,7 +1791,7 @@ async def _audit_refused_reload(
         # A hold that took no digest is told apart, so nobody goes looking for an edit that
         # never happened.
         unbound = exc.approved is None
-        _log.warning(
+        warn(
             "config reload refused: %s",
             "its approval named no config digest"
             if unbound
@@ -1807,12 +1810,12 @@ async def _audit_refused_reload(
         )
     elif isinstance(exc, ConfigDirUnreadable):
         # The engine logged the cause, scrubbed, where it raised this.
-        _log.warning("config reload refused: its config directory could not be resolved or listed")
+        warn("config reload refused: its config directory could not be resolved or listed")
         action, detail["reason"] = "config_reload_failed", "unreadable"
         status, answer = 422, "the engine could not read the config directory; see the engine log"
     elif isinstance(exc, ConfigDigestUnavailable):
         # Not "the config changed": nothing shows it did. The digest's own WARNING names the cause.
-        _log.warning("config reload refused: its config digest could not be taken")
+        warn("config reload refused: its config digest could not be taken")
         action, detail["reason"] = "config_reload_failed", "digest_unavailable"
         detail["approved_fingerprint"] = exc.approved
         detail["current_fingerprint"] = None
@@ -1826,7 +1829,7 @@ async def _audit_refused_reload(
         )
     else:
         anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
-        _log.warning(
+        warn(
             "config reload %s: %s",
             "refused (trust anchor)" if anchor_refused else "failed (invalid config)",
             scrub_log_argument(safe_exc(exc, limit=_REFUSAL_LOG_LIMIT)),

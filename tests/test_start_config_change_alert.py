@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import textwrap
 from pathlib import Path
 from typing import Any, cast
@@ -1207,3 +1208,24 @@ async def test_two_causes_that_write_the_same_row_write_it_once(
         failed = await engine.store.list_audit(action="config_reload_failed")
     assert len(failed) == 1
     assert json.loads(failed[0]["detail"])["reason"] == "invalid_config"
+
+
+async def test_a_refused_convergence_logs_no_warning_beside_the_runners_error(
+    tmp_path: Path, cfg: Path, caplog: pytest.LogCaptureFixture, alerts: list[dict[str, Any]]
+) -> None:
+    """vault BACKLOG #3109: the convergence runner logs each failed pass at ERROR, so the refusal
+    writer logs its own line at DEBUG for that reload. A WARNING per retry would repeat the same
+    refusal every interval. The row is still written."""
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        (cfg / "cfg.py").write_text("this is not python (", encoding="utf-8")
+        with caplog.at_level(logging.DEBUG, logger="messagefoundry.api.app"):
+            for _ in range(2):
+                with pytest.raises(WiringError):
+                    await engine._converge_reload(2)
+        failed = await engine.store.list_audit(action="config_reload_failed")
+    refusals = [r for r in caplog.records if r.getMessage().startswith("config reload failed")]
+    assert refusals, "control: the refusal was logged"
+    assert {r.levelno for r in refusals} == {logging.DEBUG}
+    assert len(failed) == 1
