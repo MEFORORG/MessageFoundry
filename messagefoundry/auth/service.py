@@ -197,18 +197,6 @@ _ALWAYS_REPORTED_REASONS: Final = frozenset(
     }
 )
 
-#: How many of an account's newest ``auth.ad_session_revoked`` rows
-#: ``AuthService._already_revoked_elsewhere`` reads.
-_REVOKED_ROW_PAGE: Final = 20
-
-
-def _audit_row_id(row: Any) -> object:
-    """An audit row's ``id`` for a log line, or ``None`` when the row has none."""
-    try:
-        return row["id"]
-    except (KeyError, IndexError):
-        return None
-
 
 @cache
 def _audit_write_errors() -> tuple[type[Exception], ...]:
@@ -6399,9 +6387,6 @@ class AuthService:
         if not self.directory_reconcile_enabled:
             return reconcile.ReconcilePlan()
         settings = self._settings
-        # Each account's audit watermark, read just before its session listing (owner ruling
-        # 2026-10-17, BACKLOG #3085). See `_already_revoked_elsewhere`.
-        watermarks: dict[str, int | None] = {}
 
         # Candidates: AD-provider users that are not already locally disabled AND still hold at least
         # one live session. Nobody signed in => zero binds. Derived from list_users + list_sessions
@@ -6426,13 +6411,8 @@ class AuthService:
             # empty the candidates, and the prunes below would drop every strike and the hold. The
             # read still filters on absolute expiry, so a step past the absolute lifetime does
             # that today. That predates BACKLOG #2283, and #2283 leaves it open.
-            # Before the listing, not after: only another pass's revocation row above this id can
-            # show it already revoked the account this listing saw signed in. Per account, not per
-            # pass, so a row written before the account's latest sign-in never counts.
-            watermark = await self._audit_watermark()
             if not await self._store.list_sessions(user.id):
                 continue
-            watermarks[user.id] = watermark
             if is_unkeyed:
                 # BACKLOG #2027 (ADR 0184 AC-5): never probed by name. Filtered HERE rather than
                 # answered as UNAVAILABLE by the probe, so it neither inflates the pass's
@@ -6614,10 +6594,7 @@ class AuthService:
             if revocation.user_id in self._reconcile_referred:
                 # The same, for the referral (BACKLOG #2538; `_forfeit_clears_on_attrition`).
                 self._advance_referral_standing("forfeit")
-            # An account with no watermark recorded gets None, which reports.
-            outcome = await self._apply_reconcile_revocation(
-                revocation, after_id=watermarks.get(revocation.user_id)
-            )
+            outcome = await self._apply_reconcile_revocation(revocation)
             if outcome != "skipped":
                 applied.append(revocation)
             if outcome == "reported":
@@ -7537,115 +7514,8 @@ class AuthService:
             defects=AUDIT_WRITE_DEFECTS,
         )
 
-    async def _audit_watermark(self) -> int | None:
-        """The newest audit row id the store holds now, for :meth:`_already_revoked_elsewhere`;
-        ``0`` for an empty trail. The reconciler reads it just before it lists an account's
-        sessions.
-
-        Any row committed before this read has an id at or below it, because the id is the store's
-        auto-increasing key and this is the largest committed one. So a row above it was not yet
-        committed at the read, whichever engine wrote it and whatever its clock said.
-
-        ``None`` when the read fails or the id is not an integer, logged at ERROR. ``None`` makes
-        that account's revocation report, so a fault here costs a duplicate alert, never a missed
-        one, and does not stop the pass revoking."""
-        try:
-            rows = await self._store.list_audit(limit=1)
-            if not rows:
-                return 0
-            newest = rows[0]["id"]
-        except Exception as exc:  # any class: fail toward reporting, see the docstring
-            _log.error(
-                "directory reconcile: could not read the newest audit row id (%s); a revocation "
-                "this read covers reports",
-                type(exc).__name__,
-                exc_info=True,
-            )
-            return None
-        if isinstance(newest, bool) or not isinstance(newest, int):
-            _log.error(
-                "directory reconcile: the newest audit row id is a %s, not an integer; a "
-                "revocation this read covers reports",
-                type(newest).__name__,
-            )
-            return None
-        return newest
-
-    async def _already_revoked_elsewhere(
-        self, revocation: reconcile.SessionRevocation, *, after_id: int | None
-    ) -> bool:
-        """Whether another pass already revoked this account for this reason (owner ruling
-        2026-10-17, BACKLOG #3085).
-
-        This is the one statement of the rule. The evidence is an ``auth.ad_session_revoked`` row
-        whose actor is the account's planned username, with the same ``reason``, and an ``id``
-        above ``after_id``. The reconciler passes :meth:`_audit_watermark`, read just before this
-        pass listed the account's sessions. So only a revocation written after that listing began
-        counts. An older row, such as a deleted namesake's or one from before a later sign-in, does
-        not. Read before this revocation's own row is written, so it does not find that row.
-
-        The window is on the row id, not on ``ts``. A row's ``ts`` comes from the clock of the
-        engine that wrote it, so a window on ``ts`` would move with the skew between two engines on
-        one store. An engine whose clock runs fast would make its earlier row read as written during
-        this pass, and silence a genuine new revocation.
-
-        It errs toward reporting. An ``after_id`` of ``None``, an unread watermark, answers False.
-        Two reconcilers that both read before either writes both report. Any exception while
-        reading the evidence, a store refusal or a defect alike, is logged at ERROR with its type
-        and answers False. It is not raised: the caller has not yet written this revocation's own
-        row, so a raise would end the pass and lose that row and the earlier alerts, and an account
-        left with no session is not revisited by a later pass. A fault therefore costs a duplicate
-        alert rather than a missed one. A row whose ``id`` is not an integer, or whose ``detail``
-        is not readable JSON, is logged at WARNING and passed over."""
-        if after_id is None:
-            return False
-        try:
-            rows = await self._store.list_audit(
-                action="auth.ad_session_revoked",
-                actor=revocation.username,
-                limit=_REVOKED_ROW_PAGE,
-            )
-            for row in rows:
-                # Outside the inner try: a row that cannot be indexed is a store shape defect, not
-                # an unreadable row, so it takes the ERROR path below.
-                row_id = row["id"]
-                if isinstance(row_id, bool) or not isinstance(row_id, int):
-                    _log.warning(
-                        "directory reconcile: an auth.ad_session_revoked row for %s has a %s id, "
-                        "not an integer; passed over",
-                        scrub_log_argument(revocation.username),
-                        type(row_id).__name__,
-                    )
-                    continue
-                if row_id <= after_id:
-                    continue
-                raw = row["detail"]
-                try:
-                    detail = json.loads(raw or "{}")
-                except (TypeError, ValueError) as exc:
-                    _log.warning(
-                        "directory reconcile: auth.ad_session_revoked row %s for %s is unreadable "
-                        "(%s); passed over",
-                        _audit_row_id(row),
-                        scrub_log_argument(revocation.username),
-                        scrub_log_argument(f"{type(exc).__name__}: {exc}"),
-                    )
-                    continue
-                if isinstance(detail, dict) and detail.get("reason") == revocation.reason:
-                    return True
-        except Exception as exc:  # any class: fail toward reporting, see the docstring
-            _log.error(
-                "directory reconcile: could not read earlier revocations of %s (%s); "
-                "reporting this one",
-                scrub_log_argument(revocation.username),
-                type(exc).__name__,
-                exc_info=True,
-            )
-            return False
-        return False
-
     async def _apply_reconcile_revocation(
-        self, revocation: reconcile.SessionRevocation, *, after_id: int | None
+        self, revocation: reconcile.SessionRevocation
     ) -> _RevocationApplied:
         """Apply one planned revocation: persist a role re-diff (when that is why), drop the user's
         live sessions, audit, and notify the affected user out-of-band (ASVS 6.3.7). A scope
@@ -7653,18 +7523,16 @@ class AuthService:
 
         Returns ``"skipped"`` when it applied nothing, ``"reported"`` when it applied and must
         alert, and ``"quiet"`` when it applied but must not alert. A quiet revocation ended no
-        session and changed no role, and either its reason is not in
-        :data:`_ALWAYS_REPORTED_REASONS` or :meth:`_already_revoked_elsewhere` finds another pass
-        revoked the account in a row above ``after_id``, the audit watermark read just before this
-        pass listed the account's sessions (BACKLOG #3085, owner rulings 2026-10-16 and
-        2026-10-17). The quiet case is at least what the second of two
-        reconcilers revoking one account sees. A quiet revocation still writes its
+        session, changed no role, and has a reason outside :data:`_ALWAYS_REPORTED_REASONS`
+        (BACKLOG #3085, owner rulings 2026-10-16 and 2026-10-17). It still writes its
         ``auth.ad_session_revoked`` row, with ``sessions: 0`` ("audit always"), and sends no
         notice; the caller raises no alert for it.
 
-        So a disabled or absent account whose revocation ended nothing still reports, as when the
-        user signed out mid-pass, unless another pass already revoked it. The rule is stated once,
-        in :meth:`_already_revoked_elsewhere`."""
+        So a disabled or absent account's revocation always reports, even one that ended nothing,
+        as when the user signed out mid-pass or another reconciler revoked the account first. No
+        audit row decides it (vault BACKLOG #3750 item 33): a row this pass did not write may be
+        forged, and must not silence an alert. Two reconcilers revoking one disabled account
+        therefore both alert, and that duplicate is the accepted cost."""
         user = await self._load_user(revocation.user_id)
         if revocation.reason == reconcile.SCOPE_CHANGED and (
             user is None or user.channel_scope != revocation.scope_from
@@ -7705,15 +7573,9 @@ class AuthService:
             )
         revoked = await self._store.revoke_user_sessions(revocation.user_id)
         # Owner ruling 2026-10-17 narrows "audit always": a disabled or absent account whose
-        # revocation ended nothing still reports, unless another pass already revoked it. Read
-        # BEFORE this revocation's own row is written, or the row would find itself.
+        # revocation ended nothing still reports. See the docstring for why no audit row decides it.
         quiet = (
-            not revoked
-            and not roles_changed
-            and (
-                revocation.reason not in _ALWAYS_REPORTED_REASONS
-                or await self._already_revoked_elsewhere(revocation, after_id=after_id)
-            )
+            not revoked and not roles_changed and revocation.reason not in _ALWAYS_REPORTED_REASONS
         )
         # Soft (BACKLOG #3018): the writes above are already applied, so a raise would only cost
         # the notice below, the later accounts and the alerts. See `_audit_reconciler_row`.

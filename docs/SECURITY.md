@@ -4108,17 +4108,13 @@ raise the `ad_session_revoked` alert, one per revoked principal, once the pass c
 revocations end no session and change no role. Each still writes its row, with `sessions: 0`
 (BACKLOG #3085, owner ruling 2026-10-16). When the directory says the account is disabled or
 absent, that revocation still alerts and sends its notice, as when the user signed out mid-pass
-(owner ruling 2026-10-17). It is quiet, with no alert and no notice, only when another pass already
-revoked the account. The evidence is an `auth.ad_session_revoked` row with the same username and
-reason, written after this pass began to list the account's sessions. The pass tells this by
-audit row id, not by `ts`. So clock skew between engines plays no part. An older row does not
-count. If reading that id or that evidence fails for any reason, the
-reconciler logs it at ERROR and the revocation reports, so a failed read does not cost the row.
-The rule is stated in full in `AuthService._already_revoked_elsewhere`. Any other revocation that ends nothing
-is quiet too. So when two reconcilers on one store revoke one account in turn, the second only audits. If both read
-the old roles, or both apply before either writes its row, both still report. If the first
-reconciler's pass ended before it alerted, the second's quiet revocation means that account pages
-nobody.
+(owner ruling 2026-10-17). That holds even when another reconciler revoked the account first: no
+audit row decides whether a revocation alerts, because a row this pass did not write could be
+forged to silence it (vault BACKLOG #3750 item 33). Two reconcilers revoking one disabled or absent
+account therefore both alert, and that duplicate is the accepted cost. Any other revocation that
+ends nothing is quiet, with no alert and no notice. So when two reconcilers on one store revoke one
+such account in turn, the second only audits. If both read the old roles, both still report. If
+the first reconciler's pass ended before it alerted, the second's quiet revocation means that account pages nobody.
 
 A pass that fails part-way keeps the audit rows for what it already revoked, but raises no alert for
 them. A refused audit write does not end the pass (BACKLOG #3018). That holds for the store errors

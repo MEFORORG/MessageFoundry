@@ -25,7 +25,6 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
 from tests._audit_event_paging_contract import (
     check_audit_paging,
-    check_audit_watermark,
     check_connection_event_paging,
     check_security_events_paging,
 )
@@ -43,10 +42,6 @@ async def store(tmp_path: Path) -> AsyncIterator[MessageStore]:
 
 async def test_audit_pages_by_offset_after_the_exclusion(store: MessageStore) -> None:
     await check_audit_paging(store, "sqlite")
-
-
-async def test_the_newest_audit_id_is_a_watermark_that_ignores_ts(store: MessageStore) -> None:
-    await check_audit_watermark(store, "sqlite")
 
 
 async def test_security_events_page_by_offset(store: MessageStore) -> None:
