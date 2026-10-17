@@ -11,7 +11,8 @@ MLLP wraps each message in a *block*::
 across reads or pack several into one.
 
 ACKs are built from the inbound MSH (echoing its encoding characters, swapping
-sender/receiver, copying the original control id into MSA-2). ``ack_mode`` selects the
+sender/receiver, copying the original control id into MSA-2), except where those encoding
+characters collide with the ACK's own text (BACKLOG #2875; ``_ack_echo``). ``ack_mode`` selects the
 MSA-1 code family: ``original`` → AA/AE/AR, ``enhanced`` → CA/CE/CR.
 
 **Why this module exists (BACKLOG #1697).** A client may not import the engine's runtime packages
@@ -35,6 +36,7 @@ either, and ``tests/test_dependency_boundaries.py`` pins both halves.
 from __future__ import annotations
 
 import logging
+import string
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -158,10 +160,41 @@ def _escape_ack_text(text: str, *, field_sep: str, enc: str) -> str:
     return text.replace(esc, f"{esc}E{esc}").replace(field_sep, f"{esc}F{esc}")
 
 
+def _roles(field_sep: str, enc: str) -> dict[str, str]:
+    """Each delimiter character to its role, in MSH-2 order, a short MSH-2 filled from the defaults
+    as the parser fills it. Where two roles share a character the first wins; one with no role is
+    data."""
+    roles: dict[str, str] = {}
+    enc = enc[:4] + _DEFAULT_ENC[len(enc[:4]) :]
+    for char, role in zip(field_sep + enc, "FSRET", strict=True):
+        roles.setdefault(char, role)
+    return roles
+
+
+_DEFAULT_ROLES = _roles(_DEFAULT_FIELD_SEP, _DEFAULT_ENC)
+
 _CODES = {
     AckMode.ORIGINAL: {"AA": "AA", "AE": "AE", "AR": "AR"},
     AckMode.ENHANCED: {"AA": "CA", "AE": "CE", "AR": "CR"},
 }
+
+#: The characters of the ACK's fixed text: the segment ids, ``ACK``, ``P``, every MSA-1 code, the
+#: letters of the ``\E\`` and ``\F\`` escapes :func:`_escape_ack_text` writes, the default MSH-7
+#: (digits and a ``+``/``-`` offset) and the default version ``2.5.1``. An inbound delimiter from
+#: this set would split that text when the ACK is read back, so the ACK is built under the defaults
+#: instead (BACKLOG #2875). Not covered: a caller's own ``timestamp`` or ``control_id``, and the
+#: rest of MSA-3's free text, of which only the escape character and field separator are escaped.
+_ACK_LITERAL_CHARS = frozenset(
+    "MSH"
+    + "MSA"
+    + "ACK"
+    + "P"
+    + "EF"
+    + "".join(_CODES[AckMode.ENHANCED].values())
+    + "".join(_CODES[AckMode.ORIGINAL].values())
+    + string.digits
+    + "+-."
+)
 
 
 def _ack_echo(peek: Peek | None) -> tuple[str, str, str, str, str, str, str, str]:
@@ -170,18 +203,44 @@ def _ack_echo(peek: Peek | None) -> tuple[str, str, str, str, str, str, str, str
     Returns ``(field_sep, enc, sending_app, sending_fac, receiving_app, receiving_fac, version,
     control_id)``. Every value is echoed from the (untrusted) inbound message, so CR/LF is stripped to
     prevent segment injection into the ACK; MSA-3 free text is escaped separately (HL7-3).
+
+    The inbound's MSH-1 and MSH-2 are echoed unless one of them holds a character of the ACK's
+    fixed text (:data:`_ACK_LITERAL_CHARS`), or two delimiters share a character. Then the defaults
+    ``|^~\\&`` are returned instead, so the ACK reads back as an ACK (BACKLOG #2875). An echoed
+    value is then kept only where it holds neither set's escape character and each default delimiter
+    in it has the same role in the inbound (``C^1`` under MSH-2 ``^AB``); any other is blanked.
+    Blanked, not escaped: the value is raw text split under the inbound's delimiters, so escaping it
+    would flatten its structure and re-escape its own escapes (``\\F\\`` names the field separator of
+    whichever set reads it), and an escaped control id would no longer match the one the store
+    recorded. Under the inbound's own delimiters the values need neither, because they were split
+    under them.
     """
     if peek is None:
         return _DEFAULT_FIELD_SEP, _DEFAULT_ENC, "", "", "", "", "2.5.1", ""
+    field_sep = peek.field("MSH-1") or _DEFAULT_FIELD_SEP
+    enc = peek.field("MSH-2") or _DEFAULT_ENC
+    # The characters an echoed value may not hold; none unless the ACK falls back to the defaults.
+    unsafe: frozenset[str] = frozenset()
+    roles = _roles(field_sep, enc)
+    # Fewer than five roles means two share a character, the parser's default-filled slots included.
+    if len(roles) < 5 or not _ACK_LITERAL_CHARS.isdisjoint(field_sep + enc):
+        unsafe = frozenset(c for c, role in _DEFAULT_ROLES.items() if roles.get(c) != role)
+        unsafe |= {_DEFAULT_ENC[2], enc[2:3] or _DEFAULT_ENC[2]}
+        field_sep, enc = _DEFAULT_FIELD_SEP, _DEFAULT_ENC
+
+    def echo(value: str | None, default: str = "") -> str:
+        value = _no_seg_sep(value or "")
+        return (value if unsafe.isdisjoint(value) else "") or default
+
     return (
-        peek.field("MSH-1") or _DEFAULT_FIELD_SEP,
-        peek.field("MSH-2") or _DEFAULT_ENC,
-        _no_seg_sep(peek.sending_app or ""),
-        _no_seg_sep(peek.sending_facility or ""),
-        _no_seg_sep(peek.receiving_app or ""),
-        _no_seg_sep(peek.receiving_facility or ""),
-        _no_seg_sep(peek.version or "2.5.1"),
-        _no_seg_sep(peek.control_id or ""),
+        field_sep,
+        enc,
+        echo(peek.sending_app),
+        echo(peek.sending_facility),
+        echo(peek.receiving_app),
+        echo(peek.receiving_facility),
+        echo(peek.version, "2.5.1"),
+        echo(peek.control_id),
     )
 
 
@@ -208,6 +267,11 @@ def build_ack(
     the same wall-clock hour occurs twice — so a receiver correlating an acknowledgement against its
     own UTC-stamped record would mis-order events by an hour. An explicit offset pins the instant.
     An operator-supplied ``timestamp`` is used verbatim; the caller owns its form.
+
+    The ACK echoes the inbound's MSH-1 and MSH-2, except where one of them holds a character of the
+    ACK's fixed text; then the ACK, and the NAK this also builds, goes out under ``|^~\\&``
+    (BACKLOG #2875; :func:`_ack_echo` holds the rule). MSA-3's escape character and field separator
+    are escaped under whichever set is used.
     """
     # Imported here, not at module top, so a framing-only client never loads the parsing library.
     # It was also a cycle once: `parsing` reached `config.models`, which imports AckMode from here.

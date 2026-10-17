@@ -404,12 +404,17 @@ from typing import Any
 #: surface grew. An older console on this engine is refused at mount; a newer console on an older
 #: engine would call a method that does not exist.
 #:
+#: BACKLOG #3015: ``ReloadResult`` gained ``restart_required``, the settings trust anchors a
+#: restart must apply. The console's reload result and approval pages read it by attribute, so it
+#: forces a bump. Re-derived on batch/b260-c, the tree merged with BACKLOG #3091, #3105 and #2731,
+#: none of which moved it. The value below covers all four.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "1b9da0aae75dbd52"
+ENGINE_UI_SEAM: str = "b86ce593ab8a43a4"
 
 
 @dataclass(frozen=True, slots=True)

@@ -5,12 +5,19 @@
   off-loopback TLS a hard release gate (Gate #4)**, so **WP-13a (API/WSS TLS), WP-13b (MLLP-over-TLS),
   and WP-15 (reverse-proxy / forwarded headers) are authorized for v0.1**. **WP-14 (TOTP MFA) is now
   BUILT (2026-06-17)** — native RFC 6238 TOTP for local accounts, enforced for the Administrator role
-  via `[auth].require_mfa` + the step-up gate; AD/Entra MFA stays delegated. *(Supersedes the
+  via `[auth].require_mfa` + the step-up gate (stale: see the 2026-10-16 correction in section 3); AD/Entra MFA stays delegated. *(Supersedes the
   2026-06-14 "defer to 0.2" decision — the owner pulled MFA forward because some level of local
   accounts is a supported deployment, so the engine carries its own MFA.)* On top of WP-14, the
   **multi-layer administrative-interface defense (ASVS 8.4.2, WP-L3-13) is now BUILT (2026-06-17)**:
   WP-14 MFA is wired as a genuine second factor at the step-up boundary, plus a **new-client-IP
-  contextual-risk signal** (`[auth].admin_new_ip_step_up`, default off). **Device-posture assessment
+  contextual-risk signal** (`[auth].admin_new_ip_step_up`, default off). **CORRECTED 2026-10-16
+  (vault BACKLOG #3052):** "default off" was true when this was written and is stale. The default
+  has been ON since BACKLOG #288 (owner ruling 2026-09-26, recorded in the
+  [ADR 0068](0068-browser-webauthn-passkeys-offloopback.md) amendment of that date), and turning it
+  off is a named loosening in `docs/SECURITY-LOOSENING.md`. Since vault BACKLOG #2620 the signal
+  also refuses requests, not only forces a step-up; the
+  [ADR 0068](0068-browser-webauthn-passkeys-offloopback.md) amendment of 2026-10-05 says which.
+  **Device-posture assessment
   for 8.4.2 is delegated to the deployment** — a managed/attested host + an mTLS client cert terminated
   at the **WP-15** reverse proxy — not built in-process (stdlib `ssl` does no device attestation).
   **Federated SSO (OAuth 2.0 / OIDC /
@@ -210,6 +217,15 @@ extension point at the same step-up boundary, not designed in detail here. *(WP-
 [ADR 0068](0068-browser-webauthn-passkeys-offloopback.md), 2026-07-03 — this sketch's design
 amendment; passkeys land at exactly this step-up boundary, local users only. Building — this note
 flips to "built" with the L5 code PRs.)*
+
+**CORRECTED 2026-10-16 (vault BACKLOG #3052):** the paragraph above, and the Status line's "enforced
+for the Administrator role via `[auth].require_mfa`", are stale and left as written. The key is now
+`[security].require_mfa`, on by default, covering every local account by default
+(`[security].require_mfa_scope`); the `[auth]` spelling is rejected at load. `docs/SECURITY.md` is
+the record. The L5 code has landed, so the "Building" note reads "built": WebAuthn passkeys (PR-A),
+the off-loopback hardening (PR-B) and `GET /ui/sso` (PR-C) are in the tree, and ADR 0068's own
+*Open items* list is still open. The rest of this section's flow, such as its status codes and
+route names, was not re-verified by this correction; `docs/SECURITY.md` is the record for it.
 
 ### 4. WP-15 — Reverse-proxy / forwarded-header path (alternative termination)
 

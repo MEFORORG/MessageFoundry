@@ -40,7 +40,7 @@ import os
 import re
 import shutil
 import time
-from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass, fields, replace
 from datetime import UTC, datetime
@@ -216,10 +216,12 @@ from messagefoundry.api.multipart import (
     MultipartTooLargeError,
     parse_single_file_upload,
 )
-from messagefoundry.api.outlive import OutlivingOperations
+from messagefoundry.api.outlive import CANCEL_GRACE_SECONDS, OutlivingOperations
+from messagefoundry.api.outlive import DRAIN_TIMEOUT_SECONDS as OUTLIVING_DRAIN_SECONDS
 from messagefoundry.api.paging import page_total
 from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
+    AUTH_NOT_CONFIGURED,
     AuthenticatedBeforeBodyRoute,
     ExportStopped,
     alert_sink_for,
@@ -274,7 +276,12 @@ from messagefoundry.audit_write import write_audit_soft
 # app.state.ui_ws_authorize, app.state.ui_connections_render (read by the always-on middleware/routes).
 from messagefoundry.auth import Identity, Permission, Role
 from messagefoundry.auth.audit_visibility import reads_audit_copies_in_the_log
-from messagefoundry.auth.reconcile import HOLD_REASON, REFERRAL_ABORT, ReconcilePlan
+from messagefoundry.auth.reconcile import (
+    HOLD_REASON,
+    PROBE_FAULT_ABORT,
+    REFERRAL_ABORT,
+    ReconcilePlan,
+)
 from messagefoundry.auth.service import (
     STEP_UP_ACTION_CONFIG_RELOAD,
     STEP_UP_ACTION_CONNECTION_PURGE,
@@ -286,6 +293,7 @@ from messagefoundry.auth.service import (
 )
 from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
+    AnchorStoreUnavailable,
     TrustAnchorError,
     make_lane_anchor_check,
     make_registry_anchor_preflight,
@@ -930,6 +938,33 @@ async def _record_upload_prune(store: Store, meta: UploadedFileMeta) -> None:
     )
 
 
+async def _record_upload_create(
+    store: Store, us: UploadStore, meta: UploadedFileMeta, *, actor: str, client: str | None
+) -> None:
+    """Write the ``upload.create`` row for a stored file, or remove the file (vault BACKLOG #3178).
+
+    The route runs this as an outliving operation, so a request deadline does not cut the row
+    short. A row that still fails, by an error or the shutdown drain's cancellation, removes the
+    pair, so a failed row does not leave a stored file with no row saying who created it. At
+    least two cases still can: a removal the filesystem refuses, which is logged and keeps the
+    pair, and a process that dies between the save and the row. The other way round is possible
+    too: a row that committed and then raised, such as a cancellation while the store releases
+    its connection, removes a file its row names. The file name is not in the row (vault BACKLOG
+    #2619)."""
+    try:
+        await store.record_audit(
+            "upload.create",
+            actor=actor,
+            detail=json.dumps(
+                {"file_id": meta.file_id, "size": meta.size, "message_count": meta.message_count}
+            ),
+            client=client,
+        )
+    except BaseException:
+        await us.discard(meta.file_id)
+        raise
+
+
 def _dead_letter_replay_audit(
     *,
     actor: str | None,
@@ -954,16 +989,40 @@ def _dead_letter_replay_audit(
     return _row
 
 
+def _connection_purge_audit(
+    *, actor: str | None, name: str, scope: str, client: str | None
+) -> OperatorAudit[int]:
+    """The ``connection_purge`` row the inline route and the released purge both commit with the
+    cancel (BACKLOG #2624, vault BACKLOG #3217). Written UNCONDITIONALLY, cancelled=0 included
+    (BACKLOG #1641): a purge that cancels nothing is still a completed destructive command, unlike
+    a replay that re-transmitted nothing. No channel_id: purge targets an outbound, which spans
+    every inbound feeding it."""
+
+    def _row(cancelled: int) -> AuditAppend:
+        return AuditAppend(
+            "connection_purge",
+            actor=actor,
+            detail=json.dumps({"connection": name, "scope": scope, "cancelled": cancelled}),
+            client=client,
+        )
+
+    return _row
+
+
 def _purge_in_scope(identity: Identity) -> bool:
     """Whether ``identity`` may purge an outbound. A purge spans every inbound feeding it, so only an
     unscoped caller may. Read by the route and by the approval gate, like :func:`_replay_in_scope`."""
     return identity.allowed_channels is None
 
 
-def _purge_hold_params(name: str, scope: str) -> dict[str, Any]:
+def _purge_hold_params(name: str, scope: str, requester: str) -> dict[str, Any]:
     """What a held purge captures. The route's guard and its proof-free rejoin both read it, and a
-    repeat is recognised only when the two are identical (vault BACKLOG #2625 with #2445)."""
-    return {"name": name, "scope": scope}
+    repeat is recognised only when the two are identical (vault BACKLOG #2625 with #2445).
+
+    ``requester`` is the display name the released purge's ``connection_purge`` row is attributed
+    to (vault BACKLOG #3217), the way the replay and reload holds carry theirs: the executor sees
+    only these params."""
+    return {"name": name, "scope": scope, "requester": requester}
 
 
 async def _reload_hold_params(
@@ -1045,37 +1104,274 @@ async def _reconcile_approvals_after_restart(gate: ApprovalGate) -> None:
         )
 
 
-async def _drain_approval_gate(app: FastAPI) -> None:
-    """Let approval outcome writes still running land before the store closes (BACKLOG #2087).
+#: BACKLOG #3191: the wall-clock budget of everything the managed lifespan does after its yield,
+#: engine.stop() included. NSSM sends Ctrl+C and escalates after AppStopMethodConsole, 15000 ms
+#: (scripts/service/install-service.ps1). Before the lifespan sees the shutdown, uvicorn drains the
+#: open connections, for at most ``__main__._UVICORN_DRAIN_SECONDS``, the bound serve passes
+#: uvicorn.run (BACKLOG #3256). This budget plus that bound, plus a cut step's grace (below) for
+#: each step cut, must stay inside the window with room left for the interpreter to exit.
+_SHUTDOWN_BUDGET_SECONDS: Final = 10.0
+#: The share of that budget kept back for engine.stop(). Reserved, never a bound: the stop is not cut
+#: short, because it ends in store.close(), and a store left open keeps a non-daemon worker thread
+#: alive, which is the hang BACKLOG #2087 fixed. The stop's own waits are bounded inside the engine,
+#: and nothing here holds them to this reserve.
+_ENGINE_STOP_RESERVE_SECONDS: Final = 3.0
+#: The part of a step's bound handed to the step's own graceful wait, so that wait ends, and cancels
+#: what it owns, before the teardown cuts the step.
+_INNER_SHARE: Final = 0.8
+#: How long a step cut at its bound gets to unwind its cancellation before the teardown stops waiting
+#: for it and moves on, leaving it to finish or fail on its own.
+_CUT_GRACE_SECONDS: Final = 0.1
 
-    A write whose caller was cancelled, such as by a request timeout, finishes on its own, and would
-    otherwise meet a closed store. ``drain()`` is bounded, and a failure is logged rather than
-    raised, so the teardown steps after it still run. The gate is read through getattr
-    because a startup that failed early may not have built one."""
+#: Steps the teardown stopped waiting for. The event loop holds only a weak reference to a task, so
+#: this keeps one alive until it ends.
+_left_running: set[asyncio.Future[object]] = set()
+
+
+@dataclass(frozen=True)
+class _TeardownStep:
+    """One shutdown step for :func:`_run_teardown`.
+
+    ``floor`` is the time the step is guaranteed whatever the steps before it took. ``run`` is given
+    the step's bound and returns what to await. A step that does not apply is left out of the list,
+    which frees its floor. ``bounded=False`` runs the step to completion and is never cut. At least
+    two steps run that way: the reap of the managed lifespan's store-reading tasks, since a task left
+    running would meet the closed store, and engine.stop(), whose ``floor`` is the reserve the steps
+    before it leave it."""
+
+    label: str
+    floor: float
+    run: Callable[[float], Awaitable[object]]
+    bounded: bool = True
+
+
+def _log_late_outcome(label: str) -> Callable[[asyncio.Future[object]], None]:
+    """Log how a step the teardown left running ended, since nobody else reads it."""
+
+    def _done(work: asyncio.Future[object]) -> None:
+        _left_running.discard(work)
+        if not work.cancelled() and (error := work.exception()) is not None:
+            _log.error("shutdown: %s failed after the teardown moved on", label, exc_info=error)
+
+    return _done
+
+
+async def _await_step(work: asyncio.Future[object], bound: float | None, label: str) -> bool:
+    """Wait for one step, through any cancel of the caller, for at most ``bound`` seconds.
+
+    A cancel of the caller is noted once and does not reach the step: the step finishes, or is cut
+    at its bound, as it would have been with no cancel. At the bound the step is cancelled and gets
+    :data:`_CUT_GRACE_SECONDS` to unwind; one still running then is left to end on its own. Returns
+    whether the step ended on its own, so its outcome is the caller's to read.
+
+    The wait is asyncio.wait, never asyncio.shield: once the caller is cancelled, shield reports a
+    later failure of the step to the loop's exception handler as well, so it would be logged twice
+    (BACKLOG #2087, #2263)."""
+    loop = asyncio.get_running_loop()
+    give_up = None if bound is None else loop.time() + bound
+    cut = noted = False
+    while not work.done():
+        remaining = None if give_up is None else give_up - loop.time()
+        if remaining is not None and remaining <= 0:
+            if cut:
+                _log.error(
+                    "shutdown: %s was still running %.2fs after it was cut; continuing the "
+                    "teardown without it",
+                    label,
+                    _CUT_GRACE_SECONDS,
+                )
+                _left_running.add(work)
+                work.add_done_callback(_log_late_outcome(label))
+                return False
+            _log.error("shutdown: %s did not finish within %.2fs; cutting it", label, bound)
+            cut = True
+            work.cancel()
+            give_up = loop.time() + _CUT_GRACE_SECONDS
+            continue
+        try:
+            await asyncio.wait((work,), timeout=remaining)
+        except asyncio.CancelledError:
+            # Once per step: a cancel that is re-delivered on every pass of the loop, as an anyio
+            # cancel scope does, would otherwise log a line per pass.
+            if not noted:
+                noted = True
+                _log.warning(
+                    "shutdown: cancelled during %s; it and the remaining steps run before the "
+                    "cancel propagates",
+                    label,
+                )
+    return not (cut and work.cancelled())
+
+
+async def _run_teardown(steps: Sequence[_TeardownStep], budget: float) -> None:
+    """Run every step in order, whatever the steps before it did (BACKLOG #3191).
+
+    Each step runs as its own task. A step that raises, or overruns its bound and is cut, is logged,
+    and the next step runs. Each bounded step gets what is left of ``budget`` after the floors of the
+    steps still to come, and never less than its own floor, so a slow step spends slack and not a
+    later step's share. The whole run takes at most ``budget``, plus :data:`_CUT_GRACE_SECONDS` for
+    each step cut, plus whatever an unbounded step overruns its reserve by.
+
+    A cancel of the caller reaches no step (:func:`_await_step`), and is raised once every step has
+    run. So is the first other exception a step ends with that is not an :class:`Exception`: the
+    steps after it still run, so engine.stop() still closes the store. KeyboardInterrupt and
+    SystemExit are not among them, since asyncio raises those out of the event loop itself."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + budget
+    current = asyncio.current_task()
+    # Compared at the end, so a cancel that arrived while this ran is raised, and one already on its
+    # way out when the teardown began is left to the exception carrying it.
+    baseline = 0 if current is None else current.cancelling()
+    later = sum(step.floor for step in steps)
+    fatal: BaseException | None = None
+    for step in steps:
+        later -= step.floor
+        bound = max(step.floor, deadline - loop.time() - later)
+        # Called inside the task, so an error raised while building the awaitable is the step's
+        # failure like any other, and cannot skip the steps after it.
+        work = asyncio.ensure_future(_invoke(step.run, bound))
+        if not await _await_step(work, bound if step.bounded else None, step.label):
+            continue
+        try:
+            work.result()
+        except asyncio.CancelledError:
+            _log.error("shutdown: %s ended cancelled; continuing the teardown", step.label)
+        except Exception:
+            _log.exception("shutdown: %s failed; continuing the teardown", step.label)
+        except BaseException as exc:  # re-raised below, once the later steps have run
+            _log.exception("shutdown: %s raised; it is re-raised after the teardown", step.label)
+            fatal = fatal or exc
+    if fatal is not None:
+        raise fatal
+    if current is not None and current.cancelling() > baseline:
+        raise asyncio.CancelledError
+
+
+async def _invoke(run: Callable[[float], Awaitable[object]], bound: float) -> object:
+    """A step's body, as the coroutine :func:`_run_teardown` runs in the step's own task."""
+    return await run(bound)
+
+
+def _sync(fn: Callable[[], object]) -> Callable[[float], Awaitable[None]]:
+    """A synchronous call as a teardown step, so :func:`_run_teardown` guards its failure too."""
+
+    async def _step(_bound: float) -> None:
+        fn()
+
+    return _step
+
+
+def _app_drain_steps(
+    app: FastAPI, store: Store | None, auth: AuthService | None, *, owns_auth: bool
+) -> list[_TeardownStep]:
+    """The drains an app runs at shutdown while the store is still open, in order.
+
+    Both lifespans run them: the managed one before engine.stop(), and the one
+    :func:`create_app` gives an app built around a caller's engine, before the caller stops it.
+
+    1. Long operations (vault BACKLOG #2751-#2753): a DR activate or release, or a config reload,
+       whose caller was cancelled is still running. It finishes, or is cancelled so its own
+       rollback arm restores state and records 'interrupted'. Before the approval drain, because a
+       released reload's outcome write follows the reload.
+    2. Upload stragglers (vault BACKLOG #3180), with an upload store only: the quota-ledger calls a
+       cancelled save left running, the releases they start, and the save-time sweeps that write
+       ``upload.prune`` rows. After the long-operations drain, so a pair removed because its
+       ``upload.create`` row failed there (vault BACKLOG #3178) is held as a straggler by then.
+    3. Approval outcome writes (BACKLOG #2087), which would otherwise meet a closed store.
+    4. Lock notices (BACKLOG #2216), which read and write the audit log and hand their mail to the
+       security notifier, so they drain before that notifier stops.
+    5. The open summary-access windows (M-5, BACKLOG #1640). Every clean restart otherwise dropped
+       the open hour's PHI-summary access audit, the rows that control exists to produce.
+
+    Each drain that has a graceful wait of its own is handed part of its bound for it, so it cancels
+    what it owns before the hard bound cuts it. The gate is read through getattr, because a startup
+    that failed early may not have built one, and so is the upload store, which an app with no
+    ``uploads_dir`` does not have. The summary auditor is read directly: create_app
+    always sets it, so a rename fails loudly inside the step's guard rather than silently skipping
+    the flush."""
+    outliving: OutlivingOperations = app.state.outliving_operations
+
+    async def _outliving(bound: float) -> None:
+        # At most a quarter of it waiting: the grace after is what lets a cancelled operation's
+        # rollback arm record 'interrupted' before the store closes. With the managed lifespan's
+        # full set of steps that grace is below the DR hook reap, and the NSSM window leaves the
+        # budget no room to hold it. CANCEL_GRACE_SECONDS (api/outlive.py) states what that costs.
+        wait = min(OUTLIVING_DRAIN_SECONDS, bound * _INNER_SHARE / 4)
+        await outliving.drain(wait, grace=min(CANCEL_GRACE_SECONDS, bound * _INNER_SHARE - wait))
+
+    steps = [_TeardownStep("the long-operations drain", 2.0, _outliving)]
+    uploads: UploadStore | None = getattr(app.state, "upload_store", None)
+    if uploads is not None:
+        # It usually returns at once. What it fails to drain can cost audit rows, not only quota
+        # slots that go stale: a discard removal it cancels leaves a stored file with no
+        # upload.create row, and a save-time sweep it cancels loses its upload.prune rows; each
+        # is logged at ERROR by file_id. So it keeps the approval drain's floor. Handed a share of
+        # its bound, so it cancels what it owns before the cut.
+        steps.append(
+            _TeardownStep(
+                "the upload straggler drain",
+                0.5,
+                lambda b: uploads.drain_stragglers_within(b * _INNER_SHARE),
+            )
+        )
     gate: ApprovalGate | None = getattr(app.state, "approval_gate", None)
-    if gate is None:
-        return
-    try:
-        await gate.drain()
-    except Exception:
-        _log.exception("approval gate: the shutdown drain failed; continuing the teardown")
+    if gate is not None:
+        steps.append(
+            _TeardownStep(
+                "the approval outcome-write drain", 0.5, lambda b: gate.drain(b * _INNER_SHARE)
+            )
+        )
+    if auth is not None and owns_auth:
+        # close_background is the shutdown call the service names, with its own bound (its drain
+        # and cancel grace, in auth/service.py). Only a bound below that cuts it before it cancels
+        # its notices itself; a notice cut that way meets the closed store and logs its own failure.
+        steps.append(
+            _TeardownStep("the lock-notice drain", 1.0, lambda _b: auth.close_background())
+        )
+    elif auth is not None:
+        # A service the caller owns is joined, never closed: closing it would make every later
+        # notice over it run inline on the sign-in path, which #2216 moved them off. The caller
+        # closes it before it stops its engine, as close_background asks.
+        steps.append(
+            _TeardownStep("the lock-notice drain", 1.0, lambda _b: auth.drain_background())
+        )
+    if store is not None:
+        steps.append(
+            _TeardownStep(
+                # Named for its loss: the flush clears its windows before it writes them, so a cut
+                # loses every row not yet written.
+                "the summary-access flush (a cut loses the unwritten windows' audit rows)",
+                0.5,
+                lambda _b: app.state.summary_auditor.flush(store),
+            )
+        )
+    return steps
 
 
 @asynccontextmanager
-async def _embedded_approvals_lifespan(app: FastAPI) -> AsyncIterator[None]:
+async def _embedded_lifespan(app: FastAPI) -> AsyncIterator[None]:
     """The lifespan :func:`create_app` gives an app built around a caller's engine.
 
-    The caller starts and stops the engine; this runs only the approval gate's own steps, which the
-    managed lifespan runs too. At start, :meth:`ApprovalGate.reconcile_after_restart`, before the
-    app serves an approval. At shutdown, :meth:`ApprovalGate.drain` (BACKLOG #2087), so a caller
-    that stops its engine after the app has shut down loses no outcome write. A caller that passes
-    its own ``lifespan`` replaces this one and runs these steps itself, with the store open."""
+    The caller starts and stops the engine. At start, this runs
+    :meth:`ApprovalGate.reconcile_after_restart`, before the app serves an approval. At shutdown it
+    runs the same drains the managed lifespan runs before engine.stop() (:func:`_app_drain_steps`,
+    BACKLOG #3191), so a caller that stops its engine after the app has shut down loses no outcome
+    write, notice or audit row. The lock notices of an auth service the caller passed in are waited
+    for, not closed: the service is the caller's, which closes it with
+    :meth:`AuthService.close_background` before it stops its engine. A caller that passes its own
+    ``lifespan`` replaces this one and runs these steps itself, with the store open."""
     # create_app installs this only beside an engine, and always builds the gate then.
     await _reconcile_approvals_after_restart(app.state.approval_gate)
     try:
         yield
     finally:
-        await _drain_approval_gate(app)
+        # The caller still has its engine to stop, so its reserve is left out of this budget.
+        await _run_teardown(
+            _app_drain_steps(
+                app, app.state.engine.store, getattr(app.state, "auth", None), owns_auth=False
+            ),
+            _SHUTDOWN_BUDGET_SECONDS - _ENGINE_STOP_RESERVE_SECONDS,
+        )
 
 
 def _build_approval_gate(
@@ -1142,6 +1438,19 @@ def _build_approval_gate(
         # (running/stopping) outbound could have an INFLIGHT row cancel_queued cannot cancel, so purging
         # it would mis-fire; skip fail-closed and record cancelled=0/skipped in the approval audit. The
         # operator re-Stops (lets it quiesce) and re-requests.
+        #
+        # Vault BACKLOG #3217: the connection_purge row is attributed to the REQUESTER, so a hold
+        # whose params carry none is refused before anything runs, rather than released as a
+        # destructive purge whose row names no actor. The raise reaches the gate's compensation,
+        # which records the release as 'failed', and the route answers 409. Every hold the route
+        # files carries the key (_purge_hold_params), so this is a guard, not a migration path.
+        requester = p.get("requester")
+        if not isinstance(requester, str) or not requester:
+            raise ApprovalError(
+                409,
+                "this purge request records no requester, so its connection_purge row could not "
+                "name who ran it; it was not run",
+            )
         rr = engine.registry_runner
         if rr is not None:
             # ADR 0073: a non-owning shard's quiesced signal is vacuous (it never runs the lane), so
@@ -1151,8 +1460,21 @@ def _build_approval_gate(
                 return {"cancelled": 0, "skipped": f"outbound owned by shard {owner}"}
             if not rr.outbound_quiesced(str(p["name"])):
                 return {"cancelled": 0, "skipped": "outbound running"}
+        # Vault BACKLOG #3217: the same connection_purge row the inline route writes, committed
+        # with the cancel and attributed to the REQUESTER, so a failed append cancels nothing and
+        # the gate's compensation records the release as 'failed'. No `client`, per
+        # _record_reload_audit's docstring.
+        scope = "top" if p.get("scope") == "top" else "all"
         cancelled = await engine.store.cancel_queued(
-            None, str(p["name"]), top_only=(p.get("scope") == "top")
+            None,
+            str(p["name"]),
+            top_only=(scope == "top"),
+            audit=_connection_purge_audit(
+                actor=requester,
+                name=str(p["name"]),
+                scope=scope,
+                client=None,
+            ),
         )
         return {"cancelled": cancelled}
 
@@ -1216,6 +1538,9 @@ def _build_approval_gate(
                 "outbound": len(registry.outbound),
                 "degraded": outcome.applied and bool(failures),
                 "failures": failures,
+                # The settings anchors a restart must apply, as the inline route reports them
+                # (BACKLOG #3015).
+                "restart_required": _restart_required(outcome),
             }
 
         # A cancelled approve records 'interrupted' in the gate (#1562), and this reload goes on to
@@ -1515,6 +1840,13 @@ async def _reload_or_record_interruption(
         raise
 
 
+def _restart_required(outcome: ReloadOutcome) -> list[str] | None:
+    """:attr:`ReloadOutcome.restart_required` as :attr:`ReloadResult.restart_required` reports it:
+    a list, or ``None`` when the reload did not check (BACKLOG #3015)."""
+    names = outcome.restart_required
+    return None if names is None else list(names)
+
+
 async def _reload_and_record(
     engine: Engine,
     config_dir: str | None,
@@ -1712,7 +2044,9 @@ async def _audit_refused_reload(
     with reason ``not_found`` and answers 404. A bad graph writes ``config_reload_failed`` and
     answers 422; its reason is ``trust_anchor`` when a trust anchor refused it inside the engine,
     an inbound connection's CA (BACKLOG #1142) or a settings anchor (BACKLOG #2034), so one audit
-    filter sees both, and ``invalid_config`` otherwise. A released reload whose config is not the
+    filter sees both, and ``invalid_config`` otherwise. A trust-anchor check the store stopped, by
+    refusing its audit read or write, writes reason ``store_unavailable`` and answers 503 (BACKLOG
+    #3091); it is neither a refused anchor nor a bad graph. A released reload whose config is not the
     one its approval named writes ``config_reload_failed`` with reason ``digest_mismatch``, or
     ``no_approved_digest`` when the hold took none, with both digests, and answers 422 (vault
     BACKLOG #2596); only the executor meets it. One whose digest could not be taken now writes
@@ -1785,6 +2119,16 @@ async def _audit_refused_reload(
             else "the engine could not read the config to check it against this request's "
             "approval; see the engine log"
         )
+    elif isinstance(exc.__cause__, AnchorStoreUnavailable):
+        # BACKLOG #3091: the store refused a trust-anchor check's audit read or write. Nothing is
+        # known to be wrong with the anchor or the config, so neither of the reasons below fits.
+        _log.warning(
+            "config reload failed (store unavailable): %s",
+            scrub_log_argument(safe_exc(exc, limit=_REFUSAL_LOG_LIMIT)),
+        )
+        action, detail["reason"] = "config_reload_failed", "store_unavailable"
+        status = 503
+        answer = "the engine could not reach its store to check a trust anchor; see the engine log"
     else:
         anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
         _log.warning(
@@ -2946,8 +3290,8 @@ def create_app(
     if engine is not None and lifespan is None:
         # The embedded path: the caller owns the engine, and this app still owns its approval
         # gate's start and stop (BACKLOG #1562). A caller passing its own lifespan runs those
-        # steps itself; _embedded_approvals_lifespan names them.
-        lifespan = _embedded_approvals_lifespan
+        # steps itself; _embedded_lifespan names them.
+        lifespan = _embedded_lifespan
     app = FastAPI(
         title="MessageFoundry",
         version=__version__,
@@ -4470,7 +4814,11 @@ def create_app(
             and _purge_target_refusal(engine.registry_runner, name) is None
         ):
             held = await _rejoin_without_proof(
-                request, gate, "connection_purge", _purge_hold_params(name, scope), identity
+                request,
+                gate,
+                "connection_purge",
+                _purge_hold_params(name, scope, identity.username),
+                identity,
             )
             if held is not None:
                 return _held_reply(response, held, "connection_purge")
@@ -4514,45 +4862,25 @@ def create_app(
         ):  # dual-control: hold for a second approver when [approvals] gates purge
             pending = await gate.guard(
                 "connection_purge",
-                _purge_hold_params(name, scope),
+                _purge_hold_params(name, scope, identity.username),
                 requester=identity.username,
                 requester_user_id=identity.user_id,
                 client=client_ip(request),
             )
             if pending is not None:
                 return _held_reply(response, pending, "connection_purge")
-        client = client_ip(request)
-        # BACKLOG #1641: written UNCONDITIONALLY, cancelled=0 included. Deliberately NOT the
-        # `if requeued:` shape of the dead_letter_replay sibling: replay guards on "PHI was actually
-        # re-transmitted", but a purge that cancels nothing is still a completed destructive command
-        # against a live queue, and suppressing it leaves a zero-cancel purge indistinguishable from
-        # the 409s above, which changed nothing and wrote nothing.
-        #
-        # This row covers the UNGATED path ONLY. A dual-control purge returns 202 above and is
-        # executed later by the `_purge` executor in _build_approval_gate, which never re-enters this
-        # handler and writes no connection_purge row of its own. That path is not unaudited: the
-        # gate writes approval.requested and approval.release_attempted, both before the purge runs.
-        # The executor's {"cancelled": N} result is recorded only in approval.approved, which is
-        # written after the purge and whose failure is logged and paged rather than raised (BACKLOG
-        # #1940, vault BACKLOG #2255). So a gated purge's COUNT can be missing from the audit log
-        # while the release itself is still recorded. And all of those rows identify the operation
-        # only by approval_id: the connection NAME and the SCOPE live in the pending-approval row's
-        # params, not in the audit log. So a query of action='connection_purge' answers "which outbound, at
-        # what scope, cancelling how many" completely for ungated purges and not at all for gated
-        # ones, which still need a join back through approval_id. Closing that asymmetry is the
-        # sibling gap tracked for the _purge executor; it is deliberately not fixed here.
-        #
-        # No channel_id: purge targets an outbound, which spans every inbound feeding it. The row
-        # commits with the cancel (BACKLOG #2624), so no crash keeps one without the other.
+        # BACKLOG #1641: written UNCONDITIONALLY, cancelled=0 included, so a zero-cancel purge is
+        # told apart from the 409s above, which changed nothing and wrote nothing. The row commits
+        # with the cancel (BACKLOG #2624). A dual-control purge returns 202 above, and the `_purge`
+        # executor in _build_approval_gate writes the same row at release, attributed to the
+        # requester (vault BACKLOG #3217), so action='connection_purge' answers "which outbound, at
+        # what scope, cancelling how many" for gated and ungated purges alike.
         cancelled = await engine.store.cancel_queued(
             None,
             name,
             top_only=(scope == "top"),
-            audit=lambda n: AuditAppend(
-                "connection_purge",
-                actor=identity.username,
-                detail=json.dumps({"connection": name, "scope": scope, "cancelled": n}),
-                client=client,
+            audit=_connection_purge_audit(
+                actor=identity.username, name=name, scope=scope, client=client_ip(request)
             ),
         )
         return PurgeResult(cancelled=cancelled)
@@ -4901,6 +5229,15 @@ def create_app(
         this and reveal nothing: acknowledging an alert is not the act of reading its reason."""
         return redact_unauthorized(_alert_instance_row(a), identity)
 
+    def _alert_audit(
+        action: str, identity: Identity, request: Request, detail: Mapping[str, Any]
+    ) -> AuditAppend:
+        """The metadata-only row an alert mutation commits WITH its change (vault BACKLOG #3217).
+        The store appends it only when the change applied, so a 404 still writes nothing."""
+        return AuditAppend(
+            action, actor=identity.username, detail=json.dumps(detail), client=client_ip(request)
+        )
+
     def _alert_instance_row(a: Any) -> AlertInstanceInfo:
         return AlertInstanceInfo(
             id=a.id,
@@ -4969,15 +5306,14 @@ def create_app(
         # (a scoped read returns None for an instance on another connection). This mirrors the mutating-
         # route convention (replay_dead_letters pre-checks scope + raises 403 before mutating).
         await _require_alert_scope(engine, identity, alert_id)
-        ok = await engine.store.ack_alert_instance(alert_id, actor=identity.username)
+        # Vault BACKLOG #3217: the row commits with the change, so a failed append changes nothing.
+        ok = await engine.store.ack_alert_instance(
+            alert_id,
+            actor=identity.username,
+            audit=_alert_audit("alert_ack", identity, request, {"alert_id": alert_id}),
+        )
         if not ok:
             raise HTTPException(404, "alert instance not found or already resolved")
-        await engine.store.record_audit(
-            "alert_ack",
-            actor=identity.username,
-            detail=json.dumps({"alert_id": alert_id}),
-            client=client_ip(request),
-        )
         return await _alert_instance_echo(engine, identity, alert_id)
 
     @app.post("/alerts/{alert_id}/resolve", response_model=AlertInstanceInfo)
@@ -4993,15 +5329,12 @@ def create_app(
         # AC-7: scope-check before mutating (see ack_alert) — an out-of-scope id is refused with no
         # state change and no audit row.
         await _require_alert_scope(engine, identity, alert_id)
-        ok = await engine.store.resolve_alert_instance(alert_id)
+        ok = await engine.store.resolve_alert_instance(
+            alert_id,
+            audit=_alert_audit("alert_resolve", identity, request, {"alert_id": alert_id}),
+        )
         if not ok:
             raise HTTPException(404, "alert instance not found or already resolved")
-        await engine.store.record_audit(
-            "alert_resolve",
-            actor=identity.username,
-            detail=json.dumps({"alert_id": alert_id}),
-            client=client_ip(request),
-        )
         echo = await _alert_instance_echo(engine, identity, alert_id)
         # #81 (ADR 0133): a resolved condition is closed — drop the running notifier's in-memory suspend +
         # escalation state for the key, so a later re-open starts un-suspended at the base tier (matching
@@ -5027,19 +5360,19 @@ def create_app(
         # no state change and no audit row.
         await _require_alert_scope(engine, identity, alert_id)
         until = time.time() + body.minutes * 60.0
-        info = await engine.store.suspend_alert_instance(alert_id, until=until)
+        info = await engine.store.suspend_alert_instance(
+            alert_id,
+            until=until,
+            audit=_alert_audit(
+                "alert_suspend", identity, request, {"alert_id": alert_id, "minutes": body.minutes}
+            ),
+        )
         if info is None:
             raise HTTPException(404, "alert instance not found or already resolved")
         # Update the running notifier's in-memory suspend cache so the mute is honored immediately (the
         # durable suspended_until is the cross-restart record; the sink primes from it at startup). Best-
         # effort: absent in a JSON-only/no-transport deployment (the durable state still governs).
         _notifier_suspend(request, info.event_type, info.connection, until=until)
-        await engine.store.record_audit(
-            "alert_suspend",
-            actor=identity.username,
-            detail=json.dumps({"alert_id": alert_id, "minutes": body.minutes}),
-            client=client_ip(request),
-        )
         return _alert_instance_info(info, identity)
 
     @app.post("/alerts/{alert_id}/resume", response_model=AlertInstanceInfo)
@@ -5052,16 +5385,13 @@ def create_app(
         """Clear a windowed suspend (#143) so re-alerts resume immediately. Writes one metadata-only
         ``alert_resume`` audit row. 404 if the id is unknown or already resolved."""
         await _require_alert_scope(engine, identity, alert_id)
-        info = await engine.store.resume_alert_instance(alert_id)
+        info = await engine.store.resume_alert_instance(
+            alert_id,
+            audit=_alert_audit("alert_resume", identity, request, {"alert_id": alert_id}),
+        )
         if info is None:
             raise HTTPException(404, "alert instance not found or already resolved")
         _notifier_resume(request, info.event_type, info.connection)
-        await engine.store.record_audit(
-            "alert_resume",
-            actor=identity.username,
-            detail=json.dumps({"alert_id": alert_id}),
-            client=client_ip(request),
-        )
         return _alert_instance_info(info, identity)
 
     @app.post("/alerts/test-email", response_model=AlertTestEmailResult)
@@ -5621,6 +5951,7 @@ def create_app(
             dry_run=req.dry_run,
             degraded=outcome.applied and bool(failures),
             failures=failures,
+            restart_required=_restart_required(outcome),
         )
 
     # --- messages ------------------------------------------------------------
@@ -7140,20 +7471,16 @@ def create_app(
                 client=client_ip(request),
             )
             raise HTTPException(409, str(exc)) from None
-        await engine.store.record_audit(
-            "upload.create",
-            actor=identity.username,
-            detail=json.dumps(
-                {
-                    "file_id": meta.file_id,
-                    "size": meta.size,
-                    "message_count": meta.message_count,
-                }
+        # Vault BACKLOG #3178: the creation row outlives the request, so a deadline that fires now
+        # still leaves the stored file with its row. A row that cannot be written removes the file.
+        await outliving.run(
+            _record_upload_create(
+                engine.store, us, meta, actor=identity.username, client=client_ip(request)
             ),
-            client=client_ip(request),
+            "upload.create audit",
         )
 
-        # ASVS 5.2.4: opportunistic age-based retention sweep at save time (off-loop, best-effort). A prune
+        # ASVS 5.2.4: an age-based retention sweep triggered by the save (off-loop, best-effort). A prune
         # error must never fail the upload the operator just made — it is logged and retried by the
         # periodic task. Each pruned file is audited (file_id + uploader, never content).
         #
@@ -7168,6 +7495,11 @@ def create_app(
         # rejects exactly this pairing for dual-control config reload). The owner survives as DATA in
         # `detail.uploader`, which is where it belongs.
         #
+        # BACKLOG #3184: where the lifespan's retention runner is running, the sweep is the runner's,
+        # woken here, so it is never on this request's path or under its deadline. Only an app with
+        # no runner (create_app alone) sweeps inline.
+        if us.wake_retention():
+            return _upload_info(meta)
         # BACKLOG #2261: the request deadline can cancel this handler mid-sweep. prune_on_save then
         # stops the sweep at its next file and still writes a row for each file it removed.
         prune_store = engine.store
@@ -7524,18 +7856,27 @@ def create_app(
             await _authorized_upload_meta(request, engine, us, identity, file_id, "delete")
         except _UploadSidecarRefused:
             refused = True
+        client = client_ip(request)
+
+        async def _delete_and_record() -> UploadedFileMeta:
+            removed = await us.delete(file_id, sidecar_refused=refused)
+            await engine.store.record_audit(
+                "upload.delete",
+                actor=identity.username,
+                detail=json.dumps({"file_id": removed.file_id, "size": removed.size}),
+                client=client,
+            )
+            return removed
+
+        # Vault BACKLOG #3178: the unlink and its row run as one operation that outlives the
+        # request, so a deadline can no longer land between them and leave a removed file with no
+        # row. The shutdown drain can still cancel it, as it can any outliving operation.
         try:
-            meta = await us.delete(file_id, sidecar_refused=refused)
+            meta = await outliving.run(_delete_and_record(), "upload delete")
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
         except UploadUnreadableError:
             raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
-        await engine.store.record_audit(
-            "upload.delete",
-            actor=identity.username,
-            detail=json.dumps({"file_id": meta.file_id, "size": meta.size}),
-            client=client_ip(request),
-        )
         return UploadDeleteResult(file_id=meta.file_id, filename=meta.filename, deleted=True)
 
     # --- saved / layered Log-Search filter presets (BACKLOG #151, ADR 0136) --
@@ -9455,6 +9796,9 @@ async def _directory_reconciler(
 #: from the breaker's ``directory-reconciler``, so each has its own instance, throttle and detail,
 #: and an alert rule can match one source without the other.
 _REFERRAL_ALERT_SOURCE = "directory-reconciler-referral"
+#: The source label of the probe fault's own ``ad_reconcile_aborted`` instance (BACKLOG #3100), apart
+#: from the breaker's and the referral's for the same reasons.
+_PROBE_FAULT_ALERT_SOURCE = "directory-reconciler-probe-fault"
 
 
 def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSink) -> None:
@@ -9475,6 +9819,12 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     standing referral must not silence a later breaker trip, and each keeps its own detail. An
     ``[alerts]`` rule keyed on the event type alone still matches both.
 
+    A probe fault (BACKLOG #3100) is not an outage either: the engine could not read what the
+    directory returned for an account, and that account is left unrevoked while it lasts. Any pass
+    with a faulted probe is ``auth.ad_reconcile_faulted`` and becomes one ``ad_reconcile_aborted``
+    alert with reason ``probe_fault``, under its own source label
+    (:data:`_PROBE_FAULT_ALERT_SOURCE`). It has no inverse: an operator resolves it.
+
     Reads the RETURNED plan, so it sees only a pass that finished. A failed write of the pass's own
     held, aborted, skipped, referred or unkeyed-binding row no longer ends the pass (BACKLOG #2137):
     the service logs it at ERROR and returns the plan, so these alerts still fire. A pass that raised
@@ -9494,8 +9844,9 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     ``_mark_reconcile_clears`` states that rule once."""
     if plan.directory_outage:
         return
-    if plan.aborted is not None and not plan.directory_referral:
+    if plan.aborted is not None and not plan.directory_referral and not plan.probe_fault:
         # A breaker trip. A pass of referrals only is not one: its one alert is the referral's below.
+        # Nor is a pass of faults only (BACKLOG #3100): its one alert is the fault's below.
         sink.ad_reconcile_aborted(
             "directory-reconciler",
             reason=plan.aborted,
@@ -9512,6 +9863,14 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
             reason=REFERRAL_ABORT,
             probed=plan.probed,
             detail=auth.directory_reconcile_referral or REFERRAL_ABORT,
+        )
+    if plan.faulted:
+        # BACKLOG #3100. Beside the referral's, in the same order the service records them.
+        sink.ad_reconcile_aborted(
+            _PROBE_FAULT_ALERT_SOURCE,
+            reason=PROBE_FAULT_ABORT,
+            probed=plan.probed,
+            detail=auth.directory_reconcile_fault or PROBE_FAULT_ABORT,
         )
     if plan.hold:
         # After the breaker and the revocations, matching the auth service's order: a sink that
@@ -9859,8 +10218,9 @@ def create_managed_app(
     ``synchronous``) as a SQLite shortcut. ``config_dir`` loads the code-first Connection/Router/
     Handler graph. ``auth_settings`` attaches an :class:`AuthService` and seeds the built-in roles;
     it creates no account (ADR 0183). With no ``auth_settings`` every protected route is refused
-    (503) unless the caller passes ``allow_no_auth=True``, the same opt-in :func:`create_app` takes;
-    beside ``auth_settings`` that opt-in raises ``ValueError``.
+    (503) unless the caller passes ``allow_no_auth=True``, the same opt-in :func:`create_app` takes,
+    and a build with neither logs one WARNING. Beside ``auth_settings`` that opt-in raises
+    ``ValueError``.
     The store is opened via the
     backend-agnostic :func:`~messagefoundry.store.open_store`. ``api_listener`` is the engine's own
     ``(host, port)`` (from ``[api]``), reserved so no inbound listener can be wired onto the API's port
@@ -10330,7 +10690,7 @@ def create_managed_app(
                 # or opt out in writing via [alerts].security_notifications_required) is enforced fail-closed
                 # at startup by the serve gate (messagefoundry/__main__.py), which checks these SAME two
                 # conditions — not here. This task is owned by the lifespan (started here, drained + closed
-                # after the engine in the finally below).
+                # in the finally below, before engine.stop() closes the store it records in).
                 if auth_settings.notify_security_events and alerts_settings is not None:
                     security_notifier = security_notifier_from_settings(
                         alerts_settings,
@@ -10583,84 +10943,88 @@ def create_managed_app(
                     )
             yield
         finally:
-            # BACKLOG #2087: every step before engine.stop() sits in this try, so a cancel delivered
-            # to the lifespan mid-teardown, or a step that raises, still stops the engine. Without
-            # it the store's non-daemon worker keeps the process alive. The three store-reading tasks
-            # are cancelled first, before any await, so a step that raises or a cancel cannot leave
-            # one running when engine.stop() closes the store.
+            # BACKLOG #2087, #3191: every step after the yield runs whatever the steps before it
+            # did. A step that raises, overruns its bound or is cut by a cancel is logged and the
+            # next one runs, so a cancel delivered mid-teardown still drains, stops the engine and
+            # closes both notifiers, and is re-raised once they have run. Without engine.stop()
+            # the store's non-daemon worker keeps the process alive. The three store-reading tasks
+            # are cancelled first, before any await, so no step can leave one running when
+            # engine.stop() closes the store. _SHUTDOWN_BUDGET_SECONDS bounds the steps that can be cut.
             background = [t for t in (reconciler, reaper, credential_reminder) if t is not None]
             for task in background:
                 task.cancel()
-            try:
-                if upload_retention_runner is not None:
-                    await upload_retention_runner.stop()
-                # gather(return_exceptions): absorbs both our cancellation AND any exception a
-                # previously-died task stored, so it can't skip the steps below (review M-33).
-                await asyncio.gather(*background, return_exceptions=True)
-                # vault BACKLOG #2751-#2753: a DR activate or release, or a config reload, whose
-                # caller was cancelled is still running on its own. Let it finish, or cancel it so
-                # its own rollback arm restores state and records 'interrupted', while the store is
-                # open. Before the approval drain: a released reload's outcome write follows it.
-                try:
-                    await app.state.outliving_operations.drain()
-                except Exception:
-                    _log.exception(
-                        "long operations: the shutdown drain failed; continuing the teardown"
+
+            steps: list[_TeardownStep] = []
+            if upload_retention_runner is not None:
+                # Handed part of its bound, so the runner's own wait ends, names any unaudited
+                # file and cancels the sweep before the teardown cuts it. With the managed set of
+                # steps that bound is below the runner's own default wait, which then never runs
+                # in full here.
+                steps.append(
+                    _TeardownStep(
+                        "the upload retention runner's stop",
+                        0.5,
+                        lambda b: upload_retention_runner.stop(timeout=b * _INNER_SHARE),
                     )
-                # BACKLOG #2087: let approval outcome writes still running land before the store closes.
-                await _drain_approval_gate(app)
-                # BACKLOG #2216: a lock notice still in flight reads and writes the audit log, then
-                # hands its mail to the security notifier, so it drains before engine.stop() closes
-                # the store and before that notifier stops in the finally below. Bounded, and it logs
-                # and cancels what it cannot finish; guarded like the drains above so a failure
-                # cannot skip a later step.
-                if auth is not None:
-                    try:
-                        await auth.close_background()
-                    except Exception:
-                        _log.exception(
-                            "auth: the shutdown drain of background notices failed; continuing the "
-                            "teardown"
-                        )
-                # M-5 (BACKLOG #1640): flush the open summary-access window before the store closes.
-                # `_SummaryAuditCoalescer.flush` documents itself as the engine-shutdown path and NOTHING
-                # called it, so every clean restart dropped the open hour's PHI-summary access audit --
-                # the rows the control exists to produce, lost exactly when an operator restarts after a
-                # bulk census fetch.
-                #
-                # BEFORE engine.stop(), because that ends in store.close() and the emit needs the store.
-                # Guarded like the reaper above, so a store error here is logged rather than raised
-                # out of the teardown. Read directly, not through getattr: create_app always sets the
-                # auditor, so a rename should fail loudly inside this guard rather than silently skip
-                # the flush.
-                try:
-                    await app.state.summary_auditor.flush(store)
-                except Exception:
-                    _log.exception(
-                        "summary-access coalescer: the shutdown flush failed, so at least one open "
-                        "window's audit row is lost; continuing the teardown"
+                )
+            # return_exceptions absorbs both our cancellation AND any exception a task that died
+            # earlier stored (review M-33).
+            steps.append(
+                _TeardownStep(
+                    "the store-reading tasks",
+                    0.1,
+                    lambda _b: asyncio.gather(*background, return_exceptions=True),
+                    # Never cut, as before: a task left running here would meet the store that
+                    # engine.stop() closes.
+                    bounded=False,
+                )
+            )
+            steps += _app_drain_steps(app, store, auth, owns_auth=True)
+            if security_notifier is not None:
+                # It drains queued user emails, and records a notice it could not send in the audit
+                # log, so it closes while the store is open, after the lock notices that hand it
+                # mail (BACKLOG #3191).
+                steps.append(
+                    _TeardownStep(
+                        "the security notifier's close", 0.25, lambda _b: security_notifier.aclose()
                     )
-            finally:
-                if remove_security_signals is not None:
-                    remove_security_signals()
-                await engine.stop()
-                # B11: shut down the harness-only instrumented executor (None in production / other tests).
-                # The engine is stopped (no more to_thread work), so a non-blocking shutdown is clean.
-                shim_executor = getattr(app.state, "connscale_executor", None)
-                if shim_executor is not None:
-                    shim_executor.shutdown(wait=False)
-                if security_notifier is not None:
-                    await (
-                        security_notifier.aclose()
-                    )  # drain queued user emails, bounded by SMTP timeout
-                if notifier is not None:
-                    # Stop accepting alerts last (after the engine quiesces) so any final
-                    # connection_stopped/queue_buildup still drains; bounded by the transport timeouts.
-                    await notifier.aclose()
+                )
+            if remove_security_signals is not None:
+                steps.append(
+                    _TeardownStep(
+                        "the security-signal removal", 0.05, _sync(remove_security_signals)
+                    )
+                )
+            steps.append(
+                _TeardownStep(
+                    "engine.stop()",
+                    _ENGINE_STOP_RESERVE_SECONDS,
+                    lambda _b: engine.stop(),
+                    bounded=False,
+                )
+            )
+            # B11: the harness-only instrumented executor (None in production and other tests). The
+            # engine is stopped, so no more to_thread work: a non-blocking shutdown is clean.
+            shim_executor = getattr(app.state, "connscale_executor", None)
+            if shim_executor is not None:
+                steps.append(
+                    _TeardownStep(
+                        "the instrumented executor's shutdown",
+                        0.05,
+                        _sync(partial(shim_executor.shutdown, wait=False)),
+                    )
+                )
+            if notifier is not None:
+                # Last, after the engine quiesces, so a final connection_stopped or queue_buildup
+                # alert still drains.
+                steps.append(
+                    _TeardownStep("the alert notifier's close", 0.5, lambda _b: notifier.aclose())
+                )
+            await _run_teardown(steps, _SHUTDOWN_BUDGET_SECONDS)
 
     # Settings never select the open mode: only the caller's opt-in, checked at the top, does
     # (vault BACKLOG #2611, #2825).
-    return create_app(
+    app = create_app(
         lifespan=lifespan,
         # Build the opt-in uploaded-logs store in the SERVE path too (previously only the direct/test
         # path passed store_settings, so `serve` never wired it): the ASVS 5.2.4 retention runner above
@@ -10687,3 +11051,15 @@ def create_managed_app(
         phi_read_hop_secure=phi_read_hop_secure,
         configured_log_level=configured_log_level,
     )
+    if auth_settings is None and not allow_no_auth:
+        # Vault BACKLOG #2731 item 1: no settings means no service attaches, so this app fails closed.
+        # Said here, once create_app has accepted the build, and not in create_app, which every
+        # managed app calls with auth=None before the lifespan attaches a service.
+        _log.warning(
+            "create_managed_app: built with no auth_settings and without allow_no_auth, so no "
+            "service attaches and the permission-gated routes are refused (%s). auth_settings "
+            "attaches sign-in; allow_no_auth=True instead answers those routes to any caller as the "
+            "full-access system identity",
+            AUTH_NOT_CONFIGURED,
+        )
+    return app

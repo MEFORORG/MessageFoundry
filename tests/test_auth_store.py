@@ -527,6 +527,20 @@ async def test_the_federated_binding_service_contract_on_sqlite() -> None:
         await store.close()
 
 
+async def test_the_bind_audit_factor_state_contract_on_sqlite() -> None:
+    """Vault BACKLOG #2711 step 3 on the SQLite backend: the bind, rebind and unbind audit rows say
+    whether the account holds an engine factor, against the shared body the server suites run."""
+    from tests._federated_binding_service_contract import (
+        _assert_bind_audit_names_factors_contract,
+    )
+
+    store = await _store()
+    try:
+        await _assert_bind_audit_names_factors_contract(store)
+    finally:
+        await store.close()
+
+
 async def test_the_session_binding_guard_contract_on_sqlite() -> None:
     """``create_session(require_federated_subject=...)`` on the SQLite backend, against the same
     shared body the PostgreSQL and SQL Server suites run."""

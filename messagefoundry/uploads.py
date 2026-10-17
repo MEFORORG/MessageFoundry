@@ -91,7 +91,7 @@ _ORPHAN_TMP_RE = re.compile(
 # sits far outside any single write, which is bounded by ``max_bytes``.
 _ORPHAN_MIN_AGE_SECONDS = 3600.0
 
-# How long a cancelled save waits for each cross-shard ledger call, the reserve and the release, to
+# How long a cancelled save waits for each engine-shard ledger call, the reserve and the release, to
 # finish (BACKLOG #2263). It is per call, so a save cancelled during a slow reserve can wait up to
 # two bounds. A healthy statement takes well under a second. The bound exists so a stuck store
 # cannot hold ``_quota_lock``, and the request's cancellation, indefinitely. Past it the call is
@@ -99,17 +99,39 @@ _ORPHAN_MIN_AGE_SECONDS = 3600.0
 # its audit rows after a cancelled upload (UploadStore._run_to_completion, BACKLOG #2261).
 _LEDGER_CANCEL_WAIT_SECONDS = 5.0
 
-# How often a save that holds a cross-shard reservation touches the ledger row, so a slow save keeps
-# its slot past ``store.base.UPLOAD_RESERVATION_STALE_AFTER`` (300 s) instead of having it reclaimed
-# by a sibling shard's reserve (BACKLOG #2648). A third of that window, which leaves room for touches
-# that are slow as well as one that fails. Written out rather than imported to keep this module a
-# leaf; a test pins the ratio.
+# How often a save that holds an engine-shard reservation touches the ledger row, so a slow save
+# keeps its slot past ``store.base.UPLOAD_RESERVATION_STALE_AFTER`` (300 s) instead of having it
+# reclaimed by a sibling engine shard's reserve (BACKLOG #2648). A third of that window, which
+# leaves room for touches that are slow as well as one that fails. Written out rather than imported
+# to keep this module a leaf; a test pins the ratio.
 _RESERVATION_HEARTBEAT_SECONDS = 100.0
 # How long a save keeps touching its row at most. A write that never finishes would otherwise pin
 # the row, and any leaked slot in it, for as long as the process lives. Past this the heartbeat
-# stops with a WARNING, and the row goes stale unless other activity keeps it fresh. A write is
+# stops with a WARNING, and the reservation goes stale; no other activity keeps it fresh (vault
+# BACKLOG #3180). A write is
 # bounded by ``max_upload_bytes`` (512 MiB at most), so an hour is far past any healthy save.
 _RESERVATION_HEARTBEAT_MAX_SECONDS = 3600.0
+# How long the heartbeat waits for one touch before it goes on without it (BACKLOG #3256). The
+# heartbeat leaves the touch running and never cancels it, so a slow touch that lands still
+# refreshes the reservation. One still running when the heartbeat ends is held as a straggler, so
+# it is cancelled at ``_LEDGER_STRAGGLER_MAX_SECONDS`` or by the shutdown drain (vault BACKLOG
+# #3180). Well under the interval, so the wait never delays the next beat by much.
+_RESERVATION_TOUCH_WAIT_SECONDS = 10.0
+
+# How long a ledger call a cancelled save left running may run before it is cancelled (vault
+# BACKLOG #3180). Without a cap a stalled store held every such call, and every late release it
+# spawned, for as long as the process lived. Cancelling one is safe because each reservation is its
+# own row: a slot the call did take is reclaimed once it goes stale, whatever else the uploader does.
+_LEDGER_STRAGGLER_MAX_SECONDS = 60.0
+
+# How long :meth:`UploadStore.drain_stragglers` waits at shutdown for the calls and save-time sweeps
+# a cancelled save left running, then how long it waits for the ones it cancels (vault BACKLOG
+# #3180). These are upper limits. Both lifespans run the drain as one step of the API teardown,
+# under its one shutdown budget (``api.app._SHUTDOWN_BUDGET_SECONDS``, BACKLOG #3191), through
+# :meth:`UploadStore.drain_stragglers_within`, which fits both waits inside a share of that step's
+# bound, so the drain's own waits end, and cancel what is left, before the teardown cuts the step.
+_STRAGGLER_DRAIN_SECONDS = 2.0
+_STRAGGLER_CANCEL_GRACE_SECONDS = 1.0
 
 # How much of a refused plaintext sidecar the quota reads to find the uploader it bills (BACKLOG
 # #2322). A sidecar the engine wrote is a few hundred bytes. Past this the owner counts as unknown.
@@ -227,44 +249,40 @@ class UploadQuotaError(UploadError):
     * **No ledger bound.** ``UploadStore(store=None)`` — the genuinely store-less construction path
       (embedding / tests) — keeps only the per-process lock, so the pre-#1112 bound applies there: at
       most **N-1 files** over, one per shard mid-write, each bounded by ``max_upload_bytes``.
-    * **A leaked reservation.** A process killed between reserve and release never pays back, and its
-      slot narrows that uploader's budget until the row goes idle for
-      ``UPLOAD_RESERVATION_STALE_AFTER``. It errs toward refusing, not allowing. A cancelled
-      ``save`` now waits a bounded time for its reserve and release to finish first (BACKLOG
-      #2263), which closes the common case. At least these cancelled cases still leak: a reserve
-      that raised after it may have committed, a release that fails, and a reserve or release Task
-      that ``asyncio.run``'s shutdown cancels. A call still running at the bound is left to
-      finish, and only leaks if it then lands in one of those cases. The module logs each at
-      WARNING, with at least two exceptions, both a RELEASE the shutdown cancels: one a save still
-      waits for, and the late release that pays back a reserve left running. A cancelled reserve
-      is logged whether or not a save was still waiting for it.
-      **IT DOES NOT SELF-HEAL UNCONDITIONALLY, and an earlier version of this line said it did.**
-      Every release, every applied reserve and every live save's heartbeat sets the row's
-      ``since`` to now, never backwards (BACKLOG #2648), and the row holds one clock for all of its
-      slots. **So a leaked slot self-heals only once that uploader is otherwise IDLE** for the whole
-      window, with no bound while activity continues. Any reserve, release or heartbeat for that
-      uploader, from any shard, keeps it alive. A host whose clock runs ahead holds it longer by the
-      skew, with no cap: the stamp never moves backwards, so one write from a host a year ahead
-      holds a slot leaked later for a year. A cap read from the writer's own clock cannot tell that
-      stamp from a fresh one seen by a host that lags, and the lagging host would then reset a
-      sibling's live slots, so the server-clock fix below is the one that closes it.
-    * **A reclaimed live reservation (BACKLOG #2648).** The store reclaims a row with no activity
-      for ``UPLOAD_RESERVATION_STALE_AFTER``, and it cannot tell a dead holder from a slow one.
-      Every applied reserve moves the row's clock, and a live save touches it every
-      ``_RESERVATION_HEARTBEAT_SECONDS`` (:meth:`UploadStore._start_heartbeat`), so a slow save
-      keeps its slot. A live slot is still reclaimed in at least these cases: its holder lands no
-      touch for the whole window while it is alive (a suspended process or VM, an event loop
-      starved for minutes, or a store this shard cannot reach while a sibling can); its save
-      outlives ``_RESERVATION_HEARTBEAT_MAX_SECONDS``; or the holder's host clock lags a sibling's
-      by a large part of the window. ``since`` is stamped from the writer's ``time.time()`` and
-      compared against the reader's, and the stamp never moves backwards, so a lagging host can no
-      longer age a row a sibling keeps fresh, but a row only it touches still looks old to the
-      sibling. A sibling then counts neither that file nor its slot, and the holder's later release
-      erases a sibling's slot, so the undercount lasts until the ledger next drains to zero. That
-      restores the N-1 bound above while it lasts, never worse than the pre-#1112 behaviour. The
-      window is accepted. The skew case alone could be closed inside the existing statements, by
-      stamping and comparing with the database server's clock. The rest needs one ledger row per
-      reservation, a store-contract change across three backends.
+    * **A leaked reservation.** A process killed between reserve and release never pays back, and
+      its slot narrows that uploader's budget until it goes stale. It errs toward refusing, not
+      allowing. Each reservation is its own ledger row with its own clock, named by the save's
+      ``file_id`` (vault BACKLOG #3180). So a leaked slot is reclaimed
+      ``UPLOAD_RESERVATION_STALE_AFTER`` after its last touch however active the uploader stays,
+      and a release pays back only its own slot. A cancelled ``save`` waits a bounded time for its
+      reserve and release (BACKLOG #2263), and releases by id even a reserve whose outcome it never
+      learned. At least these still leak until the window passes: a release that fails; a ledger
+      call still running ``_LEDGER_STRAGGLER_MAX_SECONDS`` after its save was cancelled, which is
+      cancelled there; a reserve whose statement commits after its call was cancelled; and a call
+      the shutdown drain cancels. The module logs each at WARNING. **On Postgres and SQL Server the
+      stamp and the staleness test both read the database server's clock (BACKLOG #3256),** so an
+      engine host's skew no longer moves either. A server clock that ran ahead and is stepped
+      back still holds a slot it stamped meanwhile longer by the step, because that stamp was
+      written ahead, and so does a failover to a replica whose clock lags the old primary's. A
+      server clock stepped forward, or a failover to a replica whose clock runs ahead, makes every
+      slot look older by the step, so it can reclaim a live slot early (the next bullet). So the
+      database servers' own time sync now carries what each engine host's did. SQLite reads the engine host's clock, and only one host ever writes a SQLite
+      store, because ``require_unified_store`` refuses SQLite for more than one engine shard.
+    * **A reclaimed live reservation (BACKLOG #2648).** The store reclaims a reservation with no
+      activity for ``UPLOAD_RESERVATION_STALE_AFTER``, and it cannot tell a dead holder from a slow
+      one. A live save touches its own reservation every ``_RESERVATION_HEARTBEAT_SECONDS``
+      (:meth:`UploadStore._start_heartbeat`), so a slow save keeps its slot. A live slot is still
+      reclaimed in at least these cases: its holder lands no touch for the whole window while it is
+      alive (a suspended process or VM, an event loop starved for minutes, or a store this shard
+      cannot reach while a sibling can); its save outlives ``_RESERVATION_HEARTBEAT_MAX_SECONDS``;
+      its touches stall on the store for the whole window; one touch never returns, since no
+      second touch starts while one runs (BACKLOG #3256); or the database server's clock steps
+      forward by a large part of the window, or a failover lands on a replica whose clock runs
+      that far ahead. A sibling then counts neither that file
+      nor its slot until the file lands. The holder's later release deletes only its own row, so
+      the undercount ends with that save. That restores the N-1 bound above while it lasts, never
+      worse than the pre-#1112 behaviour. Host clock skew is not one of these cases on the server
+      backends (the bullet above says why).
 
     The ledger is checked and paid back around the write, not in the same transaction as it, because
     the body lives on the filesystem rather than in the store. The ordering above is what stands in
@@ -327,18 +345,26 @@ class UploadedFileMeta:
 
 @dataclass(frozen=True)
 class _UnsealableUpload:
-    """An upload ``rotate-key`` cannot seal, kept inside retention and the quota (BACKLOG #2322).
+    """One kind of upload ``rotate-key`` cannot seal, which the retention prune and the quota still
+    read (BACKLOG #2322).
 
     It is a plaintext sidecar that a keyed store refuses, over a body that is missing or is not
-    text. ``rotate-key`` leaves that sidecar unsealed, because sealing it would list an upload with
-    no usable body and would seal a planted lone sidecar too. So it is refused on every read, for
-    good, and nothing here ever serves or lists it.
+    text (:meth:`UploadStore._unsealable_sync` is the test). ``rotate-key`` leaves that sidecar
+    unsealed, because sealing it would list an upload with no usable body and would seal a planted
+    lone sidecar too. So it is refused on every read, for good. The listing and the by-id reads never
+    serve it, and :meth:`UploadStore.delete` removes it.
 
-    Nothing in the plaintext is trusted where trusting it could do harm. ``file_id`` comes from the
-    PATH, so a planted sidecar cannot name another upload. ``modified`` is the sidecar's mtime, which
-    is the expiry clock. ``size`` is the body's size on disk, never the sidecar's claim, so it cannot
-    be negative. ``uploader_id`` is read from the plaintext and used ONLY to bill the quota. A plant
-    can bill another uploader that way, which errs toward refusing an upload until the plant expires.
+    **Not every refused upload is one, so this class does not keep every refused upload inside
+    retention** (BACKLOG #3240). At least these are not: a blank sidecar, or one that is not UTF-8
+    within the part :meth:`UploadStore._unsealable_sync` reads, and a plaintext sidecar over a body
+    that is oversized and not text, is not a regular file, or cannot be read for another cause. ``docs/PHI.md`` §3 names the ones outside retention.
+
+    At least these fields are not taken from the plaintext. ``file_id`` comes from the PATH, so a
+    planted sidecar cannot name another upload. ``modified`` is the sidecar's mtime, which is the
+    expiry clock. ``size`` is the body's size on disk, never the sidecar's claim, so it cannot be
+    negative. ``uploader_id`` IS read from the plaintext, and is used here only to bill the quota. A
+    plant can bill another uploader that way, which errs toward refusing an upload until the plant
+    expires.
     """
 
     file_id: str
@@ -509,8 +535,12 @@ class ResealResult:
     ``skipped`` is load-bearing, not decoration: an operator reads it to decide whether it is safe to
     drop the retired key. A file this pass could not read MAY still be sealed under the OLD key, and
     dropping that key would make it permanently unreadable, so a non-zero ``skipped`` means "fix the
-    cause and run it again before you retire anything". **A body that is missing or is not text under
-    a SEALED sidecar still counts here, and no re-run clears it,** although no key could read it.
+    cause and run it again before you retire anything". ``rotate-key`` exits non-zero and writes no
+    rotation stamp while it is non-zero (BACKLOG #3181). It includes a value no configured key opens,
+    which the pass leaves as it was and moves past. A readable-sized body that is missing or is not
+    text is not counted here when its sidecar is readable: no key reads that body and no re-run
+    changes it (``unsealable``, ``body_lost``). At least a body too large for an upload, one that is
+    not a regular file, and a sidecar that is not text are still skips.
 
     The counts use different units. ``resealed`` counts VALUES: each body or sidecar it rewrites
     adds one. ``skipped`` counts UPLOADS: a pair adds at most one, whichever half failed (BACKLOG
@@ -526,9 +556,17 @@ class ResealResult:
     unsealable: int = 0
     #: How many UPLOADS had a plaintext half that this pass sealed (BACKLOG #1169). It counts files,
     #: not values, so it matches the count ``serve`` logs at startup (:meth:`UploadStore.warn_if_unsealed`).
-    #: A keyed store refuses those uploads until this pass seals them, so this is how many it turned
-    #: from refused into readable.
+    #: A keyed store refuses those uploads until this pass seals them. An upload also counted in
+    #: ``skipped`` counts here too when one half was sealed, since a planted body under a sealed
+    #: sidecar would otherwise be sealed without ever being counted (BACKLOG #3240). The cost is
+    #: that an upload whose two plaintext halves are sealed in two runs counts in both, so after a
+    #: skip the total across runs can exceed the startup count without a plant.
     sealed_plaintext: int = 0
+    #: How many UPLOADS have a SEALED sidecar over a body that is missing or is not text (BACKLOG
+    #: #3181). Not counted in ``skipped``: the body is under no key, and the sidecar is re-sealed like
+    #: any other, so retiring the prior key loses nothing. The upload stays listed with a body that
+    #: cannot be read until an operator deletes it or the retention prune removes it at expiry.
+    body_lost: int = 0
 
 
 @dataclass(frozen=True)
@@ -554,20 +592,23 @@ class UploadQuotaLedger(Protocol):
     see :meth:`messagefoundry.store.base.Store.reserve_upload_quota` and
     :meth:`~messagefoundry.store.base.Store.upload_quota_in_flight` for the full contract.
 
-    **A release of zero files and zero bytes is a touch, and the heartbeat depends on it (BACKLOG
-    #2648).** It must take the release path and move the row's clock forward, changing no count.
-    An implementation that skipped a zero-delta release would silently leave every slow save
-    reclaimable."""
+    **A reservation is named by its caller (vault BACKLOG #3180).** ``reservation_id`` is the save's
+    ``file_id``, so a release pays back that reservation and nothing else, and is safe after a
+    reserve whose outcome is unknown. The heartbeat (BACKLOG #2648) touches that reservation only."""
 
     async def reserve_upload_quota(
         self,
         uploader_id: str,
+        reservation_id: str,
         *,
-        files: int,
         size_bytes: int,
-        max_files: int = 0,
-        max_total_bytes: int = 0,
+        max_files: int,
+        max_total_bytes: int,
     ) -> bool: ...
+
+    async def release_upload_quota(self, reservation_id: str) -> None: ...
+
+    async def touch_upload_quota(self, reservation_id: str) -> None: ...
 
     async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]: ...
 
@@ -622,12 +663,44 @@ class UploadStore:
         # cancelled upload stopped waiting for (#2261), held until they finish: the loop holds a
         # Task only weakly. See _hold.
         self._stragglers: set[asyncio.Future[Any]] = set()
+        # The tasks drain_stragglers cancelled and that have not ended yet. A reserve among them
+        # spawns no late release (#3180): the store is about to close.
+        self._drain_cancelled: set[asyncio.Future[Any]] = set()
         # Live saves' reservation heartbeats (BACKLOG #2648), held for the same reason. Each ends
         # once its save sets the stop Event. See _start_heartbeat.
         self._heartbeats: set[asyncio.Future[None]] = set()
         # Body name -> ((mtime_ns, size), decodes as text). Checking a body means reading it whole,
         # and every save's quota scan asks, so a body that has not changed is not read twice.
         self._body_checks: dict[str, tuple[tuple[int, int], bool]] = {}
+        # The running UploadRetentionRunner's wake, or None (BACKLOG #3184). See wake_retention.
+        self._retention_wake: Callable[[], bool] | None = None
+
+    def wake_retention(self) -> bool:
+        """Ask the running :class:`UploadRetentionRunner` over this store to sweep now, and return
+        whether one is running (BACKLOG #3184).
+
+        The upload route calls this after a save, in place of sweeping on the request path, so a
+        large prune never adds to an upload's latency or meets its deadline. The runner's sweep is
+        audited like any other. It returns at once: the sweep runs in the runner's own task, and a
+        wake during a sweep starts one more sweep after it, never two at once. ``False`` means no
+        runner is running, as in an app built with ``create_app`` alone, and the caller sweeps
+        itself (:meth:`prune_on_save`). The cost: the sweep now finishes after the response, so an
+        upload sent straight after it can still be billed for expired files not yet removed. That
+        errs toward refusing, and clears once the sweep lands."""
+        wake = self._retention_wake
+        return wake is not None and wake()
+
+    def bind_retention_wake(self, wake: Callable[[], bool]) -> None:
+        """Make ``wake`` what :meth:`wake_retention` calls. It returns whether its runner's loop is
+        still running, so a loop that ended without a stop sends the caller back to sweeping for
+        itself. :meth:`UploadRetentionRunner.start` binds it. One runner per store: a second
+        binding replaces the first."""
+        self._retention_wake = wake
+
+    def unbind_retention_wake(self, wake: Callable[[], bool]) -> None:
+        """Undo :meth:`bind_retention_wake` for ``wake``, and leave any other binding alone."""
+        if self._retention_wake == wake:
+            self._retention_wake = None
 
     @property
     def max_bytes(self) -> int:
@@ -687,6 +760,14 @@ class UploadStore:
         its reason are stated."""
         return not isinstance(self._cipher, AesGcmCipher)
 
+    @property
+    def _refuses_plaintext(self) -> bool:
+        """True when this surface refuses every plaintext sidecar, which is the only place an upload
+        ``rotate-key`` cannot seal exists (:class:`_UnsealableUpload`). Under
+        ``[store].allow_unmarked_ciphertext`` the listing scan reads those sidecars itself."""
+        cipher = self._cipher
+        return isinstance(cipher, AesGcmCipher) and not cipher.allow_unmarked
+
     def _decrypt_blob(self, stored: str, file_id: str) -> bytes:
         b64 = self._cipher.decrypt(
             stored,
@@ -740,7 +821,9 @@ class UploadStore:
             if _FILE_ID_RE.match(fid):
                 yield fid, entry
 
-    def _scan_metas_sync(self) -> list[UploadedFileMeta]:
+    def _scan_metas_sync(
+        self, held: list[_UnsealableUpload] | None = None
+    ) -> list[UploadedFileMeta]:
         """Walk the uploads root and decrypt every well-formed ``.meta`` sidecar (UNSORTED). A
         bad/foreign/undecryptable sidecar is skipped **with its cause named** (never a body in the
         log), so a rotated-away key can neither sink the listing nor silently drop a quota/retention
@@ -767,15 +850,31 @@ class UploadStore:
         residual for all of that. The residual is named in ``docs/PHI.md`` §3: a refused upload is
         outside retention and the quota until ``rotate-key`` seals it, and ``serve`` logs the count
         at startup so the operator knows to run it. One kind ``rotate-key`` can never seal is
-        brought back by :meth:`_scan_unsealable_sync` instead, without trusting its sidecar. At least
-        a blank or non-UTF-8 sidecar is still left out.
+        brought back through ``held`` instead, without trusting its sidecar. At least a blank
+        sidecar, or one that is not UTF-8 within the part :meth:`_unsealable_sync` reads, is still
+        left out.
+
+        **``held`` is for the quota and the prune only (BACKLOG #2322, #3184).** When it is a list
+        and the cipher refuses plaintext, each refused sidecar that is an upload ``rotate-key``
+        cannot seal is appended to it, from this same directory walk, so a quota check walks the
+        directory once rather than twice. Nothing that lists or serves an upload passes it, so the
+        strict read is not loosened. Only a sidecar the cipher refused, or one that is not UTF-8
+        as a whole, is classed; the second covers a plaintext sidecar that is not UTF-8 only past
+        the part :meth:`_unsealable_sync` reads. A sidecar the cipher decrypted is sealed, and
+        :meth:`_unsealable_sync` would decline it anyway. The class is keyed by the PATH id, never
+        by the id in a sidecar's JSON.
 
         The cipher's own message is safe to log — every ``CipherError`` carries only key ids,
         marker versions and algorithm names, never a decrypted value. The malformed-shape branch
         logs only the exception TYPE, because a ``ValueError`` from coercing a metadata field can
         echo that field's value back into the message."""
         out: list[UploadedFileMeta] = []
+        sink = held if self._refuses_plaintext else None
+        bodies: set[str] = set()
         for fid, entry in self._iter_sidecars():
+            if sink is not None:
+                bodies.add(f"{fid}{_BLOB_SUFFIX}")
+            classify = False
             try:
                 out.append(self._decrypt_meta(entry.read_text(encoding="utf-8"), fid))
             except CipherError as exc:
@@ -783,45 +882,30 @@ class UploadStore:
                 # another cell, or the refusal of an unmarked (legacy, planted or downgraded)
                 # sidecar. Named on its own so these can be told apart from a damaged file.
                 _log.warning("uploaded-file sidecar %s: cipher declined it: %s", fid, exc)
+                classify = True
             except (OSError, UnicodeDecodeError) as exc:
                 # The bytes never reached the cipher — unreadable file, or not valid UTF-8.
                 _log.warning(
                     "uploaded-file sidecar %s: unreadable on disk: %s", fid, codec_safe_str(exc)
                 )
+                # A decode error is classed too: a plaintext sidecar that is not UTF-8 only past
+                # the part the class check reads is still one rotate-key can never seal. An
+                # OSError is not, so a stalled read is not paid twice under _quota_lock.
+                classify = isinstance(exc, UnicodeDecodeError)
             except (ValueError, TypeError, KeyError) as exc:
                 # Decrypted, but the JSON is malformed or a field will not coerce. Type only.
                 _log.warning(
                     "uploaded-file sidecar %s: malformed metadata (%s)", fid, type(exc).__name__
                 )
-        return out
-
-    def _scan_unsealable_sync(self) -> list[_UnsealableUpload]:
-        """Every upload ``rotate-key`` cannot seal that the listing scan refuses (BACKLOG #2322).
-
-        :meth:`_scan_metas_sync` drops each refused sidecar. Most wait for ``rotate-key``, but this
-        kind never stops being refused, so without this pass it would sit outside retention and the
-        quota forever, with a body that may hold message content. Only the quota and the prune read
-        this list. Nothing that lists or serves an upload does, so the strict read is not loosened.
-
-        Empty unless the cipher refuses plaintext. Under ``[store].allow_unmarked_ciphertext`` the
-        listing scan reads these sidecars itself, and counting them here too would bill them twice.
-        It opens every sidecar again rather than skip the ids that scan decrypted: a decrypted id is
-        the one in the sidecar's JSON, and a sealed plant can name another upload's id there. Sync:
-        the caller runs it off the event loop."""
-        cipher = self._cipher
-        if not isinstance(cipher, AesGcmCipher) or cipher.allow_unmarked:
-            return []
-        out: list[_UnsealableUpload] = []
-        bodies: set[str] = set()
-        for fid, sidecar in self._iter_sidecars():
-            bodies.add(f"{fid}{_BLOB_SUFFIX}")
-            held = self._unsealable_sync(fid, sidecar)
-            if held is not None:
-                out.append(held)
-        # Forget the checks of uploads that are gone, so the cache cannot outgrow the directory. A
-        # copy, because a scan on another worker thread may be writing to it.
-        for name in self._body_checks.copy().keys() - bodies:
-            self._body_checks.pop(name, None)
+            if classify and sink is not None:
+                lost = self._unsealable_sync(fid, entry)
+                if lost is not None:
+                    sink.append(lost)
+        if sink is not None:
+            # Forget the checks of uploads that are gone, so the cache cannot outgrow the directory.
+            # A copy, because a scan on another worker thread may be writing to it.
+            for name in self._body_checks.copy().keys() - bodies:
+                self._body_checks.pop(name, None)
         return out
 
     def _unsealable_sync(self, fid: str, sidecar: Path) -> _UnsealableUpload | None:
@@ -926,8 +1010,9 @@ class UploadStore:
         **A cancellation that reaches ``save`` after the pair landed removes it (BACKLOG #2262).**
         The caller writes ``upload.create`` only once this returns. A kept pair would be stored with
         no creation row, while the client was told the upload failed and may well retry it. A
-        removal the filesystem refuses is logged at ERROR. This covers ``save`` only. A caller
-        cancelled in its own audit write, after this returned, still keeps the file."""
+        removal the filesystem refuses is logged at ERROR. This covers ``save`` only. The API writes
+        the row after this returns as an operation the request deadline cannot cancel, and a row
+        that fails there removes the pair through :meth:`discard` (vault BACKLOG #3178)."""
         if not uploader_id:
             raise ValueError("uploader_id is required (an upload with no owner id is unreachable)")
         # Only the cheap size check runs on the loop; the sha256, the whole-file split, the cipher, and
@@ -1015,27 +1100,30 @@ class UploadStore:
             return meta
 
         # One critical section per process: quota check + write. See _quota_lock in __init__.
-        # Inside it, one cross-PROCESS reservation around the same window (ASVS 2.3.4). The order is
-        # load-bearing: reserve, THEN read the ledger's in-flight total, THEN scan the disk inside
-        # _build_and_write. UploadQuotaError carries the argument for why that order counts every
-        # sibling upload. The reservation is released only once the file is on disk (or the write
-        # fails), which is what the argument needs.
+        # Inside it, one cross-PROCESS reservation around the same window (ASVS 2.3.4), named by
+        # this save's file_id (vault BACKLOG #3180). The order is load-bearing: reserve, THEN read
+        # the ledger's in-flight total, THEN scan the disk inside _build_and_write.
+        # UploadQuotaError carries the argument for why that order counts every sibling upload. The
+        # reservation is released only once the file is on disk (or the write fails), which is what
+        # the argument needs.
         #
-        # The cancel handler sits OUTSIDE the lock so it also catches a cancellation that lands in
-        # the release await, after the write returned. A disk scan between the release and the
-        # removal over-counts the pair, which can refuse a sibling but never admits one too many.
-        # The reserve and the release each get a bounded wait to finish before a cancellation
-        # propagates, so a cancelled save normally pays its slot back (BACKLOG #2263). The cases
-        # that still leak are listed once, in UploadQuotaError.
-        try:
-            async with self._quota_lock:
+        # The cancel handler sits outside the release, so it also catches a cancellation that lands
+        # in the release await, after the write returned, and INSIDE the lock, so no other save in
+        # this process scans the disk while a pair about to be removed is still on it (vault BACKLOG
+        # #3180; that scan answered a spurious 409 at the quota edge). A sibling engine shard's scan between
+        # the release and the removal over-counts the pair, which can refuse it but never admits one
+        # too many. The reserve and the release each get a bounded wait to finish before a
+        # cancellation propagates, so a cancelled save normally pays its slot back (BACKLOG #2263).
+        # The cases that still leak are listed once, in UploadQuotaError.
+        async with self._quota_lock:
+            try:
                 reserved = await self._reserve_across_shards(
-                    uploader_id=uploader_id, uploader=uploader, size=len(data)
+                    uploader_id=uploader_id, uploader=uploader, size=len(data), reservation=file_id
                 )
                 stop_heartbeat = asyncio.Event()
                 try:
                     if reserved:
-                        self._start_heartbeat(uploader_id, stop_heartbeat)
+                        self._start_heartbeat(file_id, uploader_id, stop_heartbeat)
                     in_flight = (
                         await self._ledger.upload_quota_in_flight(uploader_id)
                         if self._ledger is not None
@@ -1045,18 +1133,56 @@ class UploadStore:
                 finally:
                     stop_heartbeat.set()
                     if reserved:
-                        await self._release_across_shards(uploader_id=uploader_id, size=len(data))
+                        await self._release_across_shards(
+                            reservation=file_id, uploader_id=uploader_id
+                        )
+            except asyncio.CancelledError:
+                if landed:
+                    # Cancel-resistant, like the write. A request deadline is delivered through
+                    # anyio task groups, which cancel again at every await, and a plain to_thread
+                    # job that is cancelled before a worker picks it up never runs at all. A
+                    # cleanup failure must not replace the cancellation, so it is logged and the
+                    # cancel raised.
+                    try:
+                        # Not discard(): this already holds _quota_lock.
+                        await _to_thread_to_completion(self._discard_cancelled_sync, file_id)
+                    except Exception:  # noqa: BLE001 — logged; the cancellation is what propagates
+                        _log.error("could not remove cancelled upload %s", file_id, exc_info=True)
+                raise
+
+    async def discard(self, file_id: str) -> None:
+        """Remove a stored pair whose ``upload.create`` row could not be written (vault BACKLOG
+        #3178), the way a save cancelled after it landed is removed. It holds ``_quota_lock`` while
+        it removes, as that save does, so no other save in this process scans the disk partway
+        through the removal. The lock is free while the row is being written, so a save in that
+        window still counts the pair. A refused removal is logged, never raised, and so is any other
+        failure of the removal: only a cancellation of the caller itself propagates.
+
+        **The removal outlives a cancellation, the wait for the lock included.** It runs as its own
+        task, held like the other stragglers. A cancelled caller waits up to
+        ``_LEDGER_CANCEL_WAIT_SECONDS`` for it, then propagates while it goes on. If the removal is
+        itself cancelled before it finishes, such as by the shutdown drain, an ERROR names the
+        ``file_id``, so a stored file with no creation row is never left without a record."""
+        removal = asyncio.ensure_future(self._discard_under_lock(file_id))
+        self._hold(removal, functools.partial(_log_discard_unfinished, file_id=file_id))
+        try:
+            await _wait_to_completion(removal, cancel_bound=_LEDGER_CANCEL_WAIT_SECONDS)
         except asyncio.CancelledError:
-            if landed:
-                # Cancel-resistant, like the write. A request deadline is delivered through anyio
-                # task groups, which cancel again at every await, and a plain to_thread job that
-                # is cancelled before a worker picks it up never runs at all. A cleanup failure
-                # must not replace the cancellation, so it is logged and the cancel raised.
-                try:
-                    await _to_thread_to_completion(self._discard_cancelled_sync, file_id)
-                except Exception:  # noqa: BLE001 — logged; the cancellation is what propagates
-                    _log.error("could not remove cancelled upload %s", file_id, exc_info=True)
-            raise
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise
+            # The removal was cancelled, not this caller; _log_discard_unfinished named it.
+        except Exception:  # noqa: BLE001, S110 — _log_discard_unfinished logged it by file_id
+            pass
+
+    async def _discard_under_lock(self, file_id: str) -> None:
+        async with self._quota_lock:
+            try:
+                await _to_thread_to_completion(self._discard_cancelled_sync, file_id)
+            except asyncio.CancelledError:
+                # _to_thread_to_completion raises only once the thread has finished the removal,
+                # so it is done; ending normally keeps _log_discard_unfinished from saying it is not.
+                return
 
     def _discard_cancelled_sync(self, file_id: str) -> None:
         """Remove a pair whose save was cancelled after it landed (BACKLOG #2262; see :meth:`save`).
@@ -1072,20 +1198,27 @@ class UploadStore:
             meta_path.unlink(missing_ok=True)
         except OSError as exc:
             _log.error(
-                "upload %s was cancelled after its file landed and was not fully removed; what "
-                "remains has no upload.create audit row: %s",
+                "upload %s was cancelled after its file landed, or its upload.create row failed, "
+                "and it was not fully removed; what remains may have no upload.create audit "
+                "row: %s",
                 file_id,
                 exc,
             )
 
-    async def _reserve_across_shards(self, *, uploader_id: str, uploader: str, size: int) -> bool:
-        """Take this uploader's cross-shard in-flight reservation; return whether one is held.
+    async def _reserve_across_shards(
+        self, *, uploader_id: str, uploader: str, size: int, reservation: str
+    ) -> bool:
+        """Take this upload's engine-shard reservation, named ``reservation``; return whether one is
+        held.
 
         ``False`` means there is no ledger bound (the store-less construction path) — not that the
         reservation was refused. A refusal raises :class:`UploadQuotaError`, the same TYPE the
         in-process check raises, so the API's 409 + ``upload.reject_quota`` audit is unchanged; the
         message differs on purpose, so an operator can tell the two causes apart. A ledger error is
-        NOT swallowed: the store being unreachable fails the upload closed.
+        NOT swallowed: the store being unreachable fails the upload closed. It may have committed
+        before it raised, so the reservation is released by its id, and that release is awaited
+        before the error propagates, for at most ``_LEDGER_CANCEL_WAIT_SECONDS`` (vault BACKLOG
+        #3180).
 
         **This is not the quota decision (BACKLOG #1941).** ``save`` makes that after reserving, from
         a read of the ledger plus a fresh disk scan; :class:`UploadQuotaError` says why the order
@@ -1094,11 +1227,12 @@ class UploadStore:
         two same-moment uploads be refused at the ledger, rather than both reserving and each then
         refusing the other.
 
-        That makes two sidecar scans per save, this one and the one in ``_build_and_write``. Each
-        reads and decrypts EVERY sidecar in the directory, for every uploader, then filters, and walks
-        it once more for an upload ``rotate-key`` cannot seal (BACKLOG #2322). Both
-        run under the per-process ``_quota_lock``. They run off the event loop, on the operator
-        diagnostic surface rather than the data plane.
+        That makes two sidecar scans per save, this one and the one in ``_build_and_write``, and the
+        ordering argument needs both: this one is before the reserve and that one after the ledger
+        read. Each is ONE walk of the directory (BACKLOG #3184) that reads and decrypts EVERY sidecar,
+        for every uploader, then filters, and classes each refused one for an upload ``rotate-key``
+        cannot seal (BACKLOG #2322). Both run under the per-process ``_quota_lock``. They run off the
+        event loop, on the operator diagnostic surface rather than the data plane.
 
         An uploader already over budget on disk is refused here, with the on-disk wording, before the
         ledger is consulted. Otherwise a zero-headroom ledger would refuse first, and its message would
@@ -1116,11 +1250,11 @@ class UploadStore:
             raise refusal
         # A cancellation can arrive after the store committed the reserve but before the call
         # returned, so `save` never learns a slot is held and its release never runs (BACKLOG #2263).
-        # Finish the call, then pay back what it took before the cancellation propagates.
+        # Finish the call, then pay back by id whatever it took before the cancellation propagates.
         reserve = asyncio.ensure_future(
             self._ledger.reserve_upload_quota(
                 uploader_id,
-                files=1,
+                reservation,
                 size_bytes=size,
                 max_files=self._max_files_per_user - observed_files,
                 max_total_bytes=self._max_total_bytes_per_user - observed_bytes,
@@ -1130,9 +1264,22 @@ class UploadStore:
             ok = await _wait_to_completion(reserve, cancel_bound=_LEDGER_CANCEL_WAIT_SECONDS)
         except asyncio.CancelledError:
             if not reserve.done():
-                self._leave_running(reserve, what="reserve", uploader_id=uploader_id, size=size)
-            elif self._reserve_took_a_slot(reserve, uploader_id):
-                await self._release_across_shards(uploader_id=uploader_id, size=size)
+                self._leave_running(
+                    reserve, what="reserve", uploader_id=uploader_id, reservation=reservation
+                )
+            elif self._reserve_may_hold_a_slot(reserve, uploader_id):
+                await self._release_across_shards(reservation=reservation, uploader_id=uploader_id)
+            raise
+        except Exception:
+            # Its outcome is unknown, and a release by id pays back exactly what it took, if
+            # anything. Awaited, under _quota_lock, before the error propagates: a release that was
+            # only started let an immediate retry in this process reserve while its own orphan row
+            # was still counted, and be refused at the quota edge as "another engine shard". The
+            # wait is bounded, so a stalled store cannot hold the lock and every queued save. The
+            # release never raises a ledger error, so the reserve's error is what propagates.
+            release = self._release_later(reservation, uploader_id)
+            if release is not None:
+                await asyncio.wait((release,), timeout=_LEDGER_CANCEL_WAIT_SECONDS)
             raise
         if not ok:
             raise self._shard_refusal(
@@ -1141,75 +1288,117 @@ class UploadStore:
         return True
 
     @staticmethod
-    def _reserve_took_a_slot(reserve: asyncio.Future[bool], uploader_id: str) -> bool:
-        """Whether a finished reserve, abandoned by a cancelled save, holds a slot to pay back.
+    def _reserve_may_hold_a_slot(reserve: asyncio.Future[bool], uploader_id: str) -> bool:
+        """Whether a finished reserve, abandoned by a cancelled save, may hold a slot to pay back.
 
-        A reserve that raised is NOT paid back. Its outcome is unknown, and a release when nothing
-        committed would subtract a sibling shard's live slot and let an upload past the cap."""
+        Only a refusal holds none. A reserve that was cancelled or raised may have committed, and
+        the release is by its own id, so paying it back can never touch a sibling's slot (vault
+        BACKLOG #3180). Either is logged, which also marks its error retrieved."""
         if reserve.cancelled():
             _log.warning(
-                "the cross-shard upload reserve for %s was cancelled before it finished; a slot "
-                "it took is not paid back",
+                "the engine-shard upload reserve for %s was cancelled before it finished; a slot "
+                "it may have taken is released by its id",
                 uploader_id,
             )
-            return False
+            return True
         exc = reserve.exception()
         if exc is not None:
             _log.warning(
-                "the cross-shard upload reserve for %s failed while the upload was being "
-                "cancelled; a slot it took is not paid back",
+                "the engine-shard upload reserve for %s failed while the upload was being "
+                "cancelled; a slot it may have taken is released by its id",
                 uploader_id,
                 exc_info=exc,
             )
-            return False
+            return True
         return reserve.result()
 
-    def _start_heartbeat(self, uploader_id: str, stop: asyncio.Event) -> None:
-        """Touch this save's ledger row every ``_RESERVATION_HEARTBEAT_SECONDS`` until ``stop`` is
+    def _start_heartbeat(self, reservation: str, uploader_id: str, stop: asyncio.Event) -> None:
+        """Touch this save's reservation every ``_RESERVATION_HEARTBEAT_SECONDS`` until ``stop`` is
         set, so a slow save keeps its slot (BACKLOG #2648; :class:`UploadQuotaError` states the
-        residual). The touch is a release of zero files and zero bytes: it changes no count and only
-        moves the row's clock. So a touch that lands after the save's release is harmless, and
-        ``stop`` is a signal, never a wait. A failed touch is logged and the next one tried."""
+        residual). The touch moves only this reservation's clock (vault BACKLOG #3180). A touch
+        that lands after the save's release finds no row and changes nothing, so ``stop`` is a
+        signal, never a wait. A failed touch is logged and the next one tried.
+
+        **The wait for a touch is bounded, and the heartbeat never cancels a touch (BACKLOG
+        #3256).** The heartbeat waits ``_RESERVATION_TOUCH_WAIT_SECONDS`` for it, then goes on, so a
+        touch stuck on the store no longer holds the heartbeat or its lifetime cap, and a ``stop``
+        during the wait ends it at once. The stuck touch is left to land on its own, which still
+        moves the reservation's clock when it does, and no second touch starts while it runs, so a
+        stalled store never collects one abandoned statement per interval. One still running when
+        the heartbeat ends is held like the other stragglers, and so is capped at
+        ``_LEDGER_STRAGGLER_MAX_SECONDS`` and cancelled by the shutdown drain. The cost: a touch
+        that never returns ends the refreshing for that save, which :class:`UploadQuotaError`
+        lists."""
         ledger = self._ledger
         if ledger is None:
             return
 
+        def _missed(touch: asyncio.Future[Any]) -> None:
+            if not touch.cancelled() and touch.exception() is not None:
+                _log.warning(
+                    "could not refresh the engine-shard upload reservation for %s; it may be "
+                    "reclaimed if the upload outlasts the staleness window",
+                    uploader_id,
+                    exc_info=touch.exception(),
+                )
+
         async def _beat() -> None:
             deadline = time.monotonic() + _RESERVATION_HEARTBEAT_MAX_SECONDS
-            while not stop.is_set():
-                try:
-                    await asyncio.wait_for(stop.wait(), _RESERVATION_HEARTBEAT_SECONDS)
-                except TimeoutError:
-                    if time.monotonic() >= deadline:
-                        _log.warning(
-                            "an upload by %s is still writing after %gs; its cross-shard "
-                            "reservation is no longer refreshed and may be reclaimed",
-                            uploader_id,
-                            _RESERVATION_HEARTBEAT_MAX_SECONDS,
-                        )
-                        return
+            touch: asyncio.Future[None] | None = None
+            try:
+                while not stop.is_set():
                     try:
-                        await ledger.reserve_upload_quota(uploader_id, files=0, size_bytes=0)
-                    except Exception:  # noqa: BLE001 — a missed touch must not fail the upload
-                        _log.warning(
-                            "could not refresh the cross-shard upload reservation for %s; it may "
-                            "be reclaimed if the upload outlasts the staleness window",
-                            uploader_id,
-                            exc_info=True,
-                        )
+                        await asyncio.wait_for(stop.wait(), _RESERVATION_HEARTBEAT_SECONDS)
+                    except TimeoutError:
+                        if time.monotonic() >= deadline:
+                            _log.warning(
+                                "an upload by %s is still writing after %gs; its engine-shard "
+                                "reservation is no longer refreshed and may be reclaimed",
+                                uploader_id,
+                                _RESERVATION_HEARTBEAT_MAX_SECONDS,
+                            )
+                            return
+                        if touch is not None and not touch.done():
+                            continue  # the last touch is still running; it is not doubled
+                        touch = asyncio.ensure_future(ledger.touch_upload_quota(reservation))
+                        # On the touch itself, so a failure that lands after the wait is logged.
+                        touch.add_done_callback(_missed)
+                        stopped = asyncio.ensure_future(stop.wait())
+                        try:
+                            await asyncio.wait(
+                                {touch, stopped},
+                                timeout=_RESERVATION_TOUCH_WAIT_SECONDS,
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                        finally:
+                            stopped.cancel()
+                        if not touch.done() and not stop.is_set():
+                            _log.warning(
+                                "an engine-shard upload reservation touch for %s did not finish "
+                                "within %gs; it was left running, and the next waits for it",
+                                uploader_id,
+                                _RESERVATION_TOUCH_WAIT_SECONDS,
+                            )
+            finally:
+                if touch is not None and not touch.done():
+                    # Still referenced, and _missed still logs its outcome. Capped like every other
+                    # straggler, so a stalled store does not collect one per save (vault BACKLOG
+                    # #3180); a touch cancelled there moves no clock, which is all it would do.
+                    self._hold(touch, cap=_LEDGER_STRAGGLER_MAX_SECONDS)
 
         task = asyncio.ensure_future(_beat())
         self._heartbeats.add(task)
         task.add_done_callback(self._heartbeats.discard)
 
     def _leave_running(
-        self, fut: asyncio.Future[Any], *, what: str, uploader_id: str, size: int
+        self, fut: asyncio.Future[Any], *, what: str, uploader_id: str, reservation: str
     ) -> None:
-        """Let a ledger call a cancelled save stopped waiting for finish on its own (BACKLOG #2263).
+        """Let a ledger call a cancelled save stopped waiting for finish on its own (BACKLOG #2263),
+        for at most ``_LEDGER_STRAGGLER_MAX_SECONDS`` (vault BACKLOG #3180).
 
-        A reserve that then turns out to hold a slot is paid back by a fresh release."""
+        A reserve that then may hold a slot is paid back by a fresh release, by its id."""
         _log.warning(
-            "the cross-shard upload %s for %s did not finish within %gs of a cancellation; it "
+            "the engine-shard upload %s for %s did not finish within %gs of a cancellation; it "
             "was left running",
             what,
             uploader_id,
@@ -1217,37 +1406,136 @@ class UploadStore:
         )
 
         def _done(done: asyncio.Future[Any]) -> None:
-            if what == "reserve":
-                if self._reserve_took_a_slot(done, uploader_id):
-                    self._hold(
-                        asyncio.ensure_future(
-                            self._release_across_shards(uploader_id=uploader_id, size=size)
-                        )
-                    )
-            elif done.cancelled():
+            if what != "reserve":
+                _log_release_cancelled(done, uploader_id)
+            elif done in self._drain_cancelled:
+                # The drain cancelled it because the store is about to close, so nothing new
+                # starts against it; the slot is reclaimed once it goes stale. This line is its
+                # one record, so a reserve error is marked retrieved here rather than logged.
+                if not done.cancelled():
+                    done.exception()
                 _log.warning(
-                    "the cross-shard upload release for %s was cancelled before it finished; "
-                    "its slot is not paid back",
+                    "shutdown: a slot the engine-shard upload reserve for %s may have taken is "
+                    "not released; it is reclaimed once it goes stale",
                     uploader_id,
                 )
+            elif self._reserve_may_hold_a_slot(done, uploader_id):
+                self._release_later(reservation, uploader_id)
 
-        self._hold(fut, _done)
+        self._hold(fut, _done, cap=_LEDGER_STRAGGLER_MAX_SECONDS)
+
+    def _release_later(self, reservation: str, uploader_id: str) -> asyncio.Future[None] | None:
+        """Start a release of ``reservation``, held for at most ``_LEDGER_STRAGGLER_MAX_SECONDS``
+        (vault BACKLOG #3180), and return it, or ``None`` with no ledger. The held task is the
+        store call itself, so the cap or the shutdown drain cancels the call, not a wrapper that
+        would absorb the cancellation. A caller may wait on it; nothing has to."""
+        ledger = self._ledger
+        if ledger is None:
+            return None
+        release = asyncio.ensure_future(_release_reservation(ledger, reservation, uploader_id))
+        self._hold(
+            release,
+            functools.partial(_log_release_cancelled, uploader_id=uploader_id),
+            cap=_LEDGER_STRAGGLER_MAX_SECONDS,
+        )
+        return release
 
     def _hold(
         self,
         fut: asyncio.Future[Any],
         on_done: Callable[[asyncio.Future[Any]], None] | None = None,
+        *,
+        cap: float | None = None,
     ) -> None:
         """Keep ``fut`` referenced in ``_stragglers`` until it finishes, then call ``on_done``.
-        The loop holds a Task only weakly, so a task nobody awaits any more must be held here."""
+        The loop holds a Task only weakly, so a task nobody awaits any more must be held here.
+        ``cap`` cancels ``fut`` if it is still running that many seconds on (vault BACKLOG #3180),
+        which keeps the set bounded while a store stalls."""
         self._stragglers.add(fut)
+        timer = asyncio.get_running_loop().call_later(cap, fut.cancel) if cap is not None else None
 
         def _done(done: asyncio.Future[Any]) -> None:
             self._stragglers.discard(done)
+            if timer is not None:
+                timer.cancel()
             if on_done is not None:
                 on_done(done)
 
         fut.add_done_callback(_done)
+
+    async def drain_stragglers_within(self, budget: float) -> None:
+        """:meth:`drain_stragglers` with both of its waits fitted inside ``budget`` seconds, the
+        form a shutdown step under one teardown budget calls (BACKLOG #3191). Two thirds of it
+        waiting and the rest the grace for what it then cancels, each capped at the drain's own
+        default."""
+        wait = max(0.0, min(_STRAGGLER_DRAIN_SECONDS, budget * 2 / 3))
+        await self.drain_stragglers(
+            wait, grace=max(0.0, min(_STRAGGLER_CANCEL_GRACE_SECONDS, budget - wait))
+        )
+
+    async def drain_stragglers(
+        self,
+        timeout: float = _STRAGGLER_DRAIN_SECONDS,
+        *,
+        grace: float = _STRAGGLER_CANCEL_GRACE_SECONDS,
+    ) -> None:
+        """Let what a cancelled save left running finish before the store closes (vault BACKLOG
+        #3180): the ledger calls, the late releases they spawn, and the save-time sweeps. The
+        lifespan calls it before ``engine.stop()``.
+
+        It waits up to ``timeout``. A reserve that finishes inside that wait still starts its
+        release, and the wait covers that release too. Then it cancels what is left, live saves'
+        heartbeats included, and waits up to ``grace`` for those to end and for any release one of
+        them started meanwhile; such a release still running at ``grace`` is cancelled. A reserve it cancelled
+        spawns no release when it ends, however long past ``grace`` that is, so nothing new starts
+        against a store about to close; a slot it may have taken goes stale. Only those reserves
+        are refused, so a lifespan that runs again on this store releases normally. A sweep it
+        cancels logs each file it removed with no row, as a shutdown cancel always has."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while self._stragglers and (remaining := deadline - loop.time()) > 0:
+            await asyncio.wait(set(self._stragglers), timeout=remaining)
+        left = set(self._stragglers) | set(self._heartbeats)
+        if not left:
+            return
+        if self._stragglers:
+            _log.warning(
+                "shutdown: cancelling %d upload ledger call(s) or save-time sweep(s) still "
+                "running after %gs",
+                len(self._stragglers),
+                timeout,
+            )
+        # Each discard is registered after the task's own callbacks, so a reserve's done callback
+        # still finds it here and starts no release.
+        # A task already done is not cancelled and keeps its own outcome: a reserve that finished
+        # in the same pass as the wait's timeout still pays its slot back.
+        for task in left:
+            if task.cancel():
+                self._drain_cancelled.add(task)
+                task.add_done_callback(self._drain_cancelled.discard)
+        # The grace covers what a callback starts meanwhile too: a release from a reserve that
+        # finished before the cancel reached it. One still running at the bound is cancelled and
+        # marked like the rest, so a reserve among them starts no release; the drain does not wait
+        # for it to unwind, as it does not for anything still stuck in `left`.
+        # The first wait runs even when everything in `left` is done: it is also the loop pass in
+        # which a done task's own callbacks run and start that release.
+        deadline = loop.time() + grace
+        await asyncio.wait(left, timeout=grace)
+        while (pending := {t for t in left | self._stragglers if not t.done()}) and (
+            remaining := deadline - loop.time()
+        ) > 0:
+            await asyncio.wait(pending, timeout=remaining)
+        stuck = {t for t in left | self._stragglers if not t.done()}
+        for task in stuck - left:
+            if task.cancel():
+                self._drain_cancelled.add(task)
+                task.add_done_callback(self._drain_cancelled.discard)
+        if stuck:
+            _log.error(
+                "shutdown: %d cancelled upload task(s) had not finished after %gs",
+                len(stuck),
+                grace,
+            )
 
     def _shard_refusal(
         self, *, uploader: str, observed_files: int, observed_bytes: int
@@ -1268,7 +1556,7 @@ class UploadStore:
         """The per-uploader quota verdict against what is ALREADY on disk, or ``None`` if it fits.
 
         One string, two callers: the under-lock check inside ``save``'s build-and-write, and the
-        cross-shard reservation's pre-check. The bucket key is the IMMUTABLE ``uploader_id`` (the
+        engine-shard reservation's pre-check. The bucket key is the IMMUTABLE ``uploader_id`` (the
         caller filters on it, the same value the ownership check uses), so the budget and the
         ownership rule can never disagree about who a file belongs to and a recycled username is
         never billed for files it cannot read. The message names the human username, because an
@@ -1286,10 +1574,10 @@ class UploadStore:
             )
         return None
 
-    async def _release_across_shards(self, *, uploader_id: str, size: int) -> None:
-        """Pay the reservation back. Never raises a ledger error: the file is already written (or
-        already failed) by the time this runs, so turning a ledger blip into a failed upload would be
-        strictly worse.
+    async def _release_across_shards(self, *, reservation: str, uploader_id: str) -> None:
+        """Pay the reservation back, by its id (vault BACKLOG #3180). Never raises a ledger error:
+        the file is already written (or already failed) by the time this runs, so turning a ledger
+        blip into a failed upload would be strictly worse.
 
         **A cancellation waits for the release to finish, then propagates (BACKLOG #2263).** A request
         deadline arrives through an anyio scope that cancels again at every await, so a plain await
@@ -1297,36 +1585,22 @@ class UploadStore:
         caller is cancelled, the wait is bounded by ``_LEDGER_CANCEL_WAIT_SECONDS``, so a stuck store
         cannot hold ``_quota_lock`` and the cancellation indefinitely. That includes a cancellation
         an earlier wait already absorbed. A release still running at the bound is logged and left
-        to finish on its own, which pays the slot back if it succeeds.
+        to finish on its own, for at most ``_LEDGER_STRAGGLER_MAX_SECONDS``.
 
-        A reservation that is never released is reclaimed once the row goes stale, **but only once
-        that uploader is otherwise IDLE**: this release, like every applied reserve and heartbeat,
-        restarts the row's staleness clock. :class:`UploadQuotaError` states the residual."""
+        A reservation that is never released is reclaimed once it goes stale, whatever else its
+        uploader does: only its own reserve and its own heartbeat move its clock.
+        :class:`UploadQuotaError` states the residual."""
         ledger = self._ledger
         if ledger is None:
             return
-
-        # The log sits inside the task, so a failure is reported in this module's words whether or
-        # not the caller is being cancelled, and the task never ends in an error of its own.
-        async def _release() -> None:
-            try:
-                await ledger.reserve_upload_quota(
-                    uploader_id, files=-1, size_bytes=-size, max_files=0, max_total_bytes=0
-                )
-            except Exception:  # noqa: BLE001 — a release failure must not fail an upload that landed
-                _log.warning(
-                    "could not release the cross-shard upload reservation for %s; it will be "
-                    "reclaimed when it goes stale",
-                    uploader_id,
-                    exc_info=True,
-                )
-
-        release = asyncio.ensure_future(_release())
+        release = asyncio.ensure_future(_release_reservation(ledger, reservation, uploader_id))
         try:
             await _wait_to_completion(release, cancel_bound=_LEDGER_CANCEL_WAIT_SECONDS)
         except asyncio.CancelledError:
             if not release.done():
-                self._leave_running(release, what="release", uploader_id=uploader_id, size=size)
+                self._leave_running(
+                    release, what="release", uploader_id=uploader_id, reservation=reservation
+                )
             raise
 
     def _observed_sync(self, uploader_id: str) -> tuple[int, int]:
@@ -1334,10 +1608,12 @@ class UploadStore:
         the budget. Sync: the caller runs it off the event loop.
 
         An upload ``rotate-key`` cannot seal counts too, at its body's size on disk (BACKLOG #2322).
-        Its owner is unverified, so this errs toward refusing; :class:`_UnsealableUpload` says why."""
-        metas = self._scan_metas_sync()
+        Its owner is unverified, so this errs toward refusing; :class:`_UnsealableUpload` says why.
+        Both kinds come from one walk of the directory (BACKLOG #3184)."""
+        held: list[_UnsealableUpload] = []
+        metas = self._scan_metas_sync(held)
         sizes = [m.size for m in metas if m.uploader_id == uploader_id]
-        sizes += [h.size for h in self._scan_unsealable_sync() if h.uploader_id == uploader_id]
+        sizes += [h.size for h in held if h.uploader_id == uploader_id]
         return len(sizes), sum(sizes)
 
     async def list_files(self) -> list[UploadedFileMeta]:
@@ -1397,7 +1673,12 @@ class UploadStore:
 
         ``sidecar_refused`` says the caller's own :meth:`get_meta` was just refused. The sidecar is
         then not decrypted again, so one delete raises one cipher WARNING and one alert, not two.
-        Only the never-sealable kind is removed either way."""
+        It does not widen what is removed: of the uploads whose sidecar is refused, only the
+        never-sealable kind is removed, whether the refusal was the caller's read or this call's own.
+        The flag does not authorize anything either. The route decides who may pass it.
+
+        A sidecar that is gone by the time it is classed answers :class:`UploadNotFoundError`, as an
+        absent one does (BACKLOG #3240). It is checked again only after the class is refused."""
 
         def _delete() -> UploadedFileMeta:
             blob_path, meta_path = self._paths(file_id)
@@ -1405,14 +1686,9 @@ class UploadStore:
             refusal = _REFUSED_NOT_UNSEALABLE
             if sidecar_refused:
                 # The store checks the caller's claim: only a cipher that refuses plaintext can
-                # hold the never-sealable kind, as in _scan_unsealable_sync.
-                cipher = self._cipher
-                if not isinstance(cipher, AesGcmCipher) or cipher.allow_unmarked:
+                # hold the never-sealable kind.
+                if not self._refuses_plaintext:
                     raise UploadUnreadableError(refusal)
-                try:
-                    meta_path.stat()
-                except FileNotFoundError as exc:
-                    raise UploadNotFoundError(file_id) from exc
             else:
                 try:
                     meta = self._decrypt_meta(meta_path.read_text(encoding="utf-8"), file_id)
@@ -1423,6 +1699,14 @@ class UploadStore:
             if meta is None:
                 held = self._unsealable_sync(file_id, meta_path)
                 if held is None:
+                    # _unsealable_sync declines a sidecar it cannot open, so tell an absent one,
+                    # whether it was never there or went since the read, from a refused one.
+                    # Only FileNotFoundError means absent. Any other OSError propagates, as it does
+                    # from the read above, and is never answered as a missing file.
+                    try:
+                        meta_path.lstat()
+                    except FileNotFoundError as exc:
+                        raise UploadNotFoundError(file_id) from exc
                     raise UploadUnreadableError(refusal)
                 meta = held.as_meta()
             # Remove the body first, then the sidecar (best-effort on the body — the sidecar is the
@@ -1454,10 +1738,12 @@ class UploadStore:
         whole-directory crypto sweep is unbounded boot-time work over a directory with no batching
         seam.
 
-        Same contract as the store's pass: rewrites values that are plaintext **or** under a retired
-        key, skips values already under the active key (so it is idempotent), and lets a
-        :class:`CipherError` propagate rather than dropping data — a value no configured key opens
-        means the prior key was not supplied, and the CLI says so. Also mirrors its **limitation**:
+        Like the store's pass, it rewrites values that are plaintext **or** under a retired key and
+        skips values already under the active key (so it is idempotent). **Unlike it, a value no
+        configured key opens does not abort the pass (BACKLOG #3181).** It is left as it was and
+        counted in ``skipped``, and the pass moves on, so one damaged upload cannot hold back every
+        other one. Nothing is dropped, and a non-zero ``skipped`` fails ``rotate-key``, which names
+        both causes: a prior key not supplied, or a damaged file. Also mirrors its **limitation**:
         a non-``AesGcmCipher`` (the identity cipher, or a ``vault_transit`` cipher whose DEK never
         enters the heap) rotates nothing and returns zeros, exactly as ``reencrypt_to_active`` does.
 
@@ -1480,7 +1766,9 @@ class UploadStore:
         **It does not seal a plaintext sidecar over a body it did not seal (BACKLOG #2322).** Sealing
         it would list an upload with no usable body, and would seal a planted lone sidecar too. Where
         the body is missing or is not text, no re-run can change that, so the upload is counted in
-        ``unsealable`` rather than ``skipped``, and the retention prune removes it at expiry.
+        ``unsealable`` rather than ``skipped``, and the retention prune removes it at expiry. The same
+        body under a SEALED sidecar is counted in ``body_lost``, also not a skip, and its sidecar is
+        re-sealed.
 
         Runs entirely off the event loop."""
         return await asyncio.to_thread(self._reseal_to_active_sync)
@@ -1494,7 +1782,7 @@ class UploadStore:
         if not root.is_dir():
             return ResealResult()
         active = cipher.active_marker_prefix
-        resealed = skipped = sealed_plaintext = unsealable = 0
+        resealed = skipped = sealed_plaintext = unsealable = body_lost_count = 0
         for fid, _sidecar in self._iter_sidecars():
             try:
                 blob_path, meta_path = self._paths(fid)
@@ -1505,7 +1793,7 @@ class UploadStore:
                 skipped += 1
                 _log.warning("uploaded file %s: skipped, its id fails the path guard", fid)
                 continue
-            had_plaintext = pair_skipped = False
+            had_plaintext = pair_skipped = body_lost = False
             # The sidecar carries the AAD kind "meta"; the body carries "body" (see _encrypt_meta /
             # _encrypt_blob). Re-binding the SAME cell AAD is what keeps a re-sealed value readable.
             # Body FIRST, as save() writes it: the sidecar is the listing key, and a keyed store
@@ -1523,9 +1811,18 @@ class UploadStore:
                             continue  # already under the active key in the active format
                     stored = path.read_text(encoding="utf-8")
                 except (OSError, UnicodeDecodeError) as exc:
-                    # A half-deleted pair or an unreadable file. Counted and named, never silent:
-                    # this file may still be under the OLD key and the operator must not retire it
-                    # yet.
+                    if kind == "body" and self._lost_body_size(path) is not None:
+                        # BACKLOG #3181: the body is missing or is not text, so no key reads it and
+                        # no re-run changes that. It holds nothing under the OLD key, so it is not a
+                        # skip; counting one would fail every later run for good. The sidecar is
+                        # still handled below, as the unsealable kind when it is plaintext.
+                        body_lost = True
+                        _log.warning(
+                            "uploaded file %s (body): missing or not text; no key can read it", fid
+                        )
+                        continue
+                    # An unreadable file. Counted and named, never silent: this file may still be
+                    # under the OLD key and the operator must not retire it yet.
                     pair_skipped = True
                     _log.warning(
                         "uploaded file %s (%s): skipped, unreadable: %s",
@@ -1538,7 +1835,11 @@ class UploadStore:
                 # The body is missing or is not text: the one test the prune and the quota use too.
                 # Asked even when the body pass succeeded, because that pass trusts a body whose
                 # first bytes are the active marker without reading the rest.
-                lost = plaintext and kind == "meta" and self._lost_body_size(blob_path) is not None
+                lost = (
+                    plaintext
+                    and kind == "meta"
+                    and (body_lost or self._lost_body_size(blob_path) is not None)
+                )
                 if plaintext and (pair_skipped or lost):
                     # BACKLOG #2322: the body was not sealed, so a PLAINTEXT sidecar stays as it is.
                     # A keyed store refuses it, so the upload is unlisted; sealing it would list an
@@ -1548,7 +1849,7 @@ class UploadStore:
                     if lost:
                         # No key reads either half and no re-run changes that, so it is not a skip.
                         # It stays refused, and the prune removes it at expiry.
-                        pair_skipped = False
+                        pair_skipped = body_lost = False
                         unsealable += 1
                         _log.warning(
                             "uploaded file %s (meta): left unsealed for good, its body is missing "
@@ -1560,34 +1861,71 @@ class UploadStore:
                             "uploaded file %s (meta): left unsealed, its body was not", fid
                         )
                     continue
-                had_plaintext |= plaintext
                 aad = cell_aad("uploaded_file", kind, fid)
-                # A CipherError here means a prior key was not supplied. It PROPAGATES, before any
-                # write, so the operator is told to supply it rather than losing the file.
-                _atomic_write_text(root, path, _reencrypt_value(cipher, stored, aad))
-                # Drop the file-sized buffer before the next iteration allocates its own. Without
+                try:
+                    sealed = _reencrypt_value(cipher, stored, aad)
+                except _UnopenableValueError as exc:
+                    # It could not be decrypted. The causes include at least a prior key that was
+                    # not supplied, a damaged value, and a marker this cipher does not read, so the
+                    # log names the class and not one cause. Nothing is written, so the file is left exactly as it was, and it is a
+                    # skip, which fails the command and withholds the rotation stamp (BACKLOG
+                    # #3181). One bad upload used to abort the whole pass, and the CLI then blamed
+                    # a missing prior key for what may be one damaged file. An encrypt-side refusal
+                    # is not caught here and still aborts. Only the cause's class is logged: a
+                    # malformed marker's key id is cut from the stored text up to the next ':', so
+                    # the cipher's message can carry a piece of a damaged or planted file.
+                    pair_skipped = True
+                    _log.warning(
+                        "uploaded file %s (%s): skipped, it could not be decrypted (%s)",
+                        fid,
+                        kind,
+                        type(exc.__cause__ or exc).__name__,
+                    )
+                    del stored  # the pass goes on now, so free the buffer as the write path does
+                    continue
+                # Drop each file-sized buffer before the next iteration allocates its own. Without
                 # this the previous file's plaintext stays reachable from the frame while the next
                 # one is read, roughly doubling peak memory for no reason.
                 del stored
+                try:
+                    _atomic_write_text(root, path, sealed)
+                except OSError as exc:
+                    # The write failed and the temp-and-replace left the file as it was. A skip, like
+                    # a read failure, so one file that cannot be written does not stop the pass.
+                    pair_skipped = True
+                    _log.warning(
+                        "uploaded file %s (%s): skipped, could not be written: %s",
+                        fid,
+                        kind,
+                        codec_safe_str(exc),
+                    )
+                    continue
+                finally:
+                    del sealed
+                had_plaintext |= plaintext
                 resealed += 1
-            # Once per pair, whichever half failed. A skipped pair is not readable yet, so its
-            # sealed plaintext half did not turn it "from refused into readable".
+            # Once per pair, whichever half failed. A skipped pair counts in sealed_plaintext too
+            # when it had a plaintext half sealed (BACKLOG #3240): its sidecar may be sealed
+            # already, and then no later run sees any plaintext in it to count.
             skipped += pair_skipped
-            sealed_plaintext += had_plaintext and not pair_skipped
-        if resealed or skipped or unsealable:
+            sealed_plaintext += had_plaintext
+            body_lost_count += body_lost and not pair_skipped
+        if resealed or skipped or unsealable or body_lost_count:
             _log.info(
                 "re-sealed %d uploaded-file value(s) under the active key, sealing %d plaintext "
-                "upload(s) (%d upload(s) skipped, %d that cannot be sealed)",
+                "upload(s) (%d upload(s) skipped, %d that cannot be sealed, %d whose body is lost)",
                 resealed,
                 sealed_plaintext,
                 skipped,
                 unsealable,
+                body_lost_count,
             )
         return ResealResult(
             resealed=resealed,
             skipped=skipped,
             sealed_plaintext=sealed_plaintext,
             unsealable=unsealable,
+            body_lost=body_lost_count,
         )
 
     async def warn_if_unsealed(self) -> int:
@@ -1674,6 +2012,7 @@ class UploadStore:
         retention_days: int | None = None,
         abort: threading.Event | None = None,
         tally: _SweepTally | None = None,
+        audit: Callable[[UploadedFileMeta], Awaitable[None]] | None = None,
     ) -> PruneResult:
         """Age-based retention sweep (ASVS 5.2.4): delete every (blob, meta) pair whose ``uploaded_at`` is
         older than ``retention_days`` (default: the configured ``retention_days``), then sweep the write
@@ -1685,7 +2024,8 @@ class UploadStore:
         destroy data). One exception is an upload ``rotate-key`` can never seal (BACKLOG #2322):
         it is pruned once its sidecar's mtime passes the cutoff, and is reported with blank owner
         fields (:class:`_UnsealableUpload`). Runs off the event loop; the periodic runner + the
-        opportunistic save-time sweep both drive it.
+        opportunistic save-time sweep both drive it. A save wakes the runner, and sweeps itself only
+        where none is running (:meth:`wake_retention`).
 
         A pair is reported only when this pass removed its body, the PHI the audit row is about. A
         refused body unlink leaves the whole pair for the next pass; a refused sidecar unlink leaves
@@ -1697,7 +2037,16 @@ class UploadStore:
         A pair is never half-deleted by an abort.
 
         ``tally`` records, as the pass goes, each pair it removes and the pair it is removing. The
-        retention runner uses it to name the files a timed-out stop loses (:class:`_SweepTally`)."""
+        retention runner uses it to name the files a timed-out stop loses (:class:`_SweepTally`).
+
+        **``audit`` is called for each pair right after its removal, before the next pair is
+        touched (BACKLOG #3184).** The pass used to delete every due pair, then sweep the orphans,
+        and only then write the rows, so a stop that timed out mid-pass lost the row of every pair
+        removed so far. Now a timed-out stop loses at most the pair in progress and its row. Each
+        pair is removed in its own worker-thread call, so the rows are written on the event loop
+        between them, and a cancellation stops the pass at the pair in progress. A failed ``audit``
+        call is logged and the pass goes on, so one bad row never costs the others. ``tally``
+        counts each call once it returns or raises."""
         days = self._retention_days if retention_days is None else max(1, int(retention_days))
         at = time.time() if now is None else now
         cutoff = at - days * _SECONDS_PER_DAY
@@ -1705,39 +2054,57 @@ class UploadStore:
         stop = abort if abort is not None else threading.Event()
         sweep = tally if tally is not None else _SweepTally()
 
-        def _prune() -> PruneResult:
+        def _due() -> list[UploadedFileMeta]:
             # Checked before the scan too: the scan decrypts every sidecar, which is wasted on a stop.
-            metas = [] if stop.is_set() else self._scan_metas_sync()
-            due = [meta for meta in metas if meta.uploaded_at < cutoff]
-            # An upload rotate-key cannot seal ages by its sidecar's mtime (BACKLOG #2322).
-            if not stop.is_set():
-                due += [
-                    held.as_meta()
-                    for held in self._scan_unsealable_sync()
-                    if held.expired(cutoff, at)
-                ]
-            for meta in due:
-                if not sweep.begin(meta, stop):
-                    break
-                removed = False
-                try:
-                    removed = self._prune_pair_sync(meta)
-                finally:
-                    sweep.end(removed)
-            pruned = list(sweep.removed)
             if stop.is_set():
-                return PruneResult(pruned=pruned)
-            # The orphan sweep runs AFTER the deletions, so a failure in it must not raise out of
-            # here: that would drop `pruned`, and with it the audit rows (BACKLOG #2261).
-            try:
-                orphans = self._sweep_orphans_sync(now=at, abort=stop)
-            except Exception:  # noqa: BLE001 — logged; a raise would drop the pass's audit rows
-                # ERROR, as the runner logged this before the catch moved here.
-                _log.exception("uploaded-logs orphan sweep failed; will retry next pass")
-                orphans = 0
-            return PruneResult(pruned=pruned, orphans_removed=orphans)
+                return []
+            held: list[_UnsealableUpload] = []
+            metas = self._scan_metas_sync(held)
+            # An upload rotate-key cannot seal ages by its sidecar's mtime (BACKLOG #2322).
+            return [meta for meta in metas if meta.uploaded_at < cutoff] + [
+                lost.as_meta() for lost in held if lost.expired(cutoff, at)
+            ]
 
-        return await asyncio.to_thread(_prune)
+        def _remove(meta: UploadedFileMeta) -> bool | None:
+            """Remove one due pair; ``None`` when the pass was stopped before it."""
+            if not sweep.begin(meta, stop):
+                return None
+            removed = False
+            try:
+                removed = self._prune_pair_sync(meta)
+            finally:
+                sweep.end(removed)
+            return removed
+
+        def _orphans() -> int:
+            # A failure here must not raise out of the pass: that would drop `pruned` (BACKLOG
+            # #2261). ERROR, as the runner logged this before the catch moved here.
+            try:
+                return self._sweep_orphans_sync(now=at, abort=stop)
+            except Exception:  # noqa: BLE001 — logged; a raise would drop the pass's result
+                _log.exception("uploaded-logs orphan sweep failed; will retry next pass")
+                return 0
+
+        for meta in await asyncio.to_thread(_due):
+            removed = await asyncio.to_thread(_remove, meta)
+            if removed is None:
+                break
+            if removed and audit is not None:
+                try:
+                    await audit(meta)
+                except Exception:  # noqa: BLE001 — logged; one bad row must not cost the rest
+                    # ERROR: the file is gone and this was its only record, the level every other
+                    # upload.prune audit gap logs at.
+                    _log.exception(
+                        "uploaded-logs prune audit failed for %s; it has no upload.prune audit row",
+                        meta.file_id,
+                    )
+                sweep.audited += 1
+        pruned = list(sweep.removed)
+        if stop.is_set():
+            return PruneResult(pruned=pruned)
+        # The orphan sweep runs AFTER the deletions and their rows.
+        return PruneResult(pruned=pruned, orphans_removed=await asyncio.to_thread(_orphans))
 
     def _prune_pair_sync(self, meta: UploadedFileMeta) -> bool:
         """Remove one aged pair for :meth:`prune_expired`; True when THIS call removed its body.
@@ -1783,40 +2150,12 @@ class UploadStore:
             )
         return True
 
-    async def prune_and_audit(
-        self,
-        audit: Callable[[UploadedFileMeta], Awaitable[None]] | None,
-        *,
-        now: float | None = None,
-        abort: threading.Event | None = None,
-        tally: _SweepTally | None = None,
-    ) -> PruneResult:
-        """One :meth:`prune_expired` pass, then one ``audit`` call per pruned file.
-
-        The shared body of the retention runner and the save-time sweep. A failed audit call is
-        logged and the rest still run, so one bad row never costs the others. ``tally`` is
-        :meth:`prune_expired`'s, and also counts each audit call once it returns or raises."""
-        result = await self.prune_expired(now=now, abort=abort, tally=tally)
-        if audit is not None:
-            for meta in result.pruned:
-                try:
-                    await audit(meta)
-                except Exception:  # noqa: BLE001 — logged; one bad row must not cost the rest
-                    # ERROR: the file is gone and this was its only record, the level every other
-                    # upload.prune audit gap logs at.
-                    _log.exception(
-                        "uploaded-logs prune audit failed for %s; it has no upload.prune audit row",
-                        meta.file_id,
-                    )
-                if tally is not None:
-                    tally.audited += 1
-        return result
-
     async def prune_on_save(
         self, audit: Callable[[UploadedFileMeta], Awaitable[None]]
     ) -> PruneResult:
-        """The save-time sweep: :meth:`prune_and_audit` that a cancelled caller cannot cut short
-        (BACKLOG #2261).
+        """The save-time sweep: an audited :meth:`prune_expired` that a cancelled caller cannot cut
+        short (BACKLOG #2261). The upload route runs it only where no retention runner is running
+        to wake instead (:meth:`wake_retention`, BACKLOG #3184).
 
         The request deadline cancels the upload route, and a cancel used to drop the result naming
         what the sweep's thread had deleted, so no ``upload.prune`` row was written for those files.
@@ -1844,7 +2183,7 @@ class UploadStore:
             )
 
         return await self._run_to_completion(
-            self.prune_and_audit(audit, abort=abort, tally=tally),
+            self.prune_expired(audit=audit, abort=abort, tally=tally),
             what="the save-time upload prune",
             on_cancel=lambda: tally.abort(abort),
             on_late=_late,
@@ -1918,9 +2257,10 @@ class UploadStore:
         published half-written, nothing is left behind, and the operator retries. An hour against a
         25 MiB default bound is far outside that window.
 
-        ``abort`` is :meth:`prune_expired`'s, checked before each entry. The pass's audit rows are
-        written only once this returns, so a slow sweep over a large dir must not hold them past a
-        stop (BACKLOG #2264). An aborted sweep returns what it removed so far; the next one resumes."""
+        ``abort`` is :meth:`prune_expired`'s, checked before each entry, so a slow sweep over a large
+        dir does not hold a stop past its bound (BACKLOG #2264). The pass's audit rows are already
+        written when this runs (BACKLOG #3184). An aborted sweep returns what it removed so far; the
+        next one resumes."""
         stop = abort if abort is not None else threading.Event()
         root = self._root
         if stop.is_set() or not root.is_dir():
@@ -1969,21 +2309,24 @@ class UploadStore:
         return removed
 
 
-# One prune sweep per hour is ample for a day-granularity retention window (the opportunistic save-time
-# sweep covers the between-ticks case), and it keeps the background wakeups negligible.
+# One prune sweep per hour is ample for a day-granularity retention window (a save wakes the runner
+# for the between-ticks case, UploadStore.wake_retention), and it keeps the background wakeups
+# negligible.
 _DEFAULT_PRUNE_INTERVAL_SECONDS = 3600.0
 
 # How long ``UploadRetentionRunner.stop`` waits for a sweep already in flight to finish and write its
 # audit rows. The sweep stops at its next file once asked, so this bounds a hung filesystem call, a
 # sidecar scan already under way, and the audit writes for what the sweep had deleted. The runner
-# stops FIRST in the API lifespan's teardown, and engine.stop() still has to run after it.
+# stops FIRST in the API lifespan's teardown, and engine.stop() still has to run after it. It is an
+# upper limit: that teardown passes ``stop(timeout=...)`` a share of the step's bound in one shutdown
+# budget (``_SHUTDOWN_BUDGET_SECONDS`` in ``api/app.py``, BACKLOG #3191), which is shorter.
 #
 # It shares NSSM's 15 s graceful-stop window (AppStopMethodConsole in
 # scripts/service/install-service.ps1) with uvicorn's connection drain, which runs BEFORE the
-# lifespan teardown. ``serve`` passes uvicorn no ``timeout_graceful_shutdown``, so that drain has no
-# bound: a request still open at Ctrl+C can use up the window before this wait starts. A shorter
-# bound here would not fix that, and would cost audit rows on a slow disk, so 5 s stands. The fix is
-# to bound the drain where ``serve`` calls ``uvicorn.run``.
+# lifespan teardown. ``serve`` bounds that drain with ``timeout_graceful_shutdown``
+# (``__main__._UVICORN_DRAIN_SECONDS``, BACKLOG #3256), so a request still open at Ctrl+C can no
+# longer use up the window before this wait starts. Since the sweep writes each row as it goes
+# (BACKLOG #3184), a stop that runs out loses at most the pair in progress.
 _DEFAULT_STOP_TIMEOUT_SECONDS = 5.0
 
 
@@ -1995,7 +2338,7 @@ class _SweepTally:
 
     ``removed`` lists each pair the sweep's thread removed, in the order it is audited, and
     ``removing`` is the pair it is removing now. ``audited`` counts audit calls that returned or
-    raised; a raised call is counted because :meth:`UploadStore.prune_and_audit` already logs it.
+    raised; a raised call is counted because :meth:`UploadStore.prune_expired` already logs it.
     So ``unaudited()`` names every removed file whose row has not been written. It also names the
     pair in progress, which may turn out not to be removed, and a row whose interrupted write may
     still land, so it can name more than are lost, never fewer.
@@ -2062,48 +2405,58 @@ class UploadRetentionRunner:
         self._clock = clock
         self._stop_timeout = float(stop_timeout_seconds)
         self._stop = asyncio.Event()
+        # Set by stop() and by wake(): either ends the wait between sweeps (BACKLOG #3184).
+        self._kick = asyncio.Event()
         # The sweep's worker thread reads this one; an asyncio.Event is not thread-safe.
         self._abort = threading.Event()
         self._task: asyncio.Task[None] | None = None
         self._tally = _SweepTally()  # the sweep in flight, or the last one
 
     def start(self) -> None:
-        """Spawn the supervised prune loop (idempotent)."""
+        """Spawn the supervised prune loop (idempotent), and bind it as the store's
+        :meth:`UploadStore.wake_retention`."""
         if self._task is not None:
             return
         # A fresh event, not a clear(), for the same reason as _abort below: a loop a stop() is
         # still waiting on holds the old one, and clearing it would keep that loop sweeping beside
         # the new one, each replacing the tally the other's stop() reads.
         self._stop = asyncio.Event()
+        self._kick = asyncio.Event()
         # A fresh event, not a clear(): a sweep thread a timed-out stop() left running still holds
         # the old one, and clearing it would let that thread resume deleting with nobody to audit.
         self._abort = threading.Event()
-        self._task = asyncio.create_task(self._run(self._stop))
+        self._task = asyncio.create_task(self._run(self._stop, self._kick))
+        self._store.bind_retention_wake(self.wake)
         _log.info(
             "uploaded-logs retention prune enabled: older than %d days, every %gs",
             self._store.retention_days,
             self._interval,
         )
 
-    async def stop(self) -> None:
+    async def stop(self, timeout: float | None = None) -> None:
         """Signal the loop and await its exit, audit rows included (idempotent).
 
         **The loop is asked to stop, not cancelled (BACKLOG #2065).** A sweep deletes files in a
         worker thread, and cancelling the task that awaits it leaves the thread deleting while the
         result naming those files is dropped, so no ``upload.prune`` row is ever written for them.
         Instead the sweep is told to stop at its next file, and this waits for it to return and for
-        its audit rows to land, up to ``stop_timeout_seconds``.
+        its audit rows to land, up to ``stop_timeout_seconds``, or ``timeout`` when that is shorter.
+        A caller with a shutdown budget of its own passes ``timeout``, so this wait ends, and cancels
+        the sweep, before the caller cuts it.
 
         A sweep can outlast that bound: one stuck filesystem call, the sidecar scan or orphan sweep
-        already under way, or the audit writes for a long list of deletions. The task is then
-        cancelled. When the sweep had started deleting a file it had not yet audited, that loss is
-        logged as an ERROR. It covers every such file, not only one whose unlink is still running.
-        A sweep that had no such file loses no row, so it is logged as a WARNING instead.
+        already under way, or one stuck audit write. The task is then cancelled. The sweep writes
+        each pair's row before it touches the next pair (BACKLOG #3184), so at most the pair in
+        progress has no row. When the sweep had started deleting a file it had not yet audited, that
+        loss is logged as an ERROR, naming the file. A sweep that had no such file loses no row, so
+        it is logged as a WARNING instead.
 
         This never raises into the caller's teardown. If the caller is itself cancelled while
         waiting, the sweep is cancelled the same way and this returns, as it did before #2065, so the
         API lifespan's later steps, ``engine.stop()`` among them, still run."""
         self._stop.set()
+        self._kick.set()
+        self._store.unbind_retention_wake(self.wake)  # an upload sweeps for itself again
         task = self._task
         self._task = None
         if task is None:
@@ -2114,12 +2467,13 @@ class UploadRetentionRunner:
         tally = self._tally
         tally.abort(self._abort)
         self._abort = threading.Event()
+        wait = self._stop_timeout if timeout is None else min(self._stop_timeout, timeout)
         try:
             # shield: a timeout must not cancel the task mid-audit; the branches below decide that.
-            await asyncio.wait_for(asyncio.shield(task), self._stop_timeout)
+            await asyncio.wait_for(asyncio.shield(task), wait)
             return
         except TimeoutError:
-            why = f"did not finish within {self._stop_timeout:g}s of shutdown"
+            why = f"did not finish within {wait:g}s of shutdown"
         except asyncio.CancelledError:
             why = "was still running when shutdown itself was cancelled"
         # Read before the cancel. Every id is logged, since these lines are the only record of them.
@@ -2135,34 +2489,54 @@ class UploadRetentionRunner:
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
-    async def _run(self, stop: asyncio.Event) -> None:
-        # One isolated sweep per interval; an error in a pass is logged and the loop continues (a prune
-        # must never take the engine down). Cooperatively cancellable via ``stop``, this loop's own.
+    def wake(self) -> bool:
+        """Start the next sweep now rather than at the end of the interval (BACKLOG #3184), and
+        return whether the loop is running. A wake during a sweep starts one more sweep after it.
+        ``False``, doing nothing, when the loop is not running, including one that ended without a
+        :meth:`stop`."""
+        task = self._task
+        if task is None or task.done():
+            return False
+        self._kick.set()
+        return True
+
+    async def _run(self, stop: asyncio.Event, kick: asyncio.Event) -> None:
+        # One isolated sweep per interval or wake; an error in a pass is logged and the loop
+        # continues (a prune must never take the engine down). Cooperatively cancellable via
+        # ``stop``, this loop's own, which stop() pairs with a kick so the wait ends at once.
         while not stop.is_set():
+            # Cleared before the sweep, so a wake that lands during it is kept for the next one.
+            kick.clear()
             try:
                 # The loop's sweep alone owns self._tally, so a direct run_once() never hides it.
                 self._tally = _SweepTally()
                 await self._sweep(self._tally)
             except Exception:
                 _log.exception("uploaded-logs retention prune failed; will retry next interval")
-            try:  # noqa: SIM105 — wake immediately on stop so shutdown isn't held by the interval
-                await asyncio.wait_for(stop.wait(), self._interval)
+            try:  # noqa: SIM105 — a stop or a wake ends the wait; only the interval times out
+                await asyncio.wait_for(kick.wait(), self._interval)
             except TimeoutError:
                 pass
 
     async def run_once(self, now: float | None = None) -> PruneResult:
-        """One :meth:`UploadStore.prune_and_audit` pass for ``now`` (default: the injected clock).
-        The pass's orphan count rides back in the result; it is logged by the sweep and carries no
-        metadata to audit (see :class:`PruneResult`)."""
+        """One audited :meth:`UploadStore.prune_expired` pass for ``now`` (default: the injected
+        clock). The pass's orphan count rides back in the result; it is logged by the sweep and
+        carries no metadata to audit (see :class:`PruneResult`)."""
         return await self._sweep(None, now)
 
     async def _sweep(self, tally: _SweepTally | None, now: float | None = None) -> PruneResult:
-        return await self._store.prune_and_audit(
-            self._audit,
+        return await self._store.prune_expired(
+            audit=self._audit,
             now=self._clock() if now is None else now,
             abort=self._abort,
             tally=tally,
         )
+
+
+class _UnopenableValueError(CipherError):
+    """A stored upload value could not be decrypted. The reseal skips that file and goes on (BACKLOG
+    #3181). Raised only from the DECRYPT half of :func:`_reencrypt_value`, so an encrypt-side refusal,
+    such as the AES-GCM invocation ceiling, still stops the whole pass as a plain ``CipherError``."""
 
 
 def _reencrypt_value(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:
@@ -2178,14 +2552,18 @@ def _reencrypt_value(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:
     # allow_unmarked=True: the one pass that reads a plaintext upload, because sealing it is the
     # whole point. Owner ruling 2026-09-23 (BACKLOG #1169): a keyed store refuses a plaintext
     # upload on every read path until `rotate-key` runs this pass.
-    return cipher.encrypt(cipher.decrypt(stored, aad=aad, allow_unmarked=True), aad=aad)
+    try:
+        opened = cipher.decrypt(stored, aad=aad, allow_unmarked=True)
+    except CipherError as exc:
+        raise _UnopenableValueError(str(exc)) from exc
+    return cipher.encrypt(opened, aad=aad)
 
 
 async def _to_thread_to_completion[T, A](func: Callable[[A], T], arg: A) -> T:
     """``asyncio.to_thread``, except that a cancellation waits for the thread to finish first.
 
     A bare ``to_thread`` re-raises a cancellation at once while its thread keeps running. ``save``
-    then pays its cross-shard reservation back and drops ``_quota_lock`` while the file is still
+    then pays its engine-shard reservation back and drops ``_quota_lock`` while the file is still
     being written, so a sibling can read the ledger and scan the disk and count neither. That breaks
     the premise :class:`UploadQuotaError`'s ordering argument rests on. The save's thread runs the
     quota's sidecar scan and then the write. The write is bounded by ``max_bytes``. The scan is
@@ -2245,6 +2623,51 @@ def _log_unaudited(what: str, tally: _SweepTally, *, exc: BaseException | None =
         )
 
 
+async def _release_reservation(
+    ledger: UploadQuotaLedger, reservation: str, uploader_id: str
+) -> None:
+    """Release ``reservation`` on ``ledger``. The log sits inside the task, so a failure is reported
+    in this module's words whether or not anyone still waits, and the task never ends in an error
+    of its own; a release failure must not fail an upload that landed."""
+    try:
+        await ledger.release_upload_quota(reservation)
+    except Exception:  # noqa: BLE001 — logged; the slot is reclaimed once it goes stale
+        _log.warning(
+            "could not release the engine-shard upload reservation for %s; it will be "
+            "reclaimed when it goes stale",
+            uploader_id,
+            exc_info=True,
+        )
+
+
+def _log_discard_unfinished(done: asyncio.Future[Any], file_id: str) -> None:
+    """Name a removal of an unrecorded pair that did not finish (vault BACKLOG #3178). The log
+    names the ``file_id`` only, because the filename can carry PHI."""
+    if done.cancelled():
+        _log.error(
+            "upload %s has no upload.create audit row and its removal was cancelled before it "
+            "finished; the file may still be stored",
+            file_id,
+        )
+    elif (exc := done.exception()) is not None:
+        _log.error(
+            "upload %s has no upload.create audit row and its removal failed; the file may "
+            "still be stored",
+            file_id,
+            exc_info=exc,
+        )
+
+
+def _log_release_cancelled(done: asyncio.Future[Any], uploader_id: str) -> None:
+    """Name a release that was cancelled before it finished; its slot then goes stale."""
+    if done.cancelled():
+        _log.warning(
+            "the engine-shard upload release for %s was cancelled before it finished; its slot is "
+            "reclaimed once it goes stale",
+            uploader_id,
+        )
+
+
 async def _wait_to_completion[T](
     fut: asyncio.Future[T],
     *,
@@ -2253,7 +2676,7 @@ async def _wait_to_completion[T](
 ) -> T:
     """Await ``fut``; on a cancellation, wait for it to finish, then raise ``CancelledError``.
 
-    The shared body of :func:`_to_thread_to_completion` and the cross-shard ledger calls (BACKLOG
+    The shared body of :func:`_to_thread_to_completion` and the engine-shard ledger calls (BACKLOG
     #2263). Further cancellations while waiting are absorbed. A ledger call is a coroutine, so it
     runs as a Task, and ``asyncio.run``'s shutdown cancellation can still end it early. That
     leaves the reservation as a killed process would.

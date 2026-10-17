@@ -46,6 +46,7 @@ from tests._replay_settle_contract import (
     assert_replayed_ingress_row_is_received,
     assert_replayed_routed_row_settles,
 )
+from tests._store_audit import ALERT_AUDIT, no_purge_audit
 from tests.audit_chain_cases import CASES, ChainBackend, server_chain_backend
 
 # A synthetic ADT carrying a (fake) MRN + name in PID — never real PHI.
@@ -806,7 +807,7 @@ async def test_cancel_queued(store) -> None:
     mid = await store.enqueue_message(
         channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0
     )
-    cancelled = await store.cancel_queued("IB", "OB1", now=200.0)
+    cancelled = await store.cancel_queued("IB", "OB1", now=200.0, audit=no_purge_audit)
     assert cancelled == 1
     assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.CANCELLED.value
     # All deliveries terminal (cancelled) → PROCESSED.
@@ -831,7 +832,9 @@ async def test_cancel_queued_top_only_cancels_a_backing_off_head(store) -> None:
         "next_attempt_at"
     ]
     assert await store.claim_next_fifo("OB1", now=103.0) is None  # the head blocks the lane
-    assert await store.cancel_queued(None, "OB1", top_only=True, now=103.0) == 1
+    assert (
+        await store.cancel_queued(None, "OB1", top_only=True, now=103.0, audit=no_purge_audit) == 1
+    )
     assert (await store.outbox_for(m1))[0]["status"] == OutboxStatus.CANCELLED.value
     assert (await store.outbox_for(m2))[0]["status"] == OutboxStatus.PENDING.value
     nxt = await store.claim_next_fifo("OB1", now=103.0)
@@ -1174,6 +1177,17 @@ async def test_federated_binding_service_contract(store) -> None:
     )
 
     await _assert_federated_binding_service_contract(store)
+
+
+async def test_bind_audit_factor_state_contract(store) -> None:
+    """Vault BACKLOG #2711 step 3 on the real Postgres backend: the clear reads the factor state
+    after its ``FOR UPDATE``, in a statement of its own. The shared body is the one the SQLite and
+    SQL Server suites run."""
+    from tests._federated_binding_service_contract import (
+        _assert_bind_audit_names_factors_contract,
+    )
+
+    await _assert_bind_audit_names_factors_contract(store)
 
 
 async def test_session_binding_guard_store_contract(store) -> None:
@@ -4538,11 +4552,11 @@ async def test_alert_instance_lifecycle_pg(store) -> None:
     assert len(await store.list_active_alert_instances(allowed_channels=None)) == 2
 
     # ack -> acknowledged + acked_by/at, excluded from the open count; unknown id -> False.
-    assert await store.ack_alert_instance(a.id, actor="scott", now=200.0) is True
+    assert await store.ack_alert_instance(a.id, actor="scott", now=200.0, audit=ALERT_AUDIT) is True
     got = await store.get_alert_instance(a.id, allowed_channels=None)
     assert got is not None and got.status == "acknowledged"
     assert got.acked_by == "scott" and got.acked_at == 200.0
-    assert await store.ack_alert_instance(999999, actor="scott") is False
+    assert await store.ack_alert_instance(999999, actor="scott", audit=ALERT_AUDIT) is False
     assert await store.count_open_alerts_by_connection() == {"OB_Y": 1}
     # BACKLOG #1564: run the scoped aggregate on a REAL server. The generated severity CASE, the
     # `AS n`/`AS worst` aliases, the dialect scope bind and the row unpack never execute under the
@@ -4565,11 +4579,11 @@ async def test_alert_instance_lifecycle_pg(store) -> None:
     assert await store.count_open_alerts_by_connection() == {"OB_Y": 1}
 
     # resolve closes it; the same key re-opens a FRESH distinct instance (partial index frees it).
-    assert await store.resolve_alert_instance(a.id, now=300.0) is True
+    assert await store.resolve_alert_instance(a.id, now=300.0, audit=ALERT_AUDIT) is True
     assert {
         r.connection for r in await store.list_active_alert_instances(allowed_channels=None)
     } == {"OB_Y"}
-    assert await store.resolve_alert_instance(a.id) is False
+    assert await store.resolve_alert_instance(a.id, audit=ALERT_AUDIT) is False
     await store.upsert_alert_instance(
         event_type="connection_error", connection="OB_X", severity="warning", now=310.0
     )
@@ -4601,7 +4615,9 @@ async def test_alert_instance_lifecycle_pg(store) -> None:
         for r in await store.list_active_alert_instances(allowed_channels=None)
         if r.connection == "OB_Y"
     ]
-    await store.resolve_alert_instance(y.id, now=100.0)  # resolved at 100.0 -> purgeable
+    await store.resolve_alert_instance(
+        y.id, now=100.0, audit=ALERT_AUDIT
+    )  # resolved at 100.0 -> purgeable
     assert await store.purge_alert_instances(older_than=200.0) == 1
     await store.upsert_alert_instance(
         event_type="queue_buildup", connection="OB_R", severity="warning", now=500.0
@@ -4611,7 +4627,9 @@ async def test_alert_instance_lifecycle_pg(store) -> None:
         for r in await store.list_active_alert_instances(allowed_channels=None)
         if r.connection == "OB_R"
     ]
-    await store.resolve_alert_instance(rr.id, now=500.0)  # too recent for older_than=200.0
+    await store.resolve_alert_instance(
+        rr.id, now=500.0, audit=ALERT_AUDIT
+    )  # too recent for older_than=200.0
     assert await store.purge_alert_instances(older_than=200.0) == 0
 
     # side-observer: an alert write creates NO message/queue row (invisible to the finalizer).

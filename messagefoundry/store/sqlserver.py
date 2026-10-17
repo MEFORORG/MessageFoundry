@@ -263,6 +263,7 @@ from messagefoundry.store.store import (
     federated_unbind,
     first_sealed_approval,
     full_authentication_clear,
+    if_applied,
     load_audit_chain,
     lockout_clear,
     lockout_increment,
@@ -326,6 +327,19 @@ log = logging.getLogger(__name__)
 _FIFO_HEADS_LANE_CHUNK = 500
 # ADR 0066 §3.1: release_claimed id-chunk bound (ids per UPDATE statement).
 _RELEASE_CHUNK = 500
+# BACKLOG #3256: the database server's clock as epoch seconds, the unit `upload_reservation.since` holds.
+# Microseconds since the epoch fit a BIGINT for about 292,000 years. Each reference to
+# SYSUTCDATETIME() is read on its own, so two references in one statement can disagree: two
+# SYSDATETIME() calls in one INSERT ... VALUES row differed in 122 of 100,000 rows (Louis Davidson,
+# "Row-wise system function calls, always the same?", Simple Talk, 2018). So each statement here
+# references it once: the quota touch reads it into a DECLARE @now, and the reserve's stale delete
+# and its insert each name it once. The cluster lease has its own copy at millisecond grain
+# (pipeline/cluster_sqlserver.py `_DB_NOW`). Making this one the canonical copy for both is a
+# pipeline change outside BACKLOG #3256.
+_MSSQL_EPOCH_NOW = (
+    "(CAST(DATEDIFF_BIG(MICROSECOND, CAST('1970-01-01' AS DATETIME2), SYSUTCDATETIME()) AS FLOAT)"
+    " / 1000000.0)"
+)
 # BACKLOG #1169: rows per batch for the `attachment_chunk` at-rest migration. Every OTHER cipher pass
 # batches 500 because its rows are kilobyte-shaped; one attachment_chunk row is a whole
 # DETACH_CHUNK_BYTES (1 MiB) slice, ~1.33 MiB once base64+GCM sealed. 16 keeps a batch near 21 MiB,
@@ -727,6 +741,10 @@ _MSSQL_REVOKE_USER_SESSIONS_SQL: Final = (
     "UPDATE sessions SET revoked_at=?, seal='' OUTPUT inserted.token_hash"
     " WHERE user_id=? AND revoked_at IS NULL"
 )
+#: Whether the account holds at least one passkey.
+_MSSQL_WEBAUTHN_ANY_FOR_USER: Final = (
+    "SELECT TOP (1) 1 AS present FROM webauthn_credentials WHERE user_id=?"
+)
 #: store.py's ``_USER_INSERT``, the sealed user record's one INSERT (BACKLOG #2592). Spelled here
 #: rather than imported so this module's own text shows it writes ``users``, whose ``totp_secret``
 #: cell the cipher sweeps must reach (``tests/test_store_cipher_sweep_parity.py`` reads the text).
@@ -926,6 +944,13 @@ def _rcsi_remedy(database: str | None) -> str:
         f"a DBA must run once: alter database [{name}] SET READ_COMMITTED_SNAPSHOT on"
         " with rollback immediate"
     )
+
+
+def _upload_quota_lock(uploader_id: str) -> str:
+    """The applock the reserve and the release of one uploader's reservations both take (vault
+    BACKLOG #3180). One spelling, because the release's lock order holds only while the names
+    match."""
+    return f"mefor:upload_quota:{uploader_id}"
 
 
 def _applock_timeout_ms(command_timeout: int) -> int:
@@ -2130,14 +2155,20 @@ _SCHEMA: list[str] = [
         reason NVARCHAR(1000) NOT NULL, actor NVARCHAR(256) NOT NULL,
         attested_at FLOAT NOT NULL, audit_seq BIGINT NOT NULL,
         audit_hash NVARCHAR(64) NOT NULL)""",
-    # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112) — see the SQLite `_SCHEMA`
-    # for the in-flight-only rationale. One of the two backends a real sharded deployment runs
-    # (`require_unified_store` makes a server DB mandatory past one shard). No PHI (an account id and
-    # two counters). BIN2 collation matches the other id-keyed tables.
-    """IF OBJECT_ID('upload_quota','U') IS NULL CREATE TABLE upload_quota (
-        uploader_id NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL PRIMARY KEY,
-        inflight_files BIGINT NOT NULL DEFAULT 0, inflight_bytes BIGINT NOT NULL DEFAULT 0,
-        since FLOAT NOT NULL)""",
+    # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112), one row per upload in
+    # flight (vault BACKLOG #3180) — see the SQLite `_SCHEMA` for the rationale. One of the two
+    # backends a real sharded deployment runs (`require_unified_store` makes a server DB mandatory
+    # past one shard). No PHI (two ids, a size and a timestamp). BIN2 collation matches the other
+    # id-keyed tables.
+    # The table this one replaced held one row per uploader (vault BACKLOG #3180). Nothing reads
+    # it. In _SCHEMA, so the drop moves _schema_hash() and a provisioning run carries it too.
+    """IF OBJECT_ID('upload_quota','U') IS NOT NULL DROP TABLE upload_quota""",
+    """IF OBJECT_ID('upload_reservation','U') IS NULL CREATE TABLE upload_reservation (
+        reservation_id NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL PRIMARY KEY,
+        uploader_id NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
+        size_bytes BIGINT NOT NULL, since FLOAT NOT NULL)""",
+    """IF INDEXPROPERTY(OBJECT_ID('upload_reservation'),'ix_upload_reservation_uploader','IndexID')
+        IS NULL CREATE INDEX ix_upload_reservation_uploader ON upload_reservation(uploader_id)""",
     # BACKLOG #1540: `requester` is a DISPLAY label; `requester_user_id` is the authorization key the
     # self-approval refusal compares (the Store protocol's create_pending_approval says why).
     # NVARCHAR(64) matches users.id and this table's own id column.
@@ -2562,6 +2593,74 @@ def _odbc_brace(value: str) -> str:
     return "{" + value.replace("}", "}}") + "}"
 
 
+def _pin_path(settings: StoreSettings) -> str | None:
+    """The ``[store].ssl_root_cert`` pin the store sends, or ``None``: it rides only the secure
+    posture, so an escaped weakened one (verify off, or no encryption) sends none."""
+    if settings.trust_server_certificate or not settings.encrypt:
+        return None
+    return settings.ssl_root_cert or None
+
+
+def check_pinned_certificate(
+    settings: StoreSettings, *, posture: HopPosture | None = None, now: float | None = None
+) -> None:
+    """Refuse a ``[store].ssl_root_cert`` pin the engine must not send. Raises ``ValueError`` naming
+    the setting. A no-op when the store sends no pin.
+
+    Vault BACKLOG #2223: under ``Encrypt=strict`` a pin match stands in for the driver's own chain,
+    host-name and expiry checks, and the pinned file is the connection's only trust anchor. So:
+
+    * the file must be one server certificate (:func:`~messagefoundry.pki.read_pinned_server_certificate`);
+    * it takes the trust-anchor ACL and path checks with their own rules and messages
+      (:func:`~messagefoundry.auth.trust_anchors.enforce_anchor`): a file or folder a broad
+      principal can write refuses at ``[security].enforcement = enforce`` and warns at ``warn``,
+      and no posture counts as enforcing. The driver reads the file by path, so the spec carries
+      ``loads_verified_bytes=False``;
+    * it must be inside its validity period at ``now`` (default the wall clock); notAfter itself
+      still counts as valid, as RFC 5280 reads it.
+
+    Blocking: it reads the file and, on Windows, runs ``icacls``. :meth:`SqlServerStore.open` and
+    :meth:`SqlServerStore._one_connection_store` run it off the event loop once per store open,
+    before any connect, never per query. A store opened before notAfter keeps connecting after it,
+    so the certificate-expiry monitor, which watches this file, is what warns ahead of that date."""
+    from messagefoundry.auth.trust_anchors import AnchorSpec, TrustAnchorError, enforce_anchor
+    from messagefoundry.pki import read_pinned_server_certificate
+    from messagefoundry.redaction import log_timestamp
+
+    path = _pin_path(settings)
+    if path is None:
+        return
+    cert = read_pinned_server_certificate(path)
+    if isinstance(cert, str):
+        raise ValueError(f"[store].ssl_root_cert {path!r} {cert}")
+    spec = AnchorSpec(
+        "store_sqlserver_pin", "[store].ssl_root_cert", path, loads_verified_bytes=False
+    )
+    refusal: str | None = None
+    try:
+        enforce_anchor(spec, enforcing=posture is None or posture.enforcing)
+    except TrustAnchorError as exc:
+        refusal = str(exc)  # the anchor module's own message, which names the setting and the fix
+    except OSError as exc:
+        refusal = f"[store].ssl_root_cert {path!r} could not be read: {exc.strerror or type(exc).__name__}"
+    if refusal is not None:
+        raise ValueError(refusal)
+    moment = time.time() if now is None else now
+    not_before, not_after = cert.not_valid_before_utc, cert.not_valid_after_utc
+    if moment > not_after.timestamp():
+        raise ValueError(
+            f"[store].ssl_root_cert {path!r}: the pinned certificate expired at "
+            f"{log_timestamp(not_after)}. The driver does not check a pin's expiry with "
+            "Encrypt=strict, so the engine refuses it. Pin the server's renewed certificate."
+        )
+    if moment < not_before.timestamp():
+        raise ValueError(
+            f"[store].ssl_root_cert {path!r}: the pinned certificate is not valid until "
+            f"{log_timestamp(not_before)} (notAfter {log_timestamp(not_after)}). The engine "
+            "refuses a pin outside its validity period."
+        )
+
+
 def connection_string(settings: StoreSettings, *, posture: HopPosture | None = None) -> str:
     """Build an ODBC connection string for the Microsoft ODBC Driver 18 from store settings.
 
@@ -2574,7 +2673,10 @@ def connection_string(settings: StoreSettings, *, posture: HopPosture | None = N
     serve/engine caller). ``None`` reads the ambient posture, and with none the escape is NOT
     permitted (vault BACKLOG #2354). CORRECTED: this read *"``None`` (a backup/restore utility,
     embedding, or unit test) leaves the escape unclamped"*; that let a CLI command cross a weakened
-    store hop under ``enforce``."""
+    store hop under ``enforce``.
+
+    It reads no file. The pin's own checks are :func:`check_pinned_certificate`, which the store runs
+    once per open (vault BACKLOG #2223)."""
     if posture is None:
         posture = current_hop_posture()
     # A weakened TLS posture (TrustServerCertificate=yes, or Encrypt=no) is MITM-able, so it REFUSES
@@ -2583,9 +2685,8 @@ def connection_string(settings: StoreSettings, *, posture: HopPosture | None = N
     # escape through the ONE clamp (weakened_tls_escape_permitted) so the escape can NEVER relax a
     # production-PHI store hop (previously the escape crossed prod, violating decision 2). It stays a
     # STRICT verify-off cell (no gradient warn-and-cross) and keeps NO second escape.
-    if (
-        settings.trust_server_certificate or not settings.encrypt
-    ) and not weakened_tls_escape_permitted(posture):
+    weakened = settings.trust_server_certificate or not settings.encrypt
+    if weakened and not weakened_tls_escape_permitted(posture):
         raise ValueError(
             "SQL Server TLS is weakened (trust_server_certificate=true or encrypt=false), which is "
             f"MITM-able. Use a trusted server certificate, or set {INSECURE_TLS_ESCAPE_ENV}=1 on an "
@@ -2615,13 +2716,20 @@ def connection_string(settings: StoreSettings, *, posture: HopPosture | None = N
     if settings.multi_subnet_failover:
         parts.append("MultiSubnetFailover=Yes")
     # Pin the DB server's certificate by file WITHOUT a machine-wide trust import (#45), via the ODBC
-    # Driver 18.1+ `ServerCertificate` keyword — only on the SECURE posture (Encrypt=yes, verify on; the
-    # weakened branch above already refused/escaped). Brace-quoted (STORE-5). It names a cert file to
-    # match the server against; it can only tighten verification, never downgrade the last-wins
-    # Encrypt/TrustServerCertificate tail that still follows.
-    if settings.ssl_root_cert and settings.encrypt and not settings.trust_server_certificate:
-        parts.append(f"ServerCertificate={_odbc_brace(settings.ssl_root_cert)}")
-    parts.append(f"Encrypt={'yes' if settings.encrypt else 'no'}")
+    # Driver 18.1+ `ServerCertificate` keyword — only on the SECURE posture (encrypt on, verify on; the
+    # weakened branch above already refused/escaped). Brace-quoted (STORE-5). The pin goes out with
+    # Encrypt=strict: on the Driver 18.7 build tested on Windows, the pin was enforced with strict and
+    # NOT with Encrypt=yes, where a pin of the wrong certificate still connected (vault BACKLOG #2223,
+    # measured under #3009). Strict is TDS 8.0, so a server older than SQL Server 2022 refuses the
+    # connection; there is no fall back to an unenforced pin. Microsoft documents the exact match as
+    # done instead of the expiry, host-name and chain checks, so the engine checks the pinned
+    # certificate itself at store open (check_pinned_certificate). Not a revocation control. Both
+    # keywords stay inside the last-wins tail.
+    pin = _pin_path(settings)
+    if pin:
+        parts.append(f"ServerCertificate={_odbc_brace(pin)}")
+    encrypt = "strict" if pin else ("yes" if settings.encrypt else "no")
+    parts.append(f"Encrypt={encrypt}")
     parts.append(f"TrustServerCertificate={'yes' if settings.trust_server_certificate else 'no'}")
     return ";".join(parts) + ";"
 
@@ -3484,6 +3592,8 @@ class SqlServerStore:
         # sync-handoff pool) decides as the open did, wherever it is reached from (vault BACKLOG #2354).
         if posture is None:
             posture = current_hop_posture()
+        # Vault BACKLOG #2223: the pin's own checks, once, off the loop, before any connect.
+        await asyncio.to_thread(check_pinned_certificate, settings, posture=posture)
         try:
             import aioodbc  # noqa: F401 - fail on a missing extra before any connect is attempted
         except ImportError as exc:  # pragma: no cover - exercised only without the extra
@@ -4508,6 +4618,8 @@ class SqlServerStore:
 
         The result names the schema the batch landed in and any option still OFF, so the caller can
         report a partial result rather than a success."""
+        # Vault BACKLOG #2223: before the first connect, which the options step makes.
+        await asyncio.to_thread(check_pinned_certificate, settings, posture=posture)
         await cls._ensure_database_options(settings, posture=posture, fail_closed=False)
         async with cls._one_connection_store(settings, posture=posture) as store:
             applied = await store._ensure_schema(provisioning=True)
@@ -4538,6 +4650,8 @@ class SqlServerStore:
         """A one-connection store with the identity cipher, closed on exit: what
         :meth:`provision_schema` and :meth:`probe_privileges` run on instead of :meth:`open`. It hands
         the executor to the store, so :meth:`close` releases it."""
+        # Vault BACKLOG #2223: the pin's own checks, as :meth:`open` runs them.
+        await asyncio.to_thread(check_pinned_certificate, settings, posture=posture)
         pool, executor = await cls._create_pool(settings, posture=posture, maxsize=1)
         store = cls(pool, settings, posture=posture)
         store._pool_executor = executor
@@ -7281,39 +7395,52 @@ class SqlServerStore:
             escalation_tier=int(r["escalation_tier"]),
         )
 
+    async def _alert_write(
+        self, sql: str, params: tuple[Any, ...], audit: AuditAppend, now: float
+    ) -> bool:
+        """One operator alert UPDATE with its audit row, in one transaction (vault BACKLOG #3217).
+        The row is appended only when the UPDATE matched, so a 404 writes nothing. The append takes
+        the audit applock at the tail, as :meth:`cancel_queued`'s does.
+
+        ``sql`` carries ``OUTPUT inserted.id``, and the match is read from that rowset, never from
+        ``cursor.rowcount``: a session-wide ``SET NOCOUNT ON`` can make the count read -1, which
+        would commit a matched change with no audit row (BACKLOG #2283)."""
+        async with AuditedWrite(now) as written, self._acquire() as conn:
+            try:
+                async with self._cursor(conn) as cur:
+                    await cur.execute(sql, params)
+                    applied = bool(await cur.fetchall())
+                    await self._append_operator_audit(cur, written, if_applied(audit), applied)
+                    await self._commit(conn)
+            except Exception:
+                # The transaction may hold the audit applock and an audit row (BACKLOG #2624).
+                await self._rollback_or_discard(conn)
+                raise
+        return applied
+
     async def ack_alert_instance(
-        self, alert_id: int, *, actor: str, now: float | None = None
+        self, alert_id: int, *, actor: str, audit: AuditAppend, now: float | None = None
     ) -> bool:
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "UPDATE alert_instance SET status='acknowledged', acked_by=?, acked_at=?"
-                    " WHERE id=? AND status<>'resolved'",
-                    (actor, now, alert_id),
-                )
-                changed = cur.rowcount
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        return int(changed) > 0
+        return await self._alert_write(
+            "UPDATE alert_instance SET status='acknowledged', acked_by=?, acked_at=?"
+            " OUTPUT inserted.id WHERE id=? AND status<>'resolved'",
+            (actor, now, alert_id),
+            audit,
+            now,
+        )
 
-    async def resolve_alert_instance(self, alert_id: int, *, now: float | None = None) -> bool:
+    async def resolve_alert_instance(
+        self, alert_id: int, *, audit: AuditAppend, now: float | None = None
+    ) -> bool:
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "UPDATE alert_instance SET status='resolved', resolved_at=?"
-                    " WHERE id=? AND status<>'resolved'",
-                    (now, alert_id),
-                )
-                changed = cur.rowcount
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        return int(changed) > 0
+        return await self._alert_write(
+            "UPDATE alert_instance SET status='resolved', resolved_at=?"
+            " OUTPUT inserted.id WHERE id=? AND status<>'resolved'",
+            (now, alert_id),
+            audit,
+            now,
+        )
 
     async def resolve_alert_instances_for(
         self, *, event_type: str, connection: str, now: float | None = None
@@ -7334,42 +7461,31 @@ class SqlServerStore:
         return int(changed)
 
     async def suspend_alert_instance(
-        self, alert_id: int, *, until: float, now: float | None = None
+        self, alert_id: int, *, until: float, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
         # #143 windowed suspend (NOTIFICATION-only): set suspended_until on a live instance. Refuses a
         # resolved one; returns the updated row (for the API echo + seeding the sink cache) or None.
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "UPDATE alert_instance SET suspended_until=? WHERE id=? AND status<>'resolved'",
-                    (until, alert_id),
-                )
-                changed = cur.rowcount
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        if int(changed) == 0:
+        if not await self._alert_write(
+            "UPDATE alert_instance SET suspended_until=? OUTPUT inserted.id"
+            " WHERE id=? AND status<>'resolved'",
+            (until, alert_id),
+            audit,
+            time.time() if now is None else now,
+        ):
             return None
         return await self.get_alert_instance(alert_id, allowed_channels=None)
 
     async def resume_alert_instance(
-        self, alert_id: int, *, now: float | None = None
+        self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
         # #143: clear a windowed suspend. Idempotent; returns the row or None (unknown/already resolved).
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "UPDATE alert_instance SET suspended_until=NULL"
-                    " WHERE id=? AND status<>'resolved'",
-                    (alert_id,),
-                )
-                changed = cur.rowcount
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        if int(changed) == 0:
+        if not await self._alert_write(
+            "UPDATE alert_instance SET suspended_until=NULL OUTPUT inserted.id"
+            " WHERE id=? AND status<>'resolved'",
+            (alert_id,),
+            audit,
+            time.time() if now is None else now,
+        ):
             return None
         return await self.get_alert_instance(alert_id, allowed_channels=None)
 
@@ -11388,7 +11504,7 @@ class SqlServerStore:
         *,
         top_only: bool = False,
         now: float | None = None,
-        audit: OperatorAudit[int] | None = None,
+        audit: OperatorAudit[int],
     ) -> int:
         now = time.time() if now is None else now
         where = ["stage=?", "destination_name=?", "status=?"]
@@ -12100,93 +12216,128 @@ class SqlServerStore:
     async def reserve_upload_quota(
         self,
         uploader_id: str,
+        reservation_id: str,
         *,
-        files: int,
         size_bytes: int,
-        max_files: int = 0,
-        max_total_bytes: int = 0,
+        max_files: int,
+        max_total_bytes: int,
         stale_after: float = UPLOAD_RESERVATION_STALE_AFTER,
     ) -> bool:
-        """Atomically reserve (or release) an uploader's in-flight upload budget — see
+        """Atomically reserve one in-flight upload slot named ``reservation_id`` — see
         :meth:`messagefoundry.store.base.Store.reserve_upload_quota` for the contract, and the SQLite
         twin for the statement shape.
 
-        MERGE with HOLDLOCK is the SQL Server upsert that is safe under the concurrent opens of an
-        engine-shard fleet (a bare IF EXISTS/INSERT races) — the same pattern
-        :meth:`add_cipher_invocations` uses. The budget predicate rides ``WHEN MATCHED AND``, so a
-        refusal matches no rows and ``OUTPUT`` returns nothing."""
-        now = time.time()
-        if files <= 0:
-            # RELEASE — unconditional, clamped at zero (a double release cannot mint budget).
-            await self._execute(
-                "UPDATE upload_quota SET"
-                " inflight_files = CASE WHEN inflight_files + ? < 0 THEN 0 ELSE inflight_files + ? END,"
-                " inflight_bytes = CASE WHEN inflight_bytes + ? < 0 THEN 0 ELSE inflight_bytes + ? END,"
-                " since = CASE WHEN since > ? THEN since ELSE ? END"  # never backwards (#2648)
-                " WHERE uploader_id = ?",
-                (
-                    int(files),
-                    int(files),
-                    int(size_bytes),
-                    int(size_bytes),
-                    now,
-                    now,
-                    uploader_id,
-                ),
-            )
-            return True
-        if files > max_files or size_bytes > max_total_bytes:
-            # Fail closed before touching the row: WHEN NOT MATCHED inserts unconditionally.
+        A per-uploader applock serializes the reserves of one uploader across every engine shard. Under
+        RCSI each statement reads what committed before it began, and the previous holder committed
+        before it let the applock go, so the sums read here hold its row. ``OUTPUT`` reports the
+        insert, which a session-wide ``SET NOCOUNT ON`` cannot hide (BACKLOG #2283).
+
+        "Now" is the database server's clock, ``_MSSQL_EPOCH_NOW``, referenced once per statement:
+        once in the stale delete's cutoff and once in the insert's stamp (BACKLOG #3256;
+        ``uploads.UploadQuotaError`` says why)."""
+        if max_files < 1 or size_bytes > max_total_bytes:
+            # Fail closed before touching the store: a headroom that cannot hold one slot.
             return False
-        stale = now - max(0.0, stale_after)
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        async with self._acquire() as conn:
             try:
-                await cur.execute(
-                    "MERGE upload_quota WITH (HOLDLOCK) AS t"
-                    " USING (SELECT ? AS uploader_id, ? AS files, ? AS size_bytes, ? AS now_ts,"
-                    " ? AS stale_ts, ? AS max_files, ? AS max_total_bytes) AS s"
-                    " ON t.uploader_id = s.uploader_id"
-                    " WHEN MATCHED AND"
-                    " (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_files END)"
-                    " + s.files <= s.max_files"
-                    " AND (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_bytes END)"
-                    " + s.size_bytes <= s.max_total_bytes"
-                    " THEN UPDATE SET"
-                    " t.inflight_files ="
-                    " (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_files END) + s.files,"
-                    " t.inflight_bytes ="
-                    " (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_bytes END)"
-                    " + s.size_bytes,"
-                    # Every applied reserve refreshes it, never backwards (BACKLOG #2648).
-                    " t.since = CASE WHEN t.since > s.now_ts THEN t.since ELSE s.now_ts END"
-                    " WHEN NOT MATCHED THEN"
-                    " INSERT (uploader_id, inflight_files, inflight_bytes, since)"
-                    " VALUES (s.uploader_id, s.files, s.size_bytes, s.now_ts)"
-                    " OUTPUT INSERTED.inflight_files;",
-                    (
-                        uploader_id,
-                        int(files),
-                        int(size_bytes),
-                        now,
-                        stale,
-                        int(max_files),
-                        int(max_total_bytes),
-                    ),
-                )
-                row = await cur.fetchone()
-                await self._commit(conn)
+                async with self._cursor(conn) as cur:
+                    # This read OPENS the transaction the applock attaches to, as in record_audit:
+                    # the autocommit=False pool begins one only on a statement that touches a
+                    # table, and `@LockOwner='Transaction'` needs one open. Value discarded.
+                    await cur.execute(
+                        "SELECT TOP (1) reservation_id FROM upload_reservation WHERE uploader_id = ?",
+                        (uploader_id,),
+                    )
+                    await cur.fetchall()
+                    await self._applock(cur, _upload_quota_lock(uploader_id))
+                    await cur.execute(
+                        "DELETE FROM upload_reservation WHERE uploader_id = ?"
+                        f" AND since <= {_MSSQL_EPOCH_NOW} - ?",
+                        (uploader_id, float(max(0.0, stale_after))),
+                    )
+                    await cur.execute(
+                        "INSERT INTO upload_reservation"
+                        " (reservation_id, uploader_id, size_bytes, since)"
+                        " OUTPUT inserted.reservation_id"
+                        f" SELECT ?, ?, ?, {_MSSQL_EPOCH_NOW}"
+                        " WHERE (SELECT COUNT(*) FROM upload_reservation WHERE uploader_id = ?)"
+                        " + 1 <= ?"
+                        " AND (SELECT COALESCE(SUM(size_bytes), 0) FROM upload_reservation"
+                        " WHERE uploader_id = ?) + ? <= ?",
+                        (
+                            reservation_id,
+                            uploader_id,
+                            int(size_bytes),
+                            uploader_id,
+                            int(max_files),
+                            uploader_id,
+                            int(size_bytes),
+                            int(max_total_bytes),
+                        ),
+                    )
+                    row = await cur.fetchone()
+                    await self._commit(conn)
             except Exception:
-                await conn.rollback()
+                # The transaction may hold the applock; after the cursor closes, as cancel_queued.
+                await self._rollback_or_discard(conn)
                 raise
         return row is not None
+
+    async def release_upload_quota(self, reservation_id: str) -> None:
+        """See :meth:`messagefoundry.store.base.Store.release_upload_quota`.
+
+        **It takes the uploader's applock before it deletes, as the reserve does (vault BACKLOG
+        #3180).** A bare delete by the key locked the clustered row and then the uploader index
+        entry. The reserve's stale delete reaches the same row through the uploader index, so it
+        locks the index entry first and then the clustered row. A release racing the reserve that
+        sweeps its own stale row could therefore deadlock it. Under the applock the two cannot
+        hold row locks at once, because each holds no row lock when it asks for the applock.
+
+        For the release that rests on how the uploader is read. ``READCOMMITTEDLOCK`` waits out a
+        reserve still committing this row rather than reading past it under RCSI, and its shared
+        lock is released when the read ends, before the applock is requested. A hint that holds
+        it longer, such as ``HOLDLOCK``, would break the argument. Nothing to release commits the
+        empty transaction and returns."""
+        async with self._acquire() as conn:
+            try:
+                async with self._cursor(conn) as cur:
+                    await cur.execute(
+                        "SELECT uploader_id FROM upload_reservation WITH (READCOMMITTEDLOCK)"
+                        " WHERE reservation_id = ?",
+                        (reservation_id,),
+                    )
+                    row = await cur.fetchone()
+                    if row is not None:
+                        await self._applock(cur, _upload_quota_lock(str(row[0])))
+                        await cur.execute(
+                            "DELETE FROM upload_reservation WHERE reservation_id = ?",
+                            (reservation_id,),
+                        )
+                    await self._commit(conn)
+            except Exception:
+                # The transaction may hold the applock; after the cursor closes, as the reserve.
+                await self._rollback_or_discard(conn)
+                raise
+
+    async def touch_upload_quota(self, reservation_id: str) -> None:
+        """See :meth:`messagefoundry.store.base.Store.touch_upload_quota`. "Now" is the database
+        server's clock, read once into ``@now`` so the CASE's test and its result are the same
+        instant (BACKLOG #3256)."""
+        await self._execute(
+            f"DECLARE @now FLOAT = {_MSSQL_EPOCH_NOW};"
+            " UPDATE upload_reservation SET since = CASE WHEN since > @now THEN since ELSE @now END"
+            " WHERE reservation_id = ?",
+            (reservation_id,),
+        )
 
     async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
         """See :meth:`messagefoundry.store.base.Store.upload_quota_in_flight`."""
         row = await self._fetchone(
-            "SELECT inflight_files, inflight_bytes FROM upload_quota WHERE uploader_id = ?",
+            "SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes), 0) AS b"
+            " FROM upload_reservation WHERE uploader_id = ?",
             (uploader_id,),
         )
-        return (int(row["inflight_files"]), int(row["inflight_bytes"])) if row else (0, 0)
+        return (int(row["n"]), int(row["b"])) if row else (0, 0)
 
     async def cipher_invocations(self, key_id: str) -> int:
         """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet)."""
@@ -13170,9 +13321,7 @@ class SqlServerStore:
 
     async def has_webauthn_credentials(self, user_id: str) -> bool:
         """True when the user has at least one enrolled passkey (the second-factor predicate)."""
-        d = await self._fetchone(
-            "SELECT TOP (1) 1 AS present FROM webauthn_credentials WHERE user_id=?", (user_id,)
-        )
+        d = await self._fetchone(_MSSQL_WEBAUTHN_ANY_FOR_USER, (user_id,))
         return d is not None
 
     async def any_webauthn_credentials(self) -> bool:
@@ -13709,7 +13858,7 @@ class SqlServerStore:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
-                    "SELECT username, oidc_issuer, oidc_subject FROM users"
+                    "SELECT username, oidc_issuer, oidc_subject, totp_enabled, cred_digest FROM users"
                     " WITH (UPDLOCK, ROWLOCK) WHERE id=?",
                     (user_id,),
                 )
@@ -13720,6 +13869,8 @@ class SqlServerStore:
                     await conn.rollback()
                     return None
                 username, issuer, subject = rows[0][0], rows[0][1], rows[0][2]
+                totp_enrolled = bool(rows[0][3])
+                digest_names_passkey = bool(rows[0][4])
                 if (issuer, subject) != (expected_issuer, expected_subject):
                     # Compared under the UPDLOCK above, so no other write to the row can land
                     # between this and the UPDATE. Nothing written; the rollback frees the lock.
@@ -13731,13 +13882,24 @@ class SqlServerStore:
                         sessions_revoked=0,
                         changed=True,
                     )
+                # Vault BACKLOG #2711 step 3. A statement of its own AFTER the UPDLOCK: under RCSI
+                # it reads a fresh statement snapshot, so it sees a passkey whose write (which
+                # re-seals this row) committed while the lock above waited. A passkey counts when
+                # either the table or the sealed digest names one, as the service reads it.
+                await cur.execute(_MSSQL_WEBAUTHN_ANY_FOR_USER, (user_id,))
+                webauthn_enrolled = bool(await cur.fetchall()) or digest_names_passkey
                 if issuer is None and subject is None:
                     # Already unbound: write NOTHING, so a no-op cannot sign the account out. The
                     # rollback releases the UPDLOCK taken above; there is nothing else to undo.
                     # AND, not OR: a half row has something to clear (see FederatedUnbind).
                     await conn.rollback()
                     return FederatedUnbind(
-                        username=username, issuer=None, subject=None, sessions_revoked=0
+                        username=username,
+                        issuer=None,
+                        subject=None,
+                        sessions_revoked=0,
+                        totp_enrolled=totp_enrolled,
+                        webauthn_enrolled=webauthn_enrolled,
                     )
                 await self._write_user(cur, user_id, lambda r: federated_unbind(r, now))
                 await cur.execute(
@@ -13754,6 +13916,8 @@ class SqlServerStore:
             issuer=issuer,
             subject=subject,
             sessions_revoked=int(count) if count is not None else 0,
+            totp_enrolled=totp_enrolled,
+            webauthn_enrolled=webauthn_enrolled,
         )
 
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:

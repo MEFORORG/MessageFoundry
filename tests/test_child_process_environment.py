@@ -27,6 +27,7 @@ import shutil
 import site
 import subprocess
 import sys
+import types
 from collections import Counter
 from collections.abc import Mapping
 from pathlib import Path
@@ -289,6 +290,32 @@ def test_the_worker_environment_is_an_allowlist() -> None:
     assert kept == {"PATH": "/usr/bin", "TZ": "UTC", _ALLOWED: _ALLOWED_VALUE}
 
 
+def test_a_worker_default_fills_a_gap_and_never_replaces_a_passed_value() -> None:
+    """``defaults`` is how the sandbox sets ``MALLOC_ARENA_MAX`` without writing to the builder's
+    result, which the static guard below would refuse (vault BACKLOG #2724)."""
+    parent = _parent_environment()
+    filled = childenv.worker_environment(parent, defaults={"MALLOC_ARENA_MAX": "2"})
+    assert filled["MALLOC_ARENA_MAX"] == "2"
+    passed = childenv.worker_environment(
+        {**parent, "MALLOC_ARENA_MAX": "8"},
+        extra_names=("MALLOC_ARENA_MAX",),
+        defaults={"MALLOC_ARENA_MAX": "2"},
+    )
+    assert passed["MALLOC_ARENA_MAX"] == "8"
+
+
+def test_a_system_tool_gets_the_platforms_start_up_names_and_nothing_else() -> None:
+    """``icacls`` and ``sc`` (vault BACKLOG #2716). Not an interpreter variable either, which a
+    Python child would keep: the tool is not Python."""
+    parent = _parent_environment()
+    env = childenv.system_tool_environment(parent)
+    assert env == {"PATH": "/usr/bin", "TZ": "UTC"}
+    # Case-insensitive on Windows, as the platform reads a name.
+    spelled = childenv.system_tool_environment({"SystemRoot": "C:\\Windows", "Path": "x"})
+    expected = {"SystemRoot": "C:\\Windows", "Path": "x"} if sys.platform == "win32" else {}
+    assert spelled == expected
+
+
 def test_a_variable_that_only_looks_like_the_interpreters_or_the_locales_does_not_cross() -> None:
     """The allowlist is names, not prefixes: an operator's own variable can start with the same
     letters as an interpreter or a locale variable."""
@@ -405,19 +432,173 @@ def test_a_python_child_starts_with_the_interpreters_remote_debugging_disabled()
         pytest.skip("this interpreter starts with remote debugging already off")
     flags = childenv.CHILD_INTERPRETER_FLAGS
     assert answer(flags) == "True False"
-    assert childenv.python_child_argv("a.module")[1 : 1 + len(flags)] == list(flags)
+    inherited = list(childenv.inherited_interpreter_flags())
+    head = childenv.python_child_argv("a.module")[1 : 1 + len(inherited) + len(flags)]
+    assert head == [*inherited, *flags]
 
 
 @pytest.mark.parametrize("build", [childenv.python_child_argv, childenv.python_module_argv])
-def test_a_callers_own_flags_go_ahead_of_the_shared_ones(build: Any) -> None:
+def test_a_callers_own_flags_go_ahead_of_the_shared_ones(
+    build: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Vault BACKLOG #2852: the tray's login command adds ``-E`` this way. A bare string is refused,
     because it would arrive one character at a time."""
+    monkeypatch.setattr(childenv, "inherited_interpreter_flags", lambda: ())
     argv = build("a.module", executable="py", extra_flags=("-E",))
     flags = list(childenv.CHILD_INTERPRETER_FLAGS)
     assert argv[: 2 + len(flags)] == ["py", "-E", *flags]
     assert build("a.module", executable="py")[: 1 + len(flags)] == ["py", *flags]
     with pytest.raises(TypeError):
         build("a.module", extra_flags="-E")
+
+
+def _flags(
+    isolated: int = 0,
+    ignore_environment: int = 0,
+    no_user_site: int = 0,
+    dont_write_bytecode: int = 0,
+) -> Any:
+    return types.SimpleNamespace(
+        isolated=isolated,
+        ignore_environment=ignore_environment,
+        no_user_site=no_user_site,
+        dont_write_bytecode=dont_write_bytecode,
+    )
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected"),
+    [
+        (_flags(isolated=1, ignore_environment=1, no_user_site=1), ("-I",)),
+        (_flags(ignore_environment=1), ("-E",)),
+        (_flags(no_user_site=1), ("-s",)),
+        (_flags(ignore_environment=1, no_user_site=1), ("-E", "-s")),
+        (_flags(), ()),
+    ],
+)
+def test_a_child_repeats_its_parents_isolation(
+    monkeypatch: pytest.MonkeyPatch, flags: Any, expected: tuple[str, ...]
+) -> None:
+    """Vault BACKLOG #2701, #2724: a child honours ``PYTHONPATH`` exactly when its parent does. A
+    flag the caller already passed is not repeated."""
+    monkeypatch.delenv("PYTHONUNBUFFERED", raising=False)
+    monkeypatch.setattr(sys, "flags", flags)
+    assert childenv.inherited_interpreter_flags() == expected
+    shared = list(childenv.CHILD_INTERPRETER_FLAGS)
+    head = childenv.python_child_argv("m", executable="py")[: 1 + len(expected) + len(shared)]
+    assert head == ["py", *expected, *shared]
+    once = childenv.python_module_argv("m", executable="py", extra_flags=("-E",))
+    assert once.count("-E") == 1
+
+
+def test_a_child_that_ignores_the_variables_keeps_the_two_the_image_sets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The container image starts the engine with ``-I -u -B`` and sets ``PYTHONUNBUFFERED`` and
+    ``PYTHONDONTWRITEBYTECODE`` for its children. An isolated child ignores both variables, so the
+    flags carry them. The control is a parent that reads the variables: no ``-u`` is added, as
+    the child reads the variable itself."""
+    monkeypatch.setenv("PYTHONUNBUFFERED", "1")
+    monkeypatch.setattr(sys, "flags", _flags(isolated=1, dont_write_bytecode=1))
+    assert childenv.inherited_interpreter_flags() == ("-I", "-B", "-u")
+    monkeypatch.setattr(sys, "flags", _flags())
+    assert childenv.inherited_interpreter_flags() == ()
+
+
+@pytest.mark.parametrize("build", [childenv.python_child_argv, childenv.python_module_argv])
+def test_a_stored_command_line_does_not_take_this_processs_isolation(
+    build: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tray's login command is stored and run later, so ``inherit=False`` leaves the running
+    process's own options out. The control is the default, which repeats them."""
+    monkeypatch.setattr(sys, "flags", _flags(isolated=1))
+    shared = list(childenv.CHILD_INTERPRETER_FLAGS)
+    assert build("m", executable="py", inherit=False)[: 1 + len(shared)] == ["py", *shared]
+    assert build("m", executable="py")[:2] == ["py", "-I"]
+
+
+def test_only_the_trays_stored_command_leaves_out_the_parents_isolation() -> None:
+    """``inherit=False`` is for a command line stored and run later. An engine child built with it
+    would honour the ``PYTHON*`` variables its isolated engine ignores, and nothing else reports
+    that since the inventory searches the engine's own path only (vault BACKLOG #2701)."""
+    passing = {
+        rel
+        for rel, source in _scanned_sources().items()
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.keyword) and node.arg == "inherit"
+    }
+    assert passing == {"tray/autostart.py"}
+
+
+def test_a_worker_default_may_not_name_an_engine_variable() -> None:
+    """A builder call is all the spawn guard checks, so ``defaults`` refuses what
+    ``[sandbox].pass_environment`` refuses."""
+    for name in ("MEFOR_STORE_KEY", "mefor_x", "VAULT_TOKEN"):
+        with pytest.raises(ValueError, match="engine's own"):
+            childenv.worker_environment({}, defaults={name: _MARKER})
+    with pytest.raises(ValueError, match="interpreter's variable"):
+        childenv.worker_environment({}, defaults={"PYTHONPATH": "."})
+
+
+def test_a_worker_default_does_not_add_a_second_spelling_on_windows() -> None:
+    """On Windows a name is case-insensitive, so a default never sits beside a passed value that
+    differs only in case."""
+    env = childenv.worker_environment(
+        {"malloc_arena_max": "8"},
+        extra_names=("MALLOC_ARENA_MAX",),
+        defaults={"MALLOC_ARENA_MAX": "2"},
+    )
+    expected = {"malloc_arena_max": "8"} if sys.platform == "win32" else {"MALLOC_ARENA_MAX": "2"}
+    assert {k: v for k, v in env.items() if k.upper() == "MALLOC_ARENA_MAX"} == expected
+
+
+def test_an_isolated_engine_starts_an_isolated_child_that_ignores_pythonpath(
+    tmp_path: Path,
+) -> None:
+    """Through real interpreters (vault BACKLOG #2701). A parent started with ``-I`` starts a child
+    through :func:`childenv.python_child_argv` with :func:`childenv.engine_environment`, which still
+    carries an absolute ``PYTHONPATH`` entry. The child reports itself isolated and does not import
+    the decoy that entry names. The control is the same parent without ``-I``: its child imports
+    the decoy, so "not imported" above is the flag's doing."""
+    decoys = tmp_path / "decoys"
+    decoys.mkdir()
+    (decoys / "mf_child_isolation_decoy.py").write_text("", encoding="utf-8")
+    probe = (
+        "import subprocess, sys\n"
+        "from messagefoundry import childenv\n"
+        "code = ('import sys\\n'\n"
+        "        'try:\\n'\n"
+        "        '    import mf_child_isolation_decoy\\n'\n"
+        "        '    found = \"DECOY\"\\n'\n"
+        "        'except ImportError:\\n'\n"
+        "        '    found = \"CLEAN\"\\n'\n"
+        "        'print(sys.flags.isolated, found)\\n')\n"
+        "argv = childenv.python_child_argv('mf_unused')\n"
+        "head = argv[: argv.index(childenv.CHILD_INTERPRETER_FLAGS[-1]) + 1]\n"
+        "done = subprocess.run([*head, '-c', code], env=childenv.engine_environment(),\n"
+        "                      capture_output=True, text=True, timeout=60, check=True)\n"
+        "print(childenv.__file__)\n"
+        "print(done.stdout.strip())\n"
+    )
+
+    def child_says(*parent_flags: str) -> str:
+        done = subprocess.run(  # noqa: S603 - this interpreter, a fixed command line
+            [sys.executable, *parent_flags, "-c", probe],
+            cwd=tmp_path,
+            env=childenv.engine_environment({**os.environ, "PYTHONPATH": str(decoys)}),
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        assert done.returncode == 0, done.stderr
+        module, said = done.stdout.strip().splitlines()
+        # The build under test, not another copy the venv may hold.
+        assert Path(module).resolve() == Path(childenv.__file__).resolve()
+        return said
+
+    assert child_says() == "0 DECOY"
+    assert child_says("-I") == "1 CLEAN"
 
 
 def test_the_bootstrap_runs_a_module_with_its_arguments_and_without_the_working_directory(
@@ -585,21 +766,25 @@ def test_a_site_packages_directory_on_pythonpath_does_not_let_the_checkout_shado
 # from. The walk over calls is this file's own.
 #
 # Its limits, so nobody reads a green run as more than it is. It reads at least the starts the
-# inventory's tables name. It takes ``env=<name>`` on trust when that name is bound once, in the
-# same function body, straight from a builder; it does not see the dict being changed afterwards
-# (``env.update(...)``). It cannot see a start made by a third-party library, or one reached
+# inventory's tables name. It takes ``env=<name>`` on trust only when that name is bound once, in
+# the same function body, straight from a builder, and is then read nowhere but as the ``env=`` of
+# a process start. Any other read, nested functions included, withdraws the trust: a method call
+# such as ``env.update(...)``, an item write or delete, a second name for the dict, or handing it
+# to another function. So a change made to the dict after it is bound is refused, not missed
+# (vault BACKLOG #2724). It cannot see a start made by a third-party library, or one reached
 # through ``getattr`` with a computed name.
 
 #: The only environments that count as chosen: a call to one of these.
 _BUILDERS = frozenset(
     f"messagefoundry.childenv.{name}"
-    for name in ("worker_environment", "hook_environment", "engine_environment")
+    for name in (
+        "worker_environment",
+        "hook_environment",
+        "engine_environment",
+        "system_tool_environment",
+    )
 )
 
-_PINNED_TOOL = (
-    "runs one fixed Windows system tool by its absolute System32 path, with an argument list and no "
-    "shell; it executes nothing an operator or a config author wrote"
-)
 _TRAY_OPENS_FOR_ITS_USER = (
     "the tray is the desktop user's own process, not the engine service; it opens a file, a folder "
     "or a page in that user's own program, which needs the user's environment"
@@ -616,17 +801,14 @@ _AS_A_VALUE = " (as a value)"
 #: the function that is not itself a call. An entry covers ONE start unless :data:`_MORE_THAN_ONE`
 #: says otherwise: a second start added to a listed function fails the guard.
 _INHERITS_ON_PURPOSE: dict[tuple[str, str, str], str] = {
-    ("auth/trust_anchors.py", "dacl_is_owner_only", "subprocess.run"): _PINNED_TOOL,
-    ("store/store.py", "_secure_file", "subprocess.run"): _PINNED_TOOL,
-    ("store/store.py", "_grant_read", "subprocess.run"): _PINNED_TOOL,
-    ("service.py", "service_state", "subprocess.run"): _PINNED_TOOL,
     ("service.py", "control_service", "ShellExecuteW"): _SERVICE_CONTROL,
     ("service.py", "_runas_wait", "ShellExecuteExW"): _SERVICE_CONTROL,
     ("service.py", "_runas_wait", "ShellExecuteExW" + _AS_A_VALUE): (
         "sets the ctypes prototype of the call listed on the line above; it starts nothing"
     ),
     ("service.py", "install_service", "ShellExecuteW"): _SERVICE_CONTROL,
-    ("service_status.py", "_query", "subprocess.run"): _PINNED_TOOL,
+    # Accepted as an exemption (vault BACKLOG #2716): the service never runs it, and the tools it
+    # runs are the developer's own, configured through the developer's environment.
     ("checks.py", "_run_tool", "subprocess.run"): (
         "the developer's own `messagefoundry check` command, run by hand or in CI and never by the "
         "service; ruff and mypy read their settings from the developer's environment, so it passes "
@@ -655,6 +837,12 @@ _MUST_CHOOSE = frozenset(
         ("pipeline/supervisor.py", "preflight_shard_config", "create_subprocess_exec"),
         # The tray starting itself again under its branded launcher (vault BACKLOG #2801).
         ("tray/branding.py", "relaunch_branded", "subprocess.Popen"),
+        # The fixed system tools, by their absolute System32 path (vault BACKLOG #2716).
+        ("auth/trust_anchors.py", "dacl_is_owner_only", "subprocess.run"),
+        ("store/store.py", "_secure_file", "subprocess.run"),
+        ("store/store.py", "_grant_read", "subprocess.run"),
+        ("service.py", "service_state", "subprocess.run"),
+        ("service_status.py", "_query", "subprocess.run"),
     }
 )
 
@@ -695,19 +883,50 @@ def _own_nodes(scope: ast.AST) -> list[ast.AST]:
 
 
 def _built_names(scope: ast.AST, aliases: Mapping[str, str]) -> frozenset[str]:
-    """The local names ``scope`` binds exactly once, and binds straight from a builder call. A
-    parameter, or a name bound a second time, is not one of them."""
-    nodes = _own_nodes(scope)
+    """The local names ``scope`` binds exactly once, straight from a builder call, and then reads
+    only as the ``env=`` of a process start (vault BACKLOG #2724).
+
+    A parameter, or a name bound a second time, is not one of them. Nor is a name read any other
+    way: ``env.update(...)``, ``env[k] = v``, ``del env[k]``, ``other = env``, ``f(env)`` or
+    ``f(env=env)`` where ``f`` starts nothing. Each of those can change the dict, or hand it to
+    code that can. The reads and the second bindings are counted over the whole body, nested
+    functions included, so a closure cannot change the dict unseen; an inner function's own name
+    of the same spelling withdraws the trust too, which is the safe side."""
+    assigned = [
+        node
+        for node in _own_nodes(scope)
+        if isinstance(node, ast.Assign) and _is_builder_call(node.value, aliases)
+    ]
+    if not assigned:
+        return frozenset()  # most scopes: no need to walk the whole body
+    everything = list(ast.walk(scope))
     bound = Counter(
-        node.id for node in nodes if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+        node.id
+        for node in everything
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store | ast.Del)
     )
-    bound.update(node.arg for node in nodes if isinstance(node, ast.arg))
+    bound.update(node.arg for node in everything if isinstance(node, ast.arg))
+    handed_to_a_start = {
+        id(keyword.value)
+        for node in everything
+        if isinstance(node, ast.Call) and _start_name(node.func, aliases) is not None
+        for keyword in node.keywords
+        if keyword.arg == "env"
+    }
+    read_otherwise = {
+        node.id
+        for node in everything
+        if isinstance(node, ast.Name)
+        and isinstance(node.ctx, ast.Load)
+        and id(node) not in handed_to_a_start
+    }
     return frozenset(
         target.id
-        for node in nodes
-        if isinstance(node, ast.Assign) and _is_builder_call(node.value, aliases)
+        for node in assigned
         for target in node.targets
-        if isinstance(target, ast.Name) and bound[target.id] == 1
+        if isinstance(target, ast.Name)
+        and bound[target.id] == 1
+        and target.id not in read_otherwise
     )
 
 
@@ -960,12 +1179,54 @@ def test_a_start_passed_as_a_value_is_a_site_of_its_own() -> None:
         # A class body does not inherit what a method binds.
         "class C:\n    def g(self):\n        env = hook_environment()\n"
         "    subprocess.run(['x'], env=env)\n",
+        # Changed after it was bound (vault BACKLOG #2724): a method call.
+        "def f():\n    env = hook_environment()\n    env.update(os.environ)\n"
+        "    subprocess.run(['x'], env=env)\n",
+        # An item written, and an item deleted.
+        "def f():\n    env = hook_environment()\n    env['MEFOR_STORE_KEY'] = 'x'\n"
+        "    subprocess.run(['x'], env=env)\n",
+        "def f():\n    env = hook_environment()\n    del env['PATH']\n"
+        "    subprocess.run(['x'], env=env)\n",
+        # A second name for the same dict, written through.
+        "def f():\n    env = hook_environment()\n    other = env\n    other.clear()\n"
+        "    subprocess.run(['x'], env=env)\n",
+        # Handed to a function that may change it, as a positional and as a keyword.
+        "def f():\n    env = hook_environment()\n    os.environ.copy().update(env)\n"
+        "    subprocess.run(['x'], env=env)\n",
+        "def f():\n    env = hook_environment()\n    dict.update(env, A='1')\n"
+        "    subprocess.run(['x'], env=env)\n",
+        "def change(env):\n    env.clear()\n"
+        "def f():\n    env = hook_environment()\n    change(env=env)\n"
+        "    subprocess.run(['x'], env=env)\n",
+        # Changed inside a nested function that closes over it.
+        "def f():\n    env = hook_environment()\n    def inner():\n        env.update(os.environ)\n"
+        "    inner()\n    subprocess.run(['x'], env=env)\n",
+        # Rebound inside a nested function.
+        "def f():\n    env = hook_environment()\n    def inner():\n        nonlocal env\n"
+        "        env = dict(os.environ)\n    inner()\n    subprocess.run(['x'], env=env)\n",
+        # An augmented assignment is a second binding.
+        "def f():\n    env = hook_environment()\n    env |= dict(os.environ)\n"
+        "    subprocess.run(['x'], env=env)\n",
     ],
 )
 def test_a_name_is_trusted_only_where_a_builder_bound_it_once(body: str) -> None:
     source = _FROM_A_BUILDER + "import os, subprocess\n" + body
     chosen, inherits = _spawn_sites({"m.py": source})
     assert (sum(chosen.values()), sum(inherits.values())) == (0, 1)
+
+
+def test_a_name_handed_only_to_starts_stays_trusted() -> None:
+    """The control for the rule above: a name read as nothing but the ``env=`` of each start is
+    still trusted, however many starts it reaches."""
+    source = (
+        _FROM_A_BUILDER + "import subprocess\n"
+        "def f():\n"
+        "    env = hook_environment()\n"
+        "    subprocess.run(['x'], env=env)\n"
+        "    subprocess.Popen(['y'], env=env)\n"
+    )
+    chosen, inherits = _spawn_sites({"m.py": source})
+    assert (sum(chosen.values()), sum(inherits.values())) == (2, 0)
 
 
 def test_a_call_that_starts_no_process_is_not_a_site() -> None:

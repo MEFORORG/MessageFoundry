@@ -1061,7 +1061,10 @@ async def test_a_fault_reading_the_entry_does_not_warn_per_request_by_name(
     store: MessageStore, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The probe's own per-fault WARNING names the account. It suits a per-pass reconciler, not a
-    per-request path, so here it goes to DEBUG and the outage line reports the fault once."""
+    per-request path, so here it goes to DEBUG. The fault is not an outage (BACKLOG #3100): the
+    certificate path's per-account fault line reports it once, naming no account.
+
+    RED when: a fault the probe caught is logged as a directory outage again."""
     service, directory, user_id = await _directory_account(store, _VIEWERS)
     caplog.set_level(logging.DEBUG, logger=_SERVICE_LOGGER)
     directory.raises = KeyError("userAccountControl")
@@ -1073,8 +1076,11 @@ async def test_a_fault_reading_the_entry_does_not_warn_per_request_by_name(
     warnings = [
         r for r in caplog.records if r.name == _SERVICE_LOGGER and r.levelno >= logging.WARNING
     ]
-    assert len(warnings) == 1 and _OUTAGE_LINE in warnings[0].getMessage()
+    assert len(warnings) == 1 and "was refused: probe_fault" in warnings[0].getMessage()
+    assert "raised KeyError" in warnings[0].getMessage()  # the type survives the reason string
+    assert _OUTAGE_LINE not in warnings[0].getMessage()
     assert "jdoe" not in warnings[0].getMessage()
+    assert service._cert_directory_outage is None and user_id in service._cert_probe_faulting
 
 
 async def test_the_reconciler_and_step_up_still_warn_on_a_fault(
@@ -1088,10 +1094,15 @@ async def test_the_reconciler_and_step_up_still_warn_on_a_fault(
     assert user is not None
 
     await service.identity_for_cert_user_id(_user_id)
-    assert await service._directory_step_up_refusal(user) == "unavailable"
+    assert await service._directory_step_up_refusal(user) == "probe_fault"
     await service.reconcile_directory_sessions()  # the sign-in left a live session to probe
 
-    raised = [r for r in caplog.records if "raised KeyError" in r.getMessage()]
+    # The probe's own line only; the certificate path's per-account fault line names the type too.
+    raised = [
+        r
+        for r in caplog.records
+        if r.getMessage().startswith("directory probe of jdoe raised KeyError")
+    ]
     assert [r.levelno for r in raised] == [logging.DEBUG, logging.WARNING, logging.WARNING]
 
 

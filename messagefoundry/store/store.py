@@ -85,6 +85,7 @@ from uuid import uuid4
 
 import aiosqlite
 
+from messagefoundry.childenv import system_tool_environment
 from messagefoundry.config.models import RetryPolicy
 
 # The captured-reply record lives in the (store-free) config layer so a sandbox worker child — which
@@ -910,10 +911,11 @@ class MessageOrigin(StrEnum):
     REINGRESS = "reingress"
 
 
-#: How long an uploader's quota row may go with no activity before the next reserve reclaims its
-#: slots (seconds) — ASVS 2.3.4, BACKLOG #1112. Activity is an applied reserve, a release, or a live
-#: save's heartbeat (BACKLOG #2648), so a save slower than this keeps its slot. The reclaim exists
-#: only so a process killed between reserve and release cannot consume an uploader's budget forever.
+#: How long an upload reservation may go with no activity before its uploader's next reserve
+#: reclaims it (seconds) — ASVS 2.3.4, BACKLOG #1112. Activity is the reservation's own reserve or
+#: its live save's heartbeat (BACKLOG #2648, vault BACKLOG #3180), so a save slower than this keeps
+#: its slot. The reclaim exists only so a slot that is never released, such as one held by a process
+#: killed between reserve and release, cannot consume an uploader's budget forever.
 #: Defined here (not in ``base``) because ``base`` imports THIS module, never the reverse; ``base``
 #: re-exports it as the public name. See :meth:`Store.reserve_upload_quota`.
 UPLOAD_RESERVATION_STALE_AFTER = 300.0
@@ -1967,6 +1969,13 @@ class FederatedUnbind:
     #: written and nothing revoked. ``issuer``/``subject`` are then the pair the row holds now, which
     #: this call did NOT clear. A caller must test this before treating the pair as cleared.
     changed: bool = False
+    #: Vault BACKLOG #2711 step 3. Whether the account held each engine factor, read in this same
+    #: transaction after the row lock, so the bind and unbind audit rows can say whether the account
+    #: holds engine factors. TOTP counts only once enabled; a passkey counts when the table or the
+    #: sealed ``cred_digest`` names one. Both stay ``False`` when ``changed`` is
+    #: set: that arm writes nothing, and no caller audits these fields from it.
+    totp_enrolled: bool = False
+    webauthn_enrolled: bool = False
 
 
 @dataclass(frozen=True)
@@ -2409,6 +2418,7 @@ _WEBAUTHN_DELETE_ONE: Final = (
     "DELETE FROM webauthn_credentials WHERE user_id=? AND credential_id_hash=?"
 )
 _WEBAUTHN_DELETE_ALL: Final = "DELETE FROM webauthn_credentials WHERE user_id=?"
+_WEBAUTHN_ANY_FOR_USER: Final = "SELECT 1 FROM webauthn_credentials WHERE user_id=? LIMIT 1"
 
 # The role write (BACKLOG #2592), every column in `RoleRow` field order. SQLite only: Postgres
 # carries a `$n` twin and SQL Server a MERGE. Used only by `_write_role`; tests/test_role_seal.py
@@ -5185,6 +5195,7 @@ def _secure_file(path: Path) -> None:
             result = subprocess.run(  # nosec B603 B607
                 [_system_exe("icacls.exe"), str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
                 check=False,
+                env=system_tool_environment(),  # the platform's start-up names only (#2716)
                 capture_output=True,
                 text=True,
                 # icacls echoes the path in the OEM code page. Neither the cp1252 locale default nor
@@ -5222,6 +5233,7 @@ def _grant_read(path: Path, principal: str) -> None:
         result = subprocess.run(  # nosec B603 B607
             [_system_exe("icacls.exe"), str(path), "/grant", f"{principal}:(R)"],
             check=False,
+            env=system_tool_environment(),  # the platform's start-up names only (#2716)
             capture_output=True,
             text=True,
             encoding="oem",  # icacls's piped output; see _secure_file for why "replace"
@@ -6078,6 +6090,12 @@ def operator_audits[R](audit: OperatorAudit[R] | None, result: R) -> tuple[Audit
     return () if row is None else (row,)
 
 
+def if_applied(audit: AuditAppend) -> OperatorAudit[bool]:
+    """``audit`` when the mutation changed a row, otherwise nothing (vault BACKLOG #3217). The
+    operator alert mutations take one, so an unknown or resolved id records no row."""
+    return lambda applied: audit if applied else None
+
+
 class AuditedWrite:
     """Tee a write's audit rows off-box once its transaction has committed (BACKLOG #2624).
 
@@ -6652,8 +6670,9 @@ CREATE INDEX IF NOT EXISTS ix_resend_message ON resend_log(message_id);
 -- files another system owns can be polled without moving/deleting them and a left file is ingested
 -- ONCE. Shaped like `delivered_keys`/`resend_log`: HASHES + IDS ONLY, no body/PHI, so it is stored in
 -- the clear (NOT part of the `_cipher` seam). `file_key` is a SHA-256 of the file's identity
--- (relative-path+mtime+size local / full-remote-path+size remote — the PATH is folded in, not just the
--- basename, so two same-named files under different subdirs stay distinct and are BOTH ingested) — a
+-- (relative-path+mtime+size local / full-remote-path+size+the listed mtime remote, the mtime only where
+-- the server lists one, BACKLOG #2758 — the PATH is folded in, not just the basename, so two
+-- same-named files under different subdirs stay distinct and are BOTH ingested) — a
 -- DERIVED id, NEVER a cleartext path (a filename/path can embed an MRN) and never logged at INFO+.
 -- `channel_id` is the inbound connection name (config metadata, non-PHI) — scopes the dedup + the
 -- age/count prune per connection. The row is INSERTed AFTER the file's message(s) emit successfully (the
@@ -6804,21 +6823,25 @@ CREATE TABLE IF NOT EXISTS transit_bound_attestation (
     audit_hash  TEXT NOT NULL
 );
 
--- Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112). One row per uploader holding
--- only the IN-FLIGHT total: uploads reserved but not yet landed in `uploads_dir`, and therefore
--- invisible to the sidecar scan that counts everything already on disk. The scan is uncached and so
--- already fleet-visible; this row is what the per-event-loop `UploadStore._quota_lock` cannot give:
--- a shard's upload in flight, visible to its siblings. It is not the whole decision; see
--- `uploads.UploadQuotaError` (BACKLOG #1941). `since` is the row's last activity: an applied
--- reserve, a release, or a live save's heartbeat (BACKLOG #2648). A row idle that long while
--- non-zero holds only leaked slots, so a reservation leaked by a killed process is reclaimed
--- rather than consuming the uploader's budget forever. No PHI: an account id and two counters.
-CREATE TABLE IF NOT EXISTS upload_quota (
-    uploader_id    TEXT PRIMARY KEY,
-    inflight_files INTEGER NOT NULL DEFAULT 0,
-    inflight_bytes INTEGER NOT NULL DEFAULT 0,
+-- Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112). One row per upload IN
+-- FLIGHT: reserved but not yet landed in `uploads_dir`, and therefore invisible to the sidecar scan
+-- that counts everything already on disk. The scan is uncached and so already fleet-visible; these
+-- rows are what the per-event-loop `UploadStore._quota_lock` cannot give: a shard's upload in
+-- flight, visible to its siblings. It is not the whole decision; see `uploads.UploadQuotaError`
+-- (BACKLOG #1941). `reservation_id` is the save's own id, so a release pays back only its own slot
+-- (vault BACKLOG #3180). `since` is that reservation's last activity: its reserve or a live save's
+-- heartbeat (BACKLOG #2648). A reservation idle that long is a leak, from a killed process or a
+-- release that never landed, and the uploader's next reserve deletes it. No PHI: two ids, a size
+-- and a timestamp.
+-- The table this one replaced held one row per uploader (vault BACKLOG #3180). Nothing reads it.
+DROP TABLE IF EXISTS upload_quota;
+CREATE TABLE IF NOT EXISTS upload_reservation (
+    reservation_id TEXT PRIMARY KEY,
+    uploader_id    TEXT NOT NULL,
+    size_bytes     INTEGER NOT NULL,
     since          REAL NOT NULL
 );
+CREATE INDEX IF NOT EXISTS ix_upload_reservation_uploader ON upload_reservation(uploader_id);
 
 CREATE TABLE IF NOT EXISTS pending_approvals (
     id           TEXT PRIMARY KEY,
@@ -12725,7 +12748,7 @@ class MessageStore:
         *,
         top_only: bool = False,
         now: float | None = None,
-        audit: OperatorAudit[int] | None = None,
+        audit: OperatorAudit[int],
     ) -> int:
         """Soft-cancel **pending** deliveries for a destination: mark them ``cancelled``, append
         a ``cancelled`` audit event each, and finalize any message whose deliveries are now all
@@ -13466,34 +13489,45 @@ class MessageStore:
             escalation_tier=r["escalation_tier"],
         )
 
-    async def ack_alert_instance(
-        self, alert_id: int, *, actor: str, now: float | None = None
+    async def _commit_alert_change(
+        self, written: AuditedWrite, audit: AuditAppend, applied: bool
     ) -> bool:
-        # Operator ack: open|acknowledged → acknowledged, recording acked_by/acked_at. Idempotent (a
+        """Append an operator alert mutation's row, when its UPDATE matched, and commit both in the
+        one transaction (vault BACKLOG #3217), so a failed append changes nothing and a 404 writes
+        no row. Each caller spells its UPDATE at its own ``execute``, which the transaction-verb
+        guard reads (tests/test_writer_txn_is_the_only_begin.py)."""
+        await self._append_operator_audit(written, if_applied(audit), applied)
+        await self._commit()
+        return applied
+
+    async def ack_alert_instance(
+        self, alert_id: int, *, actor: str, audit: AuditAppend, now: float | None = None
+    ) -> bool:
+        # Operator ack: open|acknowledged -> acknowledged, recording acked_by/acked_at. Idempotent (a
         # re-ack is a no-op update). Returns True iff a non-resolved instance with this id existed (so
-        # the API can 404 a resolved/unknown id). Ack'ing a resolved instance is refused (no-op → False).
+        # the API can 404 a resolved/unknown id). Acking a resolved instance is refused (no-op, False).
         now = time.time() if now is None else now
-        async with _writer_guard(self._db, self._lock):
+        async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE alert_instance SET status='acknowledged', acked_by=?, acked_at=?"
                 " WHERE id=? AND status!='resolved'",
                 (actor, now, alert_id),
             )
-            await self._commit()
-            return cur.rowcount > 0
+            return await self._commit_alert_change(written, audit, cur.rowcount > 0)
 
-    async def resolve_alert_instance(self, alert_id: int, *, now: float | None = None) -> bool:
-        # Operator resolve: open|acknowledged → resolved, recording resolved_at. Returns True iff a
+    async def resolve_alert_instance(
+        self, alert_id: int, *, audit: AuditAppend, now: float | None = None
+    ) -> bool:
+        # Operator resolve: open|acknowledged -> resolved, recording resolved_at. Returns True iff a
         # non-resolved instance with this id existed.
         now = time.time() if now is None else now
-        async with _writer_guard(self._db, self._lock):
+        async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE alert_instance SET status='resolved', resolved_at=?"
                 " WHERE id=? AND status!='resolved'",
                 (now, alert_id),
             )
-            await self._commit()
-            return cur.rowcount > 0
+            return await self._commit_alert_change(written, audit, cur.rowcount > 0)
 
     async def resolve_alert_instances_for(
         self, *, event_type: str, connection: str, now: float | None = None
@@ -13511,36 +13545,38 @@ class MessageStore:
             return int(cur.rowcount)
 
     async def suspend_alert_instance(
-        self, alert_id: int, *, until: float, now: float | None = None
+        self, alert_id: int, *, until: float, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
         # #143 windowed suspend: mute NOTIFICATIONS for this instance's (event_type, connection) key until
         # `until` (an epoch). NOTIFICATION-only (ADR 0044 AC-3): the instance's status/count/visibility is
-        # untouched — only `suspended_until` is set, so it stays open on the dashboard. Refuses a resolved
+        # untouched; only `suspended_until` is set, so it stays open on the dashboard. Refuses a resolved
         # instance (a resolved condition has nothing to mute). Returns the updated row (for the API echo +
         # so the caller can seed the running sink's suspend cache), or None if unknown/already resolved.
-        async with _writer_guard(self._db, self._lock):
+        now = time.time() if now is None else now
+        async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE alert_instance SET suspended_until=? WHERE id=? AND status!='resolved'",
                 (until, alert_id),
             )
-            await self._commit()
-            if cur.rowcount == 0:
-                return None
+            applied = await self._commit_alert_change(written, audit, cur.rowcount > 0)
+        if not applied:
+            return None
         return await self.get_alert_instance(alert_id, allowed_channels=None)
 
     async def resume_alert_instance(
-        self, alert_id: int, *, now: float | None = None
+        self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
         # #143: clear a windowed suspend (re-alerts resume immediately). Idempotent (clearing an
         # un-suspended instance is a no-op UPDATE). Returns the row, or None if unknown/already resolved.
-        async with _writer_guard(self._db, self._lock):
+        now = time.time() if now is None else now
+        async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE alert_instance SET suspended_until=NULL WHERE id=? AND status!='resolved'",
                 (alert_id,),
             )
-            await self._commit()
-            if cur.rowcount == 0:
-                return None
+            applied = await self._commit_alert_change(written, audit, cur.rowcount > 0)
+        if not applied:
+            return None
         return await self.get_alert_instance(alert_id, allowed_channels=None)
 
     async def count_open_alerts_by_connection(self) -> dict[str, int]:
@@ -14293,72 +14329,44 @@ class MessageStore:
     async def reserve_upload_quota(
         self,
         uploader_id: str,
+        reservation_id: str,
         *,
-        files: int,
         size_bytes: int,
-        max_files: int = 0,
-        max_total_bytes: int = 0,
+        max_files: int,
+        max_total_bytes: int,
         stale_after: float = UPLOAD_RESERVATION_STALE_AFTER,
     ) -> bool:
-        """Atomically reserve (or release) an uploader's in-flight upload budget — see
+        """Atomically reserve one in-flight upload slot named ``reservation_id`` — see
         :meth:`messagefoundry.store.base.Store.reserve_upload_quota` for the contract.
 
-        The reserve is ONE statement: an upsert whose ``DO UPDATE`` carries the budget predicate, so
-        the read and the write cannot be separated by another connection. That is what makes it
-        exclusive across processes rather than across coroutines. ``rowcount`` discriminates applied
-        from refused; the row is left untouched on a refusal."""
-        now = time.time()
-        if files <= 0:
-            # RELEASE — always applies, clamped at zero so a double release cannot mint budget. Never
-            # conditional: refusing a release would strand the reservation it is paying back.
-            async with _writer_guard(self._db, self._lock):
-                await self._db.execute(
-                    "UPDATE upload_quota SET"
-                    " inflight_files = MAX(0, inflight_files + ?),"
-                    " inflight_bytes = MAX(0, inflight_bytes + ?),"
-                    # Never backwards: a host whose clock lags must not age a live row (#2648).
-                    " since = MAX(since, ?)"
-                    " WHERE uploader_id = ?",
-                    (int(files), int(size_bytes), now, uploader_id),
-                )
-                await self._commit()
-            return True
-        if files > max_files or size_bytes > max_total_bytes:
-            # Fail closed BEFORE touching the row: the insert branch below (no row yet) applies
-            # unconditionally, so an empty uploader with zero headroom must be refused here.
+        The reclaim and the reserve run in one transaction under the one writer connection, and the
+        reserve is ONE statement whose ``WHERE`` carries the budget, so no other connection can
+        write between the sums it reads and the row it inserts. ``rowcount`` discriminates applied
+        from refused."""
+        if max_files < 1 or size_bytes > max_total_bytes:
+            # Fail closed before touching the store: a headroom that cannot hold one slot.
             return False
+        now = time.time()
         stale = now - max(0.0, stale_after)
         async with _writer_guard(self._db, self._lock):
+            await self._db.execute(
+                "DELETE FROM upload_reservation WHERE uploader_id = ? AND since <= ?",
+                (uploader_id, stale),
+            )
             cur = await self._db.execute(
-                "INSERT INTO upload_quota (uploader_id, inflight_files, inflight_bytes, since)"
-                " VALUES (?,?,?,?)"
-                " ON CONFLICT(uploader_id) DO UPDATE SET"
-                " inflight_files ="
-                " CASE WHEN upload_quota.since <= ? THEN 0 ELSE upload_quota.inflight_files END + ?,"
-                " inflight_bytes ="
-                " CASE WHEN upload_quota.since <= ? THEN 0 ELSE upload_quota.inflight_bytes END + ?,"
-                # Every applied reserve refreshes `since`, as a release does: a live slot joining
-                # an old row must not be reclaimed along with it (BACKLOG #2648). Never backwards,
-                # so a host whose clock lags cannot age a row a sibling keeps fresh.
-                " since = MAX(upload_quota.since, ?)"
-                " WHERE (CASE WHEN upload_quota.since <= ? THEN 0"
-                " ELSE upload_quota.inflight_files END) + ? <= ?"
-                " AND (CASE WHEN upload_quota.since <= ? THEN 0"
-                " ELSE upload_quota.inflight_bytes END) + ? <= ?",
+                "INSERT INTO upload_reservation (reservation_id, uploader_id, size_bytes, since)"
+                " SELECT ?, ?, ?, ?"
+                " WHERE (SELECT COUNT(*) FROM upload_reservation WHERE uploader_id = ?) + 1 <= ?"
+                " AND (SELECT COALESCE(SUM(size_bytes), 0) FROM upload_reservation"
+                " WHERE uploader_id = ?) + ? <= ?",
                 (
+                    reservation_id,
                     uploader_id,
-                    int(files),
                     int(size_bytes),
                     now,
-                    stale,
-                    int(files),
-                    stale,
-                    int(size_bytes),
-                    now,
-                    stale,
-                    int(files),
+                    uploader_id,
                     int(max_files),
-                    stale,
+                    uploader_id,
                     int(size_bytes),
                     int(max_total_bytes),
                 ),
@@ -14367,15 +14375,33 @@ class MessageStore:
             await self._commit()
         return applied
 
+    async def release_upload_quota(self, reservation_id: str) -> None:
+        """See :meth:`messagefoundry.store.base.Store.release_upload_quota`."""
+        async with _writer_guard(self._db, self._lock):
+            await self._db.execute(
+                "DELETE FROM upload_reservation WHERE reservation_id = ?", (reservation_id,)
+            )
+            await self._commit()
+
+    async def touch_upload_quota(self, reservation_id: str) -> None:
+        """See :meth:`messagefoundry.store.base.Store.touch_upload_quota`."""
+        async with _writer_guard(self._db, self._lock):
+            await self._db.execute(
+                "UPDATE upload_reservation SET since = MAX(since, ?) WHERE reservation_id = ?",
+                (time.time(), reservation_id),
+            )
+            await self._commit()
+
     async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
         """See :meth:`messagefoundry.store.base.Store.upload_quota_in_flight`."""
         async with self._read() as db:
             cur = await db.execute(
-                "SELECT inflight_files, inflight_bytes FROM upload_quota WHERE uploader_id = ?",
+                "SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes), 0) AS b"
+                " FROM upload_reservation WHERE uploader_id = ?",
                 (uploader_id,),
             )
             row = await cur.fetchone()
-        return (int(row["inflight_files"]), int(row["inflight_bytes"])) if row else (0, 0)
+        return (int(row["n"]), int(row["b"])) if row else (0, 0)
 
     async def audit_anchor(self) -> tuple[int, str]:
         """The audit log's external anchor: ``(seq, head_hash)`` of its newest row, or ``(0, "")``
@@ -14990,9 +15016,7 @@ class MessageStore:
     async def has_webauthn_credentials(self, user_id: str) -> bool:
         """True when the user has at least one enrolled passkey (the second-factor predicate)."""
         async with self._read() as db:
-            cur = await db.execute(
-                "SELECT 1 FROM webauthn_credentials WHERE user_id=? LIMIT 1", (user_id,)
-            )
+            cur = await db.execute(_WEBAUTHN_ANY_FOR_USER, (user_id,))
             return (await cur.fetchone()) is not None
 
     async def any_webauthn_credentials(self) -> bool:
@@ -15499,7 +15523,9 @@ class MessageStore:
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
             cur = await self._db.execute(
-                "SELECT username, oidc_issuer, oidc_subject FROM users WHERE id=?", (user_id,)
+                "SELECT username, oidc_issuer, oidc_subject, totp_enabled, cred_digest FROM users"
+                " WHERE id=?",
+                (user_id,),
             )
             row = await cur.fetchone()
             if row is None:
@@ -15515,6 +15541,11 @@ class MessageStore:
                     sessions_revoked=0,
                     changed=True,
                 )
+            # Vault BACKLOG #2711 step 3: read under the same writer lock as the pair. A passkey
+            # counts when either the table or the sealed digest names one, as the service reads it.
+            totp_enrolled = bool(row["totp_enabled"])
+            cur = await self._db.execute(_WEBAUTHN_ANY_FOR_USER, (user_id,))
+            webauthn_enrolled = (await cur.fetchone()) is not None or bool(row["cred_digest"])
             if issuer is None and subject is None:
                 # Already unbound: write NOTHING. Falling through would revoke this account's live
                 # sessions for a no-op change, and an unbind of nothing must not sign anybody out.
@@ -15522,7 +15553,12 @@ class MessageStore:
                 # the residual column with no admin path to remove it (see FederatedUnbind).
                 await self._db.rollback()
                 return FederatedUnbind(
-                    username=row["username"], issuer=None, subject=None, sessions_revoked=0
+                    username=row["username"],
+                    issuer=None,
+                    subject=None,
+                    sessions_revoked=0,
+                    totp_enrolled=totp_enrolled,
+                    webauthn_enrolled=webauthn_enrolled,
                 )
             await self._write_user(user_id, lambda r: federated_unbind(r, now))
             revoked = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
@@ -15532,6 +15568,8 @@ class MessageStore:
                 issuer=issuer,
                 subject=subject,
                 sessions_revoked=int(revoked.rowcount),
+                totp_enrolled=totp_enrolled,
+                webauthn_enrolled=webauthn_enrolled,
             )
 
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:

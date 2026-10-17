@@ -522,19 +522,8 @@ def test_runtime_joined_code_lists_survive_redaction(monkeypatch: pytest.MonkeyP
         False,
         False,
         code_path_variables=("PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE"),
-        reaching_children=("PYTHONPATH", "PYTHONHOME"),
     )
     texts += [risk for _, risk in startup_loosenings(StartupPosture(launch=launch))]
-    # Under -I the children branch is the one that names the variables reaching a child.
-    isolated = InterpreterLaunch(
-        True,
-        True,
-        True,
-        True,
-        code_path_variables=("PYTHONPATH", "PYTHONHOME"),
-        reaching_children=("PYTHONPATH", "PYTHONHOME"),
-    )
-    texts += [risk for _, risk in startup_loosenings(StartupPosture(launch=isolated))]
     # The two refusals of an unknown log level list the levels. Both raise before they change
     # anything: the run-time one checks the name first, and the settings one is a field validator.
     for refuse in (
@@ -550,7 +539,6 @@ def test_runtime_joined_code_lists_survive_redaction(monkeypatch: pytest.MonkeyP
     for joined in (
         "/".join(sorted(trust_anchors._WRITE_RIGHTS)),
         "PYTHONPATH/PYTHONHOME/PYTHONUSERBASE is set",
-        "PYTHONPATH/PYTHONHOME is set in the engine's environment",
         # Past the parenthesis: the Windows spelling of this group was scrubbed out of it (vault
         # BACKLOG #3227), and an assert that stops at "Users" cannot see that.
         "such as Everyone or Users (or Authenticated users), that holds a write right",
