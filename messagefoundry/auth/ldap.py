@@ -947,10 +947,13 @@ def _ldap3_call(operation: str, *, close: bool = False) -> Iterator[None]:
 
     ``close`` closes the socket the failed read was on, where nothing else will. Only the service
     account's bind passes it: its ``auto_bind`` runs inside ldap3's ``Connection`` constructor, so
-    when it raises no caller holds the connection to unbind. A search does not. Its caller holds
-    the connection in a ``with`` block, and ldap3 2.9.1's ``Connection.__exit__`` reopens a
-    connection that was open on entry and is closed on exit, so a close there would cost one more
-    connect and close nothing (measured, BACKLOG #3010).
+    when it raises no caller holds the connection to unbind. A search does not (BACKLOG #3010).
+    ``authenticate`` and ``probe_principal`` hold the service connection in ldap3's own ``with``,
+    and ldap3 2.9.1's ``Connection.__exit__`` reopens a connection that was open on entry and is
+    closed on exit. So a close there shut the failed socket and then cost one more connect for a
+    fresh, unbound one. The cost of not closing: after an undecodable search response, those two
+    callers' connection stays open and bound, on a stream that may be out of step, until it is
+    collected. ``read_bind_account`` unbinds its own in a ``finally``.
     """
     import ldap3
 
@@ -1031,7 +1034,8 @@ def _search_paged(conn: Any, operation: str, **kwargs: Any) -> list[Any]:
 
     **A refused search is abandoned** (:func:`_abandon_paging`) once the directory has sent a
     cookie, so it need not hold the paging state until its own timeout. Not after a response ldap3
-    could not decode: the stream may be out of step after one, so nothing more is sent on it.
+    could not decode: the stream may be out of step after one, so no abandon is sent on it, and
+    the directory holds the paging state until its own timeout or the connection ends.
     """
     entries: list[Any] = []
     cookie: bytes | None = None  # what the next page is asked with

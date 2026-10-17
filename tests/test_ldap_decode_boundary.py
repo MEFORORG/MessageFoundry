@@ -243,7 +243,7 @@ def test_a_paged_control_ldap3_cannot_decode_is_an_outage_and_is_not_abandoned(
         with _service_conn(authenticator) as conn:
             with pytest.raises(LdapError) as refused:
                 authenticator._resolve_groups(conn, _USER_DN, [])
-            # Not closed: the caller's ``with`` would reopen it (_ldap3_call says why).
+            # Not closed: _search leaves the connection to its caller (_ldap3_call says why).
             assert not conn.closed, "a search refusal must not close the caller's connection"
         _assert_undecodable(refused.value, "group search", fault)
         assert len(dc.searches) == (2 if later else 1), "a search was sent after the refusal"
