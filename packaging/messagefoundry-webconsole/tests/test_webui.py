@@ -9140,6 +9140,21 @@ def test_a_new_address_continuation_keeps_the_path_encoded() -> None:
     assert _new_address_continuation(encoded, landing=land) == "/ui/messages/a%3Fb"
     with_query = req("/ui/messages/a?b", "/ui/messages/a%3Fb", "x=1")
     assert _new_address_continuation(with_query, landing=land) == "/ui/messages/a%3Fb?x=1"
+    # A query with a byte outside ASCII falls back to the landing (review round 2): the redirect
+    # quotes the target as UTF-8, so the raw byte would come back as different bytes. The same
+    # query sent percent-encoded is ASCII, and comes back unchanged.
+    for raw_query in (b"x=\xe9", "x=é".encode()):
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/ui/messages/ab",
+            "raw_path": b"/ui/messages/ab",
+            "query_string": raw_query,
+            "headers": [],
+        }
+        assert _new_address_continuation(Request(scope), landing=land) == land, raw_query
+    encoded_query = req("/ui/messages/ab", "/ui/messages/ab", "x=%C3%A9")
+    assert _new_address_continuation(encoded_query, landing=land) == "/ui/messages/ab?x=%C3%A9"
     # The control: a plain segment still comes back to itself.
     assert _new_address_continuation(req("/ui/messages/ab", "/ui/messages/ab"), landing=land) == (
         "/ui/messages/ab"

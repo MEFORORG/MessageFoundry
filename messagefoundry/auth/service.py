@@ -382,14 +382,34 @@ _NEW_IP_PER_SESSION_MAX = 8
 # _NEW_IP_OVER_CAP_LOG_MAX such addresses per session; its repeats share the interval.
 _NEW_IP_REPEAT_LOG_SECONDS = 60.0
 _NEW_IP_OVER_CAP_LOG_MAX = 64
+# The first-sighting set never holds attacker-chosen text: an address that does not parse, or
+# whose canonical text is longer than this (a long IPv6 scope id), is remembered as the one
+# sentinel below. So the set is at most _NEW_IP_OVER_CAP_LOG_MAX keys of at most this length, for
+# each of _NEW_IP_DEDUP_MAX sessions, and every unparseable address shares one first sighting.
+_NEW_IP_LOG_KEY_MAX = 64
+_NEW_IP_UNPARSED_LOG_KEY = "unparsed"
+
+
+def _over_cap_log_key(address_key: str) -> str:
+    """The bounded key the log throttle remembers for a past-the-cap address (vault BACKLOG
+    #3052): the address's canonical text when it parses and fits, else one fixed sentinel."""
+    if len(address_key) > _NEW_IP_LOG_KEY_MAX:
+        return _NEW_IP_UNPARSED_LOG_KEY
+    try:
+        ipaddress.ip_address(address_key)
+    except ValueError:
+        return _NEW_IP_UNPARSED_LOG_KEY
+    return address_key
 
 
 @dataclass
 class _NewIpLogState:
     """One session's new-address log throttle (vault BACKLOG #3052 item 16): when it last wrote a
-    held-back line, and the past-the-cap addresses whose first sighting it has already logged."""
+    held-back line, how many lines it has held back since, and the bounded keys of the past-the-cap
+    addresses whose first sighting it has already logged (:func:`_over_cap_log_key`)."""
 
     last_line: float | None = None
+    suppressed: int = 0
     over_cap_logged: set[str] = field(default_factory=set)
 
 
@@ -9915,25 +9935,33 @@ class AuthService:
         """Whether this session's new-address WARNING may be written now (vault BACKLOG #3052
         item 16). ``over_cap_key`` is the host key of an address past the per-session cap: its
         first sighting is always due, for up to ``_NEW_IP_OVER_CAP_LOG_MAX`` addresses, because
-        that line is its only record. Any other line is due at most once per
-        ``_NEW_IP_REPEAT_LOG_SECONDS``. The refusal never depends on it. Per process and bounded,
-        so an eviction can only ever write extra lines, never hide a refusal."""
+        that line is its only record; it is remembered by :func:`_over_cap_log_key`, so every
+        unparseable address shares one first sighting. Any other line is due at most once per
+        ``_NEW_IP_REPEAT_LOG_SECONDS``, and a line held back writes a DEBUG line with the count
+        held back since the last WARNING, so a suppressed repeat is never silent. The refusal never
+        depends on it. Per process and bounded, so an eviction can only ever write extra lines,
+        never hide a refusal."""
         state = self._new_ip_logged.get(token_hash)
         if state is None:
             if len(self._new_ip_logged) >= _NEW_IP_DEDUP_MAX:
                 self._new_ip_logged.pop(next(iter(self._new_ip_logged)))
             state = self._new_ip_logged[token_hash] = _NewIpLogState()
-        if (
-            over_cap_key is not None
-            and over_cap_key not in state.over_cap_logged
-            and len(state.over_cap_logged) < _NEW_IP_OVER_CAP_LOG_MAX
-        ):
-            state.over_cap_logged.add(over_cap_key)
-            return True
+        if over_cap_key is not None and len(state.over_cap_logged) < _NEW_IP_OVER_CAP_LOG_MAX:
+            log_key = _over_cap_log_key(over_cap_key)
+            if log_key not in state.over_cap_logged:
+                state.over_cap_logged.add(log_key)
+                return True
         now = time.monotonic()
         if state.last_line is not None and now - state.last_line < _NEW_IP_REPEAT_LOG_SECONDS:
+            state.suppressed += 1
+            _log.debug(
+                "a new-address WARNING was held back by the per-session throttle: "
+                "suppressed=%d since the last one",
+                state.suppressed,
+            )
             return False
         state.last_line = now
+        state.suppressed = 0
         return True
 
     def _restart_new_ip_dedupe(self, token_hash: str) -> None:

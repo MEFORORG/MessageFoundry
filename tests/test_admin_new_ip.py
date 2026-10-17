@@ -37,8 +37,11 @@ from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import ALL_CHANNELS, Identity
 from messagefoundry.auth.notifications import NEW_ADDRESS_REVERIFY, SecurityEvent
 from messagefoundry.auth.service import (
+    _NEW_IP_LOG_KEY_MAX,
+    _NEW_IP_OVER_CAP_LOG_MAX,
     _NEW_IP_PER_SESSION_MAX,
     _NEW_IP_REPEAT_LOG_SECONDS,
+    _NEW_IP_UNPARSED_LOG_KEY,
     STEP_UP_ACTION_ADMIN_USER_UPDATE,
     STEP_UP_ACTION_SESSION_TERMINATE,
     AuthService,
@@ -268,6 +271,104 @@ async def test_repeat_warning_is_held_to_one_per_session_per_interval(
         service._rekey_token_state(hash_token(token), new_hash)
         assert service._new_ip_logged.get(new_hash) is state
         assert hash_token(token) not in service._new_ip_logged
+    finally:
+        await store.close()
+
+
+async def test_the_past_cap_first_sighting_record_is_bounded() -> None:
+    """RED when: the past-the-cap first-sighting record keeps the text of an address that does not
+    parse, or keeps more than ``_NEW_IP_OVER_CAP_LOG_MAX`` keys, for a session (vault BACKLOG #3052
+    review finding 7). On a proxied hop the address is attacker-supplied text, so up to 4096
+    sessions could each hold 64 keys of whatever length the sender chose. Every unparseable or
+    over-long address must share one sentinel, and a parseable one is kept at its canonical text."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
+        await service.initialize()
+        token, _ = await _enabled_admin(service, client="10.1.1.1")
+        for i in range(_NEW_IP_PER_SESSION_MAX + 1):
+            assert await service.flag_new_client_ip(token, f"10.3.3.{i}", path="/users") is True
+        for i in range(200):
+            junk = f"not-an-address-{i}-" + "x" * 500
+            assert await service.flag_new_client_ip(token, junk, path="/users") is True
+        # A parseable address too long to keep (a long IPv6 scope id) is the sentinel as well.
+        scoped = "fe80::1%" + "s" * (2 * _NEW_IP_LOG_KEY_MAX)
+        assert await service.flag_new_client_ip(token, scoped, path="/users") is True
+        state = service._new_ip_logged[hash_token(token)]
+        assert state.over_cap_logged == {_NEW_IP_UNPARSED_LOG_KEY}
+        for i in range(2 * _NEW_IP_OVER_CAP_LOG_MAX):
+            assert await service.flag_new_client_ip(token, f"10.4.{i}.1", path="/users") is True
+        assert len(state.over_cap_logged) == _NEW_IP_OVER_CAP_LOG_MAX
+        assert all(len(key) <= _NEW_IP_LOG_KEY_MAX for key in state.over_cap_logged)
+        assert "10.4.0.1" in state.over_cap_logged
+    finally:
+        await store.close()
+
+
+async def test_a_refused_request_past_the_cap_writes_what_main_writes(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """RED when: a request past the per-session cap writes an audit row or a notice, or is not
+    refused (vault BACKLOG #3052 review finding 2). Past the cap the shipped code before this item
+    wrote no row and no notice for any further address; the log throttle must not change that, for
+    the first ``_NEW_IP_OVER_CAP_LOG_MAX`` such addresses or for any past them. Each of those first
+    sightings logs its address; past them the lines share the session's interval."""
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _FakeNotifier()
+        service = AuthService(
+            store, AuthSettings(admin_new_ip_step_up=True), security_notifier=notifier
+        )
+        await service.initialize()
+        token, _ = await _enabled_admin(service, client="10.1.1.1")
+        reported = [f"10.3.3.{i}" for i in range(_NEW_IP_PER_SESSION_MAX + 1)]
+        for seen in reported:
+            assert await service.flag_new_client_ip(token, seen, path="/users") is True
+        assert await _new_ip_rows(store) == reported
+        past = [f"10.5.{i // 250}.{i % 250}" for i in range(_NEW_IP_OVER_CAP_LOG_MAX + 40)]
+        with caplog.at_level("WARNING", logger="messagefoundry.auth.service"):
+            for seen in past:
+                assert await service.flag_new_client_ip(token, seen, path="/users") is True
+        assert await _new_ip_rows(store) == reported
+        assert sum(1 for e in notifier.events if e.event_type == NEW_ADDRESS_REVERIFY) == len(
+            reported
+        )
+        lines = [r.getMessage() for r in caplog.records if "past the per-session" in r.getMessage()]
+        assert len(lines) == _NEW_IP_OVER_CAP_LOG_MAX + 1
+        assert all(seen in line for seen, line in zip(past, lines, strict=False))
+    finally:
+        await store.close()
+
+
+async def test_a_held_back_warning_writes_a_debug_count(caplog: pytest.LogCaptureFixture) -> None:
+    """RED when: a WARNING the throttle holds back leaves no line at all (vault BACKLOG #3052
+    review finding 4). Each held-back repeat writes a DEBUG line with the count held back since the
+    last WARNING, and the count starts over once a WARNING is written again."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
+        await service.initialize()
+        token, _ = await _enabled_admin(service, client="10.1.1.1")
+        assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+
+        def counts() -> list[str]:
+            return [
+                r.getMessage().split("suppressed=")[1].split()[0]
+                for r in caplog.records
+                if "held back" in r.getMessage() and r.levelname == "DEBUG"
+            ]
+
+        with caplog.at_level("DEBUG", logger="messagefoundry.auth.service"):
+            for _ in range(4):
+                assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+            assert counts() == ["1", "2", "3"]
+            state = service._new_ip_logged[hash_token(token)]
+            assert state.last_line is not None
+            state.last_line -= _NEW_IP_REPEAT_LOG_SECONDS + 1
+            caplog.clear()
+            assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+            assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+            assert counts() == ["1"]
     finally:
         await store.close()
 
@@ -844,6 +945,23 @@ async def test_filling_the_notification_address_from_a_second_address_is_refused
         assert r.status_code == 200, r.text
     user = await service.store.get_user_by_username("boss")
     assert user is not None and user.notify_email == "boss@example.test"
+
+
+async def test_filling_the_notification_address_is_paced(engine: Engine) -> None:
+    """RED when: ``POST /me/notify-email`` is not paced (vault BACKLOG #3052 review finding 6).
+    Under the base gate a second fill at once answers 409, because the first set the address; under
+    ``require_paced`` it answers 429 with a ``Retry-After`` before the handler runs."""
+    service = _new_ip_service(engine, admin_write_min_interval_seconds=10.0)
+    await service.initialize()
+    await _add_admin(service, "boss")
+    body = {"email": "boss@example.test"}
+    async with _client_at(engine, service, "10.0.0.1") as a:
+        token = await _login_token(a)
+        first = await a.post("/me/notify-email", headers=_auth(token), json=body)
+        assert first.status_code == 200, first.text
+        again = await a.post("/me/notify-email", headers=_auth(token), json=body)
+        assert again.status_code == 429, again.text
+        assert again.headers.get("Retry-After")
 
 
 async def test_a_confined_session_from_a_second_address_still_has_a_way_out(
