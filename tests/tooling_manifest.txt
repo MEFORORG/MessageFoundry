@@ -81,9 +81,6 @@ tests/test_durability_hook_provenance.py
 tests/test_durability_hook_push_bound.py
 tests/test_durability_hook_remote_guard.py
 tests/test_durability_hook_rewrite_coverage.py
-# The process-tree helpers push_bound imports. Listed so a diff to them alone still runs the
-# tooling job; the engine-leg tests that import them run on any code diff anyway.
-tests/_proc_tree.py
 tests/test_gate_ci_mirror_parity.py
 tests/test_hook_payload_cwd.py
 tests/test_hook_prose_folding.py
