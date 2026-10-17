@@ -91,6 +91,10 @@ class FrameEncodeError(ValueError):
     :class:`UnicodeEncodeError` quotes the character and carries the whole payload."""
 
 
+#: What :meth:`FrameCodec.neutralise` puts in place of a frame byte.
+_SPACE = b" "
+
+
 def _body(payload: str | bytes, encoding: str) -> bytes:
     return payload.encode(encoding) if isinstance(payload, str) else bytes(payload)
 
@@ -118,6 +122,12 @@ class FrameCodec:
     stateful streaming :class:`FrameDecoder`. The ``trailer`` (e.g. MLLP's CR) is **emitted** when
     framing but **not required** when decoding — a tolerant receiver treats any inter-frame bytes,
     including a stray trailer after the end delimiter, as noise to discard.
+
+    ``start`` and ``end`` must differ, and neither may be ``0x20``, the space (BACKLOG #2900).
+    :meth:`neutralise` replaces each frame byte in a reply with a space, so a space frame byte would
+    be replaced by itself and the reply could not go as one frame; and a delivery holding a space
+    would be refused under ADR 0205 rule 1. A space trailer is allowed: the start byte is never a
+    space, so a space trailer cannot open a frame.
     """
 
     start: int
@@ -132,6 +142,12 @@ class FrameCodec:
                 raise ValueError(f"frame {name} must be a byte value in 0..255, got {value!r}")
         if self.start == self.end:
             raise ValueError("frame start and end delimiters must differ")
+        for name, value in (("start", self.start), ("end", self.end)):
+            if value == _SPACE[0]:  # the class docstring says why
+                raise ValueError(
+                    f"frame {name} must not be 0x20 (a space): a space is what replaces a frame "
+                    "byte in a reply, and a space in a message would be taken as a frame byte"
+                )
 
     def frame(self, payload: str | bytes, encoding: str = "utf-8") -> bytes:
         """Wrap a message: ``start payload end [trailer]``."""
@@ -167,7 +183,7 @@ class FrameCodec:
         comes back as is, uncopied; compare with ``!=`` to learn whether anything was replaced."""
         if self.start not in body and self.end not in body:
             return body
-        return body.replace(bytes([self.start]), b" ").replace(bytes([self.end]), b" ")
+        return body.replace(bytes([self.start]), _SPACE).replace(bytes([self.end]), _SPACE)
 
     def frame_checked(
         self, payload: str | bytes, encoding: str = "utf-8", *, transport: str = "frame"
@@ -184,8 +200,9 @@ class FrameCodec:
         return self.frame(body)
 
     def frame_neutralised(self, payload: str | bytes, encoding: str = "utf-8") -> bytes:
-        """:meth:`frame` after :meth:`neutralise`: one frame for a reply, for any codec whose start
-        and end bytes are not the space. Raises :class:`FrameEncodeError` as :meth:`frame_checked`."""
+        """:meth:`frame` after :meth:`neutralise`, so the framed body holds neither frame byte: no
+        codec may have the space as its start or end byte (see the class docstring). Raises
+        :class:`FrameEncodeError` as :meth:`frame_checked`."""
         return self.frame(self.neutralise(_encoded(payload, encoding, "reply")))
 
     def decoder(self, max_frame_bytes: int | None = None) -> FrameDecoder:

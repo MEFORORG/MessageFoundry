@@ -1000,6 +1000,7 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
     ceremony = sorted(r for r, fn in routes.items() if _called(fn, "allow_reauth_attempt"))
     assert ceremony == [
         "POST /ui/account/mfa/verify",
+        "POST /ui/account/webauthn/verify",  # BACKLOG #3014: the passkey registration finish
         "POST /ui/mfa",
         "POST /ui/reauth",
         # BACKLOG #296: the federated step-up's start leg, registered only with federation on.

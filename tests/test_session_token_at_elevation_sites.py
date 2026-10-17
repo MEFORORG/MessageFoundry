@@ -159,7 +159,8 @@ async def test_the_totp_second_factor_elevates_the_pre_mfa_token_in_place(
     when the legitimate user completes the second factor.
 
     BOTH of ``verify_mfa``'s stamps are still asserted, now against the NEW token. #1146 names the
-    ordering trap — every session UPDATE but ``revoke_session``/``rotate_session`` is rowcount-blind —
+    ordering trap — a session stamp UPDATE is rowcount-blind (which single-session UPDATEs report
+    what they changed is ``AuthStore.rotate_session``'s docstring to say) —
     so a stamp written AFTER the rotation writes nothing and reports success. Reading the elevated
     state off the new token is what catches that: it is only there if both stamps landed first.
     """
@@ -288,15 +289,20 @@ async def test_the_passkey_registration_elevates_the_enrolling_token_in_place() 
     elevated in place. That is the trap #1146 names against the owner-specified two-route subset, and
     this arm is what would have caught it.
 
-    TOTP first, then a fresh sign-in: under the shipped require_mfa a passkey cannot be a covered
-    account's FIRST factor in wave 1 (ADR 0197 Amendment A, AC-A3). The fresh sign-in is the
-    not-yet-satisfied token this arm registers from, and the rotation it measures is unchanged.
+    A directory account's Kerberos session, with no factor yet. Under the shipped require_mfa a
+    passkey cannot be a covered LOCAL account's first factor (ADR 0197 Amendment A, AC-A3), and a
+    pending session on an account that already HAS a factor is refused at finish (BACKLOG #3014).
+    A directory account is never covered, and its Kerberos session mints unstamped, so it is the
+    not-yet-satisfied token a registration can still elevate.
     """
+    from tests.test_mfa_access_gate import _principal
+
     store, service = await _service()
     try:
-        identity, first, password = await login_admin(service)
-        await _enroll_totp(service, identity, first)
-        enrolling = await _login(service, password)
+        await service.initialize()
+        out = await service._complete_ad_login(_principal("adrotate"), None, mfa_verified=False)
+        assert out.token is not None and out.identity is not None
+        identity, enrolling = out.identity, out.token
         assert await service.mfa_satisfied(enrolling) is False
 
         _, fresh = await _enroll_passkey(service, identity, enrolling)

@@ -43,6 +43,17 @@ _WHITESPACE_STR = " \t\r\n\x0b\x0c"
 # A segment that is the IEA trailer, after cosmetic whitespace. Matched in place with pos/endpos, so the
 # check never copies a segment, however long.
 _IEA_SEGMENT = re.compile(rb"[ \t\r\n\x0b\x0c]*IEA")
+#: Line-end bytes a sender may put after an interchange's closing terminator, such as a newline after
+#: ``IEA*...~``. Up to :data:`_FRAME_TAIL_MAX` of them directly after a completed interchange are its
+#: ending, however reads split them (vault BACKLOG #2938). The cap keeps a peer from trickling them
+#: to hold a listener's frame deadline off: past it they are inter-interchange noise like any byte.
+#: The same rule as ``messagefoundry.framing.FrameDecoder``'s, written as a local copy because
+#: ``parsing`` may not import ``messagefoundry.framing`` (its import allowlist in
+#: tests/test_dependency_boundaries.py). So the two can drift; the x12 and MLLP rows of
+#: ``test_line_end_bytes_ending_a_frame_do_not_start_the_frame_deadline`` in
+#: tests/test_listener_admission.py pin that both allow two line ends and cut on a third.
+_FRAME_TAIL_BYTES = b"\r\n"
+_FRAME_TAIL_MAX = 2
 
 
 def split(raw: str) -> list[str]:
@@ -101,6 +112,15 @@ class X12FrameReader:
         # received begins; ``_scan`` is where the terminator search picks up, at or after it.
         self._seg_start = 0
         self._scan = 0
+        #: Line-end bytes the last completed interchange may still take as its ending; 0 once any
+        #: other byte has followed it. See :data:`_FRAME_TAIL_BYTES`.
+        self._tail_left = 0
+        #: Whether the most recent :meth:`feed` held nothing but line-end bytes ending the
+        #: interchange before it. Such a read finishes that interchange rather than starting anything,
+        #: which is how a listener's frame deadline tells it from inter-interchange noise (vault
+        #: BACKLOG #2938). Set when :meth:`feed` is called, before its generator is iterated. It only
+        #: observes: the bytes still go to the buffer, so the noise handling is unchanged.
+        self.trailer_only = False
 
     @property
     def in_frame(self) -> bool:
@@ -110,6 +130,24 @@ class X12FrameReader:
         return self._buf.startswith(b"ISA")
 
     def feed(self, data: bytes) -> Iterator[bytes]:
+        """Yield each interchange completed by ``data``, carrying any partial one to the next call.
+
+        :attr:`trailer_only` is decided here, eagerly, so it never describes an earlier read; the
+        reassembly itself still runs lazily as the generator is iterated. The allowance it reads is
+        set as an interchange is taken, so drain one call's generator before the next call, as the
+        listener does; a caller that stops early reads the next call's flag against a stale
+        allowance.
+        """
+        self.trailer_only = bool(data) and _only_line_ends(data, self._tail_left)
+        # Any other byte ends the allowance: what follows it is not the interchange's ending. An
+        # empty read holds no byte, so it leaves the allowance as it was, as FrameDecoder does.
+        if data and not self.trailer_only:
+            self._tail_left = 0
+        else:
+            self._tail_left -= len(data)
+        return self._frames(data)
+
+    def _frames(self, data: bytes) -> Iterator[bytes]:
         self._buf.extend(data)
         while True:
             frame = self._take_one()
@@ -163,6 +201,10 @@ class X12FrameReader:
                 frame = bytes(buf[:end])
                 del buf[:end]
                 self._seg_start = self._scan = 0
+                # What the read held past the terminator: line ends alone are owed to this
+                # interchange, so the allowance left is what they have not used yet.
+                tail = _only_line_ends(buf, _FRAME_TAIL_MAX)
+                self._tail_left = _FRAME_TAIL_MAX - len(buf) if tail else 0
                 return frame
             self._seg_start = self._scan = idx + len(terminator)
 
@@ -189,6 +231,12 @@ class X12FrameReader:
             raise X12FrameError(
                 f"X12 interchange exceeded {self.max_interchange_bytes} bytes before the IEA segment"
             )
+
+
+def _only_line_ends(data: bytes | bytearray, limit: int) -> bool:
+    """Whether ``data`` is at most ``limit`` bytes, every one a line end. The length is checked
+    first, so a large buffer is never copied by the strip."""
+    return len(data) <= limit and not data.strip(_FRAME_TAIL_BYTES)
 
 
 def check_integrity(raw: str) -> list[str]:

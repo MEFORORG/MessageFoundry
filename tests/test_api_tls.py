@@ -994,6 +994,10 @@ def test_serve_forwarded_allow_ips_empty_when_no_proxy(
     assert captured["forwarded_allow_ips"] == []
     # WP-L3-07 (ASVS 13.4.6): the `Server: uvicorn` banner is suppressed.
     assert captured["server_header"] is False
+    # BACKLOG #3256: the connection drain before the lifespan teardown is bounded.
+    from messagefoundry.__main__ import _UVICORN_DRAIN_SECONDS
+
+    assert captured["timeout_graceful_shutdown"] == _UVICORN_DRAIN_SECONDS
 
 
 # --- #200: Posture-B (upstream TLS termination) declared-floor validation --------------------
