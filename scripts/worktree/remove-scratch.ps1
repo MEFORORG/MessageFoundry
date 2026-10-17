@@ -323,18 +323,20 @@ function Get-Remains([string]$Dir) {
     return , $out
 }
 
-# Whether a directory above a target is a git checkout or a bare repository: the refusal text, or ''.
-# Each of the four names is looked up directly, so a folder above a target is never listed in full:
-# the temp root, which every target shares, can hold thousands of entries. Nothing is kept between
-# targets either. A -Delete run can take minutes, and a checkout made above a later target meanwhile
-# must still refuse it. A lookup can match a short (8.3) name, so only the long name counts.
+# Whether $Name is in $Dir, found by a lookup of that one name rather than a listing of $Dir. A lookup
+# can also match a short (8.3) name, so only the long name counts.
 function Test-NameIn([string]$Dir, [string]$Name) {
     $hits = @([IO.DirectoryInfo]::new($Dir).GetFileSystemInfos($Name) | Where-Object { $_.Name -ieq $Name })
     return $hits.Count -gt 0
 }
+
+# Whether a directory above a target is a git checkout or a bare repository: the refusal text, or ''.
+# Each name is looked up directly, so a folder above a target is never listed in full: the temp root,
+# which every target shares, can hold thousands of entries. Nothing is kept between targets either. A
+# -Delete run can take minutes, and a checkout made above a later target meanwhile must still refuse it.
 function Get-GitShapeAbove([string]$Dir) {
     if (Test-NameIn $Dir '.git') { return "the target sits inside the git checkout at '$Dir'" }
-    if ((Test-NameIn $Dir 'HEAD') -and (Test-NameIn $Dir 'objects') -and (Test-NameIn $Dir 'refs')) {
+    if (Test-BareShape @(@('HEAD', 'objects', 'refs') | Where-Object { Test-NameIn $Dir $_ })) {
         return "the target sits inside the bare git repository at '$Dir'"
     }
     return ''

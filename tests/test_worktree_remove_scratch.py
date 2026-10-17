@@ -1171,6 +1171,11 @@ def test_a_delete_that_records_a_failure_is_never_reported_as_deleted(rig: Rig) 
     assert not [line for line in b.extra if line.startswith("remains: ")], r.out
 
 
+def _ps_quoted(value: object) -> str:
+    """``value`` as a single-quoted PowerShell literal, so an apostrophe in a path cannot break it."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 _FULL_LISTING = re.compile(r"\[IO\.DirectoryInfo\]::new\((\$\w+)\)\.GetFileSystemInfos\(\)")
 
 
@@ -1179,14 +1184,15 @@ def test_no_folder_above_a_target_is_listed_in_full(rig: Rig) -> None:
     full, and the temp root, which every target shares, can hold thousands of entries. It now looks
     up the four names it needs, so no folder above a target is listed in full at all.
 
-    Every full listing in the script is routed through a planted function that logs the folder. The
-    targets' own trees are listed too, which shows the log works."""
+    Every full listing the script writes as ``[IO.DirectoryInfo]::new($x).GetFileSystemInfos()`` is
+    routed through a planted function that logs the folder. A listing spelled another way would not
+    be seen. The targets' own trees are listed that way too, which shows the log works."""
     rig.caller()
     targets = [rig.tree(rig.root / "shared" / name) for name in ("one", "two", "three")]
     log = rig.base / "listed.log"
     logger = (
         "function Get-LoggedListing([string]$Dir) {\n"
-        f"    Add-Content -LiteralPath '{log}' -Value $Dir\n"
+        f"    Add-Content -LiteralPath {_ps_quoted(log)} -Value $Dir\n"
         "    return [IO.DirectoryInfo]::new($Dir).GetFileSystemInfos()\n"
         "}\n"
     )
@@ -1222,7 +1228,8 @@ def test_a_checkout_made_above_a_later_target_mid_run_refuses_it(rig: Rig) -> No
     script = _planted_copy(
         rig.base,
         "    Write-Host $verdict",
-        f"    if ($raw -eq '{first}') {{ [void][IO.Directory]::CreateDirectory('{shared / '.git'}') }}",
+        f"    if ($raw -eq {_ps_quoted(first)}) "
+        f"{{ [void][IO.Directory]::CreateDirectory({_ps_quoted(shared / '.git')}) }}",
     )
 
     r = rig.run(first, second, delete=False, script=script)
@@ -1231,6 +1238,18 @@ def test_a_checkout_made_above_a_later_target_mid_run_refuses_it(rig: Rig) -> No
     assert r.block(first).verdict.startswith("WOULD DELETE"), r.out
     r.refused(second, "git", f"the target sits inside the git checkout at '{shared}'")
     assert r.code == 1, r.out
+
+
+def test_the_walk_up_reaches_past_the_given_temp_root_to_the_real_one(rig: Rig) -> None:
+    """The walk climbs to the real temp root, not to -TempRoot. A checkout above -TempRoot, still
+    under the real temp root, refuses a target below it."""
+    rig.caller()
+    target = rig.tree(rig.root / "below")
+    (rig.base / ".git").mkdir()
+
+    r = rig.run(target, delete=False)
+
+    r.refused(target, "git", f"the target sits inside the git checkout at '{rig.base}'")
 
 
 @pytest.mark.parametrize("which", ["write time", "creation time"])
