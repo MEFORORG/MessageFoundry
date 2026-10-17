@@ -9115,6 +9115,65 @@ def test_a_new_address_continuation_never_drops_a_query_or_overflows() -> None:
     assert _new_address_continuation(req("POST", "/ui/messages"), landing=land) == land
 
 
+def test_a_new_address_continuation_keeps_the_path_encoded() -> None:
+    """RED when: the continuation is built from the decoded path, so an encoded ``?`` inside a
+    segment comes back from the re-auth as a query (vault BACKLOG #3052 item 8). Also RED when an
+    encoded ``/`` or ``..`` passes as one segment of a registered page: decoded, it names another
+    page, so those fall back to the landing."""
+    from starlette.requests import Request
+
+    from messagefoundry_webconsole._auth import _new_address_continuation
+
+    def req(path: str, raw: str, query: str = "") -> Request:
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": path,
+            "raw_path": raw.encode(),
+            "query_string": query.encode(),
+            "headers": [],
+        }
+        return Request(scope)
+
+    land = "/ui/account"
+    encoded = req("/ui/messages/a?b", "/ui/messages/a%3Fb")
+    assert _new_address_continuation(encoded, landing=land) == "/ui/messages/a%3Fb"
+    with_query = req("/ui/messages/a?b", "/ui/messages/a%3Fb", "x=1")
+    assert _new_address_continuation(with_query, landing=land) == "/ui/messages/a%3Fb?x=1"
+    # The control: a plain segment still comes back to itself.
+    assert _new_address_continuation(req("/ui/messages/ab", "/ui/messages/ab"), landing=land) == (
+        "/ui/messages/ab"
+    )
+    slash = req("/ui/messages/a/b", "/ui/messages/a%2Fb")
+    assert _new_address_continuation(slash, landing=land) == land
+    dots = req("/ui/messages/..", "/ui/messages/%2e%2e")
+    assert _new_address_continuation(dots, landing=land) == land
+
+
+async def test_an_encoded_question_mark_survives_the_new_address_reauth(engine: Engine) -> None:
+    """RED when: a PHI page whose id carries an encoded ``?`` is refused for a new address with a
+    continuation that splits the id at it (vault BACKLOG #3052 item 8). The whole round trip: the
+    refusal's ``next``, and the re-auth's 303 back to the page as the browser sent it."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    page = "/ui/messages/a%3Fb"
+    same = {"Sec-Fetch-Site": "same-origin"}
+    async with _client_from(engine, service, "10.0.0.1") as a:
+        await _cookie_login(a, "op")
+        tok = a.cookies.get("mf_session")
+        assert tok is not None
+    async with _client_from(engine, service, "10.9.9.9") as b:
+        b.cookies.set("mf_session", tok)
+        r = await b.get(page)
+        assert (r.status_code, r.headers.get("location")) == (
+            303,
+            "/ui/reauth?next=" + quote(page, safe="/"),
+        )
+        assert (await b.get("/ui/reauth", params={"next": page})).status_code == 200
+        done = await b.post("/ui/reauth", data={"next": page, "password": PW}, headers=same)
+        assert (done.status_code, done.headers["location"]) == (303, page)
+
+
 async def test_the_continuation_cap_is_the_reauth_pages_own(engine: Engine) -> None:
     """RED when: ``_REAUTH_NEXT_MAX`` and ``GET /ui/reauth``'s own cap on ``next`` drift apart
     (vault BACKLOG #3052 item 18). The unit test above reads the constant, so a refused PHI read

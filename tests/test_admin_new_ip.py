@@ -38,6 +38,7 @@ from messagefoundry.auth.identity import ALL_CHANNELS, Identity
 from messagefoundry.auth.notifications import NEW_ADDRESS_REVERIFY, SecurityEvent
 from messagefoundry.auth.service import (
     _NEW_IP_PER_SESSION_MAX,
+    _NEW_IP_REPEAT_LOG_SECONDS,
     STEP_UP_ACTION_ADMIN_USER_UPDATE,
     STEP_UP_ACTION_SESSION_TERMINATE,
     AuthService,
@@ -218,6 +219,44 @@ async def test_repeat_from_same_new_ip_is_deduped() -> None:
         actions = [r["action"] for r in await store.list_audit(limit=50)]
         assert actions.count("auth.new_address_reverify_required") == 2
         assert sum(1 for e in notifier.events if e.event_type == NEW_ADDRESS_REVERIFY) == 2
+    finally:
+        await store.close()
+
+
+async def test_repeat_warning_is_held_to_one_per_session_per_interval(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """RED when: every refused repeat from an already-reported address writes its own WARNING
+    line (vault BACKLOG #3052 item 16), so a token replayed in a loop floods the general log. The
+    refusal itself must stay on every request, and the line comes back once the interval passes.
+    The past-the-cap line is the control that is NOT held back: it is the only record of an
+    address that writes no row."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
+        await service.initialize()
+        token, _ = await _enabled_admin(service, client="10.1.1.1")
+        assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+
+        def repeat_lines() -> int:
+            return sum("already flagged" in r.getMessage() for r in caplog.records)
+
+        with caplog.at_level("WARNING", logger="messagefoundry.auth.service"):
+            for _ in range(5):
+                assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+            assert repeat_lines() == 1
+            # The interval passes (moved back on the record, not on the clock the loop runs on).
+            service._new_ip_repeat_logged[hash_token(token)] -= _NEW_IP_REPEAT_LOG_SECONDS + 1
+            assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+            assert repeat_lines() == 2
+            # Past the cap every request still logs, address included.
+            for i in range(_NEW_IP_PER_SESSION_MAX):
+                assert await service.flag_new_client_ip(token, f"10.3.3.{i}", path="/users")
+            caplog.clear()
+            for _ in range(3):
+                assert await service.flag_new_client_ip(token, "10.4.4.4", path="/users") is True
+            past_cap = [r for r in caplog.records if "past the per-session cap" in r.getMessage()]
+            assert len(past_cap) == 3
     finally:
         await store.close()
 
@@ -764,6 +803,36 @@ async def test_a_token_replayed_from_a_second_address_is_refused_on_phi_and_pace
         assert (await b.get("/messages", headers=_auth(token))).status_code == 200
         raw = await b.get(f"/messages/{mid}/raw", headers=_auth(token))
         assert raw.status_code == 200 and raw.json()["raw"]
+
+
+async def test_filling_the_notification_address_from_a_second_address_is_refused(
+    engine: Engine,
+) -> None:
+    """RED when: ``POST /me/notify-email`` from a host the session has not verified from fills the
+    address with no step-up, while its console twin ``POST /ui/account/notify-address`` is refused
+    (vault BACKLOG #3052 item 6). A replayed token would otherwise choose where the holder's
+    security notices go. The re-verification from the new address is the control: the same body
+    then sets the address, so the refusal is the gate's and not the handler's."""
+    service = _new_ip_service(engine)
+    await service.initialize()
+    await _add_admin(service, "boss")
+    user = await service.store.get_user_by_username("boss")
+    assert user is not None and not user.notify_email
+    body = {"email": "boss@example.test"}
+    async with _client_at(engine, service, "10.0.0.1") as a:
+        token = await _login_token(a)
+    async with _client_at(engine, service, "10.9.9.9") as b:
+        r = await b.post("/me/notify-email", headers=_auth(token), json=body)
+        assert (r.status_code, r.headers.get("X-Step-Up-Required")) == (403, "1"), r.text
+        user = await service.store.get_user_by_username("boss")
+        assert user is not None and not user.notify_email
+        ok = await b.post("/me/reauth", headers=_auth(token), json={"password": PW})
+        assert ok.status_code == 200
+        token = str(ok.json()["token"])
+        r = await b.post("/me/notify-email", headers=_auth(token), json=body)
+        assert r.status_code == 200, r.text
+    user = await service.store.get_user_by_username("boss")
+    assert user is not None and user.notify_email == "boss@example.test"
 
 
 async def test_a_refusal_for_a_new_address_charges_no_budget(engine: Engine) -> None:

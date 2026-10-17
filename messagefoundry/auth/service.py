@@ -374,6 +374,12 @@ _NEW_IP_DEDUP_MAX = 4096
 # that has already been reported nine times, and the step-up stays forced for every further address.
 # With _NEW_IP_DEDUP_MAX it bounds the cache at 4096 x 9 address keys.
 _NEW_IP_PER_SESSION_MAX = 8
+# Vault BACKLOG #3052 item 16: at most one "already flagged" WARNING per session per this many
+# seconds, in each engine process. Such a request is still refused every time, and its address
+# already has its audit row; only the log line is held back, so a refused token replayed in a loop
+# cannot flood the general log. The past-the-cap line is not held back: it is the only record of
+# an address that writes no row.
+_NEW_IP_REPEAT_LOG_SECONDS = 60.0
 
 # The first-seen login-address signal (BACKLOG #288, ASVS 8.2.4). Its baseline is the store's
 # per-account ``known_login_addresses`` record (vault BACKLOG #2145), read at every session mint with
@@ -2584,6 +2590,9 @@ class AuthService:
         # re-anchor drops the entry (_restart_new_ip_dedupe). Bounded twice: _NEW_IP_DEDUP_MAX sessions,
         # and _NEW_IP_PER_SESSION_MAX + 1 keys each (the last is the cap-reached row's address).
         self._new_ip_seen: dict[str, set[str]] = {}
+        # Vault BACKLOG #3052: token_hash -> monotonic time of the session's last "already flagged"
+        # WARNING (_new_ip_repeat_log_due). Bounded by _NEW_IP_DEDUP_MAX sessions.
+        self._new_ip_repeat_logged: dict[str, float] = {}
         # BACKLOG #288: (user id, address) -> monotonic time of the last ``login_new_ip`` notice.
         self._login_new_ip_noticed: dict[tuple[str, str], float] = {}
         # In-flight WebAuthn ceremony challenges (ADR 0068 §2): bounded, TTL'd, process-local —
@@ -9884,6 +9893,20 @@ class AuthService:
         flagged.add(address_key)
         return "audit" if len(flagged) <= _NEW_IP_PER_SESSION_MAX else "audit_cap_reached"
 
+    def _new_ip_repeat_log_due(self, token_hash: str) -> bool:
+        """Whether this session's "already flagged" WARNING may be written now: at most once per
+        ``_NEW_IP_REPEAT_LOG_SECONDS`` (vault BACKLOG #3052 item 16). The refusal never depends on
+        it. Per process and bounded, so an eviction can only ever write one extra line."""
+        now = time.monotonic()
+        last = self._new_ip_repeat_logged.get(token_hash)
+        if last is not None and now - last < _NEW_IP_REPEAT_LOG_SECONDS:
+            return False
+        self._new_ip_repeat_logged.pop(token_hash, None)
+        if len(self._new_ip_repeat_logged) >= _NEW_IP_DEDUP_MAX:
+            self._new_ip_repeat_logged.pop(next(iter(self._new_ip_repeat_logged)))
+        self._new_ip_repeat_logged[token_hash] = now
+        return True
+
     def _restart_new_ip_dedupe(self, token_hash: str) -> None:
         """Start the new-address dedupe over for a session that just re-anchored, so an address
         reported before the re-anchor is reported again (BACKLOG #2159).
@@ -10155,11 +10178,14 @@ class AuthService:
         # alternates between addresses (BACKLOG #2159).
         flag = self._first_new_ip_flag(token_hash, seen_key)
         if flag == "repeat":
-            _log.warning(
-                "a request from a new client address must re-verify; the address was already "
-                "flagged since the session's last re-verification (audit suppressed): path=%s",
-                path,
-            )
+            if self._new_ip_repeat_log_due(token_hash):
+                _log.warning(
+                    "a request from a new client address must re-verify; the address was already "
+                    "flagged since the session's last re-verification (audit suppressed; repeats "
+                    "from this session log at most once per %d s): path=%s",
+                    int(_NEW_IP_REPEAT_LOG_SECONDS),
+                    path,
+                )
             return True
         if flag == "over_cap":
             # Past the cap no row is written, so this line is the only record of where the token

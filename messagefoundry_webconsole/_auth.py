@@ -898,10 +898,22 @@ def _new_address_continuation(request: Request, *, landing: str) -> str:
     A GET comes back to itself, query included, so a filtered or deferred list does not return as
     a broader read than the operator asked for. A write, or a GET whose whole target ``/ui/reauth``
     would not take (not a registered unlock page, or past :data:`_REAUTH_NEXT_MAX`), goes to
-    ``landing``. A query is never dropped to make a target fit."""
+    ``landing``. A query is never dropped to make a target fit.
+
+    The path is the one the browser sent, still percent-encoded (vault BACKLOG #3052 item 8). Built
+    from the decoded path, an encoded ``?`` inside a segment became a query on the way back. The
+    decoded path must name a registered unlock page too, so an encoded ``/`` or ``..`` cannot pass
+    as one segment and resolve to another page once the browser follows it."""
     if request.method == "GET":
-        target = request.url.path + (f"?{request.url.query}" if request.url.query else "")
-        if len(target) <= _REAUTH_NEXT_MAX and is_unlock_action(target):
+        raw = request.scope.get("raw_path")
+        path = raw.decode("latin-1") if isinstance(raw, bytes) else request.url.path
+        query = request.scope.get("query_string", b"").decode("latin-1")
+        target = path + (f"?{query}" if query else "")
+        if (
+            len(target) <= _REAUTH_NEXT_MAX
+            and is_unlock_action(target)
+            and is_unlock_action(request.scope["path"])
+        ):
             return target
     return landing
 
