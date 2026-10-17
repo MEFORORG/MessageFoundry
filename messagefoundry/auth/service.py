@@ -340,8 +340,8 @@ _LOGIN_NEW_IP_NOTICE_SECONDS = 900.0
 # The one row an administrator's password or MFA reset leaves in the account's known-address record
 # (vault BACKLOG #2946). It is the baseline for an account that has never stamped ``last_login_at``,
 # so the next sign-in after the reset is judged NEW rather than failed open as no-baseline. It is
-# never a match: it is stamped at the epoch, outside every lookback, and the first real write's prune
-# removes it. A space keeps it apart from any address text.
+# never a match: it is stamped at the epoch, outside every lookback, and the next real write's prune
+# usually removes it. A space keeps it apart from any address an ASGI server reports.
 _LOGIN_ADDRESS_RESET_MARKER = "cleared by reset"
 # Larger than any ``last_seen`` the record can hold, so a prune with it deletes every row. Finite,
 # because SQL Server's FLOAT cannot hold an infinity.
@@ -359,7 +359,8 @@ class _LoginAddress(Enum):
     NEW = "new"
     # The account has never completed a sign-in and has no known address, so every address would be
     # "first seen". Challenging and notifying here would fire on every account's first login, which is
-    # noise, not signal.
+    # noise, not signal. An administrator's password or MFA reset leaves a marker row, so an account
+    # reset before its first sign-in is judged, and that sign-in is NEW (vault BACKLOG #2946).
     UNEVALUATED_NO_BASELINE = "no_baseline"
     # The caller passed no client address (an in-process caller, or an ASGI scope with no client).
     UNEVALUATED_UNKNOWN_ADDRESS = "unknown_address"
@@ -9651,13 +9652,15 @@ class AuthService:
         It leaves one row, ``_LOGIN_ADDRESS_RESET_MARKER``, stamped at the epoch so the lookback
         read never returns it. An account that never stamped ``last_login_at`` would otherwise read
         as having no baseline, and its next sign-in would fail open as ``UNEVALUATED_NO_BASELINE``
-        rather than be judged NEW. Only the prune after a later write removes the marker, and that
-        write has just added a real row. Every reset leaves it, an account that never signed in
-        included, as the ruling asks.
+        rather than be judged NEW. In the usual case the prune after the next real write removes
+        it, and that write has just added a real row; ``delete_user`` and a later reset also remove
+        it. Every reset leaves it, an account that never signed in included, as the ruling asks.
 
         Best-effort and never raising, for the reason :meth:`_mark_login_address_known` gives: the
         reset has committed, and its reply carries the one-time credential. A failure is logged at
-        ERROR, and the reset stands with the record as the failure left it."""
+        ERROR, and the reset stands with the record as the failure left it: unchanged, or emptied
+        with no marker. The two calls are separate transactions, so a sign-in finishing while the
+        reset runs can also write its address back after the delete."""
         try:
             await self._store.forget_login_addresses(user_id, before=_LOGIN_ADDRESS_FOREVER)
             # Stamped at the epoch, so the lookback read never returns it and only the any-age
@@ -10884,7 +10887,6 @@ class AuthService:
                 ),
             )
         await self._store.revoke_user_sessions(user_id)
-        await self._clear_login_addresses(user_id)
         await self._audit(
             "auth.mfa_reset",
             actor=actor,
@@ -10913,6 +10915,9 @@ class AuthService:
                     else {"expires_at": issued.expires_at}
                 ),
             )
+        # Last, after the audit row and the notices, as the #2964 record work runs: it is
+        # best-effort, and a slow store must not hold them back.
+        await self._clear_login_addresses(user_id)
         return issued
 
     async def mfa_status(self, identity: Identity) -> MfaStatus:
@@ -11917,7 +11922,6 @@ class AuthService:
             password_generated=True,
         )
         await self._store.revoke_user_sessions(user_id)  # invalidate any live sessions on reset
-        await self._clear_login_addresses(user_id)
         await self._audit(
             "auth.password_reset",
             actor=actor,
@@ -11937,6 +11941,7 @@ class AuthService:
             email=user.notify_email,
             detail=None if expires_at is None or user.disabled else {"expires_at": expires_at},
         )
+        await self._clear_login_addresses(user_id)  # last, as in admin_reset_mfa
         return IssuedCredential(password=temp, expires_at=expires_at)
 
     async def remind_expiring_initial_credential(

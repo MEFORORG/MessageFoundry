@@ -1230,6 +1230,26 @@ async def test_a_cleared_account_with_no_last_login_is_judged_new_not_no_baselin
         await store.close()
 
 
+async def test_the_next_real_write_prunes_the_reset_marker() -> None:
+    """The marker is stamped at the epoch, so the prune after the next real write removes it and
+    leaves that write's row as the baseline (vault BACKLOG #2946)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, _FakeNotifier())
+        uid = await _operator(service)
+        issued = await service.admin_reset_password(uid, actor="boss")
+        stepped = await service.login("oper", issued.password, client="10.1.1.1")
+        assert stepped.ok and stepped.identity is not None and stepped.token is not None
+        assert (
+            await service.reauth(
+                stepped.identity, issued.password, token=stepped.token, client="10.1.1.1"
+            )
+        ).ok
+        assert await store.list_known_login_addresses(uid, since=0.0) == ["10.1.1.1"]
+    finally:
+        await store.close()
+
+
 @pytest.mark.parametrize("reset", ["admin_reset_password", "admin_reset_mfa"])
 @pytest.mark.parametrize("method", ["forget_login_addresses", "remember_login_address"])
 async def test_a_failed_clear_logs_and_does_not_refuse_the_reset(
