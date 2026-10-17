@@ -702,6 +702,12 @@ def test_frame_reader_marks_only_an_interchanges_own_line_ends_as_trailer_only()
     assert list(reader.feed(data)) == [data]
     assert list(reader.feed(b"\r\n")) == []
     assert reader.trailer_only
+    # An empty read is not trailer-only, and holds no byte to end the allowance with.
+    assert list(reader.feed(data)) == [data]
+    assert list(reader.feed(b"")) == []
+    assert not reader.trailer_only
+    assert list(reader.feed(b"\r")) == []
+    assert reader.trailer_only
     # CONTROL: three in one read are past the allowance.
     assert list(reader.feed(data)) == [data]
     assert list(reader.feed(b"\r\n\r")) == []

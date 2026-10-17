@@ -765,6 +765,54 @@ async def test_a_stop_cut_short_in_its_wait_still_clears_the_per_host_count(
         await asyncio.wait_for(source.stop(), timeout=10.0)
 
 
+@pytest.mark.parametrize("kind", ["mllp", "tcp", "x12"])
+async def test_a_straggler_releasing_after_a_restart_leaves_the_new_per_host_count(
+    kind: str,
+) -> None:
+    """vault BACKLOG #2939, end to end through the listener's own admit and release. A client held
+    in its handler outlives a stop() cut short; the same instance restarts and admits the host
+    again; then the straggler releases. The restarted run's count must still hold its connection.
+    This pins the MLLP, raw-TCP and X12 listeners passing on the epoch their admit returned. The
+    HTTP listener's handler has another shape and is not driven here."""
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(raw: bytes) -> str:
+        entered.set()
+        await release.wait()
+        return build_ack(raw, code="AA")
+
+    source = _build(kind)
+    await source.start(handler)
+    gate = source._admission  # type: ignore[attr-defined]
+    writers: list[asyncio.StreamWriter] = []
+    try:
+        _reader, old = await asyncio.open_connection("127.0.0.1", source.sockport)  # type: ignore[attr-defined]
+        writers.append(old)
+        old.write(_whole_frame(kind, HL7))
+        await old.drain()
+        await asyncio.wait_for(entered.wait(), 3.0)
+        stopping = asyncio.ensure_future(source.stop())
+        await asyncio.sleep(0.1)  # inside the client-task grace wait
+        stopping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stopping
+        assert gate.per_host == {}  # the reset ran; the straggler is still in its handler
+        await source.start(handler)  # the same instance restarts
+        _reader, new = await asyncio.open_connection("127.0.0.1", source.sockport)  # type: ignore[attr-defined]
+        writers.append(new)
+        assert await _until(lambda: gate.per_host == {"127.0.0.1": 1})
+        assert gate.active == 2
+        release.set()
+        assert await _until(lambda: gate.active == 1), "the straggler never released"
+        assert gate.per_host == {"127.0.0.1": 1}, "the straggler took the restarted run's slot"
+    finally:
+        release.set()
+        for writer in writers:
+            await _close(writer)
+        await asyncio.wait_for(source.stop(), timeout=10.0)
+
+
 # --- A normal frame still flows, and is answered, with every new bound at its default -------------
 
 

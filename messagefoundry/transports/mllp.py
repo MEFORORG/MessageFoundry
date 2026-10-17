@@ -2196,7 +2196,8 @@ class MLLPSource(SourceConnector):
             # epoch of the run that admitted it, and `reset` advances the epoch, so that release
             # leaves the restarted listener's per-host count alone rather than undercounting it
             # (vault BACKLOG #2939). `active` still drops on it: that socket was open until then,
-            # and the global cap that predates this row reads it.
+            # and the global cap that predates this row reads it. What the epoch leaves open while
+            # a straggler is still live is stated once, in `ListenerAdmission.release`.
             self._admission.reset()
         # Now that no client handlers are in flight, this should complete promptly — but on the Windows
         # ProactorEventLoop a still-pending overlapped accept/read can make wait_closed() never return,

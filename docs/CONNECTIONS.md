@@ -3581,9 +3581,9 @@ Facts that are easy to get wrong, stated plainly first:
     Noise in the same read as a completed frame starts nothing. A sender that holds
     a quiet socket open with them is closed at `max_frame_seconds`, even where `receive_timeout` is
     longer or off.
-  * On X12 the frame is the interchange, from its `ISA` to its `IEA`. X12 has no line-end allowance
-    yet, so a newline after the `IEA` that arrives in a read of its own starts the clock. That is a
-    known gap, not the intended rule.
+  * On X12 the frame is the interchange, from its `ISA` to the terminator of its `IEA` segment. Up
+    to two bytes directly after that terminator belong to the interchange when each is CR or LF, so
+    a newline after the `IEA` starts nothing, however late it arrives (vault BACKLOG #2938).
   * Time the engine withholds, for pacing or an intake pause, is not counted.
 
   Vault BACKLOG #2847 moved MLLP onto this rule. Its clock used to start only at a start byte.

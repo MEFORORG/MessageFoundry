@@ -47,8 +47,11 @@ _IEA_SEGMENT = re.compile(rb"[ \t\r\n\x0b\x0c]*IEA")
 #: ``IEA*...~``. Up to :data:`_FRAME_TAIL_MAX` of them directly after a completed interchange are its
 #: ending, however reads split them (vault BACKLOG #2938). The cap keeps a peer from trickling them
 #: to hold a listener's frame deadline off: past it they are inter-interchange noise like any byte.
-#: The same rule as ``messagefoundry.framing.FrameDecoder``'s, kept local so this pure parsing module
-#: imports nothing from the transport layer.
+#: The same rule as ``messagefoundry.framing.FrameDecoder``'s, written as a local copy because
+#: ``parsing`` may not import ``messagefoundry.framing`` (its import allowlist in
+#: tests/test_dependency_boundaries.py). So the two can drift; the x12 and MLLP rows of
+#: ``test_line_end_bytes_ending_a_frame_do_not_start_the_frame_deadline`` in
+#: tests/test_listener_admission.py pin that both allow two line ends and cut on a third.
 _FRAME_TAIL_BYTES = b"\r\n"
 _FRAME_TAIL_MAX = 2
 
@@ -130,11 +133,18 @@ class X12FrameReader:
         """Yield each interchange completed by ``data``, carrying any partial one to the next call.
 
         :attr:`trailer_only` is decided here, eagerly, so it never describes an earlier read; the
-        reassembly itself still runs lazily as the generator is iterated.
+        reassembly itself still runs lazily as the generator is iterated. The allowance it reads is
+        set as an interchange is taken, so drain one call's generator before the next call, as the
+        listener does; a caller that stops early reads the next call's flag against a stale
+        allowance.
         """
         self.trailer_only = bool(data) and _only_line_ends(data, self._tail_left)
-        # Any other byte ends the allowance: what follows it is not the interchange's ending.
-        self._tail_left = self._tail_left - len(data) if self.trailer_only else 0
+        # Any other byte ends the allowance: what follows it is not the interchange's ending. An
+        # empty read holds no byte, so it leaves the allowance as it was, as FrameDecoder does.
+        if data and not self.trailer_only:
+            self._tail_left = 0
+        else:
+            self._tail_left -= len(data)
         return self._frames(data)
 
     def _frames(self, data: bytes) -> Iterator[bytes]:

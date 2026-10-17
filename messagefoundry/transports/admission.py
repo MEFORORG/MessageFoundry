@@ -195,7 +195,9 @@ class ListenerAdmission:
         already dropped its per-host slot, and the table now counts the restarted listener's
         connections, so it touches neither that table nor the warned set (vault BACKLOG #2939).
         It still gives back ``active``, which :meth:`reset` leaves alone: that socket was open, and
-        counted, until now, whichever run admitted it."""
+        counted, until now, whichever run admitted it. The per-host cap is not exact across a
+        restart: while such a straggler is still open, its host may hold one socket over
+        ``max_connections_per_host`` for it, since the reset already dropped its slot."""
         self.active -= 1
         if peer_host is None or epoch != self._epoch:
             return
