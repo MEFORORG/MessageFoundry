@@ -56,11 +56,13 @@ only the host can. On a host that does not provide it:
 - an **exposed** PHI instance **warns at every start** until the decision is recorded —
   `[security].memory_encryption_operator_declared = true` is the operator's declaration that the host
   provides it. The engine **starts either way**: this is a host property, not a config error, and a
-  Windows engine VM gets it only as an Azure or Azure Local confidential VM (table below, verified
+  Windows engine VM is listed as getting it only as an Azure or Azure Local confidential VM (table below, verified
   2026-07-22), so refusing by default would stop a Windows engine on Windows Server Hyper-V over
   something its operator cannot change. An estate that has standardized on confidential-computing hosts can make the missing
   declaration fatal with `[security].require_memory_encryption_declaration = true` (default `false`).
-  Loopback and synthetic instances are **silent — but not exempt.** The warning is keyed on exposure to
+  Unexposed instances ([ADR 0140](adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md)'s
+  exposure rule, as amended 2026-10-06) are **silent — but not exempt**, and no instance is spared as
+  synthetic ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)). The warning is keyed on exposure to
   keep startup output off deployments nobody is watching, **not because the risk differs**: hardware
   memory encryption addresses a host / hypervisor / physical-attacker threat that does not care which
   interface is bound, and a loopback-bound engine ingesting real HL7 over an MLLP listener holds exactly
@@ -122,7 +124,9 @@ The ruling changes the support statement, not the code or CI:
   compose file, Kubernetes manifests, smoke test) stays as a development and CI artifact.
 - CI keeps its Linux legs. A green Linux leg is not evidence that a Linux deployment works.
 - Some CI jobs run only on Linux hosted runners, at least the SQL Server and PostgreSQL store jobs.
-  Their Windows counterpart, `selfhosted-win2025-sql.yml`, runs only when dispatched by hand.
+  On Windows that leaves a gap. `selfhosted-win2025-sql.yml` covers SQL Server only, and has no
+  runner known to be registered ([CI-SELFHOSTED-RUNNER.md](CI-SELFHOSTED-RUNNER.md)). The PostgreSQL
+  store has no Windows CI leg.
 
 ## Runtime
 
@@ -315,7 +319,7 @@ multi-engine deployments as **active-passive** (one active writer per store) for
 > **Platform of the source runs.** The Pilot and Standard rows come from the reference config in
 > [TUNING-BASELINE.md](benchmarks/TUNING-BASELINE.md), measured on a GitHub-hosted `ubuntu-latest` runner.
 > Linux is [not supported for v1](#linux-is-not-a-supported-v1-deployment-target). That file's Windows
-> Server 2025 sharding run also measured one process on SQLite at ~50 msg/s, inside the Standard band.
+> Server 2025 engine-shard run also measured one process on SQLite at ~50 msg/s, inside the Standard band.
 > The High single-node and engine-shard rows had a Windows engine host.
 
 **Reading the tiers — and checking the arithmetic**
