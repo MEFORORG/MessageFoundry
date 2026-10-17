@@ -9095,8 +9095,9 @@ class PostgresStore:
     ) -> bool:
         """Strict compare-and-set of the authenticator sign counter (the ``consume_totp_step``
         precedent): ``True`` iff the stored count still equalled ``expected``. A miss means a
-        concurrent assertion consumed the same counter — the caller treats it as a clone signal
-        (ADR 0068 §4). The ``SELECT ... FOR UPDATE`` + guarded ``UPDATE`` run in one transaction
+        concurrent assertion consumed the same counter, or the passkey was deleted; the caller
+        reads it as a clone signal unless the passkey is confirmed gone (ADR 0068 §4, BACKLOG
+        #3068). The ``SELECT ... FOR UPDATE`` + guarded ``UPDATE`` run in one transaction
         (no cross-node double-spend)."""
         async with self._timed_acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
@@ -9105,7 +9106,7 @@ class PostgresStore:
                 credential_id_hash,
             )
             if row is None or row["sign_count"] != expected:
-                return False  # consumed by a concurrent assertion — clone signal
+                return False  # consumed by a concurrent assertion, or the passkey deleted
             await conn.execute(
                 "UPDATE webauthn_credentials SET sign_count=$1, last_used_at=$2"
                 " WHERE credential_id_hash=$3",

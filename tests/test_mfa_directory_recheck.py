@@ -35,6 +35,7 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.base import Store
+from messagefoundry.store.crypto import CipherError
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import login_admin
 from tests._fake_directory import FakeDirectory as _Directory
@@ -441,7 +442,16 @@ async def test_a_lock_set_during_the_lookup_is_honoured(
 
 @pytest.mark.parametrize(
     "change",
-    ["lock", "revoke", "disable", "factor-off", "factor-replaced", "factor-replaced-same-stamp"],
+    [
+        "lock",
+        "revoke",
+        "disable",
+        "factor-off",
+        "factor-replaced",
+        "factor-replaced-same-stamp",
+        "factor-restamped",
+        "secret-unopenable",
+    ],
 )
 @pytest.mark.parametrize("account", ["directory", "local"])
 async def test_what_lands_during_the_code_check_stops_the_factor_write(
@@ -453,10 +463,14 @@ async def test_what_lands_during_the_code_check_stops_the_factor_write(
     code's check does not stop the write, which would then mark the factor, stamp the window and
     clear the lockout counters. ``factor-replaced`` turns TOTP off and enrols it again with a new
     secret, so the row holds a factor again but not the one the code proved; it is audited
-    ``factor_replaced``, apart from a plain disable."""
+    ``factor_replaced``, apart from a plain disable. ``factor-restamped`` enrols the SAME secret
+    again under a new stamp, so only the stamp tells the enrolments apart. ``secret-unopenable``
+    makes the fresh row's secret fail to open once the code is spent: refused and audited
+    ``factor_unverified``, never raised."""
     if account == "directory":
         e = await _enrolled_directory_session(store, monkeypatch)
         service, token, user_id, code = e.service, e.token, e.user_id, totp.totp(e.secret, now=_T1)
+        secret = e.secret
     else:
         service = AuthService(store, _settings())
         identity, first, _ = await login_admin(service)
@@ -475,6 +489,7 @@ async def test_what_lands_during_the_code_check_stops_the_factor_write(
             idp_auth_time=None,
         )
         user_id, code = identity.user_id, confirmed.recovery_codes[0]
+        secret = enroll.secret
     real_verify = service._verify_second_factor
 
     async def _verify_while_something_lands(*args: Any, **kwargs: Any) -> bool:
@@ -485,6 +500,24 @@ async def test_what_lands_during_the_code_check_stops_the_factor_write(
             await store.revoke_session(hash_token(token))
         elif change == "disable":
             await store.set_user_disabled(user_id, disabled=True)
+        elif change == "secret-unopenable":
+
+            def _refuse(*_args: object) -> str | None:
+                raise CipherError("synthetic: the cell does not open")
+
+            monkeypatch.setattr(store, "open_totp_secret", _refuse)
+        elif change == "factor-restamped":
+            before = await store.get_user(user_id)
+            assert before is not None and before.totp_enrolled_at is not None
+            await store.disable_totp(user_id)
+            cell = await store.set_totp_secret(user_id, secret=secret)
+            assert cell is not None
+            assert await store.enable_totp(
+                user_id,
+                recovery_code_hashes=[],
+                expected_secret_cell=cell,
+                now=before.totp_enrolled_at + 1.0,
+            )
         else:
             before = await store.get_user(user_id)
             assert before is not None
@@ -513,6 +546,8 @@ async def test_what_lands_during_the_code_check_stops_the_factor_write(
         "factor-off": "factor_removed",
         "factor-replaced": "factor_replaced",
         "factor-replaced-same-stamp": "factor_replaced",
+        "factor-restamped": "factor_replaced",
+        "secret-unopenable": "factor_unverified",
     }.get(change, "session_lost")
     assert {"reason": reason} in await _audited_mfa_failures(store)
     session = await store.get_session(hash_token(token))
