@@ -19,6 +19,7 @@ import json
 import logging
 import math
 import os
+import re
 import secrets
 import time
 import unicodedata
@@ -2031,6 +2032,8 @@ _REMINDER_MARK_PAGE: Final = 50
 #: session writes when it ends nothing, because the id names no session or another account's.
 #: One action for both, and the same detail, so the row cannot tell the two apart either.
 SESSION_REVOKE_MISSED_ACTION: Final = "auth.session_revoke_missed"
+#: What a session id can look like: a token hash, lower-case hex, cut to at most its full length.
+_SESSION_ID_SHAPE: Final = re.compile(r"[0-9a-f]{1,64}")
 
 #: Vault BACKLOG #3260: the row an admin route writes when it refuses the caller's own account.
 #: Its detail's ``op`` names the route, one of :data:`SelfTargetOp`.
@@ -4848,9 +4851,7 @@ class AuthService:
             return flow
         actor = await self._step_up_actor(flow)
         if flow.step_up_session_hash is None:
-            return await self._step_up_refused(
-                FLOW_PURPOSE_MISMATCH, actor=actor, client=client, flow=flow
-            )
+            return await self._step_up_refused(FLOW_PURPOSE_MISMATCH, actor=actor, client=client)
         return await self._step_up_refused(
             reason, actor=actor, client=client, return_to=flow.return_to, flow=flow
         )
@@ -4912,8 +4913,9 @@ class AuthService:
         The session is re-anchored to the callback's address when the callback has one. The
         ``auth.reauth`` row a completed step-up writes, including one whose rotation lost the
         session, also records the start leg's address as ``start_client`` and whether the two are
-        different hosts as ``client_moved`` (BACKLOG #2160). So does a refusal made after the flow
-        was redeemed (vault BACKLOG #3145); one made before carries neither. A move is recorded,
+        different hosts as ``client_moved`` (BACKLOG #2160). So does a refusal made after a
+        step-up flow was redeemed (vault BACKLOG #3145); :meth:`_step_up_refused` names the rows
+        that carry neither. A move is recorded,
         never refused. Behind a proxy the engine does not trust, both legs carry
         the proxy's address, so ``client_moved`` reads false there.
 
@@ -4929,9 +4931,7 @@ class AuthService:
         actor = await self._step_up_actor(flow)
         token_hash = flow.step_up_session_hash
         if token_hash is None:
-            return await self._step_up_refused(
-                FLOW_PURPOSE_MISMATCH, actor=actor, client=client, flow=flow
-            )
+            return await self._step_up_refused(FLOW_PURPOSE_MISMATCH, actor=actor, client=client)
         # Every refusal below is made after the flow was redeemed, so each carries the address
         # fields (vault BACKLOG #3145): bound once, so a new arm cannot leave them out.
         refuse = partial(
@@ -4956,23 +4956,14 @@ class AuthService:
         except oidc.TokenRefusedError as exc:
             # The endpoint answered. As on the sign-in leg, that is not an outage (#1948), and the
             # status is what tells a junk code from a misconfiguration or a failing IdP.
-            return await refuse(
-                "token_refused",
-                extra={"status": exc.status},
-            )
+            return await refuse("token_refused", extra={"status": exc.status})
         except (OSError, ValueError, http.client.HTTPException) as exc:
             # The sign-in leg's outage arm, for the same reasons (#1948). Only the exception TYPE,
             # and a received status, are kept.
             if not _is_idp_transport_failure(exc):
-                return await refuse(
-                    IDP_ANSWER_UNUSABLE,
-                    extra=_idp_error_fields(exc),
-                )
+                return await refuse(IDP_ANSWER_UNUSABLE, extra=_idp_error_fields(exc))
             self.mark_oidc_unavailable(type(exc).__name__)
-            return await refuse(
-                "idp_unavailable",
-                extra=_idp_error_fields(exc),
-            )
+            return await refuse("idp_unavailable", extra=_idp_error_fields(exc))
         floor_exempt_amr = (
             self._oidc_callback_floor_exemption(principal_claims.amr) if arrived_too_early else ()
         )
@@ -4990,16 +4981,10 @@ class AuthService:
             # stepped up, so the operator is not told "verified" and then signed out.
             or not session.is_live(now=now, idle_seconds=self.session_idle_seconds)
         ):
-            return await refuse(
-                "session_gone",
-                lost=True,
-            )
+            return await refuse("session_gone", lost=True)
         user = await self._load_user(session.user_id)
         if user is None or user.disabled or user.auth_provider != AuthProvider.AD.value:
-            return await refuse(
-                "session_gone",
-                lost=True,
-            )
+            return await refuse("session_gone", lost=True)
         if (user.oidc_issuer, user.oidc_subject) != (
             principal_claims.issuer,
             principal_claims.subject,
@@ -5033,13 +5018,9 @@ class AuthService:
         # row and the operator's text say which one refused.
         held_auth_time = session.idp_auth_time
         if held_auth_time is None:
-            return await refuse(
-                STEP_UP_IDP_AUTH_TIME_MISSING,
-            )
+            return await refuse(STEP_UP_IDP_AUTH_TIME_MISSING)
         if principal_claims.auth_time <= held_auth_time:
-            return await refuse(
-                STEP_UP_IDP_AUTH_TIME_NOT_LATER,
-            )
+            return await refuse(STEP_UP_IDP_AUTH_TIME_NOT_LATER)
         # The DIRECTORY still has the account. The password re-bind this leg replaces failed for a
         # disabled or deleted AD object, and the sign-in leg refuses one as not_in_directory. An IdP
         # can still sign such a user in (sync lag, or its own credential store), so the engine asks
@@ -5049,9 +5030,7 @@ class AuthService:
         if not user.directory_object_id:
             # Never a name-only lookup: a directory may reissue a freed name to someone else. The
             # sign-in leg refuses such a row for the same reason (BACKLOG #2027).
-            return await refuse(
-                DIRECTORY_OBJECT_ID_MISSING,
-            )
+            return await refuse(DIRECTORY_OBJECT_ID_MISSING)
         try:
             principal = await asyncio.to_thread(
                 self._ldap.resolve_principal, user.username, object_id=user.directory_object_id
@@ -5076,10 +5055,7 @@ class AuthService:
         # as before, through the loader (BACKLOG #2592).
         fresh = await self._load_user(user.id)
         if fresh is None:
-            return await refuse(
-                "session_gone",
-                lost=True,
-            )
+            return await refuse("session_gone", lost=True)
         if not set(fresh.role_ids) <= await self._ad_roles_for_groups(principal.groups):
             return await refuse(DIRECTORY_ROLES_DEMOTED)
         purpose = flow.step_up_purpose
@@ -5171,9 +5147,10 @@ class AuthService:
         type (BACKLOG #1948). It never carries IdP text.
 
         ``flow`` adds ``start_client`` and ``client_moved``, as the success row carries them (vault
-        BACKLOG #3145). Only a refusal made after the flow was redeemed passes it: before ``state``
-        matched, the callback is not shown to belong to the flow, and some refusals have no flow
-        at all, so those rows carry neither field."""
+        BACKLOG #3145). Only a refusal made after a STEP-UP flow was redeemed passes it: before
+        ``state`` matched, the callback is not shown to belong to the flow; a sign-in flow refused
+        as ``flow_purpose_mismatch`` started another ceremony, so its address is not a step-up's;
+        and some refusals have no flow at all. Those rows carry neither field."""
         # `extra` first, so it can never overwrite a closed-set field.
         detail: dict[str, object] = {
             **(extra or {}),
@@ -8492,7 +8469,7 @@ class AuthService:
         or letting a user touch another's session. Audited.
 
         A miss writes :data:`SESSION_REVOKE_MISSED_ACTION` (vault BACKLOG #3260, limb 2; owner
-        ruling 2026-10-16). Its detail is the id's first 12 characters, as the success row's is,
+        ruling 2026-10-16). Its detail is the id's first 12 characters (or ``malformed``), as the success row's is,
         and nothing else: an unknown id and another account's id write the same row, so the trail
         records no ownership a caller could not already learn. The write is soft with no defect
         re-raised, for the reason ``api.auth_routes._refuse_if_self`` gives: a raise would replace
@@ -8500,11 +8477,14 @@ class AuthService:
         :meth:`audit_self_target_refused`, because both planes call this from a request."""
         session = await self._load_session(session_id)
         if session is None or session.user_id != identity.user_id:
+            # The console passes the id as plain text, so only an id-shaped one is copied into the
+            # trail; anything else is recorded as malformed, never as the caller's own characters.
+            shown = session_id[:12] if _SESSION_ID_SHAPE.fullmatch(session_id) else "malformed"
             await write_audit_soft(
                 lambda: self._audit(
                     SESSION_REVOKE_MISSED_ACTION,
                     actor=actor,
-                    detail=_json({"session": session_id[:12]}),
+                    detail=_json({"session": shown}),
                     client=client,
                 ),
                 log=_log,
@@ -10192,8 +10172,12 @@ class AuthService:
             # first, so no exception the revoke raises can skip it. ``session_ended`` records
             # what the revoke did. The token is not handed back either way, so the caller still
             # cannot use the session; a session the revoke left live expires on its own timers.
-            # A fault that also refuses the read and the audit write below still loses the row.
+            # The row's own write is soft too, so a store fault there is logged at ERROR rather
+            # than replacing the answer, or a defect already propagating. Known limit: a
+            # cancellation can land after the store committed the revoke, and the row then says
+            # ``session_ended: false`` for a session that did end.
             rotated = hash_token(elevation.token)
+            refused = (*store_call_errors(), CipherError)
             session_ended = False
             try:
                 session_ended = await write_audit_soft(
@@ -10201,11 +10185,18 @@ class AuthService:
                     log=_log,
                     message="a refused TOTP enrolment for %s could not end the session it rotated",
                     args=lambda: (scrub_log_argument(identity.username),),
-                    errors=(*store_call_errors(), CipherError),
+                    errors=refused,
                     defects=AUDIT_WRITE_DEFECTS,
                 )
             finally:
-                await self._audit_enroll_refused(identity, session_ended, client=client)
+                await write_audit_soft(
+                    lambda: self._audit_enroll_refused(identity, session_ended, client=client),
+                    log=_log,
+                    message="a refused TOTP enrolment for %s could not write its refusal row",
+                    args=lambda: (scrub_log_argument(identity.username),),
+                    errors=refused,
+                    defects=AUDIT_WRITE_DEFECTS,
+                )
             return Elevation(session_lost=True)
         await self._audit("auth.mfa_enrolled", actor=identity.username, client=client)
         # ADR 0197 Amendment A: enrolment now comes BEFORE the first rotation, so whoever intercepts

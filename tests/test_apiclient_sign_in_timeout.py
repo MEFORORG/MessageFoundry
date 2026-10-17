@@ -6,9 +6,10 @@
 ``EngineClient.login`` names the token it replaces, and the engine ends that session inside the
 sign-in (BACKLOG #2281). A sign-in waiting in the engine's per-account queue could outlast the
 client's 5 s default, and a lost reply then leaves the client holding a token the engine ended.
-``login``, ``reauth`` and ``verify_mfa`` now carry ``SIGN_IN_TIMEOUT_SECONDS``, which matches the
-IDE's ``SIGN_IN_TIMEOUT_MS``; every other request keeps the client's own timeout. The queue has no
-bound, so this makes the lost reply rarer, not impossible.
+``login``, ``reauth``, ``verify_mfa`` and ``confirm_mfa`` now wait ``SIGN_IN_TIMEOUT_SECONDS``
+for their reply, which matches the IDE's ``SIGN_IN_TIMEOUT_MS``; their other phases, and every
+other request, keep the client's own timeout. The queue has no bound, so this makes the lost reply
+rarer, not impossible.
 
 The transport is an ``httpx.MockTransport``: what is pinned is the timeout each request carries,
 read from ``request.extensions["timeout"]``, not what an engine does with it.
@@ -42,6 +43,8 @@ def _reply(request: httpx.Request) -> httpx.Response:
         body: object = {"token": _TOKEN, "user": _USER}
     elif path in ("/me/reauth", "/auth/mfa-verify"):
         body = {"detail": "re-verified", "token": _ROTATED}
+    elif path == "/me/mfa/confirm":
+        body = {"recovery_codes": ["code-one"], "token": _ROTATED}
     else:
         body = _USER
     return httpx.Response(200, json=body)
@@ -69,21 +72,28 @@ def _every_phase(seconds: float) -> dict[str, float | None]:
     return {"connect": seconds, "read": seconds, "write": seconds, "pool": seconds}
 
 
-def test_the_sign_in_and_the_queued_elevations_carry_the_longer_timeout() -> None:
-    """RED when: ``/auth/login``, ``/me/reauth`` or ``/auth/mfa-verify`` runs under the client's
-    5 s default (vault BACKLOG #2950), or ``/auth/me`` loses that default."""
+#: The requests that wait in the engine's per-account queue.
+_QUEUED = ("/auth/login", "/me/reauth", "/auth/mfa-verify", "/me/mfa/confirm")
+
+
+def test_the_sign_in_and_the_queued_elevations_wait_longer_for_their_reply() -> None:
+    """RED when: ``/auth/login``, ``/me/reauth``, ``/auth/mfa-verify`` or ``/me/mfa/confirm``
+    waits only the client's 5 s default for its reply (vault BACKLOG #2950), when anything but
+    the read phase is raised, or when ``/auth/me`` loses that default."""
     client, seen = _recording_client()
     try:
         client.login("jdoe", "a-strong-test-passphrase")
         client.reauth("a-strong-test-passphrase")
         client.verify_mfa("123456")
+        assert client.confirm_mfa("123456") == ["code-one"]
         client.me()
     finally:
         client.close()
-    longer = _every_phase(SIGN_IN_TIMEOUT_SECONDS)
-    assert seen["/auth/login"] == longer
-    assert seen["/me/reauth"] == longer
-    assert seen["/auth/mfa-verify"] == longer
+    # Only the read phase waits out the queue; connect, write and pool keep the client's bound,
+    # so an unreachable engine is still reported as fast as before.
+    longer = {**_every_phase(5.0), "read": SIGN_IN_TIMEOUT_SECONDS}
+    for path in _QUEUED:
+        assert seen[path] == longer, path
     # The control: any other request keeps the client's default.
     assert seen["/auth/me"] == _every_phase(5.0)
 

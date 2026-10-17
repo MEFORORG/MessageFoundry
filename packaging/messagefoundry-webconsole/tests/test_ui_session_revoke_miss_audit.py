@@ -4,7 +4,7 @@
 
 Owner ruling 2026-10-16: one ``auth.session_revoke_missed`` row per miss, with the id cut to its
 first 12 characters, and the answer unchanged and the same for an unknown id and another account's.
-The console takes the id as plain text, so the cut also bounds what a caller can put in the row.
+The console takes the id as plain text, so one that is not lower-case hex is recorded as malformed.
 The JSON plane's twin is ``tests/test_self_target_refusal_audit.py``.
 """
 
@@ -63,5 +63,7 @@ async def test_a_missed_console_revoke_writes_one_row_and_the_same_answer(
     assert len(rows) == 1, "one miss, one row"
     assert rows[0]["actor"] == "a"
     assert rows[0]["client"] == "127.0.0.1", "the miss row dropped the caller's address"
-    # The cut id and nothing else, so the row records no ownership either.
-    assert json.loads(str(rows[0]["detail"])) == {"session": target[:12]}
+    # The cut id and nothing else, so the row records no ownership either. Text that cannot be a
+    # session id is recorded as malformed, never copied.
+    shown = "malformed" if kind == "long" else target[:12]
+    assert json.loads(str(rows[0]["detail"])) == {"session": shown}

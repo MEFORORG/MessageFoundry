@@ -1150,10 +1150,13 @@ async def _step_up_refusal(
         # Vault BACKLOG #3145 item 6: the read only picks the wording, and the gate has already
         # refused, so a store fault keeps the 403 rather than becoming a 500. It answers with the
         # password wording; an oidc client's POST /me/reauth then asks again and is told the IdP.
+        # With its traceback: ValueError and RuntimeError are also what a bug raises, and the log
+        # line is the only place a fault and a defect can be told apart.
         log.warning(
             "a step-up refusal could not read the session's sign-in mechanism (%s); it answers"
             " with the password wording",
             type(exc).__name__,
+            exc_info=True,
         )
         via_idp = False
     if via_idp:

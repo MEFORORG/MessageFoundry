@@ -135,15 +135,15 @@ _FRAMING_HEADERS = frozenset({"content-encoding", "content-length", "transfer-en
 # handlers by test_apiclient_approval_hold.py, which reads the code back rather than trusting 202.
 _HTTP_PENDING_APPROVAL = 202
 
-#: How long a request that can wait in the engine's per-account queue may go silent, in seconds
-#: (vault BACKLOG #2950): the sign-in, and the two elevations that also rotate the token and queue
-#: on that account, ``reauth`` behind the re-proof lock and ``verify_mfa`` behind the credential
-#: lock. Matches the IDE's ``SIGN_IN_TIMEOUT_MS`` (``ide/src/signInSession.ts``). The queue has no
-#: bound (``keyed_lock.hold_keyed_lock`` takes no timeout), so no value covers every wait: this
-#: makes a lost reply rarer than the 5 s default did, and does not rule one out. Every other
-#: request keeps the client's own timeout.
+#: How long the reply to a request that can wait in the engine's per-account queue may take, in
+#: seconds (vault BACKLOG #2950): the sign-in, and the elevations that rotate the token, which
+#: queue on that account too: ``reauth``, ``verify_mfa`` and ``confirm_mfa`` (each rotation runs
+#: under the account's re-proof lock, and ``verify_mfa`` also under its credential lock). Matches
+#: the IDE's ``SIGN_IN_TIMEOUT_MS`` (``ide/src/signInSession.ts``). The queue has no bound
+#: (``keyed_lock.hold_keyed_lock`` takes no timeout), so no value covers every wait: this makes a
+#: lost reply rarer than the 5 s default did, and does not rule one out. It raises the read phase
+#: only (:meth:`EngineClient._sign_in_timeout`); every other request keeps the client's timeout.
 SIGN_IN_TIMEOUT_SECONDS = 30.0
-_SIGN_IN_TIMEOUT = httpx.Timeout(SIGN_IN_TIMEOUT_SECONDS)
 
 
 class ApiError(RuntimeError):
@@ -1084,6 +1084,13 @@ class EngineClient:
             raise ApiError(_error_detail(response), status=response.status_code)
         return response
 
+    def _sign_in_timeout(self) -> httpx.Timeout:
+        """This client's timeout with only the READ phase raised to :data:`SIGN_IN_TIMEOUT_SECONDS`
+        (vault BACKLOG #2950). The engine's per-account queue is waited out after the request is
+        sent, so connect, write and pool keep the client's own bound: a caller on a GUI thread
+        still learns of an unreachable engine as fast as before."""
+        return httpx.Timeout(self._timeout, read=SIGN_IN_TIMEOUT_SECONDS)
+
     def _adopt_rotated(self, response: httpx.Response) -> None:
         """Adopt the re-keyed session token an elevation route hands back (ASVS 7.2.4).
 
@@ -1142,7 +1149,7 @@ class EngineClient:
                 "/me/reauth",
                 json=body,
                 _allow_step_up=False,
-                timeout=_SIGN_IN_TIMEOUT,
+                timeout=self._sign_in_timeout(),
             )
         )
 
@@ -1175,7 +1182,11 @@ class EngineClient:
         ``MfaConfirmResponse.token`` is a required ``str`` today, so a token-less body fails in
         ``_decode`` rather than clearing the session. That is a property of a different file, not of
         the rule, and the rule is the one thing all three sites must share."""
-        response = self._request("POST", "/me/mfa/confirm", json={"code": code})
+        # Vault BACKLOG #2950: the rotation queues behind the account's re-proof lock, and a lost
+        # reply here also loses the one-time recovery codes, so it gets the sign-in's timeout.
+        response = self._request(
+            "POST", "/me/mfa/confirm", json={"code": code}, timeout=self._sign_in_timeout()
+        )
         self._adopt_rotated(response)
         return _decode(response, MfaConfirmResponse).recovery_codes
 
@@ -1194,7 +1205,7 @@ class EngineClient:
                 "/auth/mfa-verify",
                 json={"code": code},
                 _allow_mfa=False,
-                timeout=_SIGN_IN_TIMEOUT,
+                timeout=self._sign_in_timeout(),
             )
         )
 
@@ -1678,8 +1689,8 @@ class EngineClient:
           ``login`` raises :class:`ApiError` and every later call on the held token is refused
           with a 401 until the caller signs in again. A timeout is the likely way in: a sign-in
           waiting in the engine's per-account queue can outlast the client, while the engine goes
-          on to finish it. This request therefore gets :data:`SIGN_IN_TIMEOUT_SECONDS` (30 s per
-          phase) rather than the client's 5 s default (vault BACKLOG #2950). That makes a lost
+          on to finish it. This request therefore waits :data:`SIGN_IN_TIMEOUT_SECONDS` (30 s) for
+          its reply rather than the client's 5 s default (vault BACKLOG #2950). That makes a lost
           reply rarer, not impossible: the queue has no bound, so a long enough queue still
           outlasts it. Before, the old token stayed live in that case. The new session nobody holds stays valid
           until it idles out or expires, as it did before. This is the accepted price of ending the
@@ -1694,7 +1705,7 @@ class EngineClient:
         if prior and self._token_cell.issued_here:
             body["supersedes"] = prior
         result = _decode(
-            self._request("POST", "/auth/login", json=body, timeout=_SIGN_IN_TIMEOUT),
+            self._request("POST", "/auth/login", json=body, timeout=self._sign_in_timeout()),
             LoginResponse,
         )
         self._hold_issued(result.token)

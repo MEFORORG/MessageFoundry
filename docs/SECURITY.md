@@ -756,7 +756,10 @@ stored id matters on the console. A self-service revoke of one session that ends
 `404` of `DELETE /me/sessions/{session_id}` and the console's "Nothing was revoked" notice, writes
 one `auth.session_revoke_missed` row (vault BACKLOG #3260, limb 2). It names the actor, the
 caller's address and the first 12 characters of the id, and nothing else: an unknown id and
-another account's id get the same answer and the same row.
+another account's id get the same answer and the same row. The console takes the id as plain
+text, so an id that is not lower-case hex is recorded as `malformed` rather than copied. The
+write is soft: if the audit log refuses it, the answer still stands and the loss is logged at
+ERROR, so the row is the record of a miss only while the audit log accepts writes.
 
 **Delegated identity & admin device posture (#193 sibling; ASVS 13.2.1 / 13.3.2 / 8.4.2 — the delegation
 boundary).** Three controls whose enforcement is largely the deploying organization's to provide.
@@ -3859,7 +3862,8 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   also carry `start_client`, the address the start leg staged on the flow, and `client_moved`,
   whether the callback came from another host by the new-address comparison, or null when either
   address is unknown (BACKLOG #2160, vault BACKLOG #3145). Neither is ever read from the token. A
-  refusal before the `state` check names neither. A move is recorded, never refused. Behind a proxy
+  refusal before the `state` check names neither, nor does a sign-in flow refused as
+  `flow_purpose_mismatch`, whose start was another ceremony. A move is recorded, never refused. Behind a proxy
   the engine does not trust, both legs carry the proxy's address, so `client_moved` reads false
   there. A cancel at the IdP returns to the same page.
   A callback without the flow's own `state` consumes nothing, and the flow waits for the real

@@ -406,15 +406,16 @@ from typing import Any
 #:
 #: Vault BACKLOG #3260, limb 2: ``AuthService.revoke_own_session`` takes a required keyword
 #: ``client``, the address on its new ``auth.session_revoke_missed`` row and on its
-#: ``auth.session_revoked`` row, and ``/ui/account/sessions/{id}/revoke`` passes it. The digest did
-#: not move, for the same reason as #3259, and the same TypeError skew applies to that call.
+#: ``auth.session_revoked`` row, and ``/ui/account/sessions/{id}/revoke`` passes it. Unlike the
+#: ``AdminHandlers`` fields of #3259, an ``AuthService`` method is on the discovered surface with
+#: its signature, so the digest moved and a skew in either direction is refused at mount.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "1b9da0aae75dbd52"
+ENGINE_UI_SEAM: str = "0971e2440e4237c7"
 
 
 @dataclass(frozen=True, slots=True)
