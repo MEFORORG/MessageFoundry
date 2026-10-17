@@ -39,6 +39,7 @@ from messagefoundry.auth.service import (  # noqa: E402
 )
 from messagefoundry.auth.tokens import hash_token  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
+from messagefoundry.store.crypto import generate_key, make_cipher  # noqa: E402
 from messagefoundry.store.store import MessageStore, UserRecord  # noqa: E402
 from tests._admin_account import ADMIN_USERNAME, login_admin  # noqa: E402
 from tests._fake_directory import FakeDirectory as _Directory  # noqa: E402
@@ -573,3 +574,34 @@ async def test_what_lands_before_the_factor_write_is_honoured(
     if change == "lock":
         user = await store.get_user(user_id)
         assert user is not None and user.second_step_locked_until is not None  # not cleared
+
+
+async def test_an_account_deleted_mid_assertion_on_a_keyed_store_is_a_lost_session() -> None:
+    """On a keyed store an account gone also fails its passkey set's seal re-read, which once sent
+    a sign-count miss down the clone branch. RED when: the miss is audited as a suspected clone or
+    answers as a wrong proof rather than a lost session."""
+    store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
+    try:
+        service = AuthService(store, _settings())
+        identity, first, password = await login_admin(service)
+        key = SoftAuthenticator(rp_id=_RP, origin=_ORIGIN)
+        await _register_passkey(service, identity, first, key)
+        out = await service.login(ADMIN_USERNAME, password)
+        assert out.ok and out.token is not None
+        response = await _staged_assertion(service, out.token, key)
+        real_update = store.update_webauthn_sign_count
+
+        async def _update_after_the_account_goes(*args: Any, **kwargs: Any) -> bool:
+            await store.delete_user(identity.user_id)
+            return await real_update(*args, **kwargs)
+
+        store.update_webauthn_sign_count = _update_after_the_account_goes  # type: ignore[method-assign]
+
+        refused = await service.finish_webauthn_assertion(
+            out.token, response, rp_id=_RP, origin=_ORIGIN
+        )
+
+        assert refused.ok is False and refused.session_lost is True
+        assert await store.list_audit(action="auth.webauthn_clone_suspected") == []
+    finally:
+        await store.close()

@@ -2617,16 +2617,19 @@ account gone after the lookup answers **401**.
 write the factor (BACKLOG #3068).** This applies to every account, local ones included. A
 revocation, a disable or a second-step lock that lands while a good code or a good assertion is
 being checked stops the write, and so does the proved factor itself going meanwhile: a TOTP
-factor turned off (`reason=factor_removed`), or turned off and enrolled again, or replaced, with a
-new secret (`reason=factor_replaced`, read from the enrolment stamp, which a store-key rotation
-does not touch), or the passkey that signed deleted (`reason=factor_removed`). The factor is then
-not marked and no counter is cleared, and because the proof is already spent the refusal is
-audited, with one of those reasons or `reason=session_lost`. A passkey deleted before its sign
-count is written fails that compare-and-set, as a concurrent assertion does. The leg then reads
-the session, the account and its lock again, as before the factor write, so an MFA reset, which
-deletes every passkey and then revokes the sessions, answers as a lost session; otherwise the
-delete is refused `reason=factor_removed` rather than audited as a suspected clone. A session or
-account gone answers as gone on at least these surfaces: **401** on `POST /auth/mfa-verify` and
+factor turned off (`reason=factor_removed`), or turned off and enrolled again with a new secret
+(`reason=factor_replaced`, read from the enrolment stamp and the opened secret, neither of which a
+store-key rotation changes), or the passkey that signed deleted (`reason=factor_removed`). An
+administrator's TOTP replace or MFA reset revokes the account's sessions, so once its revocation
+has landed it answers as a lost session; a re-read that falls between its factor write and its
+revocation reads as the factor gone. The factor is then not marked and no counter is cleared, and
+because the proof is already spent the refusal is audited, with at least the reasons named here.
+The passkey leg re-reads whether or not its sign-count compare-and-set succeeded, and asks whether
+the passkey is still held before it reads a miss as a clone, so a passkey deleted before its sign
+count is written is refused `reason=factor_removed`, not audited as a suspected clone. A miss on a
+session or account gone, or on a lock, answers as those do, so it writes no clone row. A passkey
+set that fails its seal is refused `reason=factor_unverified`. A session or account gone answers
+as gone on at least these surfaces: **401** on `POST /auth/mfa-verify` and
 `POST /ui/reauth/webauthn`, and a sign-in redirect on `/ui/mfa` and the `/ui/reauth` code leg.
 On the code leg it answers the same when it goes during the directory lookup or the account
 queue. A lock answers as the leg's locked refusal, audited `reason=locked`. By then the proof is
@@ -2904,7 +2907,8 @@ updated via a strict compare-and-set** — a regression or a concurrent same-cou
 as a **clone signal** (rejected + audited `auth.webauthn_clone_suspected`; a permanent counter of 0 is
 normal for synced passkeys). A compare-and-set that misses because the passkey was deleted after it
 was read is no clone signal: it is refused as `auth.webauthn_failed` with `reason=factor_removed`
-(BACKLOG #3068). Assertion failures are audited but deliberately do **not** feed the
+(BACKLOG #3068). A miss on a session or account gone, or a second-step lock, answers as those do,
+before the clone question is asked. Assertion failures are audited but deliberately do **not** feed the
 account lockout (signatures aren't guessable secrets). While `[auth].login_rate_limit_enabled` is on, abuse is bounded instead by the **per-actor
 credential-ceremony limiter** — the sole route that finishes an assertion, `POST /ui/reauth/webauthn`,
 charges `allow_reauth_attempt`, not the sign-in window — plus cookie-holder-only reachability. With it

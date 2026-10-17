@@ -439,7 +439,10 @@ async def test_a_lock_set_during_the_lookup_is_honoured(
     assert session is not None and session.reauth_at is None
 
 
-@pytest.mark.parametrize("change", ["lock", "revoke", "disable", "factor-off", "factor-replaced"])
+@pytest.mark.parametrize(
+    "change",
+    ["lock", "revoke", "disable", "factor-off", "factor-replaced", "factor-replaced-same-stamp"],
+)
 @pytest.mark.parametrize("account", ["directory", "local"])
 async def test_what_lands_during_the_code_check_stops_the_factor_write(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, change: str, account: str
@@ -483,13 +486,18 @@ async def test_what_lands_during_the_code_check_stops_the_factor_write(
         elif change == "disable":
             await store.set_user_disabled(user_id, disabled=True)
         else:
+            before = await store.get_user(user_id)
+            assert before is not None
             await store.disable_totp(user_id)
-            if change == "factor-replaced":
+            if change.startswith("factor-replaced"):
                 cell = await store.set_totp_secret(user_id, secret=_REPLACING_SECRET)
                 assert cell is not None
-                # An explicit stamp, so the new enrolment cannot share the old one's clock tick.
+                # ``-same-stamp`` gives the new enrolment the old one's stamp, so only the secret
+                # tells them apart; the other passes an explicit, different stamp.
+                stamp = before.totp_enrolled_at if change.endswith("same-stamp") else _T1
+                assert stamp is not None
                 assert await store.enable_totp(
-                    user_id, recovery_code_hashes=[], expected_secret_cell=cell, now=_T1
+                    user_id, recovery_code_hashes=[], expected_secret_cell=cell, now=stamp
                 )
         return good
 
@@ -504,6 +512,7 @@ async def test_what_lands_during_the_code_check_stops_the_factor_write(
         "lock": "locked",
         "factor-off": "factor_removed",
         "factor-replaced": "factor_replaced",
+        "factor-replaced-same-stamp": "factor_replaced",
     }.get(change, "session_lost")
     assert {"reason": reason} in await _audited_mfa_failures(store)
     session = await store.get_session(hash_token(token))
