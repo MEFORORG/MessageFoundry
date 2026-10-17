@@ -1262,9 +1262,9 @@ def _posture_security(state: Any, visible: Callable[[str], bool] | None = None) 
     every part of a reading uses one ``[security]``. On the serve path the two stashes are the same
     object; off it they can differ.
 
-    ``visible`` narrows it for a channel-scoped reader (BACKLOG #3189). The static-credential
-    opt-outs are the one ``[security]`` value keyed by connection name, and an opt-out
-    :func:`_posture_shows` would hide is dropped."""
+    ``visible`` (:func:`_posture_visible`) narrows it for a channel-scoped reader (BACKLOG #3189).
+    The static-credential opt-outs are the one ``[security]`` value keyed by connection name, and
+    an opt-out ``visible`` hides is dropped."""
     cred_settings = getattr(state, "static_credential_settings", None)
     if cred_settings is not None:
         security: SecuritySettings = cred_settings.security
@@ -1275,15 +1275,9 @@ def _posture_security(state: Any, visible: Callable[[str], bool] | None = None) 
     accepted = {
         name: reason
         for name, reason in security.static_credential_accepted.items()
-        if _posture_shows(name, visible)
+        if visible(name)
     }
     return security.model_copy(update={"static_credential_accepted": accepted})
-
-
-def _posture_shows(name: str, visible: Callable[[str], bool]) -> bool:
-    """Whether a channel-scoped posture reader is shown a static-credential hop or opt-out named
-    ``name``. A ``settings:`` name is a service-settings hop, which names no connection."""
-    return name.startswith(SETTINGS_PREFIX) or visible(name)
 
 
 def _posture_visible(
@@ -1292,13 +1286,16 @@ def _posture_visible(
     """Which per-connection report names a posture reader is shown, or ``None`` for an unscoped
     reader, who is shown every one (BACKLOG #3189). A channel-scoped reader is shown only an inbound
     in its own scope that the running graph holds, the connections dashboard's rule: an outbound
-    spans channels, and a ``FhirLookup`` is no channel. Names are read as
+    spans channels, and a ``FhirLookup`` is no channel. A ``settings:`` static-credential name is a
+    service-settings hop, which names no connection, so it is shown. Names are read as
     :func:`~messagefoundry.connection_names.inbound_record_name` spells them."""
     if identity.allowed_channels is None:
         return None
     inbound = runner.registry.inbound if runner is not None else {}
 
     def shown(record: str) -> bool:
+        if record.startswith(SETTINGS_PREFIX):
+            return True
         name = inbound_name_of(record)
         return name is not None and name in inbound and identity.can_access_channel(name)
 
@@ -1382,18 +1379,19 @@ def _posture_loosenings(
     revocation_hops = hops(revocation_attested_hops)
     # Vault BACKLOG #2571. This reader returns plain names already.
     path_form_hops = [] if registry is None else keep(path_form_fhir_updates(registry))
+    notes: list[str] = []
     if runner is None:
-        loosenings_scope: str | None = (
+        notes.append(
             "settings only — no connection graph is loaded on this engine, so the per-connection "
             "cleartext_accepted / tls_allow_expired / tls_check_hostname / url_query_credential / "
             "generic-ODBC-DATABASE-TLS / tls_hop_attested / "
             "tls_revocation_attested / FHIR update_url_form declarations are NOT included "
             "(see `messagefoundry check`)"
         )
-    elif visible is not None:
-        loosenings_scope = POSTURE_NARROWED_TO_SCOPE
-    else:
-        loosenings_scope = None
+    if visible is not None:
+        # With no graph too: the [security] opt-outs keyed by connection are still narrowed.
+        notes.append(POSTURE_NARROWED_TO_SCOPE)
+    loosenings_scope = "; ".join(notes) or None
     pairs = list(
         security_loosenings(
             security,
@@ -3609,7 +3607,7 @@ def create_app(
             for hop in static_credential_hops(
                 registry=runner.registry if runner is not None else None, settings=cred_settings
             )
-            if visible is None or _posture_shows(hop.name, visible)
+            if visible is None or visible(hop.name)
         ]
         unseen = [
             half
@@ -3621,7 +3619,6 @@ def create_app(
                     # Set only when the config has two or more engine shards (ADR 0073).
                     runner is not None and runner.registry.all_shard_ids is not None,
                 ),
-                (POSTURE_NARROWED_TO_SCOPE, runner is not None and visible is not None),
             )
             if missing
         ]
@@ -3631,6 +3628,9 @@ def create_app(
             static_hops_scope = STATIC_CREDENTIAL_HOPS_PARTIAL + "; ".join(unseen)
         else:
             static_hops_scope = STATIC_CREDENTIAL_HOPS_COMPLETE
+        if visible is not None:
+            # Read, then withheld from this reader (BACKLOG #3189), so it is not an unread half.
+            static_hops_scope += "; " + POSTURE_NARROWED_TO_SCOPE
         store_privilege_view = (
             StorePrivilegeView(status=STORE_PRIVILEGE_NOT_PROBED)
             if store_privilege is None
@@ -3665,6 +3665,9 @@ def create_app(
                     # observe a different graph after a concurrent reload, and the audit row must record
                     # exactly what the response reports.
                     "loosenings": [entry.switch for entry in loosenings],
+                    # BACKLOG #3189: a channel-scoped reader's list is narrowed, and the row says
+                    # so, so it never reads as the whole posture.
+                    "loosenings_scope": loosenings_scope,
                 }
             ),
             client=client_ip(request),

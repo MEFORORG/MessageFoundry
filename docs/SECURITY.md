@@ -1996,7 +1996,9 @@ the same permission set on the same method reds CI until it is listed here.
 > - `GET /security/posture` shows a scoped reader a per-connection entry only for an inbound in its
 >   own scope that the graph holds. That covers the loosenings, the static-credential hops and
 >   their opt-outs, and the audit row. `loosenings_scope` and `static_credential_hops_scope` then
->   say the reading is narrowed. Anything that names no connection is shown whole.
+>   say the reading is narrowed, with or without a loaded graph. The audit row carries
+>   `loosenings_scope` too, and the console's status page shows it. Anything that names no
+>   connection is shown whole.
 > - `GET /users` sends each account's `channel_scope` and `channel_scope_source` only to a
 >   `users:manage` holder, the tier `GET /users/{user_id}/channel-scope` reads on. Everyone else
 >   gets null for both, which there means "not shown", as `lock_state` does. The console's user

@@ -204,10 +204,36 @@ async def test_posture_names_only_the_scoped_readers_own_inbounds(engine: Engine
 
     # The audit row records what the response reported, for each reader.
     rows = {
-        r["actor"]: json.loads(r["detail"])["loosenings"]
+        r["actor"]: json.loads(r["detail"])
         for r in await engine.store.list_audit(limit=50, action="security.posture_view")
     }
-    assert "tls_allow_expired" in rows["wide"] and "tls_allow_expired" not in rows["scoped"]
+    assert "tls_allow_expired" in rows["wide"]["loosenings"]
+    assert "tls_allow_expired" not in rows["scoped"]["loosenings"]
+    # And it says which of the two lists was narrowed.
+    assert rows["wide"]["loosenings_scope"] is None
+    assert rows["scoped"]["loosenings_scope"] == POSTURE_NARROWED_TO_SCOPE
+
+
+async def test_posture_with_no_graph_still_says_it_is_narrowed(engine: Engine) -> None:
+    # No registry: the opt-outs keyed by connection are still withheld from a scoped reader, so the
+    # settings-only reading must say that too, not only that no graph is loaded.
+    assert engine.registry_runner is None
+    security = SecuritySettings(
+        require_nonstatic_credentials=True,
+        static_credential_accepted={f"inbound:{THEIRS}": "a synthetic opt-out on another channel"},
+    )
+    service = await _service(engine)
+    await _user(service, "scoped", [Role.VIEWER.value], [MINE])
+    await _user(service, "wide", [Role.VIEWER.value], [ALL_CHANNELS])
+    async with _client(engine, service, security_settings=security) as c:
+        scoped = await c.get("/security/posture", headers=await _login(c, "scoped"))
+        wide = await c.get("/security/posture", headers=await _login(c, "wide"))
+    assert scoped.status_code == 200 and wide.status_code == 200
+    assert THEIRS in wide.text and THEIRS not in scoped.text
+    assert POSTURE_NARROWED_TO_SCOPE not in wide.json()["loosenings_scope"]
+    assert POSTURE_NARROWED_TO_SCOPE in scoped.json()["loosenings_scope"]
+    assert POSTURE_NARROWED_TO_SCOPE in scoped.json()["static_credential_hops_scope"]
+    assert POSTURE_NARROWED_TO_SCOPE not in wide.json()["static_credential_hops_scope"]
 
 
 # --- GET /users ----------------------------------------------------------------------------------

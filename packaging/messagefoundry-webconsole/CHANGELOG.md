@@ -96,6 +96,10 @@ this line.**
   account's channel scope to a `users:manage` holder only, so `/ui/users` drops its Channel scope
   and Scope source columns for any other reader rather than showing every account as "(none)".
   (vault BACKLOG #3189)
+- **The status page says when its loosenings list is incomplete.** It now shows the engine's
+  `loosenings_scope` note under the security posture, so a list narrowed to a channel-scoped
+  reader's scope, or read with no connection graph loaded, no longer reads as the whole posture.
+  (vault BACKLOG #3189)
 - **The bulk control and bulk purge pages no longer write a malformed name into the audit log.** A
   channel-scoped operator's selection that is not a valid connection name is still recorded as an
   `auth.channel_denied` row naming the operator and host, but the row carries no channel. It used to
