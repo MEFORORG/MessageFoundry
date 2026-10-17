@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import pytest
 
+from messagefoundry.config import settings as settings_module
 from messagefoundry.config.ai_policy import AiMode, SecurityEnforcement
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import (
@@ -60,9 +61,9 @@ _ESCAPE_HONOURED = {"1", "true", "yes", "on"}
 def test_weakened_tls_escape_agrees_with_the_hop_clamp(
     monkeypatch: pytest.MonkeyPatch, escape: str | None, posture: HopPosture | None
 ) -> None:
-    # Vault BACKLOG #3753 item 1: weakened_tls_escape_permitted applies hop_insecure_escape_downgrades
-    # rather than a copy of it. The expected value is spelled out here, not derived from either
-    # function, so a change to the shared clamp fails this table too.
+    # Vault BACKLOG #3753 item 1: the two functions give the same answer for every posture and escape
+    # value. The expected value is spelled out here, not derived from either function, so a change
+    # to the shared clamp fails this table too. The test below pins that one calls the other.
     if escape is None:
         monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     else:
@@ -72,6 +73,22 @@ def test_weakened_tls_escape_agrees_with_the_hop_clamp(
     assert weakened_tls_escape_permitted(posture) is expected
     if posture is not None:
         assert hop_insecure_escape_downgrades(enforcing=posture.enforcing) is expected
+
+
+def test_weakened_tls_escape_calls_the_hop_clamp(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A copy of the clamp passes the table above too; this fails on one. An unknown posture still
+    # fails closed without asking the clamp.
+    calls: list[bool] = []
+
+    def clamp(*, enforcing: bool) -> bool:
+        calls.append(enforcing)
+        return True
+
+    monkeypatch.setattr(settings_module, "hop_insecure_escape_downgrades", clamp)
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    assert weakened_tls_escape_permitted(HopPosture(enforcing=True)) is True
+    assert weakened_tls_escape_permitted(None) is False
+    assert calls == [True]
 
 
 # --- decision 3: the per-connection attestation model field, load-validated --------------------

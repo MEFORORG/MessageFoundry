@@ -17,9 +17,11 @@ Standard library only (``urllib.request``) — no new dependency (ADR 0003). Red
 the alert-webhook hardening (ASVS 15.3.2 / 1.3.6); the `[egress].allowed_http` allowlist is the
 fail-closed host gate (enforced by the runner at load/reload/start). Per-connection
 ``verify_tls=False`` on an ``https`` URL is decided by :func:`refuse_verify_off`, whose docstring
-states the rule once. The dev escape ``MEFOR_ALLOW_INSECURE_TLS`` can turn that refusal into a
-loud warning only on an instance at ``[security].enforcement = warn``; under ``enforce``, the
-default, or with no posture known, it changes nothing.
+is the source of record for the rule. The dev escape ``MEFOR_ALLOW_INSECURE_TLS`` can turn that
+refusal into a loud warning only on an instance at ``[security].enforcement = warn``; under
+``enforce``, the default, or with no posture known, it changes nothing. It never lifts the
+refusal of a hop that sends a credential the refusal can see; the section of
+docs/SECURITY-LOOSENING.md that :func:`refuse_verify_off` links names what it cannot see.
 
 There is **no REST source yet** — a non-HL7 source needs the payload-agnostic ingress decided in
 ADR 0003 (its own follow-up ADR). This is the first non-HL7 connector.
@@ -1103,9 +1105,11 @@ def refuse_verify_off(
 ) -> InsecureHopGuard | None:
     """Refuse a ``verify_tls=false`` (unverified-TLS) hop to a non-loopback host (posture-keyed, #200).
 
-    This docstring is the one statement of the HTTP family's verify-off rule (vault BACKLOG #3753);
-    the module docstring points here. The credential half is stated once in
-    docs/SECURITY-LOOSENING.md, as the paragraph on ``credentials`` below says.
+    This docstring is the source of record for the HTTP family's verify-off rule (vault BACKLOG
+    #3753), and the module docstring points here. The credential half is stated once in
+    docs/SECURITY-LOOSENING.md, as the paragraph on ``credentials`` below says. At least
+    docs/CONNECTIONS.md, :func:`_shipped_strict_disposition` and the ``verify_tls`` parameter
+    comments in ``config/wiring.py`` still restate parts of it; change them with it.
 
     Disabling certificate verification makes the ``https`` hop MITM-able, so it is an insecure hop:
     an enforcing hop REFUSES, an on-box loopback / per-hop-attested hop is allowed, and the CLAMPED

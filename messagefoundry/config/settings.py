@@ -561,12 +561,13 @@ def insecure_config_source_escape_permitted(environ: Mapping[str, str] | None = 
     so it never does under ``[security].enforcement = enforce`` (vault BACKLOG #2599).
 
     The escape is honoured only when the SAME environment also carries
-    ``MEFOR_SECURITY_ENFORCEMENT=warn``. Under ``enforce`` it is inert, as ``MEFOR_ALLOW_INSECURE_TLS``
-    is, which is honoured only at ``[security].enforcement = warn``
-    (:func:`weakened_tls_escape_permitted`): a safe source loads, an unsafe one is refused, and the
-    refusal names the variable. It used to be honoured at any dial, so one variable in the service
-    environment would have turned off the check that keeps writable Python from running as the service
-    account, and nothing would have reported it.
+    ``MEFOR_SECURITY_ENFORCEMENT=warn``. Under ``enforce`` it is inert: a safe source loads, an unsafe
+    one is refused, and the refusal names the variable. It used to be honoured at any dial, so one
+    variable in the service environment would have turned off the check that keeps writable Python
+    from running as the service account, and nothing would have reported it. The insecure-TLS escape
+    ``MEFOR_ALLOW_INSECURE_TLS`` is clamped the same way, honoured only on an instance at
+    ``[security].enforcement = warn`` (:func:`weakened_tls_escape_permitted`), but it reads that dial
+    from the instance's posture, not from the environment.
 
     **Why the dial is read from the environment and not from loaded settings.** The check runs inside
     ``load_config``, in every process that executes config: ``serve``, a reload, the sandbox worker's
@@ -7434,7 +7435,8 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
     At least these names are spared:
 
     * one that names no modelled section either way (``MEFOR_ALLOW_INSECURE_TLS``, the escape
-      honoured only at ``[security].enforcement = warn``; a harness variable; another tool's). So a typo in the SECTION part of a name is not refused.
+      honoured only at ``[security].enforcement = warn``; a harness variable; another tool's).
+      So a typo in the SECTION part of a name is not refused.
       :func:`_unread_env_notes` writes a note, which :func:`load_settings` logs as a WARNING,
       for at least some of those, and the rest are dropped with no message;
     * one with no key part, which gets the same note when it is a section's name;

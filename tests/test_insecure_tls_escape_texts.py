@@ -39,7 +39,8 @@ BACKLOG #3753 it read only a pinned list, because some docstrings named the vari
 to define the rule without the posture. Those now name it too, so a docstring that names the
 variable anywhere in the packages is held to the rule. Each pinned file must hold at least one
 such docstring, and each one, with the posture struck out, must be flagged in every paragraph that
-names the variable, so a walk that silently skips a file cannot pass.
+names the variable, so a walk that silently skips a file cannot pass. ``_MUST_NAME_IN_DOCSTRING``
+pins the functions whose own docstrings must keep spelling the variable.
 
 **What none of them sees**, at least: a message built in a variable before the call; the variable
 imported under another name; a message with no space that only interpolates the variable, such
@@ -68,7 +69,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV
-from tests._ast_sites import parse_source
+from tests._ast_sites import named_func, parse_source
 
 _REPO = Path(__file__).resolve().parent.parent
 #: Every shipped Python package ci.yml type-checks. The engine is ``messagefoundry``; the others
@@ -110,6 +111,7 @@ _DOCSTRING_FILES = frozenset(
         "messagefoundry/config/wiring.py",
         "messagefoundry/pipeline/reference_sync.py",
         "messagefoundry/pipeline/wiring_runner.py",
+        "messagefoundry/store/base.py",
         "messagefoundry/store/postgres.py",
         "messagefoundry/transports/database.py",
         "messagefoundry/transports/direct.py",
@@ -118,6 +120,15 @@ _DOCSTRING_FILES = frozenset(
         "messagefoundry/transports/remotefile.py",
         "messagefoundry/transports/rest.py",
     }
+)
+#: Functions whose own docstring must spell the variable, so a rewrite that drops it, and with it
+#: the posture, fails here rather than leaving nothing in that docstring for the walk to judge.
+#: The pinned file can still pass the walk on its other docstrings.
+_MUST_NAME_IN_DOCSTRING = (
+    ("messagefoundry/config/settings.py", "insecure_tls_allowed"),
+    ("messagefoundry/config/settings.py", "hop_insecure_escape_downgrades"),
+    ("messagefoundry/config/settings.py", "weakened_tls_escape_permitted"),
+    ("messagefoundry/transports/rest.py", "refuse_verify_off"),
 )
 #: The posture as source spells it, wrapped or not, so the planted control can strike it out.
 _POSTURE_IN_SOURCE = re.compile(r"\s+".join(map(re.escape, _POSTURE.split())))
@@ -465,15 +476,25 @@ def _text(rel: str) -> str:
 def test_the_docstring_walk_flags_a_pinned_file_whose_posture_is_struck_out() -> None:
     """Vault BACKLOG #3753's planted control. Each pinned file, with the posture struck out of its
     source, has every paragraph that names the variable flagged, so a docstring that loses the
-    posture fails the walk, and a pinned file the walk reads as clean is one it really judged."""
+    posture fails the walk. The sources come from the walk's own read, so a pinned file the walk
+    drops fails here too."""
+    walked = dict(_package_sources())
     for rel in sorted(_DOCSTRING_FILES):
-        source = _text(rel)
+        assert rel in walked, f"the walk does not read {rel}"
+        source = walked[rel]
         _, seen = docstrings_without_posture(source)
+        assert seen, f"{rel} has no docstring that names the escape"
         struck, count = _POSTURE_IN_SOURCE.subn("[security].enforcement", source)
         assert count, f"{rel} spells no posture to strike out"
         unposted, seen_struck = docstrings_without_posture(struck)
         assert seen_struck == seen, rel
         assert len(unposted) == seen, f"{rel}: {len(unposted)} of {seen} paragraphs flagged"
+
+
+def test_the_pinned_functions_still_name_the_escape_in_their_docstrings() -> None:
+    for rel, name in _MUST_NAME_IN_DOCSTRING:
+        text = ast.get_docstring(named_func(parse_source(_text(rel)), name), clean=False) or ""
+        assert INSECURE_TLS_ESCAPE_ENV in text, f"{rel}:{name}"
 
 
 def test_every_authoring_text_naming_the_escape_names_the_posture() -> None:

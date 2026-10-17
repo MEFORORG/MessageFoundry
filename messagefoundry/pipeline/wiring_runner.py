@@ -11429,9 +11429,9 @@ def _inbound_revocation_gap_permitted(*, posture: HopPosture | None) -> bool:
     warns and crosses. It required enforcing AND PHI until BACKLOG #1279 made every instance PHI.
 
     There is deliberately NO blunt process-wide escape here. ``MEFOR_ALLOW_INSECURE_TLS`` governs
-    weakened TLS, and only at ``[security].enforcement = warn``; a listener that verifies its peers correctly but does not check revocation is
-    not a weakened-TLS hop; reusing that escape would let one env var silence a control it was never
-    scoped to."""
+    weakened TLS, and only at ``[security].enforcement = warn``; a listener that verifies its peers
+    correctly but does not check revocation is not a weakened-TLS hop; reusing that escape would
+    let one env var silence a control it was never scoped to."""
     if posture is None:
         return True  # un-postured (direct/embedding) call: never a new refusal (see above)
     return not posture.enforcing  # the `and posture.is_phi` conjunct went with BACKLOG #1279
