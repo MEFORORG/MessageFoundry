@@ -414,7 +414,8 @@ def test_release_pypi_publish_is_last_step_and_tag_gated() -> None:
 
     Since vault BACKLOG #2631 limb 1 the publish runs in `publish-pypi`, which needs `release`. So
     "last" has two halves: the build job ends by handing the files over, after build, leak gate,
-    sign and the GitHub release; and the publish job ends with the engine upload.
+    sign and the GitHub release; and the publish job uploads the toolkit, the engine and, last,
+    the harness (vault BACKLOG #2975).
 
     THE GUARD ITSELF IS SECTION (4b)'s, NOT THIS TEST'S: it parses the YAML, conjoins job and step,
     and covers every publishing step. What stays here is the ORDER.
@@ -3473,7 +3474,8 @@ def test_every_job_that_can_publish_waits_on_the_provenance_gate() -> None:
 #
 # An immutable release refuses any asset change once it is published. So the engine's release is a
 # draft until every job that attaches an asset has run, and then one job publishes it. The console's
-# release is created by one call that carries its one asset. A re-run never uploads to a published
+# release is a draft created by one call that carries its one asset, and its own job publishes it
+# once the wheel is on PyPI (vault BACKLOG #2975). A re-run never uploads to a published
 # release. The structural tests hold the shape; the executed tests run each step against a stand-in
 # `gh` that records what it was asked to do.
 
@@ -3563,6 +3565,15 @@ def test_the_console_release_is_a_draft_until_its_wheel_is_on_pypi() -> None:
     assert not any("--draft=false" in ln for ln in lines), "the console job publishes its own draft"
     needs = set(needs_of(jobs[_CONSOLE_PUBLISH_JOB]))
     assert needs >= {"release-webconsole", "publish-pypi-webconsole"}, sorted(needs)
+    # The upload job's success must mean the upload ran: its variable gate is on the job only, so
+    # no step inside the environment can skip the upload in a job that still succeeds.
+    upload = jobs["publish-pypi-webconsole"]
+    assert "vars.PUBLISH_WEBCONSOLE" in str(upload.get("if")), upload.get("if")
+    assert not any("vars." in str(s.get("if") or "") for s in upload["steps"]), upload["steps"]
+    # The two draft publishers are one body, held here as the digest checks are.
+    engine = _step_script_by_prefix("Publish the draft GitHub release", "the engine publish")
+    console = _step_script_by_prefix("Publish the draft console GitHub release", "the console")
+    assert engine == console, "the two draft-publish steps differ; they must be one body"
 
 
 #: A stand-in for `gh`. It records each call, answers `release view` from FAKE_RELEASE (absent,
@@ -4013,10 +4024,20 @@ _MANIFEST = "\n".join(f"{_sha(d)}  {n}" for n, d in _FILES.items())
         ({**_FILES, "dist-pub/extra.whl": b"x\n"}, _MANIFEST, False, "not exactly the gated set"),
         ({"dist-pub/a.whl": _FILES["dist-pub/a.whl"]}, _MANIFEST, False, "toolkit-dist/b.whl"),
         (_FILES, "", False, "handed over no digests"),
+        # Two empty outputs joined by `publish-pypi`'s `|-` block (vault BACKLOG #2975).
+        (_FILES, "\n", False, "handed over no digests"),
         # Two producers' outputs joined, one ending in a newline (vault BACKLOG #2975).
         (_FILES, _MANIFEST.replace("\n", "\n\n"), True, "verified 2 file(s)"),
     ],
-    ids=["match", "changed-byte", "extra-file", "missing-file", "no-digests", "joined-outputs"],
+    ids=[
+        "match",
+        "changed-byte",
+        "extra-file",
+        "missing-file",
+        "no-digests",
+        "joined-empty",
+        "joined-outputs",
+    ],
 )
 def test_the_digest_check_refuses_anything_but_the_gated_files(
     tmp_path: Path, files: dict[str, bytes], manifest: str, ok: bool, needle: str

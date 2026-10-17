@@ -531,8 +531,8 @@ def test_the_prose_arm_fires_on_the_text_it_was_written_for(tmp_path: Path) -> N
 # --- BACKLOG #1193 (ASVS 15.2.4): the README's signing claim must match the workflow -------------
 
 
-def _release_publish_jobs() -> dict[str, str]:
-    """Each top-level job in ``release.yml`` that publishes a distribution, name -> its YAML text.
+def _release_job_texts() -> dict[str, str]:
+    """Each top-level job in ``release.yml``, name -> its YAML text.
 
     Read as TEXT rather than parsed YAML: the question is which STEPS a job contains, and the job
     boundary is a top-level two-space key, which is unambiguous here and needs no dependency.
@@ -547,10 +547,26 @@ def _release_publish_jobs() -> dict[str, str]:
     jobs: dict[str, str] = {}
     for idx, (line_no, name) in enumerate(starts):
         end = starts[idx + 1][0] if idx + 1 < len(starts) else len(lines)
-        body = "\n".join(lines[line_no:end])
-        if "pypi-publish" in body or "attestations: true" in body:
-            jobs[name] = body
+        jobs[name] = "\n".join(lines[line_no:end])
     return jobs
+
+
+def _release_publish_jobs() -> dict[str, str]:
+    """Each top-level job in ``release.yml`` that publishes a distribution, name -> its YAML text."""
+    return {
+        name: body
+        for name, body in _release_job_texts().items()
+        if "pypi-publish" in body or "attestations: true" in body
+    }
+
+
+#: How a publish-only job names a job whose gated files it publishes (vault BACKLOG #2631).
+_DIGEST_SOURCE = re.compile(r"needs\.([\w-]+)\.outputs\.pypi-digests")
+
+
+def _uncommented(body: str) -> str:
+    """``body`` without its comment lines: the rationale prose names signing it does not do."""
+    return "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("#"))
 
 
 def test_readme_does_not_claim_signing_coverage_the_release_workflow_does_not_provide() -> None:
@@ -566,17 +582,30 @@ def test_readme_does_not_claim_signing_coverage_the_release_workflow_does_not_pr
     Derived rather than prose-pinned: if someone later adds signing to the console job the unscoped
     claim becomes TRUE, and this test stops objecting to it on its own.
     """
+    texts = _release_job_texts()
     jobs = _release_publish_jobs()
     signing = re.compile(r"sigstore|attest-build-provenance|cyclonedx", re.IGNORECASE)
-    signed = {name for name, body in jobs.items() if signing.search(body)}
+
+    # A publish-only job signs nothing itself: what it publishes was built, and signed or not, by
+    # the jobs whose digests it checks. Each of them must sign, or part of what it publishes is
+    # unsigned. Read per producer since vault BACKLOG #2975 put the harness upload in `publish-pypi`,
+    # whose producers are `release` (which signs) and `release-harness` (which does not).
+    def producers(name: str) -> list[str]:
+        return _DIGEST_SOURCE.findall(jobs[name]) or [name]
+
+    def signs(name: str) -> bool:
+        return signing.search(_uncommented(texts[name])) is not None
+
+    signed = {name for name in jobs if all(signs(p) for p in producers(name))}
 
     # POSITIVE CONTROLS, both directions: the parse found the jobs, and the detector can SEE signing
     # where signing exists. Without these a broken job-splitter yields an empty unsigned set and this
     # test passes while measuring nothing.
     # Two since vault BACKLOG #2975 folded the harness publish into `publish-pypi`.
     assert len(jobs) >= 2, f"the release-job parse found {len(jobs)} publish jobs; expected 2+"
-    assert signed, (
-        "no publish job appears to sign -- the detector matched nothing, so its silence is meaningless"
+    assert any(signs(p) for name in jobs for p in producers(name)), (
+        "no producer of a published file appears to sign -- the detector matched nothing, so its "
+        "silence is meaningless"
     )
 
     unsigned = set(jobs) - signed

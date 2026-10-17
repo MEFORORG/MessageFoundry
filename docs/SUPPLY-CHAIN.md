@@ -103,7 +103,7 @@ flowchart TB
   PUBHARN -.->|"publish"| PYPI
   HARN --> GHPUB
   PUBENG --> GHPUB
-  PUBHARN -.-> GHPUB
+  PUBHARN --> GHPUB
   GHPUB -->|"publish the release"| GH
   MAIN -->|"a maintainer tags a console release"| TAGW
   TAGW --> PROV
@@ -111,7 +111,7 @@ flowchart TB
   WEB -->|"create the release as a draft"| GH
   WEB -->|"hand over files and digests"| PUBWEB
   PUBWEB -.->|"publish"| PYPI
-  PUBWEB -.-> WEBPUB
+  PUBWEB --> WEBPUB
   WEBPUB -->|"publish the release"| GH
 ```
 
@@ -147,7 +147,8 @@ Facts the labels leave out:
   `publish-pypi` job, so one approval of the `pypi` environment covers all three. The harness
   upload runs only when the `PUBLISH_HARNESS` repository variable is set.
 - **The draft.** The engine's GitHub release stays a draft until the harness wheel is on it
-  too, and until every upload of `publish-pypi` has run. A separate job publishes it last, so no
+  too, and until every upload `publish-pypi` runs has succeeded. With `PUBLISH_HARNESS` unset,
+  that is the toolkit and the engine only. A separate job publishes it last, so no
   job adds an asset to a published release. The console's release is a draft too, until its wheel
   is on PyPI. With `PUBLISH_WEBCONSOLE` unset, the console upload is skipped, and the console's
   release stays a draft.
