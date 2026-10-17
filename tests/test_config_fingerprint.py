@@ -290,3 +290,38 @@ def test_the_detail_of_a_missing_directory_is_an_empty_bundle_and_not_partial(
 )
 def test_digest_coverage(detail: dict[str, object] | None, expected: object) -> None:
     assert digest_coverage(detail) == expected
+
+
+def test_the_detail_names_every_folder_it_could_not_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review round 2: naming only the first unlistable folder let two digests that reported the
+    same coverage cover different files."""
+    d = tmp_path / "cfg"
+    _bundle(d)
+    real_scandir = os.scandir
+
+    def _scandir(path: Any) -> Any:
+        if Path(path).name in {"codesets", "environments"}:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", _scandir)
+    assert config_fingerprint_detail(d)[UNREADABLE_FILES_KEY] == ["codesets", "environments"]
+
+
+def test_a_file_removed_mid_digest_is_gone_not_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    d = tmp_path / "cfg"
+    _bundle(d)
+    real = Path.read_bytes
+
+    def _read(self: Path) -> bytes:
+        if self.name == "cfg.py":
+            raise FileNotFoundError(2, "No such file", str(self))
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", _read)
+    detail = config_fingerprint_detail(d)
+    assert UNREADABLE_FILES_KEY not in detail and detail["files"] == 4

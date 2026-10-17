@@ -1995,8 +1995,9 @@ async def _compare_start_config(
     (vault BACKLOG #2944). The start's own digest is taken after the load, so an edit between the
     two reads would be recorded as loaded, and the next start would then see no change. When the
     two digests differ, or the first could not be taken, the outcome is ``changed_during_load``.
-    Two reads cannot see an edit that lands and is reverted between them: the load then ran bytes
-    neither digest names, and the start reads as unchanged.
+    Two reads miss at least two cases: an edit that lands and is reverted between them, and a
+    module the loader runs from a still-valid ``__pycache__`` bytecode file rather than from the
+    source the digests hash.
 
     Digests are compared like for like (:func:`digest_coverage`): one that left out files it could
     not read is compared only with one that left out the same files. A file held by an antivirus
@@ -2109,6 +2110,23 @@ async def _compare_start_config(
             safe_exc(exc),
         )
         return "read_failed", None
+
+
+def _moved_during_load(
+    before_load: Mapping[str, object] | None, loaded: _LoadedConfig | None
+) -> bool:
+    """Whether two digests over the same files, one just before the start's load and one just
+    after it, differ: bytes did change in between (vault BACKLOG #2944). Not every
+    ``changed_during_load``: a digest that failed, or two that left out different files (a passing
+    antivirus lock), say nothing changed, and they cost only the comparison."""
+    before = digest_coverage(before_load)
+    after = digest_coverage(loaded.fingerprint if loaded is not None else None)
+    return (
+        before is not None
+        and after is not None
+        and before[1] == after[1]
+        and not fingerprint_matches(before[0], after[0])
+    )
 
 
 def _raise_config_changed(
@@ -10318,7 +10336,7 @@ def create_managed_app(
                     _log.warning(
                         "the start could not digest its config before the load (%s); it checks "
                         "no config change",
-                        type(exc).__name__,
+                        safe_exc(exc),
                     )
                 loaded = load_config(config_dir)
                 # Before the shard filter, as the reload path does inside the engine: the guard judges
@@ -10359,7 +10377,7 @@ def create_managed_app(
                 )
                 # This process cannot vouch for a config it never checked: its flag rows say so.
                 engine.config_baseline_unchecked = start_outcome in _UNCHECKED_OUTCOMES
-                if start_outcome == "changed_during_load":
+                if _moved_during_load(before_load, start_loaded):
                     # The digest may name bytes this process never loaded, so the provenance route
                     # and a DR activation must not vouch for it (vault BACKLOG #2944).
                     engine.loaded_config_fingerprint = None

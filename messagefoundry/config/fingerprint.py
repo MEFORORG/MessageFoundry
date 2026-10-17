@@ -117,15 +117,13 @@ def _iter_entries(base: Path, *, strict: bool, unreadable: set[str]) -> list[tup
     from messagefoundry.config.wiring import config_py_files
 
     try:
-        _require_listable(base)
+        # Not strict, every folder that cannot be listed is collected, not just the first, so two
+        # digests that report the same coverage do cover the same files.
+        _require_listable(base, unlistable=None if strict else unreadable)
     except ConfigDirMissing:
         if strict:
             raise
         # Not strict: a missing directory digests as an empty bundle, as it always has.
-    except OSError as exc:
-        if strict:
-            raise
-        unreadable.add(_relative(exc.filename, base))
     seen: set[Path] = set()
     entries: list[tuple[str, bytes]] = []
     globbed = (path for pattern in _FINGERPRINT_GLOBS for path in base.glob(pattern))
@@ -141,6 +139,10 @@ def _iter_entries(base: Path, *, strict: bool, unreadable: set[str]) -> list[tup
                 continue
             seen.add(resolved)
             data = path.read_bytes()
+        except FileNotFoundError:
+            if strict:
+                raise
+            continue  # removed since the listing: gone, as _is_file judges a gone path
         except OSError:
             if strict:
                 raise
@@ -151,19 +153,10 @@ def _iter_entries(base: Path, *, strict: bool, unreadable: set[str]) -> list[tup
     return entries
 
 
-def _relative(filename: object, base: Path) -> str:
-    """``filename``, an error's path, relative to ``base`` as a POSIX path; ``.`` for ``base``
-    itself or for an error that names no path under it."""
-    if not isinstance(filename, str):
-        return "."
-    try:
-        return Path(filename).relative_to(base).as_posix()
-    except ValueError:
-        return "."
-
-
-def _require_listable(base: Path) -> None:
-    """Raise unless ``base`` and each folder a glob reads in it can be listed.
+def _require_listable(base: Path, *, unlistable: set[str] | None = None) -> None:
+    """Raise unless ``base`` and each folder a glob reads in it can be listed. With ``unlistable``,
+    a folder that cannot be listed is added to it, by its path relative to ``base`` (``.`` for
+    ``base``), instead of raising; a missing ``base`` still raises.
 
     ``glob`` swallows a listing error, so a missing or unlistable directory would digest as an empty
     bundle, and an unlistable ``codesets`` folder as a bundle without it. A missing ``base`` raises
@@ -176,7 +169,10 @@ def _require_listable(base: Path) -> None:
             pass
     except OSError as exc:
         if not is_missing_directory(exc):
-            raise
+            if unlistable is None:
+                raise
+            unlistable.add(".")  # nothing under it can be listed either
+            return
         missing = True
     if missing:
         # Raised after the handler, so the error it replaces does not ride __context__.
@@ -188,7 +184,9 @@ def _require_listable(base: Path) -> None:
         except OSError as exc:
             # The same rule as base: a folder no path can open holds nothing the loader reads.
             if not is_missing_directory(exc):
-                raise
+                if unlistable is None:
+                    raise
+                unlistable.add(folder.as_posix())
 
 
 def _is_file(path: Path) -> bool:

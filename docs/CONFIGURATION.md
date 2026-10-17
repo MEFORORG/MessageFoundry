@@ -1622,13 +1622,16 @@ started together, can each raise it; the alert list folds them into one instance
   until the look-back window below fills and a start begins a new baseline that left out the same
   file, so fix the file the WARNING names.
 - The start fingerprints the directory just before it loads it and again just after. When the two
-  differ, the comparison is `changed_during_load`, the row is marked `baseline_unchecked`, and
-  `GET /config/provenance` has no loaded fingerprint to vouch for until the next reload. An edit
-  that lands and is reverted between the two reads is not seen.
+  differ, or the first cannot be taken, the comparison is `changed_during_load` and the row is
+  marked `baseline_unchecked`. When both cover the same files and still differ, `GET
+  /config/provenance` also has no loaded fingerprint to vouch for until the next reload. The two
+  reads miss at least an edit that lands and is reverted between them, and a module the loader runs
+  from a still-valid `__pycache__` bytecode file rather than from its source.
 - The check is alert-only. A baseline read that fails or takes over five seconds is logged at
   WARNING, and the start goes on.
 - A start that never checked its config, because its read failed, it took no fingerprint, its
-  fingerprint is not comparable or its directory changed while it loaded, marks its own row `baseline_unchecked`, and every flag toggle row that process writes too. A
+  fingerprint is partial and left out other files than the baseline's, or its directory changed
+  while it loaded, marks its own row `baseline_unchecked`, and every flag toggle row that process writes too. A
   later start passes over those rows, and over any row whose detail is not a JSON object (at
   WARNING), and compares against the newest usable row before them. So the change the unchecked
   start could not see is reported by the next start that can read. A config reload's row is
