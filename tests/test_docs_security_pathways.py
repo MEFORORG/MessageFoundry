@@ -546,7 +546,8 @@ def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> N
     Since BACKLOG #3061 the two enrolment legs call the same helper, so a directory account is
     asked before an enrolment marks its factor. That too only adds a refusal: a confirmed directory
     account still enrols TOTP or a passkey, which ``tests/test_enrolment_directory_recheck.py``
-    pins. The begin legs still read no provider, and the finish legs read none themselves.
+    pins, and ``test_the_enrolment_legs_ask_the_directory_and_the_doc_says_so`` pins the call. The
+    begin legs still read no provider, and the finish legs read none themselves.
     """
 
     # Since BACKLOG #3068 the one provider branch lives in the shared helper both second-factor legs
@@ -580,12 +581,6 @@ def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> N
         assert not _reads_auth_provider(func), (
             f"{func.__qualname__} now reads auth_provider. The pathway rows say a directory account "
             "can enrol TOTP or a passkey and that its TOTP leg feeds the lockout; re-derive both."
-        )
-    # BACKLOG #3061: the provider branch the finish legs have is the shared helper's, nothing more.
-    for func in (AuthService.confirm_mfa_enrollment, AuthService.finish_webauthn_registration):
-        assert "_directory_vouches_for_factor" in _attrs(func), (
-            f"{func.__qualname__} no longer asks the directory; the TOTP and passkey pathway rows "
-            "say both enrolment legs do (BACKLOG #3061)."
         )
     verify_tree = ast.parse(textwrap.dedent(inspect.getsource(AuthService.verify_mfa)))
     assert any(

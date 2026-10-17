@@ -30,6 +30,7 @@ import uuid
 import pytest
 from _ui_clients import (
     SAME_ORIGIN,
+    PresentDirectory,
     cookie_login,
     held_totp_code,
     hold_auth_wall_clock,
@@ -38,7 +39,7 @@ from _ui_clients import (
     ui_client,
 )
 
-from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProbe
+from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import TOO_EARLY, AuthService, Elevation
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
@@ -46,18 +47,6 @@ from messagefoundry.pipeline import Engine
 
 FLOOR = AuthSettings().mfa_verify_min_elapsed_seconds
 assert FLOOR > 0, "the floor ships off, so these tests would test nothing"
-
-
-class _PresentDirectory:
-    """A directory that confirms ``principal`` as present and enabled. Since BACKLOG #3061 the
-    passkey registration asks the directory about a directory account after the floor, so the
-    control half of the passkey test needs one that says yes. Synthetic data only."""
-
-    def __init__(self, principal: AdPrincipal) -> None:
-        self.principal = principal
-
-    def probe_principal(self, username: str, *, object_id: str | None = None) -> DirectoryProbe:
-        return DirectoryProbe(DirectoryAnswer.FOUND, self.principal)
 
 
 async def _floored_service(
@@ -159,7 +148,7 @@ async def test_a_console_passkey_registration_inside_the_floor_is_a_failed_verif
         groups=frozenset(),
         directory_object_id=str(uuid.uuid5(uuid.NAMESPACE_URL, "adfloor")),
     )
-    service, now = await _floored_service(engine, monkeypatch, ldap=_PresentDirectory(principal))
+    service, now = await _floored_service(engine, monkeypatch, ldap=PresentDirectory(principal))
     out = await service._complete_ad_login(principal, None, mfa_verified=False)
     assert out.ok and out.token is not None and out.identity is not None
     assert not await service.mfa_satisfied(out.token), "the session must owe its factor"
@@ -245,7 +234,7 @@ async def test_the_console_passkey_finish_says_the_directory_could_not_confirm_t
         groups=frozenset(),
         directory_object_id=str(uuid.uuid5(uuid.NAMESPACE_URL, "adwords")),
     )
-    service, _now = await _floored_service(engine, monkeypatch, ldap=_PresentDirectory(principal))
+    service, _now = await _floored_service(engine, monkeypatch, ldap=PresentDirectory(principal))
     out = await service._complete_ad_login(principal, None, mfa_verified=False)
     assert out.ok and out.token is not None
     await service.store.mark_session_reauthed(hash_token(out.token))

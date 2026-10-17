@@ -52,14 +52,16 @@ requires_webauthn = pytest.mark.skipif(
 )
 
 
-async def _service() -> tuple[MessageStore, AuthService]:
+async def _service(ldap: object | None = None) -> tuple[MessageStore, AuthService]:
     # mfa_recovery_code_count=1 (precedent: tests/test_mfa.py) because every minted recovery code
     # costs an argon2 hash and no test here redeems one — the default 10 spends about 13 s of argon2
     # this file never reads, and the worst arm would sit inside the 60 s per-test watchdog's shadow on
     # a loaded runner.
     store = await MessageStore.open(":memory:")
     return store, AuthService(
-        store, AuthSettings(mfa_verify_min_elapsed_seconds=0, mfa_recovery_code_count=1)
+        store,
+        AuthSettings(mfa_verify_min_elapsed_seconds=0, mfa_recovery_code_count=1),
+        ldap=ldap,  # type: ignore[arg-type]
     )
 
 
@@ -297,9 +299,8 @@ async def test_the_passkey_registration_elevates_the_enrolling_token_in_place() 
     from tests._fake_directory import DirectoryOf
     from tests.test_mfa_access_gate import _principal
 
-    store, service = await _service()
     # BACKLOG #3061: the enrolment legs ask the directory about a directory account first.
-    service._ldap = DirectoryOf(_principal("adrotate"))  # type: ignore[assignment]
+    store, service = await _service(ldap=DirectoryOf(_principal("adrotate")))
     try:
         await service.initialize()
         out = await service._complete_ad_login(_principal("adrotate"), None, mfa_verified=False)

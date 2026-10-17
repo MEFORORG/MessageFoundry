@@ -32,6 +32,7 @@ from messagefoundry.auth.service import (
     DIRECTORY_ROLES_DEMOTED,
     DIRECTORY_UNCONFIRMED,
     AuthService,
+    Elevation,
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
@@ -76,6 +77,8 @@ def _settings(**overrides: object) -> AuthSettings:
         **{  # type: ignore[arg-type]
             "require_mfa": False,
             "mfa_verify_min_elapsed_seconds": 0,
+            # No test redeems a recovery code; each one minted is an argon2 hash.
+            "mfa_recovery_code_count": 1,
             "ad_enabled": True,
             "ad_server": "ldaps://dc.test.invalid",
             "ad_user_search_base": "OU=Staff,DC=test,DC=invalid",
@@ -333,22 +336,15 @@ async def _passkey_staged(s: _Signed) -> _PasskeyStaged:
     return _PasskeyStaged(s, key.create_response(base64url_to_bytes(options["challenge"])))
 
 
-async def _register(p: _PasskeyStaged, token: str | None = None) -> object:
+async def _register(p: _PasskeyStaged) -> Elevation:
     return await p.signed.service.finish_webauthn_registration(
-        p.signed.identity,
-        p.response,
-        label="key",
-        token=token or p.signed.token,
-        rp_id=_RP,
-        origin=_ORIGIN,
+        p.signed.identity, p.response, label="key", token=p.signed.token, rp_id=_RP, origin=_ORIGIN
     )
 
 
 async def _assert_passkey_refused_and_unspent(p: _PasskeyStaged, outcome: str) -> None:
     s = p.signed
-    refused = await s.service.finish_webauthn_registration(
-        s.identity, p.response, label="key", token=s.token, rp_id=_RP, origin=_ORIGIN
-    )
+    refused = await _register(p)
     assert refused.ok is False
     assert refused.directory_unconfirmed is True
     assert refused.session_lost is False
@@ -379,9 +375,7 @@ async def test_a_directory_the_account_is_not_confirmed_in_refuses_the_passkey_r
     # The ceremony stayed in flight, so the SAME response registers once the directory answers.
     p.signed.directory.answer = DirectoryAnswer.FOUND
     p.signed.directory.unreachable = False
-    served = await p.signed.service.finish_webauthn_registration(
-        p.signed.identity, p.response, label="key", token=p.signed.token, rp_id=_RP, origin=_ORIGIN
-    )
+    served = await _register(p)
     assert served.ok is True
     assert len(await store.list_webauthn_credentials(p.signed.identity.user_id)) == 1
 
@@ -422,9 +416,7 @@ async def test_a_disable_during_the_lookup_is_a_lost_passkey_registration(
 
     monkeypatch.setattr(p.signed.service, "_probe_principal", _probe_while_disabled)
 
-    lost = await p.signed.service.finish_webauthn_registration(
-        p.signed.identity, p.response, label="key", token=p.signed.token, rp_id=_RP, origin=_ORIGIN
-    )
+    lost = await _register(p)
 
     assert lost.ok is False and lost.session_lost is True
     assert await store.list_webauthn_credentials(p.signed.identity.user_id) == []
@@ -444,5 +436,5 @@ async def test_a_local_account_is_never_probed_on_passkey_registration(
 
     served = await _register(p)
 
-    assert getattr(served, "ok", False) is True
+    assert served.ok is True
     assert directory.probes == []

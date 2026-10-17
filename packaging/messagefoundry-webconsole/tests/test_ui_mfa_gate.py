@@ -1145,7 +1145,9 @@ async def _directory_session(
 
     ``enrolled`` activates TOTP on the account first, on a throwaway session, so the returned one
     is enrolled-but-unverified. Either way the directory floor leaves it unsatisfied."""
-    from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProbe
+    from _ui_clients import PresentDirectory
+
+    from messagefoundry.auth.ldap import AdPrincipal
 
     principal = AdPrincipal(
         username="aduser",
@@ -1155,15 +1157,8 @@ async def _directory_session(
         groups=frozenset(),
         directory_object_id="1291e547-a91b-5700-88cb-a198a209fb05",
     )
-
-    class _Present:
-        """Confirms ``principal``: since BACKLOG #3061 the TOTP enrolment below asks the
-        directory about a directory account first, and with none wired it refuses."""
-
-        def probe_principal(self, username: str, *, object_id: str | None = None) -> DirectoryProbe:
-            return DirectoryProbe(DirectoryAnswer.FOUND, principal)
-
-    service._ldap = _Present()  # type: ignore[assignment]
+    # BACKLOG #3061: the TOTP enrolment below asks the directory about a directory account.
+    service._ldap = PresentDirectory(principal)  # type: ignore[assignment]
     if enrolled:
         _pin_totp_clock(monkeypatch, 1_000_000.0)  # no step boundary between code and check
         setup = await service._complete_ad_login(principal, None, mfa_verified=False)

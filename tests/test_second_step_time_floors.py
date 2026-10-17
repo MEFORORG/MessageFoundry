@@ -497,9 +497,10 @@ async def test_a_directory_sessions_first_passkey_inside_the_floor_is_refused(
     rp, origin = "t", "http://t"
     store = await MessageStore.open(":memory:")
     try:
-        service = AuthService(store, AuthSettings())  # require_mfa on, the shipped default
-        # BACKLOG #3061: the enrolment legs ask the directory about a directory account first.
-        service._ldap = DirectoryOf(_principal("adfloor"), _principal("adfloor2"))  # type: ignore[assignment]
+        # require_mfa on, the shipped default. BACKLOG #3061: the enrolment legs ask the
+        # directory about a directory account first.
+        directory = DirectoryOf(_principal("adfloor"), _principal("adfloor2"))
+        service = AuthService(store, AuthSettings(), ldap=directory)  # type: ignore[arg-type]
         await service.initialize()
         out = await service._complete_ad_login(_principal("adfloor"), None, mfa_verified=False)
         assert out.ok and out.token is not None
