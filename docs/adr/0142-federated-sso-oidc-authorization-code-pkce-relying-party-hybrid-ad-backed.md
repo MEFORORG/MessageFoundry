@@ -683,9 +683,12 @@ that shows while the IdP is failing, rather than a link any caller can hide.
 - A JWKS reply that `bounded_read` refuses for its body framing or size, or cuts short, still
   marks the IdP. `jwks_fetcher` in `auth/oidc_http.py` retypes it as a plain `http.client`
   exception, which reads as transport. No caller input reaches the JWKS request.
+  **[NARROWED by Amendment G (2026-10-17): only a reply cut short still marks the IdP.]**
 - Any other `http.client` exception also reads as transport, `BadStatusLine` among them, even
   where a reply did arrive, such as a header line over the length limit. So does a refusal the
   engine makes before it sends, such as a proxy URL carrying credentials.
+  **[NARROWED by Amendment G (2026-10-17): only `BadStatusLine` and `IncompleteRead` still read as
+  transport. The pre-send refusal is unchanged.]**
 
 ---
 
@@ -740,3 +743,43 @@ code, and charges nothing to the lockout; the route's rate-limit budget is still
 /auth/mfa-verify` answers 403 with `X-Step-Up-Via: idp`, and `POST /ui/mfa` sends the browser to
 `/ui`, as its GET does for any satisfied session. The check runs before the account-lock check,
 because neither account lock refuses the IdP leg.
+
+---
+
+## Amendment G (2026-10-17) — typed JWKS refusals, and a verified token clears the flag (BACKLOG #3221)
+
+> Decided 2026-10-17 by the batch 260 Manager, which ruled that the remedy be built. This amendment
+> does not change the status line at the top of this ADR.
+
+Amendment E drew the line at whether an answer arrived, and left two leaks on the JWKS leg and in
+the `http.client` family. This amendment closes both, and states when the flag clears.
+
+- **`jwks_fetcher` raises typed errors.** `auth/oidc_http.py` defines `IdpReplyError`, an
+  `http.client.HTTPException` so every existing outage arm still catches it, and not a `JwksError`,
+  which `claims.py` would retype as `ClaimsError('unknown_kid')`. A reply refused for its framing or
+  its size raises `IdpReplyUnusableError`: an answer, audited `marked_unavailable=false` with
+  `reason=idp_answer_unusable`. A reply that stops before its declared end raises
+  `IdpReplyCutShortError`: a transport failure, as the token leg already reads one.
+- **Only named `http.client` faults read as transport.** `is_idp_transport_http_exception` in the
+  same module answers for the family: `IdpReplyCutShortError`, `BadStatusLine` (which covers
+  `RemoteDisconnected`, a close before any status line) and `IncompleteRead`. Every other one, such
+  as `LineTooLong` or `UnknownProtocol`, is a reply that arrived, so it no longer marks the IdP.
+  `_is_idp_transport_failure` in `auth/service.py` calls it.
+- **A verified token clears the flag.** Both legs clear it once the code exchange yields a token
+  that passed the claims ladder, before any later check. A refusal after that point, a too-early
+  one included, no longer leaves the flag set while the IdP is answering. A `token_refused` answer
+  still neither sets nor clears it, as Amendment E says.
+
+**Why this cannot weaken a control.** The flag drives only the federated link on `/ui/login` and
+`/auth/providers`; no sign-in path gates on it, and nothing falls back when it is set. Narrowing what
+sets it keeps the link showing in more cases, which takes a lever away from a caller who would hide
+it. Clearing it sooner shows the link once the IdP has proved it answers.
+
+**The cost, stated.** A JWKS endpoint or proxy that answers with a misframed or oversized body, or a
+header line over the limit, no longer hides the link. Visitors keep seeing a federated sign-in that
+fails, and the operator reads `idp_answer_unusable` with the exception type on each audit row.
+
+**At least these residuals remain.** Amendment E's first residual stands: a firewall that resets a
+connection whose body looks hostile still produces a transport failure. A `BadStatusLine` carrying a
+non-HTTP status line is a reply that arrived, and still reads as transport. So does a refusal the
+engine makes before it sends, such as a proxy URL carrying credentials.

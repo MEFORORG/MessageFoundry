@@ -4614,12 +4614,13 @@ until restart (`AuthService.kerberos_available` in `auth/service.py`). `oidc` is
 `[auth].oidc_enabled` **and** a directory to resolve roles against, `AuthService.oidc_enabled`) **and** the last IdP
 interaction not having failed. That second term is deliberately **advisory and non-sticky**, and
 *no login path gates on it* (`AuthService.oidc_available`). A transport failure, where no answer
-arrived, sets it, and the next success clears it. Any status the token endpoint answers with, a
+arrived, sets it, and the next code exchange that yields a verified token clears it. Any status the token endpoint answers with, a
 5xx included, leaves it alone, because a caller's bad code can draw one (BACKLOG #1948). So an IdP
 behind a proxy that answers its outage with a 503 keeps the link showing.
 [ADR 0142](adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)
-Amendment E is the source of record for which failures count and what each is audited as. It also
-names the residuals, at least a firewall reset a caller provokes and a misframed JWKS reply. Neither
+Amendment E, as Amendment G narrows it, is the source of record for which failures count and what
+each is audited as. Together they name the residuals, at least a firewall reset a caller provokes.
+Neither
 flag consults `settings.api.serve_ui`, so the route can still advertise `oidc: true` on a console-less
 engine that registers no OIDC route. The mTLS plane is deliberately absent from it, because it is not a
 sign-in offer.

@@ -93,7 +93,11 @@ from messagefoundry.auth.notifications import (
     notice_kind_log_label,
 )
 from messagefoundry.auth.oidc import PendingFlow
-from messagefoundry.auth.oidc_http import build_idp_opener, jwks_fetcher
+from messagefoundry.auth.oidc_http import (
+    build_idp_opener,
+    is_idp_transport_http_exception,
+    jwks_fetcher,
+)
 from messagefoundry.auth.passwords import hash_password, needs_rehash, verify_password
 from messagefoundry.auth.permissions import (
     CUSTOM_ROLE_ID_PREFIX,
@@ -167,7 +171,6 @@ from messagefoundry.store.store import (
     session_sealed_by_retired_key,
     user_seal_ok,
 )
-from messagefoundry.transports.bounded_read import EgressReplyError
 from messagefoundry.transports.email import envelope_address_problem
 from messagefoundry.transports.rest import opener_tls_context
 
@@ -1986,14 +1989,15 @@ def _is_idp_transport_failure(exc: BaseException) -> bool:
     unavailable (BACKLOG #1948). ADR 0142 Amendment E is the source of record for the rule, its
     reason, and the residuals it leaves.
 
-    In code: a ``TokenEndpointUnreachableError``, an ``http.client`` exception such as
-    ``BadStatusLine``, or an ``OSError`` that is not an ``HTTPError``."""
+    In code: a ``TokenEndpointUnreachableError``, an ``http.client`` exception that
+    :func:`~messagefoundry.auth.oidc_http.is_idp_transport_http_exception` names (a JWKS reply cut
+    short, ``BadStatusLine`` or ``IncompleteRead``; ADR 0142 Amendment G, BACKLOG #3221), or an
+    ``OSError`` that is not an ``HTTPError``. Every other ``http.client`` exception is a reply that
+    arrived, ``MalformedReplyHeadError`` and a JWKS reply refused for its framing among them."""
     if isinstance(exc, oidc.TokenEndpointUnreachableError):
         return True
     if isinstance(exc, http.client.HTTPException):
-        # MalformedReplyHeadError is an HTTPException too, raised for a reply whose header block
-        # did not parse, as from the JWKS fetch. A reply arrived, so it is an answer.
-        return not isinstance(exc, EgressReplyError)
+        return is_idp_transport_http_exception(exc)
     # HTTPError is an OSError subclass that carries a received status, as from the JWKS fetch.
     return isinstance(exc, OSError) and not isinstance(exc, urllib.error.HTTPError)
 
