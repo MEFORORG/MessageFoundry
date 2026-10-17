@@ -3596,9 +3596,10 @@ jobs:
     needs: changes
     if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.serverdb == 'true') && github.repository == 'MEFORORG/MessageFoundry'
     runs-on: ${{ matrix.os }}
-    # A GUESS, stated as one: the ubuntu job has no job cap and no measured duration to size from.
-    # This bounds a hang below GitHub's 6-hour default and should be re-sized from the first runs.
-    timeout-minutes: 90
+    # About 3x the slower of the first measured runs, run 39059057328 (2026-10-17): 7m43s on
+    # windows-2022 and 4m58s on windows-2025. This bounds a hang well below GitHub's 6-hour default;
+    # re-size it from fresh runs if the suite grows.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
