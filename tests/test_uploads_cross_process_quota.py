@@ -370,10 +370,13 @@ def test_a_stuck_heartbeat_touch_no_longer_holds_the_heartbeat(
 ) -> None:
     """BACKLOG #3256 item 3. The heartbeat awaited its touch with no time bound, so one touch stuck
     on the store held the heartbeat, and its lifetime cap, for as long as the store stalled. The
-    wait is bounded now and the touch is left running, never cancelled, and never doubled. Red
-    before the fix: the heartbeat never reached its cap."""
+    wait is bounded now and the heartbeat leaves the touch running, never cancels it, and never
+    doubles it. Red before the fix: the heartbeat never reached its cap. The held touch is then
+    capped like every other straggler (vault BACKLOG #3180), so a stalled store does not collect
+    one per save."""
     monkeypatch.setattr(uploads_mod, "_RESERVATION_HEARTBEAT_SECONDS", 0.02)
     monkeypatch.setattr(uploads_mod, "_RESERVATION_TOUCH_WAIT_SECONDS", 0.01)
+    monkeypatch.setattr(uploads_mod, "_LEDGER_STRAGGLER_MAX_SECONDS", 1.0)
     monkeypatch.setattr(uploads_mod, "_RESERVATION_HEARTBEAT_MAX_SECONDS", 0.3)
     ledger = _StuckTouchLedger()
 
@@ -402,9 +405,17 @@ def test_a_stuck_heartbeat_touch_no_longer_holds_the_heartbeat(
             assert "no longer refreshed" in caplog.text, "a stuck touch held the heartbeat"
             await asyncio.sleep(0.05)  # the task leaves the set on its done callback
             assert not uploads._heartbeats
-            # The stuck touch was left running, held, and never doubled or cancelled.
+            # The stuck touch was left running, held, and never doubled or cancelled by the
+            # heartbeat.
             assert (ledger.touches, ledger.cut_off) == (1, 0)
             assert uploads._stragglers, "the stuck touch was dropped instead of held"
+            # Then the straggler cap cancels it and the set empties.
+            for _ in range(250):
+                if ledger.cut_off and not uploads._stragglers:
+                    break
+                await asyncio.sleep(0.02)
+            assert (ledger.touches, ledger.cut_off) == (1, 1), "the held touch was never capped"
+            assert not uploads._stragglers
         finally:
             gate.set()
             await asyncio.gather(save, return_exceptions=True)

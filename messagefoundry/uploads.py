@@ -262,10 +262,10 @@ class UploadQuotaError(UploadError):
       the shutdown drain cancels. The module logs each at WARNING. **On Postgres and SQL Server the
       stamp and the staleness test both read the database server's clock (BACKLOG #3256),** so an
       engine host's skew no longer moves either. A server clock that ran ahead and is stepped
-      back still holds a slot it stamped meanwhile longer by the step, since the stamp never moves
-      backwards, and so does a failover to a replica whose clock lags the old primary's. A server
-      clock stepped forward, or a failover to a replica whose clock runs ahead, makes every slot
-      look older by the step, so it can reclaim a live slot early (the next bullet). So the
+      back still holds a slot it stamped meanwhile longer by the step, because that stamp was
+      written ahead, and so does a failover to a replica whose clock lags the old primary's. A
+      server clock stepped forward, or a failover to a replica whose clock runs ahead, makes every
+      slot look older by the step, so it can reclaim a live slot early (the next bullet). So the
       database servers' own time sync now carries what each engine host's did. SQLite reads the engine host's clock, and only one host ever writes a SQLite
       store, because ``require_unified_store`` refuses SQLite for more than one engine shard.
     * **A reclaimed live reservation (BACKLOG #2648).** The store reclaims a reservation with no
@@ -277,7 +277,8 @@ class UploadQuotaError(UploadError):
       cannot reach while a sibling can); its save outlives ``_RESERVATION_HEARTBEAT_MAX_SECONDS``;
       its touches stall on the store for the whole window; one touch never returns, since no
       second touch starts while one runs (BACKLOG #3256); or the database server's clock steps
-      forward by a large part of the window. A sibling then counts neither that file
+      forward by a large part of the window, or a failover lands on a replica whose clock runs
+      that far ahead. A sibling then counts neither that file
       nor its slot until the file lands. The holder's later release deletes only its own row, so
       the undercount ends with that save. That restores the N-1 bound above while it lasts, never
       worse than the pre-#1112 behaviour. Host clock skew is not one of these cases on the server

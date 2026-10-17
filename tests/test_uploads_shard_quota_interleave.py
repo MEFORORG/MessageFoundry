@@ -337,7 +337,7 @@ async def test_the_server_backends_stamp_since_with_the_database_clock(
 
         with monkeypatch.context() as m:
             m.setattr(store_module, "time", _HostClockAhead())
-            assert await _reserve(shard_a, "a")  # shard A, never released
+            assert await _reserve(shard_a, "a")  # engine shard A, never released
             await shard_a.touch_upload_quota(f"{uploader_id}-a")
         await asyncio.sleep(0.05)  # past A's stamp on the server's own clock
         assert await _reserve(shard_b, "b", stale_after=0.0)

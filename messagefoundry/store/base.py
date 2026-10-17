@@ -1541,8 +1541,9 @@ class QueueStore(StoreLifecycle, Protocol):
     async def touch_upload_quota(self, reservation_id: str) -> None:
         """Move the reservation's clock to now, never backwards, so a slow save keeps its slot past
         ``stale_after`` (BACKLOG #2648). A no-op once the reservation is released or reclaimed.
-        Never backwards, so a host whose clock lags cannot age a reservation a faster host
-        stamped."""
+        Never backwards, so a touch after the clock is stepped back cannot make a reservation look
+        older than its last stamp. Which clock "now" is, per backend, is stated in
+        ``messagefoundry.uploads.UploadQuotaError`` (BACKLOG #3256)."""
         ...
 
     async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:

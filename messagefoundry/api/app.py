@@ -1300,14 +1300,15 @@ def _app_drain_steps(
     steps = [_TeardownStep("the long-operations drain", 2.0, _outliving)]
     uploads: UploadStore | None = getattr(app.state, "upload_store", None)
     if uploads is not None:
-        # The smallest floor a drain here has: it usually returns at once, and every floor comes
-        # out of the earlier steps' bounds, the long-operations drain's rollback grace among them.
-        # What it fails to drain costs a quota slot that goes stale, never a lost audit row of a
-        # DR operation. Handed a share of its bound, so it cancels what it owns before the cut.
+        # It usually returns at once. What it fails to drain can cost audit rows, not only quota
+        # slots that go stale: a discard removal it cancels leaves a stored file with no
+        # upload.create row, and a save-time sweep it cancels loses its upload.prune rows; each
+        # is logged at ERROR by file_id. So it keeps the approval drain's floor. Handed a share of
+        # its bound, so it cancels what it owns before the cut.
         steps.append(
             _TeardownStep(
                 "the upload straggler drain",
-                0.25,
+                0.5,
                 lambda b: uploads.drain_stragglers_within(b * _INNER_SHARE),
             )
         )
