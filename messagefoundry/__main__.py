@@ -9335,11 +9335,14 @@ def _rotate_key(args: argparse.Namespace) -> int:
     if uploads.sealed_plaintext:
         # BACKLOG #1169: these were plaintext uploads that a keyed store refused on read until now.
         # Sealing makes them readable, and it would seal a planted file just the same, so say how
-        # many. The operator can check this against the count `serve` logged at startup.
+        # many. The operator can check this against the count `serve` logged at startup. The
+        # last sentence is BACKLOG #3240's double count; see ResealResult.sealed_plaintext.
         print(
             f"note: sealed {uploads.sealed_plaintext} plaintext uploaded file(s) under the active "
             "key. If serve logged a count of plaintext uploads at startup, check this number against "
-            "it; an extra one may be a file that did not come through the engine."
+            "it; an extra one may be a file that did not come through the engine. After a run that "
+            "skipped files, an upload sealed partly in that run and partly in the next counts in "
+            "both, so the total across runs can exceed that count with no such file."
         )
     if uploads.unsealable:
         # BACKLOG #2322: these are left as they were on purpose, and no re-run changes them. They hold
