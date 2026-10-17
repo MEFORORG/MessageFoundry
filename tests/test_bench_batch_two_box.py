@@ -158,8 +158,8 @@ def test_rig_sign_in_env_names_real_auth_settings_and_their_shipped_defaults() -
 def test_rig_copied_auth_defaults_match_the_engine_settings_model(
     constant: int, field: str
 ) -> None:
-    """batchbox.py copies these defaults because a harness client may not import the engine's config
-    package; this pin is what keeps the copy honest when an engine default moves."""
+    """batchbox.py copies these defaults rather than import them (its comment says why); this pin
+    is what keeps the copy honest when an engine default moves."""
     from messagefoundry.config.settings import AuthSettings
 
     assert constant == AuthSettings.model_fields[field].get_default(call_default_factory=True)

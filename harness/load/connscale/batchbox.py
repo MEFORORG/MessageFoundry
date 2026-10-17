@@ -96,8 +96,9 @@ def rig_sign_in_env(procs: int) -> dict[str, str]:
     Each of the driver's ``procs`` ``connscale-remote`` processes signs in for itself as the one rig
     Administrator, from the one load-gen box address. At least these engine limits meet that fleet:
 
-    * the per-user session cap (``SHIPPED_MAX_SESSIONS_PER_USER``): past it a login ends the user's oldest session, so a sixth
-      process would end the first one's, which would sign in again and end the next;
+    * the per-user session cap (``SHIPPED_MAX_SESSIONS_PER_USER``): past it a login ends the
+      user's oldest session, so one process past the cap would end the first one's, which would
+      sign in again and end the next;
     * the per-address sign-in limit (``SHIPPED_LOGIN_RATE_LIMIT_PER_IP`` attempts per window,
       successes counted too): every process signs in at the start of the cell, inside one window,
       so one process past that limit would be refused with HTTP 429 (BACKLOG #2795);
@@ -105,7 +106,8 @@ def rig_sign_in_env(procs: int) -> dict[str, str]:
       way by one process past it.
 
     Each is raised to the fleet, doubled for a process that signs in again, plus two, and only when
-    that size passes the shipped default, so a small fleet never runs below a stock engine. The
+    that size passes the shipped default, so a small fleet never runs below a stock engine whose
+    defaults match the copies above. The
     per-address value also sets the engine's per-user credential-ceremony limit and its
     repeated-credential audit limit, and the all-clients value that audit limit's global ceiling, so
     those are raised with them. Each process signing in for itself keeps the rig's sessions apart;
