@@ -7,8 +7,9 @@ What this file proves, and the instrument for each:
 * **The alert carries the file, the remedy class and the count, and no CRL contents.** A real
   reload pass over a real refused file, read through a recording sink. The control for "no CRL
   contents" is the refusal's reason from the same pass, which does quote the issuer.
-* **One alert per file version.** The same pass run again and again raises nothing more. A second
-  refused version raises one more.
+* **One alert per file version, then a reminder while it stands.** The same pass run again and again
+  raises nothing more until the reminder is due. A second refused version raises one more (vault
+  BACKLOG #3543 added the reminder).
 * **It is raised on the event loop.** A real ``NotifierAlertSink`` writes its alert-state row only
   with a running loop. The control makes the same call from a worker thread, and no row lands.
 * **Its inverse, ``crl_reload_applied``, resolves it only on evidence.** Applying the file, putting
@@ -621,8 +622,8 @@ async def test_a_clear_that_fails_at_stop_is_said_at_stop(
 
 
 async def test_a_refusal_after_a_clear_is_not_held_back_by_the_cooldown() -> None:
-    """The runner raises once per file version and sends no reminders. So a refusal the
-    notifier throttled would never be paged at all, and the clear must end the cooldown."""
+    """A refusal the notifier throttled would wait for the runner's next reminder. So the clear
+    must end the cooldown, and the refusal after it pages at once."""
     transport = _RecordingTransport("webhook")
     sink = NotifierAlertSink([transport])  # the default cooldown, far longer than this test
 
@@ -662,6 +663,127 @@ async def test_the_same_bytes_refused_again_after_a_fix_alert_again(pki: _Pki) -
 
     assert [p["remedy_class"] for p in sink.refused()] == ["fix_file", "fix_file"]
     assert sink.kinds() == ["refused", "applied", "refused"]
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+# --- the reminder while a refusal stands (vault BACKLOG #3543 item 1) ----------------------------
+
+
+class _Clock:
+    """The runner's reminder clock, moved by hand."""
+
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
+    moved = _Clock()
+    monkeypatch.setattr(crl_reload, "_monotonic", moved)
+    return moved
+
+
+async def test_a_reminder_fires_while_the_refusal_stands_and_stops_once_it_clears(
+    pki: _Pki, clock: _Clock
+) -> None:
+    """The owner ruling of 2026-10-13: a periodic reminder while the refusal stands, as
+    ``intake_paused`` has. It repeats the version raised, with its payload, and no more often
+    than ``reminder_seconds``."""
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    runner = _runner(sink, reminder_seconds=300)
+    pki.crl.write_bytes(_expired(pki))
+
+    _pass(runner)
+    clock.now += 299
+    _pass(runner)
+    assert len(sink.refused()) == 1, "not before it is due"
+    clock.now += 1
+    _pass(runner)
+    _pass(runner)
+    first, reminder = sink.refused()
+    assert reminder == first, "one reminder, with the payload of the version raised"
+    assert sink.events[0][1] == sink.events[1][1] == reload_alert_subject(pki.crl)
+    clock.now += 300
+    _pass(runner)
+    assert len(sink.refused()) == 3
+
+    pki.crl.write_bytes(_fresher(pki, revoke=False))
+    _pass(runner)
+    clock.now += 900
+    _pass(runner)
+    assert sink.kinds() == ["refused", "refused", "refused", "applied"], "none once it clears"
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_a_reminder_follows_the_record_when_the_pass_cannot_read_the_file(
+    pki: _Pki, clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pass returns no outcome for a file it cannot read, while the refusal still stands. The
+    reminder reads the record, so it still fires."""
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    runner = _runner(sink, reminder_seconds=300)
+    pki.crl.write_bytes(_expired(pki))
+    _pass(runner)
+
+    def unreadable(_path: str) -> tuple[int, int, int]:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(crl_reload, "_stamp", unreadable)
+    clock.now += 300
+    assert _pass(runner) == [], "the control: no outcome at all"
+    assert len(sink.refused()) == 2
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_a_reminder_the_sink_refuses_waits_for_the_next_reminder(
+    pki: _Pki, clock: _Clock, caplog: pytest.LogCaptureFixture
+) -> None:
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    runner = _runner(sink, reminder_seconds=300)
+    pki.crl.write_bytes(_expired(pki))
+    _pass(runner)
+    sink.down = True
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.crl_reload"):
+        clock.now += 300
+        for _ in range(3):
+            _pass(runner)
+        sink.down = False
+        _pass(runner)
+        assert len(sink.refused()) == 1, "spaced from the attempt, not retried every pass"
+        clock.now += 300
+        _pass(runner)
+    assert len(sink.refused()) == 2
+    failures = [r.getMessage() for r in caplog.records if "as a reminder" in r.getMessage()]
+    assert len(failures) == 1 and "the next reminder tries again" in failures[0]
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_the_notifier_pages_the_reminder_once_its_cooldown_has_passed(
+    pki: _Pki, clock: _Clock
+) -> None:
+    """What the reminder is for: a page sent again while the refusal stands. The notifier's own
+    cooldown still spaces it, so it is set to zero here."""
+    hop = pki.outbound_hop()
+    transport = _RecordingTransport("webhook")
+    sink = NotifierAlertSink([transport], realert_seconds=0)
+    runner = _runner(sink, reminder_seconds=300)
+    pki.crl.write_bytes(_expired(pki))
+
+    _pass(runner)
+    _pass(runner)
+    clock.now += 300
+    _pass(runner)
+    await _drain_transports(sink)
+
+    paged = [(e["type"], e["connection"], e["remedy_class"]) for e in transport.events]
+    assert paged == [("crl_reload_refused", reload_alert_subject(pki.crl), "fix_file")] * 2
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 

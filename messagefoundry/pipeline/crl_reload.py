@@ -45,7 +45,8 @@ count read then races the lazy loading of a hashed root directory, and nothing f
 undone anyway. A refusal is logged at ERROR once per file version and recorded, so the expiry monitor
 says why the hop's copy is still old. The old copy keeps its ``crl_expiry`` alert. That alert speaks
 only once the held copy nears its ``nextUpdate``, so :class:`CrlReloadRunner` also raises
-``crl_reload_refused`` for the refusal itself, once per file version (vault BACKLOG #2904).
+``crl_reload_refused`` for the refusal itself, at once for each file version (vault BACKLOG #2904),
+and again as a reminder while that refusal stands (vault BACKLOG #3543).
 
 **One refusal is reported per file, the strongest.** Hops holding one file can need different things.
 A file to fix outranks a restart, and both outrank a wait (:data:`_PRECEDENCE`), because waiting would
@@ -101,7 +102,7 @@ import os
 import ssl
 import threading
 import time
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import NamedTuple
@@ -128,7 +129,7 @@ from messagefoundry.config.tls_policy import (
     judge_crl_bytes,
     staged_crl,
 )
-from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.alerts import REMINDER_SECONDS, AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.intake_bound import process_alert_subject, shorten_with_checksum
 from messagefoundry.pki import CrlBlock, CrlFacts, crl_signature_refusal
 from messagefoundry.redaction import log_timestamp
@@ -783,8 +784,8 @@ def _finish(
     if prior is None or prior.reason != reason:
         # Once per file version: a retried pass repeats every minute, and the monitor carries it.
         # The runner raises ``crl_reload_refused`` by the same rule, from the outcome returned
-        # here. Not from this function: it runs in a worker thread, and a notifier's alert-state
-        # write needs the event loop.
+        # here, and then reminds while the refusal stands. Not from this function: it runs in a
+        # worker thread, and a notifier's alert-state write needs the event loop.
         log.error(
             "crl_reload: refused to apply the replaced CRL file to %d running TLS context(s), "
             "which keep the copy they hold: %s. %s",
@@ -898,6 +899,13 @@ def reload_replaced_crls(
     return outcomes
 
 
+#: The reminder clock, a module name so a test can move it without moving the event loop's.
+_monotonic = time.monotonic
+
+#: What tries a failed sink call again, where it is not the next pass or the stop.
+_RETRIED_BY = {"sent as a reminder": "the next reminder tries again"}
+
+
 class _Alerted(NamedTuple):
     """A refusal :class:`CrlReloadRunner` has raised ``crl_reload_refused`` for and not resolved."""
 
@@ -906,6 +914,10 @@ class _Alerted(NamedTuple):
     #: The refused bytes and the reason: together, the file version the alert was raised for.
     fingerprint: tuple[int, int]
     reason: str
+    #: The latest outcome for that version, so a reminder carries the latest count.
+    outcome: ReloadOutcome
+    #: When the next reminder is due, on :data:`_monotonic`'s clock.
+    remind_at: float
 
 
 class CrlReloadRunner:
@@ -915,12 +927,21 @@ class CrlReloadRunner:
     must not also stop revocations reaching a running hop. Not leader-gated: each process holds its
     own contexts.
 
-    **It raises ``crl_reload_refused`` for a refused file (vault BACKLOG #2904).** Once per file
-    version, by the rule the pass logs its ERROR by: again only when the file's bytes change or
+    **It raises ``crl_reload_refused`` for a refused file (vault BACKLOG #2904).** At once for
+    each file version, by the rule the pass logs its ERROR by: when the file's bytes change or
     the refusal's reason does. The pass runs in a worker thread, so the alert is raised here,
     on the event loop, from the outcomes the pass returns. ``alert_sink`` defaults to a
     :class:`~messagefoundry.pipeline.alerts.LoggingAlertSink`, as the expiry monitor's does.
     ``node`` names this process in the alert subject (:func:`reload_alert_subject`).
+
+    **And again every ``reminder_seconds`` while that refusal stands (vault BACKLOG #3543, owner
+    ruling 2026-10-13).** One alert per file version left a page that was throttled, muted or
+    resolved by hand never sent again. So the runner reminds, as ``intake_paused`` does, and
+    from the same constant by default
+    (:data:`~messagefoundry.pipeline.alerts.REMINDER_SECONDS`). It reads the refusal record for
+    that, not the outcomes, so a pass that could not read the file still reminds. A reminder
+    repeats the version raised, with the latest count, and only while the record holds that
+    version; a newer version is raised from its own outcome instead.
 
     **It resolves that alert with ``crl_reload_applied``, and only on evidence.** A pass returns
     no outcome for a file it could not read, and none when it failed, while the refusal still
@@ -941,8 +962,10 @@ class CrlReloadRunner:
         skip_when_idle: bool = True,
         alert_sink: AlertSink | None = None,
         node: str | None = None,
+        reminder_seconds: float = REMINDER_SECONDS,
     ) -> None:
         self._interval = interval_seconds
+        self._reminder_seconds = reminder_seconds
         self._reload = reload or functools.partial(reload_replaced_crls, max_reloads=max_reloads)
         # With no CRL load recorded there is nothing to reload, so no worker thread is started.
         self._skip_when_idle = skip_when_idle
@@ -952,7 +975,7 @@ class CrlReloadRunner:
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
         self._node = node
         # Per path key, the refusal already alerted. A pass returns a refused outcome every
-        # minute, so this is what keeps the alert to one per file version. It is also the set of
+        # minute, so this is what spaces the alert to its reminders. It is also the set of
         # alerts this runner has open. Touched only on the event loop.
         self._alerted: dict[str, _Alerted] = {}
         # The sink calls now failing, as (what, path key): one WARNING per failing streak of each,
@@ -1076,13 +1099,15 @@ class CrlReloadRunner:
         standing = reload_refusals()
         cleared = [key for key in self._alerted if key not in standing]
         # End a streak whose call is no longer owed, so the next failure for that file is logged
-        # again. A raise is owed while the refusal stands; a clear while its alert awaits one.
+        # again. A raise or a reminder is owed while the refusal stands; a clear while its alert
+        # awaits one.
         self._sink_failing = {
             (what, key)
             for what, key in self._sink_failing
-            if (key in standing if what == "raised" else key in cleared)
+            if (key in cleared if what == "resolved" else key in standing)
         }
         self._resolve(cleared, "the refusal no longer stands")
+        self._remind(standing)
 
     def _resolve(self, keys: Sequence[str], why: str) -> None:
         """Raise ``crl_reload_applied`` for each alert in ``keys``, and forget the ones raised."""
@@ -1108,10 +1133,10 @@ class CrlReloadRunner:
         if (what, key) not in self._sink_failing:
             self._sink_failing.add((what, key))
             log.warning(
-                "crl_reload: the refused-reload alert for %s could not be %s; the next pass, or "
-                "the stop, tries again",
+                "crl_reload: the refused-reload alert for %s could not be %s; %s",
                 key,
                 what,
+                _RETRIED_BY.get(what, "the next pass, or the stop, tries again"),
                 exc_info=True,
             )
 
@@ -1120,7 +1145,40 @@ class CrlReloadRunner:
         version = (refusal.fingerprint, refusal.reason)
         known = self._alerted.get(key)
         if known is not None and (known.fingerprint, known.reason) == version:
-            return  # this version of the file is alerted already
+            # This version is alerted already. Keep its latest count for the next reminder.
+            self._alerted[key] = known._replace(outcome=outcome)
+            return
+        if self._send_refused(key, outcome, refusal, "raised"):
+            self._alerted[key] = _Alerted(outcome.path, *version, outcome, self._next_reminder())
+
+    def _remind(self, standing: Mapping[str, ReloadRefusal]) -> None:
+        """Raise ``crl_reload_refused`` again for each open alert whose reminder is due, while the
+        record still holds the version it was raised for (vault BACKLOG #3543).
+
+        Spaced from the attempt, as ``intake_paused`` spaces its reminders, so a sink that refuses
+        one is not called again every pass. Read after the call returns: the notifier stamps its
+        own cooldown inside the call, so a window measured from before it could close a moment
+        early and land the next reminder inside that cooldown, where it is throttled."""
+        now = _monotonic()
+        for key, alerted in list(self._alerted.items()):
+            held = standing.get(key)
+            if held is None or (held.fingerprint, held.reason) != (
+                alerted.fingerprint,
+                alerted.reason,
+            ):
+                continue  # resolved below, or a newer version its own outcome raises
+            if now < alerted.remind_at or alerted.outcome.refusal is None:
+                continue
+            self._send_refused(key, alerted.outcome, alerted.outcome.refusal, "sent as a reminder")
+            self._alerted[key] = alerted._replace(remind_at=self._next_reminder())
+
+    def _next_reminder(self) -> float:
+        return _monotonic() + self._reminder_seconds
+
+    def _send_refused(
+        self, key: str, outcome: ReloadOutcome, refusal: ReloadRefusal, what: str
+    ) -> bool:
+        """Call the sink's ``crl_reload_refused`` for ``outcome``. False when the sink raised."""
         token = _remedy_class(refusal.remedy)
         try:
             self._alert_sink.crl_reload_refused(
@@ -1134,8 +1192,9 @@ class CrlReloadRunner:
             )
         except Exception:
             # Broad on purpose: a sink must never raise, and a broken one must not end the loop
-            # that applies revocations. Not recorded as alerted, so the next pass retries it.
-            self._sink_failed("raised", key)
-            return
-        self._sink_failing.discard(("raised", key))
-        self._alerted[key] = _Alerted(outcome.path, *version)
+            # that applies revocations. A raise is not recorded as alerted, so the next pass
+            # retries it; a reminder is tried again at the next reminder.
+            self._sink_failed(what, key)
+            return False
+        self._sink_failing.discard((what, key))
+        return True

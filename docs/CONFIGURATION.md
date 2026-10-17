@@ -1953,13 +1953,19 @@ belong to the CRL expiry alert too. This event carries none of them.
 The engine sends at least these eight. A remedy it has no token for would be sent as `other`, with
 no remedy sentence.
 
-**One alert per file version.** The engine raises the alert when it first refuses a version of the
-file. It raises it again only when the file's bytes change or the reason does, which is the rule the
-ERROR line follows. It sends no reminders while a refusal stands. The notifier's cooldown still
-applies while the alert is open: a second refused version inside `[alerts].realert_seconds` of the
-first updates the open alert and does not page again. So a page can name an older class than the
-alert list shows. When the engine resolves the alert itself, that ends the cooldown, so it does not
-hold back a refusal that follows a fix. A resolve made by hand in the alert list does not end it.
+**A reminder while the refusal stands (vault BACKLOG #3543).** The engine raises the alert at once
+when it first refuses a version of the file, and at once again when the file's bytes change or the
+reason does, which is the rule the ERROR line follows. While a refusal stands it then raises the
+alert again as a reminder, as `intake_paused` reminds, with the same fields. A reminder goes at the
+first reload pass five minutes or more after the last try, so they come five to six minutes apart. This replaced
+the rule of one alert per file version, under which a page that was throttled, muted or resolved
+by hand was never sent again. A reminder is sent even while the engine cannot read the file, since
+the refusal still stands. The notifier's cooldown still applies while the alert is open: a second
+refused version, or a reminder, inside `[alerts].realert_seconds` of the last page updates the open
+alert and does not page again. So a page can name an older class than the alert list shows, until
+the next reminder pages. A cooldown longer than five minutes throttles some reminders. When the
+engine resolves the alert itself, that ends the cooldown, so it does not hold back a refusal that
+follows a fix. A resolve made by hand in the alert list does not end it.
 
 **Restart only when the class says to.** That is `restart`, `no_issuer` or `retry`, and only when
 the event carries no `start_refuses`. With any other class a start can refuse the file too, and
