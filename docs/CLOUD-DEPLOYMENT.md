@@ -12,6 +12,10 @@ For the **PHI / HIPAA cloud architecture** (BAA, KMS, PrivateLink, region pinnin
 [`CLOUD-PHI-HIPAA.md`](CLOUD-PHI-HIPAA.md). For the per-channel TLS posture and bind guards, read
 [`DEPLOYMENT.md`](DEPLOYMENT.md). For the container image itself, read [`../docker/README.md`](../docker/README.md).
 
+> **Not supported for v1.** The Kubernetes and container shapes here run the Linux image
+> ([why](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target)). For HA on
+> Windows Server VMs, see [AOAG-DEPLOYMENT.md](AOAG-DEPLOYMENT.md).
+
 > **On-prem-first.** MessageFoundry's identity is on-premises ([ADR 0017](adr/0017-consumer-deployment-model.md)
 > Decision 8: every instance runs inside the adopter's trusted network). Cloud is a **credible,
 > demand-gated fast-follow**, not a hosted SaaS — there is no MessageFoundry-operated multi-tenant

@@ -2298,8 +2298,9 @@ nodes automatically:
 #### `[cluster.vip]` — engine-managed virtual IP (ADR 0056, Windows-only)
 
 **Windows-only.** Engine-managed VIP is a Windows feature at v1, and IPv4 only; IPv6 is deferred on every
-platform. Linux and container deployments keep the external floating VIP or load balancer described in
-[CLUSTERING.md](CLUSTERING.md) §"Client reconnect". The settings themselves load on any platform.
+platform. A node that cannot use it keeps the external floating VIP or load balancer described in
+[CLUSTERING.md](CLUSTERING.md) §"Client reconnect". The settings themselves load on any platform, but
+Linux is [not supported for v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target).
 
 **The engine checks this block at load and does nothing else with it yet.** No code in this build binds,
 releases or announces the address. That controller is a later change, so the engine logs a WARNING at

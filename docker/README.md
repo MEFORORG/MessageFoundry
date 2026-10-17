@@ -3,6 +3,10 @@
 
 # Containerizing the MessageFoundry engine
 
+> **Not supported for v1.** The image runs Linux
+> ([why](../docs/SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target)). Deploy v1
+> as a Windows service ([SERVICE.md](../docs/SERVICE.md)).
+
 The **headless engine** runs cleanly as an OCI container (ADR 0017 "container fast-follow"). This
 directory holds the image, a Topology-A `compose.yaml`, minimal Kubernetes manifests, and a CI smoke.
 

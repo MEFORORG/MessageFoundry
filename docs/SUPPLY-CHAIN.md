@@ -190,9 +190,10 @@ Windows than on Linux:
 That list is what the lock's `sys_platform` markers select today. Read the lock, not this table, for
 the current set.
 
-The SBOM generator lists what is actually installed, so one SBOM cannot be right for both. The engine
-runs as a Windows service ([SERVICE.md](SERVICE.md)) and in a Linux container, so the release ships
-both. The Windows SBOM is built on a Windows runner, because only a Windows interpreter picks packages
+The SBOM generator lists what is actually installed, so one SBOM cannot be right for both. The release
+ships both. The Windows SBOM covers the supported v1 install, a Windows service
+([SERVICE.md](SERVICE.md)). The Linux SBOM covers a `pip install` on Linux, which is
+[not supported for v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target). The Windows SBOM is built on a Windows runner, because only a Windows interpreter picks packages
 the way a Windows install does.
 
 Neither SBOM is built by the job that signs. Each comes from its own job with read-only access, one on

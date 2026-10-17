@@ -81,7 +81,7 @@ limitation travels with any copy of the posture body. The engine measures and re
 determines the verdict.
 
 **Availability on today's on-premises platforms (verified 2026-07-22).** For a **Windows** engine host —
-the primary supported platform — this requirement is presently **unmeetable on-premises**, and the
+the only supported v1 platform — this requirement is presently **unmeetable on-premises**, and the
 blocker is the hypervisor, not the CPU:
 
 | Platform | Confidential guest for a **Windows** engine VM |
@@ -89,10 +89,11 @@ blocker is the hypervisor, not the CPU:
 | **Hyper-V on-premises** (Windows Server 2019–2025) | ⛔ None. Windows Server 2025 ships no confidential VM; the vNext Insider "Trusted Launch" (Secure Boot + vTPM) is **not** memory encryption. |
 | **VMware ESXi 9.0** | **CAUTION:** SEV-SNP is a *Limited Availability* release and its guest requirements are stated in Linux-kernel terms; Windows is not listed as a supported SEV-SNP guest. |
 | **Azure / Azure Local confidential VMs** | ✅ SEV-SNP and TDX with Windows Server guests (a Microsoft paravisor supplies what a Windows guest needs). |
-| **Linux guests on KVM / AWS / GCP / ESXi 9** | ✅ Where the host is SEV-SNP/TDX-capable and the guest is launched confidential. |
+| **Linux guests on KVM / AWS / GCP / ESXi 9** | ✅ Where the host is SEV-SNP/TDX-capable and the guest is launched confidential. Linux is [not supported for v1](#linux-is-not-a-supported-v1-deployment-target). |
 
-So a Windows on-prem deployment is honestly capped at **Partial** today, and a Linux or Azure
-confidential-VM deployment is the route to the hardware property. Plan hardware refresh accordingly —
+So a Windows on-prem deployment is honestly capped at **Partial** today, and the Linux row does not
+apply to v1. For a v1 deployment, the only row this table marks as a route is the Azure / Azure
+Local confidential-VM row. Plan hardware refresh accordingly —
 SEV-SNP needs EPYC 7003+ and TDX needs 5th Gen Xeon Scalable+, which is newer than much of a typical
 5–7-year hospital server refresh cycle.
 
@@ -103,14 +104,30 @@ SEV-SNP needs EPYC 7003+ and TDX needs 5th Gen Xeon Scalable+, which is newer th
 | **Windows Server 2022 / 2025** | ✅ Primary supported & serviced platform (Windows-service deployment via NSSM) |
 | Windows Server 2019 | ✅ Supported |
 | Windows 10 / 11 | ✅ Supported (development, pilot, test-harness host) |
-| **Linux** (modern x86-64 distributions) | ✅ Engine supported (cross-platform Python); no bundled service installer — run under systemd yourself |
+| **Linux** (any distribution, on a host or in a container) | **Not supported for v1 deployment** ([below](#linux-is-not-a-supported-v1-deployment-target)); development and CI use only |
 | macOS | **CAUTION:** Development / test-harness use only |
+
+### Linux is not a supported v1 deployment target
+
+Owner ruling, 2026-10-16: **Windows is the only supported v1 deployment platform** (versions in the
+table above). Linux, on a host or in the container image, is not. A Linux deployment would need its
+own thorough testing. That covers at least the POSIX branches in the security code, the container
+hardening and a systemd unit. It is too much for v1. Linux support may return after v1; no date is
+set.
+
+The ruling changes the support statement, not the code or CI:
+
+- The engine keeps its POSIX code paths, and the [`docker/`](../docker/README.md) tree (image,
+  compose file, Kubernetes manifests, smoke test) stays as a development and CI artifact.
+- CI keeps its Linux legs. A green Linux leg is not evidence that a Linux deployment works.
+- Some CI jobs run only on Linux hosted runners, at least the SQL Server and PostgreSQL store jobs.
+  Their Windows counterpart, `selfhosted-win2025-sql.yml`, runs only when dispatched by hand.
 
 ## Runtime
 
 | Component | Requirement |
 |---|---|
-| **Python** | **3.14**, 64-bit (the only supported runtime; CI-validated on Linux + Windows Server 2022 + 2025, the primary deploy target) |
+| **Python** | **3.14**, 64-bit (the only supported runtime; CI-validated on Windows Server 2022 + 2025 and on Linux, which is [not supported for v1](#linux-is-not-a-supported-v1-deployment-target)) |
 | Service manager (Windows) | **NSSM** (auto-provisioned, SHA-256-pinned, by the installer; or pre-staged). Requires administrator / elevation to register the service. |
 | C compiler | Not required for the default install with standard CPython 3.14 on x86-64 Windows, glibc Linux (x86-64 or arm64) or arm64 macOS. The locked runtime dependencies ship wheels there (read from `uv.lock`, 2026-09-30). At least two other interpreters build packages from source. arm64 Windows builds `cryptography` and `httptools`. x86-64 macOS builds `cryptography` and `argon2-cffi-bindings`. Building `cryptography` needs a C compiler, a Rust toolchain and OpenSSL headers. |
 | **`httptools`** | **Required by `serve`.** The engine API parses HTTP requests with `httptools` (llhttp) and pins it to the version the request-framing tests measured (BACKLOG #1125). `serve` does not fall back to uvicorn's other parser, h11, because h11 frames some ambiguous requests differently. If `httptools` does not import, `serve` prints an error naming the module and the pinned HTTP parser, ending `refusing to start.`, and exits 2 before it creates any file. `supervise` refuses the same way, ending `refusing to start the fleet.`, before it starts any engine shard. The lock ships a ready-built wheel for x86-64 Windows, glibc and musl Linux (x86-64 or arm64) and macOS (arm64, and x86-64 through the universal2 wheel). arm64 Windows has none, so it builds `httptools` from source, and that needs a C compiler; so does any platform outside that list. |
@@ -121,7 +138,7 @@ SEV-SNP needs EPYC 7003+ and TDX needs 5th Gen Xeon Scalable+, which is newer th
 requirement. The engine reads the host's wall clock and trusts it. It never sets the clock, and by
 default it does not check it.
 
-The requirement covers each host that runs an engine process, on Windows and on Linux.
+The requirement covers each host that runs an engine process.
 
 ### What reads the clock
 
@@ -172,7 +189,8 @@ is **not** disciplined:
 
 ### Check it on Linux
 
-On a systemd host, run `timedatectl`. A healthy host shows `System clock synchronized: yes` and
+Linux is [not supported for v1](#linux-is-not-a-supported-v1-deployment-target); this check is for
+a Linux host outside that support, such as a development box. On a systemd host, run `timedatectl`. A healthy host shows `System clock synchronized: yes` and
 `NTP service: active`. Where chrony is the time service, `chronyc tracking` shows the current
 offset, and a healthy host shows a `Leap status` of `Normal`.
 

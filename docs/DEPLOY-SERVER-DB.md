@@ -695,6 +695,10 @@ unconfigured host, which reads as healthy.
 
 #### Linux: the host OpenSSL configuration binds the driver (measured)
 
+Linux is [not supported for v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target);
+this applies only to a Linux engine host outside that support, such as the container image. The
+v1 platform is the Windows half above, whose cipher-suite result is **unmeasured**.
+
 **Measured: the OpenSSL configuration decides which suites and versions the driver offers.** An
 earlier reading held that the driver might use a suite list of its own. On the rig below, it did not.
 
