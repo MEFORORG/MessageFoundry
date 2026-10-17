@@ -222,7 +222,7 @@ def _seed_compare(
     return db
 
 
-def _compare_to(db: str, out: Path) -> int:
+def _compare_to(db: str, out: Path | str) -> int:
     return main(
         [
             "compare",
@@ -341,7 +341,7 @@ def test_compare_out_that_cannot_be_written_is_an_error_line(
 _ANON_SALT = "tee-cli-salt-0123456789abcdef"
 
 
-def _anonymize_to(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, out: Path) -> int:
+def _anonymize_to(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, out: Path | str) -> int:
     """Seed one synthetic capture and run ``anonymize-captures --out`` on it in process. Logging
     setup is stubbed, since it would reconfigure logging for the whole pytest session."""
     db = str(tmp_path / "tee.db")
@@ -365,7 +365,7 @@ def _anonymize_to(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, out: Path) ->
     return main(["anonymize-captures", "--db", db, "--out", str(out)])
 
 
-def _export_to(tmp_path: Path, out: Path) -> int:
+def _export_to(tmp_path: Path, out: Path | str) -> int:
     db = str(tmp_path / "tee.db")
     asyncio.run(_seed(db))
     return main(["export", "--db", db, "--out", str(out)])
@@ -395,7 +395,9 @@ def test_export_out_is_created_owner_only(tmp_path: Path) -> None:
 _OUT_COMMANDS = ["anonymize-captures", "export", "compare"]
 
 
-def _write_out(command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, out: Path) -> int:
+def _write_out(
+    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, out: Path | str
+) -> int:
     """Run one of the tee commands that take ``--out``, writing to ``out``."""
     if command == "export":
         return _export_to(tmp_path, out)
@@ -488,7 +490,18 @@ def _sddl_of(path: Path, scratch: Path) -> str:
 
 def _harden(path: Path, grant: str) -> None:
     """Strip ``path``'s inherited entries and grant this account only ``grant`` (F or R)."""
-    _win_run("icacls.exe", str(path), "/inheritance:r", "/grant:r", f"*{_own_sid()}:{grant}")
+    # OWNER RIGHTS and CREATOR OWNER can survive as explicit entries (see test_store_trio_acl.py),
+    # and an OWNER RIGHTS full-control entry would let an R-hardened file be written anyway.
+    _win_run(
+        "icacls.exe",
+        str(path),
+        "/inheritance:r",
+        "/remove:g",
+        "*S-1-3-4",
+        "*S-1-3-0",
+        "/grant:r",
+        f"*{_own_sid()}:{grant}",
+    )
 
 
 @_WINDOWS_ACLS
@@ -583,20 +596,25 @@ def test_out_through_a_symlink_keeps_the_hardened_target_on_windows(
     assert b"\r\n" not in data
 
 
+_WHAT = {"anonymize-captures": "dataset", "export": "export", "compare": "report"}
+
+
 @_WINDOWS_ACLS
-@pytest.mark.parametrize("linked", [False, True], ids=["plain", "second-hard-link"])
+@pytest.mark.parametrize("command", _OUT_COMMANDS)
+@pytest.mark.parametrize("name", ["plain", "second-hard-link", "trailing-separator"])
 def test_out_refuses_a_target_hardened_against_this_account_writing_on_windows(
-    linked: bool,
+    command: str,
+    name: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     # A replace could still swap a read-only file out through the folder's grant, trading its list
-    # for the folder's. It is an error instead, and the file is left as it was, whether or not the
-    # name is one of two hard links to it.
+    # for the folder's. It is an error instead, and the file is left as it was, whether the name is
+    # one of two hard links to it or carries a trailing separator that Path would drop.
     scratch = tmp_path / "acl"
     out = tmp_path / "out.json"
-    if linked:
+    if name == "second-hard-link":
         other = tmp_path / "elsewhere.json"
         other.write_text("untouched\n", encoding="utf-8")
         os.link(other, out)
@@ -604,7 +622,10 @@ def test_out_refuses_a_target_hardened_against_this_account_writing_on_windows(
         out.write_text("untouched\n", encoding="utf-8")
     _harden(out, "R")
     hardened = _sddl_of(out, scratch)
-    assert _export_to(tmp_path, out) == 1
-    assert "error: could not write the export" in capsys.readouterr().err
+    # A str, since Path itself would drop the separator before the CLI saw it.
+    named = str(out) + os.sep if name == "trailing-separator" else str(out)
+    assert _write_out(command, tmp_path, monkeypatch, named) == 1
+    assert f"error: could not write the {_WHAT[command]}" in capsys.readouterr().err
     assert _sddl_of(out, scratch) == hardened
     assert out.read_text(encoding="utf-8") == "untouched\n"
+    assert not list(tmp_path.glob("*.tmp"))
