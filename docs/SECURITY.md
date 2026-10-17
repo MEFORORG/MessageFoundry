@@ -2737,7 +2737,7 @@ naming `/ui/reauth`, audited `reason=idp_step_up_required`. The JSON plane has n
 password routes are rate-limited like the password change, and every verify, and every refusal of
 an `oidc` session by `reauth()`, is audited (`auth.reauth`). A wrong password or a rejected re-bind **counts toward the engine's per-account
 lockout**, on the **sign-in** counter, except while the sign-in lock is live, when it is charged to the session
-only. A directory that cannot be reached, or that finds no such principal, counts nothing. Each session may fail `lockout_threshold` re-proofs before it is
+only. A directory that cannot be reached, that finds no such principal, or that ends the bind busy (51), unavailable (52), unwillingToPerform (53) or adminLimitExceeded (11) counts nothing (BACKLOG #3169). Each session may fail `lockout_threshold` re-proofs before it is
 revoked. Neither account lock refuses this password re-proof, so a live session that has
 already met its second factor keeps step-up during a lock (BACKLOG #1138; see the
 [protection set](#the-documented-protection-set-asvs-611)). The IdP leg checks no engine credential,
@@ -4752,9 +4752,11 @@ on the engine's own row and against the session. The engine never writes a lock 
 account. Each rejected re-bind still reaches the DC, though, up to `lockout_threshold` per session. So a
 domain lockout policy can still lock the domain account if its threshold is at or below that, or if
 several sessions or engine sign-in failures add up within its observation window. A directory it cannot
-reach, or one with no such principal, is a refusal but not a counted failure. A correct password the DC refuses anyway, for example because the
-domain account is locked or its password has expired, **is** counted: the engine does not read the
-bind's reason. While `[auth].login_rate_limit_enabled` is on, the per-actor
+reach, or one with no such principal, is a refusal but not a counted failure, and so is a bind the DC ends
+busy (51), unavailable (52), unwillingToPerform (53) or adminLimitExceeded (11), which judged no password
+(BACKLOG #3169). Any other refused bind counts. A correct password the DC refuses anyway, for example because the
+domain account is locked or its password has expired, **is** counted: AD answers both with invalidCredentials
+(49), and the engine reads the bind's result code, never its diagnostic text. While `[auth].login_rate_limit_enabled` is on, the per-actor
 budget applies there; the sign-in limiter never does. AD and Kerberos brute-force resistance
 is otherwise the directory's job, so set the domain lockout/complexity policy accordingly. The engine-side
 throttle that *does* cover Kerberos and OIDC is the sliding-window sign-in limiter — **per client IP and

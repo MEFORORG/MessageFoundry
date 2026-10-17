@@ -873,6 +873,34 @@ def _unanswered(operation: str, code: int | None) -> LdapUnansweredError:
     return LdapUnansweredError(message, code=code, code_name=name)
 
 
+#: The result codes that end a user bind without judging its password (BACKLOG #3169): busy (51),
+#: unavailable (52), unwillingToPerform (53) and adminLimitExceeded (11), the codes #3010 names
+#: for a search the directory did not finish. Literals, because every ldap3 import here is lazy; a
+#: test pins each against ldap3's constant.
+_UNJUDGED_BIND_CODES = frozenset({11, 51, 52, 53})
+
+
+def _refuse_unjudged_bind(conn: Any) -> None:
+    """Raise :class:`LdapUnansweredError` when ``conn``'s bind ended with a code in
+    :data:`_UNJUDGED_BIND_CODES`, and do nothing otherwise.
+
+    BACKLOG #3169. ldap3's ``bind()`` returns ``False`` for each of these, as it does for
+    invalidCredentials (49), so read on, a busy domain controller was a wrong password: the step-up
+    re-bind counted it toward the engine lockout and could lock out a user who typed the right
+    password. Raised, it is an :class:`LdapError`, which the re-bind reads as
+    ``directory_unavailable`` and does not count.
+
+    Not :func:`_refuse_unanswered`, which refuses every code outside a set of answers: every other
+    refused bind, 49 included, still reads as a refused password, so the bind's answers are an open
+    set. The refusal is :func:`_unanswered`'s, so its text and warning match the searches'.
+    """
+    result = conn.result
+    code = result.get("result") if isinstance(result, dict) else None
+    # type(), not isinstance(): a bool is an int, and is no result code.
+    if type(code) is int and code in _UNJUDGED_BIND_CODES:
+        raise _unanswered("user bind", code)
+
+
 def _search(conn: Any, operation: str, **kwargs: Any) -> None:
     """``conn.search(**kwargs)``, refusing a referral result and any other result but success
     (:func:`_refuse_unanswered`). Every search in this module goes through here, so none can read
@@ -1396,7 +1424,9 @@ class LdapAuthenticator:
         branches open a socket to the same directory, so such a fault fails them alike; swallowing
         it here alone would answer "wrong password" for an absent account and "directory error" for
         a present one. The same holds for a bind response ldap3 could not decode (BACKLOG #3010):
-        both binds refuse it through :func:`_ldap3_call` as the "user bind".
+        both binds refuse it through :func:`_ldap3_call` as the "user bind". So does a bind ended
+        busy, unavailable, unwillingToPerform or adminLimitExceeded (BACKLOG #3169): both binds
+        raise it through :func:`_refuse_unjudged_bind`, which raises no ``LDAPException``.
 
         **What #2566 does not settle:** ldap3's OWN socket errors still differ between the branches.
         This method swallows an ``LDAPSocketOpenError`` while the real bind's handler maps it, so a
@@ -1423,8 +1453,13 @@ class LdapAuthenticator:
             )
             # Labelled as the real bind is, and released the same way, so an undecodable answer
             # fails both branches with the same text (_ldap3_call, _released).
-            with _released(conn), _ldap3_call("user bind"):
-                conn.bind()  # result deliberately ignored — this branch always fails the login
+            with _released(conn):
+                with _ldap3_call("user bind"):
+                    conn.bind()  # result deliberately ignored — this branch always fails the login
+                # BACKLOG #3169: an unjudged bind raises here as it does on the real bind, so a busy
+                # directory answers an absent account and a present one alike. It is no
+                # LDAPException, so the arm below does not swallow it.
+                _refuse_unjudged_bind(conn)
         except ldap3.core.exceptions.LDAPException:
             return
 
@@ -1675,7 +1710,8 @@ class LdapAuthenticator:
         self, username: str, password: str, *, object_id: str | None = None
     ) -> DirectoryBind:
         """Verify ``username``/``password`` against AD. Raises :class:`LdapError` on a
-        connectivity/config failure.
+        connectivity/config failure, and on a bind the directory ended without judging the
+        password (:func:`_refuse_unjudged_bind`, BACKLOG #3169).
 
         The answer carries the principal on success, and otherwise says what the lookup found
         (:class:`DirectoryBind`, BACKLOG #2434). Before that it returned ``None`` for a wrong
@@ -1740,6 +1776,8 @@ class LdapAuthenticator:
                         bound = user_conn.bind()
                     if not bound:
                         _refuse_referral(user_conn, "user bind")
+                        # A busy or unavailable directory judged no password (BACKLOG #3169).
+                        _refuse_unjudged_bind(user_conn)
                         # The entry was found enabled, so the refusal judged this account.
                         return DirectoryBind(DirectoryAnswer.FOUND)
                 groups = self._resolve_groups(svc, user_dn, info["memberOf"])
