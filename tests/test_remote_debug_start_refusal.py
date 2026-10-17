@@ -178,12 +178,23 @@ def _stand_down_the_gates_before_logging(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(cli, "_forwarder_posture_refused", lambda settings, **kw: False)
 
 
+@pytest.mark.parametrize(
+    ("posture", "warn", "audited"),
+    [(_ON, False, True), (_OFF, False, False), (_ON, True, False)],
+    ids=["lifts-a-refusal", "interface-off", "enforcement-warn"],
+)
 def test_serve_logs_the_audit_line_again_once_logging_reaches_its_handlers(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    posture: RemoteDebugPosture,
+    warn: bool,
+    audited: bool,
 ) -> None:
     """The first AUDIT line is written before ``configure_logging`` installs the operator's
-    handlers and forwarder, so ``serve`` writes it again after ``_start_logging``. The gates in
-    between are stood down and the start is stopped by the first call after the re-log."""
+    handlers and forwarder, so ``serve`` writes it again after ``_start_logging``, and neither
+    where nothing was lifted. The gates in between are stood down and the start is stopped by the
+    first call after the re-log."""
     marker = "TEST MARKER: logging has reached its handlers"
 
     def started(*args: object, **kwargs: object) -> None:
@@ -195,12 +206,15 @@ def test_serve_logs_the_audit_line_again_once_logging_reaches_its_handlers(
     monkeypatch.setattr("messagefoundry.config.settings.unread_env_warnings", _stop_past_the_re_log)
     with caplog.at_level(logging.WARNING, logger=cli.__name__):
         # main's last-resort handler turns the stop into a non-zero exit.
-        assert _serve(tmp_path, monkeypatch, _ON, accept=True) != 0
+        assert _serve(tmp_path, monkeypatch, posture, warn=warn, accept=True) != 0
     assert any("_PastTheReLog" in r.getMessage() for r in caplog.records), (
         "the start stopped before the re-log, so this arm proves nothing"
     )
     messages = [r.getMessage() for r in caplog.records if r.name == cli.__name__]
     audits = _audit_lines(caplog, "start")
+    if not audited:
+        assert not audits and marker in messages, messages
+        return
     assert len(audits) == 2, messages
     # One as the gate ran, and one after the handlers exist.
     started_at = messages.index(marker)
@@ -284,15 +298,20 @@ def test_supervise_writes_the_audit_line_where_the_acceptance_lifts_its_refusal(
     assert len(lines) == 1 and REMOTE_DEBUG_ACCEPTANCE in lines[0], lines
 
 
+@pytest.mark.parametrize("forwarder", [True, False], ids=["forwarder", "no-forwarder"])
 def test_supervise_logs_the_audit_line_again_for_the_forwarder(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    forwarder: bool,
 ) -> None:
     """With a forwarder installed, ``supervise`` writes the AUDIT line once more so the off-box
-    copy has it. The gates in between are stood down; the renewal after the re-log stops it."""
+    copy has it, and only then. The gates in between are stood down; the renewal after the re-log
+    stops it."""
 
     def started(*args: object, configure: Callable[[None], object], **kwargs: object) -> None:
-        # _supervise below stubs configure_logging out; a forwarder that installs is this arm.
-        monkeypatch.setattr(cli, "configure_logging", lambda *a, **k: True)
+        # _supervise below stubs configure_logging out; its return says whether one installed.
+        monkeypatch.setattr(cli, "configure_logging", lambda *a, **k: forwarder)
         configure(None)
 
     _stand_down_the_gates_before_logging(monkeypatch)
@@ -303,9 +322,8 @@ def test_supervise_logs_the_audit_line_again_for_the_forwarder(
         _supervise(tmp_path, monkeypatch, _ON, accept=True)
     lines = _audit_lines(caplog, "start the fleet")
     relogged = "(Logged again for the off-box forwarder.)"
-    assert len(lines) == 2 and not lines[0].endswith(relogged) and lines[1].endswith(relogged), (
-        lines
-    )
+    assert not lines[0].endswith(relogged), lines
+    assert [line.endswith(relogged) for line in lines[1:]] == ([True] if forwarder else []), lines
 
 
 # --- a real interpreter, started both ways ---------------------------------------------------------
@@ -331,7 +349,7 @@ def _real_serve(tmp_path: Path, *options: str) -> subprocess.CompletedProcess[st
         env=_child_env(),
         capture_output=True,
         text=True,
-        timeout=50,  # under the suite's 60 s pytest-timeout
+        timeout=45,  # with the probe's 10 s, under the suite's 60 s pytest-timeout
         check=False,
     )
 
@@ -347,7 +365,7 @@ def test_a_real_start_with_the_interface_on_refuses(tmp_path: Path) -> None:
         env=_child_env(),
         capture_output=True,
         text=True,
-        timeout=50,
+        timeout=10,
         check=True,
     )
     if probe.stdout.strip() != "True":

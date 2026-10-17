@@ -16,9 +16,14 @@
  *  `ModuleNotFoundError: No module named 'pydantic'` a hand-run `python -m messagefoundry serve` produces. */
 export const PREFLIGHT_IMPORT = "messagefoundry.config.models";
 
+/** The interpreter options every engine command the IDE starts takes. `-P` keeps the working
+ *  directory off the import path, so the preflight, provision-admin and serve import the same
+ *  engine; `-X disable-remote-debug` is what serve's enforce refusal names (vault BACKLOG #2700). */
+export const INTERPRETER_OPTIONS: readonly string[] = ["-P", "-X", "disable-remote-debug"];
+
 /** The argv for the preflight import check (`python <these>`). */
 export function preflightArgs(): string[] {
-  return ["-c", `import ${PREFLIGHT_IMPORT}`];
+  return [...INTERPRETER_OPTIONS, "-c", `import ${PREFLIGHT_IMPORT}`];
 }
 
 /**
@@ -40,10 +45,15 @@ export function buildServeInvocation(opts: {
   return {
     command: opts.python,
     // Vault BACKLOG #2700: under the default enforce, serve refuses to start with the
-    // interpreter's remote debugging on; -P keeps the working directory off the import path. The
-    // argv is the launch that refusal names.
-    args: ["-P", "-X", "disable-remote-debug", "-m", "messagefoundry", "serve", "--config", opts.configDir],
+    // interpreter's remote debugging on. The argv is the launch that refusal names.
+    args: [...INTERPRETER_OPTIONS, "-m", "messagefoundry", "serve", "--config", opts.configDir],
   };
+}
+
+/** The pill's Start command as one line, for the clipboard and for hints: the same argv as
+ *  {@link buildServeInvocation}, with `python` for the interpreter. */
+export function serveCommandLine(configDir: string): string {
+  return ["python", ...buildServeInvocation({ python: "python", configDir }).args].join(" ");
 }
 
 /** The outcome of the interpreter preflight, each with a DIFFERENT remedy. */
@@ -164,7 +174,7 @@ export function buildProvisionInvocation(opts: { python: string } & AdminDetails
   command: string;
   args: string[];
 } {
-  const args = ["-m", "messagefoundry", "provision-admin", `--username=${opts.username}`, `--email=${opts.email.trim()}`];
+  const args = [...INTERPRETER_OPTIONS, "-m", "messagefoundry", "provision-admin", `--username=${opts.username}`, `--email=${opts.email.trim()}`];
   return { command: opts.python, args };
 }
 

@@ -1,8 +1,9 @@
 # Running the engine as a Windows service
 
 MessageFoundry runs as a long-lived background service via
-[NSSM](https://nssm.cc) (the "Non-Sucking Service Manager"). NSSM wraps the existing
-`messagefoundry serve` command: it starts the engine on boot, restarts it on crash,
+[NSSM](https://nssm.cc) (the "Non-Sucking Service Manager"). NSSM wraps the engine's
+`serve` command, run as `python -I -X disable-remote-debug -m messagefoundry serve`: it starts
+the engine on boot, restarts it on crash,
 and captures its output to rotating log files. Stopping the service sends Ctrl+C so the
 engine drains its connections cleanly (the ASGI lifespan calls `engine.stop()`).
 
