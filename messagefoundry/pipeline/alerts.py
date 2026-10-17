@@ -104,7 +104,9 @@ def config_changed_detail(
     The alert instance's reason column keeps only about the first 200 characters, and its cut drops
     a token that straddles the limit whole. So the baseline's time and node lead, and a node id
     longer than :data:`_DETAIL_NODE_MAX` is shortened here, which keeps the whole line inside the
-    cut; the event carries the node whole (vault BACKLOG #2944)."""
+    cut for a baseline action name of up to 36 characters; the event carries the node whole (vault
+    BACKLOG #2944). The store's redaction replaces the ISO time in that column as date-shaped text,
+    so there it reads ``[redacted]``; the event's ``baseline_at`` carries it whole."""
     node = _short_node(baseline_node) if baseline_node else "unknown"
     return (
         f"baseline {baseline_at or 'unknown'} on node {node} ({baseline_action}): started on "

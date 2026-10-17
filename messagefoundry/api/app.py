@@ -298,11 +298,7 @@ from messagefoundry.config.ai_policy import (
     resolve_effective_policy,
 )
 from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
-from messagefoundry.config.fingerprint import (
-    UNREADABLE_FILES_KEY,
-    fingerprint_matches,
-    whole_fingerprint,
-)
+from messagefoundry.config.fingerprint import digest_coverage, fingerprint_matches
 from messagefoundry.config.memory_encryption import (
     READOUT_DISCLAIMER,
     platform_memory_encryption_readout,
@@ -1889,7 +1885,9 @@ _CONFIG_BASELINE_WINDOW = 50
 #: one, so the change the unchecked start could not see is still reported. A start row that a reload
 #: superseded before it was written carries it too (vault BACKLOG #2838): its digest is no baseline.
 #: So does an inline or released reload's row written after a later reload or a flag toggle moved
-#: the loaded fingerprint on (vault BACKLOG #2257), and a convergence reload's row with no digest.
+#: the loaded fingerprint on (vault BACKLOG #2257), and a convergence reload's row with no digest
+#: or a partial one. So does a start whose digest is partial or whose directory changed while it
+#: loaded (vault BACKLOG #2944).
 _BASELINE_UNCHECKED = "baseline_unchecked"
 
 #: What a start's ``config_loaded`` row records as ``comparison``.
@@ -1993,34 +1991,42 @@ async def _compare_start_config(
     cannot change what this start is said to have loaded. Only the ``fingerprint`` key is compared,
     since ``git_head``, ``dir`` and ``node`` differ between nodes running the same bytes.
 
-    ``before_load`` is the digest the caller took of the same directory just before the load
+    ``before_load`` is the digest the caller took of the directory it loads, just before the load
     (vault BACKLOG #2944). The start's own digest is taken after the load, so an edit between the
     two reads would be recorded as loaded, and the next start would then see no change. When the
     two digests differ, or the first could not be taken, the outcome is ``changed_during_load``.
-    A start digest that left a file out (``unreadable_files``) is ``partial_start_digest``: a file
-    held by an antivirus lock at one start and not at the next would otherwise alert on the same
-    bytes.
+    Two reads cannot see an edit that lands and is reverted between them: the load then ran bytes
+    neither digest names, and the start reads as unchanged.
+
+    Digests are compared like for like (:func:`digest_coverage`): one that left out files it could
+    not read is compared only with one that left out the same files. A file held by an antivirus
+    lock at one start and not at the next would otherwise alert on the same bytes. A start whose
+    partial digest meets a baseline that covers other files is ``partial_start_digest``; a whole
+    start that meets a partial baseline reads it as a degraded baseline.
 
     Only ``compared`` carries a comparison. ``read_failed``, ``no_start_digest``,
     ``partial_start_digest`` and ``changed_during_load`` leave the start unchecked
     (:data:`_UNCHECKED_OUTCOMES`), so a later start compares against the last checked row instead.
-    A fresh store, a degraded baseline (one with no digest, or a partial one) or a new scheme each
-    starts a new baseline, since passing over those rows would leave every later start in the same
-    place. It never raises, except on cancellation: the read is bounded by
+    A file that stays unreadable therefore holds every start unchecked, with a WARNING naming it,
+    until the look-back window fills and a start begins a new baseline that left out the same
+    file. A fresh store, a degraded baseline (one with no digest, or a partial one) or a new scheme
+    each starts a new baseline, since passing over those rows would leave every later start in the
+    same place. It never raises, except on cancellation: the read is bounded by
     :data:`_CONFIG_BASELINE_TIMEOUT_SECONDS`, and any failure, in the read or in a row it returns,
     is logged at WARNING and costs only the comparison."""
-    current = snapshot.get("fingerprint") if snapshot is not None else None
-    if snapshot is None or not isinstance(current, str) or not current:
+    start = digest_coverage(snapshot)
+    if snapshot is None or start is None:
         _log.info("config change check skipped: this start has no config fingerprint")
         return "no_start_digest", None
-    if snapshot.get(UNREADABLE_FILES_KEY):
+    current, left_out = start
+    if left_out:
         _log.warning(
-            "config change check skipped: this start's config fingerprint left out %s file(s) it "
-            "could not read, so it is no record of what loaded",
-            snapshot.get(UNREADABLE_FILES_KEY),
+            "config change check: this start's config fingerprint left out what it could not "
+            "read: %s",
+            scrub_log_argument(", ".join(left_out)),
         )
-        return "partial_start_digest", None
-    if not fingerprint_matches(whole_fingerprint(before_load), current):
+    before = digest_coverage(before_load)
+    if before is None or before[1] != left_out or not fingerprint_matches(before[0], current):
         _log.warning(
             "config change check skipped: the config directory changed while this start loaded "
             "it, or could not be read just before the load, so its digest may name bytes this "
@@ -2056,11 +2062,25 @@ async def _compare_start_config(
             else:
                 _log.info("config change check: no earlier config row; this start is the baseline")
             return "no_baseline", None
-        previous = whole_fingerprint(detail)
-        if previous is None:
+        baseline = digest_coverage(detail)
+        if baseline is None:
             _log.info(
-                "config change check skipped: the store's newest usable %s row has no fingerprint, "
-                "or one that left out a file it could not read",
+                "config change check skipped: the store's newest usable %s row has no fingerprint",
+                row.get("action"),
+            )
+            return "degraded_baseline", None
+        previous, baseline_left_out = baseline
+        if baseline_left_out != left_out:
+            if left_out:
+                _log.warning(
+                    "config change check skipped: this start's fingerprint left out files the "
+                    "store's newest usable %s row covered, so the two are not comparable",
+                    row.get("action"),
+                )
+                return "partial_start_digest", None
+            _log.info(
+                "config change check skipped: the store's newest usable %s row has a fingerprint "
+                "that left out a file it could not read",
                 row.get("action"),
             )
             return "degraded_baseline", None
@@ -10256,7 +10276,10 @@ def create_managed_app(
             # A row with no digest would be the newest baseline and leave the next start nothing
             # to compare against. Unlike an operator's row, one lands per follower per cluster
             # reload, so it is marked and a later start passes over it to a digest-bearing row.
-            no_digest = "config_fingerprint" in failed
+            # A partial digest is no baseline for a start that can read the whole directory
+            # either (vault BACKLOG #2944).
+            coverage = digest_coverage(outcome.fingerprint)
+            no_digest = "config_fingerprint" in failed or coverage is None or bool(coverage[1])
             await _record_reload_audit(
                 engine,
                 actor=_CONVERGENCE_ACTOR,
@@ -10283,14 +10306,20 @@ def create_managed_app(
                 # Before the load reads the directory, so a sibling's reload that lands after it is
                 # still converged on (vault BACKLOG #3076). Never raises; a no-op on a single node.
                 await engine.seed_config_version()
-                # The same directory's digest just before the load, set against the one taken just
-                # after it below, so an edit between the load and that digest leaves this start
-                # unchecked rather than recorded as loaded (vault BACKLOG #2944). Never raises.
-                before_load, _reason = (
-                    await engine.fingerprint_bundle(engine.config_dir)
-                    if engine.config_dir is not None
-                    else (None, None)
-                )
+                # The digest of the directory the load reads, just before it, set against the
+                # one taken just after it below, so an edit between the load and that digest
+                # leaves this start unchecked rather than recorded as loaded (vault BACKLOG #2944).
+                # Audit only, so it never refuses a start (#2597 step 5): a failure leaves None,
+                # which reads as a changed directory.
+                before_load: Mapping[str, object] | None = None
+                try:
+                    before_load, _reason = await engine.fingerprint_bundle(Path(config_dir))
+                except Exception as exc:  # noqa: BLE001 - see the comment above
+                    _log.warning(
+                        "the start could not digest its config before the load (%s); it checks "
+                        "no config change",
+                        type(exc).__name__,
+                    )
                 loaded = load_config(config_dir)
                 # Before the shard filter, as the reload path does inside the engine: the guard judges
                 # the whole graph.
@@ -10330,6 +10359,10 @@ def create_managed_app(
                 )
                 # This process cannot vouch for a config it never checked: its flag rows say so.
                 engine.config_baseline_unchecked = start_outcome in _UNCHECKED_OUTCOMES
+                if start_outcome == "changed_during_load":
+                    # The digest may name bytes this process never loaded, so the provenance route
+                    # and a DR activation must not vouch for it (vault BACKLOG #2944).
+                    engine.loaded_config_fingerprint = None
                 # Raised here, before engine.start(), so new bytes that make the start itself fail
                 # still page on every attempt of a crash loop. Never raises.
                 if start_config is not None and start_config.changed:

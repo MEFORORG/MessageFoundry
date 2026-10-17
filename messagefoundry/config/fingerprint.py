@@ -39,8 +39,8 @@ __all__ = [
     "config_fingerprint",
     "config_fingerprint_detail",
     "fingerprint_matches",
+    "digest_coverage",
     "is_missing_directory",
-    "whole_fingerprint",
 ]
 
 # Version the scheme so a future change to *what* is hashed (or *how*) is itself detectable in the
@@ -55,10 +55,12 @@ _SCHEME = b"mefor-cfg-fp:v2\n"
 #: as a changed config (vault BACKLOG #2597).
 FINGERPRINT_SCHEME = _SCHEME.decode("ascii").strip()
 
-#: The :func:`config_fingerprint_detail` key that marks a partial digest: how many covered files, or
-#: folders a glob reads, could not be read and were left out (vault BACKLOG #2944). Absent when the
-#: digest covers the whole bundle. Not ``degraded``: an audit row merges this detail into its own,
-#: and there ``degraded`` already names failed reload steps.
+#: The :func:`config_fingerprint_detail` key that marks a partial digest: the sorted relative paths of
+#: the covered files, and of the folders a glob reads, that could not be read and were left out
+#: (vault BACKLOG #2944). Absent when the digest covers the whole bundle. Paths, not a count, so two
+#: partial digests can be compared like for like, and an operator can tell which file to fix. Not
+#: ``degraded``: an audit row merges this detail into its own, and there ``degraded`` already names
+#: failed reload steps.
 UNREADABLE_FILES_KEY = "unreadable_files"
 
 # Every file ``load_config`` consumes that defines the running graph's behaviour, transport config,
@@ -123,7 +125,7 @@ def _iter_entries(base: Path, *, strict: bool, unreadable: set[str]) -> list[tup
     except OSError as exc:
         if strict:
             raise
-        unreadable.add(exc.filename if isinstance(exc.filename, str) else str(base))
+        unreadable.add(_relative(exc.filename, base))
     seen: set[Path] = set()
     entries: list[tuple[str, bytes]] = []
     globbed = (path for pattern in _FINGERPRINT_GLOBS for path in base.glob(pattern))
@@ -147,6 +149,17 @@ def _iter_entries(base: Path, *, strict: bool, unreadable: set[str]) -> list[tup
         entries.append((rel, hashlib.sha256(data).digest()))
     entries.sort()
     return entries
+
+
+def _relative(filename: object, base: Path) -> str:
+    """``filename``, an error's path, relative to ``base`` as a POSIX path; ``.`` for ``base``
+    itself or for an error that names no path under it."""
+    if not isinstance(filename, str):
+        return "."
+    try:
+        return Path(filename).relative_to(base).as_posix()
+    except ValueError:
+        return "."
 
 
 def _require_listable(base: Path) -> None:
@@ -222,10 +235,10 @@ def config_fingerprint_detail(directory: str | Path) -> dict[str, object]:
     ``files`` (int), and optionally ``git_head``.
 
     It stays best-effort: a file it cannot read is left out of the digest. But it says so, under
-    :data:`UNREADABLE_FILES_KEY` (the count of files and folders left out), present only when one
-    was. A digest of part of a bundle is no record of the bundle: a file held by an antivirus lock
-    at one start and not at the next gives two digests for the same bytes, so a reader that
-    compares digests passes over a partial one (vault BACKLOG #2944). The strict digest a
+    :data:`UNREADABLE_FILES_KEY` (the files and folders left out), present only when one was. Two
+    digests describe the same files only when they left out the same ones: a file held by an
+    antivirus lock at one start and not at the next gives two digests for the same bytes. A reader
+    that compares digests uses :func:`digest_coverage` (vault BACKLOG #2944). The strict digest a
     dual-control approval binds is :func:`config_fingerprint` with ``strict``, which raises instead.
     """
     base = Path(directory)
@@ -237,22 +250,31 @@ def config_fingerprint_detail(directory: str | Path) -> dict[str, object]:
         "files": len(entries),
     }
     if unreadable:
-        detail[UNREADABLE_FILES_KEY] = len(unreadable)
+        detail[UNREADABLE_FILES_KEY] = sorted(unreadable)
     head = _git_head(base)
     if head is not None:
         detail["git_head"] = head
     return detail
 
 
-def whole_fingerprint(detail: Mapping[str, object] | None) -> str | None:
-    """The ``fingerprint`` of a :func:`config_fingerprint_detail`, or ``None`` when there is none or
-    it left out a file it could not read (:data:`UNREADABLE_FILES_KEY`). A partial digest is no
-    record of the bundle, so a reader that compares digests treats it as absent (vault BACKLOG
-    #2944)."""
-    if detail is None or detail.get(UNREADABLE_FILES_KEY):
+def digest_coverage(detail: Mapping[str, object] | None) -> tuple[str, tuple[str, ...]] | None:
+    """The ``fingerprint`` of a :func:`config_fingerprint_detail` with what it left out, or ``None``
+    when it has no fingerprint (vault BACKLOG #2944).
+
+    Two digests are comparable only when their second elements are equal: then they cover the same
+    files, and differ only when one of those files did. An ``unreadable_files`` value that is not a
+    list of strings reads as ``("?",)``, which equals no list a digest records."""
+    if detail is None:
         return None
     fingerprint = detail.get("fingerprint")
-    return fingerprint if isinstance(fingerprint, str) and fingerprint else None
+    if not isinstance(fingerprint, str) or not fingerprint:
+        return None
+    left_out = detail.get(UNREADABLE_FILES_KEY)
+    if left_out is None:
+        return fingerprint, ()
+    if isinstance(left_out, list) and all(isinstance(rel, str) for rel in left_out):
+        return fingerprint, tuple(left_out)
+    return fingerprint, ("?",)
 
 
 def fingerprint_matches(current: object, loaded: str) -> bool:

@@ -1024,7 +1024,7 @@ async def test_a_start_whose_digest_left_out_a_file_raises_no_alert_and_is_passe
         _unreadable(m, "cfg.py")
         partial = await _start(tmp_path, cfg)
     assert alerts == []
-    assert partial[-1][UNREADABLE_FILES_KEY] == 1
+    assert partial[-1][UNREADABLE_FILES_KEY] == ["cfg.py"]
     assert partial[-1]["comparison"] == "partial_start_digest"
     assert partial[-1]["baseline_unchecked"] is True
     # The next start, with the file readable again, passes over the partial row.
@@ -1048,7 +1048,11 @@ async def test_a_partial_baseline_raises_no_alert(
             "config_reload",
             actor="alice",
             detail=json.dumps(
-                {"fingerprint": "f" * 64, "scheme": FINGERPRINT_SCHEME, UNREADABLE_FILES_KEY: 1}
+                {
+                    "fingerprint": "f" * 64,
+                    "scheme": FINGERPRINT_SCHEME,
+                    UNREADABLE_FILES_KEY: ["codesets/x.csv"],
+                }
             ),
         )
     finally:
@@ -1076,11 +1080,16 @@ async def test_an_edit_during_the_start_load_leaves_the_start_unchecked(
 
     with monkeypatch.context() as m:
         m.setattr(app_module, "load_config", _load_then_revert)
-        rows = await _start(tmp_path, cfg)
+        app = _app(tmp_path, cfg)
+        async with app.router.lifespan_context(app):
+            engine: Engine = app.state.engine
+            provenance_after = engine.loaded_config_fingerprint
+            rows = await _start_rows(engine)
     assert config_fingerprint(cfg) == before, "control: the digest after the load matches"
     assert alerts == []
     assert rows[-1]["comparison"] == "changed_during_load"
     assert rows[-1]["baseline_unchecked"] is True
+    assert provenance_after is None, "the digest may name bytes the process never loaded"
     # The next start passes over that row to the checked one.
     _edit(cfg)
     rows = await _start(tmp_path, cfg)
@@ -1142,3 +1151,64 @@ async def test_the_config_changed_reason_survives_a_long_node_sqlite(tmp_path: P
         await check_config_changed_reason_survives_a_long_node(store)
     finally:
         await store.close()
+
+
+async def test_two_digests_that_left_out_the_same_file_are_compared(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """Item 4, review round 1: a file that stays unreadable must not turn the check off. Digests
+    that left out the same files cover the same files, so they compare like for like."""
+    (cfg / "_locked.py").write_text("LOCKED = 1\n", encoding="utf-8")
+    with monkeypatch.context() as m:
+        _unreadable(m, "_locked.py")
+        first = await _start(tmp_path, cfg)
+        assert first[-1]["comparison"] == "no_baseline"
+        rows = await _start(tmp_path, cfg)
+        assert alerts == []
+        assert rows[-1]["comparison"] == "compared" and rows[-1]["changed"] is False
+        _edit(cfg)
+        rows = await _start(tmp_path, cfg)
+    assert len(alerts) == 1, "an edit to a file both digests cover is reported"
+    assert rows[-1]["comparison"] == "compared" and rows[-1]["changed"] is True
+
+
+async def test_a_convergence_row_with_a_partial_digest_is_passed_over(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """Review round 1: a partial convergence digest is no baseline for a start that reads the whole
+    directory, so it is marked unchecked like one with no digest."""
+    before = config_fingerprint(cfg)
+    await _start(tmp_path, cfg)
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        with monkeypatch.context() as m:
+            _unreadable(m, "cfg.py")
+            await engine._converge_reload()
+        reload_rows = await engine.store.list_audit(action="config_reload")
+    row = json.loads(reload_rows[0]["detail"])
+    assert row[UNREADABLE_FILES_KEY] == ["cfg.py"] and row["baseline_unchecked"] is True
+    _edit(cfg)
+    rows = await _start(tmp_path, cfg)
+    assert rows[-1]["comparison"] == "compared"
+    assert len(alerts) == 1 and alerts[0]["previous_fingerprint"] == before
+
+
+async def test_a_failed_digest_before_the_load_never_blocks_the_start(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    await _start(tmp_path, cfg)
+    real = Engine.fingerprint_bundle
+    calls: list[Path] = []
+
+    async def _first_raises(self: Engine, path: Path) -> Any:
+        calls.append(path)
+        if len(calls) == 1:
+            raise RuntimeError("synthetic")
+        return await real(self, path)
+
+    with monkeypatch.context() as m:
+        m.setattr(Engine, "fingerprint_bundle", _first_raises)
+        rows = await _start(tmp_path, cfg)  # asserts the graph is serving
+    assert rows[-1]["comparison"] == "changed_during_load"
+    assert alerts == []

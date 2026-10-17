@@ -22,6 +22,7 @@ from messagefoundry.config.fingerprint import (
     ConfigDirMissing,
     config_fingerprint,
     config_fingerprint_detail,
+    digest_coverage,
 )
 
 _HEXDIGITS = set("0123456789abcdef")
@@ -242,7 +243,8 @@ def test_the_detail_marks_a_digest_that_left_out_a_file_it_could_not_read(
     assert UNREADABLE_FILES_KEY not in config_fingerprint_detail(d), "control: a whole bundle"
     _unreadable(monkeypatch, name)
     detail = config_fingerprint_detail(d)
-    assert detail[UNREADABLE_FILES_KEY] == 1
+    rel = "cfg.py" if name == "cfg.py" else "environments/dev.toml"
+    assert detail[UNREADABLE_FILES_KEY] == [rel]
     # Still best-effort: the rest is digested, as config_fingerprint's default does.
     assert detail["files"] == 4 and detail["fingerprint"] == config_fingerprint(d)
 
@@ -260,7 +262,7 @@ def test_the_detail_marks_a_digest_whose_folder_could_not_be_listed(
         return real_scandir(path)
 
     monkeypatch.setattr(os, "scandir", _scandir)
-    assert config_fingerprint_detail(d)[UNREADABLE_FILES_KEY] == 1
+    assert config_fingerprint_detail(d)[UNREADABLE_FILES_KEY] == ["codesets"]
     monkeypatch.undo()
     shutil.rmtree(d / "codesets")
     # The control: a folder that is absent left nothing out.
@@ -272,3 +274,19 @@ def test_the_detail_of_a_missing_directory_is_an_empty_bundle_and_not_partial(
 ) -> None:
     detail = config_fingerprint_detail(tmp_path / "gone")
     assert detail["files"] == 0 and UNREADABLE_FILES_KEY not in detail
+
+
+@pytest.mark.parametrize(
+    ("detail", "expected"),
+    [
+        ({"fingerprint": "f"}, ("f", ())),
+        ({"fingerprint": "f", UNREADABLE_FILES_KEY: ["a.py", "b.py"]}, ("f", ("a.py", "b.py"))),
+        ({"fingerprint": "f", UNREADABLE_FILES_KEY: 1}, ("f", ("?",))),
+        ({"fingerprint": ""}, None),
+        ({}, None),
+        (None, None),
+    ],
+    ids=["whole", "partial", "not-a-list", "empty", "no-fingerprint", "none"],
+)
+def test_digest_coverage(detail: dict[str, object] | None, expected: object) -> None:
+    assert digest_coverage(detail) == expected
