@@ -16,9 +16,11 @@ subagent is refused outright and from a session asks the owner. Closing the venv
 prompt-free entry point usable. Both behaviours are recorded once, in docs/WORKTREES.md section "Start
 the session in the worktree".
 
-WHAT IS ASSERTED HERE, AND WHAT IS NOT. The refusal and no-op paths are DRIVEN as a subprocess -- they
-are fast and touch nothing. The install path is not executed: it creates a venv and downloads the
-world, which is minutes of I/O per run. Its two invariants (extras parity with ``ci.yml``, and
+WHAT IS ASSERTED HERE, AND WHAT IS NOT. The refusal, no-op and import-check paths are DRIVEN as a
+subprocess, against a real venv that has NO PIP. The install is never completed: it downloads the
+world, which is minutes of I/O per run. A test that reaches the install line instead proves it did so
+by pip's absence ("No module named pip"), so a venv fixture that gained pip would turn those tests into
+real installs. Its two invariants (extras parity with ``ci.yml``, and
 ``--constraint constraints.lock``) are held by the two tests that already owned them and now read this
 file instead of ``new.ps1``.
 
@@ -165,6 +167,37 @@ def test_a_web_console_copy_that_matches_the_source_is_accepted(
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "messagefoundry_webconsole OK copy-matching-source" in proc.stdout
     assert "nothing to do" in proc.stdout
+
+
+def test_a_tool_cache_in_the_source_does_not_make_a_current_copy_stale(
+    tmp_path: Path, _template_venv: Path
+) -> None:
+    """A cache a tool writes into the source never reaches the copy. Counting it would fail a fresh
+    copy, and the reinstall after it, on every run."""
+    root, site = _venv_checkout(tmp_path, _template_venv)
+    name = "messagefoundry_webconsole"
+    _plant_copy(site, root, name, stale=False)
+    (root / name / ".mypy_cache").mkdir()
+    (root / name / ".mypy_cache" / "cache.json").write_text("{}", encoding="utf-8")
+
+    proc = _run("-Path", str(root))
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert f"{name} OK copy-matching-source" in proc.stdout
+
+
+def test_sqlserver_takes_the_install_even_when_both_packages_are_current(
+    tmp_path: Path, _template_venv: Path
+) -> None:
+    """-Sqlserver asks for an extra the import check cannot see, so it must not read as a no-op."""
+    root, _site = _venv_checkout(tmp_path, _template_venv)
+
+    proc = _run("-Path", str(root), "-Sqlserver")
+
+    assert proc.returncode != 0, proc.stdout
+    assert "nothing to do" not in proc.stdout
+    assert "for -Sqlserver" in proc.stdout
+    assert "No module named pip" in proc.stdout + proc.stderr
 
 
 @pytest.mark.parametrize("name", ["messagefoundry_webconsole", "messagefoundry"])

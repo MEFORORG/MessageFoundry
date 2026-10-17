@@ -23,7 +23,8 @@
     and read the dry run first.
 
     THE CHECKS, in the order the receipt prints them. The first refusal stops that target. THIS LIST
-    IS THE ONE SOURCE: docs/WORKTREES.md points here without naming them, so change them here only.
+    IS THE ONE SOURCE for what each check refuses: docs/WORKTREES.md points here without naming them.
+    Its own table of whose folder waits how long repeats the idle windows, so change both.
 
       spelling    The path must be drive-absolute and spelled plainly. Refused: a UNC or device path,
                   a relative path, a '.' or '..' component, a component ending in a dot or a space
@@ -323,8 +324,9 @@ function Get-Remains([string]$Dir) {
 }
 
 # Whether a directory above a target is a git checkout or a bare repository: the refusal text, or ''.
-# Kept for the whole run, so the temp root, which every target shares and which can hold thousands of
-# entries, is listed once per run rather than once per target. A listing that throws is not kept.
+# Only the temp root's answer is kept for the run: every target shares it and it can hold thousands of
+# entries. A folder below it is listed fresh for each target, because a -Delete run can take minutes
+# and a checkout made there meanwhile must still refuse. A listing that throws is not kept.
 $gitShapeAbove = @{}
 function Get-GitShapeAbove([string]$Dir) {
     if ($gitShapeAbove.ContainsKey($Dir)) { return $gitShapeAbove[$Dir] }
@@ -332,7 +334,7 @@ function Get-GitShapeAbove([string]$Dir) {
     $why = ''
     if ($names -contains '.git') { $why = "the target sits inside the git checkout at '$Dir'" }
     elseif (Test-BareShape $names) { $why = "the target sits inside the bare git repository at '$Dir'" }
-    $gitShapeAbove[$Dir] = $why
+    if ($Dir -ieq $realRoot) { $gitShapeAbove[$Dir] = $why }
     return $why
 }
 
@@ -661,11 +663,12 @@ foreach ($raw in $Path) {
                 $found = @()
                 try { $found = Get-Remains $tomb }
                 catch { $failures.Add("what remains could not be listed: $($_.Exception.Message)") }
-                if ($null -eq $found) { $where = "is gone, but $($failures.Count) failure(s) were recorded on the way" }
-                else {
-                    $remains = @($found)
-                    $where = "holds $($remains.Count) entr$(if ($remains.Count -eq 1) { 'y' } else { 'ies' })"
-                }
+                # Gone by the time it was listed, with nothing failed on the way, is a clean delete.
+                if ($null -eq $found) { $gone = $failures.Count -eq 0 }
+                else { $remains = @($found) }
+            }
+            if (-not $gone) {
+                $where = if ($null -eq $found) { "is gone, but $($failures.Count) failure(s) were recorded on the way" } else { "holds $($remains.Count) entr$(if ($remains.Count -eq 1) { 'y' } else { 'ies' })" }
                 $verdict = "PARTIAL $($res.Full): the delete stopped part-way. The tree was renamed to '$tomb', which $where."
                 $counts.partial++
             }

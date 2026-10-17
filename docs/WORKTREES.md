@@ -146,18 +146,21 @@ pwsh -NoProfile -File scripts\worktree\ensure-venv.ps1
 ```
 
 **before its first `pytest`, `mypy` or `ruff` run** -- not at the top of every brief. On a worktree that
-already has an environment the script prints one line and returns, but a **fresh** managed worktree
+already has an environment the script checks where the engine and the web console import from, and
+returns without installing when both come from this checkout. A **fresh** managed worktree
 always takes the full install: measured here, **47 seconds and 887 MB** with a warm pip cache. A worker
 that runs no checks should not pay that, and 39 of the 86 nested worktrees on this machine would.
 
 **Keeping managed worktrees inherits a staleness mode the sibling pattern did not have.** The script
-decides freshness by file EXISTENCE, so a venv is only as current as the day it was built. A
-disposable sibling made and removed inside a day never meets a `constraints.lock` bump. A managed
-worktree is likelier to be **kept** -- that is much of its appeal -- and a kept one outlives lock bumps
-while the script correctly reports nothing to do. So if you keep them, **delete `.venv` and re-run** is
-a habit rather than a footnote: reach for it whenever a reused worktree gives a lint or type result CI
-disagrees with. There is deliberately no `-Force`; an untested refresh path on a script whose contract
-is "run it and it does the right thing" is a second, quieter way for it to lie.
+reinstalls when a package imports from somewhere else, such as a stale web console copy (BACKLOG
+#2857). It does not compare installed versions against `constraints.lock`, so a venv's dependencies
+are only as current as the day it was built. A disposable sibling made and removed inside a day never
+meets a lock bump. A managed worktree is likelier to be **kept** -- that is much of its appeal -- and a
+kept one outlives lock bumps while the script reports nothing to do. So if you keep them, **delete
+`.venv` and re-run** is a habit rather than a footnote: reach for it whenever a reused worktree gives a
+lint or type result CI disagrees with. The web console copy also goes stale again the moment its
+source changes, so re-run the script after editing `messagefoundry_webconsole/`. There is deliberately
+no `-Force`.
 
 Raised 2026-09-16 by a manager who had just removed five same-day siblings and pointed out that the
 trap does not reach that pattern at all -- which is the point: this recommendation moves people onto

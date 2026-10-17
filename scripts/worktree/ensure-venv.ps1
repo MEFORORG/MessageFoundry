@@ -69,7 +69,8 @@ $venvPy = Join-Path $venv "Scripts\python.exe"
 # One line per package: "<name> OK <how> <dir>" or "<name> BAD <why>".
 #
 # -I, which includes -P, so the answer cannot come from the current directory, PYTHONPATH or the
-# user site. find_spec locates a package without running its code, so a stale copy is never executed.
+# user site. -X utf8 because -I also drops PYTHONUTF8, and a piped stdout would otherwise use the ANSI
+# code page and fail on a checkout path it cannot encode. find_spec locates a package without running its code, so a stale copy is never executed.
 #
 # THE WEB CONSOLE IS NEVER TRULY EDITABLE. Its import package lives at the repo root and its build
 # pulls it in with hatch force-include, so even `pip install -e packaging/messagefoundry-webconsole`
@@ -81,12 +82,14 @@ import filecmp, importlib.util, os, sys
 
 root = sys.argv[1]
 
+# Bytecode and tool caches are left out of both trees. A cache a tool writes into the source (a
+# .mypy_cache, say) never reaches the copy, so counting it would fail a fresh copy on every run.
 def files(top):
     out = {}
     for base, dirs, names in os.walk(top):
-        dirs[:] = [d for d in dirs if d != '__pycache__']
+        dirs[:] = [d for d in dirs if d != '__pycache__' and not d.startswith('.')]
         for n in names:
-            if not n.endswith(('.pyc', '.pyo')):
+            if not n.endswith(('.pyc', '.pyo')) and n != '.DS_Store':
                 p = os.path.join(base, n)
                 out[os.path.relpath(p, top)] = os.path.getsize(p)
     return out
@@ -118,7 +121,7 @@ for name in ('messagefoundry', 'messagefoundry_webconsole'):
 '@
 
 function Get-ImportState {
-    $lines = @($importCheck | & $venvPy -I - $root 2>&1 | ForEach-Object { "$_" })
+    $lines = @($importCheck | & $venvPy -I -X utf8 - $root 2>&1 | ForEach-Object { "$_" })
     if ($LASTEXITCODE -ne 0 -or $lines.Count -ne 2) {
         throw "The venv interpreter could not run the import check (exit $LASTEXITCODE): $($lines -join ' | '). Delete $venv and run this script again."
     }
@@ -144,14 +147,16 @@ $extras = if ($Sqlserver) { "dev,harness,fhir,dicom,x12,xml,webauthn,vault,sftp,
 if (Test-Path -LiteralPath $venvPy) {
     $state = Get-ImportState
     $bad = @(Select-Bad $state)
-    if ($bad.Count -eq 0) {
+    if ($bad.Count -eq 0 -and -not $Sqlserver) {
         Write-Host "venv already present and both packages import from this checkout, nothing to do: $venvPy" -ForegroundColor Green
         $state | ForEach-Object { Write-Host "  $_" }
         return
     }
     # The one install line below reinstalls both. pip always reinstalls an editable requirement, and
     # a second declaration of the line is the drift the two text tests in the header exist to catch.
-    Write-Host "venv already present, but it imports a package from outside this checkout; reinstalling .[$extras] and the web console:" -ForegroundColor Yellow
+    # -Sqlserver asks for an extra the import check cannot see, so it always takes the install.
+    if ($bad.Count -eq 0) { Write-Host "venv already present; installing .[$extras] for -Sqlserver:" -ForegroundColor Yellow }
+    else { Write-Host "venv already present, but it imports a package from outside this checkout; reinstalling .[$extras] and the web console:" -ForegroundColor Yellow }
     $bad | ForEach-Object { Write-Host "  $_" }
 }
 else {
