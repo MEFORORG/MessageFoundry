@@ -325,9 +325,9 @@ def warn_url_query_credentials(label: str, settings: Mapping[str, Any]) -> None:
     Called from :func:`check_egress_allowed`, the one function every outbound build path runs (at
     least check, start, operator start and test), and from :func:`check_fhir_lookup_allowed`, its
     FhirLookup twin. Both run on env-resolved settings, so this sees a URL that ``env()`` supplied.
-    A reload's own rebuilds skip it, because that reload's build check already warned;
-    :func:`check_egress_allowed` says how. docs/SECURITY-LOOSENING.md is the source of record for
-    where it fires.
+    A reload that replaces a running graph skips it on its rebuilds, because that reload's build
+    check already warned; :func:`check_egress_allowed` says how. docs/SECURITY-LOOSENING.md is the
+    source of record for where it fires.
     ``config.wiring.query_credential_hops`` is the graph-side reader for ``check`` and the posture
     registry, and walks the same two tables."""
     url = settings.get("url")

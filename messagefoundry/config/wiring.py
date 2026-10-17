@@ -5919,7 +5919,8 @@ def query_credential_hops(registry: Registry) -> list[tuple[str, str]]:
     it nowhere else, so it is reported rather than refused.
 
     It reads a literal ``url`` only. An ``env()`` URL is unresolved here and cannot be read; the
-    construction WARNING in ``pipeline.wiring_runner`` reads the resolved one. Pure."""
+    construction WARNING, ``transports.egress.warn_url_query_credentials``, reads the resolved one.
+    Pure."""
     out: list[tuple[str, str]] = []
     for name, settings in (
         *((oc.name, oc.spec.settings) for oc in registry.outbound.values()),
