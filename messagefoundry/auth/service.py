@@ -2001,6 +2001,16 @@ def _idp_error_fields(exc: BaseException) -> dict[str, object]:
     return fields
 
 
+def _floor_exempt_marker(floor_exempt_amr: Sequence[str]) -> dict[str, object]:
+    """The audit fields for an OIDC callback the floor exemption let through, empty when it did not
+    apply (BACKLOG #2388).
+
+    BACKLOG #3220: every row the attempt writes after the exemption applied carries it, refusals
+    included, so the review ``docs/SECURITY-LOOSENING.md`` asks for also sees exempted attempts
+    that failed. The values are the CONFIGURED ones the token matched, never the token's own."""
+    return {"callback_floor_exempt_amr": list(floor_exempt_amr)} if floor_exempt_amr else {}
+
+
 # BACKLOG #1138, ASVS 6.3.5: the audit action each suspicious-sign-in event is recorded under. A fixed
 # map, not ``f"auth.{event_type}"``, so the action names stay greppable and no other notice kind can
 # be passed in and double-audit an event its own call site already audits.
@@ -4564,12 +4574,14 @@ class AuthService:
         # fresh; the refusal then clears once the skew has passed, and it never lets a flow through.
         signed_in_during_flow = principal_claims.auth_time >= math.floor(flow.issued_at)
         # BACKLOG #2388: an IdP that re-authenticates with no human step (an amr the operator named
-        # in oidc_callback_floor_exempt_amr) is exempt. Recorded on the success row, below.
+        # in oidc_callback_floor_exempt_amr) is exempt. Recorded on the success row, below, and on
+        # every refusal after this point (BACKLOG #3220).
         floor_exempt_amr = (
             self._oidc_callback_floor_exemption(principal_claims.amr)
             if signed_in_during_flow and arrived_too_early
             else ()
         )
+        floor_marker = _floor_exempt_marker(floor_exempt_amr)
         if signed_in_during_flow and arrived_too_early and not floor_exempt_amr:
             # With the client address, as the token_refused arm records it: a run of these is
             # automation, and the operator needs to see where it comes from.
@@ -4624,6 +4636,7 @@ class AuthService:
                 actor="<oidc>",
                 detail=_json(
                     {
+                        **floor_marker,
                         "provider": "ad",
                         "mech": "oidc",
                         "reason": FEDERATED_SUBJECT_NOT_BOUND,
@@ -4650,7 +4663,7 @@ class AuthService:
             # layer: a binding placed on one by any other means still never signs a LOCAL account in
             # through the directory path.
             await self._directory_reject_audit(
-                username, "oidc", "local_account_conflict", client=client
+                username, "oidc", "local_account_conflict", client=client, extra=floor_marker
             )
             return LoginOutcome(ok=False, error="account conflict", reason="local_account_conflict")
         if not bound.directory_object_id:
@@ -4669,7 +4682,7 @@ class AuthService:
             # The error is the generic one, and the web console collapses this slug to
             # `oidc_failed`. The precise reason is on the audit row, for the operator.
             await self._directory_reject_audit(
-                username, "oidc", DIRECTORY_OBJECT_ID_MISSING, client=client
+                username, "oidc", DIRECTORY_OBJECT_ID_MISSING, client=client, extra=floor_marker
             )
             return LoginOutcome(
                 ok=False, error="federated sign-in failed", reason=DIRECTORY_OBJECT_ID_MISSING
@@ -4690,7 +4703,7 @@ class AuthService:
             await self._audit(
                 "auth.login_error",
                 actor="<oidc>",
-                detail=_json({"provider": "ad", "mech": "oidc", "error": str(exc)}),
+                detail=_json({**floor_marker, "provider": "ad", "mech": "oidc", "error": str(exc)}),
                 client=client,
             )
             return LoginOutcome(
@@ -4698,7 +4711,9 @@ class AuthService:
             )
         if principal is None:
             # Hybrid-only by design: a bound account with no on-prem AD object is refused.
-            await self._directory_reject_audit(username, "oidc", "not_in_directory", client=client)
+            await self._directory_reject_audit(
+                username, "oidc", "not_in_directory", client=client, extra=floor_marker
+            )
             return LoginOutcome(
                 ok=False, error="user not found in directory", reason="not_in_directory"
             )
@@ -4706,7 +4721,9 @@ class AuthService:
         # IdP step-up leg applies, before its groups or name are used.
         mismatch = _directory_answer_mismatch(principal, bound.directory_object_id)
         if mismatch is not None:
-            await self._directory_reject_audit(username, "oidc", mismatch, client=client)
+            await self._directory_reject_audit(
+                username, "oidc", mismatch, client=client, extra=floor_marker
+            )
             return LoginOutcome(ok=False, error="federated sign-in failed", reason=mismatch)
 
         now = time.time()
@@ -4717,7 +4734,9 @@ class AuthService:
             # The ladder accepts an exp up to clock_skew_seconds in the PAST, so a token inside the
             # grace window would otherwise mint an already-dead session: the user "logs in" and is
             # revoked on their first request, with no audited reason. Refuse loudly instead.
-            await self._directory_reject_audit(username, "oidc", "expired", client=client)
+            await self._directory_reject_audit(
+                username, "oidc", "expired", client=client, extra=floor_marker
+            )
             return LoginOutcome(ok=False, error="federated sign-in failed", reason="expired")
         # BACKLOG #1150 (ASVS 6.8.4 / 7.6.1): the session also ends max_age after the user last
         # authenticated AT THE IdP. The ladder checks recency only at login. The IdP step-up leg
@@ -4733,7 +4752,9 @@ class AuthService:
             min(principal_claims.auth_time, now) + self._settings.oidc_max_age_seconds
         )
         if recency_deadline <= now:
-            await self._directory_reject_audit(username, "oidc", "auth_time_stale", client=client)
+            await self._directory_reject_audit(
+                username, "oidc", "auth_time_stale", client=client, extra=floor_marker
+            )
             return LoginOutcome(
                 ok=False, error="federated sign-in failed", reason="auth_time_stale"
             )
@@ -4756,9 +4777,8 @@ class AuthService:
             "sub": principal_claims.subject,
             "mfa_verified": mfa_verified,
         }
-        if floor_exempt_amr:
-            # BACKLOG #2388: present only when the exemption let a too-early callback through.
-            evidence["callback_floor_exempt_amr"] = list(floor_exempt_amr)
+        # BACKLOG #2388: present only when the exemption let a too-early callback through.
+        evidence.update(floor_marker)
         return await self._complete_ad_login(
             principal,
             client,
@@ -4773,6 +4793,7 @@ class AuthService:
             idp_auth_time=principal_claims.auth_time,
             # ASVS 7.2.4: the session the START leg saw (see PendingFlow.prior_session_hash).
             supersedes_hash=flow.prior_session_hash,
+            refusal_extra=floor_marker,
         )
 
     # --- the federated step-up leg (BACKLOG #296, ADR 0142 Amendment B) ---------------------------
@@ -5029,6 +5050,9 @@ class AuthService:
         floor_exempt_amr = (
             self._oidc_callback_floor_exemption(principal_claims.amr) if arrived_too_early else ()
         )
+        # BACKLOG #3220: every refusal past the floor carries the marker when the exemption applied,
+        # so a failed exempted step-up is as visible to the loosening's review as a served one.
+        floor_marker = _floor_exempt_marker(floor_exempt_amr)
         if arrived_too_early and not floor_exempt_amr:
             # The opted-in site's too-early callback whose amr names no exempt value (BACKLOG #2388).
             return await self._step_up_refused(
@@ -5046,12 +5070,22 @@ class AuthService:
             or not session.is_live(now=now, idle_seconds=self.session_idle_seconds)
         ):
             return await self._step_up_refused(
-                "session_gone", actor=actor, client=client, return_to=return_to, lost=True
+                "session_gone",
+                actor=actor,
+                client=client,
+                return_to=return_to,
+                lost=True,
+                extra=floor_marker,
             )
         user = await self._load_user(session.user_id)
         if user is None or user.disabled or user.auth_provider != AuthProvider.AD.value:
             return await self._step_up_refused(
-                "session_gone", actor=actor, client=client, return_to=return_to, lost=True
+                "session_gone",
+                actor=actor,
+                client=client,
+                return_to=return_to,
+                lost=True,
+                extra=floor_marker,
             )
         if (user.oidc_issuer, user.oidc_subject) != (
             principal_claims.issuer,
@@ -5066,7 +5100,11 @@ class AuthService:
             # the claims ladder is filed as a subject mismatch whatever its auth_time. Both tests
             # below judge this session's identity, so neither is the right name for someone else.
             return await self._step_up_refused(
-                STEP_UP_SUBJECT_MISMATCH, actor=actor, client=client, return_to=return_to
+                STEP_UP_SUBJECT_MISMATCH,
+                actor=actor,
+                client=client,
+                return_to=return_to,
+                extra=floor_marker,
             )
         # FRESHNESS, two tests, and both must pass. max_age=0 and prompt=login ask the IdP to
         # authenticate the user afresh, so a conforming IdP's auth_time postdates this request.
@@ -5075,7 +5113,11 @@ class AuthService:
         skew = self._settings.oidc_clock_skew_seconds
         if flow.issued_at <= 0 or principal_claims.auth_time < flow.issued_at - skew:
             return await self._step_up_refused(
-                STEP_UP_NOT_FRESH, actor=actor, client=client, return_to=return_to
+                STEP_UP_NOT_FRESH,
+                actor=actor,
+                client=client,
+                return_to=return_to,
+                extra=floor_marker,
             )
         # (b) Against the IdP's own clock (BACKLOG #2143): auth_time must be LATER than the one the
         # session holds, which is the sign-in's or the last step-up's. No skew applies, because
@@ -5091,11 +5133,19 @@ class AuthService:
         held_auth_time = session.idp_auth_time
         if held_auth_time is None:
             return await self._step_up_refused(
-                STEP_UP_IDP_AUTH_TIME_MISSING, actor=actor, client=client, return_to=return_to
+                STEP_UP_IDP_AUTH_TIME_MISSING,
+                actor=actor,
+                client=client,
+                return_to=return_to,
+                extra=floor_marker,
             )
         if principal_claims.auth_time <= held_auth_time:
             return await self._step_up_refused(
-                STEP_UP_IDP_AUTH_TIME_NOT_LATER, actor=actor, client=client, return_to=return_to
+                STEP_UP_IDP_AUTH_TIME_NOT_LATER,
+                actor=actor,
+                client=client,
+                return_to=return_to,
+                extra=floor_marker,
             )
         # The DIRECTORY still has the account. The password re-bind this leg replaces failed for a
         # disabled or deleted AD object, and the sign-in leg refuses one as not_in_directory. An IdP
@@ -5103,13 +5153,21 @@ class AuthService:
         # the directory itself, by the row's immutable id as the sign-in leg does (BACKLOG #1532).
         if self._ldap is None:
             return await self._step_up_refused(
-                "not_configured", actor=actor, client=client, return_to=return_to
+                "not_configured",
+                actor=actor,
+                client=client,
+                return_to=return_to,
+                extra=floor_marker,
             )
         if not user.directory_object_id:
             # Never a name-only lookup: a directory may reissue a freed name to someone else. The
             # sign-in leg refuses such a row for the same reason (BACKLOG #2027).
             return await self._step_up_refused(
-                DIRECTORY_OBJECT_ID_MISSING, actor=actor, client=client, return_to=return_to
+                DIRECTORY_OBJECT_ID_MISSING,
+                actor=actor,
+                client=client,
+                return_to=return_to,
+                extra=floor_marker,
             )
         try:
             principal = await asyncio.to_thread(
@@ -5120,18 +5178,26 @@ class AuthService:
                 "directory lookup failed during a federated step-up: %s", type(exc).__name__
             )
             return await self._step_up_refused(
-                "directory_unavailable", actor=actor, client=client, return_to=return_to
+                "directory_unavailable",
+                actor=actor,
+                client=client,
+                return_to=return_to,
+                extra=floor_marker,
             )
         if principal is None:
             return await self._step_up_refused(
-                "not_in_directory", actor=actor, client=client, return_to=return_to
+                "not_in_directory",
+                actor=actor,
+                client=client,
+                return_to=return_to,
+                extra=floor_marker,
             )
         # BACKLOG #3174: the answer must name the row's own directory object before its groups are
         # trusted, by the test the sign-in leg and the AD step-up re-bind apply.
         mismatch = _directory_answer_mismatch(principal, user.directory_object_id)
         if mismatch is not None:
             return await self._step_up_refused(
-                mismatch, actor=actor, client=client, return_to=return_to
+                mismatch, actor=actor, client=client, return_to=return_to, extra=floor_marker
             )
         # BACKLOG #2154: the account's stored roles must all be among the roles its current groups
         # map to, the same test _directory_step_up_refusal applies on the TOTP and passkey legs
@@ -5142,11 +5208,20 @@ class AuthService:
         fresh = await self._load_user(user.id)
         if fresh is None:
             return await self._step_up_refused(
-                "session_gone", actor=actor, client=client, return_to=return_to, lost=True
+                "session_gone",
+                actor=actor,
+                client=client,
+                return_to=return_to,
+                lost=True,
+                extra=floor_marker,
             )
         if not set(fresh.role_ids) <= await self._ad_roles_for_groups(principal.groups):
             return await self._step_up_refused(
-                DIRECTORY_ROLES_DEMOTED, actor=actor, client=client, return_to=return_to
+                DIRECTORY_ROLES_DEMOTED,
+                actor=actor,
+                client=client,
+                return_to=return_to,
+                extra=floor_marker,
             )
         purpose = flow.step_up_purpose
         # The password leg's three ORDER-CRITICAL steps (see :meth:`reauth`), against the hash.
@@ -5192,10 +5267,9 @@ class AuthService:
             "start_client": start_client,
             "client_moved": client_moved,
         }
-        if floor_exempt_amr:
-            # BACKLOG #2388: present only when the exemption let a too-early callback through, and
-            # holding only configured values, never the token's own.
-            detail["callback_floor_exempt_amr"] = list(floor_exempt_amr)
+        # BACKLOG #2388: present only when the exemption let a too-early callback through, and
+        # holding only configured values, never the token's own.
+        detail.update(floor_marker)
         await self._audit("auth.reauth", actor=user.username, detail=_json(detail), client=client)
         return OidcStepUp(elevation=elevation, return_to=return_to)
 
@@ -5243,7 +5317,12 @@ class AuthService:
         )
 
     async def _refuse_directory_row(
-        self, username: str, reason: str, *, client: str | None
+        self,
+        username: str,
+        reason: str,
+        *,
+        client: str | None,
+        extra: Mapping[str, object] | None = None,
     ) -> LoginOutcome:
         """Audit and render the refusal of an ineligible mirror row (BACKLOG #1637 / #1638).
 
@@ -5255,26 +5334,42 @@ class AuthService:
 
         ``error`` is the generic string on purpose: an unauthenticated caller learns that the attempt
         failed and nothing about whether the account exists, is disabled, or is locked.
+
+        ``extra`` adds fields to the audit row only, as on :meth:`_directory_reject_audit`.
         """
         await self._audit(
             "auth.login_failed",
             actor=username,
-            detail=_json({"provider": "ad", "reason": reason}),
+            detail=_json({**(extra or {}), "provider": "ad", "reason": reason}),
             client=client,
         )
         return LoginOutcome(ok=False, error="invalid credentials", reason=reason)
 
     async def _directory_reject_audit(
-        self, actor: str, mech: str, reason: str, *, client: str | None, error: str | None = None
+        self,
+        actor: str,
+        mech: str,
+        reason: str,
+        *,
+        client: str | None,
+        error: str | None = None,
+        extra: Mapping[str, object] | None = None,
     ) -> None:
         """Audit a rejected directory-SSO attempt. ``mech`` is the mechanism slug ("kerberos" /
         "oidc"); ``reason`` must come from a closed set so no IdP-influenced text is ever stored.
         ``error``, when given, is an exception's TYPE name, never its message (BACKLOG #3196).
+        ``extra`` adds fields to the audit row only and never overwrites a closed-set one; the
+        federated leg passes the ``callback_floor_exempt_amr`` marker through it (BACKLOG #3220).
 
         ``client`` is keyword-only with no default, so every caller must name it (BACKLOG #2132).
         The type still accepts ``None``, so this forces a decision and does not enforce an address.
         A run of refusals is how a spray shows, and the operator needs to see its source."""
-        detail: dict[str, object] = {"provider": "ad", "mech": mech, "reason": reason}
+        detail: dict[str, object] = {
+            **(extra or {}),
+            "provider": "ad",
+            "mech": mech,
+            "reason": reason,
+        }
         if error is not None:
             detail["error"] = error
         await self._audit("auth.login_failed", actor=actor, detail=_json(detail), client=client)
@@ -5298,6 +5393,10 @@ class AuthService:
         # BACKLOG #2143: the federated sign-in's verified auth_time, stored on the session. Only the
         # federated caller passes it; a Kerberos session has no IdP clock to compare.
         idp_auth_time: float | None = None,
+        # BACKLOG #3220: extra fields for every refusal row this login writes. The federated caller
+        # passes the callback_floor_exempt_amr marker when the floor exemption let it through, so a
+        # refused exempted attempt carries it as the success row does. Kerberos passes nothing.
+        refusal_extra: Mapping[str, object] | None = None,
     ) -> LoginOutcome:
         # ``federated_subject`` is the verified OIDC ``(issuer, sub)`` and is passed ONLY by the
         # federated path (BACKLOG #1015). It defaults to None, so the Kerberos caller's audit row is
@@ -5323,14 +5422,16 @@ class AuthService:
             # BACKLOG #2592: the name's row fails its integrity seal. It is refused, and never
             # adopted or re-created over: the store will not re-seal it.
             return await self._refuse_directory_row(
-                principal.username, ACCOUNT_REFUSED, client=client
+                principal.username, ACCOUNT_REFUSED, client=client, extra=refusal_extra
             )
         if existing is not None and existing.auth_provider != AuthProvider.AD.value:
             # Never let an AD login adopt/overwrite a like-named LOCAL account (provider confusion).
             await self._audit(
                 "auth.login_failed",
                 actor=principal.username,
-                detail=_json({"provider": "ad", "reason": "local_account_conflict"}),
+                detail=_json(
+                    {**(refusal_extra or {}), "provider": "ad", "reason": "local_account_conflict"}
+                ),
                 client=client,
             )
             return LoginOutcome(ok=False, error="account conflict")
@@ -5358,13 +5459,17 @@ class AuthService:
             # below is reached only through a directory implementation that does not check it.
             if federated:
                 await self._directory_reject_audit(
-                    principal.username, "oidc", DIRECTORY_OBJECT_ID_MISSING, client=client
+                    principal.username,
+                    "oidc",
+                    DIRECTORY_OBJECT_ID_MISSING,
+                    client=client,
+                    extra=refusal_extra,
                 )
                 return LoginOutcome(
                     ok=False, error="federated sign-in failed", reason=DIRECTORY_OBJECT_ID_MISSING
                 )
             return await self._refuse_directory_row(
-                principal.username, DIRECTORY_OBJECT_ID_MISSING, client=client
+                principal.username, DIRECTORY_OBJECT_ID_MISSING, client=client, extra=refusal_extra
             )
         if existing is not None and existing.directory_object_id != principal.directory_object_id:
             # BACKLOG #1471. THE ROW HOLDING THIS NAME MUST AGREE WITH THE PRESENTED IDENTITY.
@@ -5400,7 +5505,13 @@ class AuthService:
             await self._audit(
                 "auth.login_failed",
                 actor=principal.username,
-                detail=_json({"provider": "ad", "reason": DIRECTORY_IDENTITY_CONFLICT}),
+                detail=_json(
+                    {
+                        **(refusal_extra or {}),
+                        "provider": "ad",
+                        "reason": DIRECTORY_IDENTITY_CONFLICT,
+                    }
+                ),
                 client=client,
             )
             return LoginOutcome(
@@ -5432,7 +5543,9 @@ class AuthService:
         if existing is not None:
             refusal = _directory_login_refusal(existing, time.time(), federated=federated)
             if refusal is not None:
-                return await self._refuse_directory_row(principal.username, refusal, client=client)
+                return await self._refuse_directory_row(
+                    principal.username, refusal, client=client, extra=refusal_extra
+                )
         try:
             user = await self._upsert_ad_user(
                 principal, by_name=existing, federated=federated, client=client
@@ -5445,7 +5558,7 @@ class AuthService:
             await self._audit(
                 "auth.login_failed",
                 actor=principal.username,
-                detail=_json({"provider": "ad", "reason": exc.reason}),
+                detail=_json({**(refusal_extra or {}), "provider": "ad", "reason": exc.reason}),
                 client=client,
             )
             return LoginOutcome(ok=False, error="account conflict", reason=exc.reason)
@@ -5453,7 +5566,9 @@ class AuthService:
             # The resolver refused before it wrote anything. Rendered here rather than there so the
             # audit row carries the caller's ``client`` and every directory refusal in this method
             # has one shape.
-            return await self._refuse_directory_row(principal.username, exc.reason, client=client)
+            return await self._refuse_directory_row(
+                principal.username, exc.reason, client=client, extra=refusal_extra
+            )
         if (
             federated_subject is not None
             and (
@@ -5483,7 +5598,9 @@ class AuthService:
             reason = (
                 FEDERATED_SUBJECT_NOT_BOUND if holder is None else "federated_subject_already_bound"
             )
-            await self._directory_reject_audit(principal.username, "oidc", reason, client=client)
+            await self._directory_reject_audit(
+                principal.username, "oidc", reason, client=client, extra=refusal_extra
+            )
             return LoginOutcome(ok=False, error="federated sign-in failed", reason=reason)
         role_ids = sorted(await self._ad_roles_for_groups(principal.groups))
         previous = set(user.role_ids)
@@ -5591,11 +5708,18 @@ class AuthService:
                 # also written for a row deleted in the same window, which the guard
                 # refuses too; that row has no binding to look for.
                 refused = await self._refuse_directory_row(
-                    principal.username, FEDERATED_SIGN_IN_REQUIRED, client=client
+                    principal.username,
+                    FEDERATED_SIGN_IN_REQUIRED,
+                    client=client,
+                    extra=refusal_extra,
                 )
                 return replace(refused, roles_gained=roles_gained)
             await self._directory_reject_audit(
-                principal.username, "oidc", "federated_subject_unbound", client=client
+                principal.username,
+                "oidc",
+                "federated_subject_unbound",
+                client=client,
+                extra=refusal_extra,
             )
             return LoginOutcome(
                 ok=False,
