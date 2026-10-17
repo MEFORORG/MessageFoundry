@@ -375,7 +375,9 @@ gh run list --repo MEFORORG/MessageFoundry --workflow=ci.yml --event=schedule --
 ```
 
 A **green nightly run** means every gated leg was green on `main` that night, because `CI gate`
-`needs:` them all -- one run conclusion answers it, with no per-job walk.
+`needs:` them all -- one run conclusion answers it, with no per-job walk. The converse does not
+hold: a red run may be only an ungated leg, such as `postgres store (windows-*)`, so read the
+`CI gate` job's conclusion, not the run's, to ask whether a gated leg broke.
 
 Two limits, stated so nobody reads more into a green than it carries:
 

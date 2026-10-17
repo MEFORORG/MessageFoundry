@@ -33,38 +33,46 @@ def _ci_jobs() -> dict[str, dict[str, Any]]:
     return jobs_of("ci.yml")
 
 
-def _env_by_test_file(job: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Each test file a job's steps run, mapped to the env that step runs it under.
+#: The one pytest flag the Windows leg may add: the `test` matrix's Windows per-test watchdog.
+_WINDOWS_ONLY_FLAG = "--timeout=120"
 
-    Job env and step env merged as GitHub merges them. `#` lines inside a `run:` are skipped, so a
-    file a comment names is not counted as run.
+
+def _runs_by_test_file(job: dict[str, Any]) -> dict[str, list[tuple[str, str]]]:
+    """Each test file a job's steps run, mapped to every (env, flags) it is run under.
+
+    Job env and step env merged as GitHub merges them; flags are the run's other tokens, so a
+    narrowing (`-m`, `--ignore`, `-x`, a swallowed exit code, ...) shows up as a difference. A LIST
+    per file, so a file run twice is not collapsed into one run. `#` lines inside a `run:` are
+    skipped, so a file a comment names is not counted as run.
     """
-    out: dict[str, dict[str, Any]] = {}
+    out: dict[str, list[tuple[str, str]]] = {}
     for step in job.get("steps") or []:
         run = "\n".join(
             line
             for line in str(step.get("run", "")).splitlines()
             if not line.lstrip().startswith("#")
         )
-        env = {**(job.get("env") or {}), **(step.get("env") or {})}
-        for name in _TEST_FILE.findall(run):
-            out[name] = env
-    return out
+        files = _TEST_FILE.findall(run)
+        env = repr(sorted({**(job.get("env") or {}), **(step.get("env") or {})}.items()))
+        flags = " ".join(t for t in run.split() if t not in files and t != _WINDOWS_ONLY_FLAG)
+        for name in files:
+            out.setdefault(name, []).append((env, flags))
+    return {name: sorted(runs) for name, runs in out.items()}
 
 
-def test_the_windows_leg_runs_the_ubuntu_legs_files_under_the_same_env() -> None:
-    """Same files, and each under the same MEFOR_* env, so only the server under them differs."""
-    linux = _env_by_test_file(_ci_jobs()[_LINUX])
-    windows = _env_by_test_file(_ci_jobs()[_WINDOWS])
-    assert linux and all(e.get("MEFOR_TEST_POSTGRES") == "1" for e in linux.values()), (
-        "control: the ubuntu postgres-store job parsed to no gated test files; the parsing drifted"
-    )
+def test_the_windows_leg_runs_the_ubuntu_legs_files_the_same_way() -> None:
+    """Same files, each under the same MEFOR_* env and pytest flags, as often as on ubuntu."""
+    linux = _runs_by_test_file(_ci_jobs()[_LINUX])
+    windows = _runs_by_test_file(_ci_jobs()[_WINDOWS])
+    assert linux and all(
+        "('MEFOR_TEST_POSTGRES', '1')" in env for runs in linux.values() for env, _ in runs
+    ), "control: the ubuntu postgres-store job parsed to no gated test files; the parsing drifted"
     assert windows == linux, (
         "postgres-store-windows has drifted from postgres-store. Append a file, or change a step's "
-        "env, in BOTH jobs.\n"
+        "env or flags, in BOTH jobs.\n"
         f"  only ubuntu:  {sorted(set(linux) - set(windows))}\n"
         f"  only windows: {sorted(set(windows) - set(linux))}\n"
-        f"  env differs:  {sorted(k for k in set(linux) & set(windows) if linux[k] != windows[k])}"
+        f"  run differs:  {sorted(k for k in set(linux) & set(windows) if linux[k] != windows[k])}"
     )
 
 
@@ -92,7 +100,7 @@ def test_the_windows_leg_runs_on_hosted_windows_with_a_job_timeout() -> None:
 
 
 def test_the_windows_leg_runs_every_step_and_can_go_red() -> None:
-    """Ways to run less, or never go red, that the file and env pin above cannot see."""
+    """Ways to skip a step, or never go red, that the per-file comparison cannot see."""
     job = _ci_jobs()[_WINDOWS]
     assert "continue-on-error" not in job
     for step in job["steps"]:
@@ -101,8 +109,8 @@ def test_the_windows_leg_runs_every_step_and_can_go_red() -> None:
         if "pytest" not in run:
             continue
         assert "if" not in step, f"a pytest step is conditional: {step.get('name')}"
-        for narrowing in (" -k ", "--deselect", "::", "|| true", "--lf", "-x "):
-            assert narrowing not in f" {run} ", f"{step.get('name')} narrows with {narrowing!r}"
+        # Narrowing flags are caught by the per-file comparison; this flag is Windows-only.
+        assert _WINDOWS_ONLY_FLAG in run.split(), f"{step.get('name')} lacks the flag"
 
 
 def test_the_windows_leg_uses_the_ubuntu_legs_action_pins() -> None:

@@ -3572,8 +3572,10 @@ jobs:
 
   # The Postgres store suite on HOSTED WINDOWS, the only supported v1 deployment platform (owner
   # ruling 2026-10-16). `postgres-store` above runs on ubuntu only, so before this job the store
-  # backend had no automatic leg on the OS v1 ships on. Same test files and MEFOR_STORE_* env as
-  # that job, and its triggers minus merge_group; only the server differs.
+  # backend had no automatic leg on the OS v1 ships on. Same test files, pytest flags (bar the
+  # per-test timeout below) and MEFOR_STORE_* env as that job, and its triggers minus merge_group.
+  # The OS and the server differ, and with the server its major, locale and the image's own
+  # machine-wide PGUSER/PGPASSWORD, so a Windows-only red is not attributable to the OS alone.
   #
   # THE SERVER IS THE ONE THE RUNNER IMAGE PREINSTALLS, not a container: hosted Windows runners
   # cannot run Linux service containers. The runner-images readmes (images/windows/
@@ -3633,12 +3635,17 @@ jobs:
           if ($svc.Count -ne 1) { throw "expected one postgresql-x64-* service, found $($svc.Count)" }
           Set-Service -InputObject $svc[0] -StartupType Manual
           Start-Service -InputObject $svc[0]
-          & "$env:PGBIN\pg_isready.exe" -h localhost -p 5432 -t 60
+          if (-not $env:PGBIN -or -not (Test-Path "$env:PGBIN\psql.exe")) {
+            throw "the runner image no longer provides PostgreSQL at PGBIN='$env:PGBIN'; re-read its readme"
+          }
+          $port = $env:MEFOR_STORE_PORT
+          & "$env:PGBIN\pg_isready.exe" -h localhost -p $port -t 60
           if ($LASTEXITCODE -ne 0) { throw "pg_isready exited $LASTEXITCODE" }
-          & "$env:PGBIN\psql.exe" -h localhost -p 5432 -U postgres -d postgres -v ON_ERROR_STOP=1 `
+          & "$env:PGBIN\psql.exe" -h localhost -p $port -U $env:MEFOR_STORE_USERNAME -d postgres `
+            -v ON_ERROR_STOP=1 `
             -c "SELECT version()" `
-            -c "CREATE DATABASE messagefoundry" `
-            -c "ALTER ROLE postgres PASSWORD 'mefor'"
+            -c "CREATE DATABASE $env:MEFOR_STORE_DATABASE" `
+            -c "ALTER ROLE $env:MEFOR_STORE_USERNAME PASSWORD '$env:MEFOR_STORE_PASSWORD'"
           if ($LASTEXITCODE -ne 0) { throw "psql exited $LASTEXITCODE" }
 
       - name: Set up Python
@@ -5523,8 +5530,9 @@ jobs:
       # smoke only where its `github.repository` clause ALSO holds, so on a fork it skips in the queue
       # for the same cost reason it skips on a pull request. They are ENUMERATED here rather than
       # called "the heavy legs" because that phrase is not single-valued in this file: the `schedule`
-      # block at the top and the `changes` nightly arm both use it for SIX jobs, docker-smoke
-      # included, and docker-smoke is the one job this sentence would be false for.
+      # block at the top and the `changes` nightly arm both use it for SEVEN jobs, docker-smoke and
+      # postgres-store-windows included, and those two are the jobs this sentence would be false
+      # for: neither names merge_group, and neither is in this job's `needs`.
       #
       # THE TWO HALVES DESCRIBE DIFFERENT EVENTS, so neither generalises. Path-gating is a
       # pull_request property; running whatever `changes` emits is a merge_group one. WHAT THE QUEUE
