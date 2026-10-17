@@ -25,6 +25,7 @@ from _fhir_fixtures import (
     OPERATION_OUTCOME_SUCCESS,
     OPERATION_OUTCOME_TRANSIENT,
     PATIENT_R4B,
+    PHI_CANARY,
     as_json,
 )
 
@@ -723,6 +724,311 @@ async def test_too_deep_2xx_reply_captures_as_unparseable() -> None:
         dest._opener = _FakeOpener(body=b"[" * 200_000)  # type: ignore[assignment]
         resp = await dest.send(UPDATE_1965)
         assert isinstance(resp, DeliveryResponse) and resp.outcome == "unparseable"
+
+
+# --- vault BACKLOG #2812: an outgoing body that repeats a JSON key is refused; a wrapped update's
+# reply that does is judged only when its two readings agree ---------------------------------------
+
+#: Synthetic. json keeps the last id, so the engine would gate on the canary (and, in the path
+#: form, put it in the URL) while a server keeping the first key would write first-id.
+_REPEATED_ID = '{"resourceType": "Patient", "id": "first-id", "id": "' + PHI_CANARY + '"}'
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"interaction": "create"},
+        {"interaction": "update"},
+        {"conditional": "if-match"},
+        {"interaction": "update", "update_url_form": "path"},
+        {"conditional": "conditional-update", "conditional_query": "identifier=sys|val"},
+        {"conditional": "if-none-exist", "conditional_query": "identifier=sys|val"},
+    ],
+    ids=["create", "update", "if-match", "path-form", "conditional-update", "if-none-exist"],
+)
+async def test_an_outgoing_body_that_repeats_a_key_is_dead_lettered_unsent(
+    over: dict[str, str],
+) -> None:
+    dest = _dest(**over)
+    opener = _FakeOpener(body=_transaction_response("200 OK"))
+    dest._opener = opener  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(_REPEATED_ID)
+    assert ei.value.permanent is True
+    assert ei.value.code == "bad-body"
+    assert opener.requests == []
+    assert "repeats a key" in str(ei.value)  # the peek's reason reaches the operator
+    assert PHI_CANARY not in str(ei.value) and "first-id" not in str(ei.value)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        _REPEATED_ID,
+        '{"resourceType": "Patient", "id": ' + PHI_CANARY,  # not JSON
+        '["' + PHI_CANARY + '"]',  # not an object
+        "<Patient><id value='" + PHI_CANARY + "'/></Patient>",  # FHIR-XML
+    ],
+    ids=["repeated-key", "not-json", "not-an-object", "xml"],
+)
+async def test_the_bad_body_text_carries_nothing_of_the_body(body: str) -> None:
+    # _peek puts the FhirPeekError's text into the refusal, so every refusal the peek can raise is
+    # pinned here as free of the body (CLAUDE.md section 9).
+    dest = _dest(interaction="create")
+    dest._opener = _FakeOpener()  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(body)
+    assert ei.value.code == "bad-body"
+    assert PHI_CANARY not in str(ei.value) and "first-id" not in str(ei.value)
+
+
+async def test_an_outgoing_body_with_one_of_each_key_is_sent() -> None:
+    # Control for the refusal above: the same resource with a single id goes out.
+    dest = _dest(interaction="update")
+    opener = _FakeOpener(body=_transaction_response("200 OK"))
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send('{"resourceType": "Patient", "id": "first-id", "active": true}')
+    assert len(opener.requests) == 1
+
+
+def _reply_with(response: str, *, meta: str = "{}") -> bytes:
+    """A transaction-response written by hand, since json.dumps cannot repeat a key."""
+    return (
+        '{"resourceType": "Bundle", "type": "transaction-response", "meta": '
+        + meta
+        + ', "entry": [{"response": '
+        + response
+        + "}]}"
+    ).encode()
+
+
+@pytest.mark.parametrize("capture", [True, False], ids=["capture", "no-capture"])
+@pytest.mark.parametrize(
+    "reply",
+    [
+        # Keeping the last key, as json does, reads the 404 and dead-letters; a server keeping
+        # the first meant 200. The readings disagree, so it dead-letters either way round.
+        _reply_with('{"status":"200 OK","status":"404 Not Found"}'),
+        # json alone reads 200 here and delivers, while a first-key reader sees the 404.
+        _reply_with('{"status": "404 Not Found", "status": "200 OK"}'),
+        # A disagreement in a value the delivery takes is enough, whatever the capture mode.
+        _reply_with(
+            '{"status": "200 OK", "etag": "W/\\"1\\"", "etag": "W/\\"' + PHI_CANARY + '\\""}'
+        ),
+        _reply_with('{"status": "200 OK", "location": "Patient/a", "location": "Patient/b"}'),
+        _reply_with(
+            '{"status": "200 OK", "lastModified": "2026-01-01T00:00:00Z", '
+            '"lastModified": "2026-01-02T00:00:00Z"}'
+        ),
+        # The outcome's severity sets the capture outcome, which is part of the judgment.
+        _reply_with(
+            '{"status": "200 OK", "outcome": {"resourceType": "OperationOutcome", "issue": '
+            '[{"severity": "error", "severity": "information"}]}}'
+        ),
+        # A repeated resourceType changes the entry shape the reply is read through.
+        b'{"resourceType": "OperationOutcome", "resourceType": "Bundle", '
+        b'"entry": [{"response": {"status": "404 Not Found"}}]}',
+        # Two permanent rejects with different codes are two judgments.
+        _reply_with('{"status": "404 Not Found", "status": "400 Bad Request"}'),
+        # A transient failure against a permanent one.
+        _reply_with('{"status": "503 Service Unavailable", "status": "404 Not Found"}'),
+    ],
+    ids=[
+        "measured-200-then-404",
+        "404-then-200",
+        "etag",
+        "location",
+        "last-modified",
+        "outcome-severity",
+        "resource-type",
+        "two-reject-codes",
+        "transient-against-reject",
+    ],
+)
+async def test_a_wrapped_update_reply_whose_readings_disagree_is_dead_lettered(
+    reply: bytes, capture: bool
+) -> None:
+    # Vault BACKLOG #2812: the reply is read keeping the first and keeping the last value of each
+    # key. When the two reach different judgments, or differ in a value the delivery takes, the
+    # update fails closed, like a reply over the byte bound (#2180), and is never recorded as
+    # delivered.
+    dest = _dest(interaction="update", capture_response=capture)
+    dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(UPDATE_1965)
+    assert ei.value.permanent is True
+    assert ei.value.code == "reply-repeats-a-key"
+    text = str(ei.value)
+    for word in ("status", "etag", "Not Found", "Patient/", "2026-", PHI_CANARY):
+        assert word not in text
+
+
+@pytest.mark.parametrize("capture", [True, False], ids=["capture", "no-capture"])
+@pytest.mark.parametrize(
+    "reply",
+    [
+        # A repeat nothing reads: both readings are a 200.
+        _reply_with('{"status": "200 OK"}', meta='{"tag": 1, "tag": "' + PHI_CANARY + '"}'),
+        _reply_with('{"status": "200 OK", "status": "200 OK"}'),
+        # Two successes whose text differs reach one judgment: delivered.
+        _reply_with('{"status": "200 OK", "status": "201 Created"}'),
+        b'{"resourceType": "OperationOutcome", "issue": [{"severity": "information", '
+        b'"severity": "information"}]}',
+    ],
+    ids=["in-meta", "equal-values", "two-successes", "not-a-transaction-response"],
+)
+async def test_a_wrapped_update_reply_whose_readings_agree_is_delivered(
+    reply: bytes, capture: bool
+) -> None:
+    dest = _dest(interaction="update", capture_response=capture)
+    dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
+    resp = await dest.send(UPDATE_1965)
+    if capture:
+        assert isinstance(resp, DeliveryResponse) and resp.outcome == "accepted"
+    else:
+        assert resp is None
+
+
+@pytest.mark.parametrize("capture", [True, False], ids=["capture", "no-capture"])
+@pytest.mark.parametrize(
+    "reply",
+    [
+        # First and last agree on 200; the middle 404 is a third reading they would never see.
+        _reply_with('{"status": "200 OK", "status": "404 Not Found", "status": "200 OK"}'),
+        # First and last disagree already (the two-reading comparison refuses it on its own).
+        _reply_with('{"status": "200 OK", "status": "200 OK", "status": "404 Not Found"}'),
+        # A, B, A inside meta refuses too: the fail-closed direction, accepted.
+        _reply_with(
+            '{"status": "200 OK"}', meta='{"tag": "a", "tag": "' + PHI_CANARY + '", "tag": "a"}'
+        ),
+        # The middle response reads 200 keeping the first status and 404 keeping the last; both
+        # readings of every occurrence count, so this and its mirror are refused alike.
+        b'{"resourceType": "Bundle", "entry": [{"response": {"status": "200 OK"}, '
+        b'"response": {"status": "200 OK", "status": "404 Not Found"}, '
+        b'"response": {"status": "200 OK"}}]}',
+        b'{"resourceType": "Bundle", "entry": [{"response": {"status": "200 OK"}, '
+        b'"response": {"status": "404 Not Found", "status": "200 OK"}, '
+        b'"response": {"status": "200 OK"}}]}',
+        # A number and a boolean are different JSON values, though Python calls 1 == True.
+        _reply_with('{"status": "200 OK"}', meta='{"tag": 1, "tag": true, "tag": 1}'),
+        # Pinned as the occurrence rule reads: values, not judgments, so these are refused too.
+        _reply_with('{"status": "200 OK", "status": "201 Created", "status": "200 OK"}'),
+        _reply_with('{"status": "503", "status": "500", "status": "503"}'),
+    ],
+    ids=[
+        "200-404-200",
+        "200-200-404",
+        "a-b-a-in-meta",
+        "middle-reads-404-last",
+        "middle-reads-404-first",
+        "number-boolean-number",
+        "200-201-200",
+        "503-500-503",
+    ],
+)
+async def test_a_key_repeated_three_times_with_a_third_value_is_dead_lettered(
+    reply: bytes, capture: bool
+) -> None:
+    dest = _dest(interaction="update", capture_response=capture)
+    dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(UPDATE_1965)
+    assert ei.value.permanent is True and ei.value.code == "reply-repeats-a-key"
+    for word in ("tag", "status", "Not Found", PHI_CANARY):
+        assert word not in str(ei.value)
+
+
+@pytest.mark.parametrize(
+    "meta",
+    ['{"x": NaN, "x": NaN}', '{"x": NaN, "tag": 1, "tag": 1}'],
+    ids=["nan-twice", "nan-beside-a-repeat"],
+)
+async def test_a_nan_beside_or_in_a_two_occurrence_repeat_behaves_as_before(meta: str) -> None:
+    # NaN != NaN, so a value check that walked every pair would refuse these; two occurrences
+    # behave as before, and a lone key is never a third reading.
+    dest = _dest(interaction="update", capture_response=True)
+    dest._opener = _FakeOpener(body=_reply_with('{"status": "200 OK"}', meta=meta))  # type: ignore[assignment]
+    resp = await dest.send(UPDATE_1965)
+    assert isinstance(resp, DeliveryResponse) and resp.outcome == "accepted"
+
+
+@pytest.mark.parametrize("capture", [True, False], ids=["capture", "no-capture"])
+async def test_a_key_repeated_three_times_with_one_value_is_delivered(capture: bool) -> None:
+    reply = _reply_with('{"status": "200 OK", "status": "200 OK", "status": "200 OK"}')
+    dest = _dest(interaction="update", capture_response=capture)
+    dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
+    resp = await dest.send(UPDATE_1965)
+    if capture:
+        assert isinstance(resp, DeliveryResponse) and resp.outcome == "accepted"
+    else:
+        assert resp is None
+
+
+@pytest.mark.parametrize("capture", [True, False], ids=["capture", "no-capture"])
+async def test_two_transient_readings_retry_as_the_shared_classification_says(
+    capture: bool,
+) -> None:
+    # 503 and 500 both classify as transient (_classify_status), so the readings agree and the
+    # update is retried, not refused.
+    reply = _reply_with(
+        '{"status": "503 Service Unavailable", "status": "500 Internal Server Error"}'
+    )
+    dest = _dest(interaction="update", capture_response=capture)
+    dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        await dest.send(UPDATE_1965)
+    assert not isinstance(ei.value, NegativeAckError)
+
+
+async def test_a_reply_the_keep_first_read_cannot_take_is_dead_lettered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The hook lowers json's depth limit a little, so a reply in that band parses plain but not
+    # keeping the first key. It can no longer be shown to read one way, so it fails closed. The
+    # trigger is a raised RecursionError, since the real depth is a property of the runner.
+    import messagefoundry.transports.fhir as fhir_module
+
+    def _too_deep(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        raise RecursionError("simulated deep nesting")
+
+    monkeypatch.setattr(fhir_module, "_keep_first_key", _too_deep)
+    dest = _dest(interaction="update")
+    reply = _reply_with('{"status": "404 Not Found"}', meta='{"tag": 1, "tag": 1}')
+    dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(UPDATE_1965)
+    assert ei.value.permanent is True and ei.value.code == "reply-repeats-a-key"
+
+
+@pytest.mark.parametrize(
+    ("reply", "code"),
+    [
+        (_reply_with('{"status": "404 Not Found", "status": "404 Not Found"}'), "404"),
+        (_reply_with('{"status": "400 Bad Request"}', meta='{"tag": 1, "tag": 2}'), "400"),
+    ],
+    ids=["equal-values", "repeat-elsewhere"],
+)
+async def test_a_wrapped_update_reply_whose_readings_agree_on_a_failure_is_classified(
+    reply: bytes, code: str
+) -> None:
+    # Agreement means judged as on main, so an agreed failure dead-letters on its own status.
+    dest = _dest(interaction="update")
+    dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(UPDATE_1965)
+    assert ei.value.code == code
+
+
+@pytest.mark.parametrize("capture", [True, False], ids=["capture", "no-capture"])
+async def test_a_wrapped_update_reply_with_one_of_each_key_is_delivered(capture: bool) -> None:
+    # Control for the refusal above.
+    dest = _dest(interaction="update", capture_response=capture)
+    dest._opener = _FakeOpener(body=_reply_with('{"status": "200 OK"}'))  # type: ignore[assignment]
+    resp = await dest.send(UPDATE_1965)
+    if capture:
+        assert isinstance(resp, DeliveryResponse) and resp.outcome == "accepted"
+    else:
+        assert resp is None
 
 
 async def test_reply_that_is_not_a_transaction_response_is_delivered() -> None:
