@@ -92,7 +92,7 @@ its nodes, and then signs in. You pass nothing.
 |---|---|
 | You start `serve` yourself | Set `MEFOR_SECURITY_REQUIRE_MFA=false` on it. `provision-admin` enrols an authenticator app at a terminal and offers no other way, so the rig account has none. |
 | That `serve` runs under `[security].enforcement = enforce` | Give it an `[alerts]` channel too. With sign-in on, an enforcing start refuses without a way to send account-security notices. The `load test (smoke, sqlite)` step in [`ci.yml`](../.github/workflows/ci.yml) shows the settings. |
-| You keep one store across runs | Use the same credential each run: set `MEFOR_RIG_ADMIN_USERNAME` and `MEFOR_RIG_ADMIN_PASSWORD` in the shell. `provision-admin` declines when the store already has a local Administrator with a usable password, and a new run draws a new password, so the engine then refuses the sign-in. A fresh store needs neither variable. |
+| You keep one store across runs | Use the same credential each run: set `MEFOR_RIG_ADMIN_USERNAME` and `MEFOR_RIG_ADMIN_PASSWORD` in the shell. The rig declines when the store already has an enabled Administrator of any kind, directory accounts included, and a new run draws a new password, so the engine then refuses the sign-in. A fresh store needs neither variable. |
 | The drive is a separate process from the engines (a second box, or `batch-driver` beside `batch-engine`) | Export the same two variables for both. The drive signs in to engines another process started, and refuses to start without the credential: one drawn there could only be wrong. |
 
 **Signed-in polling is in the numbers, and the report measures its share.** The poller's reads are

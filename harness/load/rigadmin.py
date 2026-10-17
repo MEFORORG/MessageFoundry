@@ -60,7 +60,7 @@ import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO, Protocol
+from typing import IO, Any, Protocol
 from urllib.parse import urlsplit
 
 __all__ = [
@@ -325,8 +325,10 @@ def _provision_here(db: str | None, service_config: str | None) -> int:
     def _held_password(prompt: str) -> str:
         return held
 
-    # The ONE seam. Everything else provision-admin does is the shipped code path.
+    # The ONE seam for the password. Everything else provision-admin does is the shipped code path,
+    # narrowed by the guard below and never widened.
     cli._read_new_password = _held_password
+    _keep_the_narrow_rule(cli)
     argv = ["provision-admin", "--username", username, "--email", _NOTIFY_ADDRESS]
     argv += ["--no-totp", "--json"]
     if db is not None:
@@ -341,11 +343,61 @@ def _provision_here(db: str | None, service_config: str | None) -> int:
         return 0
     refusal = _json_error(captured.getvalue())
     if _ADMIN_EXISTS in refusal:
+        if refusal == _RIG_REFUSAL:
+            print(_RIG_REFUSAL, file=sys.stderr)
         print("the store already has an enabled Administrator; nothing provisioned")
         return EXIT_EXISTS
     # The command's refusals name settings and clauses, never the password it was given.
     print(refusal or captured.getvalue().strip(), file=sys.stderr)
     return code or 1
+
+
+#: The rig's own refusal. It carries :data:`_ADMIN_EXISTS`, so a caller reads it as the shipped
+#: "already has one" answer (:data:`EXIT_EXISTS`).
+_RIG_REFUSAL = (
+    "the store already has an enabled Administrator (a directory or federated one counts here), so "
+    "the load rig provisions nothing: it adds its Administrator, which has no second factor, only "
+    "to a store with no enabled Administrator at all"
+)
+
+
+def _keep_the_narrow_rule(cli: Any) -> None:
+    """Hold the rig to the rule ``provision-admin`` had before vault BACKLOG #2711 step 1.
+
+    Step 1 (owner ruling B258-R4) lets the command run whenever no enabled LOCAL Administrator has
+    a usable password, so a directory-run site can get back in while its directory is down. The
+    rig runs it with ``--no-totp``, so on such a store it would add a no-MFA Administrator beside
+    live directory Administrators. The rig keeps the old rule instead: it provisions only when the
+    store has no enabled Administrator of any kind. The engine adds no flag for this.
+
+    It wraps the command's one :class:`~messagefoundry.auth.service.AuthService`, built by
+    ``_build_provision_auth_service``, so both the pre-prompt refusal and the write ask the wider
+    question first, against the store the command has open at that moment.
+    """
+    build = cli._build_provision_auth_service
+
+    def _narrow_build(*args: Any, **kwargs: Any) -> Any:
+        service = build(*args, **kwargs)
+        refusal_of = service.provision_refusal
+        write = service.provision_first_administrator
+
+        async def _refusal(*a: Any, **kw: Any) -> Any:
+            if await service.has_enabled_administrator():
+                return _RIG_REFUSAL
+            return await refusal_of(*a, **kw)
+
+        async def _write(*a: Any, **kw: Any) -> Any:
+            if await service.has_enabled_administrator():
+                from messagefoundry.auth.service import FirstAdministratorRefused
+
+                raise FirstAdministratorRefused(_RIG_REFUSAL)
+            return await write(*a, **kw)
+
+        service.provision_refusal = _refusal
+        service.provision_first_administrator = _write
+        return service
+
+    cli._build_provision_auth_service = _narrow_build
 
 
 def _json_error(text: str) -> str:
