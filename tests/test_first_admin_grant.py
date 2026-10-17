@@ -30,6 +30,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.service import AuthService, FirstAdministratorRefused
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store import store as store_module
@@ -323,32 +324,112 @@ async def test_mutation_control_an_unguarded_grant_lets_both_runs_through(
         await store.close()
 
 
-async def test_an_unknown_grant_outcome_is_refused_and_shows_no_recovery_codes(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """The grant's outcome fails closed: only ``AdminGrant.GRANTED`` is success. An outcome the
-    service does not know -- a future enum member, or a store answering out of contract -- is
-    refused with an ERROR log, so no recovery codes are returned and no provisioned row is written.
-    The old comparison refused only ``ADMIN_EXISTS`` and ``ACCOUNT_CHANGED`` and read anything else
-    as granted."""
-    service = AuthService(store, AuthSettings())
-    await service.initialize()
+async def _roleless_row(store: MessageStore, username: str) -> None:
+    """A row an earlier run left roleless, so the next provision takes the repair branch."""
+    await store.create_user(
+        user_id="halfwritten",
+        username=username,
+        auth_provider=AuthProvider.LOCAL.value,
+        display_name=None,
+        email=None,
+        password_hash=None,
+        must_change_password=True,
+        password_generated=False,
+    )
 
-    async def unknown_outcome(*_a: Any, **_k: Any) -> object:
+
+def _out_of_contract_grant(
+    store: MessageStore, *, writes_role: bool
+) -> Callable[..., Awaitable[object]]:
+    """A store answering out of contract: it may write the role, and returns no ``AdminGrant``."""
+
+    async def grant(
+        user_id: str, *, admin_role_id: str, assigned_by: str | None = None, **_: Any
+    ) -> object:
+        if writes_role:
+            await store.set_user_roles(user_id, [admin_role_id], assigned_by=assigned_by)
         return object()
 
-    monkeypatch.setattr(store, "grant_first_admin_unless_admin_exists", unknown_outcome)
-    with (
-        caplog.at_level("ERROR", logger="messagefoundry.auth.service"),
-        pytest.raises(FirstAdministratorRefused, match="unexpected outcome"),
-    ):
-        await _provision(service, "site-admin")
-    assert any(
-        r.levelname == "ERROR"
+    return grant
+
+
+def _error_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelname == "ERROR"
         and r.name == "messagefoundry.auth.service"
         and "unexpected outcome" in r.getMessage()
-        for r in caplog.records
+    ]
+
+
+async def test_an_unknown_grant_outcome_that_wrote_the_role_advises_the_totp_reset(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The grant's outcome fails closed: only ``AdminGrant.GRANTED`` is success. A store that
+    WROTE the role and answered out of contract is refused with no recovery codes and no
+    provisioned row. The advice reads the row: it holds the Administrator role, so an Administrator
+    may now exist under this name and its seed is replaced with ``admin-reset-totp`` -- not "keep
+    the entry and re-run", which a re-run would refuse. On the repair branch the second revoke runs,
+    and the ERROR line is written before it, so a revoke that raises cannot lose the only trace."""
+    await _roleless_row(store, "site-admin")
+    service = AuthService(store, AuthSettings())
+    await service.initialize()
+    monkeypatch.setattr(
+        store,
+        "grant_first_admin_unless_admin_exists",
+        _out_of_contract_grant(store, writes_role=True),
     )
+    revokes: list[int] = []
+    original_revoke = store.revoke_user_sessions
+
+    async def counted_revoke(user_id: str) -> int:
+        # How many ERROR lines had landed when this revoke ran.
+        revokes.append(len(_error_lines(caplog)))
+        return await original_revoke(user_id)
+
+    monkeypatch.setattr(store, "revoke_user_sessions", counted_revoke)
+    with (
+        caplog.at_level("ERROR", logger="messagefoundry.auth.service"),
+        pytest.raises(FirstAdministratorRefused, match="unexpected outcome") as refused,
+    ):
+        await _provision(service, "site-admin")
+    message = str(refused.value)
+    assert "holds the Administrator role" in message
+    assert "an Administrator may now exist under this name" in message
+    assert "showed no recovery codes" in message
+    assert "run `messagefoundry admin-reset-totp --username 'site-admin'`" in message
+    assert "keep any authenticator entry" not in message
+    [line] = _error_lines(caplog)
+    assert "'site-admin'" in line and "object" in line
+    # The repair branch's first revoke, then the refusal's, which runs after the ERROR line.
+    assert revokes == [0, 1]
+    assert await _provisioned_rows(store) == []
+    assert await enabled_admins(store) == {"halfwritten"}
+
+
+async def test_an_unknown_grant_outcome_that_wrote_no_role_advises_a_re_run(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The same refusal when the store wrote no role: the account is roleless, a re-run takes the
+    repair branch and enrols a new authenticator, so the advice is to remove the entry and re-run."""
+    service = AuthService(store, AuthSettings())
+    await service.initialize()
+    monkeypatch.setattr(
+        store,
+        "grant_first_admin_unless_admin_exists",
+        _out_of_contract_grant(store, writes_role=False),
+    )
+    with (
+        caplog.at_level("ERROR", logger="messagefoundry.auth.service"),
+        pytest.raises(FirstAdministratorRefused, match="unexpected outcome") as refused,
+    ):
+        await _provision(service, "site-admin")
+    message = str(refused.value)
+    assert "holds no Administrator role" in message
+    assert "remove any authenticator entry it showed, then run the command again" in message
+    assert "admin-reset-totp" not in message
+    assert len(_error_lines(caplog)) == 1
     assert await _provisioned_rows(store) == []
     assert await enabled_admins(store) == set()
 

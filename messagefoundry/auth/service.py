@@ -3352,25 +3352,41 @@ class AuthService:
         if grant is not AdminGrant.GRANTED:
             # Fail closed: only GRANTED is success. Any other value -- an outcome added later, or a
             # store answering out of contract -- is refused, so no recovery codes are shown and no
-            # provisioned row is written. Such a store MAY still have written the role, so this is
-            # not the roleless end state the two refusals above leave: the repair branch's second
-            # revoke runs first (it is harmless with no role), and the advice is to keep the
-            # authenticator entry, since it may be the only factor of an Administrator. A re-run
-            # reports which state the store is in. No audit row records this refusal; the ERROR
-            # line is its only trace. The logged outcome is its type name, never its repr, because
-            # an out-of-contract value could carry what the grant was handed.
-            if repaired:
-                await self._store.revoke_user_sessions(user_id)
+            # provisioned row is written. No audit row records this refusal, so the ERROR line is
+            # its only trace and is written FIRST, before any later await can raise past it. The
+            # outcome is logged as a member's name or a type name, never a repr, because an
+            # out-of-contract value could carry what the grant was handed.
             _log.error(
-                "first-administrator grant for %s returned an unexpected outcome of type %s; refused",
+                "first-admin grant for %r returned unexpected outcome %s; refused",
                 scrub_log_argument(username),
-                type(grant).__name__,
+                grant.name if isinstance(grant, AdminGrant) else type(grant).__name__,
             )
+            # Such a store MAY still have written the role, so the row is read again here and the
+            # advice matches what it holds. A re-run of a row that holds the role refuses it, and a
+            # re-run of a roleless one takes the repair branch, which clears the authenticator
+            # this run enrolled, so "keep the entry and re-run" is right for neither.
+            roles = await self._store.get_user_role_ids(user_id)
+            if repaired:
+                # The repair branch's second revoke, as on success below; harmless with no role.
+                await self._store.revoke_user_sessions(user_id)
+            if Role.ADMINISTRATOR.value in roles:
+                reset = (
+                    "to replace its authenticator seed and get recovery codes, run `messagefoundry "
+                    f"admin-reset-totp --username {username!r}`"
+                    if totp_secret is not None
+                    else "it enrolled no authenticator"
+                )
+                raise FirstAdministratorRefused(
+                    "the role grant returned an unexpected outcome, and the account named "
+                    f"{username!r} holds the Administrator role, so an Administrator may now exist "
+                    f"under this name; this run showed no recovery codes, and {reset}"
+                )
             raise FirstAdministratorRefused(
-                "the role grant returned an unexpected outcome, so this run cannot confirm that "
-                f"the account named {username!r} holds the Administrator role and shows no "
-                "recovery codes; keep any authenticator entry it showed, and run the command "
-                "again: it completes the account, or reports that an Administrator already exists"
+                "the role grant returned an unexpected outcome, and the account named "
+                f"{username!r} holds no Administrator role, so this run granted none and showed "
+                "no recovery codes; remove any authenticator entry it showed"
+                # A row holding some other role is one a re-run refuses, so it is not advised.
+                + ("" if roles else ", then run the command again")
             )
         if repaired:
             # AGAIN, after the role (ADR 0197 Amendment A, AC-A5). The earlier holder's password
