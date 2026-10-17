@@ -26,7 +26,8 @@ THE CLASSES.
   :func:`test_administrator_only_routes_admit_no_scoped_caller`.
 * ``known_unscoped_1152`` -- channel-bearing and NOT narrowed, tracked under BACKLOG #1152.
 * ``unscoped_unfiled`` -- channel-bearing and NOT narrowed, and on no backlog row this change could
-  find. Listed so the gap is visible rather than silent. Filing them is not this test's job.
+  find. Listed so the gap is visible rather than silent. Filing them is not this test's job. EMPTY
+  since BACKLOG #3189 classed its three routes, and kept so the next such route has an honest home.
 
 NOT-DEPLOYED beta: an unscoped route here is a gap a first deployment would carry, not a live
 exposure.
@@ -111,9 +112,10 @@ ROUTES: dict[str, tuple[str, str]] = {
     "PUT /roles/custom/{role_id}": (ADMINISTRATOR_ONLY, "users:manage"),
     "DELETE /roles/custom/{role_id}": (ADMINISTRATOR_ONLY, "users:manage"),
     "GET /users": (
-        UNSCOPED_UNFILED,
-        "returns every account's channel_scope to a users:read holder, and users:read can be "
-        "minted into a custom role, which can be channel-scoped",
+        NOT_CHANNEL_BEARING,
+        "#3189: channel_scope and its source go only to a users:manage holder, always an "
+        "all-channels Administrator; a users:read caller, which a scoped custom role can be, gets "
+        "null for both (tests/test_channel_scope_posture_users_reload.py)",
     ),
     "GET /users/{user_id}/permissions": (NOT_CHANNEL_BEARING, "roles and permissions, no channel"),
     "POST /users": (ADMINISTRATOR_ONLY, "users:manage"),
@@ -141,9 +143,8 @@ ROUTES: dict[str, tuple[str, str]] = {
     "GET /ai/policy": (NOT_CHANNEL_BEARING, "the AI policy for this environment"),
     "POST /ai/chat": (NOT_CHANNEL_BEARING, "sends code to the assistant, never a message body"),
     "GET /security/posture": (
-        UNSCOPED_UNFILED,
-        "names connections in its loosenings and static_credential_hops, to any "
-        "monitoring:read holder, not narrowed",
+        SCOPED,
+        "#3189: per-connection entries narrowed to the caller's own inbounds, and declared narrowed",
     ),
     # --- connections ----------------------------------------------------------------------------
     "GET /channels": (SCOPED, "narrowed to the caller's inbounds"),
@@ -179,11 +180,14 @@ ROUTES: dict[str, tuple[str, str]] = {
     "POST /approvals/{approval_id}/resolve": (ADMINISTRATOR_ONLY, "approvals:approve"),
     # --- config ---------------------------------------------------------------------------------
     "POST /config/reload": (
-        UNSCOPED_UNFILED,
-        "reloads every connection's config for a config:deploy holder, which the deployment role "
-        "can be while channel-scoped; no ruling says whether it should be narrowed",
+        SCOPED,
+        "#3189: a scoped caller cannot reload, a dry run included; a reload spans every channel",
     ),
-    "GET /config/provenance": (NOT_CHANNEL_BEARING, "a fingerprint and a commit, no connection"),
+    "GET /config/provenance": (
+        NOT_CHANNEL_BEARING,
+        "a fingerprint and a commit, no connection; reload_refused reads only whether the caller "
+        "is all-channels, never a channel (BACKLOG #3189)",
+    ),
     # --- messages -------------------------------------------------------------------------------
     "GET /messages": (SCOPED, "allowed_channels on the store read"),
     "GET /messages/search": (SCOPED, "allowed_channels on the store read"),
@@ -260,7 +264,8 @@ def test_the_walk_sees_every_class_it_claims() -> None:
     stale and say nothing about coverage, so pin that it finds routes in every class."""
     app_routes = _routes_of_the_app()
     assert len(app_routes) >= 100
-    for cls in _CLASSES:
+    # unscoped_unfiled is a gap list, empty since BACKLOG #3189; the other classes must be found.
+    for cls in _CLASSES - {UNSCOPED_UNFILED}:
         assert any(ROUTES[key][0] == cls for key in app_routes if key in ROUTES), cls
 
 
@@ -312,6 +317,8 @@ _QUERY: dict[str, tuple[tuple[str, str], ...]] = {
 _QUIET_HERE = {
     # tests/test_single_route_data_rules_doc_drift.py measures the narrowing with a stubbed failure.
     "/status": "no inbound failed to start, so there is no failed-inbound name to narrow",
+    # tests/test_channel_scope_posture_users_reload.py measures it with declared deviations (#3189).
+    "/security/posture": "no connection here declares a deviation or a static-credential hop",
 }
 
 #: What the scoped caller may legitimately see, and what it must never see. ``OB_X`` is the shared

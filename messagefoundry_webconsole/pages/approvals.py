@@ -22,10 +22,10 @@ hand-built POST either way.
 **Each row shows the parameters its hold captured** (BACKLOG #2458), so an approver sees what a
 release would do. A ``None`` reads as the scope it means, such as all inbound connections.
 
-**A pending row whose operation dual control no longer gates offers no Approve.** The engine marks
-it ``gated`` False, from the same test its release refusal uses, so the page offers the reject and
-says why, rather than a button the gate answers with 409. The reject reads Withdraw on the
-requester's own row and Reject on anyone else's, and the note names the same verb.
+**A pending row the gate refuses whoever approves it offers no Approve** (vault BACKLOG #3192). The
+engine names the reason in ``release_blocked``; ``PendingApprovalInfo`` says what each value means.
+The page offers the reject and says why, rather than a button the gate answers with 409. The reject reads Withdraw on the requester's own row and Reject on anyone
+else's, and the note names the same verb.
 
 Every value goes through the escaping ``el`` builder.
 """
@@ -38,6 +38,7 @@ from messagefoundry.api.models import (
     ApprovalDecisionResult,
     ApprovalList,
     PendingApprovalInfo,
+    ReleaseBlocked,
     ResolveOutcome,
 )
 
@@ -90,15 +91,30 @@ _INTERRUPTED_NOTE = (
 
 _OWN_REQUEST = "Your request. A different approver decides it."
 
-_UNREADABLE = "Unreadable; reject it."
-
-# Follows the engine's approval.no_longer_gated refusal. ``{verb}`` is the row's own button label,
-# Withdraw on the requester's row and Reject elsewhere, so the note never names a button the row
-# does not have; the engine's text always says Reject.
-_NOT_GATED = (
-    "Dual control no longer applies to this operation, so it cannot be approved. {verb} it; if it "
-    "is still needed, run it again, without a second approver."
-)
+# Why the engine refuses this row's approve whoever approves it, keyed by its ``release_blocked``
+# (vault BACKLOG #3192); a test pins that every value has a note. Each follows the engine's own
+# 409. ``{verb}`` is the row's own button label, Withdraw on the requester's row and Reject
+# elsewhere, so a note never names a button the row does not have; the engine's text always says
+# Reject.
+_BLOCKED: dict[ReleaseBlocked, str] = {
+    "no_requester_id": (
+        "This request predates requester-id attribution, so it cannot be approved. {verb} it; if "
+        "it is still needed, request it again."
+    ),
+    "operation_unavailable": (
+        "This engine no longer offers this operation, so it cannot be approved. {verb} it."
+    ),
+    "not_gated": (
+        "Dual control no longer applies to this operation, so it cannot be approved. {verb} it; "
+        "if it is still needed, run it again, without a second approver."
+    ),
+    "params_unreadable": "Its parameters are unreadable, so it cannot be approved. {verb} it.",
+    "requester_not_authorized": (
+        "The requester no longer holds the authority this operation requires, so it cannot be "
+        "approved while that lasts. If their authority is restored, it can be approved then. "
+        "Otherwise, {verb} it, and have an authorized user request it again if it is still needed."
+    ),
+}
 
 # What a None parameter means for the operations that hold one: the broadest scope, not "nothing".
 # Any other None reads "not set".
@@ -195,17 +211,15 @@ def _params(a: PendingApprovalInfo) -> Markup:
 
 def _pending_row(a: PendingApprovalInfo) -> list[object]:
     base = f"{_PAGE}/{_seg(a.id)}"
-    # BACKLOG #2460: Approve is not offered where the gate would refuse it: to the requester, on a
-    # row whose operation dual control no longer gates, and on a row whose params are unreadable.
-    # Each such row gets the reject and a note saying why. The not-gated note comes first, so the
-    # requester, who alone can run the operation again, sees it on their own row too.
+    # BACKLOG #2460, vault BACKLOG #3192: Approve is not offered where the gate would refuse it:
+    # to the requester, and on a row the engine marks release_blocked. Each such row gets the
+    # reject and a note saying why. The blocked note comes first, so the requester, who alone can
+    # run the operation again, sees it on their own row too.
     verb = "Withdraw" if a.caller_is_requester else "Reject"
-    if not a.gated:
-        note: str | None = _NOT_GATED.format(verb=verb)
+    if a.release_blocked is not None:
+        note: str | None = _BLOCKED[a.release_blocked].format(verb=verb)
     elif a.caller_is_requester:
         note = _OWN_REQUEST
-    elif a.params is None:
-        note = _UNREADABLE
     else:
         note = None
     reject = _post_button(f"{base}/reject", verb)

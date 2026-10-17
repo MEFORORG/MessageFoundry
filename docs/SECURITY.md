@@ -1898,17 +1898,36 @@ the same permission set on the same method reds CI until it is listed here.
 
 > **The per-name connection routes do not tell a scoped caller which names exist (BACKLOG #2551).**
 > This covers at least `GET /connections/{name}/metadata` and `POST /connections/{name}/test`,
-> `/test-credential`, `/start`, `/stop` and `/restart`. Each checks the scope before it looks the
-> name up. A scoped caller reaches only an inbound in its own scope. Every other name gets one 403,
+> `/test-credential`, `/start`, `/stop` and `/restart`, and the web console's bulk start, stop and
+> restart. All of them resolve the name through one helper, `_resolve_connection` in
+> `messagefoundry/api/app.py` (BACKLOG #3031). It looks the name up among the inbounds first and
+> checks the scope then, and the answer does not depend on that order. A scoped caller reaches only
+> an inbound in its own scope. Every other name gets one 403,
 > one body and one `auth.channel_denied` row: an inbound outside its scope, any outbound, and a
 > name that exists nowhere. That holds even when the caller's scope lists the outbound or the
 > unknown name, since a scope is not checked against the registry (BACKLOG #2640). Only an
 > unscoped caller gets 404 for an unknown name. So a denial row can name a channel inside the
 > actor's own scope, for example one a reload removed. Read such a row as a miss, not a probe.
-> With the engine not started there is no graph and no name exists. Every route still checks the
-> scope first, so a name outside it gets the 403. A name inside it gets 503 from the first three
-> routes and 404 from the control routes, with no denial row. Names still show elsewhere. At
-> least the Prometheus exposition above lists them.
+> A name that fails the connection-name rule is never in a scope, and its denial row carries no
+> channel, so `audit_log.channel_id` never holds a caller-chosen string of unbounded length. The
+> console checks the rule before it calls in, and `audit_channel_denied` in
+> `messagefoundry/api/message_scope.py`, which writes every `auth.channel_denied` row the API and
+> the console seam record, checks it again. Its detail then carries `"malformed_name": true`, so
+> such a row is told apart from a refusal that names no channel by design (BACKLOG #3031).
+> On a deployment with more than one engine shard the same row has a second cause. Each engine
+> shard's graph holds only its own inbounds, and each serves its own API port. So a scoped caller
+> who asks one engine shard about an in-scope inbound that another owns gets the 403 and a denial
+> row, for a channel it may reach. The row does not say which engine shard answered. To read one,
+> look the named inbound up in the whole config, which `messagefoundry check` reads: an inbound
+> that exists and that the actor's scope lists was asked of the wrong engine shard, or was removed
+> by a reload. That case was read from the code, not run on more than one engine shard (BACKLOG
+> #3031).
+> With an engine bound but not started there is no graph and no name exists. Every route still
+> checks the scope first, so a name outside it gets the 403. A name inside it gets 503 from the
+> first three routes and 404 from the control routes, with no denial row. With no engine bound at
+> all, every one of these routes answers 503 `engine not started` before any scope check, the same
+> answer for every name. Names still show elsewhere. At least the Prometheus exposition above
+> lists them.
 > `POST /connections/{name}/flag` refuses the same way (BACKLOG #1152). A scoped caller flags only
 > an inbound in its own scope, and every other target gets that 403, before the engine looks the
 > name up. An in-scope inbound the graph holds, or any in-scope name when no graph is loaded,
@@ -1917,7 +1936,8 @@ the same permission set on the same method reds CI until it is listed here.
 > only the rules that name no connection outside its scope: `connection` is `*` or a name in its
 > scope, and `control_target` is unset or in it.
 > `tests/test_channel_rbac.py` pins the six routes, not that list.
-> `tests/test_object_scope_flag_and_alert_rules.py` pins the flag route and the rules.
+> `tests/test_object_scope_flag_and_alert_rules.py` pins the flag route and the rules. The console's
+> `test_webui.py` pins the bulk page's 403 for an in-scope name no connection uses, on both roles.
 
 > **Single-route data rules: at least these routes narrow or refuse by scope or owner, each in its
 > own way (BACKLOG #1151).** Their route rows above point here. A *scoped caller* is any
@@ -1968,9 +1988,11 @@ the same permission set on the same method reds CI until it is listed here.
 > - `POST /approvals/{approval_id}/approve` checks the requester's channel scope again before it
 >   releases a held request, by the rule the request route used. A held dead-letter replay needs
 >   a scope that still covers its `channel_id`, and a held replay of every channel needs an
->   all-channels requester. A held purge needs a requester who is still all-channels. Otherwise
->   the release answers 409, the request stays pending, and an `approval.stale_requester` row
->   records the reason `requester_out_of_scope`.
+>   all-channels requester. A held purge, and a held config reload, need a requester who is still
+>   all-channels. Otherwise the release answers 409, the request stays pending, and an
+>   `approval.stale_requester` row records the reason `requester_out_of_scope`. The approvals
+>   queue reads the same check when it lists the request, and marks it `release_blocked:
+>   requester_not_authorized` (BACKLOG #3189).
 > - `GET /me/security-events` returns the `auth.*` rows recorded under the caller's username, and
 >   only those at or after the account's `created_at`. So an account does not see rows written
 >   under its name before it existed, such as a failed sign-in or a deleted account's history. The
@@ -2017,10 +2039,31 @@ the same permission set on the same method reds CI until it is listed here.
 >
 > The store reads that take `allowed_channels` require it, so a caller cannot read every channel by
 > leaving it out. A test refuses a literal `allowed_channels=None` on those reads under
-> `messagefoundry/api/`. The table also lists at least three unscoped routes that no
-> backlog item tracks yet: `GET /security/posture` names connections, `GET /users` returns every
-> account's channel scope to a `users:read` holder, and `POST /config/reload` acts on every
-> connection.
+> `messagefoundry/api/`. The table's class for routes that no backlog item tracked is empty since
+> BACKLOG #3189 classed its three:
+>
+> - `GET /security/posture` shows a scoped reader a per-connection entry only for an inbound in its
+>   own scope that the graph holds. That covers the loosenings, the static-credential hops and
+>   their opt-outs, and the audit row. `loosenings_scope` and `static_credential_hops_scope` then
+>   say the reading is narrowed, with or without a loaded graph. The audit row carries
+>   `loosenings_scope` too, and the console's status page shows it. The rest is shown whole. Some
+>   of it is operator free text, such as an alert rule's id or an attestation reason, which may
+>   name a connection.
+> - `GET /users` sends each account's `channel_scope` and `channel_scope_source` only to a
+>   `users:manage` holder, the tier `GET /users/{user_id}/channel-scope` reads on. Everyone else
+>   gets null for both and `channel_scope_withheld: true`, so a null there means "not shown". The
+>   console's user list reads that flag and drops both scope columns for such a reader.
+> - `POST /config/reload` refuses a scoped caller 403, a dry run included, because a reload loads
+>   the whole graph and a dry run's reply describes it. So a deployer needs the all-channels grant.
+>   The refusal writes one `auth.channel_denied` row naming no channel. The approval gate refuses
+>   to release a held reload whose requester has been scoped since, as it does for a purge, and
+>   `GET /approvals` marks such a request blocked. `GET /config/provenance` carries
+>   `reload_refused`, the refusal the reload gives this caller, read off the same rule, and the
+>   console's configuration page shows that reason in place of its Reload form.
+>
+> `tests/test_channel_scope_posture_users_reload.py` pins at least the three routes' rules, the
+> queue's prediction for a held reload and purge, `reload_refused`, and the bound on a malformed
+> name in a denial row.
 
 > **`/config/reload` executes Python** from the target directory in-process, so it is constrained
 > beyond the `config:deploy` permission: the directory must resolve **within** an allowed root —
@@ -2097,8 +2140,25 @@ the approver, whose `reason` says which (`approvals_disabled` or `operation_not_
 runs. The request stays pending until an approver rejects it or it expires. The refusal's wording
 tells the approver to reject it and, if the operation is still needed, to run it again, which now
 runs it without a second approver. `GET /approvals` marks such a request `gated: false`, read from
-the same settings test at listing time, and the console's Approvals page offers it only Reject,
-with that advice beside it.
+the same settings test at listing time, and gives it a `release_blocked` reason, below, which the
+console's Approvals page keys on.
+
+**`GET /approvals` names at least some of the releases the gate refuses whoever approves them
+(vault BACKLOG #3192).** Each pending request carries `release_blocked`, which the release refuses
+on directly, so where it names a reason the two cannot disagree. It names at least a request with
+no requester id, an operation no longer registered, one dual control no longer gates, unreadable
+parameters, and a requester who no longer holds the authority the operation needs, such as a held
+reload or purge whose requester has since been channel-scoped (`requester_not_authorized`, BACKLOG
+#3189). The requester's standing is read when the queue is listed, by the rule the release
+applies, so a change after the listing, or a standing the listing could not read, is met only at
+release. A `null` does not promise a release: at least the self-approval refusal,
+the expiry, the dwell floor, the row's seal and the operation's own refusals are met only then.
+`PendingApprovalInfo` in `messagefoundry/api/models.py` lists the values. The console's Approvals
+page keys on it, and offers a blocked request only Reject, or Withdraw on the requester's own row,
+with a note saying why. A release refused for unreadable parameters writes an
+`approval.params_unreadable` row against the approver, which carries no parameters. A release
+refused on the requester's standing writes `approval.stale_requester`, above. A refusal for a
+request with no requester id, or for an operation no longer registered, still writes no row.
 
 **Each state change and its audit row are one write (vault BACKLOG #2255).** The store
 moves the request and appends its audit row in one transaction, so the two commit or roll back
@@ -2115,12 +2175,14 @@ the release still succeeds, because the operation has already run; see the outco
 The 503 means the claim and its row are absent, not merely unconfirmed. When a COMMIT fails, no
 later write can commit them. SQLite's writer guard rolls it back. SQL Server's audit appends roll it
 back explicitly, and discard the connection if that rollback fails too. Postgres ends the
-transaction itself, and its pool rolls a connection back before lending it again. There are at
-least two exceptions, where the row may have committed after all:
+transaction itself, and its pool rolls a connection back before lending it again. There is at
+least one exception, where the row may have committed after all: a COMMIT whose reply is lost on
+the network to Postgres or SQL Server.
 
-- a COMMIT whose reply is lost on the network to Postgres or SQL Server;
-- a SQL Server COMMIT that hits the per-statement `[store].command_timeout`, which the driver
-  reports as an error while the server may still finish the commit.
+The per-statement `[store].command_timeout` is not a second one, by a reading of pyodbc's
+documentation rather than a measurement (vault BACKLOG #3193). pyodbc applies the timeout to each
+cursor's statements, and a commit is a call on the connection, so the timeout does not bound a SQL
+Server COMMIT at all. A COMMIT that stalls is waited on, not abandoned.
 
 A config reload applies the same rule to its own `config_reload` row, inline or released. The graph
 has already swapped when that row is written. So a failed write is logged at ERROR, and the reload
@@ -2135,8 +2197,8 @@ loads or swaps, and an `audit_write_failed` alert keyed `config_reload:inline` i
 writes no such row, because it swaps nothing. Like the gate's row, it says *attempted*, and an
 attempt row with no row after it is not proof the reload was refused or cancelled. At least a
 refusal or cancellation whose own row then fails, and an unexpected fault in the reload, leave it
-alone. The 503 has the same two lost-COMMIT exceptions as the gate's, listed above, where the
-attempt row may have committed after all.
+alone. The 503 has the same lost-COMMIT exception as the gate's, stated above, where the attempt
+row may have committed after all.
 
 **A reload's `config_reload_failed` row names why in `reason`.** At least these values are
 written: `trust_anchor`, `invalid_config`, `not_found`, `unreadable`, `digest_mismatch`,
@@ -2234,10 +2296,10 @@ is running or owned by another engine shard cancels nothing and writes no `conne
 
 **An audit or store outage that refuses writes answers a mapped status on at least these approval
 paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own audit row fails still
-answers **409**: that is at least `approval.too_early`, `approval.stale_requester` and
-`approval.no_longer_gated`. A claim, a rejection or a resolution that the store cannot write with
+answers **409**: that is at least `approval.too_early`, `approval.stale_requester`,
+`approval.no_longer_gated` and `approval.params_unreadable`. A claim, a rejection or a resolution that the store cannot write with
 its audit row answers **503**. The request does not move, except where a COMMIT lands despite the
-error, as listed above.
+error, as stated above.
 
 When an audit row write fails, the gate logs it at ERROR and pages `audit_write_failed` on at
 least these paths. The alert is keyed `approval:<id>` and carries the row's action name.
@@ -2246,34 +2308,48 @@ least these paths. The alert is keyed `approval:<id>` and carries the row's acti
   row's detail;
 - the `approval.approver_provenance` row a release or a resolution writes after it has gone ahead.
   The log line carries the row's detail;
-- the request or repeat write. The log line names the actor and the operation;
+- the request or repeat write, including one that reads back as held, as below. The log line names
+  the actor and the operation, or is a WARNING for a held one;
 - a claim, a rejection or a resolution that answers 503, and a claim whose approve was cancelled.
   The log line carries the exception, not the row's detail.
 
-For some failed writes the gate logs at ERROR and pages nothing. At least these two:
+For some failed writes the gate logs at ERROR and pages nothing. At least this one: a restart
+cannot move a leftover `executing` row to `interrupted`. The row stays `executing`, and the next
+start tries again.
 
-- a restart cannot move a leftover `executing` row to `interrupted`. The row stays `executing`,
-  and the next start tries again;
-- an outcome's combined write fails, and the status write that follows finds the row already
-  moved. The combined write most likely committed, and only its reply was lost.
+An outcome's combined write can fail while the status write that follows finds the row already
+moved. The combined write most likely committed, and only its reply was lost, so the gate writes
+no second row. It logs at ERROR and pages, because the store writes a row's off-box copy only
+after a commit it saw succeed (vault BACKLOG #3193).
 
 A call can be cancelled mid-write, for example by the request timeout. The gate then writes no
-ERROR line and no alert for at least three writes. They are the request or repeat write, a
-rejection, and a refusal's row. The gate shields at least the claim, each outcome and a resolution
-from a cancel. Those writes finish on their own, and log and page as above.
+ERROR line and no alert for at least two writes: a rejection, and a refusal's row. The gate
+shields at least the request or repeat write, the claim, each outcome and a resolution from a
+cancel. Those writes finish on their own, and log and page as above.
 
 What this does not cover, at least: a store that refuses READS of the request row or the
-requester's account still answers a raw 500. A request or a repeat whose write fails is not mapped
-either. It answers a raw 500, or the request timeout's 503 when the call is cancelled.
+requester's account still answers a raw 500. A request or a repeat whose write fails, and that
+does not read back as held, is not mapped either. It answers a raw 500, or the request timeout's
+503 when the call is cancelled.
 
-**A failed request write can still hold the request, so a retry may file a second one.** The request
-and its `approval.requested` row are one write, as above, so a write that fails before its COMMIT
-holds neither. At least these cases hold the request while the call still fails:
+**A failed request write is read back, and the write outlives its caller (vault BACKLOG #3193).**
+The request and its `approval.requested` row are one write, as above. When that write reports an
+error, the gate reads the request back by its id. If it is held and its seal holds, the COMMIT
+landed and only its reply was lost. The gate then answers the same **202** with that id, logs a
+WARNING, and still pages. Its row reaches the local audit log but not the off-box copy, which is
+written only after a commit the store saw succeed, and the page is what reports that gap. A cancel reaches the caller at once, while
+the write finishes on its own, and the shutdown drain waits for it.
 
-- a COMMIT that lands despite the error, as listed above, such as a lost reply or a driver
-  timeout. Its `approval.requested` row lands with it, though the ERROR line and alert call it lost;
-- a call cancelled while its COMMIT runs, for example by the request timeout. The gate writes no
-  ERROR line and no alert for it;
+A retry can still file a second request. At least these cases leave the request held while the
+call fails or never answers:
+
+- the read-back fails, or finds a row whose seal fails. The gate raises, logs at ERROR and pages.
+  A row whose seal fails can never be released;
+- the read-back finds nothing, and a COMMIT still finishing on the server lands after it. The gate
+  raises, logs at ERROR and pages, saying that most likely nothing is held;
+- a call cancelled while the write runs, for example by the request timeout. The write lands, and
+  the requester gets the timeout's 503 rather than the 202. The gate logs a WARNING naming the
+  request;
 - a repeat whose `approval.request_repeated` row fails. The earlier request it named stays held.
 
 A retry files nothing new when the repeat rule above joins it to the held request. The rule misses

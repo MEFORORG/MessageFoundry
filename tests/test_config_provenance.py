@@ -71,6 +71,8 @@ async def test_provenance_before_any_load(client: httpx.AsyncClient) -> None:
         "git_head": None,
         "files": None,
         "drift": False,
+        # The open-mode caller holds every channel, so its reload is not refused (BACKLOG #3189).
+        "reload_refused": None,
     }
 
 

@@ -14,7 +14,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import httpx
@@ -2707,6 +2707,11 @@ def test_status_builder_escapes_and_formats() -> None:
     # When reporting is off, the badge says so (no state leaked).
     off = ServiceStatusInfo(enabled=False, state="disabled", service_name="")
     assert "reporting is off" in str(status(sys_status, posture, cluster, nodes, dr, off))
+    # BACKLOG #3189: a narrowed or blind loosenings list says so, even when it is empty.
+    assert "Loosenings listed:" not in html
+    narrowed = posture.model_copy(update={"loosenings_scope": "narrowed to your channel scope"})
+    shown = str(status(sys_status, narrowed, cluster, nodes, dr, svc))
+    assert "Loosenings listed: narrowed to your channel scope" in shown
 
 
 # --- L0b: register_ui_action write-action registry (the extensible step-up allow-list) ---------
@@ -3696,6 +3701,7 @@ def test_users_page_scope_column_shows_what_the_account_reaches() -> None:
             disabled=False,
             roles=roles,
             channel_scope=scope,
+            channel_scope_withheld=False,
         )
 
     assert _scope_cell(_u(["operator"], None)) == "(none)"  # never granted -> denies
@@ -3705,6 +3711,61 @@ def test_users_page_scope_column_shows_what_the_account_reaches() -> None:
     # By role, and the stored scope is irrelevant in BOTH directions.
     assert _scope_cell(_u(["administrator"], None)) == "all (administrator)"
     assert _scope_cell(_u(["administrator"], ["IB_A"])) == "all (administrator)"
+
+
+def test_users_page_hides_the_scope_columns_from_a_reader_who_is_not_shown_scopes() -> None:
+    """BACKLOG #3189: the engine shows channel scopes only to a users:manage holder, and sends
+    anyone else null with ``channel_scope_withheld``. This page renders a null scope as "(none)",
+    "reaches nothing", so for such a reader it must drop both scope columns rather than print that
+    beside every account. It reads the engine's flag, and does not re-derive the rule."""
+    from messagefoundry.api.auth_models import UserSummary
+    from messagefoundry_webconsole.pages.admin import _scope_cell, _scope_source_text, users_page
+
+    def _u(withheld: bool) -> UserSummary:
+        return UserSummary(
+            id="u",
+            username="u",
+            auth_provider="local",
+            disabled=False,
+            roles=["operator"],
+            channel_scope_withheld=withheld,
+        )
+
+    hidden = str(users_page([_u(True)]))
+    assert "Channel scope" not in hidden and "Scope source" not in hidden
+    assert "(none)" not in hidden
+    assert _scope_cell(_u(True)) == "not shown"
+    assert _scope_source_text(_u(True)) == "not shown"
+    # A mixed list keeps the columns, as the Lock column does, and a withheld cell still never
+    # reads "(none)".
+    mixed = str(users_page([_u(True), _u(False)]))
+    assert "<th>Channel scope</th>" in mixed and mixed.count("not shown") == 2
+    # The control: the same null scope, not withheld, is a scope that denies, and both columns show.
+    shown = str(users_page([_u(False)]))
+    assert "<th>Channel scope</th>" in shown and "<th>Scope source</th>" in shown
+    assert "(none)" in shown
+
+
+async def test_users_page_shows_scopes_only_to_a_users_manage_holder(engine: Engine) -> None:
+    """The route half of the rule above: a users:read-only reader, here a custom role, sees no
+    account's channels on /ui/users, while an administrator sees them (BACKLOG #3189)."""
+    service = await _service(engine)
+    role = await service.create_custom_role(
+        display_name="User reader", description=None, permissions=["users:read"], actor="test"
+    )
+    await _add_with_role_ids(service, "reader", [role.id])
+    await _add(service, "scoped-op", Role.OPERATOR)
+    await service.set_channel_scope(await _uid(service, "scoped-op"), ["IB_SECRET"], actor="test")
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "reader")
+        r = await c.get("/ui/users")
+        assert r.status_code == 200, r.text
+        assert "scoped-op" in r.text
+        assert "IB_SECRET" not in r.text and "Channel scope" not in r.text
+    async with _boss_client(engine, service) as c:
+        r = await c.get("/ui/users")
+        assert r.status_code == 200
+        assert "IB_SECRET" in r.text and "<th>Channel scope</th>" in r.text
 
 
 async def test_l4a_actions_registered_in_correct_allowlists(engine: Engine) -> None:
@@ -4265,6 +4326,7 @@ def test_scope_source_renders_in_words() -> None:
             roles=["operator"],
             channel_scope=["IB_A"],
             channel_scope_source=source,
+            channel_scope_withheld=False,
         )
 
     assert _scope_source_text(_u("ad")) == "directory (AD group map)"
@@ -4292,6 +4354,7 @@ def test_which_scopes_need_the_manual_confirmation() -> None:
             roles=["operator"],
             channel_scope=scope,
             channel_scope_source=source,
+            channel_scope_withheld=False,
         )
 
     assert needs_manual_scope_confirm(_u("ad", ["IB_A"], "ad"))
@@ -4510,6 +4573,7 @@ def test_only_a_directory_scope_sends_expected_source_on_a_ticked_save() -> None
             roles=["operator"],
             channel_scope=["IB_A"] if stored else None,
             channel_scope_source=source,
+            channel_scope_withheld=False,
         )
 
     assert ticked_scope_expected_source(_u("ad")) == "ad"
@@ -4561,6 +4625,7 @@ async def test_the_console_and_the_engine_agree_on_who_owns_a_scope(engine: Engi
             roles=["operator"],
             channel_scope=scope,
             channel_scope_source=source,
+            channel_scope_withheld=False,
         )
         engine_says = _effective_scope_source(record) == "ad"
         assert needs_manual_scope_confirm(summary) is engine_says, (provider, source, scope)
@@ -5196,7 +5261,12 @@ def test_the_error_banner_escapes_hostile_text() -> None:
     from messagefoundry_webconsole import pages
 
     user = UserSummary(
-        id="0" * 32, username="u1", auth_provider="local", disabled=False, roles=["viewer"]
+        id="0" * 32,
+        username="u1",
+        auth_provider="local",
+        disabled=False,
+        roles=["viewer"],
+        channel_scope_withheld=False,
     )
     hostile = "<img src=x onerror=alert(1)>"
     page = str(pages.user_detail_page(user, [], error=hostile))
@@ -7840,6 +7910,102 @@ async def test_bulk_control_forbidden_target_does_not_abort_batch(
         assert "403" in r.text and "out1" in r.text  # the forbidden target is enumerated
     assert rr.inbound_running("in1") is False  # the in-scope target still applied (batch continued)
     assert rr.outbound_running("out1") is True  # the forbidden target was NOT stopped
+
+
+async def test_bulk_control_answers_an_in_scope_unknown_name_with_the_audited_403(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """BACKLOG #3031 finding 1: the bulk page always passes a ``role``, and the JSON routes never do,
+    so this is the only test of the refusal on the role-keyed path.
+
+    A scoped operator whose scope lists names no connection uses must get the same audited 403 for
+    them as for an out-of-scope connection, on both roles. A 404 there would tell it which listed
+    names exist (BACKLOG #2640). The mutant this kills applied the early refusal only when ``role``
+    was ``None`` or the name was an outbound: both selections below then answered 404."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await service.set_channel_scope(
+        await _uid(service, "op"), ["in1", "ghost_in", "ghost_out"], actor="admin"
+    )
+    await _start_two_out(engine, tmp_path)
+
+    async def denied() -> list[str | None]:
+        rows = await engine.store.list_audit(limit=100, action="auth.channel_denied")
+        return sorted(r["channel_id"] for r in rows)
+
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await _post_pairs(
+            c,
+            "/ui/connections/bulk-control",
+            [
+                ("action", "stop"),
+                ("sel", _rowkey("source", "ghost_in")),
+                ("sel", _rowkey("destination", "in1", "ghost_out")),
+            ],
+        )
+        assert r.status_code == 200, r.text
+        assert r.text.count("403: not authorized for this connection") == 2, r.text
+        assert "404" not in r.text and "no such connection" not in r.text
+    assert await denied() == ["ghost_in", "ghost_out"]
+
+
+async def test_bulk_routes_audit_a_scoped_malformed_name_without_writing_it(
+    engine: Engine,
+) -> None:
+    """BACKLOG #3031 finding 5: a scoped actor's malformed name is still a recorded denial, but the
+    row carries no channel. The name is caller-chosen text bounded only by the request body, and it
+    used to be written whole to ``audit_log.channel_id``."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await service.set_channel_scope(await _uid(service, "op"), ["in1"], actor="admin")
+    long_bad = "bad name " + "x" * 5000
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await _post_pairs(
+            c,
+            "/ui/connections/bulk-control",
+            [("action", "stop"), ("sel", _rowkey("source", long_bad))],
+        )
+        assert r.status_code == 200, r.text
+        assert "not applied: not a valid connection name" in r.text
+        assert long_bad not in r.text
+    rows = await engine.store.list_audit(limit=100, action="auth.channel_denied")
+    assert [(row["actor"], row["channel_id"]) for row in rows] == [("op", None)]
+    assert all("xxxxx" not in str(dict(row)) for row in rows)
+
+
+async def test_a_failed_malformed_name_audit_does_not_abort_the_batch(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3031: the malformed-name denial is written outside the per-target capture, so a
+    failed write must still leave the batch to run and render its result table."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await service.set_channel_scope(await _uid(service, "op"), ["in1"], actor="admin")
+    await _start_two_out(engine, tmp_path)
+    real = engine.store.record_audit
+
+    async def failing(action: str, *args: Any, **kwargs: Any) -> Any:
+        if action == "auth.channel_denied":
+            raise RuntimeError("synthetic audit failure")
+        return await real(action, *args, **kwargs)
+
+    monkeypatch.setattr(engine.store, "record_audit", failing)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await _post_pairs(
+            c,
+            "/ui/connections/bulk-control",
+            [
+                ("action", "stop"),
+                ("sel", _rowkey("source", "bad name")),
+                ("sel", _rowkey("source", "in1")),
+            ],
+        )
+    assert r.status_code == 200, r.text
+    assert "not applied: not a valid connection name" in r.text
+    assert "applied (running=False)" in r.text
 
 
 async def test_bulk_control_bad_action_404(engine: Engine) -> None:
