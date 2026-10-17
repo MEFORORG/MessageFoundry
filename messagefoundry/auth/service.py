@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import http.client
 import ipaddress
 import json
@@ -315,6 +316,24 @@ _PROBE_FAULT_KIND: ContextVar[str | None] = ContextVar("_PROBE_FAULT_KIND", defa
 #: The errors ``_probe_principal`` reads as an unreachable directory although they are not an
 #: ``LdapError`` (BACKLOG #3100): the network-class ``OSError`` subtypes. At least these.
 _UNREACHED_DIRECTORY = (ConnectionError, TimeoutError, socket.gaierror)
+#: The errnos that mark a plain ``OSError`` as the network failing, not the engine. Python gives
+#: these no ``ConnectionError`` subclass, so a type test alone read an unreachable host as a FAULT,
+#: which pages. Read by name, because the values differ by platform and a platform may lack one.
+#: On Windows these names carry the Winsock values (``ENETUNREACH`` is ``WSAENETUNREACH``).
+_UNREACHED_ERRNOS: Final = frozenset(
+    code
+    for name in ("ENETUNREACH", "EHOSTUNREACH", "ENETDOWN", "EHOSTDOWN")
+    if (code := getattr(errno, name, None)) is not None
+)
+
+
+def _unreached_directory(exc: Exception) -> bool:
+    """Whether ``exc`` means the directory was not reached, rather than an engine fault."""
+    if isinstance(exc, _UNREACHED_DIRECTORY):
+        return True
+    return isinstance(exc, OSError) and exc.errno in _UNREACHED_ERRNOS
+
+
 #: Outcomes the directory itself gave. Any of them ends a logged outage.
 _CERT_DIRECTORY_ANSWERS = frozenset(
     outcome.value
@@ -6268,15 +6287,16 @@ class AuthService:
             # user per pass; the pass-level summary below reports the count at WARNING.
             _log.debug("directory probe failed for %s: %s", user.username, exc)
             return reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.UNAVAILABLE)
-        except _UNREACHED_DIRECTORY as exc:
-            # BACKLOG #3100. ldap.py wraps the socket faults it knows of as LdapError (BACKLOG
-            # #2566). A connection, timeout or name-lookup error that escapes it is still the
-            # directory not being reached. Read as FAULT, a network blip would page and open an
-            # alert nothing resolves. Any other OSError, such as a missing file, is an engine fault
-            # and falls through to FAULT below. Debug-level, like the outage above.
-            _log.debug("directory probe of %s failed: %s", user.username, type(exc).__name__)
-            return reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.UNAVAILABLE)
         except Exception as exc:
+            if _unreached_directory(exc):
+                # BACKLOG #3100. ldap.py wraps the socket faults it knows of as LdapError (BACKLOG
+                # #2566). A connection, timeout, name-lookup or unreachable-network error that
+                # escapes it is still the directory not being reached. Read as FAULT, a network
+                # blip would page and open an alert nothing resolves. Any other OSError, such as a
+                # missing file, is an engine fault and reads as FAULT below. Debug-level, like the
+                # outage above.
+                _log.debug("directory probe of %s failed: %s", user.username, type(exc).__name__)
+                return reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.UNAVAILABLE)
             # BACKLOG #2241. Anything else the directory layer raised: a KeyError or ValueError on a
             # malformed entry, a fault in a test double. Uncaught, it was a 500 from
             # verify_mfa instead of an audited refusal, and it ended the WHOLE reconcile pass, so one

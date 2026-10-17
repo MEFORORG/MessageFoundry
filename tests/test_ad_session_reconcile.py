@@ -18,6 +18,7 @@ All directory data here is synthetic.
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
 import sqlite3
@@ -1194,12 +1195,34 @@ async def test_one_principal_that_raises_no_longer_ends_the_pass(
         await store.close()
 
 
-async def test_an_os_error_escaping_the_directory_layer_is_still_an_outage() -> None:
+_NETWORK_ERRNOS = [
+    name
+    for name in ("ENETUNREACH", "EHOSTUNREACH", "ENETDOWN", "EHOSTDOWN")
+    if hasattr(errno, name)
+]
+
+
+@pytest.mark.parametrize(
+    ("exc", "outage"),
+    [
+        (TimeoutError("synthetic: read timed out"), True),
+        # Python gives these errnos no ConnectionError subclass, so a type test alone read an
+        # unreachable network as a probe fault, which pages (BACKLOG #3100 follow-up).
+        *[(OSError(getattr(errno, n), "synthetic: unreachable"), True) for n in _NETWORK_ERRNOS],
+        # The control: the errno set is narrow. A missing file is the engine failing, not the
+        # directory, so it still reads as FAULT.
+        (OSError(errno.ENOENT, "synthetic: no such file"), False),
+    ],
+    ids=lambda v: v if isinstance(v, bool) else f"{type(v).__name__}-{getattr(v, 'errno', None)}",
+)
+async def test_an_os_error_escaping_the_directory_layer_is_still_an_outage(
+    exc: Exception, outage: bool
+) -> None:
     """BACKLOG #3100, the review's ask. A socket fault ldap.py did not wrap is the directory not
     being reached. Read as a probe fault, a network blip would page and open an alert that nothing
-    resolves.
+    resolves. Any other OSError is an engine fault.
 
-    RED when: an OSError maps to FAULT."""
+    RED when: a network-class OSError maps to FAULT, or every OSError maps to UNAVAILABLE."""
     store = await MessageStore.open(":memory:")
     try:
         ldap = _FakeLdap({"jdoe": _principal("jdoe")})
@@ -1207,10 +1230,13 @@ async def test_an_os_error_escaping_the_directory_layer_is_still_an_outage() -> 
         await service.initialize()
         await _signed_in_ad_user(service, store, "jdoe")
 
-        ldap.broken["jdoe"] = TimeoutError("synthetic: read timed out")
+        ldap.broken["jdoe"] = exc
         plan = await service.reconcile_directory_sessions()
-        assert plan.directory_outage and plan.faulted == () and plan.unavailable == 1
-        assert service.directory_reconcile_fault is None
+        if outage:
+            assert plan.directory_outage and plan.faulted == () and plan.unavailable == 1
+            assert service.directory_reconcile_fault is None
+        else:
+            assert len(plan.faulted) == 1 and plan.unavailable == 0
     finally:
         await store.close()
 
