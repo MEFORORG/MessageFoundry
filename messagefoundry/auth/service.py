@@ -2619,7 +2619,7 @@ class AuthService:
         #: (BACKLOG #2136). `_mark_reconcile_clears` reports no breaker clear while one is signed in.
         self._reconcile_unconfirmed: set[str] = set()
         #: Whether THIS process may resolve the durable ``ad_reconcile_aborted`` instance (BACKLOG
-        #: #2136), on the rule `_mark_reconcile_clears` states for both alerts: a process clears
+        #: #2136), on the rule `_mark_reconcile_clears` states for every alert: a process clears
         #: only what it watched open. ``"fresh"``: no pass here has tripped, so it resolves no
         #: trip, whatever an earlier run left open. ``"tripped"``: a pass here tripped, so a clear
         #: it then sees is of a trip it watched. ``"forfeit"``: an account signed in at a trip left
@@ -6653,7 +6653,7 @@ class AuthService:
           referred account has no answer from this pass, and an older one on record may predate
           the referral. So a standing referral keeps the breaker's and the hold's instances open
           after their own causes are gone: a missed clear, never a false one (BACKLOG #3100 item
-          7). A pass with a probe fault marks none either, for the same reason.
+          7). A pass with a probe fault marks none either, for the same reason. Unlike a referral, a fault is not carried to later passes, so a later pass whose sample misses the faulting account can still mark one (left open under BACKLOG #3100).
         * The referral's own instance is clear when, on top of the first test, every account signed
           in at the last referral has since read PRESENT on a pass with no referral
           (``_reconcile_referred``), and ``_reconcile_referral_standing`` is ``"referred"``: a
@@ -6700,7 +6700,7 @@ class AuthService:
         **The usual cost is a missed clear, with one reconciler on the store.** An account that
         never answers keeps every instance open while it is signed in. So does a hold, for the
         breaker's instance. So does a reconciler that is switched off, and so does every cluster
-        or multi-shard engine. A fresh process keeps both instances an earlier run left open, and
+        or multi-shard engine. A fresh process keeps every instance an earlier run left open, and
         a forfeited one keeps the instance it forfeited (`_forfeit_clears_on_attrition` says
         when). An operator resolves those by hand. **At least this case can still clear
         falsely.** Any engine that declares neither ``[cluster]`` nor more than one shard clears

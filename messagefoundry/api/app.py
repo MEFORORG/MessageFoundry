@@ -9496,7 +9496,7 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     part-way for another reason, such as inside one revocation, has already audited the revocations
     it applied before that point; those rows stand, and no alert is raised for them.
 
-    Each standing alert also gets its inverse, which pages nobody and resolves the open instance
+    Each standing alert but the probe fault's also gets its inverse, which pages nobody and resolves the open instance
     (BACKLOG #2136): ``ad_reconcile_breaker_cleared`` and ``ad_reconcile_hold_released``, and
     ``ad_reconcile_breaker_cleared`` under the referral's source for the referral's instance. The
     auth service decides when a pass is evidence of a clear (``plan.breaker_clear``,

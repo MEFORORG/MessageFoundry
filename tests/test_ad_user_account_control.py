@@ -953,6 +953,7 @@ def test_a_referral_pages_and_clears_under_its_own_source(
     assert [(e[0], e[1]) for e in sink.events] == expected
     # BACKLOG #3100 item 6: every referral page carries the closed-set slug.
     pages = [e for e in sink.events if (e[0], e[1]) == ("ad_reconcile_aborted", _REFERRAL_SOURCE)]
+    assert len(pages) == sum(1 for e in expected if e[1] == _REFERRAL_SOURCE and "aborted" in e[0])
     assert all(e[2]["reason"] == REFERRAL_ABORT for e in pages)
 
 

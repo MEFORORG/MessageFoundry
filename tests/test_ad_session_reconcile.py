@@ -932,8 +932,9 @@ async def test_a_referring_user_search_base_judges_nothing_and_pages_every_pass(
         # alert instance's reason, and the setting is what the page exists to name.
         assert "ad_user_search_base" in alert[:200] and "ad_group_search_base" in alert[:200]
         assert "revoked nothing" in alert and "circuit breaker" not in alert
-        # BACKLOG #3100 items 4 and 6. The page says what a referral costs: a disabled account
-        # behind the base is not revoked while it lasts. And it names no account.
+        # BACKLOG #3100 items 4 and 6. The detail says what a referral costs: a disabled account
+        # behind the base is not revoked while it lasts. That sentence falls past the 200
+        # characters the alert instance keeps; the notifier's detail carries it. No account named.
         assert "never revoked while it is referred" in alert
         assert "jdoe" not in alert and "asmith" not in alert
         audit = await store.list_audit()
@@ -1111,7 +1112,7 @@ async def test_revoking_an_account_signed_in_at_a_referral_forfeits_the_clear_on
     None
 ):
     """BACKLOG #3100 item 6, the revocation-loop forfeit. ``asmith`` is signed in at the referral
-    with a strike already on record. The base is fixed, and the next pass reads ``jdoe`` PRESENT and
+    and takes its first strike on that pass. The base is fixed, and the next pass reads ``jdoe`` PRESENT and
     revokes ``asmith`` on its second strike. ``asmith`` was never read PRESENT, so that pass is no
     evidence the referral cleared, although every account it leaves signed in reads clean.
 
