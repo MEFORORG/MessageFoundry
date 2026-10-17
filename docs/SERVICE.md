@@ -424,16 +424,18 @@ re-install that changes the account never keeps a restricted SID from the accoun
 SID type you set by hand with `sc.exe sidtype` is replaced.
 
 The `windows-service-smoke` CI leg has an account leg for `-AllowLocalSystem`, on Windows Server
-2025. It checks that the engine starts, takes a message over MLLP, and that the service's root
-process and the engine's processes run with SID type `none` and only `SeChangeNotifyPrivilege`.
-Read the leg's latest run for the result.
+2025. It reads SID type `none` and the one-entry privilege list on the registration. It checks that
+the engine starts and takes a message over MLLP. And it checks that the token of the service's root
+process and of the engine's processes runs as SYSTEM, carries no restricting SID, and holds only
+`SeChangeNotifyPrivilege`. Its first run is in the merge queue.
 
 **No leg runs a named account yet, a local user or a gMSA.** A local-user leg is wired in `ci.yml`
 and left out of the matrix. Read from the code, a SQLite store in the data directory would lock
 such a service out when the operator provisions the first Administrator before the first start.
 The store shares its files between the service and the operator only when the data directory
-grants a per-service virtual account, `NT SERVICE\<name>`. A gMSA could not have a leg in any case:
-it needs an Active Directory domain that the runner has joined, and no hosted runner has one.
+grants nobody but SYSTEM, Administrators and at most one per-service virtual account,
+`NT SERVICE\<name>`. A named account's grant is none of those. A gMSA also needs an Active
+Directory domain that the runner has joined, and no hosted runner has one.
 
 **`-SkipRestrictedServiceSid` opts out** for the default account. Use it only when the engine must
 write somewhere you cannot grant to `NT SERVICE\<ServiceName>`. The engine can then write wherever

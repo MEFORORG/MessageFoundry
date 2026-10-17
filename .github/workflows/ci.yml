@@ -3922,13 +3922,10 @@ jobs:
         # vault BACKLOG #2702: account legs install the service under an account other than its own
         # virtual account, which the installer gives SID type none. Each must start, take a message
         # and run with exactly the privilege list the installer writes. One Server SKU each.
-        # - localsystem (-AllowLocalSystem) runs.
-        # - localuser (-ServiceAccount, a local user created on the runner) is WIRED BUT NOT LISTED.
-        #   Read from the code, it cannot pass yet: the store's hardened-directory rule
-        #   (_hardening_refusal in messagefoundry/store/store.py) accepts only a per-service virtual
-        #   account, so the rig's provision-first order would leave the store files to the
-        #   operator alone and lock the service out. Add the row below once that rule accepts the
-        #   installer's named account:
+        # - localsystem (-AllowLocalSystem) is listed. Its first run is in the merge queue.
+        # - localuser (-ServiceAccount, a local user created on the runner) is WIRED BUT NOT LISTED,
+        #   for the reason docs/SERVICE.md "Restrict the service token" gives (the store's
+        #   _hardening_refusal in messagefoundry/store/store.py). Add this row once that changes:
         #     - { os: windows-2025, python-version: "3.14", account: localuser }
         # - A gMSA gets no leg. docs/SERVICE.md "Restrict the service token" says why.
         include:
@@ -4131,7 +4128,7 @@ jobs:
           # install path rather than the MEFOR_ALLOW_INSECURE_CONFIG_SOURCE dev escape. It also locks
           # environments\, the value file's folder, which `serve` now refuses to read when Users can
           # write it (vault BACKLOG #2626). -Config is named because it no longer has a default.
-          # #224: NO -ServiceAccount and NO -AllowLocalSystem, so this install exercises the NEW DEFAULT -
+          # #224: on the virtual-account legs, NO -ServiceAccount and NO -AllowLocalSystem, so this install exercises the NEW DEFAULT -
           # the least-privilege virtual account NT SERVICE\MessageFoundry (no password). This leg is the
           # gate for that flip: it proves the virtual account is granted config-read (RX, via the
           # -LockConfigDir path that now runs AFTER ObjectName so the per-service SID resolves) + data-dir
@@ -4557,7 +4554,8 @@ jobs:
       #
       # NOT PROVEN HERE: an explicit -ServiceAccount, a gMSA and -AllowLocalSystem. The installer
       # does not set the restricted SID for those, so this step runs on the virtual-account legs
-      # only; the next step reads the localsystem and localuser legs, and no leg runs a gMSA. Nor is a real
+      # only; the next step reads the account legs (localsystem; localuser is wired, not listed), and
+      # no leg runs a gMSA. Nor is a real
       # network share: the probe's credential is made up, so it runs the logon and the
       # impersonation and never the SMB hop, which the far end checks and this token does not.
       #

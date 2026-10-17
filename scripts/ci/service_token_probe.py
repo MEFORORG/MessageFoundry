@@ -33,7 +33,8 @@ or not. This script is the instrument that looks. ``windows-service-smoke`` in
     write-restricted. The control is the leg's own elevated shell, which holds more privileges.
 
 Reading and judging are kept apart. :func:`read_token` and the ``inside`` mode only report.
-:func:`token_problems`, :func:`privilege_problems` and :func:`inside_problems` hold the whole rule for what passes, as plain
+:func:`token_problems`, :func:`privilege_problems` and :func:`inside_problems` hold the whole
+rule for what passes, as plain
 functions over the reports, so the tests can hand them a token that must fail.
 
 Windows only. ``tests/test_service_token_hardening.py`` starts a child process under a
@@ -403,12 +404,13 @@ def try_alternate_credential(granted: Path, denied: Path) -> dict[str, Any]:
     try:
         inner = asyncio.run(run())
     except OSError as exc:
-        # wincred raises CredentialLogonError, an OSError, from the logon and the impersonation
-        # only. Any other OSError came from somewhere else, and a red must not blame the logon.
+        # wincred raises CredentialLogonError, an OSError, when LogonUserW or
+        # ImpersonateLoggedOnUser refuses. Any other OSError, such as a library load that failed,
+        # is not that refusal, and a red must not read as one.
         if isinstance(exc, wincred.CredentialLogonError):
             stage = "the logon or the impersonation"
         else:
-            stage = "a call outside the logon and the impersonation"
+            stage = "a call outside the logon and the impersonation themselves"
         return {"ran": True, "ok": False, "stage": stage, "error": f"{type(exc).__name__}: {exc}"}
     return {"ran": True, "ok": True, "error": None, **inner}
 
@@ -568,8 +570,8 @@ def privilege_problems(
     that account is not the service's own virtual account. Empty when it is.
 
     Three things, each on its own. The user is the account: a privilege list survives a change of
-    account. It holds exactly ``privileges``, held but switched off counting as held. And it is NOT
-    restricted at all, no restricting SID and not write-restricted, because the installer writes SID type none for such an account; a restricted
+    account. It holds exactly ``privileges``, held but switched off counting as held. And it is
+    NOT restricted at all, no restricting SID and not write-restricted, because the installer writes SID type none for such an account; a restricted
     token here would mean the registration and the installer's own account of it disagree.
     """
     if token.get("error"):

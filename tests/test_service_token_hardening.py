@@ -779,7 +779,8 @@ def test_the_token_step_reconfigures_only_a_stopped_service() -> None:
 
 def test_the_account_legs_run_localsystem_and_wire_a_local_user() -> None:
     """Vault BACKLOG #2702: the installer gives LocalSystem and any -ServiceAccount SID type none
-    and the privilege list. Two legs install under those accounts. This checks the wiring; the
+    and the privilege list. A LocalSystem leg runs, and a local-user leg is wired but not listed.
+    This checks the wiring; the
     legs' own result is the reading, and a pull_request event skips the job."""
     from tests._workflow_contexts import jobs_of
 
@@ -863,6 +864,24 @@ def test_the_account_reader_does_not_pass_an_ordinary_process() -> None:
     token = probe.read_token(None)
     problems = probe.privilege_problems(token, account_sid=token["user"], privileges=[_PRIVILEGE])
     assert any("not exactly" in p for p in problems), problems
+
+
+@_windows_only
+def test_the_check_privileges_mode_fails_a_process_with_more_privileges(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The command line the account step runs, end to end on this process: its own token holds
+    more than the one privilege, so the --pid reading fails and the mode exits 1. The control fails
+    the rule too, which is the control working, so no CONTROL line prints. A wiring slip in the
+    subparser would fail here and not first on a hosted runner."""
+    probe = _probe()
+    me = probe.read_token(None)
+    pid = str(me["pid"])
+    argv = ["check-privileges", "--account-sid", me["user"], "--privilege", _PRIVILEGE]
+    assert probe.main([*argv, "--control-pid", pid, "--pid", pid]) == 1
+    out = capsys.readouterr().out
+    assert f"FAIL: process {pid}: it holds" in out, out
+    assert "FAIL: CONTROL" not in out and "OK:" not in out, out
 
 
 @pytest.mark.parametrize(
