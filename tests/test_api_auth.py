@@ -866,6 +866,29 @@ async def test_create_user_route_refuses_a_site_context_word(engine: Engine) -> 
         assert "globex" not in created.json()["temp_password"].lower()
 
 
+async def test_create_user_with_a_repeated_role_grants_it_once(engine: Engine) -> None:
+    # BACKLOG #2733: a repeated role once failed the user_roles primary key after the account row
+    # had committed. The store now writes one grant, and the reply and audit name the role once.
+    settings = AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
+    service = await _service(engine, settings)
+    await _add(service, "root", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        h = _auth((await _login(c, "root")).json()["token"])
+        body = {"username": "twice", "roles": ["viewer", "viewer"], "email": "t@x.org"}
+        created = await c.post("/users", headers=h, json=body)
+        assert created.status_code == 201, created.text
+        assert created.json()["roles"] == ["viewer"]
+    user = await service.store.get_user_by_username("twice")
+    assert user is not None
+    assert await service.store.get_user_role_ids(user.id) == ["viewer"]
+    details = [
+        json.loads(dict(a)["detail"])
+        for a in await engine.store.list_audit(limit=50)
+        if dict(a)["action"] == "user.created" and dict(a)["actor"] == "root"
+    ]
+    assert details == [{"username": "twice", "roles": ["viewer"]}]
+
+
 async def test_a_reset_the_generator_cannot_satisfy_names_the_setting(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:

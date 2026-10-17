@@ -1162,7 +1162,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> UserCreatedResponse:
-        await _validate_roles(service, body.roles)
+        # BACKLOG #2733: a repeated role is one grant. The store already writes it once; this keeps
+        # the audit detail and the reply from naming it twice. First-seen order, for the audit row.
+        roles = list(dict.fromkeys(body.roles))
+        await _validate_roles(service, roles)
         if await service.store.get_user_by_username(body.username) is not None:
             raise HTTPException(status.HTTP_409_CONFLICT, USERNAME_TAKEN)
         try:
@@ -1171,7 +1174,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 username=body.username,
                 display_name=body.display_name,
                 email=body.email,
-                roles=body.roles,
+                roles=roles,
                 actor=identity.username,
                 client=client_ip(request),  # ADR 0150, BACKLOG #315: attribute the user.created row
             )
@@ -1187,7 +1190,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             # written. The console answers 503 as well.
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         # Only after the create succeeded: a lost username race (409 above) granted nobody anything.
-        if Role.ADMINISTRATOR.value in body.roles:
+        if Role.ADMINISTRATOR.value in roles:
             _alert_administrator_granted(
                 app, f"user:{body.username}", via="account_created", granted_by=identity.username
             )
@@ -1198,7 +1201,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # stored stamp create_local_user just wrote, never a fresh clock.
         summary = _user_summary(
             user,
-            sorted(body.roles),
+            sorted(roles),
             credential_expires_at=pending_credential_deadline(service, user),
             lock_state_at=time.time(),
         )
