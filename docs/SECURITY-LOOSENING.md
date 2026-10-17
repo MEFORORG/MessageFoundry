@@ -1111,9 +1111,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 > every range of that family as trusting every peer, so a `10.0.0.0/8` beside `0.0.0.0/0` gets that
 > wording too. A range in the other family gets the range wording.
 >
-> The check parses each entry the way uvicorn does, strictly. An entry with host bits set, such as
-> `10.1.2.3/0`, would become a literal in uvicorn that matches no peer, so the load refuses it
-> ([BACKLOG #2488](BACKLOG.md)).
+> The check reads each entry with the same parser as the load, and skips an entry the load
+> refuses. Those forms, a host-bits CIDR such as `10.1.2.3/0` among them, are listed in the
+> `trusted_proxies` row of [CONFIGURATION.md](CONFIGURATION.md). An IPv4-mapped entry counts as
+> the IPv4 range it names, so `::ffff:0:0/96` gets the whole-family wording.
 - **What you lose:** uvicorn trusts `X-Forwarded-For` from every host an entry covers, so each of those
   hosts can declare its own source address. For a whole family, that is any client. That poisons the
   audit source address, the per-address sign-in limit and the new-client-IP step-up signal. With
