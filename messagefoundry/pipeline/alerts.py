@@ -557,12 +557,16 @@ class AlertSink(Protocol):
         (``reason`` ``mass_revoke_breaker``), so the pass applied NOTHING, the same event as the
         ``auth.ad_reconcile_aborted`` audit row; or the directory answered one or more probes with a
         referral (``directory_referral``, BACKLOG #2538, the ``auth.ad_reconcile_referred`` row),
-        which leaves the referred accounts unjudged and may sit beside revocations the pass applied.
-        The type's name predates the second case. Read ``reason`` before naming the cause.
+        which leaves the referred accounts unjudged and may sit beside revocations the pass applied;
+        or one or more probes raised a fault the engine could not read (``probe_fault``, BACKLOG
+        #3100, the ``auth.ad_reconcile_faulted`` row), which leaves those accounts unjudged the same
+        way. The type's name predates the second and third cases. Read ``reason`` before naming the
+        cause.
 
-        ``name`` labels the source: ``"directory-reconciler"`` for the breaker, and
-        ``"directory-reconciler-referral"`` for a referral, so each is its own instance and
-        throttle. ``reason`` is one of those two closed-set slugs. ``probed`` is how many
+        ``name`` labels the source: ``"directory-reconciler"`` for the breaker,
+        ``"directory-reconciler-referral"`` for a referral, and
+        ``"directory-reconciler-probe-fault"`` for a probe fault, so each is its own instance and
+        throttle. ``reason`` is one of those three closed-set slugs. ``probed`` is how many
         principals the pass probed. ``detail`` is the operator-facing explanation the auth service
         latches. No PHI. Emitted by the API-lifespan
         reconciler task, never from ``auth/``. A whole-directory outage is NOT this event: it is

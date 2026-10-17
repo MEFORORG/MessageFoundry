@@ -30,6 +30,7 @@ from messagefoundry.auth.notifications import (
     SecurityEvent,
     deadline_utc,
 )
+from messagefoundry.auth.reconcile import REVOKE_REASONS, ProbeOutcome
 from messagefoundry.config.settings import AlertsSettings
 from messagefoundry.pipeline.security_notify import (
     _SUBJECTS,
@@ -202,16 +203,43 @@ def test_a_non_last_factor_removal_renders_its_own_subject_and_body() -> None:
     assert "disabled" not in body.lower()
 
 
-def test_a_directory_sessions_ended_notice_renders_its_own_text_and_claims_no_disable() -> None:
-    """vault BACKLOG #2140. Both renderers fall back silently, so a half-wired kind would mail the
-    generic wording. The directory never answered that the account is disabled or gone, so the text
-    must not say either, and an engine act cannot carry the "if this was you" closing."""
+#: Every reconcile reason that sends DIRECTORY_SESSIONS_ENDED (vault BACKLOG #2140, #3171): all of
+#: ``REVOKE_REASONS`` but the read disabled bit, which sends ACCOUNT_DISABLED. Derived, so a reason
+#: added there reaches the per-reason render test below with no edit here.
+_SESSIONS_ENDED_REASONS = tuple(
+    reason for outcome, reason in REVOKE_REASONS.items() if outcome is not ProbeOutcome.DISABLED
+)
+
+
+def test_the_sessions_ended_reasons_include_the_unkeyed_one() -> None:
+    """vault BACKLOG #3171: the reason the old wording was false for is among those rendered."""
+    assert "directory_object_id_missing" in _SESSIONS_ENDED_REASONS
+
+
+@pytest.mark.parametrize("reason", _SESSIONS_ENDED_REASONS)
+def test_a_directory_sessions_ended_notice_is_true_for_each_reason(reason: str) -> None:
+    """vault BACKLOG #2140, #3171. Both renderers fall back silently, so a half-wired kind would mail
+    the generic wording. The DESCRIPTION is pinned here, not words the subject alone supplies. For
+    ``directory_object_id_missing`` no directory lookup ran, so neither the subject nor the body may
+    say a check against the directory ended the sessions. The directory never answered that the
+    account is disabled or gone, and an engine act cannot carry the "if this was you" closing."""
     assert DIRECTORY_SESSIONS_ENDED in _SUBJECTS
-    body = _build_body(SecurityEvent(DIRECTORY_SESSIONS_ENDED, username="jdoe", email=None))
-    text = (_SUBJECTS[DIRECTORY_SESSIONS_ENDED] + "\n" + body).lower()
+    subject = _SUBJECTS[DIRECTORY_SESSIONS_ENDED]
+    # Pinned exactly: a subject naming the directory as the actor is false for the unkeyed reason.
+    assert subject == "Your MessageFoundry sessions were ended"
+    body = _build_body(
+        SecurityEvent(
+            DIRECTORY_SESSIONS_ENDED, username="jdoe", email=None, detail={"reason": reason}
+        )
+    )
+    description = (
+        "MessageFoundry ended your sessions. It could not confirm from your organization's "
+        "directory that your account may still sign in."
+    )
+    assert description in body.splitlines()
+    text = (subject + "\n" + body).lower()
     assert "a security event occurred on your account." not in text
-    assert "directory" in text and "sessions" in text
-    for claim in ("disabled", "deleted", "if this was you"):
+    for claim in ("disabled", "deleted", "if this was you", "directory check", "a check against"):
         assert claim not in text
     assert body.endswith(
         "If you did not expect this change, contact your MessageFoundry administrator."

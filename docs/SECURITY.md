@@ -401,6 +401,12 @@ gets you back in. `admin-unlock` clears a local lockout only (vault BACKLOG #271
 - At start, the engine checks for this. When every enabled Administrator needs an outside service,
   it logs a WARNING naming them and writes one `auth.no_local_administrator` audit row. It never
   refuses the start.
+- The `auth.federated_subject_bound`, `auth.federated_subject_rebound` and
+  `auth.federated_subject_unbound` audit rows carry `totp_enrolled` and `webauthn_enrolled`. They
+  say whether the account held each engine factor when the binding changed. A bind first removes
+  any old binding, then writes the new one. The fields are read when the old binding is removed,
+  so a bind or rebind row can miss a factor change made between the two steps. The
+  `bind_federated_subject` docstring says when that can happen.
 - Turning sign-in off is not a way back in. `serve` has no setting that turns it off, and a
   config that still carries the removed switch is refused at load (vault BACKLOG #2719). The
   old loopback mode could not repair an account anyway: with no auth service, creating
@@ -634,13 +640,38 @@ step that follows the first faster than a person can:
 
 | Pair | Floor | Default | Refused with |
 |---|---|---|---|
-| Sign-in, then a TOTP or recovery code, or a passkey, on the MFA-pending session, including an enrolment that would satisfy it: `POST /me/mfa/confirm` or a passkey registration (BACKLOG #2389) | `[auth].mfa_verify_min_elapsed_seconds`, from the session's mint | 1 s | the leg's ordinary failure: `401 invalid code` on `POST /auth/mfa-verify`, `400 invalid code` on `POST /me/mfa/confirm`, the console's `Invalid code.` page on its TOTP confirm, and `400 passkey verification failed` on the console's passkey registration; audited `auth.mfa_failed` or `auth.webauthn_failed` with `reason=too_early`, and `phase=enroll` on an enrolment |
+| Sign-in, then a TOTP or recovery code, or a passkey, on the MFA-pending session, including an enrolment that would satisfy it: `POST /me/mfa/confirm` or a passkey registration (BACKLOG #2389) | `[auth].mfa_verify_min_elapsed_seconds`, from the session's mint | 1 s | the leg's ordinary failure, at least: `401 invalid code` on `POST /auth/mfa-verify`, `400 invalid code` on `POST /me/mfa/confirm`, the console's gate page with `400` and "That code wasn't accepted" on `POST /ui/mfa`, the re-authentication page with `Invalid code.` on `POST /ui/reauth` with a code, the console's `Invalid code.` page on its TOTP confirm, and `400 passkey verification failed` on the console's passkey assertion (`POST /ui/reauth/webauthn`) and its passkey registration; audited `auth.mfa_failed` or `auth.webauthn_failed` with `reason=too_early`, and `phase=enroll` on an enrolment |
 | A federated start, then its callback: the step-up always, the sign-in only when `auth_time` falls inside the flow. A callback whose verified `amr` names a value in `oidc_callback_floor_exempt_amr` is exempt (BACKLOG #2388) | `[auth].oidc_callback_min_elapsed_seconds`, from the flow's start on the flow cache's clock | 1 s | `federated sign-in failed`, audited `auth.login_failed`, or the generic step-up refusal, audited `auth.reauth`; both with `reason=too_early` |
 
-Neither response says anything about timing, so by the answer alone a caller cannot tell it from a
-wrong code or a failed IdP proof. The MFA floor charges no lockout and spends no code or passkey
-challenge, so the person simply submits again. That also means a resubmission can show the floor
-fired: the same code or passkey response then succeeds, where a wrong one never would. The floor
+Neither response says anything about timing. On most legs a wrong code gets the same answer either
+side of the floor, so a caller that does not know whether its proof is good cannot tell the refusal
+from a wrong code or a failed IdP proof. The exceptions are listed below. A caller that does know,
+such as a script holding the TOTP secret or the authenticator, learns from its first refused proof
+that the floor fired. The floors hide nothing from that caller; they only make it wait. The MFA
+floor charges no lockout and spends no code or passkey challenge, so the person simply submits
+again. That also means a resubmission can show the floor fired, on the verify legs and on both
+enrolment legs: the same code or passkey response then succeeds, where a wrong one never would.
+This is kept on purpose: spending the code or challenge would make the person start the ceremony
+again after a refusal that was not their error (BACKLOG #3194 declined that change). At least these
+answers also differ either side of the floor, whatever the proof:
+
+- A pending directory session whose account the directory does not confirm. `verify_mfa` and
+  `finish_webauthn_assertion` run the floor before the directory lookup, so any code or assertion
+  gets the leg's ordinary failure inside the floor and the directory refusal past it (see *The
+  passkey leg asks the same question before it checks an assertion*, below).
+- A passkey registration whose credential is already enrolled, on this or another account, is
+  refused inside the floor as a failed verification, and past it as `this passkey is already
+  enrolled`. `label already in use` differs the same way, but the console lets a pending session
+  begin only a first passkey, so only two finishes racing on one account can reach it. Both checks run after the
+  attestation is verified, so a response that fails verification learns nothing about which
+  credentials exist. Registration asks for no attestation, so a verified response proves only that
+  the caller answered this session's challenge, and the order protects little. Removing the tell
+  would mean verifying the response and checking for a duplicate against the peeked challenge, then
+  running the floor, and only then consuming the challenge, so a floor refusal still leaves the
+  ceremony in flight. That is a change to `finish_webauthn_registration` that BACKLOG #3194 left
+  open.
+
+The floor
 applies only while the session still owes its factor. A step-up code on a satisfied session is not
 floored, and neither is an enrolment on a session that owes no factor. Under the default
 `[auth].require_action_step_up`, a TOTP enrolment confirm costs one more step. Its route spends the
@@ -678,7 +709,12 @@ below that, at 1 s, because M is an average and some people are faster. The comm
 - The floor on an enrolment is measured from sign-in, not from the enrolment's own start. A script
   holding the password can sign in, re-prove the password and start the enrolment inside the floor,
   then wait out only what is left of it. The floor does not time the step between start and
-  confirm, where a person scans the code and types it.
+  confirm, where a person scans the code and types it. On the TOTP leg, timing that step
+  would need the enrolment's begin time stored beside its staged secret, which is schema work, so
+  BACKLOG #3194 declined it and this stays a gap. A passkey ceremony is held in memory and
+  carries only its deadline, on the cache's monotonic clock, so timing that leg would mean
+  deriving the start from the deadline or storing it with the ceremony. That needs no schema
+  change, and BACKLOG #3194 left it open.
 - An IdP that re-authenticates with no human step, such as integrated Windows sign-in, answers a
   step-up faster than the floor on every try. The step-up is then refused each time. At such a site,
   list the `amr` values that method sends in `oidc_callback_floor_exempt_amr` (BACKLOG #2388),
@@ -3027,6 +3063,24 @@ alone:
    first address past that, because the check runs on every sensitive request. So a replayed
    token, retrying from one address or alternating between several, is force-stepped-up each time
    but cannot inflate the audit log / notifications (BACKLOG #2159).
+   **That bound is per process, and the owner accepted it as one (vault BACKLOG #2951, owner
+   ruling 2026-10-16, "Accept, doc only").** The record that enforces it is `_new_ip_seen` on
+   `AuthService`. It maps each session's token hash to the addresses already flagged, and it lives
+   in one process's memory. Each process that serves the API keeps its own. So with N such
+   processes over one store, one session can write **N x 9** rows and notices between
+   re-verifications (nine is `_NEW_IP_PER_SESSION_MAX` plus the cap row). A restart empties the record, and each address can be reported again.
+   **N x 9 is not a hard ceiling either.** At least two more paths add rows. A token rotation
+   without a re-verification moves the record only in the rotating process. The other processes
+   start the new token at zero. And past `_NEW_IP_DEDUP_MAX` sessions a process drops
+   its oldest entry, whose addresses can then be reported again.
+   **Each engine shard serves the API.** `messagefoundry supervise` starts one `serve --shard <id>`
+   process per engine shard. `build_shard_specs` in `pipeline/supervisor.py` gives each one its own
+   API port, `base_port + i`. `_serve` in `__main__.py` builds the API app with or without
+   `--shard`. A cluster node is a plain `serve`, so it serves its own API too.
+   The forced step-up never reads the record, so only the rows and notices grow. Every caller of
+   `flag_new_client_ip` shares one record per process. At least these call it: the step-up gates
+   in `api/security.py`, `refuse_from_new_address` there, and the web console's gates in
+   `messagefoundry_webconsole/_auth.py`. So the gates below sit under the same bound.
    **Since vault BACKLOG #2620 the message reads and the paced writes ask too.** Before it, only the
    step-up gates asked. In that shipped code a bearer token replayed from a second address could
    list messages, read a raw body and start or stop connections with no signal, and would have
@@ -3055,6 +3109,14 @@ alone:
    rolling 60 s, sized by `[auth].login_rate_limit_per_ip` and `login_rate_limit_window_seconds`.
    So on a first deployment a client that must re-verify more often than that would spend it.
    While it is spent, a password re-verification through either route would be refused with 429.
+   **A code at `POST /auth/mfa-verify` re-anchors too, and it draws a different budget.** On any
+   session but an `oidc` one, a correct TOTP or recovery code from the new address re-anchors the
+   session there and clears the refusal. That route draws the sign-in window, not the per-actor
+   ceremony budget ([the route-to-limiter map](#route--limiter-map) has its row), and it carries the
+   sign-in route's other conditions, such as the second-step lock. That window is per address and
+   also engine-wide, so moving frequent re-verification onto this route would spend the sign-in
+   budget every user shares. The console refusal sends the
+   browser to `/ui/reauth` instead, which draws the ceremony budget.
    Until the session re-verifies, its requests from the new address would still get the refusals
    above, so it would read no message and make none of those writes. Where the changing address
    belongs to a reverse proxy, declare that proxy in `[api].trusted_proxies`, so the engine
@@ -3381,7 +3443,7 @@ slack.
 | Live directory mass-revoke breaker | the size of one pass's revocation set vs the probed population | the set exceeds **both** `ad_session_revoke_max` (**5**) **and** `ad_session_revoke_max_fraction` (**0.34**) — a second **binary** predicate layered on the three rows above, never a score (see "Directory session reconciliation") | **LOG** — the pass aborts revoking **nothing**, logs at ERROR and writes an `auth.ad_reconcile_aborted` audit row + loud alert | 5 / 0.34 | `[auth].ad_session_revoke_max`, `ad_session_revoke_max_fraction` |
 | PHI-read volume, per actor | `identity.user_id` | > 120 reads (`phi_read_rate_limit_per_actor`) per 60 s (`phi_read_rate_limit_window_seconds`); the global dimension `phi_read_rate_limit_global` defaults to `0` = **off** | **THROTTLE** 429 + `Retry-After: 10`, charged at **admission** before any store work. WARNING-logged on the JSON API; the `/ui` `phi=True` arm is not (see *The console's refusal differs from the JSON floor's*) | on, 120 / 60 s | `[auth].phi_read_rate_limit_enabled` |
 | Admin-write rate, per actor | `identity.user_id` × request method | **non-GET only**; > 12 writes (`admin_write_rate_limit_per_actor`) per 15 s (`admin_write_rate_limit_window_seconds`), or a write less than 0.15 s after the actor's last admitted one (`admin_write_min_interval_seconds`, BACKLOG #2301), both provisional human-timing defaults; no global dimension (`glob=0`) | **THROTTLE** 429 + a `Retry-After` naming the actor's wait, the same on the JSON API and on `/ui`. Charged on the JSON API and on `/ui`, which re-applies it. WARNING-logged on the JSON API; the `/ui` refusal is not (see *The console's refusal differs from the JSON floor's*) | on, 12 writes / 15 s | `[auth].admin_write_rate_limit_enabled` |
-| Time from sign-in to the second factor | `session.created_at` vs the service's wall clock, while `session.mfa_verified_at` is unset | a TOTP or recovery code (`verify_mfa`), a passkey assertion, or an enrolment (`confirm_mfa_enrollment`, `finish_webauthn_registration`, BACKLOG #2389) that completes an MFA-pending session less than 1 s after the session was minted (`mfa_verify_min_elapsed_seconds`, BACKLOG #2301), a provisional human-timing default; a session whose factor is already satisfied, or that owes none, is not floored | **DENY** with the leg's ordinary failure, so nothing tells the caller about timing (`401 invalid code` on `POST /auth/mfa-verify`, `400 invalid code` on `POST /me/mfa/confirm`, the gate's own error on `POST /ui/mfa`, `400 passkey verification failed` on the console's passkey registration); audited `auth.mfa_failed` or `auth.webauthn_failed` with `reason=too_early`, and `phase=enroll` on an enrolment; no lockout count, no code or challenge spent, though under the default `require_action_step_up` a TOTP enrolment confirm's route has already spent its password step-up | on, 1 s | `[auth].mfa_verify_min_elapsed_seconds` (`0` = off) |
+| Time from sign-in to the second factor | `session.created_at` vs the service's wall clock, while `session.mfa_verified_at` is unset | a TOTP or recovery code (`verify_mfa`), a passkey assertion, or an enrolment (`confirm_mfa_enrollment`, `finish_webauthn_registration`, BACKLOG #2389) that completes an MFA-pending session less than 1 s after the session was minted (`mfa_verify_min_elapsed_seconds`, BACKLOG #2301), a provisional human-timing default; a session whose factor is already satisfied, or that owes none, is not floored | **DENY** with the leg's ordinary failure, which says nothing about timing, though a caller that knows its proof is good, or resubmits it, can tell the floor fired (the answers per leg, and the tells, are under *Two second steps have a time floor too*); audited `auth.mfa_failed` or `auth.webauthn_failed` with `reason=too_early`, and `phase=enroll` on an enrolment; no lockout count, no code or challenge spent, though under the default `require_action_step_up` a TOTP enrolment confirm's route has already spent its password step-up | on, 1 s | `[auth].mfa_verify_min_elapsed_seconds` (`0` = off) |
 | Time from a federated start to its callback | the flow cache's monotonic clock when the flow was staged vs at the callback | a step-up callback less than 1 s after its `POST /ui/reauth/oidc` start (`oidc_callback_min_elapsed_seconds`, BACKLOG #2301), a provisional human-timing default; a sign-in callback likewise, **only** when the verified `auth_time` is at or after the flow's start, because an IdP holding a live single sign-on session answers with no human step | **DENY** with the leg's ordinary failure: `federated sign-in failed`, audited `auth.login_failed` with `reason=too_early`, or the generic step-up refusal, audited `auth.reauth` with `reason=too_early`. The step-up is refused before its code is redeemed, unless `oidc_callback_floor_exempt_amr` is set (BACKLOG #2388): a callback whose verified `amr` names a listed value is then exempt, and the refusal waits for the code exchange | on, 1 s | `[auth].oidc_callback_min_elapsed_seconds` (`0` = off), `[auth].oidc_callback_floor_exempt_amr` |
 | Serve-hop security posture | `[security].enforcement` × (`api.is_loopback` **or** `exposure_protected`), via `phi_read_hop_disposition` | disposition is REFUSE — an instance under `enforcement = enforce` whose serve hop is neither loopback, nor in-process TLS, nor a declared TLS-terminating proxy. Setting `[security].enforcement = warn` turns the refusal into WARN-and-serve. **No data-class value switches it off**: BACKLOG #1279 deleted that axis | **DENY** 403 (PHI-free message) on every **JSON-API** PHI-read route (`require_phi_read`, plus the step-up bulk routes), **before** any identity work — and on the `/ui` PHI routes through `require_ui`'s `phi=True` arm, **after** identity work, so an unauthenticated visit still gets its login redirect instead of a 403 disclosing the posture (BACKLOG #1738). Two tests, and they pin different things: `test_ui_plane_states_the_phi_read_hop_gap` pins the DISCLOSURE both ways, by comparing this document against the console's call sites — it issues no request and cannot see ordering; the ORDER is pinned by the console suite's `test_the_refusal_lands_after_identity_so_a_visitor_still_gets_the_login_page` | ALLOW on loopback | `[security].enforcement`, `[api].tls_cert_file`, `tls_terminated_upstream` + `trusted_proxies` |
 | Bind / exposure posture — refusing arms | `settings.api.host` loopback-ness, `tls_terminated_upstream`, `trusted_proxies`, `settings.api.public_origin`; derived `instance_exposed` (an off-loopback bind, a declared terminator, **or** a set `trusted_proxies`, vault BACKLOG #2251) and `admin_exposed`, plus `ui_exposed` for the `/ui` arms only; `[security].enforcement` | at least: `/ui` exposed without the required origin/TLS declarations; a non-loopback bind with neither in-process TLS nor a declared terminator, where `enforce` clamps both `--allow-insecure-bind` and `[security].require_encryption_for_remote = false` shut; `admin_exposed` + `enforcing` + `require_mfa` explicitly opted out; a declared terminator with no `[api].tls_cert_file` and no `[api].plaintext_upstream_hop_acknowledged`, in every mode (BACKLOG #1179). `serve` has no arm for sign-in off: the settings loader and the settings model refuse `[auth].enabled`, and nothing reads that key (vault BACKLOG #2719, #2825) | **DENY at startup** — `serve` prints an error and exits **2**. The refuse/warn dial is `[security].enforcement` (default `enforce`), **not** `production`: the `/ui`-exposure and plaintext-hop-acknowledgement arms refuse **unconditionally**, and the `require_mfa` arm refuses on enforcement `enforce` alone — no data-class term narrows it, so `dev` and `staging` are gated exactly as `prod` is — and warns otherwise. `[security].allow_single_factor_admin_when_exposed = true` downgrades that one arm to permitted-but-audited. **`admin_exposed` is `instance_exposed`, and reads no console flag** (BACKLOG #326): the ADR 0143 degrade arms rewrite `settings.api.serve_ui` in place earlier in the same startup, so deriving an exposure decision from it made this arm and the dual-control arm below miss a declared-proxy instance whose console had been degraded or disabled — while the ASVS 11.7.1 arm called that same boot exposed. The same attributes force the session cookie's `Secure` flag + HSTS, and permit WebAuthn `rp_id` derivation from the request URL **only** on a loopback bind with no proxy declared or trusted (`trusted_proxies` empty, BACKLOG #2116) | loopback, nothing declared | `[security].local_access_only`, `listen_address`, `serve_web_console`, `web_console_public_address`, `require_mfa`, `require_encryption_for_remote`, `[api].tls_cert_file`, `tls_terminated_upstream`, `plaintext_upstream_hop_acknowledged`, `trusted_proxies`, `[security].enforcement`, `[security].allow_single_factor_admin_when_exposed` |
@@ -4172,10 +4234,18 @@ role or channel-scope change in the directory does not reach those accounts' ses
 lasts.
 
 A probe that raises something other than an LDAP error, such as a malformed entry the engine cannot
-read, fails open for that one account (BACKLOG #2241). It is logged at WARNING by name on every
-pass, and the rest of the estate is still reconciled. **The cost:** while it repeats, that account's
-sessions are never revoked by the reconciler, and no alert is raised. If it hits every probe, the
-pass reads as a directory outage.
+read, is a probe fault. It fails open for that one account (BACKLOG #2241), and it is not a
+directory outage (BACKLOG #3100). Each such probe is logged at WARNING by name, and the rest of the
+estate is still reconciled. A pass with any fault logs one ERROR naming no account and audits
+`auth.ad_reconcile_faulted`. It also raises the `ad_reconcile_aborted` alert with reason
+`probe_fault`, under its own source `directory-reconciler-probe-fault`. If every probe faults or
+fails, the pass judges nothing and revokes nothing, like an outage, but it still pages. A
+connection, timeout or name-lookup error that escapes the directory layer is still read as
+unreachable. **The cost:** while a fault repeats, that account's sessions are never revoked by the
+reconciler, so they run to the absolute cap. That cap is the only bound; the alert makes the gap
+visible and limits nothing. A pass with a fault marks no alert clear. When it resolves is stated once, in
+[CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-two-alerts-resolve-themselves). Step-up
+refuses the account with outcome `probe_fault`.
 
 ### The engine session is independent of the IdP session (ASVS 7.6.1)
 
@@ -4384,9 +4454,14 @@ Users are notified of security-relevant changes to their account through **two**
   alert distribution list). Fired on: account **lockout** and the **first successful login after ≥3
   failed attempts**, or a step-up re-auth that clears such a run (suspicious-login signals, 6.3.5); and **password change**, **email change**, **role
   change**, **account disable**, and a **directory rename** of the username (credential changes,
-  6.3.7). When the directory session reconciler ends an account's sessions because it could not
-  match the account or could not read its `userAccountControl`, it sends `directory_sessions_ended`,
-  not `account_disabled` (vault BACKLOG #2140).
+  6.3.7). When the directory session reconciler ends an account's sessions for a reason other than
+  a read disabled bit, it sends `directory_sessions_ended`, not `account_disabled` (vault BACKLOG
+  #2140). At least `directory_absent`, `directory_undetermined` and `directory_object_id_missing`
+  send it. The comment on `DIRECTORY_SESSIONS_ENDED` in `auth/notifications.py` says what each one
+  means. For at least `directory_object_id_missing` the engine never asks the directory (BACKLOG
+  #2434). So the notice names no directory check. It says only that the engine could not confirm
+  from the directory that the account may still sign in, which is true for each current reason. A
+  new reason must be checked against that wording (vault BACKLOG #3171).
   The rename notice, `username_changed`, names the old and the new name, and is sent only when
   the new name was written (BACKLOG #2017). An **unreplaced temporary password** near its deadline
   (ASVS 6.4.5, BACKLOG #2007) sends two reminders, beside the operator's `initial_credential_expiring`

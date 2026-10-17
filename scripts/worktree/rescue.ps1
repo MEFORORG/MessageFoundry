@@ -21,7 +21,8 @@
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
+    # NOT Mandatory, ON PURPOSE: a call without -Name would prompt for it, which hangs a caller with
+    # stdin open (tests/_no_prompt.py, vault BACKLOG #3627). The refusal is right after this param block.
     # \A..\z for the reason given in new.ps1's param block; keep all four copies identical.
     [ValidatePattern('\A[A-Za-z0-9._-]+\z')]
     [string]$Name,
@@ -30,6 +31,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# No -Name: refuse by name, before anything is read or moved. See $Name.
+if (-not $Name) { throw "rescue.ps1 needs -Name <slug> for the new worktree. Nothing was moved. Add -Name and re-run." }
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $Parent   = Split-Path $RepoRoot -Parent
