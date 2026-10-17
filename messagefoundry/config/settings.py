@@ -444,11 +444,15 @@ INSECURE_TLS_ESCAPE_ENV = "MEFOR_ALLOW_INSECURE_TLS"
 
 
 def insecure_tls_allowed() -> bool:
-    """Whether the explicit dev escape to permit insecure TLS overrides is set (ASVS 12.3.2).
+    """Whether the dev escape for insecure TLS overrides is present in the environment (ASVS 12.3.2).
 
-    Certificate-validation overrides (``trust_server_certificate=true`` for SQL Server, for one) are
-    MITM-able, so they now **refuse** at startup unless ``MEFOR_ALLOW_INSECURE_TLS`` is truthy. This means a production deployment can't silently disable
-    server-cert validation; an operator must opt in loudly for a trusted-network dev/test bind."""
+    Present is not honoured. Certificate-validation overrides (``trust_server_certificate=true`` for
+    SQL Server, for one) are MITM-able, so they **refuse** at startup unless
+    ``MEFOR_ALLOW_INSECURE_TLS`` is set on an instance at ``[security].enforcement = warn``. The cells
+    ask :func:`weakened_tls_escape_permitted` or :func:`hop_insecure_escape_downgrades`, which add
+    that condition. Under ``enforce``, the default, or where the code knows no posture, the escape
+    changes nothing. Some credential hops refuse even at ``warn``; docs/SECURITY-LOOSENING.md, *No
+    escape sends a credential to an unverified peer*, names them and the ones that still cross."""
     return os.environ.get(INSECURE_TLS_ESCAPE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 

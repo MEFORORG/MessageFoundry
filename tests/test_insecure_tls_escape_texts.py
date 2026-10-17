@@ -34,12 +34,11 @@ because a factory's parameter comments are the help text the connection editor s
 name that one some other way. The editor joins a parameter's comments by its own rules, and this
 scan does not copy them: it reads each trailing comment alone, which is stricter.
 
-**The docstring files are a pinned list, not the tree.** At least ``_reject_unknown_env_keys`` and
-``weakened_tls_escape_permitted`` in ``config/settings.py`` name the variable to list it or to
-define the rule, so a scan of every docstring flags some text that misleads nobody. The list is
-the files brought into line so far, and it is not every file that needs it: at least the module
-docstring of ``transports/rest.py`` and ``insecure_tls_allowed`` in ``config/settings.py`` still
-name the variable without the posture, and no scan here reads them.
+**The docstring files are a pinned list, not the tree.** The list is the files brought into line
+so far, and it is not every file that needs it. Inside a pinned file, a docstring that names the
+variable to list it, to define the rule, or to compare another escape with it misleads nobody, so
+its function is named in ``_DOCSTRING_EXEMPT``: at least ``_reject_unknown_env_keys`` and
+``weakened_tls_escape_permitted`` in ``config/settings.py``. Every other docstring there is read.
 
 **What none of them sees**, at least: a message built in a variable before the call; the variable
 imported under another name; a message with no space that only interpolates the variable, such
@@ -102,13 +101,29 @@ _MUST_FIND = frozenset(
 #: Files whose docstrings are held to the rule. Each must hold at least one docstring that names
 #: the escape, for the same reason ``_MUST_FIND`` is pinned.
 _DOCSTRING_FILES = (
+    "messagefoundry/config/settings.py",
     "messagefoundry/config/wiring.py",
     "messagefoundry/store/postgres.py",
     "messagefoundry/transports/database.py",
     "messagefoundry/transports/direct.py",
     "messagefoundry/transports/email.py",
     "messagefoundry/transports/remotefile.py",
+    "messagefoundry/transports/rest.py",
 )
+#: Functions in ``_DOCSTRING_FILES`` whose docstrings name the variable to define the rule, to
+#: compare another escape with it, or to list it, and send nobody to set it. Each must still name
+#: the escape, so a stale entry fails instead of hiding a new text.
+_DOCSTRING_EXEMPT = {
+    "messagefoundry/config/settings.py": frozenset(
+        {
+            "hop_insecure_escape_downgrades",
+            "weakened_tls_escape_permitted",
+            "insecure_config_source_escape_permitted",
+            "_plain_ldap_refused_under_enforce",
+            "_reject_unknown_env_keys",
+        }
+    ),
+}
 #: Files whose comments are held to it. The authoring factories live here, and their parameter
 #: comments reach an operator as help text.
 _COMMENT_FILES = ("messagefoundry/config/wiring.py",)
@@ -209,13 +224,18 @@ def escape_texts_without_posture(source: str) -> tuple[list[int], int]:
     return unposted, seen
 
 
-def docstrings_without_posture(source: str) -> tuple[list[int], int]:
+def docstrings_without_posture(
+    source: str, *, exempt: frozenset[str] = frozenset()
+) -> tuple[list[int], int]:
     """Lines of docstring paragraphs that name the escape but not the posture, and how many
-    paragraphs named the escape at all. The line is where the paragraph first spells the variable."""
+    paragraphs named the escape at all. The line is where the paragraph first spells the variable.
+    A function or class named in ``exempt`` is not read."""
     unposted: list[int] = []
     seen = 0
     for node in ast.walk(parse_source(source)):
         if not isinstance(node, _DOCUMENTED):
+            continue
+        if not isinstance(node, ast.Module) and node.name in exempt:
             continue
         text = ast.get_docstring(node, clean=False)
         if text is None:
@@ -406,6 +426,9 @@ def test_the_prose_scans_flag_a_text_that_omits_the_posture() -> None:
     # The posture two paragraphs up does not cover the last paragraph, and line 14 is where that
     # paragraph spells the variable, not where it starts.
     assert docstrings_without_posture(_PROSE_THAT_OMITS_THE_POSTURE) == ([1, 14], 2)
+    # An exempt function is not read; the module docstring still is.
+    exempt = frozenset({"factory"})
+    assert docstrings_without_posture(_PROSE_THAT_OMITS_THE_POSTURE, exempt=exempt) == ([1], 1)
     assert comments_without_posture(_PROSE_THAT_OMITS_THE_POSTURE) == ([6, 7, 16], 3)
 
 
@@ -438,18 +461,41 @@ def test_every_runtime_text_naming_the_escape_names_the_posture() -> None:
     )
 
 
+def _text(rel: str) -> str:
+    return (_REPO / rel).read_text(encoding="utf-8")
+
+
+def _exempt(rel: str) -> frozenset[str]:
+    return _DOCSTRING_EXEMPT.get(rel, frozenset())
+
+
+def test_every_docstring_exemption_still_names_the_escape() -> None:
+    # A stale entry would hide a new docstring of the same name, so each must still be a function
+    # in a pinned file whose docstring spells the variable.
+    assert set(_DOCSTRING_EXEMPT) <= set(_DOCSTRING_FILES)
+    stale: list[str] = []
+    for rel, names in _DOCSTRING_EXEMPT.items():
+        naming = {
+            node.name
+            for node in ast.walk(parse_source(_text(rel)))
+            if isinstance(node, _DEF | ast.ClassDef)
+            and INSECURE_TLS_ESCAPE_ENV in (ast.get_docstring(node, clean=False) or "")
+        }
+        stale.extend(f"{rel}:{name}" for name in sorted(names - naming))
+    assert not stale, f"these exempt docstrings no longer name the escape: {stale}"
+
+
 def test_every_authoring_text_naming_the_escape_names_the_posture() -> None:
     failures: list[str] = []
     silent: list[str] = []
-    for kind, scan, files in (
-        ("docstring", docstrings_without_posture, _DOCSTRING_FILES),
-        ("comment", comments_without_posture, _COMMENT_FILES),
-    ):
-        for rel in files:
-            unposted, seen = scan((_REPO / rel).read_text(encoding="utf-8"))
-            if not seen:
-                silent.append(f"{rel} ({kind}s)")
-            failures.extend(f"{rel}:{line} ({kind})" for line in unposted)
+    results = [
+        ("docstring", rel, docstrings_without_posture(_text(rel), exempt=_exempt(rel)))
+        for rel in _DOCSTRING_FILES
+    ] + [("comment", rel, comments_without_posture(_text(rel))) for rel in _COMMENT_FILES]
+    for kind, rel, (unposted, seen) in results:
+        if not seen:
+            silent.append(f"{rel} ({kind}s)")
+        failures.extend(f"{rel}:{line} ({kind})" for line in unposted)
     assert not silent, f"the scan found no text naming the escape in {silent}"
     assert not failures, (
         f"these docstrings and comments name {INSECURE_TLS_ESCAPE_ENV}, or say "

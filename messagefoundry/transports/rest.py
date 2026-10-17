@@ -16,9 +16,11 @@ Standard library only (``urllib.request``) — no new dependency (ADR 0003). Red
 (a 3xx could divert PHI to an unintended host) and the scheme is constrained to http/https, mirroring
 the alert-webhook hardening (ASVS 15.3.2 / 1.3.6); the `[egress].allowed_http` allowlist is the
 fail-closed host gate (enforced by the runner at load/reload/start). Per-connection
-``verify_tls=False`` is honored only when the dev escape ``MEFOR_ALLOW_INSECURE_TLS`` is set, exactly
-like the SQL Server backend, and only on a hop that carries no credential
-(:func:`refuse_verify_off`).
+``verify_tls=False`` on an ``https`` URL is refused, with no escape, when its settings send a
+credential (:func:`refuse_verify_off`). Without one it is allowed to a loopback host or with
+``tls_hop_attested``, and refused otherwise. The dev escape ``MEFOR_ALLOW_INSECURE_TLS`` turns that
+refusal into a loud warning only on an instance at ``[security].enforcement = warn``; under
+``enforce``, the default, it changes nothing, as for the SQL Server backend.
 
 There is **no REST source yet** — a non-HL7 source needs the payload-agnostic ingress decided in
 ADR 0003 (its own follow-up ADR). This is the first non-HL7 connector.
@@ -657,7 +659,8 @@ def _shipped_strict_disposition(
       and the only one where the declaration is a genuine escape (``Tcp()``/``X12()`` never reach here).
     * A **``verify_tls=false``** hop is NOT cleartext — it is encrypted but unauthenticated — so it is
       explicitly OUT of 0153's scope ("the cleartext transport-hop decision only"). It keeps the
-      pre-0153 clamped global escape (``weakened_tls=True``), which is also what the MLLP/FTPS
+      pre-0153 clamped global escape (``weakened_tls=True``), honoured only at
+      ``[security].enforcement = warn``, which is also what the MLLP/FTPS
       ``tls_verify=false`` cells do via ``weakened_tls_escape_permitted_here()``; ``cleartext_accepted``
       deliberately does NOT reach it. Threading the acceptance here would have LOOSENED an enforcing hop
       that refuses today (0092 decision 5 forbids that), attached an operator's "this hop has no TLS"
@@ -1102,8 +1105,9 @@ def refuse_verify_off(
 
     Disabling certificate verification makes the ``https`` hop MITM-able, so it is an insecure hop:
     an enforcing hop REFUSES, an on-box loopback / per-hop-attested hop is allowed, and the CLAMPED
-    global escape (``MEFOR_ALLOW_INSECURE_TLS``, inert under ENFORCE) downgrades a non-enforcing one to
-    a loud WARN. Only meaningful for ``https`` (an ``http`` url has no TLS to verify and is handled by
+    global escape (``MEFOR_ALLOW_INSECURE_TLS``, honoured only at ``[security].enforcement = warn`` and
+    inert under ``enforce``) downgrades a non-enforcing one to a loud WARN. Only meaningful for
+    ``https`` (an ``http`` url has no TLS to verify and is handled by
     :func:`refuse_cleartext_egress`); returns ``None`` for a non-https scheme. Returns an
     :class:`InsecureHopGuard` when the hop was permitted (a warned / attested off-box hop).
 
