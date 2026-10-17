@@ -65,9 +65,15 @@ def _paths_keeping(text: str, *values: str, paths: tuple[str, ...] = ()) -> list
 
 @contextmanager
 def _rule_off() -> Iterator[None]:
-    """The redactor as it was before BACKLOG #3318: every route goes through ``redaction.redact``."""
+    """The redactor as it was before BACKLOG #3318. ``redact`` and ``safe_text`` both answer through
+    ``_redact_answers``, so patching it reaches every route."""
+
+    def plain(text: str) -> tuple[str, str, list[str]]:
+        answer = redaction._redact_text(text, None)
+        return answer, answer, []
+
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(redaction, "redact", lambda text: redaction._redact_text(text, None))
+        patch.setattr(redaction, "_redact_answers", plain)
         yield
 
 
@@ -156,16 +162,27 @@ def test_a_value_whose_words_print_elsewhere_is_still_caught() -> None:
 def test_the_kept_text_check_is_what_guards_it(monkeypatch: pytest.MonkeyPatch) -> None:
     """THE POSITIVE CONTROL for the guards above: with the check passing everything, the value
     prints."""
-    monkeypatch.setattr(redaction, "_keeps_only_what_plain_kept", lambda out, plain, labels: True)
+    monkeypatch.setattr(redaction, "_answer_holds", lambda *args, **kwargs: True)
     assert "4455667" in redact('x|y|z"family":"Zq PatientID="4455667"')
     assert '"44 55"' in redact('x|y|z"family":"Zq 44 x 55 PatientID="44 55"')
 
 
-def test_a_record_over_the_window_still_gets_the_rule() -> None:
+def test_a_clamped_record_still_gets_the_rule() -> None:
     """``clamp_untrusted`` joins its bound note with a line break. That break is this module's, not a
-    peer's, so it does not take the rule off."""
+    peer's, so it does not take the rule off. A small window, so the answer stays under the length
+    cap the next test pins."""
+    text = _SHAPES["compact-json"][0] + " " + "w " * 4096
+    assert "Vandtjane" not in redaction.redact_untrusted(text, window=4096)
+
+
+def test_an_answer_a_clamp_could_reach_gets_the_old_answer() -> None:
+    """A clamp cuts both answers at a different place, and its walks are not read by the cut check,
+    so an answer within reach of one is the old answer. The price, stated: a record clamped at the
+    default window keeps the value it kept before BACKLOG #3318."""
     text = _SHAPES["compact-json"][0] + " " + "w " * redaction._REDACT_WINDOW
-    assert "Vandtjane" not in redaction.redact_untrusted(text)
+    head = redaction.clamp_untrusted(text)
+    assert redaction.redact(head) == redaction._redact_text(head, None)
+    assert len(redaction._redact_text(head, None)) > redaction._GLUED_LENGTH_CAP
 
 
 @pytest.mark.parametrize(
@@ -270,3 +287,86 @@ def test_no_route_prints_a_value_the_redactor_before_the_rule_hid() -> None:
             fixed += bool({value for value in _PLANTED if value in before[path]} - printed)
     assert not newly, newly[:10]
     assert fixed > 1000, fixed
+
+
+# --- A cut falls at a different place in each answer (BACKLOG #3318, repair) --------------------
+#
+# Found by a grammar differential against main, at limits 40 to 200: the two answers differ in
+# length, so one limit cut each at a different place, and the answer the rule shortened kept text
+# the old answer cut off. Each text below printed its value by every route named here on the head
+# before this repair, and prints nothing on main.
+
+#: ``(text, the synthetic value, limit)``: one ``safe_text`` cut at each of three limits.
+_CUT_SHAPES = {
+    "limit-40": (
+        ',Plantone"00101040":"PatientID=\'"mrn": "https://h.example/Patient?a=1&b=2&c=3 ok<given>'
+        'a&b&cOtherPatientIDs=|"family":"<: PatientName=\'name\':\'<name>"identifier":{"value":"',
+        "Plantone",
+        40,
+    ),
+    "limit-80": (
+        '"1980-05-05 OtherPatientIDs=A^B^C(0008,0020)  4455667(0008,0020) x|y|z<ns:name>""'
+        '<value value="<value value=" retryVandtjane=',
+        "Vandtjane",
+        80,
+    ),
+    "limit-120": (
+        '{"00101040":"?a=1&b=2&<connection reset by peer while sendingOtherPatientIDs=  1980-05-05'
+        '(0008,0020) "mrn: Zqxdoe></name>x"00100010":"00101040":"</name>Vandtjane',
+        "Zqxdoe",
+        120,
+    ),
+}
+_EACH_CUT = pytest.mark.parametrize(
+    ("text", "value", "limit"), list(_CUT_SHAPES.values()), ids=list(_CUT_SHAPES)
+)
+
+#: The store route at its real default: ``safe_exc`` at an emit site, then the store's
+#: ``safe_text`` chokepoint over the result, both at the default limit of 200.
+_STORE_TEXT = (
+    'mrn="00100010": \'name\':\'mrn="00100010":4455667ok Plantone</name>A^B^C<family value="'
+    'connection reset by peer while sendingVandtjane]<value value="IB_ACME_ADT4455667</name>'
+    "OtherPatientIDs=="
+)
+
+
+def _stored(text: str) -> str:
+    return safe_text(safe_exc(ValueError(text)))
+
+
+@_EACH_CUT
+def test_a_cut_answer_keeps_nothing_the_cut_old_answer_did_not(
+    text: str, value: str, limit: int
+) -> None:
+    assert value not in safe_text(text, limit=limit)
+    assert value not in safe_exc(ValueError(text), limit=limit)
+    assert value not in _through_the_chain(safe_text(text, limit=limit))
+
+
+def test_the_store_bound_keeps_nothing_the_old_answer_did_not() -> None:
+    """Only the second cut is pinned: ``safe_exc`` alone prints this value on main too, a residual of
+    the redactor that this item does not touch, and the store's cut drops it there."""
+    assert redaction._DEFAULT_LIMIT == 200
+    assert "4455667" not in _stored(_STORE_TEXT)
+
+
+def test_the_cut_pins_print_nothing_with_the_rule_off_either() -> None:
+    """Main parity: the redactor before BACKLOG #3318 printed none of these values."""
+    with _rule_off():
+        for text, value, limit in _CUT_SHAPES.values():
+            assert value not in safe_text(text, limit=limit)
+        assert "4455667" not in _stored(_STORE_TEXT)
+
+
+def test_the_cut_reading_is_what_guards_the_store_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE POSITIVE CONTROL: with the reading of every cut passing everything, the store route
+    prints the value. So the green above is that reading's work, and not a text the rule missed."""
+    monkeypatch.setattr(redaction, "_survives_every_cut", lambda *args: True)
+    assert "4455667" in _stored(_STORE_TEXT)
+
+
+def test_the_cut_character_pattern_is_the_cut_characters() -> None:
+    """``_CUT_CHAR_RE`` is written out for the ReDoS scanner, so it is pinned to its source."""
+    every = {chr(code) for code in range(0x3000)}
+    matched = {char for char in every if redaction._CUT_CHAR_RE.fullmatch(char)}
+    assert matched == set(redaction._CUT_CHARS)

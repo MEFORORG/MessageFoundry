@@ -75,7 +75,7 @@ import weakref
 from abc import ABCMeta
 from bisect import bisect_left
 from collections import ChainMap, OrderedDict, UserDict, defaultdict, deque
-from collections.abc import Callable, MappingView
+from collections.abc import Callable, Iterable, MappingView
 from datetime import UTC, datetime
 from functools import lru_cache
 from itertools import islice
@@ -1753,7 +1753,7 @@ def redact(text: str) -> str:
     **A PHI label glued to a field run keeps its place, and the answer is checked against the one
     that took it (BACKLOG #3318).** :func:`_glued_label_replacement` says what it keeps. Where it kept
     a label, this function also computes the answer without it, and returns that one instead unless
-    all three of these hold. First, the input is printable: ``ControlCharScrubFilter`` writes a line
+    all of these hold. First, the input is printable: ``ControlCharScrubFilter`` writes a line
     break as visible text, so a second handler reads two lines as one, and a kept quote there closed
     an earlier value that the line end had closed on the first call. The price is large and stated: a
     traceback is many lines, so the rule never applies to one. Second, no credential shape is in the
@@ -1762,11 +1762,25 @@ def redact(text: str) -> str:
     ordinary words such as ``state=`` or ``session:``, and the rule is off on such a text. Third, the
     text the answer keeps, outside the labels it kept and the placeholders, is a run of text the answer
     without it also kept, in the same order (:func:`_keeps_only_what_plain_kept`). So on one call,
-    text this redactor printed was printed before #3318 too, by construction. A second call over the first one's output is not
-    covered by that check, and is measured instead; it can scrub more than the first, as other
-    exceptions :func:`safe_text` names can. Nor is a cut: a kept label is shorter than the run it
-    split, so :func:`safe_text`'s limit can fall later in the answer and keep text the old answer cut
-    off. That text was never redacted, only cut.
+    text this redactor printed was printed before #3318 too, by construction.
+
+    **The rest are there because a later step reads the answer, not because this call prints more.**
+    Each was found by a grammar differential against the redactor before #3318, over routes that
+    cut the answer or redact it again, and none of them is a proof. Fourth, the third check holds at
+    every place a later limit can cut both answers: they differ in length, so one limit falls at a
+    different place in each, and the shorter one kept text the other cut off
+    (:func:`_survives_every_cut`; :func:`safe_text` runs it again on its own cut). Fifth, it holds
+    again over each answer redacted once more, pass after pass (:func:`_answer_holds`): a kept label
+    is context a later pass reads. Sixth, the answer holds no percent-encoded run: a kept label turns
+    that run's pass off on a later call, and the old answer, cut short of its own labels, then lost
+    text the new one kept. Seventh, neither answer is long enough for a clamp to reach
+    (:data:`_GLUED_LENGTH_CAP`), since a clamp's walks are not read by the fourth check. The price of
+    the last: a record clamped at the default window gets the old answer.
+
+    **What the differential does not cover, at least.** A caller that puts more than a limit's worth
+    of its own text around an answer before it bounds the whole moves the cut by its own text, which
+    the fourth check reads only as a shift; and the routes it ran are the ones it names, not every
+    composition a caller can write.
 
     The rule is dropped silently where those checks refuse it, at least: a text the widened stage
     reads only because of a kept label, which then keeps an encoded run the answer without the rule
@@ -1774,41 +1788,66 @@ def redact(text: str) -> str:
     rule writes after ``<name>`` is no evidence of markup to that pass; and a FHIR structure whose
     earlier member closes a string inside the token (``"telecom":[{"system":"phone","value":"555
     0188"}]``), since the rule reads that closing quote as the value's."""
-    note = _TRAILING_NOTES.search(text) if text.endswith("unscanned]") else None
-    if not (text if note is None else text[: note.start()]).isprintable():
-        return _redact_text(text, None)
+    return _redact_answers(text)[0]
+
+
+#: The longest answer the glued-label rule may give. :func:`clamp_untrusted` and :func:`safe_text`
+#: cut a text longer than :data:`_REDACT_WINDOW`, and a further call can be handed an answer with a
+#: count note and a bound note after it, so each note's room comes off. Under this, no clamp reaches
+#: an answer, or a result this module built from one, so the old answer is the only one a clamp cuts.
+_GLUED_LENGTH_CAP = _REDACT_WINDOW - 2 * _CLAMP_MARKER_BUDGET
+
+
+def _redact_answers(text: str) -> tuple[str, str, list[str]]:
+    """``(answer, plain, labels)``: what :func:`redact` returns, the answer without the glued-label
+    rule (BACKLOG #3318), and the labels ``answer`` kept. ``labels`` is empty, and ``answer`` is
+    ``plain``, wherever the rule kept nothing or a check refused it. :func:`safe_text` strips both
+    and checks the two again."""
+    if not _split_trailing_note(text, "")[0].isprintable():
+        plain = _redact_text(text, None)
+        return plain, plain, []
     labels: list[str] = []
     out = _redact_text(text, labels)
     if not labels:
-        return out
+        return out, out, []
     plain = _redact_text(text, None)
     # One screen of the input is enough: a scrub only writes the placeholder, and a kept label holds
     # no credential word.
-    if _holds_a_credential_shape(text) or not _keeps_only_what_plain_kept(out, plain, labels):
-        return plain
-    return out
+    if (
+        max(len(out), len(plain)) > _GLUED_LENGTH_CAP
+        or _holds_a_credential_shape(text)
+        or _holds_an_encoded_run(out)
+        or not _answer_holds(out, plain, labels)
+    ):
+        return plain, plain, []
+    return out, plain, labels
 
 
 def _redact_text(text: str, labels: list[str] | None) -> str:
     """:func:`redact` with the glued-label rule on (``labels`` a list, which collects every label it
     kept) or off (``None``, the redactor before BACKLOG #3318)."""
     out = _redact_stages(text, labels)
-    if "%" not in out or _ENCODED_SEPARATOR.search(out) is None:
-        return out
-    if _HL7_ENCODED_FIELD_RUN.search(out) is None:
+    if not _holds_an_encoded_run(out):
         return out
     # This module's own bound note is joined by a line break (:data:`_TRAILING_NOTES`). It is the one
     # unprintable character that is not a peer's, so it is set aside before the test below.
-    note = _TRAILING_NOTES.search(out) if out.endswith("unscanned]") else None
-    body = out if note is None else out[: note.start()]
     if (
-        not body.isprintable()
+        not _split_trailing_note(out, "")[0].isprintable()
         or _USERINFO_OPENER in out
         or _needs_widened_stage(out)
         or _CREDENTIAL_AHEAD.search(out) is not None
     ):
         return out
     return _redact_stages(_field_run_sub(_HL7_ENCODED_FIELD_RUN, out, labels), labels)
+
+
+def _holds_an_encoded_run(text: str) -> bool:
+    """Whether :data:`_HL7_ENCODED_FIELD_RUN` matches ``text``, behind its C-speed screens."""
+    return (
+        "%" in text
+        and _ENCODED_SEPARATOR.search(text) is not None
+        and _HL7_ENCODED_FIELD_RUN.search(text) is not None
+    )
 
 
 def _redact_stages(text: str, labels: list[str] | None = None) -> str:
@@ -2032,33 +2071,162 @@ _KEPT_WORD = re.compile(r"\w")
 #: The most distinct labels :func:`_keeps_only_what_plain_kept` sets aside. Past it the check
 #: refuses, so a peer that varies every label pays one bounded refusal and gets the old answer.
 _MAX_DISTINCT_LABELS = 64
-#: Joins the runs an answer kept. :func:`redact` takes the rule only on printable text, which holds
-#: no NUL.
-_JOIN = "\x00"
+#: What stands in for a placeholder or a kept label while the runs are read. :func:`redact` takes
+#: the rule only on printable text, which holds no NUL. One per character, so an index into the
+#: masked text is an index into the answer, which is what lets the check read a cut.
+_MASK = "\x00"
+#: A run of an answer that is neither placeholder nor kept label.
+_UNMASKED_RUN = re.compile(r"[^\x00]+")
 
 
-def _keeps_only_what_plain_kept(out: str, plain: str, labels: list[str]) -> bool:
+def _masked(text: str, spans: Iterable[str]) -> str:
+    """``text`` with each of ``spans`` replaced, in turn, by as many :data:`_MASK` characters."""
+    for span in spans:
+        text = text.replace(span, _MASK * len(span))
+    return text
+
+
+#: How many further passes :func:`_answer_holds` reads before it gives up. Each answer it has met
+#: stops changing after two or fewer; one that has not stopped by then gets the old answer.
+_FURTHER_PASSES = 4
+
+
+def _answer_holds(
+    out: str, plain: str, labels: list[str], *, out_notes: str = "", plain_notes: str = ""
+) -> bool:
+    """:func:`_keeps_only_what_plain_kept` over the two answers, and again over each answer redacted
+    once more without the rule, pass after pass, until neither changes.
+
+    **The further passes are read because a further call reads the two answers differently.** A log
+    record passes two handlers, and the store bounds a value an emit site already bounded, so a
+    later :func:`redact` runs over each answer, and over what that one returned. The old answer can
+    lose more on one of those passes than the new one: a label the rule kept is context that pass
+    reads (a JSON ``address`` key turns the percent-encoded run off, :func:`_needs_widened_stage`),
+    and the old answer had none. So text both answers kept could survive a later pass only after
+    the new one. Measured on a grammar fuzz, at the second pass and then at the third, not reasoned.
+    A later pass with the rule on keeps no more than the same pass without it, by this same check,
+    so the rule-off pass stands in for it. Answers that are still changing after
+    :data:`_FURTHER_PASSES` passes are refused.
+
+    **A pass over an answer a later bound already cut is not read here**: reading one at every cut
+    would be quadratic. The refusal of an answer holding a percent-encoded run
+    (:func:`_redact_answers`) stands in for that gap, which is where the differential found it."""
+    for _ in range(_FURTHER_PASSES):
+        if not _keeps_only_what_plain_kept(
+            out, plain, labels, out_notes=out_notes, plain_notes=plain_notes
+        ):
+            return False
+        again, plain_again = _redact_text(out, None), _redact_text(plain, None)
+        if again == out and plain_again == plain:
+            return True
+        out, plain = again, plain_again
+    return False
+
+
+def _keeps_only_what_plain_kept(
+    out: str, plain: str, labels: list[str], *, out_notes: str = "", plain_notes: str = ""
+) -> bool:
     """Whether every run of text ``out`` keeps, between placeholders and the ``labels`` the
-    glued-label rule kept, sits inside one run ``plain`` keeps, in order. A count of words was the
-    first form and a review broke it: a kept quote closed a leaf string early, the next label's
-    value printed, and its words were all printed elsewhere in ``plain``. Labels are vocabulary: an
-    XML label with a namespace prefix, the one kind that could carry free text, is never kept."""
+    glued-label rule kept, sits inside one run ``plain`` keeps, in order, and still does after any
+    cut a later bound makes to both. A count of words was the first form and a review broke it: a
+    kept quote closed a leaf string early, the next label's value printed, and its words were all
+    printed elsewhere in ``plain``. Labels are vocabulary: an XML label with a namespace prefix, the
+    one kind that could carry free text, is never kept.
+
+    **Every cut, because the two answers differ in length (BACKLOG #3318).** A bound cuts each at
+    the last whitespace before its limit (:func:`_whole_token_prefix`), so the same limit falls at a
+    different place in each, and the answer the rule shortened kept text the old answer cut off.
+    Review measured it at :func:`safe_text`'s limit. A caller can also put text before either answer
+    and bound the whole (:func:`safe_exc`, then the store's :func:`safe_text`), which moves both cuts
+    by the same amount. So the check runs at every place a cut of ``out`` can land: at each
+    whitespace, the text before it must sit inside what a cut at the same place keeps of
+    ``plain``. The match of a run cut in half is read at its whole run's place, which can refuse an
+    answer that would have passed, never the other way.
+
+    **This module's notes after each answer, ``out_notes`` and ``plain_notes``.** A cut inside one
+    moves back to before it (:func:`_clear_of_own_notes`), so a note keeps its answer whole from its
+    first whitespace on, and that whitespace sits at a different place after each answer: the two
+    counts differ in length. A note anywhere else is not followed, so an answer holding one is
+    refused. The bound note :func:`clamp_untrusted` ends a text with counts as one of these.
+
+    A later call REDACTS before it cuts, and the two answers can then shrink by different amounts:
+    :func:`_answer_holds` runs this check again after each such pass."""
+    out, out_notes = _split_trailing_note(out, out_notes)
+    plain, plain_notes = _split_trailing_note(plain, plain_notes)
+    if any(note in text for note in (_COUNT_OPENER, _BOUND_OPENER) for text in (out, plain)):
+        return False
     distinct = sorted(set(labels), key=len, reverse=True)
     if len(distinct) > _MAX_DISTINCT_LABELS:
         return False
-    body = out.replace(_REDACTED, _JOIN)
-    for label in distinct:
-        body = body.replace(label, _JOIN)
-    kept = plain.replace(_REDACTED, _JOIN)
+    kept = _masked(plain, (_REDACTED,))
+    runs: list[tuple[int, int, int, int]] = []  # (start, end) in out, (start, end) in plain
     pos = 0
-    for piece in body.split(_JOIN):
-        if _KEPT_WORD.search(piece) is None:
+    for run in _UNMASKED_RUN.finditer(_masked(out, (_REDACTED, *distinct))):
+        text = run.group().strip(_CUT_CHARS)
+        if _KEPT_WORD.search(text) is None:
             continue
-        found = kept.find(piece, pos)
+        found = kept.find(text, pos)
         if found < 0:
             return False
-        pos = found + len(piece)
+        pos = found + len(text)
+        run_start = run.start() + run.group().index(text)
+        runs.append((run_start, run_start + len(text), found, pos))
+    return not runs or _survives_every_cut(out, plain, runs, out_notes, plain_notes)
+
+
+def _survives_every_cut(
+    out: str, plain: str, runs: list[tuple[int, int, int, int]], out_notes: str, plain_notes: str
+) -> bool:
+    """Whether each cut a later bound can make to ``out`` keeps no more of ``runs`` than the same
+    cut keeps of ``plain`` (:func:`_keeps_only_what_plain_kept` says why). ``runs`` holds each run
+    ``out`` keeps, as its ``(start, end)`` in ``out`` and its match's ``(start, end)`` in ``plain``,
+    in order. Linear in the two answers."""
+    # A limit ``at`` keeps ``text[:kept]``, where ``kept`` is the last whitespace at or before
+    # ``at``, or the whole answer once ``at`` reaches its notes' first whitespace (or its end).
+    # Walk every place ``out``'s cut moves, with what the same limit keeps of ``plain``.
+    cuts = [(m.start(), m.start()) for m in _CUT_CHAR_RE.finditer(out)]
+    cuts.append((len(out) + _first_cut(out_notes), len(out)))
+    plain_cuts = [m.start() for m in _CUT_CHAR_RE.finditer(plain)]
+    plain_whole = len(plain) + _first_cut(plain_notes)
+    old_kept = 0
+    p_index = 0
+    r_index = 0  # the first run not yet wholly kept
+    for at, new_kept in cuts:
+        while p_index < len(plain_cuts) and plain_cuts[p_index] <= at:
+            old_kept = plain_cuts[p_index]
+            p_index += 1
+        if plain_whole <= at:
+            old_kept = len(plain)
+        while r_index < len(runs) and runs[r_index][1] <= new_kept:
+            r_index += 1
+        if r_index and runs[r_index - 1][3] > old_kept:
+            return False
+        if r_index < len(runs) and runs[r_index][0] < new_kept:
+            run_start, _, found, _ = runs[r_index]
+            if found + new_kept - run_start > old_kept:
+                return False
     return True
+
+
+#: One :data:`_CUT_CHARS` character, so the cut walk finds every place a cut lands at C speed.
+#: Written out so the ReDoS scanner reads it; a test pins it to :data:`_CUT_CHARS`.
+_CUT_CHAR_RE = re.compile(r"[ \t\n\r\x0b\x0c]")
+
+
+def _split_trailing_note(text: str, notes: str) -> tuple[str, str]:
+    """``(text, notes)`` with the bound note :func:`clamp_untrusted` ends ``text`` with moved to the
+    front of ``notes``."""
+    note = _TRAILING_NOTES.search(text) if text.endswith("unscanned]") else None
+    if note is None:
+        return text, notes
+    return text[: note.start()], text[note.start() :] + notes
+
+
+def _first_cut(notes: str) -> int:
+    """Where in ``notes`` a cut first lands: at its first whitespace, or at its end when it holds
+    none (``0`` for no notes, where the answer itself ends)."""
+    found = _CUT_CHAR_RE.search(notes)
+    return len(notes) if found is None else found.start()
 
 
 def _redact_flat(
@@ -2242,15 +2410,36 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     (BACKLOG #2079) a JSON ``name``/``address`` key that ``limit`` leaves last has the count read as its
     value by a further pass, so ``{"name":…(+316 chars)`` becomes ``{"name":…([redacted] [redacted])``
     and loses how much was cut. Before BACKLOG #1797 the limit cut the kept string itself and left it
-    unterminated, which a further pass scrubbed the same way."""
+    unterminated, which a further pass scrubbed the same way.
+
+    **The glued-label check runs again after the cut (BACKLOG #3318).** :func:`redact` returns an
+    answer only where its text sits inside the old answer's, but the two differ in length, so
+    ``limit`` falls at a different place in each, and the shorter one kept text the old answer cut
+    off. So both answers are cut here and checked again (:func:`_answer_holds`), with the notes this
+    call writes after each, and where the cut answer could keep text the cut old one does not, the
+    cut old one is returned. The notes are compared as places a later cut lands, never as text: the
+    two counts differ."""
     head, dropped = _clamp(text, _REDACT_WINDOW)
-    message = redact(head).strip()
-    if len(message) > limit:
-        kept = _clear_of_own_notes(message, _whole_token_prefix(message, limit))
-        message = f"{message[:kept]}{_COUNT_OPENER}{len(message) - kept}{_COUNT_CLOSER}"
-    if dropped:
-        message = f"{message} {_clamp_marker(dropped)}"
-    return message
+    answer, plain, labels = _redact_answers(head)
+    bound = f" {_clamp_marker(dropped)}" if dropped else ""
+    kept, count = _bounded(answer.strip(), limit)
+    if labels:
+        old_kept, old_count = _bounded(plain.strip(), limit)
+        # Uncut, unstripped and unclamped, the two are what _redact_answers already checked.
+        if (kept, old_kept, bound) != (answer, plain, "") and not _answer_holds(
+            kept, old_kept, labels, out_notes=count + bound, plain_notes=old_count + bound
+        ):
+            kept, count = old_kept, old_count
+    return kept + count + bound
+
+
+def _bounded(message: str, limit: int) -> tuple[str, str]:
+    """``(head, count)``: ``message`` cut to ``limit`` at a whole token, and the note counting what
+    the cut held back, or ``(message, "")`` when it fits."""
+    if len(message) <= limit:
+        return message, ""
+    kept = _clear_of_own_notes(message, _whole_token_prefix(message, limit))
+    return message[:kept], f"{_COUNT_OPENER}{len(message) - kept}{_COUNT_CLOSER}"
 
 
 def safe_error(error: str | None, *, show_phi: bool = False) -> str | None:
