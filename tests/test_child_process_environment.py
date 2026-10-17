@@ -843,6 +843,9 @@ _MUST_CHOOSE = frozenset(
         ("store/store.py", "_grant_read", "subprocess.run"),
         ("service.py", "service_state", "subprocess.run"),
         ("service_status.py", "_query", "subprocess.run"),
+        # verify's host cipher policy probes (BACKLOG #3277): OpenSSL reads OPENSSL_CONF, so they
+        # take everything outside the engine's namespace rather than the start-up names only.
+        ("verify/cipher_policy.py", "_run_lines", "subprocess.run"),
     }
 )
 

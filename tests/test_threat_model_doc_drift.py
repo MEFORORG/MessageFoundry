@@ -1210,6 +1210,10 @@ _ALLOWED_SUBPROCESS_SITES: dict[str, str] = {
     "tray/actions.py": "tray's VS Code open, list-form argv; os.startfile opens the log",
     "tray/app.py": "tray's os.startfile open of tray.toml in the default editor (BACKLOG #1934)",
     "tray/branding.py": "tray's branded-launcher relaunch, fixed argv, close_fds=True",
+    "verify/cipher_policy.py": (
+        "verify's host cipher policy read (BACKLOG #3277): Get-TlsCipherSuite through the System32 "
+        "powershell.exe, or `openssl ciphers` on PATH; fixed argv, 30 s bound"
+    ),
 }
 
 #: Every spawn form, not just the two the narrow version matched. The 15.1.5 row above asserts the

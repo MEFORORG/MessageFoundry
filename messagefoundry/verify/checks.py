@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 from messagefoundry import __version__
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import codec_safe_str
+from messagefoundry.verify import cipher_policy
 from messagefoundry.verify.model import CheckResult, Status
 
 if TYPE_CHECKING:
@@ -120,6 +121,22 @@ def check_sqlserver_odbc_driver() -> CheckResult:
         f"{target!r} not found; SQL Server drivers seen: {seen or 'none'}",
         evidence=", ".join(drivers),
     )
+
+
+def check_host_cipher_policy() -> CheckResult:
+    """DEPLOY-SERVER-DB.md section 5.4: the host TLS policy every ODBC Driver 18 hop takes.
+
+    Reported where an ODBC hop could run, which is wherever pyodbc imports: the SQL Server store, the
+    DATABASE connector, ``db_lookup`` and ``DatabaseRef`` all reach the driver through it. Without
+    it no such hop exists here, so the row SKIPs rather than failing a host that needs no policy."""
+    if not _can_import("pyodbc"):
+        return CheckResult(
+            cipher_policy.RID,
+            cipher_policy.TITLE,
+            Status.SKIP,
+            "pyodbc not importable, so no ODBC hop runs here",
+        )
+    return cipher_policy.read_host_cipher_policy()
 
 
 def _asyncpg_has_connect_hook() -> bool | None:
@@ -416,6 +433,7 @@ def run_host_checks(*, ports: dict[str, int], writable_dir: Path) -> list[CheckR
         check_python_runtime(),
         check_optional_drivers(),
         check_sqlserver_odbc_driver(),
+        check_host_cipher_policy(),
         check_postgres_driver(),
         check_listener_ports(ports),
         check_writable_dir(writable_dir),
