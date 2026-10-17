@@ -5,9 +5,10 @@
 ``POST /ui/account/mfa/verify`` confirms a TOTP enrolment and ``POST /ui/account/webauthn/verify``
 finishes a passkey registration. Either can turn a session that still owes its factor into a
 satisfied one, so the service floors both against the session's mint
-(``[auth].mfa_verify_min_elapsed_seconds``). Every other console suite turns that floor off, so it
-can drive a ceremony at machine speed. These tests keep it ON, at its shipped default, and pin what
-each route answers inside it and past it.
+(``[auth].mfa_verify_min_elapsed_seconds``). The console suites that drive a ceremony at machine
+speed either turn that floor off or run with require_mfa off, where no session owes a factor and
+the floor never applies. These tests keep it ON, at its shipped default, with require_mfa on, and
+pin what each route answers inside it and past it.
 
 No test sleeps. The wall clock the service and the store read is held, so no time passes between
 the sign-in and the early attempt however slow the runner is, and the clock then moves only forward.
@@ -47,8 +48,8 @@ async def _floored_service(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[AuthService, list[float]]:
     """A service with the floor at its shipped default and require_mfa on, so a fresh sign-in owes
-    its factor, and the held clock it reads. Only the admin-write pacing floor is off, as in every
-    console suite: it is not the floor under test, and the ceremony posts several writes at once."""
+    its factor, and the held clock it reads. The admin-write pacing floor and the sign-in rate
+    limit are off: neither is under test, and the ceremony posts several writes at once."""
     now = [time.time()]
     hold_auth_wall_clock(monkeypatch, now)
     service = AuthService(
@@ -70,8 +71,9 @@ async def test_a_console_totp_confirm_inside_the_floor_is_an_ordinary_invalid_co
 ) -> None:
     """RED when: ``confirm_mfa_enrollment`` stops calling the enrolment floor.
 
-    Inside the floor, a good code gets the page a wrong code gets, ``Invalid code.`` with a 400.
-    Past it, after a fresh step-up, the SAME code activates TOTP, so the refusal spent no step."""
+    Inside the floor, a good code gets the status and message a wrong code gets past it,
+    ``Invalid code.`` with a 400. Past it, after a fresh step-up, the SAME code activates TOTP, so
+    the refusal spent no step."""
     service, now = await _floored_service(engine, monkeypatch)
     user_id = await provision(service, "op", ["operator"])
     async with ui_client(engine, service) as c:
@@ -94,8 +96,16 @@ async def test_a_console_totp_confirm_inside_the_floor_is_an_ordinary_invalid_co
             assert user is not None and not user.totp_enabled
             assert user.second_step_failed_attempts == 0, "it charged the second-step lockout"
 
-            # CONTROL: past the floor, the SAME code activates TOTP and shows the recovery codes.
+            # Past the floor, a genuinely wrong code gets the answer the early good code got.
             now[0] += FLOOR + 0.001
+            await mint_bound_proof(c, "/ui/account/mfa/confirm")
+            wrong = f"{(int(code) + 1) % 1_000_000:06d}"  # never the live code at skew 0
+            refused = await c.post(
+                "/ui/account/mfa/verify", data={"code": wrong}, headers=SAME_ORIGIN
+            )
+            assert refused.status_code == early.status_code and "Invalid code." in refused.text
+
+            # CONTROL: past the floor, the SAME good code activates TOTP and shows the codes.
             await mint_bound_proof(c, "/ui/account/mfa/confirm")
             served = await c.post(
                 "/ui/account/mfa/verify", data={"code": code}, headers=SAME_ORIGIN
@@ -153,6 +163,8 @@ async def test_a_console_passkey_registration_inside_the_floor_is_a_failed_verif
         rows = await _too_early_rows(engine, "auth.webauthn_failed")
         assert [r.get("phase") for r in rows] == ["enroll"]
         assert await service.store.list_webauthn_credentials(out.identity.user_id) == []
+        user = await service.store.get_user(out.identity.user_id)
+        assert user is not None and user.second_step_failed_attempts == 0, "it charged the lockout"
 
         # CONTROL: past the floor, the SAME response binds the passkey and satisfies the session.
         now[0] += FLOOR + 0.001
