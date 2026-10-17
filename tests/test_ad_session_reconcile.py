@@ -47,7 +47,7 @@ from messagefoundry.auth.notifications import (
     USERNAME_CHANGED,
 )
 from messagefoundry.auth.permissions import Role
-from messagefoundry.auth.service import AuthService, DirectoryObjectIdMissing
+from messagefoundry.auth.service import AuthService, DirectoryObjectIdMissing, _UserLookup
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import CipherError
 from messagefoundry.store.store import (
@@ -2991,6 +2991,115 @@ async def test_a_stale_held_row_refusal_names_the_row_that_holds_the_name_now(
         )
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert ["holder-row" in r.getMessage() for r in warnings] == [True]
+        assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+    finally:
+        await store.close()
+
+
+async def test_a_pass_whose_holder_read_went_stale_writes_the_rename(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #3070, through the real reconciler pass. The pass reads ``held`` and finds
+    ``gone-holder`` on ``jdoe-married``; before the refresh reads the row, that holder renames itself
+    away. The hook is the pass's own ``held`` read, so the refresh's re-read, which goes through
+    ``_lookup_by_username`` and not this hook, sees the store as it is. The rename lands once, with
+    no conflict audit and no lockout warning."""
+    store, _ldap, service, notifier, user_id = await _renamed_service()
+    try:
+        load_by_name = service._load_user_by_username
+        hooked: list[str] = []
+
+        async def _holder_lets_go(username: str) -> VerifiedUser | None:
+            if username != "jdoe-married" or hooked:
+                return await load_by_name(username)
+            hooked.append(username)
+            await store.create_user(
+                user_id="gone-holder",
+                username="jdoe-married",
+                auth_provider="ad",
+                password_generated=False,
+            )
+            seen = await load_by_name(username)
+            assert seen is not None and seen.id == "gone-holder"
+            assert await store.set_user_username(
+                "gone-holder", "jdoe-retired", expected_username="jdoe-married"
+            )
+            return seen
+
+        service._load_user_by_username = _holder_lets_go  # type: ignore[method-assign]
+        caplog.set_level(logging.INFO, logger="messagefoundry.auth.service")
+        caplog.clear()
+
+        plan = await service.reconcile_directory_sessions()
+
+        assert plan.aborted is None
+        assert hooked, "the pass never read the holder of the new name"
+        after = await store.get_user(user_id)
+        assert after is not None and after.username == "jdoe-married"
+        assert [a["action"] for a in await _rename_audits(store)] == [
+            "auth.ad_username_refreshed"
+        ], "a stale held read in the pass filed a conflict"
+        assert not [
+            r
+            for r in caplog.records
+            if r.levelno >= logging.WARNING and "already held" in r.getMessage()
+        ], "a stale held read in the pass warned of a lockout"
+        assert len([e for e in notifier.sent if e.event_type == USERNAME_CHANGED]) == 1
+    finally:
+        await store.close()
+
+
+async def test_a_stale_held_row_is_no_conflict_when_this_row_took_the_name_since(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #3070. ``held`` is stale, and between the refresh's read of the row and its re-read
+    of the holder a sign-in gives the name to this very row. That is not a conflict against itself:
+    the compare-and-set on the name read first writes nothing, and the refresh says so at INFO with
+    no audit row, notice or warning (BACKLOG #2290)."""
+    store, _ldap, service, notifier, user_id = await _renamed_service()
+    try:
+        lookup = service._lookup_by_username
+
+        async def _sign_in_renames_first(username: str) -> _UserLookup:
+            assert await store.set_user_username(user_id, username, expected_username="jdoe")
+            return await lookup(username)
+
+        service._lookup_by_username = _sign_in_renames_first  # type: ignore[method-assign]
+        caplog.set_level(logging.INFO, logger="messagefoundry.auth.service")
+        caplog.clear()
+
+        await _refresh_with_stale_held(service, store, user_id)
+
+        after = await store.get_user(user_id)
+        assert after is not None and after.username == "jdoe-married"
+        assert not await _rename_audits(store), "this row filed a conflict against itself"
+        assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any("BACKLOG #2290" in r.getMessage() for r in caplog.records)
+    finally:
+        await store.close()
+
+
+async def test_a_holder_that_fails_its_seal_is_still_a_conflict() -> None:
+    """BACKLOG #3070 with #2592. A row that fails its seal still holds its name and still locks
+    this account out at its next sign-in, so the re-read refuses on it rather than reading it as
+    "nobody holds the name". Its id is not exposed unverified, so the audit names the holder the
+    caller verified."""
+    store, _ldap, service, notifier, user_id = await _renamed_service()
+    try:
+
+        async def _unsealed_holder(username: str) -> _UserLookup:
+            return _UserLookup(None, True)
+
+        service._lookup_by_username = _unsealed_holder  # type: ignore[method-assign]
+
+        await _refresh_with_stale_held(service, store, user_id)
+
+        after = await store.get_user(user_id)
+        assert after is not None and after.username == "jdoe"
+        [conflict] = await _rename_audits(store)
+        detail = json.loads(conflict["detail"])
+        assert (detail["detected"], detail["held_by_user_id"]) == ("pre_check", "gone-holder")
         assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
     finally:
         await store.close()

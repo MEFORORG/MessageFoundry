@@ -6794,10 +6794,9 @@ class AuthService:
         policies, and the one that ran less often would be the one nobody noticed drifting.
 
         ``held`` is the row holding ``new_username`` when the caller read it. It is a hint, not the
-        verdict: a ``held`` naming another row is re-read after this method's own read of the row,
-        and only the fresh holder is refused and audited (BACKLOG #3070), because the caller's read
-        is older and the holder may have let the name go since. ``held=None`` costs no read, which
-        is what it saves the login caller, which **provably** already has the answer.
+        verdict: when it names another row, the holder of ``new_username`` is read again before any
+        refusal (BACKLOG #3070; the reasoning is at that read, and only there). ``held=None`` costs
+        no read, which is what it saves the login caller, which **provably** already has the answer.
         ``_complete_ad_login`` reads that exact row before it calls down, and refuses outright when
         it exists with a different id -- so the login path reaches this method only with
         ``held=None``, and the collision branch below is reachable from the **reconciler alone**,
@@ -6986,13 +6985,25 @@ class AuthService:
             )
             return
         if held is not None and held.id != user_id:
-            # BACKLOG #3070. The caller read ``held`` before ``before``, so the holder may have let
-            # the name go since. Filing on that read would audit a conflict and warn of a lockout
-            # nobody faces, so a conflict is re-read here, after ``before``, and the refusal names
-            # the row that holds the name now. One extra read, on the conflict path only.
-            current = await self._load_user_by_username(new_username)
-            if current is not None and current.id != user_id:
-                await _refuse(current.id, "pre_check", before.username)
+            # BACKLOG #3070. THE ONE STATEMENT OF THIS RULE. The caller read ``held`` before
+            # ``before``, so its holder may have let the name go since, and filing on that read
+            # would audit a conflict and warn of a lockout nobody faces. So the holder of
+            # ``new_username`` is read again here, after ``before``, and only a row that holds the
+            # name now is refused; the audit names that row. If nobody holds it, or this row does
+            # (a sign-in renamed it just now, and the compare-and-set below then writes nothing),
+            # it is no conflict. A verified holder load, not one statement, but only when the
+            # caller's read named another row.
+            #
+            # A row that fails its seal still holds its name (BACKLOG #2592) and still locks this
+            # account out at its next sign-in, so it is refused too. Its id is not exposed
+            # unverified, so the audit names the holder the caller verified, as before #3070.
+            found = await self._lookup_by_username(new_username)
+            if found.refused or (found.user is not None and found.user.id != user_id):
+                await _refuse(
+                    found.user.id if found.user is not None else held.id,
+                    "pre_check",
+                    before.username,
+                )
                 return
         try:
             # BACKLOG #2290. A compare-and-set on the name just read, so of two refreshes of this
