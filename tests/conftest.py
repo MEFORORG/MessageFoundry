@@ -583,6 +583,35 @@ def remote_debugging_off(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("messagefoundry.api.app.service_env_posture", lambda: not_a_service)
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _remote_debug_start_gate_stood_down() -> Iterator[Callable[..., bool]]:
+    """Stand down the start-up refusal for remote debugging (vault BACKLOG #2700) in the
+    in-process ``serve`` and ``supervise`` runs, and yield the real gate.
+
+    That gate reads the PROCESS, and pytest's process has the interpreter's remote debugging on
+    however the suite was started, so under the shipped ``enforce`` every in-process start would
+    stop there, whatever gate the test is about. Autouse for that reason, like the config-source
+    read above: it is a fact about the test runner, not about any scenario. A test whose subject
+    is the gate takes :func:`remote_debug_start_gate`. A subprocess start is not covered."""
+    from messagefoundry import __main__ as cli
+
+    real = cli._remote_debug_refused
+    with pytest.MonkeyPatch.context() as patch:
+        # setattr raises on a missing name, so a renamed gate fails here rather than going unstubbed.
+        patch.setattr(cli, "_remote_debug_refused", lambda *args, **kwargs: False)
+        yield real
+
+
+@pytest.fixture
+def remote_debug_start_gate(
+    monkeypatch: pytest.MonkeyPatch, _remote_debug_start_gate_stood_down: Callable[..., bool]
+) -> None:
+    """Put the real remote-debugging start gate back for one test (vault BACKLOG #2700)."""
+    monkeypatch.setattr(
+        "messagefoundry.__main__._remote_debug_refused", _remote_debug_start_gate_stood_down
+    )
+
+
 @pytest.fixture
 def bounded_warn_only_retention(monkeypatch: pytest.MonkeyPatch) -> None:
     """BACKLOG #1967: an enforcing start refuses a warn-only retention tier with neither a window nor

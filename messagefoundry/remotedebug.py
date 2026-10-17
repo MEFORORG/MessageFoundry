@@ -29,8 +29,10 @@ command. What is left is at least the interpreter's own start-up, the package's 
 loading that module, and this module's imports, which are most of the part the engine controls.
 And the capability underneath is untouched: a process that can write this process's
 memory can run code in it some other way, and can remove a hook. So an enabled interface with the
-hook in place is reported as a residual (:func:`remote_debug_loosening`), and turning the
-interface off at launch is separate work.
+hook in place is reported as a residual (:func:`remote_debug_loosening`). Under ``enforce``,
+``serve`` and ``supervise`` refuse to start with the interface on unless
+:data:`REMOTE_DEBUG_ACCEPTANCE` accepts it (:func:`remote_debug_refusal`); the shipped service
+launches turn it off with ``-X disable-remote-debug``.
 ``docs/SECURITY-LOOSENING.md`` carries the operator's account of what stays open.
 
 **Why the hook does so little.** The interpreter calls it on the main thread between two bytecodes
@@ -96,13 +98,29 @@ from typing import Final
 from messagefoundry.controlchars import scrub_log_argument
 
 __all__ = [
+    "REMOTE_DEBUG_ACCEPTANCE",
+    "REMOTE_DEBUG_ACCEPTANCE_LOOSENING",
     "REMOTE_SCRIPT_EVENT",
     "RemoteDebugPosture",
     "RemoteScriptRefused",
     "install_remote_debug_guard",
     "remote_debug_loosening",
     "remote_debug_posture",
+    "remote_debug_refusal",
 ]
+
+#: The named acceptance that lifts :func:`remote_debug_refusal` under ``enforce`` (owner ruling
+#: 2026-10-16, vault BACKLOG #2700). One spelling, for the refusal and the docs.
+REMOTE_DEBUG_ACCEPTANCE: Final = "[security].allow_remote_debugging"
+
+#: The loosening entry for that acceptance, while it is set: one wording for
+#: ``security_loosenings()`` and the ``supervise`` start-up line.
+REMOTE_DEBUG_ACCEPTANCE_LOOSENING: Final = (
+    "allow_remote_debugging",
+    "an enforcing instance is permitted to start with the interpreter's remote debugging "
+    "(PEP 768) enabled in its process -- the start-up refusal is acknowledged away. Whether the "
+    "interface is on in this process is the remote_debug_enabled or remote_debug_unguarded entry",
+)
 
 #: The audit event the target interpreter raises before it runs an injected script. Its one
 #: argument is the script's path.
@@ -297,6 +315,27 @@ def remote_debug_posture() -> RemoteDebugPosture:
         interpreter_enabled=sys.is_remote_debug_enabled(),
         guard_installed=_guard_answers(),
         refused_scripts=_refused,
+    )
+
+
+def remote_debug_refusal(posture: RemoteDebugPosture) -> str | None:
+    """Why ``serve`` and ``supervise`` refuse to start under ``enforce``, or None where the
+    interface is off (owner ruling 2026-10-16, vault BACKLOG #2700).
+
+    It reads only ``interpreter_enabled``, the same reading the posture reports. The hook does not
+    lift it: the hook closes the interface from the moment it is installed, not before, and not
+    against a process that can write this one's memory. The caller decides whether
+    :data:`REMOTE_DEBUG_ACCEPTANCE` lifts it."""
+    if not posture.interpreter_enabled:
+        return None
+    return (
+        "the interpreter's remote debugging (PEP 768) is enabled in this process, so a process "
+        "the operating system lets attach to it could run Python inside the engine. Start the "
+        "interpreter as `python -I -X disable-remote-debug -m messagefoundry ...`, as the shipped "
+        "service launches do; a console-script start such as `messagefoundry serve` cannot pass "
+        "the option, and takes PYTHON_DISABLE_REMOTE_DEBUG=1 instead, which -I and -E ignore. To "
+        f"accept the interface on, set {REMOTE_DEBUG_ACCEPTANCE} = true, which is reported as a "
+        "loosening. See docs/SECURITY-LOOSENING.md"
     )
 
 

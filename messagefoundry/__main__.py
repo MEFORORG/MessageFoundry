@@ -22,6 +22,8 @@ deferred per-command so a quick `validate`/`hl7schema`/`lens schema` call doesn'
 from __future__ import annotations
 
 from messagefoundry.remotedebug import (
+    REMOTE_DEBUG_ACCEPTANCE_LOOSENING,
+    RemoteDebugPosture,
     install_remote_debug_guard,
     remote_debug_loosening,
     remote_debug_posture,
@@ -2479,6 +2481,22 @@ def _missing_service_config_refused(service_config: str | None, *, fleet: str = 
     return True
 
 
+def _remote_debug_refused(
+    settings: ServiceSettings, posture: RemoteDebugPosture, *, enforcing: bool, what: str
+) -> bool:
+    """True, with the reason printed, when :func:`messagefoundry.remotedebug.remote_debug_refusal`
+    refuses ``posture`` and nothing lifts it (vault BACKLOG #2700). ``what`` is what is refused."""
+    from messagefoundry.remotedebug import remote_debug_refusal
+
+    if not enforcing or settings.security.allow_remote_debugging:
+        return False
+    refused = remote_debug_refusal(posture)
+    if refused is None:
+        return False
+    print(f"error: refusing to {what}: {refused}.", file=sys.stderr)
+    return True
+
+
 def _serve(args: argparse.Namespace) -> int:
     # Vault BACKLOG #2700: first in this function, ahead of the imports below and of config,
     # because a script injected before the hook is in place runs. It is NOT first in the process:
@@ -2641,6 +2659,8 @@ def _serve(args: argparse.Namespace) -> int:
     startup_refused = startup_refusal(startup)
     if startup_refused is not None and enforcing:
         print(f"error: refusing to start: {startup_refused}.", file=sys.stderr)
+        return 2
+    if _remote_debug_refused(settings, remote_debug_posture(), enforcing=enforcing, what="start"):
         return 2
 
     # Anchor for the per-environment value dir: [environments].base_dir (or --project-root) when set,
@@ -4837,7 +4857,8 @@ def _supervise(args: argparse.Namespace) -> int:
     # The supervisor has no API and builds no loosening list, so its own reading is reported here.
     # Each shard reports its own through `serve`.
     security_lines: list[tuple[str, str]] = []
-    remote_debug = remote_debug_loosening(remote_debug_posture())
+    remote_debug_reading = remote_debug_posture()
+    remote_debug = remote_debug_loosening(remote_debug_reading)
     if remote_debug is not None:
         security_lines.append(remote_debug)
         logging.getLogger(__name__).warning(
@@ -4922,6 +4943,18 @@ def _supervise(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    # Vault BACKLOG #2700: the supervisor's OWN process. Its engine shards start with the
+    # interface off (messagefoundry/childenv.py), so none of them would refuse on it.
+    if _remote_debug_refused(
+        settings, remote_debug_reading, enforcing=enforcing, what="start the fleet"
+    ):
+        return 2
+    if settings.security.allow_remote_debugging:
+        accepted = REMOTE_DEBUG_ACCEPTANCE_LOOSENING
+        security_lines.append(accepted)
+        logging.getLogger(__name__).warning(
+            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *accepted
+        )
     # Vault BACKLOG #2626 step 3: the settings-file and value-file check each engine shard's
     # `serve` makes next, at the same place among its gates. Without it here, a file another
     # account can write would refuse every engine shard, and the supervisor would only restart
