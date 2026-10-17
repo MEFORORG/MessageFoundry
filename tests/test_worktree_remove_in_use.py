@@ -72,7 +72,6 @@ def _target(route: str, wt: Path) -> list[str]:
 _PROBE = r"""
 param([string]$Dir)
 $ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $opts = [System.IO.EnumerationOptions]::new()
 $opts.IgnoreInaccessible = $false
 $opts.AttributesToSkip = [System.IO.FileAttributes]0
@@ -101,6 +100,9 @@ def _run_probe(root: Path, directory: Path) -> subprocess.CompletedProcess[str]:
         ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(probe_file), str(directory)],
         cwd=str(root),
         capture_output=True,
+        # pwsh writes in the console's code page. The probe must not change that page: it is shared
+        # with the caller's terminal and outlives the probe. What it prints is ASCII in practice,
+        # so a page that is not UTF-8 costs at most a replaced character, never a decode error.
         encoding="utf-8",
         errors="replace",
         check=False,
@@ -200,8 +202,10 @@ def _privileges_disabled(names: tuple[str, ...] = _BYPASS_PRIVILEGES) -> Iterato
             # PreviousState lists only the privileges this call changed, so these were enabled.
             yield int(was.PrivilegeCount)
         finally:
-            if was.PrivilegeCount:
-                advapi.AdjustTokenPrivileges(token, False, ctypes.byref(was), 0, None, None)
+            if was.PrivilegeCount and not advapi.AdjustTokenPrivileges(
+                token, False, ctypes.byref(was), 0, None, None
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
     finally:
         kernel.CloseHandle(token)
 
