@@ -423,6 +423,15 @@ account and LocalSystem, and prints a warning that says so. It writes `none` on 
 re-install that changes the account never keeps a restricted SID from the account before, and a
 SID type you set by hand with `sc.exe sidtype` is replaced.
 
+The `windows-service-smoke` CI leg has two account legs for this, on Windows Server 2025. One installs
+with `-AllowLocalSystem`. The other creates a local user on the runner and installs with
+`-ServiceAccount` and its password. Each checks that the engine starts, takes a message over MLLP, and
+runs with SID type `none` and only `SeChangeNotifyPrivilege` in every service process. Their first
+run is in the merge queue, so until a run has passed, treat a start under those accounts as
+unmeasured. **A gMSA has no leg.** It needs an Active Directory domain that the runner has joined,
+and no hosted runner has one. Before you rely on a gMSA install, start the service once, then read
+its token, for example with `scripts/ci/service_token_probe.py check-privileges`.
+
 **`-SkipRestrictedServiceSid` opts out** for the default account. Use it only when the engine must
 write somewhere you cannot grant to `NT SERVICE\<ServiceName>`. The engine can then write wherever
 its account, or any group the account is in, can. The privilege list is still set.

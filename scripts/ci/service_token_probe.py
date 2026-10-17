@@ -26,6 +26,12 @@ or not. This script is the instrument that looks. ``windows-service-smoke`` in
 ``check-inside --report FILE --service-sid S --privilege P``
     Run by the leg on that report.
 
+``check-privileges --account-sid S --privilege P --control-pid C --pid N``
+    Run by the leg when the service runs as an account other than its own virtual account:
+    LocalSystem, or a local user. The installer gives those accounts the same privilege list and
+    SID type none, so the token must run as that account, hold exactly ``P``, and NOT be
+    write-restricted. The control is the leg's own elevated shell, which holds more privileges.
+
 Reading and judging are kept apart. :func:`read_token` and the ``inside`` mode only report.
 :func:`token_problems` and :func:`inside_problems` hold the whole rule for what passes, as plain
 functions over the reports, so the tests can hand them a token that must fail.
@@ -48,6 +54,7 @@ import sys
 import tempfile
 import time
 import uuid
+from collections.abc import Callable
 from ctypes import wintypes
 from pathlib import Path
 from typing import Any
@@ -396,7 +403,13 @@ def try_alternate_credential(granted: Path, denied: Path) -> dict[str, Any]:
     try:
         inner = asyncio.run(run())
     except OSError as exc:
-        return {"ran": True, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        # wincred raises CredentialLogonError, an OSError, from the logon and the impersonation
+        # only. Any other OSError came from somewhere else, and a red must not blame the logon.
+        if isinstance(exc, wincred.CredentialLogonError):
+            stage = "the logon or the impersonation"
+        else:
+            stage = "a call outside the logon and the impersonation"
+        return {"ran": True, "ok": False, "stage": stage, "error": f"{type(exc).__name__}: {exc}"}
     return {"ran": True, "ok": True, "error": None, **inner}
 
 
@@ -528,8 +541,8 @@ def inside_problems(
         if not cred.get("ran"):
             problems.append(f"the alternate-credential call could not be run: {cred.get('error')}")
         elif not cred.get("ok"):
-            # The error names the call that failed: the logon, the impersonation or a later one.
-            problems.append(f"the alternate-credential call failed: {cred.get('error')}")
+            stage = cred.get("stage") or "an unnamed stage"
+            problems.append(f"the alternate-credential call failed in {stage}: {cred.get('error')}")
         else:
             thread = cred.get("thread_token")
             level = thread["impersonation_level"] if thread else None
@@ -548,13 +561,50 @@ def inside_problems(
     return problems
 
 
+def privilege_problems(
+    token: dict[str, Any], *, account_sid: str, privileges: list[str]
+) -> list[str]:
+    """Why ``token`` is not the token the installer gives a service run as ``account_sid``, when
+    that account is not the service's own virtual account. Empty when it is.
+
+    Three things, each on its own. The user is the account: a privilege list survives a change of
+    account. It holds exactly ``privileges``, held but switched off counting as held. And it is NOT
+    write-restricted, because the installer writes SID type none for such an account; a restricted
+    token here would mean the registration and the installer's own account of it disagree.
+    """
+    if token.get("error"):
+        return [f"its token could not be read: {token['error']}"]
+    problems = []
+    if token["user"] != account_sid:
+        problems.append(f"it runs as {token['user']}, not as {account_sid}")
+    if sorted(token["privileges"]) != sorted(privileges):
+        problems.append(
+            f"it holds {', '.join(token['privileges']) or 'no privilege'}, "
+            f"not exactly {', '.join(sorted(privileges))}"
+        )
+    if token["write_restricted"]:
+        problems.append(
+            "it is write-restricted, but the installer sets SID type none for this account"
+        )
+    return problems
+
+
 def _report_problems(subject: str, problems: list[str]) -> None:
     for problem in problems:
         print(f"FAIL: {subject}: {problem}")
 
 
-def _check_read(args: argparse.Namespace) -> int:
-    rule = {"service_sid": args.service_sid, "privileges": args.privilege}
+def _judge_processes(
+    args: argparse.Namespace,
+    sid: str,
+    judge: Callable[[dict[str, Any], str], list[str]],
+    *,
+    shape: str,
+) -> int:
+    """Read and judge each ``--pid`` against ``sid``, then the ``--control-pid``, which must fail.
+
+    ``judge(token, sid)`` is the rule. ``shape`` names what a passing token holds, for the output.
+    """
     failed = False
     # Only here, and not in read_token: a caller that imports this module, such as a test, must not
     # be left holding a privilege it did not ask for.
@@ -567,25 +617,42 @@ def _check_read(args: argparse.Namespace) -> int:
         except OSError as exc:
             token = {"pid": pid, "error": str(exc)}
         print(json.dumps(token, indent=2))
-        problems = token_problems(token, **rule)
+        problems = judge(token, sid)
         _report_problems(f"process {pid}", problems)
         failed = failed or bool(problems)
     control = read_token(args.control_pid)
     print(json.dumps(control, indent=2))
     # The control is judged as if its own account were the service's. It always runs as someone
-    # else, so judged against the real service SID it would fail on the account alone, and would
-    # no longer show that the three readings of the token's shape can tell it apart.
-    if not token_problems(control, service_sid=control["user"], privileges=args.privilege):
+    # else, so judged against the real SID it would fail on the account alone, and would no longer
+    # show that the rest of the rule can tell it apart.
+    if not judge(control, control["user"]):
         print(
             f"FAIL: CONTROL: process {args.control_pid} is not the service and still reads as "
-            "hardened, so this reader cannot tell a hardened token from any other"
+            f"{shape}, so this reader cannot tell that token from any other"
         )
         failed = True
     if not failed:
-        print(
-            f"OK: {len(args.pid)} service process(es) hold the hardened token; the control does not"
-        )
+        print(f"OK: {len(args.pid)} service process(es) hold {shape}; the control does not")
     return 1 if failed else 0
+
+
+def _check_read(args: argparse.Namespace) -> int:
+    return _judge_processes(
+        args,
+        args.service_sid,
+        lambda token, sid: token_problems(token, service_sid=sid, privileges=args.privilege),
+        shape="the hardened token",
+    )
+
+
+def _check_privileges(args: argparse.Namespace) -> int:
+    # An elevated shell holds more than the list, so the control fails on the privilege set.
+    return _judge_processes(
+        args,
+        args.account_sid,
+        lambda token, sid: privilege_problems(token, account_sid=sid, privileges=args.privilege),
+        shape=f"exactly {', '.join(sorted(args.privilege))}, unrestricted",
+    )
 
 
 def _check_inside(args: argparse.Namespace) -> int:
@@ -621,8 +688,14 @@ def main(argv: list[str]) -> int:
     judged = sub.add_parser("check-inside", help="judge a report the inside mode wrote")
     judged.add_argument("--report", required=True)
     judged.set_defaults(run=_check_inside)
+    other = sub.add_parser("check-privileges", help="judge a service run as another account")
+    other.add_argument("--pid", type=int, action="append", required=True)
+    other.add_argument("--control-pid", type=int, required=True)
+    other.add_argument("--account-sid", required=True)
+    other.set_defaults(run=_check_privileges)
     for rule in (read, judged):
         rule.add_argument("--service-sid", required=True)
+    for rule in (read, judged, other):
         rule.add_argument("--privilege", action="append", required=True)
     args = parser.parse_args(argv)
     return int(args.run(args))
