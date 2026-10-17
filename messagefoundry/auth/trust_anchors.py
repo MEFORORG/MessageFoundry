@@ -1782,8 +1782,8 @@ def make_settings_anchor_preflight(
     preflight passes, it warns and audits ``restart_required`` for each anchor whose bytes on disk
     differ from its consumer's (:func:`loaded_fingerprint`), and returns those anchors' setting
     names, which the reload's response reports as ``restart_required`` (BACKLOG #3015). That
-    repeats on every reload until a restart. The specs are frozen here, pins included, so a reload re-reads the paths and pins the
-    engine started with. The report skips the dialling settings CAs of module item 10."""
+    repeats on every reload until a restart. The specs are frozen here, pins included, so a
+    reload re-reads the paths and pins the engine started with. The report skips the dialling settings CAs of module item 10."""
     if not specs:
         return None
     from messagefoundry.config.wiring import WiringError

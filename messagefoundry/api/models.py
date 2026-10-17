@@ -618,12 +618,16 @@ class ReloadResult(BaseModel):
     ``restart_required`` names each settings trust anchor (for example
     ``[auth].ad_tls_ca_cert_file``) whose file changed on disk since the engine loaded it. The
     reload checked the new file and passed it, but no reload rebuilds the consumer that loaded the
-    old one, so the engine keeps trusting the old CA until it restarts (BACKLOG #2185, #3015). An
-    empty list means the check ran and found nothing to restart for. ``None`` means **not
-    checked**: a dry run skips the settings preflight, so it cannot say. The dialling settings CAs
-    (``[tls].internal_ca_file``, ``[alerts].email_tls_ca_file``, ``[logging].forward_tls_ca_file``)
-    are never listed, even the syslog CA, which does take a restart: their hops load the file by
-    path and record no fingerprint to compare with."""
+    old one, so the engine keeps trusting the old CA until it restarts (BACKLOG #2185, #3015).
+    ``None`` means **not checked**: a dry run skips the settings preflight, so it cannot say.
+
+    An empty list is narrower than "no restart needed". It means no anchor this field covers
+    changed, including when none is configured. It covers only the node that answered, so in a
+    cluster each node that converges on the reload reports its own anchors in its log and audit
+    trail, not here. It never lists at least the dialling settings CAs (``[tls].internal_ca_file``,
+    ``[alerts].email_tls_ca_file``, ``[logging].forward_tls_ca_file``): their hops load the file by
+    path and record no fingerprint to compare with. A changed one can still need a restart or a
+    rebuild of the connections that use it; ``docs/SECURITY.md`` says which."""
 
     inbound: int
     outbound: int
