@@ -312,6 +312,7 @@ from messagefoundry.store.store import (
     totp_disable,
     totp_enable,
     totp_replace,
+    totp_stage,
     totp_step_spend,
     transit_attested_audit,
     transit_withdrawn_audit,
@@ -8895,14 +8896,13 @@ class PostgresStore:
     # --- MFA: native TOTP second factor (local accounts, WP-14) --------------
 
     async def set_totp_secret(
-        self, user_id: str, *, secret: str | None, now: float | None = None
-    ) -> None:
-        """Stage (or clear) a user's base32 TOTP secret, store-cipher encrypted. Does not enable MFA."""
+        self, user_id: str, *, secret: str, now: float | None = None
+    ) -> str | None:
+        """See :meth:`MessageStore.set_totp_secret`: conditional on TOTP being off (#3025)."""
         now = time.time() if now is None else now
         sealed = self._enc(secret, aad=cell_aad("users", "totp_secret", user_id))
-        await self._write_user_txn(
-            user_id, lambda r: r.changed(totp_secret=sealed, updated_at=float(now))
-        )
+        written = await self._write_user_txn(user_id, totp_stage(sealed, now))
+        return None if written is None else sealed
 
     async def get_totp_secret(self, user_id: str) -> str | None:
         d = await self._fetchone("SELECT totp_secret FROM users WHERE id=$1", user_id)
@@ -8913,13 +8913,17 @@ class PostgresStore:
         return self._dec(cell, aad=cell_aad("users", "totp_secret", user_id))
 
     async def enable_totp(
-        self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
+        self,
+        user_id: str,
+        *,
+        recovery_code_hashes: list[str],
+        expected_secret_cell: str | None,
+        now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
-        # Conditional, and the result says whether it wrote: see ``totp_enable`` (#2224).
-        return (
-            await self._write_user_txn(user_id, totp_enable(recovery_code_hashes, now)) is not None
-        )
+        # Conditional, and the result says whether it wrote: see ``totp_enable`` (#2224, #3025).
+        change = totp_enable(recovery_code_hashes, now, expected_secret_cell=expected_secret_cell)
+        return await self._write_user_txn(user_id, change) is not None
 
     async def replace_totp_enrolment(
         self,
@@ -9097,8 +9101,9 @@ class PostgresStore:
     ) -> bool:
         """Strict compare-and-set of the authenticator sign counter (the ``consume_totp_step``
         precedent): ``True`` iff the stored count still equalled ``expected``. A miss means a
-        concurrent assertion consumed the same counter — the caller treats it as a clone signal
-        (ADR 0068 §4). The ``SELECT ... FOR UPDATE`` + guarded ``UPDATE`` run in one transaction
+        concurrent assertion consumed the same counter, or the passkey was deleted; the caller
+        reads it as a clone signal (ADR 0068 §4) unless the passkey is confirmed gone (BACKLOG
+        #3068). The ``SELECT ... FOR UPDATE`` + guarded ``UPDATE`` run in one transaction
         (no cross-node double-spend)."""
         async with self._timed_acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
@@ -9107,7 +9112,7 @@ class PostgresStore:
                 credential_id_hash,
             )
             if row is None or row["sign_count"] != expected:
-                return False  # consumed by a concurrent assertion — clone signal
+                return False  # consumed by a concurrent assertion, or the passkey deleted
             await conn.execute(
                 "UPDATE webauthn_credentials SET sign_count=$1, last_used_at=$2"
                 " WHERE credential_id_hash=$3",

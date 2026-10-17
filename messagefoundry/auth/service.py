@@ -878,7 +878,9 @@ class Elevation:
       the session was ended because its temporary password lapsed, with the proof checked or not,
       as that ``auth.temp_password_expired`` row records; or (``confirm_mfa_enrollment`` only,
       BACKLOG #2224) the proof was good but turning TOTP on matched no row, so the confirm ended
-      the session it had just rotated, as its ``auth.mfa_enroll_refused`` row records. Fails
+      the session it had just rotated, as its ``auth.mfa_enroll_refused`` row records; or (the TOTP
+      and passkey legs, BACKLOG #3068) the session or its account went while the leg waited on the
+      directory lookup, the account queue or the proof check, with the proof checked or not. Fails
       CLOSED: no token is handed back. Held apart from a wrong proof so a route answers 401 rather than re-prompting on a
       session that no longer exists. The ``auth.reauth`` row's ``session_revoked`` says which.
 
@@ -1920,6 +1922,27 @@ def _requirement_covers(settings: AuthSettings, user: UserRecord, roles: frozens
     return not _is_directory_account(user) and _scope_covers(settings, roles)
 
 
+#: `AuthService._passkey_held`: whether an account still holds the passkey that signed, or why not.
+_PasskeyHeld = Literal["held", "removed", "unverified", "account_gone"]
+#: `AuthService._totp_enrolment`: an enrolment stamp and a digest of the opened TOTP secret.
+_TotpEnrolment = tuple[float | None, str | None]
+
+
+def _log_totp_undecryptable(username: str) -> None:
+    """Log an account whose TOTP cell does not open under this store key, naming the account and
+    never the value."""
+    _log.warning("the TOTP secret of account %r does not decrypt under this store key", username)
+
+
+def _same_totp_enrolment(a: _TotpEnrolment, b: _TotpEnrolment) -> bool:
+    """Whether two :data:`_TotpEnrolment` readings name one enrolment. The secret digests are
+    compared in constant time (ASVS 11.2.4); the stamps are not secret."""
+    (stamp_a, digest_a), (stamp_b, digest_b) = a, b
+    if stamp_a != stamp_b or (digest_a is None) != (digest_b is None):
+        return False
+    return constant_time_equal(digest_a or "", digest_b or "")
+
+
 class CensusNeedsTheStoreKey(RuntimeError):
     """The census read a TOTP cell that is still ciphertext: the store was opened without the key it
     was written under (a keyless open passes cells through unchanged). That is a fact about the
@@ -1938,9 +1961,7 @@ async def _totp_secret_usable(store: AdminStore, user: UserRecord) -> bool:
     try:
         secret = await store.get_totp_secret(user.id)
     except CipherError:
-        _log.warning(
-            "the TOTP secret of account %r does not decrypt under this store key", user.username
-        )
+        _log_totp_undecryptable(user.username)
         return False
     if not secret:
         return False
@@ -3216,15 +3237,27 @@ class AuthService:
             # Enrolled BEFORE the role, which stays last, so every interruption still leaves a
             # roleless row a re-run completes -- and the repair branch above clears a half-enrolled
             # one before this runs again.
-            await self._store.set_totp_secret(user_id, secret=totp_secret)
+            # Conditional (BACKLOG #3025): another run that enabled TOTP on this row first makes
+            # the stage write nothing. The enable below is bound to the cell this run staged.
+            staged_cell = await self._store.set_totp_secret(user_id, secret=totp_secret)
+            if staged_cell is None:
+                raise FirstAdministratorRefused(
+                    "the authenticator enrolment was changed while this command ran, so this run "
+                    "did not stage its authenticator and granted no role; remove the authenticator "
+                    "entry it showed. If another provision-admin run is in progress, let it "
+                    "finish. Then run the command again"
+                )
             plain_codes = tuple(
                 totp.generate_recovery_codes(self._settings.mfa_recovery_code_count)
             )
             hashes = [await self._argon2(hash_password, c) for c in plain_codes]
-            # Conditional (BACKLOG #2224): a factor clear by another run's repair branch, or another
-            # run that enabled TOTP first, since the secret was staged above makes it match no row.
-            # Refused before the role, so the row stays roleless and a re-run completes it.
-            if not await self._store.enable_totp(user_id, recovery_code_hashes=hashes):
+            # Conditional (BACKLOG #2224, #3025): a factor clear by another run's repair branch,
+            # another run that enabled TOTP first, or another run that staged its own secret, since
+            # the secret was staged above makes it match no row. Refused before the role, so the
+            # row stays roleless and a re-run completes it.
+            if not await self._store.enable_totp(
+                user_id, recovery_code_hashes=hashes, expected_secret_cell=staged_cell
+            ):
                 raise FirstAdministratorRefused(
                     "the authenticator enrolment was changed while this command ran, so this run "
                     "did not turn TOTP on and granted no role; remove the authenticator entry it "
@@ -6034,6 +6067,7 @@ class AuthService:
                     old_username=existing.username,
                     new_username=principal.username,
                     held=by_name,
+                    from_plan=False,
                     client=client,
                 )
             # BACKLOG #1139. AN ABSENT DIRECTORY ATTRIBUTE IS NOT AN INSTRUCTION TO ERASE.
@@ -6767,6 +6801,7 @@ class AuthService:
                 old_username=refresh.old_username,
                 new_username=refresh.new_username,
                 held=await self._load_user_by_username(refresh.new_username),
+                from_plan=True,
             )
         # BACKLOG #2538. After the revocations, like the hold below: the referred accounts were left
         # unjudged, and every other account's revocation above has already been applied.
@@ -7036,9 +7071,14 @@ class AuthService:
         old_username: str,
         new_username: str,
         held: UserRecord | None,
+        from_plan: bool,
         client: str | None = None,
     ) -> None:
         """Copy a directory-reported rename down onto a row's cached ``username`` (BACKLOG #1532).
+
+        ``from_plan`` is required, so each caller states its policy (BACKLOG #3069; the reasoning
+        is at the skip below, and only there). True for the reconciler: a row that holds neither
+        the plan's old name nor its new one is skipped. False for the login, which writes.
 
         **ONE implementation for two callers, deliberately.** The login path
         (:meth:`_upsert_ad_user`) and the ADR 0079 reconciler pass both reach a renamed account and
@@ -7119,6 +7159,12 @@ class AuthService:
             # ``old_username`` (BACKLOG #2291). The reconciler captured that at plan time, and a
             # sign-in may have renamed the row since, so it can name an account that no longer
             # exists. The audit actor and the warning both use the name an operator would find.
+            # On the reconciler's path the two names now agree, because the BACKLOG #3069 skip below
+            # returns first. On the LOGIN path they can still differ, when a pass wrote between the
+            # sign-in's read and this one. So each ``_refuse`` call passes the name the row held,
+            # never ``old_username``: passing that would bring back the #2291 defect on the login
+            # path, an audit row naming an account that no longer exists. The one exception is the
+            # ``row_gone`` refusal at the pre-read, where no row was read to hold a name.
             await self._audit(
                 "auth.ad_username_refresh_conflict",
                 actor=holds,
@@ -7141,12 +7187,14 @@ class AuthService:
                 return
             if held_by is None:
                 # The write lost to another writer, but the re-read found no row holding the name
-                # now. Nothing is locked out, and the next sign-in or pass copies the name down
-                # again, so the lockout warning below would be false (BACKLOG #2291).
+                # now. Nothing is locked out, and a later sign-in or a pass that probes the account
+                # copies the name down again, so the lockout warning below would be false (BACKLOG
+                # #2291).
                 _log.warning(
                     "AD account %s was renamed in the directory but the write lost to another "
                     "writer (detected %s), and no row holds the new name now; nothing was written, "
-                    "and the next sign-in or reconcile pass retries it (BACKLOG #2291)",
+                    "and the account's next sign-in, or a later reconcile pass that probes it, "
+                    "retries it (BACKLOG #2291)",
                     scrub_log_argument(holds),
                     detected,
                 )
@@ -7168,7 +7216,9 @@ class AuthService:
         # read.
         #
         # A row that already carries the new name has nothing to change, so it gets no second audit
-        # row and no second notice. The notice names the name the row actually had, not the plan's.
+        # row and no second notice. The reconciler's rule for a row that carries neither name is
+        # stated once, at the BACKLOG #3069 skip below. The notice and every refusal name what the
+        # row held.
         # The write below compares on this name (BACKLOG #2290), so a refresh that read it just
         # before another refresh of this row wrote cannot write as well. And each refusal after
         # this read audits under this name (BACKLOG #2291), so the read comes BEFORE the ``held``
@@ -7197,6 +7247,44 @@ class AuthService:
                 "AD account %s already holds its directory name, so the rename refresh wrote "
                 "nothing and sends no second audit row or notice (BACKLOG #2291)",
                 user_id,
+            )
+            return
+        if from_plan and before.username != old_username:
+            # BACKLOG #3069. THE ONE STATEMENT OF THIS RULE. The row holds neither the plan's old
+            # name (read when the pass listed its accounts) nor its new one, so another writer,
+            # most likely a sign-in, renamed it since. The compare-and-set below compares on the
+            # name just read, so it would match and could write an older name over a newer one.
+            # Skip, and leave the name to a later read of the directory. Nothing was attempted, so
+            # no audit row, no conflict and no notice; INFO says why.
+            #
+            # A HEURISTIC ON NAMES, NOT AN ORDERING OF DIRECTORY READS. Nothing here knows which
+            # directory read is newer, so at least these residuals stand:
+            #   - the sign-in may have written before this pass's probe, so the skipped plan can
+            #     hold the NEWER name; the label then lags until a later read, below;
+            #   - a directory that renamed the account away and back (jdoe -> jdoe-married -> jdoe)
+            #     leaves the row on the plan's old name, so the plan writes and notifies;
+            #   - the login (``from_plan`` False) writes whatever it carries, so a sign-in whose
+            #     bind ran before a pass that probed and wrote a newer name can still write the
+            #     older one. It is exempt because its name came from a bind made moments before,
+            #     and skipping it would as often keep an older name a pass wrote.
+            # Each converges when a later read copies the directory's name down: the account's next
+            # sign-in, or a pass that probes it. That need not be the next pass, because a pass
+            # probes the least-recently-probed accounts first, at most
+            # ``ad_session_recheck_max_users`` of them (``reconcile.select_candidates``), so the
+            # label can lag several passes.
+            #
+            # AFTER the already-applied check, because a row that holds the new name is the no-op
+            # above, not a skip. BEFORE the ``held`` pre-check, because a stale plan is not a
+            # collision: filing one would send an operator looking for a holder this caller has no
+            # current claim against.
+            _log.info(
+                "AD account %s was renamed by another writer after this reconciler pass read it, "
+                "so its planned rename to %s was skipped (the row now holds %s); nothing was "
+                "written, audited or sent, and the name is copied down when a later pass probes "
+                "the account or it signs in again (BACKLOG #3069)",
+                user_id,
+                scrub_log_argument(new_username),
+                scrub_log_argument(before.username),
             )
             return
         if held is not None and held.id != user_id:
@@ -7271,9 +7359,11 @@ class AuthService:
         #   - The row's name moved after the pre-read, so the compare failed: another refresh of
         #     this same row wrote first (BACKLOG #2290). That caller audits and notifies, so this one
         #     does neither. It is not a conflict either, because no other row holds anything. The
-        #     first writer wins, so when two refreshes carry DIFFERENT new names the stored one can
-        #     be the older of the two until the next sign-in or pass copies the directory's name
-        #     down again. Logged at INFO so the skipped write is visible without paging anyone.
+        #     first writer wins, so when two refreshes carry DIFFERENT new names and both read the
+        #     row before either wrote, the stored one can be the older of the two until a later
+        #     read copies the directory's name down again. The BACKLOG #3069 skip above, which
+        #     names when that read comes, does not order these: it stops only a reconciler plan
+        #     that a write overtook before this pre-read. Logged at INFO so the skipped write is visible without paging anyone.
         if not written:
             after = await self._load_user(user_id)
             if after is None:
@@ -8342,6 +8432,12 @@ class AuthService:
         """:meth:`_username_held`, for the directory's immutable id."""
         return await self._store.get_user_by_directory_object_id(object_id) is not None
 
+    async def _user_id_held(self, user_id: str) -> bool:
+        """:meth:`_username_held`, for the account id: whether the row exists at all, sealed or not,
+        so a caller can tell an account deleted from one whose record fails its check (BACKLOG
+        #3068)."""
+        return await self._store.get_user(user_id) is not None
+
     async def _verified(self, user: UserRecord | None) -> VerifiedUser | None:
         """``user`` with its whole authorization record checked against its seal (BACKLOG #2592):
         the ``users`` row, the account's role rows and its passkey digest. The ONLY place a
@@ -8382,6 +8478,18 @@ class AuthService:
         ``None``. Never a second read of the store: a secret swapped in after the checked load would
         be checked against no seal, and its codes would sign in."""
         return self._store.open_totp_secret(user.id, user.totp_secret_cell)
+
+    def _totp_enrolment(self, user: VerifiedUser) -> _TotpEnrolment | None:
+        """``user``'s TOTP enrolment as :meth:`verify_mfa` compares it across a code check (BACKLOG
+        #3068): the enrolment stamp and a digest of the opened secret, so the plaintext is not held
+        across the check. ``None`` when the cell does not open, logged by
+        :func:`_log_totp_undecryptable`."""
+        try:
+            secret = self._totp_secret(user)
+        except CipherError:
+            _log_totp_undecryptable(user.username)
+            return None
+        return user.totp_enrolled_at, None if secret is None else hash_token(secret)
 
     async def _verified_passkeys(self, user: VerifiedUser) -> list[WebAuthnCredential] | None:
         """The account's passkeys, or ``None`` when they do not match the digest its seal covers
@@ -10502,10 +10610,17 @@ class AuthService:
         user = await self._load_user(identity.user_id)
         if user is None:
             raise ValueError("no such user")
+        already_enabled = "MFA is already enabled; disable it before re-enrolling"
         if user.totp_enabled:
-            raise ValueError("MFA is already enabled; disable it before re-enrolling")
+            raise ValueError(already_enabled)
         secret = totp.generate_secret()
-        await self._store.set_totp_secret(identity.user_id, secret=secret)
+        # Conditional (BACKLOG #3025): a confirm that enabled TOTP after the check above makes the
+        # stage write nothing, so a begin never replaces the secret of an enabled factor. Nothing
+        # written can also mean the row is gone, which is told apart by reading it again.
+        if await self._store.set_totp_secret(identity.user_id, secret=secret) is None:
+            if await self._load_user(identity.user_id) is None:
+                raise ValueError("no such user")
+            raise ValueError(already_enabled)
         await self._audit("auth.mfa_enroll_started", actor=identity.username)
         return MfaEnrollment(secret=secret, otpauth_uri=totp.otpauth_uri(secret, identity.username))
 
@@ -10522,8 +10637,9 @@ class AuthService:
         (or a time-step already consumed -- single-use, BACKLOG #1021) elevates nothing and carries
         none. A good code on a session revoked before the rotation returns ``session_lost`` with MFA
         still OFF (BACKLOG #1902), so a lost session never leaves MFA on with codes nobody saw. So
-        does a good code whose activation matches no row, because a reset cleared the staged secret
-        or a second confirm enabled first (BACKLOG #2224). That confirm ends the session it rotated,
+        does a good code whose activation matches no row, for example because a reset cleared the
+        staged secret, a second confirm enabled first (BACKLOG #2224), or a second begin staged a
+        secret this confirm never verified (BACKLOG #3025). That confirm ends the session it rotated,
         hands back no codes, and audits ``auth.mfa_enroll_refused``.
 
         This is one of the two legs that turn an MFA-pending session into an MFA-satisfied one for a
@@ -10540,6 +10656,10 @@ class AuthService:
         secret = self._totp_secret(user)
         if not secret:
             raise ValueError("no enrollment in progress")
+        # The stored cell this code is checked against. The enable below turns TOTP on only while
+        # the row still holds this cell (BACKLOG #3025), so a begin from another session that
+        # stages a different secret inside the ceremony cannot decide which factor is enabled.
+        verified_cell = user.totp_secret_cell
         if await self._enrolment_too_early(
             token, user, arrived_at, event="auth.mfa_failed", client=client
         ):
@@ -10588,10 +10708,13 @@ class AuthService:
         )
         if elevation.token is None:  # not ``ok``, spelled so mypy narrows the token below
             return elevation
-        if not await self._store.enable_totp(identity.user_id, recovery_code_hashes=hashes):
-            # BACKLOG #2224: the conditional enable matched no row, because an administrator's
-            # reset cleared the staged secret inside the rotation window, or a second confirm
-            # enabled TOTP first. This confirm turns nothing on and its codes are dropped. The
+        if not await self._store.enable_totp(
+            identity.user_id, recovery_code_hashes=hashes, expected_secret_cell=verified_cell
+        ):
+            # BACKLOG #2224, #3025: the conditional enable matched no row, for example because an
+            # administrator's reset cleared the staged secret inside the rotation window, a second
+            # confirm enabled TOTP first, or a second begin staged a secret this confirm never
+            # verified. This confirm turns nothing on and its codes are dropped. The
             # rotated session was stamped MFA-verified against a factor that is gone or not this
             # ceremony's, so it is ended rather than handed back: ``session_lost``, the same
             # fail-closed answer as a session revoked before the rotation.
@@ -10607,8 +10730,16 @@ class AuthService:
                 reason = "account_gone"
             elif after.totp_enabled:
                 reason = "already_enabled"
-            else:
+            elif after.totp_secret_cell is None:
                 reason = "secret_cleared"
+            elif after.totp_secret_cell != verified_cell:
+                reason = "secret_replaced"
+            else:
+                # The row still holds the verified cell with TOTP off, so the write lost to some
+                # other concurrent write to the row. The session is revoked above, so a plain
+                # retry is a lost session; recovery is as for a session lost before the rotation
+                # (the ROTATE BEFORE ENABLING comment above).
+                reason = "write_lost"
             await self._audit(
                 "auth.mfa_enroll_refused",
                 actor=identity.username,
@@ -10709,50 +10840,106 @@ class AuthService:
             session, user, arrived_at, event="auth.mfa_failed", client=client
         ):
             return Elevation()
-        if user.auth_provider == AuthProvider.AD.value:
-            # BACKLOG #2023: a good code below can renew the step-up window (on any session but an
-            # OIDC one, BACKLOG #2142) or meet a pending factor, so a DIRECTORY account must
-            # still be in the directory before the code is even checked. Asked first, so a refusal
-            # spends no TOTP step or recovery code and charges nothing to the lockout: the caller
-            # did not guess wrong, the directory could not vouch for the account. This branch only
-            # ADDS a refusal; a confirmed directory account meets the same lock and lockout feed.
-            refusal = await self._directory_step_up_refusal(user)
-            if refusal is not None:
-                await self._audit(
-                    "auth.mfa_failed",
-                    actor=user.username,
-                    detail=_json({"reason": DIRECTORY_UNCONFIRMED, "outcome": refusal}),
-                    client=client,
-                )
-                return Elevation(directory_unconfirmed=True)
+        # BACKLOG #2023: a good code below can renew the step-up window (on any session but an OIDC
+        # one, BACKLOG #2142) or meet a pending factor, so a DIRECTORY account must still be in the
+        # directory before the code is even checked. Asked first, so a refusal spends no TOTP step
+        # or recovery code and charges nothing to the lockout: the caller did not guess wrong, the
+        # directory could not vouch for the account. This only ADDS a refusal; a confirmed
+        # directory account meets the same lock and lockout feed. A local account is not asked.
+        current = await self._directory_vouches_for_factor(
+            token, user, event="auth.mfa_failed", client=client, report_lock=True
+        )
+        if isinstance(current, Elevation):
+            return current
+        user = current
         async with self._account_credential_lock(user.username):
-            # Read the session, the account and its lock again. For a directory account the lookup
-            # above was a network round trip, and for any account the queue may have been a wait, so
-            # what was read before either may be stale: a session revoked meanwhile would still spend
-            # its code, and a lock set by the attempt ahead in the queue would go unseen.
+            # Read the session, the account and its lock again. The queue may have been a wait, so
+            # what was read before it may be stale: a session revoked meanwhile would still spend
+            # its code, and a lock set by the attempt ahead in the queue would go unseen. A session
+            # or account gone answers ``session_lost``, as the re-reads before and after this one
+            # do (BACKLOG #3068): the token no longer authenticates.
             session = await self._load_session(hash_token(token))
             if session is None or session.revoked_at is not None:
-                return Elevation()
+                return Elevation(session_lost=True)
             user = await self._load_user(session.user_id)
-            if user is None or user.disabled or not user.totp_enabled:
+            if user is None or user.disabled:
+                return Elevation(session_lost=True)
+            if not user.totp_enabled:
                 return Elevation()
             if await self._mfa_lapsed(token, user, client=client, factor_checked=False):
                 return Elevation(session_lost=True)
             if await self._mfa_lock_refused(user, client=client):
                 return Elevation(locked=True)
             now = time.time()
-            if await self._verify_second_factor(user, code, client=client, arrived=arrived):
-                # Asked again after the verify, on the stored row read afresh: a recovery-code walk
-                # is argon2 work off the loop, and the deadline can pass during it. This ask guards
-                # the writes below; the rotation asks once more. Only a must-change account has a
-                # deadline to pass, so no other account pays the read. A row gone meanwhile fails
-                # closed.
-                if user.must_change_password:
-                    fresh = await self._load_user(user.id)
-                    if fresh is None or await self._mfa_lapsed(
-                        token, fresh, client=client, factor_checked=True
-                    ):
-                        return Elevation(session_lost=True)
+            # The enrolment this code is checked against: the factor write below lands only while
+            # the row still holds it. Every enable stamps ``totp_enrolled_at`` afresh, as
+            # ``replace_totp_enrolment``'s compare-and-set relies on, and the opened secret is
+            # compared too, so two enrolments sharing a stamp still differ. Neither moves under a
+            # store-key rotation, which re-encrypts the cell, so a rotation refuses nothing.
+            verified_enrolment = self._totp_enrolment(user)
+            try:
+                proved = await self._verify_second_factor(
+                    user, code, client=client, arrived=arrived
+                )
+            except CipherError:
+                # The cell did not open for the check either (logged just above). The check raises
+                # at its TOTP decrypt, before any recovery code is read, so nothing is spent and
+                # nothing is charged. Refused with the reason the after-side gives, rather than
+                # raised past the "never raises" contract.
+                await self._audit(
+                    "auth.mfa_failed",
+                    actor=user.username,
+                    detail=_json({"reason": "factor_unverified"}),
+                    client=client,
+                )
+                return Elevation()
+            if proved:
+                # BACKLOG #3068: the verify awaited (a recovery-code walk is argon2 work off the
+                # loop), and a revocation or a disable needs no queue to land. So the session, the
+                # account and its lock are read again right before the factor is written. Fails
+                # closed on a row gone meanwhile.
+                fresh = await self._factor_holder_current(
+                    token,
+                    actor=user.username,
+                    event="auth.mfa_failed",
+                    client=client,
+                    report_lock=True,
+                )
+                if isinstance(fresh, Elevation):
+                    return fresh
+                # A self-service disable takes no queue, so the factor this code proved may be gone
+                # (``factor_removed``), or turned off and enrolled again with a new secret
+                # (``factor_replaced``). An administrator's replace revokes the sessions with it,
+                # so it answers ``session_lost`` above. Either way the code proved a factor the row
+                # no longer holds. It is spent by now, so the refusal is audited with its reason.
+                # A cell that no longer opens proves nothing either way; the proof is spent, so it
+                # is refused and audited too rather than raised past the "never raises" contract.
+                enrolment_now = self._totp_enrolment(fresh) if fresh.totp_enabled else None
+                refusal: str | None = None
+                if not fresh.totp_enabled:
+                    refusal = "factor_removed"
+                elif verified_enrolment is None or enrolment_now is None:
+                    refusal = "factor_unverified"
+                elif not _same_totp_enrolment(verified_enrolment, enrolment_now):
+                    refusal = "factor_replaced"
+                if refusal is not None:
+                    await self._audit(
+                        "auth.mfa_failed",
+                        actor=fresh.username,
+                        detail=_json({"reason": refusal}),
+                        client=client,
+                    )
+                    return Elevation()
+                # Carried on with the fresh row, so the success audits below name the account as
+                # it is now, not a name a rename replaced during the verify (BACKLOG #2291 class).
+                user = fresh
+                # The temporary-credential deadline is asked again on that fresh row, since it can
+                # pass during the verify too. This ask guards the writes below; the rotation asks
+                # once more. It awaits only when it ends the session.
+                if user.must_change_password and await self._mfa_lapsed(
+                    token, user, client=client, factor_checked=True
+                ):
+                    return Elevation(session_lost=True)
                 # ORDER-CRITICAL: this whole write group lands against the OLD hash, and only then
                 # does the session rotate. Moving any of them after the rotation writes NOTHING and
                 # reports success — every session stamp UPDATE is rowcount-blind. The group is not
@@ -10937,8 +11124,13 @@ class AuthService:
         )
         return True
 
-    async def _mfa_lock_refused(self, user: UserRecord, *, client: str | None) -> bool:
-        """Whether :meth:`verify_mfa` must refuse ``user`` as locked, auditing the refusal if so.
+    async def _mfa_lock_refused(
+        self, user: UserRecord, *, client: str | None, event: str = "auth.mfa_failed"
+    ) -> bool:
+        """Whether a second-factor leg must refuse ``user`` as locked, auditing the refusal as
+        ``event`` if so. :meth:`verify_mfa` calls it with the default event.
+        :meth:`finish_webauthn_assertion` calls it directly with ``auth.webauthn_failed``, and
+        :meth:`_factor_holder_current` passes whichever leg's event it was handed.
 
         Per-account lockout covers the SECOND factor too: a run of wrong codes locks the account, so
         MFA guessing isn't bounded only by the shared per-IP login limiter (which IP-rotation can
@@ -10948,7 +11140,7 @@ class AuthService:
         if not user.second_step_locked(time.time()):
             return False
         await self._audit(
-            "auth.mfa_failed",
+            event,
             actor=user.username,
             # The shared constant, so the users:manage-only exclusion matches it exactly (#1131).
             detail=LOCKED_REFUSAL_DETAIL,
@@ -10956,11 +11148,92 @@ class AuthService:
         )
         return True
 
+    async def _directory_vouches_for_factor(
+        self,
+        token: str,
+        user: VerifiedUser,
+        *,
+        event: str,
+        client: str | None,
+        report_lock: bool,
+    ) -> Elevation | VerifiedUser:
+        """The directory check a leg runs before it marks a DIRECTORY account's factor met, with
+        the re-read that must follow the lookup. Returns the refusal to hand back, or the account
+        to carry on with: ``user`` itself for a local account, which is never asked and costs no
+        read, or the row read afresh after a confirmed lookup.
+
+        The one copy of a block :meth:`verify_mfa` (BACKLOG #2023) and
+        :meth:`finish_webauthn_assertion` (BACKLOG #2239) each used to spell out (BACKLOG #3068).
+        For an AD row it asks :meth:`_directory_step_up_refusal`. A refusal is audited as ``event``
+        with ``reason=directory_unconfirmed`` and the lookup's outcome, and returns
+        ``directory_unconfirmed``: nothing was checked or charged, and the token still
+        authenticates. A confirmed lookup was a network round trip, so the session, the account
+        and its second-step lock are then read again through :meth:`_factor_holder_current`.
+
+        **Calling it from another leg (BACKLOG #3061 names the two enrolment legs).** Pass the
+        caller's session ``token`` and the account it loaded through :meth:`_load_user`; no session
+        object is needed, because the re-read loads it from the token. That suits
+        :meth:`confirm_mfa_enrollment`, which holds an identity and a token but no session. Pass
+        the leg's own failure ``event`` (``auth.mfa_failed`` on the TOTP legs,
+        ``auth.webauthn_failed`` on the passkey legs). ``report_lock`` sets ``locked`` on a lock
+        refusal, which only :meth:`verify_mfa` reports. Call it before anything the refusal must
+        not spend (a challenge, a TOTP step, a stored credential), and after the cheap local
+        refusals, so a caller already refused costs no lookup. Note that the re-read refuses a
+        second-step-locked account, and that a caller's own detail fields, such as
+        ``phase=enroll``, are not added to the refusal row."""
+        if user.auth_provider != AuthProvider.AD.value:
+            return user
+        refusal = await self._directory_step_up_refusal(user)
+        if refusal is not None:
+            await self._audit(
+                event,
+                actor=user.username,
+                detail=_json({"reason": DIRECTORY_UNCONFIRMED, "outcome": refusal}),
+                client=client,
+            )
+            return Elevation(directory_unconfirmed=True)
+        return await self._factor_holder_current(
+            token, actor=user.username, event=event, client=client, report_lock=report_lock
+        )
+
+    async def _factor_holder_current(
+        self, token: str, *, actor: str, event: str, client: str | None, report_lock: bool
+    ) -> Elevation | VerifiedUser:
+        """Read the session, its account and the second-step lock again, and return the account,
+        or the refusal when any of them no longer allows the factor to be marked.
+
+        For a check that must land just before a factor is written, after awaits in which a
+        revocation, a disable or a lock could have landed (BACKLOG #3068).
+        :meth:`_directory_vouches_for_factor` runs it after a confirmed lookup, and both second-
+        factor legs run it again right before ``mark_session_mfa_verified``. A session revoked or
+        gone, or an account disabled or gone, returns ``session_lost``: the token no longer
+        authenticates, so the caller must not report a wrong proof. It is audited as ``event``
+        with ``reason=session_lost``, filed under ``actor`` (the account name the caller last
+        read), because the proof may already be spent. A live second-step lock is audited as
+        ``event`` with the shared locked detail, and returns a wrong-proof refusal, with
+        ``locked`` set when ``report_lock`` is. Only revocation is asked of the session, not its
+        expiry; the rotation that follows a factor write refuses an expired one."""
+        session = await self._load_session(hash_token(token))
+        user = (
+            None
+            if session is None or session.revoked_at is not None
+            else (await self._load_user(session.user_id))
+        )
+        if user is None or user.disabled:
+            await self._audit(
+                event, actor=actor, detail=_json({"reason": "session_lost"}), client=client
+            )
+            return Elevation(session_lost=True)
+        if await self._mfa_lock_refused(user, client=client, event=event):
+            return Elevation(locked=report_lock)
+        return user
+
     async def _directory_step_up_refusal(self, user: UserRecord) -> str | None:
         """Why the directory cannot vouch for directory account ``user`` before :meth:`verify_mfa`
         renews its step-up window (BACKLOG #2023) or :meth:`finish_webauthn_assertion` marks its
-        factor met (BACKLOG #2239), or ``None`` when it can. Called only for an AD row; a local
-        account is never asked.
+        factor met (BACKLOG #2239), or ``None`` when it can. Both reach it through
+        :meth:`_directory_vouches_for_factor`, which calls it only for an AD row; a local account is
+        never asked.
 
         Without this, an account disabled in the directory kept renewing its window with a good code
         until the reconciliation pass revoked its sessions. The engine row's ``disabled`` flag is
@@ -10969,10 +11242,11 @@ class AuthService:
         **FAILS CLOSED, UNLIKE THE RECONCILER.** The reconciler REVOKES, so it fails open on an
         unreachable directory and wants two strikes for an ambiguous answer. This GRANTS, so any
         answer short of a present, enabled account refuses: absent, disabled, undetermined,
-        unavailable, referred (BACKLOG #2538) and probe_fault (BACKLOG #3100) alike. The directory step-up legs already refuse this way: ``_reauth_ad`` on a
-        failed bind, and the federated step-up on ``directory_unavailable``. A refusal revokes
-        nothing, so the next attempt asks again. An AD row on an engine with no directory
-        configured is refused as ``not_configured``, because nothing can confirm it.
+        unavailable, referred (BACKLOG #2538) and probe_fault (BACKLOG #3100) alike. The directory
+        step-up legs already refuse this way: ``_reauth_ad`` on a failed bind, and the federated
+        step-up on ``directory_unavailable``. A refusal revokes nothing, so the next attempt asks
+        again. An AD row on an engine with no directory configured is refused as
+        ``not_configured``, because nothing can confirm it.
 
         **A row with no ``directory_object_id`` is refused unasked, whether or not it holds a
         federated binding** (ADR 0184 AC-5, BACKLOG #2027). Its only other key is its name, and a
@@ -11548,8 +11822,11 @@ class AuthService:
         direction and the divergence does not cover it — see the call site.
 
         **A directory account must be confirmed by the directory first** (BACKLOG #2239), through
-        the same :meth:`_directory_step_up_refusal` :meth:`verify_mfa` asks. A refusal returns
-        ``directory_unconfirmed`` and spends neither the challenge nor the sign count."""
+        the same :meth:`_directory_vouches_for_factor` :meth:`verify_mfa` calls. A refusal returns
+        ``directory_unconfirmed`` and spends neither the challenge nor the sign count. The lookup
+        runs only once a ceremony is staged for the session, so a post with nothing staged gets the
+        plain ``expired`` refusal and costs no lookup (BACKLOG #3068). The session, the account and
+        the lock are read once more right before the factor is written."""
         if not token:
             return Elevation()
         session = await self._load_session(hash_token(token))
@@ -11561,14 +11838,7 @@ class AuthService:
         now = time.time()
         # A locked account is refused BEFORE any verify (verify_mfa parity). ADR 0197: the SECOND-STEP
         # lock, as on verify_mfa; the sign-in lock guards the step this session already passed.
-        if user.second_step_locked(now):
-            await self._audit(
-                "auth.webauthn_failed",
-                actor=user.username,
-                # The shared constant, so the users:manage-only exclusion matches it exactly (#1131).
-                detail=LOCKED_REFUSAL_DETAIL,
-                client=client,
-            )
+        if await self._mfa_lock_refused(user, client=client, event="auth.webauthn_failed"):
             return Elevation()
         # BACKLOG #2301: the login-then-MFA floor, as on verify_mfa. Before the challenge is popped,
         # so a refusal leaves the ceremony in flight rather than spending it.
@@ -11576,61 +11846,40 @@ class AuthService:
             session, user, now, event="auth.webauthn_failed", client=client
         ):
             return Elevation()
-        if user.auth_provider == AuthProvider.AD.value:
-            # BACKLOG #2239: a good assertion below marks the factor met, so a DIRECTORY account
-            # must still be in the directory first, as verify_mfa asks (#2023). Without this an
-            # account disabled in the directory would clear the MFA gate with its passkey until the
-            # reconciler revoked it. Asked before the challenge is popped and before the sign count
-            # moves, so a refusal leaves the ceremony in flight and charges nothing; assertion
-            # failures feed no lockout here anyway (ADR 0068).
-            refusal = await self._directory_step_up_refusal(user)
-            if refusal is not None:
-                await self._audit(
-                    "auth.webauthn_failed",
-                    actor=user.username,
-                    detail=_json({"reason": DIRECTORY_UNCONFIRMED, "outcome": refusal}),
-                    client=client,
-                )
-                return Elevation(directory_unconfirmed=True)
-            # The lookup was a network round trip, so read the session, the account and its lock
-            # again, as verify_mfa does. A revocation, a disable or a second-step lock that landed
-            # meanwhile must stop this assertion before it marks the factor or clears the counters.
-            # A session or account gone meanwhile is ``session_lost``: the token no longer
-            # authenticates, so the caller must not report a wrong passkey.
-            session = await self._load_session(hash_token(token))
-            if session is None or session.revoked_at is not None:
-                return Elevation(session_lost=True)
-            user = await self._load_user(session.user_id)
-            if user is None or user.disabled:
-                return Elevation(session_lost=True)
-            now = time.time()
-            if user.second_step_locked(now):
-                await self._audit(
-                    "auth.webauthn_failed",
-                    actor=user.username,
-                    detail=LOCKED_REFUSAL_DETAIL,
-                    client=client,
-                )
-                return Elevation()
-        pending = self._webauthn_challenges.pop((hash_token(token), "assert"))
+        challenge_key = (hash_token(token), "assert")
+        # BACKLOG #3068: the directory lookup below costs a network round trip and its answer is
+        # a fact about the account, so a caller that has staged no ceremony, which includes every
+        # account holding no passkey, must not reach it. PEEKED, never popped: a refusal below must
+        # leave a staged ceremony in flight. The miss is answered as the pop below answers it.
+        staged = self._webauthn_challenges.peek(challenge_key)
+        if staged is None or staged.user_id != user.id:
+            if staged is not None:
+                # Another account's entry under this token is dead, so it is ended here as the pop
+                # below and the registration leg end one.
+                self._webauthn_challenges.pop(challenge_key)
+            return await self._assertion_refused(user, client, "expired")
+        # BACKLOG #2239: a good assertion below marks the factor met, so a DIRECTORY account must
+        # still be in the directory first, as verify_mfa asks (#2023). Without this an account
+        # disabled in the directory would clear the MFA gate with its passkey until the reconciler
+        # revoked it. Asked before the challenge is popped and before the sign count moves, so a
+        # refusal leaves the ceremony in flight and charges nothing; assertion failures feed no
+        # lockout here anyway (ADR 0068). A local account is not asked.
+        current = await self._directory_vouches_for_factor(
+            token, user, event="auth.webauthn_failed", client=client, report_lock=False
+        )
+        if isinstance(current, Elevation):
+            return current
+        user = current
+        now = time.time()
+        # Popped, not reused from the peek: the ceremony may have expired, or been replaced,
+        # during the lookup.
+        pending = self._webauthn_challenges.pop(challenge_key)
         if pending is None or pending.user_id != user.id:
-            await self._audit(
-                "auth.webauthn_failed",
-                actor=user.username,
-                detail=_json({"reason": "expired"}),
-                client=client,
-            )
-            return Elevation()
+            return await self._assertion_refused(user, client, "expired")
         try:
             raw_id = webauthn.credential_id_from_response(response_json)
         except webauthn.WebAuthnVerificationError:
-            await self._audit(
-                "auth.webauthn_failed",
-                actor=user.username,
-                detail=_json({"reason": "malformed"}),
-                client=client,
-            )
-            return Elevation()
+            return await self._assertion_refused(user, client, "malformed")
         # The account's passkeys, checked against the digest its seal covers (BACKLOG #2592): a
         # passkey row the store did not write fails the whole set, so none of them signs in.
         held = await self._verified_passkeys(user)
@@ -11639,13 +11888,7 @@ class AuthService:
         if cred is None or cred.user_id != user.id or cred.rp_id != rp_id:
             # Unknown credential, another user's, or minted under a different origin — same
             # refusal either way (no oracle distinguishing the three).
-            await self._audit(
-                "auth.webauthn_failed",
-                actor=user.username,
-                detail=_json({"reason": "unknown_credential"}),
-                client=client,
-            )
-            return Elevation()
+            return await self._assertion_refused(user, client, "unknown_credential")
         try:
             new_count = webauthn.verify_assertion(
                 response_json=response_json,
@@ -11684,17 +11927,59 @@ class AuthService:
                 client=client,
             )
             return Elevation()
-        if not await self._store.update_webauthn_sign_count(
+        moved = await self._store.update_webauthn_sign_count(
             cred.credential_id_hash, expected=cred.sign_count, new=new_count, used_at=now
-        ):
-            # CAS miss: a concurrent assertion consumed the same counter — the clone signal.
-            await self._audit(
-                "auth.webauthn_clone_suspected",
-                actor=user.username,
-                detail=_json({"label": cred.label}),
-                client=client,
-            )
-            return Elevation()
+        )
+        standing: _PasskeyHeld | None = None
+        if not moved:
+            # A compare-and-set miss is a clone signal (ADR 0068 decision 4) unless the passkey is
+            # confirmed gone: a self-service delete takes no queue, and an MFA reset deletes every
+            # passkey before it revokes the sessions, so either fails this compare-and-set too
+            # (BACKLOG #3068). Asked BEFORE the holder re-read below, and answered whatever that
+            # re-read finds, so ending one's own session, a disable or a lock landing mid-flight
+            # cannot suppress the signal. A set whose seal fails proves nothing either way, so it
+            # keeps the signal, and so does a question that raises: the row is written on the way
+            # out, so a store error in the reads cannot drop it.
+            try:
+                standing = await self._passkey_held(user, cred)
+            finally:
+                if standing in (None, "held", "unverified"):
+                    # Written now, under the name loaded before the write, so an exception in the
+                    # re-read below cannot drop the signal either.
+                    await self._audit(
+                        "auth.webauthn_clone_suspected",
+                        actor=user.username,
+                        detail=_json({"label": cred.label}),
+                        client=client,
+                    )
+        # BACKLOG #3068: the passkey read and the sign-count write awaited since the session, the
+        # account and its lock were last read, so a revocation, a disable or a lock that landed in
+        # between must stop the factor write, as on verify_mfa. Asked on both paths, so each
+        # refusal is audited with its own reason.
+        fresh = await self._factor_holder_current(
+            token,
+            actor=user.username,
+            event="auth.webauthn_failed",
+            client=client,
+            report_lock=False,
+        )
+        if isinstance(fresh, Elevation):
+            return fresh
+        user = fresh
+        if standing is None:
+            # The code leg's TOTP-off check, for a passkey: a self-service delete takes no queue, so
+            # the passkey that signed may be gone. Asked after the holder re-read, as the last read
+            # before the factor write.
+            standing = await self._passkey_held(user, cred)
+        if standing == "account_gone":
+            # Deleted after the holder re-read: the token no longer authenticates, so the answer
+            # is the lost session the re-read would have given, not a factor question.
+            return await self._assertion_refused(user, client, "session_lost", session_lost=True)
+        if standing != "held":
+            reason = "factor_removed" if standing == "removed" else "factor_unverified"
+            return await self._assertion_refused(user, client, reason)
+        if not moved:
+            return Elevation()  # the clone signal, audited above
         # BACKLOG #2298: the passkey leg of /ui/mfa, asked as verify_mfa asks after a good code, so
         # an assertion that straddles the deadline marks nothing and clears no counter.
         if user.must_change_password and await self._mfa_lapsed(
@@ -11724,6 +12009,44 @@ class AuthService:
             # vault BACKLOG #2145, as in verify_mfa.
             await self._mark_login_address_known(user.id, client)
         return elevation
+
+    async def _passkey_held(self, user: VerifiedUser, cred: WebAuthnCredential) -> _PasskeyHeld:
+        """Whether ``user`` still holds passkey ``cred``, asked of the set its seal covers (BACKLOG
+        #2592). :meth:`finish_webauthn_assertion` asks it after the sign-count write (BACKLOG
+        #3068). ``"held"``, or why not: ``"account_gone"`` when the account row no longer exists,
+        ``"removed"`` when the set holds no such passkey, and ``"unverified"`` when the answer
+        cannot be trusted: the set fails its seal, or the account row still exists but does not
+        load (its own seal fails, or its lookup keys changed). That says nothing about this passkey,
+        so a sign-count miss keeps its clone signal. The account is asked only on a miss, since
+        a set read of a deleted account fails its seal on a keyed store and is empty on a keyless
+        one. This re-check compares every credential, each in constant time (ASVS 11.2.4, as the
+        delete path does); the lookup that first picked ``cred`` does not."""
+        held = await self._verified_passkeys(user)
+        if held is not None:
+            # A list, not a generator: any() over a generator would stop at the first match.
+            matches = [
+                constant_time_equal(c.credential_id_hash, cred.credential_id_hash) for c in held
+            ]
+            if any(matches):
+                return "held"
+        if not await self._user_id_held(user.id):
+            return "account_gone"
+        return "removed" if held is not None else "unverified"
+
+    async def _assertion_refused(
+        self, user: UserRecord, client: str | None, reason: str, *, session_lost: bool = False
+    ) -> Elevation:
+        """A refusal :meth:`finish_webauthn_assertion` gives, audited ``auth.webauthn_failed`` with
+        ``reason``. One spelling for the expired ceremony, so the peek before the directory lookup
+        and the pop after it cannot be told apart, and for the passkey that signed, or its account,
+        gone or unverifiable before the factor write (BACKLOG #3068)."""
+        await self._audit(
+            "auth.webauthn_failed",
+            actor=user.username,
+            detail=_json({"reason": reason}),
+            client=client,
+        )
+        return Elevation(session_lost=session_lost)
 
     async def delete_webauthn_credential(
         self, identity: Identity, credential_id_hash: str, *, client: str | None = None

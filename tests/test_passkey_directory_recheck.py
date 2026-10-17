@@ -16,8 +16,10 @@ data here is synthetic.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
+from typing import Any
 
 import pytest
 
@@ -26,12 +28,8 @@ pytest.importorskip("webauthn")
 from webauthn.helpers import base64url_to_bytes  # noqa: E402
 
 from messagefoundry.auth import reconcile  # noqa: E402
-from messagefoundry.auth.ldap import (  # noqa: E402
-    AdPrincipal,
-    DirectoryAnswer,
-    DirectoryProbe,
-    LdapError,
-)
+from messagefoundry.auth.identity import SessionMechanism  # noqa: E402
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer  # noqa: E402
 from messagefoundry.auth.service import (  # noqa: E402
     DIRECTORY_OBJECT_ID_MISSING,
     DIRECTORY_ROLES_DEMOTED,
@@ -41,8 +39,10 @@ from messagefoundry.auth.service import (  # noqa: E402
 )
 from messagefoundry.auth.tokens import hash_token  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
+from messagefoundry.store.crypto import generate_key, make_cipher  # noqa: E402
 from messagefoundry.store.store import MessageStore, UserRecord  # noqa: E402
 from tests._admin_account import ADMIN_USERNAME, login_admin  # noqa: E402
+from tests._fake_directory import FakeDirectory as _Directory  # noqa: E402
 from tests._soft_webauthn import SoftAuthenticator  # noqa: E402
 
 _RP, _ORIGIN = "t", "http://t"
@@ -55,24 +55,6 @@ _PRINCIPAL = AdPrincipal(
     groups=frozenset(),
     directory_object_id="3b9e7a10-5c2d-4f8e-a1b6-0d4c8e2f7a91",
 )
-
-
-class _Directory:
-    """A directory whose answer the test sets. ``unreachable`` raises the connectivity signal."""
-
-    def __init__(self, principal: AdPrincipal) -> None:
-        self.principal = principal
-        self.answer = DirectoryAnswer.FOUND
-        self.unreachable = False
-        self.probes: list[tuple[str, str | None]] = []
-
-    def probe_principal(self, username: str, *, object_id: str | None = None) -> DirectoryProbe:
-        self.probes.append((username, object_id))
-        if self.unreachable:
-            raise LdapError("synthetic: LDAP socket closed")
-        if self.answer is DirectoryAnswer.FOUND:
-            return DirectoryProbe(DirectoryAnswer.FOUND, self.principal)
-        return DirectoryProbe(self.answer)
 
 
 def _settings() -> AuthSettings:
@@ -97,6 +79,7 @@ class _Pending:
     token: str  # a session that still owes its passkey
     user_id: str
     response: str  # an assertion answering the session's staged challenge
+    key: SoftAuthenticator  # the account's one passkey
 
 
 async def _register_passkey(
@@ -148,7 +131,7 @@ async def _directory_session_owing_a_passkey(
     assert await service.mfa_satisfied(second.token) is False
     response = await _staged_assertion(service, second.token, key)
     directory.probes.clear()
-    return _Pending(service, store, directory, second.token, second.identity.user_id, response)
+    return _Pending(service, store, directory, second.token, second.identity.user_id, response, key)
 
 
 async def _finish(p: _Pending) -> Elevation:
@@ -385,6 +368,9 @@ async def test_what_lands_during_the_lookup_is_honoured(
     if change == "lock":
         user = await store.get_user(p.user_id)
         assert user is not None and user.second_step_locked_until is not None
+        # BACKLOG #3068, item 3: the re-check's refusal writes its own audit row. The lock landed
+        # after the first check, so only the re-check can have written it.
+        assert {"reason": "locked"} in await _audited_assertion_failures(store)
 
 
 async def test_a_local_account_is_never_probed(store: MessageStore) -> None:
@@ -404,3 +390,410 @@ async def test_a_local_account_is_never_probed(store: MessageStore) -> None:
 
     assert verified.ok is True
     assert directory.probes == []
+
+
+# --- BACKLOG #3068: the follow-ups from engine PR 2055's review ------------------------------------
+
+
+async def _directory_session_with_no_passkey(store: MessageStore) -> _Pending:
+    """A directory account that holds no passkey, signed in, so nothing can be staged for it."""
+    directory = _Directory(_PRINCIPAL)
+    service = AuthService(store, _settings(), ldap=directory)  # type: ignore[arg-type]
+    await service.initialize()
+    out = await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=False)
+    assert out.token is not None and out.identity is not None
+    assert await service.begin_webauthn_assertion(out.token, rp_id=_RP) is None  # nothing staged
+    key = SoftAuthenticator(rp_id=_RP, origin=_ORIGIN)
+    return _Pending(service, store, directory, out.token, out.identity.user_id, "{}", key)
+
+
+@pytest.mark.parametrize("caller", ["nothing-staged", "no-passkey"])
+async def test_a_post_with_nothing_staged_costs_no_directory_lookup(
+    store: MessageStore, caller: str
+) -> None:
+    """Item 1. A directory session with no ceremony staged has proved nothing, so its post must not
+    reach the directory or learn its answer: it gets the plain ``expired`` refusal the pop gives.
+    RED when: the lookup runs before the staged ceremony is checked (the directory, set to refuse,
+    is then probed and the answer reads ``directory_unconfirmed``)."""
+    if caller == "nothing-staged":
+        p = await _directory_session_owing_a_passkey(store)
+        assert p.service._webauthn_challenges.pop((hash_token(p.token), "assert")) is not None
+    else:
+        p = await _directory_session_with_no_passkey(store)
+    p.directory.answer = DirectoryAnswer.DISABLED
+
+    refused = await _finish(p)
+
+    assert refused == Elevation()  # the plain failure, nothing about the directory
+    assert p.directory.probes == []
+    failures = await _audited_assertion_failures(store)
+    assert {"reason": "expired"} in failures
+    assert not any(d.get("reason") == DIRECTORY_UNCONFIRMED for d in failures)
+
+
+async def test_a_staged_ceremony_is_peeked_not_taken_before_the_lookup(
+    store: MessageStore,
+) -> None:
+    """Item 1, the other half. RED when: the check before the lookup pops the staged ceremony, so
+    the assertion it refused cannot verify once the directory answers."""
+    p = await _directory_session_owing_a_passkey(store)
+    p.directory.answer = DirectoryAnswer.DISABLED
+    assert (await _finish(p)).directory_unconfirmed is True
+    assert p.service._webauthn_challenges.peek((hash_token(p.token), "assert")) is not None
+
+    p.directory.answer = DirectoryAnswer.FOUND
+    assert (await _finish(p)).ok is True
+
+
+async def test_an_oidc_minted_session_is_checked_too(store: MessageStore) -> None:
+    """Item 3. The check keys on the ACCOUNT's provider, not on how the session was minted, so a
+    session the federated sign-in minted is asked as a Kerberos one is. RED when: the check is
+    skipped for an ``oidc`` session."""
+    p = await _directory_session_owing_a_passkey(store)
+    oidc = await p.service._issue_session(
+        p.user_id,
+        None,
+        mfa_verified=False,
+        seed_reauth=False,
+        mechanism=SessionMechanism.OIDC,
+        idp_auth_time=time.time(),
+    )
+    response = await _staged_assertion(p.service, oidc, p.key)
+    p.directory.answer = DirectoryAnswer.DISABLED
+
+    refused = await p.service.finish_webauthn_assertion(oidc, response, rp_id=_RP, origin=_ORIGIN)
+
+    assert refused.directory_unconfirmed is True
+    assert p.directory.probes == [("kpark", _PRINCIPAL.directory_object_id)]
+    session = await store.get_session(hash_token(oidc))
+    assert session is not None and session.mfa_verified_at is None
+
+
+async def test_the_lookup_comes_after_the_too_early_floor(store: MessageStore) -> None:
+    """Item 3. The login-then-MFA floor (BACKLOG #2301) is a local check, so a passkey that arrives
+    too soon is refused before the directory is asked. RED when: the lookup moves ahead of it."""
+    p = await _directory_session_owing_a_passkey(store)
+    p.service._settings = p.service._settings.model_copy(
+        update={"mfa_verify_min_elapsed_seconds": 3600}
+    )
+    p.directory.answer = DirectoryAnswer.DISABLED
+
+    refused = await _finish(p)
+
+    assert refused == Elevation()
+    assert p.directory.probes == []
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "lock",
+        "revoke",
+        "disable",
+        "passkey-deleted",
+        "passkey-deleted-first",
+        "counter-moved",
+        "reset",
+    ],
+)
+@pytest.mark.parametrize("account", ["directory", "local"])
+async def test_what_lands_before_the_factor_write_is_honoured(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, change: str, account: str
+) -> None:
+    """Item 2. The passkey read and the sign-count write await after the session, the account and
+    its lock were last read. RED when: a lock, a revocation, a disable or a delete of the passkey
+    that signed lands there and does not stop the factor write, which would then mark the factor
+    and clear both lockout counters, or when the refusal of a spent proof writes no audit row.
+
+    A delete that lands BEFORE the sign-count write fails its compare-and-set, as a concurrent
+    assertion that moved the counter does. RED when: that delete is audited as a suspected clone,
+    or the moved counter is not, or an MFA reset (every passkey deleted, then the sessions revoked)
+    landing there answers as a wrong proof rather than a lost session."""
+    if account == "directory":
+        p = await _directory_session_owing_a_passkey(store)
+        service, token, response, user_id = p.service, p.token, p.response, p.user_id
+    else:
+        service = AuthService(store, _settings())
+        identity, first, password = await login_admin(service)
+        key = SoftAuthenticator(rp_id=_RP, origin=_ORIGIN)
+        await _register_passkey(service, identity, first, key)
+        out = await service.login(ADMIN_USERNAME, password)
+        assert out.ok and out.token is not None
+        token, user_id = out.token, identity.user_id
+        response = await _staged_assertion(service, token, key)
+    real_update = store.update_webauthn_sign_count
+
+    async def _update_while_something_lands(*args: Any, **kwargs: Any) -> bool:
+        if change == "lock":
+            await _lock_second_step(store, user_id)
+        elif change == "revoke":
+            await store.revoke_session(hash_token(token))
+        elif change == "disable":
+            await store.set_user_disabled(user_id, disabled=True)
+        elif change in ("passkey-deleted-first", "reset"):
+            (held,) = await store.list_webauthn_credentials(user_id)
+            assert await store.delete_webauthn_credential(user_id, held.credential_id_hash)
+            if change == "reset":
+                await store.revoke_session(hash_token(token))
+        elif change == "counter-moved":
+            # A concurrent assertion of the same passkey got its count written first.
+            (held,) = await store.list_webauthn_credentials(user_id)
+            assert await real_update(
+                held.credential_id_hash,
+                expected=held.sign_count,
+                new=held.sign_count + 100,
+                used_at=0.0,
+            )
+        else:
+            # After the write: a delete before it already fails the sign-count compare-and-set.
+            moved = await real_update(*args, **kwargs)
+            (held,) = await store.list_webauthn_credentials(user_id)
+            assert await store.delete_webauthn_credential(user_id, held.credential_id_hash)
+            return moved
+        return await real_update(*args, **kwargs)
+
+    monkeypatch.setattr(store, "update_webauthn_sign_count", _update_while_something_lands)
+
+    refused = await service.finish_webauthn_assertion(token, response, rp_id=_RP, origin=_ORIGIN)
+
+    assert refused.ok is False
+    assert refused.session_lost is (change in ("revoke", "disable", "reset"))
+    session = await store.get_session(hash_token(token))
+    assert session is not None and session.mfa_verified_at is None
+    clones = await store.list_audit(action="auth.webauthn_clone_suspected")
+    if change == "counter-moved":
+        assert len(clones) == 1
+        return
+    assert clones == []
+    reason = {
+        "lock": "locked",
+        "passkey-deleted": "factor_removed",
+        "passkey-deleted-first": "factor_removed",
+    }.get(change, "session_lost")
+    assert {"reason": reason} in await _audited_assertion_failures(store)
+    if change == "lock":
+        user = await store.get_user(user_id)
+        assert user is not None and user.second_step_locked_until is not None  # not cleared
+
+
+async def test_an_account_deleted_mid_assertion_on_a_keyed_store_is_a_lost_session() -> None:
+    """On a keyed store an account gone also fails its passkey set's seal re-read, which once sent
+    a sign-count miss down the clone branch. RED when: the miss is audited as a suspected clone or
+    answers as a wrong proof rather than a lost session."""
+    store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
+    try:
+        service, token, response, user_id = await _local_assertion(store)
+        real_update = store.update_webauthn_sign_count
+
+        async def _update_after_the_account_goes(*args: Any, **kwargs: Any) -> bool:
+            await store.delete_user(user_id)
+            return await real_update(*args, **kwargs)
+
+        store.update_webauthn_sign_count = _update_after_the_account_goes  # type: ignore[method-assign]
+
+        refused = await service.finish_webauthn_assertion(
+            token, response, rp_id=_RP, origin=_ORIGIN
+        )
+
+        assert refused.ok is False and refused.session_lost is True
+        assert await store.list_audit(action="auth.webauthn_clone_suspected") == []
+        assert {"reason": "session_lost"} in await _audited_assertion_failures(store)
+    finally:
+        await store.close()
+
+
+async def _local_assertion(store: MessageStore) -> tuple[AuthService, str, str, str]:
+    """A local account on ``store`` holding one passkey, a session owing it, and a staged assertion:
+    the service, the token, the assertion and the account id."""
+    service = AuthService(store, _settings())
+    identity, first, password = await login_admin(service)
+    key = SoftAuthenticator(rp_id=_RP, origin=_ORIGIN)
+    await _register_passkey(service, identity, first, key)
+    out = await service.login(ADMIN_USERNAME, password)
+    assert out.ok and out.token is not None
+    response = await _staged_assertion(service, out.token, key)
+    return service, out.token, response, identity.user_id
+
+
+async def _break_the_passkey_seal(store: MessageStore, user_id: str) -> None:
+    """Change a column the account's passkey digest covers, outside the store's write helper, so the
+    set no longer matches the digest its seal holds (BACKLOG #2592)."""
+    await store._db.execute(
+        "UPDATE webauthn_credentials SET label=? WHERE user_id=?", ("tampered", user_id)
+    )
+    await store._db.commit()
+
+
+#: What each change does to a sign-count miss: whether it writes the clone row, and the reason the
+#: refusal is audited with. Only a passkey confirmed gone, alone or with its account, writes none.
+_MISS_OUTCOMES: dict[str, tuple[bool, str]] = {
+    "revoke": (True, "session_lost"),
+    "disable": (True, "session_lost"),
+    "lock": (True, "locked"),
+    "seal": (True, "factor_unverified"),
+    "passkey-deleted": (False, "factor_removed"),
+    "reset": (False, "session_lost"),
+    "account-deleted": (False, "session_lost"),
+}
+
+
+@pytest.mark.parametrize("change", list(_MISS_OUTCOMES))
+async def test_a_sign_count_miss_is_a_clone_signal_unless_the_passkey_is_gone(change: str) -> None:
+    """BACKLOG #3068, ADR 0068 decision 4. A compare-and-set miss is a clone signal, and only a
+    passkey confirmed gone (deleted, by itself, by an MFA reset or with its account) explains one
+    away. RED when: a session the holder ended, a disable, a lock or a passkey set failing its seal
+    suppresses the ``auth.webauthn_clone_suspected`` row, or a confirmed delete still writes one, or
+    the refusal is not audited with that change's own reason. Keyed, so the seal can fail."""
+    store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
+    try:
+        service, token, response, user_id = await _local_assertion(store)
+        real_update = store.update_webauthn_sign_count
+
+        async def _miss_while_something_lands(*args: Any, **kwargs: Any) -> bool:
+            (held,) = await store.list_webauthn_credentials(user_id)
+            if _MISS_OUTCOMES[change][0]:
+                # A concurrent assertion of the same passkey got its count written first.
+                assert await real_update(
+                    held.credential_id_hash,
+                    expected=held.sign_count,
+                    new=held.sign_count + 100,
+                    used_at=0.0,
+                )
+            if change == "revoke":
+                await store.revoke_session(hash_token(token))
+            elif change == "disable":
+                await store.set_user_disabled(user_id, disabled=True)
+            elif change == "lock":
+                await _lock_second_step(store, user_id)
+            elif change == "seal":
+                await _break_the_passkey_seal(store, user_id)
+            elif change == "account-deleted":
+                await store.delete_user(user_id)
+            elif change == "reset":
+                # The real administrator reset: a generated credential, the factors cleared, then
+                # the sessions revoked.
+                await service.admin_reset_mfa(user_id, actor="synthetic-admin")
+            else:
+                assert await store.delete_webauthn_credential(user_id, held.credential_id_hash)
+            moved = await real_update(*args, **kwargs)
+            assert moved is False
+            return moved
+
+        store.update_webauthn_sign_count = _miss_while_something_lands  # type: ignore[method-assign]
+
+        refused = await service.finish_webauthn_assertion(
+            token, response, rp_id=_RP, origin=_ORIGIN
+        )
+
+        clone, reason = _MISS_OUTCOMES[change]
+        assert refused.ok is False
+        assert refused.session_lost is (reason == "session_lost")
+        clones = await store.list_audit(action="auth.webauthn_clone_suspected")
+        assert len(clones) == (1 if clone else 0)
+        assert {"reason": reason} in await _audited_assertion_failures(store)
+        session = await store.get_session(hash_token(token))
+        assert session is None or session.mfa_verified_at is None
+    finally:
+        await store.close()
+
+
+async def test_a_sign_count_miss_keeps_its_clone_signal_when_the_holder_question_raises() -> None:
+    """BACKLOG #3068, review of the merged head. The passkey question after a miss is two to four
+    store reads, and a store error in any of them must not drop the clone row (ADR 0068 decision
+    4). RED when: the error propagates with no ``auth.webauthn_clone_suspected`` row written."""
+    store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
+    try:
+        service, token, response, user_id = await _local_assertion(store)
+        real_update = store.update_webauthn_sign_count
+
+        async def _store_error(*_args: Any) -> list[object]:
+            raise RuntimeError("synthetic: the store read failed")
+
+        async def _miss(*args: Any, **kwargs: Any) -> bool:
+            (held,) = await store.list_webauthn_credentials(user_id)
+            assert await real_update(
+                held.credential_id_hash,
+                expected=held.sign_count,
+                new=held.sign_count + 100,
+                used_at=0.0,
+            )
+            # Every read of the set from here on fails, which is the holder question's first read.
+            store.list_webauthn_credentials = _store_error  # type: ignore[method-assign,assignment]
+            return await real_update(*args, **kwargs)
+
+        store.update_webauthn_sign_count = _miss  # type: ignore[method-assign]
+
+        with pytest.raises(RuntimeError, match="synthetic"):
+            await service.finish_webauthn_assertion(token, response, rp_id=_RP, origin=_ORIGIN)
+
+        assert len(await store.list_audit(action="auth.webauthn_clone_suspected")) == 1
+        session = await store.get_session(hash_token(token))
+        assert session is not None and session.mfa_verified_at is None
+    finally:
+        await store.close()
+
+
+async def test_a_passkey_set_failing_its_seal_after_the_write_is_unverified() -> None:
+    """BACKLOG #3068, the ``factor_unverified`` branch on its own. A set that fails its seal once the
+    sign count has moved says nothing about the passkey, so the factor write is refused as
+    unverifiable, and no clone row is written, since the compare-and-set did not miss. RED when: it
+    is refused as a removed factor, raises, or marks the factor."""
+    store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
+    try:
+        service, token, response, user_id = await _local_assertion(store)
+        real_update = store.update_webauthn_sign_count
+
+        async def _update_then_break_the_seal(*args: Any, **kwargs: Any) -> bool:
+            moved = await real_update(*args, **kwargs)
+            assert moved is True
+            await _break_the_passkey_seal(store, user_id)
+            return moved
+
+        store.update_webauthn_sign_count = _update_then_break_the_seal  # type: ignore[method-assign]
+
+        refused = await service.finish_webauthn_assertion(
+            token, response, rp_id=_RP, origin=_ORIGIN
+        )
+
+        assert refused.ok is False and refused.session_lost is False
+        failures = await _audited_assertion_failures(store)
+        assert {"reason": "factor_unverified"} in failures
+        assert {"reason": "factor_removed"} not in failures
+        assert await store.list_audit(action="auth.webauthn_clone_suspected") == []
+        session = await store.get_session(hash_token(token))
+        assert session is not None and session.mfa_verified_at is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("keyed", [True, False], ids=["keyed", "keyless"])
+async def test_an_account_deleted_after_the_holder_re_read_is_a_lost_session(keyed: bool) -> None:
+    """BACKLOG #3068. An account deleted between the holder re-read and the passkey re-read leaves a
+    passkey set that is empty (keyless) or fails its seal (keyed). Either way the token no longer
+    authenticates. RED when: it is refused as a removed or unverifiable factor rather than a lost
+    session."""
+    cipher = make_cipher(generate_key()) if keyed else None
+    store = await MessageStore.open(":memory:", cipher=cipher)
+    try:
+        service, token, response, user_id = await _local_assertion(store)
+        real_holder = service._factor_holder_current
+
+        async def _holder_then_the_account_goes(*args: Any, **kwargs: Any) -> Any:
+            holder = await real_holder(*args, **kwargs)
+            assert not isinstance(holder, Elevation)
+            await store.delete_user(user_id)
+            return holder
+
+        service._factor_holder_current = _holder_then_the_account_goes  # type: ignore[method-assign]
+
+        refused = await service.finish_webauthn_assertion(
+            token, response, rp_id=_RP, origin=_ORIGIN
+        )
+
+        assert refused.ok is False and refused.session_lost is True
+        failures = await _audited_assertion_failures(store)
+        assert {"reason": "session_lost"} in failures
+        assert not any(d.get("reason") in ("factor_removed", "factor_unverified") for d in failures)
+        assert await store.list_audit(action="auth.webauthn_clone_suspected") == []
+    finally:
+        await store.close()

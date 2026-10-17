@@ -1704,8 +1704,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             set_session_cookie(resp, elevation.token, request=request)
             return resp
         if elevation.session_lost:
-            # A correct code on a session revoked underneath it: there is nothing to re-render the
-            # gate for, and the cookie is dead. Land on login like any other post-termination exit.
+            # The session or its account went during the ceremony, under a correct code or before
+            # the code was checked (BACKLOG #3068): there is nothing to re-render the gate for, and
+            # the cookie is dead. Land on login like any other post-termination exit.
             return login_redirect_response()
         if elevation.idp_step_up_required:
             # BACKLOG #2142: an oidc session that already met its factor owes no code, as the GET
@@ -1880,7 +1881,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 await auth.verify_mfa(token, code, client=client) if code else Elevation()
             )
             if code_elevation.session_lost:
-                return login_redirect_response()  # session ended under a correct code
+                # The session ended during the ceremony, whether or not the code was checked yet
+                # (BACKLOG #3068).
+                return login_redirect_response()
             if code_elevation.token is not None:
                 rekey_continuations(token, code_elevation.token)
                 token = code_elevation.token  # rotation 1 of 2
