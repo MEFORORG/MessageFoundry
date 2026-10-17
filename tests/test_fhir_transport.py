@@ -25,6 +25,7 @@ from _fhir_fixtures import (
     OPERATION_OUTCOME_SUCCESS,
     OPERATION_OUTCOME_TRANSIENT,
     PATIENT_R4B,
+    PHI_CANARY,
     as_json,
 )
 
@@ -723,6 +724,99 @@ async def test_too_deep_2xx_reply_captures_as_unparseable() -> None:
         dest._opener = _FakeOpener(body=b"[" * 200_000)  # type: ignore[assignment]
         resp = await dest.send(UPDATE_1965)
         assert isinstance(resp, DeliveryResponse) and resp.outcome == "unparseable"
+
+
+# --- vault BACKLOG #2812: a repeated JSON key is refused on every FhirPeek path ----------------
+
+#: Synthetic. json keeps the last id, so the URL would name the canary while a server keeping the
+#: first key would write first-id.
+_REPEATED_ID = '{"resourceType": "Patient", "id": "first-id", "id": "' + PHI_CANARY + '"}'
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"interaction": "create"},
+        {"interaction": "update"},
+        {"conditional": "if-match"},
+        {"interaction": "update", "update_url_form": "path"},
+        {"conditional": "conditional-update", "conditional_query": "identifier=sys|val"},
+        {"conditional": "if-none-exist", "conditional_query": "identifier=sys|val"},
+    ],
+    ids=["create", "update", "if-match", "path-form", "conditional-update", "if-none-exist"],
+)
+async def test_an_outgoing_body_that_repeats_a_key_is_dead_lettered_unsent(
+    over: dict[str, str],
+) -> None:
+    dest = _dest(**over)
+    opener = _FakeOpener(body=_transaction_response("200 OK"))
+    dest._opener = opener  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(_REPEATED_ID)
+    assert ei.value.permanent is True
+    assert ei.value.code == "bad-body"
+    assert opener.requests == []
+    assert "repeats a key" in str(ei.value)  # the peek's reason reaches the operator
+    assert PHI_CANARY not in str(ei.value) and "first-id" not in str(ei.value)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        _REPEATED_ID,
+        '{"resourceType": "Patient", "id": ' + PHI_CANARY,  # not JSON
+        '["' + PHI_CANARY + '"]',  # not an object
+        "<Patient><id value='" + PHI_CANARY + "'/></Patient>",  # FHIR-XML
+    ],
+    ids=["repeated-key", "not-json", "not-an-object", "xml"],
+)
+async def test_the_bad_body_text_carries_nothing_of_the_body(body: str) -> None:
+    # _peek puts the FhirPeekError's text into the refusal, so every refusal the peek can raise is
+    # pinned here as free of the body (CLAUDE.md section 9).
+    dest = _dest(interaction="create")
+    dest._opener = _FakeOpener()  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(body)
+    assert ei.value.code == "bad-body"
+    assert PHI_CANARY not in str(ei.value) and "first-id" not in str(ei.value)
+
+
+async def test_an_outgoing_body_with_one_of_each_key_is_sent() -> None:
+    # Control for the refusal above: the same resource with a single id goes out.
+    dest = _dest(interaction="update")
+    opener = _FakeOpener(body=_transaction_response("200 OK"))
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send('{"resourceType": "Patient", "id": "first-id", "active": true}')
+    assert len(opener.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("response", "outcome"),
+    [
+        ('{"status": "404 Not Found", "status": "200 OK"}', "unparseable"),
+        ('{"status": "200 OK", "status": "404 Not Found"}', "unparseable"),
+        ('{"status": "200 OK"}', "accepted"),  # control
+    ],
+    ids=["failure-first", "failure-last", "control"],
+)
+async def test_a_wrapped_update_reply_that_repeats_a_key_captures_as_unparseable(
+    response: str, outcome: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The two orders read differently by which key a reader keeps, so the peek refuses the reply
+    # and the entry status is not read in either. The 2xx then counts as delivered, as an
+    # unreadable entry status does, and a warning says so. Before #2812 the failure-last order
+    # dead-lettered on the 404 and the failure-first order was delivered.
+    reply = (
+        '{"resourceType": "Bundle", "type": "transaction-response", "entry": [{"response": '
+        + response
+        + "}]}"
+    )
+    dest = _dest(interaction="update", capture_response=True)
+    dest._opener = _FakeOpener(body=reply.encode())  # type: ignore[assignment]
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.fhir"):
+        resp = await dest.send(UPDATE_1965)
+    assert isinstance(resp, DeliveryResponse) and resp.outcome == outcome
+    assert ("without its entry status" in caplog.text) is (outcome == "unparseable")
 
 
 async def test_reply_that_is_not_a_transaction_response_is_delivered() -> None:

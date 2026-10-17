@@ -71,7 +71,11 @@ from messagefoundry.connection_names import fhir_lookup_record_name
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.fhirsearch import FhirSearchParams, resolve_search_pairs
 from messagefoundry.parsing.fhir import FhirPeek, FhirPeekError
-from messagefoundry.redaction import json_loads_or_refusal
+from messagefoundry.redaction import (
+    RepeatedKeyError,
+    json_loads_or_refusal,
+    refuse_repeated_keys,
+)
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -301,19 +305,6 @@ def entry_screen_settings(interaction: str, methods: object, types: object) -> _
     )
 
 
-class _RepeatedKey(ValueError):
-    """A JSON object in the body repeats a key. Carries neither the key nor any value."""
-
-
-def _refuse_repeated_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    # json.loads keeps the LAST of two equal keys; a server may keep the first. Refused, so the
-    # screen and the server can never read two different entries out of one body.
-    obj = dict(pairs)
-    if len(obj) != len(pairs):
-        raise _RepeatedKey
-    return obj
-
-
 #: A percent-encoded control character (%00-%1F, %7F). A server decodes it back into one.
 _ENCODED_CONTROL_RE = re.compile(r"%(?:[01][0-9A-Fa-f]|7[Ff])")
 
@@ -407,10 +398,12 @@ def _screen_bundle(payload: str, interaction: str, screen: _EntryScreen) -> None
 
 def _bundle_refusal(payload: str, interaction: str, screen: _EntryScreen) -> str | None:
     """Why :func:`_screen_bundle` refuses ``payload``, or None when every entry passes."""
+    # A repeated key is refused, so the screen and the server can never read two different
+    # entries out of one body.
     parsed, hint = json_loads_or_refusal(
-        payload.lstrip(_BOM), object_pairs_hook=_refuse_repeated_keys
+        payload.lstrip(_BOM), object_pairs_hook=refuse_repeated_keys
     )
-    if hint == _RepeatedKey.__name__:
+    if hint == RepeatedKeyError.__name__:
         return "a JSON object in it repeats a key"
     if hint is not None:
         return f"it is not parseable JSON ({hint})"
@@ -661,6 +654,14 @@ def _unwrap_transaction_reply(
     try:
         peek = FhirPeek.parse(body)
     except FhirPeekError:
+        # Among them a reply that repeats a key (vault BACKLOG #2812): the entry status cannot be
+        # read either way, so, like an unreadable status below, the 2xx counts as delivered. Said
+        # aloud, because a failed entry hides behind it. An empty reply is send()'s no_reply.
+        if body.strip():
+            logger.warning(
+                "FHIR transaction-response is not a readable FHIR resource; taking the 2xx reply "
+                "as delivered without its entry status"
+            )
         return headers, "unparseable"
     entries = peek.obj.get("entry") if peek.resource_type == "Bundle" else None
     first = entries[0] if isinstance(entries, list) and entries else None
@@ -986,8 +987,10 @@ class FhirDestination(DestinationConnector):
         try:
             return FhirPeek.parse(payload)
         except FhirPeekError as exc:
+            # A FhirPeekError's text is content-free; it says which refusal fired (a repeated key
+            # is valid JSON, so "not parseable" alone would mislead the operator).
             raise NegativeAckError(
-                "outgoing FHIR body is not parseable JSON", code="bad-body", permanent=True
+                f"outgoing FHIR body refused: {exc}", code="bad-body", permanent=True
             ) from exc
 
     def _resolve_request(self, payload: str) -> _FhirRequest:
