@@ -354,8 +354,11 @@ async def test_a_reconcile_pass_that_newly_grants_administrator_pages_once(rig: 
     assert await rig.roles("jdoe") == [Role.ADMINISTRATOR.value]
     assert rig.grants == [("jdoe", RECONCILE_VIA)]
     assert rig.alerts == []
-    # The pass after it finds nothing to change, so it pages nothing more.
-    assert (await rig.service.reconcile_directory_sessions()).revocations == ()
+    # Why the pass must page: the account's next sign-in finds the role written and gains nothing.
+    outcome = await rig.service._complete_ad_login(
+        rig.ldap.present["jdoe"], None, mfa_verified=True
+    )
+    assert outcome.ok and outcome.roles_gained is None
     assert rig.grants == [("jdoe", RECONCILE_VIA)]
 
 
@@ -477,9 +480,14 @@ async def test_a_loss_after_a_reconciler_regrant_is_not_held_back_by_the_cooldow
     regrant = administrator_granted_alert(sink, granted_by=DIRECTORY_GRANTED_BY)
 
     lose("jdoe", "ad-reconcile")
+    # The control: a grant that cleared every account's cooldown would let asmith's second loss
+    # through and fail the count below.
+    lose("asmith", "ad-reconcile")
     regrant("jdoe", RECONCILE_VIA)
     lose("jdoe", "ad-reconcile")
+    lose("asmith", "ad-reconcile")
     await _drain(sink)
 
     losses = [e["connection"] for e in transport.events if e["type"] == "no_enabled_administrator"]
     assert losses.count("user:jdoe") == 2
+    assert losses.count("user:asmith") == 1

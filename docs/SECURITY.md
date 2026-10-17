@@ -2453,7 +2453,9 @@ with no page.
     `via` set to `directory_reconcile`. That alert clears the account's `no_enabled_administrator`
     cooldown, as a sign-in's does. An account that already held Administrator raises nothing. The
     next sign-in then writes no `auth.ad_roles_resynced` row and raises no second
-    `administrator_granted`. That section lists when a pass revokes or alerts nothing.
+    `administrator_granted`. A sign-in that runs at the same time as the pass can still raise a
+    second one, since each judges against its own read of the roles; a duplicate page is the safe
+    direction. That section lists when a pass revokes or alerts nothing.
     No pass runs at `[auth].ad_session_recheck_seconds = 0`. A pass probes at most
     `ad_session_recheck_max_users` accounts (200 by default), least recently probed first. When more
     directory accounts than that hold live sessions, an account can wait several passes.
@@ -4116,7 +4118,8 @@ writes no roles, and it strikes and revokes as an absent account does, with the 
 0195 hold. It is never asked, so it is no part of an outage either: a pass whose every lookup fails
 still audits `auth.ad_reconcile_skipped`, and that row's `asked` count leaves it out. Such a pass,
 and one whose every lookup was referred, still strikes the row, because its answer never came from
-the directory (BACKLOG #3170). A referral's `auth.ad_reconcile_referred` row and alert count only
+the directory (BACKLOG #3170). Neither pass revokes it: that waits for the next pass that is not
+aborted. A referral's `auth.ad_reconcile_referred` row and alert count only
 the lookups sent too. Its revocation does count toward the mass-revoke breaker below. Such a
 row cannot take a federated binding: the bind refuses it, so every binding the bind has made since
 BACKLOG #1143 slice C sits on a row probed by its id (ADR 0184 AC-5). A binding already on an id-less
