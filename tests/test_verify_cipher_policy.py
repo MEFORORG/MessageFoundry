@@ -3,7 +3,8 @@
 """``host.ciphers``: DEPLOY-SERVER-DB.md section 5.4's host cipher checks, run by ``verify``.
 
 The platform probes are stubbed, so both platform branches run on any OS. Each branch has a passing
-and a failing policy reading, and the control-is-zero case, which must never read as a PASS."""
+and a failing policy reading, and the control-is-zero case, which must never read as a PASS. One
+Windows-only test runs the real PowerShell command."""
 
 from __future__ import annotations
 
@@ -18,6 +19,8 @@ import pytest
 from messagefoundry.verify import checks, cipher_policy
 from messagefoundry.verify.cipher_policy import ProbeFailed, ProbeUnavailable
 from messagefoundry.verify.model import CheckResult, Status
+from tests._ast_sites import callee_name, parse_source
+from tests.test_dependency_boundaries import _modules_imported_by
 
 # Names as Get-TlsCipherSuite prints them.
 _WIN_AEAD = ["TLS_AES_256_GCM_SHA384", "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"]
@@ -57,12 +60,13 @@ def _linux(
     monkeypatch: pytest.MonkeyPatch,
     lines: list[str] | Exception,
     settings: list[tuple[str, str]] | Exception,
+    section: str | None = "system_default_sect",
 ) -> CheckResult:
     monkeypatch.setattr(cipher_policy, "_openssl_suites", lambda: _give(lines))
     monkeypatch.setattr(
         cipher_policy,
         "_openssl_policy_lines",
-        lambda: (cipher_policy._OPENSSL_CNF, _give(settings)),
+        lambda: (cipher_policy._OPENSSL_CNF, section, _give(settings)),
     )
     return cipher_policy.read_host_cipher_policy("linux")
 
@@ -153,6 +157,75 @@ def test_a_group_policy_suite_order_is_checked_too(
 
 
 @pytest.mark.parametrize(
+    ("raised", "status", "expect"),
+    [
+        (ProbeUnavailable("no registry"), Status.MANUAL, "Group Policy suite order not read (no"),
+        (ProbeFailed("denied"), Status.ERROR, "Group Policy suite order not read: denied"),
+    ],
+)
+def test_an_unread_group_policy_order_is_never_a_pass(
+    monkeypatch: pytest.MonkeyPatch, raised: Exception, status: Status, expect: str
+) -> None:
+    """A healthy local table and both protocols off still leave the policy order unread."""
+    r = _windows(monkeypatch, _WIN_AEAD, _OFF, order=raised)
+    assert r.status is status, r.detail
+    assert expect in r.detail
+
+
+def _powershell_returns(
+    monkeypatch: pytest.MonkeyPatch, returncode: int, stdout: str
+) -> list[list[str]]:
+    """Stub the PowerShell start; returns the argument lists it was called with."""
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(cipher_policy, "_system_exe", lambda *parts: "powershell.exe")
+    monkeypatch.setattr(subprocess, "run", run)
+    return calls
+
+
+def test_suite_names_are_read_one_per_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _powershell_returns(monkeypatch, 0, "TLS_AES_256_GCM_SHA384\n\n SSL_CK_RC4_X \n")
+    assert cipher_policy._windows_enabled_suites() == ["TLS_AES_256_GCM_SHA384", "SSL_CK_RC4_X"]
+    assert "Get-TlsCipherSuite" in calls[0][-1]
+    assert "$WarningPreference = 'SilentlyContinue'" in calls[0][-1]
+
+
+@pytest.mark.parametrize("odd", ["WARNING: module loaded late", "AVERTISSEMENT : x", "TLS AES"])
+def test_a_line_that_is_not_a_suite_name_is_an_error(
+    monkeypatch: pytest.MonkeyPatch, odd: str
+) -> None:
+    """Windows PowerShell 5.1 writes stream lines to a redirected stdout. One the command did not
+    silence is neither counted as a suite nor dropped, since a dropped line could be a suite."""
+    _powershell_returns(monkeypatch, 0, f"TLS_AES_256_GCM_SHA384\n{odd}\n")
+    with pytest.raises(ProbeFailed, match="not a suite name"):
+        cipher_policy._windows_enabled_suites()
+
+
+def test_a_host_without_the_tls_cmdlet_is_manual(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No ``Get-TlsCipherSuite`` is an instrument missing from the host, not a failed reading."""
+    _powershell_returns(monkeypatch, cipher_policy._NO_CMDLET_EXIT, "")
+    with pytest.raises(ProbeUnavailable, match="Get-TlsCipherSuite not found"):
+        cipher_policy._windows_enabled_suites()
+
+
+def test_a_cmdlet_that_ran_and_failed_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    _powershell_returns(monkeypatch, 1, "")
+    with pytest.raises(ProbeFailed, match="exited 1"):
+        cipher_policy._windows_enabled_suites()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="runs the real Windows PowerShell")
+def test_the_powershell_command_runs_on_this_host() -> None:
+    """The guarded command parses and prints suite names on a host with stock suites, so the
+    stubs above match a real start: the cmdlet guard did not fire and the names kept their shape."""
+    assert cipher_policy._windows_enabled_suites()
+
+
+@pytest.mark.parametrize(
     ("found", "expect"),
     [
         (None, None),
@@ -225,29 +298,157 @@ def test_linux_missing_policy_file_is_manual(monkeypatch: pytest.MonkeyPatch) ->
     assert "confirm MinProtocol by hand" in r.detail
 
 
+def test_no_system_default_section_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    r = _linux(monkeypatch, _SSL_AEAD, [], section=None)
+    assert r.status is Status.FAIL
+    assert "no system-default section" in r.detail
+
+
+#: The chain of the stock Ubuntu file, from the default section to the policy section.
+_CHAIN = (
+    "openssl_conf = openssl_init\n"
+    "[openssl_init]\nssl_conf = ssl_sect\n"
+    "[ssl_sect]\nsystem_default = system_default_sect\n"
+)
+
+
+def _read_cnf(
+    monkeypatch: pytest.MonkeyPatch, cnf: Path, text: str
+) -> tuple[Path, str | None, list[tuple[str, str]]]:
+    cnf.write_text(text, encoding="utf-8")
+    monkeypatch.setenv("OPENSSL_CONF", str(cnf))
+    return cipher_policy._openssl_policy_lines()
+
+
 def test_policy_lines_read_the_openssl_conf_file(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """``OPENSSL_CONF`` names the file the ``openssl`` probe loads, so it is the one read."""
     cnf = tmp_path / "openssl.cnf"
-    cnf.write_text(
-        "[system_default_sect]\n"
+    path, section, settings = _read_cnf(
+        monkeypatch,
+        cnf,
+        _CHAIN + "[system_default_sect]\n"
         "# CipherString = commented out\n"
         "CipherString = ECDHE+AESGCM  # trailing comment\n"
         "  MinProtocol = TLSv1.2\n"
         "Options = ServerPreference\n"
         "minprotocol = TLSv1\n",
-        encoding="utf-8",
     )
-    monkeypatch.setenv("OPENSSL_CONF", str(cnf))
-    path, settings = cipher_policy._openssl_policy_lines()
-    assert path == cnf
+    assert (path, section) == (cnf, "system_default_sect")
     # OpenSSL matches a command name without case, so the last line is the floor in effect.
     assert settings == [
         ("CipherString", "ECDHE+AESGCM"),
         ("MinProtocol", "TLSv1.2"),
         ("MinProtocol", "TLSv1"),
     ]
+
+
+def test_policy_lines_come_from_the_section_openssl_applies(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Policy lines in another section are not applied, so they are not read. The chain may name
+    any section, not only ``[system_default_sect]``."""
+    _, section, settings = _read_cnf(
+        monkeypatch,
+        tmp_path / "openssl.cnf",
+        "openssl_conf = init\n"
+        "[ init ]\nssl_conf = ssl\n"
+        "[ssl]\nsystem_default = tls_policy\n"
+        "[system_default_sect]\nMinProtocol = TLSv1.3\nCipherString = HIGH\n"
+        "[tls_policy]\nMinProtocol = TLSv1\n"
+        "[client_sect]\nCipherString = DEFAULT\n",
+    )
+    assert section == "tls_policy"
+    assert settings == [("MinProtocol", "TLSv1")]
+
+
+def test_a_file_with_no_chain_has_no_policy_section(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Without ``openssl_conf``, OpenSSL applies none of the file's TLS lines."""
+    text = "[system_default_sect]\nCipherString = ECDHE+AESGCM\nMinProtocol = TLSv1.2\n"
+    assert _read_cnf(monkeypatch, tmp_path / "a.cnf", text)[1:] == (None, [])
+    # The chain broken at its second link: ssl_conf names nothing.
+    broken = "openssl_conf = init\n[init]\nproviders = p\n" + text
+    assert _read_cnf(monkeypatch, tmp_path / "b.cnf", broken)[1:] == (None, [])
+
+
+@pytest.mark.parametrize(
+    ("raw", "value"),
+    [
+        ('"TLSv1.2"', "TLSv1.2"),
+        ("'TLSv1.2'  # quoted", "TLSv1.2"),
+        ('"DEFAULT:#x" # comment', "DEFAULT:#x"),
+        (r"a\#b", "a#b"),
+        ('" spaced "  ', " spaced "),
+        ("TLSv1.2   ", "TLSv1.2"),
+        ("", ""),
+    ],
+)
+def test_config_values_are_read_as_openssl_reads_them(raw: str, value: str) -> None:
+    assert cipher_policy._config_value(raw) == value
+
+
+_HEALTHY_SECTION = "[system_default_sect]\nCipherString = ECDHE+AESGCM\nMinProtocol = TLSv1.2\n"
+
+
+@pytest.mark.parametrize(
+    ("text", "construct"),
+    [
+        (_CHAIN + _HEALTHY_SECTION + ".include /etc/ssl/more.cnf\n", ".include"),
+        (".include = /etc/ssl/more.cnf\n" + _CHAIN + _HEALTHY_SECTION, ".include"),
+        (".pragma dollarid:on\n" + _CHAIN + _HEALTHY_SECTION, ".pragma"),
+        (_CHAIN + _HEALTHY_SECTION + "Options = A,\\\n  B\n", "a line continued"),
+        (_CHAIN + _HEALTHY_SECTION + "MinProtocol = $floor\n", "$ variable expansion"),
+        (_CHAIN.replace("ssl_sect\n[", "$name\n[") + _HEALTHY_SECTION, "$ variable expansion"),
+    ],
+)
+def test_a_file_using_what_the_check_does_not_follow_is_manual(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, text: str, construct: str
+) -> None:
+    """Each can change the lines OpenSSL applies, so the row must never PASS on what it read."""
+    cnf = tmp_path / "openssl.cnf"
+    cnf.write_text(text, encoding="utf-8")
+    monkeypatch.setenv("OPENSSL_CONF", str(cnf))
+    monkeypatch.setattr(cipher_policy, "_openssl_suites", lambda: _SSL_AEAD)
+    r = cipher_policy.read_host_cipher_policy("linux")
+    assert r.status is Status.MANUAL, r.detail
+    assert construct in r.detail
+    assert str(cnf) in r.detail
+
+
+def test_a_dollar_outside_the_read_lines_is_not_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The stock Ubuntu file uses ``$dir`` in its CA sections, which the TLS policy never reads."""
+    text = "HOME = .\n" + _CHAIN + _HEALTHY_SECTION + "[CA_default]\ncerts = $dir/certs\n"
+    assert _read_cnf(monkeypatch, tmp_path / "openssl.cnf", text)[1] == "system_default_sect"
+
+
+def test_a_quoted_min_protocol_passes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _read_cnf(
+        monkeypatch,
+        tmp_path / "openssl.cnf",
+        _CHAIN + '[system_default_sect]\nCipherString = "ECDHE+AESGCM"\nMinProtocol = "TLSv1.2"\n',
+    )
+    monkeypatch.setattr(cipher_policy, "_openssl_suites", lambda: _SSL_AEAD)
+    r = cipher_policy.read_host_cipher_policy("linux")
+    assert r.status is Status.PASS, r.detail
+
+
+def test_without_openssl_conf_the_system_file_is_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cnf = tmp_path / "system.cnf"
+    cnf.write_text(_CHAIN + "[system_default_sect]\nMinProtocol = TLSv1.2\n", encoding="utf-8")
+    monkeypatch.delenv("OPENSSL_CONF", raising=False)
+    monkeypatch.setattr(cipher_policy, "_OPENSSL_CNF", cnf)
+    assert cipher_policy._openssl_policy_lines() == (
+        cnf,
+        "system_default_sect",
+        [("MinProtocol", "TLSv1.2")],
+    )
 
 
 # ---- the probe runner and the platform gates --------------------------------------------------
@@ -340,37 +541,71 @@ _PROBE_MODULES = frozenset(
 )
 
 
-def _reaches_the_probe(node: ast.AST) -> bool:
-    if isinstance(node, ast.ImportFrom):
-        names = {f"{node.module}.{alias.name}" for alias in node.names}
-        return node.module in _PROBE_MODULES or bool(names & _PROBE_MODULES)
-    return isinstance(node, ast.Import) and any(a.name in _PROBE_MODULES for a in node.names)
+def _reaches_the_probe(tree: ast.AST, package: str) -> bool:
+    """Whether code under ``tree``, in a file of the dotted ``package``, imports a probe module:
+    by an absolute or relative import, or by ``import_module`` or ``__import__`` given its name as
+    a literal."""
+    if _modules_imported_by(tree, package, with_names=True) & _PROBE_MODULES:
+        return True
+    return any(
+        isinstance(node, ast.Call)
+        and callee_name(node) in {"import_module", "__import__"}
+        and bool(node.args)
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value in _PROBE_MODULES
+        for node in ast.walk(tree)
+    )
 
 
 def test_only_the_verify_command_reaches_the_policy() -> None:
     """Report only: owner ruling R3 declined a startup check. Outside ``verify/``, the only import
-    of a module that runs the probe is in the ``verify`` subcommand's own handler."""
+    of a module that runs the probe is in the ``verify`` subcommand's own handler.
+
+    It does not see a module name built at run time, a module reached through an attribute of one
+    already imported, or a plugin entry point. A file whose text never says ``verify`` is skipped,
+    since every import the detector sees names it."""
     root = Path(cipher_policy.__file__).resolve().parents[2]
     reachers: set[tuple[str, str]] = set()
     for package in ("messagefoundry", "messagefoundry_webconsole", "messagefoundry_toolkit"):
         for path in (root / package).rglob("*.py"):
-            rel = path.relative_to(root).as_posix()
-            if rel.startswith("messagefoundry/verify/"):
+            rel = path.relative_to(root)
+            if rel.as_posix().startswith("messagefoundry/verify/"):
                 continue
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            for top in tree.body:
-                name = getattr(top, "name", "<module>")
-                if any(_reaches_the_probe(node) for node in ast.walk(top)):
-                    reachers.add((rel, name))
+            text = path.read_text(encoding="utf-8")
+            if "verify" not in text:
+                continue
+            dotted = ".".join(rel.parent.parts)  # an __init__.py sits in its own package
+            for top in parse_source(text).body:
+                if _reaches_the_probe(top, dotted):
+                    reachers.add((rel.as_posix(), getattr(top, "name", "<module>")))
     assert reachers == {("messagefoundry/__main__.py", "_verify")}
 
 
-def test_the_reach_detector_fires() -> None:
-    assert _reaches_the_probe(
-        ast.parse("from messagefoundry.verify.runner import run_verify").body[0]
-    )
-    assert _reaches_the_probe(ast.parse("from messagefoundry.verify import checks").body[0])
-    assert _reaches_the_probe(ast.parse("import messagefoundry.verify.cipher_policy").body[0])
-    assert not _reaches_the_probe(
-        ast.parse("from messagefoundry.verify.model import Status").body[0]
-    )
+@pytest.mark.parametrize(
+    ("source", "package"),
+    [
+        ("from messagefoundry.verify.runner import run_verify", ""),
+        ("from messagefoundry.verify import checks", ""),
+        ("import messagefoundry.verify.cipher_policy", ""),
+        ("from .verify import runner", "messagefoundry"),
+        ("from ..verify.checks import run_host_checks", "messagefoundry.api"),
+        ("from .. import verify", "messagefoundry.api"),
+        ("importlib.import_module('messagefoundry.verify.checks')", ""),
+        ("__import__('messagefoundry.verify')", ""),
+    ],
+)
+def test_the_reach_detector_fires(source: str, package: str) -> None:
+    assert _reaches_the_probe(ast.parse(source), package)
+
+
+@pytest.mark.parametrize(
+    ("source", "package"),
+    [
+        ("from messagefoundry.verify.model import Status", ""),
+        ("from .verify.model import Status", "messagefoundry"),
+        ("from . import checks", "messagefoundry"),
+        ("importlib.import_module('messagefoundry.verify.model')", ""),
+    ],
+)
+def test_the_reach_detector_spares_other_modules(source: str, package: str) -> None:
+    assert not _reaches_the_probe(ast.parse(source), package)
