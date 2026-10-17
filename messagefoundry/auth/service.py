@@ -9916,6 +9916,8 @@ class AuthService:
         re-anchor rather than on ``reauth_at`` keeps it free of the wall clock, which can step
         back."""
         self._new_ip_seen.pop(token_hash, None)
+        # The repeat-line throttle starts over too, so the first repeat after a re-anchor logs.
+        self._new_ip_repeat_logged.pop(token_hash, None)
 
     async def _classify_login_address(self, user: UserRecord, client: str | None) -> _LoginAddress:
         """The first-seen login-address signal's verdict for one sign-in (BACKLOG #288, ASVS 8.2.4).
