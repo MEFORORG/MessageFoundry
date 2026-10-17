@@ -5,9 +5,11 @@
   of running a Router or Handler body nobody reloaded. Under the default
   `internal_error = "continue"` each message on that inbound dead-letters with an error naming
   `config module content`; under `"stop"` the inbound stops. A load whose config modules change
-  while it runs is refused too. Reload the config. Each refusal also raises a new
-  `sandbox_worker_refused` alert, keyed by the inbound's name, once per refusal and not once per
-  message, under either `internal_error` setting. Its text names the cause and the remedy and
+  while it runs is refused too. Reload the config. A worker refused because its graph differs
+  from the engine's also raises a new `sandbox_worker_refused` alert, keyed by the inbound's
+  name, once per refusal and not once per message, under either `internal_error` setting. A
+  worker whose load fails, such as an edit that no longer imports or a load the change refused
+  mid-run, raises no such alert. Its text names the cause and the remedy and
   carries no message content (owner ruling 2026-10-16: alert, keep dead-letter). Alert rules can
   route it by `event_type`. [CONFIGURATION.md](../docs/CONFIGURATION.md) says, under `[sandbox]`,
   what an operator sees meanwhile. The spawn guard in

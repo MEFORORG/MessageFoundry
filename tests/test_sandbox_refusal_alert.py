@@ -31,6 +31,7 @@ from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
 from messagefoundry.pipeline.alerts import LoggingAlertSink, sandbox_worker_refused_detail
 from messagefoundry.pipeline.dryrun import transform_one
 from messagefoundry.pipeline.sandbox import (
+    GraphShape,
     SandboxMode,
     SandboxPolicy,
     SandboxSession,
@@ -140,8 +141,11 @@ async def test_a_refusal_reached_through_the_closed_session_retry_alerts(tmp_pat
     store = await MessageStore.open(tmp_path / "retry.db")
     try:
         runner = _runner(registry, store, tmp_path, cast(Any, sink))
-        with pytest.raises(SandboxWorkerRefused):
-            await runner._off_loop_sandboxed("IB_X", dispatch, registry)
+        try:
+            with pytest.raises(SandboxWorkerRefused):
+                await runner._off_loop_sandboxed("IB_X", dispatch, registry)
+        finally:
+            await runner._close_sandbox_sessions()
     finally:
         await store.close()
     assert len(calls) == 2
@@ -149,24 +153,31 @@ async def test_a_refusal_reached_through_the_closed_session_retry_alerts(tmp_pat
 
 
 async def test_a_refusal_against_a_replaced_graph_does_not_alert(tmp_path: Path) -> None:
-    """A reload swapped the registry while the refused spawn compared with the old one. The
-    reload is the remedy, so an alert would stay open with nothing left to fix."""
-    old, new = Registry(), Registry()
+    """The refused spawn compared with a graph the runner no longer serves, as after a reload,
+    or a reload that swapped and then rolled back. The reload is the remedy, so an alert would
+    stay open with nothing left to fix."""
+    registry = Registry()
     sink = _Recorder()
+    compared: list[GraphShape] = []
+
+    def dispatch(_registry: Registry, *, sandbox: Any) -> None:
+        raise SandboxWorkerRefused("refused", first=True, content_only=True, graph=compared[0])
+
     store = await MessageStore.open(tmp_path / "stale.db")
     try:
-        runner = _runner(new, store, tmp_path, cast(Any, sink))
-
-        def dispatch(_registry: Registry, *, sandbox: Any) -> None:
-            raise SandboxWorkerRefused("refused", first=True, content_only=True)
-
-        with pytest.raises(SandboxWorkerRefused):
-            await runner._off_loop_sandboxed("IB_X", dispatch, old)
-        assert sink.refused == []
-        # CONTROL: the same refusal against the graph being served does alert.
-        with pytest.raises(SandboxWorkerRefused):
-            await runner._off_loop_sandboxed("IB_X", dispatch, new)
-        assert sink.refused == [("IB_X", True)]
+        runner = _runner(registry, store, tmp_path, cast(Any, sink))
+        try:
+            compared.append(graph_shape(registry))  # equal, but not the object being served
+            with pytest.raises(SandboxWorkerRefused):
+                await runner._off_loop_sandboxed("IB_X", dispatch, registry)
+            assert sink.refused == []
+            # CONTROL: the same refusal against the graph being served does alert.
+            compared[0] = runner._engine_graph_shape()
+            with pytest.raises(SandboxWorkerRefused):
+                await runner._off_loop_sandboxed("IB_X", dispatch, registry)
+            assert sink.refused == [("IB_X", True)]
+        finally:
+            await runner._close_sandbox_sessions()
     finally:
         await store.close()
 

@@ -560,13 +560,23 @@ class SandboxWorkerRefused(SandboxError):
     engine graph is refused from the session's cached refusal with ``first`` False, so the runner
     raises its ``sandbox_worker_refused`` alert once per refusal, not once per message (vault
     BACKLOG #2724, owner ruling 2026-10-16). ``content_only`` is True when the config modules'
-    bytes are the only difference, so the cause is an edit on disk with no reload. Both default
-    to False only so that a copy or an unpickle, which passes the message alone, still builds."""
+    bytes are the only difference, so the cause is an edit on disk with no reload. ``graph`` is
+    the engine graph the worker was compared with, so the runner can tell a refusal against a
+    graph it no longer serves. The defaults exist only so that a copy or an unpickle, which
+    passes the message alone, still builds."""
 
-    def __init__(self, message: str, *, first: bool = False, content_only: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        first: bool = False,
+        content_only: bool = False,
+        graph: GraphShape | None = None,
+    ) -> None:
         super().__init__(message)
         self.first = first
         self.content_only = content_only
+        self.graph = graph
 
 
 class SandboxSession:
@@ -646,7 +656,9 @@ class SandboxSession:
         self._kill(self._proc)
         engine_graph = self._graph() if self._graph is not None else None
         if self._refused is not None and self._refused[0] is engine_graph:
-            raise SandboxWorkerRefused(self._refused[1], first=False, content_only=self._refused[2])
+            raise SandboxWorkerRefused(
+                self._refused[1], first=False, content_only=self._refused[2], graph=engine_graph
+            )
         # A fresh response queue per spawn so a prior (killed) worker's trailing EOF can't leak into
         # this generation's reads.
         self._responses = queue.Queue()
@@ -776,10 +788,10 @@ class SandboxSession:
                     "The config files changed on disk since the engine loaded them: reload the "
                     "config."
                     if content_only
-                    else "Two things cause this. The config files changed on disk since the "
-                    "engine loaded them: reload the config. Or config code reads an environment "
-                    "variable the worker is not given, because the worker loads the config again "
-                    "under an allowlisted environment: name each such variable in "
+                    else "Most often the config files changed on disk since the engine loaded "
+                    "them: reload the config. Or config code reads an environment variable the "
+                    "worker is not given, because the worker loads the config again under an "
+                    "allowlisted environment: name each such variable in "
                     "[sandbox].pass_environment and restart."
                 )
                 # Short before the differences: a dead-lettered message keeps about the first 200
@@ -789,7 +801,9 @@ class SandboxSession:
                     f"the engine's. {'. '.join(differing)}. {causes}"
                 )
                 self._refused = (engine_graph, refusal, content_only)
-                raise SandboxWorkerRefused(refusal, first=True, content_only=content_only)
+                raise SandboxWorkerRefused(
+                    refusal, first=True, content_only=content_only, graph=engine_graph
+                )
         self._refused = None
         self._proc = proc
 

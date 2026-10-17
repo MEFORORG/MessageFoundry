@@ -5443,8 +5443,10 @@ class RegistryRunner:
                 )
         except SandboxWorkerRefused as exc:
             # Not for a refusal computed against a graph a reload has since replaced: the reload
-            # is the remedy, so the alert would stay open with nothing left to fix.
-            if exc.first and self.registry is registry:
+            # is the remedy, so the alert would stay open with nothing left to fix. The graph the
+            # worker was compared with is checked, not ``registry``: a reload that swapped and
+            # then rolled back leaves ``registry`` served though the comparison used the other.
+            if exc.first and (exc.graph is None or exc.graph is self._engine_graph_shape()):
                 # The whole refusal, once: what differs and both digests. A dead-lettered message
                 # keeps only the first 200 characters of it. Config names and digests, no message.
                 log.warning("inbound %r: %s", name, exc)

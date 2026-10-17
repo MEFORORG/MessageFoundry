@@ -1229,6 +1229,8 @@ worker ran an edited Router or Handler body nobody had reloaded. What you see wh
 2. The engine raises a `sandbox_worker_refused` alert for the inbound, under either
    `internal_error` setting. Its `connection` is the inbound's name, and its text names the cause
    and says to reload the config. It carries fixed words only, never the message or the refusal.
+   An edit that stops the worker's load from finishing, such as one that no longer imports, is a
+   bootstrap failure rather than this refusal: its messages fail the same way, with no alert.
 3. Under the default `[delivery].internal_error = "continue"` the message is dead-lettered with
    status `ERROR`, the error is its last error, and the log has a `WARNING` naming the inbound and
    the error type. Under `"stop"` the inbound stops, the head message is held, and the
