@@ -74,7 +74,7 @@ import traceback
 import weakref
 from abc import ABCMeta
 from bisect import bisect_left
-from collections import ChainMap, Counter, OrderedDict, UserDict, defaultdict, deque
+from collections import ChainMap, OrderedDict, UserDict, defaultdict, deque
 from collections.abc import Callable, MappingView
 from datetime import UTC, datetime
 from functools import lru_cache
@@ -1760,28 +1760,31 @@ def redact(text: str) -> str:
     input or in either answer (:func:`_holds_a_credential_shape`): the credential filters run after
     this module, and a kept label can take theirs into its own value. That screen also matches
     ordinary words such as ``state=`` or ``session:``, and the rule is off on such a text. Third, the
-    answer keeps no word that the answer without it scrubbed, beyond the vocabulary words of the
-    labels it kept (:func:`_keeps_no_new_word`). So on one call, a word this redactor printed was
-    printed before #3318 too, by construction. A second call over the first one's output is not
+    text the answer keeps, outside the labels it kept and the placeholders, is a run of text the answer
+    without it also kept, in the same order (:func:`_keeps_only_what_plain_kept`). So on one call,
+    text this redactor printed was printed before #3318 too, by construction. A second call over the first one's output is not
     covered by that check, and is measured instead; it can scrub more than the first, as other
-    exceptions :func:`safe_text` names can.
+    exceptions :func:`safe_text` names can. Nor is a cut: a kept label is shorter than the run it
+    split, so :func:`safe_text`'s limit can fall later in the answer and keep text the old answer cut
+    off. That text was never redacted, only cut.
 
     The rule is dropped silently where those checks refuse it, at least: a text the widened stage
     reads only because of a kept label, which then keeps an encoded run the answer without the rule
-    scrubs; and an unclosed XML element after the token, which its pass reads as prose."""
-    if not text.isprintable():
+    scrubs. It does not reach, at least: an XML element that never closes, since the placeholder the
+    rule writes after ``<name>`` is no evidence of markup to that pass; and a FHIR structure whose
+    earlier member closes a string inside the token (``"telecom":[{"system":"phone","value":"555
+    0188"}]``), since the rule reads that closing quote as the value's."""
+    note = _TRAILING_NOTES.search(text) if text.endswith("unscanned]") else None
+    if not (text if note is None else text[: note.start()]).isprintable():
         return _redact_text(text, None)
     labels: list[str] = []
     out = _redact_text(text, labels)
     if not labels:
         return out
     plain = _redact_text(text, None)
-    if (
-        _holds_a_credential_shape(text)
-        or _holds_a_credential_shape(plain)
-        or _holds_a_credential_shape(out)
-        or not _keeps_no_new_word(out, plain, labels)
-    ):
+    # One screen of the input is enough: a scrub only writes the placeholder, and a kept label holds
+    # no credential word.
+    if _holds_a_credential_shape(text) or not _keeps_only_what_plain_kept(out, plain, labels):
         return plain
     return out
 
@@ -1928,25 +1931,30 @@ _GLUED_LABEL_PASSES: tuple[tuple[str, re.Pattern[str]], ...] = (
 
 class _GluedLabels:
     """Every label :data:`_GLUED_LABEL_PASSES` finds in one text, by start, so each field-run token
-    is answered by a bisection rather than by scans of its own."""
+    is answered by a bisection rather than by scans of its own. Found on the first token asked
+    about, so a text with no field run pays nothing."""
 
     def __init__(self, text: str) -> None:
-        found = sorted(
-            (
-                (match.start(), kind, match)
-                for kind, pattern in _GLUED_LABEL_PASSES
-                for match in pattern.finditer(text)
-            ),
-            key=lambda entry: entry[0],
-        )
-        self.starts = [entry[0] for entry in found]
-        self._found = [(entry[1], entry[2]) for entry in found]
+        self._text = text
+        self._starts: list[int] | None = None
+        self._found: list[tuple[str, re.Match[str]]] = []
 
     def last_in(self, start: int, end: int) -> tuple[str, re.Match[str]] | None:
         """``(kind, match)`` for the label that starts last in ``[start, end)``, or ``None``. A match
         that runs more than :data:`_LABEL_REACH` past ``end`` is not one."""
-        index = bisect_left(self.starts, end) - 1
-        if index < 0 or self.starts[index] < start:
+        if self._starts is None:
+            found = sorted(
+                (
+                    (match.start(), kind, match)
+                    for kind, pattern in _GLUED_LABEL_PASSES
+                    for match in pattern.finditer(self._text)
+                ),
+                key=lambda entry: entry[0],
+            )
+            self._starts = [entry[0] for entry in found]
+            self._found = [(entry[1], entry[2]) for entry in found]
+        index = bisect_left(self._starts, end) - 1
+        if index < 0 or self._starts[index] < start:
             return None
         kind, match = self._found[index]
         return None if match.end() > end + _LABEL_REACH else (kind, match)
@@ -2003,8 +2011,6 @@ def _field_run_sub(pattern: re.Pattern[str], text: str, labels: list[str] | None
     if labels is None or _GLUE_SCREEN.search(text) is None:
         return pattern.sub(_REDACTED, text)
     glued = _GluedLabels(text)
-    if not glued.starts:
-        return pattern.sub(_REDACTED, text)
     return pattern.sub(lambda token: _glued_label_replacement(token, glued, labels), text)
 
 
@@ -2021,22 +2027,38 @@ def _holds_a_credential_shape(text: str) -> bool:
     return "%" in text and _CREDENTIAL_AHEAD.search(_PERCENT_ESCAPE.sub(" ", text)) is not None
 
 
-#: A word an answer keeps, for :func:`_keeps_no_new_word`.
-_KEPT_WORD = re.compile(r"\w+")
+#: A word character: a piece of an answer without one carries no value, only punctuation.
+_KEPT_WORD = re.compile(r"\w")
+#: The most distinct labels :func:`_keeps_only_what_plain_kept` sets aside. Past it the check
+#: refuses, so a peer that varies every label pays one bounded refusal and gets the old answer.
+_MAX_DISTINCT_LABELS = 64
+#: Joins the runs an answer kept. :func:`redact` takes the rule only on printable text, which holds
+#: no NUL.
+_JOIN = "\x00"
 
 
-def _kept_words(text: str) -> Counter[str]:
-    return Counter(_KEPT_WORD.findall(text.replace(_REDACTED, " ")))
-
-
-def _keeps_no_new_word(out: str, plain: str, labels: list[str]) -> bool:
-    """Whether ``out`` keeps no word, counted with repeats, that ``plain`` does not, apart from the
-    words of the ``labels`` the glued-label rule kept. Those are vocabulary: an XML label with a
-    namespace prefix, the one kind that could carry free text, is never kept."""
-    allowed = _kept_words(plain)
-    for label in labels:
-        allowed.update(_KEPT_WORD.findall(label))
-    return not _kept_words(out) - allowed
+def _keeps_only_what_plain_kept(out: str, plain: str, labels: list[str]) -> bool:
+    """Whether every run of text ``out`` keeps, between placeholders and the ``labels`` the
+    glued-label rule kept, sits inside one run ``plain`` keeps, in order. A count of words was the
+    first form and a review broke it: a kept quote closed a leaf string early, the next label's
+    value printed, and its words were all printed elsewhere in ``plain``. Labels are vocabulary: an
+    XML label with a namespace prefix, the one kind that could carry free text, is never kept."""
+    distinct = sorted(set(labels), key=len, reverse=True)
+    if len(distinct) > _MAX_DISTINCT_LABELS:
+        return False
+    body = out.replace(_REDACTED, _JOIN)
+    for label in distinct:
+        body = body.replace(label, _JOIN)
+    kept = plain.replace(_REDACTED, _JOIN)
+    pos = 0
+    for piece in body.split(_JOIN):
+        if _KEPT_WORD.search(piece) is None:
+            continue
+        found = kept.find(piece, pos)
+        if found < 0:
+            return False
+        pos = found + len(piece)
+    return True
 
 
 def _redact_flat(

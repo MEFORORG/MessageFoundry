@@ -145,11 +145,27 @@ def test_an_answer_that_keeps_a_new_word_is_not_used(text: str, value: str) -> N
     assert not _paths_keeping(text, value)
 
 
-def test_the_word_check_is_what_guards_it(monkeypatch: pytest.MonkeyPatch) -> None:
-    """THE POSITIVE CONTROL for the guard above: with the check passing everything, the value
+def test_a_value_whose_words_print_elsewhere_is_still_caught() -> None:
+    """Found by code review: a count of words passed this, because ``plain`` printed 44 and 55 in
+    the prose the kept quote swallowed. The check reads runs in order, not words."""
+    text = 'x|y|z"family":"Zq 44 x 55 PatientID="44 55"'
+    assert redact(text) == redaction._redact_text(text, None)
+    assert '"44 55"' not in redact(text)
+
+
+def test_the_kept_text_check_is_what_guards_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE POSITIVE CONTROL for the guards above: with the check passing everything, the value
     prints."""
-    monkeypatch.setattr(redaction, "_keeps_no_new_word", lambda out, plain, labels: True)
+    monkeypatch.setattr(redaction, "_keeps_only_what_plain_kept", lambda out, plain, labels: True)
     assert "4455667" in redact('x|y|z"family":"Zq PatientID="4455667"')
+    assert '"44 55"' in redact('x|y|z"family":"Zq 44 x 55 PatientID="44 55"')
+
+
+def test_a_record_over_the_window_still_gets_the_rule() -> None:
+    """``clamp_untrusted`` joins its bound note with a line break. That break is this module's, not a
+    peer's, so it does not take the rule off."""
+    text = _SHAPES["compact-json"][0] + " " + "w " * redaction._REDACT_WINDOW
+    assert "Vandtjane" not in redaction.redact_untrusted(text)
 
 
 @pytest.mark.parametrize(
@@ -168,8 +184,12 @@ def test_a_text_holding_a_credential_shape_gets_the_answer_without_the_rule(text
 
 
 def test_the_credential_screen_is_what_guards_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE POSITIVE CONTROL: with the screen off, the chain prints the credential. ``redact`` alone
+    never scrubs one, so the chain is what is asserted on."""
+    text = 'x|y|z,"name":"q r password: "zq9hunter2z"'
+    assert "zq9hunter2z" not in _through_the_chain(text)
     monkeypatch.setattr(redaction, "_holds_a_credential_shape", lambda text: False)
-    assert "zq9hunter2z" in redact('x|y|z,"name":"q r password: "zq9hunter2z"')
+    assert "zq9hunter2z" in _through_the_chain(text)
 
 
 def test_a_text_with_a_line_break_gets_the_answer_without_the_rule() -> None:
