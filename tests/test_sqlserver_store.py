@@ -37,6 +37,7 @@ from tests._replay_settle_contract import (
     assert_replayed_ingress_row_is_received,
     assert_replayed_routed_row_settles,
 )
+from tests._store_audit import ALERT_AUDIT, no_purge_audit
 from tests.audit_chain_cases import CASES, ChainBackend, server_chain_backend
 
 # A synthetic ADT carrying a (fake) MRN + name in PID — never real PHI.
@@ -2172,7 +2173,7 @@ async def test_cancel_queued_finalizes_via_batch_lock(store) -> None:
         disposition=MessageStatus.ROUTED,
         now=100.0,
     )
-    assert await store.cancel_queued(None, "OB", now=200.0) == 1
+    assert await store.cancel_queued(None, "OB", now=200.0, audit=no_purge_audit) == 1
     assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.CANCELLED.value
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
 
@@ -2191,7 +2192,9 @@ async def test_cancel_queued_top_only_cancels_a_backing_off_head(store) -> None:
         "next_attempt_at"
     ]
     assert await store.claim_next_fifo("OB", now=103.0) is None  # the head blocks the lane
-    assert await store.cancel_queued(None, "OB", top_only=True, now=103.0) == 1
+    assert (
+        await store.cancel_queued(None, "OB", top_only=True, now=103.0, audit=no_purge_audit) == 1
+    )
     assert (await store.outbox_for(m1))[0]["status"] == OutboxStatus.CANCELLED.value
     assert (await store.outbox_for(m2))[0]["status"] == OutboxStatus.PENDING.value
     nxt = await store.claim_next_fifo("OB", now=103.0)
@@ -4874,11 +4877,11 @@ async def test_alert_instance_lifecycle_ss(store) -> None:
     assert len(await store.list_active_alert_instances(allowed_channels=None)) == 2
 
     # ack -> acknowledged + acked_by/at, excluded from the open count; unknown id -> False.
-    assert await store.ack_alert_instance(a.id, actor="scott", now=200.0) is True
+    assert await store.ack_alert_instance(a.id, actor="scott", now=200.0, audit=ALERT_AUDIT) is True
     got = await store.get_alert_instance(a.id, allowed_channels=None)
     assert got is not None and got.status == "acknowledged"
     assert got.acked_by == "scott" and got.acked_at == 200.0
-    assert await store.ack_alert_instance(999999, actor="scott") is False
+    assert await store.ack_alert_instance(999999, actor="scott", audit=ALERT_AUDIT) is False
     assert await store.count_open_alerts_by_connection() == {"OB_Y": 1}
     # BACKLOG #1564: run the scoped aggregate on a REAL server. The generated severity CASE, the
     # `AS n`/`AS worst` aliases, the dialect scope bind and the row unpack never execute under the
@@ -4901,11 +4904,11 @@ async def test_alert_instance_lifecycle_ss(store) -> None:
     assert await store.count_open_alerts_by_connection() == {"OB_Y": 1}
 
     # resolve closes it; the same key re-opens a FRESH distinct instance (partial index frees it).
-    assert await store.resolve_alert_instance(a.id, now=300.0) is True
+    assert await store.resolve_alert_instance(a.id, now=300.0, audit=ALERT_AUDIT) is True
     assert {
         r.connection for r in await store.list_active_alert_instances(allowed_channels=None)
     } == {"OB_Y"}
-    assert await store.resolve_alert_instance(a.id) is False
+    assert await store.resolve_alert_instance(a.id, audit=ALERT_AUDIT) is False
     await store.upsert_alert_instance(
         event_type="connection_error", connection="OB_X", severity="warning", now=310.0
     )
@@ -4937,7 +4940,9 @@ async def test_alert_instance_lifecycle_ss(store) -> None:
         for r in await store.list_active_alert_instances(allowed_channels=None)
         if r.connection == "OB_Y"
     ]
-    await store.resolve_alert_instance(y.id, now=100.0)  # resolved at 100.0 -> purgeable
+    await store.resolve_alert_instance(
+        y.id, now=100.0, audit=ALERT_AUDIT
+    )  # resolved at 100.0 -> purgeable
     assert await store.purge_alert_instances(older_than=200.0) == 1
     await store.upsert_alert_instance(
         event_type="queue_buildup", connection="OB_R", severity="warning", now=500.0
@@ -4947,7 +4952,9 @@ async def test_alert_instance_lifecycle_ss(store) -> None:
         for r in await store.list_active_alert_instances(allowed_channels=None)
         if r.connection == "OB_R"
     ]
-    await store.resolve_alert_instance(rr.id, now=500.0)  # too recent for older_than=200.0
+    await store.resolve_alert_instance(
+        rr.id, now=500.0, audit=ALERT_AUDIT
+    )  # too recent for older_than=200.0
     assert await store.purge_alert_instances(older_than=200.0) == 0
 
     # side-observer: an alert write creates NO message/queue row (invisible to the finalizer).
@@ -6089,6 +6096,38 @@ async def _nocount_reading(store: Any) -> tuple[int, int]:
     row = await store._fetchone("SELECT @@SPID AS spid, @@OPTIONS & 512 AS nocount")
     assert row is not None
     return int(row["spid"]), int(row["nocount"])
+
+
+async def test_an_alert_ack_under_nocount_still_writes_its_audit_row(store) -> None:
+    """Vault BACKLOG #3217, review round two: the alert mutations read their match from ``OUTPUT``,
+    so a session with ``SET NOCOUNT ON`` left on still appends the row for a matched change, and
+    an unmatched one still writes none. A one-connection store makes the NOCOUNT session the one
+    the ack borrows; the reading of the bit is the control that it is."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.base import AuditAppend
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    await store.upsert_alert_instance(
+        event_type="connection_error", connection="OB_NOCOUNT", severity="warning", now=100.0
+    )
+    [a] = [
+        x
+        for x in await store.list_active_alert_instances(allowed_channels=None)
+        if x.connection == "OB_NOCOUNT"
+    ]
+    action = f"test.alert.nocount.{uuid4().hex[:8]}"
+    settings = load_settings(environ=os.environ).store
+    async with SqlServerStore._one_connection_store(settings, posture=None) as one:
+        try:
+            await one._fetchall("SET NOCOUNT ON; SELECT 1 AS one")
+            _, nocount = await _nocount_reading(one)
+            assert nocount == 512, "the control: the session the ack borrows has NOCOUNT on"
+            audit = AuditAppend(action, actor="op")
+            assert await one.ack_alert_instance(a.id, actor="op", audit=audit) is True
+            assert await one.ack_alert_instance(999999999, actor="op", audit=audit) is False
+        finally:
+            await one._execute("SET NOCOUNT OFF;")
+    assert len(await store.list_audit(action=action)) == 1
 
 
 async def test_backlog_2097_nocount_persistence_probe() -> None:

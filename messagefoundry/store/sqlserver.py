@@ -263,6 +263,7 @@ from messagefoundry.store.store import (
     federated_unbind,
     first_sealed_approval,
     full_authentication_clear,
+    if_applied,
     load_audit_chain,
     lockout_clear,
     lockout_increment,
@@ -326,13 +327,13 @@ log = logging.getLogger(__name__)
 _FIFO_HEADS_LANE_CHUNK = 500
 # ADR 0066 §3.1: release_claimed id-chunk bound (ids per UPDATE statement).
 _RELEASE_CHUNK = 500
-# BACKLOG #3256: the database server's clock as epoch seconds, the unit `upload_quota.since` holds.
+# BACKLOG #3256: the database server's clock as epoch seconds, the unit `upload_reservation.since` holds.
 # Microseconds since the epoch fit a BIGINT for about 292,000 years. Each reference to
 # SYSUTCDATETIME() is read on its own, so two references in one statement can disagree: two
 # SYSDATETIME() calls in one INSERT ... VALUES row differed in 122 of 100,000 rows (Louis Davidson,
 # "Row-wise system function calls, always the same?", Simple Talk, 2018). So each statement here
-# references it once: the quota release reads it into a DECLARE @now, and the reserve MERGE names it
-# once, in its one-row USING source. The cluster lease has its own copy at millisecond grain
+# references it once: the quota touch reads it into a DECLARE @now, and the reserve's stale delete
+# and its insert each name it once. The cluster lease has its own copy at millisecond grain
 # (pipeline/cluster_sqlserver.py `_DB_NOW`). Making this one the canonical copy for both is a
 # pipeline change outside BACKLOG #3256.
 _MSSQL_EPOCH_NOW = (
@@ -943,6 +944,13 @@ def _rcsi_remedy(database: str | None) -> str:
         f"a DBA must run once: alter database [{name}] SET READ_COMMITTED_SNAPSHOT on"
         " with rollback immediate"
     )
+
+
+def _upload_quota_lock(uploader_id: str) -> str:
+    """The applock the reserve and the release of one uploader's reservations both take (vault
+    BACKLOG #3180). One spelling, because the release's lock order holds only while the names
+    match."""
+    return f"mefor:upload_quota:{uploader_id}"
 
 
 def _applock_timeout_ms(command_timeout: int) -> int:
@@ -2147,14 +2155,20 @@ _SCHEMA: list[str] = [
         reason NVARCHAR(1000) NOT NULL, actor NVARCHAR(256) NOT NULL,
         attested_at FLOAT NOT NULL, audit_seq BIGINT NOT NULL,
         audit_hash NVARCHAR(64) NOT NULL)""",
-    # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112) — see the SQLite `_SCHEMA`
-    # for the in-flight-only rationale. One of the two backends a real sharded deployment runs
-    # (`require_unified_store` makes a server DB mandatory past one shard). No PHI (an account id and
-    # two counters). BIN2 collation matches the other id-keyed tables.
-    """IF OBJECT_ID('upload_quota','U') IS NULL CREATE TABLE upload_quota (
-        uploader_id NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL PRIMARY KEY,
-        inflight_files BIGINT NOT NULL DEFAULT 0, inflight_bytes BIGINT NOT NULL DEFAULT 0,
-        since FLOAT NOT NULL)""",
+    # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112), one row per upload in
+    # flight (vault BACKLOG #3180) — see the SQLite `_SCHEMA` for the rationale. One of the two
+    # backends a real sharded deployment runs (`require_unified_store` makes a server DB mandatory
+    # past one shard). No PHI (two ids, a size and a timestamp). BIN2 collation matches the other
+    # id-keyed tables.
+    # The table this one replaced held one row per uploader (vault BACKLOG #3180). Nothing reads
+    # it. In _SCHEMA, so the drop moves _schema_hash() and a provisioning run carries it too.
+    """IF OBJECT_ID('upload_quota','U') IS NOT NULL DROP TABLE upload_quota""",
+    """IF OBJECT_ID('upload_reservation','U') IS NULL CREATE TABLE upload_reservation (
+        reservation_id NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL PRIMARY KEY,
+        uploader_id NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
+        size_bytes BIGINT NOT NULL, since FLOAT NOT NULL)""",
+    """IF INDEXPROPERTY(OBJECT_ID('upload_reservation'),'ix_upload_reservation_uploader','IndexID')
+        IS NULL CREATE INDEX ix_upload_reservation_uploader ON upload_reservation(uploader_id)""",
     # BACKLOG #1540: `requester` is a DISPLAY label; `requester_user_id` is the authorization key the
     # self-approval refusal compares (the Store protocol's create_pending_approval says why).
     # NVARCHAR(64) matches users.id and this table's own id column.
@@ -7381,39 +7395,52 @@ class SqlServerStore:
             escalation_tier=int(r["escalation_tier"]),
         )
 
+    async def _alert_write(
+        self, sql: str, params: tuple[Any, ...], audit: AuditAppend, now: float
+    ) -> bool:
+        """One operator alert UPDATE with its audit row, in one transaction (vault BACKLOG #3217).
+        The row is appended only when the UPDATE matched, so a 404 writes nothing. The append takes
+        the audit applock at the tail, as :meth:`cancel_queued`'s does.
+
+        ``sql`` carries ``OUTPUT inserted.id``, and the match is read from that rowset, never from
+        ``cursor.rowcount``: a session-wide ``SET NOCOUNT ON`` can make the count read -1, which
+        would commit a matched change with no audit row (BACKLOG #2283)."""
+        async with AuditedWrite(now) as written, self._acquire() as conn:
+            try:
+                async with self._cursor(conn) as cur:
+                    await cur.execute(sql, params)
+                    applied = bool(await cur.fetchall())
+                    await self._append_operator_audit(cur, written, if_applied(audit), applied)
+                    await self._commit(conn)
+            except Exception:
+                # The transaction may hold the audit applock and an audit row (BACKLOG #2624).
+                await self._rollback_or_discard(conn)
+                raise
+        return applied
+
     async def ack_alert_instance(
-        self, alert_id: int, *, actor: str, now: float | None = None
+        self, alert_id: int, *, actor: str, audit: AuditAppend, now: float | None = None
     ) -> bool:
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "UPDATE alert_instance SET status='acknowledged', acked_by=?, acked_at=?"
-                    " WHERE id=? AND status<>'resolved'",
-                    (actor, now, alert_id),
-                )
-                changed = cur.rowcount
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        return int(changed) > 0
+        return await self._alert_write(
+            "UPDATE alert_instance SET status='acknowledged', acked_by=?, acked_at=?"
+            " OUTPUT inserted.id WHERE id=? AND status<>'resolved'",
+            (actor, now, alert_id),
+            audit,
+            now,
+        )
 
-    async def resolve_alert_instance(self, alert_id: int, *, now: float | None = None) -> bool:
+    async def resolve_alert_instance(
+        self, alert_id: int, *, audit: AuditAppend, now: float | None = None
+    ) -> bool:
         now = time.time() if now is None else now
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "UPDATE alert_instance SET status='resolved', resolved_at=?"
-                    " WHERE id=? AND status<>'resolved'",
-                    (now, alert_id),
-                )
-                changed = cur.rowcount
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        return int(changed) > 0
+        return await self._alert_write(
+            "UPDATE alert_instance SET status='resolved', resolved_at=?"
+            " OUTPUT inserted.id WHERE id=? AND status<>'resolved'",
+            (now, alert_id),
+            audit,
+            now,
+        )
 
     async def resolve_alert_instances_for(
         self, *, event_type: str, connection: str, now: float | None = None
@@ -7434,42 +7461,31 @@ class SqlServerStore:
         return int(changed)
 
     async def suspend_alert_instance(
-        self, alert_id: int, *, until: float, now: float | None = None
+        self, alert_id: int, *, until: float, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
         # #143 windowed suspend (NOTIFICATION-only): set suspended_until on a live instance. Refuses a
         # resolved one; returns the updated row (for the API echo + seeding the sink cache) or None.
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "UPDATE alert_instance SET suspended_until=? WHERE id=? AND status<>'resolved'",
-                    (until, alert_id),
-                )
-                changed = cur.rowcount
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        if int(changed) == 0:
+        if not await self._alert_write(
+            "UPDATE alert_instance SET suspended_until=? OUTPUT inserted.id"
+            " WHERE id=? AND status<>'resolved'",
+            (until, alert_id),
+            audit,
+            time.time() if now is None else now,
+        ):
             return None
         return await self.get_alert_instance(alert_id, allowed_channels=None)
 
     async def resume_alert_instance(
-        self, alert_id: int, *, now: float | None = None
+        self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
         # #143: clear a windowed suspend. Idempotent; returns the row or None (unknown/already resolved).
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "UPDATE alert_instance SET suspended_until=NULL"
-                    " WHERE id=? AND status<>'resolved'",
-                    (alert_id,),
-                )
-                changed = cur.rowcount
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        if int(changed) == 0:
+        if not await self._alert_write(
+            "UPDATE alert_instance SET suspended_until=NULL OUTPUT inserted.id"
+            " WHERE id=? AND status<>'resolved'",
+            (alert_id,),
+            audit,
+            time.time() if now is None else now,
+        ):
             return None
         return await self.get_alert_instance(alert_id, allowed_channels=None)
 
@@ -11488,7 +11504,7 @@ class SqlServerStore:
         *,
         top_only: bool = False,
         now: float | None = None,
-        audit: OperatorAudit[int] | None = None,
+        audit: OperatorAudit[int],
     ) -> int:
         now = time.time() if now is None else now
         where = ["stage=?", "destination_name=?", "status=?"]
@@ -12200,97 +12216,128 @@ class SqlServerStore:
     async def reserve_upload_quota(
         self,
         uploader_id: str,
+        reservation_id: str,
         *,
-        files: int,
         size_bytes: int,
-        max_files: int = 0,
-        max_total_bytes: int = 0,
+        max_files: int,
+        max_total_bytes: int,
         stale_after: float = UPLOAD_RESERVATION_STALE_AFTER,
     ) -> bool:
-        """Atomically reserve (or release) an uploader's in-flight upload budget — see
+        """Atomically reserve one in-flight upload slot named ``reservation_id`` — see
         :meth:`messagefoundry.store.base.Store.reserve_upload_quota` for the contract, and the SQLite
         twin for the statement shape.
 
-        MERGE with HOLDLOCK is the SQL Server upsert that is safe under the concurrent opens of an
-        engine-shard fleet (a bare IF EXISTS/INSERT races) — the same pattern
-        :meth:`add_cipher_invocations` uses. The budget predicate rides ``WHEN MATCHED AND``, so a
-        refusal matches no rows and ``OUTPUT`` returns nothing.
+        A per-uploader applock serializes the reserves of one uploader across every engine shard. Under
+        RCSI each statement reads what committed before it began, and the previous holder committed
+        before it let the applock go, so the sums read here hold its row. ``OUTPUT`` reports the
+        insert, which a session-wide ``SET NOCOUNT ON`` cannot hide (BACKLOG #2283).
 
-        "Now" is the database server's clock, ``_MSSQL_EPOCH_NOW``, read once: in the MERGE's
-        ``USING`` row, and into ``@now`` for the release (BACKLOG #3256; ``uploads.UploadQuotaError``
-        says why)."""
-        if files <= 0:
-            # RELEASE — unconditional, clamped at zero (a double release cannot mint budget).
-            await self._execute(
-                # One read of the clock, so the CASE's test and its result are the same instant.
-                f"DECLARE @now FLOAT = {_MSSQL_EPOCH_NOW};"
-                " UPDATE upload_quota SET"
-                " inflight_files = CASE WHEN inflight_files + ? < 0 THEN 0 ELSE inflight_files + ? END,"
-                " inflight_bytes = CASE WHEN inflight_bytes + ? < 0 THEN 0 ELSE inflight_bytes + ? END,"
-                # never backwards (#2648)
-                " since = CASE WHEN since > @now THEN since ELSE @now END"
-                " WHERE uploader_id = ?",
-                (
-                    int(files),
-                    int(files),
-                    int(size_bytes),
-                    int(size_bytes),
-                    uploader_id,
-                ),
-            )
-            return True
-        if files > max_files or size_bytes > max_total_bytes:
-            # Fail closed before touching the row: WHEN NOT MATCHED inserts unconditionally.
+        "Now" is the database server's clock, ``_MSSQL_EPOCH_NOW``, referenced once per statement:
+        once in the stale delete's cutoff and once in the insert's stamp (BACKLOG #3256;
+        ``uploads.UploadQuotaError`` says why)."""
+        if max_files < 1 or size_bytes > max_total_bytes:
+            # Fail closed before touching the store: a headroom that cannot hold one slot.
             return False
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        async with self._acquire() as conn:
             try:
-                await cur.execute(
-                    "MERGE upload_quota WITH (HOLDLOCK) AS t"
-                    " USING (SELECT ? AS uploader_id, ? AS files, ? AS size_bytes,"
-                    " n.now_ts AS now_ts, n.now_ts - ? AS stale_ts,"
-                    " ? AS max_files, ? AS max_total_bytes"
-                    f" FROM (SELECT {_MSSQL_EPOCH_NOW} AS now_ts) AS n) AS s"
-                    " ON t.uploader_id = s.uploader_id"
-                    " WHEN MATCHED AND"
-                    " (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_files END)"
-                    " + s.files <= s.max_files"
-                    " AND (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_bytes END)"
-                    " + s.size_bytes <= s.max_total_bytes"
-                    " THEN UPDATE SET"
-                    " t.inflight_files ="
-                    " (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_files END) + s.files,"
-                    " t.inflight_bytes ="
-                    " (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_bytes END)"
-                    " + s.size_bytes,"
-                    # Every applied reserve refreshes it, never backwards (BACKLOG #2648).
-                    " t.since = CASE WHEN t.since > s.now_ts THEN t.since ELSE s.now_ts END"
-                    " WHEN NOT MATCHED THEN"
-                    " INSERT (uploader_id, inflight_files, inflight_bytes, since)"
-                    " VALUES (s.uploader_id, s.files, s.size_bytes, s.now_ts)"
-                    " OUTPUT INSERTED.inflight_files;",
-                    (
-                        uploader_id,
-                        int(files),
-                        int(size_bytes),
-                        float(max(0.0, stale_after)),
-                        int(max_files),
-                        int(max_total_bytes),
-                    ),
-                )
-                row = await cur.fetchone()
-                await self._commit(conn)
+                async with self._cursor(conn) as cur:
+                    # This read OPENS the transaction the applock attaches to, as in record_audit:
+                    # the autocommit=False pool begins one only on a statement that touches a
+                    # table, and `@LockOwner='Transaction'` needs one open. Value discarded.
+                    await cur.execute(
+                        "SELECT TOP (1) reservation_id FROM upload_reservation WHERE uploader_id = ?",
+                        (uploader_id,),
+                    )
+                    await cur.fetchall()
+                    await self._applock(cur, _upload_quota_lock(uploader_id))
+                    await cur.execute(
+                        "DELETE FROM upload_reservation WHERE uploader_id = ?"
+                        f" AND since <= {_MSSQL_EPOCH_NOW} - ?",
+                        (uploader_id, float(max(0.0, stale_after))),
+                    )
+                    await cur.execute(
+                        "INSERT INTO upload_reservation"
+                        " (reservation_id, uploader_id, size_bytes, since)"
+                        " OUTPUT inserted.reservation_id"
+                        f" SELECT ?, ?, ?, {_MSSQL_EPOCH_NOW}"
+                        " WHERE (SELECT COUNT(*) FROM upload_reservation WHERE uploader_id = ?)"
+                        " + 1 <= ?"
+                        " AND (SELECT COALESCE(SUM(size_bytes), 0) FROM upload_reservation"
+                        " WHERE uploader_id = ?) + ? <= ?",
+                        (
+                            reservation_id,
+                            uploader_id,
+                            int(size_bytes),
+                            uploader_id,
+                            int(max_files),
+                            uploader_id,
+                            int(size_bytes),
+                            int(max_total_bytes),
+                        ),
+                    )
+                    row = await cur.fetchone()
+                    await self._commit(conn)
             except Exception:
-                await conn.rollback()
+                # The transaction may hold the applock; after the cursor closes, as cancel_queued.
+                await self._rollback_or_discard(conn)
                 raise
         return row is not None
+
+    async def release_upload_quota(self, reservation_id: str) -> None:
+        """See :meth:`messagefoundry.store.base.Store.release_upload_quota`.
+
+        **It takes the uploader's applock before it deletes, as the reserve does (vault BACKLOG
+        #3180).** A bare delete by the key locked the clustered row and then the uploader index
+        entry. The reserve's stale delete reaches the same row through the uploader index, so it
+        locks the index entry first and then the clustered row. A release racing the reserve that
+        sweeps its own stale row could therefore deadlock it. Under the applock the two cannot
+        hold row locks at once, because each holds no row lock when it asks for the applock.
+
+        For the release that rests on how the uploader is read. ``READCOMMITTEDLOCK`` waits out a
+        reserve still committing this row rather than reading past it under RCSI, and its shared
+        lock is released when the read ends, before the applock is requested. A hint that holds
+        it longer, such as ``HOLDLOCK``, would break the argument. Nothing to release commits the
+        empty transaction and returns."""
+        async with self._acquire() as conn:
+            try:
+                async with self._cursor(conn) as cur:
+                    await cur.execute(
+                        "SELECT uploader_id FROM upload_reservation WITH (READCOMMITTEDLOCK)"
+                        " WHERE reservation_id = ?",
+                        (reservation_id,),
+                    )
+                    row = await cur.fetchone()
+                    if row is not None:
+                        await self._applock(cur, _upload_quota_lock(str(row[0])))
+                        await cur.execute(
+                            "DELETE FROM upload_reservation WHERE reservation_id = ?",
+                            (reservation_id,),
+                        )
+                    await self._commit(conn)
+            except Exception:
+                # The transaction may hold the applock; after the cursor closes, as the reserve.
+                await self._rollback_or_discard(conn)
+                raise
+
+    async def touch_upload_quota(self, reservation_id: str) -> None:
+        """See :meth:`messagefoundry.store.base.Store.touch_upload_quota`. "Now" is the database
+        server's clock, read once into ``@now`` so the CASE's test and its result are the same
+        instant (BACKLOG #3256)."""
+        await self._execute(
+            f"DECLARE @now FLOAT = {_MSSQL_EPOCH_NOW};"
+            " UPDATE upload_reservation SET since = CASE WHEN since > @now THEN since ELSE @now END"
+            " WHERE reservation_id = ?",
+            (reservation_id,),
+        )
 
     async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
         """See :meth:`messagefoundry.store.base.Store.upload_quota_in_flight`."""
         row = await self._fetchone(
-            "SELECT inflight_files, inflight_bytes FROM upload_quota WHERE uploader_id = ?",
+            "SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes), 0) AS b"
+            " FROM upload_reservation WHERE uploader_id = ?",
             (uploader_id,),
         )
-        return (int(row["inflight_files"]), int(row["inflight_bytes"])) if row else (0, 0)
+        return (int(row["n"]), int(row["b"])) if row else (0, 0)
 
     async def cipher_invocations(self, key_id: str) -> int:
         """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet)."""
