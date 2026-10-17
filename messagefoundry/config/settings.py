@@ -1834,7 +1834,7 @@ class InboundSettings(_Section):
     # Default ACK timing for every inbound (staged pipeline, ADR 0001): INGEST = ACK-on-receipt
     # (the message is ACKed once durably committed to the ingress stage). A connection's own
     # ack_after= overrides this. Step A supports only INGEST; 'delivered' (defer the ACK until
-    # delivery) is not yet implemented and is rejected at engine start.
+    # delivery) is not yet implemented and is refused at load (_ack_after_is_built).
     ack_after: AckAfter = AckAfter.INGEST
 
     # Very-large-document streaming in-flight budget (#149, ADR 0105 Phase 1a) — the OPT-IN aggregate DoS
@@ -1882,6 +1882,19 @@ class InboundSettings(_Section):
     def _non_negative_depth(cls, value: int) -> int:
         if value < 0:
             raise ValueError("max_staged_depth must be >= 0 (0 = off)")
+        return value
+
+    @field_validator("ack_after")
+    @classmethod
+    def _ack_after_is_built(cls, value: AckAfter) -> AckAfter:
+        # Vault BACKLOG #3063 item 9: refused here, at load, as a connection's own
+        # ack_after='delivered' is refused at wiring. Listener start refused only the inherited
+        # value, so `messagefoundry check` said OK and serve came up with every listener isolated.
+        if value == AckAfter.DELIVERED:
+            raise ValueError(
+                "ack_after = 'delivered' (defer the ACK until delivery) is not yet implemented; "
+                "use 'ingest', the default (ACK-on-receipt)"
+            )
         return value
 
 

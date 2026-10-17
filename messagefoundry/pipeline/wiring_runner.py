@@ -35,7 +35,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import Enum, StrEnum
+from enum import Enum, StrEnum, auto
 from typing import Any, Literal, NamedTuple, Protocol, cast
 
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
@@ -2739,35 +2739,96 @@ class RegistryRunner:
             return False
         return (declared or self._priority_default).rank < threshold.rank
 
-    def listener_bind_predicate(self) -> Callable[[InboundConnection], bool]:
+    def listener_bind_predicate(
+        self, *, now: datetime | None = None
+    ) -> Callable[[InboundConnection], bool]:
         """Which inbound listeners this runner would bind, as a predicate over a snapshot of what is
         listening now (vault BACKLOG #2622 item 1). :meth:`build_check` and an engine's flag toggle
         run the inbound exposure gates only where it holds, so neither refuses a config for a
         listener the engine leaves unbound.
 
-        It holds for a listener that is deployed; that has ``auto_start``, or is listening now (a
-        reload keeps an operator's start); and that the DR run-profile does not park. These are the
-        skips of :meth:`start` and of :meth:`reload`'s inbound loop, without their side effects.
-        Reload also skips a listener outside its schedule window, but the scheduler binds that one
-        when the window opens, so it is gated here. A fresh runner has nothing listening, so this
-        is exactly :meth:`start`'s test there. On a passive DR standby it holds for the listeners
-        an activation would bind, though none is bound yet, so a config that activation would
-        refuse is refused before the disaster rather than during it (vault BACKLOG #3140).
+        It reads :meth:`_listener_skip`, the one copy of the skips :meth:`start` and
+        :meth:`reload` apply, without their side effects (vault BACKLOG #3063 item 12). It holds for
+        a listener that is deployed; that has ``auto_start``, or is listening now (a reload keeps an
+        operator's start); and that the DR run-profile does not park. Reload also skips a listener
+        outside its schedule window. The scheduler binds an ``auto_start`` one when the window
+        opens, so that one is gated here. It never starts an ``auto_start = false`` one, so an
+        operator-started one outside its window is not gated: neither the reload nor the
+        scheduler binds it again (item 13). At least an operator start and an alert rule's
+        restart can, and each runs the gates on the listener as it binds it. A fresh runner has nothing listening, so this is exactly
+        :meth:`start`'s test there. On a passive DR standby it holds for the listeners an
+        activation would bind, though none is bound yet, so a config that activation would refuse
+        is refused before the disaster rather than during it (vault BACKLOG #3140).
 
         The listening set is snapshotted now, on the caller's thread, so the predicate can run on a
-        worker thread (the flag toggle validates off the event loop). The DR threshold and default
-        tier are read through ``self`` when it runs. The tier is set only at construction; the
-        threshold is set there and by :meth:`set_dr_threshold`."""
+        worker thread (the flag toggle validates off the event loop). The DR threshold, default
+        tier and schedule clock are read through ``self`` when it runs. The tier is set only at
+        construction; the threshold is set there and by :meth:`set_dr_threshold`. ``now`` pins
+        the schedule clock instead: :meth:`reload` passes the time its listener loop also reads,
+        so a window that opens during the quiesce cannot make the two disagree.
+
+        **At least two callers take the snapshot outside the reload lock, and that window is accepted**
+        (vault BACKLOG #3063 item 5): a dry-run reload, through :meth:`build_check`, and an
+        engine's flag toggle. The lock is an ``asyncio.Lock``, which the worker thread cannot take,
+        and holding it on the loop across the toggle's file write would stall every reload behind
+        it. A snapshot taken during a reload's quiesce can miss a listener an operator started, so
+        the dry run or toggle passes a config the reload then refuses. Or it can keep one an
+        operator has just stopped, so it refuses one the reload would pass. Neither path binds
+        anything: a dry run applies nothing, and a toggle writes only the cosmetic ``flagged``
+        field. A reload takes its own snapshot under the lock and runs the gates on it, and a
+        start runs them on the listener itself, so the window never admits a bind."""
         listening = frozenset(self._sources)
 
         def binds(ic: InboundConnection) -> bool:
-            if not ic.deployed:
-                return False
-            if not ic.auto_start and ic.name not in listening:
-                return False
-            return not self._below_dr_threshold(ic.priority)
+            skip = self._listener_skip(ic, listening, binding_now=False, now=now)
+            if skip is _ListenerSkip.OUT_OF_WINDOW:
+                # Bound at the window open by the scheduler, whose start test is auto_start
+                # (_reconcile_schedule). Read here from the candidate graph, not the live one.
+                return ic.auto_start
+            return skip is None
 
         return binds
+
+    def _listener_skip(
+        self,
+        ic: InboundConnection,
+        listening: Collection[str],
+        *,
+        binding_now: bool,
+        now: datetime | None = None,
+    ) -> _ListenerSkip | None:
+        """Why ``ic``'s listener is left unbound, or ``None`` when it is bound. The first that
+        applies, in the order :meth:`start` and :meth:`reload` apply them. The one copy of those
+        skips, which :meth:`listener_bind_predicate` and :meth:`_reload_anchor_candidates` read
+        too, so start, reload and the build check's gates cannot drift apart (vault BACKLOG #3063
+        item 12). The scheduler's own start test is not here; the predicate names it.
+
+        ``listening`` names the listeners bound before: a reload keeps an operator's start of an
+        ``auto_start = false`` listener. :meth:`start` passes none.
+
+        ``binding_now`` picks the DR test. ``True`` is a bind about to happen:
+        :meth:`_dr_filters_out`, which records the ``filtered`` marker and parks every inbound on
+        a passive standby. ``False`` asks what the graph binds once the box is active:
+        :meth:`_below_dr_threshold`, with no marker.
+
+        The schedule window is tested last, at ``now`` when given, else at the schedule clock.
+        :meth:`start` does not act on it: it binds such a listener, and the scheduler's first
+        tick parks it."""
+        if not ic.deployed:
+            return _ListenerSkip.NOT_DEPLOYED
+        if not inbound_listener_starts(ic) and ic.name not in listening:
+            return _ListenerSkip.NOT_STARTED
+        if (
+            self._dr_filters_out(ic.name, ic.priority, kind="inbound")
+            if binding_now
+            else self._below_dr_threshold(ic.priority)
+        ):
+            return _ListenerSkip.DR_PARKED
+        if ic.schedule is not None and not ic.schedule.is_active(
+            self._schedule_clock() if now is None else now
+        ):
+            return _ListenerSkip.OUT_OF_WINDOW
+        return None
 
     @property
     def dr_threshold(self) -> Priority | None:
@@ -3809,10 +3870,7 @@ class RegistryRunner:
             if (
                 ic.spec.type is not ConnectorType.REMOTEFILE
                 or not ic.spec.settings.get("tls_ca_file")
-                or not ic.deployed
-                or (not ic.auto_start and ic.name not in old_inbound_names)
-                or self._below_dr_threshold(ic.priority)
-                or (ic.schedule is not None and not ic.schedule.is_active(self._schedule_clock()))
+                or self._listener_skip(ic, old_inbound_names, binding_now=False) is not None
                 or self._keeps_anchor_failure("inbound", ic.name, old, ic, bound=old_inbound_names)
             ):
                 continue
@@ -4344,8 +4402,9 @@ class RegistryRunner:
         ic = self.registry.inbound[name]
         # Resolve + guard the ACK-timing setting (per-connection override > global default). Step A
         # only ships ACK-on-receipt; reject a resolved 'delivered' loud at start/reload rather than
-        # silently downgrade (covers a global [inbound] ack_after='delivered' inherited by a
-        # connection — the per-connection case is already rejected in inbound()). Compare by VALUE,
+        # silently downgrade (covers a global ack_after_default='delivered' inherited by a
+        # connection — the per-connection case is already rejected in inbound(), and the
+        # [inbound].ack_after setting at load, so this is an embedding caller's). Compare by VALUE,
         # not identity: AckAfter is a str-Enum, so a stray raw-string 'delivered' must still be caught.
         if (ic.ack_after or self._ack_after_default) == AckAfter.DELIVERED:
             raise WiringError(
@@ -5182,15 +5241,18 @@ class RegistryRunner:
                     # when auto_start is True — every normal connection. Both flags are read through
                     # inbound_listener_starts, the predicate the offline build check uses to pick the
                     # listeners it runs the exposure gates on (vault BACKLOG #2622 item 1).
-                    if not inbound_listener_starts(ic):
-                        continue
                     # DR run-profile (#61, ADR 0048): a below-threshold inbound LISTENER is NOT bound
                     # (no source.start) — but its router + transform workers are still spawned below, so
                     # any crash-recovered ingress/routed backlog carried in the (cold-restored) store
                     # still drains. The listener simply isn't accepting NEW work — the operator intent of
                     # a DR box running only its critical feeds. status:"filtered" (not "failed")
                     # distinguishes it from an ADR-0031 bind failure.
-                    if self._dr_filters_out(ic.name, ic.priority, kind="inbound"):
+                    # All of these are _listener_skip, which reload and the build check's predicate
+                    # read too (vault BACKLOG #3063 item 12). Nothing was listening before a start.
+                    # Start binds a listener outside its schedule window; the scheduler's first tick
+                    # parks it.
+                    skip = self._listener_skip(ic, (), binding_now=True)
+                    if skip is not None and skip is not _ListenerSkip.OUT_OF_WINDOW:
                         continue
                     self._filtered.pop(
                         ("inbound", ic.name), None
@@ -6335,7 +6397,13 @@ class RegistryRunner:
             # (In per_lane the equivalent check sits inside the worker loop's own except:backoff.)
             log.exception("pooled buildup check failed for stage %s lane %s", stage, lane)
 
-    def build_check(self, registry: Registry, env_values: Mapping[str, Any] | None = None) -> None:
+    def build_check(
+        self,
+        registry: Registry,
+        env_values: Mapping[str, Any] | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> None:
         """Construct (and discard) every connector in ``registry`` so a bad connector spec fails
         BEFORE a reload quiesces anything — i.e. the running graph is left untouched. Construction
         is side-effect-free (no socket bind / file I/O — binding happens later in ``start_inbound``).
@@ -6351,7 +6419,10 @@ class RegistryRunner:
         ``Reference(...)`` on a backend with no snapshot store (SQL Server).
 
         ``env_values`` defaults to the runner's own. A dry run passes the values it re-read, so it
-        checks them without making them the live graph's (vault BACKLOG #2596)."""
+        checks them without making them the live graph's (vault BACKLOG #2596).
+
+        ``now`` pins the schedule clock the exposure gates' predicate reads
+        (:meth:`listener_bind_predicate`); ``None`` reads the clock."""
         build_check_registry(
             registry,
             inbound_bind_host=self._inbound_bind_host,
@@ -6362,8 +6433,9 @@ class RegistryRunner:
             trust_anchor_policy=self._trust_anchor_policy,
             allow_insecure_bind=self._allow_insecure_bind,
             # The exposure gates run on the listeners this runner would bind, read against its live
-            # state. A listener left unbound meets the same gates when something starts it.
-            exposure_gated=self.listener_bind_predicate(),
+            # state. A reload calls this under its lock; a dry run does not, and
+            # listener_bind_predicate says why that window is accepted (vault BACKLOG #3063 item 5).
+            exposure_gated=self.listener_bind_predicate(now=now),
         )
         # PT-backend allow-list — folded in here (vs only at Engine.start) so EVERY reload + dry-run
         # path that build-checks the new registry also rejects a PT-on-non-SQLite graph before any
@@ -6896,8 +6968,13 @@ class RegistryRunner:
             old_env_values = self._env_values
             if env_values is not None:
                 self._env_values = dict(env_values)
+            # One schedule time for the build check's gates and the listener loop below, so a
+            # window that opens during the quiesce cannot leave a listener the gates skipped to a
+            # bind that refuses after intake has stopped (vault BACKLOG #3063 item 13).
+            now = self._schedule_clock()
             try:
-                self.build_check(new_registry)  # raises before any change on a bad connector
+                # raises before any change on a bad connector
+                self.build_check(new_registry, now=now)
             except BaseException:
                 self._env_values = old_env_values
                 raise
@@ -7019,14 +7096,17 @@ class RegistryRunner:
                 # process. No-op unless mode=subprocess actually spawned any.
                 await self._close_sandbox_sessions()
                 for ic in new_registry.inbound.values():
+                    # The skips are _listener_skip, in its order, which listener_bind_predicate reads
+                    # too, so the build check gates exactly what this loop binds (vault BACKLOG #3063
+                    # item 12). What each one means here:
+                    #
                     # Present but NOT DEPLOYED (#233, ADR 0111) — checked FIRST, so deployed=False WINS
-                    # over auto_start. Unconditional (unlike the auto_start gate below, which honors an
+                    # over auto_start. Unconditional (unlike the auto_start test after it, which honors an
                     # operator start): `deployed` is a config fact, not a runtime one, so a reload that
                     # declares the inbound not-deployed leaves it UNBOUND even if an operator had it
                     # listening a moment ago — step 1 above already quiesced every source. Its router +
                     # transform workers are still re-armed below, so an in-flight backlog drains (AC-3).
-                    if not ic.deployed:
-                        continue
+                    #
                     # Per-connection auto-start (#115): a reload must not BIND a start-disabled listener
                     # (it had no gate here at all, so every reload/GUI edit silently undid auto_start=False
                     # and the feed came up). The test is "was it LISTENING before this reload?", not "is it
@@ -7035,7 +7115,8 @@ class RegistryRunner:
                     # listener an operator started at runtime bound across a reload (a reload never undoes
                     # an operator action) while a never-started one stays down. Its router/transform
                     # workers are still re-armed below, so any backlog drains (the AC-3 rule).
-                    if not ic.auto_start and ic.name not in old_inbound_names:
+                    skip = self._listener_skip(ic, old_inbound_names, binding_now=True, now=now)
+                    if skip is _ListenerSkip.NOT_DEPLOYED or skip is _ListenerSkip.NOT_STARTED:
                         continue
                     # DR run-profile (#61, ADR 0048): a reload re-evaluates the whole graph against the
                     # threshold (the profile is a per-run decision read at start/reload), so a
@@ -7043,7 +7124,7 @@ class RegistryRunner:
                     # workers below still drain any backlog. No DR profile → byte-identical to before.
                     # A failed record goes with it, as the schedule branch below drops one: with no
                     # bind here to clear it, it would hold the status at failed while parked.
-                    if self._dr_filters_out(ic.name, ic.priority, kind="inbound"):
+                    if skip is _ListenerSkip.DR_PARKED:
                         self._failed.pop(("inbound", ic.name), None)
                         continue
                     self._filtered.pop(("inbound", ic.name), None)
@@ -7055,9 +7136,7 @@ class RegistryRunner:
                     # open left is dropped: the reload is the recovery its alert names, and with no
                     # bind here to clear it, it would hold the status at failed until the next open.
                     # That open re-records and re-alerts if the cause is still there.
-                    if ic.schedule is not None and not ic.schedule.is_active(
-                        self._schedule_clock()
-                    ):
+                    if skip is _ListenerSkip.OUT_OF_WINDOW:
                         self._failed.pop(("inbound", ic.name), None)
                         continue
                     # vault BACKLOG #2371: an Ftp poller its CA failed stays down, as an outbound does.
@@ -10915,8 +10994,11 @@ def build_check_registry(
     ``exposure_gated`` picks the inbound listeners those four gates run on. ``None`` means
     :func:`inbound_listener_starts`, the deployed-and-auto-start test engine start applies, which is
     all an offline caller (``check``, ``connection``) can know. A live runner, and an engine's flag
-    toggle, pass :meth:`RegistryRunner.listener_bind_predicate`. A listener the gates skip is still
-    refused when it is started: an operator start runs the same gates."""
+    toggle, pass :meth:`RegistryRunner.listener_bind_predicate`. A listener the gates skip meets
+    them when it would be bound. An operator start of an ``auto_start = false`` listener runs the
+    same gates. A ``deployed = false`` listener cannot be started (the start raises
+    :class:`NotDeployedError`); the reload that deploys it meets the gates if the engine would then
+    bind it, and otherwise its first start does (vault BACKLOG #3063 item 10)."""
     # Port-conflict pre-flight (env-resolved + reserved-port aware): a listener stealing a sibling's or
     # the API's (host, port) fails the whole reload here, before quiescing, naming both ends — rather
     # than half-applying and surfacing as a bare bind OSError. PortConflictError is a WiringError → 422.
@@ -11382,15 +11464,31 @@ def inbound_listener_starts(ic: InboundConnection) -> bool:
     return ic.deployed and ic.auto_start
 
 
+class _ListenerSkip(Enum):
+    """Why start or reload leaves an inbound listener unbound (:meth:`RegistryRunner._listener_skip`),
+    in the order they test it."""
+
+    NOT_DEPLOYED = auto()
+    NOT_STARTED = auto()  # auto_start = false, and not listening before
+    DR_PARKED = auto()
+    OUT_OF_WINDOW = auto()  # outside its schedule window
+
+
 def _build_check_exposure_tail(name: str) -> str:
     """What the build check adds to an inbound exposure refusal (vault BACKLOG #2622 item 1). Start
     isolates the one listener and brings the rest up (ADR 0031); the build check refuses the whole
-    config, so a reload, promote, connection edit or DR activation stops on this one listener."""
+    config, so a reload, promote, connection edit or DR activation stops on this one listener.
+
+    It follows the gate's own text, which names ``serve --allow-insecure-bind``; ``check`` and
+    ``connection`` key their note on that flag. What each setting does when the listener is
+    started is the meaning ``docs/SECURITY.md`` Table B gives (vault BACKLOG #3063 item 10)."""
     return (
         f"The build check refuses the whole config while {name!r} would be bound; engine start "
         "would isolate only that listener. To leave it unbound instead, set deployed = false on it, "
-        "or set auto_start = false and stop it if it is running; a later start meets the same "
-        "refusal."
+        "or set auto_start = false and stop it if it is running. An operator start of an "
+        "auto_start = false listener meets the same refusal. A deployed = false listener cannot be "
+        "started; the reload that deploys it meets the refusal if the engine would then bind it, "
+        "and otherwise its first start does."
     )
 
 
