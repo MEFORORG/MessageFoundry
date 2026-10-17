@@ -51,8 +51,11 @@ MIN_SALT_ENTROPY_BITS = 32.0
 #: 2.0 bits per character means an effective alphabet of four symbols. Measured against the shapes
 #: that matter: ``"ab"`` repeated scores 1.00 and is refused at any length; ``"abc"`` repeated scores
 #: about 1.58 and is refused; a random DECIMAL salt -- the narrowest alphabet a real generator would
-#: produce -- scores about 3.32, and random hex about 3.9, so neither is touched. A single repeated
-#: character scores 0.00 and was already refused by the total.
+#: produce -- scores about 3.32 on average, and random hex about 3.9. A single repeated character
+#: scores 0.00 and was already refused by the total. ON AVERAGE is the qualifier: at 16 characters
+#: this floor is the same inequality as the total (2.0 x 16 = 32), and from 17 it is the BINDING
+#: floor for an unlucky random decimal draw, though the total, checked first, still raises for some.
+#: The rates are in ``_estimated_entropy_bits``.
 MIN_SALT_ENTROPY_BITS_PER_CHAR = 2.0
 
 #: **WHY 32 BITS AND NOT THE 128 THE ADR NAMES.** ADR 0030 section 4 requires ``dataset_key`` to be
@@ -69,6 +72,17 @@ MIN_SALT_ENTROPY_BITS_PER_CHAR = 2.0
 #: visibly degenerate salt, sitting underneath the ADR requirement rather than implementing it. The
 #: control that actually delivers 128 bits is generating the salt with the tool the error message
 #: names, and that stays where the ADR puts it.
+
+#: The advice both entropy refusals carry, held once so the two cannot drift apart. It names the
+#: generator and nothing else on purpose: a salt drawn at random from a narrow alphabet, such as
+#: decimal digits, can be refused, and the remedy is ``secrets.token_urlsafe(24)``, not another draw
+#: from the same alphabet. Sixteen random digits carry about 53 bits, under ADR 0030's 128.
+_GENERATE_ADVICE = (
+    "Generate one with secrets.token_urlsafe(24) and supply it from the environment. A random salt "
+    "from a narrow alphabet, such as decimal digits, can be refused; replace it with one from "
+    "secrets.token_urlsafe(24), not another draw from the same alphabet. The salt itself is "
+    "withheld from this message on purpose."
+)
 
 #: Ceiling on the salt's UTF-8 length in BYTES, set by BLAKE2b's keyed mode
 #: (``hashlib.blake2b.MAX_KEY_SIZE``, 64). Checked here at construction rather than left to
@@ -107,7 +121,28 @@ def _estimated_entropy_bits(salt: str) -> float:
     carries only about 53 bits of real entropy to begin with. The zeros are trustworthy because the
     same run returned NON-ZERO at higher floors (at 40 bits the same four alphabets rejected 0, 2,
     306 and 11,066 of 200,000), so the instrument can fire. A 40-bit floor would refuse better than
-    5 percent of genuinely random 16-digit salts, which is refusing real secrets; 32 bits does not.
+    5 percent of genuinely random 16-digit salts, which is refusing real secrets.
+
+    32 BITS STILL REFUSES A SMALL SHARE OF REAL RANDOM SALTS, AND THAT IS ACCEPTED. This is the
+    source of record for the rate; docs/PHI.md section 9 and the tests point here. BACKLOG #3359
+    took the accepted path rather than lowering the floor, which would weaken the screen. Whether a
+    different estimator could refuse fewer random salts without passing more degenerate ones is a
+    separate question nobody has measured. A draw that happens to repeat characters scores low.
+    Computed EXACTLY, by enumerating every multiset of character counts against both floors, a
+    uniform random salt is refused with probability:
+
+    * 16 decimal digits: 2.76e-4, about 1 in 3,600. 17 digits: 1.50e-4. 20 digits: 1.38e-5.
+      From 17 digits the per-character floor is the binding one, though the total, checked
+      first, still raises for about a fifth of the 17-digit refusals.
+    * 16 lowercase hex characters (``secrets.token_hex(8)``): 2.51e-6, about 1 in 400,000. The
+      sampled count of 1 above was too few to give the rate.
+    * 32 URL-safe characters, the shape ``secrets.token_urlsafe(24)`` emits: 3.96e-29.
+
+    The stated bound is UNDER 1 IN 1,000 for random decimal salts of 16 characters or more, since
+    the rate only falls with length. ``tests/test_anon_core.py`` pins the decimal and hex rates
+    above by the same enumeration, run through ``Keyer`` itself, and holds the bound and the
+    32-character URL-safe shape with seeded sweeps. An operator refused with a real random salt
+    replaces it with one from ``secrets.token_urlsafe(24)``.
     """
     if not salt:
         return 0.0
@@ -148,11 +183,9 @@ class Keyer:
         if entropy < MIN_SALT_ENTROPY_BITS:
             raise ValueError(
                 f"anonymizer salt is too predictable: about {entropy:.1f} bits of estimated "
-                f"entropy against a floor of {MIN_SALT_ENTROPY_BITS:.0f}. Generate one with "
-                "secrets.token_urlsafe(24) and supply it from the environment. The salt itself is "
-                "withheld from this message on purpose. Note this floor is a SCREEN, not the ADR "
-                "0030 section 4 requirement: that one is 128 bits at generation, which no check on "
-                "a supplied string can confirm."
+                f"entropy against a floor of {MIN_SALT_ENTROPY_BITS:.0f}. {_GENERATE_ADVICE} "
+                "Note this floor is a SCREEN, not the ADR 0030 section 4 requirement: that one is "
+                "128 bits at generation, which no check on a supplied string can confirm."
             )
         # Checked SEPARATELY from the total, because the total is length-scaled and length would
         # otherwise rescue a degenerate pattern -- "ab" repeated sixteen times reaches the 32-bit
@@ -163,8 +196,7 @@ class Keyer:
                 f"anonymizer salt repeats too few distinct characters: about {per_char:.2f} bits "
                 f"per character against a floor of {MIN_SALT_ENTROPY_BITS_PER_CHAR:.1f}. Making it "
                 "longer will NOT help -- a repeating pattern carries the same rate at any length. "
-                "Generate one with secrets.token_urlsafe(24) and supply it from the environment. "
-                "The salt itself is withheld from this message on purpose."
+                f"{_GENERATE_ADVICE}"
             )
         # Hold the salt as bytes only; it is PHI-equivalent (a re-identification key) and must
         # never be logged, persisted, or surfaced — so we keep no other reference to it.
