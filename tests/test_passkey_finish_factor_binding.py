@@ -14,8 +14,9 @@ factor. A local sign-in that owes nothing mints stamped, so it does not reach th
 data is synthetic.
 
 BACKLOG #3061 added a second ask on both enrolment legs, after the directory lookup each awaits.
-The tests at the end pin its TOTP mirror on ``confirm_mfa_enrollment``, whose first ask is its
-route's gate.
+The test at the end pins its TOTP mirror on ``confirm_mfa_enrollment``, whose first ask is its
+route's gate; the mirror's tests that need no passkey are in
+``tests/test_enrolment_directory_recheck.py``.
 """
 
 from __future__ import annotations
@@ -316,37 +317,5 @@ async def test_a_passkey_bound_during_the_directory_lookup_stops_the_totp_confir
     rows = await store.list_audit(action="auth.mfa_denied")
     assert {"path": "confirm_mfa_enrollment"} in [json.loads(r["detail"]) for r in rows]
     # No step was spent: the code's step is still unconsumed.
-    step = totp.verify_totp_step(secret, code, now=t0)
-    assert step is not None and await store.consume_totp_step(identity.user_id, step)
-
-
-async def test_a_session_revoked_between_the_two_totp_asks_is_lost_not_owing_a_factor(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The TOTP confirm's second ask carries the same session guard as the passkey finish's. RED
-    when: a session revoked after the route's gate asked is told the account "already has a second
-    factor" (it holds none) and an ``auth.mfa_denied`` row is written for it; or when the confirm
-    spends the step before it finds the session gone. A LOCAL account, for the reason the passkey
-    test above gives."""
-    t0 = time.time()
-    pin_totp_clock(monkeypatch, t0)
-    service = await _service(store, require_mfa=False)
-    identity, token, _password = await login_admin(service)
-    secret = (await service.begin_mfa_enrollment(identity)).secret
-    code = totp.totp(secret, now=t0)
-    real_floor = service._enrolment_too_early
-
-    async def _floor_while_revoked(*args: object, **kwargs: object) -> bool:
-        await store.revoke_session(hash_token(token))
-        return await real_floor(*args, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(service, "_enrolment_too_early", _floor_while_revoked)
-
-    lost = await service.confirm_mfa_enrollment(identity, code, token=token)
-
-    assert lost.session_lost is True and lost.ok is False and lost.recovery_codes == ()
-    assert await store.list_audit(action="auth.mfa_denied") == []
-    user = await store.get_user(identity.user_id)
-    assert user is not None and not user.totp_enabled
     step = totp.verify_totp_step(secret, code, now=t0)
     assert step is not None and await store.consume_totp_step(identity.user_id, step)

@@ -361,6 +361,74 @@ async def test_a_second_step_locked_directory_account_cannot_register_a_passkey(
     assert {"reason": "locked"} in await _audited(store, "auth.webauthn_failed")
 
 
+async def test_a_session_revoked_between_the_two_totp_asks_is_lost_not_owing_a_factor(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3061: the confirm's second factor-binding ask carries the passkey finish's session
+    guard. RED when: a session revoked after the route's gate asked is told the account "already
+    has a second factor" (it holds none) and an ``auth.mfa_denied`` row is written for it; or when
+    the confirm spends the step before it finds the session gone. A LOCAL account, because a
+    directory account's lookup re-reads the session and answers it lost first."""
+    service = AuthService(store, _settings())
+    identity, token, _password = await login_admin(service)
+    pin_totp_clock(monkeypatch, _T0)
+    secret = (await service.begin_mfa_enrollment(identity)).secret
+    code = totp.totp(secret, now=_T0)
+    real_floor = service._enrolment_too_early
+
+    async def _floor_while_revoked(*args: object, **kwargs: object) -> bool:
+        await store.revoke_session(hash_token(token))
+        return await real_floor(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(service, "_enrolment_too_early", _floor_while_revoked)
+
+    lost = await service.confirm_mfa_enrollment(identity, code, token=token)
+
+    assert lost.session_lost is True and lost.ok is False and lost.recovery_codes == ()
+    assert await store.list_audit(action="auth.mfa_denied") == []
+    user = await store.get_user(identity.user_id)
+    assert user is not None and not user.totp_enabled
+    step = totp.verify_totp_step(secret, code, now=_T0)
+    assert step is not None and await store.consume_totp_step(identity.user_id, step)
+
+
+async def test_a_totp_enabled_by_another_confirm_is_still_a_lost_session_not_a_factor_refusal(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2224 stands under #3061's second ask: a TOTP that another session's confirm enabled
+    during this one ends this confirm through the enable's compare-and-set, as SECURITY.md
+    documents (401 lost session, ``auth.mfa_enroll_refused`` with ``reason=already_enabled``). RED
+    when: the second ask refuses it as "already has a second factor" instead, which tells the user
+    to enrol an authenticator app the account already has on."""
+    t = await _totp_staged(await _directory_sign_in(store), monkeypatch)
+    s = t.signed
+    real_probe = s.service._probe_principal
+
+    async def _probe_while_another_confirm_enables(user: UserRecord) -> reconcile.Probe:
+        # Restored first: the confirm below runs its own lookup through the same seam.
+        monkeypatch.setattr(s.service, "_probe_principal", real_probe)
+        other = await s.service._complete_ad_login(_PRINCIPAL, None, mfa_verified=False)
+        assert other.token is not None and other.identity is not None
+        staged = await s.service.begin_mfa_enrollment(other.identity)
+        # An EARLIER step: steps are single-use per account, so a later one would leave this
+        # confirm's code refused as spent before it reached the enable this test is about.
+        earlier = _T0 - totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, earlier)
+        code = totp.totp(staged.secret, now=earlier)
+        assert (await s.service.confirm_mfa_enrollment(other.identity, code, token=other.token)).ok
+        pin_totp_clock(monkeypatch, _T0)
+        return await real_probe(user)
+
+    monkeypatch.setattr(s.service, "_probe_principal", _probe_while_another_confirm_enables)
+
+    lost = await s.service.confirm_mfa_enrollment(s.identity, t.code, token=s.token)
+
+    assert lost.session_lost is True and lost.ok is False and lost.recovery_codes == ()
+    assert await store.list_audit(action="auth.mfa_denied") == []
+    refused = await _audited(store, "auth.mfa_enroll_refused")
+    assert {"reason": "already_enabled", "session_ended": True} in refused
+
+
 async def test_a_local_account_is_never_probed_on_totp_enrolment(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

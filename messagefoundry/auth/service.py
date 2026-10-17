@@ -9703,7 +9703,9 @@ class AuthService:
     #: A new action on either reauth-only action gate belongs here too. A test in
     #: ``tests/test_mfa_access_gate.py`` catches at least a missing one wired in the engine or
     #: console packages. The action-less ``require_ui_reauth_only`` gate never consults it, so
-    #: ``finish_webauthn_registration`` asks it for ``webauthn_enroll`` itself (BACKLOG #3014).
+    #: ``finish_webauthn_registration`` asks it for ``webauthn_enroll`` itself (BACKLOG #3014), and
+    #: both enrolment legs, that one and ``confirm_mfa_enrollment`` (``mfa_confirm``), ask it again
+    #: after their directory lookup (BACKLOG #3061).
     _PENDING_REFUSED_ACTIONS = frozenset(
         {
             STEP_UP_ACTION_MFA_ENROLL,
@@ -10664,10 +10666,12 @@ class AuthService:
 
         **The factor-binding rule is asked again after the lookup** (BACKLOG #3061), as
         :meth:`finish_webauthn_registration` asks it. A pending session on an account that gained a
-        factor since the route's gate asked, for example a passkey bound on another session during
-        the lookup, raises :class:`ValueError` (audited ``auth.mfa_denied``) before the code is
-        checked, so no step is spent, no recovery codes are minted and MFA stays off. A session
-        revoked before that ask returns ``session_lost``."""
+        passkey since the route's gate asked, for example one bound on another session during the
+        lookup, raises :class:`ValueError` (audited ``auth.mfa_denied``) before the code is checked,
+        so no step is spent, no recovery codes are minted and MFA stays off. A TOTP enabled by
+        another confirm meanwhile is not refused here: the enable's compare-and-set ends this
+        session, as above. A session revoked before that ask returns ``session_lost``. Read-then-
+        act: a passkey bound after the ask, while the recovery codes are hashed, is not caught."""
         arrived_at = time.time()  # the floor's clock, read before any await
         # The TOTP clock at arrival: the directory lookup below can cross a step boundary, so the
         # code is judged as of now, as verify_mfa judges it (BACKLOG #1943, #3061).
@@ -10700,12 +10704,18 @@ class AuthService:
         user = current
         # The #3014 factor-binding rule, asked again after the awaits above (BACKLOG #3061; see the
         # docstring). Mirrors finish_webauthn_registration's second ask, session guard first for the
-        # reason given there; read-then-act as there.
+        # reason given there; read-then-act as there. Only a PASSKEY is refused here. A TOTP that
+        # another confirm enabled meanwhile, or an account gone, is left to the enable's
+        # compare-and-set below, which ends this session as #2224 documents.
         if await self._load_session(hash_token(token)) is None:
             return Elevation(session_lost=True)
         if await self._factor_binding_is_blocked(token, STEP_UP_ACTION_MFA_CONFIRM):
-            await self.audit_mfa_denied(identity, "confirm_mfa_enrollment", client=client)
-            raise ValueError(self._TOTP_FACTOR_PRESENT)
+            fresh = await self._load_user(identity.user_id)
+            if fresh is not None and (
+                fresh.has_passkeys or await self._store.has_webauthn_credentials(fresh.id)
+            ):
+                await self.audit_mfa_denied(identity, "confirm_mfa_enrollment", client=client)
+                raise ValueError(self._TOTP_FACTOR_PRESENT)
         # Verify the enrollment proof under the SAME configured clock-skew window as a login (BACKLOG
         # #187): default 0 = strict current-step only. Enrolling under the same window a login uses
         # avoids the trap of a skewed-clock authenticator that confirms enrollment yet then fails every
@@ -11668,10 +11678,10 @@ class AuthService:
         "this account already has a second factor; verify it first, then start adding the passkey "
         "again from the account page"
     )
-    #: The same refusal on a TOTP confirm, when a factor was bound during its directory lookup
-    #: (BACKLOG #3061). The staged secret is kept, so it points at the confirm, not a new begin.
+    #: The same refusal on a TOTP confirm, when a passkey was bound after the route's gate asked
+    #: (BACKLOG #3061). The account page offers only a new enrolment, which stages a new secret.
     _TOTP_FACTOR_PRESENT = (
-        "this account already has a second factor; verify it first, then confirm the "
+        "this account already has a second factor (a passkey); verify it first, then enrol the "
         "authenticator app again from the account page"
     )
 

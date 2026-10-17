@@ -135,10 +135,11 @@ async def _login(c: httpx.AsyncClient, username: str) -> str:
     return str(r.json()["token"])
 
 
-async def _add_passkey(service: AuthService, username: str) -> None:
-    """Give ``username`` one stored passkey and no TOTP secret, so a passkey is its only factor."""
+async def _add_passkey(service: AuthService, username: str, *, beside_totp: bool = False) -> None:
+    """Give ``username`` one stored passkey. Without ``beside_totp`` the account must hold no TOTP,
+    so the passkey is its only factor."""
     user = await service.store.get_user_by_username(username)
-    assert user is not None and not user.totp_enabled
+    assert user is not None and user.totp_enabled is beside_totp
     await service.store.add_webauthn_credential(
         WebAuthnCredential(
             credential_id_hash=f"{username}-passkey-hash",
@@ -1135,14 +1136,16 @@ async def test_the_status_and_last_factor_guards_skip_the_directory_floor_the_ga
     await _add_passkey(service, "adadmin")
     with pytest.raises(ValueError, match="enroll another factor first"):
         await service.delete_webauthn_credential(admin, "adadmin-passkey-hash")
-    # Drop the passkey, then enrol TOTP, so TOTP is the last factor; disabling it must refuse. The
-    # passkey goes through the store because the guard above refuses it, and it goes BEFORE the
-    # enrolment because confirm_mfa_enrollment refuses a pending session on an account that already
-    # holds a factor (BACKLOG #3061), as the confirm route's gate does.
+    # Enrol TOTP, then drop the passkey, so TOTP is the last factor; disabling it must refuse. The
+    # passkey is set aside through the store first because confirm_mfa_enrollment refuses a pending
+    # session on an account that holds a passkey (BACKLOG #3061), as the confirm route's gate does,
+    # and put back once TOTP is on, so the service's delete is still exercised beside TOTP.
     admin_row = await service.store.get_user_by_username("adadmin")
     assert admin_row is not None
     assert await service.store.delete_webauthn_credential(admin_row.id, "adadmin-passkey-hash")
     await enrol_totp(admin, admin_login.token)
+    await _add_passkey(service, "adadmin", beside_totp=True)
+    assert await service.delete_webauthn_credential(admin, "adadmin-passkey-hash") is True
     with pytest.raises(ValueError, match="enroll another factor first"):
         await service.disable_mfa(admin)
 
