@@ -180,6 +180,9 @@ _FACTOR_CEREMONIES: Final = frozenset(
     {"mfa_enroll_confirm", "mfa_verify", "webauthn_enroll", "webauthn_assert"}
 )
 
+#: What ``AuthService._apply_reconcile_revocation`` did with one planned revocation (BACKLOG #3085).
+_RevocationApplied = Literal["skipped", "quiet", "reported"]
+
 
 @cache
 def _audit_write_errors() -> tuple[type[Exception], ...]:
@@ -6520,6 +6523,7 @@ class AuthService:
                 plan.asked,
             )
         applied: list[reconcile.SessionRevocation] = []
+        reported: list[reconcile.SessionRevocation] = []
         for revocation in plan.revocations:
             if (
                 self._reconcile_outcomes.get(revocation.user_id)
@@ -6535,8 +6539,11 @@ class AuthService:
             if revocation.user_id in self._reconcile_referred:
                 # The same, for the referral (BACKLOG #2538; `_forfeit_clears_on_attrition`).
                 self._advance_referral_standing("forfeit")
-            if await self._apply_reconcile_revocation(revocation):
+            outcome = await self._apply_reconcile_revocation(revocation)
+            if outcome != "skipped":
                 applied.append(revocation)
+            if outcome == "reported":
+                reported.append(revocation)
         for refresh in plan.renames:
             # BACKLOG #1532. Applied only on a pass that was NOT aborted, with every other write the
             # plan carries: the reconciler's invariant is that an aborted pass leaves the store
@@ -6552,6 +6559,8 @@ class AuthService:
                 old_username=refresh.old_username,
                 new_username=refresh.new_username,
                 held=await self._load_user_by_username(refresh.new_username),
+                # BACKLOG #3018: a refused audit write here must not skip the renames after it.
+                audit_soft=True,
             )
         # BACKLOG #2538. After the revocations, like the hold below: the referred accounts were left
         # unjudged, and every other account's revocation above has already been applied.
@@ -6565,10 +6574,14 @@ class AuthService:
         # only this report and never stops the probes and revocations above from running. A
         # failed write is logged, not raised (BACKLOG #2137), for the same reason as the hold's.
         await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
-        # What the pass DID, which is what the caller alerts on: a scope revocation skipped at apply
-        # time (ADR 0198) was audited as nothing, so it must page as nothing too. Marked after that,
-        # so the account a skipped revocation left signed in still counts toward the evidence.
-        return self._mark_reconcile_clears(replace(plan, revocations=tuple(applied)), users)
+        # The returned plan carries what the caller alerts on, the REPORTED revocations: a scope
+        # revocation skipped at apply time (ADR 0198) was audited as nothing, so it must page as
+        # nothing too, and a quiet one pages nobody (BACKLOG #3085). The clears are marked first,
+        # over every APPLIED revocation, quiet ones included: a quiet revocation's account holds no
+        # session now, and the account a skipped revocation left signed in still counts toward the
+        # evidence.
+        marked = self._mark_reconcile_clears(replace(plan, revocations=tuple(applied)), users)
+        return replace(marked, revocations=tuple(reported))
 
     def _mark_reconcile_clears(
         self, plan: reconcile.ReconcilePlan, users: Mapping[str, UserRecord]
@@ -6818,8 +6831,13 @@ class AuthService:
         new_username: str,
         held: UserRecord | None,
         client: str | None = None,
+        audit_soft: bool = False,
     ) -> None:
         """Copy a directory-reported rename down onto a row's cached ``username`` (BACKLOG #1532).
+
+        ``audit_soft`` is passed by the reconciler alone (BACKLOG #3018), so its audit writes go
+        through :meth:`_audit_reconciler_row`. The login path leaves it off, so there a refused
+        write still fails the sign-in, as it always has.
 
         **ONE implementation for two callers, deliberately.** The login path
         (:meth:`_upsert_ad_user`) and the ADR 0079 reconciler pass both reach a renamed account and
@@ -6858,6 +6876,8 @@ class AuthService:
         id and its current session, but its next sign-in is refused with ``directory_identity_conflict``
         until an operator removes the row holding the name. See the comment on that branch.
         """
+
+        write_audit = self._audit_reconciler_row if audit_soft else self._audit
 
         async def _refuse(held_by: str | None, detected: str, holds: str) -> None:
             # A DIFFERENT ROW ALREADY HOLDS THE NAME. Two accounts cannot share one; refusing the
@@ -6900,7 +6920,7 @@ class AuthService:
             # ``old_username`` (BACKLOG #2291). The reconciler captured that at plan time, and a
             # sign-in may have renamed the row since, so it can name an account that no longer
             # exists. The audit actor and the warning both use the name an operator would find.
-            await self._audit(
+            await write_audit(
                 "auth.ad_username_refresh_conflict",
                 actor=holds,
                 detail=_json(
@@ -7073,7 +7093,7 @@ class AuthService:
                     scrub_log_argument(after.username),
                 )
             return
-        await self._audit(
+        await write_audit(
             "auth.ad_username_refreshed",
             actor=new_username,
             detail=_json({"user_id": user_id, "source": "directory"}),
@@ -7333,34 +7353,53 @@ class AuthService:
             ),
         )
 
-    async def _audit_reconciler_row(self, action: str, *, detail: str) -> bool:
-        """Write one of the reconcile pass's own rows, and say whether it was written.
+    async def _audit_reconciler_row(
+        self,
+        action: str,
+        *,
+        detail: str,
+        actor: str = "<reconciler>",
+        client: str | None = None,
+    ) -> bool:
+        """Write one of the reconcile pass's rows, and say whether it was written.
 
         BACKLOG #2137. These rows are the held row, the breaker's aborted row, the outage's skipped
-        row, the referral's row (BACKLOG #2538) and the unkeyed-binding report. Each is written
-        after the pass's revocations, or on a pass that applies none. **A failed write here does
-        not end the pass.** If it raised, the pass would return no plan, and the lifespan task
-        would raise no alert for the revocations already applied, nor for the hold, the breaker or
-        the referral. So a store refusal is logged at ERROR, naming the action, and the pass goes
-        on. The log line is then the only record of that row. A per-revocation audit write is not routed through here: that one
-        still raises.
+        row, the referral's row (BACKLOG #2538) and the unkeyed-binding report. Since BACKLOG #3018
+        they also include each account's ``auth.ad_session_revoked`` row and, on the reconciler's
+        call only, a rename's ``auth.ad_username_refreshed`` and
+        ``auth.ad_username_refresh_conflict`` rows; those name the account as ``actor``. **A failed
+        write here does not end the pass.** If it raised, the pass would return no plan, and the
+        lifespan task would raise no alert for the revocations already applied, nor for the hold,
+        the breaker or the referral. It would also skip every account after this one. So a store
+        refusal is logged at ERROR, naming the action and the actor, and the pass goes on. The log
+        line is then the only record of that row: nothing retries it. A revocation or rename it
+        records has already committed, and any notice or alert it was due still goes.
 
         A defect is raised, not passed over (:data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS`).
         """
         return await write_audit_soft(
-            lambda: self._audit(action, actor="<reconciler>", detail=detail),
+            lambda: self._audit(action, actor=actor, detail=detail, client=client),
             log=_log,
-            message="directory reconcile: the %s audit row could not be written; the pass goes on, "
-            "so its alerts still fire",
-            args=(action,),
+            message="directory reconcile: the %s audit row for %s could not be written; the pass "
+            "goes on",
+            args=lambda: (action, scrub_log_argument(actor)),
             errors=_audit_write_errors(),
             defects=AUDIT_WRITE_DEFECTS,
         )
 
-    async def _apply_reconcile_revocation(self, revocation: reconcile.SessionRevocation) -> bool:
+    async def _apply_reconcile_revocation(
+        self, revocation: reconcile.SessionRevocation
+    ) -> _RevocationApplied:
         """Apply one planned revocation: persist a role re-diff (when that is why), drop the user's
         live sessions, audit, and notify the affected user out-of-band (ASVS 6.3.7). A scope
-        revocation writes no scope (ADR 0198): the next login does. Returns whether it applied."""
+        revocation writes no scope (ADR 0198): the next login does.
+
+        Returns ``"skipped"`` when it applied nothing, ``"reported"`` when it applied and must
+        alert, and ``"quiet"`` when it applied but ended no session and changed no role. The quiet
+        case is at least what the second of two reconcilers revoking one account sees (BACKLOG
+        #3085). Owner ruling 2026-10-16, "audit always": that revocation still writes its
+        ``auth.ad_session_revoked`` row, with ``sessions: 0``, and sends no notice; the caller
+        raises no alert for it."""
         user = await self._load_user(revocation.user_id)
         if revocation.reason == reconcile.SCOPE_CHANGED and (
             user is None or user.channel_scope != revocation.scope_from
@@ -7374,10 +7413,19 @@ class AuthService:
                 "directory reconcile: scope revocation for %s skipped; the stored scope changed",
                 revocation.username,
             )
-            return False
+            return "skipped"
         # No role write for an account that is gone or fails its seal (BACKLOG #2592): the store would
-        # refuse it, and ending the sessions below needs no write to the account.
-        if revocation.role_ids is not None and user is not None:
+        # refuse it, and ending the sessions below needs no write to the account. None either when
+        # the stored roles already match, as they do once another reconciler wrote them (BACKLOG
+        # #3085). Read before the write, so two reconcilers that both read the old roles before
+        # either wrote both count it as a change, and both report.
+        roles_changed = False
+        if (
+            revocation.role_ids is not None
+            and user is not None
+            and set(user.role_ids) != set(revocation.role_ids)
+        ):
+            roles_changed = True
             await self._store.set_user_roles(
                 revocation.user_id, list(revocation.role_ids), assigned_by="ad-reconcile"
             )
@@ -7391,7 +7439,9 @@ class AuthService:
                 user, before=user.role_ids, after=revocation.role_ids, via="ad-reconcile"
             )
         revoked = await self._store.revoke_user_sessions(revocation.user_id)
-        await self._audit(
+        # Soft (BACKLOG #3018): the writes above are already applied, so a raise would only cost
+        # the notice below, the later accounts and the alerts. See `_audit_reconciler_row`.
+        await self._audit_reconciler_row(
             "auth.ad_session_revoked",
             actor=revocation.username,
             detail=_json(
@@ -7425,6 +7475,8 @@ class AuthService:
             revocation.username,
             revocation.reason,
         )
+        if not revoked and not roles_changed:
+            return "quiet"  # audited above, no notice and no alert: see the docstring
         # A directory-pushed disable or demotion is the same event to the user as a local one, so it
         # gets the same out-of-band notice the login-path re-sync sends (best-effort).
         #
@@ -7450,7 +7502,7 @@ class AuthService:
                 email=user.notify_email,
                 detail={"reason": revocation.reason},
             )
-        return True
+        return "reported"
 
     async def _report_directory_admin_loss(
         self,
