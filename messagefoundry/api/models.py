@@ -613,7 +613,17 @@ class ReloadResult(BaseModel):
     Reporting outright failure there would describe an engine that does not exist; reporting plain
     success would hide the step. The step labels are stable and PHI-free
     (``config_fingerprint``, ``reference_sync``, ``cluster_propagate``, and ``audit`` when the
-    ``config_reload`` audit row failed after the swap, BACKLOG #1940)."""
+    ``config_reload`` audit row failed after the swap, BACKLOG #1940).
+
+    ``restart_required`` names each settings trust anchor (for example
+    ``[auth].ad_tls_ca_cert_file``) whose file changed on disk since the engine loaded it. The
+    reload checked the new file and passed it, but no reload rebuilds the consumer that loaded the
+    old one, so the engine keeps trusting the old CA until it restarts (BACKLOG #2185, #3015). An
+    empty list means the check ran and found nothing to restart for. ``None`` means **not
+    checked**: a dry run skips the settings preflight, so it cannot say. The dialling settings CAs
+    (``[tls].internal_ca_file``, ``[alerts].email_tls_ca_file``, ``[logging].forward_tls_ca_file``)
+    are never listed, even the syslog CA, which does take a restart: their hops load the file by
+    path and record no fingerprint to compare with."""
 
     inbound: int
     outbound: int
@@ -623,6 +633,7 @@ class ReloadResult(BaseModel):
     dry_run: bool = False
     degraded: bool = False
     failures: list[str] = []
+    restart_required: list[str] | None = None
 
 
 class ConfigProvenance(BaseModel):
