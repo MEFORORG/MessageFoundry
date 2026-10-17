@@ -404,12 +404,17 @@ from typing import Any
 #: surface grew. An older console on this engine is refused at mount; a newer console on an older
 #: engine would call a method that does not exist.
 #:
+#: 2026-10-16, vault BACKLOG #2954: ``SecurityPosture`` gained ``undeclared_route_refusals``, the
+#: deny-by-default refusal count (#2604) by path template. The console renders no new field, but the
+#: DTO is on the discovered surface, so the digest moved because it grew. A default of ``{}`` keeps
+#: the field additive; the pinned digest still refuses a skewed pair at mount.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "1b9da0aae75dbd52"
+ENGINE_UI_SEAM: str = "2b5df86a8fc5d31f"
 
 
 @dataclass(frozen=True, slots=True)

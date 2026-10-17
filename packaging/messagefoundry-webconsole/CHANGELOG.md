@@ -78,6 +78,9 @@ this line.**
 - **Seam only: `/status` names the FHIR lookups that failed to start.** `EngineInfo` gains
   `fhir_lookups_failed` (vault `BACKLOG #3008`). The console does not show it yet, but the field
   is on the seam it pins, so the supported digest moved.
+- **Seam only: the posture reports the deny-by-default refusal count.** `SecurityPosture` gains
+  `undeclared_route_refusals` (vault `BACKLOG #2954`). The console does not show it yet, but the
+  field is on the seam it pins, so the supported digest moved.
 - **Each group input on the AD group page shows an example full DN.** The placeholder reads
   `CN=MF-Admins,OU=Groups,DC=example,DC=com`, since both maps refuse a short name. Nothing is
   stored from it. The page's two save forms now trim only a space, a tab and a line break from a
@@ -94,6 +97,9 @@ this line.**
   page (`/ui/mfa`) and the forced password page used to tell the holder the password "stops
   working" at an instant already gone. They now say it stopped working then, and to ask an
   administrator to reset it. No seam change. (vault BACKLOG #2298)
+- **The Approvals page's 503 guidance names no single action.** It said an audit log could not
+  record a release, and it also answered a rejection and, now, a queue the store could not read.
+  It now covers all three and says nothing ran. No seam change. (BACKLOG #3157)
 
 ### Security
 

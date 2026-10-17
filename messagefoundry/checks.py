@@ -209,6 +209,7 @@ def run_checks(
     suppress_service_toml_search: bool = False,
     project_root: str | Path | None = None,
     allow_empty_config: bool = False,
+    service_config_from_root: bool = False,
 ) -> CheckReport:
     """Run the gate against ``config_dir``; ``messages_dir`` enables the dry-run check when it has
     fixtures. Set ``run_lint=False`` to skip the advisory ruff/mypy pass. ``strict_handler_security``
@@ -231,6 +232,10 @@ def run_checks(
     ``__main__.py``'s ``serve`` does. Left ``None`` the resolution is unchanged and still falls back to
     the process directory, so the documented ``check --config config`` invocation is untouched.
 
+    ``service_config_from_root`` says ``service_config`` is the project root's file, which the CLI
+    picks under ``--project-root`` when no ``--service-config`` is given, and not a file the caller
+    named. :func:`_serve_reads_other_note` says what follows from it (BACKLOG #3063 item 2).
+
     ``allow_empty_config`` (``--allow-empty-config``, BACKLOG #1648) drops the empty-graph rule from
     the blocking validate leg.
 
@@ -252,8 +257,17 @@ def run_checks(
     names the instance (vault BACKLOG #2355). Each of those legs' lines that ran says so; the
     dry-run line does not. :func:`_settings_source` says why that variable is the trigger.
     """
-    _toml, env_only = _settings_source(
+    toml, env_only = _settings_source(
         config_dir, service_config=service_config, suppress_search=suppress_service_toml_search
+    )
+    source_note = (
+        _ENV_ONLY_SOURCE
+        if env_only
+        else _serve_reads_other_note(
+            toml,
+            explicit=service_config is not None and not service_config_from_root,
+            suppress_search=suppress_service_toml_search,
+        )
     )
     results = [
         _check_validate(config_dir, allow_empty=allow_empty_config),
@@ -271,7 +285,7 @@ def run_checks(
                 service_config=service_config,
                 suppress_search=suppress_service_toml_search,
             ),
-            env_only,
+            source_note,
         ),
         _with_source(
             _check_build(
@@ -280,7 +294,7 @@ def run_checks(
                 suppress_search=suppress_service_toml_search,
                 project_root=project_root,
             ),
-            env_only,
+            source_note,
         ),
         _with_source(
             _check_reference_backend(
@@ -288,7 +302,7 @@ def run_checks(
                 service_config=service_config,
                 suppress_search=suppress_service_toml_search,
             ),
-            env_only,
+            source_note,
         ),
         # BACKLOG #1179: serve refuses a declared terminator whose plaintext hop nobody acknowledged.
         # Required, so the gate refuses what serve refuses.
@@ -298,7 +312,7 @@ def run_checks(
                 service_config=service_config,
                 suppress_search=suppress_service_toml_search,
             ),
-            env_only,
+            source_note,
         ),
         # BACKLOG #2131 / ADR 0173 AC-4: serve refuses an off-box OIDC leg that checks no
         # revocation under an enforcing posture. Required, so the gate refuses what serve refuses.
@@ -308,7 +322,7 @@ def run_checks(
                 service_config=service_config,
                 suppress_search=suppress_service_toml_search,
             ),
-            env_only,
+            source_note,
         ),
         # Vault BACKLOG #2280: serve refuses an unbounded PHI retention tier nobody acknowledged.
         # Required, so the gate refuses what serve refuses, in serve's words.
@@ -318,7 +332,7 @@ def run_checks(
                 service_config=service_config,
                 suppress_search=suppress_service_toml_search,
             ),
-            env_only,
+            source_note,
         ),
         # Vault BACKLOG #2368: serve's registry guard refuses a connection's own keep-forever
         # retention override nobody acknowledged. Required, for the same reason.
@@ -328,7 +342,7 @@ def run_checks(
                 service_config=service_config,
                 suppress_search=suppress_service_toml_search,
             ),
-            env_only,
+            source_note,
         ),
         # ADR 0153: name every outbound that declares cleartext_accepted, so the accepted set is visible
         # in review rather than discoverable only by reading each connection. Advisory — see the check.
@@ -357,7 +371,7 @@ def run_checks(
                 service_config=service_config,
                 suppress_search=suppress_service_toml_search,
             ),
-            env_only,
+            source_note,
         ),
         # vault BACKLOG #2550: every FHIR connection that puts the update id back in the URL, a
         # listed loosening of owner ruling R3. Advisory, as tls_allow_expired is -- see the check.
@@ -379,7 +393,7 @@ def run_checks(
                 service_config=service_config,
                 suppress_search=suppress_service_toml_search,
             ),
-            env_only,
+            source_note,
         ),
         # #1182 / ASVS 13.2.1: name every backend hop on an unchanging credential or none, graph and
         # settings. Advisory; the opt-in refusal is [security].require_nonstatic_credentials at serve.
@@ -389,7 +403,7 @@ def run_checks(
                 service_config=service_config,
                 suppress_search=suppress_service_toml_search,
             ),
-            env_only,
+            source_note,
         ),
         # #323 layer 3: report whether the [alerts] SMTP hop authenticates the relay. The defect this
         # closes was invisible for exactly as long as nothing reported it. Advisory — see the check.
@@ -399,7 +413,7 @@ def run_checks(
                 service_config=service_config,
                 suppress_search=suppress_service_toml_search,
             ),
-            env_only,
+            source_note,
         ),
     ]
     if run_lint:
@@ -1970,6 +1984,26 @@ def _no_settings_detail(service_config: str | Path | None, suppress_search: bool
     )
 
 
+#: serve's cleartext-listener flag, which an inbound exposure refusal names. ``check`` and
+#: ``connection`` take no such flag (BACKLOG #3063 item 1), so they recognise the refusal by it.
+INSECURE_BIND_FLAG = "--allow-insecure-bind"
+
+
+def insecure_bind_note(detail: str, command: str) -> str:
+    """``detail`` with a note that ``messagefoundry <command>`` cannot read serve's flag, when the
+    refusal names it, and which escape the command does read; otherwise ``detail`` unchanged. One
+    text for ``check`` and ``connection`` (BACKLOG #3063 items 1 and 7)."""
+    if INSECURE_BIND_FLAG not in detail:
+        return detail
+    sep = " " if detail.endswith(".") else "; "
+    return (
+        f"{detail}{sep}`messagefoundry {command}` has no {INSECURE_BIND_FLAG}; it reads the "
+        "per-connection attestation above, and in place of the flag "
+        "[security].require_encryption_for_remote = false, which applies only under "
+        '[security].enforcement = "warn"'
+    )
+
+
 #: Appended to a settings leg's line when no file was read (vault BACKLOG #2355), so a verdict about
 #: settings never reads as one about a file nobody wrote.
 _ENV_ONLY_SOURCE = (
@@ -2026,20 +2060,53 @@ def _load_check_settings(
     from messagefoundry.config.settings import load_settings
 
     if toml is not None:
+        if toml.is_dir():
+            # BACKLOG #3063 item 3: say what the path is, where opening it would report only an OS
+            # error (on Windows, "Permission denied") that sends the operator to the wrong cause.
+            raise IsADirectoryError(
+                f"{toml} is a directory; serve stops on a directory named messagefoundry.toml"
+            )
         return load_settings(config_path=toml, cli=cli)
     return load_settings(cli=cli, default_file=False)
 
 
-def _with_source(result: CheckResult, env_only: bool) -> CheckResult:
-    """``result`` with :data:`_ENV_ONLY_SOURCE` on its line when the settings came from the
-    environment alone, so the source shares a line with the verdict.
+def _serve_reads_other_note(
+    toml: Path | None, *, explicit: bool, suppress_search: bool
+) -> str | None:
+    """The note a settings leg's line carries when it graded a file ``serve`` with the same flags
+    would not read, or ``None`` (BACKLOG #3063 item 2).
+
+    Under ``--project-root`` with no ``--service-config``, ``check`` reads the project root's file,
+    or the config dir's, while ``serve`` with the same flags reads ``./messagefoundry.toml`` in its
+    own working directory. Run from that file's folder the two are one file. From anywhere else
+    the leg still grades this file, because it is the file a service install names with
+    ``--service-config``, and skipping it would turn a refusal into a pass. The note names the
+    difference instead. Reading the gate's own working directory was refused by vault BACKLOG
+    #2355, because it may hold another instance's file."""
+    from messagefoundry.config.settings import settings_file_path
+
+    if toml is None or explicit or not suppress_search:
+        return None
+    here = settings_file_path(None)
+    if here.is_file() and toml.samefile(here):
+        return None
+    return (
+        f"read {toml}; serve --project-root with no --service-config reads messagefoundry.toml in "
+        "its own working directory, so it reads this file only when started from its folder or "
+        "given it with --service-config"
+    )
+
+
+def _with_source(result: CheckResult, note: str | None) -> CheckResult:
+    """``result`` with ``note`` on its line, so where the settings came from shares a line with the
+    verdict: :data:`_ENV_ONLY_SOURCE`, or :func:`_serve_reads_other_note`'s text.
 
     A SKIP is left alone. Under an environment declaration no settings leg skips for a settings
     reason, so a skip there is about the graph (``config did not load``) or the fixtures, and the
     tag would name the wrong cause."""
-    if not env_only or result.skipped:
+    if note is None or result.skipped:
         return result
-    return replace(result, detail=f"{result.detail} [{_ENV_ONLY_SOURCE}]")
+    return replace(result, detail=f"{result.detail} [{note}]")
 
 
 def _settings_error(exc: Exception) -> str:
@@ -2059,15 +2126,22 @@ def _find_service_toml(config_dir: str | Path) -> Path | None:
 
     A config repo (ADR 0017) keeps the service toml at its root and the modules under ``config/``,
     so we search ``config_dir`` and each parent (then the CWD) for ``messagefoundry.toml`` and return
-    the first hit. Absent → ``None`` (the posture check then skips, never errors)."""
+    the first hit. Absent → ``None`` (the posture check then skips, never errors).
+
+    In the working directory a hit is anything of that name, a directory included (BACKLOG #3063
+    item 3). ``serve`` with no ``--service-config`` tests ``./messagefoundry.toml`` with ``exists()``
+    and then opens it, so a directory there stops ``serve``. Returning it makes each leg's settings
+    load fail, which refuses as ``serve`` does, where passing over it read the environment alone and
+    printed OK. Elsewhere only a file is a hit, as before: ``serve`` reads no other directory."""
+    cwd = Path.cwd().resolve()
+    config = Path(config_dir).resolve()
     seen: set[Path] = set()
-    candidates = [Path(config_dir).resolve(), *Path(config_dir).resolve().parents, Path.cwd()]
-    for base in candidates:
+    for base in (config, *config.parents, cwd):
         if base in seen:
             continue
         seen.add(base)
         toml = base / "messagefoundry.toml"
-        if toml.is_file():
+        if toml.is_file() or (base == cwd and toml.exists()):
             return toml
     return None
 
@@ -2258,44 +2332,62 @@ def _check_build(
             required=True,
             detail=f"environment values or [tls] trust anchors did not load: {exc}",
         )
-    try:
+
+    # The residual: stamp THIS instance's derived posture so the posture-keyed insecure-hop refusal
+    # (ADR 0092) decides at commit/CI exactly as serve/reload do — a prod-PHI cleartext hop raises
+    # here rather than shipping and only refusing at serve. Derived here, not in _build, so the
+    # posture census (tests/test_vault_posture_census.py) finds the read where it has always been.
+    posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
+
+    def _build(*, allow_insecure_bind: bool) -> None:
         build_check_registry(
             registry,
             inbound_bind_host=settings.inbound.bind_host,
             env_values=env_values,
             egress=settings.egress,
             reserved_bindings=((API_LISTENER_LABEL, settings.api.host, settings.api.port),),
-            # The residual: stamp THIS instance's derived posture so the posture-keyed insecure-hop
-            # refusal (ADR 0092) decides at commit/CI exactly as serve/reload do — a prod-PHI cleartext
-            # hop raises here rather than shipping and only refusing at serve.
-            posture=hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement),
+            posture=posture,
             trust_anchor_policy=trust_anchor_policy,
             # ADR 0154 D4: the EFFECTIVE ordering / max_attempts refusals need the resolved
             # [delivery] defaults. Without them that arm is skipped rather than guessed, and the
             # misconfiguration would surface only at serve rather than at commit/CI.
             delivery=settings.delivery,
-            # Vault BACKLOG #2622 item 1: the inbound exposure gates now run here, so pass serve's
-            # cleartext escape. `check` has no --allow-insecure-bind, so this is the settings half of
-            # serve's fold alone; a site that relies on the flag sees check refuse what serve admits.
-            allow_insecure_bind=insecure_bind_escape(settings),
+            allow_insecure_bind=allow_insecure_bind,
         )
+
+    # Vault BACKLOG #2622 item 1: the inbound exposure gates run here, so pass serve's cleartext
+    # escape, its settings half alone; a site that relies on the flag sees check refuse what serve
+    # admits. BACKLOG #3063 item 1, a Manager ruling, is why `check` takes no --allow-insecure-bind:
+    # a CI gate takes its loosening only from reviewed settings
+    # ([security].require_encryption_for_remote = false), a per-invocation flag would add a new
+    # loosening surface, and a false red at `check` is the safe direction.
+    escape = insecure_bind_escape(settings)
+    admitted: str | None = None
+    try:
+        # BACKLOG #3063 item 8: build without the escape first, so the OK line can say that the
+        # escape admitted a cleartext listener. The two builds differ in that one flag, so a
+        # refusal the escaped build then passes is one the escape admitted, whatever its text
+        # says. The strict build stops at its first refusal, so this names one listener, not
+        # every one; naming all would need the gates to report what they admit.
+        try:
+            _build(allow_insecure_bind=False)
+        except WiringError as exc:
+            if not escape:
+                raise
+            admitted = str(exc).split(";", 1)[0]
+            _build(allow_insecure_bind=True)
     except WiringError as exc:
-        detail = str(exc)
-        if "--allow-insecure-bind" in detail:
-            # The gate's own text names serve's flag, which this command cannot read. Say which
-            # escape check does honour, or an operator adds the flag and the leg stays red.
-            sep = " " if detail.endswith(".") else "; "
-            detail += (
-                f"{sep}`messagefoundry check` has no --allow-insecure-bind and reads only "
-                "[security].require_encryption_for_remote = false"
-            )
+        # The gate's own text names serve's flag, which this command cannot read. Say which
+        # escape check does honour, or an operator adds the flag and the leg stays red.
+        detail = insecure_bind_note(str(exc), "check")
         return CheckResult("build-check", ok=False, required=True, detail=detail)
-    return CheckResult(
-        "build-check",
-        ok=True,
-        required=True,
-        detail=f"connectors build against the {env_name or 'default'} posture",
-    )
+    detail = f"connectors build against the {env_name or 'default'} posture"
+    if admitted is not None:
+        detail += (
+            "; [security].require_encryption_for_remote = false admitted at least one cleartext "
+            f"listener this check would otherwise refuse, first: {admitted}"
+        )
+    return CheckResult("build-check", ok=True, required=True, detail=detail)
 
 
 def _check_alert_smtp_tls(

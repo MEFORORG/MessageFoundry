@@ -24,7 +24,7 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
-from messagefoundry.api.approvals import ApprovalError, ApprovalGate
+from messagefoundry.api.approvals import ApprovalError, ApprovalGate, RestartReconciliation
 from messagefoundry.auth import Permission, Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
@@ -2269,3 +2269,289 @@ async def test_the_embedded_app_drains_an_orphaned_write_at_shutdown(engine: Eng
         assert not finished.is_set()
     assert finished.is_set(), "the shutdown returned before the orphaned write landed"
     assert len(await engine.store.list_audit(action="approval.drain_probe")) == 1
+
+
+# --- BACKLOG #3252 item 2: an owner the engine cannot name yet is not fixed -----------------------
+
+
+async def test_an_owner_not_known_yet_is_read_again_and_not_fixed(engine: Engine) -> None:
+    """A source answering None reads as the default without fixing it, so a later engine shard
+    identity still wins; once it names an owner, that owner is fixed."""
+    identity: list[str | None] = [None]
+    gate = ApprovalGate(engine.store, ON, claim_owner=lambda: identity[0])
+    assert gate.claim_owner == "engine"
+    identity[0] = "shard:a"
+    assert gate.claim_owner == "shard:a"
+    identity[0] = "shard:b"
+    assert gate.claim_owner == "shard:a"
+
+
+async def test_a_claim_under_the_default_owner_fixes_it(engine: Engine) -> None:
+    """The invariant the deferral keeps: a claim written under the default is reconciled under the
+    default, so the owner cannot move after it."""
+    from tests._pending_approval_store_contract import _resolve, _StandingStore
+
+    identity: list[str | None] = [None]
+    gate = ApprovalGate(
+        _StandingStore(engine.store), ON, resolve_identity=_resolve, claim_owner=lambda: identity[0]
+    )
+    gate.register("dead_letter_replay", "op", _runs, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+    )
+    assert approval_id is not None
+    await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None and row["claim_owner"] == "engine"
+    identity[0] = "shard:a"
+    assert gate.claim_owner == "engine"
+
+
+async def test_an_embedded_gate_claims_under_the_engine_shard_its_engine_loads_later(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """create_app(engine=...) reconciles in its own lifespan, which can run before the engine
+    holds its graph. That read must not fix the default, or every embedded engine shard would
+    claim as "engine" (BACKLOG #3252). The pre-fix wiring answered the default and fixed it, so
+    the second assertion below failed."""
+    monkeypatch.setattr(Engine, "filters_its_graph", property(lambda _self: True))
+    app = create_app(engine, approvals=ON)
+    async with app.router.lifespan_context(app):
+        gate: ApprovalGate = app.state.approval_gate
+        assert engine.registry_runner is None
+        assert gate.claim_owner == "engine"
+        monkeypatch.setattr(Engine, "instance_identity", property(lambda _self: "shard:a"))
+        assert gate.claim_owner == "shard:a"
+
+
+async def test_an_embedded_gate_reconciles_its_own_rows_once_its_owner_is_known(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The early reconcile ran under the default, so an engine shard's own leftover row was not
+    moved. The first list that finds the owner known reconciles again under it."""
+    from tests._pending_approval_store_contract import _claimed_directly
+
+    then = time.time() - 60.0
+    leftover = await _claimed_directly(engine.store, claim_owner="shard:a", claimed_at=then)
+    # A sibling's row under the default: the early sweep under "engine" used to move it.
+    sibling = await _claimed_directly(engine.store, claim_owner="engine", claimed_at=then)
+    monkeypatch.setattr(Engine, "filters_its_graph", property(lambda _self: True))
+    app = create_app(engine, approvals=ON)
+    async with app.router.lifespan_context(app):
+        gate: ApprovalGate = app.state.approval_gate
+        await gate.list_pending()
+        assert await _status_of(engine, leftover) == "executing"  # the owner is not known yet
+        assert await _status_of(engine, sibling) == "executing"
+        monkeypatch.setattr(Engine, "instance_identity", property(lambda _self: "shard:a"))
+        await gate.list_interrupted()
+        assert await _status_of(engine, leftover) == "interrupted"
+        assert await _status_of(engine, sibling) == "executing"
+
+
+async def test_a_put_off_reconcile_never_takes_this_lifes_claim_for_a_leftover(
+    engine: Engine,
+) -> None:
+    """A claim made before the owner was known fixes the default. The reconcile that then runs
+    moves the older default row and leaves the one this process claimed since it started."""
+    from tests._pending_approval_store_contract import _claimed_directly
+
+    old = await _claimed_directly(engine.store, claim_owner="engine", claimed_at=time.time() - 60)
+    gate = ApprovalGate(engine.store, ON, claim_owner=lambda: None)
+    assert await gate.reconcile_after_restart() == RestartReconciliation((), (), ())
+    assert await _status_of(engine, old) == "executing"  # put off: the owner is not known
+    assert gate._owner_for_claim() == "engine"  # what approve() does just before it claims
+    mine = await _claimed_directly(engine.store, claim_owner="engine", claimed_at=time.time() + 1)
+    await gate.list_pending()
+    assert await _status_of(engine, old) == "interrupted"
+    assert await _status_of(engine, mine) == "executing"
+
+
+async def test_a_read_defect_is_raised_not_answered_as_an_outage(engine: Engine) -> None:
+    """A programming defect in a store read is a bug, not a 503 to retry."""
+    from tests._pending_approval_store_contract import _StandingStore
+
+    store = _StandingStore(engine.store)
+
+    async def _defect(*_a: Any, **_k: Any) -> Any:
+        raise sqlite3.ProgrammingError("PROBE: a bad bind")
+
+    setattr(store, "list_pending_approvals", _defect)  # noqa: B010 - not a declared attribute
+    with pytest.raises(sqlite3.ProgrammingError):
+        await ApprovalGate(store, ON).list_pending()
+
+
+async def test_an_embedded_lone_engine_holding_its_graph_fixes_the_default(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An engine that filters no graph is never an engine shard, and one holding its graph is
+    known to be neither engine shard nor node, so for each the default is an answer, and fixed."""
+    assert create_app(engine, approvals=ON).state.approval_gate.claim_owner == "engine"
+    monkeypatch.setattr(Engine, "filters_its_graph", property(lambda _self: True))
+    app = create_app(engine, approvals=ON)
+    gate: ApprovalGate = app.state.approval_gate
+    monkeypatch.setattr(Engine, "registry_runner", property(lambda _self: object()))
+    assert gate.claim_owner == "engine"
+    monkeypatch.setattr(Engine, "instance_identity", property(lambda _self: "shard:a"))
+    assert gate.claim_owner == "engine"
+
+
+# --- BACKLOG #3252 item 3: the queue warns once per unreadable row, approve every time ------------
+
+
+async def test_the_queue_warns_once_per_unreadable_row_and_approve_every_time(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    from tests._pending_approval_store_contract import _resolve, _StandingStore
+
+    damaged = uuid4().hex
+    await engine.store.create_pending_approval(
+        approval_id=damaged,
+        operation="dead_letter_replay",
+        params="not json",
+        requester="maker",
+        requester_user_id="maker-id",
+        requested_at=time.time(),
+        expires_at=None,
+    )
+    gate = ApprovalGate(_StandingStore(engine.store), ON, resolve_identity=_resolve)
+    gate.register("dead_letter_replay", "op", _runs, permission=Permission.MESSAGES_REPLAY)
+
+    def _warned() -> int:
+        return sum("not a JSON object" in r.getMessage() for r in caplog.records)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.approvals"):
+        for _ in range(3):
+            [entry] = await gate.list_pending()
+            assert entry["params"] is None
+        assert _warned() == 1
+        for _ in range(2):
+            with pytest.raises(ApprovalError) as refused:
+                await gate.approve(damaged, approver="checker", approver_user_id="checker-id")
+            assert refused.value.status == 409
+        assert _warned() == 3
+
+
+# --- BACKLOG #3157 item 1: a store read on an approval route answers 503 and pages nothing --------
+
+
+async def _refuse_reads(*_a: Any, **_k: Any) -> Any:
+    raise OSError("PROBE: the store refuses reads")
+
+
+def _paging_sink() -> tuple[Any, list[str]]:
+    """An alert sink that records each ``audit_write_failed`` page's action, and that list."""
+    from types import SimpleNamespace
+
+    paged: list[str] = []
+    return SimpleNamespace(audit_write_failed=lambda _name, *, action: paged.append(action)), paged
+
+
+_READ_FAULT_ACTS: dict[str, Callable[[ApprovalGate, str], Awaitable[Any]]] = {
+    "list": lambda gate, _id: gate.list_pending(),
+    "list_interrupted": lambda gate, _id: gate.list_interrupted(),
+    "approve": lambda gate, aid: gate.approve(aid, approver="checker", approver_user_id="c-id"),
+    "reject": lambda gate, aid: gate.reject(aid, approver="checker"),
+    "resolve": lambda gate, aid: gate.resolve_interrupted(
+        aid, outcome="effects_applied", resolver="checker", resolver_user_id="c-id"
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("reader", "act", "what"),
+    [
+        ("list_pending_approvals", "list", "the approval queue"),
+        ("list_interrupted_approvals", "list_interrupted", "the interrupted releases"),
+        ("get_pending_approval", "approve", "this approval request"),
+        ("get_pending_approval", "reject", "this approval request"),
+        ("get_pending_approval", "resolve", "this approval request"),
+        ("get_user", "approve", "the requester's account"),
+    ],
+)
+async def test_a_store_read_fault_answers_503_and_pages_nothing(
+    engine: Engine, caplog: pytest.LogCaptureFixture, reader: str, act: str, what: str
+) -> None:
+    from tests._pending_approval_store_contract import _resolve, _StandingStore
+
+    store = _StandingStore(engine.store)
+    sink, paged = _paging_sink()
+    gate = ApprovalGate(store, ON, resolve_identity=_resolve, alert_sink=sink)
+    gate.register("dead_letter_replay", "op", _runs, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+    )
+    assert approval_id is not None
+    setattr(store, reader, _refuse_reads)  # an instance attribute wins over the class's get_user
+    with (
+        caplog.at_level(logging.ERROR, logger="messagefoundry.api.approvals"),
+        pytest.raises(ApprovalError) as refused,
+    ):
+        await _READ_FAULT_ACTS[act](gate, approval_id)
+    assert refused.value.status == 503
+    assert f"could not read {what}" in refused.value.detail
+    assert paged == []
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors == [f"approvals: the store failed to read {what}"]
+    assert await _status_of(engine, approval_id) == "pending"
+
+
+async def test_a_queue_the_store_cannot_read_answers_503_on_the_route(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GET /approvals caught nothing, so a store that refused the read answered a raw 500."""
+    service = await _service(engine)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    async with _client(engine, service, ON) as c:
+        approver = await _token(c, "approver")
+        assert (await c.get("/approvals", headers=approver)).status_code == 200  # the control
+        monkeypatch.setattr(engine.store, "list_interrupted_approvals", _refuse_reads)
+        r = await c.get("/approvals", headers=approver)
+    assert r.status_code == 503, r.text
+    assert "could not read the interrupted releases" in r.json()["detail"]
+
+
+# --- BACKLOG #3157 item 7: a cancelled resolve whose write fails logs one ERROR, not two ---------
+
+
+async def test_a_cancelled_resolve_whose_write_fails_logs_one_error(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The resolve's store fault is logged at ERROR and paged where it is raised. Its caller was
+    cancelled, so the orphaned-write callback read the same 503 and logged a second ERROR."""
+    from tests._pending_approval_store_contract import _resolve, _StandingStore
+
+    approval_id = await _interrupted_row(engine, "maker", "maker-id")
+
+    class _ResolveFails(_StandingStore):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+            if kw["status"] == "resolved_applied":
+                self.entered.set()
+                await self.release.wait()
+                raise OSError("store unreachable")
+            return bool(await self._store.decide_pending_approval(approval_id, **kw))
+
+    store = _ResolveFails(engine.store)
+    sink, paged = _paging_sink()
+    gate = ApprovalGate(store, ON, resolve_identity=_resolve, alert_sink=sink)
+    with caplog.at_level(logging.WARNING), _loop_reports() as loop_reports:
+        task = asyncio.create_task(
+            gate.resolve_interrupted(
+                approval_id, outcome="effects_applied", resolver="a", resolver_user_id="a-id"
+            )
+        )
+        await asyncio.wait_for(store.entered.wait(), _WAIT_S)
+        task.cancel()
+        store.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, _WAIT_S)
+        reports = await _reported_after(caplog, "after its caller was cancelled")
+    assert _described(loop_reports) == []
+    errors = [r.getMessage() for r in reports if r.levelno >= logging.ERROR]
+    assert len(errors) == 1, errors
+    assert "failed to record the resolution" in errors[0]
+    assert len(reports) == 2, [r.getMessage() for r in reports]  # the ERROR and one WARNING
+    assert paged == ["approval.resolved"]
+    assert await _status_of(engine, approval_id) == "interrupted"

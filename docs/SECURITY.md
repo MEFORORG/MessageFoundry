@@ -224,7 +224,11 @@ before it is accepted. Such a route is a defect in the code that registered it. 
 every refusal in memory and writes an ERROR line at most once a minute for each route. Each line
 names the route's path template, never the request, and says how many refusals came since the
 previous line. Refusals after a burst's last line stay in that count. They reach the log only with
-a later refusal of the same route, a minute or more after the last line. No API reads the count,
+a later refusal of the same route, a minute or more after the last line. `GET /security/posture`
+reports the count as `undeclared_route_refusals`, under `monitoring:read`, keyed by path template
+(vault BACKLOG #2954). It is the count of the process that answered; under engine shards each
+process has its own. `undeclared_route_refusal_counts` in `messagefoundry/api/security.py` says
+what each key means, including `<unknown>`, and what the walk misses. The count is not persisted,
 and a restart loses it. On a body-taking route built by the app's route class, the
 refusal comes before the body is read. The check asks only that a route declared a gate. It does not check that
 the gate is correct.
@@ -2247,9 +2251,17 @@ ERROR line and no alert for at least three writes. They are the request or repea
 rejection, and a refusal's row. The gate shields at least the claim, each outcome and a resolution
 from a cancel. Those writes finish on their own, and log and page as above.
 
-What this does not cover, at least: a store that refuses READS of the request row or the
-requester's account still answers a raw 500. A request or a repeat whose write fails is not mapped
-either. It answers a raw 500, or the request timeout's 503 when the call is cancelled.
+A store that refuses a READ on the approval routes answers 503 for at least the queue, the request
+row and the requester's `users` row (BACKLOG #3157). The gate logs it at ERROR, at most once per
+five minutes for each kind of read, and pages nothing, because a read loses no audit row. Nothing
+is decided or run.
+
+What this does not cover, at least: a request or a repeat whose write fails is not mapped. It
+answers a raw 500, or the request timeout's 503 when the call is cancelled. At least these reads
+are not mapped either, and can answer a raw 500: the requester's roles and scope, which the
+release reads through the auth service, and the open-request read a reload or purge makes before
+its step-up to answer a repeat. A read that fails on a programming defect, rather than a store
+fault, is raised as it is.
 
 **A failed request write can still hold the request, so a retry may file a second one.** The request
 and its `approval.requested` row are one write, as above, so a write that fails before its COMMIT
@@ -2358,6 +2370,12 @@ row claimed before the column existed has no owner, and the first process to sta
 own. Two plain `serve` processes over one store would share the `engine` owner; that layout is
 unsupported anyway. For the same reason, build one app per engine: a second app over the same
 engine runs the reconcile again and would take the first one's live releases for leftovers.
+
+An app embedded around an engine (`create_app(engine=...)`) can start before its engine holds its
+graph, when the engine shard's name is not known yet. Its start then puts the reconcile off, and
+the first queue read that finds the owner known runs it, over rows claimed before the app started
+(BACKLOG #3252). A release made before the engine holds its graph claims under `engine` and keeps
+that owner for the app's life, so start the engine before the app serves approvals.
 
 **A request must also be old enough before it can be approved (ASVS 2.4.2).** The expiry is a
 ceiling. `[approvals].min_dwell_seconds` is the floor, default **2 s**. An approve that arrives sooner

@@ -1353,12 +1353,14 @@ def alert_store_cipher_refusal(sink: AlertSink, table: str, column: str) -> None
     if table == UPLOADED_FILE_TABLE:
         # The uploaded-file store (BACKLOG #1169, owner ruling 2026-09-23). Unlike a store column, a
         # plaintext file here is usually legitimate: one written before the key was enabled. So the
-        # reason says what fixes it. Still the surface only: never a file id and never a filename.
+        # reason offers the remedies, and promises none, because rotate-key does not seal every one
+        # (BACKLOG #2322, #3183). Still the surface only: never a file id and never a filename.
         subject = UPLOAD_CIPHER_SUBJECT
         reason = (
             f"the keyed store refused a plaintext uploaded file ({table}.{column}): one stored before "
-            "the key was enabled, or a planted one; it stays refused until 'messagefoundry "
-            "rotate-key' seals it"
+            "the key was enabled, or a planted one. An operator may seal it by running 'messagefoundry "
+            "rotate-key' with the engine stopped. If rotate-key leaves it unsealed for good, it can "
+            "only be deleted, by an operator or by the retention prune once it expires"
         )
     else:
         subject = STORE_CIPHER_SUBJECT

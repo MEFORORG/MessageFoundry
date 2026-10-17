@@ -393,9 +393,14 @@ class _UnmarkedPolicy:
         table, column = aad_cell_name(aad)
         if table == UPLOADED_FILE_AAD_TABLE:
             # An uploaded file (BACKLOG #1169, owner ruling 2026-09-23). Usually one stored before
-            # the key was enabled, and the fix is rotate-key, never the loosening.
+            # the key was enabled. The remedy offered is rotate-key, never the loosening, and it is
+            # offered rather than promised: rotate-key does not seal every one (BACKLOG #2322, #3183).
             cause = "a plaintext upload stored before the key was enabled, or a planted one"
-            fix = "run 'messagefoundry rotate-key' with the engine stopped to seal it"
+            fix = (
+                "an operator may seal it by running 'messagefoundry rotate-key' with the engine "
+                "stopped; if rotate-key leaves it unsealed for good, it can only be deleted, by an "
+                "operator or by the retention prune once it expires"
+            )
         else:
             cause = "a stripped marker or a planted row"
             fix = "set [store].allow_unmarked_ciphertext to accept unmarked values"
