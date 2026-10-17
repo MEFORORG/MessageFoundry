@@ -57,7 +57,12 @@ from messagefoundry.auth.reconcile import (
     ReconcilePlan,
     SessionRevocation,
 )
-from messagefoundry.auth.service import AuthService, _BreakerStanding, _HoldStanding
+from messagefoundry.auth.service import (
+    AuthService,
+    _BreakerStanding,
+    _HoldStanding,
+    _ReferralStanding,
+)
 from messagefoundry.config.settings import (
     _ALERT_EVENT_TYPES,
     AuthSettings,
@@ -946,6 +951,9 @@ def test_a_referral_pages_and_clears_under_its_own_source(
     sink = _InverseSink()
     _alert_reconcile_plan(plan, _AUTH, sink)  # type: ignore[arg-type]
     assert [(e[0], e[1]) for e in sink.events] == expected
+    # BACKLOG #3100 item 6: every referral page carries the closed-set slug.
+    pages = [e for e in sink.events if (e[0], e[1]) == ("ad_reconcile_aborted", _REFERRAL_SOURCE)]
+    assert all(e[2]["reason"] == REFERRAL_ABORT for e in pages)
 
 
 _FAULT_PAGE = ("ad_reconcile_aborted", _PROBE_FAULT_ALERT_SOURCE)
@@ -1675,6 +1683,25 @@ async def test_the_clear_predicate_control_reads_both_clear() -> None:
     assert await _marked(plan, {"a": PRESENT, "b": PRESENT}) == (True, True)
 
 
+_CLEAN_TWO = ReconcilePlan(probed=3, readable=2, outcomes={"a": PRESENT, "b": PRESENT})
+
+
+@pytest.mark.parametrize(
+    "plan",
+    [replace(_CLEAN_TWO, referred=("c",)), replace(_CLEAN_TWO, faulted=("c",))],
+    ids=["referral", "probe-fault"],
+)
+async def test_a_pass_with_a_referral_or_fault_beside_clean_answers_marks_no_clear(
+    plan: ReconcilePlan,
+) -> None:
+    """BACKLOG #3100 item 6. The control's inputs, plus one account the pass referred or faulted
+    on. Its answer on record may predate the referral or the fault, so the pass is no evidence of
+    either clear, however clean the rest reads.
+
+    RED when: a pass with a referral or a fault beside other answers marks a clear."""
+    assert await _marked(plan, {"a": PRESENT, "b": PRESENT, "c": PRESENT}) == (False, False)
+
+
 async def test_an_estate_that_reads_only_undetermined_is_no_breaker_clear() -> None:
     """``undetermined not in outcomes``: a pass of held accounts only cannot trip the breaker at
     all, so it says nothing about whether the breaker is still tripped."""
@@ -1751,17 +1778,19 @@ async def test_a_process_whose_own_pass_has_not_tripped_resolves_no_trip() -> No
     assert await _marked(plan, record, breaker="tripped") == (True, True)
 
 
-@pytest.mark.parametrize(
-    ("start", "event", "end"),
-    [
-        ("fresh", "tripped", "tripped"),
-        ("fresh", "forfeit", "forfeit"),
-        ("tripped", "tripped", "tripped"),
-        ("tripped", "forfeit", "forfeit"),
-        ("forfeit", "tripped", "forfeit"),
-        ("forfeit", "forfeit", "forfeit"),
-    ],
-)
+#: Every move of the breaker's standing. The referral's runs the same machine (BACKLOG #3100 item
+#: 12), so its table is this one with its own opened state.
+_BREAKER_MOVES = [
+    ("fresh", "tripped", "tripped"),
+    ("fresh", "forfeit", "forfeit"),
+    ("tripped", "tripped", "tripped"),
+    ("tripped", "forfeit", "forfeit"),
+    ("forfeit", "tripped", "forfeit"),
+    ("forfeit", "forfeit", "forfeit"),
+]
+
+
+@pytest.mark.parametrize(("start", "event", "end"), _BREAKER_MOVES)
 async def test_the_breaker_standing_never_leaves_a_forfeit(
     start: _BreakerStanding, event: _BreakerStanding, end: _BreakerStanding
 ) -> None:
@@ -1774,6 +1803,31 @@ async def test_the_breaker_standing_never_leaves_a_forfeit(
         service._reconcile_breaker_standing = start
         service._advance_breaker_standing(event)
         assert service._reconcile_breaker_standing == end
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("start", "event", "end"),
+    [tuple("referred" if s == "tripped" else s for s in move) for move in _BREAKER_MOVES],
+)
+async def test_the_referral_standing_runs_the_breakers_machine(
+    start: _ReferralStanding,
+    event: _ReferralStanding,
+    end: _ReferralStanding,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #2538, and #3100 item 12, which folded the two machines into one. The referral's
+    standing moves exactly as the breaker's does, and warns once, on the move into a forfeit."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _fresh_process(store)
+        service._reconcile_referral_standing = start
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            service._advance_referral_standing(event)
+        assert service._reconcile_referral_standing == end
+        warned = [r for r in caplog.records if "LDAP referral left" in r.getMessage()]
+        assert len(warned) == (1 if start != "forfeit" and end == "forfeit" else 0)
     finally:
         await store.close()
 

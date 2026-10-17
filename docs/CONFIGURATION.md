@@ -802,7 +802,7 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 > logins reuse the **same** AD-group→role mapping —
 > the role source is on-prem AD, never a token claim ([ADR 0142](adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)).
 
-#### When the reconciler's two alerts resolve themselves
+#### When the reconciler's alerts resolve themselves
 
 The session reconciler's `ad_reconcile_aborted` (the breaker) and `ad_reconcile_held` (the hold)
 alerts resolve on their own when a pass is evidence the condition has gone (BACKLOG #2136). So
@@ -811,11 +811,11 @@ needs alert state ([ADR 0044](adr/0044-operator-alert-state.md)). The pass must 
 this engine process, for every signed-in directory account it did not just revoke.
 
 **An engine process resolves only an alert it watched open.** It resolves the breaker only after a
-pass of its own tripped, and the hold only after a pass of its own held. It never resolves an
-alert that was already open when it started, even after it trips or holds itself. A restart
-forgets which accounts were behind a trip or a hold, and it cannot see the accounts that sign out
-while the engine is down. So an operator resolves an alert the last run left open. After that, the
-engine resolves the next trip or hold on its own.
+pass of its own tripped, the hold only after a pass of its own held, and the referral only after
+a pass of its own saw one. It never resolves an alert that was already open when it started, even
+after it trips, holds or sees a referral itself. A restart forgets which accounts were behind each
+of these, and it cannot see the accounts that sign out while the engine is down. So an operator
+resolves an alert the last run left open. After that, the engine resolves the next one on its own.
 
 - The hold resolves when no answer is undetermined and this pass read `userAccountControl` at
   least once. An account the pass just revoked still counts as an answer here.
@@ -832,8 +832,7 @@ engine resolves the next trip or hold on its own.
   account counts as leaving. The engine then resolves no trip until its
   next restart. The engine logs a warning when it gives up any resolve.
 - An LDAP referral opens its own `ad_reconcile_aborted` instance, with reason `directory_referral`
-  and source `directory-reconciler-referral` (BACKLOG #2538). It follows the same rule: the engine
-  resolves it only after a pass of its own saw a referral. It resolves once every account signed
+  and source `directory-reconciler-referral` (BACKLOG #2538). It resolves once every account signed
   in at the last referral has since been read in full, present and enabled, on a pass with no
   referral. A pass with any referral resolves none of these alerts.
 - So an account that never reads in full keeps the referral's alert open while it is signed in. A
