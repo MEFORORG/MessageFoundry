@@ -14,6 +14,7 @@ against the login gate.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from typing import Any
@@ -361,16 +362,18 @@ async def test_two_rows_from_one_administrator_still_name_that_administrator() -
         await store.close()
 
 
-async def test_a_reset_reminds_the_resetting_administrator_not_the_creator() -> None:
+@pytest.mark.parametrize("reset", ["admin_reset_password", "admin_reset_mfa"])
+async def test_a_reset_reminds_the_resetting_administrator_not_the_creator(reset: str) -> None:
     """The issuer is whoever issued the CURRENT credential. ``user_roles.assigned_by`` still names
-    the creator here, which is why the audit row is read instead."""
+    the creator here, which is why the audit row is read instead. A factor reset issues one too
+    (BACKLOG #3160): RED when ``_ISSUE_ROW_KEYS`` leaves ``auth.mfa_reset`` out."""
     store, service, notifier = await _notified_service()
     try:
         await _account(service, "root", email="root@example.org", actor="provision", admin=True)
         await _account(service, "sam", email="sam@example.org", actor="provision", admin=True)
         alice = await _account(service, "alice", email="alice@example.org", actor="root")
         await _age_audit_rows(store, "user.created", 2 * _HOUR)
-        await service.admin_reset_password(alice, actor="sam")
+        assert await getattr(service, reset)(alice, actor="sam") is not None
         deadline = await _pass(store, service, alice)
         reminders = notifier.reminders("alice")
         issuer = [r for r in reminders if r[0] == TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER]
@@ -379,6 +382,33 @@ async def test_a_reset_reminds_the_resetting_administrator_not_the_creator() -> 
                 TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER,
                 "sam",
                 "sam@example.org",
+                {"expires_at": deadline, "holder": "alice"},
+            )
+        ]
+    finally:
+        await store.close()
+
+
+async def test_a_factor_reset_that_issued_nothing_is_not_read_as_an_issue() -> None:
+    """BACKLOG #3160. ``auth.mfa_reset`` on a directory account says ``credential_issued: false``.
+    Such a row in the window must not count as a second issuer. RED when the lookup reads it: the
+    two actors then disagree and the creating administrator is not told."""
+    store, service, notifier = await _notified_service()
+    try:
+        await _account(service, "root", email="root@example.org", actor="provision", admin=True)
+        await _account(service, "sam", email="sam@example.org", actor="provision", admin=True)
+        alice = await _account(service, "alice", email="alice@example.org", actor="root")
+        await service._audit(
+            "auth.mfa_reset",
+            actor="sam",
+            detail=json.dumps({"user_id": alice, "credential_issued": False}),
+        )
+        deadline = await _pass(store, service, alice)
+        assert notifier.reminders("alice")[1:] == [
+            (
+                TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER,
+                "root",
+                "root@example.org",
                 {"expires_at": deadline, "holder": "alice"},
             )
         ]

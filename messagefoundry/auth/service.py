@@ -37,7 +37,7 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from enum import Enum
-from functools import cache
+from functools import cache, partial
 from types import MappingProxyType
 from typing import Any, Final, Literal, TypeVar
 from uuid import uuid4
@@ -281,6 +281,10 @@ _CERT_PROBE_MAX_CONCURRENCY = 8
 _CERT_PROBE_SLOT_WAIT_SECONDS = 2.0
 #: The refusal reason when no probe slot freed in time. Not a directory answer.
 CERT_PROBE_SATURATED = "probe_capacity_saturated"
+#: The refusal reason when the certificate path's probe raised past every catch below it: an engine
+#: fault, so it is not a directory outage (BACKLOG #3115). ``_note_cert_probe_fault`` says what it
+#: logs.
+CERT_PROBE_FAULT = "probe_fault"
 #: Refusals that say the directory could not be asked, not what it said about the account. The
 #: certificate path logs these once per outage rather than once per request.
 _CERT_DIRECTORY_OUTAGES = frozenset(
@@ -291,8 +295,11 @@ _CERT_DIRECTORY_OUTAGES = frozenset(
     }
 )
 #: The least time between two certificate-path outage WARNINGs, so a flapping outage cannot log
-#: one WARNING and INFO pair per request.
+#: one WARNING and INFO pair per request. The per-account probe-fault WARNING uses it too.
 _CERT_OUTAGE_LOG_INTERVAL_SECONDS = 60.0
+#: Bound on the accounts the certificate path tracks a probe fault for. Evicting one only lets its
+#: next fault log a WARNING early, so the bound is about memory, not correctness.
+_CERT_PROBE_FAULT_TRACKED_MAX = 4096
 #: The level ``_probe_principal`` logs an unexpected directory fault at. WARNING for the reconciler
 #: and step-up; the certificate path sets DEBUG in its probe task's own context (BACKLOG #2316).
 _PROBE_FAULT_LOG_LEVEL: ContextVar[int] = ContextVar(
@@ -1040,7 +1047,7 @@ def generate_policy_password(
     # or the username, and the suffix keeps either one. Read from the policy, not from four field
     # names, so a class rule added later is not skipped here (BACKLOG #2359). The suffix still
     # covers only the four classes today: a new class it misses needs the suffix extended too, and
-    # until then the screen refuses that candidate rather than issuing it.
+    # until then the screen refuses that candidate rather than issuing it (pinned by test, #3160).
     class_rules = policy.requires_character_class
     for _ in range(_RESET_GENERATION_ATTEMPTS):
         token = secrets.token_urlsafe(length)[:chars]
@@ -1854,10 +1861,16 @@ def _scope_covers(settings: AuthSettings, roles: frozenset[Role]) -> bool:
     return settings.require_mfa_scope == "every_local_account" or Role.ADMINISTRATOR in roles
 
 
+def _is_directory_account(user: UserRecord) -> bool:
+    """Whether ``user`` is a directory account. Any other provider, an unrecognised one included,
+    reads as local, as :meth:`AuthService._build_identity` reads it (BACKLOG #3117)."""
+    return user.auth_provider == AuthProvider.AD.value
+
+
 def _requirement_covers(settings: AuthSettings, user: UserRecord, roles: frozenset[Role]) -> bool:
     """Whether the requirement covers ``user`` as a LOCAL account, enrolled or not (ADR 0197
-    Amendment A): :func:`_scope_covers`, restricted to local accounts."""
-    return user.auth_provider == AuthProvider.LOCAL.value and _scope_covers(settings, roles)
+    Amendment A): :func:`_scope_covers`, restricted to accounts that are not directory accounts."""
+    return not _is_directory_account(user) and _scope_covers(settings, roles)
 
 
 class CensusNeedsTheStoreKey(RuntimeError):
@@ -1930,6 +1943,7 @@ async def lockable_account_census(
         if (
             user.password_generated
             or user.password_hash is None
+            # Only a LOCAL row can sign in by password, so only it can be locked (#3117).
             or user.auth_provider != AuthProvider.LOCAL.value
             or not settings.require_mfa
         ):
@@ -1994,20 +2008,21 @@ _BACKGROUND_DRAIN_SECONDS: Final = 2.0
 _BACKGROUND_CANCEL_GRACE_SECONDS: Final = 0.5
 
 #: BACKLOG #2007, ASVS 6.4.5: how :meth:`AuthService._temporary_credential_issuer` finds the audit row
-#: that issued an account's current temporary password. The two issuing paths stamp
+#: that issued an account's current temporary password. The three issuing paths stamp
 #: ``password_changed_at`` first and write their audit row a moment later, both off the same Python
-#: clock, so the row sits just after the stamp; only one or two store writes lie between them. The
+#: clock, so the row sits just after the stamp; only a few store writes lie between them. The
 #: window allows a slow store on the late side and a clock step on the early side, and no more,
 #: because every create and reset in it counts against the page. A page that comes back full may
 #: have dropped the row that matters, so a full page is treated as unresolved rather than read. Each
 #: action maps to the detail key that names the account: ``user.created`` carries only the username.
+#: ``auth.mfa_reset`` issues one too, on a local account (BACKLOG #3160).
 _ISSUE_ROW_KEYS: Final[Mapping[str, str]] = MappingProxyType(
-    {"user.created": "username", "auth.password_reset": "user_id"}
+    {"user.created": "username", "auth.password_reset": "user_id", "auth.mfa_reset": "user_id"}
 )
 #: BACKLOG #2359: the row a refused credential issue writes, when the generator raises
 #: :class:`TemporaryPasswordUnavailable` on account creation or either reset. A name of its own, and
-#: never ``user.created`` or ``auth.password_reset``: :data:`_ISSUE_ROW_KEYS` reads those two as
-#: "this administrator issued the credential", so a refusal written under either would name an issuer
+#: never an action :data:`_ISSUE_ROW_KEYS` names: it reads each of those as
+#: "this administrator issued the credential", so a refusal written under one would name an issuer
 #: for a credential that was never set. Its detail's ``op`` says which of the three refused.
 CREDENTIAL_ISSUE_REFUSED_ACTION: Final = "auth.credential_issue_refused"
 #: The ``op`` values that row carries, one per issuing operation.
@@ -2067,6 +2082,20 @@ def _allowed_channels(user: UserRecord, roles: frozenset[Role]) -> frozenset[str
     return channel_scope.scope_channels(user.channel_scope)
 
 
+def _cert_outcome(answer: reconcile.Probe | str) -> str:
+    """The certificate path's outcome string for ``answer``: a probe's outcome, or the bare reason
+    a refusal carries (``_directory_presence`` returns some directory answers as strings)."""
+    return answer.outcome.value if isinstance(answer, reconcile.Probe) else answer
+
+
+def _bounded_put[V](table: dict[str, V], key: str, value: V) -> None:
+    """Set ``table[key]``, evicting the oldest entry first when the table already holds
+    :data:`_CERT_PROBE_FAULT_TRACKED_MAX` others."""
+    if key not in table and len(table) >= _CERT_PROBE_FAULT_TRACKED_MAX:
+        del table[next(iter(table))]
+    table[key] = value
+
+
 def _cert_narrowed_scope[U: UserRecord](
     user: U, mapped: frozenset[str], *, administrator: bool
 ) -> U:
@@ -2075,9 +2104,11 @@ def _cert_narrowed_scope[U: UserRecord](
 
     The rule is :func:`~messagefoundry.auth.channel_scope.decide_ad_channel_scope`, the one login
     and the reconciler share. Only a narrowing applies, and only as far as the stored scope reaches:
-    the result is the stored channels intersected with what the groups now map to. A scope the groups
-    would widen stays as stored, because this path must not grant, so a widening still waits for a
-    sign-in to write it."""
+    then the result is the stored channels intersected with what the narrowing leaves. Every other
+    decision returns ``user`` unchanged (BACKLOG #3115). That covers a scope the groups would widen,
+    because this path must not grant, so a widening still waits for a sign-in to write it. It also
+    covers a scope an administrator set when none of the account's groups is in the scope map,
+    which the rule keeps as stored."""
     decision = channel_scope.decide_ad_channel_scope(
         channel_scope.ScopeInput(
             stored_scope=user.channel_scope,
@@ -2407,6 +2438,16 @@ class AuthService:
         self._cert_outage_kind_noted_at: float | None = None
         #: Configuration refusals already logged by this process.
         self._cert_config_refusals_logged: set[str] = set()
+        #: Certificate-path probe-fault state per account id (`_note_cert_probe_fault`): the
+        #: sequence number of the latest faulting probe, and the time of the last WARNING.
+        self._cert_probe_seq = 0
+        self._cert_probe_faulting: dict[str, int] = {}
+        self._cert_probe_fault_warned_at: dict[str, float] = {}
+        #: Probes still running per account id, and, for an account that left the probe set while
+        #: some ran, the sequence number they predate (`_forget_cert_probe_fault`). Both hold only
+        #: accounts with a probe running, so the probe cap bounds them.
+        self._cert_probe_inflight: dict[str, int] = {}
+        self._cert_probe_left_at: dict[str, int] = {}
         self._login_limiter: SlidingWindowRateLimiter | None = (
             SlidingWindowRateLimiter(
                 per_key=settings.login_rate_limit_per_ip,
@@ -8217,9 +8258,13 @@ class AuthService:
         cannot get a slot within :data:`_CERT_PROBE_SLOT_WAIT_SECONDS` is refused. Refusals do not
         log one line per request; :meth:`_note_cert_directory_answer` says what they log."""
         user = await self._load_user(user_id)
+        # An account out of the probe set drops any fault tracked for it. A disable by a writer
+        # other than update_user reaches this process first here.
         if user is None or user.disabled:
+            self._forget_cert_probe_fault(user_id if user is None else user.id)
             return None
         if user.auth_provider != AuthProvider.AD.value:
+            self._forget_cert_probe_fault(user.id)
             return await self._build_identity(user)
         answer = await self._cert_directory_presence(user)
         self._note_cert_directory_answer(answer)
@@ -8237,6 +8282,7 @@ class AuthService:
             or user.auth_provider != asked.auth_provider
             or user.directory_object_id != asked.directory_object_id
         ):
+            self._forget_cert_probe_fault(asked.id)
             return None
         granted = await self._ad_roles_for_groups(answer.groups)
         kept = [role_id for role_id in user.role_ids if role_id in granted]
@@ -8257,41 +8303,156 @@ class AuthService:
         The slot is held until the probe itself ends, not until this caller stops waiting. The
         probe's worker thread cannot be cancelled, so releasing on a cancelled request would let
         the threads outnumber the cap. The probe therefore runs as its own task, shielded, and
-        releases its slot when it finishes."""
+        releases its slot when it finishes.
+
+        The probe is numbered and counted as running here, before the slot wait, so a request that
+        read the account before it left the probe set is a probe that predates the exit even while
+        it waits for a slot (:meth:`_forget_cert_probe_fault`)."""
+        self._cert_probe_seq += 1
+        seq = self._cert_probe_seq
+        self._cert_probe_inflight[user.id] = self._cert_probe_inflight.get(user.id, 0) + 1
+        started = False
         try:
-            async with asyncio.timeout(_CERT_PROBE_SLOT_WAIT_SECONDS):
-                await self._cert_probe_slots.acquire()
-        except TimeoutError:
-            return CERT_PROBE_SATURATED
-        try:
-            task = asyncio.create_task(self._cert_probe(user))
-        except BaseException:
-            self._cert_probe_slots.release()
-            raise
+            try:
+                async with asyncio.timeout(_CERT_PROBE_SLOT_WAIT_SECONDS):
+                    await self._cert_probe_slots.acquire()
+            except TimeoutError:
+                return CERT_PROBE_SATURATED
+            try:
+                task = asyncio.create_task(self._cert_probe(user, seq))
+            except BaseException:
+                self._cert_probe_slots.release()
+                raise
+            started = True
+        finally:
+            if not started:
+                self._cert_probe_ended(user.id)
         self._cert_probe_tasks.add(task)
-        task.add_done_callback(self._cert_probe_done)
+        task.add_done_callback(partial(self._cert_probe_done, user.id))
         return await asyncio.shield(task)
 
-    async def _cert_probe(self, user: UserRecord) -> reconcile.Probe | str:
+    async def _cert_probe(self, user: UserRecord, seq: int) -> reconcile.Probe | str:
         # This task's own context, so the DEBUG level never reaches the reconciler or step-up. A
         # fault on one account's entry would otherwise log a WARNING naming it on every request;
         # the outage line below reports it once instead.
         token = _PROBE_FAULT_LOG_LEVEL.set(logging.DEBUG)
         try:
-            return await self._directory_presence(user)
-        except Exception:
+            answer = await self._directory_presence(user)
+        except Exception as exc:
             # Returned, never raised: a raise from a probe whose caller was cancelled would reach
             # the loop's exception handler through the shield, one ERROR per orphaned request.
-            # Read as an outage, which fails closed and logs by the outage rules. The traceback can
-            # quote a directory value, so it goes to DEBUG and names no account.
-            _log.debug("certificate-path directory probe raised", exc_info=True)
-            return reconcile.ProbeOutcome.UNAVAILABLE.value
+            # It fails closed under its own reason. The traceback can quote a directory value, so
+            # it goes to DEBUG and names the account only by its row id.
+            _log.debug(
+                "certificate-path directory probe of user id %s raised", user.id, exc_info=True
+            )
+            self._note_cert_probe_fault(user.id, seq, exc)
+            return CERT_PROBE_FAULT
         finally:
             _PROBE_FAULT_LOG_LEVEL.reset(token)
+        faulted = self._cert_probe_faulting.get(user.id)
+        # Only a probe that started after the latest fault ends it, so a slow answer to a probe
+        # issued before the fault cannot.
+        if (
+            faulted is not None
+            and seq > faulted
+            and _cert_outcome(answer) in _CERT_DIRECTORY_ANSWERS
+        ):
+            del self._cert_probe_faulting[user.id]
+        return answer
 
-    def _cert_probe_done(self, task: asyncio.Task[reconcile.Probe | str]) -> None:
+    def _cert_probe_ended(self, user_id: str) -> None:
+        """Count one of ``user_id``'s probes as no longer running. The last one to end drops the
+        account's exit mark, since no probe that predates it is left."""
+        running = self._cert_probe_inflight[user_id] - 1
+        if running:
+            self._cert_probe_inflight[user_id] = running
+        else:
+            del self._cert_probe_inflight[user_id]
+            self._cert_probe_left_at.pop(user_id, None)
+
+    def _note_cert_probe_fault(self, user_id: str, seq: int, exc: Exception) -> None:
+        """Log a certificate-path probe fault (:data:`CERT_PROBE_FAULT`) without one line per
+        request: at most one WARNING a minute per account, naming the exception type, and DEBUG
+        for the rest.
+
+        The fault ends when a probe of the same account, started after the fault, gets any answer
+        from the directory: present, absent, disabled or undetermined. An outage does not end it.
+        The WARNING follows time, not that state. A fault logs one when
+        :data:`_CERT_OUTAGE_LOG_INTERVAL_SECONDS` has passed since the account's last WARNING,
+        whether it is a repeat or a new fault. Inside the interval it logs at DEBUG. So a fault
+        that returns after the account went unprobed for a while warns. A fault that persists warns
+        about once a minute. A fault that starts and clears inside one interval logs only at DEBUG.
+        The state decides only whether a DEBUG line says the fault is a repeat.
+
+        The state is keyed by account because the case it exists for is one account's entry that
+        always raises. Keyed process-wide, any other account's healthy answer would end it, and the
+        one account would read as flapping. An account that leaves or re-enters the probe set, when
+        this process sees it, starts afresh (:meth:`_forget_cert_probe_fault`). A fault from a
+        probe that predates that move logs at DEBUG and is recorded nowhere. It runs in the probe
+        task, so a fault still counts when its caller stopped waiting. The WARNING names no account
+        and never the exception's message, which can quote a directory value."""
+        kind = type(exc).__name__
+        if seq <= self._cert_probe_left_at.get(user_id, 0):
+            _log.debug(
+                "certificate-path directory probe of user id %s raised %s after the account left"
+                " the probe set",
+                user_id,
+                kind,
+            )
+            return
+        faulted = self._cert_probe_faulting.get(user_id)
+        _bounded_put(
+            self._cert_probe_faulting, user_id, seq if faulted is None else max(faulted, seq)
+        )
+        now = time.monotonic()
+        last = self._cert_probe_fault_warned_at.get(user_id)
+        if last is not None and now - last < _CERT_OUTAGE_LOG_INTERVAL_SECONDS:
+            _log.debug(
+                "certificate-path directory probe of user id %s raised %s%s",
+                user_id,
+                kind,
+                "" if faulted is None else " again",
+            )
+            return
+        _bounded_put(self._cert_probe_fault_warned_at, user_id, now)
+        _log.warning(
+            "an mTLS certificate identity for a directory account was refused: %s (the probe "
+            "raised %s). Logged again for that account at most once a minute while it faults",
+            CERT_PROBE_FAULT,
+            kind,
+        )
+
+    def _forget_cert_probe_fault(self, user_id: str) -> None:
+        """Drop ``user_id``'s probe-fault state from both tables, when the account leaves the
+        certificate path's probe set (disabled locally, deleted, or no longer a directory account)
+        or re-enters it (enabled again). Its next fault then warns at once, inside the interval or
+        not.
+
+        At least these callers see a move: :meth:`update_user` when its save moves the flag,
+        :meth:`delete_user`, and :meth:`identity_for_cert_user_id` when it reads the account out of
+        the set. On a move none of them sees, the account's next fault still warns once the
+        interval since its last WARNING has passed.
+
+        A probe of the account still running or waiting for a slot read the account before the
+        move, so its fault says nothing about the account as it is. The current sequence number is
+        kept until those probes end. :meth:`_note_cert_probe_fault` logs their faults at DEBUG and
+        records nothing. Without that, each one would recreate the state just dropped and warn.
+
+        A move this process never sees keeps the state, for example a disable and re-enable by
+        another writer with no certificate request between them. So does a delete by an id spelled
+        differently from the stored one, on a store that compares ids without case."""
+        self._cert_probe_faulting.pop(user_id, None)
+        self._cert_probe_fault_warned_at.pop(user_id, None)
+        if user_id in self._cert_probe_inflight:
+            self._cert_probe_left_at[user_id] = self._cert_probe_seq
+
+    def _cert_probe_done(self, user_id: str, task: asyncio.Task[reconcile.Probe | str]) -> None:
         self._cert_probe_slots.release()
         self._cert_probe_tasks.discard(task)
+        # Here rather than in the task's own finally, which never runs for a task cancelled
+        # before its first step.
+        self._cert_probe_ended(user_id)
         if not task.cancelled():
             # Only a BaseException that is not an Exception can end here; _cert_probe returns
             # everything else. Retrieved so it is not also reported as never retrieved.
@@ -8312,10 +8473,11 @@ class AuthService:
 
         A configuration refusal (no directory wired, a row with no immutable id) asks nothing and
         moves neither way. It logs one WARNING per reason per process instead.
+        :data:`CERT_PROBE_FAULT` moves neither way either; :meth:`_note_cert_probe_fault` logs it.
 
         The lines name no account. Every service request during an outage is refused the same way,
         and the username is not the useful fact."""
-        outcome = answer.outcome.value if isinstance(answer, reconcile.Probe) else answer
+        outcome = _cert_outcome(answer)
         if outcome in _CERT_DIRECTORY_OUTAGES:
             now = time.monotonic()
             latched = self._cert_directory_outage
@@ -8348,7 +8510,7 @@ class AuthService:
                 )
             self._cert_directory_outage = None
             self._cert_outage_announced = False
-        elif outcome not in self._cert_config_refusals_logged:
+        elif outcome != CERT_PROBE_FAULT and outcome not in self._cert_config_refusals_logged:
             self._cert_config_refusals_logged.add(outcome)
             _log.warning(
                 "an mTLS certificate identity for a directory account was refused: %s. Logged "
@@ -9812,11 +9974,12 @@ class AuthService:
     # --- MFA: native TOTP second factor (every account, WP-14, ASVS 6.3.3) -----
 
     def _covered_by_requirement(self, user: UserRecord, roles: frozenset[Role]) -> bool:
-        """Whether ``user`` is a LOCAL account that ``[security].require_mfa`` covers, enrolled or not
-        (ADR 0197 Amendment A). The gates of N-B2 part 4 key on this and on
-        :meth:`_has_way_past`, never on ``must_change_password``: a site that ran with the requirement
-        off and then turned it on holds accounts with a chosen password, no factor and no must-change
-        flag, and the gates must reach those too."""
+        """Whether ``[security].require_mfa`` covers ``user``, enrolled or not: any account that is
+        not a directory account, an unrecognised provider included (ADR 0197 Amendment A). The
+        gates of N-B2 part 4 key on this and on :meth:`_has_way_past`, never on
+        ``must_change_password``: a site that ran with the requirement off and then turned it on
+        holds accounts with a chosen password, no factor and no must-change flag, and the gates
+        must reach those too."""
         return _requirement_covers(self._settings, user, roles)
 
     @staticmethod
@@ -11600,7 +11763,14 @@ class AuthService:
             )
             if not refused:
                 await self._store.revoke_user_sessions(user_id)
+                # After the write, so a request that read the row before it predates the exit.
+                self._forget_cert_probe_fault(user_id)
         elif disabled is not None:
+            if before is not None and before.disabled:
+                # Re-entry only: every save posts the flag, and an ordinary edit must not reset a
+                # still-faulting account. Before the write, so no request reads the row enabled
+                # ahead of the reset.
+                self._forget_cert_probe_fault(user_id)
             await self._store.set_user_disabled(user_id, disabled=False)
         updated: dict[str, Any] = {"user_id": user_id}
         if refused:
@@ -11650,6 +11820,7 @@ class AuthService:
             user_id, AdminRemoval.DELETE, admin_role_id=Role.ADMINISTRATOR.value
         ):
             raise LastAdministratorRefused("cannot delete the last administrator")
+        self._forget_cert_probe_fault(user_id)
         await self._audit("user.deleted", actor=actor, detail=_json({"user_id": user_id}))
 
     async def set_roles(self, user_id: str, roles: Sequence[str], *, actor: str) -> None:
@@ -11952,9 +12123,10 @@ class AuthService:
 
         Read from the AUDIT row the issuing path wrote, and not from ``user_roles.assigned_by``:
         ``set_user_roles`` rewrites every row of the account on each role change, so that column
-        names whoever last set the roles, not whoever issued the credential. Two paths issue one:
-        :meth:`create_local_user` writes ``user.created``, and :meth:`admin_reset_password` writes
-        ``auth.password_reset``. Each stamps ``password_changed_at`` just before its row, so the row
+        names whoever last set the roles, not whoever issued the credential. Three paths issue one:
+        :meth:`create_local_user` writes ``user.created``, :meth:`admin_reset_password` writes
+        ``auth.password_reset``, and :meth:`admin_reset_mfa` writes ``auth.mfa_reset`` on a local
+        account (BACKLOG #3160). Each stamps ``password_changed_at`` just before its row, so the row
         is found in a short window after the stamp; ``_ISSUE_ROW_*`` states the window.
 
         The matching rows in that window must all name ONE actor. None, or two different actors,
@@ -11995,7 +12167,12 @@ class AuthService:
                             user.username,
                         )
                         continue
-                    if isinstance(detail, dict) and detail.get(key) == ids[key]:
+                    if (
+                        isinstance(detail, dict)
+                        and detail.get(key) == ids[key]
+                        # A factor reset on a directory account issues nothing (#3160).
+                        and detail.get("credential_issued") is not False
+                    ):
                         actors.add(str(row["actor"] or ""))
                         # The earliest matching row, so the account must predate all of them.
                         issued_at = min(issued_at, float(row["ts"]))
