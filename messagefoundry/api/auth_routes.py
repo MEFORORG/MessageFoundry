@@ -379,6 +379,7 @@ def _user_summary(
         roles=sorted(role_ids),
         channel_scope=_parse_channel_scope(user.channel_scope) if show_scope else None,
         channel_scope_source=user.channel_scope_source if show_scope else None,
+        channel_scope_withheld=not show_scope,
         credential_expires_at=credential_expires_at,
         lock_state=None if lock_state_at is None else _lock_state(user, lock_state_at),
     )

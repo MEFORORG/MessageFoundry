@@ -108,7 +108,15 @@ this line.**
 - **The users list shows channel scopes only to an administrator.** The engine now sends each
   account's channel scope to a `users:manage` holder only, so `/ui/users` drops its Channel scope
   and Scope source columns for any other reader rather than showing every account as "(none)".
+  The page reads the engine's `channel_scope_withheld` flag rather than deciding the rule itself,
+  so this console needs an engine that sends it, and refuses an older one at startup.
   (vault BACKLOG #3189)
+- **The configuration page offers no reload the engine will refuse.** For a channel-scoped
+  deployer, whose reload the engine refuses after the step-up is spent, `/ui/config` shows the
+  engine's reason in place of the Reload form. The engine computes the rule. (vault BACKLOG #3189)
+- **The Approvals page stops offering Approve on a request whose requester lost the authority it
+  needs**, such as a held reload or purge whose requester has since been channel-scoped. Every
+  approver was refused such a release. (vault BACKLOG #3189, #3192)
 - **The status page says when its loosenings list is incomplete.** It now shows the engine's
   `loosenings_scope` note under the security posture, so a list narrowed to a channel-scoped
   reader's scope, or read with no connection graph loaded, no longer reads as the whole posture.

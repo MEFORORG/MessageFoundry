@@ -45,13 +45,22 @@ def _provenance_badge(prov: ConfigProvenance | None) -> Markup:
 
 def config_page(prov: ConfigProvenance | None = None) -> Markup:
     """The config-deploy page: a single 'Reload configuration' action (server's startup dir only), with
-    a read-only provenance badge (running commit + clean/DRIFTED) when available (ADR 0041 D1)."""
-    reload_form = el(
-        "form",
-        el("button", "Reload configuration", type="submit"),
-        method="post",
-        action="/ui/config/reload",
-        class_="ctl",
+    a read-only provenance badge (running commit + clean/DRIFTED) when available (ADR 0041 D1).
+
+    When the engine says it will refuse this caller's reload (``reload_refused``, BACKLOG #3189),
+    the form is replaced by the engine's own reason. Offering it would send the caller through a
+    re-auth and spend the step-up for a 403. The engine computes the rule; this page only reads it."""
+    refused = prov.reload_refused if prov is not None else None
+    reload_form: Markup = (
+        el("p", text(f"Reload is not available to you: {refused}."), class_="banner")
+        if refused is not None
+        else el(
+            "form",
+            el("button", "Reload configuration", type="submit"),
+            method="post",
+            action="/ui/config/reload",
+            class_="ctl",
+        )
     )
     return page(
         "Configuration",

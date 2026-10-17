@@ -802,35 +802,48 @@ class ApprovalGate:
         rows = await self._verified_rows(
             await self._store.list_pending_approvals(now=self._clock())
         )
-        return [self._queue_entry(r, caller_user_id) for r in rows]
+        return [await self._queue_entry(r, caller_user_id) for r in rows]
 
     async def list_interrupted(self, *, caller_user_id: str | None = None) -> list[dict[str, Any]]:
         """Releases cut off mid-run and awaiting an operator's record of what happened
         (:meth:`resolve_interrupted`). They do not expire. ``caller_user_id`` as for
         :meth:`list_pending`."""
         rows = await self._verified_rows(await self._store.list_interrupted_approvals())
-        return [self._queue_entry(r, caller_user_id) for r in rows]
+        return [await self._queue_entry(r, caller_user_id) for r in rows]
 
-    def _release_blocked(
+    async def _release_blocked(
         self, r: ApprovalRow, params: dict[str, Any] | None
-    ) -> ReleaseBlocked | None:
+    ) -> tuple[ReleaseBlocked | None, str | None]:
         """Why :meth:`approve` would refuse this request whoever approves it, or ``None`` (vault
         BACKLOG #3192). approve() refuses on exactly these, so the queue cannot predict a refusal
         the gate does not make; :class:`~messagefoundry.api.models.PendingApprovalInfo` states
-        what each value means and what ``None`` does not promise."""
-        if not r.requester_user_id:
-            return "no_requester_id"
-        if r.operation not in self._ops:
-            return "operation_unavailable"
-        if not self.gates(r.operation):
-            return "not_gated"
-        if params is None:
-            return "params_unreadable"
-        return None
+        what each value means and what ``None`` does not promise.
 
-    def _queue_entry(self, r: ApprovalRow, caller_user_id: str | None) -> dict[str, Any]:
+        The second value is :meth:`_requester_standing`'s reason slug when the first is
+        ``requester_not_authorized``, for the refusal's audit row and alert, and ``None`` otherwise.
+        The requester's standing is read here, after every other test passes, so a held request
+        whose requester has lost the authority it needs, such as a reload whose requester has since
+        been channel-scoped, is predicted and refused through this one read (BACKLOG #3189)."""
+        if not r.requester_user_id:
+            return "no_requester_id", None
+        op = self._ops.get(r.operation)
+        if op is None:
+            return "operation_unavailable", None
+        if not self.gates(r.operation):
+            return "not_gated", None
+        if params is None:
+            return "params_unreadable", None
+        standing = await self._requester_standing(r.requester_user_id, op, params)
+        if standing is not None:
+            return "requester_not_authorized", standing
+        return None, None
+
+    async def _queue_entry(self, r: ApprovalRow, caller_user_id: str | None) -> dict[str, Any]:
         operation = r.operation
         params = _stored_params(r.id, r.params)
+        # Only a pending row can be approved; an interrupted one is resolved instead, so its
+        # requester's standing is not read.
+        blocked = (await self._release_blocked(r, params))[0] if r.status == "pending" else None
         return {
             # BACKLOG #2460: keyed on the immutable id, like the refusals it predicts (#1540), so a
             # page can hide Approve from the requester. A row with no id never matches; approve
@@ -850,8 +863,7 @@ class ApprovalGate:
             # The same test approve() refuses on (approval.no_longer_gated), so a page can stop
             # offering a release the gate would refuse. Read now, like the refusal it predicts.
             "gated": self.gates(operation),
-            # Only a pending row can be approved; an interrupted one is resolved instead.
-            "release_blocked": self._release_blocked(r, params) if r.status == "pending" else None,
+            "release_blocked": blocked,
         }
 
     async def approve(
@@ -904,7 +916,7 @@ class ApprovalGate:
         params = _stored_params(approval_id, row.params)
         # vault BACKLOG #3192: the refusals no approver can get past are tested once, in
         # _release_blocked, which the queue reads too, so the page's prediction cannot drift.
-        blocked = self._release_blocked(row, params)
+        blocked, standing = await self._release_blocked(row, params)
         if blocked == "no_requester_id":
             # Fail closed. A request with no recorded requester id cannot be checked for
             # self-approval, and the stored NAME is not a usable fallback -- after a rename it may
@@ -947,9 +959,15 @@ class ApprovalGate:
             )
             raise ApprovalError(409, "request parameters are unreadable; reject it instead")
         op = self._ops.get(operation)
-        if blocked is not None or not requester_user_id or op is None or params is None:
-            # Unreachable while every reason has its arm above. Fail closed if one is added
-            # without one, rather than release past a refusal the queue already predicts.
+        if (
+            blocked not in (None, "requester_not_authorized")
+            or not requester_user_id
+            or op is None
+            or params is None
+        ):
+            # Unreachable while every reason has its arm above, or, for
+            # requester_not_authorized, below the dwell floor. Fail closed if one is added without
+            # one, rather than release past a refusal the queue already predicts.
             raise ApprovalError(409, f"this request cannot be released ({blocked})")
         # ASVS 2.4.2: the FLOOR on the request's age, beside the expiry CEILING in _require_pending.
         # Here, inside approve(), because every release path calls this method, so no caller can skip
@@ -1013,14 +1031,15 @@ class ApprovalGate:
         # account, so a directory-side change counts once it reaches that copy (module docstring). Checked
         # BEFORE the transition, so a refused request stays pending, like a removed operation above.
         # It can still be rejected, or released later if the requester's authority is restored.
-        reason = await self._requester_standing(requester_user_id, op, params)
-        if reason is not None:
+        # Read once, by _release_blocked above, which the queue reads too (BACKLOG #3189), and
+        # refused here, after the dwell floor, where this refusal has always been.
+        if blocked == "requester_not_authorized":
             await self._refuse_stale_requester(
                 approval_id,
                 operation=op,
                 approver=approver,
                 requester=row.requester,
-                reason=reason,
+                reason=standing or "requester_unverifiable",
                 client=client,
             )
             raise ApprovalError(

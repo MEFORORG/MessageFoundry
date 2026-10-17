@@ -9,13 +9,20 @@ JSON-API ``GET /config/provenance`` tests in ``tests/test_config_provenance.py``
 
 from __future__ import annotations
 
-from messagefoundry.api.models import ConfigProvenance
+from messagefoundry.api.models import RELOAD_REFUSED_CHANNEL_SCOPED, ConfigProvenance
 from messagefoundry_webconsole.pages.config import config_page
 
 
 def test_config_page_badge_clean() -> None:
     html = config_page(
-        ConfigProvenance(loaded=True, fingerprint="a" * 64, git_head="b" * 40, files=3, drift=False)
+        ConfigProvenance(
+            loaded=True,
+            fingerprint="a" * 64,
+            git_head="b" * 40,
+            files=3,
+            drift=False,
+            reload_refused=None,
+        )
     )
     assert "Running config:" in html
     assert "commit bbbbbbb" in html  # 7-char abbreviated commit
@@ -26,7 +33,14 @@ def test_config_page_badge_clean() -> None:
 
 def test_config_page_badge_drifted() -> None:
     html = config_page(
-        ConfigProvenance(loaded=True, fingerprint="a" * 64, git_head="c" * 40, files=3, drift=True)
+        ConfigProvenance(
+            loaded=True,
+            fingerprint="a" * 64,
+            git_head="c" * 40,
+            files=3,
+            drift=True,
+            reload_refused=None,
+        )
     )
     assert ">DRIFTED<" in html
     assert "status-error" in html
@@ -36,7 +50,14 @@ def test_config_page_badge_drifted() -> None:
 def test_config_page_badge_without_git_uses_fingerprint() -> None:
     # No .git on the engine host (common) -> fall back to the content-fingerprint identity.
     html = config_page(
-        ConfigProvenance(loaded=True, fingerprint="d" * 64, git_head=None, files=2, drift=False)
+        ConfigProvenance(
+            loaded=True,
+            fingerprint="d" * 64,
+            git_head=None,
+            files=2,
+            drift=False,
+            reload_refused=None,
+        )
     )
     assert "fingerprint dddddddddddd" in html  # 12-char abbreviated fingerprint
     assert "commit" not in html
@@ -45,5 +66,19 @@ def test_config_page_badge_without_git_uses_fingerprint() -> None:
 def test_config_page_no_badge_when_not_loaded() -> None:
     # Backward-compatible: no provenance (older/embedding path) renders the page unchanged.
     assert "Running config:" not in config_page(None)
-    assert "Running config:" not in config_page(ConfigProvenance(loaded=False))
+    assert "Running config:" not in config_page(ConfigProvenance(loaded=False, reload_refused=None))
     assert "Reload configuration" in config_page(None)  # the page still renders its action
+
+
+def test_config_page_offers_no_reload_the_engine_will_refuse() -> None:
+    """BACKLOG #3189: the engine refuses a channel-scoped caller's reload after the step-up is
+    spent, so the page states the engine's reason instead of offering the form. The control: with
+    no refusal the form is offered."""
+    refused = str(
+        config_page(ConfigProvenance(loaded=False, reload_refused=RELOAD_REFUSED_CHANNEL_SCOPED))
+    )
+    assert 'action="/ui/config/reload"' not in refused
+    assert RELOAD_REFUSED_CHANNEL_SCOPED in refused
+    offered = str(config_page(ConfigProvenance(loaded=False, reload_refused=None)))
+    assert 'action="/ui/config/reload"' in offered
+    assert RELOAD_REFUSED_CHANNEL_SCOPED not in offered

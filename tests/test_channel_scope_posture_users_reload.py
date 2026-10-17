@@ -16,6 +16,7 @@ first deployment would have carried, not a live exposure.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -24,7 +25,7 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
-from messagefoundry.api.models import POSTURE_NARROWED_TO_SCOPE
+from messagefoundry.api.models import POSTURE_NARROWED_TO_SCOPE, RELOAD_REFUSED_CHANNEL_SCOPED
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
@@ -259,12 +260,17 @@ async def test_users_list_shows_scopes_only_to_a_users_manage_holder(engine: Eng
     rows = {u["username"]: u for u in by_reader["boss"].json()}
     assert rows["other"]["channel_scope"] == [THEIRS]
     assert rows["other"]["channel_scope_source"] == "manual"
+    # The flag says the values are the stored ones, so the administrator's own null scope denies.
+    assert all(u["channel_scope_withheld"] is False for u in rows.values())
+    assert rows["boss"]["channel_scope"] is None
     # A users:read holder is shown none, scoped or not: the rule is the permission, not the scope.
     for who in ("scoped-reader", "wide-reader"):
         listed = by_reader[who].json()
         assert {u["username"] for u in listed} >= {"other", "boss", who}
         assert all(u["channel_scope"] is None for u in listed), who
         assert all(u["channel_scope_source"] is None for u in listed), who
+        # And says so, so a reader never re-derives which null this is.
+        assert all(u["channel_scope_withheld"] is True for u in listed), who
         assert THEIRS not in by_reader[who].text
 
 
@@ -308,8 +314,138 @@ async def test_a_held_reload_is_not_released_once_its_requester_is_scoped(
         held = await c.post("/config/reload", json={}, headers=await _login(c, "maker"))
         assert held.status_code == 202, held.text
         approval_id = held.json()["approval_id"]
+        checker = await _login(c, "checker")
+        # The control for the prediction below: while the requester holds every channel, nothing
+        # is predicted.
+        assert await _release_blocked(c, approval_id, checker) is None
         await service.set_channel_scope(maker, ["IB_T_ADT"], actor="test")
-        r = await c.post(f"/approvals/{approval_id}/approve", headers=await _login(c, "checker"))
+        # The queue now predicts the refusal, so the Approvals page offers only the reject rather
+        # than an Approve every approver is refused (BACKLOG #3189, #3192).
+        assert await _release_blocked(c, approval_id, checker) == "requester_not_authorized"
+        r = await c.post(f"/approvals/{approval_id}/approve", headers=checker)
         assert r.status_code == 409, r.text
     stale = await engine.store.list_audit(limit=50, action="approval.stale_requester")
     assert [json.loads(row["detail"])["reason"] for row in stale] == ["requester_out_of_scope"]
+
+
+async def _release_blocked(
+    c: httpx.AsyncClient, approval_id: str, headers: dict[str, str]
+) -> object:
+    r = await c.get("/approvals", headers=headers)
+    assert r.status_code == 200, r.text
+    [entry] = [e for e in r.json()["approvals"] if e["id"] == approval_id]
+    return entry["release_blocked"]
+
+
+async def test_a_held_purge_is_predicted_refused_once_its_requester_is_scoped(
+    tmp_path: Path,
+) -> None:
+    """The same gap on the purge, the other operation no channel scope can confine. A purge held
+    while the requester held every channel is predicted refused once the requester is scoped."""
+    out = tmp_path / "purge_out"
+    out.mkdir()
+    eng = await Engine.create(
+        tmp_path / "purge3189.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        reg = Registry()
+        reg.add_outbound(
+            build_outbound_connection(
+                SHARED, ConnectionSpec(type=ConnectorType.FILE, settings={"directory": str(out)})
+            )
+        )
+        eng.add_registry(reg)
+        await eng.start()
+        rr = eng.registry_runner
+        assert rr is not None
+        await rr.stop_outbound(SHARED)  # a purge needs a quiesced outbound before it is held
+        for _ in range(200):
+            if rr.outbound_quiesced(SHARED):
+                break
+            await asyncio.sleep(0.02)
+        assert rr.outbound_quiesced(SHARED)
+        gated = ApprovalsSettings(
+            enabled=True, operations=["connection_purge"], min_dwell_seconds=0.0
+        )
+        service = await _service(eng)
+        maker = await _user(service, "maker", [Role.OPERATOR.value], [ALL_CHANNELS])
+        await _user(service, "checker", [Role.ADMINISTRATOR.value], None)
+        async with _client(eng, service, approvals=gated) as c:
+            held = await c.post(f"/connections/{SHARED}/purge", headers=await _login(c, "maker"))
+            assert held.status_code == 202, held.text
+            approval_id = held.json()["approval_id"]
+            checker = await _login(c, "checker")
+            assert await _release_blocked(c, approval_id, checker) is None
+            await service.set_channel_scope(maker, [MINE], actor="test")
+            assert await _release_blocked(c, approval_id, checker) == "requester_not_authorized"
+            r = await c.post(f"/approvals/{approval_id}/approve", headers=checker)
+            assert r.status_code == 409, r.text
+    finally:
+        await eng.stop()
+
+
+# --- GET /config/provenance: the console's Reload form follows the engine -------------------------
+
+
+async def test_provenance_names_the_reload_refusal_the_route_gives(engine: Engine) -> None:
+    """BACKLOG #3189: ``reload_refused`` is read off the rule the reload refuses on, so a page can
+    stop offering a reload that would cost a step-up and then answer 403. A deployer with no scope
+    set at all is channel-scoped too: an empty scope is a scope (Manager decision)."""
+    service = await _service(engine)
+    await _user(service, "scoped-deployer", [Role.DEPLOYMENT.value], ["IB_T_ADT"])
+    await _user(service, "unset-deployer", [Role.DEPLOYMENT.value], None)
+    await _user(service, "wide-deployer", [Role.DEPLOYMENT.value], [ALL_CHANNELS])
+    async with _client(engine, service) as c:
+        seen = {}
+        for who in ("scoped-deployer", "unset-deployer", "wide-deployer"):
+            headers = await _login(c, who)
+            prov = await c.get("/config/provenance", headers=headers)
+            assert prov.status_code == 200, prov.text
+            reload = await c.post("/config/reload", json={"dry_run": True}, headers=headers)
+            seen[who] = (prov.json()["reload_refused"], reload.status_code)
+    assert seen == {
+        "scoped-deployer": (RELOAD_REFUSED_CHANNEL_SCOPED, 403),
+        "unset-deployer": (RELOAD_REFUSED_CHANNEL_SCOPED, 403),
+        # The control: the field is not always set.
+        "wide-deployer": (None, 200),
+    }
+
+
+# --- _deny_connection bounds the name it audits ---------------------------------------------------
+
+
+async def test_the_engine_refusal_audits_no_malformed_name(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3031: the console checks a bulk selection's name before it calls in, and the JSON
+    routes bound it on the path, but the core handler takes any string. So ``_deny_connection``
+    bounds it too: a name that fails the connection-name rule is audited with no channel, and the
+    caller is still refused. The control: a well-formed out-of-scope name is audited by name."""
+    from fastapi import HTTPException
+
+    import messagefoundry_webconsole
+    from messagefoundry.api._ui_seam import UiDeps
+    from messagefoundry.auth import AuthProvider, Identity
+
+    captured: list[UiDeps] = []
+    monkeypatch.setattr(
+        messagefoundry_webconsole, "mount_ui", lambda _app, deps: captured.append(deps)
+    )
+    service = await _service(engine)
+    create_app(engine, auth=service, serve_ui=True)
+    [deps] = captured
+    actor = "direct-caller"
+    scoped = Identity.build(
+        user_id="direct-caller-id",
+        username=actor,
+        auth_provider=AuthProvider.LOCAL,
+        roles=[Role.OPERATOR],
+        allowed_channels=frozenset({MINE}),
+    )
+    for name in ("A" * 5000, "IB_BAD/NAME", THEIRS):
+        with pytest.raises(HTTPException) as refused:
+            await deps.core.dual_role_control(engine, scoped, name, "start", role="source")
+        assert refused.value.status_code == 403, name
+    assert sorted(await _denials(engine, actor), key=str) == sorted([None, None, THEIRS], key=str)

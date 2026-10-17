@@ -102,6 +102,7 @@ from messagefoundry.api.metrics import (
 )
 from messagefoundry.api.models import (
     POSTURE_NARROWED_TO_SCOPE,
+    RELOAD_REFUSED_CHANNEL_SCOPED,
     STATIC_CREDENTIAL_HOPS_COMPLETE,
     STATIC_CREDENTIAL_HOPS_PARTIAL,
     STORE_PRIVILEGE_NOT_PROBED,
@@ -374,7 +375,7 @@ from messagefoundry.config.wiring import (
     revocation_attested_hops,
     unverified_generic_db_hops,
 )
-from messagefoundry.connection_names import inbound_name_of
+from messagefoundry.connection_names import inbound_name_of, is_connection_name
 from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.integrity import run_startup_attestation
 from messagefoundry.last_resort import install_loop_exception_handler
@@ -4127,7 +4128,14 @@ def create_app(
         # The one refusal a channel-scoped caller gets for a connection it may not reach. It names
         # no reason on purpose: a body naming "shared outbound" would tell an outbound apart from an
         # out-of-scope inbound or a name that exists nowhere (BACKLOG #2551).
-        await _audit_channel_denied(engine, identity, name, client)
+        #
+        # BACKLOG #3031: a name that fails the connection-name rule is audited with no channel. The
+        # JSON routes bound the name on the path, and the console checks it before it calls in, but
+        # the core handlers take any string, so the bound is held here too: no caller of this
+        # refusal can write an unbounded name to audit_log.channel_id. Such a name is never in a
+        # scope, and the actor and host still identify the attempt.
+        channel = name if is_connection_name(name) else None
+        await _audit_channel_denied(engine, identity, channel, client)
         raise HTTPException(403, "not authorized for this connection")
 
     async def _resolve_connection(
@@ -5608,7 +5616,7 @@ def create_app(
         # refusal names no channel, so its audit row carries none.
         if not _cross_channel_in_scope(user):
             await _audit_channel_denied(engine, user, None, client_ip(request))
-            raise HTTPException(403, "channel-scoped users cannot reload the configuration")
+            raise HTTPException(403, RELOAD_REFUSED_CHANNEL_SCOPED)
         # Hold a real (non-dry-run) reload for a second approver when dual-control gates it. A dry_run
         # is a read-only pre-flight (no swap), so it is never held. The guard runs AFTER the caller's
         # own step-up + config:deploy check (in reload_config, or the console's own gate) — the second
@@ -8108,11 +8116,16 @@ def create_app(
         DRIFTED. No PHI/secrets — a one-way hash + a commit sha; gated by ``monitoring:read`` like
         ``/status`` (no step-up). ``drift`` recomputes the on-disk fingerprint off the event loop and
         compares it to the loaded baseline; it degrades to clean when the baseline is missing or the
-        config dir is unreadable, so a read never raises."""
+        config dir is unreadable, so a read never raises.
+
+        ``reload_refused`` is read off :func:`_cross_channel_in_scope`, the rule the reload itself
+        refuses on, so the console's Reload form follows the engine (BACKLOG #3189)."""
+        reload_refused = None if _cross_channel_in_scope(_user) else RELOAD_REFUSED_CHANNEL_SCOPED
         loaded = engine.loaded_config_fingerprint
         fp = loaded.get("fingerprint") if loaded else None
         if not isinstance(fp, str) or not fp:
-            return ConfigProvenance(loaded=False)  # no graph loaded yet, or fingerprint unavailable
+            # No graph loaded yet, or fingerprint unavailable.
+            return ConfigProvenance(loaded=False, reload_refused=reload_refused)
         drift = False
         target = engine.running_config_dir
         if target is not None:
@@ -8130,6 +8143,7 @@ def create_app(
             git_head=git_head if isinstance(git_head, str) else None,
             files=files if isinstance(files, int) else None,
             drift=drift,
+            reload_refused=reload_refused,
         )
 
     # --- engine + DB status --------------------------------------------------

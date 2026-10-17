@@ -56,7 +56,15 @@ def _gate(store: Any, runs: list[str], sink: _Sink | None = None) -> ApprovalGat
         return {"requeued": 0}
 
     for key in (_REPLAY, _PURGE):
-        gate.register(key, "op", _execute, permission=Permission.MESSAGES_REPLAY)
+        # A requester is out of scope for a row whose params say so (BACKLOG #3189), standing in
+        # for a held reload or purge whose requester has since been channel-scoped.
+        gate.register(
+            key,
+            "op",
+            _execute,
+            permission=Permission.MESSAGES_REPLAY,
+            in_scope=lambda _identity, p: not p.get("out_of_scope"),
+        )
     return gate
 
 
@@ -87,6 +95,7 @@ async def _rows(store: MessageStore) -> dict[str, ReleaseBlocked | None]:
         await _row(store, operation=_RELOAD): "operation_unavailable",
         await _row(store, operation=_PURGE): "not_gated",
         await _row(store, params="[1]"): "params_unreadable",
+        await _row(store, params='{"out_of_scope": true}'): "requester_not_authorized",
         await _row(store): None,
     }
 
@@ -114,6 +123,9 @@ async def test_the_prediction_matches_the_refusal(store: MessageStore) -> None:
         row = await store.get_pending_approval(approval_id)
         assert row is not None and str(row["status"]) == "pending", reason
     assert runs == ["ran"]
+    # The requester refusal is still the stale-requester refusal, with its own reason slug.
+    [stale] = await store.list_audit(action="approval.stale_requester")
+    assert json.loads(str(stale["detail"]))["reason"] == "requester_out_of_scope"
 
 
 async def test_an_unreadable_params_refusal_writes_its_audit_row(store: MessageStore) -> None:

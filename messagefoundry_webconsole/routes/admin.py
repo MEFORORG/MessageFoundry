@@ -224,9 +224,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity: Identity = Depends(require_ui(Permission.USERS_READ)),
     ) -> HTMLResponse:
         users = await admin.list_users(service=service, identity=identity)
-        # The engine shows scopes only to a users:manage holder (BACKLOG #3189).
-        show_scope = identity.has(Permission.USERS_MANAGE)
-        return HTMLResponse(pages.users_page(users, show_scope=show_scope))
+        # Each summary says whether its scope was withheld from this caller (BACKLOG #3189).
+        return HTMLResponse(pages.users_page(users))
 
     # Declared BEFORE /ui/users/{user_id} so the literal segment wins the route match.
     @app.get("/ui/users/new", response_class=HTMLResponse)

@@ -83,7 +83,12 @@ def _scope_cell(user: UserSummary) -> str:
     an account that reaches nothing sends an administrator hunting a permission bug that is not
     there. Showing "(none)" for an account that reaches everything hides real access from the person
     whose job is to review it, which is the worse of the two.
+
+    A scope the engine withheld from this reader (BACKLOG #3189) renders as not shown, never as
+    "(none)".
     """
+    if user.channel_scope_withheld:
+        return "not shown"
     if Role.ADMINISTRATOR.value in user.roles:
         return "all (administrator)"
     stored = user.channel_scope
@@ -248,17 +253,18 @@ def _lock_card(user: UserSummary) -> Markup:
     )
 
 
-def users_page(users: Sequence[UserSummary], *, show_scope: bool) -> Markup:
+def users_page(users: Sequence[UserSummary]) -> Markup:
     """The user list: every account with provider, roles, scope, and status; links to the admin forms.
 
     The Lock column appears only when the engine disclosed lock state, which it does only to a
     users:manage holder (BACKLOG #1131). An empty column would read as "nobody is locked".
 
-    The two scope columns appear only when ``show_scope`` is set, which the route sets for a
-    users:manage holder, the only caller the engine shows scopes to (BACKLOG #3189). The engine's
-    null for anyone else means "not shown", and this page would render it as "(none)", which reads
-    as "reaches nothing"."""
+    The two scope columns appear only when the engine sent the scopes, which its
+    ``channel_scope_withheld`` says (BACKLOG #3189). A withheld scope is null, and this page would
+    render it as "(none)", which reads as "reaches nothing". The engine decides who is shown them;
+    this page does not re-derive the rule."""
     show_lock = any(u.lock_state is not None for u in users)
+    show_scope = not any(u.channel_scope_withheld for u in users)
     rows: list[list[object]] = []
     for u in users:
         row: list[object] = [

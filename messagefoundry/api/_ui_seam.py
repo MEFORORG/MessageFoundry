@@ -428,12 +428,24 @@ from typing import Any
 #: (#2709 to 589456358a5fe441, #3192 to bd77ef41628d287c). The value below was re-derived with
 #: ``--write`` on the merged tree, so it covers both: the route-gate section and the grown DTO.
 #:
+#: Vault BACKLOG #3189, #3031 and #3192, MOVED ON PURPOSE: ``UserSummary`` gained the required
+#: ``channel_scope_withheld``, which the users page reads to tell a withheld scope from one that
+#: denies. ``ConfigProvenance`` gained the required ``reload_refused``, the engine's own reload
+#: refusal for the caller, which the config page reads to stop offering a Reload the engine will
+#: refuse after the step-up. ``ReleaseBlocked`` gained ``requester_not_authorized``, which the
+#: Approvals page has a note for. The channel-scope change before these moved no digest, so a
+#: console built before it shared this engine's digest and passed the handshake. Such a console
+#: rendered "(none)" for a withheld scope, never rendered the posture's ``loosenings_scope`` line on
+#: ``/ui/status``, and skipped the name check on a channel-scoped actor's bulk selection, which
+#: ``_deny_connection`` now bounds itself. Moving the digest refuses that console at mount, which
+#: closes all three. Re-derived with ``--write``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "2a36a37fa99d8fc2"
+ENGINE_UI_SEAM: str = "bb8c11820c5638ed"
 
 
 @dataclass(frozen=True, slots=True)

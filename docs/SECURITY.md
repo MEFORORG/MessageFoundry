@@ -1867,6 +1867,10 @@ the same permission set on the same method reds CI until it is listed here.
 > unknown name, since a scope is not checked against the registry (BACKLOG #2640). Only an
 > unscoped caller gets 404 for an unknown name. So a denial row can name a channel inside the
 > actor's own scope, for example one a reload removed. Read such a row as a miss, not a probe.
+> A name that fails the connection-name rule is never in a scope, and its denial row carries no
+> channel, so `audit_log.channel_id` never holds a caller-chosen string of unbounded length. The
+> console checks the rule before it calls in, and the engine's own refusal checks it again for
+> any caller of the handler (BACKLOG #3031).
 > On a deployment with more than one engine shard the same row has a second cause. Each engine
 > shard's graph holds only its own inbounds, and each serves its own API port. So a scoped caller
 > who asks one engine shard about an in-scope inbound that another owns gets the 403 and a denial
@@ -1941,9 +1945,11 @@ the same permission set on the same method reds CI until it is listed here.
 > - `POST /approvals/{approval_id}/approve` checks the requester's channel scope again before it
 >   releases a held request, by the rule the request route used. A held dead-letter replay needs
 >   a scope that still covers its `channel_id`, and a held replay of every channel needs an
->   all-channels requester. A held purge needs a requester who is still all-channels. Otherwise
->   the release answers 409, the request stays pending, and an `approval.stale_requester` row
->   records the reason `requester_out_of_scope`.
+>   all-channels requester. A held purge, and a held config reload, need a requester who is still
+>   all-channels. Otherwise the release answers 409, the request stays pending, and an
+>   `approval.stale_requester` row records the reason `requester_out_of_scope`. The approvals
+>   queue reads the same check when it lists the request, and marks it `release_blocked:
+>   requester_not_authorized` (BACKLOG #3189).
 > - `GET /me/security-events` returns the `auth.*` rows recorded under the caller's username, and
 >   only those at or after the account's `created_at`. So an account does not see rows written
 >   under its name before it existed, such as a failed sign-in or a deleted account's history. The
@@ -2002,12 +2008,15 @@ the same permission set on the same method reds CI until it is listed here.
 >   name a connection.
 > - `GET /users` sends each account's `channel_scope` and `channel_scope_source` only to a
 >   `users:manage` holder, the tier `GET /users/{user_id}/channel-scope` reads on. Everyone else
->   gets null for both, which there means "not shown", as `lock_state` does. The console's user
->   list drops both scope columns for such a reader.
+>   gets null for both and `channel_scope_withheld: true`, so a null there means "not shown". The
+>   console's user list reads that flag and drops both scope columns for such a reader.
 > - `POST /config/reload` refuses a scoped caller 403, a dry run included, because a reload loads
 >   the whole graph and a dry run's reply describes it. So a deployer needs the all-channels grant.
 >   The refusal writes one `auth.channel_denied` row naming no channel. The approval gate refuses
->   to release a held reload whose requester has been scoped since, as it does for a purge.
+>   to release a held reload whose requester has been scoped since, as it does for a purge, and
+>   `GET /approvals` marks such a request blocked. `GET /config/provenance` carries
+>   `reload_refused`, the refusal the reload gives this caller, read off the same rule, and the
+>   console's configuration page shows that reason in place of its Reload form.
 >
 > `tests/test_channel_scope_posture_users_reload.py` pins all three.
 
@@ -2089,14 +2098,21 @@ runs it without a second approver. `GET /approvals` marks such a request `gated:
 the same settings test at listing time, and gives it a `release_blocked` reason, below, which the
 console's Approvals page keys on.
 
-**`GET /approvals` names a release the gate refuses whoever approves it (vault BACKLOG #3192).**
-Each pending request carries `release_blocked`, which the release refuses on directly, so the
-two cannot disagree. `PendingApprovalInfo` in `messagefoundry/api/models.py` lists its values and
-what `null` does not promise. The console's Approvals page keys on it, and offers a blocked request
-only Reject, or Withdraw on the requester's own row, with a note saying why. A release
-refused for unreadable parameters writes an `approval.params_unreadable` row against the
-approver, which carries no parameters. A refusal for a request with no requester id, or for an
-operation no longer registered, still writes no row.
+**`GET /approvals` names at least some of the releases the gate refuses whoever approves them
+(vault BACKLOG #3192).** Each pending request carries `release_blocked`, which the release refuses
+on directly, so where it names a reason the two cannot disagree. It names at least a request with
+no requester id, an operation no longer registered, one dual control no longer gates, unreadable
+parameters, and a requester who no longer holds the authority the operation needs, such as a held
+reload or purge whose requester has since been channel-scoped (`requester_not_authorized`, BACKLOG
+#3189). The requester's standing is read when the queue is listed, so a change after the listing
+is met only at release. A `null` does not promise a release: at least the self-approval refusal,
+the expiry, the dwell floor, the row's seal and the operation's own refusals are met only then.
+`PendingApprovalInfo` in `messagefoundry/api/models.py` lists the values. The console's Approvals
+page keys on it, and offers a blocked request only Reject, or Withdraw on the requester's own row,
+with a note saying why. A release refused for unreadable parameters writes an
+`approval.params_unreadable` row against the approver, which carries no parameters. A release
+refused on the requester's standing writes `approval.stale_requester`, above. A refusal for a
+request with no requester id, or for an operation no longer registered, still writes no row.
 
 **Each state change and its audit row are one write (vault BACKLOG #2255).** The store
 moves the request and appends its audit row in one transaction, so the two commit or roll back

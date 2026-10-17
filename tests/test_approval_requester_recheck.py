@@ -117,10 +117,20 @@ async def _hold_replay(
     return str(r.json()["approval_id"])
 
 
+async def _release_blocked(c: httpx.AsyncClient, approval_id: str, headers: dict[str, str]) -> Any:
+    r = await c.get("/approvals", headers=headers)
+    assert r.status_code == 200, r.text
+    [entry] = [e for e in r.json()["approvals"] if e["id"] == approval_id]
+    return entry["release_blocked"]
+
+
 async def _assert_refused(
     engine: Engine, c: httpx.AsyncClient, approval_id: str, sink: _Sink, reason: str
 ) -> None:
-    r = await c.post(f"/approvals/{approval_id}/approve", headers=await _token(c, "checker"))
+    checker = await _token(c, "checker")
+    # BACKLOG #3189: the queue predicts this refusal, so a page offers only the reject.
+    assert await _release_blocked(c, approval_id, checker) == "requester_not_authorized"
+    r = await c.post(f"/approvals/{approval_id}/approve", headers=checker)
     assert r.status_code == 409, r.text
     assert STALE in r.json()["detail"]
     # Refused BEFORE the transition: the row is still pending and nothing executed.
@@ -215,7 +225,10 @@ async def test_a_requester_still_in_good_standing_is_released(engine: Engine) ->
     c, _ = _client_with_sink(engine, service, sink)
     async with c:
         approval_id = await _hold_replay(c, await _token(c, "maker"), {"channel_id": "IB_ACME_ADT"})
-        r = await c.post(f"/approvals/{approval_id}/approve", headers=await _token(c, "checker"))
+        checker = await _token(c, "checker")
+        # The control for the prediction in _assert_refused: nothing withdrawn, nothing predicted.
+        assert await _release_blocked(c, approval_id, checker) is None
+        r = await c.post(f"/approvals/{approval_id}/approve", headers=checker)
         assert r.status_code == 200, r.text
         assert r.json()["result"] == {"requeued": 0}
     assert sink.events == []

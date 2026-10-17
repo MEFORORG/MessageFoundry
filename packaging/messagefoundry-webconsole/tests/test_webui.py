@@ -3682,6 +3682,7 @@ def test_users_page_scope_column_shows_what_the_account_reaches() -> None:
             disabled=False,
             roles=roles,
             channel_scope=scope,
+            channel_scope_withheld=False,
         )
 
     assert _scope_cell(_u(["operator"], None)) == "(none)"  # never granted -> denies
@@ -3695,20 +3696,30 @@ def test_users_page_scope_column_shows_what_the_account_reaches() -> None:
 
 def test_users_page_hides_the_scope_columns_from_a_reader_who_is_not_shown_scopes() -> None:
     """BACKLOG #3189: the engine shows channel scopes only to a users:manage holder, and sends
-    anyone else null. This page renders a null scope as "(none)", "reaches nothing", so for such a
-    reader it must drop both scope columns rather than print that beside every account."""
+    anyone else null with ``channel_scope_withheld``. This page renders a null scope as "(none)",
+    "reaches nothing", so for such a reader it must drop both scope columns rather than print that
+    beside every account. It reads the engine's flag, and does not re-derive the rule."""
     from messagefoundry.api.auth_models import UserSummary
-    from messagefoundry_webconsole.pages.admin import users_page
+    from messagefoundry_webconsole.pages.admin import _scope_cell, users_page
 
-    withheld = UserSummary(
-        id="u", username="u", auth_provider="local", disabled=False, roles=["operator"]
-    )
-    hidden = str(users_page([withheld], show_scope=False))
+    def _u(withheld: bool) -> UserSummary:
+        return UserSummary(
+            id="u",
+            username="u",
+            auth_provider="local",
+            disabled=False,
+            roles=["operator"],
+            channel_scope_withheld=withheld,
+        )
+
+    hidden = str(users_page([_u(True)]))
     assert "Channel scope" not in hidden and "Scope source" not in hidden
     assert "(none)" not in hidden
-    # The control: the same row on the page a users:manage holder gets carries both columns.
-    shown = str(users_page([withheld], show_scope=True))
+    assert _scope_cell(_u(True)) == "not shown"
+    # The control: the same null scope, not withheld, is a scope that denies, and both columns show.
+    shown = str(users_page([_u(False)]))
     assert "<th>Channel scope</th>" in shown and "<th>Scope source</th>" in shown
+    assert "(none)" in shown
 
 
 async def test_users_page_shows_scopes_only_to_a_users_manage_holder(engine: Engine) -> None:
@@ -4291,13 +4302,14 @@ def test_scope_source_renders_in_words() -> None:
             roles=["operator"],
             channel_scope=["IB_A"],
             channel_scope_source=source,
+            channel_scope_withheld=False,
         )
 
     assert _scope_source_text(_u("ad")) == "directory (AD group map)"
     assert _scope_source_text(_u("manual")) == "set by an administrator"
     assert _scope_source_text(_u(None)) == "not recorded"
     assert _scope_source_text(_u("future")) == "future"
-    listing = str(users_page([_u("ad")], show_scope=True))
+    listing = str(users_page([_u("ad")]))
     assert "<th>Scope source</th>" in listing
     assert "directory (AD group map)" in listing
 
@@ -4318,6 +4330,7 @@ def test_which_scopes_need_the_manual_confirmation() -> None:
             roles=["operator"],
             channel_scope=scope,
             channel_scope_source=source,
+            channel_scope_withheld=False,
         )
 
     assert needs_manual_scope_confirm(_u("ad", ["IB_A"], "ad"))
@@ -4536,6 +4549,7 @@ def test_only_a_directory_scope_sends_expected_source_on_a_ticked_save() -> None
             roles=["operator"],
             channel_scope=["IB_A"] if stored else None,
             channel_scope_source=source,
+            channel_scope_withheld=False,
         )
 
     assert ticked_scope_expected_source(_u("ad")) == "ad"
@@ -4587,6 +4601,7 @@ async def test_the_console_and_the_engine_agree_on_who_owns_a_scope(engine: Engi
             roles=["operator"],
             channel_scope=scope,
             channel_scope_source=source,
+            channel_scope_withheld=False,
         )
         engine_says = _effective_scope_source(record) == "ad"
         assert needs_manual_scope_confirm(summary) is engine_says, (provider, source, scope)
@@ -5206,7 +5221,12 @@ def test_the_error_banner_escapes_hostile_text() -> None:
     from messagefoundry_webconsole import pages
 
     user = UserSummary(
-        id="0" * 32, username="u1", auth_provider="local", disabled=False, roles=["viewer"]
+        id="0" * 32,
+        username="u1",
+        auth_provider="local",
+        disabled=False,
+        roles=["viewer"],
+        channel_scope_withheld=False,
     )
     hostile = "<img src=x onerror=alert(1)>"
     page = str(pages.user_detail_page(user, [], error=hostile))

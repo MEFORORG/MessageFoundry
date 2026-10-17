@@ -109,6 +109,10 @@ _BLOCKED: dict[ReleaseBlocked, str] = {
         "if it is still needed, run it again, without a second approver."
     ),
     "params_unreadable": "Its parameters are unreadable, so it cannot be approved. {verb} it.",
+    "requester_not_authorized": (
+        "The requester no longer holds the authority this operation requires, so it cannot be "
+        "approved. {verb} it; if it is still needed, an authorized user must request it again."
+    ),
 }
 
 # What a None parameter means for the operations that hold one: the broadest scope, not "nothing".

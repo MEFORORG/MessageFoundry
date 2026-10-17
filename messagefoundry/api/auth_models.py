@@ -139,7 +139,8 @@ class UserSummary(BaseModel):
     #: all-channels grant, or ``None`` when nobody has set a scope — which denies (BACKLOG #1152).
     #: ``GET /users`` sends this and ``channel_scope_source`` only to a ``users:manage`` caller, the
     #: tier ``GET /users/{id}/channel-scope`` reads on (BACKLOG #3189). Everyone else gets ``None``
-    #: for both, which from that route means NOT SHOWN TO YOU, as ``lock_state`` does.
+    #: for both and ``channel_scope_withheld`` True, so a reader never has to tell "no scope set"
+    #: from "not shown to you" by re-deriving the rule.
     channel_scope: list[str] | None = None
     #: Who last wrote ``channel_scope`` (BACKLOG #1958): ``"ad"`` for the AD login sync,
     #: ``"manual"`` for an administrator, ``None`` when no scope writer has run. The rule it decides
@@ -147,6 +148,11 @@ class UserSummary(BaseModel):
     #: a directory scope makes it manual. Typed ``str`` rather than the store's ``Literal`` so an
     #: older client reading a newer engine tolerates a value it has not learned yet.
     channel_scope_source: str | None = None
+    #: True when this summary leaves ``channel_scope`` and ``channel_scope_source`` out because the
+    #: caller may not read them (BACKLOG #3189), as ``AuditList.withheld`` does for rows. Both are then
+    #: ``None`` whatever is stored. False means they are the stored values, ``None`` included, and a
+    #: ``None`` scope then denies. REQUIRED, so every summary says which of the two a ``None`` means.
+    channel_scope_withheld: bool
     #: BACKLOG #1141 (ASVS 6.4.5): while the account still holds an admin-issued must-change
     #: credential, the Unix instant it stops working. The create-user response and the console's
     #: user page carry it, both behind users:manage, so the administrator who conveys the initial

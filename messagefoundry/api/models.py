@@ -522,7 +522,11 @@ class PendingApprovalResponse(BaseModel):
 #: Why the gate refuses a pending request's approve whoever approves it (vault BACKLOG #3192).
 #: ``PendingApprovalInfo`` says what each value means.
 ReleaseBlocked = Literal[
-    "no_requester_id", "operation_unavailable", "not_gated", "params_unreadable"
+    "no_requester_id",
+    "operation_unavailable",
+    "not_gated",
+    "params_unreadable",
+    "requester_not_authorized",
 ]
 
 
@@ -548,11 +552,15 @@ class PendingApprovalInfo(BaseModel):
     ``release_blocked`` names why the engine refuses a ``pending`` request's approve whoever the
     approver is, or is ``None`` (vault BACKLOG #3192). Each value is a 409 the gate raises, in the
     order it raises them: ``no_requester_id`` (the row predates requester-id attribution),
-    ``operation_unavailable`` (no such operation is registered), ``not_gated`` (as ``gated`` above)
-    and ``params_unreadable``. ``None`` does not promise a release. At least the self-approval
-    refusal, the expiry, the dwell floor, the requester's standing, the row's seal and the
-    operation's own refusals, such as a held reload with no config digest, are met only at
-    release. It lets a page offer only the reject. It is ``None`` on an ``interrupted`` row."""
+    ``operation_unavailable`` (no such operation is registered), ``not_gated`` (as ``gated`` above),
+    ``params_unreadable``, and ``requester_not_authorized``, which the gate raises after the dwell
+    floor: the requester no longer holds the authority the operation needs, read when the queue is
+    listed (``approval.stale_requester``; BACKLOG #3189). A held reload or purge whose requester has
+    since been channel-scoped is one. ``None`` does not promise a release. At least the
+    self-approval refusal, the expiry, the dwell floor, a change to the requester's standing after
+    the listing, the row's seal and the operation's own refusals, such as a held reload with no
+    config digest, are met only at release. It lets a page offer only the reject. It is ``None`` on
+    an ``interrupted`` row."""
 
     id: str
     operation: str
@@ -654,6 +662,19 @@ class ConfigProvenance(BaseModel):
     git_head: str | None = None  # commit sha at load, when the config dir is a git work tree
     files: int | None = None  # number of files folded into the fingerprint
     drift: bool = False  # the on-disk config now differs from what was loaded
+    #: The refusal ``POST /config/reload`` gives THIS caller whatever it proves, or ``None`` when no
+    #: such refusal applies (BACKLOG #3189). Today that is :data:`RELOAD_REFUSED_CHANNEL_SCOPED`
+    #: for a channel-scoped caller. It is computed by the engine's own rule, so a page can stop
+    #: offering a reload the engine will refuse, after the caller has spent a step-up, without
+    #: re-deriving that rule. ``None`` does not promise a reload: at least ``config:deploy``, the
+    #: step-up and the reload's own refusals are still met when it runs. REQUIRED, so no reading
+    #: can leave it unstated.
+    reload_refused: str | None
+
+
+#: The 403 detail ``POST /config/reload`` gives a channel-scoped caller (BACKLOG #3189), and
+#: ``ConfigProvenance.reload_refused`` for one.
+RELOAD_REFUSED_CHANNEL_SCOPED = "channel-scoped users cannot reload the configuration"
 
 
 class ConnectionRow(PhiGatedModel):
