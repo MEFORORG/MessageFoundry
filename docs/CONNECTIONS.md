@@ -2464,14 +2464,13 @@ What a site needs to know:
   that entry status, like any other HTTP status. An entry status that does not read as an HTTP code is
   logged as a warning, and the 2xx reply counts as delivered.
 - A reply in which a JSON object repeats a key is read twice, once keeping the first value of each key
-  and once keeping the last (vault BACKLOG #2812). If both readings reach the same judgment (delivered
-  with one capture outcome, retried, or dead-lettered with one code) and agree on the resource type,
-  whether there is an entry response, and the entry's `etag`, `location` and `lastModified`, the reply
-  is judged as above. So `200 OK` against `201 Created` is delivered, and two statuses that both
-  classify as transient are retried. Otherwise the update is a permanent refusal, code
-  `reply-repeats-a-key`, in either capture mode, and it is not sent again. That includes an ETag that
-  differs with capture off, and a reply only one of the two reads can parse. It is not recorded as
-  delivered, as with a reply over the byte bound below. ADR 0095 Amendment B.1 records the decision.
+  and once keeping the last (vault BACKLOG #2812). When the two readings reach the same judgment and
+  agree on what a delivery takes, the reply is judged as above. Otherwise the update is a permanent
+  refusal, code `reply-repeats-a-key`, in either capture mode. It is not sent again and not recorded
+  as delivered, as with a reply over the byte bound below. The full rule, with what counts as
+  agreement and its costs, is in
+  [ADR 0095](adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md), Amendment B.1,
+  the 2026-10-17 entry.
 - A reply body over the byte bound is not kept, so the engine cannot see the entry's status. The
   update is then a permanent refusal, code `reply-too-large`, in either capture mode, and it is not
   sent again. It is not recorded as delivered. See *A 2xx reply over the byte bound* under [REST](#rest--rest).

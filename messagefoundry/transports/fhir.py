@@ -443,11 +443,8 @@ def _entry_verdict(obj: dict[str, Any]) -> DeliveryError | str:
 
 def _reply_reading(obj: dict[str, Any]) -> tuple[object, ...]:
     """The judgment :func:`_unwrap_transaction_reply` reaches on a parsed reply, plus the values a
-    delivery takes from it: the resource type, whether there is an entry response, and the entry's
-    ``etag``, ``location`` and ``lastModified``. The judgment is a delivery with its capture
-    outcome, a retry, or a permanent refusal with its code, so two readings that differ only in a
-    status's text, such as ``200 OK`` and ``201 Created``, or ``503`` and ``500``, agree. Two
-    readings that give equal tuples are judged identically."""
+    delivery takes from it. Two readings that give equal tuples are judged identically; the rule is
+    stated once, in ADR 0095 Amendment B.1 (the 2026-10-17 entry)."""
     verdict = _entry_verdict(obj)
     judged: tuple[object, ...] = (
         (
@@ -468,13 +465,11 @@ def _reply_reading(obj: dict[str, Any]) -> tuple[object, ...]:
 def _agreed_reading(body: str) -> dict[str, Any] | None:
     """A reply :class:`FhirPeek` refused, read once keeping the first and once keeping the last
     value of each repeated key (vault BACKLOG #2812). Returns the reading when both are JSON objects
-    and agree on everything :func:`_reply_reading` names, or ``None`` when the plain read is not a
-    JSON object, which is judged ``unparseable`` as before. Raises the permanent
-    ``reply-repeats-a-key`` refusal when they disagree: the server may have meant either, so, like
-    a reply over the byte bound (#2180), the update fails closed rather than counting as delivered.
-    So does a reply the plain read takes but the keep-first read cannot, such as one nested just
-    past the hook's lower depth limit, since it can no longer be shown to read one way. The refusal
-    names neither a key nor a value."""
+    and :func:`_reply_reading` gives them equal tuples, or ``None`` when the plain read is not a
+    JSON object, which is judged ``unparseable`` as before. Otherwise, including a body only the
+    plain read can parse, raises the permanent ``reply-repeats-a-key`` refusal, which names neither
+    a key nor a value. ADR 0095 Amendment B.1 (the 2026-10-17 entry) states the rule and its
+    costs."""
     text = body.lstrip(_BOM)
     # The plain read first: a body that is not a JSON object stops here, after one more parse.
     last, hint = json_loads_or_refusal(text)
@@ -742,10 +737,8 @@ def _unwrap_transaction_reply(
     ``status`` text or ``outcome``.
 
     A reply that repeats a JSON key is read twice, keeping the first and keeping the last value of
-    each key (vault BACKLOG #2812). When the two readings reach the same judgment (deliver, retry,
-    or dead-letter with one code) and agree on the values a delivery takes, the reply is judged as
-    any other. Otherwise it is a permanent refusal, code ``reply-repeats-a-key``, and is not
-    recorded as delivered (see :func:`_agreed_reading`; recorded in ADR 0095 Amendment B.1).
+    each key (vault BACKLOG #2812), and judged as any other only when the readings agree; see
+    :func:`_agreed_reading`.
 
     The entry's ``etag``/``location``/``lastModified`` describe the updated resource, so a field the
     entry carries suppresses the reply header of the same name, which describes the Bundle, even
