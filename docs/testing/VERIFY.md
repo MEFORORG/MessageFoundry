@@ -56,12 +56,13 @@ because it made whatever it was pointed at. Run `messagefoundry serve` once befo
 directory tree at the configured path, which is the service-identity gap the `store.connect` row's
 own text tells you to go and confirm.
 
-**That is narrower than "verify only reads", and the difference matters on a live box.** Three
-things still write:
+**That is narrower than "verify only reads", and the difference matters on a live box.** At least
+these things still write:
 
 | What | When | What it writes |
 |---|---|---|
 | `host.writable` | every host run | a probe temp file in the store dir, deleted immediately |
+| `host.ciphers` | every host run on Windows where `pyodbc` imports | nothing of its own; the Windows PowerShell it starts may write that program's own per-account files, such as its module analysis cache, as any PowerShell start can |
 | `store.connect` | `--section store`, store **already exists** | the schema-ensure and migrations `open_store` runs, plus SQLite `-wal`/`-shm` sidecars — as the calling user |
 | `smoke.live` | `--smoke live` only | one synthetic message, persisted by the engine |
 
