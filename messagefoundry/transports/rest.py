@@ -16,13 +16,10 @@ Standard library only (``urllib.request``) — no new dependency (ADR 0003). Red
 (a 3xx could divert PHI to an unintended host) and the scheme is constrained to http/https, mirroring
 the alert-webhook hardening (ASVS 15.3.2 / 1.3.6); the `[egress].allowed_http` allowlist is the
 fail-closed host gate (enforced by the runner at load/reload/start). Per-connection
-``verify_tls=False`` on an ``https`` URL is refused, with no escape, when it sends a credential the
-refusal can see (:func:`refuse_verify_off`; docs/SECURITY-LOOSENING.md, *No escape sends a
-credential to an unverified peer*, names what it cannot see). Otherwise it is allowed to a
-loopback host or with ``tls_hop_attested``, and refused elsewhere. The dev escape
-``MEFOR_ALLOW_INSECURE_TLS`` turns that refusal into a loud warning only on an instance at
-``[security].enforcement = warn``; under ``enforce``, the default, or with no posture known, it
-changes nothing.
+``verify_tls=False`` on an ``https`` URL is decided by :func:`refuse_verify_off`, whose docstring
+states the rule once. The dev escape ``MEFOR_ALLOW_INSECURE_TLS`` can turn that refusal into a
+loud warning only on an instance at ``[security].enforcement = warn``; under ``enforce``, the
+default, or with no posture known, it changes nothing.
 
 There is **no REST source yet** — a non-HL7 source needs the payload-agnostic ingress decided in
 ADR 0003 (its own follow-up ADR). This is the first non-HL7 connector.
@@ -1106,11 +1103,16 @@ def refuse_verify_off(
 ) -> InsecureHopGuard | None:
     """Refuse a ``verify_tls=false`` (unverified-TLS) hop to a non-loopback host (posture-keyed, #200).
 
+    This docstring is the one statement of the HTTP family's verify-off rule (vault BACKLOG #3753);
+    the module docstring points here. The credential half is stated once in
+    docs/SECURITY-LOOSENING.md, as the paragraph on ``credentials`` below says.
+
     Disabling certificate verification makes the ``https`` hop MITM-able, so it is an insecure hop:
     an enforcing hop REFUSES, an on-box loopback / per-hop-attested hop is allowed, and the CLAMPED
     global escape (``MEFOR_ALLOW_INSECURE_TLS``, honoured only at ``[security].enforcement = warn``
-    and inert under ``enforce``) downgrades a non-enforcing one to a loud WARN. Only meaningful for
-    ``https`` (an ``http`` url has no TLS to verify and is handled by
+    and inert under ``enforce``) downgrades a non-enforcing one to a loud WARN. A non-enforcing hop
+    without the escape is still refused, and an unknown posture counts as enforcing. Only meaningful
+    for ``https`` (an ``http`` url has no TLS to verify and is handled by
     :func:`refuse_cleartext_egress`); returns ``None`` for a non-https scheme. Returns an
     :class:`InsecureHopGuard` when the hop was permitted (a warned / attested off-box hop).
 
