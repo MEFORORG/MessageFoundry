@@ -58,8 +58,12 @@ def test_kill_tolerates_a_root_that_refuses_with_PermissionError(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     node, ended = _node(tmp_path, monkeypatch, _RefusingProc())
-    node.kill()
-    assert ended == ["end"]
+    try:
+        node.kill()
+        assert ended == ["end"]
+    finally:
+        node._log.close()
+        Path(node._log.name).unlink(missing_ok=True)
 
 
 async def test_stop_tolerates_a_root_that_refuses_with_PermissionError(

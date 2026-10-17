@@ -73,7 +73,7 @@ tests/test_coord_fleet_fetch_clock.py
 # packaging/messagefoundry-webconsole/**, so the reason that keeps a scanner in
 # _STAYS_WITHOUT_IMPORTING does not apply. tests/test_durability_hook_push_bound.py shares the
 # subject but is NOT listed: it imports messagefoundry.proctree for its kill-on-close job, so a diff
-# there must select it, and that makes it an engine test. The header's
+# to proctree.py must select it, and that makes it an engine test. The header's
 # "when ambiguous, leave it off" is not in play, because nothing here is ambiguous about which
 # tier owns the subject.
 tests/test_durability_hook_provenance.py

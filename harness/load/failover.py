@@ -245,8 +245,9 @@ class EngineNode:
         try:
             self._job = resume_into_job(proc.pid, who=f"node {self.node_id}")
         except OSError:
-            # It could not be resumed, so it never ran: kill it rather than leave it frozen.
-            with contextlib.suppress(ProcessLookupError):
+            # It could not be resumed, so it never ran: kill it rather than leave it frozen. The
+            # failed resume may already have ended its job, hence PermissionError as in kill().
+            with contextlib.suppress(ProcessLookupError, PermissionError):
                 proc.kill()
             await proc.wait()
             raise
