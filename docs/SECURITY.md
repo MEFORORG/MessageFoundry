@@ -2624,10 +2624,11 @@ administrator's TOTP replace swaps the secret and revokes the account's sessions
 transaction, so a re-read answers it as a lost session. An MFA reset removes the factors and then
 revokes the sessions in separate writes, so a re-read that falls between them reads as the factor
 gone. The factor is then not marked and no counter is cleared, and because the proof is already
-spent the refusal is audited, with at least the reasons named here. A factor that can no longer be
-read, a TOTP secret that does not open or a passkey set that fails its seal, is refused
-`reason=factor_unverified`. The passkey leg re-reads whether or not its sign-count
-compare-and-set succeeded; what a miss means is in the passkey section's sign-count sentence.
+spent the refusal is audited, with at least the reasons named here. A factor that cannot be read
+is refused `reason=factor_unverified`. That covers a TOTP secret that does not open, which is
+also logged, and a passkey set that fails its seal. The passkey leg re-reads whether or not its
+sign-count compare-and-set succeeded. What a miss means is stated once, under
+[WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068).
 A session or account gone answers
 as gone on at least these surfaces: **401** on `POST /auth/mfa-verify` and
 `POST /ui/reauth/webauthn`, and a sign-in redirect on `/ui/mfa` and the `/ui/reauth` code leg.
@@ -2905,13 +2906,16 @@ COSE **public keys are stored plaintext by design** (verification material, not 
 outside the store cipher, documented in the crypto inventory); the authenticator **sign counter is
 updated via a strict compare-and-set** — a regression or a concurrent same-counter assertion is treated
 as a **clone signal** (rejected + audited `auth.webauthn_clone_suspected`; a permanent counter of 0 is
-normal for synced passkeys). A compare-and-set that misses because the passkey, or its account,
-was deleted after it was read is no clone signal: the passkey is confirmed gone, so the miss is
-refused as `auth.webauthn_failed` with `reason=factor_removed`, or `reason=session_lost` for the
-account (BACKLOG #3068). Every other miss writes the clone row, asked before the session, the
-account and the lock are read again, so a holder who ends their own session, or a disable or a lock
-landing meanwhile, cannot suppress it; the refusal then carries that change's own reason too. A
-passkey set that fails its seal is not confirmed gone, so its miss writes the clone row as well.
+normal for synced passkeys). One case writes no clone row (BACKLOG #3068). The leg cannot tell
+why a compare-and-set missed, so after a miss it asks whether the passkey is still held. If the
+passkey, or its whole account, is gone by then, no clone row is written. The miss is refused as
+`auth.webauthn_failed`: `reason=factor_removed` for a deleted passkey, and `reason=session_lost`
+for a deleted account or an MFA reset, which also revokes the sessions. So a genuine counter race
+that a delete follows leaves no clone row; that is accepted. Every other miss writes the clone
+row. The question is asked before the session, the account and the lock are read again, so a
+holder ending their own session cannot suppress the row. Nor can a disable or a lock landing
+meanwhile. The refusal then also carries that change's own reason. A passkey set that fails its
+seal is not confirmed gone, so its miss writes the clone row too.
 Assertion failures are audited but deliberately do **not** feed the
 account lockout (signatures aren't guessable secrets). While `[auth].login_rate_limit_enabled` is on, abuse is bounded instead by the **per-actor
 credential-ceremony limiter** — the sole route that finishes an assertion, `POST /ui/reauth/webauthn`,

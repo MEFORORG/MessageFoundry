@@ -669,10 +669,12 @@ async def test_a_sign_count_miss_is_a_clone_signal_unless_the_passkey_is_gone(ch
                 await _break_the_passkey_seal(store, user_id)
             elif change == "account-deleted":
                 await store.delete_user(user_id)
+            elif change == "reset":
+                # The real administrator reset: a generated credential, the factors cleared, then
+                # the sessions revoked.
+                await service.admin_reset_mfa(user_id, actor="synthetic-admin")
             else:
                 assert await store.delete_webauthn_credential(user_id, held.credential_id_hash)
-                if change == "reset":
-                    await store.revoke_session(hash_token(token))
             moved = await real_update(*args, **kwargs)
             assert moved is False
             return moved

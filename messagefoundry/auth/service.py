@@ -1872,9 +1872,9 @@ def _same_totp_enrolment(a: _TotpEnrolment, b: _TotpEnrolment) -> bool:
     """Whether two :data:`_TotpEnrolment` readings name one enrolment. The secret digests are
     compared in constant time (ASVS 11.2.4); the stamps are not secret."""
     (stamp_a, digest_a), (stamp_b, digest_b) = a, b
-    if digest_a is None or digest_b is None:
-        return stamp_a == stamp_b and digest_a == digest_b
-    return stamp_a == stamp_b and constant_time_equal(digest_a, digest_b)
+    if stamp_a != stamp_b or (digest_a is None) != (digest_b is None):
+        return False
+    return constant_time_equal(digest_a or "", digest_b or "")
 
 
 class CensusNeedsTheStoreKey(RuntimeError):
@@ -8143,11 +8143,18 @@ class AuthService:
         be checked against no seal, and its codes would sign in."""
         return self._store.open_totp_secret(user.id, user.totp_secret_cell)
 
-    def _totp_enrolment(self, user: VerifiedUser) -> _TotpEnrolment:
+    def _totp_enrolment(self, user: VerifiedUser) -> _TotpEnrolment | None:
         """``user``'s TOTP enrolment as :meth:`verify_mfa` compares it across a code check (BACKLOG
         #3068): the enrolment stamp and a digest of the opened secret, so the plaintext is not held
-        across the check. Raises :class:`CipherError` when the cell does not open."""
-        secret = self._totp_secret(user)
+        across the check. ``None`` when the cell does not open, logged as
+        :func:`_totp_secret_usable` logs it, naming the account and never the value."""
+        try:
+            secret = self._totp_secret(user)
+        except CipherError:
+            _log.warning(
+                "the TOTP secret of account %r does not decrypt under this store key", user.username
+            )
+            return None
         return user.totp_enrolled_at, None if secret is None else hash_token(secret)
 
     async def _verified_passkeys(self, user: VerifiedUser) -> list[WebAuthnCredential] | None:
@@ -10404,6 +10411,15 @@ class AuthService:
             # compared too, so two enrolments sharing a stamp still differ. Neither moves under a
             # store-key rotation, which re-encrypts the cell, so a rotation refuses nothing.
             verified_enrolment = self._totp_enrolment(user)
+            if verified_enrolment is None:
+                # A secret that does not open checks no code. Refused before any code is spent.
+                await self._audit(
+                    "auth.mfa_failed",
+                    actor=user.username,
+                    detail=_json({"reason": "factor_unverified"}),
+                    client=client,
+                )
+                return Elevation()
             if await self._verify_second_factor(user, code, client=client, arrived=arrived):
                 # BACKLOG #3068: the verify awaited (a recovery-code walk is argon2 work off the
                 # loop), and a revocation or a disable needs no queue to land. So the session, the
@@ -10425,17 +10441,14 @@ class AuthService:
                 # no longer holds. It is spent by now, so the refusal is audited with its reason.
                 # A cell that no longer opens proves nothing either way; the proof is spent, so it
                 # is refused and audited too rather than raised past the "never raises" contract.
+                enrolment_now = self._totp_enrolment(fresh) if fresh.totp_enabled else None
                 refusal: str | None = None
                 if not fresh.totp_enabled:
                     refusal = "factor_removed"
-                else:
-                    try:
-                        enrolment_now = self._totp_enrolment(fresh)
-                    except CipherError:
-                        refusal = "factor_unverified"
-                    else:
-                        if not _same_totp_enrolment(verified_enrolment, enrolment_now):
-                            refusal = "factor_replaced"
+                elif enrolment_now is None:
+                    refusal = "factor_unverified"
+                elif not _same_totp_enrolment(verified_enrolment, enrolment_now):
+                    refusal = "factor_replaced"
                 if refusal is not None:
                     await self._audit(
                         "auth.mfa_failed",
@@ -11440,17 +11453,10 @@ class AuthService:
             # cannot suppress the signal. A set whose seal fails proves nothing either way, so it
             # keeps the signal.
             standing = await self._passkey_held(user, cred)
-            if standing in ("held", "unverified"):
-                await self._audit(
-                    "auth.webauthn_clone_suspected",
-                    actor=user.username,
-                    detail=_json({"label": cred.label}),
-                    client=client,
-                )
         # BACKLOG #3068: the passkey read and the sign-count write awaited since the session, the
         # account and its lock were last read, so a revocation, a disable or a lock that landed in
         # between must stop the factor write, as on verify_mfa. Asked on both paths, so each
-        # refusal is audited with its own reason, a miss's after its clone row.
+        # refusal is audited with its own reason.
         fresh = await self._factor_holder_current(
             token,
             actor=user.username,
@@ -11458,6 +11464,15 @@ class AuthService:
             client=client,
             report_lock=False,
         )
+        if standing in ("held", "unverified"):
+            # Written whatever the re-read found, under the name the row holds now when it still
+            # loads (the BACKLOG #2291 class).
+            await self._audit(
+                "auth.webauthn_clone_suspected",
+                actor=user.username if isinstance(fresh, Elevation) else fresh.username,
+                detail=_json({"label": cred.label}),
+                client=client,
+            )
         if isinstance(fresh, Elevation):
             return fresh
         user = fresh
@@ -11469,7 +11484,7 @@ class AuthService:
         if standing == "account_gone":
             # Deleted after the holder re-read: the token no longer authenticates, so the answer
             # is the lost session the re-read would have given, not a factor question.
-            return await self._assertion_refused(user, client, "session_lost")
+            return await self._assertion_refused(user, client, "session_lost", session_lost=True)
         if standing != "held":
             reason = "factor_removed" if standing == "removed" else "factor_unverified"
             return await self._assertion_refused(user, client, reason)
@@ -11509,8 +11524,10 @@ class AuthService:
         """Whether ``user`` still holds passkey ``cred``, asked of the set its seal covers (BACKLOG
         #2592). :meth:`finish_webauthn_assertion` asks it after the sign-count write (BACKLOG
         #3068). ``"held"``, or why not: ``"account_gone"`` when the account row no longer exists,
-        ``"removed"`` when the set holds no such passkey, and ``"unverified"`` when the set fails
-        its seal, which says nothing about this passkey. The account is asked only on a miss, since
+        ``"removed"`` when the set holds no such passkey, and ``"unverified"`` when the answer
+        cannot be trusted: the set fails its seal, or the account row still exists but does not
+        load (its own seal fails, or its lookup keys changed). That says nothing about this passkey,
+        so a sign-count miss keeps its clone signal. The account is asked only on a miss, since
         a set read of a deleted account fails its seal on a keyed store and is empty on a keyless
         one. This re-check compares every credential, each in constant time (ASVS 11.2.4, as the
         delete path does); the lookup that first picked ``cred`` does not."""
@@ -11527,7 +11544,7 @@ class AuthService:
         return "removed" if held is not None else "unverified"
 
     async def _assertion_refused(
-        self, user: UserRecord, client: str | None, reason: str
+        self, user: UserRecord, client: str | None, reason: str, *, session_lost: bool = False
     ) -> Elevation:
         """A refusal :meth:`finish_webauthn_assertion` gives, audited ``auth.webauthn_failed`` with
         ``reason``. One spelling for the expired ceremony, so the peek before the directory lookup
@@ -11539,7 +11556,7 @@ class AuthService:
             detail=_json({"reason": reason}),
             client=client,
         )
-        return Elevation(session_lost=reason == "session_lost")
+        return Elevation(session_lost=session_lost)
 
     async def delete_webauthn_credential(
         self, identity: Identity, credential_id_hash: str, *, client: str | None = None

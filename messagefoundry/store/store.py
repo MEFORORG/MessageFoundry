@@ -15069,7 +15069,7 @@ class MessageStore:
         """Strict compare-and-set of the authenticator sign counter (the ``consume_totp_step``
         precedent): ``True`` iff the stored count still equalled ``expected``. A miss means a
         concurrent assertion consumed the same counter, or the passkey was deleted; the caller
-        reads it as a clone signal unless the passkey is confirmed gone (ADR 0068 §4, BACKLOG
+        reads it as a clone signal (ADR 0068 §4) unless the passkey is confirmed gone (BACKLOG
         #3068). Runs as one guarded UPDATE under the writer lock."""
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(

@@ -558,6 +558,45 @@ async def test_what_lands_during_the_code_check_stops_the_factor_write(
         assert user is not None and user.second_step_locked_until is not None  # not cleared
 
 
+async def test_a_secret_that_does_not_open_is_refused_before_any_code_is_spent(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3068. A TOTP cell that does not open checks no code, so the attempt is refused and
+    audited ``factor_unverified`` before the verify, and the cause is logged without the value.
+    RED when: it raises (an unaudited 500), spends the recovery code, or logs nothing."""
+    service = AuthService(store, _settings())
+    identity, first, _ = await login_admin(service)
+    enroll = await service.begin_mfa_enrollment(identity)
+    confirmed = await service.confirm_mfa_enrollment(
+        identity, fresh_totp(enroll.secret), token=first
+    )
+    assert confirmed.ok and confirmed.recovery_codes
+    token = await service._issue_session(
+        identity.user_id,
+        None,
+        mfa_verified=False,
+        seed_reauth=False,
+        mechanism=SessionMechanism.PASSWORD,
+        idp_auth_time=None,
+    )
+    spare = await store.get_recovery_code_hashes(identity.user_id)
+
+    def _refuse(*_args: object) -> str | None:
+        raise CipherError("synthetic: the cell does not open")
+
+    monkeypatch.setattr(store, "open_totp_secret", _refuse)
+
+    with caplog.at_level("WARNING", logger="messagefoundry.auth.service"):
+        refused = await service.verify_mfa(token, confirmed.recovery_codes[0])
+
+    assert refused.ok is False
+    assert {"reason": "factor_unverified"} in await _audited_mfa_failures(store)
+    assert await store.get_recovery_code_hashes(identity.user_id) == spare  # nothing spent
+    assert any("does not decrypt" in r.getMessage() for r in caplog.records)
+    session = await store.get_session(hash_token(token))
+    assert session is not None and session.mfa_verified_at is None
+
+
 async def test_a_rename_during_the_code_check_is_audited_under_the_new_name(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
