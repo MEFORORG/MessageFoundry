@@ -872,9 +872,16 @@ def _unanswered(operation: str, code: int | None) -> LdapUnansweredError:
     else:
         name = RESULT_CODES.get(code, "an unknown result code")
         shown, hint = f"result code {code} ({name})", _UNANSWERED_HINTS.get(code, "")
+    # A configuration code is not read as the directory not answering: the session reconciler
+    # reads it as a configuration refusal, which alerts (LdapUnansweredError.configuration).
+    reading = (
+        "a fault in the configuration"
+        if code in _CONFIGURATION_CODES
+        else "the directory not answering"
+    )
     message = (
         f"AD ended the {operation} with {shown}, which is not an answer; the engine reads it as "
-        f"the directory not answering (BACKLOG #3010).{hint}"
+        f"{reading} (BACKLOG #3010).{hint}"
     )
     # Keyed on ldap3's name, not the raw code: a directory chooses the code, and ldap3's table is
     # finite, so the set of warnings stays bounded.
@@ -1006,6 +1013,8 @@ def _ldap3_call(operation: str, *, close: bool = False) -> Iterator[None]:
 
 #: The context tag of the ``referral`` field of an LDAPResult (RFC 4511 section 4.1.9).
 _REFERRAL_TAG = 3
+#: ldap3's number for the context-specific tag class (``utils/asn1.py``, ``CLASSES``).
+_CONTEXT_CLASS = 2
 
 
 def _is_bind_referral(exc: BaseException) -> bool:
@@ -1017,7 +1026,9 @@ def _is_bind_referral(exc: BaseException) -> bool:
     ``KeyError(3)`` from anywhere else, such as a stray tag [3] in some other response or engine
     code, is not this. A test pins the ldap3 names this reads.
     """
-    if not isinstance(exc, KeyError):
+    # The context-class tag alone: a universal, application or private tag 3 raises KeyError((class,
+    # 3)) from the class table instead, and is a malformed response, not a referral.
+    if not isinstance(exc, KeyError) or exc.args != (_REFERRAL_TAG,):
         return False
     from ldap3.utils import asn1  # lazy, like every ldap3 import here
 
@@ -1031,6 +1042,7 @@ def _is_bind_referral(exc: BaseException) -> bool:
         frame.f_globals.get("__name__") == asn1.__name__
         and frame.f_code.co_name == "decode_sequence"
         and frame.f_locals.get("context_decoders") is asn1.BIND_RESPONSE_CONTEXT
+        and frame.f_locals.get("ber_class") == _CONTEXT_CLASS
         and frame.f_locals.get("ber_type") == _REFERRAL_TAG
     )
 
@@ -1220,14 +1232,16 @@ def _socket_faults_as_ldap_error() -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def _released(conn: Any) -> Iterator[None]:
+def _released(conn: Any, *, quiet: bool = False) -> Iterator[None]:
     """Unbind ``conn`` when the block ends, however it ends.
 
     An ldap3 error from the unbind never replaces an exception the block raised (BACKLOG #3010).
     The decoy bind swallows an ``LDAPException`` and the real bind maps it to :class:`LdapError`, so
     an unbind failing after an undecodable bind would otherwise answer an absent account and a
     present one differently. After a block that raised nothing, the unbind's error propagates as
-    before.
+    before, unless ``quiet``: the service connection passes it, because its lookup has already been
+    answered, and ldap3's own ``with``, which it replaced, swallowed an unbind error too. Its type
+    is logged at debug level then.
     """
     import ldap3
 
@@ -1237,7 +1251,12 @@ def _released(conn: Any) -> Iterator[None]:
         with contextlib.suppress(ldap3.core.exceptions.LDAPException):
             conn.unbind()
         raise
-    conn.unbind()
+    try:
+        conn.unbind()
+    except ldap3.core.exceptions.LDAPException as failed:
+        if not quiet:
+            raise
+        logger.debug("AD unbind after an answered lookup failed: %s", _type_name(failed))
 
 
 class LdapAuthenticator:
@@ -1697,7 +1716,7 @@ class LdapAuthenticator:
             # Released explicitly (BACKLOG #3010): ldap3's own ``with`` never unbinds a connection
             # that was bound on entry, so the session stayed open until it was collected.
             svc = self._service_conn()
-            with _released(svc):
+            with _released(svc, quiet=True):
                 found = (
                     self._lookup_by_object_id(svc, object_id, fallback_username=username)
                     if object_id is not None
@@ -1813,7 +1832,7 @@ class LdapAuthenticator:
             raise ValueError("pass object_id or tie_break_object_id, not both")
         try:
             svc = self._service_conn()
-            with _released(svc):  # not ldap3's own ``with``: see ``authenticate``
+            with _released(svc, quiet=True):  # not ldap3's own ``with``: see ``authenticate``
                 found = (
                     self._lookup_by_object_id(svc, object_id, fallback_username=username)
                     if object_id is not None

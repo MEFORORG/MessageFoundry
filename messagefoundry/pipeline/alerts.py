@@ -1097,8 +1097,8 @@ class LoggingAlertSink:
 
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
         log.warning(
-            # The count is the candidates the pass took up for the breaker and a probe fault, or a
-            # referral's probes asked (BACKLOG #3170); see AlertSink.ad_reconcile_aborted.
+            # The count is the candidates the breaker judged, or for every other source the probes
+            # the pass asked (BACKLOG #3170); see AlertSink.ad_reconcile_aborted.
             "ALERT ad_reconcile_aborted: %r left accounts unrevoked, counting %d principal(s) "
             "(%s): %s",
             name,

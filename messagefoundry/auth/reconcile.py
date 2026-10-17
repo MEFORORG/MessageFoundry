@@ -24,9 +24,10 @@ Four safety properties are built in, in order of importance:
    at once. :func:`hold_engaged` holds those accounts, and only those: none of them is revoked, and
    the rest of the estate is reconciled as usual. The mass-revoke breaker below cannot do this on a
    small estate, because its absolute floor lets five or fewer revocations through.
-4. **A mass-revoke circuit breaker.** Users moved out of the search base, or a base that exists
-   but is the wrong one, return "not found" for **every** user, which looks the same as "everyone
-   was deleted". :func:`breaker_tripped` aborts such a pass wholesale rather than signing out the
+4. **A mass-revoke circuit breaker.** Users moved out of the search base, a base that exists but
+   is the wrong one, or a service account that lost read rights on the user entries but not on
+   the base, return "not found" for **every** user, which looks the same as "everyone was
+   deleted". :func:`breaker_tripped` aborts such a pass wholesale rather than signing out the
    estate. This is why the pass is planned in full before anything is written: an abort must leave
    the store byte-identical, including the role re-diff. A base that was deleted or moved, or that
    the service account may not read, is not "not found": the search ends with a result code, which

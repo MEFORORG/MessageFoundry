@@ -86,6 +86,12 @@ _BAD_BINDS = [
         KeyError,
         id="context-tag-22",
     ),
+    # A universal tag 3 is not the referral field, so it stays undecodable (D3b review round 1).
+    pytest.param(
+        _result(_BIND_RESPONSE, RESULT_SUCCESS, extra=_tlv(0x03, b"\x00")),
+        KeyError,
+        id="universal-tag-3",
+    ),
     pytest.param(_result(_BIND_RESPONSE, 4242), KeyError, id="unknown-code-4242"),
     pytest.param(
         _result(_BIND_RESPONSE, RESULT_SUCCESS, matched=_tlv(0x02, b"\x05")),
@@ -549,7 +555,9 @@ def test_the_ldap3_methods_the_origin_check_names_still_exist() -> None:
     assert {"decode_response", "set_response"} <= set(vars(ExtendedOperation))
     assert "populate_result" in vars(WhoAmI)
     # What _is_bind_referral reads (D3b): the decoder's locals, and a bind table with no referral.
-    assert {"context_decoders", "ber_type"} <= set(asn1.decode_sequence.__code__.co_varnames)
+    assert {"context_decoders", "ber_class", "ber_type"} <= set(
+        asn1.decode_sequence.__code__.co_varnames
+    )
     assert ldap_module._REFERRAL_TAG not in asn1.BIND_RESPONSE_CONTEXT
 
 
@@ -565,6 +573,35 @@ def test_an_unbind_error_never_replaces_the_refusal() -> None:
     assert raised.value is refusal
     with pytest.raises(ldap3.core.exceptions.LDAPSocketSendError), ldap_module._released(conn):
         pass
+
+
+def test_the_service_connection_release_never_fails_an_answered_lookup() -> None:
+    """D3b review round 1. ``authenticate`` and ``probe_principal`` release the service connection
+    with ``quiet``: the lookup was answered, and ldap3's own ``with``, which the release replaced,
+    swallowed an unbind error too. Without it, a reset after the last search would turn a verified
+    sign-in into a login error and a read answer into an outage."""
+    unbind_fault = ldap3.core.exceptions.LDAPSocketSendError("synthetic")
+    conn = SimpleNamespace(unbind=_raise(unbind_fault))
+    with ldap_module._released(conn, quiet=True):
+        pass
+    refusal = LdapUndecodableError("synthetic refusal")
+    with pytest.raises(LdapUndecodableError) as raised, ldap_module._released(conn, quiet=True):
+        raise refusal
+    assert raised.value is refusal
+
+
+def test_a_probe_answered_before_the_unbind_fails_keeps_its_answer() -> None:
+    """The same, end to end: the unbind's send fails, and the probe still answers."""
+    with _scripted_dc(_groups_answered) as (_dc, authenticator):
+        real = ldap3.Connection.unbind
+
+        def failing_unbind(self: Any) -> Any:
+            real(self)
+            raise ldap3.core.exceptions.LDAPSocketSendError("synthetic")
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(ldap3.Connection, "unbind", failing_unbind)
+            assert authenticator.probe_principal("alice").principal is not None
 
 
 def test_the_refusal_warns_once_per_operation_and_fault(caplog: pytest.LogCaptureFixture) -> None:

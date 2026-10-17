@@ -7395,8 +7395,8 @@ class AuthService:
         )
         others = self._unjudged_others(plan, others, faults=True, refusals=True)
         self._reconcile_referral_alert = (
-            "LDAP referral: check [auth].ad_user_search_base and, for nested groups, "
-            "[auth].ad_group_search_base; one names a base in another domain of the forest. "
+            "LDAP referral: check [auth].ad_user_search_base, [auth].ad_group_search_base for "
+            "nested groups, and [auth].ad_bind_dn; one names another domain of the forest. "
             f"{len(plan.referred)} of {plan.asked} signed-in directory account(s) probed were "
             f"referred and left unjudged. {others} A referred account is never revoked while it "
             "is referred, because the engine does not follow referrals. Use a base in the bound "
@@ -7458,7 +7458,7 @@ class AuthService:
             if plan.aborted is not None
             else "Accounts that answered were judged as usual."
         )
-        others = self._unjudged_others(plan, others)
+        others = self._unjudged_others(plan, others, refusals=True)
         # The pointer to the account comes first: the store keeps only the first 200 characters
         # of an alert instance's reason, as `_record_reconcile_referral` says.
         self._reconcile_fault_alert = (
@@ -7515,7 +7515,7 @@ class AuthService:
             if plan.aborted is not None
             else "Accounts that answered were judged as usual."
         )
-        others = self._unjudged_others(plan, others)
+        others = self._unjudged_others(plan, others, faults=True)
         # The settings to change come first: the store keeps only the first 200 characters of an
         # alert instance's reason, as `_record_reconcile_referral` says.
         self._reconcile_misconfigured_alert = (
@@ -7552,8 +7552,9 @@ class AuthService:
 
         A pass whose every answer went unjudged is recorded by its referral, refusal or fault and
         not as an outage, so its failures are counted here, or a near-total outage would read as a
-        configuration fault. ``faults`` and ``refusals`` add those counts too: the referral's
-        message carries both, since either is recorded under its own alert as well."""
+        configuration fault. ``faults`` and ``refusals`` add those counts too, each passed by every
+        recorder but its own kind's, so each message names the other unjudged kinds, which are
+        recorded under their own alerts as well."""
         if faults and plan.faulted:
             others = f"{len(plan.faulted)} raised a probe fault. {others}"
         if refusals and plan.misconfigured:
@@ -8739,7 +8740,8 @@ class AuthService:
         """Log the certificate path's directory refusals without logging one line per request.
 
         An outage is a refusal that says the directory could not be asked: unreachable, referring,
-        or the probe cap full. It logs one WARNING per outage and, if that
+        refusing the search for its configuration (``misconfigured``, BACKLOG #3010), or the probe
+        cap full. It logs one WARNING per outage and, if that
         WARNING was logged, one INFO on the next answer the directory actually gave, whatever it
         said about the account. WARNINGs are at least :data:`_CERT_OUTAGE_LOG_INTERVAL_SECONDS`
         apart, so an outage that flaps (a full cap turning over, or one referring account beside a

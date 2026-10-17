@@ -4186,10 +4186,12 @@ the right one*:
   and no floor. **The cost:**
   two genuinely disabled accounts whose attribute the bind account cannot read keep their sessions to
   the absolute cap.
-- **A mass-revoke circuit breaker.** An `ad_user_search_base` that names the wrong OU, or an OU
-  reorganisation that moves the users out of it, answers "not found" for *every* user. A base that
-  was deleted or moved, or that the service account may not read, does not: the search ends with a
-  result code, which is the configuration refusal described below (BACKLOG #3010). A pass whose revocation
+- **A mass-revoke circuit breaker.** An `ad_user_search_base` that names the wrong OU, an OU
+  reorganisation that moves the users out of it, or a service account that lost read rights on the
+  user entries while it can still read the base, answers "not found" for *every* user. A base that
+  was deleted or moved, or that the service account may not read at all, usually does not: the
+  search ends with a result code, which is the configuration refusal described below (BACKLOG
+  #3010). Which of the two a directory answers is not measured against a domain controller. A pass whose revocation
   set exceeds **both** `ad_session_revoke_max` (5) **and** `ad_session_revoke_max_fraction` (0.34) of
   the probed population **aborts**: nothing is revoked, nothing is written, the engine logs at ERROR
   and audits `auth.ad_reconcile_aborted`, raises the `ad_reconcile_aborted` alert, and the condition
@@ -4214,8 +4216,9 @@ revoked. A pass with any referral audits `auth.ad_reconcile_referred` and raises
 `directory-reconciler-referral`. So it is its own instance, apart from the breaker's, and
 acknowledging or suspending one does not silence the other. An `[alerts]` rule keyed on the event
 type alone matches both, and so does a source glob such as `directory-reconciler*`. To mute only
-the referral, a rule names its source exactly. The alert's text names `ad_user_search_base` and
-`ad_group_search_base`. When it resolves itself is stated once, in
+the referral, a rule names its source exactly. The alert's text names `ad_user_search_base`,
+`ad_group_search_base` and `ad_bind_dn`: a bind answered with a referral is one too (BACKLOG
+#3010), and its hosts cannot be named. When it resolves itself is stated once, in
 [CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-two-alerts-resolve-themselves).
 Referred accounts stay in the mass-revoke breaker's count, as unreachable ones do. Left out, a referring group base would
 trip the breaker on any handful of genuine disables. A base in another domain of the forest
