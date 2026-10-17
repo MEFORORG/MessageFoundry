@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-import unicodedata
 from collections.abc import Callable
 from importlib import metadata
 
@@ -33,7 +32,7 @@ from messagefoundry.cli_common import (
 )
 from messagefoundry.cli_surface import TOOLKIT_COMMAND
 from messagefoundry.console_streams import harden_console_streams
-from messagefoundry.controlchars import CONTROL_CATEGORIES
+from messagefoundry.terminal_text import escape_for_terminal
 
 #: The two distributions whose versions must match (ADR 0201 section 1). The toolkit's distribution
 #: and command share one name, held in ``cli_surface`` so the engine's refusal names the same one.
@@ -183,32 +182,20 @@ def _adr_analyze(args: argparse.Namespace) -> int:
 
 def _print_record_line(line: str) -> None:
     """``_safe_print`` a line that carries record text, with each character a terminal would act
-    on written as its Python escape (BACKLOG #2516). Every human line goes through here, so a new
+    on written as a visible escape (BACKLOG #2516). Every human line goes through here, so a new
     one cannot forget the escape.
 
-    The categories are the engine's own ``CONTROL_CATEGORIES``, imported rather than copied, so the
-    terminal and the log escape the same categories (BACKLOG #2976). They do not render alike. At
-    least these differ: this escapes a tab, which the log keeps; it doubles a backslash, which the
-    log does not; and it writes Python's escapes, where the log writes JSON's. An ADR is read as
-    data, and a terminal acts on a C0 or C1 control, a format character such as a bidirectional
-    override, or a line or paragraph separator. A lone surrogate, a private-use code point or an
-    unassigned one is escaped too, so it prints as text rather than as ``?`` or whatever the
-    terminal makes of it. ``messagefoundry.controlchars.scrub_control_chars`` is not reused: it
-    does not double a backslash, so record text spelling an escape out, such as ``\\u001b``, would
-    read the same as the escaped character.
+    THE RULE IS THE ENGINE'S SHARED ONE, :func:`messagefoundry.terminal_text.escape_for_terminal`
+    (BACKLOG #2891), so a later hardening there reaches this command too; its docstring says what
+    it escapes. ``keep_printable_unicode`` because an ADR's own text is not ASCII and its em dash
+    should print as one, while the engine's ``CONTROL_CATEGORIES`` are still escaped (BACKLOG
+    #2976). ``single_line`` because each call is one line of the report, so a newline or tab in an
+    item cannot start a line of its own.
 
-    Local to the toolkit on purpose. ``_safe_print`` serves every engine command too, and its job
-    is the console codec, not what the line says. The JSON output needs nothing: ``json.dumps``
-    already escapes every control and non-ASCII character.
-
-    A backslash is doubled as well, so a record that spells ``\\x1b`` out in text cannot pass for
-    one that holds the escape character itself."""
-    _safe_print(
-        "".join(
-            ascii(ch)[1:-1] if ch == "\\" or unicodedata.category(ch) in CONTROL_CATEGORIES else ch
-            for ch in line
-        )
-    )
+    The JSON output needs nothing: ``json.dumps`` already escapes every control and non-ASCII
+    character. ``_safe_print`` handles only the console codec, as it does for every engine
+    command."""
+    _safe_print(escape_for_terminal(line, single_line=True, keep_printable_unicode=True))
 
 
 _DISPATCH: dict[str, Callable[[argparse.Namespace], int]] = {

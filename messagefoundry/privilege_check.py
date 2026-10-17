@@ -45,6 +45,7 @@ from messagefoundry.config.settings import (
     StorePrivilegeStatus,
     StoreSettings,
 )
+from messagefoundry.controlchars import CONTROL_CATEGORIES
 from messagefoundry.store.privilege import (
     OVER_GRANT_OPT_OUT,
     SQLSERVER_DOCUMENTED_DATABASE_ROLES,
@@ -54,6 +55,7 @@ from messagefoundry.store.privilege import (
     preflight_outcome,
     refusal_reason,
 )
+from messagefoundry.terminal_text import escape_for_terminal
 
 if TYPE_CHECKING:
     from messagefoundry.auth.ldap import BindAccountReading
@@ -316,14 +318,29 @@ def vault_consumers(settings: ServiceSettings) -> list[VaultConsumer]:
 
 
 def printable(text: str) -> str:
-    """``text`` with every Unicode control, format and unassigned character removed, for printing
-    a value a remote server chose (a Vault policy name, a Who am I answer).
+    """``text`` with every character in :data:`~messagefoundry.controlchars.CONTROL_CATEGORIES`
+    REMOVED: what a reader would take a server-chosen value (a Vault policy name) for once the
+    characters a terminal does not show are gone. The set is the one the terminal and log escapes
+    use, imported rather than copied, so it includes C1, the bidi and zero-width format
+    characters and U+2028/U+2029 (BACKLOG #2891).
 
-    Wider than :func:`~messagefoundry.controlchars.strip_control_chars`, which removes C0 and DEL:
-    this also removes C1 controls such as U+009B, which a terminal can read as an escape sequence,
-    and format characters such as the U+202E right-to-left override, which can reorder a line so a
-    policy named ``root`` reads as something else. Category ``C*`` covers all of them."""
-    return "".join(ch for ch in text if not unicodedata.category(ch).startswith("C"))
+    It strips rather than escapes for the root comparison in :func:`vault_hop`: ``r`` + U+200B +
+    ``oot`` must still compare equal to root, and an escaped form would not. Printing is the other
+    job, and goes through :func:`_shown` instead. ``privilege_probes`` also strips with this
+    before it logs."""
+    return "".join(ch for ch in text if unicodedata.category(ch) not in CONTROL_CATEGORIES)
+
+
+def _shown(text: str) -> str:
+    """A hop's whole detail as one terminal line, by the shared strict ``single_line`` rule."""
+    return escape_for_terminal(text, single_line=True)
+
+
+def _quoted(text: str) -> str:
+    """``text`` in single quotes, NOT escaped: :func:`_shown` escapes the whole detail once, and a
+    ``repr`` here would escape twice, so U+200B would print as the literal text ``\\\\u200b``. A
+    quote inside ``text`` is not escaped; the judgement does not depend on the printed form."""
+    return f"'{text}'"
 
 
 #: Vault's capability words. Any other string a server returns is shown escaped, so a value that
@@ -346,7 +363,7 @@ _VAULT_CAPABILITIES = frozenset(
 
 
 def _caps(caps: Iterable[str]) -> str:
-    return ", ".join(sorted(c if c in _VAULT_CAPABILITIES else repr(c) for c in caps)) or "none"
+    return ", ".join(sorted(c if c in _VAULT_CAPABILITIES else _quoted(c) for c in caps)) or "none"
 
 
 def vault_hop(
@@ -375,8 +392,8 @@ def vault_hop(
             over.append("the token carries the root policy")
         elif not (p.isascii() and p.isprintable()):
             over.append(
-                f"the policy name {p!r} is not plain printable ASCII, so it cannot be told apart "
-                "from root by reading it; read the policy by hand"
+                f"the policy name {_quoted(p)} is not plain printable ASCII, so it cannot be told "
+                "apart from root by reading it; read the policy by hand"
             )
     for path, needed in reading.required.items():
         if path not in reading.capabilities:
@@ -428,9 +445,9 @@ def vault_hop(
             "paths the engine does not call were read only for the administrative ones; "
             "attest the rest of the policy by hand"
         )
-    # printable() over the whole text, once, at the output boundary: a policy name reaches it inside
+    # _shown() over the whole text, once, at the output boundary: a policy name reaches it inside
     # an administrative PATH as well as in the policy list, and a per-field call misses the next one.
-    detail = printable(". ".join(parts))
+    detail = _shown(". ".join(parts))
     return HopPrivilege(consumer.hop, state, consumer.identity, consumer.minimal, detail)
 
 
@@ -562,7 +579,7 @@ def ldap_hop(settings: ServiceSettings, probe: Callable[[], BindAccountReading])
         )
     parts: list[str] = []
     if reading.authzid is not None:
-        parts.append(f"Who am I: bound as {printable(reading.authzid)!r}")
+        parts.append(f"Who am I: bound as {_quoted(reading.authzid)}")
     # Each group is labelled by the read that found it, so a direct-only find is not read as nested.
     found = [f"{g} (transitive, from tokenGroups)" for g in sorted(by_sid)]
     found += [f"{g} (direct memberOf)" for g in sorted(direct - by_sid)]
@@ -577,8 +594,8 @@ def ldap_hop(settings: ServiceSettings, probe: Callable[[], BindAccountReading])
         parts.append("in none of the administrative groups the check knows (transitive read)")
     parts += [f"could not observe: {p}" for p in problems]
     parts.append(_LDAP_RIGHTS_NOT_READ)
-    # As for a Vault hop: one printable() over everything the directory or ldap3 supplied.
-    return HopPrivilege("ldap", state, identity, minimal, printable(". ".join(parts)))
+    # As for a Vault hop: one _shown() over everything the directory or ldap3 supplied.
+    return HopPrivilege("ldap", state, identity, minimal, _shown(". ".join(parts)))
 
 
 # --- the hops the engine cannot probe ---------------------------------------------------------
