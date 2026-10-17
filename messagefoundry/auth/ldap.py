@@ -185,8 +185,10 @@ class DirectoryBind:
     :meth:`LdapAuthenticator.authenticate` returns this (BACKLOG #2434), so the step-up re-bind can
     tell a refused password from an absent or disabled account without a second directory read.
     ``answer`` is ``None`` when no lookup ran, which only an empty password causes. ``FOUND`` with
-    no principal means the entry was found enabled and the directory refused the bind, so the
-    password was judged against that account. Any other answer means no bind was judged. None of
+    no principal means the entry was found enabled and the directory refused the bind with a code
+    outside :data:`_UNJUDGED_BIND_CODES`, which ``authenticate`` raises instead (BACKLOG #3169). The
+    engine reads every such refusal as the password judged against that account, though a code
+    such as strongerAuthRequired (8) judges none. Any other answer means no bind was judged. None of
     this may reach a client: a sign-in caller must refuse every answer alike.
     """
 
@@ -1424,9 +1426,14 @@ class LdapAuthenticator:
         branches open a socket to the same directory, so such a fault fails them alike; swallowing
         it here alone would answer "wrong password" for an absent account and "directory error" for
         a present one. The same holds for a bind response ldap3 could not decode (BACKLOG #3010):
-        both binds refuse it through :func:`_ldap3_call` as the "user bind". So does a bind ended
-        busy, unavailable, unwillingToPerform or adminLimitExceeded (BACKLOG #3169): both binds
-        raise it through :func:`_refuse_unjudged_bind`, which raises no ``LDAPException``.
+        both binds refuse it through :func:`_ldap3_call` as the "user bind".
+
+        **The decoy reads no result code, an outage code included (BACKLOG #3169).** The real bind
+        refuses one in :data:`_UNJUDGED_BIND_CODES` as the directory not answering; here the lookup
+        has already answered, and its answer (absent, disabled, undetermined) is what the caller
+        audits. Refusing it would replace that answer with an outage. The branches already differ
+        on a referral and on ldap3's own socket errors; the caller is a signed-in session re-proving
+        its own account, so the difference names nothing it does not hold.
 
         **What #2566 does not settle:** ldap3's OWN socket errors still differ between the branches.
         This method swallows an ``LDAPSocketOpenError`` while the real bind's handler maps it, so a
@@ -1453,13 +1460,8 @@ class LdapAuthenticator:
             )
             # Labelled as the real bind is, and released the same way, so an undecodable answer
             # fails both branches with the same text (_ldap3_call, _released).
-            with _released(conn):
-                with _ldap3_call("user bind"):
-                    conn.bind()  # result deliberately ignored — this branch always fails the login
-                # BACKLOG #3169: an unjudged bind raises here as it does on the real bind, so a busy
-                # directory answers an absent account and a present one alike. It is no
-                # LDAPException, so the arm below does not swallow it.
-                _refuse_unjudged_bind(conn)
+            with _released(conn), _ldap3_call("user bind"):
+                conn.bind()  # result deliberately ignored — this branch always fails the login
         except ldap3.core.exceptions.LDAPException:
             return
 
