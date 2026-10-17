@@ -1874,7 +1874,8 @@ a restart for a file that is not in effect yet, it also says not to restart befo
 **A start checks each CRL's signature too (vault BACKLOG #2905).** When a hop builds its TLS context,
 the engine checks each CRL in the file against the CA certificates that hop already lists. It refuses
 the file in one case only, where it has proof. Three things all hold then. A listed CA has the
-CRL's issuer name, compared exactly. The CRL names that CA's key by its key identifier. The engine
+CRL's issuer name, compared as OpenSSL compares it for the case of ASCII letters and exactly
+otherwise (the first bullet below says what that leaves out). The CRL names that CA's key by its key identifier. The engine
 ran the signature check with that key, and the check failed. Where several listed CAs share that
 name, the check must run and fail for each of them that the engine finds to fit the CRL's
 authority key identifier. A handshake that OpenSSL judges by such a CRL fails with
@@ -1894,13 +1895,17 @@ such a file was measured to pass its handshakes. Remove the bad copy.
 Anything short of that proof loads, and the engine logs one WARNING for the file. At least these
 three cases warn:
 
-- The engine matches the CRL to no CA the hop lists. It compares the issuer name exactly, and then
-  the CRL's authority key identifier, where it carries one. This is the usual case when the peer
+- The engine matches the CRL to no CA the hop lists. It compares the issuer name exactly but for
+  the case of ASCII letters, which it folds as OpenSSL does (vault BACKLOG #3543), and then the
+  CRL's authority key identifier, where it carries one. This is the usual case when the peer
   sends the intermediate CA that issued the CRL. A CA in a CA directory reads the same way until a
   handshake first uses it. So does a listed CA whose name differs from the CRL's issuer name only
-  in letter case. Where the letters that differ are ASCII, OpenSSL was measured to treat the two
-  names as one, so it still judges peers by that CRL. A badly signed CRL of that kind started with
-  the WARNING, and then failed its handshake with `CRL signature failure`.
+  in white space, at least: around a value, which was measured, and in a run of spaces inside one,
+  by OpenSSL's source. OpenSSL treats those two names as one, so it still judges peers by that
+  CRL, and a badly signed CRL of that kind starts with the WARNING and then fails its handshake
+  with `CRL signature failure`. A name that differs in a letter outside ASCII, case included, is
+  another name to OpenSSL too. The name a CRL's authority key identifier may carry for the CA's
+  issuer is compared the same way as the issuer name.
 - A listed CA has the CRL's issuer name and does not verify it, but the CRL names no key. A CA that
   renewed its key can read this way while handshakes still pass. That was measured for one chain
   shape, where the peer sends the renewed CA certified by the old key.
@@ -1991,13 +1996,26 @@ belong to the CRL expiry alert too. This event carries none of them.
 The engine sends at least these eight. A remedy it has no token for would be sent as `other`, with
 no remedy sentence.
 
-**One alert per file version.** The engine raises the alert when it first refuses a version of the
-file. It raises it again only when the file's bytes change or the reason does, which is the rule the
-ERROR line follows. It sends no reminders while a refusal stands. The notifier's cooldown still
-applies while the alert is open: a second refused version inside `[alerts].realert_seconds` of the
-first updates the open alert and does not page again. So a page can name an older class than the
-alert list shows. When the engine resolves the alert itself, that ends the cooldown, so it does not
-hold back a refusal that follows a fix. A resolve made by hand in the alert list does not end it.
+**A reminder while the refusal stands (vault BACKLOG #3543).** The engine raises the alert at once
+when it first refuses a version of the file, and at once again when the file's bytes change or the
+reason does, which is the rule the ERROR line follows. While a refusal stands it then raises the
+alert again as a reminder, as `intake_paused` reminds, with the same fields. A reminder goes at the
+first reload pass five minutes or more after the last try, so they come five to six minutes apart. This replaced
+the rule of one alert per file version, under which a page that was throttled, muted or resolved
+by hand was never sent again. Each reminder is another occurrence of the alert, as an
+`intake_paused` reminder is, so a rule's count-based `escalate` tiers climb while the refusal
+stands. Neither acknowledging the alert nor resolving it by hand stops the reminders; suspending
+it mutes their pages. While the engine cannot read the file, a
+reminder is still sent for a refusal the engine treats as final, such as `fix_file`. One it judges
+again every pass, such as `wait` or one that carries `start_refuses`, can name a time that has
+passed, so it is not reminded about until the engine can read the file again. A read that hangs
+rather than fails, such as on a share that stops answering, holds the whole reload loop, so no
+reminder is sent while it hangs. The notifier's cooldown still applies while the alert is open: a second
+refused version, or a reminder, inside `[alerts].realert_seconds` of the last page updates the open
+alert and does not page again. So a page can name an older class than the alert list shows, until
+the next reminder pages. A cooldown longer than five minutes throttles some reminders. When the
+engine resolves the alert itself, that ends the cooldown, so it does not hold back a refusal that
+follows a fix. A resolve made by hand in the alert list does not end it.
 
 **Restart only when the class says to.** That is `restart`, `no_issuer` or `retry`, and only when
 the event carries no `start_refuses`. With any other class a start can refuse the file too, and
@@ -2012,7 +2030,11 @@ rule's `event_type`. The engine raises it once the refusal no longer stands on t
 
 A file the engine cannot read resolves nothing, and neither does a reload pass that fails. The
 engine also resolves its open alerts when it stops, because a restart builds every hop from the
-file. An engine that dies without stopping leaves its alert open; resolve it in the alert list. A
+file. An engine that dies without stopping leaves its alert open (vault BACKLOG #3543). Its next
+start under the same identity resolves it at the first reload pass, if a hop still holds the file
+and the engine refuses nothing in it. Resolve any other in the alert list: one for a file no hop
+holds now, and one raised under an identity that changes on every start, as an unpinned cluster
+node's does. A
 rule cannot attach a `control_action` to `crl_reload_refused`, because it is not a connection-scoped
 event.
 

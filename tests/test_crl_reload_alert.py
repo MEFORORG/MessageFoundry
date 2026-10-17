@@ -7,8 +7,9 @@ What this file proves, and the instrument for each:
 * **The alert carries the file, the remedy class and the count, and no CRL contents.** A real
   reload pass over a real refused file, read through a recording sink. The control for "no CRL
   contents" is the refusal's reason from the same pass, which does quote the issuer.
-* **One alert per file version.** The same pass run again and again raises nothing more. A second
-  refused version raises one more.
+* **One alert per file version, then a reminder while it stands.** The same pass run again and again
+  raises nothing more until the reminder is due. A second refused version raises one more (vault
+  BACKLOG #3543 added the reminder).
 * **It is raised on the event loop.** A real ``NotifierAlertSink`` writes its alert-state row only
   with a running loop. The control makes the same call from a worker thread, and no row lands.
 * **Its inverse, ``crl_reload_applied``, resolves it only on evidence.** Applying the file, putting
@@ -56,7 +57,11 @@ from messagefoundry.pipeline.crl_reload import (
     reload_alert_subject,
     reload_replaced_crls,
 )
-from messagefoundry.pipeline.intake_bound import INTAKE_SUBJECT_MAX_LENGTH
+from messagefoundry.pipeline.intake_bound import (
+    INTAKE_SUBJECT_MAX_LENGTH,
+    process_alert_subject,
+    shorten_with_checksum,
+)
 from messagefoundry.pki import read_soonest_crl_facts
 from tests import test_crl_reload as _base
 from tests._refusal_log_capture import until
@@ -528,6 +533,49 @@ async def test_an_outcome_the_report_cannot_read_stops_nothing_else(
     assert any("could not report a refused file" in r.getMessage() for r in caplog.records)
 
 
+@pytest.mark.parametrize("idle", [False, True], ids=["after-a-pass", "idle-branch"])
+async def test_a_report_that_raises_does_not_end_the_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    idle: bool,
+) -> None:
+    """Vault BACKLOG #3543 item 6: the guard around the whole report came back. Each outcome is
+    guarded inside, but the clears read the refusal record, and that read raising must not end
+    the loop that applies revocations to running hops. Both places the loop reports from."""
+    path = str(tmp_path / "a.pem")
+    refusal = ReloadRefusal((1, 2), "why", RESTART)
+    loaded_crls.record_reload_refusal(path, refusal)
+    sink = _Sink()
+    passes: list[int] = []
+
+    def reload() -> list[ReloadOutcome]:
+        passes.append(1)
+        return [ReloadOutcome(path, 0, refusal, 1)]
+
+    runner = _runner(sink, interval_seconds=0.01, reload=reload, skip_when_idle=idle)
+    runner._report([ReloadOutcome(path, 0, refusal, 1)])  # one open alert, so clears read
+    reads: list[int] = []
+
+    def broken_record() -> dict[str, ReloadRefusal]:
+        reads.append(1)
+        raise RuntimeError("the record could not be read")
+
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.crl_reload"):
+        runner.start()
+        try:
+            # Its own context, so leaving it undoes this patch alone and not the fixture's.
+            with monkeypatch.context() as patched:
+                patched.setattr(crl_reload, "reload_refusals", broken_record)
+                await until(lambda: len(reads) >= 3, "three reports that raised")
+                assert runner._task is not None and not runner._task.done(), "the loop lives on"
+        finally:
+            await runner.stop()
+    logged = [r for r in caplog.records if "step failed" in r.getMessage()]
+    assert len(logged) == 1, "once per failing streak, not once a pass"
+    assert bool(passes) is not idle, "the control: which branch reported"
+
+
 async def test_a_streak_ends_once_its_call_is_no_longer_owed(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -575,9 +623,43 @@ async def test_a_clear_that_fails_at_stop_is_said_at_stop(
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
+async def test_the_stop_warnings_list_of_files_survives_the_log_redaction(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Vault BACKLOG #3543 item 8, dropped on this reading. The finding: the stop's WARNING joins
+    path keys with ", ", a shape the redaction pass might rewrite, unconfirmed whether the log
+    filter applies it. Measured: the filter does apply it, and the join is not a shape it
+    rewrites, because every key after a comma starts with a separator or, on Windows, a drive
+    letter the key has folded to lower case. A path's own text can still be rewritten, as in any
+    log line that names a path; this pins only the join."""
+    from messagefoundry.logging_setup import RedactionFilter
+
+    root = Path(os.path.abspath(os.sep))
+    paths = [str(root / "pki" / "Acme"), str(root / "pki" / "Partner-CRL.pem")]
+    refusal = ReloadRefusal((1, 2), "why", RESTART)
+    sink = _Sink()
+    runner = _runner(sink)
+    for path in paths:
+        loaded_crls.record_reload_refusal(path, refusal)
+    runner._report([ReloadOutcome(path, 0, refusal, 1) for path in paths])
+    sink.down = True
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.crl_reload"):
+        await runner.stop()
+    (record,) = [r for r in caplog.records if "could not be resolved at stop" in r.getMessage()]
+    joined = ", ".join(sorted(crl_path_key(path) for path in paths))
+    assert joined in record.getMessage()
+    assert RedactionFilter().filter(record)
+    assert joined in record.getMessage(), "the filter left the list as it was"
+    # The control: the same filter does rewrite a name run, so it ran on this record.
+    control = logging.LogRecord("x", logging.WARNING, __file__, 1, "%s", ("Doe, Jane",), None)
+    RedactionFilter().filter(control)
+    assert "Jane" not in control.getMessage()
+
+
 async def test_a_refusal_after_a_clear_is_not_held_back_by_the_cooldown() -> None:
-    """The runner raises once per file version and sends no reminders. So a refusal the
-    notifier throttled would never be paged at all, and the clear must end the cooldown."""
+    """A refusal the notifier throttled would wait for the runner's next reminder. So the clear
+    must end the cooldown, and the refusal after it pages at once."""
     transport = _RecordingTransport("webhook")
     sink = NotifierAlertSink([transport])  # the default cooldown, far longer than this test
 
@@ -617,6 +699,153 @@ async def test_the_same_bytes_refused_again_after_a_fix_alert_again(pki: _Pki) -
 
     assert [p["remedy_class"] for p in sink.refused()] == ["fix_file", "fix_file"]
     assert sink.kinds() == ["refused", "applied", "refused"]
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+# --- the reminder while a refusal stands (vault BACKLOG #3543 item 1) ----------------------------
+
+
+class _Clock:
+    """The runner's reminder clock, moved by hand."""
+
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
+    moved = _Clock()
+    monkeypatch.setattr(crl_reload, "_monotonic", moved)
+    return moved
+
+
+async def test_a_reminder_fires_while_the_refusal_stands_and_stops_once_it_clears(
+    pki: _Pki, clock: _Clock
+) -> None:
+    """The owner ruling of 2026-10-13: a periodic reminder while the refusal stands, as
+    ``intake_paused`` has. It repeats the version raised, with its payload, and no more often
+    than ``reminder_seconds``."""
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    runner = _runner(sink, reminder_seconds=300)
+    pki.crl.write_bytes(_expired(pki))
+
+    _pass(runner)
+    clock.now += 299
+    _pass(runner)
+    assert len(sink.refused()) == 1, "not before it is due"
+    clock.now += 1
+    _pass(runner)
+    _pass(runner)
+    first, reminder = sink.refused()
+    assert reminder == first, "one reminder, with the payload of the version raised"
+    assert sink.events[0][1] == sink.events[1][1] == reload_alert_subject(pki.crl)
+    clock.now += 300
+    _pass(runner)
+    assert len(sink.refused()) == 3
+
+    pki.crl.write_bytes(_fresher(pki, revoke=False))
+    _pass(runner)
+    clock.now += 900
+    _pass(runner)
+    assert sink.kinds() == ["refused", "refused", "refused", "applied"], "none once it clears"
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_a_reminder_follows_the_record_when_the_pass_cannot_read_the_file(
+    pki: _Pki, clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pass returns no outcome for a file it cannot read, while the refusal still stands. The
+    reminder reads the record, so it still fires."""
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    runner = _runner(sink, reminder_seconds=300)
+    pki.crl.write_bytes(_expired(pki))
+    _pass(runner)
+
+    def unreadable(_path: str) -> tuple[int, int, int]:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(crl_reload, "_stamp", unreadable)
+    clock.now += 300
+    assert _pass(runner) == [], "the control: no outcome at all"
+    assert len(sink.refused()) == 2
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_a_refusal_judged_every_pass_is_not_reminded_about_unjudged(
+    pki: _Pki, clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wait names a time, which may pass while the file cannot be read. So unlike a final
+    verdict, it is reminded about only once a pass has judged it again."""
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    runner = _runner(sink, reminder_seconds=300)
+    pki.crl.write_bytes(pki.crl_pem(issued=-_DAY, lasts=60 * _DAY, revoke=True))
+    (waiting,) = _pass(runner)
+    assert waiting.refusal is not None and not waiting.refusal.sticky  # the premise
+
+    def unreadable(_path: str) -> tuple[int, int, int]:
+        raise PermissionError(13, "Permission denied")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(crl_reload, "_stamp", unreadable)
+        clock.now += 900
+        _pass(runner)
+        _pass(runner)
+        assert len(sink.refused()) == 1, "no reminder from a verdict nobody judged again"
+    _pass(runner)
+    assert [p["remedy_class"] for p in sink.refused()] == ["wait", "wait"], "judged, reminded"
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_a_reminder_the_sink_refuses_waits_for_the_next_reminder(
+    pki: _Pki, clock: _Clock, caplog: pytest.LogCaptureFixture
+) -> None:
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    runner = _runner(sink, reminder_seconds=300)
+    pki.crl.write_bytes(_expired(pki))
+    _pass(runner)
+    sink.down = True
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.crl_reload"):
+        clock.now += 300
+        for _ in range(3):
+            _pass(runner)
+        sink.down = False
+        _pass(runner)
+        assert len(sink.refused()) == 1, "spaced from the attempt, not retried every pass"
+        clock.now += 300
+        _pass(runner)
+    assert len(sink.refused()) == 2
+    failures = [r.getMessage() for r in caplog.records if "as a reminder" in r.getMessage()]
+    assert len(failures) == 1 and "the next reminder tries again" in failures[0]
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_the_notifier_pages_the_reminder_once_its_cooldown_has_passed(
+    pki: _Pki, clock: _Clock
+) -> None:
+    """What the reminder is for: a page sent again while the refusal stands. The notifier's own
+    cooldown still spaces it, so it is set to zero here."""
+    hop = pki.outbound_hop()
+    transport = _RecordingTransport("webhook")
+    sink = NotifierAlertSink([transport], realert_seconds=0)
+    runner = _runner(sink, reminder_seconds=300)
+    pki.crl.write_bytes(_expired(pki))
+
+    _pass(runner)
+    _pass(runner)
+    clock.now += 300
+    _pass(runner)
+    await _drain_transports(sink)
+
+    paged = [(e["type"], e["connection"], e["remedy_class"]) for e in transport.events]
+    assert paged == [("crl_reload_refused", reload_alert_subject(pki.crl), "fix_file")] * 2
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
@@ -801,6 +1030,122 @@ async def test_stop_resolves_what_is_still_open_and_pages_nobody(pki: _Pki) -> N
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
+async def test_an_alert_a_dead_process_left_open_is_resolved_once_by_the_next_run(
+    pki: _Pki,
+) -> None:
+    """Vault BACKLOG #3543 item 3. Open alerts lived only in runner memory, so a process killed
+    with one open left it open, false, with nothing to clear it. The next run of that process
+    holds the file afresh and refuses nothing, so its loop resolves the subject, once, and pages
+    nobody."""
+    hop = pki.outbound_hop()  # built from the file as it is: nothing to refuse
+    transport, store = _RecordingTransport("webhook"), _RecordingStore()
+    sink = NotifierAlertSink([transport], store=cast(Any, store))
+    passes = _CountedPasses()
+    runner = CrlReloadRunner(interval_seconds=0.01, reload=passes, alert_sink=sink, node="node:a")
+    runner.start()
+    try:
+        await passes.more(3)
+    finally:
+        await runner.stop()
+    await _drain_state(sink)
+    await _drain_transports(sink)
+
+    subject = reload_alert_subject(pki.crl, "node:a")
+    assert store.resolves == [{"event_type": "crl_reload_refused", "connection": subject}]
+    assert store.upserts == [] and transport.events == []
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_the_first_sight_clear_leaves_this_runners_own_refusal_open(pki: _Pki) -> None:
+    """The control for the test above: a file this run refuses is not cleared at first sight.
+    Its own alert stays open until its refusal ends, or the stop."""
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    passes = _CountedPasses()
+    runner = CrlReloadRunner(interval_seconds=0.01, reload=passes, alert_sink=sink)
+    pki.crl.write_bytes(_expired(pki))
+    runner.start()
+    try:
+        await passes.more(3)
+        assert sink.kinds() == ["refused"]
+    finally:
+        await runner.stop()
+    assert sink.kinds() == ["refused", "applied"], "the stop's clear, and no other"
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_a_first_sight_clear_the_sink_refuses_is_retried(
+    pki: _Pki, caplog: pytest.LogCaptureFixture
+) -> None:
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    sink.down = True
+    runner = _runner(sink)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.crl_reload"):
+        for _ in range(3):
+            runner._clear_on_first_sight()
+            runner._report([])  # each pass's report retries the clear
+        sink.down = False
+        runner._report([])
+        runner._clear_on_first_sight()
+        runner._report([])
+    assert sink.kinds() == ["applied"], "retried, then sent once, and the file judged once"
+    failures = [r for r in caplog.records if "could not be resolved" in r.getMessage()]
+    assert len(failures) == 1, "one WARNING for the streak"
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_the_first_sight_clear_waits_for_a_pass_that_judged_the_file(
+    pki: _Pki, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only on evidence, as every other clear: a pass that failed on the file, or could not
+    read it, says nothing about whether a refusal would stand, so it clears nothing."""
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    runner = _runner(sink)
+
+    def boom(*_args: object) -> None:
+        raise RuntimeError("the triage failed")
+
+    def unreadable(_path: str) -> tuple[int, int, int]:
+        raise PermissionError(13, "Permission denied")
+
+    for name, broken in (("_triage", boom), ("_stamp", unreadable)):
+        with monkeypatch.context() as patched:
+            patched.setattr(crl_reload, name, broken)
+            assert _pass(runner) == []
+            runner._clear_on_first_sight()
+            assert sink.events == [], f"no clear while {name} fails"
+    _pass(runner)
+    runner._clear_on_first_sight()
+    assert sink.kinds() == ["applied"], "the control: a pass that judged it clears"
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_a_refused_file_whose_raise_failed_is_judged_again_at_first_sight(
+    pki: _Pki,
+) -> None:
+    """A file refused at first sight whose own raise failed has no alert of this run to clear
+    the subject. If the refusal ends before a raise lands, the first-sight clear must still
+    reach it, so the file is not counted as judged yet."""
+    hop = pki.outbound_hop()
+    original = pki.crl.read_bytes()
+    sink = _Sink()
+    runner = _runner(sink)
+    pki.crl.write_bytes(_expired(pki))
+    sink.down = True
+    _pass(runner)
+    runner._clear_on_first_sight()
+    assert sink.events == [] and crl_path_key(pki.crl) not in runner._seen_held
+
+    sink.down = False
+    pki.crl.write_bytes(original)  # the refusal ends before any raise landed
+    _pass(runner)
+    runner._clear_on_first_sight()
+    assert sink.kinds() == ["applied"], "the subject a dead process may have left is cleared"
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
 async def test_a_runner_started_again_raises_a_refusal_that_still_stands(pki: _Pki) -> None:
     hop = pki.outbound_hop()
     sink = _Sink()
@@ -882,6 +1227,27 @@ def test_a_long_path_and_a_long_node_label_stay_inside_the_column(tmp_path: Path
             assert "partner-crl.pem" in subject, "the tail, which holds the file name, is kept"
     # Deterministic, so a clear names the instance its raise opened.
     assert reload_alert_subject(first, "shard:a") == reload_alert_subject(first, "shard:a")
+
+
+def test_a_path_and_a_node_label_are_shortened_by_one_rule(tmp_path: Path) -> None:
+    """Vault BACKLOG #3543 item 7: one shortening routine, where there were two hand-rolled
+    copies. A CRL path keeps its tail and a node label its head, with one checksum of the whole
+    text between, so the two cannot drift apart."""
+    key = crl_path_key(tmp_path.joinpath(*["a-long-directory-name"] * 12, "partner-crl.pem"))
+    short = shorten_with_checksum(key, ALERT_PATH_MAX_LENGTH, keep_tail=True)
+    assert reload_alert_subject(key) == f"crl_reload:{short}"
+    assert len(short) == ALERT_PATH_MAX_LENGTH and short.endswith("partner-crl.pem")
+    assert shorten_with_checksum(key, ALERT_PATH_MAX_LENGTH) == f"{key[:111]}~{short[1:9]}"
+    assert shorten_with_checksum("short", ALERT_PATH_MAX_LENGTH, keep_tail=True) == "short"
+    # A limit with no room for a tail keeps none, rather than the whole text.
+    assert len(shorten_with_checksum(key, 10, keep_tail=True)) == 10
+
+    node = "node:" + "x" * 400
+    subject = process_alert_subject("crl_reload:a", node)
+    assert subject == f"crl_reload:a@{shorten_with_checksum(node, INTAKE_SUBJECT_MAX_LENGTH - 13)}"
+    assert len(subject) == INTAKE_SUBJECT_MAX_LENGTH
+    # A lone surrogate gets a checksum on both paths. The node label's copy used to raise.
+    assert process_alert_subject("intake:x", "node:\ud800" + "y" * 400).startswith("intake:x@")
 
 
 def test_the_subject_is_outside_the_connection_name_grammar(tmp_path: Path) -> None:

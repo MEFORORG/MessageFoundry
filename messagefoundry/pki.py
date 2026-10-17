@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import datetime
 import ipaddress
+import string
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Literal
@@ -392,14 +393,16 @@ class CrlSignature:
     """What a hop's CA list says about the signature of one CRL in a file (vault BACKLOG #2905).
 
     ``where`` names the block and its issuer, for a message. ``state`` is one of five. A CA "fits"
-    when its subject equals the CRL's issuer name exactly and it fits the CRL's Authority Key
-    Identifier (:func:`_akid_fit`). "Exactly" is ``cryptography``'s name comparison, in which
-    letter case counts. OpenSSL's comparison is looser: it folds the case of ASCII letters, at
-    least. So a listed CA whose name differs from the issuer's only in the case of ASCII letters
-    is ``unlisted`` here, while OpenSSL takes it for the issuer and judges peers by the CRL.
-    Measured 2026-10-13 on CPython 3.14.6 with OpenSSL 3.5.7: such a CRL, badly signed and
-    naming that CA's key, started with the warning and then failed its handshake with ``CRL
-    signature failure``. Every text that describes ``unlisted`` must stay true of that case.
+    when its subject is the CRL's issuer name by :func:`_issuer_name_key` and it fits the CRL's
+    Authority Key Identifier (:func:`_akid_fit`). That name test folds the case of ASCII letters,
+    as OpenSSL's name comparison does, and is exact otherwise (vault BACKLOG #3543). Before it
+    folded case, a listed CA whose name differed from the issuer's only in ASCII letter case read
+    ``unlisted`` here, while OpenSSL took it for the issuer and judged peers by the CRL. Measured
+    2026-10-13 on CPython 3.14.6 with OpenSSL 3.5.7: such a CRL, badly signed and naming that CA's
+    key, started with the warning and then failed its handshake with ``CRL signature failure``.
+    OpenSSL's comparison is looser than this one in at least one more way, which
+    :func:`_issuer_name_key` names, so every text that describes ``unlisted`` must stay true of
+    a CA OpenSSL takes for the issuer and this test does not.
 
     * ``verified``: a CA that fits verifies the CRL.
     * ``bad``: **proven** badly signed. The CRL's key identifier equals a fitting CA's Subject Key
@@ -430,11 +433,11 @@ def judge_crl_signatures(pem: bytes, ca_ders: Iterable[bytes]) -> Iterator[CrlSi
     that OpenSSL loads. Before vault BACKLOG #2905 such a CA raised out of the reload's check,
     which then retried every pass. ``pem`` must be bytes :func:`judge_every_crl` accepted; a
     block that does not parse raises ``ValueError``."""
-    cas: list[tuple[x509.Name, x509.Certificate]] = []
+    cas: list[tuple[_NameKey, x509.Certificate]] = []
     for der in ca_ders:
         try:
             ca = x509.load_der_x509_certificate(der)
-            cas.append((ca.subject, ca))
+            cas.append((_issuer_name_key(ca.subject), ca))
         except _UNREADABLE_CA:
             continue
     blocks = list(_crl_blocks(pem))
@@ -449,12 +452,55 @@ def judge_crl_signatures(pem: bytes, ca_ders: Iterable[bytes]) -> Iterator[CrlSi
 #: parse, and ``UnsupportedGeneralNameType`` from reading extensions; neither is a ``ValueError``.
 _UNREADABLE_CA = (ValueError, x509.InvalidVersion, x509.UnsupportedGeneralNameType)
 
+#: One name as :func:`_issuer_name_key` compares it: per RDN, in order, the sorted attributes.
+_NameKey = tuple[tuple[tuple[str, bool, str | bytes], ...], ...]
+
+#: The 26 ASCII capitals to their lower case, and no other character.
+_ASCII_FOLD = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+
+
+def _issuer_name_key(name: x509.Name) -> _NameKey:
+    """``name`` in the form :func:`_signature_state` compares a CRL issuer with a CA subject in
+    (vault BACKLOG #3543).
+
+    It is ``cryptography``'s own comparison with one change: **the case of ASCII letters is
+    folded**, because OpenSSL folds it. OpenSSL compares names by a canonical form that lowers
+    ``A`` to ``Z`` and copies every other byte, so a listed CA named ``CN=Partner CA`` is the
+    issuer of a CRL from ``CN=PARTNER CA``. Matched exactly, that CA read as unlisted, so a badly
+    signed CRL naming its key started with a warning and failed at the handshake.
+
+    **Nothing else is loosened, and RFC 5280 is not followed where it reaches further.** Its
+    name matching folds case beyond ASCII and maps characters (LDAP StringPrep). OpenSSL does
+    neither, and a match looser than OpenSSL's would refuse a start for a CRL OpenSSL never
+    judges that CA's peers by. So a letter outside ASCII is compared exactly, as OpenSSL compares
+    it. Attributes in one RDN are compared as a multiset, as both do.
+
+    **Where this still differs from OpenSSL, at least.** OpenSSL is looser about white space: it
+    drops it around a value, measured on OpenSSL 3.5.7, and by its source collapses a run of it
+    to one space. This does not, so a CA whose name differs only there reads ``unlisted``, the
+    warning arm, while OpenSSL judges its peers by the CRL. Folding that too would close the same
+    gap for spacing; it is left open on purpose, as a change of its own. This is looser about
+    string type: ``cryptography`` ignores it, while OpenSSL ignores it only for the text types
+    (UTF8String, PrintableString, T61String, IA5String, VisibleString, BMPString,
+    UniversalString), by its source. So a value in another type, such as a NumericString, can
+    match here where OpenSSL sees another name, and a start can refuse a CRL OpenSSL would not
+    judge that CA's peers by. That fails closed, at a start, and names the file."""
+    return tuple(tuple(sorted(map(_attribute_key, rdn))) for rdn in name.rdns)
+
+
+def _attribute_key(attribute: x509.NameAttribute[str | bytes]) -> tuple[str, bool, str | bytes]:
+    """One attribute as :func:`_issuer_name_key` compares it. The flag keeps a ``bytes`` value
+    (``x500UniqueIdentifier``) from being ordered against a ``str`` one."""
+    value = attribute.value
+    folded = value.translate(_ASCII_FOLD) if isinstance(value, str) else value
+    return attribute.oid.dotted_string, isinstance(value, bytes), folded
+
 
 def _signature_state(
-    crl: x509.CertificateRevocationList, cas: list[tuple[x509.Name, x509.Certificate]]
+    crl: x509.CertificateRevocationList, cas: list[tuple[_NameKey, x509.Certificate]]
 ) -> CrlSignatureState:
     """Which :class:`CrlSignature` state ``cas`` gives ``crl``."""
-    issuer = crl.issuer
+    issuer = _issuer_name_key(crl.issuer)
     fitting = False
     named = False  # the CRL names some fitting CA's key
     unchecked = False
@@ -508,8 +554,9 @@ def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bo
             # two together.
             unlisted = unlisted or (
                 f"{signature.where}: the engine matched it to no CA certificate this hop lists "
-                "(it compares the issuer name exactly, letter case included, and then the CRL's "
-                "authority key identifier, where it carries one)"
+                "(it compares the issuer name with the case of ASCII letters folded, as OpenSSL "
+                "does, and white space exactly, and then the CRL's authority key identifier, "
+                "where it carries one)"
             )
         elif signature.state != "verified":
             return (
@@ -555,7 +602,11 @@ def _akid_fit(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool
         for name in akid.authority_cert_issuer or ()
         if isinstance(name, x509.DirectoryName)
     ]
-    return names_key if not names or ca.issuer in names else None
+    # By the name test the issuer match uses, since OpenSSL compares this name by the same
+    # canonical form. OpenSSL reads only the first directory name here; any one counts here,
+    # as it did before vault BACKLOG #3543.
+    fits = not names or _issuer_name_key(ca.issuer) in {_issuer_name_key(n) for n in names}
+    return names_key if fits else None
 
 
 def _verifies(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool | None:
