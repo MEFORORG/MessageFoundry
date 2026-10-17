@@ -240,20 +240,58 @@ def test_usercustomize_counts_only_where_the_user_site_is_on(
     assert [i.kind for i in _customize(site_dir)] == ["usercustomize"]
 
 
-def test_the_path_the_children_inherit_is_searched_too(
+def test_the_search_path_is_the_engines_own_import_path(
     tmp_path: Path, site_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An isolated engine does not have PYTHONPATH on its own import path. Its Python children are
-    handed the absolute entries and are not isolated, so a module there runs in them."""
+    """A Python child repeats the engine's isolation (vault BACKLOG #2701), so a ``PYTHONPATH``
+    entry the engine did not import from reaches no child either, and is not searched. The control
+    is the same directory on the engine's own path: it is found, and checked for write access."""
     inherited = tmp_path / "inherited"
     inherited.mkdir()
     (inherited / "sitecustomize.py").write_text("x = 1\n", encoding="utf-8")
-    assert _customize(site_dir) == []  # CONTROL: not on sys.path
-    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(["relative/entry", str(inherited)]))
+    monkeypatch.setenv("PYTHONPATH", str(inherited))
+    assert _customize(site_dir) == []
+    assert str(inherited) not in read_startup_posture().startup_dirs
+    monkeypatch.setattr(sys, "path", [*sys.path, str(inherited)])
     found = [Path(i.path).parent.name for i in _customize(site_dir)]
     assert found == ["inherited"]
-    # The directory joins the ones checked for write access.
     assert str(inherited) in read_startup_posture().startup_dirs
+
+
+def test_a_site_directory_that_cannot_be_listed_is_logged(
+    site_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No item comes back, which reads the same as a directory with no ``.pth`` file, so the
+    failure is logged (vault BACKLOG #2701). The control is the same directory listed."""
+    (site_dir / "planted.pth").write_text("import os\n", encoding="utf-8")
+    assert [Path(i.path).name for i in startupcode._pth_items(site_dir)] == ["planted.pth"]
+
+    def refuse(path: object) -> list[str]:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(os, "listdir", refuse)
+    with caplog.at_level("WARNING", logger=startupcode.__name__):
+        assert startupcode._pth_items(site_dir) == []
+    assert "could not list" in caplog.text and "denied" in caplog.text
+
+
+def test_a_pth_file_that_cannot_be_read_is_listed_and_logged(
+    site_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The file is still listed, judged by its RECORD row alone, and the log says it was not read."""
+    planted = site_dir / "planted.pth"
+    planted.write_text("import os\n", encoding="utf-8")
+    real = Path.read_bytes
+
+    def refuse(self: Path) -> bytes:
+        if self == planted:
+            raise PermissionError("denied")
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", refuse)
+    with caplog.at_level("WARNING", logger=startupcode.__name__):
+        assert startupcode._executable_lines(planted) is None
+    assert "could not read" in caplog.text and "denied" in caplog.text
 
 
 def test_a_namespace_package_named_sitecustomize_runs_nothing_and_is_not_listed(
@@ -811,21 +849,8 @@ def test_the_hardened_launch_reports_nothing() -> None:
             StartupPosture(launch=_HARDENED, unchecked_startup_dirs=("/v",)),
             ["startup_directory_unchecked"],
         ),
-        (
-            StartupPosture(
-                launch=InterpreterLaunch(
-                    True,
-                    True,
-                    True,
-                    True,
-                    code_path_variables=("PYTHONPATH",),
-                    reaching_children=("PYTHONPATH",),
-                )
-            ),
-            ["python_variables_reach_children"],
-        ),
-        # A variable that is set and reaches no child, such as a PYTHONPATH with no absolute
-        # entry, is not reported for the children.
+        # An isolated engine's children are isolated too, so a variable it ignores reaches
+        # nothing and is not reported (vault BACKLOG #2701).
         (
             StartupPosture(
                 launch=InterpreterLaunch(
@@ -846,17 +871,10 @@ def test_a_variable_the_engine_honours_is_named_in_the_not_isolated_entry() -> N
     assert "PYTHONPATH is set in its environment now" in risk
     assert "It reads the PYTHON* environment variables" in risk
     # CONTROL: under -E the same variable is not honoured, and the entry does not claim it is.
-    # The children still receive it, so that entry is there as well.
-    ignored = InterpreterLaunch(
-        False,
-        False,
-        True,
-        False,
-        code_path_variables=("PYTHONPATH",),
-        reaching_children=("PYTHONPATH",),
-    )
+    # The children repeat the -E, so nothing is said about them either.
+    ignored = InterpreterLaunch(False, False, True, False, code_path_variables=("PYTHONPATH",))
     entries = dict(startup_loosenings(StartupPosture(launch=ignored)))
-    assert list(entries) == ["interpreter_not_isolated", "python_variables_reach_children"]
+    assert list(entries) == ["interpreter_not_isolated"]
     assert "is set in its environment now" not in entries["interpreter_not_isolated"]
     assert "It reads the PYTHON*" not in entries["interpreter_not_isolated"]
 
@@ -864,23 +882,19 @@ def test_a_variable_the_engine_honours_is_named_in_the_not_isolated_entry() -> N
 def test_the_launch_reading_names_a_variable_only_when_it_holds_something(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A variable set to nothing changes nothing. And the child builders drop a ``PYTHONPATH``
-    entry that is not absolute, so a variable holding only those reaches no child."""
+    """A variable set to nothing changes nothing."""
     for name in startupcode._CODE_PATH_VARIABLES:
         monkeypatch.delenv(name, raising=False)
 
-    def reading() -> tuple[tuple[str, ...], tuple[str, ...]]:
-        launch = startupcode._interpreter_launch()
-        return launch.code_path_variables, launch.reaching_children
+    def reading() -> tuple[str, ...]:
+        return startupcode._interpreter_launch().code_path_variables
 
     monkeypatch.setenv("PYTHONPATH", "")
-    assert reading() == ((), ())
+    assert reading() == ()
     monkeypatch.setenv("PYTHONPATH", "relative/entry")
-    assert reading() == (("PYTHONPATH",), ())
-    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
-    assert reading() == (("PYTHONPATH",), ("PYTHONPATH",))
+    assert reading() == ("PYTHONPATH",)
     monkeypatch.setenv("PYTHONHOME", str(tmp_path))
-    assert reading()[1] == ("PYTHONHOME", "PYTHONPATH")
+    assert reading() == ("PYTHONHOME", "PYTHONPATH")
 
 
 def test_an_import_path_entry_that_is_not_text_does_not_stop_the_reading(
@@ -898,8 +912,9 @@ def test_a_file_name_cannot_break_the_log_line() -> None:
 
 
 def test_the_reported_variables_are_ones_the_children_inherit() -> None:
-    """The children-entry says a Python child honours these. It does because the child builders
-    pass each one by name; this ties the two lists."""
+    """The not-isolated entry says the engine's Python children read these too. A child that is
+    not isolated does because the child builders pass each one by name; this ties the two
+    lists."""
     from messagefoundry import childenv
 
     assert set(startupcode._CODE_PATH_VARIABLES) <= childenv._INTERPRETER_NAMES

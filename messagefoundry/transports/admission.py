@@ -119,9 +119,9 @@ _AT_HOST_CAPACITY = Refusal(kind="at_capacity", reason="max_connections_per_host
 class ListenerAdmission:
     """The pre-read admission decision for one socket listener, and the counts it rests on.
 
-    Call :meth:`check` first. ``None`` means admit: call :meth:`admit`, and pair it with exactly one
-    :meth:`release` in a ``finally``. A :class:`Refusal` means close the socket unread; nothing was
-    taken, so nothing is released.
+    Call :meth:`check` first. ``None`` means admit: call :meth:`admit`, keep the epoch it returns,
+    and pair it with exactly one :meth:`release` of that epoch in a ``finally``. A :class:`Refusal`
+    means close the socket unread; nothing was taken, so nothing is released.
 
     ``max_connections`` counts sockets on this listener. ``max_connections_per_host`` counts sockets
     from one peer address, so one address cannot take the whole listener. It keys on the source IP,
@@ -152,6 +152,10 @@ class ListenerAdmission:
         #: Hosts already warned about their per-host cap this episode, cleared with the count above.
         self.host_capacity_warned: set[str] = set()
         self.refusal_log = RefusalLog()
+        #: Which run of the listener the per-host tables describe. :meth:`admit` hands it to the
+        #: connection and :meth:`reset` advances it, so a release from an earlier run can be told
+        #: from one the tables still count (vault BACKLOG #2939).
+        self._epoch = 0
 
     def check(self, writer: asyncio.StreamWriter, peer_host: str | None) -> Refusal | None:
         """Decide whether to admit this connection. Logs a refusal, throttled; emits no event."""
@@ -173,17 +177,29 @@ class ListenerAdmission:
             return _AT_HOST_CAPACITY
         return None
 
-    def admit(self, peer_host: str | None) -> None:
-        """Take one connection slot, globally and (when the peer has an address) for that host."""
+    def admit(self, peer_host: str | None) -> int:
+        """Take one connection slot, globally and (when the peer has an address) for that host.
+
+        Returns the epoch to hand back to :meth:`release`."""
         self.active += 1
         if peer_host is not None:
             self.per_host[peer_host] = self.per_host.get(peer_host, 0) + 1
+        return self._epoch
 
-    def release(self, peer_host: str | None) -> None:
+    def release(self, peer_host: str | None, epoch: int) -> None:
         """Give both slots back. One place for both counters, so they cannot drift: a per-host count
-        left behind by a missed release would lock that peer out until restart."""
+        left behind by a missed release would lock that peer out until restart.
+
+        ``epoch`` is what :meth:`admit` returned, and it is required, so a call site cannot leave it
+        out. A release from an earlier epoch is a connection that outlived a stop: :meth:`reset`
+        already dropped its per-host slot, and the table now counts the restarted listener's
+        connections, so it touches neither that table nor the warned set (vault BACKLOG #2939).
+        It still gives back ``active``, which :meth:`reset` leaves alone: that socket was open, and
+        counted, until now, whichever run admitted it. The per-host cap is not exact across a
+        restart: while such a straggler is still open, its host may hold one socket over
+        ``max_connections_per_host`` for it, since the reset already dropped its slot."""
         self.active -= 1
-        if peer_host is None:
+        if peer_host is None or epoch != self._epoch:
             return
         remaining = self.per_host.get(peer_host, 0) - 1
         if remaining > 0:
@@ -199,9 +215,13 @@ class ListenerAdmission:
 
         A no-op once the listener has started again: a stop() that finishes after a restart must
         not wipe the counts of connections the restarted listener has admitted. Call it from a
-        ``finally`` so a cancelled stop() still clears the tables."""
+        ``finally`` so a cancelled stop() still clears the tables.
+
+        Clearing advances the epoch, so a connection admitted before it that releases later gives
+        back no per-host slot it no longer holds."""
         if not self.stopping:
             return
+        self._epoch += 1
         self.per_host.clear()
         self.host_capacity_warned.clear()
 
@@ -357,11 +377,13 @@ class FrameClock:
         ``in_frame`` would never reach a peer trickling them. So any bytes must lead to a completed
         frame within ``max_frame_seconds`` of read time; the engine's own waits are withheld.
 
-        ``trailer_only`` (:attr:`~messagefoundry.framing.FrameDecoder.trailer_only`) is the one
-        exception: a read holding only the line-end bytes that end the frame before it, such as
-        MLLP's CR arriving after its FS, belongs to that completed frame and starts nothing (vault
-        BACKLOG #2847). Without it a healthy peer that went quiet after such a read would be cut
-        here. It is required, so a new caller cannot leave it out by accident.
+        ``trailer_only`` (:attr:`~messagefoundry.framing.FrameDecoder.trailer_only`, or
+        :attr:`~messagefoundry.parsing.x12.interchange.X12FrameReader.trailer_only` for X12) is the
+        one exception: a read holding only the line-end bytes that end the frame before it, such as
+        MLLP's CR arriving after its FS or a newline after an X12 ``IEA``, belongs to that completed
+        frame and starts nothing (vault BACKLOG #2847, #2938). Without it a healthy peer that went
+        quiet after such a read would be cut here. It is required, so a new caller cannot leave it
+        out by accident.
         """
         if decoded:
             self.opened_at = time.monotonic() if in_frame else None

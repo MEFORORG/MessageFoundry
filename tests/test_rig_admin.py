@@ -401,6 +401,22 @@ def test_an_answer_that_is_not_a_usable_session_is_a_refusal_and_never_carries_t
     assert admin.password not in str(refused.value)
 
 
+def test_a_rate_limited_sign_in_names_the_limit_not_a_stale_administrator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HTTP 429 is the sign-in rate limit, so the stale-store advice would send the operator after
+    the wrong cause (BACKLOG #2795)."""
+    _answers(monkeypatch, (429, {"detail": "too many attempts; please retry later"}))
+    admin = RigAdmin("rig-operator", "cd" * 24)
+    with pytest.raises(rigadmin.RigSignInRefused) as refused:
+        rigadmin.sign_in("https://127.0.0.1:1", admin)
+    message = str(refused.value)
+    assert "HTTP 429" in message
+    assert "MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP" in message
+    assert rigadmin.ADMIN_NAME_ENV not in message, "the stale-Administrator advice is not the cause"
+    assert admin.password not in message
+
+
 def test_an_engine_that_does_not_answer_is_unreachable_and_not_a_refusal() -> None:
     """A real socket with nothing behind it: the hop itself, with no fake. A caller that treats
     "unreachable" as "still starting" must not be handed a refusal, and the reverse."""

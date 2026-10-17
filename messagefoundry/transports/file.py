@@ -677,6 +677,13 @@ class FileSource(SourceConnector):
         self.min_age_seconds: float = float_setting(
             s.get("min_age_seconds", 0.0), knob="min_age_seconds", transport="file source"
         )
+        # Zero is the shipped default (no extra wait), so this is not positive_seconds; only a negative
+        # is refused, as a typo. The scan's `> 0` test would read it as zero (BACKLOG #3151).
+        if self.min_age_seconds < 0:
+            raise ValueError(
+                "file source min_age_seconds must be a number of seconds, zero or more "
+                "(value withheld)"
+            )
         self.after_read: str = s.get("after_read", "move")  # "move" | "delete" | "leave" (#142)
         if self.after_read not in ("move", "delete", "leave"):
             raise ValueError(
@@ -762,6 +769,15 @@ class FileSource(SourceConnector):
         # service-account identity, byte-identical. On a non-Windows host a configured credential
         # raises CredentialUnsupportedError here (a build error), never a silent no-op.
         self._cred_ctx = _build_credential_context(s)
+        if self.max_file_bytes is None:
+            # Off is allowed but never silent (BACKLOG #2749). Logged after every check in this
+            # constructor, so a source it refuses has not logged it. The line names the setting,
+            # never its value.
+            logger.warning(
+                "file source %s: max_file_bytes is off, so a drop is read whole with no byte "
+                "ceiling; set a positive value to bound it",
+                config.name or self.directory,
+            )
 
     async def _run_fs(self, fn: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
         """Run a blocking filesystem callable off the event loop — under the alternate credential (on a

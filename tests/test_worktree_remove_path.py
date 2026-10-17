@@ -78,13 +78,27 @@ REAL_SCRIPTS = (
 )
 
 
-def settle_worktrees(primary: Path) -> None:
-    """Date every linked worktree's own git state two days back, as if nothing had touched it since.
+def copy_real_scripts(root: Path) -> None:
+    """Copy remove.ps1 and the scripts it dot-sources to their tracked paths under ``root``."""
+    for rel in REAL_SCRIPTS:
+        dest = root / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(_REPO / rel, dest)
 
-    ``-Path`` refuses a tree whose git directory was written to inside its quiet period, and a
-    fixture tree is seconds old. This stands in for the passing of time, for every test that is
-    about some OTHER check. The quiet period itself is driven by the tests that pass
-    ``settle=False``, which leave a tree as fresh as it really is.
+
+def _is_link(path: Path) -> bool:
+    return path.is_symlink() or path.is_junction()
+
+
+def settle_worktrees(primary: Path) -> None:
+    """Date every linked worktree two days back, as if nothing had touched it since: its own git
+    state, and every file and directory in its working tree.
+
+    Both removal routes refuse a tree whose git directory or working tree was written to inside its
+    quiet period, and a fixture tree is seconds old. This stands in for the passing of time, for
+    every test that is about some OTHER check. The quiet period itself is driven by the tests that
+    pass ``settle=False``, which leave a tree as fresh as it really is. A link is not followed, so
+    nothing outside a tree is touched.
     """
     then = time.time() - 2 * 24 * 3600
     admin = primary / ".git" / "worktrees"
@@ -94,6 +108,19 @@ def settle_worktrees(primary: Path) -> None:
         for state in [*tree.iterdir(), tree / "logs" / "HEAD"]:
             if state.is_file():
                 os.utime(state, (then, then))
+        pointer = tree / "gitdir"
+        if not pointer.is_file():
+            continue
+        top = Path(pointer.read_text(encoding="utf-8").strip()).parent
+        if not top.is_dir():
+            continue
+        for here, dirs, files in os.walk(top, topdown=True):
+            dirs[:] = [d for d in dirs if not _is_link(Path(here) / d)]
+            for name in [*files, *dirs]:
+                entry = Path(here) / name
+                if not _is_link(entry):
+                    os.utime(entry, (then, then))
+            os.utime(here, (then, then))
 
 
 def write_registry(root: Path, home: Path, *occupied: Path) -> Path:
@@ -196,9 +223,9 @@ def _out(proc: subprocess.CompletedProcess[str]) -> str:
     return proc.stdout + proc.stderr
 
 
-@pytest.fixture
-def rig(tmp_path: Path) -> Rig:
-    r = Rig(tmp_path)
+def build_rig(root: Path) -> Rig:
+    """A primary with one seed commit, an origin/main at it, and a readable session registry."""
+    r = Rig(root)
     r.primary.mkdir()
     _git(r.primary, "init", "-q", "-b", "main")
     _git(r.primary, "config", "user.email", "t@example.invalid")
@@ -212,6 +239,11 @@ def rig(tmp_path: Path) -> Rig:
     _git(r.primary, "update-ref", "refs/remotes/origin/main", seed)
     r.registry()
     return r
+
+
+@pytest.fixture
+def rig(tmp_path: Path) -> Rig:
+    return build_rig(tmp_path)
 
 
 def _common(rig: Rig) -> Path:
@@ -279,14 +311,16 @@ def test_a_tree_that_still_holds_a_claim_is_refused_and_its_claim_is_left_alone(
     claim.write_text("{ half-written", encoding="utf-8")
     proc = rig.run("-Path", str(wt), "-Force")
     assert proc.returncode != 0
-    assert "could not be parsed" in _out(proc) and "9001.json" in _out(proc), _out(proc)
+    assert "9001.json does not parse" in _out(proc), _out(proc)
     assert wt.exists()
 
     # A record that parses but names no worktree cannot be ruled out either.
     claim.write_text(json.dumps({"key": "9001", "note": "no holder recorded"}), encoding="utf-8")
     proc = rig.run("-Path", str(wt), "-Force")
     assert proc.returncode != 0
-    assert "9001.json" in _out(proc), _out(proc)
+    # It parsed, so the refusal must not say it did not (vault BACKLOG #2985, item 17).
+    assert "9001.json names no worktree" in _out(proc), _out(proc)
+    assert "does not parse" not in _out(proc), _out(proc)
     assert wt.exists()
 
     claim.unlink()
@@ -461,10 +495,7 @@ def test_the_unsafe_spellings_and_inherited_git_variables_are_refused(rig: Rig) 
 
 def test_a_copy_of_the_script_inside_the_target_refuses_to_remove_it(rig: Rig) -> None:
     wt = rig.add(rig.scratch("selfhost"))
-    for rel in REAL_SCRIPTS:
-        dest = wt / rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(_REPO / rel, dest)
+    copy_real_scripts(wt)
 
     proc = rig.run("-Path", str(wt), "-Force", script=wt / "scripts" / "worktree" / "remove.ps1")
 

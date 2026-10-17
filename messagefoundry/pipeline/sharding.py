@@ -211,6 +211,8 @@ def filter_registry_for_shard(registry: Registry, shard: str) -> Registry:
         fhir_lookups=registry.fhir_lookups,
         # A sandbox worker re-loads the functions from the directory the graph came from.
         source_dir=registry.source_dir,
+        # And compares the digest of what it loaded with the engine's (vault BACKLOG #2724).
+        code_digest=registry.code_digest,
         shard_id=shard if sharded else None,
         all_shard_ids=tuple(ids) if sharded else None,
         # Pin the UNFILTERED loopback inbounds beside the shard identity: `selected` drops the inbounds

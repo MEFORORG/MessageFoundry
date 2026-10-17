@@ -5,7 +5,9 @@
 Replay, dead-letter replay, purge (``cancel_queued``), resend, the edit-and-resubmit re-ingress and
 the upload inject each take an :data:`~messagefoundry.store.store.OperatorAudit`. The store appends
 the row it builds inside the mutation's own transaction. Before #2624 the API wrote the row in a
-second transaction, so a crash between the two kept the change and lost who made it.
+second transaction, so a crash between the two kept the change and lost who made it. The four
+operator alert mutations (ack, resolve, suspend, resume) take one ``AuditAppend`` the same way
+(vault BACKLOG #3217).
 
 Each case runs twice. First the audit append is made to fail, and the case asserts the store change
 rolled back with it: neither committed. Then it runs clean and asserts both committed, the row
@@ -120,6 +122,92 @@ async def _check(
     assert len(rows) == 1, f"{label}: the clean run committed {len(rows)} audit rows"
     row = rows[0]
     assert (row["actor"], row["channel_id"], row["client"]) == ("contract-op", channel, _CLIENT)
+
+
+async def _assert_alert_mutations_atomic(store: Any, tag: str) -> None:
+    """Alert ack, resolve, suspend and resume commit their row with the change (vault BACKLOG
+    #3217). Each takes one ``AuditAppend``, which the store appends only when the change applied."""
+    conn = f"OB_A{tag}"
+    await store.upsert_alert_instance(
+        event_type="connection_error", connection=conn, severity="warning"
+    )
+    rows = await store.list_active_alert_instances(limit=1000, allowed_channels=None)
+    [alert_id] = [r.id for r in rows if r.connection == conn]
+
+    async def instance() -> Any:
+        got = await store.get_alert_instance(alert_id, allowed_channels=None)
+        assert got is not None
+        return got
+
+    async def is_open_unsuspended() -> None:
+        got = await instance()
+        assert (got.status, got.acked_by, got.suspended_until) == ("open", None, None)
+
+    async def suspended() -> None:
+        assert (await instance()).suspended_until == 9_999_999_999.0
+
+    async def acked(ok: Any) -> None:
+        got = await instance()
+        assert ok is True and (got.status, got.acked_by) == ("acknowledged", "contract-op")
+
+    async def was_suspended(info: Any) -> None:
+        assert info is not None and info.suspended_until == 9_999_999_999.0
+        await suspended()
+
+    async def was_resumed(info: Any) -> None:
+        assert info is not None and info.suspended_until is None
+
+    async def is_acked() -> None:
+        assert (await instance()).status == "acknowledged"
+
+    async def resolved(ok: Any) -> None:
+        assert ok is True and (await instance()).status == "resolved"
+
+    await _check(
+        store,
+        label="alert_suspend",
+        channel=None,
+        run=lambda audit: store.suspend_alert_instance(
+            alert_id, until=9_999_999_999.0, audit=audit(True)
+        ),
+        unchanged=is_open_unsuspended,
+        changed=was_suspended,
+    )
+    await _check(
+        store,
+        label="alert_resume",
+        channel=None,
+        run=lambda audit: store.resume_alert_instance(alert_id, audit=audit(True)),
+        unchanged=suspended,
+        changed=was_resumed,
+    )
+    await _check(
+        store,
+        label="alert_ack",
+        channel=None,
+        run=lambda audit: store.ack_alert_instance(
+            alert_id, actor="contract-op", audit=audit(True)
+        ),
+        unchanged=is_open_unsuspended,
+        changed=acked,
+    )
+    await _check(
+        store,
+        label="alert_resolve",
+        channel=None,
+        run=lambda audit: store.resolve_alert_instance(alert_id, audit=audit(True)),
+        unchanged=is_acked,
+        changed=resolved,
+    )
+    # A mutation that changes nothing, here of a resolved instance, records nothing: the route
+    # answers 404 for it, as it did before the row moved into the store.
+    none_action = f"contract.alert_noop.{tag}"
+    noop = _builder(none_action, None)(None)
+    assert await store.ack_alert_instance(alert_id, actor="contract-op", audit=noop) is False
+    assert await store.resolve_alert_instance(alert_id, audit=noop) is False
+    assert await store.suspend_alert_instance(alert_id, until=1.0, audit=noop) is None
+    assert await store.resume_alert_instance(alert_id, audit=noop) is None
+    assert await _rows(store, none_action) == []
 
 
 async def assert_operator_audit_atomic(store: Any) -> None:
@@ -315,6 +403,8 @@ async def assert_operator_audit_atomic(store: Any) -> None:
         unchanged=inject_unchanged,
         changed=inject_changed,
     )
+
+    await _assert_alert_mutations_atomic(store, tag)
 
     # The rows joined the hash chain the way record_audit's do: the chain still verifies.
     ok, message = await store.verify_audit_chain()

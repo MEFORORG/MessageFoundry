@@ -23,9 +23,10 @@ The text is every such string that holds a space or spells the variable, so a ba
 ``""`` default of ``os.environ.get`` is not a message. That text must name the posture, and a
 phrase that wraps or is split across ``+`` still counts.
 
-**What the prose scans see** (vault BACKLOG #3099). Docstrings in ``_DOCSTRING_FILES``, one
-paragraph at a time: a paragraph that spells the variable must name the posture, so a mention
-cannot ride on the posture in another paragraph. Two mentions inside one paragraph are judged
+**What the prose scans see** (vault BACKLOG #3099). Docstrings in ``_DOCSTRING_FILES``, and
+the one docstring of each function in ``_DOCSTRING_FUNCTIONS``, one paragraph at a time: a
+paragraph that spells the variable must name the posture, so a mention cannot ride on the
+posture in another paragraph. Two mentions inside one paragraph are judged
 together. Comments in ``_COMMENT_FILES``: own-line comments on consecutive
 lines are one comment, and a comment after code is read alone. A comment names the escape when it
 spells the variable. A comment in a ``def`` signature also names it when it says "the escape",
@@ -37,9 +38,11 @@ scan does not copy them: it reads each trailing comment alone, which is stricter
 **The docstring files are a pinned list, not the tree.** At least ``_reject_unknown_env_keys`` and
 ``weakened_tls_escape_permitted`` in ``config/settings.py`` name the variable to list it or to
 define the rule, so a scan of every docstring flags some text that misleads nobody. The list is
-the files brought into line so far, and it is not every file that needs it: at least the module
-docstring of ``transports/rest.py`` and ``insecure_tls_allowed`` in ``config/settings.py`` still
-name the variable without the posture, and no scan here reads them.
+the files brought into line so far, and it is not every file that needs it. Where a file cannot be
+held whole, ``_DOCSTRING_FUNCTIONS`` holds single functions to the rule, at least
+``insecure_tls_allowed`` in ``config/settings.py``. Every other docstring in that file goes unread,
+and so do the docstrings in at least ``config/tls_policy.py``, ``config/ai_policy.py`` and
+``pipeline/wiring_runner.py`` that spell the variable.
 
 **What none of them sees**, at least: a message built in a variable before the call; the variable
 imported under another name; a message with no space that only interpolates the variable, such
@@ -67,7 +70,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV
-from tests._ast_sites import parse_source
+from tests._ast_sites import named_func, parse_source
 
 _REPO = Path(__file__).resolve().parent.parent
 #: Every shipped Python package ci.yml type-checks. The engine is ``messagefoundry``; the others
@@ -107,8 +110,13 @@ _DOCSTRING_FILES = (
     "messagefoundry/transports/database.py",
     "messagefoundry/transports/direct.py",
     "messagefoundry/transports/email.py",
+    "messagefoundry/transports/mllp.py",
     "messagefoundry/transports/remotefile.py",
+    "messagefoundry/transports/rest.py",
 )
+#: Single functions held to the rule, in a file that cannot be held whole. Each docstring must name
+#: the escape, so a rewrite that drops it fails instead of passing with nothing to judge.
+_DOCSTRING_FUNCTIONS = (("messagefoundry/config/settings.py", "insecure_tls_allowed"),)
 #: Files whose comments are held to it. The authoring factories live here, and their parameter
 #: comments reach an operator as help text.
 _COMMENT_FILES = ("messagefoundry/config/wiring.py",)
@@ -209,25 +217,34 @@ def escape_texts_without_posture(source: str) -> tuple[list[int], int]:
     return unposted, seen
 
 
+def _docstring_without_posture(node: _DOCUMENTED) -> tuple[list[int], int]:
+    """:func:`docstrings_without_posture` for ``node``'s own docstring alone."""
+    unposted: list[int] = []
+    seen = 0
+    text = ast.get_docstring(node, clean=False)
+    if text is None:
+        return unposted, seen
+    line = node.body[0].lineno
+    for chunk in _PARAGRAPH_BREAK.split(text):
+        at = chunk.find(INSECURE_TLS_ESCAPE_ENV)
+        if at >= 0:
+            seen += 1
+            if _POSTURE not in _squash(chunk):
+                unposted.append(line + chunk.count("\n", 0, at))
+        line += chunk.count("\n")
+    return unposted, seen
+
+
 def docstrings_without_posture(source: str) -> tuple[list[int], int]:
     """Lines of docstring paragraphs that name the escape but not the posture, and how many
     paragraphs named the escape at all. The line is where the paragraph first spells the variable."""
     unposted: list[int] = []
     seen = 0
     for node in ast.walk(parse_source(source)):
-        if not isinstance(node, _DOCUMENTED):
-            continue
-        text = ast.get_docstring(node, clean=False)
-        if text is None:
-            continue
-        line = node.body[0].lineno
-        for chunk in _PARAGRAPH_BREAK.split(text):
-            at = chunk.find(INSECURE_TLS_ESCAPE_ENV)
-            if at >= 0:
-                seen += 1
-                if _POSTURE not in _squash(chunk):
-                    unposted.append(line + chunk.count("\n", 0, at))
-            line += chunk.count("\n")
+        if isinstance(node, _DOCUMENTED):
+            lines, count = _docstring_without_posture(node)
+            unposted.extend(lines)
+            seen += count
     return sorted(unposted), seen
 
 
@@ -406,6 +423,9 @@ def test_the_prose_scans_flag_a_text_that_omits_the_posture() -> None:
     # The posture two paragraphs up does not cover the last paragraph, and line 14 is where that
     # paragraph spells the variable, not where it starts.
     assert docstrings_without_posture(_PROSE_THAT_OMITS_THE_POSTURE) == ([1, 14], 2)
+    # One function alone, as _DOCSTRING_FUNCTIONS reads it: the module docstring is not its text.
+    factory = named_func(parse_source(_PROSE_THAT_OMITS_THE_POSTURE), "factory")
+    assert _docstring_without_posture(factory) == ([14], 1)
     assert comments_without_posture(_PROSE_THAT_OMITS_THE_POSTURE) == ([6, 7, 16], 3)
 
 
@@ -438,18 +458,29 @@ def test_every_runtime_text_naming_the_escape_names_the_posture() -> None:
     )
 
 
+def _text(rel: str) -> str:
+    return (_REPO / rel).read_text(encoding="utf-8")
+
+
 def test_every_authoring_text_naming_the_escape_names_the_posture() -> None:
     failures: list[str] = []
     silent: list[str] = []
-    for kind, scan, files in (
-        ("docstring", docstrings_without_posture, _DOCSTRING_FILES),
-        ("comment", comments_without_posture, _COMMENT_FILES),
-    ):
-        for rel in files:
-            unposted, seen = scan((_REPO / rel).read_text(encoding="utf-8"))
-            if not seen:
-                silent.append(f"{rel} ({kind}s)")
-            failures.extend(f"{rel}:{line} ({kind})" for line in unposted)
+    results = (
+        [("docstring", rel, docstrings_without_posture(_text(rel))) for rel in _DOCSTRING_FILES]
+        + [
+            (
+                "docstring",
+                f"{rel}:{name}",
+                _docstring_without_posture(named_func(parse_source(_text(rel)), name)),
+            )
+            for rel, name in _DOCSTRING_FUNCTIONS
+        ]
+        + [("comment", rel, comments_without_posture(_text(rel))) for rel in _COMMENT_FILES]
+    )
+    for kind, rel, (unposted, seen) in results:
+        if not seen:
+            silent.append(f"{rel} ({kind}s)")
+        failures.extend(f"{rel}:{line} ({kind})" for line in unposted)
     assert not silent, f"the scan found no text naming the escape in {silent}"
     assert not failures, (
         f"these docstrings and comments name {INSECURE_TLS_ESCAPE_ENV}, or say "

@@ -9,7 +9,8 @@ event loop**. There is deliberately NO control here — start/stop/restart is cu
 can't restart its own host over the API (stopping it kills the API). Windows-only; elsewhere / when
 ``sc`` is absent the state is ``"unavailable"``.
 
-Neutral (stdlib-only) so both :mod:`messagefoundry.config` (name validation) and :mod:`messagefoundry.api`
+Neutral (the stdlib, and :mod:`messagefoundry.childenv`, itself stdlib-only, for the ``sc`` start's
+environment) so both :mod:`messagefoundry.config` (name validation) and :mod:`messagefoundry.api`
 (the endpoint) may import it without crossing a layer boundary.
 
 Being the neutral leaf is also why :func:`_system_exe` lives here rather than beside the elevated
@@ -28,6 +29,8 @@ import os
 import re
 import subprocess  # nosec B404 - fixed system tool (sc), no shell, validated arg (below)
 import sys
+
+from messagefoundry.childenv import system_tool_environment
 
 __all__ = ["ServiceState", "is_safe_service_name", "parse_service_state", "query_service_state"]
 
@@ -145,6 +148,7 @@ def _query(name: str) -> ServiceState:
             [_system_exe("sc.exe"), "query", name],
             capture_output=True,
             text=True,
+            env=system_tool_environment(),  # the platform's start-up names only (#2716)
             encoding="oem",  # sc.exe's piped output; see service.service_state for why "replace"
             errors="replace",
             timeout=5,

@@ -15,6 +15,7 @@ never re-parses or mutates them — only the ACK path looks inside a message.
 from __future__ import annotations
 
 import re
+import string
 from collections.abc import Iterator
 from datetime import datetime
 
@@ -38,6 +39,27 @@ CR = 0x0D
 # Default MSH-1 field separator / MSH-2 encoding characters, used when the inbound can't be parsed.
 _DEFAULT_FIELD_SEP = "|"
 _DEFAULT_ENC = "^~\\&"
+
+# The characters of the ACK's fixed text: the segment ids, ACK, P, every MSA-1 code (original and
+# enhanced), the letters of the engine's MSA-3 escapes (kept equal to the engine), MSH-7's digits and +/- offset, and the default version 2.5.1. An inbound delimiter from
+# this set would split that text when the ACK is read back, so the ACK is built under the defaults
+# instead (BACKLOG #2875). The engine's messagefoundry/mllpcodec.py holds the same rule, and
+# tests/test_tee_mllp.py pins the two equal.
+_ACK_LITERAL_CHARS = frozenset("MSHMSAACKP" + "EF" + "AAAEARCACECR" + string.digits + "+-.")
+
+
+def _roles(field_sep: str, enc: str) -> dict[str, str]:
+    """Each delimiter character to its role, in MSH-2 order, a short MSH-2 filled from the defaults
+    as the engine's parser fills it. Where two roles share a character the first wins; one with no
+    role is data. The engine's mllpcodec has the same function."""
+    roles: dict[str, str] = {}
+    enc = enc[:4] + _DEFAULT_ENC[len(enc[:4]) :]
+    for char, role in zip(field_sep + enc, "FSRET", strict=True):
+        roles.setdefault(char, role)
+    return roles
+
+
+_DEFAULT_ROLES = _roles(_DEFAULT_FIELD_SEP, _DEFAULT_ENC)
 
 # HL7 segments are CR-delimited, but tolerant peers emit LF/CRLF too — split on any run of either.
 _SEG_SPLIT = re.compile(r"[\r\n]+")
@@ -110,25 +132,36 @@ def _msh_fields(message: bytes) -> tuple[str, list[str]]:
     if not first.startswith("MSH") or len(first) < 4:
         return _DEFAULT_FIELD_SEP, []
     field_sep = first[3]
-    return field_sep, first.split(field_sep)
+    # Split after MSH-1, not the whole line: a field separator of M, S or H would split "MSH" too.
+    return field_sep, ["MSH", *first[4:].split(field_sep)]
 
 
 def build_ack(message: bytes, *, code: str = "AA", timestamp: str | None = None) -> bytes:
     """Build an HL7 acknowledgement for ``message`` (default ``AA`` — the relay always accepts).
 
-    Reads the field separator + encoding characters from the inbound MSH (never hardcoded), echoes the
-    control id into MSA-2, swaps sender/receiver so the ACK routes back the way it came, and sanitizes
-    every echoed field against segment injection. If ``message`` isn't parseable HL7 it still returns a
-    generic ``AA`` (the relay always ACKs on receipt). Encoded latin-1 to preserve the inbound's bytes.
+    Reads the field separator + encoding characters from the inbound MSH, echoes the control id into
+    MSA-2, swaps sender/receiver so the ACK routes back the way it came, and sanitizes every echoed
+    field against segment injection. If ``message`` isn't parseable HL7 it still returns a generic
+    ``AA`` (the relay always ACKs on receipt). Encoded latin-1 to preserve the inbound's bytes.
+
+    The one exception to echoing the inbound's delimiters: where its MSH-1 or MSH-2 holds a
+    character of the ACK's fixed text (``_ACK_LITERAL_CHARS``), or two delimiters share a character,
+    the ACK goes out under ``|^~\\&`` so it reads back as an ACK. An echoed value holding either
+    set's escape character, or a default delimiter in a role it does not have in the inbound, is
+    then blanked rather than escaped, by the engine's rule (BACKLOG #2875).
     """
     field_sep, parts = _msh_fields(message)
     enc = _field(parts, 1) or _DEFAULT_ENC
-    sending_app = _no_seg_sep(_field(parts, 2))
-    sending_fac = _no_seg_sep(_field(parts, 3))
-    receiving_app = _no_seg_sep(_field(parts, 4))
-    receiving_fac = _no_seg_sep(_field(parts, 5))
-    control = _no_seg_sep(_field(parts, 9))
-    version = _no_seg_sep(_field(parts, 11)) or "2.5.1"
+    echoed = tuple(_no_seg_sep(_field(parts, index)) for index in (2, 3, 4, 5, 9, 11))
+    roles = _roles(field_sep, enc)
+    # Fewer than five roles means two delimiters share a character, default-filled slots included.
+    if len(roles) < 5 or not _ACK_LITERAL_CHARS.isdisjoint(field_sep + enc):
+        unsafe = {c for c, role in _DEFAULT_ROLES.items() if roles.get(c) != role}
+        unsafe |= {_DEFAULT_ENC[2], enc[2:3] or _DEFAULT_ENC[2]}
+        field_sep, enc = _DEFAULT_FIELD_SEP, _DEFAULT_ENC
+        echoed = tuple(v if unsafe.isdisjoint(v) else "" for v in echoed)
+    sending_app, sending_fac, receiving_app, receiving_fac, control, version = echoed
+    version = version or "2.5.1"
     # MSH-7 carries an explicit numeric UTC offset (BACKLOG #1196), matching the engine's own
     # build_ack. A bare local stamp is ambiguous across a daylight-saving fall-back, where the
     # same wall-clock hour occurs twice, so a partner correlating this acknowledgement against
@@ -174,7 +207,12 @@ def parse_ack(ack: bytes) -> tuple[str | None, str | None]:
             break
     for seg in segments:
         if seg.startswith("MSA"):
-            parts = seg.split(field_sep)
+            # Split after the segment id, not the whole line, as _msh_fields does: a field
+            # separator of M, S or A would split "MSA" too.
+            if seg[3:4] == field_sep:
+                parts = ["MSA", *seg[4:].split(field_sep)]
+            else:
+                parts = seg.split(field_sep)
             return (_field(parts, 1) or None), (_field(parts, 3) or None)
     return None, None
 
