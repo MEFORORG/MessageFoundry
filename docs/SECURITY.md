@@ -4114,7 +4114,10 @@ account's entry and write its roles onto the row. No sign-in or step-up admits s
 writes no roles, and it strikes and revokes as an absent account does, with the reason
 `directory_object_id_missing`. It is not a `userAccountControl` answer, so it never moves the ADR
 0195 hold. It is never asked, so it is no part of an outage either: a pass whose every lookup fails
-still audits `auth.ad_reconcile_skipped`, and that row's `asked` count leaves it out. Such a
+still audits `auth.ad_reconcile_skipped`, and that row's `asked` count leaves it out. Such a pass,
+and one whose every lookup was referred, still strikes the row, because its answer never came from
+the directory (BACKLOG #3170). A referral's `auth.ad_reconcile_referred` row and alert count only
+the lookups sent too. Its revocation does count toward the mass-revoke breaker below. Such a
 row cannot take a federated binding: the bind refuses it, so every binding the bind has made since
 BACKLOG #1143 slice C sits on a row probed by its id (ADR 0184 AC-5). A binding already on an id-less
 row, made before that refusal, is **never probed by name** (BACKLOG #2027). The pass skips the row and

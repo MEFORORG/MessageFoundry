@@ -9512,7 +9512,9 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         sink.ad_reconcile_aborted(
             _REFERRAL_ALERT_SOURCE,
             reason=REFERRAL_ABORT,
-            probed=plan.probed,
+            # The probes ASKED (BACKLOG #3170): an UNKEYED row was never sent, so no referral
+            # could answer it. The breaker's count above stays its judged denominator.
+            probed=plan.asked,
             detail=auth.directory_reconcile_referral or REFERRAL_ABORT,
         )
     if plan.hold:

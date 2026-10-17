@@ -542,10 +542,11 @@ class AlertSink(Protocol):
 
         ``name`` labels the source: ``"directory-reconciler"`` for the breaker, and
         ``"directory-reconciler-referral"`` for a referral, so each is its own instance and
-        throttle. ``reason`` is one of those two closed-set slugs. ``probed`` is how many
-        principals the pass probed. ``detail`` is the operator-facing explanation the auth service
-        latches. No PHI. Emitted by the API-lifespan
-        reconciler task, never from ``auth/``. A whole-directory outage is NOT this event: it is
+        throttle. ``reason`` is one of those two closed-set slugs. ``probed`` is, for the breaker,
+        how many principals the pass judged, its denominator, and for a referral how many probes
+        the pass sent to the directory, which leaves out an id-less row (BACKLOG #3170).
+        ``detail`` is the operator-facing explanation the auth service latches. No PHI. Emitted by
+        the API-lifespan reconciler task, never from ``auth/``. A whole-directory outage is NOT this event: it is
         audited as ``auth.ad_reconcile_skipped`` and pages nothing, because the accounts are fine."""
         ...
 

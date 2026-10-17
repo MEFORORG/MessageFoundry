@@ -192,14 +192,17 @@ class ReconcilePlan:
     #: count``. A PRESENT probe maps to 0 (reset), and so does a HELD one (ADR 0195 rule item 7;
     #: ``held`` tells the two apart). An UNAVAILABLE or REFERRED probe is absent from this mapping,
     #: leaving whatever strike the user already carried untouched. Populated even on a breaker
-    #: abort — see :func:`plan_pass`.
+    #: abort — see :func:`plan_pass`. On an outage or a pass of referrals only it holds the UNKEYED
+    #: rows' strikes alone (BACKLOG #3170), since those were judged without the directory.
     strikes: Mapping[str, int] = field(default_factory=dict)
     #: Candidates this pass judged, asked or not. Excludes the per-pass budget remainder. An UNKEYED
     #: row counts here, because it can revoke. This is the breaker's denominator (``judged``).
     probed: int = 0
     #: Probes this pass actually sent to the directory: ``probed`` less its UNKEYED rows (BACKLOG
     #: #2434). An outage and a pass of referrals only are judged over these, and the outage's log
-    #: line and the ``asked`` field of its ``auth.ad_reconcile_skipped`` row count these.
+    #: line and the ``asked`` field of its ``auth.ad_reconcile_skipped`` row count these. So do the
+    #: referral's latched message, the ``asked`` field of its ``auth.ad_reconcile_referred`` row
+    #: and its alert's count (BACKLOG #3170): a referral can only answer a probe that was sent.
     asked: int = 0
     unavailable: int = 0
     #: ``user_id`` of every probe the directory answered with a referral (BACKLOG #2538). Any one
@@ -377,6 +380,14 @@ def plan_pass(
     # BACKLOG #2434. The caller reads a row it may not ask about as UNKEYED, so that outcome is
     # the one mark of "never asked": it says nothing about whether the directory answered.
     asked = sum(1 for p in probes if p.outcome is not ProbeOutcome.UNKEYED)
+    # BACKLOG #3170 item 3. An UNKEYED row was judged without the directory, so a pass that learned
+    # nothing from the directory still strikes it, as any other pass does. Only the strike: its
+    # outcome is not recorded here, so the hold's record, and so its carry-over, stays as it was.
+    unkeyed_strikes = {
+        p.user_id: prior_strikes.get(p.user_id, 0) + 1
+        for p in probes
+        if p.outcome is ProbeOutcome.UNKEYED
+    }
 
     if referred and len(unavailable) + len(referred) == asked:
         # BACKLOG #2538. Nothing the pass asked was answered, as on an outage, so it judges nothing
@@ -384,6 +395,7 @@ def plan_pass(
         # failures is not read as a plain outage, which pages nobody. A user search base in another
         # domain of the forest refers every probe, and this is the shape it takes.
         return ReconcilePlan(
+            strikes=unkeyed_strikes,
             probed=len(probes),
             asked=asked,
             unavailable=len(unavailable),
@@ -399,6 +411,7 @@ def plan_pass(
         # zero-revocation pass. The hold is not judged on a pass that learned nothing, so its state
         # carries over.
         return ReconcilePlan(
+            strikes=unkeyed_strikes,
             probed=len(probes),
             asked=asked,
             unavailable=len(unavailable),
@@ -501,6 +514,9 @@ def plan_pass(
         readable=readable,
     )
     # Held and referred probes both stay in the breaker's denominator; ReconcilePlan.judged says why.
+    # UNKEYED revocations stay in its numerator, so while such rows hold sessions they push toward
+    # a trip on every pass. Exempting them is declined (BACKLOG #3170 item 2): it would change what
+    # the mass-revoke breaker counts, a security control, and that is not a follow-up's call.
     if breaker_tripped(
         revoke_count=len(revocations),
         probed=plan.judged,

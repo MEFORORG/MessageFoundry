@@ -1586,17 +1586,25 @@ def _holds_federated_binding(user: UserRecord) -> bool:
     return user.oidc_issuer is not None or user.oidc_subject is not None
 
 
+def _directory_key(user: UserRecord) -> str | None:
+    """The ``directory_object_id`` the engine may ask the directory about ``user`` by, or ``None``
+    when the row carries none (an empty value counts as none). :func:`_holds_directory_key` states
+    the rule; a caller that goes on to send the id takes it from here, so the type narrows."""
+    return user.directory_object_id or None
+
+
 def _holds_directory_key(user: UserRecord) -> bool:
-    """Whether the reconciler may ask the directory about ``user``: it carries a
+    """Whether the engine may ask the directory about ``user``: it carries a
     ``directory_object_id`` (BACKLOG #2434).
 
-    **The reconcile pass's one statement of the rule**; the sign-in, step-up and bind refusals
-    still test the column inline. A row without one is never asked about by name, so it is no
-    directory evidence: the pass reads it as UNKEYED without a lookup, and a trip or a referral
-    leaves it unmarked, because no pass can ever read it PRESENT. ``reconcile.plan_pass`` sees only
-    the UNKEYED outcome this produces, and counts what was asked from that.
+    **The one statement of the rule**: the reconcile pass and the sign-in, step-up and bind
+    refusals all read it (BACKLOG #3170 item 7). A row without one is never asked about by name,
+    so on the reconcile pass it is no directory evidence: the pass reads it as UNKEYED without a
+    lookup, and a trip or a referral leaves it unmarked, because no pass can ever read it PRESENT.
+    ``reconcile.plan_pass`` sees only the UNKEYED outcome this produces, and counts what was asked
+    from that.
     """
-    return bool(user.directory_object_id)
+    return _directory_key(user) is not None
 
 
 def _holds_unkeyed_federated_binding(user: UserRecord) -> bool:
@@ -4610,7 +4618,8 @@ class AuthService:
                 username, "oidc", "local_account_conflict", client=client
             )
             return LoginOutcome(ok=False, error="account conflict", reason="local_account_conflict")
-        if not bound.directory_object_id:
+        object_id = _directory_key(bound)
+        if object_id is None:
             # BACKLOG #2027 (ADR 0184 AC-5). A BOUND ROW WITH NO IMMUTABLE ID IS REFUSED, NOT
             # RE-RESOLVED BY NAME. The bind refuses such a row since BACKLOG #1143 slice C, so this
             # reaches only a binding written before that, or planted in the store. Its only
@@ -4641,7 +4650,7 @@ class AuthService:
         # re-resolve is never keyed on the name alone (BACKLOG #2027).
         try:
             principal = await asyncio.to_thread(
-                self._ldap.resolve_principal, bound.username, object_id=bound.directory_object_id
+                self._ldap.resolve_principal, bound.username, object_id=object_id
             )
         except LdapError as exc:
             await self._audit(
@@ -4661,7 +4670,7 @@ class AuthService:
             )
         # BACKLOG #3174: the answer must name the bound row's own directory object, by the test the
         # IdP step-up leg applies, before its groups or name are used.
-        mismatch = _directory_answer_mismatch(principal, bound.directory_object_id)
+        mismatch = _directory_answer_mismatch(principal, object_id)
         if mismatch is not None:
             await self._directory_reject_audit(username, "oidc", mismatch, client=client)
             return LoginOutcome(ok=False, error="federated sign-in failed", reason=mismatch)
@@ -5031,13 +5040,14 @@ class AuthService:
         # the directory itself, by the row's immutable id as the sign-in leg does (BACKLOG #1532).
         if self._ldap is None:
             return await refuse("not_configured")
-        if not user.directory_object_id:
+        object_id = _directory_key(user)
+        if object_id is None:
             # Never a name-only lookup: a directory may reissue a freed name to someone else. The
             # sign-in leg refuses such a row for the same reason (BACKLOG #2027).
             return await refuse(DIRECTORY_OBJECT_ID_MISSING)
         try:
             principal = await asyncio.to_thread(
-                self._ldap.resolve_principal, user.username, object_id=user.directory_object_id
+                self._ldap.resolve_principal, user.username, object_id=object_id
             )
         except LdapError as exc:
             _log.warning(
@@ -5048,7 +5058,7 @@ class AuthService:
             return await refuse("not_in_directory")
         # BACKLOG #3174: the answer must name the row's own directory object before its groups are
         # trusted, by the test the sign-in leg and the AD step-up re-bind apply.
-        mismatch = _directory_answer_mismatch(principal, user.directory_object_id)
+        mismatch = _directory_answer_mismatch(principal, object_id)
         if mismatch is not None:
             return await refuse(mismatch)
         # BACKLOG #2154: the account's stored roles must all be among the roles its current groups
@@ -7251,7 +7261,7 @@ class AuthService:
         self._reconcile_referral_alert = (
             "LDAP referral: check [auth].ad_user_search_base and, for nested groups, "
             "[auth].ad_group_search_base; one names a base in another domain of the forest. "
-            f"{len(plan.referred)} of {plan.probed} signed-in directory account(s) probed were "
+            f"{len(plan.referred)} of {plan.asked} signed-in directory account(s) probed were "
             f"referred and left unjudged. {others} A referred account is never revoked while it "
             "is referred, because the engine does not follow referrals. Use a base in the bound "
             "domain controller's own domain, or a global catalog. The ERROR log line for each such "
@@ -7273,7 +7283,9 @@ class AuthService:
                     "reason": reconcile.REFERRAL_ABORT,
                     "referred": len(plan.referred),
                     "unavailable": plan.unavailable,
-                    "probed": plan.probed,
+                    # Over the probes ASKED (BACKLOG #3170), as the outage's row is (#2434): an
+                    # UNKEYED row was never sent, so no referral could answer it.
+                    "asked": plan.asked,
                     "aborted": plan.aborted,
                 }
             ),
@@ -8942,7 +8954,8 @@ class AuthService:
         verdict: bool | None
         reason: str | None = None
         if directory:
-            if not user.directory_object_id:
+            object_id = _directory_key(user)
+            if object_id is None:
                 # BACKLOG #2027, ADR 0184 AC-5. The re-bind finds its entry by the row's id, and a
                 # row with none has only its name, which a directory may have reissued to someone
                 # else whose password would then step this session up. Refused before the directory
@@ -8950,9 +8963,7 @@ class AuthService:
                 # did not guess wrong.
                 verdict, reason = None, DIRECTORY_OBJECT_ID_MISSING
             else:
-                rebind = await self._reauth_ad(
-                    user.username, password, object_id=user.directory_object_id
-                )
+                rebind = await self._reauth_ad(user.username, password, object_id=object_id)
                 verdict, reason = rebind.verdict, rebind.reason
         else:
             verdict = user.password_hash is not None and await self._argon2(
@@ -10655,11 +10666,11 @@ class AuthService:
         """
         if self._ldap is None:
             return "not_configured"
-        if not user.directory_object_id:
+        if not _holds_directory_key(user):
             return DIRECTORY_OBJECT_ID_MISSING
         # The reconciler's own probe, so both ask the same question by the same key, off the loop.
-        # They differ on an id-less row only: this leg refuses it above, and the reconciler still
-        # probes an unbound one by name (BACKLOG #2027).
+        # Neither asks about an id-less row: this leg refuses it above, and the reconciler reads it
+        # as UNKEYED without a lookup (BACKLOG #2434, #3170 item 6).
         probe = await self._probe_principal(user)
         if probe.outcome is not reconcile.ProbeOutcome.PRESENT:
             return str(probe.outcome.value)
@@ -12367,7 +12378,7 @@ class AuthService:
         if user.auth_provider != AuthProvider.AD.value:
             await audit_refused("not_a_directory_account", user.username)
             raise ValueError("only a directory (AD) account can take a federated binding")
-        if not user.directory_object_id:
+        if not _holds_directory_key(user):
             # BACKLOG #1143 slice C: see DirectoryObjectIdMissing. After the no-op check, so a
             # legacy binding resubmitted as it stands gets the harmless answer above, while moving
             # it to another pair is still refused. Unbinding it stays open.

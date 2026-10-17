@@ -616,6 +616,38 @@ def test_an_unkeyed_probe_does_not_hide_an_outage_or_a_referral_only_pass() -> N
     assert alone.aborted is None and (alone.probed, alone.asked) == (1, 0)
 
 
+@pytest.mark.parametrize(
+    "asked",
+    [
+        [reconcile.Probe("a", "a", reconcile.ProbeOutcome.UNAVAILABLE)],
+        [reconcile.Probe("r", "r", reconcile.ProbeOutcome.REFERRED)],
+        [
+            reconcile.Probe("a", "a", reconcile.ProbeOutcome.UNAVAILABLE),
+            reconcile.Probe("r", "r", reconcile.ProbeOutcome.REFERRED),
+        ],
+    ],
+    ids=["outage", "referrals-only", "referrals-and-failures"],
+)
+def test_an_unkeyed_row_is_struck_on_a_pass_that_judged_nothing(
+    asked: list[reconcile.Probe],
+) -> None:
+    """BACKLOG #3170 item 3. An UNKEYED row is judged without the directory, so a pass that learned
+    nothing from it still strikes the row. Only the strike: the asked probes' strikes, the outcome
+    record the hold reads, and the hold's latch all stay as they were.
+
+    RED before #3170: both early returns carried no strikes, so such a row went unstruck."""
+    unkeyed = reconcile.Probe("k", "k", reconcile.ProbeOutcome.UNKEYED)
+    plan = _plan([*asked, unkeyed], prior_strikes={"k": 1, "a": 1, "r": 1}, latched=True)
+    assert plan.judged_nothing
+    assert plan.strikes == {"k": 2}
+    assert plan.outcomes == {} and plan.latched and not plan.hold
+    assert plan.revocations == ()
+    # The control: the same row on an ordinary pass strikes the same way, and revokes there.
+    ordinary = _plan([unkeyed], prior_strikes={"k": 1})
+    assert ordinary.strikes == {"k": 2}
+    assert [r.reason for r in ordinary.revocations] == ["directory_object_id_missing"]
+
+
 def test_breaker_ceiling_reports_the_larger_of_the_two_thresholds() -> None:
     assert reconcile.breaker_ceiling(probed=10, max_absolute=5, max_fraction=0.34) == 5
     assert reconcile.breaker_ceiling(probed=300, max_absolute=5, max_fraction=0.34) == 102
@@ -872,7 +904,7 @@ async def test_a_referring_user_search_base_judges_nothing_and_pages_every_pass(
             "reason": "directory_referral",
             "referred": 2,
             "unavailable": 0,
-            "probed": 2,
+            "asked": 2,
             "aborted": "directory_referral",
         }
         assert len(referred) == 3 and all(d == expected for d in referred)
@@ -1497,6 +1529,57 @@ async def test_a_referral_does_not_mark_an_id_less_row_it_can_never_confirm() ->
 
         assert plan.referred == (ids["alice"],)
         assert service._reconcile_referred == {ids["alice"], ids["bob"]}
+    finally:
+        await store.close()
+
+
+async def test_a_referral_is_counted_over_the_probes_asked() -> None:
+    """BACKLOG #3170 item 1. An id-less row is never sent to the directory, so no referral could
+    answer it. The referral's row, its latched message and its alert count the probes asked, and
+    the row names the field ``asked``, as the outage's row does (#2434).
+
+    RED before #3170: all three counted ``probed``, which takes in the id-less row."""
+    from messagefoundry.api.app import _alert_reconcile_plan
+    from messagefoundry.pipeline.alerts import LoggingAlertSink
+
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap(
+            {
+                "alice": _principal("alice"),
+                "bob": _principal("bob"),
+                "jdoe": replace(_principal("jdoe"), directory_object_id=None),
+            }
+        )
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for name in ("alice", "bob", "jdoe"):
+            assert await _signed_in_ad_user(service, store, name) is not None
+        ldap.referring.add("alice")
+
+        plan = await service.reconcile_directory_sessions()
+
+        assert (plan.probed, plan.asked, len(plan.referred)) == (3, 2, 1)
+        [row] = _referred_rows(await store.list_audit())
+        assert row["asked"] == 2 and "probed" not in row
+        message = service.directory_reconcile_referral
+        assert message is not None and "1 of 2 signed-in" in message
+
+        counts: list[tuple[str, int]] = []
+
+        class _Sink(LoggingAlertSink):
+            def ad_reconcile_aborted(
+                self, name: str, *, reason: str, probed: int, detail: str
+            ) -> None:
+                counts.append((reason, probed))
+
+        _alert_reconcile_plan(plan, service, _Sink())
+        assert counts == [("directory_referral", 2)]
+        # The breaker's page keeps its judged denominator, which counts the id-less row.
+        counts.clear()
+        tripped = replace(plan, aborted="mass_revoke_breaker")
+        _alert_reconcile_plan(tripped, service, _Sink())
+        assert counts == [("mass_revoke_breaker", 3), ("directory_referral", 2)]
     finally:
         await store.close()
 
