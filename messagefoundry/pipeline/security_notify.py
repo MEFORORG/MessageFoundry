@@ -613,7 +613,8 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         try:
             await asyncio.to_thread(self._send, event)
         except Exception:
-            # Best-effort: a failed send must never propagate. The event is also in the audit log.
+            # Best-effort: a failed send must never propagate. The event is usually also in the audit
+            # log; a refused directory-reconciler audit write leaves no row (BACKLOG #3018).
             # A lock notice fails silently here (BACKLOG #1131, LOG_SILENT_EVENT_TYPES): a line per
             # failed lock mail would show a logs:view reader when a lock landed. A relay that is down
             # still shows, on every other kind of notice.

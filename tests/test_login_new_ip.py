@@ -15,6 +15,7 @@ Synthetic accounts and RFC 5737 / RFC 1918 addresses only.
 from __future__ import annotations
 
 import json
+import logging
 import time
 import urllib.parse
 from typing import Any
@@ -1064,8 +1065,8 @@ async def test_an_enrolment_records_its_address_after_its_audit_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The enrolment's write runs after ``auth.mfa_enrolled`` is appended, so no address is ever
-    known for an enrolment that has no audit row. A store fault in that append skips the write,
-    and the account's next proved factor writes it instead."""
+    known for an enrolment that has no audit row. A store fault in that append raises out of the
+    confirm before the write, so the account's next proved factor writes the address instead."""
     store = await MessageStore.open(":memory:")
     try:
         owed = await _owing_service(store)
@@ -1130,7 +1131,10 @@ async def test_verify_mfa_records_its_address_inside_the_account_queue(
     [("remember_login_address", TypeError), ("forget_login_addresses", AttributeError)],
 )
 async def test_a_programming_error_in_the_record_does_not_lose_the_enrolment_reply(
-    monkeypatch: pytest.MonkeyPatch, method: str, fault: type[Exception]
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    method: str,
+    fault: type[Exception],
 ) -> None:
     """The record's helper logs and never raises, even a ``TypeError`` or an ``AttributeError``.
     It runs after the enrolment has committed, so a raise there would lose the reply that carries
@@ -1142,15 +1146,22 @@ async def test_a_programming_error_in_the_record_does_not_lose_the_enrolment_rep
         out = await owed.login("oper", PW, client="10.1.1.1")
         assert out.ok and out.identity is not None and out.token is not None
 
+        calls: list[str] = []
+
         async def _broken(*_a: object, **_kw: object) -> None:
+            calls.append(method)
             raise fault("synthetic programming error")
 
         monkeypatch.setattr(store, method, _broken)
         enroll = await owed.begin_mfa_enrollment(out.identity)
-        elevation = await owed.confirm_mfa_enrollment(
-            out.identity, fresh_totp(enroll.secret), token=out.token, client="10.1.1.1"
-        )
+        with caplog.at_level(logging.ERROR, logger=service_module._log.name):
+            elevation = await owed.confirm_mfa_enrollment(
+                out.identity, fresh_totp(enroll.secret), token=out.token, client="10.1.1.1"
+            )
         assert elevation.ok and elevation.token is not None
         assert elevation.recovery_codes
+        # The fault was reached, and its traceback logged: the only way it surfaces now.
+        assert calls == [method]
+        assert any(r.exc_info and r.exc_info[0] is fault for r in caplog.records)
     finally:
         await store.close()

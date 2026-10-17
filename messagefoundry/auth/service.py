@@ -9626,9 +9626,10 @@ class AuthService:
                 user_id, before=now - _LOGIN_ADDRESS_LOOKBACK_SECONDS
             )
         except Exception:
-            _log.warning(
-                "could not prune old known sign-in addresses; the address itself was recorded",
-                exc_info=True,
+            # ERROR with the traceback, as the write logs: a fault here that repeats at every
+            # sign-in disables the record's only retention, and must not read as a passing warning.
+            _log.exception(
+                "could not prune old known sign-in addresses; the address itself was recorded"
             )
 
     def _login_new_ip_notice_due(self, user_id: str, client: str | None) -> bool:
@@ -12845,8 +12846,9 @@ class AuthService:
         one channel that reaches both of those accounts, so the label has to be written where it reads.
 
         The row is written whether or not a notifier is wired, for that reason. It is written BEFORE
-        the notice, and the action is resolved before either, so the notifier's "the event is still in
-        the audit log" is true when it says it and an unknown kind fails before any side effect.
+        the notice, and the action is resolved before either, so for this event the notifier's "the
+        event is usually still in the audit log" always holds, and an unknown kind fails before any
+        side effect.
 
         **``audit_detail`` MIRRORS THE ATTEMPT'S OWN ROW, never ``notice_detail``.** The failure count
         goes in the notice only. The audit row carries no more than the ``auth.login_failed``,
