@@ -71,19 +71,28 @@ _STOP_GRACE = 5.0
 _DEFAULT_SINK_PROCS = 6  # the >= 5-6 sink-PROCESS attribution gate
 
 
-def _auth_shipped_default(setting: str) -> int:
-    """The engine's shipped default for an integer ``[auth]`` setting, read from its own settings
-    model rather than copied, so the rig compares against the value a stock engine runs."""
-    from messagefoundry.config.settings import AuthSettings
+# The engine's shipped ``[auth]`` defaults the rig compares against, copied rather than imported:
+# a harness client may not import ``messagefoundry.config`` (tests/test_dependency_boundaries.py).
+# tests/test_bench_batch_two_box.py pins each to ``AuthSettings.model_fields``, so a changed engine
+# default fails there rather than silently on the two-box rig.
+SHIPPED_MAX_SESSIONS_PER_USER = 5
+SHIPPED_LOGIN_RATE_LIMIT_PER_IP = 10
+SHIPPED_LOGIN_RATE_LIMIT_GLOBAL = 60
 
-    return int(AuthSettings.model_fields[setting].get_default(call_default_factory=True))
-
-
-#: The ``[auth]`` limits a fleet of rig sign-ins from one address meets, as ``(env name, field)``.
+#: The ``[auth]`` limits a fleet of rig sign-ins from one address meets, as
+#: ``(env name, field, shipped default)``.
 _RIG_SIGN_IN_LIMITS = (
-    ("MEFOR_AUTH_MAX_SESSIONS_PER_USER", "max_sessions_per_user"),
-    ("MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP", "login_rate_limit_per_ip"),
-    ("MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL", "login_rate_limit_global"),
+    ("MEFOR_AUTH_MAX_SESSIONS_PER_USER", "max_sessions_per_user", SHIPPED_MAX_SESSIONS_PER_USER),
+    (
+        "MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP",
+        "login_rate_limit_per_ip",
+        SHIPPED_LOGIN_RATE_LIMIT_PER_IP,
+    ),
+    (
+        "MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL",
+        "login_rate_limit_global",
+        SHIPPED_LOGIN_RATE_LIMIT_GLOBAL,
+    ),
 )
 
 
@@ -108,11 +117,7 @@ def rig_sign_in_env(procs: int) -> dict[str, str]:
     one session handed to every process would need none of this, and is not what the rig does.
     """
     size = 2 * procs + 2
-    return {
-        name: str(size)
-        for name, setting in _RIG_SIGN_IN_LIMITS
-        if size > _auth_shipped_default(setting)
-    }
+    return {name: str(size) for name, _setting, shipped in _RIG_SIGN_IN_LIMITS if size > shipped}
 
 
 # --- the matrix cell ---------------------------------------------------------

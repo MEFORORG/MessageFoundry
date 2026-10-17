@@ -147,6 +147,31 @@ def test_rig_sign_in_env_names_real_auth_settings_and_their_shipped_defaults() -
     assert auth.login_rate_limit_global == 62
 
 
+@pytest.mark.parametrize(
+    ("constant", "field"),
+    [
+        (bb.SHIPPED_MAX_SESSIONS_PER_USER, "max_sessions_per_user"),
+        (bb.SHIPPED_LOGIN_RATE_LIMIT_PER_IP, "login_rate_limit_per_ip"),
+        (bb.SHIPPED_LOGIN_RATE_LIMIT_GLOBAL, "login_rate_limit_global"),
+    ],
+)
+def test_rig_copied_auth_defaults_match_the_engine_settings_model(
+    constant: int, field: str
+) -> None:
+    """batchbox.py copies these defaults because a harness client may not import the engine's config
+    package; this pin is what keeps the copy honest when an engine default moves."""
+    from messagefoundry.config.settings import AuthSettings
+
+    assert constant == AuthSettings.model_fields[field].default
+
+
+def test_rig_sign_in_limits_pair_each_field_with_its_copied_default() -> None:
+    from messagefoundry.config.settings import AuthSettings
+
+    for _name, field, shipped in bb._RIG_SIGN_IN_LIMITS:
+        assert shipped == AuthSettings.model_fields[field].default, field
+
+
 def _sign_ins_admitted(environ: Mapping[str, str], attempts: int) -> list[bool]:
     """``attempts`` sign-ins from one address, through the engine's own sign-in gate, built from
     settings loaded from ``environ`` the way serve loads them. The gate runs before any store read."""
