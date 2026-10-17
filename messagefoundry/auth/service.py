@@ -3216,15 +3216,27 @@ class AuthService:
             # Enrolled BEFORE the role, which stays last, so every interruption still leaves a
             # roleless row a re-run completes -- and the repair branch above clears a half-enrolled
             # one before this runs again.
-            await self._store.set_totp_secret(user_id, secret=totp_secret)
+            # Conditional (BACKLOG #3025): another run that enabled TOTP on this row first makes
+            # the stage write nothing. The enable below is bound to the cell this run staged.
+            staged_cell = await self._store.set_totp_secret(user_id, secret=totp_secret)
+            if staged_cell is None:
+                raise FirstAdministratorRefused(
+                    "the authenticator enrolment was changed while this command ran, so this run "
+                    "did not stage its authenticator and granted no role; remove the authenticator "
+                    "entry it showed. If another provision-admin run is in progress, let it "
+                    "finish. Then run the command again"
+                )
             plain_codes = tuple(
                 totp.generate_recovery_codes(self._settings.mfa_recovery_code_count)
             )
             hashes = [await self._argon2(hash_password, c) for c in plain_codes]
-            # Conditional (BACKLOG #2224): a factor clear by another run's repair branch, or another
-            # run that enabled TOTP first, since the secret was staged above makes it match no row.
-            # Refused before the role, so the row stays roleless and a re-run completes it.
-            if not await self._store.enable_totp(user_id, recovery_code_hashes=hashes):
+            # Conditional (BACKLOG #2224, #3025): a factor clear by another run's repair branch,
+            # another run that enabled TOTP first, or another run that staged its own secret, since
+            # the secret was staged above makes it match no row. Refused before the role, so the
+            # row stays roleless and a re-run completes it.
+            if not await self._store.enable_totp(
+                user_id, recovery_code_hashes=hashes, expected_secret_cell=staged_cell
+            ):
                 raise FirstAdministratorRefused(
                     "the authenticator enrolment was changed while this command ran, so this run "
                     "did not turn TOTP on and granted no role; remove the authenticator entry it "
@@ -6034,6 +6046,7 @@ class AuthService:
                     old_username=existing.username,
                     new_username=principal.username,
                     held=by_name,
+                    from_plan=False,
                     client=client,
                 )
             # BACKLOG #1139. AN ABSENT DIRECTORY ATTRIBUTE IS NOT AN INSTRUCTION TO ERASE.
@@ -6767,6 +6780,7 @@ class AuthService:
                 old_username=refresh.old_username,
                 new_username=refresh.new_username,
                 held=await self._load_user_by_username(refresh.new_username),
+                from_plan=True,
             )
         # BACKLOG #2538. After the revocations, like the hold below: the referred accounts were left
         # unjudged, and every other account's revocation above has already been applied.
@@ -7036,9 +7050,14 @@ class AuthService:
         old_username: str,
         new_username: str,
         held: UserRecord | None,
+        from_plan: bool,
         client: str | None = None,
     ) -> None:
         """Copy a directory-reported rename down onto a row's cached ``username`` (BACKLOG #1532).
+
+        ``from_plan`` is required, so each caller states its policy (BACKLOG #3069; the reasoning
+        is at the skip below, and only there). True for the reconciler: a row that holds neither
+        the plan's old name nor its new one is skipped. False for the login, which writes.
 
         **ONE implementation for two callers, deliberately.** The login path
         (:meth:`_upsert_ad_user`) and the ADR 0079 reconciler pass both reach a renamed account and
@@ -7119,6 +7138,12 @@ class AuthService:
             # ``old_username`` (BACKLOG #2291). The reconciler captured that at plan time, and a
             # sign-in may have renamed the row since, so it can name an account that no longer
             # exists. The audit actor and the warning both use the name an operator would find.
+            # On the reconciler's path the two names now agree, because the BACKLOG #3069 skip below
+            # returns first. On the LOGIN path they can still differ, when a pass wrote between the
+            # sign-in's read and this one. So each ``_refuse`` call passes the name the row held,
+            # never ``old_username``: passing that would bring back the #2291 defect on the login
+            # path, an audit row naming an account that no longer exists. The one exception is the
+            # ``row_gone`` refusal at the pre-read, where no row was read to hold a name.
             await self._audit(
                 "auth.ad_username_refresh_conflict",
                 actor=holds,
@@ -7141,12 +7166,14 @@ class AuthService:
                 return
             if held_by is None:
                 # The write lost to another writer, but the re-read found no row holding the name
-                # now. Nothing is locked out, and the next sign-in or pass copies the name down
-                # again, so the lockout warning below would be false (BACKLOG #2291).
+                # now. Nothing is locked out, and a later sign-in or a pass that probes the account
+                # copies the name down again, so the lockout warning below would be false (BACKLOG
+                # #2291).
                 _log.warning(
                     "AD account %s was renamed in the directory but the write lost to another "
                     "writer (detected %s), and no row holds the new name now; nothing was written, "
-                    "and the next sign-in or reconcile pass retries it (BACKLOG #2291)",
+                    "and the account's next sign-in, or a later reconcile pass that probes it, "
+                    "retries it (BACKLOG #2291)",
                     scrub_log_argument(holds),
                     detected,
                 )
@@ -7168,7 +7195,9 @@ class AuthService:
         # read.
         #
         # A row that already carries the new name has nothing to change, so it gets no second audit
-        # row and no second notice. The notice names the name the row actually had, not the plan's.
+        # row and no second notice. The reconciler's rule for a row that carries neither name is
+        # stated once, at the BACKLOG #3069 skip below. The notice and every refusal name what the
+        # row held.
         # The write below compares on this name (BACKLOG #2290), so a refresh that read it just
         # before another refresh of this row wrote cannot write as well. And each refusal after
         # this read audits under this name (BACKLOG #2291), so the read comes BEFORE the ``held``
@@ -7197,6 +7226,44 @@ class AuthService:
                 "AD account %s already holds its directory name, so the rename refresh wrote "
                 "nothing and sends no second audit row or notice (BACKLOG #2291)",
                 user_id,
+            )
+            return
+        if from_plan and before.username != old_username:
+            # BACKLOG #3069. THE ONE STATEMENT OF THIS RULE. The row holds neither the plan's old
+            # name (read when the pass listed its accounts) nor its new one, so another writer,
+            # most likely a sign-in, renamed it since. The compare-and-set below compares on the
+            # name just read, so it would match and could write an older name over a newer one.
+            # Skip, and leave the name to a later read of the directory. Nothing was attempted, so
+            # no audit row, no conflict and no notice; INFO says why.
+            #
+            # A HEURISTIC ON NAMES, NOT AN ORDERING OF DIRECTORY READS. Nothing here knows which
+            # directory read is newer, so at least these residuals stand:
+            #   - the sign-in may have written before this pass's probe, so the skipped plan can
+            #     hold the NEWER name; the label then lags until a later read, below;
+            #   - a directory that renamed the account away and back (jdoe -> jdoe-married -> jdoe)
+            #     leaves the row on the plan's old name, so the plan writes and notifies;
+            #   - the login (``from_plan`` False) writes whatever it carries, so a sign-in whose
+            #     bind ran before a pass that probed and wrote a newer name can still write the
+            #     older one. It is exempt because its name came from a bind made moments before,
+            #     and skipping it would as often keep an older name a pass wrote.
+            # Each converges when a later read copies the directory's name down: the account's next
+            # sign-in, or a pass that probes it. That need not be the next pass, because a pass
+            # probes the least-recently-probed accounts first, at most
+            # ``ad_session_recheck_max_users`` of them (``reconcile.select_candidates``), so the
+            # label can lag several passes.
+            #
+            # AFTER the already-applied check, because a row that holds the new name is the no-op
+            # above, not a skip. BEFORE the ``held`` pre-check, because a stale plan is not a
+            # collision: filing one would send an operator looking for a holder this caller has no
+            # current claim against.
+            _log.info(
+                "AD account %s was renamed by another writer after this reconciler pass read it, "
+                "so its planned rename to %s was skipped (the row now holds %s); nothing was "
+                "written, audited or sent, and the name is copied down when a later pass probes "
+                "the account or it signs in again (BACKLOG #3069)",
+                user_id,
+                scrub_log_argument(new_username),
+                scrub_log_argument(before.username),
             )
             return
         if held is not None and held.id != user_id:
@@ -7271,9 +7338,11 @@ class AuthService:
         #   - The row's name moved after the pre-read, so the compare failed: another refresh of
         #     this same row wrote first (BACKLOG #2290). That caller audits and notifies, so this one
         #     does neither. It is not a conflict either, because no other row holds anything. The
-        #     first writer wins, so when two refreshes carry DIFFERENT new names the stored one can
-        #     be the older of the two until the next sign-in or pass copies the directory's name
-        #     down again. Logged at INFO so the skipped write is visible without paging anyone.
+        #     first writer wins, so when two refreshes carry DIFFERENT new names and both read the
+        #     row before either wrote, the stored one can be the older of the two until a later
+        #     read copies the directory's name down again. The BACKLOG #3069 skip above, which
+        #     names when that read comes, does not order these: it stops only a reconciler plan
+        #     that a write overtook before this pre-read. Logged at INFO so the skipped write is visible without paging anyone.
         if not written:
             after = await self._load_user(user_id)
             if after is None:
@@ -10502,10 +10571,17 @@ class AuthService:
         user = await self._load_user(identity.user_id)
         if user is None:
             raise ValueError("no such user")
+        already_enabled = "MFA is already enabled; disable it before re-enrolling"
         if user.totp_enabled:
-            raise ValueError("MFA is already enabled; disable it before re-enrolling")
+            raise ValueError(already_enabled)
         secret = totp.generate_secret()
-        await self._store.set_totp_secret(identity.user_id, secret=secret)
+        # Conditional (BACKLOG #3025): a confirm that enabled TOTP after the check above makes the
+        # stage write nothing, so a begin never replaces the secret of an enabled factor. Nothing
+        # written can also mean the row is gone, which is told apart by reading it again.
+        if await self._store.set_totp_secret(identity.user_id, secret=secret) is None:
+            if await self._load_user(identity.user_id) is None:
+                raise ValueError("no such user")
+            raise ValueError(already_enabled)
         await self._audit("auth.mfa_enroll_started", actor=identity.username)
         return MfaEnrollment(secret=secret, otpauth_uri=totp.otpauth_uri(secret, identity.username))
 
@@ -10522,8 +10598,9 @@ class AuthService:
         (or a time-step already consumed -- single-use, BACKLOG #1021) elevates nothing and carries
         none. A good code on a session revoked before the rotation returns ``session_lost`` with MFA
         still OFF (BACKLOG #1902), so a lost session never leaves MFA on with codes nobody saw. So
-        does a good code whose activation matches no row, because a reset cleared the staged secret
-        or a second confirm enabled first (BACKLOG #2224). That confirm ends the session it rotated,
+        does a good code whose activation matches no row, for example because a reset cleared the
+        staged secret, a second confirm enabled first (BACKLOG #2224), or a second begin staged a
+        secret this confirm never verified (BACKLOG #3025). That confirm ends the session it rotated,
         hands back no codes, and audits ``auth.mfa_enroll_refused``.
 
         This is one of the two legs that turn an MFA-pending session into an MFA-satisfied one for a
@@ -10540,6 +10617,10 @@ class AuthService:
         secret = self._totp_secret(user)
         if not secret:
             raise ValueError("no enrollment in progress")
+        # The stored cell this code is checked against. The enable below turns TOTP on only while
+        # the row still holds this cell (BACKLOG #3025), so a begin from another session that
+        # stages a different secret inside the ceremony cannot decide which factor is enabled.
+        verified_cell = user.totp_secret_cell
         if await self._enrolment_too_early(
             token, user, arrived_at, event="auth.mfa_failed", client=client
         ):
@@ -10588,10 +10669,13 @@ class AuthService:
         )
         if elevation.token is None:  # not ``ok``, spelled so mypy narrows the token below
             return elevation
-        if not await self._store.enable_totp(identity.user_id, recovery_code_hashes=hashes):
-            # BACKLOG #2224: the conditional enable matched no row, because an administrator's
-            # reset cleared the staged secret inside the rotation window, or a second confirm
-            # enabled TOTP first. This confirm turns nothing on and its codes are dropped. The
+        if not await self._store.enable_totp(
+            identity.user_id, recovery_code_hashes=hashes, expected_secret_cell=verified_cell
+        ):
+            # BACKLOG #2224, #3025: the conditional enable matched no row, for example because an
+            # administrator's reset cleared the staged secret inside the rotation window, a second
+            # confirm enabled TOTP first, or a second begin staged a secret this confirm never
+            # verified. This confirm turns nothing on and its codes are dropped. The
             # rotated session was stamped MFA-verified against a factor that is gone or not this
             # ceremony's, so it is ended rather than handed back: ``session_lost``, the same
             # fail-closed answer as a session revoked before the rotation.
@@ -10607,8 +10691,16 @@ class AuthService:
                 reason = "account_gone"
             elif after.totp_enabled:
                 reason = "already_enabled"
-            else:
+            elif after.totp_secret_cell is None:
                 reason = "secret_cleared"
+            elif after.totp_secret_cell != verified_cell:
+                reason = "secret_replaced"
+            else:
+                # The row still holds the verified cell with TOTP off, so the write lost to some
+                # other concurrent write to the row. The session is revoked above, so a plain
+                # retry is a lost session; recovery is as for a session lost before the rotation
+                # (the ROTATE BEFORE ENABLING comment above).
+                reason = "write_lost"
             await self._audit(
                 "auth.mfa_enroll_refused",
                 actor=identity.username,
