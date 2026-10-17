@@ -2613,32 +2613,55 @@ async def test_an_inherited_row_keeps_only_its_own_clear_from_resolving(
         await store.close()
 
 
+#: The logger the lifespan loop writes through (``_log`` in messagefoundry/api/app.py).
+_RECONCILER_LOGGER = "messagefoundry.api.app"
+
+#: Logged through :data:`_RECONCILER_LOGGER` after the passes, so a capture that sees nothing from
+#: that logger reads as empty rather than as a reconciler that said nothing.
+_CAPTURE_CONTROL = "capture control: the reconciler's logger reaches this capture"
+
+
+async def _reconciler_warnings(caplog: pytest.LogCaptureFixture, *, inherited: bool) -> list[str]:
+    """The WARNING-and-above messages :data:`_RECONCILER_LOGGER` logs over four passes of the
+    lifespan loop on a fresh store, with the earlier run's two alerts left open when ``inherited``,
+    then :data:`_CAPTURE_CONTROL`. Read before the store closes, so nothing it logs lands here."""
+    store = await MessageStore.open(":memory:")
+    try:
+        if inherited:
+            await _left_open_by_an_earlier_run(store)
+        auth = _ScriptedAuth([_BOTH_CLEAR], {})
+        with caplog.at_level(logging.WARNING, logger=_RECONCILER_LOGGER):
+            caplog.clear()
+            await _run_reconciler(auth, store, NotifierAlertSink([], store=store), passes=4)
+            logging.getLogger(_RECONCILER_LOGGER).warning(_CAPTURE_CONTROL)
+            return [
+                r.getMessage()
+                for r in caplog.records
+                if r.name == _RECONCILER_LOGGER and r.levelno >= logging.WARNING
+            ]
+    finally:
+        await store.close()
+
+
 async def test_a_restart_over_open_reconcile_alerts_says_once_that_it_will_not_resolve_them(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """BACKLOG #3084, item 1. A restarted engine drops every clear of an instance an earlier run
     left open. It says so once, at the read that fixes the inherited set, naming each alert by its
     event type and source, and not again on each pass that drops the clear. The control: an engine
-    that starts over no open alert says nothing."""
-    for inherited in (True, False):
-        caplog.clear()
-        store = await MessageStore.open(":memory:")
-        try:
-            if inherited:
-                await _left_open_by_an_earlier_run(store)
-            auth = _ScriptedAuth([_BOTH_CLEAR], {})
-            with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
-                await _run_reconciler(auth, store, NotifierAlertSink([], store=store), passes=4)
-        finally:
-            await store.close()
-        lines = [r.getMessage() for r in caplog.records if "already open" in r.getMessage()]
-        if not inherited:
-            assert lines == []
-            continue
-        assert len(lines) == 1, lines
-        assert "ad_reconcile_aborted (directory-reconciler)" in lines[0]
-        assert "ad_reconcile_held (directory-reconciler)" in lines[0]
-        assert "will not resolve those alerts itself" in lines[0]
+    that starts over no open alert says nothing at WARNING or above, read from a capture shown to
+    hold the line the test logs through the reconciler's logger, so an empty capture cannot pass."""
+    restarted = await _reconciler_warnings(caplog, inherited=True)
+    lines = [m for m in restarted if "already open" in m]
+    assert len(lines) == 1, lines
+    assert "ad_reconcile_aborted (directory-reconciler)" in lines[0]
+    assert "ad_reconcile_held (directory-reconciler)" in lines[0]
+    assert "will not resolve those alerts itself" in lines[0]
+
+    fresh = await _reconciler_warnings(caplog, inherited=False)
+    assert len(fresh) >= 1, "the capture saw nothing, so its silence proves nothing"
+    said = [m for m in fresh if m != _CAPTURE_CONTROL]
+    assert said == []
 
 
 async def test_a_pass_that_revokes_every_account_is_no_evidence_for_a_clear(
