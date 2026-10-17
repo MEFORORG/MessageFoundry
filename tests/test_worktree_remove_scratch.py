@@ -46,7 +46,7 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -1068,6 +1068,16 @@ _DELETE_ENTRY = (
 
 def _planted_copy(base: Path, anchor: str, planted: str) -> Path:
     """A copy of the script with ``planted`` as a new line directly under the line ``anchor``."""
+
+    def plant(text: str) -> str:
+        assert text.count(anchor) == 1, f"the anchor line matched {text.count(anchor)} times"
+        return text.replace(anchor, f"{anchor}\n{planted}")
+
+    return _edited_copy(base, plant)
+
+
+def _edited_copy(base: Path, edit: Callable[[str], str]) -> Path:
+    """A copy of the script, in a repository of its own, with ``edit`` applied to its text."""
     repo = base / "copy"
     for rel in (
         "scripts/worktree/remove-scratch.ps1",
@@ -1086,9 +1096,7 @@ def _planted_copy(base: Path, anchor: str, planted: str) -> Path:
     ):
         subprocess.run(["git", *args], check=True, capture_output=True, text=True)
     script = repo / "scripts" / "worktree" / "remove-scratch.ps1"
-    text = script.read_text(encoding="utf-8")
-    assert text.count(anchor) == 1, f"the anchor line matched {text.count(anchor)} times"
-    script.write_text(text.replace(anchor, f"{anchor}\n{planted}"), encoding="utf-8")
+    script.write_text(edit(script.read_text(encoding="utf-8")), encoding="utf-8")
     return script
 
 
@@ -1163,27 +1171,66 @@ def test_a_delete_that_records_a_failure_is_never_reported_as_deleted(rig: Rig) 
     assert not [line for line in b.extra if line.startswith("remains: ")], r.out
 
 
-def test_the_folders_above_the_targets_are_listed_once_per_run(rig: Rig) -> None:
-    """BACKLOG #2963 (h). The git walk up to the temp root listed each folder on the way once per
-    target. The temp root is shared by every target and can hold thousands of entries.
+_FULL_LISTING = re.compile(r"\[IO\.DirectoryInfo\]::new\((\$\w+)\)\.GetFileSystemInfos\(\)")
 
-    A planted line logs each listing the walk makes. Three targets share every folder above them."""
+
+def test_no_folder_above_a_target_is_listed_in_full(rig: Rig) -> None:
+    """BACKLOG #2963 (h). The git walk up to the temp root once listed every folder on the way in
+    full, and the temp root, which every target shares, can hold thousands of entries. It now looks
+    up the four names it needs, so no folder above a target is listed in full at all.
+
+    Every full listing in the script is routed through a planted function that logs the folder. The
+    targets' own trees are listed too, which shows the log works."""
     rig.caller()
-    targets = [rig.tree(rig.root / name) for name in ("one", "two", "three")]
+    targets = [rig.tree(rig.root / "shared" / name) for name in ("one", "two", "three")]
     log = rig.base / "listed.log"
-    script = _planted_copy(
-        rig.base,
-        "    if ($gitShapeAbove.ContainsKey($Dir)) { return $gitShapeAbove[$Dir] }",
-        f"    Add-Content -LiteralPath '{log}' -Value $Dir",
+    logger = (
+        "function Get-LoggedListing([string]$Dir) {\n"
+        f"    Add-Content -LiteralPath '{log}' -Value $Dir\n"
+        "    return [IO.DirectoryInfo]::new($Dir).GetFileSystemInfos()\n"
+        "}\n"
     )
+
+    def route_listings(text: str) -> str:
+        routed, n = _FULL_LISTING.subn(r"(Get-LoggedListing \1)", text)
+        assert n > 0, "no full listing was found to route"
+        return routed.replace("function Get-Remains(", logger + "function Get-Remains(", 1)
+
+    script = _edited_copy(rig.base, route_listings)
 
     r = rig.run(*targets, delete=False, script=script)
 
     assert r.code == 0, r.out
-    listed = log.read_text(encoding="utf-8").splitlines()
-    assert listed.count(str(rig.anchor)) == 1, listed
-    assert str(rig.root) in listed, listed
-    assert len(listed) == len(set(listed)), listed
+    for t in targets:
+        assert r.block(t).receipt["git"].startswith("PASS"), r.out
+    listed = [Path(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert set(targets) <= set(listed), listed
+    above = {parent for t in targets for parent in t.parents}
+    assert not [p for p in listed if p in above], listed
+
+
+def test_a_checkout_made_above_a_later_target_mid_run_refuses_it(rig: Rig) -> None:
+    """BACKLOG #2963 (h). A -Delete run can take minutes. A git checkout that appears above a later
+    target while the run goes on must still refuse that target, so no answer about a folder above a
+    target is kept from one target to the next.
+
+    A planted line makes a .git folder above both targets as soon as the first one is decided."""
+    rig.caller()
+    first = rig.tree(rig.root / "shared" / "one")
+    second = rig.tree(rig.root / "shared" / "two")
+    shared = rig.root / "shared"
+    script = _planted_copy(
+        rig.base,
+        "    Write-Host $verdict",
+        f"    if ($raw -eq '{first}') {{ [void][IO.Directory]::CreateDirectory('{shared / '.git'}') }}",
+    )
+
+    r = rig.run(first, second, delete=False, script=script)
+
+    assert (shared / ".git").is_dir(), r.out
+    assert r.block(first).verdict.startswith("WOULD DELETE"), r.out
+    r.refused(second, "git", f"the target sits inside the git checkout at '{shared}'")
+    assert r.code == 1, r.out
 
 
 @pytest.mark.parametrize("which", ["write time", "creation time"])
