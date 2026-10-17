@@ -3072,11 +3072,14 @@ alone:
    refused token replayed in a loop cannot flood the general log either. An address past the cap
    writes no row, so the line is its only record: its first sighting always logs, with the
    address, for up to 64 such addresses per session (`_NEW_IP_OVER_CAP_LOG_MAX`), and its repeats
-   share the per-minute limit. Text that does not parse as an address is remembered as one
-   sentinel, so every such address shares one first sighting and the record never holds
-   attacker-chosen text. A line held back writes a DEBUG line with the count held back since the
-   last WARNING. The throttle touches log lines only: every such request is refused, and the
-   audit rows are the ones the cap above allows.
+   share the per-minute limit. Only an address's canonical text with no scope id is remembered
+   for that. Text that does not parse, and an IPv6 address with a scope id, are remembered as one
+   sentinel and share one first sighting, so the record holds no text past the address itself; a
+   proxy that appends a port to the address therefore gets one first sighting in all. The line
+   carries at most 64 characters of the address. A line held back writes a DEBUG line with the
+   count held back since the session's last interval line, and the next WARNING carries that
+   count as `held_back`. The throttle touches log lines only: every such request is refused, and
+   the audit rows are the ones the cap above allows.
    **That bound is per process, and the owner accepted it as one (vault BACKLOG #2951, owner
    ruling 2026-10-16, "Accept, doc only").** The record that enforces it is `_new_ip_seen` on
    `AuthService`. It maps each session's token hash to the addresses already flagged, and it lives
@@ -3108,10 +3111,11 @@ alone:
    write gate (every non-GET) send the browser to `/ui/reauth`. A PHI page comes back to itself
    afterwards, query included, so a filtered list does not return as a broader read. Its path
    comes back as the browser sent it, still percent-encoded, so an encoded `?` in an id stays in
-   the id (vault BACKLOG #3052). A GET whose target the browser would rewrite before it follows
-   the redirect lands as a write does, below: a path with an encoded `/`, `.` or `\`, a literal
-   `\`, a `.` or `..` segment once decoded, or a byte outside ASCII, and a query with a byte
-   outside ASCII. A write lands
+   the id (vault BACKLOG #3052). At least these GETs land as a write does, below. A path the
+   browser would rewrite before it follows the redirect: an encoded `/`, `.` or `\`, a literal
+   `\`, a `.` or `..` segment once decoded, or a byte outside ASCII. A query with a byte outside
+   ASCII, because the redirect quotes the target as UTF-8 and the byte would come back changed.
+   A target that is not a registered page or is too long for `/ui/reauth`. A write lands
    on `/ui`, or on `/ui/account` for a session without `monitoring:read`, because its body cannot
    ride the re-auth. A must-change session is not asked: `/ui/reauth` sends it back to its
    confinement page, so a refusal would loop. These checks run **before** the

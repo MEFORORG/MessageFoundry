@@ -291,9 +291,10 @@ async def test_the_past_cap_first_sighting_record_is_bounded() -> None:
         for i in range(200):
             junk = f"not-an-address-{i}-" + "x" * 500
             assert await service.flag_new_client_ip(token, junk, path="/users") is True
-        # A parseable address too long to keep (a long IPv6 scope id) is the sentinel as well.
-        scoped = "fe80::1%" + "s" * (2 * _NEW_IP_LOG_KEY_MAX)
-        assert await service.flag_new_client_ip(token, scoped, path="/users") is True
+        # An IPv6 scope id is the sender's text, short or long, so it is the sentinel as well
+        # (review round 2: "::%<text>" parses as an address).
+        for scoped in ("fe80::1%" + "s" * (2 * _NEW_IP_LOG_KEY_MAX), "::%\n<evil>"):
+            assert await service.flag_new_client_ip(token, scoped, path="/users") is True
         state = service._new_ip_logged[hash_token(token)]
         assert state.over_cap_logged == {_NEW_IP_UNPARSED_LOG_KEY}
         for i in range(2 * _NEW_IP_OVER_CAP_LOG_MAX):
@@ -305,7 +306,7 @@ async def test_the_past_cap_first_sighting_record_is_bounded() -> None:
         await store.close()
 
 
-async def test_a_refused_request_past_the_cap_writes_what_main_writes(
+async def test_a_refused_request_past_the_cap_writes_no_row_or_notice(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """RED when: a request past the per-session cap writes an audit row or a notice, or is not
@@ -335,7 +336,10 @@ async def test_a_refused_request_past_the_cap_writes_what_main_writes(
         )
         lines = [r.getMessage() for r in caplog.records if "past the per-session" in r.getMessage()]
         assert len(lines) == _NEW_IP_OVER_CAP_LOG_MAX + 1
-        assert all(seen in line for seen, line in zip(past, lines, strict=False))
+        assert all(
+            line.endswith(f"seen_ip={seen}")
+            for seen, line in zip(past[:_NEW_IP_OVER_CAP_LOG_MAX], lines, strict=False)
+        )
     finally:
         await store.close()
 
@@ -343,7 +347,9 @@ async def test_a_refused_request_past_the_cap_writes_what_main_writes(
 async def test_a_held_back_warning_writes_a_debug_count(caplog: pytest.LogCaptureFixture) -> None:
     """RED when: a WARNING the throttle holds back leaves no line at all (vault BACKLOG #3052
     review finding 4). Each held-back repeat writes a DEBUG line with the count held back since the
-    last WARNING, and the count starts over once a WARNING is written again."""
+    session's last interval line, and the next WARNING carries the count as ``held_back``, so it
+    shows at INFO too. A past-the-cap first sighting carries it without starting it over; the next
+    interval line does start it over (review round 2)."""
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
@@ -367,8 +373,17 @@ async def test_a_held_back_warning_writes_a_debug_count(caplog: pytest.LogCaptur
             state.last_line -= _NEW_IP_REPEAT_LOG_SECONDS + 1
             caplog.clear()
             assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+            assert any(r.getMessage().endswith("held_back=3") for r in caplog.records)
             assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
             assert counts() == ["1"]
+            # Past the cap, a first sighting carries the count and does not start it over.
+            for i in range(_NEW_IP_PER_SESSION_MAX):
+                assert await service.flag_new_client_ip(token, f"10.3.3.{i}", path="/users")
+            caplog.clear()
+            assert await service.flag_new_client_ip(token, "10.6.6.6", path="/users") is True
+            assert any("held_back=1 seen_ip=10.6.6.6" in r.getMessage() for r in caplog.records)
+            assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+            assert counts() == ["2"]
     finally:
         await store.close()
 

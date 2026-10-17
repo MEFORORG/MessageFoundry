@@ -378,22 +378,24 @@ _NEW_IP_PER_SESSION_MAX = 8
 # session per this many seconds, in each engine process. Such a request is still refused every
 # time; only the log line is held back, so a refused token replayed in a loop cannot flood the
 # general log. An address already reported has its audit row. An address past the per-session cap
-# writes no row, so its FIRST sighting always logs, with the address, for up to
-# _NEW_IP_OVER_CAP_LOG_MAX such addresses per session; its repeats share the interval.
+# writes no row, so its first sighting logs, with the address, for up to _NEW_IP_OVER_CAP_LOG_MAX
+# such addresses per session (every address _over_cap_log_key maps to its sentinel shares one);
+# its repeats share the interval.
 _NEW_IP_REPEAT_LOG_SECONDS = 60.0
 _NEW_IP_OVER_CAP_LOG_MAX = 64
-# The first-sighting set never holds attacker-chosen text: an address that does not parse, or
-# whose canonical text is longer than this (a long IPv6 scope id), is remembered as the one
-# sentinel below. So the set is at most _NEW_IP_OVER_CAP_LOG_MAX keys of at most this length, for
-# each of _NEW_IP_DEDUP_MAX sessions, and every unparseable address shares one first sighting.
+# The first-sighting set holds only an address's canonical text with no scope id. Anything else
+# (text that does not parse, or an IPv6 address with a scope id, whose text after the "%" is the
+# sender's) is remembered as the one sentinel below. So the set is at most
+# _NEW_IP_OVER_CAP_LOG_MAX keys of at most this length, for each of _NEW_IP_DEDUP_MAX sessions.
+# The same length bounds the address a past-the-cap WARNING writes.
 _NEW_IP_LOG_KEY_MAX = 64
 _NEW_IP_UNPARSED_LOG_KEY = "unparsed"
 
 
 def _over_cap_log_key(address_key: str) -> str:
     """The bounded key the log throttle remembers for a past-the-cap address (vault BACKLOG
-    #3052): the address's canonical text when it parses and fits, else one fixed sentinel."""
-    if len(address_key) > _NEW_IP_LOG_KEY_MAX:
+    #3052): the address's canonical text when it parses with no scope id, else one sentinel."""
+    if len(address_key) > _NEW_IP_LOG_KEY_MAX or "%" in address_key:
         return _NEW_IP_UNPARSED_LOG_KEY
     try:
         ipaddress.ip_address(address_key)
@@ -404,8 +406,8 @@ def _over_cap_log_key(address_key: str) -> str:
 
 @dataclass
 class _NewIpLogState:
-    """One session's new-address log throttle (vault BACKLOG #3052 item 16): when it last wrote a
-    held-back line, how many lines it has held back since, and the bounded keys of the past-the-cap
+    """One session's new-address log throttle (vault BACKLOG #3052 item 16): when it last wrote an
+    interval line, how many lines it has held back since, and the bounded keys of the past-the-cap
     addresses whose first sighting it has already logged (:func:`_over_cap_log_key`)."""
 
     last_line: float | None = None
@@ -9931,16 +9933,19 @@ class AuthService:
         flagged.add(address_key)
         return "audit" if len(flagged) <= _NEW_IP_PER_SESSION_MAX else "audit_cap_reached"
 
-    def _new_ip_log_due(self, token_hash: str, over_cap_key: str | None = None) -> bool:
+    def _new_ip_log_due(self, token_hash: str, over_cap_key: str | None = None) -> int | None:
         """Whether this session's new-address WARNING may be written now (vault BACKLOG #3052
-        item 16). ``over_cap_key`` is the host key of an address past the per-session cap: its
-        first sighting is always due, for up to ``_NEW_IP_OVER_CAP_LOG_MAX`` addresses, because
-        that line is its only record; it is remembered by :func:`_over_cap_log_key`, so every
-        unparseable address shares one first sighting. Any other line is due at most once per
-        ``_NEW_IP_REPEAT_LOG_SECONDS``, and a line held back writes a DEBUG line with the count
-        held back since the last WARNING, so a suppressed repeat is never silent. The refusal never
-        depends on it. Per process and bounded, so an eviction can only ever write extra lines,
-        never hide a refusal."""
+        item 16): ``None`` holds it back, and a number means write it, carrying that count of lines
+        held back since the session's last interval line.
+
+        ``over_cap_key`` is the host key of an address past the per-session cap: its first sighting
+        is always due, for up to ``_NEW_IP_OVER_CAP_LOG_MAX`` addresses, because that line is its
+        only record; it is remembered by :func:`_over_cap_log_key`, so every address that maps to
+        the sentinel shares one first sighting. Any other line is an interval line, due at most
+        once per ``_NEW_IP_REPEAT_LOG_SECONDS``, and it starts the held-back count over. A line held
+        back writes a DEBUG line with the count, and the next WARNING carries it, so a suppressed
+        repeat is not silent at INFO either. The refusal never depends on it. Per process and
+        bounded, so an eviction can only ever write extra lines, never hide a refusal."""
         state = self._new_ip_logged.get(token_hash)
         if state is None:
             if len(self._new_ip_logged) >= _NEW_IP_DEDUP_MAX:
@@ -9950,19 +9955,19 @@ class AuthService:
             log_key = _over_cap_log_key(over_cap_key)
             if log_key not in state.over_cap_logged:
                 state.over_cap_logged.add(log_key)
-                return True
+                return state.suppressed
         now = time.monotonic()
         if state.last_line is not None and now - state.last_line < _NEW_IP_REPEAT_LOG_SECONDS:
             state.suppressed += 1
             _log.debug(
                 "a new-address WARNING was held back by the per-session throttle: "
-                "suppressed=%d since the last one",
+                "suppressed=%d since the last interval line",
                 state.suppressed,
             )
-            return False
+            return None
+        held_back, state.suppressed = state.suppressed, 0
         state.last_line = now
-        state.suppressed = 0
-        return True
+        return held_back
 
     def _restart_new_ip_dedupe(self, token_hash: str) -> None:
         """Start the new-address dedupe over for a session that just re-anchored, so an address
@@ -10199,8 +10204,8 @@ class AuthService:
         log — so a token replayed in a tight loop, from one address or alternating between several,
         cannot inflate the audit table / notification channel (mirrors the ``_rate_limited``
         precedent). Those log lines are throttled too, to one per session per
-        ``_NEW_IP_REPEAT_LOG_SECONDS``, except the first sighting of each address past the cap
-        (:meth:`_new_ip_log_due`, vault BACKLOG #3052). One epoch audits at most ``_NEW_IP_PER_SESSION_MAX`` addresses, plus one row
+        ``_NEW_IP_REPEAT_LOG_SECONDS``, except the first sighting of an address past the cap,
+        within the bounds :meth:`_new_ip_log_due` states (vault BACKLOG #3052). One epoch audits at most ``_NEW_IP_PER_SESSION_MAX`` addresses, plus one row
         carrying ``cap_reached`` for the first address past that, because this runs on every
         sensitive request (BACKLOG #2159). The step-up
         dependencies treat ``True`` as "force a fresh step-up"; a successful re-verify (``POST
@@ -10239,26 +10244,31 @@ class AuthService:
         # alternates between addresses (BACKLOG #2159).
         flag = self._first_new_ip_flag(token_hash, seen_key)
         if flag == "repeat":
-            if self._new_ip_log_due(token_hash):
+            held_back = self._new_ip_log_due(token_hash)
+            if held_back is not None:
                 _log.warning(
                     "a request from a new client address must re-verify; the address was already "
                     "flagged since the session's last re-verification (audit suppressed; repeats "
-                    "from this session log at most once per %d s): path=%s",
+                    "from this session log at most once per %d s): path=%s held_back=%d",
                     int(_NEW_IP_REPEAT_LOG_SECONDS),
                     path,
+                    held_back,
                 )
             return True
         if flag == "over_cap":
             # Past the cap no row is written, so this line is the only record of where the token
             # is being used from: each address's first sighting logs, and its repeats are held to
-            # the session's interval. The address is attacker-supplied text on a proxied hop.
-            if self._new_ip_log_due(token_hash, seen_key):
+            # the session's interval. The address is attacker-supplied text on a proxied hop, so
+            # the line carries at most _NEW_IP_LOG_KEY_MAX characters of it.
+            held_back = self._new_ip_log_due(token_hash, seen_key)
+            if held_back is not None:
                 _log.warning(
                     "a request from a new client address must re-verify; the address is past the "
-                    "per-session cap of %d (audit suppressed): path=%s seen_ip=%s",
+                    "per-session cap of %d (audit suppressed): path=%s held_back=%d seen_ip=%s",
                     _NEW_IP_PER_SESSION_MAX,
                     path,
-                    scrub_log_argument(client_ip),
+                    held_back,
+                    scrub_log_argument(client_ip[:_NEW_IP_LOG_KEY_MAX]),
                 )
             return True
         detail: dict[str, object] = {
