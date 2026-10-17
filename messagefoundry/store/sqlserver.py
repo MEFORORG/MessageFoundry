@@ -1538,9 +1538,6 @@ _EPOCH_GUARD_RESOLVE = (
 #: and on ``mark_failed``'s retry branch with its status term (ADR 0157 Amendment A), which is NOT a
 #: fence. So the clause alone does not mean a fence is armed.
 _RESOLVE_OUTPUT = " OUTPUT inserted.id"
-#: The clause an operator alert UPDATE carries so :meth:`SqlServerStore._alert_write` reads its match
-#: from a rowset rather than ``cursor.rowcount`` (vault BACKLOG #3217; the reason is BACKLOG #2283).
-_ALERT_MATCHED = " OUTPUT inserted.id"
 
 
 class _FencedWrite(Exception):
@@ -7327,7 +7324,7 @@ class SqlServerStore:
         now = time.time() if now is None else now
         return await self._alert_write(
             "UPDATE alert_instance SET status='acknowledged', acked_by=?, acked_at=?"
-            f"{_ALERT_MATCHED} WHERE id=? AND status<>'resolved'",
+            " OUTPUT inserted.id WHERE id=? AND status<>'resolved'",
             (actor, now, alert_id),
             audit,
             now,
@@ -7339,7 +7336,7 @@ class SqlServerStore:
         now = time.time() if now is None else now
         return await self._alert_write(
             "UPDATE alert_instance SET status='resolved', resolved_at=?"
-            f"{_ALERT_MATCHED} WHERE id=? AND status<>'resolved'",
+            " OUTPUT inserted.id WHERE id=? AND status<>'resolved'",
             (now, alert_id),
             audit,
             now,
@@ -7369,7 +7366,7 @@ class SqlServerStore:
         # #143 windowed suspend (NOTIFICATION-only): set suspended_until on a live instance. Refuses a
         # resolved one; returns the updated row (for the API echo + seeding the sink cache) or None.
         if not await self._alert_write(
-            f"UPDATE alert_instance SET suspended_until=?{_ALERT_MATCHED}"
+            "UPDATE alert_instance SET suspended_until=? OUTPUT inserted.id"
             " WHERE id=? AND status<>'resolved'",
             (until, alert_id),
             audit,
@@ -7383,7 +7380,7 @@ class SqlServerStore:
     ) -> AlertInstance | None:
         # #143: clear a windowed suspend. Idempotent; returns the row or None (unknown/already resolved).
         if not await self._alert_write(
-            f"UPDATE alert_instance SET suspended_until=NULL{_ALERT_MATCHED}"
+            "UPDATE alert_instance SET suspended_until=NULL OUTPUT inserted.id"
             " WHERE id=? AND status<>'resolved'",
             (alert_id,),
             audit,

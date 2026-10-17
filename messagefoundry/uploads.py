@@ -1363,8 +1363,9 @@ class UploadStore:
                 self._drain_cancelled.add(task)
                 task.add_done_callback(self._drain_cancelled.discard)
         # The grace covers what a callback starts meanwhile too: a release from a reserve that
-        # finished before the cancel reached it. One still running at the bound is cancelled, so
-        # none outlives the drain into a closing store.
+        # finished before the cancel reached it. One still running at the bound is cancelled and
+        # marked like the rest, so a reserve among them starts no release; the drain does not wait
+        # for it to unwind, as it does not for anything still stuck in `left`.
         # The first wait runs even when everything in `left` is done: it is also the loop pass in
         # which a done task's own callbacks run and start that release.
         deadline = loop.time() + grace
@@ -1375,7 +1376,9 @@ class UploadStore:
             await asyncio.wait(pending, timeout=remaining)
         stuck = {t for t in left | self._stragglers if not t.done()}
         for task in stuck - left:
-            task.cancel()
+            if task.cancel():
+                self._drain_cancelled.add(task)
+                task.add_done_callback(self._drain_cancelled.discard)
         if stuck:
             _log.error(
                 "shutdown: %d cancelled upload task(s) had not finished after %gs",
