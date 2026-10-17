@@ -298,7 +298,7 @@ from messagefoundry.config.ai_policy import (
     resolve_effective_policy,
 )
 from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
-from messagefoundry.config.fingerprint import fingerprint_matches
+from messagefoundry.config.fingerprint import ConfigDirMissing, fingerprint_matches
 from messagefoundry.config.memory_encryption import (
     READOUT_DISCLAIMER,
     platform_memory_encryption_readout,
@@ -1069,7 +1069,13 @@ async def _embedded_approvals_lifespan(app: FastAPI) -> AsyncIterator[None]:
     managed lifespan runs too. At start, :meth:`ApprovalGate.reconcile_after_restart`, before the
     app serves an approval. At shutdown, :meth:`ApprovalGate.drain` (BACKLOG #2087), so a caller
     that stops its engine after the app has shut down loses no outcome write. A caller that passes
-    its own ``lifespan`` replaces this one and runs these steps itself, with the store open."""
+    its own ``lifespan`` replaces this one and runs these steps itself, with the store open.
+
+    Before the engine holds its graph the claim owner may not be known. The gate then puts the
+    reconcile off until a queue list finds the owner known, and does not fix the default, so the
+    app's later claims still carry the engine shard's own name (BACKLOG #3252). A release made
+    before the engine holds its graph fixes the default for the app's life, so start the engine
+    before serving approvals."""
     # create_app installs this only beside an engine, and always builds the gate then.
     await _reconcile_approvals_after_restart(app.state.approval_gate)
     try:
@@ -1093,14 +1099,25 @@ def _build_approval_gate(
     the endpoint has one, so the gate can re-check the REQUESTER at release (ASVS 8.3.2). Keep each
     pair in step with the route that raises the request: the route checks at request time, the gate
     at release, and a divergence would let one of the two pass what the other refuses."""
+
+    def _claim_owner() -> str | None:
+        # BACKLOG #1562: read on use, not here, because the engine shard id is known only once
+        # the engine holds its graph. Until then this answers None, "not known yet", rather than
+        # the default, which the gate would otherwise fix for life: an embedded engine shard whose
+        # app started before its graph would then share "engine" with its siblings (#3252).
+        identity = engine.instance_identity
+        if identity is not None:
+            return identity
+        if engine.filters_its_graph and engine.registry_runner is None:
+            return None  # an engine shard whose graph has not loaded yet
+        return DEFAULT_CLAIM_OWNER  # no engine shard and no cluster node
+
     gate = ApprovalGate(
         engine.store,
         settings,
         resolve_identity=resolve_identity,
         alert_sink=alert_sink,
-        # BACKLOG #1562: read on the gate's first claim or reconcile, not here, because the shard
-        # id is known only once the engine holds its graph.
-        claim_owner=lambda: engine.instance_identity or DEFAULT_CLAIM_OWNER,
+        claim_owner=_claim_owner,
     )
     # A released reload runs inside the approve request, so it outlives that request's deadline the
     # way the inline route's does (vault BACKLOG #2753). Required, so the lifespan's drain sees it.
@@ -1221,7 +1238,10 @@ def _build_approval_gate(
         # A cancelled approve records 'interrupted' in the gate (#1562), and this reload goes on to
         # write its own config_reload row rather than stopping with intake half swapped. A refusal
         # raised inside _apply is part of that operation too, so a timed-out approve does not cut
-        # its row short. A shutdown drain that cancels the operation still can.
+        # its row short. A shutdown drain that cancels the operation stops it, but not mid row: a
+        # cancel during the reload writes config_reload_interrupted (vault BACKLOG #2753), and one
+        # during the config_reload or refusal row's write waits for it (_write_through_cancel,
+        # BACKLOG #3157 item 4).
         return await outliving.run(_apply(), "released config reload")
 
     def _replay_params_in_scope(identity: Identity, p: Mapping[str, Any]) -> bool:
@@ -1542,6 +1562,71 @@ async def _reload_and_record(
     return outcome, failures
 
 
+#: How long a cancel waits for a reload's audit row to land (:func:`_write_through_cancel`). A store
+#: write may have no bound of its own, and engine.stop() awaits a cancelled convergence reload
+#: without one, so a hung write must not hold the shutdown. Inside OutlivingOperations' grace.
+_ROW_CANCEL_WAIT_SECONDS: Final = 3.0
+
+#: Row writes still running after the cancel bound. The event loop keeps only a weak reference to a
+#: task, so this set keeps each alive until it ends and its outcome is logged.
+_UNLANDED_ROW_WRITES: set[asyncio.Future[Any]] = set()
+
+
+async def _write_through_cancel(
+    write: Coroutine[Any, Any, object], lost: Callable[[], str]
+) -> None:
+    """Await an audit row's ``write`` so that a cancel cannot cut it short (BACKLOG #3157 item 4).
+
+    At least :meth:`OutlivingOperations.drain` cancels a reload still running at shutdown, and the
+    cancel can land while the reload's own outcome row is being written. Cancelling that write
+    would lose the row with no ERROR line, since a cancel is no ``Exception``. So the write runs as
+    its own task, and a cancel waits up to :data:`_ROW_CANCEL_WAIT_SECONDS` for it to land, through
+    the uploads module's ``_wait_to_completion``. The reload's task then ends inside the drain's
+    grace, with the store still open. Past the bound the cancel goes on and the write is left to
+    finish on its own.
+
+    Not :meth:`ApprovalGate._shielded`'s shape, which re-raises at once and leaves the gate's own
+    drain to wait for the write. Nothing would drain this one once the reload's task has ended. A
+    write that does not land after the cancel is logged at ERROR with ``lost()``, which names the
+    row, because the caller's fail-soft handler sees only the cancel."""
+    from messagefoundry.uploads import _wait_to_completion
+
+    task = asyncio.ensure_future(write)
+    try:
+        await _wait_to_completion(task, cancel_bound=_ROW_CANCEL_WAIT_SECONDS)
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        if task.cancelled() and (current is None or current.cancelling() == 0):
+            # Nobody cancelled the caller: the write itself was cancelled, as by a store that
+            # closed under it. That is a failed write for the caller's fail-soft handler to log,
+            # not a cancellation to pass on.
+            raise RuntimeError("the audit row's write was cancelled") from None
+        if not task.done():
+            _UNLANDED_ROW_WRITES.add(task)
+            task.add_done_callback(_UNLANDED_ROW_WRITES.discard)
+        task.add_done_callback(lambda done: _log_unlanded_row(done, lost))
+        raise
+
+
+def _log_unlanded_row(task: asyncio.Future[Any], lost: Callable[[], str]) -> None:
+    """Log a reload audit row that did not land after its caller was cancelled. Reading the error
+    also marks it retrieved, so asyncio does not report it a second time."""
+    error = None if task.cancelled() else task.exception()
+    if task.cancelled() or error is not None:
+        _log.error(
+            "an audit row's write did not land after its operation was cancelled. Lost row: %s",
+            lost(),
+            exc_info=error,
+        )
+
+
+def _lost_row(action: str, actor: str, detail: str | None) -> str:
+    """A lost audit row for :func:`_write_through_cancel`'s log line, its values scrubbed for CodeQL
+    py/log-injection as the fail-soft lines scrub theirs."""
+    shown = None if detail is None else scrub_log_argument(detail)
+    return f"action={action} actor={scrub_log_argument(actor)} detail={shown}"
+
+
 async def _record_reload_audit(
     engine: Engine,
     *,
@@ -1605,7 +1690,9 @@ async def _record_reload_audit(
     steps, so the answer says the new graph is live and its row is missing. A released reload
     carries that into ``approval.approved``.
 
-    A cancellation still propagates: it is not a failure of this helper. The write goes through
+    A cancellation still propagates: it is not a failure of this helper. One that lands during the
+    write waits for the row first (:func:`_write_through_cancel`, BACKLOG #3157). The write goes
+    through
     :func:`~messagefoundry.audit_write.write_audit_soft` with ``defects=()``, because even a defect
     raised here would misreport a reload that ran (vault BACKLOG #2260)."""
     detail: str | None = None
@@ -1640,7 +1727,8 @@ async def _record_reload_audit(
         await engine.store.record_audit(action, actor=actor, detail=detail, client=client)
 
     written = await write_audit_soft(
-        write,
+        # A shutdown drain's cancel waits for the row rather than cutting it short (BACKLOG #3157).
+        lambda: _write_through_cancel(write(), lambda: _lost_row(action, actor, detail)),
         log=_log,
         message="config %s, but its %s audit row failed (step %s). Lost row: actor=%s detail=%s",
         # Scrubbed at the call site for CodeQL py/log-injection; scrub_log_argument says why. Read
@@ -1665,7 +1753,9 @@ _RELOAD_REFUSALS: tuple[type[Exception], ...] = (
     ConfigDigestMismatch,
     ConfigDigestUnavailable,
     ConfigDirUnreadable,
-    FileNotFoundError,
+    # Not FileNotFoundError: a runner start or swap that raises one is a fault, not a missing
+    # directory, and must not be audited and answered as not_found (BACKLOG #3157 item 3).
+    ConfigDirMissing,
     WiringError,
 )
 
@@ -1733,12 +1823,13 @@ async def _audit_refused_reload(
 
     **The row's write never raises.** A refusal changed nothing, so its answer stands whether or
     not the row lands, and a store fault here would otherwise turn it into a raw 500 (vault BACKLOG
-    #2255). A failed write is logged at ERROR with the row's detail."""
+    #2255). A failed write is logged at ERROR with the row's detail. A cancellation, such as a
+    shutdown drain's, is not a failure: it waits for the row, then propagates (BACKLOG #3157)."""
     detail: dict[str, object] = {"requested": requested, "dry_run": dry_run}
     if isinstance(exc, ConfigReloadDenied):
         action = "config_reload_denied"
         status, answer = 403, "config directory is not an allowed reload root"
-    elif isinstance(exc, FileNotFoundError):
+    elif isinstance(exc, ConfigDirMissing):
         _log.warning(
             "config reload failed (missing dir): %s",
             scrub_log_argument(safe_exc(exc, limit=_REFUSAL_LOG_LIMIT)),
@@ -1803,7 +1894,11 @@ async def _audit_refused_reload(
     # handler's ControlCharScrubFilter escapes that. ``defects=()`` keeps the docstring's promise
     # that this write never raises (vault BACKLOG #2260).
     await write_audit_soft(
-        lambda: engine.store.record_audit(action, actor=actor, detail=row, client=client),
+        # A shutdown drain's cancel waits for the row rather than cutting it short (BACKLOG #3157).
+        lambda: _write_through_cancel(
+            engine.store.record_audit(action, actor=actor, detail=row, client=client),
+            lambda: _lost_row(action, actor, row),
+        ),
         log=_log,
         message="a refused config reload's %s audit row failed. Lost row: actor=%s detail=%s",
         args=lambda: (action, scrub_log_argument(actor), scrub_log_argument(row)),
@@ -5344,8 +5439,11 @@ def create_app(
         ``caller_is_requester`` marks the caller's own requests (BACKLOG #2460)."""
         if gate is None:
             raise HTTPException(503, "approval workflow is not available")
-        pending = await gate.list_pending(caller_user_id=identity.user_id)
-        interrupted = await gate.list_interrupted(caller_user_id=identity.user_id)
+        try:
+            pending = await gate.list_pending(caller_user_id=identity.user_id)
+            interrupted = await gate.list_interrupted(caller_user_id=identity.user_id)
+        except ApprovalError as exc:  # a store read that failed: 503 (BACKLOG #3157 item 1)
+            raise HTTPException(exc.status, exc.detail, headers=exc.headers) from exc
         # Two reads, so a release cut off between them can appear in both. The interrupted read is
         # the later one and a row never returns to pending, so that status wins. A row released and
         # settled between the reads still shows as pending; approving it then answers 409.
