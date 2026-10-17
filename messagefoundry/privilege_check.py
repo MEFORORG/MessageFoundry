@@ -321,26 +321,26 @@ def printable(text: str) -> str:
     """``text`` with every character in :data:`~messagefoundry.controlchars.CONTROL_CATEGORIES`
     REMOVED: what a reader would take a server-chosen value (a Vault policy name) for once the
     characters a terminal does not show are gone. The set is the one the terminal and log escapes
-    use, imported rather than copied, so it includes C1, the bidi and zero-width format
-    characters and U+2028/U+2029 (BACKLOG #2891).
+    use, imported rather than copied (BACKLOG #2891).
 
     It strips rather than escapes for the root comparison in :func:`vault_hop`: ``r`` + U+200B +
     ``oot`` must still compare equal to root, and an escaped form would not. Printing is the other
-    job, and goes through :func:`_shown` instead. ``privilege_probes`` also strips with this
+    job, and :func:`render_text` escapes instead. ``privilege_probes`` also strips with this
     before it logs."""
     return "".join(ch for ch in text if unicodedata.category(ch) not in CONTROL_CATEGORIES)
 
 
-def _shown(text: str) -> str:
-    """A hop's whole detail as one terminal line, by the shared strict ``single_line`` rule."""
-    return escape_for_terminal(text, single_line=True)
-
-
 def _quoted(text: str) -> str:
-    """``text`` in single quotes, NOT escaped: :func:`_shown` escapes the whole detail once, and a
-    ``repr`` here would escape twice, so U+200B would print as the literal text ``\\\\u200b``. A
-    quote inside ``text`` is not escaped; the judgement does not depend on the printed form."""
-    return f"'{text}'"
+    """``text`` quoted as ``repr`` would choose, single quotes unless it holds one and no double
+    quote, but with no other escape: :func:`render_text` escapes each printed line once, and a
+    ``repr`` escape here would print twice escaped, U+200B as the literal text ``\\u200b``. Only
+    a text holding both quote characters has its single quotes written as ``\\'``, so a
+    server-chosen value cannot close its quote and append words that read as the check's own."""
+    if "'" not in text:
+        return f"'{text}'"
+    if '"' not in text:
+        return f'"{text}"'
+    return "'" + text.replace("'", "\\'") + "'"
 
 
 #: Vault's capability words. Any other string a server returns is shown escaped, so a value that
@@ -445,9 +445,10 @@ def vault_hop(
             "paths the engine does not call were read only for the administrative ones; "
             "attest the rest of the policy by hand"
         )
-    # _shown() over the whole text, once, at the output boundary: a policy name reaches it inside
-    # an administrative PATH as well as in the policy list, and a per-field call misses the next one.
-    detail = _shown(". ".join(parts))
+    # Kept as the server sent it: render_text escapes every printed line once, which reaches a
+    # policy name inside an administrative PATH as well as in the policy list, and the JSON output
+    # carries the value itself (json.dumps escapes it there).
+    detail = ". ".join(parts)
     return HopPrivilege(consumer.hop, state, consumer.identity, consumer.minimal, detail)
 
 
@@ -594,8 +595,8 @@ def ldap_hop(settings: ServiceSettings, probe: Callable[[], BindAccountReading])
         parts.append("in none of the administrative groups the check knows (transitive read)")
     parts += [f"could not observe: {p}" for p in problems]
     parts.append(_LDAP_RIGHTS_NOT_READ)
-    # As for a Vault hop: one _shown() over everything the directory or ldap3 supplied.
-    return HopPrivilege("ldap", state, identity, minimal, _shown(". ".join(parts)))
+    # As for a Vault hop: render_text escapes what the directory or ldap3 supplied.
+    return HopPrivilege("ldap", state, identity, minimal, ". ".join(parts))
 
 
 # --- the hops the engine cannot probe ---------------------------------------------------------
@@ -719,7 +720,14 @@ def _store_verdict(report: StorePrivilegeReport, settings: ServiceSettings) -> s
 
 
 def render_text(hops: Iterable[HopPrivilege]) -> list[str]:
-    """Operator-readable lines, one block per hop."""
+    """Operator-readable lines, one block per hop, each through the shared terminal rule.
+
+    This is the one place check-privileges prints, so every line is escaped here, by
+    :func:`~messagefoundry.terminal_text.escape_for_terminal` strict and ``single_line``
+    (BACKLOG #2891): a hop's detail, the store summary's server-supplied role names and the
+    configured identity alike. A control, format, separator or non-ASCII character a server or
+    config chose prints as a visible escape, and the line stays one line. The judging functions
+    keep the raw text, so ``--json`` carries the values themselves."""
     lines: list[str] = []
     for h in hops:
         lines.append(f"{h.hop}: {_LOUD_LABEL.get(h.state, h.state.value.replace('_', ' '))}")
@@ -728,4 +736,4 @@ def render_text(hops: Iterable[HopPrivilege]) -> list[str]:
         if h.minimal:
             lines.append(f"  minimal:  {h.minimal}")
         lines.append(f"  {h.detail}")
-    return lines
+    return [escape_for_terminal(line, single_line=True) for line in lines]

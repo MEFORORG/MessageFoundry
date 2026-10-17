@@ -480,7 +480,7 @@ _ONE_PER_CATEGORY = {
 def _disagreements() -> list[str]:
     """Every place one of the three terminal-text callers fails to treat a code point of
     ``CONTROL_CATEGORIES`` as dangerous (BACKLOG #2891): the toolkit report line and the
-    ``check-privileges`` hop detail must print it as its visible escape, and the root comparison
+    ``check-privileges`` text must print it as its visible escape, and the root comparison
     in ``privilege_check.printable`` must strip it. The escape is looked for, not the raw
     character's absence, because ``_safe_print`` turns an unencodable one into ``?``."""
     consumer = privilege_check.VaultConsumer("vault.store", "kek", "store key", "read the KEK")
@@ -493,8 +493,9 @@ def _disagreements() -> list[str]:
         if escape not in printed.getvalue():
             found.append(f"the toolkit line does not escape {category}")
         reading = VaultTokenReading(looked_up=True, policies=(f"p{char}q",))
-        if escape not in privilege_check.vault_hop(consumer, reading).detail:
-            found.append(f"the check-privileges detail does not escape {category}")
+        hop = privilege_check.vault_hop(consumer, reading)
+        if escape not in "\n".join(privilege_check.render_text([hop])):
+            found.append(f"the check-privileges text does not escape {category}")
         if privilege_check.printable(f"ro{char}ot") != "root":
             found.append(f"the root comparison does not strip {category}")
     return found
@@ -526,7 +527,7 @@ def test_the_agreement_check_fails_when_the_shared_terminal_rule_diverges(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Control: a shared rule that stopped escaping the line separator reaches the toolkit line,
-    which keeps printable Unicode. The hop detail is strict, so it still escapes everything past
+    which keeps printable Unicode. check-privileges is strict, so it still escapes everything past
     ASCII, and the check says only what diverged."""
     monkeypatch.setattr(terminal_text, "CONTROL_CATEGORIES", CONTROL_CATEGORIES - {"Zl"})
     assert _disagreements() == ["the toolkit line does not escape Zl"]

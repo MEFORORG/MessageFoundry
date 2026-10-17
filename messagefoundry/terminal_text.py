@@ -15,7 +15,8 @@ so a later hardening applies to all of them at once (BACKLOG #2891). It is not e
 least ``tee`` imports nothing from this package by design. ``privilege_check.printable`` still
 STRIPS the characters in :data:`CONTROL_CATEGORIES`, for one job this rule cannot do, judging
 whether a policy name reads as ``root``, and its docstring says why.
-``tests/test_adr_analyze.py`` holds the three to the one set of categories.
+``tests/test_adr_analyze.py`` holds the toolkit report, the ``check-privileges`` text and
+that comparison to the one set of categories.
 
 THE RULE. Printable ASCII, newline and tab print as themselves. Every other character prints as a
 visible escape: a C0 control or DEL as ``\\xNN``, and every code point past ASCII -- a C1 control,

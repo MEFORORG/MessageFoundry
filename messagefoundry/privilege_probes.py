@@ -86,7 +86,8 @@ class VaultTokenReading:
 
 def _problem(text: str) -> str:
     """Log one probe problem and return it. The text is already secret-free (:func:`_why`), and
-    is logged without control or format characters, as it is printed."""
+    is logged with every character in ``CONTROL_CATEGORIES`` stripped. The terminal escapes
+    them instead (``privilege_check.render_text``)."""
     logger.warning("check-privileges: %s", printable(text))
     return text
 
@@ -117,8 +118,9 @@ def _why(exc: BaseException) -> str:
 
 def _strings(value: object) -> tuple[str, ...]:
     """The string members of a Vault list, kept EXACTLY as Vault sent them. A policy name is also
-    a path the probe asks about, so altering it here would ask about a different policy. Every
-    printed or logged text goes through ``printable()`` at the output boundary instead."""
+    a path the probe asks about, so altering it here would ask about a different policy. A
+    printed line is escaped at ``privilege_check.render_text``, and a logged one is stripped by
+    ``printable()``, each at its output boundary instead."""
     if not isinstance(value, (list, tuple)):
         return ()
     return tuple(v for v in value if isinstance(v, str))

@@ -182,8 +182,8 @@ def _adr_analyze(args: argparse.Namespace) -> int:
 
 def _print_record_line(line: str) -> None:
     """``_safe_print`` a line that carries record text, with each character a terminal would act
-    on written as a visible escape (BACKLOG #2516). Every human line goes through here, so a new
-    one cannot forget the escape.
+    on written as a visible escape (BACKLOG #2516). Every human stdout line goes through here, so
+    a new one cannot forget the escape. The ``error:`` line on stderr does not.
 
     THE RULE IS THE ENGINE'S SHARED ONE, :func:`messagefoundry.terminal_text.escape_for_terminal`
     (BACKLOG #2891), so a later hardening there reaches this command too; its docstring says what

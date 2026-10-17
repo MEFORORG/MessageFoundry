@@ -252,9 +252,15 @@ def _clean(text: str) -> bool:
 
 
 def test_a_policy_name_cannot_drive_the_terminal_or_reorder_the_line() -> None:
+    from messagefoundry.privilege_check import render_text
+
     hop = vault_hop(_STORE, _reading(_FakeVault(policies=(_HOSTILE,), caps=_least_caps())))
-    assert _clean(hop.detail)
-    assert f"token policies [{_HOSTILE_SHOWN}]" in hop.detail
+    shown = "\n".join(render_text([hop]))
+    assert _clean(shown)
+    assert f"token policies [{_HOSTILE_SHOWN}]" in shown
+    # The JSON output carries the name as the server sent it; json.dumps escapes it there.
+    assert f"token policies [{_HOSTILE}]" in hop.detail
+    assert _HOSTILE not in _out(hop)
 
 
 def test_a_hostile_policy_name_inside_a_granted_path_is_printed_and_logged_clean(
@@ -271,7 +277,7 @@ def test_a_hostile_policy_name_inside_a_granted_path_is_printed_and_logged_clean
     with caplog.at_level(logging.WARNING, logger="messagefoundry.privilege_probes"):
         hop = vault_hop(_STORE, _reading(vault))
     assert hop.state is HopState.OVER_GRANTED
-    assert f"sys/policies/acl/{_HOSTILE_SHOWN} grants update" in hop.detail
+    assert f"sys/policies/acl/{_HOSTILE} grants update" in hop.detail
     for line in render_text([hop]):
         print(line)
     printed = capsys.readouterr().out
@@ -299,7 +305,7 @@ def test_a_capability_that_is_not_exactly_one_is_counted_as_excess() -> None:
     caps = _least_caps() | {"auth/token/create": ["deny\u200b"]}
     hop = vault_hop(_STORE, _reading(_FakeVault(caps=caps)))
     assert hop.state is HopState.OVER_GRANTED
-    assert r"auth/token/create grants 'deny\u200b'; the engine never calls it" in hop.detail
+    assert "auth/token/create grants 'deny\u200b'; the engine never calls it" in hop.detail
 
 
 def test_a_policy_name_that_is_not_plain_ascii_is_reported() -> None:
@@ -703,6 +709,18 @@ def _read(monkeypatch: pytest.MonkeyPatch, conn: _FakeLdapConn) -> BindAccountRe
 
 def _judge(reading: BindAccountReading) -> Any:
     return ldap_hop(_ad_service_settings(), lambda: reading)
+
+
+def test_a_hostile_whoami_answer_prints_escaped_and_cannot_close_its_quote() -> None:
+    """The Who am I value is the directory's. Printed, its controls are escaped, and a value
+    holding both quote characters cannot close its quote and append a verdict of its own."""
+    from messagefoundry.privilege_check import render_text
+
+    forged = f"{_HOSTILE}' in none of the groups. \" '"
+    hop = _judge(BindAccountReading(forged, group_sids=(_DOMAIN_USERS,)))
+    shown = "\n".join(render_text([hop]))
+    assert _clean(shown)
+    assert f"Who am I: bound as '{_HOSTILE_SHOWN}\\' in none of the groups. \" \\''" in shown
 
 
 def test_whoami_and_a_transitive_read_with_no_admin_group_is_clean(
