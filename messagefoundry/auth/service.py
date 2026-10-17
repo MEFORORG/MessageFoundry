@@ -3265,6 +3265,10 @@ class AuthService:
         # was never told. An earlier slot would tell them of a takeover that a later refusal leaves
         # unfinished. A refusal above, on the repair branch, has still cleared their factors and
         # sessions and tells nobody; that predates #2915 and is shipped open.
+        # BACKLOG #3078 adds ONE refusal after this slot: the guarded grant below, which a race can
+        # refuse. On the repair branch that refusal leaves the notice sent and the address replaced,
+        # as the crash #2915 names does, and a re-run then reads the operator's address as the
+        # earlier holder's. It is shipped open: the grant has to stay last (see there).
         # Two at-least-once costs remain, and no state records a sent notice. A crash between this
         # notice and the address write sends the earlier holder a second notice on the re-run. A
         # crash after the address write makes the re-run send one to the operator's own address,
@@ -3302,8 +3306,12 @@ class AuthService:
         # awaits, so two runs with different usernames could each pass it and each grant. The grant
         # re-checks under the last-administrator guard's lock, in the transaction that writes it,
         # so the run whose grant commits second is refused. It is also bound to the password and the
-        # TOTP cell this run wrote: two runs on ONE row can interleave so that one run's password
-        # sits beside the other's TOTP, and then neither run is granted. A loser was refused after
+        # TOTP cell this run wrote, and refuses a row that already holds a role: two runs on ONE row
+        # can interleave so that one run's password sits beside the other's TOTP before either
+        # grant, and then neither run is granted. A run on ONE row whose writes land after the
+        # other's grant committed can still overwrite that Administrator's credentials, because
+        # the writes above are not conditional on the row being roleless; that window is open and
+        # is the same-username race's, not this one's. A loser was refused after
         # its credential writes rather than before them, because the role stays last (ADR 0183):
         # granted first, a crash would leave an Administrator with no credential and a store this
         # command then refuses. Its account therefore holds no role, and nothing it wrote is undone:
@@ -3318,16 +3326,15 @@ class AuthService:
         if grant is AdminGrant.ADMIN_EXISTS:
             raise FirstAdministratorRefused(
                 "another enabled Administrator was created while this command ran, so this run "
-                f"granted no role, and the account named {username!r} holds none; remove the "
-                "authenticator entry it showed, and delete that account from the web console if "
-                "nobody needs it"
+                f"granted no role, and the account named {username!r} holds none; remove any "
+                "authenticator entry it showed. If this run created that account and nobody needs "
+                "it, delete it from the web console"
             )
         if grant is AdminGrant.ACCOUNT_CHANGED:
             raise FirstAdministratorRefused(
-                "the account's password, authenticator or enabled state was changed while this "
-                "command ran, so this run granted no role; remove the authenticator entry it "
-                "showed. If another "
-                "provision-admin run is in progress, let it finish. Then run the command again"
+                "the account was changed or removed while this command ran, so this run granted "
+                "no role; remove any authenticator entry it showed. If another provision-admin run "
+                "is in progress, let it finish. Then run the command again"
             )
         if repaired:
             # AGAIN, after the role (ADR 0197 Amendment A, AC-A5). The earlier holder's password

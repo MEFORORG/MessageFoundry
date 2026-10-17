@@ -2549,13 +2549,13 @@ class AuthStore(Protocol):
         each engine shard serves its own API over one unified store (ADR 0063). So two removals
         that each see two administrators cannot both pass, which a check in one await and a write
         in the next allowed. A write that only ADDS an administrator cannot empty the set, so it
-        needs this lock only when it is itself guarded: the first-administrator grant
-        (:meth:`grant_first_admin_unless_admin_exists`, BACKLOG #3078) takes it, and every other
-        role write that adds one does not. The directory-driven role writes (the AD sign-in sync and
-        the session reconciler) do not come through here and were never guarded: they take roles on
-        the directory's word. ``DISABLE`` and ``SET_ROLES`` leave the account's sessions for the
-        caller to revoke after; ``DELETE``, like :meth:`delete_user`, removes them with the
-        account."""
+        needs this lock only when it is itself guarded, as the first-administrator grant
+        (:meth:`grant_first_admin_unless_admin_exists`, BACKLOG #3078) is. An unguarded role write
+        that adds one, such as :meth:`set_user_roles`, takes no lock. The directory-driven role
+        writes (the AD sign-in sync and the session reconciler) do not come through here and were
+        never guarded: they take roles on the directory's word. ``DISABLE`` and ``SET_ROLES`` leave
+        the account's sessions for the caller to revoke after; ``DELETE``, like
+        :meth:`delete_user`, removes them with the account."""
         ...
 
     async def grant_first_admin_unless_admin_exists(
@@ -2569,16 +2569,17 @@ class AuthStore(Protocol):
         now: float | None = None,
     ) -> AdminGrant:
         """Give ``user_id`` exactly ``admin_role_id`` unless another enabled administrator exists
-        (BACKLOG #3078). ``provision_first_administrator``'s grant, and its only caller.
+        (BACKLOG #3078). ``provision_first_administrator``'s grant.
 
         One transaction re-reads the enabled accounts holding ``admin_role_id``, counting each other
         than ``user_id`` only when its record passes its integrity seal, as
         :meth:`remove_unless_last_admin` counts them. When any is counted it writes nothing and
         returns :attr:`AdminGrant.ADMIN_EXISTS`. Otherwise it writes the role only while the
-        account is enabled and still holds the credentials the caller wrote:
-        ``expected_password_hash``, and TOTP off when ``expected_totp_secret_cell`` is ``None`` or
-        on with that staged cell when it is not. When those no longer hold it writes nothing and
-        returns :attr:`AdminGrant.ACCOUNT_CHANGED`; a missing account answers the same.
+        account is enabled, holds no role, and still holds the credentials the caller wrote:
+        ``expected_password_hash``, and no TOTP secret when ``expected_totp_secret_cell`` is
+        ``None`` or TOTP on with that staged cell when it is not. When those no longer hold it
+        writes nothing and returns :attr:`AdminGrant.ACCOUNT_CHANGED`; a missing account, and a
+        compare on the seal lost to a concurrent write, answer the same.
 
         **It is serialized against every other call of this and of :meth:`remove_unless_last_admin`
         on the same database**, under the same lock, not only in this process. So two provisioning

@@ -88,14 +88,20 @@ async def assert_first_admin_grant_contract(store: Any) -> None:
     assert await grant(store, "a", None) is AdminGrant.ACCOUNT_CHANGED  # TOTP is on
     assert await grant(store, "a", "not-the-cell") is AdminGrant.ACCOUNT_CHANGED
     assert await grant(store, "b", "a-cell-it-never-had") is AdminGrant.ACCOUNT_CHANGED
+    # A secret another run staged but has not enabled is a secret: a TOTP-less grant is refused.
+    staged = await store.set_totp_secret("c", secret=TOTP_SECRET)
+    assert staged is not None
+    assert await grant(store, "c", None) is AdminGrant.ACCOUNT_CHANGED
+    await store.disable_totp("c")
     assert await grant(store, "absent", None) is AdminGrant.ACCOUNT_CHANGED
     assert await enabled_admins(store) == set()
 
     # Paired control: the same account with its own credentials is granted, holding exactly the role.
     assert await grant(store, "a", a_cell) is AdminGrant.GRANTED
     assert await store.get_user_role_ids("a") == [ADMIN]
-    # The target is excluded from the count, so granting it again is not refused by itself.
-    assert await grant(store, "a", a_cell) is AdminGrant.GRANTED
+    # A row that already holds a role is refused: a second run on a row the first already granted
+    # is not granted over it. The target is still left out of the count, so it is not ADMIN_EXISTS.
+    assert await grant(store, "a", a_cell) is AdminGrant.ACCOUNT_CHANGED
 
     # Another enabled administrator now exists: refused, writing nothing, whatever the credentials.
     assert await grant(store, "b", b_cell) is AdminGrant.ADMIN_EXISTS

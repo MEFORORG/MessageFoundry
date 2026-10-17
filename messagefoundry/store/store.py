@@ -1708,8 +1708,8 @@ class AdminGrant(StrEnum):
     GRANTED = "granted"
     #: Another enabled, seal-valid administrator exists, so nothing was written.
     ADMIN_EXISTS = "admin_exists"
-    #: The account no longer holds the credentials the caller wrote, or is disabled or gone, so
-    #: nothing was written.
+    #: The account no longer holds the credentials the caller wrote, holds a role already, or is
+    #: disabled or gone, so nothing was written.
     ACCOUNT_CHANGED = "account_changed"
 
 
@@ -2734,19 +2734,23 @@ def first_admin_grant(
     now: float,
 ) -> UserChange:
     """What ``grant_first_admin_unless_admin_exists`` writes once the guard passes (BACKLOG
-    #3078): the account holding exactly ``admin_role_id``, only while it is enabled and still holds
-    the credentials the caller wrote. That is the password hash, compared byte for byte, and either
-    TOTP off (``expected_totp_secret_cell`` ``None``) or TOTP on with that staged cell. Two
-    provisioning runs on one row can interleave so that one run's password sits beside the other's
-    TOTP; this then writes nothing, so no Administrator is granted with credentials no single run
-    holds."""
+    #3078): the account holding exactly ``admin_role_id``, only while it is enabled, holds no role,
+    and still holds the credentials the caller wrote. That is the password hash, compared byte for
+    byte, and either no TOTP secret at all (``expected_totp_secret_cell`` ``None``; a secret another
+    run staged but has not enabled counts) or TOTP on with that staged cell.
+
+    Two provisioning runs on one row can interleave before either grant so that one run's password
+    sits beside the other's TOTP; this then writes nothing. A row that already holds a role is
+    refused too, so a second run on a row the first run already granted is never granted over it.
+    What this cannot see is a write landing AFTER a grant committed: the provisioning credential
+    writes before it are not conditional on the row being roleless."""
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
         row = r.row
-        if row.disabled or row.password_hash != expected_password_hash:
+        if row.disabled or r.roles or row.password_hash != expected_password_hash:
             return None
         if expected_totp_secret_cell is None:
-            if row.totp_enabled:
+            if row.totp_enabled or row.totp_secret is not None:
                 return None
         elif not row.totp_enabled or row.totp_secret != expected_totp_secret_cell:
             return None

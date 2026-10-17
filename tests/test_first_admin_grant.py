@@ -220,7 +220,7 @@ async def test_two_runs_with_different_usernames_make_one_administrator(
         won = [o for o in outcomes if not isinstance(o, BaseException)]
         assert len(refused) == 1 and len(won) == 1, outcomes
         assert "another enabled Administrator was created while this command ran" in str(refused[0])
-        assert "remove the authenticator entry" in str(refused[0])
+        assert "remove any authenticator entry" in str(refused[0])
         # One enabled Administrator, and it is the winner's account.
         assert await enabled_admins(stores[0]) == {won[0].user_id}
         assert won[0].recovery_codes
@@ -349,7 +349,7 @@ async def test_a_password_beside_another_runs_totp_is_never_granted(
     monkeypatch.setattr(store, "enable_totp", then_a_rival_password)
     with pytest.raises(FirstAdministratorRefused, match="granted no role") as refusal:
         await _provision(service, "site-admin")
-    assert "remove the authenticator entry" in str(refusal.value)
+    assert "remove any authenticator entry" in str(refusal.value)
     row = await store.get_user_by_username("site-admin")
     assert row is not None
     assert await store.get_user_role_ids(row.id) == []
