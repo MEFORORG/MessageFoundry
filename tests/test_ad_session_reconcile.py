@@ -2810,17 +2810,20 @@ async def test_a_refused_rename_is_audited_under_the_name_the_row_holds(shape: s
     so the audit names an account an operator can find.
 
     The row is renamed to ``jdoe-interim`` first and the refresh is passed the stale ``jdoe``,
-    driven as the login calls it (``from_plan=False``): since BACKLOG #3069 the reconciler skips
-    that shape before any refusal. ``pre_check`` is the exception. The login reaches this method
-    only with ``held=None``, so a pre-check refusal is the reconciler's alone, and there the row
-    still holds the plan's ``jdoe``. One case per way the refresh refuses after it has read the
-    row; each is asserted to have refused, so none passes by never reaching the branch."""
+    driven with ``from_plan=False``: since BACKLOG #3069 the reconciler skips that shape before
+    any refusal, so on its path the two names agree and the actor check could not tell them apart.
+    One case per way the refresh refuses after it has read the row; each is asserted to have
+    refused, so none passes by never reaching the branch.
+
+    ``pre_check`` is a direct call no production caller makes today. The login reaches this method
+    only with ``held=None`` (``_complete_ad_login`` refuses a held name first), and the reconciler,
+    the only caller passing ``held``, has the two names equal there. The case is kept because it
+    pins the method's own contract: a refusal names what the row held, whichever caller passes a
+    holder."""
     store, _ldap, service, notifier, user_id = await _renamed_service()
     try:
-        from_plan = shape == "pre_check"
-        holds = "jdoe" if from_plan else "jdoe-interim"
-        if not from_plan:
-            assert await store.set_user_username(user_id, holds, expected_username="jdoe")
+        holds = "jdoe-interim"
+        assert await store.set_user_username(user_id, holds, expected_username="jdoe")
         held: UserRecord | None = None
         if shape == "pre_check":
             await store.create_user(
@@ -2868,7 +2871,7 @@ async def test_a_refused_rename_is_audited_under_the_name_the_row_holds(shape: s
             old_username="jdoe",
             new_username="jdoe-married",
             held=held,
-            from_plan=from_plan,
+            from_plan=False,
         )
 
         [conflict] = [
