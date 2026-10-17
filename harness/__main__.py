@@ -154,20 +154,23 @@ _DEFAULT_ENGINE = "https://127.0.0.1:8765"
 _children_job: int | None = None
 
 
-def _hold_children_job(argv: list[str] | None) -> None:
-    """Put this process in a kill-on-close job, so every process a headless run starts dies with it.
+def hold_children_job(argv: list[str] | None) -> None:
+    """On Windows, put this process in a kill-on-close job, so every process a headless run starts
+    dies with it.
 
     A headless run starts engines, sinks, sender workers and ``connscale-remote`` bands, and stops
     them in ``finally`` blocks. A coordinator that is killed, or ends by ``os._exit``, runs none of
-    them, so on Windows its children were left running. One job here covers every start site, the
-    ones added later included, so no start site needs its own.
+    them, so its children were left running. The job covers every start site reached from an entry
+    point that calls this: ``main`` here, and ``python -m harness.acceptance``, which starts pytest.
+    A new headless entry point must call it too. On POSIX it does nothing, so there a killed
+    coordinator's children are still reparented and left running.
 
     Only for the process entry point (``argv is None``: the console script, ``python -m harness``).
     A test calling ``main([...])`` in-process is a pytest worker, which ``tests/_process_guard.py``
     already guards; a second job there would change the innermost job of every test that runs after
     it in that worker. The GUI starts no process, so it holds no job. The cost is the one that guard
     names: a child asking for ``CREATE_BREAKAWAY_FROM_JOB`` is refused, and nothing here asks. A job
-    that cannot be set up is logged by :mod:`messagefoundry.proctree` and the run goes on unguarded."""
+    that cannot be set up is reported on stderr and the run goes on unguarded."""
     global _children_job
     # The entry point is inferred from argv rather than given its own function because the console
     # script and the release job's harness smoke both name `harness.__main__:main`.
@@ -176,6 +179,11 @@ def _hold_children_job(argv: list[str] | None) -> None:
     from messagefoundry import proctree  # lazy: nothing from messagefoundry at module scope
 
     _children_job = proctree.adopt_current_process(who="harness")
+    if _children_job is None and sys.platform == "win32":
+        print(
+            "harness: could not set up a Windows job, so a process this run starts can outlive it",
+            file=sys.stderr,
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -216,7 +224,7 @@ def main(argv: list[str] | None = None) -> int:
         "batch-driver": _run_batch_driver,
     }
     if raw and raw[0] in subcommands:
-        _hold_children_job(argv)
+        hold_children_job(argv)
         return subcommands[raw[0]](raw[1:])
 
     from messagefoundry.api_tls_source import GENERATED_CERT_NAME
@@ -405,7 +413,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     if any(modes):
-        _hold_children_job(argv)
+        hold_children_job(argv)
     if fuzz:
         return _run_fuzz(args)
     if args.failover:
