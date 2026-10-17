@@ -241,16 +241,18 @@ and that limit is open.**
 user's `PYTHON*` variables reach it. `tests/test_tray_hand_start.py` measured it on Windows, Python
 3.14.7, on 2026-10-16, with a stand-in for the tray that records whether it had a stderr. A
 GUI-script launcher of the kind pip writes, and `pythonw -m`, were each started with no standard
-handles. The launcher was also started through ShellExecute (`os.startfile`), the Windows
-shell's call for opening a file. With neither variable set, each start ran the stand-in, with no stderr.
-With `PYTHONFAULTHANDLER=1`, and again with `PYTHONDEVMODE=1`, none of them ran it; the two
-starts that report an exit code exited 1. `pythonw -m` that inherited its parent's handles, as
-from a terminal that hands its own on, had a stderr and ran under each variable. Not measured:
-the installed `messagefoundry-tray` launcher itself, a real click in Explorer or the Start menu,
-and a start typed into an interactive console window. `docs/TRAY.md` gives the operator's remedy.
+handles. The launcher was also started through `ShellExecuteExW`, the Windows shell's call for
+opening a file. With neither variable set, each start ran the stand-in, with no stderr. With
+`PYTHONFAULTHANDLER=1`, and again with `PYTHONDEVMODE=1`, each exited 1 without running it.
+`pythonw -m` that inherited its parent's handles, as from a terminal that hands its own on, had a
+stderr and ran under each variable. Not measured, at least: the installed `messagefoundry-tray`
+launcher itself, a real click in Explorer or the Start menu, a `.lnk` shortcut, a start typed
+into an interactive console window, and other `PYTHON*` variables. `docs/TRAY.md` gives the
+operator's remedy.
 
-Shipping a hand start that carries `-E` was rejected. A GUI-script launcher passes no interpreter
-options: the installer writes its first line from the interpreter's path. A documented command
+Shipping a hand start that carries `-E` was rejected. The project cannot add `-E` to the
+`messagefoundry-tray` launcher: pip writes the interpreter line from the interpreter's path alone,
+and a `[project.gui-scripts]` entry names only a function. A documented command
 to type instead, such as `pythonw -E -P -m messagefoundry.tray`, would not match the login
 command, which also turns remote debugging off, uses the bootstrap script in a checkout, and adds
 `-s` where `PYTHONNOUSERSITE` is set. Start at Login already writes the right command for the

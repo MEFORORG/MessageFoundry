@@ -44,8 +44,10 @@ your environment sets `PYTHONFAULTHANDLER` or `PYTHONDEVMODE`, at least. All thr
 `pythonw.exe` without `-E`, and a start with no stderr then stops before any tray code runs. To
 get past it, start the tray once from a terminal with those variables cleared, for example
 `$env:PYTHONFAULTHANDLER = $null; $env:PYTHONDEVMODE = $null; messagefoundry-tray`, and turn on
-**Start at Login**, whose command carries `-E`. `docs/DANGEROUS-FUNCTIONALITY.md` section 3 gives
-the measurement and what it did not cover.
+**Start at Login**, whose command carries `-E`. A start from Explorer or the Start menu keeps
+failing while the variables stay in your user environment, and so does every start where Start at
+Login is refused for its length; remove the variables there to fix those starts.
+`docs/DANGEROUS-FUNCTIONALITY.md` section 3 gives the measurement and what it did not cover.
 
 To **start it automatically at login**, use the tray's **Start at Login** menu item (opt-in, off by
 default). It writes an `HKCU\…\Run` entry pinning the absolute `pythonw.exe` you launched with, so it

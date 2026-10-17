@@ -15,7 +15,6 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -40,8 +39,8 @@ _STAND_IN_SOURCE = (
     ".write_text(repr(sys.stderr is None), encoding='utf-8')\n"
 )
 
-#: Each start's own budget. The per-test pytest timeout is 60 s, and a test makes three starts.
-_START_TIMEOUT_S = 15.0
+#: Each start's own budget. A test makes three starts, inside its own 120 s pytest timeout.
+_START_TIMEOUT_S = 30
 
 #: The outcomes a start can have: the stand-in did not run, or it ran with or without a stderr.
 _DID_NOT_RUN, _RAN_WITH_NO_STDERR, _RAN_WITH_A_STDERR = "did not run", "no stderr", "a stderr"
@@ -62,18 +61,15 @@ def _gui_script_launcher(tmp_path: Path, pythonw: str) -> str:
         pytest.skip("pip's distlib is not installed here, so no launcher can be written")
     target = tmp_path / "launcher"
     target.mkdir()
+    # No ``executable``, as pip sets none: distlib derives the GUI interpreter from sys.executable.
     maker = ScriptMaker(None, str(target))
-    # Given python.exe, as pip gives it; for a GUI script distlib names pythonw.exe in the shebang.
-    # distlib's class attribute is a bare ``executable = None``, so mypy infers ``None`` for it.
-    maker.executable = str(Path(pythonw).with_name("python.exe"))  # type: ignore[assignment]
     maker.variants = {""}
     # The template's whole body is the stand-in, so the launcher imports nothing of ours.
     maker.script_template = _STAND_IN_SOURCE
     made = maker.make(f"{_STAND_IN} = unused:unused", options={"gui": True})
     exe = next((p for p in made if p.lower().endswith(".exe")), None)
     assert exe is not None, f"ScriptMaker wrote no launcher: {made}"
-    shebang = b"#!" + os.fsencode(pythonw) + b"\n"
-    assert shebang in Path(exe).read_bytes(), "the launcher does not start this pythonw.exe"
+    assert os.fsencode(pythonw) in Path(exe).read_bytes(), "the launcher names another pythonw"
     return exe
 
 
@@ -86,9 +82,13 @@ def _environment(marker: Path, variable: str | None) -> dict[str, str]:
     return env
 
 
-def _outcome(marker: Path) -> str:
+def _outcome(marker: Path, returncode: int, what: object) -> str:
+    """What the stand-in did, read from its marker once the start has exited. The exit code must
+    agree: 1 where the stand-in did not run, 0 where it did."""
     if not marker.is_file():
+        assert returncode == 1, f"{what} exited {returncode} without running"
         return _DID_NOT_RUN
+    assert returncode == 0, f"{what} ran and exited {returncode}"
     return (
         _RAN_WITH_NO_STDERR if marker.read_text(encoding="utf-8") == "True" else _RAN_WITH_A_STDERR
     )
@@ -97,9 +97,8 @@ def _outcome(marker: Path) -> str:
 def _run(command: list[str], cwd: Path, variable: str | None, *, inherit: bool) -> str:
     """Start ``command`` and wait for it. With ``inherit`` False no standard handle reaches it, as
     from a Run value; with it True the child inherits this process's handles, as from a terminal
-    that hands its own on. The exit code must agree with the marker."""
+    that hands its own on."""
     marker = cwd / "marker.txt"
-    marker.unlink(missing_ok=True)
     done = subprocess.run(  # noqa: S603 - this interpreter, our own command line
         command,
         cwd=cwd,
@@ -108,32 +107,59 @@ def _run(command: list[str], cwd: Path, variable: str | None, *, inherit: bool) 
         timeout=_START_TIMEOUT_S,
         check=False,
     )
-    outcome = _outcome(marker)
-    if outcome == _DID_NOT_RUN:
-        assert done.returncode == 1, f"{command} exited {done.returncode} without running"
-    else:
-        assert done.returncode == 0, f"{command} ran and exited {done.returncode}"
-    return outcome
+    return _outcome(marker, done.returncode, command)
+
+
+#: Run by this interpreter: open argv[1] through ShellExecuteExW in folder argv[2], wait for the
+#: process it starts, and print its exit code. The struct is the one ``service.py`` already uses.
+_SHELL_EXECUTE_SOURCE = f"""
+import ctypes, sys
+from ctypes import wintypes
+from messagefoundry.service import _SHELLEXECUTEINFOW
+shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+shell32.ShellExecuteExW.argtypes = (ctypes.c_void_p,)
+shell32.ShellExecuteExW.restype = wintypes.BOOL
+kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+kernel32.WaitForSingleObject.restype = wintypes.DWORD
+kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, wintypes.LPDWORD)
+kernel32.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
+kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+info = _SHELLEXECUTEINFOW()
+info.cbSize = ctypes.sizeof(info)
+info.fMask = 0x40  # SEE_MASK_NOCLOSEPROCESS, so the start's process handle comes back
+info.lpFile = sys.argv[1]
+info.lpDirectory = sys.argv[2]
+info.nShow = 1
+if not shell32.ShellExecuteExW(ctypes.byref(info)) or not info.hProcess:
+    sys.exit(f"ShellExecuteExW failed: {{ctypes.get_last_error()}}")
+try:
+    if kernel32.WaitForSingleObject(info.hProcess, {(_START_TIMEOUT_S - 5) * 1000}) != 0:
+        kernel32.TerminateProcess(info.hProcess, 99)
+        sys.exit("the start did not exit in time")
+    code = wintypes.DWORD()
+    kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(code))
+    print(code.value)
+finally:
+    kernel32.CloseHandle(info.hProcess)
+"""
 
 
 def _shell_execute(launcher: str, cwd: Path, variable: str | None) -> str:
-    """Start ``launcher`` through ShellExecute (``os.startfile``), from a child that carries the
-    environment, and wait for the marker. ShellExecute gives no exit code, so a start that did not
-    run is told by the marker's absence after the wait; the control shows the wait is long enough."""
+    """Start ``launcher`` through ShellExecuteExW, from a child that carries the environment.
+    ShellExecute passes no standard handles on; the child's own are pipes, so it has a stderr
+    whatever the variable."""
     marker = cwd / "marker.txt"
-    marker.unlink(missing_ok=True)
-    subprocess.run(  # noqa: S603 - this interpreter, our own command line
-        [sys.executable, "-c", "import os, sys; os.startfile(sys.argv[1], cwd=sys.argv[2])"]
-        + [launcher, str(cwd)],
+    done = subprocess.run(  # noqa: S603 - this interpreter, our own command line
+        [sys.executable, "-c", _SHELL_EXECUTE_SOURCE, launcher, str(cwd)],
         env=_environment(marker, variable),
+        capture_output=True,
+        text=True,
         timeout=_START_TIMEOUT_S,
-        check=True,
+        check=False,
     )
-    deadline = time.monotonic() + _START_TIMEOUT_S
-    while not marker.is_file() and time.monotonic() < deadline:
-        time.sleep(0.2)
-    time.sleep(0.2)  # the stand-in may still be writing
-    return _outcome(marker)
+    assert done.returncode == 0, done.stderr
+    return _outcome(marker, int(done.stdout), f"ShellExecute of {launcher}")
 
 
 def _gui_script(tmp_path: Path, variable: str | None) -> str:
@@ -163,7 +189,7 @@ def test_a_hand_start_with_no_stderr_does_not_run_under_either_variable(
     tmp_path: Path, start: Callable[[Path, str | None], str]
 ) -> None:
     """Vault BACKLOG #2914: a hand start that has no stderr does not run the stand-in under either
-    variable, and runs it under neither. ``docs/DANGEROUS-FUNCTIONALITY.md`` section 3 rests on
+    variable, and runs it when neither is set. ``docs/DANGEROUS-FUNCTIONALITY.md`` section 3 rests on
     this test. Each fresh ``tmp_path`` subfolder holds one start, so no state carries over.
 
     Skipped where the control shows the stand-in had a stderr anyway: such a host cannot show the
