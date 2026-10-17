@@ -339,11 +339,15 @@ an unrelated PR without turning the gate red.
 `postgres store (windows-2025)` (job `postgres-store-windows` in `ci.yml`) run the same Postgres
 store test files as `postgres store`, on hosted Windows, the only supported v1 deployment platform.
 They use the PostgreSQL that the runner image preinstalls: 14 on windows-2022 and 17 on
-windows-2025 at the time of writing, against 16 on the ubuntu leg. They run on the same triggers as
-`postgres store`, on this repository only. **They are not required, and `CI gate` does not `need`
-them, so a red there blocks no merge.** A red one still turns the workflow run red, so a red nightly
-opens the usual `nightly-notice.yml` issue. `tests/test_ci_postgres_windows_leg.py` pins both
-halves and keeps their test files equal to the ubuntu leg's. Making them blocking is a decision
+windows-2025 at the time of writing, against 16 on the ubuntu leg. They run on a pull request that
+touches the server-DB paths, nightly and on dispatch, on this repository only, and not in the merge
+queue. **They are not required, and `CI gate` does not `need` them, so a red there blocks no
+merge.** That is deliberate: the leg is new, runs on an unpinned runner image, and has no run
+history to judge a red against, so it reports and is read rather than gating. In the queue it could
+stop nothing and would take Windows runners from the required `test` legs, so it does not run
+there. A red one still turns the workflow run red, so a red nightly opens the usual
+`nightly-notice.yml` issue. `tests/test_ci_postgres_windows_leg.py` pins all of this and keeps the
+leg's test files and their env equal to the ubuntu leg's. Making the leg blocking is a decision
 that moves that test.
 
 There is no SQL Server leg on hosted Windows. The runner images ship no SQL Server instance, and
