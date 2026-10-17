@@ -27,17 +27,20 @@ import errno
 import hashlib
 import os
 import stat
+from collections.abc import Mapping
 from pathlib import Path
 
 from messagefoundry.credential import constant_time_equal
 
 __all__ = [
     "FINGERPRINT_SCHEME",
+    "UNREADABLE_FILES_KEY",
     "ConfigDirMissing",
     "config_fingerprint",
     "config_fingerprint_detail",
     "fingerprint_matches",
     "is_missing_directory",
+    "whole_fingerprint",
 ]
 
 # Version the scheme so a future change to *what* is hashed (or *how*) is itself detectable in the
@@ -51,6 +54,12 @@ _SCHEME = b"mefor-cfg-fp:v2\n"
 #: one only when the tags match, so a change to what is hashed reads as "not comparable" rather than
 #: as a changed config (vault BACKLOG #2597).
 FINGERPRINT_SCHEME = _SCHEME.decode("ascii").strip()
+
+#: The :func:`config_fingerprint_detail` key that marks a partial digest: how many covered files, or
+#: folders a glob reads, could not be read and were left out (vault BACKLOG #2944). Absent when the
+#: digest covers the whole bundle. Not ``degraded``: an audit row merges this detail into its own,
+#: and there ``degraded`` already names failed reload steps.
+UNREADABLE_FILES_KEY = "unreadable_files"
 
 # Every file ``load_config`` consumes that defines the running graph's behaviour, transport config,
 # or reference data. Globs are relative to the config dir. The config modules themselves are not a
@@ -92,37 +101,49 @@ def is_missing_directory(exc: OSError) -> bool:
     )
 
 
-def _iter_entries(base: Path, *, strict: bool = False) -> list[tuple[str, bytes]]:
+def _iter_entries(base: Path, *, strict: bool, unreadable: set[str]) -> list[tuple[str, bytes]]:
     """Return ``(posix-relpath, sha256(content))`` for every fingerprinted file, sorted.
 
     Sorting by relpath makes the fold order-independent (filesystem enumeration order can vary);
     keying on the *relative* path (not absolute) makes the digest location-independent, so two
-    byte-identical bundles at different paths fingerprint identically. An unreadable file is
-    skipped rather than crashing the audit it feeds, unless ``strict`` (see
-    :func:`config_fingerprint`).
+    byte-identical bundles at different paths fingerprint identically. A file that cannot be stat'ed
+    or read, and a folder a glob reads that cannot be listed, raises when ``strict`` (see
+    :func:`config_fingerprint`); otherwise it is left out and added to ``unreadable``, so a caller
+    can tell a digest of the whole bundle from one of part of it (vault BACKLOG #2944).
     """
     # Lazy: wiring is the loader, and this module stays importable without pulling it in at import time.
     from messagefoundry.config.wiring import config_py_files
 
-    if strict:
+    try:
         _require_listable(base)
+    except ConfigDirMissing:
+        if strict:
+            raise
+        # Not strict: a missing directory digests as an empty bundle, as it always has.
+    except OSError as exc:
+        if strict:
+            raise
+        unreadable.add(exc.filename if isinstance(exc.filename, str) else str(base))
     seen: set[Path] = set()
     entries: list[tuple[str, bytes]] = []
     globbed = (path for pattern in _FINGERPRINT_GLOBS for path in base.glob(pattern))
     for path in [*config_py_files(base), *globbed]:
-        if not _is_file(path, strict=strict):
-            continue
-        resolved = path.resolve()
-        if resolved in seen:
-            continue
-        seen.add(resolved)
+        rel = path.relative_to(base).as_posix()
         try:
+            # A stat that fails for any reason but absence is an unreadable file, not a missing
+            # one: Path.is_file would answer False and the file would drop out unremarked.
+            if not _is_file(path):
+                continue
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
             data = path.read_bytes()
         except OSError:
             if strict:
                 raise
+            unreadable.add(rel)
             continue
-        rel = path.relative_to(base).as_posix()
         entries.append((rel, hashlib.sha256(data).digest()))
     entries.sort()
     return entries
@@ -157,12 +178,10 @@ def _require_listable(base: Path) -> None:
                 raise
 
 
-def _is_file(path: Path, *, strict: bool) -> bool:
+def _is_file(path: Path) -> bool:
     """Whether ``path`` is a regular file, following links. ``Path.is_file`` answers ``False`` for a
-    path it cannot stat, so ``strict`` stats it instead and raises that error. A path that is gone
-    (a dangling link, or a file removed since the listing) is not a file either way."""
-    if not strict:
-        return path.is_file()
+    path it cannot stat, so this stats it instead and raises that error. A path that is gone (a
+    dangling link, or a file removed since the listing) is not a file."""
     try:
         return stat.S_ISREG(path.stat().st_mode)
     except FileNotFoundError:
@@ -191,7 +210,7 @@ def config_fingerprint(directory: str | Path, *, strict: bool = False) -> str:
     the approval never covered, so ``strict`` raises instead: :class:`ConfigDirMissing` when
     ``directory`` is not a directory, and the ``OSError`` when a folder it reads cannot be listed or
     a file it covers cannot be stat'ed or read."""
-    return _fold(_iter_entries(Path(directory), strict=strict))
+    return _fold(_iter_entries(Path(directory), strict=strict, unreadable=set()))
 
 
 def config_fingerprint_detail(directory: str | Path) -> dict[str, object]:
@@ -201,18 +220,39 @@ def config_fingerprint_detail(directory: str | Path) -> dict[str, object]:
     be read purely from files; it is advisory provenance, not the integrity anchor (the content
     ``fingerprint`` is). Keys: ``fingerprint`` (str), ``scheme`` (str, :data:`FINGERPRINT_SCHEME`),
     ``files`` (int), and optionally ``git_head``.
+
+    It stays best-effort: a file it cannot read is left out of the digest. But it says so, under
+    :data:`UNREADABLE_FILES_KEY` (the count of files and folders left out), present only when one
+    was. A digest of part of a bundle is no record of the bundle: a file held by an antivirus lock
+    at one start and not at the next gives two digests for the same bytes, so a reader that
+    compares digests passes over a partial one (vault BACKLOG #2944). The strict digest a
+    dual-control approval binds is :func:`config_fingerprint` with ``strict``, which raises instead.
     """
     base = Path(directory)
-    entries = _iter_entries(base)
+    unreadable: set[str] = set()
+    entries = _iter_entries(base, strict=False, unreadable=unreadable)
     detail: dict[str, object] = {
         "fingerprint": _fold(entries),
         "scheme": FINGERPRINT_SCHEME,
         "files": len(entries),
     }
+    if unreadable:
+        detail[UNREADABLE_FILES_KEY] = len(unreadable)
     head = _git_head(base)
     if head is not None:
         detail["git_head"] = head
     return detail
+
+
+def whole_fingerprint(detail: Mapping[str, object] | None) -> str | None:
+    """The ``fingerprint`` of a :func:`config_fingerprint_detail`, or ``None`` when there is none or
+    it left out a file it could not read (:data:`UNREADABLE_FILES_KEY`). A partial digest is no
+    record of the bundle, so a reader that compares digests treats it as absent (vault BACKLOG
+    #2944)."""
+    if detail is None or detail.get(UNREADABLE_FILES_KEY):
+        return None
+    fingerprint = detail.get("fingerprint")
+    return fingerprint if isinstance(fingerprint, str) and fingerprint else None
 
 
 def fingerprint_matches(current: object, loaded: str) -> bool:

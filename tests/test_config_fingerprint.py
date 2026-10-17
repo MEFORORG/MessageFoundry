@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.fingerprint import (
+    UNREADABLE_FILES_KEY,
     ConfigDirMissing,
     config_fingerprint,
     config_fingerprint_detail,
@@ -225,3 +226,49 @@ def test_strict_refuses_a_folder_it_cannot_list(
     monkeypatch.undo()
     shutil.rmtree(d / "codesets")
     assert config_fingerprint(d, strict=True) != readable  # the control: absent, not refused
+
+
+# --- vault BACKLOG #2944: the observational digest says when it left something out --------------
+
+
+@pytest.mark.parametrize("name", ["cfg.py", "dev.toml"])
+def test_the_detail_marks_a_digest_that_left_out_a_file_it_could_not_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """An antivirus lock at one start and not the next gave two digests for the same bytes, and
+    nothing in the detail said the first covered only part of the bundle."""
+    d = tmp_path / "cfg"
+    _bundle(d)
+    assert UNREADABLE_FILES_KEY not in config_fingerprint_detail(d), "control: a whole bundle"
+    _unreadable(monkeypatch, name)
+    detail = config_fingerprint_detail(d)
+    assert detail[UNREADABLE_FILES_KEY] == 1
+    # Still best-effort: the rest is digested, as config_fingerprint's default does.
+    assert detail["files"] == 4 and detail["fingerprint"] == config_fingerprint(d)
+
+
+def test_the_detail_marks_a_digest_whose_folder_could_not_be_listed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    d = tmp_path / "cfg"
+    _bundle(d)
+    real_scandir = os.scandir
+
+    def _scandir(path: Any) -> Any:
+        if Path(path).name == "codesets":
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", _scandir)
+    assert config_fingerprint_detail(d)[UNREADABLE_FILES_KEY] == 1
+    monkeypatch.undo()
+    shutil.rmtree(d / "codesets")
+    # The control: a folder that is absent left nothing out.
+    assert UNREADABLE_FILES_KEY not in config_fingerprint_detail(d)
+
+
+def test_the_detail_of_a_missing_directory_is_an_empty_bundle_and_not_partial(
+    tmp_path: Path,
+) -> None:
+    detail = config_fingerprint_detail(tmp_path / "gone")
+    assert detail["files"] == 0 and UNREADABLE_FILES_KEY not in detail
