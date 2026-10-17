@@ -486,6 +486,11 @@ def _sddl_of(path: Path, scratch: Path) -> str:
     return [line for line in text.splitlines() if line.strip()][1]
 
 
+def _harden(path: Path, grant: str) -> None:
+    """Strip ``path``'s inherited entries and grant this account only ``grant`` (F or R)."""
+    _win_run("icacls.exe", str(path), "/inheritance:r", "/grant:r", f"*{_own_sid()}:{grant}")
+
+
 @_WINDOWS_ACLS
 @pytest.mark.parametrize("command", _OUT_COMMANDS)
 def test_out_keeps_the_access_list_of_a_hardened_target_on_windows(
@@ -497,7 +502,7 @@ def test_out_keeps_the_access_list_of_a_hardened_target_on_windows(
     out = tmp_path / "out.json"
     # Longer than any output, so a write that skipped the truncate would leave stale bytes behind.
     out.write_text("stale\n" * 4000, encoding="utf-8")
-    _win_run("icacls.exe", str(out), "/inheritance:r", "/grant:r", f"*{_own_sid()}:F")
+    _harden(out, "F")
     hardened = _sddl_of(out, scratch)
     sibling = tmp_path / "fresh.json"
     sibling.write_text("x\n", encoding="utf-8")
@@ -512,8 +517,9 @@ def test_out_keeps_the_access_list_of_a_hardened_target_on_windows(
     assert not list(tmp_path.glob("*.tmp"))
 
 
-def test_out_replaces_a_second_hard_link(tmp_path: Path) -> None:
-    # Writing in place through a name with a second link would also rewrite the other name.
+@_POSIX_MODES
+def test_out_replaces_a_second_hard_link_on_posix(tmp_path: Path) -> None:
+    # On POSIX an existing name is replaced, so a second link to the old file is left as it was.
     other = tmp_path / "elsewhere.json"
     other.write_text("untouched\n", encoding="utf-8")
     out = tmp_path / "out.json"
@@ -524,36 +530,79 @@ def test_out_replaces_a_second_hard_link(tmp_path: Path) -> None:
 
 
 @_WINDOWS_ACLS
-def test_out_is_refused_when_the_name_changes_while_it_is_opened_on_windows(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("command", _OUT_COMMANDS)
+def test_out_through_a_second_hard_link_keeps_the_hardened_access_list_on_windows(
+    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The lstat names one file and the open reaches another, as a name swapped for a link between
-    # the two would: nothing is written and the command fails with its error line.
+    # write_text on main wrote a hard-linked name in place, so both names see the new content and
+    # the one file keeps its list. A replace would give the --out name the folder's list instead.
+    scratch = tmp_path / "acl"
+    other = tmp_path / "elsewhere.json"
+    other.write_text("stale\n", encoding="utf-8")
     out = tmp_path / "out.json"
-    out.write_text("untouched\n", encoding="utf-8")
-    decoy = tmp_path / "decoy.json"
-    decoy.write_text("x\n", encoding="utf-8")
-    real_lstat = os.lstat
-    monkeypatch.setattr(
-        os,
-        "lstat",
-        lambda path, *a, **k: real_lstat(decoy if str(path) == str(out) else path, *a, **k),
-    )
-    assert _export_to(tmp_path, out) == 1
-    assert "error: could not write the export" in capsys.readouterr().err
-    assert out.read_text(encoding="utf-8") == "untouched\n"
+    os.link(other, out)
+    _harden(out, "F")
+    hardened = _sddl_of(out, scratch)
+    assert os.stat(out).st_nlink == 2  # control: the target really has a second link
+    assert _write_out(command, tmp_path, monkeypatch, out) == 0
+    assert _sddl_of(out, scratch) == hardened
+    data = out.read_bytes()
+    assert other.read_bytes() == data
+    assert b"stale" not in data
+    assert data.endswith(b"}\n")
+    assert b"\r\n" not in data
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except OSError as exc:  # no SeCreateSymbolicLinkPrivilege and no Developer Mode
+        pytest.skip(f"this account cannot create symlinks: {exc}")
 
 
 @_WINDOWS_ACLS
+@pytest.mark.parametrize("command", _OUT_COMMANDS)
+def test_out_through_a_symlink_keeps_the_hardened_target_on_windows(
+    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # write_text on main wrote THROUGH the link: the link stays a link and its hardened target
+    # gets the content with its list kept. A replace would put a regular file at the link's name.
+    scratch = tmp_path / "acl"
+    target = tmp_path / "hardened.json"
+    target.write_text("stale\n", encoding="utf-8")
+    _harden(target, "F")
+    hardened = _sddl_of(target, scratch)
+    out = tmp_path / "out.json"
+    _symlink_or_skip(out, target)
+    assert _write_out(command, tmp_path, monkeypatch, out) == 0
+    assert out.is_symlink()
+    assert _sddl_of(target, scratch) == hardened
+    data = target.read_bytes()
+    assert b"stale" not in data
+    assert data.endswith(b"}\n")
+    assert b"\r\n" not in data
+
+
+@_WINDOWS_ACLS
+@pytest.mark.parametrize("linked", [False, True], ids=["plain", "second-hard-link"])
 def test_out_refuses_a_target_hardened_against_this_account_writing_on_windows(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    linked: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     # A replace could still swap a read-only file out through the folder's grant, trading its list
-    # for the folder's. It is an error instead, and the file is left as it was.
+    # for the folder's. It is an error instead, and the file is left as it was, whether or not the
+    # name is one of two hard links to it.
     scratch = tmp_path / "acl"
     out = tmp_path / "out.json"
-    out.write_text("untouched\n", encoding="utf-8")
-    _win_run("icacls.exe", str(out), "/inheritance:r", "/grant:r", f"*{_own_sid()}:R")
+    if linked:
+        other = tmp_path / "elsewhere.json"
+        other.write_text("untouched\n", encoding="utf-8")
+        os.link(other, out)
+    else:
+        out.write_text("untouched\n", encoding="utf-8")
+    _harden(out, "R")
     hardened = _sddl_of(out, scratch)
     assert _export_to(tmp_path, out) == 1
     assert "error: could not write the export" in capsys.readouterr().err

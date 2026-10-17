@@ -486,35 +486,35 @@ def _write_owner_only(path: str, text: str) -> None:
     Newlines are written as LF on every platform. The text layer's default would write CRLF on
     Windows, and the dataset is JSONL that the harness corpus reads back line by line.
 
-    The report is written to a NEW file that ``mkstemp`` creates exclusively at 0600 in the same
-    directory, flushed to disk, then renamed over ``path``. On POSIX a regular file already at
-    ``path``, or a link, is replaced rather than written into, so neither its owner nor its mode
-    carries over, and a reader holding the old file open keeps the old contents. A failed write
-    leaves no temp file. Windows writes an existing regular file in place instead; see below.
+    A ``path`` that does not exist, on any platform, is created as a NEW file that ``mkstemp``
+    creates exclusively at 0600 in the same directory, flushed to disk, then renamed to ``path``.
+    A failed write leaves no temp file. On Windows the 0600 mode means nothing and the new file
+    takes its directory's access list, the stance :mod:`tee.store` takes for the capture DB; the
+    tee imports nothing from ``messagefoundry``, so the engine's ``restricted_file`` is out of reach.
 
-    One exception: a stream the caller named on purpose, such as ``/dev/stdout`` or a shell's
-    ``>(...)``, is written through, since replacing it would break it and nothing is created there.
-    That covers a character device, and a pipe or socket this account owns; any other non-regular
-    file falls to the replace.
+    On POSIX an existing ``path`` gets the same treatment: a regular file, or a link, is replaced
+    rather than written into, so neither its owner nor its mode carries over, and a reader holding
+    the old file open keeps the old contents. One exception: a stream the caller named on purpose,
+    such as ``/dev/stdout`` or a shell's ``>(...)``, is written through, since replacing it would
+    break it and nothing is created there. That covers a character device, and a pipe or socket
+    this account owns; any other non-regular file falls to the replace.
 
-    Windows has no POSIX mode, and the tee imports nothing from ``messagefoundry``, so the engine's
-    ``restricted_file`` is out of reach. A NEW file there takes its directory's access list, the
-    stance :mod:`tee.store` takes for the capture DB. An existing regular file is instead written in
-    place, so its access list and owner are kept: a file renamed over it would take the folder's
-    list, and a hardened export or dataset in a looser folder would lose its hardening. (``export``
-    and ``anonymize-captures`` wrote in place through ``write_text`` before vault BACKLOG #3166;
-    ``compare`` had replaced its file since #2792, and on Windows now writes in place too.) The
-    list is kept whatever it holds, so a target looser than its folder stays looser, and a file
-    another account created stays that account's. A target this account may not write is an
-    error, never replaced. The write is not atomic: an OSError part way leaves the file truncated
-    or partly written, and the command prints its error line and exits 1; an interruption leaves
-    it the same way. :func:`_write_in_place_on_windows` says which files fall to the replace.
+    On Windows an existing ``path`` of any kind -- a regular file, one with a second hard link, a
+    symlink, even a dangling one -- is opened with ``open(path, "w")``, as ``write_text`` did for
+    ``export`` and ``anonymize-captures`` on main before #3166, and written through the name as that
+    open resolves it. A renamed-in file would take the folder's access list, so a hardened export,
+    dataset or report in a looser folder would lose its hardening; written in place, the file keeps
+    its access list and owner, and a link's target is the file written. (``compare`` had replaced
+    its file since #2792; on Windows it now writes in place like the other two.) A target this
+    account may not write, a read-only one included, raises, and the command prints its error line
+    and exits 1; it never falls back to a replace. Two known properties match ``write_text`` on
+    main and are not new: the list is kept whatever it holds, so a target another account
+    pre-created stays that account's, with its access list, and the write is not atomic, so an
+    OSError or an interruption part way would leave the file truncated or partly written.
     """
-    if _is_named_stream(path):
+    if (os.name == "nt" and os.path.lexists(path)) or _is_named_stream(path):
         with open(path, "w", encoding="utf-8", newline="\n") as stream:
             stream.write(text)
-        return
-    if os.name == "nt" and _write_in_place_on_windows(path, text):
         return
     target = Path(path)
     fd, temp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
@@ -532,50 +532,6 @@ def _write_owner_only(path: str, text: str) -> None:
     except BaseException:
         Path(temp).unlink(missing_ok=True)
         raise
-
-
-_REPARSE_TAG_NAME_SURROGATE = 0x20000000  # IsReparseTagNameSurrogate: a symlink or mount point
-
-
-def _write_in_place_on_windows(path: str, text: str) -> bool:
-    """Write ``text`` into the existing regular file at ``path``, keeping its access list.
-
-    ``False``, having written nothing, when ``path`` is missing, is not a regular file, is a link
-    or junction (a name-surrogate reparse point), or has a second hard link; the caller then
-    replaces it. A file this account may not open for writing raises, so its access list is never
-    traded for the folder's. The file is opened without truncating and checked against the name's
-    ``lstat`` before a byte is written. A name swapped for a link in between is still opened
-    through that link, with whatever an open of its target does (a remote share's sign-in, say),
-    but nothing is written to it: the check raises before the truncate.
-    """
-    try:
-        named = os.lstat(path)
-    except FileNotFoundError:
-        return False
-    # Only a name surrogate points somewhere else. A dedup or compressed file carries another tag
-    # and is still the file at this name.
-    surrogate = getattr(named, "st_reparse_tag", 0) & _REPARSE_TAG_NAME_SURROGATE
-    if not stat.S_ISREG(named.st_mode) or surrogate or named.st_nlink != 1:
-        return False
-    data = text.encode("utf-8")  # before the open, so a failure here leaves the old file whole
-    try:
-        fd = os.open(path, os.O_WRONLY | getattr(os, "O_BINARY", 0))
-    except FileNotFoundError:
-        return False  # gone since the lstat: nothing to keep, so create it
-    try:
-        handle = os.fdopen(fd, "wb")
-    except BaseException:
-        os.close(fd)  # nothing owns the descriptor yet
-        raise
-    with handle:
-        opened = os.fstat(handle.fileno())
-        if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino) or opened.st_nlink != 1:
-            raise OSError(f"{path} changed while it was being opened; nothing was written")
-        handle.truncate(0)
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
-    return True
 
 
 def _is_named_stream(path: str) -> bool:
