@@ -89,7 +89,24 @@ def test_it_refuses_a_checkout_that_is_not_this_project(tmp_path: Path) -> None:
     assert "not a messagefoundry checkout" in (proc.stderr + proc.stdout).lower()
 
 
-def _venv_checkout(tmp_path: Path) -> tuple[Path, Path]:
+@pytest.fixture(scope="session")
+def _template_venv(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """One REAL venv with no pip, built once per session; each test gets its own copy of it.
+
+    Building one takes seconds. A Windows venv's launcher finds the ``pyvenv.cfg`` beside it, so a
+    copied tree is a working venv of its own, and no test can change another's."""
+    venv = tmp_path_factory.mktemp("template") / ".venv"
+    subprocess.run(
+        [sys.executable, "-m", "venv", "--without-pip", str(venv)],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=180,
+    )
+    return venv
+
+
+def _venv_checkout(tmp_path: Path, template: Path) -> tuple[Path, Path]:
     """A fake checkout holding both import packages, and a REAL venv with no pip in it.
 
     The venv is real because the script asks its interpreter where the packages import from. It has
@@ -102,31 +119,30 @@ def _venv_checkout(tmp_path: Path) -> tuple[Path, Path]:
         (root / name).mkdir()
         (root / name / "__init__.py").write_text(f"# {name} source\n", encoding="utf-8")
     venv = root / ".venv"
-    subprocess.run(
-        [sys.executable, "-m", "venv", "--without-pip", str(venv)],
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=180,
-    )
+    shutil.copytree(template, venv, symlinks=True)
     site = venv / "Lib" / "site-packages"
     (site / "_editable_impl_messagefoundry.pth").write_text(f"{root}\n", encoding="utf-8")
     return root, site
 
 
-def _plant_copy(site: Path, root: Path, name: str, *, stale: bool) -> None:
-    """A non-editable copy of ``name`` in site-packages, which sits ahead of the ``.pth`` root."""
+def _plant_copy(site: Path, root: Path, name: str, *, stale: bool, same_size: bool = False) -> None:
+    """A non-editable copy of ``name`` in site-packages, which sits ahead of the ``.pth`` root.
+
+    With ``same_size`` the stale copy differs by one byte at an unchanged size, so only the
+    byte-for-byte comparison can tell it from the source."""
     (site / name).mkdir()
     body = (root / name / "__init__.py").read_text(encoding="utf-8")
     if stale:
-        body += "# an older build\n"
+        body = body.replace("source", "sourcE") if same_size else body + "# an older build\n"
     (site / name / "__init__.py").write_text(body, encoding="utf-8")
 
 
-def test_it_is_a_no_op_when_both_packages_import_from_the_checkout(tmp_path: Path) -> None:
+def test_it_is_a_no_op_when_both_packages_import_from_the_checkout(
+    tmp_path: Path, _template_venv: Path
+) -> None:
     """IDEMPOTENCE IS THE POINT. A session cannot know whether its worktree already has an
     environment, so this must be safe to run unconditionally at the start of one."""
-    root, _site = _venv_checkout(tmp_path)
+    root, _site = _venv_checkout(tmp_path, _template_venv)
 
     proc = _run("-Path", str(root))
 
@@ -137,9 +153,11 @@ def test_it_is_a_no_op_when_both_packages_import_from_the_checkout(tmp_path: Pat
     assert "reinstalling" not in proc.stdout
 
 
-def test_a_web_console_copy_that_matches_the_source_is_accepted(tmp_path: Path) -> None:
+def test_a_web_console_copy_that_matches_the_source_is_accepted(
+    tmp_path: Path, _template_venv: Path
+) -> None:
     """Every install of the web console is a copy (hatch force-include), so a current one passes."""
-    root, site = _venv_checkout(tmp_path)
+    root, site = _venv_checkout(tmp_path, _template_venv)
     _plant_copy(site, root, "messagefoundry_webconsole", stale=False)
 
     proc = _run("-Path", str(root))
@@ -150,13 +168,15 @@ def test_a_web_console_copy_that_matches_the_source_is_accepted(tmp_path: Path) 
 
 
 @pytest.mark.parametrize("name", ["messagefoundry_webconsole", "messagefoundry"])
-def test_a_stale_copy_shadowing_the_checkout_is_reinstalled(tmp_path: Path, name: str) -> None:
+def test_a_stale_copy_shadowing_the_checkout_is_reinstalled(
+    tmp_path: Path, _template_venv: Path, name: str
+) -> None:
     """BACKLOG #2857. The old script returned once python.exe existed, so a stale copy in
     site-packages went on shadowing the source, and a test read the result as a code defect.
 
     The reinstall is asserted by its attempt. This venv has no pip, so the install line fails, and
     that failure shows the script left the no-op path, after naming the package that sent it."""
-    root, site = _venv_checkout(tmp_path)
+    root, site = _venv_checkout(tmp_path, _template_venv)
     _plant_copy(site, root, name, stale=True)
 
     proc = _run("-Path", str(root))
@@ -168,12 +188,29 @@ def test_a_stale_copy_shadowing_the_checkout_is_reinstalled(tmp_path: Path, name
     assert "No module named pip" in proc.stdout + proc.stderr
 
 
-def test_it_resolves_a_subdirectory_to_the_checkout_root(tmp_path: Path) -> None:
+def test_a_same_size_stale_web_console_copy_is_reinstalled(
+    tmp_path: Path, _template_venv: Path
+) -> None:
+    """Names and sizes match, so only the byte comparison can catch this copy as stale."""
+    root, site = _venv_checkout(tmp_path, _template_venv)
+    name = "messagefoundry_webconsole"
+    _plant_copy(site, root, name, stale=True, same_size=True)
+
+    proc = _run("-Path", str(root))
+
+    assert proc.returncode != 0, proc.stdout
+    assert f"{name} BAD it imports from {site / name}" in proc.stdout
+    assert "No module named pip" in proc.stdout + proc.stderr
+
+
+def test_it_resolves_a_subdirectory_to_the_checkout_root(
+    tmp_path: Path, _template_venv: Path
+) -> None:
     """Run from a subdirectory it must find the checkout root, not create a stray .venv there.
 
     Asserted through the no-op path so the test stays free of an install: the venv it reports as
     already present is the ROOT's, which is only reachable if the resolution worked."""
-    root, _site = _venv_checkout(tmp_path)
+    root, _site = _venv_checkout(tmp_path, _template_venv)
     sub = root / "messagefoundry" / "store"
     sub.mkdir(parents=True)
 

@@ -77,7 +77,7 @@ $venvPy = Join-Path $venv "Scripts\python.exe"
 # so it shadows the source, and it goes stale the moment the source changes. A copy is accepted only
 # while its files match the source byte for byte; the engine itself must import from the source.
 $importCheck = @'
-import hashlib, importlib.util, os, sys
+import filecmp, importlib.util, os, sys
 
 root = sys.argv[1]
 
@@ -88,9 +88,15 @@ def files(top):
         for n in names:
             if not n.endswith(('.pyc', '.pyo')):
                 p = os.path.join(base, n)
-                with open(p, 'rb') as f:
-                    out[os.path.relpath(p, top)] = hashlib.sha256(f.read()).hexdigest()
+                out[os.path.relpath(p, top)] = os.path.getsize(p)
     return out
+
+# Names and sizes first, which is cheap; then bytes, file by file, stopping at the first difference.
+def same_tree(a, b):
+    fa = files(a)
+    if fa != files(b):
+        return False
+    return all(filecmp.cmp(os.path.join(a, r), os.path.join(b, r), shallow=False) for r in fa)
 
 for name in ('messagefoundry', 'messagefoundry_webconsole'):
     try:
@@ -105,7 +111,7 @@ for name in ('messagefoundry', 'messagefoundry_webconsole'):
     source = os.path.realpath(os.path.join(root, name))
     if os.path.normcase(where) == os.path.normcase(source):
         print(name, 'OK source', where)
-    elif name == 'messagefoundry_webconsole' and files(where) == files(source):
+    elif name == 'messagefoundry_webconsole' and same_tree(where, source):
         print(name, 'OK copy-matching-source', where)
     else:
         print(name, 'BAD it imports from', where, 'which is not', source, 'or a current copy of it')
@@ -117,6 +123,11 @@ function Get-ImportState {
         throw "The venv interpreter could not run the import check (exit $LASTEXITCODE): $($lines -join ' | '). Delete $venv and run this script again."
     }
     return $lines
+}
+
+# The lines of an import state that name a package importing from outside this checkout.
+function Select-Bad([string[]]$State) {
+    return @($State | Where-Object { $_ -match '\A\S+ BAD ' })
 }
 
 # EXTRAS MUST MATCH ci.yml's TEST LEG, and the reason is a FALSE GREEN rather than convenience
@@ -132,7 +143,7 @@ $extras = if ($Sqlserver) { "dev,harness,fhir,dicom,x12,xml,webauthn,vault,sftp,
 
 if (Test-Path -LiteralPath $venvPy) {
     $state = Get-ImportState
-    $bad = @($state | Where-Object { $_ -match '\A\S+ BAD ' })
+    $bad = @(Select-Bad $state)
     if ($bad.Count -eq 0) {
         Write-Host "venv already present and both packages import from this checkout, nothing to do: $venvPy" -ForegroundColor Green
         $state | ForEach-Object { Write-Host "  $_" }
@@ -180,7 +191,7 @@ try {
 }
 
 # The install exits 0 and still proves nothing about where the packages import from; ask again.
-$bad = @(Get-ImportState | Where-Object { $_ -match '\A\S+ BAD ' })
+$bad = @(Select-Bad (Get-ImportState))
 if ($bad.Count -gt 0) { throw "after the install, a package still imports from outside this checkout: $($bad -join ' | ')" }
 
 Write-Host ""

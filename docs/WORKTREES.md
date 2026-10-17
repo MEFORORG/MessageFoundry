@@ -1670,8 +1670,7 @@ whatever matches on the day it runs. Let your shell expand the pattern, and read
 
 ### The checks, in the order the receipt prints them
 
-There are nine: `spelling`, `temp-root`, `exists`, `reparse`, `git`, `cwd`, `sessions`, `idle` and
-`in-use`. The first refusal stops that target.
+The first refusal stops that target.
 
 **What each one refuses is written once, in the comment block at the top of
 [`remove-scratch.ps1`](../scripts/worktree/remove-scratch.ps1)**, under *THE CHECKS*. This page does

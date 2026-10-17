@@ -23,7 +23,7 @@
     and read the dry run first.
 
     THE CHECKS, in the order the receipt prints them. The first refusal stops that target. THIS LIST
-    IS THE ONE SOURCE: docs/WORKTREES.md names the checks and points here, so change them here only.
+    IS THE ONE SOURCE: docs/WORKTREES.md points here without naming them, so change them here only.
 
       spelling    The path must be drive-absolute and spelled plainly. Refused: a UNC or device path,
                   a relative path, a '.' or '..' component, a component ending in a dot or a space
@@ -217,10 +217,7 @@ function Test-BareShape([string[]]$Names) {
 # would pass as ancient. Any stamp before $StampFloor is read as unreadable too: 1980 is the earliest
 # date a FAT or zip (DOS) stamp can hold, so no ordinary copy or extraction writes one earlier.
 #
-# A FUNCTION ON PURPOSE, though Measure-Tree calls it once per entry. Measured 2026-10-16 in pwsh 7:
-# the call adds about 18 microseconds an entry, about 2 seconds per 100,000 entries. Inlining it would
-# write this refusal rule twice, for the root and for each entry, and a safety rule written twice
-# drifts. A scratch tree is rarely that large, so the rule stays in one place.
+# A function, not inlined, so the root and every entry share one refusal rule.
 function Get-NewerStamp($Entry) {
     $made = $null
     $written = $null
@@ -300,7 +297,9 @@ function Remove-TreeNoFollow([string]$Dir, [System.Collections.Generic.List[stri
     catch { $Failures.Add("$Dir ($($_.Exception.Message))") }
 }
 
-# Everything still under $Dir, listed without following a reparse point.
+# Everything still under $Dir, listed without following a reparse point. $null when $Dir itself is
+# gone: a folder that is gone holds nothing, and listing it anyway would count its own could-not-list
+# line as a remaining entry. Gone means the listing said "not found"; any other failure is not gone.
 function Get-Remains([string]$Dir) {
     $out = [System.Collections.Generic.List[string]]::new()
     $stack = [System.Collections.Generic.Stack[string]]::new()
@@ -313,9 +312,14 @@ function Get-Remains([string]$Dir) {
                 if (($e.Attributes -band $DirectoryFlag) -and -not ($e.Attributes -band $ReparseFlag)) { $stack.Push($e.FullName) }
             }
         }
+        catch [IO.DirectoryNotFoundException] {
+            if ($d -eq $Dir) { return $null }
+            $out.Add("$d (could not list: $($_.Exception.Message))")
+        }
         catch { $out.Add("$d (could not list: $($_.Exception.Message))") }
     }
-    return $out
+    # The comma keeps an empty list a list: unrolled, it would come back as $null and read as gone.
+    return , $out
 }
 
 # Whether a directory above a target is a git checkout or a bare repository: the refusal text, or ''.
@@ -330,13 +334,6 @@ function Get-GitShapeAbove([string]$Dir) {
     elseif (Test-BareShape $names) { $why = "the target sits inside the bare git repository at '$Dir'" }
     $gitShapeAbove[$Dir] = $why
     return $why
-}
-
-# True only when listing $Dir fails because it is not there. Any other failure is not "gone".
-function Test-DirectoryGone([string]$Dir) {
-    try { [void][IO.DirectoryInfo]::new($Dir).GetFileSystemInfos(); return $false }
-    catch [IO.DirectoryNotFoundException] { return $true }
-    catch { return $false }
 }
 
 function Test-Inside([string]$Child, [string]$Parent) {
@@ -660,19 +657,15 @@ foreach ($raw in $Path) {
             # on any probe error, and a failure that left nothing behind is still not a clean delete.
             $gone = ($failures.Count -eq 0) -and -not [IO.Directory]::Exists($tomb)
             # What remains is listed whether or not the delete threw: a throw is when it matters most.
-            # A folder that is gone holds nothing. Listing it anyway would count its own could-not-list
-            # line as a remaining entry. Gone means the listing said "not found", not that Exists
-            # said false: Exists also answers false on a probe error.
-            $tombGone = $false
             if (-not $gone) {
-                $tombGone = Test-DirectoryGone $tomb
-                if (-not $tombGone) {
-                    try { $remains = @(Get-Remains $tomb) }
-                    catch { $failures.Add("what remains could not be listed: $($_.Exception.Message)") }
+                $found = @()
+                try { $found = Get-Remains $tomb }
+                catch { $failures.Add("what remains could not be listed: $($_.Exception.Message)") }
+                if ($null -eq $found) { $where = "is gone, but $($failures.Count) failure(s) were recorded on the way" }
+                else {
+                    $remains = @($found)
+                    $where = "holds $($remains.Count) entr$(if ($remains.Count -eq 1) { 'y' } else { 'ies' })"
                 }
-            }
-            if (-not $gone) {
-                $where = if ($tombGone) { "is gone, but $($failures.Count) failure(s) were recorded on the way" } else { "holds $($remains.Count) entr$(if ($remains.Count -eq 1) { 'y' } else { 'ies' })" }
                 $verdict = "PARTIAL $($res.Full): the delete stopped part-way. The tree was renamed to '$tomb', which $where."
                 $counts.partial++
             }
