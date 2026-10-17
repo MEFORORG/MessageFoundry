@@ -14089,11 +14089,12 @@ class SqlServerStore:
         #2592), whose write reads an ``OUTPUT`` rowset and never ``cursor.rowcount`` (BACKLOG
         #2283). ``token_hash`` is ``NVARCHAR(64)`` and a hex digest is exactly 64 chars, so the
         clustered-PK row move is width-safe. The lineage link goes in the same transaction, only
-        when the re-key landed (vault BACKLOG #3028)."""
-        now = time.time() if now is None else now
+        when the re-key landed (vault BACKLOG #3028), its time read then, after any wait for the
+        borrow or the row lock."""
 
         async def _link(cur: Any) -> None:
-            await cur.execute(_SESSION_LINEAGE_INSERT, (token_hash, new_token_hash, now))
+            retired_at = time.time() if now is None else now
+            await cur.execute(_SESSION_LINEAGE_INSERT, (token_hash, new_token_hash, retired_at))
 
         rotated = await self._write_session_txn(
             token_hash, lambda s: replace(s, token_hash=new_token_hash), landed=_link

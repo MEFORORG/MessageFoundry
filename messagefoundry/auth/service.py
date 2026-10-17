@@ -185,11 +185,12 @@ _FACTOR_CEREMONIES: Final = frozenset(
 
 #: Vault BACKLOG #3028: what :attr:`AuthService.supersession_lineage_seconds` adds to the flow TTL
 #: for the sign-in's own work after its last wait. At the federated callback that is the code
-#: exchange and a JWKS refresh, each a blocking call under a 10-second socket timeout; on the
-#: password and directory legs it is the whole request, whose LDAP calls each sit under
-#: ``ad_connect_timeout`` and ``ad_receive_timeout`` (10 seconds by default). A sign-in that runs
-#: past the window is a stated limit in docs/SECURITY.md.
-_LINEAGE_SIGN_IN_SLACK_SECONDS: Final = 60.0
+#: exchange and a JWKS refresh, each under a 10-second socket timeout, then the directory resolve,
+#: whose LDAP calls each sit under ``ad_connect_timeout`` and ``ad_receive_timeout`` (10 seconds
+#: by default), then the store writes before the mint. The password and directory legs are one
+#: request of the same parts. A socket timeout bounds each blocking call, not the whole, so a
+#: sign-in that runs past the window is possible, and docs/SECURITY.md states it as a limit.
+_LINEAGE_SIGN_IN_SLACK_SECONDS: Final = 120.0
 
 
 @cache
@@ -8887,8 +8888,12 @@ class AuthService:
         turn every sign-in into a forced sign-out of every other device.
 
         The prior session may belong to a different user, for example on a shared workstation. It is
-        still ended. Anyone holding that token could already end it with ``POST /auth/logout``, so
-        this grants no new power. The audit row's actor is the session's OWNER, not whoever signed
+        still ended. Anyone holding that LIVE token could already end it with ``POST
+        /auth/logout``, so ending the presented session grants no new power. Following the lineage
+        does grant one, and it is bounded: for :attr:`supersession_lineage_seconds` after an
+        elevation, a holder of the RETIRED token can end the session it became through a sign-in
+        that succeeds, which ``logout`` cannot do. docs/SECURITY.md states it. The audit row's
+        actor is the session's OWNER, not whoever signed
         in: ``/me/security-events`` selects rows by actor, so the event belongs in the feed of the
         user whose session ended, and must not put that user's ids in anyone else's.
 

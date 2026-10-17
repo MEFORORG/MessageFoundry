@@ -233,6 +233,9 @@ async def test_sqlserver_rotate_reads_its_output_rowset_not_the_row_count(
     # #3028), so a refused rotation links nothing.
     links = [sql for sql, _ in seen if sql.startswith("INSERT INTO session_lineage")]
     assert len(links) == (1 if output_rows else 0)
+    # The generic placeholder test never lands a rotation, so the link's binding is checked here.
+    for sql, params in seen:
+        assert sql.count("?") == len(params), f"{len(params)} parameters for:\n{sql}"
 
 
 @pytest.mark.parametrize("revoked", [0, 3])
@@ -255,9 +258,10 @@ async def test_sqlserver_revoke_user_sessions_counts_its_output_rowset(revoked: 
 
 
 async def test_sqlserver_supersede_returns_the_output_row_by_column_name() -> None:
-    """``supersede_session`` reads its ``OUTPUT inserted.*`` row through ``_execute_output``
-    (BACKLOG #2283), which pairs each value with its column name. Read by position instead, a
-    reordered column list would fill the record from the wrong columns."""
+    """``supersede_session`` reads its ``OUTPUT inserted.*`` row through ``_fetch_dicts``, inside
+    its own transaction (BACKLOG #2283, vault BACKLOG #3028), which pairs each value with its column
+    name. Read by position instead, a reordered column list would fill the record from the wrong
+    columns."""
     columns = (
         "user_id",
         "token_hash",

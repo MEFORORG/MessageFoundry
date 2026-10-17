@@ -51,6 +51,9 @@ async def revoke_through_lineage(
     does it read the hash's successor and step to it. So a rotation that commits between a
     ``successor`` read and the next ``revoke`` costs one more step rather than the revoke: the
     re-keyed row's old hash then has a link of its own, written in the rotation's transaction.
+    **That order is the control on Postgres and SQL Server, not the transaction:** under READ
+    COMMITTED a rotation can commit between two steps. Reading the whole chain first and revoking
+    its end afterwards would aim the revoke at a hash such a rotation had already retired.
 
     ``lineage_since`` is the oldest ``retired_at`` a followed link may carry. ``None`` follows no
     link at all, which is the plain revoke of the hash given (BACKLOG #2146's behaviour).
@@ -58,9 +61,9 @@ async def revoke_through_lineage(
     Returns the row it revoked, whose ``token_hash`` is the hash it ended under, or ``None`` when
     the walk reached a hash with no unrevoked row and no live link, or ran out of hops."""
     current = token_hash
-    for _ in range(LINEAGE_MAX_HOPS + 1):
+    for hop in range(LINEAGE_MAX_HOPS + 1):
         ended = await revoke(current)
-        if ended is not None or lineage_since is None:
+        if ended is not None or lineage_since is None or hop == LINEAGE_MAX_HOPS:
             return ended
         following = await successor(current, lineage_since)
         if following is None:

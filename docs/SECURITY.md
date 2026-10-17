@@ -4450,7 +4450,7 @@ engine client (`EngineClient.login`) both name the token they replace in `supers
 client names only a token the engine issued to it, never one adopted with `set_token`.
 
 Every elevation gives a session a new token: completing MFA, a step-up, a passkey ceremony or a
-password re-check. The supersession finds and ends the presented session in one store transaction,
+password re-check. The supersession finds and ends the presented session in one write on its row,
 so an elevation cannot land between the two (BACKLOG #2146). If the supersession runs first, a later
 elevation on that session fails and asks the user to sign in again.
 
@@ -4460,24 +4460,30 @@ elevation in another tab can finish while the sign-in is still in progress, befo
 runs. On federated sign-in that window includes the round trip to the identity provider, because
 the presented token is read on the start leg. The presented token then names no session. So each
 rotation records, in its own store transaction, which token hash replaced the old one, and the
-supersession follows those links, over as many elevations as there were, and ends the session at
-the live end, in the same transaction as the revoke. The audit row names that session and, in a
-`presented` field, the hash the browser presented.
+supersession follows those links, up to 32 elevations in a row, and ends the session at the live
+end, in the same transaction as the revoke. The audit row names that session and, in a `presented`
+field, the hash the browser presented.
 
-The link is followed for a bounded time: `[auth].oidc_flow_ttl_seconds` plus 60 seconds, which is
-360 seconds at the default, and the session reaper deletes older links. **What stays open is outside
-that bound.** A second holder of the same token who completed an elevation longer ago than that, or
-a sign-in that runs past it, leaves the presented token naming no session that is followed, so
-nothing is ended. That session lives on under the token the elevation handed out, until it expires,
-as before this change.
+The link is followed for a bounded time: `[auth].oidc_flow_ttl_seconds` plus 120 seconds, which is
+420 seconds at the default, and the session reaper deletes older links. **At least these cases stay
+open**, and in each the session lives on under the token the elevation handed out, until it expires,
+as before this change:
+
+- an elevation that a second holder of the same token completed longer ago than the bound;
+- a sign-in that runs past the bound, which a slow identity provider or directory can cause, since
+  their timeouts bound each call and not the whole sign-in;
+- more than 32 elevations on one session inside the bound;
+- a wall clock that stepped between the elevation and the sign-in, which moves the bound by the
+  size of the step, in either direction.
 
 **A retired token authenticates nothing.** No session read, the validator included, consults the
 links; the supersession is their one reader. For the length of the bound, a retired token has one
 power: presented at a sign-in that succeeds, it ends the session it became. That power is new, and
 it can only end a session, never open or extend one. Whoever held that token before the elevation
 could already end the session with `POST /auth/logout`; the link lets them do it for the length of
-the bound after the elevation too, and only through a sign-in with a credential that passes. The
-links are not under the session integrity seal (BACKLOG #2592): a forged link can only direct a
+the bound after the elevation too, and only through a sign-in with a credential that passes. A wall
+clock that stepped forward at the elevation, or back before the sign-in, lengthens that time by the
+step; the reaper's clock-step guard covers its own purge, not this. The links are not under the session integrity seal (BACKLOG #2592): a forged link can only direct a
 revoke, and a revoke needs no key on any backend.
 
 A session's `id` is its token hash, and that hash changes whenever the session completes MFA or a

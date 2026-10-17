@@ -6980,7 +6980,7 @@ CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at);
 CREATE TABLE IF NOT EXISTS session_lineage (
     retired_hash   TEXT PRIMARY KEY,           -- the hash the rotation retired
     successor_hash TEXT NOT NULL,              -- the hash the session carried next
-    retired_at     REAL NOT NULL               -- when the rotation committed (wall clock)
+    retired_at     REAL NOT NULL               -- when the re-key landed, in its transaction (wall clock)
 );
 CREATE INDEX IF NOT EXISTS ix_session_lineage_retired ON session_lineage(retired_at);
 
@@ -15856,14 +15856,17 @@ class MessageStore:
         old hash stops resolving in the same transaction. The token hash is sealed, so the re-key
         re-seals (BACKLOG #2592). Reports whether a row was re-keyed so the caller can fail closed
         when the session was revoked out from under it. The lineage link is written in the same
-        transaction, and only when the re-key landed (vault BACKLOG #3028)."""
-        now = time.time() if now is None else now
+        transaction, and only when the re-key landed (vault BACKLOG #3028). Its time is read once
+        the re-key has landed, so a wait for the lock cannot age the link before it exists."""
         async with _writer_txn(self._db, self._lock):
             rotated = await self._write_session(
                 token_hash, lambda s: replace(s, token_hash=new_token_hash)
             )
             if rotated is not None:
-                await self._db.execute(_SESSION_LINEAGE_INSERT, (token_hash, new_token_hash, now))
+                retired_at = time.time() if now is None else now
+                await self._db.execute(
+                    _SESSION_LINEAGE_INSERT, (token_hash, new_token_hash, retired_at)
+                )
             await self._commit()
         return rotated is not None
 

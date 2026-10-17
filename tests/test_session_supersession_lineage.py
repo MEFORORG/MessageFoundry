@@ -21,15 +21,26 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import closing
 from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit
+from uuid import uuid4
 
 import pytest
 
+from messagefoundry.auth import Role
+from messagefoundry.auth.oidc import FederatedPrincipal
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.store.session_lineage import LINEAGE_MAX_HOPS, revoke_through_lineage
 from messagefoundry.store.store import MessageStore, SessionRecord
 from tests._ast_sites import code_names, code_strings, parse_source
-from tests.test_session_supersession import PW, _live, _service, _superseded, _token
+from tests.test_session_supersession import (
+    PW,
+    _live,
+    _oidc_settings,
+    _service,
+    _superseded,
+    _token,
+)
 
 
 @pytest.fixture
@@ -75,6 +86,55 @@ async def test_an_elevation_that_finished_before_the_sign_in_does_not_keep_the_s
             "actor": "op",
         }
     ]
+
+
+async def test_an_elevation_during_the_identity_provider_round_trip_is_followed(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The federated leg, the widest window: the START leg stages the presented hash, an elevation
+    # in another tab rotates the session while the browser is at the identity provider, and the
+    # cookie-less callback supersedes the staged hash. The IdP exchange is replaced at the one seam
+    # the service calls, as tests/test_session_supersession.py does.
+    service = await _service(store, **_oidc_settings())
+    await service.set_ad_group_map([("cn=mf-ops,dc=x", Role.OPERATOR.value)], actor="admin")
+    jdoe_id = uuid4().hex
+    await store.create_user(
+        user_id=jdoe_id,
+        username="jdoe",
+        auth_provider="ad",
+        directory_object_id="guid-jdoe",
+        password_generated=False,
+    )
+    await service.bind_federated_subject(
+        jdoe_id, "S-1-5-21-fed", expected_issuer=None, expected_subject=None, actor="admin"
+    )
+    prior = await _token(service)
+
+    def _exchange(*_a: object, **_k: object) -> FederatedPrincipal:
+        return FederatedPrincipal(
+            username="jdoe",
+            subject="S-1-5-21-fed",
+            issuer="https://idp.example",
+            amr=("pwd", "mfa"),
+            acr=None,
+            expires_at=time.time() + 600,
+            auth_time=time.time(),
+        )
+
+    monkeypatch.setattr(service, "_exchange_and_validate", _exchange)
+    flow_id, url = await service.begin_oidc_login(
+        client=None, public_origin="https://ops.example", prior_session=prior
+    )
+    rotated = await _elevate(service, prior)  # finishes while the browser is at the IdP
+    outcome = await service.complete_oidc_login(
+        flow_id=flow_id,
+        state=dict(parse_qsl(urlsplit(url).query))["state"],
+        code="authcode",
+        client=None,
+        public_origin="https://ops.example",
+    )
+    assert outcome.ok, outcome
+    assert not await _live(service, rotated), "the federated callback did not follow the lineage"
 
 
 async def test_the_link_is_followed_over_several_elevations(store: MessageStore) -> None:
@@ -170,8 +230,10 @@ def _functions_naming_the_lineage(source: str) -> set[str]:
 
 @pytest.mark.parametrize("backend", _BACKENDS)
 def test_only_the_rotation_the_supersession_and_the_purge_touch_the_lineage(backend: str) -> None:
-    # Closing item 2, structurally: no session READ can consult the lineage, on any backend,
-    # because no method but these three names the table or a statement on it.
+    # Closing item 2, structurally, and only this much: in the three backend modules, no method but
+    # these three spells the table, one of its statements or the shared walk in code. A read through
+    # a statement under another name, or from a new module, is outside what this proves; the
+    # behavioural tests above cover the validator itself.
     source = (_STORE_DIR / backend).read_text(encoding="utf-8")
     assert _functions_naming_the_lineage(source) == {
         "rotate_session",

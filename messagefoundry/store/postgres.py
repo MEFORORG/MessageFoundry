@@ -9766,15 +9766,18 @@ class PostgresStore:
 
         The token hash is sealed, so the re-key goes through :meth:`_write_session` (BACKLOG
         #2592). The lineage link goes in the same transaction, only when the re-key landed (vault
-        BACKLOG #3028). The answer is read after the transaction has committed. The borrow is
+        BACKLOG #3028), its time read once the re-key has landed, after any wait for the borrow
+        or the row lock. The answer is read after the transaction has committed. The borrow is
         :meth:`_after_commit_txn`'s, for the reason it gives."""
-        now = time.time() if now is None else now
         async with self._after_commit_txn() as conn:
             rotated = await self._write_session(
                 conn, token_hash, lambda s: replace(s, token_hash=new_token_hash)
             )
             if rotated is not None:
-                await conn.execute(_PG_SESSION_LINEAGE_INSERT, token_hash, new_token_hash, now)
+                retired_at = time.time() if now is None else now
+                await conn.execute(
+                    _PG_SESSION_LINEAGE_INSERT, token_hash, new_token_hash, retired_at
+                )
         return rotated is not None
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None:

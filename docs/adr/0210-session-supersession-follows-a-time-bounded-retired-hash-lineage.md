@@ -44,7 +44,7 @@ and only it, follows those links for a bounded time to the live end and revokes 
    the revoke: its link was written in its own transaction. The walk follows at most 32 links.
 3. **The bound is the caller's, as `lineage_since`**: a link retired before it is not followed. The
    store reads no settings. `AuthService.supersession_lineage_seconds` is
-   `oidc_flow_ttl_seconds` plus 60 seconds, the longest sign-in a rotation can race plus the
+   `oidc_flow_ttl_seconds` plus 120 seconds, the longest sign-in a rotation can race plus the
    callback's own work after it. With no `lineage_since`, `supersede_session` is the plain revoke
    it was, which `_end_lapsed_session` keeps.
 4. **The session reaper purges links past the window**, in the same pass as expired sessions,
@@ -105,4 +105,8 @@ sign-in that succeeds, it ends the session it became. It cannot open or extend o
 **Stated limits** -- An elevation that finished longer ago than the window, such as one a second
 holder of the token completed earlier, is not followed, and neither is a sign-in that runs past the
 window; that session lives on under its new token until it expires. More than 32 links in one
-window ends nothing. The Postgres and SQL Server legs run only on hosted runners.
+window ends nothing. `retired_at` and the bound are both wall-clock readings, so a clock step
+between the elevation and the sign-in moves the bound by the step, either way. The window adds the
+flow TTL even where federated sign-in is off, where every leg is one request; the brief fixed the
+window at no less than the flow TTL, and a narrower one there is open as a refinement. The
+Postgres and SQL Server legs run only on hosted runners.

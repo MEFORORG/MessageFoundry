@@ -2795,7 +2795,8 @@ class AuthStore(Protocol):
         so it must be able to fail closed if the session died underneath it.
 
         **A re-key that lands also records a lineage link, in the SAME transaction** (vault BACKLOG
-        #3028, ADR 0210): ``token_hash`` retired at ``now``, replaced by ``new_token_hash``. The
+        #3028, ADR 0210): ``token_hash`` retired, replaced by ``new_token_hash``, stamped with
+        ``now`` or, when that is ``None``, the time the re-key landed, after any wait. The
         session row itself carries nothing of its old hash, so the old hash still resolves to
         nothing. The link's one reader is :meth:`supersede_session`; ``store/session_lineage.py``
         says why it is unsealed. A re-key that did not land writes no link.
@@ -2839,19 +2840,22 @@ class AuthStore(Protocol):
         whether the session was live, and ``revoked_at`` is ``now``. Its ``token_hash`` is the hash
         the session ended under, which differs from ``token_hash`` when a link was followed.
 
-        **ONE store transaction, so it cannot interleave with :meth:`rotate_session` (BACKLOG
-        #2146).** The login supersession used to read the row and then revoke it by hash, and a
-        rotation that re-keyed the row between the two left the revoke matching nothing. Here the
-        store orders the two writes on the row. If this one runs first, the row is revoked and the
-        rotation's ``revoked_at IS NULL`` guard refuses it, so the rotation fails closed.
+        **The revoke and the read-back are one write on the row, so they cannot interleave with
+        :meth:`rotate_session` (BACKLOG #2146).** The login supersession used to read the row and
+        then revoke it by hash, and a rotation that re-keyed the row between the two left the
+        revoke matching nothing. Here the store orders the two writes on the row. If this one runs
+        first, the row is revoked and the rotation's ``revoked_at IS NULL`` guard refuses it, so
+        the rotation fails closed.
 
         **A rotation that committed FIRST is followed, when ``lineage_since`` is given (vault
         BACKLOG #3028, ADR 0210).** The presented hash then names no row, so the revoke steps along
-        the links :meth:`rotate_session` wrote, over as many rotations as there were, and ends the
-        live end, all inside this one transaction. A link retired before ``lineage_since`` is not
-        followed, so a retired hash leads anywhere only for a bounded time; the caller chooses the
-        bound, because the store reads no settings. A rotation that commits during the walk costs
-        the walk one more step, never the revoke: ``store/session_lineage.py`` says why. With
+        the links :meth:`rotate_session` wrote, up to ``LINEAGE_MAX_HOPS`` of them, and ends the
+        live end, inside one transaction. A link retired before ``lineage_since`` is not followed,
+        so a retired hash leads anywhere only for a bounded time; the caller chooses the bound,
+        because the store reads no settings. On Postgres and SQL Server a rotation can still commit
+        between two steps; it costs the walk one more step, never the revoke, because each step
+        revokes before it reads a link. ``store/session_lineage.py`` says why that order is the
+        control. With
         ``lineage_since`` left ``None`` no link is followed, and a rotation that committed first
         leaves this returning ``None``, as before. The lineage lookup lives here and nowhere else:
         no session READ follows a link, so a retired hash authenticates nothing.
