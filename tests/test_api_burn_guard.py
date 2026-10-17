@@ -72,6 +72,23 @@ MUST_DENY = [
     pytest.param(
         "do { gh pr view 1 --json state; Start-Sleep 30 } while ($true)", id="powershell-do-while"
     ),
+    pytest.param("bash -lc 'gh run watch 5'", id="behind-bash-lc"),
+    pytest.param('cmd /c "gh run watch 5"', id="behind-cmd-c"),
+    # The measured nested shape: a forever loop reading several PRs, sleeping between rounds.
+    pytest.param(
+        "while :; do open=''; for p in 1 2 3; do s=$(gh pr view $p --json state --jq .state); "
+        'open="$open $s"; done; sleep 600; done',
+        id="measured-while-colon-nested-for",
+    ),
+    pytest.param(
+        "1..100 | ForEach-Object { gh pr view 1 --json state; Start-Sleep 30 }",
+        id="powershell-foreach-object",
+    ),
+    # No sleep at all is the worst rate, not a safe one.
+    pytest.param("while true; do gh pr view 1 --json state; done", id="tight-while-true"),
+    pytest.param("until gh pr merge 5 --squash; do :; done", id="tight-until"),
+    pytest.param("sleep 5; while true; do gh pr view 1; done", id="sleep-before-forever-loop"),
+    pytest.param("while ($true) { gh pr view 1 --json state }", id="tight-powershell-while"),
 ]
 
 MUST_ALLOW = [
@@ -94,6 +111,16 @@ MUST_ALLOW = [
     pytest.param(
         'gh pr comment 5 --body "we do this later"; sleep 2; gh pr view 5',
         id="prose-do-before-sleep",
+    ),
+    pytest.param(
+        'gh pr comment 5 --body "fix for the flake, while waiting"; sleep 2; gh pr view 5',
+        id="prose-for-and-while-before-sleep",
+    ),
+    pytest.param('gh pr comment 5 --body "never use --watch"', id="quoted-watch-at-body-end"),
+    pytest.param("for f in *.log; do grep -c gh $f; sleep 1; done", id="grep-c-gh-is-not-gh"),
+    pytest.param(
+        "gh pr list --json number --jq '.[].number' | while read n; do gh pr view $n; done",
+        id="while-read-iterates-and-ends",
     ),
 ]
 
