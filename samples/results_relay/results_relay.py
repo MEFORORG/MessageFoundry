@@ -21,7 +21,7 @@ after:
 
 Run it locally::
 
-    python -m messagefoundry serve --config samples/results_relay --env dev --db ./mf.db
+    python -X disable-remote-debug -m messagefoundry serve --config samples/results_relay --env dev --db ./mf.db
     python -m messagefoundry dryrun --config samples/results_relay \\
         --messages samples/results_relay/messages --show-phi
 """

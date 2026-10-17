@@ -82,7 +82,7 @@ promotable = true
 Start the same `serve` command on each host/process — e.g.:
 
 ```
-python -m messagefoundry serve --service-config messagefoundry.toml --config ./config
+python -X disable-remote-debug -m messagefoundry serve --service-config messagefoundry.toml --config ./config
 ```
 
 (For a local DEV Postgres, `scripts/dev/postgres.ps1` sets the `MEFOR_STORE_*` connection env and

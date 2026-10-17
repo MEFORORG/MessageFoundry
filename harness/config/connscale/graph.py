@@ -17,7 +17,7 @@ the measured cost the engine's *per-connection machinery* (workers, wake events,
 not transform CPU. Serve it on its own::
 
     MEFOR_CONNSCALE_COUNT=500 MEFOR_CONNSCALE_BASE_PORT=2600 MEFOR_CONNSCALE_SINK_PORT=2700 \
-      python -m messagefoundry serve --config harness/config/connscale --db ./connscale.db
+      python -X disable-remote-debug -m messagefoundry serve --config harness/config/connscale --db ./connscale.db
 
 Every value here is synthetic and generic — no real partner, site, host, or volume. See
 ``docs/LOAD-TESTING.md``.

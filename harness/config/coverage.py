@@ -4,7 +4,7 @@
 behavior from one place. Serve it on its own (it binds MLLP 2575, like ``samples/config/adt.py``,
 so don't load both)::
 
-    python -m messagefoundry serve --config harness/config --db ./messagefoundry.db
+    python -X disable-remote-debug -m messagefoundry serve --config harness/config --db ./messagefoundry.db
 
 Then point the harness at it: Send → 127.0.0.1:2575, Receive listening on 2576, Monitor → the
 engine API. Those are the defaults in ``harness/endpoints/coverage.py``; a

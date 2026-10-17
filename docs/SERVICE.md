@@ -89,7 +89,7 @@ and TrustedInstaller, may write them. So at least `Everyone`, `Authenticated Use
 `BUILTIN\Users` and the user who owns a checkout are refused. It also refuses an install with no `messagefoundry` folder in
 its `Lib\site-packages`, or with an `__editable__` file for it. That is an editable install, which
 imports the engine from a checkout. **A service can no longer run from a checkout.** To try the
-engine from one, run `messagefoundry serve` from a prompt.
+engine from one, run `python -X disable-remote-debug -m messagefoundry serve` from a prompt.
 
 ## Install
 

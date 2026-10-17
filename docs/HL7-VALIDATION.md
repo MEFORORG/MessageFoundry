@@ -99,7 +99,7 @@ A full worked example — wired inbound → router → handler → file — is i
 [`samples/consistency/validated_adt.py`](../samples/consistency/validated_adt.py):
 
 ```
-python -m messagefoundry serve --config samples/consistency --db ./mf.db --env dev
+python -X disable-remote-debug -m messagefoundry serve --config samples/consistency --db ./mf.db --env dev
 ```
 
 ### PHI-safety

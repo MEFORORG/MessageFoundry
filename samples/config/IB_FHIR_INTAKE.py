@@ -12,7 +12,7 @@ environment-specific, so it's authored with ``env()`` (resolved from ``environme
 A real HL7 v2 → FHIR route would do the same, with the Handler mapping an HL7 ``Message`` into a
 ``fhir.resources`` resource before ``Send`` — the mapping stays code-first here, never in the connector.
 
-    python -m messagefoundry serve --config samples/config --env dev --db ./messagefoundry.db
+    python -X disable-remote-debug -m messagefoundry serve --config samples/config --env dev --db ./messagefoundry.db
 
 The Handler's typed validation needs the optional extra: ``pip install 'messagefoundry[fhir]'`` (the
 Router's peek does not). See ``samples/messages/`` for a synthetic FHIR Patient to drop in ``./in/fhir``.

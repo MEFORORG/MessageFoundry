@@ -14,7 +14,7 @@ triggers L2b: the body is content-addressed and written **once** to ``shared_bod
 functional) and **J9/S7.6** (write-amplification)::
 
     MEFOR_LOAD_FANOUT=20 MEFOR_LOAD_SINK_PORT=2700 \
-      python -m messagefoundry serve --config harness/config/store_once --db ./store_once.db
+      python -X disable-remote-debug -m messagefoundry serve --config harness/config/store_once --db ./store_once.db
 
 then inject a few ADT messages on the inbound port and inspect the store (``shared_body`` row count,
 ``queue.body_ref``). Synthetic + generic; reuses the load graph's ``_shape`` for ports/sink/fan-out so

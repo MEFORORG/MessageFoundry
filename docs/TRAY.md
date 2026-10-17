@@ -324,6 +324,6 @@ installed `MessageFoundry` service and are verified by hand:
 - [ ] Launching a second instance shows "already running" and exits; the first keeps its icon.
 - [ ] **Start at Login** toggles the `HKCU\…\Run` value; survives a reboot.
 - [ ] Open Monitor Console is disabled (with a hint) when `serve_ui = false`; enabled when true.
-- [ ] A dev `python -m messagefoundry serve` on the port with the service stopped → `RUNNING_UNMANAGED`.
+- [ ] A dev `python -X disable-remote-debug -m messagefoundry serve` on the port with the service stopped → `RUNNING_UNMANAGED`.
 - [ ] **Exit** removes the icon and leaves the engine service running.
 - [ ] Log-off / shutdown removes the icon cleanly (no ghost after re-login).

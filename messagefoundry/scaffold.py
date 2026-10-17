@@ -349,10 +349,10 @@ messagefoundry check --config config --messages messages/sets
 
 # 3. Run an instance. environments/<env>.toml resolves against the project root — by default the
 #    process working directory, so launch from the repo root:
-messagefoundry serve --config config --env dev
+python -X disable-remote-debug -m messagefoundry serve --config config --env dev
 #    Or pin the root explicitly (an ABSOLUTE path) so it resolves no matter the launch directory —
 #    REQUIRED under a service like NSSM, where the CWD isn't the repo root:
-# messagefoundry serve --config config --env dev --project-root /srv/mefor/this-config-repo
+# python -X disable-remote-debug -m messagefoundry serve --config config --env dev --project-root /srv/mefor/this-config-repo
 #    (Equivalently, set [environments].base_dir to that absolute path in messagefoundry.toml.)
 ```
 

@@ -61,7 +61,7 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   Engine Log*, **Open the Web Console** (`/ui`), *Copy the Engine Start Command*, and *Configure Engine
   Target*. For a **local, loopback** target in a trusted workspace it also offers **Start / Stop /
   Restart the Engine** and *Set Up Python Environment* (ADR 0112) — Start runs exactly
-  `python -m messagefoundry serve --config <configDir>`, with no `--db`/`--env` overrides, so the
+  `python -X disable-remote-debug -m messagefoundry serve --config <configDir>`, with no `--db`/`--env` overrides, so the
   service TOML stays the authority on store and environment. A workspace with no store yet gets the
   guided **Set Up an Engine** page instead.
 - **Live HL7-aware autocomplete** (no language server): field paths inside `msg["…"]` /

@@ -12,7 +12,7 @@ is opaque to them (owner ruling 2). At **delivery** (Phase 1b) the handle is re-
 exact stored base64 spliced back into ``OBX-5.5`` — no decode/re-encode) and the full MDM streams
 **inline** to Epic's MLLP receiver, which does not cap the frame (owner ruling 1).
 
-    python -m messagefoundry serve --config samples/config --env dev --db ./messagefoundry.db
+    python -X disable-remote-debug -m messagefoundry serve --config samples/config --env dev --db ./messagefoundry.db
 
 All endpoints are loopback/synthetic; send a synthetic large MDM with ``samples/send_mllp.py``.
 """

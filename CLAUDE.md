@@ -686,7 +686,7 @@ mypy --platform linux --explicit-package-bases tests   # CI runs it on linux. BA
 mypy --platform linux scripts/asvs   # the ASVS verifier and writer, strict. BACKLOG #2276
 
 # run the engine (headless) — loads config modules, opens the store, serves the API + the web console at /ui
-python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev
+python -X disable-remote-debug -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev
 
 # open the web console (operator UI) — browse to the engine's /ui (e.g. https://127.0.0.1:8765/ui)
 

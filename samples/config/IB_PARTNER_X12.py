@@ -8,7 +8,7 @@ ISA + GS/ST *peek* for routing, never a full parse on the hot path. The intercha
 ``X12()`` takes no delimiter knobs (they're discovered from each ISA header, ADR 0012). The outbound
 peer is environment-specific, so it's authored with ``env()`` (resolved from ``environments/<env>.toml``).
 
-    python -m messagefoundry serve --config samples/config --env dev --db ./messagefoundry.db
+    python -X disable-remote-debug -m messagefoundry serve --config samples/config --env dev --db ./messagefoundry.db
 
 See ``samples/messages/x12_270_eligibility.edi`` for a synthetic interchange to send.
 """

@@ -118,7 +118,7 @@ pip install -e ".[otel]"         # OpenTelemetry/OTLP export seam (the /metrics 
 From the repo root, against the bundled sample config:
 
 ```powershell
-python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev
+python -X disable-remote-debug -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev
 ```
 
 - `--config` points at the directory of Connection/Router/Handler modules (here `samples/config/`, which includes [IB_ACME_ADT.py](../samples/config/IB_ACME_ADT.py) and its transform [adt.py](../samples/config/adt.py)).
@@ -151,7 +151,7 @@ It writes a runnable starter feed under `config/`, `environments/dev.toml` + `pr
 ```powershell
 pip install -r requirements.txt
 messagefoundry check --config config --messages messages/sets
-messagefoundry serve --config config --env dev
+python -X disable-remote-debug -m messagefoundry serve --config config --env dev
 ```
 
 Put it under version control with **Set Up Version Control & Checks** in the IDE (or a plain `git init`). During setup you choose **where the repo is stored** — *on this machine only* (fine for a single-box, non-HA engine or local dev) or on a *shared remote* (recommended for HA, a team, or off-machine backup); change it any time with **Config Repo Storage Location**. Choosing local vs. remote storage, and why secrets/PHI never land in the repo, are covered in [VERSION-CONTROL.md](VERSION-CONTROL.md) (with the full deployment model in [INSTALL-GUIDE.md](INSTALL-GUIDE.md)).
@@ -238,7 +238,7 @@ The sample inbound that does the work is `IB_Test_ADT` in [samples/config/adt.py
 In one terminal, from the repo root, run the engine against the sample config. The active `--env` is **required** — use `dev` for local work:
 
 ```
-python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev
+python -X disable-remote-debug -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev
 ```
 
 This loads the config modules, opens (or creates) the SQLite store at `./messagefoundry.db`, serves the localhost API, and starts every sample listener. The startup log announces the active environment and posture. Leave it running. The API binds `127.0.0.1` by default; first-run auth/console details are covered in the install guide — see [INSTALL-GUIDE.md](INSTALL-GUIDE.md).
@@ -379,7 +379,7 @@ messagefoundry connection remove --config samples/config --name IB_ACME_ADT_TCP
 Run the engine against the dev environment (the active `--env` is required), then send a synthetic message at the inbound's port:
 
 ```bash
-python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev
+python -X disable-remote-debug -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev
 python samples/send_mllp.py samples/messages/adt_a01.hl7
 ```
 
@@ -537,7 +537,7 @@ MessageFoundry has two operator-facing UIs, and they do different jobs. The **we
 The console is served by the engine itself, so start the engine first (note the active `--env` is required):
 
 ```bash
-python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev
+python -X disable-remote-debug -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev
 ```
 
 Then open the web console in a browser. With the `messagefoundry-webconsole` wheel installed, the engine serves it at `/ui` by default; `[security].serve_web_console = false` turns it off:
@@ -666,7 +666,7 @@ The SMTP password is a secret — supply it via `MEFOR_ALERTS_EMAIL_PASSWORD`, n
   Both replays need the `messages:replay` permission and step-up re-auth. `[approvals]` can also hold a **Dead letters** replay for a second approver.
 - **A connection shows `failed`.** A connection that can't build or bind **at startup** (bad settings, a port already in use) is isolated as a degraded `failed` status instead of taking the engine down — every other lane keeps running ([ADR 0031](adr/0031-startup-connection-fault-isolation.md)). Fix the config/bind, then recover it: restart an inbound (`POST /connections/{name}/start`), or reload to rebuild a failed outbound. (Reload itself stays fail-fast — a broken config is rejected whole, never partially applied.)
 - **Backlog growing.** A `queue_buildup` alert usually means a head is retrying its way toward the cap and blocking its FIFO lane, or the downstream is down. Check the destination, then inspect/purge or replay the blocking row.
-- **Console can't reach the engine.** The API binds `127.0.0.1:8765` by default and requires auth; confirm the engine is serving (`python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev`), that the `messagefoundry-webconsole` distribution is installed and `[security].serve_web_console` has not been set to `false`, and that your browser is pointed at `https://` on that host/port's `/ui`.
+- **Console can't reach the engine.** The API binds `127.0.0.1:8765` by default and requires auth; confirm the engine is serving (`python -X disable-remote-debug -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev`), that the `messagefoundry-webconsole` distribution is installed and `[security].serve_web_console` has not been set to `false`, and that your browser is pointed at `https://` on that host/port's `/ui`.
 - **Intake paused.** An `intake_paused` alert means the engine paused intake, because the staged backlog went over `[inbound].max_staged_depth` or free disk fell below `[retention].min_free_disk_mb`. Its `connection` names which, and which engine process paused: `intake:staged_depth` or `intake:disk_floor`, followed by `@node:<node_id>` or `@shard:<id>` when several processes share the store. Each process raises and clears its own alert. Not every source honours the pause (the `max_staged_depth` row under `[inbound]` in [CONFIGURATION.md](CONFIGURATION.md) says which), so the backlog can still grow. Nothing already received is lost. Clear the cause (a stalled router or transform, or a full volume) and intake resumes on its own (`[inbound]` in [CONFIGURATION.md](CONFIGURATION.md)).
 - **A replaced CRL was refused.** A `crl_reload_refused` alert means the engine refused a replaced CRL file, so running TLS hops keep the copy they hold. A revocation added to the new file is not enforced on those hops yet. The alert's `remedy_class` says what to do, and the `crl_reload` ERROR line in the engine log gives the reason. Restart only when the class tells you to (`restart`, `no_issuer` or `retry`) and the alert does not carry `start_refuses`. With any other class, or with that flag, a start can refuse the file too, and then the engine does not come up. The alert resolves itself once the file is applied (the CRL paragraphs under `[cert_monitor]` in [CONFIGURATION.md](CONFIGURATION.md)).
 - **An injected script was refused.** A `remote_debug_refused` alert means the engine refused a Python script. Another process on the host tried to run it inside the engine, through the interpreter's remote debugging. Nothing in the script ran. Treat it as a sign that something on the host can attach to the engine's process. Find out what did, and whether it was meant to. The audit log usually has a `remote_debug_refused` row for the same refusals, but a row can be lost, as the entry linked below says. Neither names a script; the engine log usually does, in a WARNING line. Nothing resolves this alert, so resolve it yourself once you know the cause. What the alert and the row carry, and how to count the refusals, is in the `remote_debug_enabled` entry of [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#remote_debug_enabled-and-remote_debug_unguarded-the-interpreter-accepts-a-script-from-another-process). The same entry says how to start the engine with the interface off.

@@ -7,7 +7,7 @@ coverage graph without a database stays clean. Serve it on its own::
 
     MEFOR_VALUE_HARNESS_DATABASE_NAME=... MEFOR_VALUE_HARNESS_DATABASE_USERNAME=... \\
     MEFOR_VALUE_HARNESS_DATABASE_PASSWORD=... \\
-    python -m messagefoundry serve --config harness/config/database --db ./harness-db.db --env dev
+    python -X disable-remote-debug -m messagefoundry serve --config harness/config/database --db ./harness-db.db --env dev
 
 It needs the ``[sqlserver]`` extra, the Microsoft ODBC Driver 18, and a SQL Server whose TLS
 certificate this host trusts: the graph never weakens TLS. ``[egress].allowed_db`` must list the

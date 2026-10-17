@@ -288,7 +288,7 @@ directory:
 
 ```powershell
 cd ./my-config-repo
-python -m messagefoundry serve --config config --db ./messagefoundry.db --env dev
+python -X disable-remote-debug -m messagefoundry serve --config config --db ./messagefoundry.db --env dev
 ```
 
 `serve` flags and their precedence (**CLI > `MEFOR_<SECTION>_<KEY>` env > `messagefoundry.toml` >

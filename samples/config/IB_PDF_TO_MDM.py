@@ -12,7 +12,7 @@ delivers it **inline** to Epic. A Handler-built large MDM rides the outbound row
 ingress detach here (nothing was over-threshold on the way in), and the outbound MLLP frame is uncapped,
 so the whole document streams inline.
 
-    python -m messagefoundry serve --config samples/config --env dev --db ./messagefoundry.db
+    python -X disable-remote-debug -m messagefoundry serve --config samples/config --env dev --db ./messagefoundry.db
 
 Drop a synthetic (never real PHI) PDF into the DEV inbox to exercise it. Endpoints are loopback/synthetic.
 """
