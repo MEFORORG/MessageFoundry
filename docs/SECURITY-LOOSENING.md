@@ -1527,19 +1527,19 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **Compensating controls:** keep the URL itself in `env()` so the credential is not in the config
   file, and treat the partner's and the proxy's access logs as holding a secret.
 - **It is never silent:** a WARNING naming the connection and the parameter names, never a value.
-  It is logged for each connection a build check builds, and at least `messagefoundry check`, a dry
-  run and a reload run one. It is also logged when a connector is built with no build check before
-  it, at least at a start, an operator start and a connection test. A reload's rebuild of an
-  outbound, or of the `FhirLookup` executor, skips it, because that reload's build check has
-  already logged it, so a reload still logs it. At least one reload logs it a second time: the one
-  that finds the engine with no runner yet builds through a start after its build check. The
-  scheduler reconcile in a reload also builds without skipping it, but only a lane with no
-  connector, and a reading of the code finds the reload has built one by then; no test measures
-  either case. There is also a `url-query-credential` line in `messagefoundry check`, and a
-  `url_query_credential` entry in `security_loosenings()`, and so in `GET /security/posture` on a
-  running engine. All three walk outbound connections and `FhirLookup` connections, whose names are
-  prefixed `fhir_lookup:`. The WARNING reads the resolved URL. The `check` line and the registry
-  read a literal `url` only, so a URL supplied by `env()` is in the WARNING alone.
+  It is logged at least whenever a build check builds the connection (at least `messagefoundry
+  check` and `POST /config/reload`, `dry_run` included) and whenever a connection is built without
+  one (at least a start, an operator start and a connection test). A reload's own rebuilds skip it,
+  because that reload's build check has already logged it. It can still appear more than once for
+  one connection, at least on a reload into an engine started without a graph, and on a start where
+  one `FhirLookup` fails to build. There is also a `url-query-credential` line in `messagefoundry
+  check`, and a `url_query_credential` entry in `security_loosenings()`, and so in
+  `GET /security/posture` on a running engine. All three walk outbound connections and `FhirLookup`
+  connections. The WARNING labels a lookup `FhirLookup '<name>'`; the `check` line and the posture
+  entry name it with a `fhir_lookup:` prefix. The WARNING reads the resolved URL. The `check` line
+  and the posture entry read a literal `url` only, so a URL supplied by `env()` is in the WARNING
+  alone. A lane the engine has not built (for example `auto_start=False`, or DR-parked) logs no
+  WARNING until it is built or checked, so an `env()` URL on such a lane appears nowhere until then.
 - **What it cannot do:** it is a guess from names. It misses a credential under a name it does not
   know, and it will name a parameter that only looks like one, such as `page_token`. OIDC's
   `response_mode=query` is a different matter and stays a recorded delta.

@@ -607,8 +607,8 @@ async def test_an_activation_reload_warns_once_for_a_lane_leaving_the_passive_pa
     reload_store: MessageStore, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Another rebuild a reload makes: a passive standby's lane, built at its activation through
-    ``_ensure_destination_built``. Not necessarily the last; ``warn_url_query_credentials`` names
-    the builds in a reload that pass no flag."""
+    ``_ensure_destination_built``. docs/SECURITY-LOOSENING.md is the source of record for where the
+    warning fires."""
     runner = _reload_runner(
         reload_store, _reload_graph(priority=Priority.CRITICAL), dr_standby=Priority.CRITICAL
     )
@@ -652,7 +652,7 @@ async def test_a_start_and_an_operator_start_still_warn_once(
 ) -> None:
     """Builds with no build check before them keep the warning. This exercises two of them: the
     engine start, for an outbound and a FhirLookup, and the operator start of a lane ``auto_start``
-    left unbuilt. There are at least others; ``warn_url_query_credentials`` names them."""
+    left unbuilt. docs/SECURITY-LOOSENING.md is the source of record for where the warning fires."""
     reg = _reload_graph(fhir=True)
     spec = ConnectionSpec(type=ConnectorType.REST, settings={"url": _KEYED.format(v=1)})
     reg.add_outbound(build_outbound_connection("OB_OFF", spec, auto_start=False))
