@@ -724,7 +724,8 @@ So on the console, an operator action's own audit row is its only record. **At l
 mutations commit that row in the same transaction as the change they record (vault BACKLOG #2624):**
 message replay, dead-letter replay (inline and released), a purge (inline and released), resend,
 edit-and-resubmit (direct and re-route), the uploaded-log inject, and alert acknowledge, resolve,
-suspend and resume (vault BACKLOG #3217). A released purge that skips writes no row; see
+suspend and resume (vault BACKLOG #3217). A released purge that skips writes no
+`connection_purge` row, and its `approval.approved` row records the skip; see
 [Dual-control approval](#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235). That holds on all three store backends. A crash between the
 change and its row, or a failed append, now keeps both or neither. Before, each row was a second write
 after the commit, so a crash between the two would have kept a console action with no row in the

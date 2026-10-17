@@ -439,3 +439,40 @@ async def test_the_old_per_uploader_ledger_table_is_dropped_at_open(tmp_path: Pa
         conn.close()
     assert "upload_reservation" in names
     assert "upload_quota" not in names
+
+
+async def test_a_reserve_already_done_when_the_drain_cancels_still_pays_its_slot_back(
+    tmp_path: Path, ledger_db: MessageStore
+) -> None:
+    """A reserve that finished in the pass the drain's wait timed out is still in the straggler
+    set, because its done callback has not run yet. The drain cannot cancel it, so it must not
+    refuse its release either (found in code review)."""
+    released: list[str] = []
+
+    class _Recording(_PassThrough):
+        async def release_upload_quota(self, reservation_id: str) -> None:
+            released.append(reservation_id)
+            await self.store.release_upload_quota(reservation_id)
+
+    store = _uploads(tmp_path, _Recording(ledger_db))
+    reserve: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+    store._leave_running(reserve, what="reserve", uploader_id="u-op", reservation="r-1")
+    reserve.set_result(True)  # done, with its callbacks scheduled but not yet run
+    await store.drain_stragglers(timeout=0.0, grace=1.0)
+    assert await _settled(store), "the release never finished"
+    assert released == ["r-1"]
+
+
+async def test_discard_waits_for_the_quota_lock_before_it_removes_the_pair(
+    tmp_path: Path,
+) -> None:
+    """A pair whose upload.create row failed is removed under the per-process lock, so a save in
+    this process cannot scan the disk while the pair is still on it (found in code review)."""
+    store = _uploads(tmp_path, None)
+    meta = await store.save(data=b"x\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    async with store._quota_lock:
+        discard = asyncio.create_task(store.discard(meta.file_id))
+        await asyncio.sleep(0.05)
+        assert [m.file_id for m in await store.list_files()] == [meta.file_id]
+    await asyncio.wait_for(discard, 10)
+    assert await store.list_files() == []

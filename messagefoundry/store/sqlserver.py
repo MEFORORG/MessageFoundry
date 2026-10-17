@@ -12183,11 +12183,13 @@ class SqlServerStore:
         entry. The reserve's stale delete reaches the same row through the uploader index, so it
         locks the index entry first and then the clustered row. A release racing the reserve that
         sweeps its own stale row could therefore deadlock it. Under the applock the two cannot
-        hold row locks at once, since each takes the applock before any row lock.
+        hold row locks at once, because each holds no row lock when it asks for the applock.
 
-        The uploader is read first under ``READCOMMITTEDLOCK``, which waits out a reserve still
-        committing this row rather than reading past it under RCSI, and holds its shared lock only
-        for the read. Nothing to release commits the empty transaction and returns."""
+        For the release that rests on how the uploader is read. ``READCOMMITTEDLOCK`` waits out a
+        reserve still committing this row rather than reading past it under RCSI, and its shared
+        lock is released when the read ends, before the applock is requested. A hint that holds
+        it longer, such as ``HOLDLOCK``, would break the argument. Nothing to release commits the
+        empty transaction and returns."""
         async with self._acquire() as conn:
             try:
                 async with self._cursor(conn) as cur:

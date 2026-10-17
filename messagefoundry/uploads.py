@@ -1068,16 +1068,21 @@ class UploadStore:
                     # cleanup failure must not replace the cancellation, so it is logged and the
                     # cancel raised.
                     try:
-                        await self.discard(file_id)
+                        # Not discard(): this already holds _quota_lock.
+                        await _to_thread_to_completion(self._discard_cancelled_sync, file_id)
                     except Exception:  # noqa: BLE001 — logged; the cancellation is what propagates
                         _log.error("could not remove cancelled upload %s", file_id, exc_info=True)
                 raise
 
     async def discard(self, file_id: str) -> None:
         """Remove a stored pair whose ``upload.create`` row could not be written (vault BACKLOG
-        #3178), the way a save cancelled after it landed is removed. Cancel-resistant: the removal
-        finishes before a cancellation propagates. A refused removal is logged, never raised."""
-        await _to_thread_to_completion(self._discard_cancelled_sync, file_id)
+        #3178), the way a save cancelled after it landed is removed. It holds ``_quota_lock`` while
+        it removes, as that save does, so no other save in this process scans the disk while the
+        pair is still on it and is refused at the quota edge. Cancel-resistant once it holds the
+        lock: the removal finishes before a cancellation propagates. A refused removal is logged,
+        never raised."""
+        async with self._quota_lock:
+            await _to_thread_to_completion(self._discard_cancelled_sync, file_id)
 
     def _discard_cancelled_sync(self, file_id: str) -> None:
         """Remove a pair whose save was cancelled after it landed (BACKLOG #2262; see :meth:`save`).
@@ -1094,8 +1099,8 @@ class UploadStore:
         except OSError as exc:
             _log.error(
                 "upload %s was cancelled after its file landed, or its upload.create row failed, "
-                "and it was not fully removed; what "
-                "remains has no upload.create audit row: %s",
+                "and it was not fully removed; what remains may have no upload.create audit "
+                "row: %s",
                 file_id,
                 exc,
             )
@@ -1262,17 +1267,19 @@ class UploadStore:
         def _done(done: asyncio.Future[Any]) -> None:
             if what != "reserve":
                 _log_release_cancelled(done, uploader_id)
+            elif done in self._drain_cancelled:
+                # The drain cancelled it because the store is about to close, so nothing new
+                # starts against it; the slot is reclaimed once it goes stale. This line is its
+                # one record, so a reserve error is marked retrieved here rather than logged.
+                if not done.cancelled():
+                    done.exception()
+                _log.warning(
+                    "shutdown: a slot the cross-shard upload reserve for %s may have taken is "
+                    "not released; it is reclaimed once it goes stale",
+                    uploader_id,
+                )
             elif self._reserve_may_hold_a_slot(done, uploader_id):
-                if done not in self._drain_cancelled:
-                    self._release_later(reservation, uploader_id)
-                else:
-                    # The drain cancelled it because the store is about to close, so nothing new
-                    # starts against it; the slot is reclaimed once it goes stale.
-                    _log.warning(
-                        "shutdown: a slot the cross-shard upload reserve for %s may have taken is "
-                        "not released; it is reclaimed once it goes stale",
-                        uploader_id,
-                    )
+                self._release_later(reservation, uploader_id)
 
         self._hold(fut, _done, cap=_LEDGER_STRAGGLER_MAX_SECONDS)
 
@@ -1348,10 +1355,12 @@ class UploadStore:
             )
         # Each discard is registered after the task's own callbacks, so a reserve's done callback
         # still finds it here and starts no release.
+        # A task already done is not cancelled and keeps its own outcome: a reserve that finished
+        # in the same pass as the wait's timeout still pays its slot back.
         for task in left:
-            self._drain_cancelled.add(task)
-            task.add_done_callback(self._drain_cancelled.discard)
-            task.cancel()
+            if task.cancel():
+                self._drain_cancelled.add(task)
+                task.add_done_callback(self._drain_cancelled.discard)
         _done, stuck = await asyncio.wait(left, timeout=grace)
         if stuck:
             _log.error(

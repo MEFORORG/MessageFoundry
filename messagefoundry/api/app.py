@@ -937,10 +937,12 @@ async def _record_upload_create(
 
     The route runs this as an outliving operation, so a request deadline does not cut the row
     short. A row that still fails, by an error or the shutdown drain's cancellation, removes the
-    pair, so no stored file is left with no row saying who created it. The other way round is
-    still possible: a row that committed and then raised, such as a cancellation while the store
-    releases its connection, removes a file its row names. The file name is not in the row
-    (vault BACKLOG #2619)."""
+    pair, so a failed row does not leave a stored file with no row saying who created it. At
+    least two cases still can: a removal the filesystem refuses, which is logged and keeps the
+    pair, and a process that dies between the save and the row. The other way round is possible
+    too: a row that committed and then raised, such as a cancellation while the store releases
+    its connection, removes a file its row names. The file name is not in the row (vault BACKLOG
+    #2619)."""
     try:
         await store.record_audit(
             "upload.create",
