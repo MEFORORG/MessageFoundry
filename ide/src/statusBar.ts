@@ -177,6 +177,14 @@ export class EngineStatusBar implements vscode.Disposable {
     return withStaleness(this.link, Date.now());
   }
 
+  /** Repaint from the current link. The hover's actions come from {@link controlContext}, whose
+   *  `canControl` reads workspace trust, so a trust grant calls this (vault BACKLOG #3166). */
+  repaint(): void {
+    if (!this.disposed) {
+      this.render();
+    }
+  }
+
   private render(): void {
     if (this.busy) {
       // Feedback AT the click site. The quick-input widget opens at the top-center of the window, a

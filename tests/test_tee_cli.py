@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import stat
 import sys
 import time
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -238,6 +240,16 @@ def _compare_to(db: str, out: Path) -> int:
 _POSIX_MODES = pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
 
 
+@contextlib.contextmanager
+def _umask_022() -> Iterator[None]:
+    """The umask under which write_text would create a world-readable file."""
+    previous = os.umask(0o022)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+
+
 @_POSIX_MODES
 def test_compare_show_diffs_out_is_created_owner_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -245,11 +257,8 @@ def test_compare_show_diffs_out_is_created_owner_only(
     # vault BACKLOG #2792: under a 022 umask, write_text created this report 0644.
     db = _seed_compare(tmp_path, monkeypatch)
     out = tmp_path / "report.json"
-    previous = os.umask(0o022)
-    try:
+    with _umask_022():
         assert _compare_to(db, out) == 0
-    finally:
-        os.umask(previous)
     assert stat.S_IMODE(out.stat().st_mode) == 0o600
     # Control: the field values the mode protects really are in the file.
     assert json.loads(out.read_text(encoding="utf-8"))["diffs"]
@@ -322,4 +331,122 @@ def test_compare_out_that_cannot_be_written_is_an_error_line(
     out = tmp_path / "no-such-dir" / "report.json"
     assert _compare_to(db, out) == 1
     assert "error: could not write the report" in capsys.readouterr().err
+    assert not out.parent.exists()
+
+
+# --- anonymize-captures --out and export --out (vault BACKLOG #3166) ------------------------------
+
+_ANON_SALT = "tee-cli-salt-0123456789abcdef"
+
+
+def _anonymize_to(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, out: Path) -> int:
+    """Seed one synthetic capture and run ``anonymize-captures --out`` on it in process. Logging
+    setup is stubbed, since it would reconfigure logging for the whole pytest session."""
+    db = str(tmp_path / "tee.db")
+    raw = (
+        "MSH|^~\\&|SAPP|SFAC|RAPP|RFAC|20260101||ADT^A01|C1|P|2.5.1\r"
+        "PID|1||999^^^H^MR||DOE^JOHN||19800101|M"
+    )
+
+    async def seed() -> None:
+        store = await RelayStore.open(db)
+        try:
+            await store.record_capture(
+                direction="corepoint_copy", control_id="C1", raw=raw.encode()
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+    monkeypatch.setenv("MEFOR_ANON_SALT", _ANON_SALT)
+    monkeypatch.setattr("tee.__main__._configure_logging", lambda level: None)
+    return main(["anonymize-captures", "--db", db, "--out", str(out)])
+
+
+def _export_to(tmp_path: Path, out: Path) -> int:
+    db = str(tmp_path / "tee.db")
+    asyncio.run(_seed(db))
+    return main(["export", "--db", db, "--out", str(out)])
+
+
+@_POSIX_MODES
+def test_anonymize_captures_out_is_created_owner_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Under a 022 umask, write_text would leave an anonymized dataset world-readable on first
+    # deployment, beside a capture DB the tee keeps at 0600.
+    out = tmp_path / "ds.jsonl"
+    with _umask_022():
+        assert _anonymize_to(tmp_path, monkeypatch, out) == 0
+    assert stat.S_IMODE(out.stat().st_mode) == 0o600
+    assert json.loads(out.read_text(encoding="utf-8").splitlines()[0])["control_id"] == "C1"
+
+
+@_POSIX_MODES
+def test_export_out_is_created_owner_only(tmp_path: Path) -> None:
+    out = tmp_path / "review.json"
+    with _umask_022():
+        assert _export_to(tmp_path, out) == 0
+    assert stat.S_IMODE(out.stat().st_mode) == 0o600
+
+
+_OUT_COMMANDS = ["anonymize-captures", "export", "compare"]
+
+
+def _write_out(command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, out: Path) -> int:
+    """Run one of the tee commands that take ``--out``, writing to ``out``."""
+    if command == "export":
+        return _export_to(tmp_path, out)
+    if command == "compare":
+        return _compare_to(_seed_compare(tmp_path, monkeypatch), out)
+    return _anonymize_to(tmp_path, monkeypatch, out)
+
+
+@pytest.mark.parametrize("command", _OUT_COMMANDS)
+def test_out_goes_through_the_owner_only_writer(
+    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The mode tests above are POSIX-only. This one runs on every platform, so a Windows run still
+    # fails if a command goes back to write_text.
+    import tee.__main__ as tee_main
+
+    calls: list[str] = []
+    real = tee_main._write_owner_only
+
+    def spy(path: str, text: str) -> None:
+        calls.append(path)
+        real(path, text)
+
+    monkeypatch.setattr(tee_main, "_write_owner_only", spy)
+    out = tmp_path / "out.json"
+    assert _write_out(command, tmp_path, monkeypatch, out) == 0
+    assert calls == [str(out)]
+
+
+@pytest.mark.parametrize("command", _OUT_COMMANDS)
+def test_out_is_lf_on_every_platform(
+    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The dataset is JSONL, read back line by line by the harness corpus. A text layer's default
+    # newline is CRLF on Windows, so this discriminates on win32.
+    out = tmp_path / "out.json"
+    assert _write_out(command, tmp_path, monkeypatch, out) == 0
+    data = out.read_bytes()
+    assert data.endswith(b"}\n")  # control: the file really has a line ending to translate
+    assert b"\r\n" not in data
+
+
+@pytest.mark.parametrize(
+    ("command", "what"), [("anonymize-captures", "dataset"), ("export", "export")]
+)
+def test_out_that_cannot_be_written_is_an_error_line(
+    command: str,
+    what: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    out = tmp_path / "no-such-dir" / "out.json"
+    assert _write_out(command, tmp_path, monkeypatch, out) == 1
+    assert f"error: could not write the {what}" in capsys.readouterr().err
     assert not out.parent.exists()
