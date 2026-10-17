@@ -235,8 +235,32 @@ in its place. That holds whether or not the relaunch then works. The process als
 tray itself in at least three cases. Branding is unavailable, the relaunch cannot start, or the
 branded child exits within a short grace window. `_CHILD_STARTUP_GRACE_S` in `tray/branding.py`
 sets that window. **A tray started by hand gets neither the script nor the options, by decision,
-and that limit is open.** The `messagefoundry-tray` command is a launcher the installer writes. It was not
-run to measure this, because it starts a real tray. Its console twin from the same install,
+and that limit is open.**
+
+**A hand start may also exit before any code runs (vault BACKLOG #2914).** It gets no `-E`, so the
+user's `PYTHON*` variables reach it. `tests/test_tray_hand_start.py` measured it on Windows, Python
+3.14.7, on 2026-10-16, with a stand-in for the tray that records whether it had a stderr. A
+GUI-script launcher of the kind pip writes, and `pythonw -m`, were each started with no standard
+handles. The launcher was also started through `ShellExecuteExW`, the Windows shell's call for
+opening a file. With neither variable set, each start ran the stand-in, with no stderr. With
+`PYTHONFAULTHANDLER=1`, and again with `PYTHONDEVMODE=1`, each exited 1 without running it.
+`pythonw -m` that inherited its parent's handles, as from a terminal that hands its own on, had a
+stderr and ran under each variable. Not measured, at least: the installed `messagefoundry-tray`
+launcher itself, a real click in Explorer or the Start menu, a `.lnk` shortcut, a start typed
+into an interactive console window, and other `PYTHON*` variables. `docs/TRAY.md` gives the
+operator's remedy.
+
+Shipping a hand start that carries `-E` was rejected. The project cannot add `-E` to the
+`messagefoundry-tray` launcher: pip writes the interpreter line from the interpreter's path alone,
+and a `[project.gui-scripts]` entry names only a function. A documented command
+to type instead, such as `pythonw -E -P -m messagefoundry.tray`, would not match the login
+command, which also turns remote debugging off, uses the bootstrap script in a checkout, and adds
+`-s` where `PYTHONNOUSERSITE` is set. Start at Login already writes the right command for the
+install it runs from.
+
+The `messagefoundry-tray` command is a launcher the installer writes. It was not run to measure its
+import path, because that starts a real tray; the stand-in measurement above covers only the
+exit. Its console twin from the same install,
 `messagefoundry.exe`, has the same form: a small program with the entry-point script archived
 inside it. Run from a working directory holding a decoy `messagefoundry` package,
 `messagefoundry.exe --version` loaded the real package, while `python -m messagefoundry --version`
