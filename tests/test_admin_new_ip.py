@@ -35,7 +35,7 @@ from messagefoundry.api.security import (
 )
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import ALL_CHANNELS, Identity
-from messagefoundry.auth.notifications import ADMIN_NEW_IP, SecurityEvent
+from messagefoundry.auth.notifications import NEW_ADDRESS_REVERIFY, SecurityEvent
 from messagefoundry.auth.service import (
     _NEW_IP_PER_SESSION_MAX,
     STEP_UP_ACTION_ADMIN_USER_UPDATE,
@@ -131,10 +131,11 @@ async def test_new_ip_flags_audits_and_notifies() -> None:
         # A different address → flagged, audited, and notified.
         assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
         assert any(
-            e.event_type == ADMIN_NEW_IP and e.client_ip == "10.2.2.2" for e in notifier.events
+            e.event_type == NEW_ADDRESS_REVERIFY and e.client_ip == "10.2.2.2"
+            for e in notifier.events
         )
         rows = await store.list_audit(limit=20)
-        [flagged] = [r for r in rows if r["action"] == "auth.admin_action_new_ip"]
+        [flagged] = [r for r in rows if r["action"] == "auth.new_address_reverify_required"]
         # Vault BACKLOG #3197: the address is in the client column, not only in the detail, so a
         # search or export by address finds the row.
         assert flagged["client"] == "10.2.2.2"
@@ -210,20 +211,20 @@ async def test_repeat_from_same_new_ip_is_deduped() -> None:
         # Repeat from the SAME address → still forces step-up, but no new audit row / notice.
         assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
         actions = [r["action"] for r in await store.list_audit(limit=50)]
-        assert actions.count("auth.admin_action_new_ip") == 1
-        assert sum(1 for e in notifier.events if e.event_type == ADMIN_NEW_IP) == 1
+        assert actions.count("auth.new_address_reverify_required") == 1
+        assert sum(1 for e in notifier.events if e.event_type == NEW_ADDRESS_REVERIFY) == 1
         # A DIFFERENT new address is a distinct event → re-emits.
         assert await service.flag_new_client_ip(token, "10.3.3.3", path="/users") is True
         actions = [r["action"] for r in await store.list_audit(limit=50)]
-        assert actions.count("auth.admin_action_new_ip") == 2
-        assert sum(1 for e in notifier.events if e.event_type == ADMIN_NEW_IP) == 2
+        assert actions.count("auth.new_address_reverify_required") == 2
+        assert sum(1 for e in notifier.events if e.event_type == NEW_ADDRESS_REVERIFY) == 2
     finally:
         await store.close()
 
 
 async def _new_ip_rows(store: MessageStore) -> list[str]:
-    """The ``seen_ip`` of every ``auth.admin_action_new_ip`` row, oldest first."""
-    rows = await store.list_audit(action="auth.admin_action_new_ip", limit=100)
+    """The ``seen_ip`` of every ``auth.new_address_reverify_required`` row, oldest first."""
+    rows = await store.list_audit(action="auth.new_address_reverify_required", limit=100)
     return [json.loads(str(r["detail"]))["seen_ip"] for r in reversed(rows)]
 
 
@@ -241,7 +242,7 @@ async def test_alternating_new_addresses_audit_once_each() -> None:
         for seen in ("10.2.2.2", "10.3.3.3", "10.2.2.2", "10.3.3.3", "10.2.2.2"):
             assert await service.flag_new_client_ip(token, seen, path="/users") is True
         assert await _new_ip_rows(store) == ["10.2.2.2", "10.3.3.3"]
-        assert sum(1 for e in notifier.events if e.event_type == ADMIN_NEW_IP) == 2
+        assert sum(1 for e in notifier.events if e.event_type == NEW_ADDRESS_REVERIFY) == 2
     finally:
         await store.close()
 
@@ -331,16 +332,18 @@ async def test_one_epoch_audits_at_most_the_per_session_cap() -> None:
                 assert await service.flag_new_client_ip(token, seen, path="/users") is True
         reported = addresses[: _NEW_IP_PER_SESSION_MAX + 1]
         assert await _new_ip_rows(store) == reported
-        assert sum(1 for e in notifier.events if e.event_type == ADMIN_NEW_IP) == len(reported)
+        assert sum(1 for e in notifier.events if e.event_type == NEW_ADDRESS_REVERIFY) == len(
+            reported
+        )
         details = [
             json.loads(str(r["detail"]))
-            for r in await store.list_audit(action="auth.admin_action_new_ip", limit=100)
+            for r in await store.list_audit(action="auth.new_address_reverify_required", limit=100)
         ]
         capped = [d for d in details if "cap_reached" in d]
         assert [d["seen_ip"] for d in capped] == [addresses[_NEW_IP_PER_SESSION_MAX]]
         assert capped[0]["cap_reached"] == _NEW_IP_PER_SESSION_MAX
         # The holder's notice for that address says so too; the eight before it do not.
-        sent = [e for e in notifier.events if e.event_type == ADMIN_NEW_IP]
+        sent = [e for e in notifier.events if e.event_type == NEW_ADDRESS_REVERIFY]
         assert [e.client_ip for e in sent if e.detail.get("cap_reached")] == [
             addresses[_NEW_IP_PER_SESSION_MAX]
         ]

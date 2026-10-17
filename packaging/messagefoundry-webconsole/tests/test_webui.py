@@ -8975,7 +8975,9 @@ async def test_a_cookie_replayed_from_a_second_address_is_sent_to_reauth(engine:
         assert (await b.get(f"/ui/messages/{mid}")).status_code == 200
     seen = [
         json.loads(str(dict(a)["detail"]))["path"]
-        for a in await engine.store.list_audit(action="auth.admin_action_new_ip", limit=100)
+        for a in await engine.store.list_audit(
+            action="auth.new_address_reverify_required", limit=100
+        )
     ]
     assert seen == [f"/ui/messages/{mid}"]  # one row: a first sighting, then deduped
 
@@ -9134,7 +9136,7 @@ async def test_the_continuation_cap_is_the_reauth_pages_own(engine: Engine) -> N
 async def test_a_cross_site_write_from_a_new_address_writes_no_row(engine: Engine) -> None:
     """RED when: ``require_ui`` asks the new-address question before its same-origin check (vault
     BACKLOG #3052 item 11). In that order a cross-site page holding a replayed cookie would make
-    the engine write ``auth.admin_action_new_ip`` and send the notice before the write is refused.
+    the engine write ``auth.new_address_reverify_required`` and send the notice before the write is refused.
 
     The write carries no ``Sec-Fetch-Site`` and a foreign ``Origin``, as an older browser's would:
     the fetch-metadata middleware lets an absent header through, so the refusal under test is
@@ -9151,10 +9153,16 @@ async def test_a_cross_site_write_from_a_new_address_writes_no_row(engine: Engin
         r = await b.post("/ui/statistics/reset", headers={"Origin": "https://attacker.example"})
         # require_ui's own refusal, by its detail, so an earlier gate cannot pass this vacuously.
         assert (r.status_code, r.json().get("detail")) == (403, "cross-origin request rejected")
-        assert await engine.store.list_audit(action="auth.admin_action_new_ip", limit=10) == []
+        assert (
+            await engine.store.list_audit(action="auth.new_address_reverify_required", limit=10)
+            == []
+        )
         r = await b.post("/ui/statistics/reset", headers={"Sec-Fetch-Site": "same-origin"})
         assert (r.status_code, r.headers["location"]) == (303, "/ui/reauth?next=/ui")
-    assert len(await engine.store.list_audit(action="auth.admin_action_new_ip", limit=10)) == 1
+    assert (
+        len(await engine.store.list_audit(action="auth.new_address_reverify_required", limit=10))
+        == 1
+    )
 
 
 async def test_a_refused_write_without_monitoring_read_lands_on_the_account_page(

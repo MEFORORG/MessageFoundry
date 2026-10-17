@@ -48,6 +48,11 @@ calls it at all" no longer holds. Neither does the caller list above, which also
 console's gates. A first sighting on a PHI read now writes `auth.admin_action_new_ip`. See
 [ADR 0068](0068-browser-webauthn-passkeys-offloopback.md)'s amendment of that date for the gates.*
 
+*Renamed 2026-10-17 (vault BACKLOG #3052, item 2): the action this section calls
+`auth.admin_action_new_ip` is now `auth.new_address_reverify_required`, with no alias, because it
+fires on PHI reads and paced writes as well as admin actions. The text above keeps the name it was
+written with.*
+
 **The session record is actively misleading, not merely lossy.** `sessions.client` is captured at
 **login**. On a replayed token it therefore holds the **original victim's** address, so joining an
 audit row to its session to recover "where from" produces a confident, wrong answer that points at

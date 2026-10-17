@@ -434,7 +434,7 @@ def require_ui(
     budget, so a password holder could throttle the real user by being refused in a loop. On a
     non-GET the same-origin check runs first. A refusal is audited here as ``auth.mfa_denied``, so
     the hook must not write that row itself. It may have other effects: the reauth-only action
-    hook records the new-IP signal, which can write ``auth.admin_action_new_ip``.
+    hook records the new-IP signal, which can write ``auth.new_address_reverify_required``.
 
     ``phi=True`` also applies the ADR 0092 serve-hop refusal (``enforce_phi_read_hop``) and the same
     per-actor anti-automation throttle as ``require_phi_read`` (the /ui PHI views call the JSON
@@ -1177,7 +1177,7 @@ async def _refuse_from_new_address(
     """Send the browser to ``/ui/reauth`` when this request comes from a host its session has not
     verified from (vault BACKLOG #2620). The cookie twin of ``api.security``'s refusal of the same
     name; :func:`require_ui` says which requests ask. ``next_path`` is as for
-    :func:`_reauth_redirect`. Records the signal (``auth.admin_action_new_ip`` and a notice on a
+    :func:`_reauth_redirect`. Records the signal (``auth.new_address_reverify_required`` and a notice on a
     first sighting) the way the step-up factories do."""
     if await auth.flag_new_client_ip(
         session_token(request), client_ip(request), path=request.url.path
