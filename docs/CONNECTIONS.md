@@ -1225,8 +1225,9 @@ upload chokepoint enforces a fixed policy independent of the directory-source po
 `/messages/{message_id}/attachments/{attachment_id}`, and its `/ui` delegate) serves the stored bytes
 **verbatim** (the preserve-the-original invariant forbids rewriting a clinical payload) but neutralizes
 them at the response. An SVG is the exception: it is served as a copy rebuilt from a tag and attribute
-allow-list, or refused with HTTP 422 when it cannot be vetted, and the stored value stays verbatim. The
-rules are recorded once, in
+allow-list, or refused with HTTP 422 when it cannot be vetted, and the stored value stays verbatim. A
+document that is not an SVG but carries an SVG element, or an `svg` start tag in the bounded head
+past leading text, is refused the same way. The rules are recorded once, in
 [ADR 0105's 2026-09-28 amendment](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md). The sender-influenced OBX-5.2 MIME goes through `_safe_attachment_content_type`,
 which is an **allow-list**: it declares the stored label only when the label exactly names one of a short,
 reviewable set of inert types (`application/pdf`, `application/dicom`, `application/json`, `text/plain`,

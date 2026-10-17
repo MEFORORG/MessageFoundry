@@ -993,8 +993,9 @@ def _chain(exc: BaseException) -> list[BaseException]:
 async def test_svg_label_on_non_markup_bytes_is_served_unchanged(
     engine: Engine, client: httpx.AsyncClient
 ) -> None:
-    """No SVG reader renders bytes that do not start with ``<``, so an SVG label alone changes nothing:
-    the document is served byte for byte under the generic type, and the audit row claims no copy."""
+    """Bytes that do not start with ``<`` and hold no ``svg`` start tag are not an SVG, so an SVG
+    label alone changes nothing: the document is served byte for byte under the generic type, and
+    the audit row claims no copy."""
     mid, ref = await _seed_labelled(engine, "image/svg+xml", marker="svg-label-on-text")
     r = await client.get(f"/messages/{mid}/attachments/{ref}")
     assert r.status_code == 200
@@ -1038,6 +1039,25 @@ async def test_xml_embedding_svg_below_another_root_is_refused(
     )
     r = await client.get(f"/messages/{mid}/attachments/{ref}")
     assert r.status_code == 422
+    assert before_marker not in r.content
+    await _assert_one_refusal_row(engine, mid, ref, "svg_unsanitizable")
+
+
+async def test_an_svg_tag_after_leading_text_is_refused(
+    engine: Engine, client: httpx.AsyncClient
+) -> None:
+    """BACKLOG #3257, end to end: a body whose first byte is not ``<`` but which carries
+    ``<svg onload=...>`` further on is refused, not served, under an inert label. The refusal is
+    audited under the route's one SVG reason, which this pins so a change to it is seen. The answer
+    says the attachment carries SVG, not that it is one: a text or PDF body refused for a tag is not
+    an SVG."""
+    before_marker = b"synthetic document text-then-svg not real PHI"
+    mid, ref = await _seed_labelled(
+        engine, "text/plain", marker="text-then-svg", suffix=b' <svg onload="x">'
+    )
+    r = await client.get(f"/messages/{mid}/attachments/{ref}")
+    assert r.status_code == 422
+    assert r.json()["detail"] == "attachment carries SVG that cannot be sanitized"
     assert before_marker not in r.content
     await _assert_one_refusal_row(engine, mid, ref, "svg_unsanitizable")
 
