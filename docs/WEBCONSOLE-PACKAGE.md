@@ -224,10 +224,12 @@ Four files implement it:
   field-name-only snapshot stayed byte-identical. It also records what the console installs on
   the app, its route gates above all (BACKLOG #2709; the reason is the #2709 entry in
   `messagefoundry/api/_ui_seam.py`). That section is read from a live mount of the console with
-  stub handlers, and the script refuses to run when the imported console is not this
-  repository's. `console_route_gates` in the script lists at least what it covers and what it
-  misses: for example, a helper a gate calls by name is not covered, nor is a route's endpoint
-  body.
+  stub handlers. It always reads this repository's console: when the process already holds a
+  console from another tree, such as the copy an install puts in site-packages, the script moves
+  that copy aside for the read and imports the console from this repository. It refuses when the
+  repository has no console. `console_route_gates` in the script lists at least what it covers and
+  what it misses: for example, module-level data a gate reads is not covered, nor is a route's
+  endpoint body.
 - [`tests/golden/webconsole_seam.snapshot`](../tests/golden/webconsole_seam.snapshot) — the checked-in
   golden.
 - [`tests/test_webconsole_seam_snapshot.py`](../tests/test_webconsole_seam_snapshot.py) — regenerates the
@@ -367,9 +369,11 @@ Option B decouples **development, test, and release**. It does **not** buy deplo
 - The `/ui` CSP is co-versioned with the `app.js`/`app.css` it governs (via the `ui_csp` hook), so a
   client-asset CSP change ships package-only.
 - Console-internal changes — presentation, client JS, `app.js` CSP tweaks — ship as a
-  **package-only** release. A change that adds a console route or changes a route's gate does not,
-  since BACKLOG #2709: the seam digest records each route's gate, so the change moves the seam and
-  needs an engine that ships the new value. That is the point: a console released from a tree
+  **package-only** release. Since BACKLOG #2709 at least these do not: a change that adds a console
+  route or changes a route's gate, and an edit to a console function a gate reaches, such as an
+  `_auth` helper it calls, or to a middleware argument or the WebSocket authorizer. The seam digest
+  records each of those, so the change moves the seam and needs an engine that ships the new
+  value. That is the point: a console released from a tree
   whose route gates differ in what the digest records pins a different digest, and is refused at
   mount. Section 3 says where the list of what it records, and misses, is kept.
 

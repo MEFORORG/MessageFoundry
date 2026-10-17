@@ -412,18 +412,24 @@ from typing import Any
 #: installs on the app: each route's top-level dependencies, gates included, with their own source
 #: and the values they captured, and its mounts, middleware and ``app.state`` hooks.
 #: ``console_route_gates`` in ``scripts/webconsole_seam_snapshot.py`` lists at least what that
-#: misses, such as a helper a gate calls by name. A change to a route's gate moves the digest, so a
+#: misses, such as module-level data a gate reads. A change to a route's gate moves the digest, so a
 #: console built before it is refused at mount. A new console route moves it too, so a console
 #: change that adds or re-gates a route now needs an engine with the new seam. The released console
 #: 0.4.0 was already refused before this change, by unrelated seam moves; this is the guard against
 #: the next gate change that moves nothing else.
+#:
+#: Vault BACKLOG #2709, review repair: the route-gate table also records the qualified name of each
+#: engine function a gate reaches by a plain global name, follows names in nested code at any depth,
+#: reads a ``functools.wraps`` wrapper's source from the function it wraps, and its section is
+#: retitled to say it holds more than gates. The digest moved from ``589456358a5fe441``; the value
+#: below was re-derived on the tree merged with main.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "589456358a5fe441"
+ENGINE_UI_SEAM: str = "ca9d9d31c1e53c1b"
 
 
 @dataclass(frozen=True, slots=True)

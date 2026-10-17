@@ -246,6 +246,10 @@ def _auth_service_symbol(obj: Any) -> str:
 _CONSOLE_PACKAGE_DIR = _REPO_ROOT / "messagefoundry_webconsole"
 _CONSOLE_PACKAGE = "messagefoundry_webconsole"
 
+#: The ``engine_seam`` the route-gate table mounts the console under. Not a digest, so it can never
+#: equal the seam the table feeds; the console is told to accept it for the mount alone.
+_MOUNT_SEAM = "route-gate-table-mount"
+
 #: This repository's console modules, kept while another tree's copy holds ``sys.modules``, so a
 #: second call reuses them and a test can patch the copy the table reads.
 _REPO_CONSOLE_MODULES: dict[str, types.ModuleType] = {}
@@ -335,8 +339,10 @@ def _import_repo_console() -> types.ModuleType:
 def _stub(label: str, *, takes_arguments: bool) -> Callable[..., Any]:
     """A stand-in for one ``UiDeps`` member, named after it. Registering a route never calls one.
 
-    One stub per member, so a row says WHICH engine dependency or handler a route reaches: dropping
-    ``Depends(deps.get_gate)``, the dual-control approval gate, moves the digest. FastAPI reads a
+    One stub per member, so a row says WHICH engine dependency a route runs: dropping
+    ``Depends(deps.get_gate)``, the dual-control approval gate, moves the digest. A handler a
+    route's body calls is not in any row, because the table does not read endpoint bodies. FastAPI
+    reads a
     ``Depends`` target's signature when a route is registered, so those stubs take no parameters
     and add none to the route."""
 
@@ -361,16 +367,21 @@ def _normalized_source(fn: Any) -> str:
     source rather than bytecode, which changes with the Python version. A lambda's source is the
     physical line holding it, which may not parse alone; that falls back to the stripped text.
 
-    Cached by code object: every route's gate built by one factory shares that factory's code, and
-    a reloaded module gets new code objects, so the cache never serves an edited function."""
-    cached = _NORMALIZED_SOURCE.get(fn.__code__)
-    if cached is None:
-        cached = _NORMALIZED_SOURCE[fn.__code__] = _normalize(fn)
-    return cached
+    Read from the function a decorator wrapped, as ``inspect.getsource`` does. Cached by the
+    IDENTITY of that function's code object, never by equality: equal code objects can belong to
+    different functions, since equality ignores the file name and annotations, and every
+    ``functools.wraps`` wrapper of one decorator shares one code object. Every route's gate built
+    by one factory shares that factory's code object, which is what the cache saves."""
+    target = inspect.unwrap(fn)
+    code = target.__code__
+    cached = _NORMALIZED_SOURCE.get(id(code))
+    if cached is None or cached[0] is not code:
+        cached = _NORMALIZED_SOURCE[id(code)] = (code, _normalize(target))
+    return cached[1]
 
 
-#: ``_normalized_source`` by code object.
-_NORMALIZED_SOURCE: dict[types.CodeType, str] = {}
+#: ``_normalized_source`` by ``id`` of the code object, which the entry holds so the id stays its.
+_NORMALIZED_SOURCE: dict[int, tuple[types.CodeType, str]] = {}
 
 
 def _normalize(fn: Any) -> str:
@@ -397,26 +408,36 @@ def _qualified(obj: Any) -> str:
     return f"{obj.__module__}:{obj.__qualname__}"
 
 
+def _code_names(code: types.CodeType) -> set[str]:
+    """The global names ``code`` and every function nested in it, at any depth, refer to."""
+    names = set(code.co_names)
+    for const in code.co_consts:
+        if inspect.iscode(const):
+            names |= _code_names(const)
+    return names
+
+
 def _console_helpers(fn: Any, found: dict[str, Any]) -> None:
-    """Collect, transitively, every console function ``fn`` calls by its global name.
+    """Collect, transitively, every function ``fn`` calls by its global name.
 
     A gate makes its decision partly in helpers such as ``_ui_action_step_up_ok``, which it names
-    rather than captures, so the gate's own source does not carry them. Only functions defined in
-    the console package are followed: an engine function is the engine's to version."""
-    names = set(fn.__code__.co_names)
-    for const in fn.__code__.co_consts:
-        if inspect.iscode(const):
-            names |= set(const.co_names)
-    for name in sorted(names):
-        value = fn.__globals__.get(name)
+    rather than captures, so the gate's own source does not carry them. A console function is
+    followed, and its source hashed. An engine function is recorded by its qualified name only,
+    as ``None``: its body is the engine's to version, but which engine function a console name is
+    bound to is the console's choice, so a rebinding moves the digest."""
+    target = inspect.unwrap(fn)
+    for name in sorted(_code_names(target.__code__)):
+        value = target.__globals__.get(name)
         if not inspect.isfunction(value):
             continue
-        if value.__module__.partition(".")[0] != "messagefoundry_webconsole":
-            continue
         key = _qualified(value)
-        if key not in found:
-            found[key] = value
-            _console_helpers(value, found)
+        if key in found:
+            continue
+        if value.__module__.partition(".")[0] != _CONSOLE_PACKAGE:
+            found[key] = None
+            continue
+        found[key] = value
+        _console_helpers(value, found)
 
 
 def _render_value(owner: str, var: str, value: Any, known: dict[int, str], seen: set[int]) -> str:
@@ -473,7 +494,9 @@ def _render_callable(fn: Any, known: dict[int, str], seen: set[int] | None = Non
     _console_helpers(fn, helpers)
     digest = hashlib.sha256(_normalized_source(fn).encode("utf-8"))
     for key in sorted(helpers):
-        digest.update(f"\n{key}\n{_normalized_source(helpers[key])}".encode())
+        helper = helpers[key]
+        body = "engine" if helper is None else _normalized_source(helper)
+        digest.update(f"\n{key}\n{body}".encode())
     gate = "gate " if security.is_route_gate(fn) else ""
     return f"{gate}{name}#{digest.hexdigest()[:12]}({'; '.join(parts)})"
 
@@ -501,26 +524,29 @@ def console_route_gates() -> list[tuple[str, str]]:
     ``messagefoundry/api/_ui_seam.py``).
 
     The table is read from a live mount of the console onto a bare app, with stub handlers. The
-    stub ``engine_seam`` is the console's own pin, which only lets ``mount_ui`` run; the table does
-    not include it. Every ``bool`` field of ``UiDeps`` is on, so a route that a switch registers,
-    such as the OIDC routes, is in the table too.
+    stub ``engine_seam`` is a fixed sentinel, ``_MOUNT_SEAM``, which the console accepts only for
+    the mount and which the table does not include. Every ``bool`` field of ``UiDeps`` is on, so a
+    route that a switch registers, such as the OIDC routes, is in the table too.
 
     It covers at least these, and misses at least these. Covered: each route's path, method and
     order; each top-level dependency's name, normalized source, defaults and captured values,
-    recursively through captured functions, and the source of every console helper it calls by
-    name; each mount's application class; each middleware class with its arguments; each
-    ``app.state`` slot named for an authorizer, rendered the same way, and the type of every other
-    hook. Missed: an engine helper a gate calls, which the engine versions; a route's endpoint body,
-    such as a proof it spends there or an argument it passes to a handler; the inside and options of
-    a mounted application; the inside of a middleware class; the value of a hook that is not an
-    authorizer, such as the CSP; a route registered only when a ``UiDeps`` field that is not a
-    ``bool`` is set, or when a ``bool`` one is off.
+    recursively through captured functions; the source of each console function it, or a console
+    function it reaches, calls through a plain global name, at any nesting depth; the qualified
+    name of each engine function reached the same way; each mount's application class; each
+    middleware class with its arguments; each ``app.state`` slot named for an authorizer, rendered
+    the same way, and the type of every other hook. Missed: an engine function's body, which the
+    engine versions; module-level data a gate reads, such as a constant or a registry; a method of
+    a console object a gate calls, such as a store's; a helper called through a module attribute
+    rather than a plain name; a route's endpoint body, such as a proof it spends there or a handler
+    it calls; the inside and options of a mounted application; the inside of a middleware class;
+    the value of a hook that is not an authorizer, such as the CSP; a route registered only when a
+    ``UiDeps`` field that is not a ``bool`` is set, or when a ``bool`` one is off.
     """
     with repo_console() as console:
         return _route_gate_rows(console)
 
 
-def _route_gate_rows(console: types.ModuleType) -> list[tuple[str, str]]:
+def _route_gate_rows(console: Any) -> list[tuple[str, str]]:
     from fastapi import FastAPI
     from fastapi.routing import APIRoute, APIWebSocketRoute
     from starlette.routing import Mount
@@ -542,7 +568,7 @@ def _route_gate_rows(console: types.ModuleType) -> list[tuple[str, str]]:
         f.name: True for f in dataclasses.fields(UiDeps) if f.type in ("bool", bool)
     }
     deps = UiDeps(
-        engine_seam=min(console.SUPPORTED_ENGINE_SEAMS),
+        engine_seam=_MOUNT_SEAM,
         default_scan_limit=0,
         core=handlers(CoreHandlers, "deps.core"),
         admin=handlers(AdminHandlers, "deps.admin"),
@@ -554,10 +580,18 @@ def _route_gate_rows(console: types.ModuleType) -> list[tuple[str, str]]:
     )
     known[id(deps)] = "deps"
     app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
-    console.mount_ui(app, deps)
+    # Mounted under a fixed sentinel the console is told to accept for the duration, never under
+    # its own pin, so the table cannot depend on the seam it feeds.
+    pinned = console.SUPPORTED_ENGINE_SEAMS
+    console.SUPPORTED_ENGINE_SEAMS = frozenset({_MOUNT_SEAM})
+    try:
+        console.mount_ui(app, deps)
+    finally:
+        console.SUPPORTED_ENGINE_SEAMS = pinned
     # A low-priority route group is not in app.routes, so this walk would not see it; refuse it,
-    # as scripts/security/route_gates.py does.
-    if getattr(app.router, "_low_priority_routes", None):
+    # as scripts/security/route_gates.py does. Read without a default, so a FastAPI release that
+    # renames the private method fails here rather than reading an empty group.
+    if list(app.router._iter_low_priority_routes()):
         raise TypeError(
             "the console registered a low-priority route group, which this table cannot read"
         )
@@ -570,8 +604,15 @@ def _route_gate_rows(console: types.ModuleType) -> list[tuple[str, str]]:
             methods = ",".join(sorted((route.methods or set()) - {"HEAD", "OPTIONS"}))
             rows.append((f"{methods} {route.path}", _render_route(route, known)))
         elif isinstance(route, Mount):
-            if getattr(route.app, "routes", None):
+            # ``Mount.routes`` reads the app beneath any middleware the mount wraps around it,
+            # which ``route.app`` would hide. ``_base_app`` is Starlette's private name for it.
+            if route.routes:
                 raise TypeError(f"the console mounted an application with routes at {route.path}")
+            if route.app is not route._base_app:
+                raise TypeError(
+                    f"the console mounted an application behind middleware at {route.path}, "
+                    "which the route-gate table cannot read"
+                )
             rows.append((f"MOUNT {route.path}", f"mount {_qualified(type(route.app))}"))
         else:
             raise TypeError(
@@ -684,7 +725,8 @@ def contract_sections() -> list[tuple[str, list[tuple[str, str]]]]:
     )
     sections.append(
         (
-            "console route gates (each route's top-level gate dependencies, BACKLOG #2709)",
+            "console install surface (each route's top-level dependencies, gates included, then "
+            "mounts, middleware and app.state hooks, BACKLOG #2709)",
             console_route_gates(),
         )
     )

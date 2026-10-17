@@ -417,22 +417,21 @@ def test_a_console_whose_dr_route_is_session_only_is_refused_at_mount(
     plant moves the digest: once it does, the refusal is the ordinary ``assert_engine_seam`` on the
     engine's real mount path, which this test drives rather than assumes. The control first: the
     unplanted console derives the engine's seam and mounts."""
-    import messagefoundry_webconsole
     from messagefoundry.api._ui_seam import ENGINE_UI_SEAM
     from messagefoundry.api.app import create_app
-    from messagefoundry_webconsole import UiSeamMismatch
 
     module = _load_script(monkeypatch, "_seam_gen_dr_mount")
     assert module.contract_digest() == ENGINE_UI_SEAM
-    create_app(serve_ui=True)
-
+    # Inside repo_console(), so create_app mounts the console the digest was read from, even where
+    # the process imported an installed copy first, as a CI worker does.
     with module.repo_console() as console:
-        _session_only_dr_gate(monkeypatch, console)
-    planted = module.contract_digest()
-    assert planted != ENGINE_UI_SEAM
-    monkeypatch.setattr(messagefoundry_webconsole, "SUPPORTED_ENGINE_SEAMS", frozenset({planted}))
-    with pytest.raises(UiSeamMismatch, match=ENGINE_UI_SEAM):
         create_app(serve_ui=True)
+        _session_only_dr_gate(monkeypatch, console)
+        planted = module.contract_digest()
+        assert planted != ENGINE_UI_SEAM
+        monkeypatch.setattr(console, "SUPPORTED_ENGINE_SEAMS", frozenset({planted}))
+        with pytest.raises(console.UiSeamMismatch, match=ENGINE_UI_SEAM):
+            create_app(serve_ui=True)
 
 
 def test_a_gate_setting_moves_the_rendering_and_an_unknown_capture_raises(
@@ -505,6 +504,46 @@ def test_a_gate_body_or_a_helper_it_calls_moves_the_rendering(
 
     monkeypatch.setattr(_auth, "_ui_action_step_up_ok", always_ok)
     assert module._render_callable(gate, {}) != helper_before
+
+
+def test_a_rebound_engine_function_or_a_wrapped_body_moves_the_rendering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two holes a review of #2709 found. A gate's global name rebound to a different ENGINE
+    function changed nothing, because engine functions were dropped without their name. Two
+    functions behind one ``functools.wraps`` decorator share the wrapper's code object, so a cache
+    keyed by code served the first one's source for the second."""
+    module = _load_script(monkeypatch, "_seam_gen_rebind")
+    probe = tmp_path / "e2709_rebind_probe.py"
+    probe.write_text(
+        "import functools\n"
+        "from messagefoundry.api.security import client_ip as helper\n"
+        "def gate(request):\n"
+        "    return helper(request)\n"
+        "def wrap(fn):\n"
+        "    @functools.wraps(fn)\n"
+        "    def wrapper(*args):\n"
+        "        return fn(*args)\n"
+        "    return wrapper\n"
+        "@wrap\n"
+        "def strict(x):\n"
+        "    return x == 'ok'\n"
+        "@wrap\n"
+        "def lax(x):\n"
+        "    return True\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    imported = importlib.import_module("e2709_rebind_probe")
+    from messagefoundry.api import security
+
+    before = module._render_callable(imported.gate, {})
+    assert "messagefoundry.api.security:client_ip" not in before  # names are hashed, not printed
+    monkeypatch.setattr(imported, "helper", security.route_declaration_of)
+    assert module._render_callable(imported.gate, {}) != before
+
+    assert imported.strict.__code__ is imported.lax.__code__  # the shape that collided
+    assert module._normalized_source(imported.strict) != module._normalized_source(imported.lax)
 
 
 def _import_console_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
