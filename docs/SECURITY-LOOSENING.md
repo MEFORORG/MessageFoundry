@@ -817,8 +817,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   writes `auth.admin_action_new_ip`, nothing notifies the account holder, and nothing forces a fresh
   step-up. A stolen token replayed from another host is the case this signal exists for.
 - **When acceptable:** a deployment whose operators reach the console through a pool of egress
-  addresses that rotates between requests (some NAT and VPN concentrators do), where every sensitive
-  action would otherwise re-prompt. Declaring `[api].trusted_proxies` correctly fixes the proxy case
+  addresses that rotates between requests (some NAT and VPN concentrators do). With the signal on,
+  each change of address would re-prompt the sensitive actions, and would refuse at least the
+  message reads and the paced writes until the session re-verifies from the new address (on the
+  console, by sending the browser to `/ui/reauth`; vault BACKLOG #2620). Declaring `[api].trusted_proxies` correctly fixes the proxy case
   and is preferred over turning this off.
 - **Compensating controls:** keep `[auth].step_up_max_age_seconds` short and `require_action_step_up`
   on, restrict the operator surface with `[security].allowed_client_networks`, and review the
@@ -971,7 +973,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   that provider really uses with no human step.
 - **Compensating controls:** keep `oidc_callback_min_elapsed_seconds` at its default, so every other
   method stays floored. Each exempted pass records the matched values as `callback_floor_exempt_amr`
-  on its audit rows, failed attempts included; [SECURITY.md](SECURITY.md), *What these floors do not
+  on its audit rows, failed attempts included except a lock refusal; [SECURITY.md](SECURITY.md), *What these floors do not
   do*, says which rows. Review those rows. Load refuses a value `oidc_mfa_amr_values` also accepts while the claim gate is
   on, since that value would exempt every token the gate admits by it.
 - **Reversible:** yes, immediately — empty the list (or delete the line) and restart.
@@ -1846,12 +1848,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **`interpreter_not_isolated`: the interpreter was started without `-I`.** It then reads the
   `PYTHON*` variables, unless it was started with `-E`, so a `PYTHONPATH` or `PYTHONHOME` left in
   the service's environment decides what the engine imports. Another product's installer can
-  leave one behind. The entry names the variables that are set.
-- **`python_variables_reach_children`: the engine ignores a variable its children would honour.**
-  The engine ignores the `PYTHON*` variables, and `PYTHONPATH`, `PYTHONHOME`, `PYTHONPLATLIBDIR`,
-  `PYTHONPYCACHEPREFIX` or `PYTHONUSERBASE` is set in its environment. The Python children it
-  starts (the sandbox worker, and each engine shard under `supervise`) are not isolated, and the
-  engine hands them these variables by name. Remove the variable from the service's environment.
+  leave one behind. The entry names the variables that are set. The Python children the engine
+  starts, the sandbox worker and each engine shard under `supervise`, repeat the engine's own
+  `-I` or `-E`, so they read the variables exactly when the engine does (vault BACKLOG #2701).
 - **`startup_code_unexpected`: a `.pth` import line or a customize module the engine does not
   know.** The entry names each file. A file is expected in three cases, and in no other:
   1. An installed package lists it in its `RECORD` with a matching hash. That covers the `.pth`
@@ -1869,9 +1868,8 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
     start-up code and is not listed.
   - `usercustomize` is listed only where the user site directory is on, which is the only place
     the interpreter imports it. It is off under `-I` and in a virtual environment.
-  - The search covers the engine's own import path and the absolute `PYTHONPATH` entries the
-    engine hands its Python children. So a `sitecustomize` that only a child would run is listed
-    too, and `supervise` refuses on it before it starts an engine shard.
+  - The search covers the engine's own import path. A Python child repeats the engine's
+    isolation, so its import path adds nothing the engine's lacks (vault BACKLOG #2701).
 - **`startup_directory_writable`: the engine's own account can add a file where start-up code is
   read from.** That is a site directory, or any directory on the import path, where a
   `sitecustomize` would be found. Code running as that account could plant start-up code there,
@@ -2025,7 +2023,7 @@ chapter was not part of the verification above.
 | `store_principal_over_granted` / `store_principal_privileges_unobserved` (observed store-principal privilege) | V13 Configuration (backend component accounts, 13.2.2) | **AC-6(5)** Privileged Accounts · **AC-6(9)** Log Use of Privileged Functions · **CM-7(5)** Authorized Software / least functionality | §164.312(a)(1) Access Control · §164.308(a)(4) Information Access Management |
 | `audit_chain_unkeyed` (observed keyless audit chain on a keyed store) | V16 Security Logging and Error Handling | **AU-9** Protection of Audit Information · **AU-9(3)** Cryptographic Protection | §164.312(b) Audit Controls · §164.312(c)(1) Integrity |
 | `remote_debug_enabled` / `remote_debug_unguarded` (observed remote-debugging interface of the engine process) | V13 Configuration | **CM-7** Least Functionality | §164.312(a)(1) Access Control |
-| `interpreter_not_isolated` / `python_variables_reach_children` / `startup_code_unexpected` / `startup_directory_writable` / `startup_directory_unchecked` (observed launch flags and start-up code of the engine's interpreter) | V13 Configuration | **CM-7** Least Functionality · **SI-7** Software, Firmware, and Information Integrity · **CM-5** Access Restrictions for Change | §164.312(c)(1) Integrity · §164.312(a)(1) Access Control |
+| `interpreter_not_isolated` / `startup_code_unexpected` / `startup_directory_writable` / `startup_directory_unchecked` (observed launch flags and start-up code of the engine's interpreter) | V13 Configuration | **CM-7** Least Functionality · **SI-7** Software, Firmware, and Information Integrity · **CM-5** Access Restrictions for Change | §164.312(c)(1) Integrity · §164.312(a)(1) Access Control |
 | `service_environment_secret` / `store_key_in_service_environment` / `service_environment_unobservable` (observed engine secrets in the Windows service's environment) | V13 Configuration (13.3.1) | **SC-12** Cryptographic Key Establishment and Management · **SC-28** Protection of Information at Rest · **AC-3** Access Enforcement | §164.312(a)(1) Access Control · §164.312(a)(2)(iv) Encryption and Decryption |
 
 > **There is no longer a synthetic-vs-PHI split to crosswalk.** It was risk-based tailoring keyed on

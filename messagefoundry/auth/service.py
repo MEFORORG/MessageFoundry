@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import http.client
 import ipaddress
 import json
@@ -319,6 +320,41 @@ _PROBE_FAULT_KIND: ContextVar[str | None] = ContextVar("_PROBE_FAULT_KIND", defa
 #: The errors ``_probe_principal`` reads as an unreachable directory although they are not an
 #: ``LdapError`` (BACKLOG #3100): the network-class ``OSError`` subtypes. At least these.
 _UNREACHED_DIRECTORY = (ConnectionError, TimeoutError, socket.gaierror)
+#: The errnos that mark a plain ``OSError`` as the network failing, not the engine. Python gives
+#: these no ``ConnectionError`` subclass, so a type test alone read an unreachable host as a FAULT,
+#: which pages. Read by name, because the values differ by platform and a platform may lack one.
+#: On Windows these names carry the Winsock values (``ENETUNREACH`` is ``WSAENETUNREACH``).
+_UNREACHED_ERRNOS: Final[frozenset[int]] = frozenset(
+    code
+    for code in (
+        getattr(errno, name, None)
+        for name in ("ENETUNREACH", "EHOSTUNREACH", "ENETDOWN", "EHOSTDOWN", "ENETRESET")
+    )
+    if code is not None
+)
+#: The Win32 codes for these failures and for the ones the type test reads. An error raised from
+#: Win32 rather than Winsock carries one in ``winerror`` and only ``EINVAL`` in ``errno``. They are
+#: ERROR_CONNECTION_REFUSED, ERROR_NETWORK_UNREACHABLE, ERROR_HOST_UNREACHABLE,
+#: ERROR_PORT_UNREACHABLE and ERROR_CONNECTION_ABORTED. At least these.
+_UNREACHED_WINERRORS: Final = frozenset({1225, 1231, 1232, 1234, 1236})
+
+
+def _unreached_directory(exc: Exception) -> bool:
+    """Whether ``exc`` means the directory was not reached, rather than an engine fault.
+
+    Never raises: it runs inside the probe's broad handler, and an escape there would end the pass.
+    An ``errno`` or ``winerror`` that is not an int, which ``OSError`` allows, reads as no match.
+    """
+    if not isinstance(exc, OSError):
+        return False
+    if isinstance(exc, _UNREACHED_DIRECTORY):
+        return True
+    winerror = getattr(exc, "winerror", None)
+    return (isinstance(exc.errno, int) and exc.errno in _UNREACHED_ERRNOS) or (
+        isinstance(winerror, int) and winerror in _UNREACHED_WINERRORS
+    )
+
+
 #: Outcomes the directory itself gave. Any of them ends a logged outage.
 _CERT_DIRECTORY_ANSWERS = frozenset(
     outcome.value
@@ -6423,15 +6459,22 @@ class AuthService:
             # user per pass; the pass-level summary below reports the count at WARNING.
             _log.debug("directory probe failed for %s: %s", user.username, exc)
             return reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.UNAVAILABLE)
-        except _UNREACHED_DIRECTORY as exc:
-            # BACKLOG #3100. ldap.py wraps the socket faults it knows of as LdapError (BACKLOG
-            # #2566). A connection, timeout or name-lookup error that escapes it is still the
-            # directory not being reached. Read as FAULT, a network blip would page and open an
-            # alert nothing resolves. Any other OSError, such as a missing file, is an engine fault
-            # and falls through to FAULT below. Debug-level, like the outage above.
-            _log.debug("directory probe of %s failed: %s", user.username, type(exc).__name__)
-            return reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.UNAVAILABLE)
         except Exception as exc:
+            if _unreached_directory(exc):
+                # BACKLOG #3100. ldap.py wraps the socket faults it knows of as LdapError (BACKLOG
+                # #2566). A connection, timeout, name-lookup or unreachable-network error that
+                # escapes it is still the directory not being reached. Read as FAULT, a network
+                # blip would page and open an alert nothing resolves. Any other OSError, such as a
+                # missing file, is an engine fault and reads as FAULT below. Debug-level, like the
+                # outage above. The codes say which failure it was; the message is not logged.
+                _log.debug(
+                    "directory probe of %s failed: %s errno=%s winerror=%s",
+                    user.username,
+                    type(exc).__name__,
+                    getattr(exc, "errno", None),
+                    getattr(exc, "winerror", None),
+                )
+                return reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.UNAVAILABLE)
             # BACKLOG #2241. Anything else the directory layer raised: a KeyError or ValueError on a
             # malformed entry, a fault in a test double. Uncaught, it was a 500 from
             # verify_mfa instead of an audited refusal, and it ended the WHOLE reconcile pass, so one
@@ -9574,7 +9617,8 @@ class AuthService:
     #:
     #: A new action on either reauth-only action gate belongs here too. A test in
     #: ``tests/test_mfa_access_gate.py`` catches at least a missing one wired in the engine or
-    #: console packages. The action-less ``require_ui_reauth_only`` gate never consults it.
+    #: console packages. The action-less ``require_ui_reauth_only`` gate never consults it, so
+    #: ``finish_webauthn_registration`` asks it for ``webauthn_enroll`` itself (BACKLOG #3014).
     _PENDING_REFUSED_ACTIONS = frozenset(
         {
             STEP_UP_ACTION_MFA_ENROLL,
@@ -11306,6 +11350,12 @@ class AuthService:
         "behind a load balancer, begin and finish must reach the same node)"
     )
     _WEBAUTHN_LABEL_MAX = 100  # matches the column cap (ADR 0068 §4)
+    #: A passkey finish on a session that owes the account's existing factor (BACKLOG #3014). It
+    #: points back to the account page because the refusal ended the ceremony this page staged.
+    _FACTOR_PRESENT = (
+        "this account already has a second factor; verify it first, then start adding the passkey "
+        "again from the account page"
+    )
 
     async def begin_webauthn_registration(
         self, identity: Identity, *, token: str, rp_id: str, rp_name: str
@@ -11353,7 +11403,8 @@ class AuthService:
         """Verify an attestation response and persist the passkey. Returns a not-``ok``
         :class:`Elevation` when the response fails verification (audited — parity with a wrong TOTP
         code); raises :class:`ValueError` for flow errors with safe, renderable messages (unknown
-        account, bad label, expired ceremony, duplicate label/credential). On success the enrolling
+        account, bad label, expired ceremony, duplicate label/credential, and a pending session on an
+        account that already holds a factor, BACKLOG #3014). On success the enrolling
         session is marked MFA-verified and re-keyed (exact :meth:`confirm_mfa_enrollment` parity,
         ASVS 7.2.4) — **no recovery codes are minted** (ADR 0068 decision 5). Accepts a directory
         account, for the reason :meth:`begin_mfa_enrollment` states.
@@ -11365,7 +11416,8 @@ class AuthService:
         **So the login-to-MFA floor covers it too** (BACKLOG #2389): see
         :meth:`_enrolment_too_early`. A registration that would satisfy a pending session too soon
         after sign-in fails as a failed verification, before the challenge is popped, so the
-        ceremony stays in flight."""
+        ceremony stays in flight. A pending session on an account that already holds a factor never
+        reaches the floor: it is refused first, at any elapsed time, and its ceremony is ended."""
         arrived_at = time.time()  # the floor's clock, read before any await
         user = await self._load_user(identity.user_id)
         if user is None:
@@ -11381,6 +11433,20 @@ class AuthService:
         if staged is None or staged.user_id != user.id:
             self._webauthn_challenges.pop((hash_token(token), "register"))
             raise ValueError(self._CEREMONY_EXPIRED)
+        # BACKLOG #3014: re-asked at finish, since a factor may have been bound since begin and the
+        # console's finish route rides the action-less gate. After the peek, so "ceremony expired"
+        # still answers first; before the floor, so this refusal reads the same at any elapsed time.
+        # It kills the stale ceremony, and is audited as the begin gate's refusal is. Read-then-act:
+        # a factor bound between here and the stamp below is not caught, as the begin gate's is not.
+        # The session is read first because the check fails closed on a dead one, which is a lost
+        # session to the caller, not a factor it owes.
+        if await self._load_session(hash_token(token)) is None:
+            self._webauthn_challenges.pop((hash_token(token), "register"))
+            return Elevation(session_lost=True)
+        if await self._factor_binding_is_blocked(token, STEP_UP_ACTION_WEBAUTHN_ENROLL):
+            self._webauthn_challenges.pop((hash_token(token), "register"))
+            await self.audit_mfa_denied(identity, "finish_webauthn_registration", client=client)
+            raise ValueError(self._FACTOR_PRESENT)
         if await self._enrolment_too_early(
             token, user, arrived_at, event="auth.webauthn_failed", client=client
         ):

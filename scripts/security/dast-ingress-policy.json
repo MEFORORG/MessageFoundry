@@ -47,9 +47,7 @@
     "min_liveness_probes": 50,
     "min_log_records_seen": 1
   },
-  "known_defects": {
-    "alphanumeric-field-separator": "Engine defect found by this pass on 2026-09-26: a message whose MSH-1 is a letter or digit is accepted, and the ACK echoes that separator, so MSA-1 (AA/AE/AR, themselves letters) cannot be read back by the sender. Pinned by a strict xfail in tests/test_dast_ingress_sweep.py."
-  },
+  "known_defects": {},
   "resource_bounds": {
     "passes": 2,
     "max_heap_growth_bytes": 4194304,
