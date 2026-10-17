@@ -16,7 +16,6 @@ supposed to succeed, and the session registry is a throwaway home.
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 import time
@@ -27,6 +26,7 @@ from pathlib import Path
 import pytest
 
 from tests.test_worktree_remove_path import (
+    _REPO,
     Rig,
     _claim,
     _commit,
@@ -56,43 +56,57 @@ def _target(route: str, wt: Path) -> list[str]:
     return [route, wt.name.removeprefix("Repo-") if route == "-Name" else str(wt)]
 
 
+#: The question the script asks of a directory, in the script's own words: a .NET walk that throws on
+#: an entry it may not read. Run in pwsh, as the script is, so the probe and the script cannot disagree.
+_PROBE = (
+    "$o = [System.IO.EnumerationOptions]::new(); $o.IgnoreInaccessible = $false; "
+    "try { foreach ($e in [System.IO.DirectoryInfo]::new($args[0]).EnumerateFileSystemInfos('*', $o)) {} "
+    "exit 0 } catch { exit 3 }"
+)
+
+
 @contextmanager
 def _denied_listing(directory: Path) -> Iterator[None]:
-    """Deny this user the right to list ``directory``, and give it back afterwards."""
-    who = subprocess.run(["whoami"], capture_output=True, text=True, check=False).stdout.strip()
+    """Deny this user the right to list ``directory``, and give it back afterwards.
+
+    The deny must take effect, or the test proves nothing. On the hosted windows-2025 runner the
+    account runneradmin could still list the directory after this deny (engine PR 2371, run
+    39005284295). Why was not measured. So the listing is probed with the script's own call, and
+    the test skips when it still works. A skip cannot hide a regression on its own: the planted-file
+    test fails the listing on every runner, and a static test pins IgnoreInaccessible.
+    """
+    who = subprocess.run(
+        ["whoami"], capture_output=True, text=True, check=False, timeout=30
+    ).stdout.strip()
     made = subprocess.run(
         ["icacls", str(directory), "/deny", f"{who}:(RD)"],
         capture_output=True,
         text=True,
         check=False,
+        timeout=30,
     )
     if not who or made.returncode != 0:
         pytest.skip(f"could not deny access with icacls: {made.stdout} {made.stderr}")
-
-    def restore() -> None:
-        subprocess.run(
-            ["icacls", str(directory), "/remove:d", who], capture_output=True, check=False
-        )
-
-    # THE DENY MUST TAKE EFFECT, OR THIS TEST PROVES NOTHING. On a hosted windows-2025 runner the
-    # account (runneradmin) still listed the directory after this deny, and the script then rightly
-    # found nothing to refuse (engine PR 2371, run 39005284295). os.listdir asks Windows the same
-    # FindFirstFile question the script's .NET walk asks. The planted-file tests below fail the
-    # listing on every runner, so a skip here cannot hide a regression in the script.
     try:
-        os.listdir(directory)
-    except PermissionError:
-        pass
-    else:
-        restore()
-        pytest.skip(
-            f"{who} can still list {directory} after a deny of list rights, for example an "
-            "administrator token with a backup privilege, so the condition cannot be produced"
+        probe = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", _PROBE, str(directory)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
         )
-    try:
+        if probe.returncode == 0:
+            pytest.skip(
+                f"{who} can still list the directory after the deny. The cause was not measured."
+            )
         yield
     finally:
-        restore()
+        subprocess.run(
+            ["icacls", str(directory), "/remove:d", who],
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
 
 
 # --- vault BACKLOG #2988: -Name has the claim and quiet-period refusals ------------------------------
@@ -401,9 +415,12 @@ def test_a_claims_directory_that_cannot_be_listed_refuses(rig: Rig, route: str) 
 @pytest.mark.parametrize("route", ROUTES)
 @pytest.mark.parametrize("registry", ["claims", "alloc"])
 def test_a_registry_path_whose_listing_throws_refuses(rig: Rig, route: str, registry: str) -> None:
-    """The guard the ACL tests above lean on when a runner cannot be denied: a FILE where the claims
-    or allocation directory belongs. The script sees something there, and listing it throws. Red
-    before the fix: Get-ChildItem listed the file as no records, and the tree went."""
+    """The guard the two ACL tests in this file lean on when a runner cannot be denied: a FILE where
+    the claims or allocation directory belongs. The script sees something there, and listing it
+    throws. Red before the fix: Get-ChildItem listed the file as no records, and the tree went.
+
+    It throws at the top of the walk only. A throw from a directory deeper in the allocation walk is
+    driven by the ACL test alone, so on a runner where that test skips, it is not driven."""
     wt = _sibling(rig, "planted")
     planted = _common(rig) / "mefor-coord" / registry
     planted.parent.mkdir(parents=True, exist_ok=True)
@@ -412,13 +429,25 @@ def test_a_registry_path_whose_listing_throws_refuses(rig: Rig, route: str, regi
     proc = rig.run(*_target(route, wt), "-Force")
     assert proc.returncode != 0, _out(proc)
     noun = "claims" if registry == "claims" else "allocations"
-    assert f"{noun} are unknown" in _out(proc), _out(proc)
+    # The listing's own words, so a different cannot-tell refusal firing first cannot pass this.
+    assert f"Could not list {noun} under" in _out(proc), _out(proc)
     assert wt.exists() and rig.is_registered(wt)
 
     planted.unlink()
     proc = rig.run(*_target(route, wt))
     assert proc.returncode == 0, _out(proc)
     assert not wt.exists()
+
+
+def test_the_listing_helper_does_not_skip_what_it_may_not_read() -> None:
+    """.NET's EnumerationOptions defaults IgnoreInaccessible to TRUE, and then an unlistable directory
+    lists as empty, which is the fail-open these refusals exist to stop. The ACL tests drive this
+    only where a deny binds, so the setting is pinned here as well, on every runner."""
+    text = (_REPO / "scripts" / "worktree" / "remove.ps1").read_text(encoding="utf-8")
+    body = text[text.index("function Get-EntriesOrThrow") :]
+    body = body[: body.index("\n}\n")]
+    assert "$opts.IgnoreInaccessible = $false" in body, body
+    assert "EnumerateFileSystemInfos('*', $opts)" in body, body
 
 
 # --- vault BACKLOG #2985, item 11: the allocation guard's fail-closed branches --------------------------
