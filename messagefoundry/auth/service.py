@@ -2598,14 +2598,9 @@ class AuthService:
         #: ``"fresh"``: no pass here saw a referral. ``"referred"``: one did. ``"forfeit"``: see
         #: `_forfeit_clears_on_attrition`. Only `_advance_referral_standing` moves it.
         self._reconcile_referral_standing: _ReferralStanding = "fresh"
-        #: Whether a referral, a trip or a hold has opened and not ended since, kept only so that a
-        #: forfeited standing logs once per new one (BACKLOG #3083; `_forfeit_clears_on_attrition`
-        #: states the rule). Each is set by its own ``_advance_*_standing`` before anything in the
-        #: pass can raise, and cleared where `reconcile_directory_sessions` says its episode ends.
-        #: Not the latched messages: a forfeited process never releases the referral's, and the
-        #: hold's is set only at the end of a pass that did not raise.
-        self._reconcile_referral_open = False
-        self._reconcile_breaker_open = False
+        #: Whether a hold has engaged and its undetermined accounts are still on record, so that a
+        #: forfeited hold standing logs once per new hold (BACKLOG #3083;
+        #: `_forfeit_clears_on_attrition` states when each standing logs).
         self._reconcile_hold_open = False
         #: Latched probe fault (BACKLOG #3100): set on a pass in which a probe faulted, and released
         #: by the next pass that judged something with no fault (`_record_reconcile_fault`).
@@ -6423,15 +6418,11 @@ class AuthService:
         if reconcile.ProbeOutcome.UNDETERMINED not in self._reconcile_outcomes.values():
             # u is 0: every held account has left the record, so the hysteresis has nothing to hold.
             self._reconcile_hold_latched = False
+            self._reconcile_hold_open = False
         if not candidates:
             # Nobody signed in: a no-op pass. A latched breaker alert is deliberately NOT cleared
             # here — this pass learned nothing about the directory, and clearing a standing alarm on
             # an absence of information would hide a misconfiguration that is still there.
-            # Every account behind a trip, hold or referral has left, though, so a later one is of
-            # accounts a forfeited process has not logged about yet (BACKLOG #3083).
-            self._reconcile_breaker_open = False
-            self._reconcile_hold_open = False
-            self._reconcile_referral_open = False
             await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
             return reconcile.ReconcilePlan()
 
@@ -6516,11 +6507,10 @@ class AuthService:
         self._reconcile_strikes.update(plan.strikes)
         self._reconcile_outcomes.update(plan.outcomes)
         self._reconcile_hold_latched = plan.latched
+        if reconcile.ProbeOutcome.UNDETERMINED not in self._reconcile_outcomes.values():
+            self._reconcile_hold_open = False
         if plan.hold:
             self._advance_hold_standing("held")
-        elif not plan.judged_nothing:
-            # A pass that judged accounts and did not hold ends the hold (BACKLOG #3083).
-            self._reconcile_hold_open = False
         # BACKLOG #2136. A trip makes every candidate unconfirmed until a pass that is not aborted
         # reads it clean, PRESENT, so a probe sample that missed the accounts behind the trip is no
         # clear. Only PRESENT confirms. A held account's probe judged neither its roles nor its
@@ -6538,24 +6528,20 @@ class AuthService:
             self._reconcile_unconfirmed.difference_update(
                 uid for uid, outcome in plan.outcomes.items() if outcome is present
             )
-            self._reconcile_breaker_open = False  # a pass that was not aborted ends a trip (#3083)
         elif not plan.judged_nothing:
+            self._advance_breaker_standing("tripped")  # first: it reads the set it replaces
             self._reconcile_unconfirmed = set(keyed)
-            self._advance_breaker_standing("tripped")
         # BACKLOG #2538. The same for a referral, on its own record and its own standing.
         # `_mark_reconcile_clears` states why every candidate is marked and why only PRESENT
         # confirms; `_forfeit_clears_on_attrition` states the forfeit.
         if plan.referred:
+            self._advance_referral_standing("referred")  # first: it reads the set it replaces
             self._reconcile_referred = set(keyed)
-            self._advance_referral_standing("referred")
         else:
             present = reconcile.ProbeOutcome.PRESENT
-            read = {uid for uid, outcome in plan.outcomes.items() if outcome is present}
-            self._reconcile_referred.difference_update(read)
-            if read:
-                # BACKLOG #3083. Only a PRESENT read ran every search a referral comes from, so
-                # only that ends one. A sample of held, disabled or absent accounts does not.
-                self._reconcile_referral_open = False
+            self._reconcile_referred.difference_update(
+                uid for uid, outcome in plan.outcomes.items() if outcome is present
+            )
         referral = next((p for p in probes if p.outcome is reconcile.ProbeOutcome.REFERRED), None)
         if plan.aborted is not None:
             if not plan.directory_referral and not plan.probe_fault:
@@ -6800,14 +6786,17 @@ class AuthService:
         **Why the forfeit lasts until a restart (BACKLOG #3083, kept by a Manager ruling).** A false
         clear would come exactly when the accounts behind the alert have left, and after that no
         pass probes them, so nothing raises the alert again and the fault would stand with its alert
-        resolved. A missed clear hides less: the lifespan task raises ``ad_reconcile_held`` on
-        every held pass and ``ad_reconcile_aborted`` on every tripped or referred pass, so an alert
-        resolved by hand opens again on the next such pass. A pass that judges nothing, such as an
-        outage, raises neither. A forfeited standing logs once when a new trip, hold or referral
-        opens, not once per pass. The three ``*_open`` flags say whether one is open: set by
-        ``_advance_*_standing``, and cleared by a pass with nobody signed in, by a pass that was
-        not aborted (a trip), by a pass that judged accounts and did not hold (a hold), and by a
-        pass with no referral that read an account PRESENT (a referral).
+        resolved. A missed clear hides less: ``api/app.py::_alert_reconcile_plan`` raises the
+        alert again on every pass that returns its plan with the condition standing, so an alert
+        resolved by hand opens again on the next such pass. A pass that raises returns no plan, and
+        an outage raises none of the three, so until then a hand-resolved alert stays resolved.
+
+        **A forfeited standing logs once when a new trip, hold or referral opens, not once per
+        pass (BACKLOG #3083).** One is open while the accounts behind it are still on record: for
+        a trip, `_reconcile_unconfirmed`; for a referral, `_reconcile_referred`; for a hold,
+        ``_reconcile_hold_open``, set when it engages and cleared once the outcome record holds no
+        undetermined answer. Each ends only as those accounts are read again (PRESENT, for a trip
+        or a referral) or leave, so a probe sample that misses them does not end one. Each standing logs only for its own alert.
         """
         if not self._reconcile_unconfirmed <= users.keys():
             self._advance_breaker_standing("forfeit")
@@ -6833,18 +6822,16 @@ class AuthService:
         aloud because the in-process breaker message still clears on the next pass that is not
         aborted, while the durable instance stays open for an operator.
 
-        A ``"tripped"`` event also opens a trip, and a forfeited process logs on the one that opens
-        it (BACKLOG #3083; `_forfeit_clears_on_attrition`).
+        Called with ``"tripped"`` before the pass replaces `_reconcile_unconfirmed`, which says
+        whether a trip is already open (`_forfeit_clears_on_attrition`, BACKLOG #3083).
         """
         current = self._reconcile_breaker_standing
-        if event == "tripped":
-            if current == "forfeit" and not self._reconcile_breaker_open:
-                _log.warning(
-                    "directory reconcile: the breaker tripped after this process gave up "
-                    "resolving ad_reconcile_aborted, so it will not resolve this trip itself until "
-                    "it restarts; an operator resolves it once the directory reads clean"
-                )
-            self._reconcile_breaker_open = True
+        if event == "tripped" and current == "forfeit" and not self._reconcile_unconfirmed:
+            _log.warning(
+                "directory reconcile: the breaker tripped after this process gave up resolving "
+                "ad_reconcile_aborted, so it will not resolve this trip itself until it restarts; "
+                "an operator resolves it once the directory reads clean"
+            )
         if event == "tripped" and current == "fresh":
             self._reconcile_breaker_standing = "tripped"
         elif event == "forfeit" and current != "forfeit":
@@ -6864,18 +6851,17 @@ class AuthService:
         to be revoked, or has left, before a pass with no referral read it PRESENT; see
         :meth:`_forfeit_clears_on_attrition`. ``"forfeit"`` is never left. The latched referral
         message is then kept until a restart too, because the test that releases it is the clear's.
-        A ``"referred"`` event opens a referral, logged as the breaker's trip is.
+        Called with ``"referred"`` before the pass replaces `_reconcile_referred`, as the breaker's
+        trip is.
         """
         current = self._reconcile_referral_standing
-        if event == "referred":
-            if current == "forfeit" and not self._reconcile_referral_open:
-                _log.warning(
-                    "directory reconcile: an LDAP referral opened after this process gave up "
-                    "resolving the referral's ad_reconcile_aborted instance, so it will not "
-                    "resolve this one itself until it restarts; an operator resolves it once the "
-                    "search bases are fixed"
-                )
-            self._reconcile_referral_open = True
+        if event == "referred" and current == "forfeit" and not self._reconcile_referred:
+            _log.warning(
+                "directory reconcile: an LDAP referral opened after this process gave up "
+                "resolving the referral's ad_reconcile_aborted instance, so it will not resolve "
+                "this one itself until it restarts; an operator resolves it once the search bases "
+                "are fixed"
+            )
         if event == "referred" and current == "fresh":
             self._reconcile_referral_standing = "referred"
         elif event == "forfeit" and current != "forfeit":
@@ -6895,9 +6881,8 @@ class AuthService:
         ``"forfeit"``: an undetermined account is about to be revoked, or has left; see
         :meth:`_forfeit_clears_on_attrition`. It forfeits unless this process has settled.
         ``"settled"``: a pass here found the hold gone. ``"forfeit"`` is never left.
-        A ``"held"`` event opens a hold, logged as the breaker's trip is. A process can forfeit
-        before it ever held, when it revokes a lone undetermined account, so the line does not say
-        the hold engaged "again".
+        A ``"held"`` event opens a hold (``_reconcile_hold_open``). A process can forfeit before it
+        ever held, when it revokes a lone undetermined account, so the line does not say "again".
         """
         current = self._reconcile_hold_standing
         if event == "held":
