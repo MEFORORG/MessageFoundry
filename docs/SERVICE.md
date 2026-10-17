@@ -483,7 +483,8 @@ What that changes for you:
   `PYTHON_DISABLE_REMOTE_DEBUG=1`, or, failing that, `[security].allow_remote_debugging = true`,
   which is reported as a loosening
   ([`SECURITY-LOOSENING.md`](SECURITY-LOOSENING.md)). Such a start is not isolated either, and
-  the engine says so (`interpreter_not_isolated`, `remote_debug_enabled`).
+  the engine says so (`interpreter_not_isolated`, and `remote_debug_enabled` under the
+  acceptance).
 - **The engine's Python children are not isolated.** The sandbox worker and each engine shard
   still read the `PYTHON*` variables the engine hands them. Keep those variables out of the
   service's environment; the engine reports one it finds (`python_variables_reach_children`).

@@ -117,9 +117,10 @@ REMOTE_DEBUG_ACCEPTANCE: Final = "[security].allow_remote_debugging"
 #: ``security_loosenings()`` and the ``supervise`` start-up line.
 REMOTE_DEBUG_ACCEPTANCE_LOOSENING: Final = (
     "allow_remote_debugging",
-    "an enforcing instance is permitted to start with the interpreter's remote debugging "
-    "(PEP 768) enabled in its process -- the start-up refusal is acknowledged away. Whether the "
-    "interface is on in this process is the remote_debug_enabled or remote_debug_unguarded entry",
+    "serve and supervise may start under enforcement = enforce with the interpreter's remote "
+    "debugging (PEP 768) enabled in their process -- the start-up refusal is acknowledged away "
+    "wherever it would fire. Whether the interface is on in this process is the "
+    "remote_debug_enabled or remote_debug_unguarded entry",
 )
 
 #: The audit event the target interpreter raises before it runs an injected script. Its one
@@ -333,8 +334,8 @@ def remote_debug_refusal(posture: RemoteDebugPosture) -> str | None:
         "the operating system lets attach to it could run Python inside the engine. Start the "
         "interpreter as `python -X disable-remote-debug -m messagefoundry ...`; the shipped "
         "service launches add -I as well. A console-script start such as `messagefoundry serve` "
-        "cannot pass "
-        "the option, and takes PYTHON_DISABLE_REMOTE_DEBUG=1 instead, which -I and -E ignore. To "
+        "cannot pass the option, and takes PYTHON_DISABLE_REMOTE_DEBUG=1 instead, which -I and "
+        "-E ignore. To "
         f"accept the interface on, set {REMOTE_DEBUG_ACCEPTANCE} = true, which is reported as a "
         "loosening. See docs/SECURITY-LOOSENING.md"
     )

@@ -209,6 +209,9 @@ def _real_serve(tmp_path: Path, *options: str) -> subprocess.CompletedProcess[st
     )
 
 
+@pytest.mark.skipif(
+    not sys.is_remote_debug_enabled(), reason="this interpreter has remote debugging off"
+)
 def test_a_real_start_with_the_interface_on_refuses(tmp_path: Path) -> None:
     proc = _real_serve(tmp_path)
     assert proc.returncode == 2, proc.stderr[-2000:]

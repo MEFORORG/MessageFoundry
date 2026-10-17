@@ -5728,8 +5728,9 @@ system lets that process write the target's memory. On a first deployment, code 
 service account could be such a process. It would then run Python inside the engine, with
 everything the engine holds.
 
-Three controls answer it, and they differ in strength. Under `enforce`, `serve` and
-`supervise` also refuse to start with the interface on (vault BACKLOG #2700):
+Under `enforce`, `serve` and `supervise` refuse to start with the interface on, unless
+`[security].allow_remote_debugging` accepts it (vault BACKLOG #2700). Three further controls
+answer it, and they differ in strength:
 
 - **The engine's Python children start with the interface off.** `messagefoundry/childenv.py` is
   the one place that says which children and how.

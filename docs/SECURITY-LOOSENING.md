@@ -1822,7 +1822,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   the variable under `-I` or `-E`. A developer loop that cannot do either sets
   `[security].allow_remote_debugging = true`, the next section. It does not let an attach
   debugger in: the hook still refuses its script. Do not use
-  `enforcement = warn` for this: it relaxes every gate, not this one. The CI legs that start the
+  `enforcement = warn` for this: it relaxes every gate, not only this one. The CI legs that start the
   engine under `enforce` start it as `python -I -X disable-remote-debug -m messagefoundry serve`.
 - **The two shipped service launches report neither entry** (vault BACKLOG #2701). The Windows
   installer and the container image start the interpreter itself, with
