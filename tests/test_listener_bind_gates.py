@@ -39,6 +39,8 @@ _KINDS: dict[str, tuple[ConnectorType, str]] = {
     "MLLP": (ConnectorType.MLLP, "HL7 bodies would cross"),
     "DIMSE": (ConnectorType.DIMSE, "DICOM-carried PHI"),
     "TCP": (ConnectorType.TCP, "plaintext-only TCP listener"),
+    # The TCP gate's second type: dropping X12 from its tuple turns this row red.
+    "X12": (ConnectorType.X12, "plaintext-only X12 listener"),
     "HTTP": (ConnectorType.HTTP, "POSTed bodies"),
 }
 
@@ -255,6 +257,39 @@ async def test_a_reload_after_the_window_closes_leaves_an_operator_start_unbound
         now[0] = _OUT_OF_WINDOW
         assert runner.listener_bind_predicate()(reg.inbound["ib"]) is False
         await runner.reload(reg)
+        assert not runner.inbound_running("ib")
+    finally:
+        await runner.stop()
+
+
+async def test_a_reload_judges_the_window_once(store: MessageStore) -> None:
+    """The build check and the listener loop of one reload read one schedule time. Here the
+    window reopens just after the reload's first read. The gates were skipped for that read, so the
+    loop must not bind on a later one: off loopback, that bind would be refused after intake had
+    stopped, and the whole reload rolled back."""
+    clock = [_IN_WINDOW]
+    pending: list[datetime] = []
+
+    def read() -> datetime:
+        return pending.pop(0) if pending else clock[0]
+
+    reg = _one_listener(ConnectorType.MLLP, auto_start=False, schedule=_MONDAY_8_TO_9)
+    runner = RegistryRunner(
+        reg,
+        store,
+        inbound_bind_host="127.0.0.1",
+        poll_interval=0.02,
+        egress=EgressSettings(deny_by_default=False),
+        schedule_clock=read,
+        schedule_tick=3600,
+    )
+    await runner.start()
+    try:
+        await runner.start_inbound("ib")
+        assert runner.inbound_running("ib")
+        pending.append(_OUT_OF_WINDOW)  # the reload's read; every later one is in the window
+        await runner.reload(reg)
+        assert not pending
         assert not runner.inbound_running("ib")
     finally:
         await runner.stop()

@@ -2739,7 +2739,9 @@ class RegistryRunner:
             return False
         return (declared or self._priority_default).rank < threshold.rank
 
-    def listener_bind_predicate(self) -> Callable[[InboundConnection], bool]:
+    def listener_bind_predicate(
+        self, *, now: datetime | None = None
+    ) -> Callable[[InboundConnection], bool]:
         """Which inbound listeners this runner would bind, as a predicate over a snapshot of what is
         listening now (vault BACKLOG #2622 item 1). :meth:`build_check` and an engine's flag toggle
         run the inbound exposure gates only where it holds, so neither refuses a config for a
@@ -2751,8 +2753,9 @@ class RegistryRunner:
         operator's start); and that the DR run-profile does not park. Reload also skips a listener
         outside its schedule window. The scheduler binds an ``auto_start`` one when the window
         opens, so that one is gated here. It never starts an ``auto_start = false`` one, so an
-        operator-started one outside its window is not gated: the reload leaves it unbound and
-        nothing binds it again (item 13). A fresh runner has nothing listening, so this is exactly
+        operator-started one outside its window is not gated: neither the reload nor the
+        scheduler binds it again (item 13). At least an operator start and an alert rule's
+        restart can, and each runs the gates on the listener as it binds it. A fresh runner has nothing listening, so this is exactly
         :meth:`start`'s test there. On a passive DR standby it holds for the listeners an
         activation would bind, though none is bound yet, so a config that activation would refuse
         is refused before the disaster rather than during it (vault BACKLOG #3140).
@@ -2760,9 +2763,11 @@ class RegistryRunner:
         The listening set is snapshotted now, on the caller's thread, so the predicate can run on a
         worker thread (the flag toggle validates off the event loop). The DR threshold, default
         tier and schedule clock are read through ``self`` when it runs. The tier is set only at
-        construction; the threshold is set there and by :meth:`set_dr_threshold`.
+        construction; the threshold is set there and by :meth:`set_dr_threshold`. ``now`` pins
+        the schedule clock instead: :meth:`reload` passes the time its listener loop also reads,
+        so a window that opens during the quiesce cannot make the two disagree.
 
-        **Two callers take the snapshot outside the reload lock, and that window is accepted**
+        **At least two callers take the snapshot outside the reload lock, and that window is accepted**
         (vault BACKLOG #3063 item 5): a dry-run reload, through :meth:`build_check`, and an
         engine's flag toggle. The lock is an ``asyncio.Lock``, which the worker thread cannot take,
         and holding it on the loop across the toggle's file write would stall every reload behind
@@ -2775,21 +2780,28 @@ class RegistryRunner:
         listening = frozenset(self._sources)
 
         def binds(ic: InboundConnection) -> bool:
-            skip = self._listener_skip(ic, listening, binding_now=False)
+            skip = self._listener_skip(ic, listening, binding_now=False, now=now)
             if skip is _ListenerSkip.OUT_OF_WINDOW:
-                # Bound at the window open by the scheduler, which starts only an auto_start one.
+                # Bound at the window open by the scheduler, whose start test is auto_start
+                # (_reconcile_schedule). Read here from the candidate graph, not the live one.
                 return ic.auto_start
             return skip is None
 
         return binds
 
     def _listener_skip(
-        self, ic: InboundConnection, listening: Collection[str], *, binding_now: bool
+        self,
+        ic: InboundConnection,
+        listening: Collection[str],
+        *,
+        binding_now: bool,
+        now: datetime | None = None,
     ) -> _ListenerSkip | None:
         """Why ``ic``'s listener is left unbound, or ``None`` when it is bound. The first that
         applies, in the order :meth:`start` and :meth:`reload` apply them. The one copy of those
         skips, which :meth:`listener_bind_predicate` and :meth:`_reload_anchor_candidates` read
-        too, so the gates and the binds cannot drift apart (vault BACKLOG #3063 item 12).
+        too, so start, reload and the build check's gates cannot drift apart (vault BACKLOG #3063
+        item 12). The scheduler's own start test is not here; the predicate names it.
 
         ``listening`` names the listeners bound before: a reload keeps an operator's start of an
         ``auto_start = false`` listener. :meth:`start` passes none.
@@ -2799,8 +2811,9 @@ class RegistryRunner:
         a passive standby. ``False`` asks what the graph binds once the box is active:
         :meth:`_below_dr_threshold`, with no marker.
 
-        The schedule window is tested last. :meth:`start` does not act on it: it binds such a
-        listener, and the scheduler's first tick parks it."""
+        The schedule window is tested last, at ``now`` when given, else at the schedule clock.
+        :meth:`start` does not act on it: it binds such a listener, and the scheduler's first
+        tick parks it."""
         if not ic.deployed:
             return _ListenerSkip.NOT_DEPLOYED
         if not inbound_listener_starts(ic) and ic.name not in listening:
@@ -2811,7 +2824,9 @@ class RegistryRunner:
             else self._below_dr_threshold(ic.priority)
         ):
             return _ListenerSkip.DR_PARKED
-        if ic.schedule is not None and not ic.schedule.is_active(self._schedule_clock()):
+        if ic.schedule is not None and not ic.schedule.is_active(
+            self._schedule_clock() if now is None else now
+        ):
             return _ListenerSkip.OUT_OF_WINDOW
         return None
 
@@ -6382,7 +6397,13 @@ class RegistryRunner:
             # (In per_lane the equivalent check sits inside the worker loop's own except:backoff.)
             log.exception("pooled buildup check failed for stage %s lane %s", stage, lane)
 
-    def build_check(self, registry: Registry, env_values: Mapping[str, Any] | None = None) -> None:
+    def build_check(
+        self,
+        registry: Registry,
+        env_values: Mapping[str, Any] | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> None:
         """Construct (and discard) every connector in ``registry`` so a bad connector spec fails
         BEFORE a reload quiesces anything — i.e. the running graph is left untouched. Construction
         is side-effect-free (no socket bind / file I/O — binding happens later in ``start_inbound``).
@@ -6398,7 +6419,10 @@ class RegistryRunner:
         ``Reference(...)`` on a backend with no snapshot store (SQL Server).
 
         ``env_values`` defaults to the runner's own. A dry run passes the values it re-read, so it
-        checks them without making them the live graph's (vault BACKLOG #2596)."""
+        checks them without making them the live graph's (vault BACKLOG #2596).
+
+        ``now`` pins the schedule clock the exposure gates' predicate reads
+        (:meth:`listener_bind_predicate`); ``None`` reads the clock."""
         build_check_registry(
             registry,
             inbound_bind_host=self._inbound_bind_host,
@@ -6411,7 +6435,7 @@ class RegistryRunner:
             # The exposure gates run on the listeners this runner would bind, read against its live
             # state. A reload calls this under its lock; a dry run does not, and
             # listener_bind_predicate says why that window is accepted (vault BACKLOG #3063 item 5).
-            exposure_gated=self.listener_bind_predicate(),
+            exposure_gated=self.listener_bind_predicate(now=now),
         )
         # PT-backend allow-list — folded in here (vs only at Engine.start) so EVERY reload + dry-run
         # path that build-checks the new registry also rejects a PT-on-non-SQLite graph before any
@@ -6944,8 +6968,13 @@ class RegistryRunner:
             old_env_values = self._env_values
             if env_values is not None:
                 self._env_values = dict(env_values)
+            # One schedule time for the build check's gates and the listener loop below, so a
+            # window that opens during the quiesce cannot leave a listener the gates skipped to a
+            # bind that refuses after intake has stopped (vault BACKLOG #3063 item 13).
+            now = self._schedule_clock()
             try:
-                self.build_check(new_registry)  # raises before any change on a bad connector
+                # raises before any change on a bad connector
+                self.build_check(new_registry, now=now)
             except BaseException:
                 self._env_values = old_env_values
                 raise
@@ -7072,7 +7101,7 @@ class RegistryRunner:
                     # item 12). What each one means here:
                     #
                     # Present but NOT DEPLOYED (#233, ADR 0111) — checked FIRST, so deployed=False WINS
-                    # over auto_start. Unconditional (unlike the auto_start gate below, which honors an
+                    # over auto_start. Unconditional (unlike the auto_start test after it, which honors an
                     # operator start): `deployed` is a config fact, not a runtime one, so a reload that
                     # declares the inbound not-deployed leaves it UNBOUND even if an operator had it
                     # listening a moment ago — step 1 above already quiesced every source. Its router +
@@ -7086,7 +7115,7 @@ class RegistryRunner:
                     # listener an operator started at runtime bound across a reload (a reload never undoes
                     # an operator action) while a never-started one stays down. Its router/transform
                     # workers are still re-armed below, so any backlog drains (the AC-3 rule).
-                    skip = self._listener_skip(ic, old_inbound_names, binding_now=True)
+                    skip = self._listener_skip(ic, old_inbound_names, binding_now=True, now=now)
                     if skip is _ListenerSkip.NOT_DEPLOYED or skip is _ListenerSkip.NOT_STARTED:
                         continue
                     # DR run-profile (#61, ADR 0048): a reload re-evaluates the whole graph against the
