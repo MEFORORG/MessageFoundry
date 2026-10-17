@@ -66,19 +66,17 @@ tests/test_coord_alloc_floor.py
 tests/test_coord_alloc_reentrancy.py
 tests/test_coord_alloc_retired_tombstone.py
 tests/test_coord_fleet_fetch_clock.py
-# The four below share one SUBJECT: scripts/hooks/durability_push.sh, copied off disk and run as a
+# The three below share one SUBJECT: scripts/hooks/durability_push.sh, copied off disk and run as a
 # real post-commit hook. They are listed rather than left off because the diff that can break them is
 # a diff to that file, which trips this job's scripts/** path gate -- so the tooling job faces the
 # change that would break them. None of them reads its SUBJECT from messagefoundry/** or
 # packaging/messagefoundry-webconsole/**, so the reason that keeps a scanner in
-# _STAYS_WITHOUT_IMPORTING does not apply. One engine file IS loaded: push_bound runs each commit
-# in a kill-on-close job from messagefoundry/proctree.py, loaded by path, so a diff there could
-# break its teardown and arrive at a leg where it is deselected. The engine legs face that diff
-# through tests/test_engine_node_process_tree.py, which drives the same two calls. The header's
+# _STAYS_WITHOUT_IMPORTING does not apply. tests/test_durability_hook_push_bound.py shares the
+# subject but is NOT listed: it imports messagefoundry.proctree for its kill-on-close job, so a diff
+# there must select it, and that makes it an engine test. The header's
 # "when ambiguous, leave it off" is not in play, because nothing here is ambiguous about which
 # tier owns the subject.
 tests/test_durability_hook_provenance.py
-tests/test_durability_hook_push_bound.py
 tests/test_durability_hook_remote_guard.py
 tests/test_durability_hook_rewrite_coverage.py
 tests/test_gate_ci_mirror_parity.py

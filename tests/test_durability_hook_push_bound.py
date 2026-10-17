@@ -51,7 +51,6 @@ temporary directory. Two routes, both closed here:
 
 from __future__ import annotations
 
-import importlib.util
 import os
 import shutil
 import subprocess
@@ -60,11 +59,11 @@ import time
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
-from types import ModuleType
 
 import psutil
 import pytest
 
+from messagefoundry import proctree
 from tests._proc_tree import alive, cmdline_of, kill_all, tree_of, wait_until
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -137,24 +136,6 @@ def _arm(repo: Path) -> None:
     hook = repo / ".git" / "hooks" / "post-commit"
     shutil.copy2(HOOK, hook)
     hook.chmod(0o755)
-
-
-def _load_proctree() -> ModuleType:
-    """``messagefoundry/proctree.py``, loaded by path rather than imported.
-
-    It is standard library only, and this file's subject is the hook, not the engine: an import of
-    the ``messagefoundry`` package would move it off the tooling legs
-    (``tests/test_tooling_partition.py``), which do not need the engine to run it."""
-    spec = importlib.util.spec_from_file_location(
-        "_durability_test_proctree", ROOT / "messagefoundry" / "proctree.py"
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-proctree = _load_proctree()
 
 
 def _commit(
