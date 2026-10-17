@@ -1465,10 +1465,10 @@ def _build_approval_gate(
         # A cancelled approve records 'interrupted' in the gate (#1562), and this reload goes on to
         # write its own config_reload row rather than stopping with intake half swapped. A refusal
         # raised inside _apply is part of that operation too, so a timed-out approve does not cut
-        # its row short. A shutdown drain that cancels the operation stops it, but not mid row: a
-        # cancel during the reload writes config_reload_interrupted (vault BACKLOG #2753), and one
-        # during the config_reload or refusal row's write waits for it (_write_through_cancel,
-        # BACKLOG #3157 item 4).
+        # its row short. A shutdown drain that cancels the operation stops it: a cancel during the
+        # reload writes config_reload_interrupted (vault BACKLOG #2753), and one during the
+        # config_reload or refusal row's write waits a bounded time for it (_write_through_cancel,
+        # BACKLOG #3157 item 4, which says when the row can still be lost).
         return await outliving.run(_apply(), "released config reload")
 
     def _replay_params_in_scope(identity: Identity, p: Mapping[str, Any]) -> bool:
@@ -1926,7 +1926,8 @@ async def _record_reload_audit(
     carries that into ``approval.approved``.
 
     A cancellation still propagates: it is not a failure of this helper. One that lands during the
-    write waits for the row first (:func:`_write_through_cancel`, BACKLOG #3157). The write goes
+    write waits a bounded time for the row first (:func:`_write_through_cancel`, BACKLOG #3157).
+    The write goes
     through
     :func:`~messagefoundry.audit_write.write_audit_soft` with ``defects=()``, because even a defect
     raised here would misreport a reload that ran (vault BACKLOG #2260)."""
@@ -1962,7 +1963,7 @@ async def _record_reload_audit(
         await engine.store.record_audit(action, actor=actor, detail=detail, client=client)
 
     written = await write_audit_soft(
-        # A shutdown drain's cancel waits for the row rather than cutting it short (BACKLOG #3157).
+        # A shutdown drain's cancel waits a bounded time for the row (BACKLOG #3157).
         lambda: _write_through_cancel(write(), lambda: _lost_row(action, actor, detail)),
         log=_log,
         message="config %s, but its %s audit row failed (step %s). Lost row: actor=%s detail=%s",
@@ -2059,7 +2060,8 @@ async def _audit_refused_reload(
     **The row's write never raises.** A refusal changed nothing, so its answer stands whether or
     not the row lands, and a store fault here would otherwise turn it into a raw 500 (vault BACKLOG
     #2255). A failed write is logged at ERROR with the row's detail. A cancellation, such as a
-    shutdown drain's, is not a failure: it waits for the row, then propagates (BACKLOG #3157)."""
+    shutdown drain's, is not a failure: it waits a bounded time for the row, then propagates
+    (BACKLOG #3157)."""
     detail: dict[str, object] = {"requested": requested, "dry_run": dry_run}
     if isinstance(exc, ConfigReloadDenied):
         action = "config_reload_denied"
@@ -2129,7 +2131,7 @@ async def _audit_refused_reload(
     # handler's ControlCharScrubFilter escapes that. ``defects=()`` keeps the docstring's promise
     # that this write never raises (vault BACKLOG #2260).
     await write_audit_soft(
-        # A shutdown drain's cancel waits for the row rather than cutting it short (BACKLOG #3157).
+        # A shutdown drain's cancel waits a bounded time for the row (BACKLOG #3157).
         lambda: _write_through_cancel(
             engine.store.record_audit(action, actor=actor, detail=row, client=client),
             lambda: _lost_row(action, actor, row),

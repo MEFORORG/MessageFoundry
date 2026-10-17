@@ -386,7 +386,9 @@ class _UnsealableUpload:
 class _Observed(NamedTuple):
     """What one uploader holds on disk, from :meth:`UploadStore._observed_sync`.
 
-    ``files`` and ``size`` are the whole of it, the uploads ``rotate-key`` cannot seal included.
+    ``files`` and ``size`` are what the quota scan bills, the uploads ``rotate-key`` cannot seal
+    (:class:`_UnsealableUpload`) included. An upload the scan neither reads nor classes is not in
+    them.
     ``unsealable_files`` and ``unsealable_size`` count those again on their own, because the listing
     never shows them, and a 409 that bills them must say how much of the budget the uploader cannot
     see (BACKLOG #3183)."""
@@ -1451,7 +1453,8 @@ class UploadStore:
         metas = self._scan_metas_sync(held)
         sizes = [m.size for m in metas if m.uploader_id == uploader_id]
         mine = [h.size for h in held if h.uploader_id == uploader_id]
-        return _Observed(len(sizes) + len(mine), sum(sizes) + sum(mine), len(mine), sum(mine))
+        held_files, held_bytes = len(mine), sum(mine)
+        return _Observed(len(sizes) + held_files, sum(sizes) + held_bytes, held_files, held_bytes)
 
     async def list_files(self) -> list[UploadedFileMeta]:
         """List all uploaded files (newest first). Undecryptable/foreign sidecars are skipped with a
