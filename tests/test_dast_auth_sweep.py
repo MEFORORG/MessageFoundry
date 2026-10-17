@@ -241,11 +241,10 @@ def test_ungated_routes_are_exactly_the_documented_anonymous_set(
         "the receipt no longer reports the WebSocket row it excluded from HTTP probing"
     )
     # Vault BACKLOG #2955: each WebSocket row carries its kind, and none is refused or unexplained.
-    assert all("kind" in r and "declaration" in r for r in receipt["websocket_rows"]), receipt[
-        "websocket_rows"
-    ]
+    fields = ("kind", "declaration", "gates")
+    assert all(f in r for r in receipt["websocket_rows"] for f in fields), receipt["websocket_rows"]
     undeclared_ws = websocket_rows_not_declared(receipt)
-    assert not undeclared_ws, f"WebSocket rows refused or with no reason: {undeclared_ws}"
+    assert not undeclared_ws, f"WebSocket rows refused or not shown to authorize: {undeclared_ws}"
 
 
 # =====================================================================================================
@@ -1109,8 +1108,10 @@ def test_a_planted_undeclared_websocket_route_reds_the_sweep(
     assert code == 1, f"a sweep with a refused WebSocket route exited {code}"
     # The red must be the WebSocket check's own, not some other finding that happens to fail the run.
     out = capsys.readouterr()
-    assert "WebSocket route(s) refused" in out.out + out.err, out
-    assert "WS /ws/planted (refused)" in out.out + out.err, out
+    assert any(
+        "WebSocket route(s) refused" in line and "WS /ws/planted (refused)" in line
+        for line in out.err.splitlines()
+    ), out.err
 
 
 # =====================================================================================================

@@ -63,8 +63,9 @@ never 0, and a run that never measured must never borrow the FINDINGS code: CI r
 canary as proof the injected defect was detected, so a crash returning 1 would certify a detection
 that never happened.
 
-THE RECEIPT RECORDS NO BODIES. Method, path TEMPLATE, status code, counts and the scanned posture only
-— never a request or response body, never a header value, never a token. It is an uploaded CI artifact.
+THE RECEIPT RECORDS NO BODIES. Method, path TEMPLATE, status code, counts, the scanned posture, and
+each unprobed row's kind, declaration reason and gate names -- never a request or response body, never a
+header value, never a token. It is an uploaded CI artifact.
 
 USAGE
     python scripts/security/dast_auth_sweep.py --receipt dast-auth-receipt.json
@@ -541,9 +542,10 @@ def _row_record(row: route_gates.RouteRow) -> dict[str, Any]:
 
 #: What a WebSocket row may be and pass (vault BACKLOG #2955). Gated outright passes. Marked
 #: ``public_route`` passes with its reason. Marked ``authorizes_in_body``, or outside the engine's
-#: refusal, passes only with a reason AND a gate the walk found in its body: the engine accepts any
-#: declaration on a socket, and outside the refusal nothing reads it, so the reason alone would
-#: vouch for a socket that authorizes nobody.
+#: refusal, passes only with a reason AND a gate the walk found: the engine accepts any declaration
+#: on a socket, and outside the refusal nothing reads it, so the reason alone would vouch for a
+#: socket that authorizes nobody. The walk finds a gate by its call, not by what the endpoint does
+#: with the answer, so a pass here is evidence of a gate call, not proof it is enforced.
 _WS_PASSES: Final = frozenset({route_gates.KIND_GATED})
 _WS_NEEDS_REASON: Final = frozenset(
     {route_gates.KIND_PUBLIC, route_gates.KIND_IN_BODY, route_gates.KIND_OUTSIDE}
@@ -804,7 +806,7 @@ def receipt_lines(receipt: dict[str, Any], policy: dict[str, Any], verdict: str)
         f"declared public with a reason -- "
         f"{len(ungated_rows) - len(not_public)}/{len(ungated_rows)} ungated routes"
         + (f"; NOT: {not_public}" if not_public else ""),
-        f"WebSocket rows gated, declared public with a reason, or shown to authorize in the body -- "
+        f"WebSocket rows gated, declared public with a reason, or declared with a gate found -- "
         f"{len(ws) - len(ws_undeclared)}/{len(ws)}"
         + (f"; NOT: {ws_undeclared}" if ws_undeclared else ""),
         f"negative probes -- {receipt.get('negative_probes')} requests "
