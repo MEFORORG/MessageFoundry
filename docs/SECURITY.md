@@ -222,8 +222,10 @@ body, the early sign-in check above still answers before it. A route passes in o
 Any other route answers **403** `this route declares no authorization`, and a WebSocket is refused
 before it is accepted. Such a route is a defect in the code that registered it. The engine counts
 every refusal in memory and writes an ERROR line at most once a minute for each route. Each line
-names the route's path template, never the request, and says how many refusals came since the
-previous line. Refusals after a burst's last line stay in that count. They reach the log only with
+names the route by its path template, never the request, and says how many refusals came since the
+previous line. The name is meant to be the key `GET /security/posture` reports the route under,
+include prefix included (vault BACKLOG #2956); `_logged_key` in `messagefoundry/api/security.py`
+says where the two can still differ. Refusals after a burst's last line stay in that count. They reach the log only with
 a later refusal of the same route, a minute or more after the last line. `GET /security/posture`
 reports the count as `undeclared_route_refusals`, under `monitoring:read`, keyed by path template
 (vault BACKLOG #2954). It is the count of the process that answered; under engine shards each

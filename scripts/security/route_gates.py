@@ -43,7 +43,8 @@ NOTHING FALLS OFF THE END OF THE WALK. An earlier revision classified only ``API
 static ``Mount`` (``/ui/static`` when ``serve_ui`` is on) was invisible to the ungated-set invariant,
 whose entire stated purpose is that an ungated route must red a run rather than join the background.
 :func:`route_rows` now emits every remaining route as an UNGATED row (a mount, which has no methods,
-under the synthetic method :data:`MOUNT_METHOD`), so a route class this walk does not understand lands
+under the synthetic method :data:`MOUNT_METHOD`; a plain Starlette WebSocket under
+:data:`PLAIN_WS_METHOD`, vault BACKLOG #2956), so a route class this walk does not understand lands
 in :func:`ungated_http_rows` and must be reviewed into a consumer's allow-list to pass.
 
 A FASTAPI NAME THAT MOVES FAILS THE WALK BY NAME (vault BACKLOG #3055); see :func:`fastapi_symbol`.
@@ -55,7 +56,8 @@ EACH ROW SAYS WHAT THE REFUSAL MAKES OF IT (vault BACKLOG #2846). "No gate" cove
 mean opposite things: one public by design, and one the engine refuses to every caller. A row's
 ``kind`` now separates them (``KIND_GATED``, ``KIND_PUBLIC``, ``KIND_IN_BODY``, ``KIND_REFUSED`` or
 ``KIND_OUTSIDE``), decided by the engine's own ``route_is_declared``, and ``declaration`` carries the
-reason a ``public_route`` or ``authorizes_in_body`` mark gives.
+reason a ``public_route`` or ``authorizes_in_body`` mark gives. A ``KIND_GATED`` row always names
+its gate: :func:`gate_of` refuses a marked gate it cannot read rather than return none (#2956).
 
 This is a LIBRARY: no argparse, no ``main()``. It imports cleanly with only the engine installed.
 """
@@ -78,7 +80,7 @@ import fastapi.routing
 from fastapi import APIRouter, FastAPI
 from fastapi.routing import APIRoute, APIWebSocketRoute
 from starlette.applications import Starlette
-from starlette.routing import BaseRoute, Mount
+from starlette.routing import BaseRoute, Mount, WebSocketRoute
 
 from messagefoundry.api.app import create_app
 from messagefoundry.api.security import (
@@ -146,6 +148,15 @@ WS_METHOD = "WS"
 #: real HTTP-reachable surface, so it is emitted as an UNGATED row rather than dropped.
 MOUNT_METHOD = "MOUNT"
 
+#: The synthetic method assigned to a plain Starlette ``WebSocketRoute``: a socket served outside
+#: FastAPI's routing, so no dependency and no refusal runs on it (vault BACKLOG #2956). It is NOT
+#: :data:`WS_METHOD` on purpose: the HTTP-only helpers filter that label out, and this row must stay
+#: in :func:`ungated_http_rows`, where a consumer's allow-list catches it.
+PLAIN_WS_METHOD = "PLAIN-WS"
+
+#: Every synthetic label above: a row carrying one is not an HTTP method a probe can send.
+NON_HTTP_METHODS: tuple[str, ...] = (WS_METHOD, MOUNT_METHOD, PLAIN_WS_METHOD)
+
 # What the engine's request-time refusal (``refuse_undeclared_route``) makes of a row, so a reader of
 # the walk can tell a route public by design from one refused to every caller (vault BACKLOG #2846).
 RouteKind = Literal["gated", "public", "in-body", "refused", "outside"]
@@ -200,17 +211,25 @@ def gate_of(call: object) -> tuple[str, tuple[str, ...], str | None] | None:
     """``(gate name, permission wire strings, action)`` for a route dependency built by one of the
     ``require*()`` factories, by reading the closure cells the factory captured. Recurses through the
     ``base`` cell, because require_paced / require_phi_read / require_step_up* wrap ``require``'s
-    closure. Returns ``None`` for a dependency that is not one of those factories.
+    closure. Returns ``None`` for a dependency that carries no gate mark.
 
     A gate is recognised by the mark its factory sets (``mark_route_gate``), never by its name
     (vault BACKLOG #2604). A dependency merely NAMED ``require_*`` is no gate, and the engine's
-    request-time refusal agrees, because it reads the same mark."""
+    request-time refusal agrees, because it reads the same mark.
+
+    Raises ``ValueError`` for a MARKED dependency that is not a closure, such as a plain function or
+    a callable class (vault BACKLOG #2956). The refusal serves its route as gated on the mark alone,
+    so returning ``None`` here gave a row ``kind=gated`` with no gate, which also counted in
+    :func:`ungated_http_rows`. Teach this function to read such a gate before registering one."""
     if not is_route_gate(call):
         return None
     closure = getattr(call, "__closure__", None)
     code = getattr(call, "__code__", None)
     if closure is None or code is None:
-        return None
+        raise ValueError(
+            f"{call!r} carries the gate mark but is not a closure, so the route walk cannot read its "
+            "gate name or permissions. Teach scripts/security/route_gates.py gate_of to read it."
+        )
     qualname = getattr(call, "__qualname__", "") or ""
     name = qualname.split(".")[0]
     cells = dict(zip(code.co_freevars, closure, strict=False))
@@ -582,15 +601,14 @@ def _walk(owner: Starlette | APIRouter | Mount, prefix: str, app: Starlette) -> 
         if isinstance(route, APIRoute):
             kind, declaration = _kind(route, effective, websocket=False)
             methods = sorted(m for m in (effective.methods or set()) if m not in _SYNTHETIC_METHODS)
-            gate: tuple[str, tuple[str, ...], str | None] | None = None
             # The route's OWN dependencies, never the include's: the engine's request-time refusal
             # reads only those, so a gate an include call adds is refused there and must read as
-            # no gate here too.
-            for dep in route.dependant.dependencies:
-                found = gate_of(dep.call)
-                if found is not None:
-                    gate = found
-                    break
+            # no gate here too. Every one is read, so a marked gate gate_of cannot read raises
+            # wherever it sits; the row reports the first gate (vault BACKLOG #2956).
+            found_gates = [
+                g for dep in route.dependant.dependencies if (g := gate_of(dep.call)) is not None
+            ]
+            gate = found_gates[0] if found_gates else None
             for method in methods:
                 yield RouteRow(
                     method=method,
@@ -621,18 +639,20 @@ def _walk(owner: Starlette | APIRouter | Mount, prefix: str, app: Starlette) -> 
             # sockets read their hooks from the mounted app's state, so the walk reads that too.
             yield from _walk(effective, path, _state_owner(effective, app))
         else:
-            # Anything else Starlette mounted: a plain ``Route`` (the OpenAPI/docs endpoints) or a
-            # ``Mount`` with no routes (the /ui static tree). It carries no FastAPI dependency
-            # closure, so it can only be reported as UNGATED — which is honest, because that is
-            # exactly what it is. Emitting it here is what stops it falling off the end of the walk
-            # and out of the ungated-set invariant; see the module docstring.
+            # Anything else Starlette mounted: a plain ``Route`` (the OpenAPI/docs endpoints), a
+            # ``Mount`` with no routes (the /ui static tree) or a plain ``WebSocketRoute``. It
+            # carries no FastAPI dependency closure, so it can only be reported as UNGATED — which
+            # is honest, because that is exactly what it is. Emitting it here is what stops it
+            # falling off the end of the walk and out of the ungated-set invariant; see the module
+            # docstring.
             declared = sorted(
                 m
                 for m in (getattr(effective, "methods", None) or set())
                 if m not in _SYNTHETIC_METHODS
             )
             marked = route_declaration_of(getattr(effective, "endpoint", None))
-            for method in declared or [MOUNT_METHOD]:
+            unlisted = PLAIN_WS_METHOD if isinstance(effective, WebSocketRoute) else MOUNT_METHOD
+            for method in declared or [unlisted]:
                 yield RouteRow(
                     method=method,
                     path=path,
@@ -682,7 +702,11 @@ def gated_http_rows(app: FastAPI | None = None) -> list[RouteRow]:
 def ungated_http_rows(app: FastAPI | None = None) -> list[RouteRow]:
     """HTTP operations with NO ``require*()`` gate — the anonymous surface. A consumer is expected to
     assert this set equals a reviewed allow-list, so a newly ungated route reds a run rather than
-    quietly joining the background."""
+    quietly joining the background.
+
+    It also holds rows under a synthetic label that no HTTP request can send, at least
+    :data:`MOUNT_METHOD` and :data:`PLAIN_WS_METHOD`, so they stay in the reviewed set. A consumer
+    that sends requests skips :data:`NON_HTTP_METHODS` or handles each label itself."""
     return [r for r in route_rows(app) if r.gate is None and r.method != WS_METHOD]
 
 
