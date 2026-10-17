@@ -13,7 +13,8 @@ would have charged a user who typed the right password. Now the bind raises
 Driven at three depths: the REAL ``LdapAuthenticator`` over the ldap3 doubles of
 ``tests/test_ldap_timeouts.py``; a REAL ldap3 stack decoding a bindResponse from the loopback server
 of ``tests/test_ldap_search_result_codes.py``, for each code, plus a Notice of Disconnection
-carrying 52, which ldap3 raises as a session the server ended and never hands to the code check;
+carrying 52, which ldap3 raises as a session the server ended and never hands to the code check
+(told apart from a bare close by what the loopback server records, since ldap3 reads both alike);
 and the REAL ``AuthService`` step-up re-bind over the
 doubles of ``tests/test_ad_user_account_control.py``, read where a caller meets it: the outcome, the
 engine lockout counter, the per-session re-proof budget and the ``auth.reauth`` audit row. Each
@@ -24,12 +25,13 @@ domain controller. Synthetic data only; no PHI.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 
 import ldap3
 import pytest
-from ldap3.core.exceptions import LDAPSessionTerminatedByServerError
+from ldap3.core.exceptions import LDAPSessionTerminatedByServerError, LDAPSocketReceiveError
 from ldap3.core.results import (
     RESULT_ADMIN_LIMIT_EXCEEDED,
     RESULT_BUSY,
@@ -50,6 +52,7 @@ from tests.test_ad_user_account_control import _signed_in_estate
 from tests.test_ldap_referrals import _BIND_RESPONSE, _tlv
 from tests.test_ldap_search_result_codes import (
     _EXTENDED_RESPONSE,
+    _HANG_UP,
     _done,
     _enumerated,
     _Reply,
@@ -192,13 +195,17 @@ def test_real_ldap3_leaves_the_bind_code_where_the_refusal_reads_it(code: int) -
 
 
 async def _rebind_after(
-    monkeypatch: pytest.MonkeyPatch, code: int
+    monkeypatch: pytest.MonkeyPatch, end: int | Callable[[Any], bool]
 ) -> tuple[Any, int, list[str], int]:
-    """Sign ``alice`` in, end every later bind with ``code``, re-bind once with the right password,
-    and return the elevation, the row's failed-attempt count, the ``auth.reauth`` details and the
-    number of sessions the per-session re-proof budget has charged."""
+    """Sign ``alice`` in, end every later bind with ``end`` (a result code, or a replacement for
+    ``ldap3.Connection.bind``), re-bind once with the right password, and return the elevation, the
+    row's failed-attempt count, the ``auth.reauth`` details and the number of sessions the
+    per-session re-proof budget has charged."""
     async with _signed_in_estate(monkeypatch, ["alice"]) as (_directory, service, store, tokens):
-        _bind_ends_with(monkeypatch, code)
+        if isinstance(end, int):
+            _bind_ends_with(monkeypatch, end)
+        else:
+            monkeypatch.setattr(ldap3.Connection, "bind", end)
         identity = await service.identity_for_token(tokens["alice"])
         assert identity is not None
         elevation = await service.reauth(identity, _PASSWORD, token=tokens["alice"])
@@ -232,19 +239,40 @@ async def test_a_refused_password_is_still_counted(monkeypatch: pytest.MonkeyPat
 
 # --- 52 as a Notice of Disconnection: a different path, to the same reading ----------------------
 
-#: RFC 4511 section 4.4.1: an unsolicited extendedResponse under messageID 0, resultCode
-#: unavailable (52), responseName (context tag 10) naming the notice.
-_NOTICE_OF_DISCONNECTION = _tlv(
-    0x30,
-    _tlv(0x02, bytes([0]))  # messageID 0: unsolicited
-    + _tlv(
-        _EXTENDED_RESPONSE,
-        _tlv(0x0A, _enumerated(RESULT_UNAVAILABLE))
-        + _tlv(0x04, b"")
-        + _tlv(0x04, b"")
-        + _tlv(0x8A, b"1.3.6.1.4.1.1466.20036"),
-    ),
-)
+
+def _unsolicited(oid: bytes) -> bytes:
+    """RFC 4511 section 4.4: an unsolicited extendedResponse under messageID 0, resultCode
+    unavailable (52), its responseName (context tag 10) naming ``oid``."""
+    return _tlv(
+        0x30,
+        _tlv(0x02, bytes([0]))  # messageID 0: unsolicited
+        + _tlv(
+            _EXTENDED_RESPONSE,
+            _tlv(0x0A, _enumerated(RESULT_UNAVAILABLE))
+            + _tlv(0x04, b"")
+            + _tlv(0x04, b"")
+            + _tlv(0x8A, oid),
+        ),
+    )
+
+
+#: RFC 4511 section 4.4.1: the Notice of Disconnection.
+_NOTICE_OF_DISCONNECTION = _unsolicited(b"1.3.6.1.4.1.1466.20036")
+
+
+def _bind_answered_with(reply: _Reply) -> tuple[LdapError, bool]:
+    """Answer alice's bind with ``reply`` over a real ldap3 stack; return what ``authenticate``
+    raised and whether the scripted DC hung up."""
+
+    def bind_reply(raw: bytes) -> _Reply | None:
+        return reply if _ALICE in raw else None
+
+    with (
+        _scripted_dc(_alice, bind_reply=bind_reply) as (dc, authenticator),
+        pytest.raises(LdapError) as caught,
+    ):
+        authenticator.authenticate("alice", _PASSWORD)
+    return caught.value, dc.hung_up
 
 
 def test_real_ldap3_reads_a_notice_of_disconnection_at_the_bind_as_an_outage() -> None:
@@ -252,17 +280,37 @@ def test_real_ldap3_reads_a_notice_of_disconnection_at_the_bind_as_an_outage() -
     bindResponse. ldap3 never hands that code to the refusal: it raises
     ``LDAPSessionTerminatedByServerError`` from the bind, which ``authenticate`` maps to a plain
     :class:`LdapError`, not :class:`LdapUnansweredError`, as measured on ldap3 2.9.1. RED if it
-    ever read as a refused password on the found entry; the step-up arm below drives the re-bind."""
+    ever read as a refused password on the found entry; the step-up arm below drives the re-bind.
 
-    def bind_reply(raw: bytes) -> _Reply | None:
-        return (_NOTICE_OF_DISCONNECTION, b"") if _ALICE in raw else None
+    ldap3 raises the same exception, with the same text, when the server only closes the socket
+    (the hang-up control below), so the exception alone cannot show the notice was decoded. What
+    shows it is that the scripted DC sent the notice and never closed: with the socket still open,
+    ldap3 never read an end of stream, so only the decoded notice can have ended the bind."""
+    refusal, hung_up = _bind_answered_with((_NOTICE_OF_DISCONNECTION, b""))
+    assert not hung_up, "the scripted DC closed the socket, so the notice was not what ldap3 read"
+    assert type(refusal) is LdapError and not isinstance(refusal, LdapUnansweredError)
+    assert isinstance(refusal.__cause__, LDAPSessionTerminatedByServerError)
 
-    with (
-        _scripted_dc(_alice, bind_reply=bind_reply) as (_dc, authenticator),
-        pytest.raises(LdapError) as caught,
-    ):
-        authenticator.authenticate("alice", _PASSWORD)
-    assert isinstance(caught.value.__cause__, LDAPSessionTerminatedByServerError)
+
+def test_a_bind_the_server_hangs_up_on_reads_the_same_to_ldap3() -> None:
+    """THE CONTROL for the notice: a bare close reads the same to ldap3, and only ``hung_up``
+    differs. RED if ldap3 ever told the two apart, which would let the notice arm assert it."""
+    refusal, hung_up = _bind_answered_with(_HANG_UP)
+    assert hung_up
+    assert type(refusal) is LdapError and not isinstance(refusal, LdapUnansweredError)
+    assert isinstance(refusal.__cause__, LDAPSessionTerminatedByServerError)
+
+
+def test_real_ldap3_reads_the_notifications_name_and_refuses_one_it_does_not_know() -> None:
+    """THE CONTRAST for the notice: the same message naming another OID raises
+    ``LDAPSocketReceiveError``, not a terminated session, so ldap3 reads the scripted messageID-0
+    message and its responseName rather than skipping it. Still a plain :class:`LdapError`, so the
+    re-bind reads it as ``directory_unavailable`` and does not count it."""
+    refusal, hung_up = _bind_answered_with((_unsolicited(b"1.3.6.1.4.1.32473.3169"), b""))
+    assert not hung_up
+    assert type(refusal) is LdapError
+    assert isinstance(refusal.__cause__, LDAPSocketReceiveError)
+    assert not isinstance(refusal.__cause__, LDAPSessionTerminatedByServerError)
 
 
 async def test_a_re_bind_ended_by_a_notice_of_disconnection_is_not_counted(
@@ -270,19 +318,11 @@ async def test_a_re_bind_ended_by_a_notice_of_disconnection_is_not_counted(
 ) -> None:
     """The step-up re-bind over the same doubles as the four codes, with the bind raising what
     ldap3 raises on a Notice of Disconnection. RED when it charges the row or the session."""
-    async with _signed_in_estate(monkeypatch, ["alice"]) as (_directory, service, store, tokens):
 
-        def bind(self: Any) -> bool:
-            raise LDAPSessionTerminatedByServerError("session terminated by server")
+    def bind(self: Any) -> bool:
+        raise LDAPSessionTerminatedByServerError("session terminated by server")
 
-        monkeypatch.setattr(ldap3.Connection, "bind", bind)
-        identity = await service.identity_for_token(tokens["alice"])
-        assert identity is not None
-        elevation = await service.reauth(identity, _PASSWORD, token=tokens["alice"])
-        row = await store.get_user(identity.user_id)
-        assert row is not None
-        details = [str(dict(r)["detail"]) for r in await store.list_audit(action="auth.reauth")]
-        assert not elevation.ok and elevation.directory_unconfirmed is True
-        assert row.failed_attempts == 0
-        assert len(service._reproof_session_failures) == 0
-        assert any('"reason": "directory_unavailable"' in d for d in details), details
+    elevation, failed, details, charged = await _rebind_after(monkeypatch, bind)
+    assert not elevation.ok and elevation.directory_unconfirmed is True
+    assert failed == 0 and charged == 0
+    assert any('"reason": "directory_unavailable"' in d for d in details), details

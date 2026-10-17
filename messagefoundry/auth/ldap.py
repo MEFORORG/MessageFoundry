@@ -114,7 +114,10 @@ class LdapReferralError(LdapError):
 
     A subclass, so every ``except LdapError`` still refuses it as before. The session reconciler
     tells it apart (BACKLOG #2538): a referral is a configuration error that recurs on every pass,
-    not an outage that passes, so it must page rather than read as unavailable forever.
+    not an outage that passes, so it must page rather than read as unavailable forever. The step-up
+    re-bind does not tell it apart (``AuthService._reauth_ad``): it refuses every ``LdapError`` as
+    ``directory_unavailable`` and counts none, which is right for a referral, because the engine
+    never follows one, so no bind judged the password (BACKLOG #3169).
     """
 
 
@@ -188,7 +191,8 @@ class DirectoryBind:
     tell a refused password from an absent or disabled account without a second directory read.
     ``answer`` is ``None`` when no lookup ran, which only an empty password causes. ``FOUND`` with
     no principal means the entry was found enabled and the directory refused the bind with a code
-    outside :data:`_UNJUDGED_BIND_CODES` that is not a referral (10). A bind on a found entry that
+    outside :data:`_UNJUDGED_BIND_CODES` that is not a referral (10), or with a result that holds no
+    integer code at all, which the step-up re-bind counts too. A bind on a found entry that
     ends with a referral or a code inside that set returns no answer at all: ``authenticate``
     raises it instead (BACKLOG #2530, #3169). The engine reads every other refusal as the password
     judged against that account, though a code such as strongerAuthRequired (8) judges none. Any other answer means no bind was judged. None of
@@ -897,7 +901,9 @@ def _refuse_unjudged_bind(conn: Any) -> None:
 
     Not :func:`_refuse_unanswered`, which refuses every code outside a set of answers: every other
     refused bind, 49 included, still reads as a refused password, so the bind's answers are an open
-    set. The refusal is :func:`_unanswered`'s, so its text and warning match the searches'.
+    set. The one exception is a referral, which ``authenticate`` refuses first through
+    :func:`_refuse_referral` and which is not counted either. The refusal is :func:`_unanswered`'s,
+    so its text and warning match the searches'.
     """
     result = conn.result
     code = result.get("result") if isinstance(result, dict) else None
