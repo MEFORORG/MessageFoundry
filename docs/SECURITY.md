@@ -4111,8 +4111,9 @@ reconcilers on one store revoke one account in turn, the second only audits. If 
 roles before either writes them, both still report. A pass that
 fails part-way keeps the audit rows for what it already revoked, but raises no alert for them. A
 refused audit write does not end the pass (BACKLOG #3018). The reconciler logs it at ERROR, naming the
-action and the account. Any alert or notice the account was due still goes. The ERROR line is then the
-only record of that row, and nothing writes it later.
+action and the account. Any notice the account was due still goes. Its alert still goes too, unless a
+later write in the same pass also fails and ends the pass. Then that account has neither its row nor
+its alert. The ERROR line is then the only record of that row, and nothing writes it later.
 
 **The probe is keyed on the directory's immutable `objectGUID`**, the same identifier a directory login
 is identified by, and a renamed account's stored username is refreshed from the directory on the same
