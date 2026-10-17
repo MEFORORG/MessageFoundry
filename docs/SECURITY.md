@@ -5821,9 +5821,11 @@ answer it, and they differ in strength:
   longer the console-script launcher, which cannot pass an option
   ([the next section](#isolated-mode-and-start-up-code-of-the-engines-interpreter)).
 - **The engine process refuses the script where the interface is still on.** A start through the
-  console script, such as a developer's `messagefoundry serve`, leaves it on; under `enforce`
-  `serve` and `supervise` then refuse to start unless the acceptance above is set. So the command line
-  installs an audit hook as it starts, for every command (`messagefoundry/remotedebug.py`). The
+  console script, such as a developer's `messagefoundry serve`, leaves it on. So the command line
+  installs an audit hook as it starts, for every command (`messagefoundry/remotedebug.py`): the
+  interface can be on in any command, and `serve` or `supervise` runs with it on under
+  `enforcement = warn` or with the acceptance above set. Under `enforce` without that
+  acceptance, `serve` and `supervise` refuse to start with it on. The
   interpreter raises an event before it runs an injected script, the hook raises on it, and the
   interpreter drops the script. A refusal is logged. Under `serve` the engine also writes a
   `remote_debug_refused` audit row and raises an alert of that name (vault BACKLOG #2742).

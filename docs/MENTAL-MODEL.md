@@ -450,7 +450,7 @@ inbound("IB_ACME_ADT", MLLP(port=2600), router="acme_adt_router", shard="a")
 ```
 
 ```bash
-python -P -X disable-remote-debug -m messagefoundry supervise --config ./config --base-port 8765   # one subprocess per shard id
+python -P -X disable-remote-debug -m messagefoundry supervise --config ./config --base-port 8765   # one subprocess per engine shard id
 ```
 
 **What’s measured, and what isn’t.** On a consumer 8-core test box, supervise scaled roughly linearly — 1 → 2 → 4 shards at ~50 → 88.7 → 165.5 msg/s aggregate, about η ≈ 0.85 of a core per added shard. The portable result is that **speedup shape**, not the absolute rate: multiply η by *your* measured single-shard rate. Two honest caveats — that run used the since-deprecated per-shard SQLite store, and N shards actively sharing one server DB, while built and invariant-tested, is **not yet certified as a supported production topology** (it awaits a clean multi-engine no-loss bench). Until it is, size production multi-engine deployments as active-passive (§14). Detail: docs/SYSTEM-REQUIREMENTS.md and docs/benchmarks/TUNING-BASELINE.md.

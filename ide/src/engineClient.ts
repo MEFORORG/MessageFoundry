@@ -226,7 +226,7 @@ function networkError(err: NodeJS.ErrnoException, baseUrl: string): NetworkError
   }
   if (err.code === "ECONNREFUSED" || err.code === "ECONNRESET" || err.code === "ENOTFOUND") {
     return new NetworkError(
-      `engine not reachable at ${baseUrl} — start it (Console or \`messagefoundry serve\`).`,
+      `engine not reachable at ${baseUrl} — start it (the status pill, or \`python -P -X disable-remote-debug -m messagefoundry serve\`).`,
       err.code,
     );
   }

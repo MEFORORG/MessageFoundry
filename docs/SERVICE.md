@@ -107,7 +107,7 @@ engine finds it runs as an NSSM service, `serve` and `supervise` refuse to start
 `messagefoundry.toml` from the working directory. Pass `-ServiceConfig <path>`, or put
 `messagefoundry.toml` where the installer looks for it, which the Defaults table below names. With
 neither, the installer refuses. A service that sets everything through its environment still needs
-the file; an empty one will do. `messagefoundry serve` from a prompt needs no flag. The engine knows it is
+the file; an empty one will do. A start from a prompt needs no `--service-config`. The engine knows it is
 the service when `nssm.exe` is the first process above it other than Python and the
 `messagefoundry` launcher. A start it cannot place, such as one under a wrapper between NSSM and the
 interpreter, is not refused. `messagefoundry/serviceenv.py` says what the reading covers.

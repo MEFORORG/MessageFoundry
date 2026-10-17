@@ -7095,7 +7095,7 @@ def _store_provision_schema(args: argparse.Namespace) -> int:
         # Checked here rather than caught from the call: a ValueError arm around the driver call would
         # also swallow the driver's own ValueErrors, unredacted and without the database named.
         return _emit_error(
-            "the sqlite store builds its own schema when `messagefoundry serve` first opens it; "
+            "the sqlite store builds its own schema when `python -P -X disable-remote-debug -m messagefoundry serve` first opens it; "
             "`messagefoundry store provision-schema` applies to the sqlserver and postgres "
             "backends only",
             as_json=args.json,

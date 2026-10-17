@@ -46,7 +46,7 @@ suite("engine control — the serve invocation is the ADR-blessed command, RUN n
     const inv = buildServeInvocation({ python: "C:\\ws\\.venv\\Scripts\\python.exe", configDir: "samples/config" });
     assert.strictEqual(inv.command, "C:\\ws\\.venv\\Scripts\\python.exe");
     assert.deepStrictEqual(inv.args, [
-      "-X", "disable-remote-debug", "-m", "messagefoundry", "serve", "--config", "samples/config",
+      "-P", "-X", "disable-remote-debug", "-m", "messagefoundry", "serve", "--config", "samples/config",
     ]);
     // The whole point of ADR 0110 §5's caution: no store/env override that could fork the user's engine.
     assert.ok(!inv.args.includes("--db"), "must not override the store — the service TOML is the authority");
