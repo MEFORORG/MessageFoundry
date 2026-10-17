@@ -584,7 +584,9 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    bound to its path, so trusting it would let a planted one name another upload for the prune to
    delete, lift a quota with a negative size, or fail every save. `rotate-key` stamps the key's rotation date only when the key
    actually changed, so running it with the same key to seal uploads does not reset the key-age
-   clock.
+   clock. It also writes no stamp, and exits non-zero, when it skipped an upload or its audit-chain
+   step did not complete (BACKLOG #3181). The next `serve` start stamps a changed key all the same,
+   so a stamp does not prove that a rotation completed.
    **At least one kind of refused upload is never sealed, so it is kept inside retention another way
    (BACKLOG #2322).** It is a plaintext sidecar over a body that is missing or is not text. Sealing it would list an
    upload with no usable body, and would seal a planted lone sidecar too, so `rotate-key` leaves it
