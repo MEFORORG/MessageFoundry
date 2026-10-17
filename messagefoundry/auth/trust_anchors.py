@@ -144,6 +144,7 @@ from messagefoundry.auth.anchor_path import (
     PathVerdict,
     anchor_path_verdict,
 )
+from messagefoundry.childenv import system_tool_environment
 from messagefoundry.config.models import bool_setting
 from messagefoundry.connection_names import fhir_lookup_record_name, inbound_record_name
 from messagefoundry.credential import constant_time_equal
@@ -713,6 +714,7 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
             result = subprocess.run(  # nosec B603 B607
                 [_system_exe("icacls.exe"), name],
                 check=False,
+                env=system_tool_environment(),  # the platform's start-up names only (#2716)
                 capture_output=True,
                 # icacls writes the OEM code page to a pipe. Decoding it with the default ANSI code
                 # page failed on a non-ASCII path (measured: "Schluessel" with u-umlaut came back as

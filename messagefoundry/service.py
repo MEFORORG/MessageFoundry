@@ -38,6 +38,7 @@ import messagefoundry
 # why the parser reads the STATE field and what it costs when it does not. Private by convention,
 # not by layer: service_status is the stdlib-only neutral leaf, so importing it here crosses
 # nothing.
+from messagefoundry.childenv import system_tool_environment
 from messagefoundry.service_status import _system_dir, _system_exe, parse_service_state
 
 # sc.exe is a console program; launched from the GUI process (pythonw has no console) each call
@@ -120,6 +121,7 @@ def service_state(name: str) -> str:
             [_system_exe("sc.exe"), "query", name],
             capture_output=True,
             text=True,
+            env=system_tool_environment(),  # the platform's start-up names only (#2716)
             # sc.exe writes its console's code page when piped, OEM unless a parent ran chcp. A byte
             # the decoding codec cannot map fails in subprocess's reader thread, run() returns
             # stdout=None, and parse_service_state raises AttributeError. Only the ASCII STATE

@@ -2496,6 +2496,22 @@ def _remote_debug_refused(
     return True
 
 
+#: How long uvicorn waits, at a stop, for open connections and their requests to finish before it
+#: cancels them and runs the lifespan teardown (BACKLOG #3256). The whole stop shares NSSM's
+#: AppStopMethodConsole window (scripts/service/install-service.ps1) with that teardown and
+#: engine.stop(). Unset, this wait had no bound, so one long request could spend the window and
+#: the service would be killed mid-teardown. A request cut off here is cancelled like one past its
+#: deadline, and uvicorn starts the teardown without waiting for it, so its cancel paths run
+#: alongside the teardown. **Any route that acts in a worker thread and then writes its audit row
+#: can lose that row here,** such as ``DELETE /uploads/{id}``, whose unlink finishes in its thread
+#: while the request is cancelled before its ``upload.delete`` row. At least these upload cases
+#: lose too: a save whose write is still running waits for it, with no bound, and may then pay its
+#: quota slot back to a closed store, leaving the slot to go stale; and a save cancelled in its own
+#: ``upload.create`` audit write keeps its file with no creation row. Before this bound, a request
+#: still open at the window's end was killed with the process instead, at any point.
+_UVICORN_DRAIN_SECONDS = 3.0
+
+
 def _serve(args: argparse.Namespace) -> int:
     # Vault BACKLOG #2700: first in this function, ahead of the imports below and of config,
     # because a script injected before the hook is in place runs. It is NOT first in the process:
@@ -2899,6 +2915,11 @@ def _serve(args: argparse.Namespace) -> int:
 
     for _env_line in unread_env_warnings(settings):
         logging.getLogger("messagefoundry.config.settings").warning("%s", _env_line)
+    # BACKLOG #3085 (owner ruling 2026-10-17, "Warn, don't refuse"): a recheck budget at or below
+    # the revoke cap leaves the mass-revoke breaker unable to trip. Logged here, once logging
+    # reaches its handlers, and only by serve, so other commands that resolve settings stay quiet.
+    if (_breaker_note := settings.auth.breaker_budget_warning()) is not None:
+        logging.getLogger("messagefoundry.config.settings").warning("%s", _breaker_note)
     # BACKLOG #1125 (owner ruling 2026-10-11): an environment proxy must not attach silently. Named
     # as soon as logging reaches its handlers, before the first hop that could use it.
     from messagefoundry.transports.ambient_proxy import warn_ambient_proxy
@@ -4662,6 +4683,7 @@ def _serve(args: argparse.Namespace) -> int:
         "server_header": False,
         "http": floored_http,
         "ws": floored_ws,
+        "timeout_graceful_shutdown": _UVICORN_DRAIN_SECONDS,  # BACKLOG #3256; see the constant
     }
     from messagefoundry.api.tls import build_api_ssl_context
 

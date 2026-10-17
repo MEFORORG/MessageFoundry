@@ -146,18 +146,21 @@ pwsh -NoProfile -File scripts\worktree\ensure-venv.ps1
 ```
 
 **before its first `pytest`, `mypy` or `ruff` run** -- not at the top of every brief. On a worktree that
-already has an environment the script prints one line and returns, but a **fresh** managed worktree
+already has an environment the script checks where the engine and the web console import from, and
+returns without installing when both come from this checkout. A **fresh** managed worktree
 always takes the full install: measured here, **47 seconds and 887 MB** with a warm pip cache. A worker
 that runs no checks should not pay that, and 39 of the 86 nested worktrees on this machine would.
 
 **Keeping managed worktrees inherits a staleness mode the sibling pattern did not have.** The script
-decides freshness by file EXISTENCE, so a venv is only as current as the day it was built. A
-disposable sibling made and removed inside a day never meets a `constraints.lock` bump. A managed
-worktree is likelier to be **kept** -- that is much of its appeal -- and a kept one outlives lock bumps
-while the script correctly reports nothing to do. So if you keep them, **delete `.venv` and re-run** is
-a habit rather than a footnote: reach for it whenever a reused worktree gives a lint or type result CI
-disagrees with. There is deliberately no `-Force`; an untested refresh path on a script whose contract
-is "run it and it does the right thing" is a second, quieter way for it to lie.
+reinstalls when a package imports from somewhere else, such as a stale web console copy (BACKLOG
+#2857). It does not compare installed versions against `constraints.lock`, so a venv's dependencies
+are only as current as the day it was built. A disposable sibling made and removed inside a day never
+meets a lock bump. A managed worktree is likelier to be **kept** -- that is much of its appeal -- and a
+kept one outlives lock bumps while the script reports nothing to do. So if you keep them, **delete
+`.venv` and re-run** is a habit rather than a footnote: reach for it whenever a reused worktree gives a
+lint or type result CI disagrees with. The web console copy also goes stale again the moment its
+source changes, so re-run the script after editing `messagefoundry_webconsole/`. There is deliberately
+no `-Force`.
 
 Raised 2026-09-16 by a manager who had just removed five same-day siblings and pointed out that the
 trap does not reach that pattern at all -- which is the point: this recommendation moves people onto
@@ -179,7 +182,7 @@ nothing prompts.
 
 | Route | Reaches | Refuses, before it removes anything |
 |---|---|---|
-| `-Name <dir>` | The `<repo>-<dir>` sibling of the checkout that copy of the script lives in | Uncommitted tracked changes. A detached HEAD no ref holds. An unlanded ledger number. |
+| `-Name <dir>` | The `<repo>-<dir>` sibling of the checkout that copy of the script lives in | Uncommitted tracked changes. A detached HEAD no ref holds. An unlanded ledger number. A held claim, git or working-tree activity in six hours, and a nested worktree, whatever `-Force` says. |
 | `-Path <path>` | Any registered linked worktree that is not under `.claude/worktrees` | Everything `-Name` refuses, and the list in the next section. |
 | `-List` | Nothing. It is read-only. | It prints each worktree, its class, and which route reaches it. |
 
@@ -225,10 +228,11 @@ is a copy for readers and can lag it.
   replaced by an amend counts, although the branch's own reflog still holds it.
 - A tree the session registry records a session in.
 - Any tree at all, when the session registry cannot be read.
-- A tree that still holds a work claim, or any tree when a claim file cannot be read. So this
-  route never releases a claim: the work lands, or the claim is released, first.
+- A tree that still holds a work claim, or any tree when a claim file cannot be read. Neither route
+  releases a claim; release with `claim.ps1 -Release`, which records it.
 - A tree whose own git directory was written to in the last six hours, by a commit, a checkout, a
   merge or a fetch.
+- A tree whose working tree was written to in six hours.
 
 Without `-Force` it also refuses uncommitted tracked changes, untracked files, ignored files, and
 files flagged skip-worktree or assume-unchanged. **One exception:** an *ignored directory* named
@@ -265,13 +269,17 @@ case: the sessions sit under `.claude/worktrees` and the work sits in sibling tr
 the first version of this route found that the registry check alone would have removed trees of a
 running batch.
 
-So `-Path` also refuses on a held **claim** and on **recent git activity**, the last two entries in
-the list above. A claim names the worktree that took it, whoever launched the session. Git activity
-is read from the tree's own git directory. Neither is proof that a tree is free:
+So `-Path` also refuses on a held **claim** and on **recent activity**, the last three entries in
+the list above. `-Name` refuses on the same three. A claim names the worktree that took it,
+whoever launched the session. Git activity is read from the tree's own git directory. Working-tree
+activity is read from the tree's top folder, each entry directly under it, and `.pytest_cache` and
+`.ruff_cache`. None is proof that a tree is free:
 
-- Work that was never claimed, in a tree nobody has committed to for six hours, passes both.
-- The six hours are a judgement. A long test run after a last commit can outlast them.
-- A tree that passes both is still removed only if it is clean.
+- Work that was never claimed, in a tree nobody has committed to or written in for six hours,
+  passes all three.
+- The six hours are a judgement. A test run still in progress has not yet written its cache, so it
+  can outlast them.
+- A tree that passes all three is still removed only if it is clean.
 
 **The occupancy check is on `-Path` only.** `-Name` has none, and it also keeps its blanket
 `git worktree prune`, which `-Path` does not run because a blanket prune drops other worktrees'
@@ -1672,30 +1680,14 @@ whatever matches on the day it runs. Let your shell expand the pattern, and read
 
 The first refusal stops that target.
 
-| Check | What it refuses |
-|---|---|
-| `spelling` | Anything but a plain drive-absolute path: a UNC or device path, a relative path, `.` or `..`, a component ending in a dot or a space, an 8.3 short name, a colon after the drive letter, a wildcard, a reserved device name. Forward slashes are accepted. |
-| `temp-root` | A target that is not strictly inside the temp root. Under `<root>\claude`, anything but the inside of a session scratchpad. |
-| `exists` | A path that does not exist, a single file, and a name that is stored under a different spelling. |
-| `reparse` | A reparse point (junction, symbolic link, mount point, cloud placeholder) on the path from the drive root down, or anywhere inside the tree. The script never follows one. |
-| `git` | A `.git` entry at any depth, a bare repository, a folder inside either, and any overlap with a registered worktree. |
-| `cwd` | A target the calling shell is standing in. |
-| `sessions` | A registry the script cannot read, a session working inside the target, and any other session's scratchpad. |
-| `idle` | A tree with anything created or modified inside the idle window. |
-| `in-use` | With `-Delete` only: a folder that cannot be renamed, because some process holds a handle inside it. |
+**What each one refuses is written once, in the comment block at the top of
+[`remove-scratch.ps1`](../scripts/worktree/remove-scratch.ps1)**, under *THE CHECKS*. This page does
+not repeat that list. The table under *Whose folder it is* below does repeat the idle windows, so a
+change to a window changes both.
 
-**The temp root is `<LocalApplicationData>\Temp`, read from the known-folder API.** It is not read
-from `TEMP` or `TMP`. Those are environment variables, and `[IO.Path]::GetTempPath()` follows a
-forged `TMP`. When `TEMP` is spelled any other way, the script prints a note and refuses every
-target. That includes a machine with a redirected temp folder, and a machine whose `TEMP` is an 8.3
-spelling of the same folder.
-
-**Under `<root>\claude`, only `claude\<project>\<session id>\scratchpad\<name>` or deeper can pass.**
-The scratchpad folder itself, a session folder and a project folder are refused.
-
-**A scratchpad worktree goes through [`remove.ps1`](../scripts/worktree/remove.ps1), never this
-script.** The worktrees compared are those of the repository the script lives in, and of every root
-in the worktree gate's own list.
+Two results surprise people. The script refuses every target while `TEMP` is spelled differently
+from the temp root, a redirected or 8.3-spelled `TEMP` included. And a scratchpad worktree goes
+through [`remove.ps1`](../scripts/worktree/remove.ps1), never this script.
 
 ### Whose folder it is
 
@@ -1716,10 +1708,8 @@ scratchpad is refused too.
 session family, and the caller cannot list its own workers. That is why its own scratchpad still
 waits ten minutes.
 
-`-IdleMinutes` can raise a window. It can never lower one. The idle check reads creation time as
-well as write time, because a copied or extracted tree keeps old write times. A stamp in the future
-refuses. So does a stamp the script cannot read at all, such as a time past the year 9999: an
-unreadable stamp is not an old one.
+`-IdleMinutes` can raise a window. It can never lower one. Which stamps the `idle` check reads, and
+which it refuses as unreadable, is in the header with the other checks.
 
 ### What it cannot see
 

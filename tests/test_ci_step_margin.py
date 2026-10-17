@@ -1087,6 +1087,8 @@ def test_every_leg_gives_the_kill_real_headroom_over_the_margin_cap() -> None:
     was measured at a cap of 9; at the cap of 8 it gives 1.375x and no longer reds.) Re-falsified at
     the 2026-10-07 re-measure, on the two kills it moved: windows-2025's 16 to 15 against its cap of
     12 (1.250x) and ubuntu's 10 to 9 against its cap of 7 (1.286x) each went RED. Restored.
+    Re-falsified at the 2026-10-17 re-measure: windows-2022's kill 15 to 14 against its cap of 11
+    (1.273x) went RED here and in the nesting check. Restored.
     """
     legs = _matrix_legs()
     names = {leg["os"] for leg in legs}
@@ -1128,6 +1130,8 @@ def test_every_leg_clears_its_own_recorded_maximum_at_its_margin_cap() -> None:
     ceil_minute(1.35x the row) floored at 5:00, as `step_margin.sized_cap_minutes` computes it. An
     integer restatement of the rule beside it fails if that function's arithmetic moves.
 
+    Re-falsified at the 2026-10-17 re-measure: windows-2022's cap set to 10 against its 7:40 row
+    (10:00 / 7:40 = 1.304x, over the floor) went RED on the rule. Restored.
     Re-falsified at the 2026-10-07 re-measure: windows-2025's cap set to 11 against its 8:29 row
     (11:00 / 8:29 = 1.297x) went RED on the floor, and set to 13 went RED on the rule. Restored. The
     original record, at the 2026-09-30 row:

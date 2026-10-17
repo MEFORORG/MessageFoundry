@@ -67,9 +67,10 @@ RUN_VALUE_LIMIT = 260
 #: Not ``-I``. It implies ``-s``, which drops the user site-packages. A ``pip install --user``
 #: tray counts as installed, so its short-form login would stop importing.
 #:
-#: Only the login command takes ``-E``. The options every child shares stay in
-#: ``CHILD_INTERPRETER_FLAGS``. The first process's own environment is unchanged, so the relaunch
-#: builds its child's environment from the same variables as before.
+#: Only the login command passes ``-E`` itself. The options every child shares stay in
+#: ``CHILD_INTERPRETER_FLAGS``. The first process's own environment is unchanged, and the relaunch
+#: repeats its ``-E`` and ``-s`` (``childenv.inherited_interpreter_flags``, vault BACKLOG #2701), so
+#: the relaunched tray ignores the ``PYTHON*`` variables too.
 LOGIN_INTERPRETER_FLAGS: Final = ("-E",)
 
 
@@ -112,7 +113,9 @@ def launcher_command(pythonw: str | None = None, *, installed: bool | None = Non
     if installed is None:
         installed = installed_in_site_packages()
     build = python_module_argv if installed else python_child_argv
-    return subprocess.list2cmdline(build(ENTRY_MODULE, executable=exe, extra_flags=login_flags()))
+    # Not this process's own isolation: the command is stored, and run at the next login.
+    argv = build(ENTRY_MODULE, executable=exe, extra_flags=login_flags(), inherit=False)
+    return subprocess.list2cmdline(argv)
 
 
 def login_flags() -> tuple[str, ...]:
