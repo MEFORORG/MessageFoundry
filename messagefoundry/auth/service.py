@@ -2094,10 +2094,11 @@ _LOCK_NOTICE_WINDOW_SECONDS: Final = 24 * 3600.0
 #: ``scripts/service/install-service.ps1``), not any one drain's constant (vault BACKLOG #3120). The
 #: API lifespans spend it through one shutdown budget. ``_SHUTDOWN_BUDGET_SECONDS`` in
 #: ``api/app.py`` states the budget and the window arithmetic (BACKLOG #3191); ``_app_drain_steps``
-#: and the managed lifespan's teardown hold the steps, their order and each bounded step's bound.
-#: Where the lock-notice step's bound is below these two together, that bound cuts this drain
-#: before it cancels its tasks, and a task it has not cancelled runs on past the drain, as the
-#: step's own comment says. A change to either is read against that budget.
+#: and the managed lifespan's teardown hold the steps, their order and each step's floor, from which
+#: ``_run_teardown`` computes the step's bound. Where the lock-notice step's bound is below
+#: :data:`_BACKGROUND_DRAIN_SECONDS`, the teardown cuts this drain before it cancels anything;
+#: ``docs/SECURITY.md``, *Residual: the background task adds one way to lose a notice*, says what
+#: that costs. A change to either constant is read against that budget.
 _BACKGROUND_DRAIN_SECONDS: Final = 2.0
 _BACKGROUND_CANCEL_GRACE_SECONDS: Final = 0.5
 

@@ -104,11 +104,10 @@ RESOLVE_OUTCOMES: Mapping[str, str] = {
 }
 
 
-#: How long :meth:`ApprovalGate.drain` waits for outcome writes still running at shutdown. It shares
-#: NSSM's 15 s graceful-stop window (AppStopMethodConsole in scripts/service/install-service.ps1)
-#: with every other shutdown step, and engine.stop() still has to run after them. It is only this
-#: method's default: the API lifespans pass the drain a share of its step's bound instead, which can
-#: be longer or shorter. ``_SHUTDOWN_BUDGET_SECONDS`` in ``api/app.py`` states the budget and the
+#: The default wait of :meth:`ApprovalGate.drain` for outcome writes still running, for a caller
+#: that passes no timeout. The API lifespans do not use it: they pass a share of the drain step's
+#: bound, which can be longer or shorter, inside NSSM's 15 s graceful-stop window
+#: (AppStopMethodConsole in scripts/service/install-service.ps1). ``_SHUTDOWN_BUDGET_SECONDS`` in ``api/app.py`` states the budget and the
 #: window arithmetic (BACKLOG #3191); ``_app_drain_steps`` and the managed lifespan's teardown hold
 #: the steps and their order.
 #: One outcome write is a status update and an audit row, so a few seconds is ample.

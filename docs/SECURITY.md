@@ -5518,8 +5518,13 @@ source of record is `SecurityEventNotifier._record_undelivered` in
   second action.*
 
 **Residual: the background task adds one way to lose a notice** (BACKLOG #2216). At shutdown the
-engine waits about two seconds for pending notices. A notice still pending then is cut off, and may be
-neither mailed nor recorded. A failed `auth.lock_notice` row write also changes: it used to fail
+engine waits at most two seconds for pending notices, then cancels any still pending, each with one
+line. A cancelled notice may be neither mailed nor recorded. The API lifespan's shutdown budget
+(BACKLOG #3191) can cut that wait short before it cancels anything, whenever the lock-notice step's
+bound falls below those two seconds. A pending notice is then not cancelled and runs on. If it
+reaches the security notifier after that notifier has closed, the notifier still takes it and
+reports it queued, so its `auth.lock_notice` row says `mailed: true` for a mail that is never sent,
+and the throttle holds back that account's next notice of that kind for 24 hours. A failed `auth.lock_notice` row write also changes: it used to fail
 the request, and now it is logged instead. The mail goes before its row, so that failure costs at
 most a duplicate mail at the next lock. Each such line names no account and no lock. It still tells
 a `logs:view` reader when some notice failed.
@@ -5536,11 +5541,8 @@ a `logs:view` reader when some notice failed.
   nothing bounds how many wait. A task follows a lock, not an attempt, and a lock takes
   `lockout_threshold` failures on its counter, so the count grows with the accounts being locked at
   once rather than with the attempts against them. Under locks on many accounts the
-  tasks wait behind the one-at-a-time read, so mails arrive later, and any still pending when the
-  shutdown drain reaches its own bound are cancelled, each with one line. Where the API lifespan's
-  shutdown budget cuts that drain first (`_app_drain_steps` in `api/app.py`, BACKLOG #3191), a
-  pending task is not cancelled: it runs on, and can meet the closed security notifier or the
-  closing store. A cap would have to drop a notice or run it on
+  tasks wait behind the one-at-a-time read, so mails arrive later, and any still pending at
+  shutdown meet the residual above. A cap would have to drop a notice or run it on
   the request path, which is what the task exists to avoid.
 
 **Client attribution ([ADR 0150](adr/0150-client-address-on-audit-entries.md)).** Every row also
