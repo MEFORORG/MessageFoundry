@@ -1988,8 +1988,13 @@ async def _reported(store: MessageStore) -> list[str]:
 
 @pytest.mark.parametrize(
     "refusal",
-    [sqlite3.OperationalError("synthetic: disk I/O error"), CipherError("synthetic: Transit down")],
-    ids=["driver", "transit-mac"],
+    [
+        sqlite3.OperationalError("synthetic: disk I/O error"),
+        CipherError("synthetic: Transit down"),
+        # aiosqlite's closed connection, raised before sqlite3 is reached (BACKLOG #3145 carry-over).
+        ValueError("no active connection"),
+    ],
+    ids=["driver", "transit-mac", "closed-connection"],
 )
 async def test_a_refused_skip_report_logs_once_per_pass_and_tries_the_next_account_next(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, refusal: Exception
@@ -1998,7 +2003,8 @@ async def test_a_refused_skip_report_logs_once_per_pass_and_tries_the_next_accou
     the first failure ended the pass; now the report stops at the first refusal, which also keeps
     a pool that times out each write to one timeout per pass. The
     account it refused goes last next pass, so the next account is tried. Both are reported once the
-    store accepts the write. A Transit outage refuses like a driver error (ADR 0138)."""
+    store accepts the write. A Transit outage refuses like a driver error (ADR 0138), and so does a
+    closed aiosqlite connection."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _two_unkeyed_bindings(store)

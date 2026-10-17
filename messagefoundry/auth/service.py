@@ -128,7 +128,7 @@ from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.credential import constant_time_equal
 from messagefoundry.keyed_lock import KeyedLock as _KeyedLock
 from messagefoundry.keyed_lock import hold_keyed_lock as _hold_keyed_lock
-from messagefoundry.store.base import AdminStore, store_call_errors, store_driver_errors
+from messagefoundry.store.base import AdminStore, store_call_errors
 from messagefoundry.store.crypto import MARKER_PREFIX, CipherError
 from messagefoundry.store.row_seal import (
     ADSET_KIND,
@@ -187,14 +187,16 @@ def _audit_write_errors() -> tuple[type[Exception], ...]:
     """What a refused audit write raises, at least on the store backends and key modes named here
     (BACKLOG #2137).
 
-    The drivers' own errors, plus the two that :func:`~messagefoundry.store.base.store_driver_errors`
-    asks a caller to add: ``RuntimeError`` for the engine's own refusals (the acquire timeout, a
-    keyless audit append) and ``OSError`` for a connection lost at the socket. And ``CipherError``,
-    which a ``vault_transit`` store raises when Transit cannot compute the audit-chain MAC (ADR
-    0138). Built on first use, because naming a server driver imports it; an ``AuthService`` that
+    :func:`~messagefoundry.store.base.store_call_errors`: the drivers' own errors, ``RuntimeError``
+    for the engine's own refusals (the acquire timeout, a keyless audit append), ``OSError`` for a
+    connection lost at the socket, and ``ValueError``, which aiosqlite raises for a closed
+    connection before sqlite3 is reached. And ``CipherError``, which a ``vault_transit`` store
+    raises when Transit cannot compute the audit-chain MAC (ADR 0138). A caller re-raises
+    :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS` first where a bug must not read as a
+    refusal. Built on first use, because naming a server driver imports it; an ``AuthService`` that
     runs the reconciler builds it at construction, so that import never runs on the event loop in
     the middle of a store incident."""
-    return (RuntimeError, OSError, CipherError, *store_driver_errors())
+    return (CipherError, *store_call_errors())
 
 
 def _warn_if_corpus_unreadable(path: str | None) -> None:
