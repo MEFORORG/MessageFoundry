@@ -2405,6 +2405,13 @@ source (`Http()`, File, a `Loopback` re-ingress) as a `RawMessage`.
 per entry); the engine never orchestrates cross-entry atomicity. The engine does screen every entry first,
 as [A Bundle connection screens every entry](#a-bundle-connection-screens-every-entry) says.
 
+On every interaction but `transaction` and `batch`, a body in which a JSON object repeats a key is refused
+before a byte is sent, for the reason rule 2 of
+[the Bundle screen](#a-bundle-connection-screens-every-entry) gives: a permanent refusal, code
+`bad-body` (vault BACKLOG #2812). A Bundle that repeats a key is refused by the screen instead, code
+`bundle-entry-refused`. `FhirPeek.parse` raises `FhirPeekError` on such a body, so a Router that peeks one
+takes the error path, and so does a `fhir_lookup` whose reply repeats a key.
+
 **Conditional knobs (idempotency / concurrency).** FHIR's native answer to the at-least-once duplicate
 problem — opt-in, off by default: `if-none-exist` (create only if no match; the search rides the
 `If-None-Exist` **header**), `conditional-update` (the server resolves which resource to update; the search
@@ -2472,6 +2479,15 @@ What a site needs to know:
 - If a server answers 2xx while the entry's own `response.status` failed, the message is classified on
   that entry status, like any other HTTP status. An entry status that does not read as an HTTP code is
   logged as a warning, and the 2xx reply counts as delivered.
+- A reply in which a JSON object repeats a key is read twice, once keeping the first value of each key
+  and once keeping the last (vault BACKLOG #2812). When the two readings reach the same judgment and
+  agree on what a delivery takes, and no occurrence of a key repeated three or more times differs
+  from both its first and last value, the reply is judged as above. Otherwise the update is a permanent
+  refusal, code `reply-repeats-a-key`, in either capture mode. It is not sent again and not recorded
+  as delivered, as with a reply over the byte bound below. The full rule, with what counts as
+  agreement and its costs, is in
+  [ADR 0095](adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md), Amendment B.1,
+  the 2026-10-17 entry.
 - A reply body over the byte bound is not kept, so the engine cannot see the entry's status. The
   update is then a permanent refusal, code `reply-too-large`, in either capture mode, and it is not
   sent again. It is not recorded as delivered. See *A 2xx reply over the byte bound* under [REST](#rest--rest).
