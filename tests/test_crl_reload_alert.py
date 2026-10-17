@@ -56,7 +56,11 @@ from messagefoundry.pipeline.crl_reload import (
     reload_alert_subject,
     reload_replaced_crls,
 )
-from messagefoundry.pipeline.intake_bound import INTAKE_SUBJECT_MAX_LENGTH
+from messagefoundry.pipeline.intake_bound import (
+    INTAKE_SUBJECT_MAX_LENGTH,
+    process_alert_subject,
+    shorten_with_checksum,
+)
 from messagefoundry.pki import read_soonest_crl_facts
 from tests import test_crl_reload as _base
 from tests._refusal_log_capture import until
@@ -923,6 +927,25 @@ def test_a_long_path_and_a_long_node_label_stay_inside_the_column(tmp_path: Path
             assert "partner-crl.pem" in subject, "the tail, which holds the file name, is kept"
     # Deterministic, so a clear names the instance its raise opened.
     assert reload_alert_subject(first, "shard:a") == reload_alert_subject(first, "shard:a")
+
+
+def test_a_path_and_a_node_label_are_shortened_by_one_rule(tmp_path: Path) -> None:
+    """Vault BACKLOG #3543 item 7: one shortening routine, where there were two hand-rolled
+    copies. A CRL path keeps its tail and a node label its head, with one checksum of the whole
+    text between, so the two cannot drift apart."""
+    key = crl_path_key(tmp_path.joinpath(*["a-long-directory-name"] * 12, "partner-crl.pem"))
+    short = shorten_with_checksum(key, ALERT_PATH_MAX_LENGTH, keep_tail=True)
+    assert reload_alert_subject(key) == f"crl_reload:{short}"
+    assert len(short) == ALERT_PATH_MAX_LENGTH and short.endswith("partner-crl.pem")
+    assert shorten_with_checksum(key, ALERT_PATH_MAX_LENGTH) == f"{key[:111]}~{short[1:9]}"
+    assert shorten_with_checksum("short", ALERT_PATH_MAX_LENGTH, keep_tail=True) == "short"
+
+    node = "node:" + "x" * 400
+    subject = process_alert_subject("crl_reload:a", node)
+    assert subject == f"crl_reload:a@{shorten_with_checksum(node, INTAKE_SUBJECT_MAX_LENGTH - 13)}"
+    assert len(subject) == INTAKE_SUBJECT_MAX_LENGTH
+    # A lone surrogate gets a checksum on both paths. The node label's copy used to raise.
+    assert process_alert_subject("intake:x", "node:\ud800" + "y" * 400).startswith("intake:x@")
 
 
 def test_the_subject_is_outside_the_connection_name_grammar(tmp_path: Path) -> None:

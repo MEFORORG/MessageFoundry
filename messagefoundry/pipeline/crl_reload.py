@@ -92,7 +92,6 @@ public CA certificates, never key material or message content.
 from __future__ import annotations
 
 import asyncio
-import binascii
 import contextlib
 import datetime
 import functools
@@ -130,7 +129,7 @@ from messagefoundry.config.tls_policy import (
     staged_crl,
 )
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
-from messagefoundry.pipeline.intake_bound import process_alert_subject
+from messagefoundry.pipeline.intake_bound import process_alert_subject, shorten_with_checksum
 from messagefoundry.pki import CrlBlock, CrlFacts, crl_signature_refusal
 from messagefoundry.redaction import log_timestamp
 
@@ -248,10 +247,6 @@ def _remedy_class(remedy: str) -> str:
 #: label inside its own cap, which sits under the SQL Server store's 256-character
 #: ``alert_instance.connection`` column.
 ALERT_PATH_MAX_LENGTH = 120
-#: Hex digits of the CRC-32 that stands in for the head of a longer path. A checksum, not a
-#: cryptographic digest: the path is the operator's own setting, so it only has to tell two
-#: honest paths apart.
-_PATH_DIGEST_HEX = 8
 
 
 def reload_alert_subject(path: str | os.PathLike[str], node: str | None = None) -> str:
@@ -268,13 +263,7 @@ def reload_alert_subject(path: str | os.PathLike[str], node: str | None = None) 
 
     The colon keeps the subject outside the connection-name grammar, so no rule's default
     control target can read it as a connection."""
-    key = crl_path_key(path)
-    if len(key) > ALERT_PATH_MAX_LENGTH:
-        # binascii, not zlib, as in process_alert_subject. backslashreplace, so a path with a
-        # lone surrogate still gets a checksum instead of raising.
-        digest = binascii.crc32(key.encode("utf-8", "backslashreplace"))
-        tail = key[-(ALERT_PATH_MAX_LENGTH - _PATH_DIGEST_HEX - len("~~")) :]
-        key = f"~{digest:0{_PATH_DIGEST_HEX}x}~{tail}"
+    key = shorten_with_checksum(crl_path_key(path), ALERT_PATH_MAX_LENGTH, keep_tail=True)
     return process_alert_subject(f"crl_reload:{key}", node)
 
 
