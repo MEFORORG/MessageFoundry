@@ -130,12 +130,13 @@ Facts the labels leave out:
   [`.github/required-contexts.txt`](../.github/required-contexts.txt).
 - **Publishing has its own jobs.** The release job signs and attests with its GitHub OIDC
   identity. Every PyPI publish runs in a separate job that only publishes, names the `pypi`
-  environment and holds nothing but that identity. It downloads the files the build job gated and
-  checks each one against the digests that job recorded. Every PyPI publish is Trusted Publishing,
+  environment and holds nothing but that identity. It downloads the files the build jobs gated and
+  checks each one against the digests those jobs recorded. Every PyPI publish is Trusted Publishing,
   with no API token. A publish job runs only on a tag push, so a manual dry-run never asks for the
   environment.
 - **The `pypi` environment.** It exists, and it admits only tags matching `v*` or `webconsole-v*`.
-  Each publish waits for a named reviewer to approve it, and an admin cannot skip that approval.
+  Each publish job waits for a named reviewer to approve it, on every run attempt, and an admin
+  cannot skip that approval.
   One step remains for the owner, once these publish jobs are on `main`: name `pypi` as the
   environment in each PyPI Trusted Publisher. Until then a publisher with a blank environment would
   accept a token from any job in `release.yml`, so the approval would not bind.

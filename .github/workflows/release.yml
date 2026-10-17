@@ -4,8 +4,9 @@
 # Cut a release:  git tag v0.1.0 && git push origin v0.1.0   (on a commit that already passed CI on main;
 #                 the `tag-provenance` job refuses any other, vault BACKLOG #2631).
 #
-#                 THE GITHUB RELEASE IS A DRAFT UNTIL EVERY ASSET IS ON IT AND EVERY PACKAGE IS ON
-#                 PYPI. `release` creates it as a draft, `release-harness` attaches to the draft,
+#                 THE GITHUB RELEASE IS A DRAFT UNTIL EVERY ASSET IS ON IT AND EVERY UPLOAD THE
+#                 RUN MAKES IS ON PYPI (with PUBLISH_HARNESS unset, the harness wheel is an asset
+#                 but is not uploaded). `release` creates it as a draft, `release-harness` attaches to the draft,
 #                 `publish-pypi` uploads the toolkit, the engine and (when PUBLISH_HARNESS is set) the
 #                 harness, and `publish-github-release` publishes the draft last. No job adds an asset
 #                 to a published release, which is what lets the owner turn on immutable releases
@@ -28,7 +29,7 @@
 #                 "run it manually to dry-run it" invites an operator to do. Reading the old guard as
 #                 "a branch ref isn't `refs/tags/...`" is what hid this: a true sentence about the
 #                 wrong half of the trigger. The steps carrying the pair are at least the four PyPI
-#                 publishes, every GitHub-release mutation, and the SLSA build-provenance
+#                 publishes, the GitHub-release mutations that test counts, and the SLSA build-provenance
 #                 attestation (BACKLOG #1805; the step's own comment says why). The COUNT is pinned in
 #                 tests/test_release_pipeline.py, which is its one authority — do not restate a
 #                 number here that nothing keeps in sync with that test.
@@ -65,9 +66,9 @@
 # exactly as before while reading as a control that is not there. Keep the name `pypi`.
 # Keep PUBLISH_HARNESS and PUBLISH_WEBCONSOLE off the environment, as repository variables only. A
 # job's `if:` is read before its environment applies, and a step's inside it after, so a copy on
-# the environment would let two gates read different values. PUBLISH_WEBCONSOLE is read only by
-# its job's `if:`; PUBLISH_HARNESS only by its step's, inside the environment, where a copy on the
-# environment would override the repository value.
+# the environment would let two gates read different values. So each is read once, outside the
+# environment: PUBLISH_WEBCONSOLE by its publish job's `if:`, and PUBLISH_HARNESS by
+# `release-harness`, which hands it to the harness upload step as a job output (vault BACKLOG #2975).
 #
 # THE HAND-OVER. Each build job records the digests once its last gate has passed, and its last
 # step uploads the files. Neither step has an `if:`, so any earlier failure skips both. In `release`
@@ -1228,7 +1229,9 @@ jobs:
   #
   # `release-harness` is a need, and its own `if:` names only this repository, so it runs whenever
   # `release` passes here. A harness build failure therefore holds the engine's upload as well as the
-  # GitHub release; a re-run of the failed job finishes both.
+  # GitHub release. A transient one is finished by re-running the failed job. One the tagged commit
+  # causes (a lockstep pin, a version that is not the tag, a member-gate refusal) fails every re-run:
+  # fix main, delete the draft and the tag, and tag again, which is safe because nothing reached PyPI.
   publish-pypi:
     if: github.repository == 'MEFORORG/MessageFoundry' && !startsWith(github.ref_name, 'webconsole-') && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     needs: [release, release-harness]
@@ -1327,9 +1330,10 @@ jobs:
       # and the GitHub release stays a draft; `skip-existing` lets a re-run finish it. GATED: a
       # no-op until the owner configures the messagefoundry-harness PyPI Trusted Publisher AND sets
       # repo variable PUBLISH_HARNESS=true. The build + version-check in release-harness still run
-      # every release.
+      # every release. The variable comes through release-harness, read outside this environment,
+      # so an environment copy of it cannot change what this step sees (the header says why).
       - name: Publish messagefoundry-harness to PyPI (Trusted Publishing / OIDC)
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_HARNESS == 'true' }}
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && needs.release-harness.outputs.publish-harness == 'true' }}
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: harness-dist/
@@ -1836,9 +1840,11 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # What publish-pypi checks the harness download against (vault BACKLOG #2631, limb 1).
+    # What publish-pypi checks the harness download against (vault BACKLOG #2631, limb 1), and the
+    # harness upload's gate, read here, outside the `pypi` environment (vault BACKLOG #2975).
     outputs:
       pypi-digests: ${{ steps.pypi-digests.outputs.sha256 }}
+      publish-harness: ${{ vars.PUBLISH_HARNESS }}
     permissions:
       contents: write   # gh release upload (attach the harness wheel)
       # No id-token: the PyPI publish is in publish-pypi (vault BACKLOG #2631, #2975).
@@ -2182,7 +2188,8 @@ jobs:
 
   # PUBLISH THE ENGINE'S GITHUB RELEASE LAST, ONCE EVERY ASSET IS ON IT (vault BACKLOG #2631, limb 6;
   # the header says why). Its `needs:` is every job that attaches an asset to the engine release. A
-  # job added later that attaches one must join it; tests/test_release_pipeline.py fails until it does.
+  # job added later that attaches one must be upstream of it, directly or through another need;
+  # tests/test_release_pipeline.py fails until it is.
   # It also needs `publish-pypi`, so the toolkit, the engine and (with PUBLISH_HARNESS set) the
   # harness are on PyPI before the release goes public, as the engine was when its publish sat
   # inside `release` (limb 1). A refused `pypi` approval on an engine tag leaves a draft. No need

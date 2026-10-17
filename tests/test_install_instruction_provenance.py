@@ -573,9 +573,9 @@ def test_readme_does_not_claim_signing_coverage_the_release_workflow_does_not_pr
     """README must not tell every reader that EVERY release is Sigstore-signed when two are not.
 
     Measured: only the engine job runs Sigstore signing, ``attest-build-provenance`` and the SBOM.
-    ``release-webconsole`` and ``release-harness`` carry none of those steps -- they set
-    ``attestations: true`` on the publish action, which is the PyPI-side PEP 740 attestation and a
-    different artifact from a GitHub attestation. A reader who installs the console wheel (the README
+    ``release-webconsole`` and ``release-harness`` carry none of those steps -- the publish jobs
+    that upload their wheels set ``attestations: true`` on the publish action, which is the
+    PyPI-side PEP 740 attestation and a different artifact from a GitHub attestation. A reader who installs the console wheel (the README
     lists that command directly above this note) and runs ``gh attestation verify`` against it finds
     nothing, having been told the opposite.
 
@@ -591,7 +591,7 @@ def test_readme_does_not_claim_signing_coverage_the_release_workflow_does_not_pr
     # unsigned. Read per producer since vault BACKLOG #2975 put the harness upload in `publish-pypi`,
     # whose producers are `release` (which signs) and `release-harness` (which does not).
     def producers(name: str) -> list[str]:
-        return _DIGEST_SOURCE.findall(jobs[name]) or [name]
+        return _DIGEST_SOURCE.findall(_uncommented(jobs[name])) or [name]
 
     def signs(name: str) -> bool:
         return signing.search(_uncommented(texts[name])) is not None

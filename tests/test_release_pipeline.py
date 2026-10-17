@@ -3524,7 +3524,7 @@ def test_only_the_publish_job_takes_a_release_out_of_draft_and_it_runs_last() ->
         f"{_CONSOLE_PUBLISH_JOB} takes a release out of draft, so it must stay on console tags"
     )
     engine_if = _despace(str(jobs[_PUBLISH_JOB].get("if") or ""))
-    assert "!startsWith(github.ref_name,'webconsole-')" in engine_if, (
+    assert "!startsWith(github.ref_name,'webconsole-')" in engine_if and "||" not in engine_if, (
         f"{_PUBLISH_JOB} takes a release out of draft, so it must stay off console tags"
     )
     # A status function would run a publish job after a job it needs had FAILED, publishing a
@@ -3885,7 +3885,13 @@ def test_every_engine_tag_upload_runs_under_one_approval_before_the_release_is_p
         for s in jobs["publish-pypi"]["steps"]
         if (s.get("with") or {}).get("packages-dir") == "harness-dist/"
     ]
-    assert len(harness) == 1 and "vars.PUBLISH_HARNESS" in str(harness[0].get("if")), harness
+    # The gate is read outside the environment and handed in, so an environment copy of the
+    # variable cannot skip the step in a job that still succeeds (vault BACKLOG #2975).
+    assert len(harness) == 1, harness
+    harness_if = str(harness[0].get("if"))
+    assert "needs.release-harness.outputs.publish-harness" in harness_if, harness_if
+    assert "vars." not in harness_if, harness_if
+    assert jobs["release-harness"]["outputs"]["publish-harness"] == "${{ vars.PUBLISH_HARNESS }}"
     gated = sorted(
         key for key in _upstream(_PUBLISH_JOB) if "vars." in str(jobs[key].get("if") or "")
     )
