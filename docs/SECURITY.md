@@ -4976,7 +4976,12 @@ the lock and its cycle count, and writes its own `auth.lock_notice` row, which i
 reads. With a relay wired, that read and the mail run in a background task (BACKLOG #2216). The
 refusal writes `auth.account_locked` first and does not wait for the task. So a large audit log would
 not push a refused sign-in past its padded slot. The task is queued per account and lock kind within
-one API process. Two locks of one kind landing together there would send one mail. A sign-in lock
+one API process. Two locks of one kind landing together there would send one mail. **One throttle
+read runs at a time in each API process, across every account**, so locks on many accounts at once
+cannot fill the store's read pool that sign-ins wait on; each mail then waits behind the reads
+queued before it. The read seeks the account's own rows on an `(actor, action, id)` index, on every
+backend (vault BACKLOG #3120). The residuals are listed below, under *Declined, each with its
+residual*. A sign-in lock
 notice on a TOTP-enrolled local account tells the owner to sign in with the password and the code
 together; a second-step notice says which factor was right and, **if the
 attempts were not the owner's**, to get a password reset or `admin-unlock` and replace that factor.
@@ -5396,7 +5401,9 @@ a failed TLS key-exchange pin is logged once per process. **The cost of the tee 
 stays broken, or recovers and breaks again, is reported only by that first line.
 
 **A notice the relay loses is audited (BACKLOG #2383).** The `auth.lock_notice` row is written
-when the notice is handed to the relay, as `mailed: true`. When the relay's queue is full, or the
+when the notice is handed to the relay. It reads `mailed: true` only when the relay queued the
+notice: one its full queue dropped reads `mailed: false`, so the next lock of the kind mails again
+(vault BACKLOG #3120). When the relay's queue is full, or the
 send fails, the engine writes one more row, with the notice's recipient as the actor. A lock
 notice writes `auth.lock_notice_undelivered`, hidden as above. Every other notice kind writes
 `auth.security_notice_undelivered`, which every `audit:read` reader sees. The detail names the
@@ -5410,8 +5417,12 @@ source of record is `SecurityEventNotifier._record_undelivered` in
 - An offline command such as `provision-admin` wires no audit writer, so it records nothing.
 - Under a long overload only 64 queue-full records are written at a time, and drops past that are
   not recorded.
-- A lock notice lost this way still leaves its `auth.lock_notice` row reading `mailed: true`, so
-  the throttle holds back the next one.
+- A lock notice whose send fails still leaves its `auth.lock_notice` row reading `mailed: true`,
+  because the send fails on the relay's own task after that row is written. So the throttle holds
+  back the next lock notice of the kind for the rest of its 24 hours. The failure is on the
+  `auth.lock_notice_undelivered` row, which the throttle does not read. *Kept as a residual (vault
+  BACKLOG #3120): closing it would need that row to carry the lock kind and the throttle to read a
+  second action.*
 
 **Residual: the background task adds one way to lose a notice** (BACKLOG #2216). At shutdown the
 engine waits about two seconds for pending notices. A notice still pending then is cut off, and may be
@@ -5419,6 +5430,22 @@ neither mailed nor recorded. A failed `auth.lock_notice` row write also changes:
 the request, and now it is logged instead. The mail goes before its row, so that failure costs at
 most a duplicate mail at the next lock. Each such line names no account and no lock. It still tells
 a `logs:view` reader when some notice failed.
+
+**Declined, each with its residual (vault BACKLOG #3120).**
+
+- **Two mails across engine shards.** The per-account queue and the one-read-at-a-time limit are
+  each per API process. Engine shards serving their own API ports would each keep their own, so two
+  locks of one kind landing on two of them at once could each read the throttle before the other
+  wrote its row, and the owner would get two mails. A duplicate mail is the cheap failure here.
+- **The timing of the failure lines.** The paragraph above states it: a line that names nothing
+  still tells a `logs:view` reader, by when it appears, that some lock's notice failed.
+- **No cap on pending notice tasks.** Each lock that lands with a relay wired starts one task, and
+  nothing bounds how many wait. A task follows a lock, not an attempt, and a lock takes
+  `lockout_threshold` failures on its counter, so the count grows with the accounts being locked at
+  once rather than with the attempts against them. Under locks on many accounts the
+  tasks wait behind the one-at-a-time read, so mails arrive later, and any still pending at the
+  shutdown bound are cut off, each with one line. A cap would have to drop a notice or run it on
+  the request path, which is what the task exists to avoid.
 
 **Client attribution ([ADR 0150](adr/0150-client-address-on-audit-entries.md)).** Every row also
 carries a `client` column — the caller's network address, stamped at write time from the request via

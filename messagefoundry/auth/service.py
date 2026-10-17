@@ -1804,7 +1804,8 @@ HOLDER_NOTICE_DISPATCHED = "dispatched"
 #: The account had no notification address before the repair, so there was nobody to tell.
 HOLDER_NOTICE_NO_PRIOR_ADDRESS = "no_prior_address"
 #: The account had an address, but nothing was handed off: no channel was wired, notices are turned
-#: off, or the notifier raised (each logged where it applies).
+#: off, the notifier raised, or it dropped the notice on a full queue (each logged where it applies;
+#: vault BACKLOG #3120 for the last).
 HOLDER_NOTICE_NO_CHANNEL = "no_channel"
 
 
@@ -2026,10 +2027,19 @@ _LOCK_NOTICE_ACTION: Final = LOCK_NOTICE_ACTION
 _LOCK_NOTICE_WINDOW_SECONDS: Final = 24 * 3600.0
 #: BACKLOG #2216: how long the API lifespan's :meth:`AuthService.drain_background` lets the
 #: service's background tasks finish at shutdown before it cancels the rest, and how long it then
-#: waits for the cancelled ones to unwind. Both are shares of the service's graceful-stop window,
-#: whose budget is stated at ``DRAIN_TIMEOUT_SECONDS`` in ``api/approvals.py``; keep the sum inside
-#: it. A task still running at the first bound is queued behind other throttle reads, or stuck on
-#: the store. A task still unwinding at the second is left to finish or fail on its own.
+#: waits for the cancelled ones to unwind. A task still running at the first bound is queued behind
+#: other throttle reads, or stuck on the store. A task still unwinding at the second is left to
+#: finish or fail on its own.
+#:
+#: The budget is NSSM's 15 s graceful-stop window (``AppStopMethodConsole`` in
+#: ``scripts/service/install-service.ps1``), not any one drain's constant (vault BACKLOG #3120). The
+#: lifespan teardown in ``api/app.py`` spends it in order, after uvicorn's own connection drain:
+#: the upload runner's stop (``uploads._DEFAULT_STOP_TIMEOUT_SECONDS``, 5 s), the long-operation
+#: drain (``api/outlive.py``, 0.5 s plus ``CANCEL_GRACE_SECONDS``, 6 s), the approval gate's drain
+#: (``api/approvals.DRAIN_TIMEOUT_SECONDS``, 3 s), then this one (2.0 s plus 0.5 s), and
+#: ``engine.stop()`` after them all. Those bounds add up to 17 s, past the window, so the
+#: teardown fits it only while they are not all busy at once; uvicorn's drain has no bound at all.
+#: A change to any of them is read against that sum.
 _BACKGROUND_DRAIN_SECONDS: Final = 2.0
 _BACKGROUND_CANCEL_GRACE_SECONDS: Final = 0.5
 
@@ -2584,15 +2594,19 @@ class AuthService:
         # one kind landing together read the throttle one after the other and mail once. Its own table:
         # the credential queue above is held across a sign-in's pad, and the notice runs off it. Per
         # API process, like that queue: engine shards serving their own API ports each keep one, so
-        # two locks landing on two of them at once can still mail twice.
+        # two locks landing on two of them at once can still mail twice. Declined in vault BACKLOG
+        # #3120, with the residual in docs/SECURITY.md.
         self._lock_notice_locks: dict[str, _KeyedLock] = {}
         # BACKLOG #2216: strong references to the service's background tasks, so a running one is not
-        # garbage-collected. Each removes itself when done; drain_background() awaits the rest.
+        # garbage-collected. Each removes itself when done; drain_background() awaits the rest. No
+        # cap on how many wait, declined in vault BACKLOG #3120: a cap would have to drop a lock
+        # notice or run it on the request path. docs/SECURITY.md states the residual.
         self._background_tasks: set[asyncio.Task[None]] = set()
         # Set by drain_background(close=True) at shutdown. After it, a lock notice runs inline,
         # since a task started then would outlive the drain and meet a closed store.
         self._background_closed = False
-        # One throttle read at a time (BACKLOG #2216); see _lock_notice_held_back.
+        # One throttle read at a time in this process, across every account (BACKLOG #2216); see
+        # _lock_notice_held_back.
         self._lock_notice_read_slots = asyncio.Semaphore(1)
         # Per-SESSION failed re-proofs (BACKLOG #1138): token_hash -> (failures charged to that
         # session, monotonic time of the first, the account's user id). At lockout_threshold the session is revoked, so a stolen session gets that many
@@ -9916,9 +9930,9 @@ class AuthService:
 
         **THE BASELINE IS THE ACCOUNT'S KNOWN-ADDRESS RECORD** (vault BACKLOG #2145): the host keys
         that :meth:`_mark_login_address_known` writes, which says when, read through the record's
-        primary key on the account id. It replaced a baseline read from ``audit_log``, which has no
-        actor index and could not tell a finished sign-in from one that stopped at the password on
-        the directory leg. Keyed on the
+        primary key on the account id. It replaced a baseline read from ``audit_log``, which then had
+        no actor index and could not tell a finished sign-in from one that stopped at the password
+        on the directory leg. Keyed on the
         account id, so a re-created namesake inherits nothing, and the account's deletion removes it.
 
         Only rows seen within ``_LOGIN_ADDRESS_LOOKBACK_SECONDS`` count. Addresses compare by
@@ -13468,10 +13482,13 @@ class AuthService:
         """The throttle's READ: whether a notice of this ``lock`` kind already went out in the window.
 
         Kept apart from the row write, so the background task can send the mail between this read
-        and :meth:`_record_lock_notice` (BACKLOG #2216). One such read runs at a time per
-        service (``_lock_notice_read_slots``). It walks every recent ``auth.lock_notice`` row of
-        every account, since the audit log has no actor index. Many locks at once would otherwise
-        fill the store's read pool, which sign-ins wait on too.
+        and :meth:`_record_lock_notice` (BACKLOG #2216). It seeks this account's rows of the
+        action on the ``ix_audit_actor`` (actor, action, id) index, on every backend (vault
+        BACKLOG #3120); before it, the read walked every recent ``auth.lock_notice`` row of every
+        account. One such read still runs at a time per service (``_lock_notice_read_slots``), so
+        locks on many accounts at once cannot fill the store's read pool, which sign-ins wait on
+        too. The cost is that each notice waits behind the reads queued before it, across every
+        account in this process; ``docs/SECURITY.md`` states it.
 
         A failed read fails OPEN (``False``) and is logged by exception class alone. The line names
         neither the account nor the notice kind (BACKLOG #1131): it runs only when a lock lands,
@@ -13505,9 +13522,15 @@ class AuthService:
         """Write the ``auth.lock_notice`` row the throttle reads, after the mail.
 
         ``mailed`` is true only when the account had an address AND the notifier took the event
-        (``handed``, BACKLOG #2019). A refused hand-off then writes ``mailed: false``, which holds
-        back no later mailable notice, so the next lock mails again rather than staying quiet for
-        a day."""
+        (``handed``, BACKLOG #2019). A refused hand-off, or one the notifier dropped on a full
+        queue (vault BACKLOG #3120), then writes ``mailed: false``, which holds back no later
+        mailable notice, so the next lock mails again rather than staying quiet for a day.
+
+        **A send that fails after the hand-off still leaves ``mailed: true``.** It fails on the
+        notifier's own task, after this row is written, and is recorded only on the notifier's
+        ``auth.lock_notice_undelivered`` row (BACKLOG #2383), which the throttle does not read. So
+        the next lock of the kind is held back for the rest of the window. A residual
+        ``docs/SECURITY.md`` states."""
         await self._audit(
             _LOCK_NOTICE_ACTION,
             actor=user.username,
@@ -13528,9 +13551,11 @@ class AuthService:
         or an admin action. The caller writes the audit row, not this method: see
         :meth:`_record_suspicious_login` for the two 6.3.5 events.
 
-        Returns ``True`` only when the notifier took the event without raising (BACKLOG #2019), so a
-        caller that audits the outcome can record what happened. That is a hand-off, not a delivery.
-        Most callers ignore it.
+        Returns ``True`` only when the notifier took the event without raising (BACKLOG #2019) and
+        said it took it: the shipped notifier answers ``False`` for an event it dropped for want of
+        an address or of room on its queue (vault BACKLOG #3120). So a caller that audits the outcome
+        can record what happened. That is a hand-off, not a delivery: a send that fails later, on
+        the notifier's own task, is not reported back. Most callers ignore it.
 
         The docstring used to promise both arms were logged while only the failure arm was (BACKLOG
         #1139), so read the branches rather than this paragraph if they ever diverge again."""
@@ -13577,7 +13602,7 @@ class AuthService:
             )
             return False
         try:
-            await self._security_notifier.notify(
+            taken = await self._security_notifier.notify(
                 SecurityEvent(
                     event_type=event_type,
                     username=username,
@@ -13601,4 +13626,6 @@ class AuthService:
                     type(exc).__name__,
                 )
             return False
-        return True
+        # bool(): a notifier outside the contract that returns nothing reads as not taken, so the
+        # cheap failure follows (a duplicate lock notice), never a day held back.
+        return bool(taken)

@@ -106,7 +106,8 @@ RESOLVE_OUTCOMES: Mapping[str, str] = {
 
 #: How long :meth:`ApprovalGate.drain` waits for outcome writes still running at shutdown. It shares
 #: NSSM's 15 s graceful-stop window (AppStopMethodConsole in scripts/service/install-service.ps1)
-#: with the upload runner's 5 s stop, which runs first, and engine.stop() still has to run after it.
+#: with every other shutdown drain, and engine.stop() still has to run after them. The drains, their
+#: order and their sum are stated once, at ``_BACKGROUND_DRAIN_SECONDS`` in ``auth/service.py``.
 #: One outcome write is a status update and an audit row, so a few seconds is ample.
 DRAIN_TIMEOUT_SECONDS = 3.0
 

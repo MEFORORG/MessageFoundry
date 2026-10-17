@@ -170,8 +170,9 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
         self._queue: asyncio.Queue[_T | None] = asyncio.Queue(maxsize=max_queue)
         self._task: asyncio.Task[None] | None = None
 
-    def _enqueue(self, item: _T, *, dropped: str | None) -> None:
+    def _enqueue(self, item: _T, *, dropped: str | None) -> bool:
         """Non-blocking enqueue; on a full queue, drop the item with a warning (``dropped`` names it).
+        Returns whether the item was queued.
 
         ``dropped=None`` drops without a line, for an item whose drop must not show in the general
         log (a lock notice, BACKLOG #1131; see ``auth.notifications.LOG_SILENT_EVENT_TYPES``)."""
@@ -180,6 +181,8 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
         except asyncio.QueueFull:
             if dropped is not None:
                 log.warning("%s queue full; dropping %s", type(self).__name__, dropped)
+            return False
+        return True
 
     def start(self) -> None:
         if self._task is None:

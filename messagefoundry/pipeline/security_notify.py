@@ -584,7 +584,10 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         if use_tls and not tls_verify:
             warn_smtp_verification_off(cell=ALERTS_SMTP_CELL, host=host)
 
-    async def notify(self, event: SecurityEvent) -> None:
+    async def notify(self, event: SecurityEvent) -> bool:
+        # Returns whether the event was queued for sending, the contract on ``SecurityNotifier``:
+        # False for no address and for a full queue (vault BACKLOG #3120), never a delivery receipt.
+        #
         # No deliverable address means nothing to email. The caller has audited the event; which
         # events the /me/security-events feed shows is stated once, in auth/notifications.py.
         # Non-blocking enqueue.
@@ -625,21 +628,20 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
                     event.event_type,
                     event.username,
                 )
-            return
-        # Read before the enqueue, with no await between, so it is the queue the enqueue meets.
-        full = self._queue.full()
-        self._enqueue(
+            return False
+        queued = self._enqueue(
             event,
             dropped=None
             if event.event_type in LOG_SILENT_EVENT_TYPES
             else f"{event.event_type} for {event.username}",
         )
-        if full and self._audit is not None and len(self._recording) < _MAX_RECORDING:
+        if not queued and self._audit is not None and len(self._recording) < _MAX_RECORDING:
             # Off the caller's path: a notice must never block a sign-in or an admin action, and
             # this write would wait on the store under exactly the overload that filled the queue.
             task = asyncio.create_task(self._record_undelivered(event, {"reason": "queue_full"}))
             self._recording.add(task)
             task.add_done_callback(self._recording.discard)
+        return queued
 
     async def aclose(self) -> None:
         try:

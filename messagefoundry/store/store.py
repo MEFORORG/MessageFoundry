@@ -6749,6 +6749,9 @@ CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit_log(ts);
 -- The newest row of a few actions (recent_audit_of): the start's config baseline read, vault BACKLOG
 -- #2597. Without it that read walks the whole chain newest-first until one of the actions turns up.
 CREATE INDEX IF NOT EXISTS ix_audit_action ON audit_log(action, id);
+-- One account's rows of one action, newest first: the lock notice's 24-hour throttle read, vault
+-- BACKLOG #3120. Without it that read walks every recent row of the action, for every account.
+CREATE INDEX IF NOT EXISTS ix_audit_actor ON audit_log(actor, action, id);
 
 -- There is no table beside audit_log that says where its keying starts. Whether a chain is keyed is
 -- decided by the process that holds the key, and the first range's key is named by the chain's own

@@ -38,17 +38,17 @@ __all__ = ["CANCEL_GRACE_SECONDS", "DRAIN_TIMEOUT_SECONDS", "OutlivingOperations
 log = logging.getLogger(__name__)
 
 #: How long :meth:`OutlivingOperations.drain` lets a running operation finish at shutdown before it
-#: cancels it. It shares NSSM's 15 s graceful-stop window with the upload runner's stop and the
-#: approval gate's drain, so it is short; an operation it cancels records ``interrupted``.
+#: cancels it. It shares NSSM's 15 s graceful-stop window with the other shutdown drains, so it is
+#: short; an operation it cancels records ``interrupted``.
 DRAIN_TIMEOUT_SECONDS = 0.5
 
 #: How long the drain then waits for the cancelled operations' rollback arms to finish, so their
 #: interrupted rows reach the store before ``engine.stop()`` closes it. Longer than the drain itself
 #: because at least one arm waits on a process: a cancelled DR takeover hook is killed and reaped
 #: for up to ``_HOOK_REAP_SECONDS`` before the activation's arm writes its row, so this is that
-#: bound plus a second for the write. Every shutdown bound together (the upload runner's stop, this
-#: drain and grace, the approval gate's drain) comes close to NSSM's 15 s window only when all of
-#: them are busy at once.
+#: bound plus a second for the write. Every shutdown bound together passes NSSM's 15 s window when
+#: all of them are busy at once; the drains, their order and their sum are stated once, at
+#: ``_BACKGROUND_DRAIN_SECONDS`` in ``auth/service.py``.
 CANCEL_GRACE_SECONDS = _HOOK_REAP_SECONDS + 1.0
 
 

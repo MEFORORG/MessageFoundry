@@ -245,8 +245,9 @@ class _FakeNotifier:
     def __init__(self) -> None:
         self.events: list[Any] = []
 
-    async def notify(self, event: Any) -> None:
+    async def notify(self, event: Any) -> bool:
         self.events.append(event)
+        return True
 
 
 # --- The lock-event limb, closed by owner ruling 2026-09-28 --------------------------------------

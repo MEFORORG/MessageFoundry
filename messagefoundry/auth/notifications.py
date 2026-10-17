@@ -128,10 +128,12 @@ SUSPICIOUS_LOGIN_FAILURE_THRESHOLD = 3
 #:
 #: Only ``ACCOUNT_LOCKED`` carries that bit. Every other kind is sent on an authenticated action, a
 #: completed sign-in, or a clock, so it keeps its per-event line (BACKLOG #1139). A lock notice with
-#: no relay or no address is still recorded where only an administrator reads it, as ``mailed: false``
-#: on the ``auth.lock_notice`` row. A full queue or a failed send is recorded on its own
-#: ``auth.lock_notice_undelivered`` row (BACKLOG #2383), since the ``auth.lock_notice`` row is written
-#: at the hand-off, as ``mailed: true``. An instance with no relay at all is reported at startup by
+#: no relay, no address or no room on the notifier's queue is still recorded where only an
+#: administrator reads it, as ``mailed: false`` on the ``auth.lock_notice`` row (vault BACKLOG #3120
+#: for the full queue). A full queue or a failed send is also recorded on its own
+#: ``auth.lock_notice_undelivered`` row (BACKLOG #2383). A failed send happens after the
+#: ``auth.lock_notice`` row is written at the hand-off, so that row still reads ``mailed: true``; the
+#: residual is stated in ``docs/SECURITY.md``. An instance with no relay at all is reported at startup by
 #: the serve gate, unless enforcement is ``warn`` and the operator waived notices in writing.
 LOG_SILENT_EVENT_TYPES: frozenset[str] = frozenset({ACCOUNT_LOCKED})
 
@@ -231,9 +233,15 @@ class SecurityEvent:
 class SecurityNotifier(Protocol):
     """Push a security event to the affected user out-of-band. Implemented in ``pipeline/`` (email over
     the ``[alerts]`` SMTP transport) and injected into :class:`AuthService`. Must be best-effort and
-    must not raise into the auth path (the caller still guards it)."""
+    must not raise into the auth path (the caller still guards it).
 
-    async def notify(self, event: SecurityEvent) -> None: ...
+    ``notify`` returns whether it took the event for sending: ``False`` when it dropped the event
+    on the spot, for example for want of an address or room on its queue (vault BACKLOG #3120).
+    ``True`` is a hand-off, never a delivery receipt: a send that fails later is not reported back.
+    The ``auth.lock_notice`` row's ``mailed`` field is recorded from this, so a notice dropped here
+    does not hold the next lock's notice back for a day."""
+
+    async def notify(self, event: SecurityEvent) -> bool: ...
 
 
 def deadline_utc(ts: float) -> str | None:

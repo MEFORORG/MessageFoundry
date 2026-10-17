@@ -2098,6 +2098,10 @@ _SCHEMA: list[str] = [
     # recent_audit_of: the start's config baseline read (vault BACKLOG #2597).
     """IF INDEXPROPERTY(OBJECT_ID('audit_log'),'ix_audit_action','IndexID') IS NULL
         CREATE INDEX ix_audit_action ON audit_log(action, id)""",
+    # The lock notice's throttle read, one account's rows of one action (vault BACKLOG #3120). The
+    # key is at most 772 bytes (actor 512, action 256, id 4), inside the 1700-byte nonclustered limit.
+    """IF INDEXPROPERTY(OBJECT_ID('audit_log'),'ix_audit_actor','IndexID') IS NULL
+        CREATE INDEX ix_audit_actor ON audit_log(actor, action, id)""",
     # No table beside audit_log says where its keying starts: the process that holds the key decides,
     # and the chain's own row at sequence number 1 (the genesis row) names the first range's key.
     # Per-key AES-GCM invocation bound (ASVS 11.3.4) — see the SQLite `_SCHEMA` for the

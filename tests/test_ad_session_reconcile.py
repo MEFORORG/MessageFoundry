@@ -2654,8 +2654,9 @@ class _CapturingNotifier:
     def __init__(self) -> None:
         self.sent: list[Any] = []
 
-    async def notify(self, event: Any) -> None:
+    async def notify(self, event: Any) -> bool:
         self.sent.append(event)
+        return True
 
 
 async def test_a_rename_and_a_role_change_in_one_pass_record_one_consistent_name() -> None:

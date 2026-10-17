@@ -59,8 +59,9 @@ class _FakeNotifier:
     def __init__(self) -> None:
         self.events: list[SecurityEvent] = []
 
-    async def notify(self, event: SecurityEvent) -> None:
+    async def notify(self, event: SecurityEvent) -> bool:
         self.events.append(event)
+        return True
 
 
 async def _store() -> MessageStore:
@@ -474,19 +475,19 @@ async def test_parallel_wrong_credentials_cannot_evade_the_account_lockout(
     also pins the one-notice-per-lockout contract.
     """
     store = await _store()
+    threshold, burst = 3, 5
+    notifier = _FakeNotifier()
+    service = AuthService(
+        store,
+        AuthSettings(
+            mfa_verify_min_elapsed_seconds=0,
+            lockout_threshold=threshold,
+            lockout_minutes=15,
+            mfa_recovery_code_count=3,
+        ),
+        security_notifier=notifier,
+    )
     try:
-        threshold, burst = 3, 5
-        notifier = _FakeNotifier()
-        service = AuthService(
-            store,
-            AuthSettings(
-                mfa_verify_min_elapsed_seconds=0,
-                lockout_threshold=threshold,
-                lockout_minutes=15,
-                mfa_recovery_code_count=3,
-            ),
-            security_notifier=notifier,
-        )
         identity, token, password = await login_admin(service)
         counts = _count_verifies(monkeypatch, service)
 
@@ -548,10 +549,11 @@ async def test_parallel_wrong_credentials_cannot_evade_the_account_lockout(
 
         # The per-account queue leaves no entry behind once every attempt has left it.
         assert service._credential_locks == {}, "the per-account lock entry must not leak"
-        # Arms 2 and 3 set locks too; finish their background notices before the store closes
-        # (BACKLOG #2216), so none runs on into a later test on the shared loop.
-        await service.drain_background()
     finally:
+        # Arms 2 and 3 set locks too; finish their background notices before the store closes
+        # (BACKLOG #2216), so none runs on into a later test on the shared loop. In the finally,
+        # so a failed assertion above cannot skip it (vault BACKLOG #3120).
+        await service.drain_background(timeout=20.0)
         await store.close()
 
 
