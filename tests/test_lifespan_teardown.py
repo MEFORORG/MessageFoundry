@@ -243,10 +243,8 @@ def test_the_shutdown_budget_fits_the_nssm_stop_window() -> None:
     window = int(match.group(1)) / 1000.0
     import messagefoundry.__main__ as cli
 
-    # Read through getattr: the bound is #3256's, built beside this in the same batch. Until it is
-    # on main, this checks the budget alone.
-    uvicorn_drain = float(getattr(cli, "_UVICORN_DRAIN_SECONDS", 0.0))
-    assert app_module._SHUTDOWN_BUDGET_SECONDS + uvicorn_drain + 1.0 <= window
+    shutdown = app_module._SHUTDOWN_BUDGET_SECONDS + cli._UVICORN_DRAIN_SECONDS
+    assert shutdown + 1.0 <= window
     assert app_module._ENGINE_STOP_RESERVE_SECONDS < app_module._SHUTDOWN_BUDGET_SECONDS
 
 
@@ -355,6 +353,45 @@ async def test_an_engine_stop_that_raises_does_not_skip_the_steps_after_it(
     finally:
         await spies.stop_if_needed()
     assert spies.calls == ["outliving", "approvals", "flush", "stop", "executor"]
+
+
+async def test_the_retention_runner_s_stop_waits_less_than_its_step_s_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The runner's own stop wait is longer than its teardown step's bound. The lifespan hands it a
+    share of that bound, so its wait ends, and it cancels its own sweep, before the step is cut."""
+    pytest.importorskip("psutil")
+    from messagefoundry import uploads as uploads_module
+    from messagefoundry.config.settings import StoreSettings
+    from messagefoundry.uploads import UploadRetentionRunner
+
+    bounds: list[float] = []
+    timeouts: list[float | None] = []
+    real_invoke, real_stop = app_module._invoke, UploadRetentionRunner.stop
+
+    async def _invoke(run: Callable[[float], Awaitable[object]], bound: float) -> object:
+        bounds.append(bound)
+        return await real_invoke(run, bound)
+
+    async def _stop(self: UploadRetentionRunner, timeout: float | None = None) -> None:
+        timeouts.append(timeout)
+        await real_stop(self, timeout)
+
+    monkeypatch.setattr(app_module, "_invoke", _invoke)
+    monkeypatch.setattr(UploadRetentionRunner, "stop", _stop)
+    settings = StoreSettings(path=str(tmp_path / "runner.db"), uploads_dir=str(tmp_path / "up"))
+    app = create_managed_app(
+        store_settings=settings, egress_settings=EgressSettings(deny_by_default=False)
+    )
+    async with app.router.lifespan_context(app):
+        assert app.state.upload_store is not None
+    # The runner's stop is the first step.
+    [timeout] = timeouts
+    assert timeout is not None
+    assert timeout == pytest.approx(bounds[0] * app_module._INNER_SHARE)
+    assert timeout < bounds[0]
+    # The premise: even with fewer steps than serve runs, the share is the shorter of the two waits.
+    assert timeout < uploads_module._DEFAULT_STOP_TIMEOUT_SECONDS
 
 
 async def test_the_teardown_is_bounded_when_every_drain_hangs(

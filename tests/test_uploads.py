@@ -521,20 +521,24 @@ async def _stop_stuck_runner(
     release: threading.Event,
     caplog: pytest.LogCaptureFixture,
     audit: Callable[[UploadedFileMeta], Awaitable[None]] | None = None,
+    *,
+    stop_timeout_seconds: float = 0.05,
+    timeout: float | None = None,
 ) -> logging.LogRecord:
-    """Start a runner over ``store``, wait for its sweep to park on ``paused``, stop it with a
-    0.05 s bound, release the sweep, and return the one record ``stop()`` logged about it."""
+    """Start a runner over ``store``, wait for its sweep to park on ``paused``, stop it, release the
+    sweep, and return the one record ``stop()`` logged about it. The runner's own bound is
+    ``stop_timeout_seconds``, and ``timeout`` is the caller's, passed to ``stop()``."""
     runner = UploadRetentionRunner(
         store,
         audit=audit or _audited_to([]),
         clock=lambda: time.time() + 31 * 86_400,
-        stop_timeout_seconds=0.05,
+        stop_timeout_seconds=stop_timeout_seconds,
     )
     runner.start()
     try:
         assert await asyncio.to_thread(paused.wait, 10), "the sweep never reached its park point"
         with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
-            await asyncio.wait_for(runner.stop(), 10)
+            await asyncio.wait_for(runner.stop(timeout=timeout), 10)
     finally:
         release.set()
         await runner.stop()  # a no-op once stop() has run; stops the loop if an assert failed
@@ -565,6 +569,24 @@ async def test_a_sweep_stuck_past_the_stop_bound_is_cancelled_and_logged(
     assert "1 file(s) it removed, or was removing, may have no" in record.getMessage()
     [named] = record.getMessage().rsplit(": ", 1)[1].split(", ")
     assert len(audited) == 1 and audited[0] != named
+
+
+async def test_a_stop_timeout_shorter_than_the_runner_s_own_bound_is_the_one_waited(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The API lifespan passes ``stop`` a share of its teardown step's bound, which is shorter than
+    the runner's own. The runner's wait must end first, so it names the audit gap and cancels the
+    sweep itself, rather than being cut by the teardown and logging that shutdown was cancelled."""
+    store = _quota_store(tmp_path, retention_days=30)
+    for i in range(2):
+        await store.save(
+            data=f"aging {i}\n".encode(), filename=f"f{i}.txt", uploader="op", uploader_id="u-op"
+        )
+    # The helper's 10 s wait_for would time out on a stop that waited the runner's own 60 s.
+    record = await _stop_stuck_runner(
+        store, *_pause_sweep_at_pair(store, 2), caplog, stop_timeout_seconds=60.0, timeout=0.05
+    )
+    assert "did not finish within 0.05s of shutdown" in record.getMessage()
 
 
 async def test_a_timed_out_stop_keeps_the_row_of_every_pair_already_removed(

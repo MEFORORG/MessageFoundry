@@ -327,10 +327,14 @@ _FIFO_HEADS_LANE_CHUNK = 500
 # ADR 0066 §3.1: release_claimed id-chunk bound (ids per UPDATE statement).
 _RELEASE_CHUNK = 500
 # BACKLOG #3256: the database server's clock as epoch seconds, the unit `upload_quota.since` holds.
-# Microseconds since the epoch fit a BIGINT for about 292,000 years. SYSUTCDATETIME() is a runtime
-# constant, read once per query, so two references in one statement agree. The cluster lease has
-# its own copy at millisecond grain (pipeline/cluster_sqlserver.py `_DB_NOW`). Making this one the
-# canonical copy for both is a pipeline change outside BACKLOG #3256.
+# Microseconds since the epoch fit a BIGINT for about 292,000 years. Each reference to
+# SYSUTCDATETIME() is read on its own, so two references in one statement can disagree: two
+# SYSDATETIME() calls in one INSERT ... VALUES row differed in 122 of 100,000 rows (Louis Davidson,
+# "Row-wise system function calls, always the same?", Simple Talk, 2018). So each statement here
+# references it once: the quota release reads it into a DECLARE @now, and the reserve MERGE names it
+# once, in its one-row USING source. The cluster lease has its own copy at millisecond grain
+# (pipeline/cluster_sqlserver.py `_DB_NOW`). Making this one the canonical copy for both is a
+# pipeline change outside BACKLOG #3256.
 _MSSQL_EPOCH_NOW = (
     "(CAST(DATEDIFF_BIG(MICROSECOND, CAST('1970-01-01' AS DATETIME2), SYSUTCDATETIME()) AS FLOAT)"
     " / 1000000.0)"
@@ -12125,16 +12129,19 @@ class SqlServerStore:
         :meth:`add_cipher_invocations` uses. The budget predicate rides ``WHEN MATCHED AND``, so a
         refusal matches no rows and ``OUTPUT`` returns nothing.
 
-        "Now" is the database server's clock, ``_MSSQL_EPOCH_NOW``, read once in the MERGE's
-        ``USING`` row (BACKLOG #3256; ``uploads.UploadQuotaError`` says why)."""
+        "Now" is the database server's clock, ``_MSSQL_EPOCH_NOW``, read once: in the MERGE's
+        ``USING`` row, and into ``@now`` for the release (BACKLOG #3256; ``uploads.UploadQuotaError``
+        says why)."""
         if files <= 0:
             # RELEASE — unconditional, clamped at zero (a double release cannot mint budget).
             await self._execute(
-                "UPDATE upload_quota SET"
+                # One read of the clock, so the CASE's test and its result are the same instant.
+                f"DECLARE @now FLOAT = {_MSSQL_EPOCH_NOW};"
+                " UPDATE upload_quota SET"
                 " inflight_files = CASE WHEN inflight_files + ? < 0 THEN 0 ELSE inflight_files + ? END,"
                 " inflight_bytes = CASE WHEN inflight_bytes + ? < 0 THEN 0 ELSE inflight_bytes + ? END,"
                 # never backwards (#2648)
-                f" since = CASE WHEN since > {_MSSQL_EPOCH_NOW} THEN since ELSE {_MSSQL_EPOCH_NOW} END"
+                " since = CASE WHEN since > @now THEN since ELSE @now END"
                 " WHERE uploader_id = ?",
                 (
                     int(files),

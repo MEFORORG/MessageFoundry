@@ -49,9 +49,9 @@ DRAIN_TIMEOUT_SECONDS = 0.5
 #: for up to ``_HOOK_REAP_SECONDS`` before the activation's arm writes its row, so this is that
 #: bound plus a second for the write. It is an upper limit: the API lifespans hand the drain a share
 #: of one shutdown budget (``_SHUTDOWN_BUDGET_SECONDS`` in ``api/app.py``, BACKLOG #3191). With the
-#: managed lifespan's full set of steps that share is below this even when they are idle, so a
-#: takeover hook that takes its whole reap can still be rolling back when the store closes, and the
-#: drain logs it.
+#: managed lifespan's full set of steps that share is below this, and below the reap alone, even
+#: when they are idle, so at least a takeover hook that takes most of its reap can still be rolling
+#: back when the store closes, and the drain logs it.
 CANCEL_GRACE_SECONDS = _HOOK_REAP_SECONDS + 1.0
 
 

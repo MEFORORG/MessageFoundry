@@ -91,7 +91,7 @@ _ORPHAN_TMP_RE = re.compile(
 # sits far outside any single write, which is bounded by ``max_bytes``.
 _ORPHAN_MIN_AGE_SECONDS = 3600.0
 
-# How long a cancelled save waits for each cross-shard ledger call, the reserve and the release, to
+# How long a cancelled save waits for each engine-shard ledger call, the reserve and the release, to
 # finish (BACKLOG #2263). It is per call, so a save cancelled during a slow reserve can wait up to
 # two bounds. A healthy statement takes well under a second. The bound exists so a stuck store
 # cannot hold ``_quota_lock``, and the request's cancellation, indefinitely. Past it the call is
@@ -99,11 +99,11 @@ _ORPHAN_MIN_AGE_SECONDS = 3600.0
 # its audit rows after a cancelled upload (UploadStore._run_to_completion, BACKLOG #2261).
 _LEDGER_CANCEL_WAIT_SECONDS = 5.0
 
-# How often a save that holds a cross-shard reservation touches the ledger row, so a slow save keeps
-# its slot past ``store.base.UPLOAD_RESERVATION_STALE_AFTER`` (300 s) instead of having it reclaimed
-# by a sibling shard's reserve (BACKLOG #2648). A third of that window, which leaves room for touches
-# that are slow as well as one that fails. Written out rather than imported to keep this module a
-# leaf; a test pins the ratio.
+# How often a save that holds an engine-shard reservation touches the ledger row, so a slow save
+# keeps its slot past ``store.base.UPLOAD_RESERVATION_STALE_AFTER`` (300 s) instead of having it
+# reclaimed by a sibling engine shard's reserve (BACKLOG #2648). A third of that window, which
+# leaves room for touches that are slow as well as one that fails. Written out rather than imported
+# to keep this module a leaf; a test pins the ratio.
 _RESERVATION_HEARTBEAT_SECONDS = 100.0
 # How long a save keeps touching its row at most. A write that never finishes would otherwise pin
 # the row, and any leaked slot in it, for as long as the process lives. Past this the heartbeat
@@ -342,9 +342,9 @@ class _UnsealableUpload:
     serve it, and :meth:`UploadStore.delete` removes it.
 
     **Not every refused upload is one, so this class does not keep every refused upload inside
-    retention** (BACKLOG #3240). At least these are not: a blank or non-UTF-8 sidecar, and a
-    plaintext sidecar over a body that is oversized and not text, is not a regular file, or cannot
-    be read for another cause. ``docs/PHI.md`` §3 names the ones outside retention.
+    retention** (BACKLOG #3240). At least these are not: a blank sidecar, or one that is not UTF-8
+    within the part :meth:`UploadStore._unsealable_sync` reads, and a plaintext sidecar over a body
+    that is oversized and not text, is not a regular file, or cannot be read for another cause. ``docs/PHI.md`` §3 names the ones outside retention.
 
     At least these fields are not taken from the plaintext. ``file_id`` comes from the PATH, so a
     planted sidecar cannot name another upload. ``modified`` is the sidecar's mtime, which is the
@@ -831,16 +831,19 @@ class UploadStore:
         residual for all of that. The residual is named in ``docs/PHI.md`` §3: a refused upload is
         outside retention and the quota until ``rotate-key`` seals it, and ``serve`` logs the count
         at startup so the operator knows to run it. One kind ``rotate-key`` can never seal is
-        brought back through ``held`` instead, without trusting its sidecar. At least a blank or
-        non-UTF-8 sidecar is still left out.
+        brought back through ``held`` instead, without trusting its sidecar. At least a blank
+        sidecar, or one that is not UTF-8 within the part :meth:`_unsealable_sync` reads, is still
+        left out.
 
         **``held`` is for the quota and the prune only (BACKLOG #2322, #3184).** When it is a list
         and the cipher refuses plaintext, each refused sidecar that is an upload ``rotate-key``
         cannot seal is appended to it, from this same directory walk, so a quota check walks the
         directory once rather than twice. Nothing that lists or serves an upload passes it, so the
-        strict read is not loosened. Only a sidecar the cipher refused is classed. A sidecar it
-        decrypted is sealed, and :meth:`_unsealable_sync` would decline it anyway. The class is keyed
-        by the PATH id, never by the id in a sidecar's JSON.
+        strict read is not loosened. Only a sidecar the cipher refused, or one that is not UTF-8
+        as a whole, is classed; the second covers a plaintext sidecar that is not UTF-8 only past
+        the part :meth:`_unsealable_sync` reads. A sidecar the cipher decrypted is sealed, and
+        :meth:`_unsealable_sync` would decline it anyway. The class is keyed by the PATH id, never
+        by the id in a sidecar's JSON.
 
         The cipher's own message is safe to log — every ``CipherError`` carries only key ids,
         marker versions and algorithm names, never a decrypted value. The malformed-shape branch
@@ -852,6 +855,7 @@ class UploadStore:
         for fid, entry in self._iter_sidecars():
             if sink is not None:
                 bodies.add(f"{fid}{_BLOB_SUFFIX}")
+            classify = False
             try:
                 out.append(self._decrypt_meta(entry.read_text(encoding="utf-8"), fid))
             except CipherError as exc:
@@ -859,20 +863,25 @@ class UploadStore:
                 # another cell, or the refusal of an unmarked (legacy, planted or downgraded)
                 # sidecar. Named on its own so these can be told apart from a damaged file.
                 _log.warning("uploaded-file sidecar %s: cipher declined it: %s", fid, exc)
-                if sink is not None:
-                    lost = self._unsealable_sync(fid, entry)
-                    if lost is not None:
-                        sink.append(lost)
+                classify = True
             except (OSError, UnicodeDecodeError) as exc:
                 # The bytes never reached the cipher — unreadable file, or not valid UTF-8.
                 _log.warning(
                     "uploaded-file sidecar %s: unreadable on disk: %s", fid, codec_safe_str(exc)
                 )
+                # A decode error is classed too: a plaintext sidecar that is not UTF-8 only past
+                # the part the class check reads is still one rotate-key can never seal. An
+                # OSError is not, so a stalled read is not paid twice under _quota_lock.
+                classify = isinstance(exc, UnicodeDecodeError)
             except (ValueError, TypeError, KeyError) as exc:
                 # Decrypted, but the JSON is malformed or a field will not coerce. Type only.
                 _log.warning(
                     "uploaded-file sidecar %s: malformed metadata (%s)", fid, type(exc).__name__
                 )
+            if classify and sink is not None:
+                lost = self._unsealable_sync(fid, entry)
+                if lost is not None:
+                    sink.append(lost)
         if sink is not None:
             # Forget the checks of uploads that are gone, so the cache cannot outgrow the directory.
             # A copy, because a scan on another worker thread may be writing to it.
@@ -1135,7 +1144,7 @@ class UploadStore:
             )
 
     async def _reserve_across_shards(self, *, uploader_id: str, uploader: str, size: int) -> bool:
-        """Take this uploader's cross-shard in-flight reservation; return whether one is held.
+        """Take this uploader's engine-shard in-flight reservation; return whether one is held.
 
         ``False`` means there is no ledger bound (the store-less construction path) — not that the
         reservation was refused. A refusal raises :class:`UploadQuotaError`, the same TYPE the
@@ -1205,7 +1214,7 @@ class UploadStore:
         committed would subtract a sibling shard's live slot and let an upload past the cap."""
         if reserve.cancelled():
             _log.warning(
-                "the cross-shard upload reserve for %s was cancelled before it finished; a slot "
+                "the engine-shard upload reserve for %s was cancelled before it finished; a slot "
                 "it took is not paid back",
                 uploader_id,
             )
@@ -1213,7 +1222,7 @@ class UploadStore:
         exc = reserve.exception()
         if exc is not None:
             _log.warning(
-                "the cross-shard upload reserve for %s failed while the upload was being "
+                "the engine-shard upload reserve for %s failed while the upload was being "
                 "cancelled; a slot it took is not paid back",
                 uploader_id,
                 exc_info=exc,
@@ -1242,7 +1251,7 @@ class UploadStore:
         def _missed(touch: asyncio.Future[Any]) -> None:
             if not touch.cancelled() and touch.exception() is not None:
                 _log.warning(
-                    "could not refresh the cross-shard upload reservation for %s; it may be "
+                    "could not refresh the engine-shard upload reservation for %s; it may be "
                     "reclaimed if the upload outlasts the staleness window",
                     uploader_id,
                     exc_info=touch.exception(),
@@ -1258,7 +1267,7 @@ class UploadStore:
                     except TimeoutError:
                         if time.monotonic() >= deadline:
                             _log.warning(
-                                "an upload by %s is still writing after %gs; its cross-shard "
+                                "an upload by %s is still writing after %gs; its engine-shard "
                                 "reservation is no longer refreshed and may be reclaimed",
                                 uploader_id,
                                 _RESERVATION_HEARTBEAT_MAX_SECONDS,
@@ -1282,7 +1291,7 @@ class UploadStore:
                             stopped.cancel()
                         if not touch.done() and not stop.is_set():
                             _log.warning(
-                                "a cross-shard upload reservation touch for %s did not finish "
+                                "an engine-shard upload reservation touch for %s did not finish "
                                 "within %gs; it was left running, and the next waits for it",
                                 uploader_id,
                                 _RESERVATION_TOUCH_WAIT_SECONDS,
@@ -1302,7 +1311,7 @@ class UploadStore:
 
         A reserve that then turns out to hold a slot is paid back by a fresh release."""
         _log.warning(
-            "the cross-shard upload %s for %s did not finish within %gs of a cancellation; it "
+            "the engine-shard upload %s for %s did not finish within %gs of a cancellation; it "
             "was left running",
             what,
             uploader_id,
@@ -1319,7 +1328,7 @@ class UploadStore:
                     )
             elif done.cancelled():
                 _log.warning(
-                    "the cross-shard upload release for %s was cancelled before it finished; "
+                    "the engine-shard upload release for %s was cancelled before it finished; "
                     "its slot is not paid back",
                     uploader_id,
                 )
@@ -1361,7 +1370,7 @@ class UploadStore:
         """The per-uploader quota verdict against what is ALREADY on disk, or ``None`` if it fits.
 
         One string, two callers: the under-lock check inside ``save``'s build-and-write, and the
-        cross-shard reservation's pre-check. The bucket key is the IMMUTABLE ``uploader_id`` (the
+        engine-shard reservation's pre-check. The bucket key is the IMMUTABLE ``uploader_id`` (the
         caller filters on it, the same value the ownership check uses), so the budget and the
         ownership rule can never disagree about who a file belongs to and a recycled username is
         never billed for files it cannot read. The message names the human username, because an
@@ -1408,7 +1417,7 @@ class UploadStore:
                 )
             except Exception:  # noqa: BLE001 — a release failure must not fail an upload that landed
                 _log.warning(
-                    "could not release the cross-shard upload reservation for %s; it will be "
+                    "could not release the engine-shard upload reservation for %s; it will be "
                     "reclaimed when it goes stale",
                     uploader_id,
                     exc_info=True,
@@ -2135,7 +2144,9 @@ _DEFAULT_PRUNE_INTERVAL_SECONDS = 3600.0
 # How long ``UploadRetentionRunner.stop`` waits for a sweep already in flight to finish and write its
 # audit rows. The sweep stops at its next file once asked, so this bounds a hung filesystem call, a
 # sidecar scan already under way, and the audit writes for what the sweep had deleted. The runner
-# stops FIRST in the API lifespan's teardown, and engine.stop() still has to run after it.
+# stops FIRST in the API lifespan's teardown, and engine.stop() still has to run after it. It is an
+# upper limit: that teardown passes ``stop(timeout=...)`` a share of the step's bound in one shutdown
+# budget (``_SHUTDOWN_BUDGET_SECONDS`` in ``api/app.py``, BACKLOG #3191), which is shorter.
 #
 # It shares NSSM's 15 s graceful-stop window (AppStopMethodConsole in
 # scripts/service/install-service.ps1) with uvicorn's connection drain, which runs BEFORE the
@@ -2249,14 +2260,16 @@ class UploadRetentionRunner:
             self._interval,
         )
 
-    async def stop(self) -> None:
+    async def stop(self, timeout: float | None = None) -> None:
         """Signal the loop and await its exit, audit rows included (idempotent).
 
         **The loop is asked to stop, not cancelled (BACKLOG #2065).** A sweep deletes files in a
         worker thread, and cancelling the task that awaits it leaves the thread deleting while the
         result naming those files is dropped, so no ``upload.prune`` row is ever written for them.
         Instead the sweep is told to stop at its next file, and this waits for it to return and for
-        its audit rows to land, up to ``stop_timeout_seconds``.
+        its audit rows to land, up to ``stop_timeout_seconds``, or ``timeout`` when that is shorter.
+        A caller with a shutdown budget of its own passes ``timeout``, so this wait ends, and cancels
+        the sweep, before the caller cuts it.
 
         A sweep can outlast that bound: one stuck filesystem call, the sidecar scan or orphan sweep
         already under way, or one stuck audit write. The task is then cancelled. The sweep writes
@@ -2281,12 +2294,13 @@ class UploadRetentionRunner:
         tally = self._tally
         tally.abort(self._abort)
         self._abort = threading.Event()
+        wait = self._stop_timeout if timeout is None else min(self._stop_timeout, timeout)
         try:
             # shield: a timeout must not cancel the task mid-audit; the branches below decide that.
-            await asyncio.wait_for(asyncio.shield(task), self._stop_timeout)
+            await asyncio.wait_for(asyncio.shield(task), wait)
             return
         except TimeoutError:
-            why = f"did not finish within {self._stop_timeout:g}s of shutdown"
+            why = f"did not finish within {wait:g}s of shutdown"
         except asyncio.CancelledError:
             why = "was still running when shutdown itself was cancelled"
         # Read before the cancel. Every id is logged, since these lines are the only record of them.
@@ -2376,7 +2390,7 @@ async def _to_thread_to_completion[T, A](func: Callable[[A], T], arg: A) -> T:
     """``asyncio.to_thread``, except that a cancellation waits for the thread to finish first.
 
     A bare ``to_thread`` re-raises a cancellation at once while its thread keeps running. ``save``
-    then pays its cross-shard reservation back and drops ``_quota_lock`` while the file is still
+    then pays its engine-shard reservation back and drops ``_quota_lock`` while the file is still
     being written, so a sibling can read the ledger and scan the disk and count neither. That breaks
     the premise :class:`UploadQuotaError`'s ordering argument rests on. The save's thread runs the
     quota's sidecar scan and then the write. The write is bounded by ``max_bytes``. The scan is
@@ -2444,7 +2458,7 @@ async def _wait_to_completion[T](
 ) -> T:
     """Await ``fut``; on a cancellation, wait for it to finish, then raise ``CancelledError``.
 
-    The shared body of :func:`_to_thread_to_completion` and the cross-shard ledger calls (BACKLOG
+    The shared body of :func:`_to_thread_to_completion` and the engine-shard ledger calls (BACKLOG
     #2263). Further cancellations while waiting are absorbed. A ledger call is a coroutine, so it
     runs as a Task, and ``asyncio.run``'s shutdown cancellation can still end it early. That
     leaves the reservation as a killed process would.
