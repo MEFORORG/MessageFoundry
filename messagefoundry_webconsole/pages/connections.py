@@ -511,8 +511,11 @@ def purge_result(scope: str, outcomes: list[tuple[str | None, str]]) -> Markup:
 
 
 def flag_rejected(name: str, detail: str) -> Markup:
-    """Shown when a flag toggle is refused (#131) — most often the SCOPE FORK: the connection is
-    code-first (no ``connections.toml`` home for the flag). Both ``name`` and ``detail`` are escaped."""
+    """Shown when a flag toggle is refused (#131): the SCOPE FORK, where the connection is
+    code-first (no ``connections.toml`` home for the flag), or a cluster node, which writes no
+    config file (vault BACKLOG #2933). ``detail`` says which; the two hints below each name the
+    case they are for, since nothing here should guess from the detail's wording. Both ``name``
+    and ``detail`` are escaped."""
     body = el(
         "div",
         el("h1", "Flag not changed"),
@@ -520,8 +523,16 @@ def flag_rejected(name: str, detail: str) -> Markup:
         el("p", text(detail), class_="muted"),
         el(
             "p",
-            "The object flag is settable only on a connections.toml-managed connection. A code-first "
-            "connection has no TOML home for it — edit its .py module to change the flag.",
+            "The object flag is settable here only on a connections.toml-managed connection. A "
+            "code-first connection has no TOML home for it, so edit its .py module to change the "
+            "flag.",
+            class_="muted",
+        ),
+        el(
+            "p",
+            "A cluster node refuses the toggle, because each node loads its own config directory. "
+            "Set flagged on the connection's entry in connections.toml on every node, then apply "
+            "it with a coordinated restart.",
             class_="muted",
         ),
         el("p", el("a", "← Connections", href="/ui")),

@@ -10,13 +10,14 @@ Handler graph.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, get_args, runtime_checkable
 
 from messagefoundry.auth.trust_anchors import LaneAnchorCheck
 from messagefoundry.config.models import (
@@ -120,7 +121,10 @@ from messagefoundry.store.transit_attestation import enforce_transit_bound_attes
 from messagefoundry.transports.base import IntakeGate
 
 __all__ = [
+    "CONFIG_BASELINE_UNCHECKED_KEY",
+    "CONFIG_WRITE_ACTIONS",
     "ApprovedConfig",
+    "ClusteredConfigWrite",
     "ConfigDigestMismatch",
     "ConfigDigestUnavailable",
     "ConfigReloadDenied",
@@ -135,6 +139,10 @@ log = logging.getLogger(__name__)
 #: (BACKLOG #2272). Short: a write that has not landed by then is logged and lost, as before.
 _ALERT_STATE_DRAIN_SECONDS = 5.0
 
+#: How long stop waits for config writes whose callers were cancelled (vault BACKLOG #2945), so
+#: their audit rows reach the store before it closes. Short, for the same reason as above.
+_CONFIG_WRITE_DRAIN_SECONDS = 5.0
+
 #: How long a DR release waits for the staged queue to drain before it hands back anyway, leaving
 #: the rest queued (vault BACKLOG #2752). Kept well under the API's 120 s request deadline
 #: (``api/request_timeout.py``) with room for the release hook's default 30 s bound and the
@@ -143,6 +151,24 @@ _ALERT_STATE_DRAIN_SECONDS = 5.0
 #: (``api/outlive.py``), so this bound decides what the caller hears, never whether the hand-back
 #: completes. ``tests/test_dr_outlive_deadline.py`` pins the ordering.
 DR_RELEASE_DRAIN_TIMEOUT_SECONDS = 60.0
+
+#: The audit actions :meth:`Engine.write_baseline_config` records, one per engine path that writes a
+#: file the config digest covers (vault BACKLOG #2945). The API's config-change check builds the
+#: names it reads from this tuple, so a new name here needs no second tuple kept in step.
+#: ``tests/test_config_write_census.py`` fails when engine code writes a config file any other way.
+ConfigWriteAction = Literal["connection_flag_set"]
+CONFIG_WRITE_ACTIONS: tuple[str, ...] = get_args(ConfigWriteAction)
+
+#: The detail key that marks a config row whose digest the writing process never checked against the
+#: store's baseline. The API's start-row comparison reads it under its own name, ``_BASELINE_UNCHECKED``,
+#: and ``tests/test_config_write_census.py`` pins the two to one spelling.
+CONFIG_BASELINE_UNCHECKED_KEY = "baseline_unchecked"
+
+#: The keys :meth:`Engine.write_baseline_config` writes into a row's detail itself: the node, the
+#: digest fields of ``config_fingerprint_detail``, and the unchecked mark. A caller may not set them.
+_BASELINE_ROW_KEYS: frozenset[str] = frozenset(
+    {"node", "fingerprint", "scheme", "files", "git_head", CONFIG_BASELINE_UNCHECKED_KEY}
+)
 
 
 class ConfigReloadDenied(Exception):
@@ -190,6 +216,28 @@ class ConfigDigestUnavailable(Exception):
             + ("" if approved is None else " to check it against its approval")
         )
         self.approved = approved
+
+
+def _log_abandoned_config_write(task: asyncio.Task[dict[str, object] | None]) -> None:
+    """Log how a config write ended after its caller was cancelled, since nobody else reads it.
+
+    Reading the error here also marks it retrieved, so asyncio does not report it again."""
+    if task.cancelled():
+        log.warning("config write cancelled after its caller had gone")
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.warning("config write failed after its caller had gone: %s", safe_exc(exc))
+
+
+class ClusteredConfigWrite(WiringError):
+    """A config file write refused because this engine is a cluster node (vault BACKLOG #2933).
+
+    Each node loads the graph from its own config directory, and ``docs/CLUSTERING.md`` requires
+    those directories to be identical. A write from one node changes only its own copy, and no
+    engine path can reach the others' files, so :meth:`Engine.write_baseline_config` refuses every
+    write before it touches a file. A :class:`WiringError`, so a route that maps a refused config
+    write to 409 maps this one too."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -633,6 +681,12 @@ class Engine:
         # `connections_edit.locked`, an OS file lock the `connection` CLI in another process takes too
         # (vault BACKLOG #2782); that one is blocking and is only ever taken in a worker thread.
         self._toml_write_lock = asyncio.Lock()
+        # The config writes write_baseline_config has started and not finished. A caller that is
+        # cancelled stops waiting but leaves its write running, so stop() waits for these before it
+        # closes the store, or such a write would land with no row (vault BACKLOG #2945).
+        self._config_writes: set[asyncio.Task[dict[str, object] | None]] = set()
+        # Set by stop() before it waits for them; a write that gets the lock after that is refused.
+        self._config_writes_closed = False
         # Background store-pool pre-warm (Workstream A — failover drain): fired on graph start/promotion
         # AFTER the on-promotion recovery, so it never competes with recovery for the pool. At most one is
         # in flight (a re-promotion cancels the prior one — see _fire_pool_warm); tracked only so stop()
@@ -663,7 +717,7 @@ class Engine:
         configured = [*config_reload_roots, *([config_dir] if config_dir else [])]
         self._reload_roots_lexical = lexical_roots([*configured, *self._reload_roots])
         # The directory the most recent APPLIED reload loaded from (resolved). At least the provenance
-        # drift check, set_connection_flag and a DR activation (vault BACKLOG #2840) trust it to name
+        # drift check, write_baseline_config and a DR activation (vault BACKLOG #2840) trust it to name
         # where the running graph came from, so a dry run or a failed reload never moves it (vault
         # BACKLOG #2598).
         self.last_reload_dir: Path | None = None
@@ -674,8 +728,9 @@ class Engine:
         # and detect on-disk DRIFT. Holds only a one-way hash + a commit sha — never resolved env values.
         self.loaded_config_fingerprint: dict[str, object] | None = None
         # vault BACKLOG #2597: True when this process's start never checked its config against the
-        # store's baseline (the read failed, or the start took no digest). Every flag toggle row it
-        # writes is then marked, so a later start passes over it to the last checked baseline. A
+        # store's baseline (the read failed, or the start took no digest). Every row it writes through
+        # write_baseline_config, such as a flag toggle's, is then marked, so a later start passes over
+        # it to the last checked baseline. A
         # reload row, operator or convergence, is not marked: the reload vouches for what it loaded.
         self.config_baseline_unchecked = False
         # vault BACKLOG #3076: writes the config_reload audit row for a cluster convergence reload,
@@ -2308,8 +2363,199 @@ class Engine:
         except Exception:  # noqa: BLE001 - see the docstring; the API's writer already logs its own
             log.exception("cluster: the convergence reload swapped the graph, but its audit failed")
 
+    async def write_baseline_config(
+        self,
+        action: ConfigWriteAction,
+        write: Callable[[Path], None],
+        *,
+        detail: Mapping[str, object],
+        actor: str | None,
+        client: str | None,
+        reflect: Callable[[], None] | None = None,
+    ) -> dict[str, object] | None:
+        """Write a file the config digest covers, take the digest, and record the baseline row.
+
+        Every engine write of such a file goes through here (vault BACKLOG #2945). The start's
+        config-change check compares its digest with the newest baseline row, so an engine write
+        that recorded no digest would raise ``config_changed`` at the next start for a change the
+        engine itself made. ``tests/test_config_write_census.py`` fails when engine code writes a
+        config file any other way, and its census says why each other writer stays outside.
+
+        ``write`` gets the running config directory. It runs on a worker thread while this engine's
+        own write lock and the cross-process ``connections.toml`` edit lock are both held, so a
+        ``connection`` or ``codeset`` CLI edit, which takes the same config-directory lock, cannot
+        land between the write and either digest. The ``impact`` CLI's rename takes no lock, so one
+        landing during ``write`` can still be taken into the after digest. It raises
+        :class:`WiringError` to refuse, and then nothing is recorded. ``reflect``, when given, then
+        runs on the event loop, still under the engine lock, to show the write on the live graph; a
+        failure there is logged and the row is still written. Last, the row is written under
+        ``action`` with ``detail``, this node's id and the fingerprint returned, still under the
+        engine lock, so two writes' rows land in the order of their writes. ``detail`` must be JSON
+        and may not set a key the helper writes (:data:`_BASELINE_ROW_KEYS`); either fault raises
+        before anything is written. A caller cancelled while it waits for the engine lock gets no
+        write. Once the lock is held, a cancelled caller stops waiting but does not stop the write or
+        its row, and :meth:`stop` waits for such a write before it closes the store.
+
+        Returns the ADR 0041 D1 fingerprint the row records (vault BACKLOG #2597). When the directory
+        held the loaded bytes before this write, it is the digest of the directory just written, and
+        :attr:`loaded_config_fingerprint` moves to it, since the write was reflected live. Otherwise
+        some other edit sits on disk unloaded, and a digest of the whole directory would vouch for
+        it, so the loaded digest is returned unchanged and the next start reports the difference.
+        ``None`` when no loaded digest exists, or when this write was the one change but the digest
+        after it could not be taken; the write still stands either way.
+
+        Raises :class:`ClusteredConfigWrite` before anything is written when this engine is a cluster
+        node (vault BACKLOG #2933): each node loads its own config directory, and this write could
+        reach only this node's copy."""
+        from messagefoundry.config import connections_edit
+        from messagefoundry.config.fingerprint import fingerprint_matches
+
+        if self._coordinator.is_clustered():
+            raise ClusteredConfigWrite(
+                "this engine is a cluster node, so it does not write config files: each node loads "
+                "its own config directory, and a write here would change this node's copy only "
+                "(docs/CLUSTERING.md). Make the change in the config deployed to every node, and "
+                "apply it with a coordinated restart"
+            )
+        # Checked before the write, since a fault here after it would leave a landed write with no
+        # row. The helper owns these keys; a caller's own would be read as the baseline digest.
+        clash = set(detail) & _BASELINE_ROW_KEYS
+        if clash:
+            raise ValueError(f"config write detail may not set {sorted(clash)}")
+        json.dumps(dict(detail))
+
+        def _digest(cfg_dir: Path) -> dict[str, object] | None:
+            # Already on a worker thread and holding the lock, so the blocking twin of
+            # `fingerprint_bundle`: the same best-effort rule, with no hop back through the loop
+            # or a second executor thread while the lock is held.
+            digest, _reason = self.fingerprint_bundle_blocking(cfg_dir)
+            return digest
+
+        def _locked_write(
+            cfg_dir: Path, loaded_fp: object
+        ) -> tuple[dict[str, object] | None, bool]:
+            """The write and both digests, all under the cross-process lock (vault BACKLOG #2782).
+
+            The lock spans the whole of ``write``, so a read-modify-write in it cannot lose a
+            `connection` CLI edit landing in the middle. It spans the digests too, so neither can
+            take in a CLI edit this engine never loaded. Re-entrant, so a writer's own acquisition
+            nests. Returns ``(after, vouched)``; ``vouched`` is False when this write was not the one
+            change."""
+            with connections_edit.locked(cfg_dir):
+                # vault BACKLOG #2597: whether the directory still holds the bytes the running
+                # graph loaded, read before this write changes it. With no loaded digest there is
+                # nothing to vouch against, so the two reads are skipped.
+                before = _digest(cfg_dir) if isinstance(loaded_fp, str) else None
+                write(cfg_dir)
+                # The digest covers the whole directory, so it may vouch for this write only when
+                # the write is the one change since the load. Otherwise another edit is on disk
+                # that the running graph never loaded, and the row keeps the loaded digest, so the
+                # next start reports it.
+                if (
+                    before is None
+                    or not isinstance(loaded_fp, str)
+                    or not fingerprint_matches(before.get("fingerprint"), loaded_fp)
+                ):
+                    return None, False
+                # The write has landed, so an unexpected failure here is logged and costs the
+                # digest, never the answer: a raise would report a landed write as failed, with
+                # no audit row.
+                try:
+                    after = _digest(cfg_dir)
+                except Exception:  # noqa: BLE001 - see the comment above; logged, never silent
+                    log.exception("config written; its config fingerprint was not taken")
+                    after = None
+                return after, True
+
+        async def _apply() -> dict[str, object] | None:
+            """The write, reflect and row, with the engine lock already held. The lock is released
+            by :meth:`_config_write_done`, which runs however the task ends, even cancelled before
+            its first step."""
+            if self._config_writes_closed:
+                raise WiringError("the engine is stopping, so a config write cannot start")
+            # Read under the lock, so a reload that applied while this write queued sends it to
+            # the directory the running graph now comes from.
+            config_dir = self.running_config_dir
+            if config_dir is None:
+                raise WiringError(
+                    "no config directory is configured, so a config write cannot persist"
+                )
+            loaded = self.loaded_config_fingerprint
+            loaded_fp = loaded.get("fingerprint") if loaded is not None else None
+            after, vouched = await asyncio.to_thread(_locked_write, config_dir, loaded_fp)
+            if reflect is not None:
+                # The write has landed, so a failed reflect costs the live view, never the row.
+                try:
+                    reflect()
+                except Exception:  # noqa: BLE001 - logged; the durable file is the truth
+                    log.exception("config written; reflecting it on the live graph failed")
+            fingerprint: dict[str, object] | None
+            if not vouched:
+                fingerprint = loaded
+            elif after is None:
+                # No digest of what is on disk now. The loaded one would read as a change at
+                # the next start, so the row records none and that start compares nothing.
+                fingerprint = None
+            else:
+                # The running graph now matches these bytes (the write was reflected live), so
+                # the provenance baseline moves with it. Before the row: a row that fails to
+                # write must not leave this process's baseline behind its own disk and graph.
+                self.loaded_config_fingerprint = after
+                fingerprint = after
+            await self.store.record_audit(
+                action,
+                actor=actor,
+                detail=json.dumps(
+                    {
+                        **detail,
+                        "node": self._coordinator.node_id,
+                        **(fingerprint or {}),
+                        # A process whose start never checked its config cannot vouch for it.
+                        **(
+                            {CONFIG_BASELINE_UNCHECKED_KEY: True}
+                            if self.config_baseline_unchecked
+                            else {}
+                        ),
+                    }
+                ),
+                client=client,
+            )
+            return fingerprint
+
+        # The engine lock serializes the whole read-modify-write, live reflect and row, so two
+        # concurrent writes can't interleave (lost update / racing temp files) and their rows land in
+        # write order. It is taken here, in the caller: a caller cancelled while it waits has started
+        # nothing, and gets no write. Once it is held, the rest runs as a tracked task the caller
+        # only waits on, so a caller cancelled from then on (a request deadline, a client that went
+        # away) stops waiting but cannot leave the write on disk with no row, which the next start
+        # would report as a change nobody made. stop() waits for these tasks before it closes the
+        # store. asyncio.wait rather than asyncio.shield, as approvals._outlive_caller does: a
+        # shield reports a failure after its caller has gone to the loop's handler with a raw
+        # traceback, where this logs it once, rendered by safe_exc.
+        await self._toml_write_lock.acquire()
+        task = asyncio.ensure_future(_apply())
+        self._config_writes.add(task)
+        task.add_done_callback(self._config_write_done)
+        try:
+            await asyncio.wait((task,))
+        except asyncio.CancelledError:
+            task.add_done_callback(_log_abandoned_config_write)
+            raise
+        return task.result()
+
+    def _config_write_done(self, task: asyncio.Task[dict[str, object] | None]) -> None:
+        """Release the engine lock and forget a finished config write, however it ended."""
+        self._config_writes.discard(task)
+        self._toml_write_lock.release()
+
     async def set_connection_flag(
-        self, name: str, *, direction: str, flagged: bool
+        self,
+        name: str,
+        *,
+        direction: str,
+        flagged: bool,
+        actor: str | None,
+        client: str | None,
     ) -> dict[str, object] | None:
         """Set the operator "object of interest" flag on a ``connections.toml``-managed connection (#131,
         ADR 0007 amendment) — the FIRST console→``connections.toml`` write seam.
@@ -2319,38 +2565,31 @@ class Engine:
         entry so no other field is lost), then reflects it on the LIVE in-memory :class:`Registry` entry
         in place — a cosmetic-field :func:`dataclasses.replace`, so **no** connector is rebuilt, **no**
         graph reload runs, and the delivery path is untouched. The flag is display-only; no runtime path
-        reads it.
+        reads it. The write, its digest and its ``connection_flag_set`` row, under ``actor`` and
+        ``client``, all go through :meth:`write_baseline_config` (vault BACKLOG #2945).
 
         ``direction`` is ``"inbound"`` / ``"outbound"`` (it disambiguates a name declared as both).
         Raises :class:`WiringError` when the connection is **not** in ``connections.toml`` — the SCOPE
         FORK: a *code-first* connection has no TOML home, so the console flag is refused there (the
         universal-object flag would need a store table, deliberately not built) — when no config dir is
-        known, or when the validated write fails. The caller maps that to a 409.
+        known, or when the validated write fails. Raises :class:`ClusteredConfigWrite`, a
+        :class:`WiringError`, on a cluster node (vault BACKLOG #2933): the flag lives in this node's
+        own ``connections.toml``, which no other node reads. The caller maps all of these to a 409.
 
-        Returns the ADR 0041 D1 fingerprint the caller's ``connection_flag_set`` row records (vault
-        BACKLOG #2597). A start compares its own digest with that row. When the directory held the
-        loaded bytes before this write, it is the digest of the directory just written, taken under
-        the same lock, and :attr:`loaded_config_fingerprint` moves to it, since the flag was
-        reflected live. Otherwise some other edit sits on disk unloaded, and a digest of the whole
-        directory would vouch for it, so the loaded digest is returned unchanged and the next start
-        reports the difference. ``None`` when no loaded digest exists, or when the toggle was the
-        one change but the digest after it could not be taken; the write still stands either way.
+        Returns the fingerprint :meth:`write_baseline_config` returns and the row records.
         """
         from messagefoundry.config import connections_edit
         from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
-        from messagefoundry.config.fingerprint import fingerprint_matches
         from messagefoundry.pipeline.wiring_runner import build_check_registry
 
         if direction not in ("inbound", "outbound"):
             raise WiringError("connection flag direction must be 'inbound' or 'outbound'")
-        config_dir = self.running_config_dir
-        if config_dir is None:
-            raise WiringError(
-                "no config directory is configured — a connection flag cannot be persisted"
-            )
-        cfg_dir: Path = config_dir
+        # Vault BACKLOG #2622 item 1: the validate callback reads this from the worker thread, so the
+        # runner's listening set is snapshotted here, on the loop. None = the offline test.
+        live = self._registry_runner
+        binds_listener = live.listener_bind_predicate() if live is not None else None
 
-        def _write() -> None:
+        def _write(cfg_dir: Path) -> None:
             entries = connections_edit.list_connections(cfg_dir)
             match = next(
                 (e for e in entries if e.get("name") == name and e.get("direction") == direction),
@@ -2390,86 +2629,32 @@ class Engine:
 
             connections_edit.upsert_connection(cfg_dir, match, validate=validate)
 
-        def _digest() -> dict[str, object] | None:
-            # Already on a worker thread and holding the lock, so the blocking twin of
-            # `fingerprint_bundle`: the same best-effort rule, with no hop back through the loop
-            # or a second executor thread while the lock is held.
-            digest, _reason = self.fingerprint_bundle_blocking(cfg_dir)
-            return digest
-
-        def _locked_write(loaded_fp: object) -> tuple[dict[str, object] | None, bool]:
-            """The write and both digests, all under the cross-process lock (vault BACKLOG #2782).
-
-            The lock spans the list as well as the upsert: the entry is read and written back whole,
-            so a `connection` CLI edit of the same entry landing between the two would otherwise be
-            overwritten. It spans the digests too, so neither can take in a CLI edit this engine
-            never loaded. Re-entrant, so the upsert's own acquisition nests. Returns ``(after,
-            vouched)``; ``vouched`` is False when the toggle was not the one change."""
-            with connections_edit.locked(cfg_dir):
-                # vault BACKLOG #2597: whether the directory still holds the bytes the running
-                # graph loaded, read before this write changes it. With no loaded digest there is
-                # nothing to vouch against, so the two reads are skipped.
-                before = _digest() if isinstance(loaded_fp, str) else None
-                _write()
-                # The digest covers the whole directory, so it may vouch for this toggle only when
-                # the toggle is the one change since the load. Otherwise another edit is on disk
-                # that the running graph never loaded, and the row keeps the loaded digest, so the
-                # next start reports it.
-                if (
-                    before is None
-                    or not isinstance(loaded_fp, str)
-                    or not fingerprint_matches(before.get("fingerprint"), loaded_fp)
-                ):
-                    return None, False
-                # The write has landed, so an unexpected failure here is logged and costs the
-                # digest, never the answer: a raise would report a landed write as failed, with
-                # no audit row.
-                try:
-                    after = _digest()
-                except Exception:  # noqa: BLE001 - see the comment above; logged, never silent
-                    log.exception("connection flag written; its config fingerprint was not taken")
-                    after = None
-                return after, True
-
-        # Serialize the whole read-modify-write + live reflect under the engine-level TOML-write lock so
-        # two concurrent config:deploy flag toggles can't interleave (lost update / racing temp files);
-        # the write itself runs off the event loop (file I/O + a full load_config in its validate callback).
-        async with self._toml_write_lock:
-            loaded = self.loaded_config_fingerprint
-            loaded_fp = loaded.get("fingerprint") if loaded is not None else None
-            # Vault BACKLOG #2622 item 1: the validate callback reads this from the worker thread, so
-            # the runner's listening set is snapshotted here, on the loop. None = the offline test.
-            live = self._registry_runner
-            binds_listener = live.listener_bind_predicate() if live is not None else None
-            after, vouched = await asyncio.to_thread(_locked_write, loaded_fp)
-
+        def _reflect() -> None:
             # Reflect it live, in place (cosmetic field only — no connector rebuild, no reload).
             # Best-effort: the durable connections.toml is the source of truth, so a concurrent reload
             # that raced this simply re-reads the persisted value on its next load.
             rr = self._registry_runner
-            if rr is not None:
-                if direction == "inbound" and name in rr.registry.inbound:
-                    rr.registry.inbound[name] = replace(rr.registry.inbound[name], flagged=flagged)
-                elif direction == "outbound" and name in rr.registry.outbound:
-                    rr.registry.outbound[name] = replace(
-                        rr.registry.outbound[name], flagged=flagged
-                    )
-            if not vouched:
-                return loaded
-            if after is None:
-                # No digest of what is on disk now. The loaded one would read as a change at the
-                # next start, so the row records none and that start compares nothing.
-                return None
-            # The running graph now matches these bytes (the flag was reflected live), so the
-            # provenance baseline moves with it.
-            self.loaded_config_fingerprint = after
-            return after
+            if rr is None:
+                return
+            if direction == "inbound" and name in rr.registry.inbound:
+                rr.registry.inbound[name] = replace(rr.registry.inbound[name], flagged=flagged)
+            elif direction == "outbound" and name in rr.registry.outbound:
+                rr.registry.outbound[name] = replace(rr.registry.outbound[name], flagged=flagged)
+
+        return await self.write_baseline_config(
+            "connection_flag_set",
+            _write,
+            detail={"connection": name, "direction": direction, "flagged": flagged},
+            actor=actor,
+            client=client,
+            reflect=_reflect,
+        )
 
     @property
     def running_config_dir(self) -> Path | None:
         """The directory the running graph came from: the last applied reload's, else the startup
         ``--config`` dir. Readers include at least the provenance drift check,
-        :meth:`set_connection_flag` and a DR activation's disk drift check (vault BACKLOG #3067).
+        :meth:`write_baseline_config` and a DR activation's disk drift check (vault BACKLOG #3067).
         A DR activation does not reload it: it re-applies the running graph."""
         return self.last_reload_dir or self.config_dir
 
@@ -2488,7 +2673,7 @@ class Engine:
     ) -> tuple[dict[str, object] | None, str | None]:
         """:meth:`fingerprint_bundle` for a caller already on a worker thread, under the same rule.
 
-        :meth:`set_connection_flag` takes its digests here while it holds the cross-process
+        :meth:`write_baseline_config` takes its digests here while it holds the cross-process
         config edit lock (vault BACKLOG #2782)."""
         from messagefoundry.config.fingerprint import config_fingerprint_detail
 
@@ -3350,6 +3535,21 @@ class Engine:
             self._warm_pool_task.cancel()
             await asyncio.gather(self._warm_pool_task, return_exceptions=True)
             self._warm_pool_task = None
+        # A config write whose caller was cancelled is still running, and its row needs the store
+        # (vault BACKLOG #2945). Bounded, as the alert drain below is: one still running past it
+        # is logged, and its row is then lost to the closed store.
+        # Closed first, so a caller still queued for the engine lock is refused once it gets the
+        # lock rather than starting a write this drain never saw.
+        self._config_writes_closed = True
+        if self._config_writes:
+            _done, pending = await asyncio.wait(
+                set(self._config_writes), timeout=_CONFIG_WRITE_DRAIN_SECONDS
+            )
+            if pending:
+                log.warning(
+                    "%d config write(s) still running at stop; their audit rows may be lost",
+                    len(pending),
+                )
         # Clears raised on the way out are background writes: an unpinned cluster node's intake
         # alerts (BACKLOG #2272) and the coordinator's leadership release. Give them a bounded chance
         # to land before the store closes. Last, so it covers every stop step above.

@@ -414,6 +414,7 @@ from messagefoundry.pipeline.cluster import (
 )
 from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
+from messagefoundry.pipeline.engine import CONFIG_WRITE_ACTIONS
 from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmission
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 from messagefoundry.pipeline.security_signals import (
@@ -1862,12 +1863,14 @@ async def _audit_reload_attempt(
 
 
 #: The audit actions that record which config bytes a process ran from: a start, an applied reload,
-#: and a flag toggle that rewrote ``connections.toml`` (vault BACKLOG #2597). A dry run's
-#: ``config_reload_check`` is not one: it applied nothing.
+#: and every engine write of a file the config digest covers, such as a flag toggle that rewrote
+#: ``connections.toml`` (vault BACKLOG #2597). The writes come from ``CONFIG_WRITE_ACTIONS``, the
+#: names ``Engine.write_baseline_config`` records under, so a new engine config write needs no edit
+#: here (vault BACKLOG #2945). A dry run's ``config_reload_check`` is not one: it applied nothing.
 _CONFIG_BASELINE_ACTIONS: tuple[str, ...] = (
     "config_loaded",
     "config_reload",
-    "connection_flag_set",
+    *CONFIG_WRITE_ACTIONS,
 )
 
 #: How long the start waits for its baseline read. A slow store costs the comparison, never the start.
@@ -4232,31 +4235,20 @@ def create_app(
         ):
             await _deny_connection(engine, identity, name, client_ip(request))
         try:
-            fingerprint = await engine.set_connection_flag(
-                name, direction=req.direction, flagged=req.flagged
+            # The engine writes the connection_flag_set row itself, with the config digest it
+            # vouches for after this write (vault BACKLOG #2597, #2945). The next start reads that
+            # row as its baseline.
+            await engine.set_connection_flag(
+                name,
+                direction=req.direction,
+                flagged=req.flagged,
+                actor=identity.username,
+                client=client_ip(request),
             )
         except WiringError as exc:
-            # Not TOML-managed (scope fork) OR a validate-before-persist failure — the edit never landed.
+            # Not TOML-managed (scope fork), a validate-before-persist failure, or a cluster node,
+            # which writes no config file (vault BACKLOG #2933): the edit never landed.
             raise HTTPException(409, str(exc)) from exc
-        # The config digest the engine vouches for after this write (vault BACKLOG #2597): the
-        # directory as written when the toggle was the one change since the load, else the loaded
-        # digest. The next start reads this row as its baseline.
-        await engine.store.record_audit(
-            "connection_flag_set",
-            actor=identity.username,
-            detail=json.dumps(
-                {
-                    "connection": name,
-                    "direction": req.direction,
-                    "flagged": req.flagged,
-                    "node": engine.coordinator.node_id,
-                    **(fingerprint or {}),
-                    # A process whose start never checked its config cannot vouch for it.
-                    **({_BASELINE_UNCHECKED: True} if engine.config_baseline_unchecked else {}),
-                }
-            ),
-            client=client_ip(request),
-        )
         return {"name": name, "direction": req.direction, "flagged": req.flagged}
 
     @app.get("/connections/{name}/metadata", response_model=ConnectionMetadata)
