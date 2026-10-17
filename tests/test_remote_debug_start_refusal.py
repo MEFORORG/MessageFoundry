@@ -121,8 +121,11 @@ def test_serve_does_not_stop_at_this_gate(
 ) -> None:
     """The controls: the interface off, the acceptance set, and ``warn``. Each may stop at a later
     gate; none may stop at this one."""
-    _serve(tmp_path, monkeypatch, posture, warn=warn, accept=accept)
-    assert _REFUSAL not in capsys.readouterr().err
+    assert _serve(tmp_path, monkeypatch, posture, warn=warn, accept=accept) == 2
+    err = capsys.readouterr().err
+    assert _REFUSAL not in err
+    # The start went on to the at-rest gate after this one, so this gate let it through.
+    assert "no MEFOR_STORE_ENCRYPTION_KEY" in err, err[-2000:]
 
 
 def _audit_lines(caplog: pytest.LogCaptureFixture, what: str) -> list[str]:
@@ -154,7 +157,7 @@ def test_the_acceptance_writes_an_audit_line_only_where_it_lifts_a_refusal(
     with caplog.at_level(logging.WARNING, logger=cli.__name__):
         _serve(tmp_path, monkeypatch, posture, warn=warn, accept=True)
     lines = _audit_lines(caplog, "start")
-    assert len(lines) == int(audited), lines
+    assert bool(lines) is audited, lines  # a start that gets as far as logging writes it twice
     assert all(REMOTE_DEBUG_ACCEPTANCE in line for line in lines)
 
 
@@ -218,8 +221,11 @@ def test_supervise_does_not_stop_at_this_gate(
     posture: RemoteDebugPosture,
     accept: bool,
 ) -> None:
-    _supervise(tmp_path, monkeypatch, posture, accept=accept)
-    assert _REFUSAL not in capsys.readouterr().err
+    rc, spawned = _supervise(tmp_path, monkeypatch, posture, accept=accept)
+    err = capsys.readouterr().err
+    assert _REFUSAL not in err
+    # The fleet went on to the store-key gate after this one, so this gate let it through.
+    assert rc == 2 and not spawned and "no store key is set" in err, err[-2000:]
 
 
 def test_supervise_writes_the_audit_line_where_the_acceptance_lifts_its_refusal(
@@ -248,7 +254,7 @@ def _real_serve(tmp_path: Path, *options: str) -> subprocess.CompletedProcess[st
         env=env,
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=50,  # under the suite's 60 s pytest-timeout
         check=False,
     )
 

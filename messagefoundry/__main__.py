@@ -2483,27 +2483,38 @@ def _missing_service_config_refused(service_config: str | None, *, fleet: str = 
     return True
 
 
+def _remote_debug_audit(
+    settings: ServiceSettings, posture: RemoteDebugPosture, *, enforcing: bool, what: str
+) -> str | None:
+    """The WARNING-level ``AUDIT:`` line for a refusal :data:`REMOTE_DEBUG_ACCEPTANCE` lifts, or
+    None where there is nothing to lift (vault BACKLOG #2700). The sibling acceptances of an
+    enforced start gate write one too, so the lift is never silent."""
+    if (
+        not enforcing
+        or not settings.security.allow_remote_debugging
+        or remote_debug_refusal(posture) is None
+    ):
+        return None
+    return (
+        f"AUDIT: permitted to {what} under enforcement = enforce with the interpreter's remote "
+        f"debugging (PEP 768) enabled in this process, because {REMOTE_DEBUG_ACCEPTANCE} = true. "
+        "See docs/SECURITY-LOOSENING.md."
+    )
+
+
 def _remote_debug_refused(
     settings: ServiceSettings, posture: RemoteDebugPosture, *, enforcing: bool, what: str
 ) -> bool:
     """True, with the reason printed, when :func:`messagefoundry.remotedebug.remote_debug_refusal`
     refuses ``posture`` and nothing lifts it (vault BACKLOG #2700). ``what`` is what is refused.
-
-    Where the acceptance lifts a refusal that would fire, it writes a WARNING-level ``AUDIT:``
-    line, as the sibling acceptances of an enforced start gate do, so the lift is never silent."""
-    if not enforcing:
+    Where the acceptance lifts it, the :func:`_remote_debug_audit` line is logged instead. The
+    caller logs it again once its log handlers exist, as BACKLOG #1989 does for its audit lines."""
+    audit = _remote_debug_audit(settings, posture, enforcing=enforcing, what=what)
+    if audit is not None:
+        logging.getLogger(__name__).warning("%s", audit)
         return False
-    refused = remote_debug_refusal(posture)
+    refused = remote_debug_refusal(posture) if enforcing else None
     if refused is None:
-        return False
-    if settings.security.allow_remote_debugging:
-        logging.getLogger(__name__).warning(
-            "AUDIT: permitted to %s under enforcement = enforce with the interpreter's remote "
-            "debugging (PEP 768) enabled in this process, because %s = true. See "
-            "docs/SECURITY-LOOSENING.md.",
-            what,
-            REMOTE_DEBUG_ACCEPTANCE,
-        )
         return False
     print(f"error: refusing to {what}: {refused}.", file=sys.stderr)
     return True
@@ -2688,7 +2699,8 @@ def _serve(args: argparse.Namespace) -> int:
     if startup_refused is not None and enforcing:
         print(f"error: refusing to start: {startup_refused}.", file=sys.stderr)
         return 2
-    if _remote_debug_refused(settings, remote_debug_posture(), enforcing=enforcing, what="start"):
+    _remote_debug_reading = remote_debug_posture()
+    if _remote_debug_refused(settings, _remote_debug_reading, enforcing=enforcing, what="start"):
         return 2
 
     # Anchor for the per-environment value dir: [environments].base_dir (or --project-root) when set,
@@ -2921,6 +2933,13 @@ def _serve(args: argparse.Namespace) -> int:
     # the gate ran above and logged again here, so they reach the handlers and forwarder
     # configure_logging just installed. A warn-mode refusal is logged here too, for the same reason.
     _log_static_credential_outcome(sc_outcome)
+    # Vault BACKLOG #2700: the remote-debugging acceptance's AUDIT line, for the same reason.
+    if (
+        _rd_audit := _remote_debug_audit(
+            settings, _remote_debug_reading, enforcing=enforcing, what="start"
+        )
+    ) is not None:
+        logging.getLogger(__name__).warning("%s", _rd_audit)
     # Vault BACKLOG #2600: the unread-variable warnings load_settings logged before logging was
     # configured, so to bare stderr only. Logged again here, under the settings logger they came
     # from, for the same reason. (_start_logging above re-logs the #2375 gate notes.)
@@ -5127,6 +5146,15 @@ def _supervise(args: argparse.Namespace) -> int:
                 "[security] %s: %s. See docs/SECURITY-LOOSENING.md. (Logged again for the off-box "
                 "forwarder.)",
                 *security_line,
+            )
+        # Vault BACKLOG #2700: the AUDIT line the remote-debugging gate logged above, if any.
+        if (
+            fleet_audit := _remote_debug_audit(
+                settings, remote_debug_reading, enforcing=enforcing, what="start the fleet"
+            )
+        ) is not None:
+            logging.getLogger(__name__).warning(
+                "%s (Logged again for the off-box forwarder.)", fleet_audit
             )
 
     try:

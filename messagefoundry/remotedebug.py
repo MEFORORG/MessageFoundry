@@ -10,8 +10,9 @@ has it. On Linux it depends on the kernel's ptrace policy: where Yama ``ptrace_s
 Ubuntu ships it, only a parent process or one with ``CAP_SYS_PTRACE`` has it. The interface is
 on unless the interpreter was started with ``-X disable-remote-debug`` or
 ``PYTHON_DISABLE_REMOTE_DEBUG=1``. The engine's children are started with the option
-(``messagefoundry/childenv.py``). The engine itself is started through a console-script launcher,
-which cannot pass an interpreter option, so every ``messagefoundry`` command would start with it on.
+(``messagefoundry/childenv.py``), and so is the engine by both shipped service launches. A start
+through the console-script launcher cannot pass an interpreter option, so it has the interface on
+unless ``PYTHON_DISABLE_REMOTE_DEBUG=1`` is set.
 
 **What this does.** Before it runs an injected script, the target interpreter raises the audit
 event ``cpython.remote_debugger_script``, and it does not run the script when an audit hook raises.
