@@ -557,6 +557,10 @@ def test_every_build_system_pins_its_backend_exactly_and_they_agree() -> None:
 
 _HARNESS_PYPROJECT = _REPO / "packaging" / "messagefoundry-harness" / "pyproject.toml"
 
+# Where the pin failures below send a version bump. The list itself is guarded in
+# tests/test_install_docs_pin_the_current_version.py, which the docs-only CI lane runs.
+_BUMP_LIST = "CONTRIBUTING.md, *Bumping the engine version*"
+
 
 def _version_literal(module: Path) -> str:
     # Both quote styles. scripts/security/sbom_finalize.py reads this same literal with the looser
@@ -667,10 +671,10 @@ def test_the_harness_pins_the_engine_at_the_version_it_ships_with() -> None:
         f"the harness must pin the engine at the version it ships with (BACKLOG #1585).\n"
         f"  {root.relative_to(_REPO).as_posix()} says: {shipped}\n"
         f"  {_HARNESS_PYPROJECT.relative_to(_REPO).as_posix()} pins: {pinned}\n"
-        f"A VERSION BUMP IS AT LEAST THREE EDITS, the toolkit pin included. PEP 621 `dependencies` is "
-        f"static and nothing in this repository "
-        f"generates it, so set that table to `messagefoundry[harness]=={shipped}` in the same commit "
-        f"that moves __version__."
+        f"A VERSION BUMP MOVES THIS PIN WITH THE OTHERS; {_BUMP_LIST} lists the others. "
+        f"PEP 621 `dependencies` is static and nothing in this repository generates it, so set "
+        f"that table to `messagefoundry[harness]=={shipped}` in the same commit that moves "
+        f"__version__."
     )
 
 
@@ -944,7 +948,7 @@ def test_the_toolkit_pins_the_engine_at_the_version_it_ships_with() -> None:
         f"the toolkit must pin the engine at the version it ships with (ADR 0201 AC-7).\n"
         f"  {root.relative_to(_REPO).as_posix()} says: {shipped}\n"
         f"  {_TOOLKIT_PYPROJECT.relative_to(_REPO).as_posix()} pins: {_engine_pin(deps)}\n"
-        f"A VERSION BUMP IS AT LEAST THREE EDITS: __version__, the harness pin and this one."
+        f"A VERSION BUMP MOVES THIS PIN WITH THE OTHERS; {_BUMP_LIST} lists the others."
     )
     engine = _engine_requirement(deps)
     assert engine is not None and not engine.extras, (
