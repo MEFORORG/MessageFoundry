@@ -2780,9 +2780,9 @@ so a `reason` points an operator at the likely cause rather than proving it. The
 stored ciphertext, so at least a store-key rotation that re-encrypts the column inside the window
 refuses too. That refusal reads as `secret_replaced` although no second enrolment started.
 `write_lost` means the row still held the verified secret with TOTP off, so the enable lost to
-some other concurrent write. A plain retry of a refused confirm gets a `401`, because the session
-is ended and the code's TOTP step is spent. After a `write_lost` or a store-key rotation, the user
-signs in again and confirms with a code from a later step. With
+some other concurrent write. After a `write_lost` or a store-key rotation the staged secret still
+stands. The user signs in again and confirms with a code from a later step, passing the same
+step-up as any confirm, because the refused confirm spent its code's step. With
 `[security].require_mfa` on — **the default since BACKLOG #187 (secure-by-default, including the
 loopback bind)** — **every account** must satisfy MFA under the default scope,
 `every_local_account` (a value now wider than its name, BACKLOG #1144). Setting the scope to

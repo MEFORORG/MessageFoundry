@@ -2815,11 +2815,12 @@ async def test_a_refused_rename_is_audited_under_the_name_the_row_holds(shape: s
     One case per way the refresh refuses after it has read the row; each is asserted to have
     refused, so none passes by never reaching the branch.
 
-    ``pre_check`` is a direct call no production caller makes today. The login reaches this method
-    only with ``held=None`` (``_complete_ad_login`` refuses a held name first), and the reconciler,
-    the only caller passing ``held``, has the two names equal there. The case is kept because it
-    pins the method's own contract: a refusal names what the row held, whichever caller passes a
-    holder."""
+    The ``pre_check`` case drives a shape no production caller produces today: a holder passed
+    while the row's name differs from ``old_username``. The reconciler reaches the pre-check in
+    production, but the skip has returned first unless the two names agree. The login passes
+    ``held`` too, but it is always None there (``_complete_ad_login`` refuses a held name first).
+    The case is kept because it pins the method's own contract: a refusal names what the row held,
+    whichever caller passes a holder."""
     store, _ldap, service, notifier, user_id = await _renamed_service()
     try:
         holds = "jdoe-interim"
