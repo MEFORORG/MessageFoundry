@@ -285,20 +285,21 @@ def test_compare_out_replaces_an_existing_readable_file(
     assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
 
 
-@_POSIX_MODES
 def test_compare_out_replaces_a_link_rather_than_following_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A link at the output name would otherwise send the report to whatever file it points at.
+    # On Windows too: compare's os.replace on main swapped the link itself (vault BACKLOG #3166).
     db = _seed_compare(tmp_path, monkeypatch)
     target = tmp_path / "elsewhere.json"
     target.write_text("untouched\n", encoding="utf-8")
     out = tmp_path / "report.json"
-    out.symlink_to(target)
+    _symlink_or_skip(out, target)
     assert _compare_to(db, out) == 0
     assert target.read_text(encoding="utf-8") == "untouched\n"
     assert not out.is_symlink()
-    assert stat.S_IMODE(out.stat().st_mode) == 0o600
+    if sys.platform != "win32":
+        assert stat.S_IMODE(out.stat().st_mode) == 0o600
 
 
 @_POSIX_MODES
@@ -394,6 +395,9 @@ def test_export_out_is_created_owner_only(tmp_path: Path) -> None:
 
 
 _OUT_COMMANDS = ["anonymize-captures", "export", "compare"]
+# The commands whose existing --out is written in place on Windows, as write_text did on main.
+# compare replaced its file on main and still does (vault BACKLOG #3166).
+_IN_PLACE_COMMANDS = ["anonymize-captures", "export"]
 _WHAT = {"anonymize-captures": "dataset", "export": "export", "compare": "report"}
 
 
@@ -416,33 +420,33 @@ def test_out_goes_through_the_owner_only_writer(
     # fails if a command goes back to write_text.
     import tee.__main__ as tee_main
 
-    calls: list[str] = []
+    calls: list[tuple[str, bool]] = []
     real = tee_main._write_owner_only
 
-    def spy(path: str, text: str) -> None:
-        calls.append(path)
-        real(path, text)
+    def spy(path: str, text: str, *, in_place_on_windows: bool) -> None:
+        calls.append((path, in_place_on_windows))
+        real(path, text, in_place_on_windows=in_place_on_windows)
 
     monkeypatch.setattr(tee_main, "_write_owner_only", spy)
     out = tmp_path / "out.json"
     assert _write_out(command, tmp_path, monkeypatch, out) == 0
-    assert calls == [str(out)]
+    assert calls == [(str(out), command in _IN_PLACE_COMMANDS)]
 
 
 @pytest.mark.parametrize("command", _OUT_COMMANDS)
-def test_out_is_lf_on_every_platform(
-    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The dataset is JSONL, read back line by line by the harness corpus. A text layer's default
-    # newline is CRLF on Windows, so this discriminates on win32.
+def test_out_newline(command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The dataset is JSONL, read back line by line by the harness corpus, so the in-place commands
+    # write LF everywhere. compare keeps main's text-layer default, CRLF on Windows (vault BACKLOG
+    # #3166). Either way this discriminates on win32.
+    newline = b"\n" if command in _IN_PLACE_COMMANDS else os.linesep.encode()
     out = tmp_path / "out.json"
     assert _write_out(command, tmp_path, monkeypatch, out) == 0
     data = out.read_bytes()
-    assert data.endswith(b"}\n")  # control: the file really has a line ending to translate
-    assert b"\r\n" not in data
+    assert data.endswith(b"}" + newline)  # control: the file really has a line ending
+    assert data.count(newline) == data.count(b"\n")
 
 
-@pytest.mark.parametrize("command", ["anonymize-captures", "export"])
+@pytest.mark.parametrize("command", _IN_PLACE_COMMANDS)
 def test_out_that_cannot_be_written_is_an_error_line(
     command: str,
     tmp_path: Path,
@@ -504,7 +508,7 @@ def _harden(path: Path, grant: str) -> None:
 
 
 @_WINDOWS_ACLS
-@pytest.mark.parametrize("command", _OUT_COMMANDS)
+@pytest.mark.parametrize("command", _IN_PLACE_COMMANDS)
 @pytest.mark.parametrize("trailing_separator", [False, True], ids=["plain", "trailing-separator"])
 def test_out_keeps_the_access_list_of_a_hardened_target_on_windows(
     command: str, trailing_separator: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -546,7 +550,7 @@ def test_out_replaces_a_second_hard_link_on_posix(tmp_path: Path) -> None:
 
 
 @_WINDOWS_ACLS
-@pytest.mark.parametrize("command", _OUT_COMMANDS)
+@pytest.mark.parametrize("command", _IN_PLACE_COMMANDS)
 def test_out_through_a_second_hard_link_keeps_the_hardened_access_list_on_windows(
     command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -577,7 +581,7 @@ def _symlink_or_skip(link: Path, target: Path) -> None:
 
 
 @_WINDOWS_ACLS
-@pytest.mark.parametrize("command", _OUT_COMMANDS)
+@pytest.mark.parametrize("command", _IN_PLACE_COMMANDS)
 def test_out_through_a_symlink_keeps_the_hardened_target_on_windows(
     command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -600,7 +604,7 @@ def test_out_through_a_symlink_keeps_the_hardened_target_on_windows(
 
 
 @_WINDOWS_ACLS
-@pytest.mark.parametrize("command", _OUT_COMMANDS)
+@pytest.mark.parametrize("command", _IN_PLACE_COMMANDS)
 @pytest.mark.parametrize("name", ["plain", "second-hard-link", "trailing-separator"])
 def test_out_refuses_a_target_hardened_against_this_account_writing_on_windows(
     command: str,
@@ -631,8 +635,9 @@ def test_out_refuses_a_target_hardened_against_this_account_writing_on_windows(
     assert not list(tmp_path.glob("*.tmp"))
 
 
+@pytest.mark.parametrize("in_place_on_windows", [True, False])
 def test_out_creates_a_missing_target_through_mkstemp(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    in_place_on_windows: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # On every platform, Windows included, a name that is not there is made by mkstemp and renamed
     # into place, never opened in place.
@@ -648,10 +653,11 @@ def test_out_creates_a_missing_target_through_mkstemp(
 
     out = tmp_path / "out.json"
     monkeypatch.setattr(tempfile, "mkstemp", spy)
-    tee_main._write_owner_only(str(out), "new\n")
+    tee_main._write_owner_only(str(out), "new\n", in_place_on_windows=in_place_on_windows)
     monkeypatch.undo()
     assert len(calls) == 1
-    assert out.read_bytes() == b"new\n"
+    newline = b"\n" if in_place_on_windows else os.linesep.encode()
+    assert out.read_bytes() == b"new" + newline
     assert not list(tmp_path.glob("*.tmp"))
 
 
@@ -673,7 +679,7 @@ def test_out_that_appears_after_the_check_is_written_in_place_on_windows(
     # Control: a file renamed into this folder would get a different list, so a replace fails this.
     assert hardened != _sddl_of(sibling, scratch)
     monkeypatch.setattr(os.path, "lexists", lambda path: False)
-    tee_main._write_owner_only(str(out), "new\n")
+    tee_main._write_owner_only(str(out), "new\n", in_place_on_windows=True)
     monkeypatch.undo()
     assert _sddl_of(out, scratch) == hardened
     assert out.read_bytes() == b"new\n"
@@ -691,3 +697,29 @@ def test_out_through_a_dangling_symlink_creates_its_target_on_windows(tmp_path: 
     assert _export_to(tmp_path, out) == 0
     assert out.is_symlink()
     assert target.read_bytes().endswith(b"}\n")
+
+
+@_WINDOWS_ACLS
+def test_compare_out_replaces_a_hardened_target_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # compare replaced an existing --out on main, so a file another account pre-created in a
+    # shared folder does not keep its owner and access list and go on receiving the report. It
+    # still does (vault BACKLOG #3166): the report takes the folder's list.
+    scratch = tmp_path / "acl"
+    out = tmp_path / "out.json"
+    # Longer than any report, so a write that skipped the truncate would leave stale bytes behind.
+    out.write_text("stale\n" * 4000, encoding="utf-8")
+    _harden(out, "F")
+    hardened = _sddl_of(out, scratch)
+    sibling = tmp_path / "fresh.json"
+    sibling.write_text("x\n", encoding="utf-8")
+    folders = _sddl_of(sibling, scratch)
+    # Control: the hardening really differs from what a new file in this folder gets.
+    assert hardened != folders
+    assert _write_out("compare", tmp_path, monkeypatch, out) == 0
+    assert _sddl_of(out, scratch) == folders
+    data = out.read_bytes()
+    assert b"stale" not in data
+    assert json.loads(data)["summary"]["matched"] >= 0
+    assert not list(tmp_path.glob("*.tmp"))

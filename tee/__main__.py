@@ -395,7 +395,7 @@ async def _export(args: argparse.Namespace) -> int:
     text = json.dumps(data, indent=2)
     if args.out:
         try:
-            _write_owner_only(args.out, text + "\n")
+            _write_owner_only(args.out, text + "\n", in_place_on_windows=True)
         except OSError as exc:
             print(f"error: could not write the export to {args.out}: {exc}", file=sys.stderr)
             return 1
@@ -474,7 +474,7 @@ async def _load_captures(db: str, since: float | None) -> list[CorepointOutput]:
     ]
 
 
-def _write_owner_only(path: str, text: str) -> None:
+def _write_owner_only(path: str, text: str, *, in_place_on_windows: bool) -> None:
     """Write ``text`` to ``path`` so that, on POSIX, only its owner can read it (vault BACKLOG #2792).
 
     Every ``--out`` the tee writes goes through here (vault BACKLOG #3166). A ``compare
@@ -483,8 +483,16 @@ def _write_owner_only(path: str, text: str) -> None:
     and NAK details from the capture DB. ``write_text`` would create any of them at the process
     umask, world-readable under 022, beside a capture DB that :mod:`tee.store` keeps at 0600.
 
-    Newlines are written as LF on every platform. The text layer's default would write CRLF on
-    Windows, and the dataset is JSONL that the harness corpus reads back line by line.
+    ``in_place_on_windows`` is True for ``export`` and ``anonymize-captures``, and False for
+    ``compare``. False is ``compare``'s writer on main, unchanged on every OS: newlines are the
+    platform's (CRLF on Windows), a named stream is written through, and anything else, an
+    existing file or link on Windows included, is replaced by the ``mkstemp`` file below with
+    ``os.replace``, so a report another account pre-created on Windows takes the folder's access
+    list and owner, a link is replaced rather than followed, and the write stays atomic. The rest
+    of this docstring describes True.
+
+    With True, newlines are written as LF on every platform. The text layer's default would write
+    CRLF on Windows, and the dataset is JSONL that the harness corpus reads back line by line.
 
     A ``path`` naming nothing, on any platform -- no file and no link, not even a dangling one --
     is created as a NEW file that ``mkstemp`` creates exclusively at 0600 in the same directory,
@@ -516,19 +524,19 @@ def _write_owner_only(path: str, text: str) -> None:
     on main and are not new: the list is kept whatever it holds, so a target another account
     pre-created stays that account's; the write is not atomic and not fsynced, so an OSError or an
     interruption part way, or a crash after it, would leave the file truncated or partly written;
-    and the refusals above. ``compare`` replaced its file on main, so on Windows all of the
-    above is new for it, including that a link at ``--out`` is followed and a second hard link
-    receives the report.
+    and the refusals above.
     """
     target = Path(path)
-    in_place = os.path.lexists(target) if os.name == "nt" else _is_named_stream(path)
+    windows_in_place = in_place_on_windows and os.name == "nt"
+    newline = "\n" if in_place_on_windows else None
+    in_place = os.path.lexists(target) if windows_in_place else _is_named_stream(path)
     if in_place:
-        _write_through(target, text)
+        _write_through(target, text, newline)
         return
     fd, temp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
     try:
         try:
-            handle = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+            handle = os.fdopen(fd, "w", encoding="utf-8", newline=newline)
         except BaseException:
             os.close(fd)  # nothing owns the descriptor yet, and Windows cannot unlink an open file
             raise
@@ -536,23 +544,23 @@ def _write_owner_only(path: str, text: str) -> None:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        if os.name != "nt":
+        if not windows_in_place:
             os.replace(temp, target)
             return
         try:
             os.rename(temp, target)  # on Windows it refuses an existing name; os.replace would not
         except FileExistsError:
             Path(temp).unlink()
-            _write_through(target, text)
+            _write_through(target, text, newline)
     except BaseException:
         Path(temp).unlink(missing_ok=True)
         raise
 
 
-def _write_through(target: Path, text: str) -> None:
-    """Open ``target`` for writing in place, as ``Path.write_text`` does, and write ``text`` with LF
-    newlines; ``write_text`` without ``newline=`` would write CRLF on Windows."""
-    with target.open("w", encoding="utf-8", newline="\n") as stream:
+def _write_through(target: Path, text: str, newline: str | None) -> None:
+    """Open ``target`` for writing in place, as ``Path.write_text`` does, and write ``text`` with
+    ``newline``: None is the platform's, CRLF on Windows."""
+    with target.open("w", encoding="utf-8", newline=newline) as stream:
         stream.write(text)
 
 
@@ -590,7 +598,7 @@ def _compare(args: argparse.Namespace) -> int:
     text = json.dumps(report, indent=2)
     if args.out:
         try:
-            _write_owner_only(args.out, text + "\n")
+            _write_owner_only(args.out, text + "\n", in_place_on_windows=False)
         except OSError as exc:
             print(f"error: could not write the report to {args.out}: {exc}", file=sys.stderr)
             return 1
@@ -755,7 +763,7 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
         )
         return 1
     try:
-        _write_owner_only(args.out, "\n".join(lines) + "\n")
+        _write_owner_only(args.out, "\n".join(lines) + "\n", in_place_on_windows=True)
     except OSError as exc:
         print(f"error: could not write the dataset to {args.out}: {exc}", file=sys.stderr)
         return 1
