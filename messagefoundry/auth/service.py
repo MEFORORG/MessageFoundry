@@ -9140,12 +9140,17 @@ class AuthService:
         the answer the caller is owed. ``client`` is required, as on
         :meth:`audit_self_target_refused`, because both planes call this from a request.
 
-        Also ``False``, with no audit row, when the revoke matched no unrevoked row (BACKLOG #3029):
-        at least a rotation that re-keyed the session after the read, which leaves it live under
-        its new id, or a concurrent revoke that ended it first. The revoke reports whether it
-        matched, so neither the return nor the trail claims a revoke that did not happen."""
+        Also ``False`` when the revoke matched no unrevoked row (BACKLOG #3029): at least a
+        rotation that re-keyed the session after the read, which leaves it live under its new id,
+        or a concurrent revoke that ended it first. The revoke reports whether it matched, so
+        neither the return nor the trail claims a revoke that did not happen. That miss answers the
+        same 404, so it writes the same miss row and no ``auth.session_revoked`` row."""
         session = await self._load_session(session_id)
-        if session is None or session.user_id != identity.user_id:
+        if (
+            session is None
+            or session.user_id != identity.user_id
+            or await self._store.supersede_session(session_id, now=time.time()) is None
+        ):
             # The console passes the id as plain text, so only an id-shaped one is copied into the
             # trail; anything else is recorded as malformed, never as the caller's own characters.
             shown = session_id[:12] if _SESSION_ID_SHAPE.fullmatch(session_id) else "malformed"
@@ -9161,8 +9166,6 @@ class AuthService:
                 args=lambda: (scrub_log_argument(actor),),
                 defects=(),
             )
-            return False
-        if await self._store.supersede_session(session_id, now=time.time()) is None:
             return False
         await self._audit(
             "auth.session_revoked",

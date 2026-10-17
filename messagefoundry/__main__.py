@@ -4668,8 +4668,9 @@ def _serve(args: argparse.Namespace) -> int:
         "ws": floored_ws,
         "timeout_graceful_shutdown": _UVICORN_DRAIN_SECONDS,  # BACKLOG #3256; see the constant
     }
-    from messagefoundry.api.tls import build_api_ssl_context
+    from messagefoundry.api.tls import ApiHandshakeRecord, build_api_ssl_context
 
+    api_handshakes: ApiHandshakeRecord | None = None
     if _material is not None:
         _cert, _key = _material
         # _key is None when the operator embedded the private key in the cert PEM (tls_key_file is
@@ -4690,6 +4691,8 @@ def _serve(args: argparse.Namespace) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         run_kwargs["ssl_context_factory"] = lambda config, default_factory: ctx
+        # Vault BACKLOG #3302: the loop runs every API handshake, so a failed one left no record.
+        api_handshakes = ApiHandshakeRecord(ctx)
         # ADR 0083 activation: only when in-process mTLS (client CA) AND a cert-identity map are BOTH
         # configured, swap in the scope-populating HTTP protocol so a verified peer cert reaches
         # resolve_client_cert_identity. Gated on both so a mutual-auth-only bind (console mTLS, no map)
@@ -4717,6 +4720,9 @@ def _serve(args: argparse.Namespace) -> int:
     except Exception as exc:  # last-resort: log an abnormal server exit PHI-redacted, then re-raise
         logging.getLogger(__name__).critical("server exited abnormally: %s", safe_exc(exc))
         raise
+    finally:
+        if api_handshakes is not None:
+            api_handshakes.close()
     return 0
 
 
