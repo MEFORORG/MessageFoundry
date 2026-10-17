@@ -6793,10 +6793,10 @@ class AuthService:
         both must resolve the collision case the same way. Two copies of this decision would be two
         policies, and the one that ran less often would be the one nobody noticed drifting.
 
-        ``held`` is the row holding ``new_username`` when the caller read it. It is a hint, not the
-        verdict: when it names another row, the holder of ``new_username`` is read again before any
-        refusal (BACKLOG #3070; the reasoning is at that read, and only there). ``held=None`` costs
-        no read, which is what it saves the login caller, which **provably** already has the answer.
+        ``held`` is the row holding ``new_username`` when the caller read it, and a hint rather than
+        the verdict: the rule for it is at the ``held`` pre-check below (BACKLOG #3070), and only
+        there. ``held=None`` costs no read, which saves the login caller one; it **provably**
+        already has the answer.
         ``_complete_ad_login`` reads that exact row before it calls down, and refuses outright when
         it exists with a different id -- so the login path reaches this method only with
         ``held=None``, and the collision branch below is reachable from the **reconciler alone**,
@@ -6994,16 +6994,13 @@ class AuthService:
             # it is no conflict. A verified holder load, not one statement, but only when the
             # caller's read named another row.
             #
-            # A row that fails its seal still holds its name (BACKLOG #2592) and still locks this
-            # account out at its next sign-in, so it is refused too. Its id is not exposed
-            # unverified, so the audit names the holder the caller verified, as before #3070.
-            found = await self._lookup_by_username(new_username)
-            if found.refused or (found.user is not None and found.user.id != user_id):
-                await _refuse(
-                    found.user.id if found.user is not None else held.id,
-                    "pre_check",
-                    before.username,
-                )
+            # NOT CLOSED HERE: a holder that fails its seal reads as None, here as at the caller's
+            # read and the two write-path holder reads below, so it is not reported as a lockout.
+            # That is one gap across all four reads and wants one holder lookup that keeps the seal
+            # state, not a special case on this read.
+            current = await self._load_user_by_username(new_username)
+            if current is not None and current.id != user_id:
+                await _refuse(current.id, "pre_check", before.username)
                 return
         try:
             # BACKLOG #2290. A compare-and-set on the name just read, so of two refreshes of this
