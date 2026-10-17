@@ -30,6 +30,7 @@ from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
 from tests._role_pairing import bypass_view_raw_pairing_rule
+from tests._session_race import rotate_after_first_call
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 
@@ -598,6 +599,39 @@ async def test_login_then_permission_enforced(engine: Engine) -> None:
         # logout revokes the token immediately
         assert (await c.post("/auth/logout", headers=_auth(token))).status_code == 200
         assert (await c.get("/stats", headers=_auth(token))).status_code == 401
+
+
+async def test_a_logout_raced_by_a_rotation_does_not_audit_a_revoke(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3029. ``POST /auth/logout`` reads the session in its auth dependency, then the
+    service revokes it by hash. A step-up on the same session that re-keys it between the two
+    leaves that hash naming no session. The ``auth.logout`` row used to read the same either way.
+
+    The rotation runs right after the dependency's read of the presented hash, so it always lands
+    and the session lives on under its new token. The row's ``outcome`` must then say nothing was
+    revoked. Ending it under the rotated token is not this route's to do; that is BACKLOG #3028.
+    The branch where the revoke lands is test_session_supersession.py's logout test.
+    """
+    service = await _service(engine)
+    await _add(service, "u", Role.VIEWER)
+    store = engine.store
+    async with _client(engine, service) as c:
+        token = (await _login(c, "u")).json()["token"]
+        rotations = rotate_after_first_call(
+            monkeypatch, store, service, token, names=("get_session",)
+        )
+        assert (await c.post("/auth/logout", headers=_auth(token))).status_code == 200
+
+    assert rotations, "the injection never fired, so this measured nothing"
+    rotated = rotations[0]
+    assert rotated is not None, "the rotation failed closed, so the race was not driven"
+    assert await service.identity_for_token(rotated, activity=False) is not None
+    outcomes = [
+        json.loads(str(row["detail"] or "{}")).get("outcome")
+        for row in await store.list_audit(action="auth.logout")
+    ]
+    assert outcomes == ["nothing_to_revoke"], "the auth.logout row claimed a revoke that missed"
 
 
 async def test_cluster_endpoints_gated_by_monitoring_read(engine: Engine) -> None:

@@ -1998,6 +1998,34 @@ def test_json_loads_or_refusal_hint_is_content_free(
     assert marker not in refusal
 
 
+@pytest.mark.parametrize(
+    ("build", "hint"),
+    [
+        pytest.param(lambda m: '{"k": 1, "k": "' + m + '"}', "RepeatedKeyError", id="top-level"),
+        pytest.param(
+            lambda m: '[{"o": {"k": 1, "k": "' + m + '"}}]', "RepeatedKeyError", id="deep"
+        ),
+        # Control: the same key in two different objects is not a repeat.
+        pytest.param(lambda m: '[{"k": 1}, {"k": "' + m + '"}]', None, id="sibling-objects"),
+    ],
+)
+def test_refuse_repeated_keys_hint_is_the_class_name_only(
+    build: Callable[[str], str], hint: str | None
+) -> None:
+    """vault BACKLOG #2812: the hook refuses a repeated key at any depth, and the hint names neither
+    the key nor a value."""
+    assert {"RepeatedKeyError", "refuse_repeated_keys"} <= set(redaction.__all__)
+    marker = "SYNTH" + str(random.getrandbits(64))
+    value, refusal = redaction.json_loads_or_refusal(
+        build(marker), object_pairs_hook=redaction.refuse_repeated_keys
+    )
+    assert refusal == hint
+    if hint is None:
+        assert value == [{"k": 1}, {"k": marker}]
+    else:
+        assert value is None and refusal == redaction.RepeatedKeyError.__name__
+
+
 # --- a labelled MRN in prose (BACKLOG #2079) ----------------------------------
 #
 # A bare ``MRN 12345678`` carried no delimiter, no date and no second capitalized token, so every
