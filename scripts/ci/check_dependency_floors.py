@@ -10,9 +10,10 @@ override left in place after its reason went away, or a dependency that is not i
 would each let the tests pass against something else. So this reads every ``[project].dependencies``
 entry whose marker applies here and compares the installed version with its ``>=`` bound.
 
-A dependency installed above its floor fails the check unless ``--raised NAME`` names it, which is
-how the workflow records a floor that cannot install on this Python. A ``--raised`` name that sits
-at its floor after all fails too, so the exception goes when its reason does.
+A dependency installed above its floor fails the check unless ``--raised NAME`` names it. The
+workflow passes none: a floor that cannot install on this Python is raised in ``pyproject.toml``
+instead (vault BACKLOG #3177). A ``--raised`` name that sits at its floor after all fails too, so
+an exception goes when its reason does.
 
 USAGE
     python scripts/ci/check_dependency_floors.py [--pyproject PATH] [--raised NAME ...]
@@ -90,7 +91,10 @@ def check(
         floor, found = floors[name], installed(name)
         raised_on_purpose = name in expected_raised
         if floor is None:
-            failures.append(f"{name}: declares no floor this check can read; write it as >=X")
+            failures.append(
+                f"{name}: declares no floor this check can read; write it as >=X, "
+                "with no other line for this name excluding X"
+            )
         elif found is None:
             failures.append(f"{name}: declared >={floor} but not installed")
         elif found < floor:

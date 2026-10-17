@@ -743,28 +743,31 @@ def _floors_workflow() -> str:
     return str(_load(_WORKFLOWS / "dependency-floors.yml")["name"])
 
 
-def test_a_cancelled_dependency_floors_nightly_opens_an_issue(tmp_path: Path) -> None:
+@pytest.mark.parametrize("conclusion", ["cancelled", "timed_out"])
+def test_a_cancelled_dependency_floors_nightly_opens_an_issue(
+    conclusion: str, tmp_path: Path
+) -> None:
     """BACKLOG #3177. That workflow's scheduled run is never superseded (its concurrency group is the
     run id), and a job that hits `timeout-minutes` concludes `cancelled`. So a hung install would be
     a red that reaches nobody if `cancelled` took the no-op path here as it does for every other
     watched workflow."""
     workflow = _floors_workflow()
-    run = _run_notice(tmp_path, workflow=workflow, conclusion="cancelled", open_issues={})
+    run = _run_notice(tmp_path, workflow=workflow, conclusion=conclusion, open_issues={})
     _ok(run)
     creates = [c for c in run.calls if c[:2] == ["issue", "create"]]
-    assert len(creates) == 1, f"a cancelled {workflow!r} nightly opened no issue{_diagnostic(run)}"
+    assert len(creates) == 1, (
+        f"a {conclusion!r} {workflow!r} nightly opened no issue{_diagnostic(run)}"
+    )
     body = _opt(creates[0], "--body")
     assert _arm_lines()[workflow] <= {line.strip() for line in body.splitlines()}, _diagnostic(run)
     # Pinned as text: the two remedies this row added, which the subset check cannot hold in place.
     assert "declares no floor this check can read" in body, _diagnostic(run)
-    assert "The run concluded cancelled" in body, _diagnostic(run)
+    assert "The run concluded cancelled or timed out" in body, _diagnostic(run)
 
 
-@pytest.mark.parametrize("conclusion", ["skipped", "timed_out"])
-def test_a_dependency_floors_run_that_did_not_fail_or_cancel_writes_nothing(
-    conclusion: str, tmp_path: Path
-) -> None:
-    """The exception is `cancelled` alone, not every non-failure conclusion."""
+def test_a_skipped_dependency_floors_run_writes_nothing(tmp_path: Path) -> None:
+    """The exception is a run that was stopped, not every non-failure conclusion."""
+    conclusion = "skipped"
     run = _run_notice(tmp_path, workflow=_floors_workflow(), conclusion=conclusion, open_issues={})
     _ok(run)
     assert _writes(run) == [], f"a {conclusion!r} run wrote something{_diagnostic(run)}"

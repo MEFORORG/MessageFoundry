@@ -14,10 +14,11 @@
 # a second time. `--resolution lowest-direct` takes the lowest release each DIRECT dependency allows
 # (the engine's own and its [dev] extra) and the newest of everything else.
 #
-# NO OVERRIDE AND NO `--raised` ENTRY. The four floors that did not install on Python 3.14 were
-# raised in pyproject.toml (vault BACKLOG #3177), so this leg installs the floors exactly as declared.
-# If one stops installing, raise it there rather than adding an override here. The floor check reads
-# only runtime dependencies, so a [dev] floor that does not hold surfaces only as a failed install.
+# NO OVERRIDE AND NO `--raised` ENTRY. At least four declared floors did not install on Python 3.14
+# and were raised in pyproject.toml (vault BACKLOG #3177). If one stops installing, raise it there
+# rather than adding an override here. The floor check reads only runtime dependencies, so a [dev]
+# floor that the resolver skips, because it is yanked or conflicts with another floor, is resolved
+# above silently and this leg stays green. Only a [dev] floor that cannot build reds the install.
 #
 # A red weekly run reaches nobody on its own, so nightly-notice.yml watches this workflow by name.
 name: dependency floors
