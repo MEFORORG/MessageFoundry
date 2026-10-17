@@ -65,6 +65,10 @@ this line.**
   `resolve_action` joins the handlers, and `PendingApprovalInfo` gains `params`,
   `caller_is_requester` and `gated`. The console also imports `ResolveOutcome` from
   `messagefoundry.api.models`, so on an older engine it fails at import, before the seam check.
+- **The reload pages say what a reload left undone.** The inline reload result page and the
+  approval page for a released reload show a banner for a degraded follow-on step and for each
+  settings trust anchor that takes a restart; before, both reached only the JSON answer. Seam
+  change: `ReloadResult` carries `restart_required`. (`BACKLOG #3015`)
 
 ### Changed
 

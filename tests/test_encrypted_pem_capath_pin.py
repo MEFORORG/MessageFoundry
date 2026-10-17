@@ -77,7 +77,7 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.auth.trust_anchors import _has_encryption_header
+from messagefoundry.auth.trust_anchors import has_encryption_header
 from tests._encrypted_pem_probe import (
     CA_COMMON_NAME,
     CAPATH_CERTIFICATE_AND_KEY,
@@ -134,8 +134,8 @@ def test_the_directory_files_are_the_ones_the_engine_calls_encrypted(shapes: Pat
         shapes / CAPATH_ENCRYPTED_CRL / f"{stem}.r0",
     )
     for path in encrypted:
-        assert _has_encryption_header(path.read_text("ascii")), path
-    assert not _has_encryption_header((shapes / CAPATH_PLAIN / f"{stem}.0").read_text("ascii"))
+        assert has_encryption_header(path.read_text("ascii")), path
+    assert not has_encryption_header((shapes / CAPATH_PLAIN / f"{stem}.0").read_text("ascii"))
 
 
 def test_the_subject_hash_is_the_value_openssl_printed() -> None:

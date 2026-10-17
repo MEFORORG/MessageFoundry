@@ -409,12 +409,20 @@ from typing import Any
 #: DTO is on the discovered surface, so the digest moved because it grew. A default of ``{}`` keeps
 #: the field additive; the pinned digest still refuses a skewed pair at mount.
 #:
+#: BACKLOG #3015: ``ReloadResult`` gained ``restart_required``, the settings trust anchors a
+#: restart must apply. The console's reload result and approval pages read it by attribute, so it
+#: forces a bump. Re-derived on batch/b260-c, the tree merged with BACKLOG #3091, #3105 and #2731,
+#: none of which moved it. The value below covers all four.
+#:
+#: 2026-10-17, batch 263 sync 2: the digest below was recomputed on the tree merged from both
+#: entries above (#2954 on the batch, #3015 on main), so it covers both.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "2b5df86a8fc5d31f"
+ENGINE_UI_SEAM: str = "29c3dad6b850d71e"
 
 
 @dataclass(frozen=True, slots=True)

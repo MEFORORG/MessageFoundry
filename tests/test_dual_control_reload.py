@@ -704,6 +704,63 @@ async def test_a_released_reload_refuses_a_swapped_settings_anchor(
         await engine.stop()
 
 
+async def test_a_released_reload_names_a_changed_settings_anchor_it_cannot_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3015: a released reload reports ``restart_required`` as the inline route does, so
+    dual control is not the quieter of the two. The control is a release before the swap, which
+    reports an empty list."""
+    good = _block(b"good")
+    anchor = tmp_path / "ad-ca.pem"
+    anchor.write_bytes(good)
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: PathVerdict(True))
+    auth = AuthSettings(admin_write_min_interval_seconds=0, ad_tls_ca_cert_file=str(anchor))
+    specs = ta.collect_anchor_specs(
+        auth,
+        ApiSettings(),
+        tls=TlsSettings(),
+        alerts=AlertsSettings(),
+        log_settings=LoggingSettings(),
+    )
+    (spec,) = specs
+    # The consumer's load, which the restart report compares against.
+    monkeypatch.setattr(ta, "_LOADED", {(spec.label, spec.path): hashlib.sha256(good).hexdigest()})
+    cfg = tmp_path / "cfg"
+    _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
+    store = await MessageStore.open(tmp_path / "dc.db")
+    engine = Engine(
+        store,
+        poll_interval=0.02,
+        config_dir=cfg,
+        settings_preflight=ta.make_settings_anchor_preflight(specs, store, enforcing=True),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        service = await _service(engine)
+        await _add(service, "op", Role.ADMINISTRATOR)
+        await _add(service, "approver", Role.ADMINISTRATOR)
+        app = create_app(engine, auth=service, approvals=GATED)
+        transport = reproving_transport(PW, app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            op, admin = await _token(c, "op"), await _token(c, "approver")
+
+            async def hold_and_release() -> dict[str, Any]:
+                held = await c.post("/config/reload", json={}, headers=op)
+                assert held.status_code == 202, held.text
+                approval_id = held.json()["approval_id"]
+                r = await c.post(f"/approvals/{approval_id}/approve", headers=admin)
+                assert r.status_code == 200, r.text
+                result: dict[str, Any] = r.json()["result"]
+                return result
+
+            assert (await hold_and_release())["restart_required"] == []
+            anchor.write_bytes(_block(b"rotated"))
+            assert (await hold_and_release())["restart_required"] == [spec.setting]
+    finally:
+        await engine.stop()
+
+
 # --- vault BACKLOG #2459: a released reload is refused like an inline one, never a 500 ----------
 
 
