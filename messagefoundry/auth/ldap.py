@@ -122,7 +122,9 @@ class LdapUnansweredError(LdapError):
     """The directory ended an operation with a result code that is not an answer (BACKLOG #3010).
 
     A subclass, so every ``except LdapError`` handles it as before; :func:`_refuse_unanswered` says
-    what that means for each caller. ``code`` is the result code, or ``None`` when the result held
+    what that means for each of its callers. A user bind raises it too, through
+    :func:`_refuse_unjudged_bind` (BACKLOG #3169), and the step-up re-bind
+    (``AuthService._reauth_ad``) reads it as ``directory_unavailable``, not counted. ``code`` is the result code, or ``None`` when the result held
     none that is an integer or a paged search was refused for its paging (:func:`_search_paged`);
     ``code_name`` is ldap3's name for the code, or the engine's for the case, never text the
     directory sent.
@@ -186,9 +188,10 @@ class DirectoryBind:
     tell a refused password from an absent or disabled account without a second directory read.
     ``answer`` is ``None`` when no lookup ran, which only an empty password causes. ``FOUND`` with
     no principal means the entry was found enabled and the directory refused the bind with a code
-    outside :data:`_UNJUDGED_BIND_CODES`, which ``authenticate`` raises instead (BACKLOG #3169). The
-    engine reads every such refusal as the password judged against that account, though a code
-    such as strongerAuthRequired (8) judges none. Any other answer means no bind was judged. None of
+    outside :data:`_UNJUDGED_BIND_CODES`. A bind on a found entry that ends with a code inside it
+    returns no answer at all: ``authenticate`` raises it instead (BACKLOG #3169). The engine reads
+    every refusal outside the set as the password judged against that account, though a code such
+    as strongerAuthRequired (8) judges none. Any other answer means no bind was judged. None of
     this may reach a client: a sign-in caller must refuse every answer alike.
     """
 

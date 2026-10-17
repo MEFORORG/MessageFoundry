@@ -12,7 +12,8 @@ would have charged a user who typed the right password. Now the bind raises
 
 Driven at three depths: the REAL ``LdapAuthenticator`` over the ldap3 doubles of
 ``tests/test_ldap_timeouts.py``; a REAL ldap3 stack decoding a bindResponse from the loopback server
-of ``tests/test_ldap_search_result_codes.py``; and the REAL ``AuthService`` step-up re-bind over the
+of ``tests/test_ldap_search_result_codes.py``, for each code, plus a Notice of Disconnection carrying
+52, which ldap3 raises as a session the server ended and never hands to the code check; and the REAL ``AuthService`` step-up re-bind over the
 doubles of ``tests/test_ad_user_account_control.py``, read where a caller meets it: the outcome, the
 engine lockout counter, the per-session re-proof budget and the ``auth.reauth`` audit row. Each
 refusal has a control on the same doubles: 49 still counts. Every other code keeps its reading from
@@ -27,6 +28,7 @@ from typing import Any
 
 import ldap3
 import pytest
+from ldap3.core.exceptions import LDAPSessionTerminatedByServerError
 from ldap3.core.results import (
     RESULT_ADMIN_LIMIT_EXCEEDED,
     RESULT_BUSY,
@@ -40,6 +42,7 @@ from messagefoundry.auth import ldap as ldap_module
 from messagefoundry.auth.ldap import (
     DirectoryAnswer,
     LdapAuthenticator,
+    LdapError,
     LdapUnansweredError,
 )
 from tests.test_ad_user_account_control import _signed_in_estate
@@ -158,12 +161,11 @@ def _alice(_raw: bytes) -> list[_Reply]:
     return [(_tlv(0x64, _tlv(0x04, _ALICE) + _tlv(0x30, attrs)), b""), _done(0)]
 
 
-@pytest.mark.parametrize(
-    "code", [RESULT_BUSY, RESULT_UNWILLING_TO_PERFORM, RESULT_INVALID_CREDENTIALS]
-)
+@pytest.mark.parametrize("code", [*(p.values[0] for p in _UNJUDGED), RESULT_INVALID_CREDENTIALS])
 def test_real_ldap3_leaves_the_bind_code_where_the_refusal_reads_it(code: int) -> None:
     """ldap3 decodes the bindResponse and leaves its code on ``conn.result``, so the refusal sees
-    it. RED if a future ldap3 cleared or moved it: the busy arms would then read as 49 does."""
+    it, for each of the four codes and the 49 control. RED if a future ldap3 cleared or moved it:
+    the outage arms would then read as 49 does."""
 
     def bind_reply(raw: bytes) -> _Reply | None:
         return _done(code, tag=_BIND_RESPONSE) if _ALICE in raw else None
@@ -217,3 +219,40 @@ async def test_a_refused_password_is_still_counted(monkeypatch: pytest.MonkeyPat
     assert not elevation.ok and elevation.directory_unconfirmed is not True
     assert failed == 1 and charged == 1
     assert not any('"reason": "directory_unavailable"' in d for d in details), details
+
+
+# --- 52 as a Notice of Disconnection: a different path, to the same reading ----------------------
+
+#: RFC 4511 section 4.4.1: an unsolicited extendedResponse under messageID 0, resultCode
+#: unavailable (52), responseName (context tag 10) naming the notice.
+_NOTICE_OF_DISCONNECTION = _tlv(
+    0x30,
+    _tlv(0x02, bytes([0]))  # messageID 0: unsolicited
+    + _tlv(
+        0x78,
+        _tlv(0x0A, bytes([RESULT_UNAVAILABLE]))
+        + _tlv(0x04, b"")
+        + _tlv(0x04, b"")
+        + _tlv(0x8A, b"1.3.6.1.4.1.1466.20036"),
+    ),
+)
+
+
+def test_real_ldap3_reads_a_notice_of_disconnection_at_the_bind_as_an_outage() -> None:
+    """A DC may answer the bind with a Notice of Disconnection, carrying 52, instead of a
+    bindResponse. ldap3 never hands that code to the refusal: it raises
+    ``LDAPSessionTerminatedByServerError`` from the bind, which ``authenticate`` maps to a plain
+    :class:`LdapError`, not :class:`LdapUnansweredError`. The step-up re-bind reads any
+    ``LdapError`` as ``directory_unavailable``, so this too is an outage, not a wrong password.
+    RED if it ever read as a refused password on the found entry."""
+
+    def bind_reply(raw: bytes) -> _Reply | None:
+        return (_NOTICE_OF_DISCONNECTION, b"") if _ALICE in raw else None
+
+    with (
+        _scripted_dc(_alice, bind_reply=bind_reply) as (_dc, authenticator),
+        pytest.raises(LdapError, match="session terminated by server") as caught,
+    ):
+        authenticator.authenticate("alice", _PASSWORD)
+    assert not isinstance(caught.value, LdapUnansweredError)
+    assert isinstance(caught.value.__cause__, LDAPSessionTerminatedByServerError)

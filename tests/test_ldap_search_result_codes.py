@@ -786,7 +786,13 @@ class _ScriptedDc:
                     else:  # unbind, or anything this server does not speak
                         return
                     for reply, controls in replies:
-                        sock.sendall(_tlv(0x30, message_id + reply + controls))
+                        # A reply that is already a whole LDAPMessage (a SEQUENCE, 0x30) goes out
+                        # as written, so a test can send one under another messageID, such as an
+                        # unsolicited notification under 0. No protocolOp tag is 0x30.
+                        if reply[:1] == b"\x30":
+                            sock.sendall(reply + controls)
+                        else:
+                            sock.sendall(_tlv(0x30, message_id + reply + controls))
         finally:
             self.ended.set()
 
