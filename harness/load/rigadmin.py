@@ -342,9 +342,12 @@ def _provision_here(db: str | None, service_config: str | None) -> int:
         print("provisioned the rig Administrator")
         return 0
     refusal = _json_error(captured.getvalue())
+    if refusal == _RIG_REFUSAL:
+        # A failure, not EXIT_EXISTS: no Administrator here signs in with a local password, so the
+        # rig could not sign in either. ``provision`` carries this text into its error.
+        print(_RIG_REFUSAL, file=sys.stderr)
+        return 1
     if _ADMIN_EXISTS in refusal:
-        if refusal == _RIG_REFUSAL:
-            print(_RIG_REFUSAL, file=sys.stderr)
         print("the store already has an enabled Administrator; nothing provisioned")
         return EXIT_EXISTS
     # The command's refusals name settings and clauses, never the password it was given.
@@ -352,12 +355,12 @@ def _provision_here(db: str | None, service_config: str | None) -> int:
     return code or 1
 
 
-#: The rig's own refusal. It carries :data:`_ADMIN_EXISTS`, so a caller reads it as the shipped
-#: "already has one" answer (:data:`EXIT_EXISTS`).
+#: The rig's own refusal, given only where the shipped command would have provisioned.
+#: It does not carry :data:`_ADMIN_EXISTS`: the rig reads it as a failure.
 _RIG_REFUSAL = (
-    "the store already has an enabled Administrator (a directory or federated one counts here), so "
-    "the load rig provisions nothing: it adds its Administrator, which has no second factor, only "
-    "to a store with no enabled Administrator at all"
+    "the store has an enabled Administrator, though none signs in with a local password (a "
+    "directory or federated one counts here), so the load rig provisions nothing: it adds its "
+    "Administrator, which has no second factor, only to a store with no enabled Administrator at all"
 )
 
 
@@ -381,13 +384,21 @@ def _keep_the_narrow_rule(cli: Any) -> None:
         refusal_of = service.provision_refusal
         write = service.provision_first_administrator
 
+        async def _only_outside_service_admins() -> bool:
+            # The case step 1 opened: an enabled Administrator, but none the shipped rule counts.
+            # Where a local one counts, the shipped command refuses in its own words.
+            if await service.has_self_sufficient_administrator():
+                return False
+            return bool(await service.has_enabled_administrator())
+
         async def _refusal(*a: Any, **kw: Any) -> Any:
-            if await service.has_enabled_administrator():
+            shipped = await refusal_of(*a, **kw)
+            if shipped is None and await _only_outside_service_admins():
                 return _RIG_REFUSAL
-            return await refusal_of(*a, **kw)
+            return shipped
 
         async def _write(*a: Any, **kw: Any) -> Any:
-            if await service.has_enabled_administrator():
+            if await _only_outside_service_admins():
                 from messagefoundry.auth.service import FirstAdministratorRefused
 
                 raise FirstAdministratorRefused(_RIG_REFUSAL)
