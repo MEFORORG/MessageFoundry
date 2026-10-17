@@ -19,15 +19,20 @@ a GET, and a POST with neither header is still refused.
 
 from __future__ import annotations
 
+import ast
+import re
 import time
+from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
 
 import httpx
 import pytest
 from _ui_clients import HEADERLESS_UI_REQUEST
 from _ui_clients import SAME_ORIGIN as _SAME
+from test_browser_support_doc import _row_for
 from test_ui_directory_admin_alert import _SUBJECT, _service, _Sink
 
+import messagefoundry_webconsole
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
 from messagefoundry.auth.oidc import FederatedPrincipal
@@ -38,6 +43,12 @@ from messagefoundry.pipeline import Engine
 _NEGOTIATE = {"Authorization": "Negotiate c3BuZWdvLXRva2Vu"}
 #: Sends the request exactly as written; the suite's browser stand-in adds nothing to it.
 _HEADERLESS = {HEADERLESS_UI_REQUEST: True}
+
+#: The sign-in GETs this file drives. ``test_the_sign_in_gets_are_derived_from_the_routes`` holds
+#: this set to the GET routes the sign-in modules register, and to the list in the user-facing doc.
+_SIGN_IN_GETS = frozenset({"/ui/sso", "/ui/oidc/callback", "/ui/oidc/start"})
+#: The route modules that register the console's federated and Kerberos sign-in legs.
+_SIGN_IN_MODULES = ("sso.py", "oidc.py")
 
 
 def _client(engine: Engine, service: AuthService, *, interstitial: bool) -> httpx.AsyncClient:
@@ -171,3 +182,49 @@ async def test_oidc_start_post_with_neither_header_is_still_refused(engine: Engi
         assert "set-cookie" not in refused.headers
         named = await c.post("/ui/oidc/start", headers=_SAME, follow_redirects=False)
         assert named.status_code == 303, named.text
+
+
+def _registered_gets(module: Path) -> set[str]:
+    """Every path ``module`` registers with ``@app.get(...)``, read from its source."""
+    paths: set[str] = set()
+    for node in ast.walk(ast.parse(module.read_text(encoding="utf-8"))):
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        for decorator in node.decorator_list:
+            if (
+                isinstance(decorator, ast.Call)
+                and isinstance(decorator.func, ast.Attribute)
+                and decorator.func.attr == "get"
+                and decorator.args
+                and isinstance(decorator.args[0], ast.Constant)
+                and isinstance(decorator.args[0].value, str)
+            ):
+                paths.add(decorator.args[0].value)
+    return paths
+
+
+def test_the_sign_in_gets_are_derived_from_the_routes() -> None:
+    """The sign-in GETs are an enumeration, and it was restated by hand in several places with
+    nothing deriving it (vault BACKLOG #3316). It is derived here: every GET the sign-in route
+    modules register is one this file drives, and the ``Origin`` row of ``docs/BROWSER-SUPPORT.md``,
+    the one place the list is written for a reader, names exactly those routes. A new sign-in GET
+    therefore fails here until it is tested and listed."""
+    routes = Path(messagefoundry_webconsole.__file__).parent / "routes"
+    derived: set[str] = set()
+    for name in _SIGN_IN_MODULES:
+        found = _registered_gets(routes / name)
+        # positive control: each module registers at least one GET, so an extraction that
+        # found nothing cannot pass as agreement
+        assert found, name
+        derived |= found
+    assert derived == _SIGN_IN_GETS, sorted(derived ^ _SIGN_IN_GETS)
+    driven = set(
+        re.findall(r'c\.get\(\s*"(/ui/[^"]+)"', Path(__file__).read_text(encoding="utf-8"))
+    )
+    assert driven >= _SIGN_IN_GETS, sorted(_SIGN_IN_GETS - driven)
+    row = " | ".join(_row_for("`Origin` on a form POST"))
+    listed = set(re.findall(r"`GET (/ui/[^`\s]+)`", row))
+    assert listed == _SIGN_IN_GETS, (
+        f"docs/BROWSER-SUPPORT.md lists {sorted(listed)} as the sign-in GETs; the code "
+        f"registers {sorted(_SIGN_IN_GETS)}"
+    )

@@ -26,10 +26,14 @@ from typing import Any
 
 import httpx
 import pytest
-from _ui_clients import HEADERLESS_UI_REQUEST, create_local_user_chosen, origin_check_request
+from _ui_clients import (
+    HEADERLESS_UI_REQUEST,
+    create_local_user_chosen,
+    fetch_metadata_answer,
+    origin_check_request,
+)
 from fastapi import HTTPException
 from starlette.datastructures import Headers
-from starlette.types import Message, Receive, Scope, Send
 
 import messagefoundry_webconsole
 import messagefoundry_webconsole._auth as webconsole_auth
@@ -38,7 +42,6 @@ from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
-from messagefoundry_webconsole._security import UiFetchMetadataMiddleware
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 
@@ -290,8 +293,9 @@ def _verdict(method: str, site: str | None, origin: str | None) -> str:
 
 
 def test_the_docstring_rule_table_is_what_the_function_does() -> None:
-    """The docstring of ``assert_same_origin`` is the ONE complete statement of the /ui origin
-    rule, and every other document points at it. Hand-written copies of that rule disagreed with
+    """The docstring of ``assert_same_origin`` is the one statement of the /ui origin rule for one
+    line of each header, and every other document points at it. The docstring also names what the
+    table does not cover, so "complete" would claim more than it holds. Hand-written copies of that rule disagreed with
     the code three times on this branch. So the table is read out of the docstring and the function
     is driven over every row, with several concrete header values per state.
 
@@ -361,31 +365,8 @@ _DISAGREEING = (("cross-site", "same-origin"), ("same-origin", "cross-site"), ("
 
 
 async def _middleware_answer(method: str, lines: tuple[str, ...]) -> tuple[int, bytes]:
-    """Put ``lines`` as repeated ``Sec-Fetch-Site`` headers through the fetch-metadata middleware
-    alone, in front of an app that answers 200."""
-
-    async def inner(scope: Scope, receive: Receive, send: Send) -> None:
-        await send({"type": "http.response.start", "status": 200, "headers": []})
-        await send({"type": "http.response.body", "body": b"inner"})
-
-    async def receive() -> Message:
-        return {"type": "http.request", "body": b"", "more_body": False}
-
-    sent: list[Message] = []
-
-    async def send(message: Message) -> None:
-        sent.append(message)
-
-    scope: Scope = {
-        "type": "http",
-        "method": method,
-        "path": "/ui/login",
-        "headers": [(b"sec-fetch-site", line.encode("latin-1")) for line in lines],
-    }
-    await UiFetchMetadataMiddleware(inner)(scope, receive, send)
-    status_code = next(m["status"] for m in sent if m["type"] == "http.response.start")
-    body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
-    return int(status_code), body
+    """Put ``lines`` as repeated ``Sec-Fetch-Site`` headers through the fetch-metadata middleware."""
+    return await fetch_metadata_answer(method, [("sec-fetch-site", line) for line in lines])
 
 
 @pytest.mark.parametrize("method", ["GET", "POST"])

@@ -25,6 +25,7 @@ from typing import Any
 import httpx
 import pytest
 from starlette.datastructures import Headers
+from starlette.types import Message, Receive, Scope, Send
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import totp
@@ -33,6 +34,7 @@ from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry_webconsole._security import UiFetchMetadataMiddleware
 
 #: >=15 characters, no app or vendor terms -- satisfies the ASVS password policy (WP-3).
 PW = "a-strong-test-passphrase"
@@ -66,6 +68,38 @@ def origin_check_request(
         headers=Headers(raw=raw),
         app=SimpleNamespace(state=SimpleNamespace(**{**posture, **state})),
     )
+
+
+async def fetch_metadata_answer(
+    method: str, headers: Sequence[tuple[str, str]], path: str = "/ui/login"
+) -> tuple[int, bytes]:
+    """Put one request through ``UiFetchMetadataMiddleware`` alone, in front of an app that
+    answers 200 with the body ``inner``, and return the status and body that came back.
+
+    ``headers`` are ``(name, value)`` pairs, so one name may repeat, as on the wire."""
+
+    async def inner(scope: Scope, receive: Receive, send: Send) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"inner"})
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    sent: list[Message] = []
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    scope: Scope = {
+        "type": "http",
+        "method": method,
+        "path": path,
+        "headers": [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers],
+    }
+    await UiFetchMetadataMiddleware(inner)(scope, receive, send)
+    status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+    body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+    return int(status), body
 
 
 async def auth_service(engine: Engine) -> AuthService:

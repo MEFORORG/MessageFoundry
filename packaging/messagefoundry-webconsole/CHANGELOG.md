@@ -131,14 +131,14 @@ this line.**
   standard defines.
   A current browser sends `Sec-Fetch-Site` on every request, so the console's pages are unaffected
   there. A browser that sends neither header on its own form POST could not sign in with a
-  password or change anything, sign-out included; `docs/BROWSER-SUPPORT.md` says what is and is
-  not measured about such a browser. A
-  script that drives `/ui` must now send `Origin`. The CSP report sink `/ui/csp-report` still
-  accepts a report with neither. A GET is not held to this: three sign-in GETs are deliberately
-  not blocked for missing fetch metadata, under owner rulings R4 and R4b of 2026-09-28: `GET
-  /ui/sso`, `GET /ui/oidc/callback`, and `GET /ui/oidc/start` when its interstitial is skipped.
-  The complete rule is the table in the `assert_same_origin` docstring
-  (`messagefoundry_webconsole/_auth.py`). No seam change. (BACKLOG #1116, #1124)
+  password or submit any `/ui` form, sign-out included; `docs/BROWSER-SUPPORT.md` says what is
+  and is not measured about such a browser. A script that drives `/ui` must now send `Origin`.
+  The CSP report sink `/ui/csp-report`, which changes nothing, still accepts a report with
+  neither. A GET is not held to this: the sign-in GETs deliberately not blocked for missing fetch
+  metadata, under owner rulings R4 and R4b of 2026-09-28, are listed in the `Origin` row of
+  `docs/BROWSER-SUPPORT.md`. The rule for one line of each header is the table in the
+  `assert_same_origin` docstring (`messagefoundry_webconsole/_auth.py`), which also names what
+  the table does not cover. No seam change. (BACKLOG #1116, #1124)
 - **The user page's self-target refusals are audited, with your address.** Reset-password,
   reset-mfa, link, unlink, disable and delete now pass the request to the engine's handler. The
   engine refuses your own account by its stored id too, and writes `auth.self_target_refused`.

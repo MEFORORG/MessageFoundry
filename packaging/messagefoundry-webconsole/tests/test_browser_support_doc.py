@@ -26,6 +26,7 @@ Each carries a positive control, so a green run cannot be an extraction that fou
 
 from __future__ import annotations
 
+import ast
 import inspect
 import os
 import re
@@ -35,7 +36,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
-from _ui_clients import origin_check_request
+from _ui_clients import fetch_metadata_answer, origin_check_request
 from fastapi import HTTPException
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from starlette.datastructures import Headers
@@ -182,26 +183,8 @@ _SAFE_SAME_SITE_NAVIGATION = {
 
 
 async def _middleware_status(headers: dict[str, str]) -> int:
-    async def inner(scope: Scope, receive: Receive, send: Send) -> None:
-        await send({"type": "http.response.start", "status": 200, "headers": []})
-        await send({"type": "http.response.body", "body": b""})
-
-    async def receive() -> Message:
-        return {"type": "http.request", "body": b"", "more_body": False}
-
-    sent: list[Message] = []
-
-    async def send(message: Message) -> None:
-        sent.append(message)
-
-    scope: Scope = {
-        "type": "http",
-        "method": "GET",
-        "path": "/ui",
-        "headers": [(k.encode("latin-1"), v.encode("latin-1")) for k, v in headers.items()],
-    }
-    await security.UiFetchMetadataMiddleware(inner)(scope, receive, send)
-    return int(next(m["status"] for m in sent if m["type"] == "http.response.start"))
+    status, _ = await fetch_metadata_answer("GET", list(headers.items()), path="/ui")
+    return status
 
 
 async def test_each_fetch_metadata_rows_absence_verdict_matches_the_middleware() -> None:
@@ -338,6 +321,51 @@ def test_the_opt_out_section_names_the_cookies_the_resolvers_return(
         assert f"`{name}`" in " ".join(clear_rows[0][1:]), (name, clear_rows[0])
     if webconsole_auth.COOKIE_NAME not in opted_out:
         assert "plain session cookie" not in _section(_TWO_CONFIGURATIONS_HEADING)
+
+
+def _serve_opt_out_warning() -> str:
+    """The text ``messagefoundry serve`` prints when the opt-out is set, read from its source: the
+    first argument of the ``print`` under ``if not browser_hardening_enabled():``."""
+    import messagefoundry
+
+    main = Path(messagefoundry.__file__).parent / "__main__.py"
+    found: list[str] = []
+    for node in ast.walk(ast.parse(main.read_text(encoding="utf-8"))):
+        test = node.test if isinstance(node, ast.If) else None
+        if not (
+            isinstance(test, ast.UnaryOp)
+            and isinstance(test.op, ast.Not)
+            and isinstance(test.operand, ast.Call)
+            and isinstance(test.operand.func, ast.Name)
+            and test.operand.func.id == "browser_hardening_enabled"
+        ):
+            continue
+        for call in ast.walk(node):
+            if (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "print"
+                and any(kw.arg == "file" for kw in call.keywords)
+            ):
+                found.append(ast.unparse(call.args[0]))
+    assert len(found) == 1, found
+    return found[0]
+
+
+def test_the_opt_out_paragraph_matches_the_serve_warning() -> None:
+    """The section says ``messagefoundry serve`` warns about the opt-out on standard error, naming
+    the variable and the nonce CSP, COOP and CSP reporting, and that the line does NOT name the
+    banners (vault BACKLOG #3316). Each half is read off the print in ``__main__.py``."""
+    warning = _serve_opt_out_warning()
+    section = _section(_TWO_CONFIGURATIONS_HEADING)
+    # positive control: the extraction found the warning, not some other print
+    assert "warning:" in warning and "BROWSER_HARDENING_OPT_OUT_ENV" in warning, warning
+    assert "`messagefoundry serve` warns about it" in section
+    for fact in ("nonce CSP", "COOP", "CSP reporting"):
+        assert fact in warning, (fact, warning)
+        assert fact in section, fact
+    assert "banner" not in warning.lower(), warning
+    assert "That line does not name the three" in section
 
 
 # --- the HSTS condition -----------------------------------------------------------------------------

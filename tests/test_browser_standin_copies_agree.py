@@ -18,6 +18,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from tests._ast_sites import named_func
+
 _REPO = Path(__file__).resolve().parents[1]
 _ENGINE_CONFTEST = _REPO / "tests" / "conftest.py"
 _CONSOLE_TESTS = _REPO / "packaging" / "messagefoundry-webconsole" / "tests"
@@ -34,19 +36,8 @@ def _module(path: Path) -> ast.Module:
 
 def _wrapper(path: Path) -> str:
     """The stand-in's inner wrapper, as an AST dump (comments and docstrings do not count)."""
-    fixtures = [
-        node
-        for node in ast.walk(_module(path))
-        if isinstance(node, ast.FunctionDef) and node.name == _FIXTURE
-    ]
-    assert len(fixtures) == 1, f"{path}: expected one {_FIXTURE}, found {len(fixtures)}"
-    wrappers = [
-        node
-        for node in ast.walk(fixtures[0])
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == _WRAPPER
-    ]
-    assert len(wrappers) == 1, f"{path}: expected one {_WRAPPER}, found {len(wrappers)}"
-    return ast.dump(wrappers[0], include_attributes=False)
+    wrapper = named_func(named_func(_module(path), _FIXTURE), _WRAPPER)
+    return ast.dump(wrapper, include_attributes=False)
 
 
 def _constant(path: Path, name: str) -> object:
