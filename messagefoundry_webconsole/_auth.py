@@ -901,19 +901,25 @@ def _new_address_continuation(request: Request, *, landing: str) -> str:
     ``landing``. A query is never dropped to make a target fit.
 
     The path is the one the browser sent, still percent-encoded (vault BACKLOG #3052 item 8). Built
-    from the decoded path, an encoded ``?`` inside a segment became a query on the way back. The
-    decoded path must name a registered unlock page too, so an encoded ``/`` or ``..`` cannot pass
-    as one segment and resolve to another page once the browser follows it."""
+    from the decoded path, an encoded ``?`` inside a segment became a query on the way back. A
+    path the browser would rewrite before it follows the 303 goes to ``landing`` instead, so it
+    cannot pass the registry as one page and arrive at another: an encoded ``/``, ``.`` or ``\\``,
+    a literal ``\\``, a ``.`` or ``..`` segment once decoded, or a byte outside ASCII."""
     if request.method == "GET":
+        decoded: str = request.scope["path"]
         raw = request.scope.get("raw_path")
-        path = raw.decode("latin-1") if isinstance(raw, bytes) else request.url.path
+        # No raw path from the server: re-encode the decoded one, so a decoded "?" stays in its
+        # segment rather than cutting the path where request.url would.
+        path = raw.decode("latin-1") if isinstance(raw, bytes) else quote(decoded, safe="/")
+        if (
+            not path.isascii()
+            or any(token in path.lower() for token in ("%2f", "%2e", "%5c", "\\"))
+            or any(segment in (".", "..") for segment in decoded.split("/"))
+        ):
+            return landing
         query = request.scope.get("query_string", b"").decode("latin-1")
         target = path + (f"?{query}" if query else "")
-        if (
-            len(target) <= _REAUTH_NEXT_MAX
-            and is_unlock_action(target)
-            and is_unlock_action(request.scope["path"])
-        ):
+        if len(target) <= _REAUTH_NEXT_MAX and is_unlock_action(target):
             return target
     return landing
 

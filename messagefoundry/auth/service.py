@@ -37,7 +37,7 @@ from collections.abc import (
 )
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import cache, partial
 from types import MappingProxyType
@@ -374,12 +374,24 @@ _NEW_IP_DEDUP_MAX = 4096
 # that has already been reported nine times, and the step-up stays forced for every further address.
 # With _NEW_IP_DEDUP_MAX it bounds the cache at 4096 x 9 address keys.
 _NEW_IP_PER_SESSION_MAX = 8
-# Vault BACKLOG #3052 item 16: at most one "already flagged" WARNING per session per this many
-# seconds, in each engine process. Such a request is still refused every time, and its address
-# already has its audit row; only the log line is held back, so a refused token replayed in a loop
-# cannot flood the general log. The past-the-cap line is not held back: it is the only record of
-# an address that writes no row.
+# Vault BACKLOG #3052 item 16: past an address's first record, at most one new-address WARNING per
+# session per this many seconds, in each engine process. Such a request is still refused every
+# time; only the log line is held back, so a refused token replayed in a loop cannot flood the
+# general log. An address already reported has its audit row. An address past the per-session cap
+# writes no row, so its FIRST sighting always logs, with the address, for up to
+# _NEW_IP_OVER_CAP_LOG_MAX such addresses per session; its repeats share the interval.
 _NEW_IP_REPEAT_LOG_SECONDS = 60.0
+_NEW_IP_OVER_CAP_LOG_MAX = 64
+
+
+@dataclass
+class _NewIpLogState:
+    """One session's new-address log throttle (vault BACKLOG #3052 item 16): when it last wrote a
+    held-back line, and the past-the-cap addresses whose first sighting it has already logged."""
+
+    last_line: float | None = None
+    over_cap_logged: set[str] = field(default_factory=set)
+
 
 # The first-seen login-address signal (BACKLOG #288, ASVS 8.2.4). Its baseline is the store's
 # per-account ``known_login_addresses`` record (vault BACKLOG #2145), read at every session mint with
@@ -2590,9 +2602,10 @@ class AuthService:
         # re-anchor drops the entry (_restart_new_ip_dedupe). Bounded twice: _NEW_IP_DEDUP_MAX sessions,
         # and _NEW_IP_PER_SESSION_MAX + 1 keys each (the last is the cap-reached row's address).
         self._new_ip_seen: dict[str, set[str]] = {}
-        # Vault BACKLOG #3052: token_hash -> monotonic time of the session's last "already flagged"
-        # WARNING (_new_ip_repeat_log_due). Bounded by _NEW_IP_DEDUP_MAX sessions.
-        self._new_ip_repeat_logged: dict[str, float] = {}
+        # Vault BACKLOG #3052: token_hash -> the session's new-address log throttle
+        # (_new_ip_log_due). Bounded by _NEW_IP_DEDUP_MAX sessions, and moved, reset and evicted
+        # beside _new_ip_seen.
+        self._new_ip_logged: dict[str, _NewIpLogState] = {}
         # BACKLOG #288: (user id, address) -> monotonic time of the last ``login_new_ip`` notice.
         self._login_new_ip_noticed: dict[tuple[str, str], float] = {}
         # In-flight WebAuthn ceremony challenges (ADR 0068 §2): bounded, TTL'd, process-local —
@@ -7976,6 +7989,8 @@ class AuthService:
           the step-up. A re-verification drops the entry before it rotates (BACKLOG #2159), so a
           strand costs something on a rotation WITHOUT one, such as a passkey assertion or an
           enrolment confirm: every address already reported would be audited and notified again.
+        * ``_new_ip_logged`` — the new-address log throttle (vault BACKLOG #3052). Stranded ⇒ one
+          extra WARNING line, and a dead entry until eviction.
         * ``_reproof_session_failures`` — the BACKLOG #1138 per-session re-proof budget. Stranded,
           any rotation would hand the session a fresh budget of guesses.
 
@@ -7992,6 +8007,9 @@ class AuthService:
         seen = self._new_ip_seen.pop(old_hash, None)
         if seen is not None:
             self._new_ip_seen[new_hash] = seen
+        logged = self._new_ip_logged.pop(old_hash, None)
+        if logged is not None:
+            self._new_ip_logged[new_hash] = logged
         failures = self._reproof_session_failures.pop(old_hash, None)
         if failures is not None:
             self._reproof_session_failures[new_hash] = failures
@@ -9893,18 +9911,29 @@ class AuthService:
         flagged.add(address_key)
         return "audit" if len(flagged) <= _NEW_IP_PER_SESSION_MAX else "audit_cap_reached"
 
-    def _new_ip_repeat_log_due(self, token_hash: str) -> bool:
-        """Whether this session's "already flagged" WARNING may be written now: at most once per
-        ``_NEW_IP_REPEAT_LOG_SECONDS`` (vault BACKLOG #3052 item 16). The refusal never depends on
-        it. Per process and bounded, so an eviction can only ever write one extra line."""
+    def _new_ip_log_due(self, token_hash: str, over_cap_key: str | None = None) -> bool:
+        """Whether this session's new-address WARNING may be written now (vault BACKLOG #3052
+        item 16). ``over_cap_key`` is the host key of an address past the per-session cap: its
+        first sighting is always due, for up to ``_NEW_IP_OVER_CAP_LOG_MAX`` addresses, because
+        that line is its only record. Any other line is due at most once per
+        ``_NEW_IP_REPEAT_LOG_SECONDS``. The refusal never depends on it. Per process and bounded,
+        so an eviction can only ever write extra lines, never hide a refusal."""
+        state = self._new_ip_logged.get(token_hash)
+        if state is None:
+            if len(self._new_ip_logged) >= _NEW_IP_DEDUP_MAX:
+                self._new_ip_logged.pop(next(iter(self._new_ip_logged)))
+            state = self._new_ip_logged[token_hash] = _NewIpLogState()
+        if (
+            over_cap_key is not None
+            and over_cap_key not in state.over_cap_logged
+            and len(state.over_cap_logged) < _NEW_IP_OVER_CAP_LOG_MAX
+        ):
+            state.over_cap_logged.add(over_cap_key)
+            return True
         now = time.monotonic()
-        last = self._new_ip_repeat_logged.get(token_hash)
-        if last is not None and now - last < _NEW_IP_REPEAT_LOG_SECONDS:
+        if state.last_line is not None and now - state.last_line < _NEW_IP_REPEAT_LOG_SECONDS:
             return False
-        self._new_ip_repeat_logged.pop(token_hash, None)
-        if len(self._new_ip_repeat_logged) >= _NEW_IP_DEDUP_MAX:
-            self._new_ip_repeat_logged.pop(next(iter(self._new_ip_repeat_logged)))
-        self._new_ip_repeat_logged[token_hash] = now
+        state.last_line = now
         return True
 
     def _restart_new_ip_dedupe(self, token_hash: str) -> None:
@@ -9916,8 +9945,8 @@ class AuthService:
         re-anchor rather than on ``reauth_at`` keeps it free of the wall clock, which can step
         back."""
         self._new_ip_seen.pop(token_hash, None)
-        # The repeat-line throttle starts over too, so the first repeat after a re-anchor logs.
-        self._new_ip_repeat_logged.pop(token_hash, None)
+        # The log throttle starts over too, so the first repeat after a re-anchor logs.
+        self._new_ip_logged.pop(token_hash, None)
 
     async def _classify_login_address(self, user: UserRecord, client: str | None) -> _LoginAddress:
         """The first-seen login-address signal's verdict for one sign-in (BACKLOG #288, ASVS 8.2.4).
@@ -10141,7 +10170,9 @@ class AuthService:
         epoch still return ``True`` (so the step-up stays forced) but only log to the rotating ops
         log — so a token replayed in a tight loop, from one address or alternating between several,
         cannot inflate the audit table / notification channel (mirrors the ``_rate_limited``
-        precedent). One epoch audits at most ``_NEW_IP_PER_SESSION_MAX`` addresses, plus one row
+        precedent). Those log lines are throttled too, to one per session per
+        ``_NEW_IP_REPEAT_LOG_SECONDS``, except the first sighting of each address past the cap
+        (:meth:`_new_ip_log_due`, vault BACKLOG #3052). One epoch audits at most ``_NEW_IP_PER_SESSION_MAX`` addresses, plus one row
         carrying ``cap_reached`` for the first address past that, because this runs on every
         sensitive request (BACKLOG #2159). The step-up
         dependencies treat ``True`` as "force a fresh step-up"; a successful re-verify (``POST
@@ -10180,7 +10211,7 @@ class AuthService:
         # alternates between addresses (BACKLOG #2159).
         flag = self._first_new_ip_flag(token_hash, seen_key)
         if flag == "repeat":
-            if self._new_ip_repeat_log_due(token_hash):
+            if self._new_ip_log_due(token_hash):
                 _log.warning(
                     "a request from a new client address must re-verify; the address was already "
                     "flagged since the session's last re-verification (audit suppressed; repeats "
@@ -10191,14 +10222,16 @@ class AuthService:
             return True
         if flag == "over_cap":
             # Past the cap no row is written, so this line is the only record of where the token
-            # is being used from. The address is attacker-supplied text on a proxied hop.
-            _log.warning(
-                "a request from a new client address must re-verify; the address is past the "
-                "per-session cap of %d (audit suppressed): path=%s seen_ip=%s",
-                _NEW_IP_PER_SESSION_MAX,
-                path,
-                scrub_log_argument(client_ip),
-            )
+            # is being used from: each address's first sighting logs, and its repeats are held to
+            # the session's interval. The address is attacker-supplied text on a proxied hop.
+            if self._new_ip_log_due(token_hash, seen_key):
+                _log.warning(
+                    "a request from a new client address must re-verify; the address is past the "
+                    "per-session cap of %d (audit suppressed): path=%s seen_ip=%s",
+                    _NEW_IP_PER_SESSION_MAX,
+                    path,
+                    scrub_log_argument(client_ip),
+                )
             return True
         detail: dict[str, object] = {
             "path": path,

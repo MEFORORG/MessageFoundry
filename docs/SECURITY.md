@@ -544,7 +544,8 @@ paragraph after this list describes:
   connection start/stop/restart/flag/test/test-credential, `POST /statistics/reset`, the four
   `/alerts/{id}/*` writes, approvals approve/reject,
   `POST /status/integrity-check`, and since BACKLOG #287 `PATCH /logging/level`,
-  `DELETE /search/presets/{preset_id}` and `POST /alerts/test-email`.
+  `DELETE /search/presets/{preset_id}` and `POST /alerts/test-email`, and since vault BACKLOG
+  #3052 `POST /me/notify-email`, as its console twin is.
 
 Both charge **non-GET requests only**, so the step-up **GET**s are exempt from *that* limiter by design
 — they are reads, not writes — but they are not unpaced: the **four** that select PHI in bulk
@@ -3068,8 +3069,10 @@ alone:
    but cannot inflate the audit log / notifications (BACKLOG #2159).
    A repeat from an address already reported writes a WARNING line instead, at most one per
    session per minute in each process (`_NEW_IP_REPEAT_LOG_SECONDS`, vault BACKLOG #3052), so a
-   refused token replayed in a loop cannot flood the general log either. The line for an address
-   past the cap is not held back: that address writes no row, so the line is its only record.
+   refused token replayed in a loop cannot flood the general log either. An address past the cap
+   writes no row, so the line is its only record: its first sighting always logs, with the
+   address, for up to 64 such addresses per session (`_NEW_IP_OVER_CAP_LOG_MAX`), and its repeats
+   share the per-minute limit.
    **That bound is per process, and the owner accepted it as one (vault BACKLOG #2951, owner
    ruling 2026-10-16, "Accept, doc only").** The record that enforces it is `_new_ip_seen` on
    `AuthService`. It maps each session's token hash to the addresses already flagged, and it lives

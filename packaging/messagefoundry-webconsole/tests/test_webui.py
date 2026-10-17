@@ -9122,7 +9122,7 @@ def test_a_new_address_continuation_keeps_the_path_encoded() -> None:
     page, so those fall back to the landing."""
     from starlette.requests import Request
 
-    from messagefoundry_webconsole._auth import _new_address_continuation
+    from messagefoundry_webconsole._auth import _new_address_continuation, is_unlock_action
 
     def req(path: str, raw: str, query: str = "") -> Request:
         scope = {
@@ -9144,10 +9144,35 @@ def test_a_new_address_continuation_keeps_the_path_encoded() -> None:
     assert _new_address_continuation(req("/ui/messages/ab", "/ui/messages/ab"), landing=land) == (
         "/ui/messages/ab"
     )
-    slash = req("/ui/messages/a/b", "/ui/messages/a%2Fb")
-    assert _new_address_continuation(slash, landing=land) == land
-    dots = req("/ui/messages/..", "/ui/messages/%2e%2e")
-    assert _new_address_continuation(dots, landing=land) == land
+    # An encoded "#" stays in its id too, and so does an encoded "?" on a page whose pattern
+    # takes no query (review round 1: a decoded-path recheck refused both).
+    hashed = req("/ui/messages/a#b", "/ui/messages/a%23b")
+    assert _new_address_continuation(hashed, landing=land) == "/ui/messages/a%23b"
+    user_page = "/ui/users/a%3Fb"
+    assert is_unlock_action(user_page) and not is_unlock_action(user_page + "?x=1")
+    assert _new_address_continuation(req("/ui/users/a?b", user_page), landing=land) == user_page
+    # A path the browser would rewrite before following the 303 falls back to the landing.
+    for decoded, raw in (
+        ("/ui/messages/a/b", "/ui/messages/a%2Fb"),
+        ("/ui/messages/a?/raw", "/ui/messages/a%3F%2Fraw"),
+        ("/ui/messages/..", "/ui/messages/%2e%2e"),
+        ("/ui/messages/.", "/ui/messages/%2E"),
+        ("/ui/messages/a\\b", "/ui/messages/a%5Cb"),
+        ("/ui/messages/a\\b", "/ui/messages/a\\b"),
+        ("/ui/messages/.", "/ui/messages/."),
+    ):
+        assert _new_address_continuation(req(decoded, raw), landing=land) == land, raw
+    # No raw path from the server: the decoded "?" is re-encoded, never read as a query.
+    bare = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/ui/messages/a?b",
+            "query_string": b"x=1",
+            "headers": [],
+        }
+    )
+    assert _new_address_continuation(bare, landing=land) == "/ui/messages/a%3Fb?x=1"
 
 
 async def test_an_encoded_question_mark_survives_the_new_address_reauth(engine: Engine) -> None:

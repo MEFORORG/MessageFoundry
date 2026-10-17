@@ -229,8 +229,9 @@ async def test_repeat_warning_is_held_to_one_per_session_per_interval(
     """RED when: every refused repeat from an already-reported address writes its own WARNING
     line (vault BACKLOG #3052 item 16), so a token replayed in a loop floods the general log. The
     refusal itself must stay on every request, and the line comes back once the interval passes.
-    The past-the-cap line is the control that is NOT held back: it is the only record of an
-    address that writes no row."""
+    Past the cap, each address's FIRST sighting must still log with its address, because that
+    line is its only record, while its repeats share the interval (review round 1: the past-the-cap
+    line was a flood of its own). A rotation carries the throttle to the new token."""
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
@@ -246,17 +247,27 @@ async def test_repeat_warning_is_held_to_one_per_session_per_interval(
                 assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
             assert repeat_lines() == 1
             # The interval passes (moved back on the record, not on the clock the loop runs on).
-            service._new_ip_repeat_logged[hash_token(token)] -= _NEW_IP_REPEAT_LOG_SECONDS + 1
+            state = service._new_ip_logged[hash_token(token)]
+            assert state.last_line is not None
+            state.last_line -= _NEW_IP_REPEAT_LOG_SECONDS + 1
             assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
             assert repeat_lines() == 2
-            # Past the cap every request still logs, address included.
+            # Past the cap: a first sighting logs with its address, its repeats are held back.
             for i in range(_NEW_IP_PER_SESSION_MAX):
                 assert await service.flag_new_client_ip(token, f"10.3.3.{i}", path="/users")
             caplog.clear()
             for _ in range(3):
                 assert await service.flag_new_client_ip(token, "10.4.4.4", path="/users") is True
-            past_cap = [r for r in caplog.records if "past the per-session cap" in r.getMessage()]
-            assert len(past_cap) == 3
+            assert await service.flag_new_client_ip(token, "10.5.5.5", path="/users") is True
+            past_cap = [
+                r.getMessage() for r in caplog.records if "past the per-session" in r.getMessage()
+            ]
+            assert len(past_cap) == 2 and "10.4.4.4" in past_cap[0] and "10.5.5.5" in past_cap[1]
+        # A rotation moves the throttle with the session, as it moves the dedupe.
+        new_hash = hash_token("rotated-token")
+        service._rekey_token_state(hash_token(token), new_hash)
+        assert service._new_ip_logged.get(new_hash) is state
+        assert hash_token(token) not in service._new_ip_logged
     finally:
         await store.close()
 
@@ -833,6 +844,38 @@ async def test_filling_the_notification_address_from_a_second_address_is_refused
         assert r.status_code == 200, r.text
     user = await service.store.get_user_by_username("boss")
     assert user is not None and user.notify_email == "boss@example.test"
+
+
+async def test_a_confined_session_from_a_second_address_still_has_a_way_out(
+    engine: Engine,
+) -> None:
+    """RED when: a session confined to setting its notification address, calling from a host it
+    has not verified from, is left with no way out (vault BACKLOG #3052 item 6, review round 1).
+    With a notice channel wired the account is confined; ``POST /me/notify-email`` is refused with the
+    step-up answer, ``POST /me/reauth`` must stay reachable and re-anchor, and the fill then
+    lands. Any other route stays confined, which is the control that the confinement is live."""
+    service = AuthService(
+        engine.store,
+        AuthSettings(
+            admin_write_min_interval_seconds=0, admin_new_ip_step_up=True, require_mfa=False
+        ),
+        security_notifier=_FakeNotifier(),
+    )
+    await service.initialize()
+    await _add_admin(service, "boss")
+    body = {"email": "boss@example.test"}
+    async with _client_at(engine, service, "10.0.0.1") as a:
+        token = await _login_token(a)
+    async with _client_at(engine, service, "10.9.9.9") as b:
+        confined = await b.get("/users", headers=_auth(token))
+        assert (confined.status_code, confined.headers.get("X-Notify-Email-Required")) == (403, "1")
+        r = await b.post("/me/notify-email", headers=_auth(token), json=body)
+        assert (r.status_code, r.headers.get("X-Step-Up-Required")) == (403, "1"), r.text
+        ok = await b.post("/me/reauth", headers=_auth(token), json={"password": PW})
+        assert ok.status_code == 200, ok.text
+        token = str(ok.json()["token"])
+        r = await b.post("/me/notify-email", headers=_auth(token), json=body)
+        assert r.status_code == 200, r.text
 
 
 async def test_a_refusal_for_a_new_address_charges_no_budget(engine: Engine) -> None:
