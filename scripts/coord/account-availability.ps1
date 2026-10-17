@@ -53,7 +53,10 @@
 #>
 [CmdletBinding(DefaultParameterSetName = 'Status')]
 param(
-    [Parameter(ParameterSetName = 'Mark', Mandatory)][switch]$Mark,
+    # NOT Mandatory, ON PURPOSE: -Reason, -EffectiveFrom or -By alone binds this set, and a Mandatory
+    # prompt there hangs a caller with stdin open (tests/_no_prompt.py, vault BACKLOG #3627). The
+    # refusal is right after this param block.
+    [Parameter(ParameterSetName = 'Mark')][switch]$Mark,
     [Parameter(ParameterSetName = 'Clear', Mandatory)][switch]$Clear,
     [Parameter(ParameterSetName = 'Status')][switch]$Status,
     # The config root to act on. Defaults in the body to THIS session's root, for the same reason
@@ -72,6 +75,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Mark-set arguments without -Mark: refuse by name, before anything is read or written. See $Mark.
+if ($PSCmdlet.ParameterSetName -eq 'Mark' -and -not $Mark) {
+    throw "Mark arguments (-Reason, -EffectiveFrom, -By) were given without -Mark. Nothing was marked. Add -Mark and re-run."
+}
 
 # NOT GUARDED THE WAY THE STATUSLINE GUARDS IT. This is an operator command run from a terminal, not a
 # decoration on a live session, so a missing library must be a loud refusal rather than a fallback --

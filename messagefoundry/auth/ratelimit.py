@@ -12,16 +12,30 @@ window. Calls are synchronous and complete without ``await``, so they're atomic 
 from __future__ import annotations
 
 import time
-from collections import deque
+from collections import OrderedDict, deque
 
 __all__ = ["SlidingWindowRateLimiter"]
+
+# More than one, so aged buckets drain even while every call adds a new key.
+_EVICT_PER_CALL = 2
 
 
 class SlidingWindowRateLimiter:
     """Allow up to ``per_key`` hits per key and ``glob`` hits overall within ``window_seconds``.
 
-    A falsy ``per_key``/``glob`` disables that dimension. Empty per-key buckets are dropped as they
-    age out, so memory is bounded by the number of *active* keys in the window.
+    A falsy ``per_key``/``glob`` disables that dimension.
+
+    A key's aged bucket is dropped by a later call for ANY key, not only for that key (BACKLOG
+    #2714). Eviction is lazy: the table is ordered by each key's newest hit, and each call drops at
+    most ``_EVICT_PER_CALL`` aged buckets from the front, stopping at the first live one. A call
+    adds at most one bucket, and aged buckets sit at the front, so the table cannot grow while any
+    aged bucket remains. It never grows past the most keys live at one time. It does not shrink
+    while nobody calls: after a burst, the aged buckets go two per later call on this limiter.
+
+    The cap bounds the work spent on other keys' buckets, so no call walks the table. The login
+    path is unauthenticated, and one call that dropped a million aged buckets would stall the
+    event loop. It does not bound the prune of the global window or of the caller's own bucket.
+    A limiter with no per-key gate (falsy ``per_key`` and no gap) keeps no buckets at all.
 
     ``min_interval_seconds`` adds a GAP floor beside the count (BACKLOG #2301, ASVS 2.4.2): a hit
     for a key is refused while that key's last allowed hit is younger than this. A count alone
@@ -43,28 +57,52 @@ class SlidingWindowRateLimiter:
         if min_interval_seconds and min_interval_seconds >= window_seconds:
             raise ValueError("min_interval_seconds must be shorter than window_seconds")
         self._min_interval = min_interval_seconds
-        self._hits: dict[str, deque[float]] = {}
+        self._keeps_buckets = bool(per_key) or bool(min_interval_seconds)
+        # The key whose newest hit is oldest comes first: ``allow`` moves a key to the end.
+        self._hits: OrderedDict[str, deque[float]] = OrderedDict()
         self._global_hits: deque[float] = deque()
 
-    def _prune(self, dq: deque[float], now: float) -> None:
-        cutoff = now - self._window
-        while dq and dq[0] <= cutoff:
+    @staticmethod
+    def _aged(hit: float, cutoff: float) -> bool:
+        # The one expiry test, shared by both prunes. Keep it ``<=``: under a NaN window every
+        # comparison is false, so this keeps every hit, and ``not hit > cutoff`` would drop them.
+        return hit <= cutoff
+
+    def _prune(self, dq: deque[float], cutoff: float) -> None:
+        while dq and self._aged(dq[0], cutoff):
             dq.popleft()
 
-    def _has_room(self, key: str, now: float) -> bool:
-        """Prune both windows to ``now`` and report whether an attempt for ``key`` would fit.
+    def _evict_aged(self, cutoff: float) -> None:
+        """Drop up to ``_EVICT_PER_CALL`` buckets from the front whose newest hit has aged out.
 
+        Only a bucket with no live hit goes, so a key a caller is being refused for keeps its
+        bucket: :meth:`retry_after` reads it right after :meth:`_has_room` refuses.
+        """
+        for _ in range(_EVICT_PER_CALL):
+            if not self._hits:
+                return
+            key, bucket = next(iter(self._hits.items()))
+            if not self._aged(bucket[-1], cutoff):
+                return
+            del self._hits[key]
+
+    def _has_room(self, key: str, now: float) -> bool:
+        """Prune to ``now`` and report whether an attempt for ``key`` would fit.
+
+        Prunes the global window and ``key``'s bucket, and drops a few aged buckets of other keys.
         Shared by :meth:`allow` and :meth:`would_allow` rather than duplicated into each, because a
         caller that consults one and charges the other must never see them disagree.
 
         Prunes, so it is **not** side-effect-free — but it never appends, which is the property
         :meth:`would_allow` sells. Dropping the prune would compare against stale counts.
         """
-        self._prune(self._global_hits, now)
+        cutoff = now - self._window
+        self._prune(self._global_hits, cutoff)
+        self._evict_aged(cutoff)
         bucket = self._hits.get(key)
         if bucket is not None:
-            self._prune(bucket, now)
-            if not bucket:
+            self._prune(bucket, cutoff)
+            if not bucket:  # aged, but still queued behind other aged buckets
                 del self._hits[key]
                 bucket = None
         global_full = bool(self._global) and len(self._global_hits) >= self._global
@@ -78,7 +116,13 @@ class SlidingWindowRateLimiter:
         if not self._has_room(key, now):
             return False  # a rejected attempt does not count toward the window
         self._global_hits.append(now)
-        self._hits.setdefault(key, deque()).append(now)
+        if self._keeps_buckets:
+            bucket = self._hits.get(key)
+            if bucket is None:
+                self._hits[key] = deque((now,))
+            else:
+                bucket.append(now)
+                self._hits.move_to_end(key)
         return True
 
     def would_allow(self, key: str) -> bool:
@@ -113,7 +157,8 @@ class SlidingWindowRateLimiter:
             return self._window
         bucket = self._hits[key]  # a per-key gate fired, so the key has hits
         # Each wait is written as the gate writes its own test (``now - last < gap`` in
-        # ``_has_room``, ``hit <= now - window`` in ``_prune``). Regrouping the same sum rounds
+        # ``_has_room``, ``hit <= cutoff`` in ``_aged``, with ``cutoff = now - window`` as
+        # ``_has_room`` computes it). Regrouping the same sum rounds
         # differently, and could then report 0.0 for a key the gate still refuses.
         wait = self._min_interval - (now - bucket[-1])
         if self._per_key and len(bucket) >= self._per_key:
