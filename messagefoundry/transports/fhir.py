@@ -400,13 +400,25 @@ def _screen_bundle(payload: str, interaction: str, screen: _EntryScreen) -> None
 _REPLY_REPEATS_A_KEY_CODE = "reply-repeats-a-key"
 
 
+class _ThirdReading(ValueError):
+    """A key occurs with a value equal to neither its first nor its last. Carries no key or value."""
+
+
 def _keep_first_key(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     """An ``object_pairs_hook`` that keeps the FIRST of two equal keys, where ``json`` keeps the
-    last: the reading a server that keeps the first would make."""
-    obj: dict[str, Any] = {}
+    last: the reading a server that keeps the first would make. Raises :class:`_ThirdReading` when
+    a key occurs three or more times and some occurrence equals neither its first nor its last
+    value, since comparing the first and last readings would never see it."""
+    first: dict[str, Any] = {}
+    last: dict[str, Any] = {}
     for key, value in pairs:
-        obj.setdefault(key, value)
-    return obj
+        first.setdefault(key, value)
+        last[key] = value
+    if len(first) != len(pairs) and any(
+        value != first[key] and value != last[key] for key, value in pairs
+    ):
+        raise _ThirdReading
+    return first
 
 
 def _entry_response(obj: dict[str, Any]) -> dict[str, Any] | None:

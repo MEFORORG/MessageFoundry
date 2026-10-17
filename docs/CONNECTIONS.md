@@ -2465,7 +2465,8 @@ What a site needs to know:
   logged as a warning, and the 2xx reply counts as delivered.
 - A reply in which a JSON object repeats a key is read twice, once keeping the first value of each key
   and once keeping the last (vault BACKLOG #2812). When the two readings reach the same judgment and
-  agree on what a delivery takes, the reply is judged as above. Otherwise the update is a permanent
+  agree on what a delivery takes, and no occurrence of a key repeated three or more times differs
+  from both its first and last value, the reply is judged as above. Otherwise the update is a permanent
   refusal, code `reply-repeats-a-key`, in either capture mode. It is not sent again and not recorded
   as delivered, as with a reply over the byte bound below. The full rule, with what counts as
   agreement and its costs, is in

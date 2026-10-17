@@ -890,6 +890,41 @@ async def test_a_wrapped_update_reply_whose_readings_agree_is_delivered(
 
 
 @pytest.mark.parametrize("capture", [True, False], ids=["capture", "no-capture"])
+@pytest.mark.parametrize(
+    "reply",
+    [
+        # First and last agree on 200; the middle 404 is a third reading they would never see.
+        _reply_with('{"status": "200 OK", "status": "404 Not Found", "status": "200 OK"}'),
+        # First and last disagree already.
+        _reply_with('{"status": "200 OK", "status": "200 OK", "status": "404 Not Found"}'),
+        # A, B, A inside meta refuses too: the fail-closed direction, accepted.
+        _reply_with('{"status": "200 OK"}', meta='{"tag": "a", "tag": "b", "tag": "a"}'),
+    ],
+    ids=["200-404-200", "200-200-404", "a-b-a-in-meta"],
+)
+async def test_a_key_repeated_three_times_with_a_third_value_is_dead_lettered(
+    reply: bytes, capture: bool
+) -> None:
+    dest = _dest(interaction="update", capture_response=capture)
+    dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(UPDATE_1965)
+    assert ei.value.permanent is True and ei.value.code == "reply-repeats-a-key"
+
+
+@pytest.mark.parametrize("capture", [True, False], ids=["capture", "no-capture"])
+async def test_a_key_repeated_three_times_with_one_value_is_delivered(capture: bool) -> None:
+    reply = _reply_with('{"status": "200 OK", "status": "200 OK", "status": "200 OK"}')
+    dest = _dest(interaction="update", capture_response=capture)
+    dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
+    resp = await dest.send(UPDATE_1965)
+    if capture:
+        assert isinstance(resp, DeliveryResponse) and resp.outcome == "accepted"
+    else:
+        assert resp is None
+
+
+@pytest.mark.parametrize("capture", [True, False], ids=["capture", "no-capture"])
 async def test_two_transient_readings_retry_as_the_shared_classification_says(
     capture: bool,
 ) -> None:

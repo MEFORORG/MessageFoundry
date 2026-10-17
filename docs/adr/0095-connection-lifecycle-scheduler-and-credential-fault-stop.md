@@ -430,7 +430,10 @@ resource type, whether there is an entry response, and the entry's `etag`, `loca
 and two statuses that both classify as transient are retried. When the readings differ in any of
 those, in either capture mode, or the keep-first read cannot parse a body the plain read takes,
 the delivery is a permanent refusal, code `reply-repeats-a-key`, not sent again and not recorded
-as delivered, as a reply the engine needs and cannot read is above.
+as delivered, as a reply the engine needs and cannot read is above. The same refusal applies when
+a key occurs three or more times in one object, at any depth, and some occurrence equals neither
+its first nor its last value, because the two readings alone would never see it (so
+`200 OK`, `404 Not Found`, `200 OK` dead-letters, as does such a repeat inside `meta`).
 
 It fails closed only on disagreement because a reply that reads one way under both rules carries
 no ambiguity to resolve, and refusing it would dead-letter an update that applied, which a replay
