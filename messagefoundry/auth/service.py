@@ -10370,10 +10370,11 @@ class AuthService:
             if await self._mfa_lock_refused(user, client=client):
                 return Elevation(locked=True)
             now = time.time()
-            # The secret cell this code is checked against: the factor write below lands only while
-            # the row still holds it, as the enrolment confirm does (BACKLOG #3025). The compare is
-            # on ciphertext, so a store-key rotation inside the check refuses too, which fails closed.
-            verified_cell = user.totp_secret_cell
+            # The enrolment this code is checked against: the factor write below lands only while
+            # the row still holds it. Every enable and every replace stamps ``totp_enrolled_at``
+            # afresh, as ``replace_totp_enrolment``'s compare-and-set relies on, and a store-key
+            # rotation leaves it alone, so it names the factor where the secret ciphertext does not.
+            verified_enrolment = user.totp_enrolled_at
             if await self._verify_second_factor(user, code, client=client, arrived=arrived):
                 # BACKLOG #3068: the verify awaited (a recovery-code walk is argon2 work off the
                 # loop), and a revocation or a disable needs no queue to land. So the session, the
@@ -10388,15 +10389,18 @@ class AuthService:
                 )
                 if isinstance(fresh, Elevation):
                     return fresh
-                # A self-service disable takes no queue, so the factor this code proved may be gone,
-                # or turned off and enrolled again with a new secret. Either way the code proved a
-                # factor the row no longer holds. It is spent by now, so the refusal is audited with
-                # its reason.
-                if not fresh.totp_enabled or fresh.totp_secret_cell != verified_cell:
+                # A self-service disable takes no queue, so the factor this code proved may be gone
+                # (``factor_removed``), or turned off and enrolled again, or replaced, with a new
+                # secret (``factor_replaced``). Either way the code proved a factor the row no
+                # longer holds. It is spent by now, so the refusal is audited with its reason.
+                replaced = fresh.totp_enabled and fresh.totp_enrolled_at != verified_enrolment
+                if not fresh.totp_enabled or replaced:
                     await self._audit(
                         "auth.mfa_failed",
                         actor=fresh.username,
-                        detail=_json({"reason": "factor_removed"}),
+                        detail=_json(
+                            {"reason": "factor_replaced" if replaced else "factor_removed"}
+                        ),
                         client=client,
                     )
                     return Elevation()
@@ -10714,8 +10718,9 @@ class AuthService:
         answer short of a present, enabled account refuses: absent, disabled, undetermined,
         unavailable and referred (BACKLOG #2538) alike. The directory step-up legs already refuse
         this way: ``_reauth_ad`` on a failed bind, and the federated step-up on
-        ``directory_unavailable``. A refusal revokes nothing, so the next attempt asks again. An AD row on an engine with no directory
-        configured is refused as ``not_configured``, because nothing can confirm it.
+        ``directory_unavailable``. A refusal revokes nothing, so the next attempt asks again. An
+        AD row on an engine with no directory configured is refused as ``not_configured``, because
+        nothing can confirm it.
 
         **A row with no ``directory_object_id`` is refused unasked, whether or not it holds a
         federated binding** (ADR 0184 AC-5, BACKLOG #2027). Its only other key is its name, and a
@@ -11387,10 +11392,22 @@ class AuthService:
         ):
             # CAS miss. Either a concurrent assertion consumed the same counter, which is the clone
             # signal, or the passkey was deleted after it was read: a self-service delete takes no
-            # queue. A passkey gone is refused as the factor-removed check below refuses it, so a
-            # delete raises no false clone alarm (BACKLOG #3068).
-            if await self._passkey_removed(user, cred, client):
-                return Elevation()
+            # queue, and an MFA reset deletes every passkey and then revokes the sessions. A
+            # passkey seen gone is refused as the check before the factor write refuses it, after
+            # the same re-read, so a delete raises no false clone alarm and a reset answers as a
+            # lost session (BACKLOG #3068). A set whose seal fails proves nothing either way, so
+            # it keeps the clone signal.
+            if await self._passkey_held(user, cred) is False:
+                holder = await self._factor_holder_current(
+                    token,
+                    actor=user.username,
+                    event="auth.webauthn_failed",
+                    client=client,
+                    report_lock=False,
+                )
+                if isinstance(holder, Elevation):
+                    return holder
+                return await self._passkey_removed(holder, client)
             await self._audit(
                 "auth.webauthn_clone_suspected",
                 actor=user.username,
@@ -11414,8 +11431,8 @@ class AuthService:
         user = fresh
         # The code leg's TOTP-off check, for a passkey: a self-service delete takes no queue, so the
         # passkey that signed may be gone.
-        if await self._passkey_removed(user, cred, client):
-            return Elevation()
+        if not await self._passkey_held(user, cred):  # a set failing its seal holds nothing
+            return await self._passkey_removed(user, client)
         # BACKLOG #2298: the passkey leg of /ui/mfa, asked as verify_mfa asks after a good code, so
         # an assertion that straddles the deadline marks nothing and clears no counter.
         if user.must_change_password and await self._mfa_lapsed(
@@ -11446,28 +11463,29 @@ class AuthService:
             await self._mark_login_address_known(user.id, client)
         return elevation
 
-    async def _passkey_removed(
-        self, user: VerifiedUser, cred: WebAuthnCredential, client: str | None
-    ) -> bool:
-        """Whether ``user`` no longer holds passkey ``cred``, auditing the refusal as
-        ``auth.webauthn_failed`` with ``reason=factor_removed`` if so. Asked of the set its seal
-        covers (BACKLOG #2592), so a set that fails its seal holds nothing.
-        :meth:`finish_webauthn_assertion` asks it after a sign-count miss and again before the
-        factor write (BACKLOG #3068). Every credential is compared, each in constant time (ASVS
-        11.2.4, as the delete path does)."""
-        matches = [
-            constant_time_equal(c.credential_id_hash, cred.credential_id_hash)
-            for c in await self._verified_passkeys(user) or ()
-        ]
-        if any(matches):
-            return False
+    async def _passkey_held(self, user: VerifiedUser, cred: WebAuthnCredential) -> bool | None:
+        """Whether ``user`` still holds passkey ``cred``, asked of the set its seal covers (BACKLOG
+        #2592), or ``None`` when that set fails its seal. :meth:`finish_webauthn_assertion` asks
+        it after a sign-count miss and again before the factor write (BACKLOG #3068). This re-check
+        compares every credential, each in constant time (ASVS 11.2.4, as the delete path does);
+        the lookup that first picked ``cred`` does not."""
+        held = await self._verified_passkeys(user)
+        if held is None:
+            return None
+        # A list, not a generator: any() over a generator would stop at the first match.
+        matches = [constant_time_equal(c.credential_id_hash, cred.credential_id_hash) for c in held]
+        return any(matches)
+
+    async def _passkey_removed(self, user: VerifiedUser, client: str | None) -> Elevation:
+        """The refusal :meth:`finish_webauthn_assertion` gives when the passkey that signed is gone,
+        audited ``auth.webauthn_failed`` with ``reason=factor_removed`` (BACKLOG #3068)."""
         await self._audit(
             "auth.webauthn_failed",
             actor=user.username,
             detail=_json({"reason": "factor_removed"}),
             client=client,
         )
-        return True
+        return Elevation()
 
     async def _assertion_expired(self, user: UserRecord, client: str | None) -> Elevation:
         """The refusal :meth:`finish_webauthn_assertion` gives when no ceremony of this account's

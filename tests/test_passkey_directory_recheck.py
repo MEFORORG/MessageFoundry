@@ -485,7 +485,15 @@ async def test_the_lookup_comes_after_the_too_early_floor(store: MessageStore) -
 
 @pytest.mark.parametrize(
     "change",
-    ["lock", "revoke", "disable", "passkey-deleted", "passkey-deleted-first", "counter-moved"],
+    [
+        "lock",
+        "revoke",
+        "disable",
+        "passkey-deleted",
+        "passkey-deleted-first",
+        "counter-moved",
+        "reset",
+    ],
 )
 @pytest.mark.parametrize("account", ["directory", "local"])
 async def test_what_lands_before_the_factor_write_is_honoured(
@@ -498,7 +506,8 @@ async def test_what_lands_before_the_factor_write_is_honoured(
 
     A delete that lands BEFORE the sign-count write fails its compare-and-set, as a concurrent
     assertion that moved the counter does. RED when: that delete is audited as a suspected clone,
-    or the moved counter is not."""
+    or the moved counter is not, or an MFA reset (every passkey deleted, then the sessions revoked)
+    landing there answers as a wrong proof rather than a lost session."""
     if account == "directory":
         p = await _directory_session_owing_a_passkey(store)
         service, token, response, user_id = p.service, p.token, p.response, p.user_id
@@ -520,9 +529,11 @@ async def test_what_lands_before_the_factor_write_is_honoured(
             await store.revoke_session(hash_token(token))
         elif change == "disable":
             await store.set_user_disabled(user_id, disabled=True)
-        elif change == "passkey-deleted-first":
+        elif change in ("passkey-deleted-first", "reset"):
             (held,) = await store.list_webauthn_credentials(user_id)
             assert await store.delete_webauthn_credential(user_id, held.credential_id_hash)
+            if change == "reset":
+                await store.revoke_session(hash_token(token))
         elif change == "counter-moved":
             # A concurrent assertion of the same passkey got its count written first.
             (held,) = await store.list_webauthn_credentials(user_id)
@@ -545,7 +556,7 @@ async def test_what_lands_before_the_factor_write_is_honoured(
     refused = await service.finish_webauthn_assertion(token, response, rp_id=_RP, origin=_ORIGIN)
 
     assert refused.ok is False
-    assert refused.session_lost is (change in ("revoke", "disable"))
+    assert refused.session_lost is (change in ("revoke", "disable", "reset"))
     session = await store.get_session(hash_token(token))
     assert session is not None and session.mfa_verified_at is None
     clones = await store.list_audit(action="auth.webauthn_clone_suspected")

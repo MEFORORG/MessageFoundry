@@ -449,7 +449,8 @@ async def test_what_lands_during_the_code_check_stops_the_factor_write(
     before the factor is written, for every account. RED when: a change that lands during a good
     code's check does not stop the write, which would then mark the factor, stamp the window and
     clear the lockout counters. ``factor-replaced`` turns TOTP off and enrols it again with a new
-    secret, so the row holds a factor again but not the one the code proved."""
+    secret, so the row holds a factor again but not the one the code proved; it is audited
+    ``factor_replaced``, apart from a plain disable."""
     if account == "directory":
         e = await _enrolled_directory_session(store, monkeypatch)
         service, token, user_id, code = e.service, e.token, e.user_id, totp.totp(e.secret, now=_T1)
@@ -486,8 +487,9 @@ async def test_what_lands_during_the_code_check_stops_the_factor_write(
             if change == "factor-replaced":
                 cell = await store.set_totp_secret(user_id, secret=_REPLACING_SECRET)
                 assert cell is not None
+                # An explicit stamp, so the new enrolment cannot share the old one's clock tick.
                 assert await store.enable_totp(
-                    user_id, recovery_code_hashes=[], expected_secret_cell=cell
+                    user_id, recovery_code_hashes=[], expected_secret_cell=cell, now=_T1
                 )
         return good
 
@@ -501,7 +503,7 @@ async def test_what_lands_during_the_code_check_stops_the_factor_write(
     reason = {
         "lock": "locked",
         "factor-off": "factor_removed",
-        "factor-replaced": "factor_removed",
+        "factor-replaced": "factor_replaced",
     }.get(change, "session_lost")
     assert {"reason": reason} in await _audited_mfa_failures(store)
     session = await store.get_session(hash_token(token))

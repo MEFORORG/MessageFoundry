@@ -2601,8 +2601,8 @@ post from an account that has never staged a ceremony because it holds no passke
 failure audited `reason=expired` and causes no lookup, so such a caller does not learn what the
 directory said on this leg (BACKLOG #3068). The code leg does not gate this way: it asks the
 directory before it checks any code, so a session that has proved nothing can still read the
-directory refusal there, up to the route's rate limiter. **The passkey leg's gate does not stop a
-session that has staged a ceremony from reading the directory refusal.** The lookup still runs before the assertion is verified, so such a session can post a response that
+directory refusal there, up to the route's rate limiter. **The passkey leg's gate does not stop
+a session that has staged a ceremony from reading the directory refusal.** The lookup still runs before the assertion is verified, so such a session can post a response that
 proves nothing and still cost one lookup and read the directory refusal, up to the per-actor
 limiter on `POST /ui/reauth/webauthn`. A ceremony staged before its passkey was deleted stays
 staged until it expires. After a confirmed lookup
@@ -2617,20 +2617,22 @@ account gone after the lookup answers **401**.
 write the factor (BACKLOG #3068).** This applies to every account, local ones included. A
 revocation, a disable or a second-step lock that lands while a good code or a good assertion is
 being checked stops the write, and so does the proved factor itself going meanwhile: a TOTP
-factor turned off, or turned off and enrolled again with a new secret, or the passkey that signed
-deleted. The code leg compares the stored `totp_secret` cell the code was checked against, so a
-store-key rotation that re-encrypts that column during the check refuses too, under the same
-reason. The factor is then not marked and no counter is cleared, and because the proof is already
-spent the refusal is audited, with `reason=session_lost` or `reason=factor_removed`. A passkey
-deleted before its sign count is written fails that compare-and-set, as a concurrent assertion
-does, and is refused the same way, `reason=factor_removed`, rather than audited as a suspected
-clone. A session or account gone answers as gone on at least these surfaces: **401** on
-`POST /auth/mfa-verify` and `POST /ui/reauth/webauthn`, and a sign-in redirect on `/ui/mfa` and
-the `/ui/reauth` code leg. On the code leg it answers the same when it goes during the directory
-lookup or the account queue. A lock answers as the leg's locked refusal, audited
-`reason=locked`. By then the proof is
-spent: the code leg has consumed the TOTP step or the single-use recovery code, with no refund, and
-on the passkey leg the sign count has moved, because the passkey did sign that challenge.
+factor turned off (`reason=factor_removed`), or turned off and enrolled again, or replaced, with a
+new secret (`reason=factor_replaced`, read from the enrolment stamp, which a store-key rotation
+does not touch), or the passkey that signed deleted (`reason=factor_removed`). The factor is then
+not marked and no counter is cleared, and because the proof is already spent the refusal is
+audited, with one of those reasons or `reason=session_lost`. A passkey deleted before its sign
+count is written fails that compare-and-set, as a concurrent assertion does. The leg then reads
+the session, the account and its lock again, as before the factor write, so an MFA reset, which
+deletes every passkey and then revokes the sessions, answers as a lost session; otherwise the
+delete is refused `reason=factor_removed` rather than audited as a suspected clone. A session or
+account gone answers as gone on at least these surfaces: **401** on `POST /auth/mfa-verify` and
+`POST /ui/reauth/webauthn`, and a sign-in redirect on `/ui/mfa` and the `/ui/reauth` code leg.
+On the code leg it answers the same when it goes during the directory lookup or the account
+queue. A lock answers as the leg's locked refusal, audited `reason=locked`. By then the proof is
+spent: the code leg has consumed the TOTP step or the single-use recovery code, with no refund.
+On the passkey leg the challenge is spent, and the sign count has moved, because the passkey did
+sign that challenge, except where the compare-and-set missed.
 **A window remains, and it is accepted.** It runs from the re-read through the factor stamp (and
 on the code leg the window stamp) to `record_login_success`, which clears both lockout counters
 unconditionally. A change landing there is not seen: for example, a run of wrong codes on another
@@ -2820,8 +2822,9 @@ refuses too. That refusal reads as `secret_replaced` although no second enrolmen
 `write_lost` means the row still held the verified secret with TOTP off, so the enable lost to
 some other concurrent write. After a `write_lost` or a store-key rotation the staged secret still
 stands. The user signs in again, because the refused confirm ended the session, and passes the
-password step-up bound to the confirm action, which `POST /me/mfa/confirm` requires of every confirm
-(ADR 0077). The user then confirms with a code from a later step, because the refused confirm spent
+step-up `POST /me/mfa/confirm` asks of any confirm: a password proof bound to the confirm action
+(ADR 0077), or a recent step-up window where `[auth].require_action_step_up` is off. The user then
+confirms with a code from a later step, because the refused confirm spent
 its code's step. With
 `[security].require_mfa` on — **the default since BACKLOG #187 (secure-by-default, including the
 loopback bind)** — **every account** must satisfy MFA under the default scope,
