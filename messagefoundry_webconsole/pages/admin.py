@@ -146,6 +146,8 @@ def ticked_scope_expected_source(user: UserSummary) -> Literal["ad"] | None:
 
 
 def _scope_source_text(user: UserSummary) -> str:
+    if user.channel_scope_withheld:
+        return "not shown"
     source = user.channel_scope_source
     return _SCOPE_SOURCE_TEXT.get(source, str(source))
 
@@ -259,12 +261,12 @@ def users_page(users: Sequence[UserSummary]) -> Markup:
     The Lock column appears only when the engine disclosed lock state, which it does only to a
     users:manage holder (BACKLOG #1131). An empty column would read as "nobody is locked".
 
-    The two scope columns appear only when the engine sent the scopes, which its
-    ``channel_scope_withheld`` says (BACKLOG #3189). A withheld scope is null, and this page would
-    render it as "(none)", which reads as "reaches nothing". The engine decides who is shown them;
-    this page does not re-derive the rule."""
+    The two scope columns appear only when the engine sent at least one account's scope, which its
+    ``channel_scope_withheld`` says (BACKLOG #3189), as the Lock column does. A withheld scope is
+    null, which would otherwise render as "(none)", "reaches nothing", so its cells read "not
+    shown". The engine decides who is shown them; this page does not re-derive the rule."""
     show_lock = any(u.lock_state is not None for u in users)
-    show_scope = not any(u.channel_scope_withheld for u in users)
+    show_scope = any(not u.channel_scope_withheld for u in users)
     rows: list[list[object]] = []
     for u in users:
         row: list[object] = [

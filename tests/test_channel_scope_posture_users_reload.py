@@ -46,6 +46,7 @@ from messagefoundry.config.wiring import (
 from messagefoundry.pipeline import Engine
 from tests._admin_account import create_local_user_chosen
 from tests._bound_proof import reproving_transport
+from tests.test_approval_requester_recheck import _release_blocked
 from tests.test_dual_control_reload import _write_valid_config
 
 PW = "a-strong-test-passphrase"
@@ -328,15 +329,6 @@ async def test_a_held_reload_is_not_released_once_its_requester_is_scoped(
     assert [json.loads(row["detail"])["reason"] for row in stale] == ["requester_out_of_scope"]
 
 
-async def _release_blocked(
-    c: httpx.AsyncClient, approval_id: str, headers: dict[str, str]
-) -> object:
-    r = await c.get("/approvals", headers=headers)
-    assert r.status_code == 200, r.text
-    [entry] = [e for e in r.json()["approvals"] if e["id"] == approval_id]
-    return entry["release_blocked"]
-
-
 async def test_a_held_purge_is_predicted_refused_once_its_requester_is_scoped(
     tmp_path: Path,
 ) -> None:
@@ -413,16 +405,17 @@ async def test_provenance_names_the_reload_refusal_the_route_gives(engine: Engin
     }
 
 
-# --- _deny_connection bounds the name it audits ---------------------------------------------------
+# --- the channel-denied audit bounds the name it records ---------------------------------------------------
 
 
 async def test_the_engine_refusal_audits_no_malformed_name(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """BACKLOG #3031: the console checks a bulk selection's name before it calls in, and the JSON
-    routes bound it on the path, but the core handler takes any string. So ``_deny_connection``
-    bounds it too: a name that fails the connection-name rule is audited with no channel, and the
-    caller is still refused. The control: a well-formed out-of-scope name is audited by name."""
+    routes bound it on the path, but the core handlers take any string. So the engine's
+    ``audit_channel_denied`` bounds it too: a name that fails the connection-name rule is audited
+    with no channel, and the caller is still refused. The control: a well-formed out-of-scope name
+    is audited by name."""
     from fastapi import HTTPException
 
     import messagefoundry_webconsole
@@ -449,3 +442,20 @@ async def test_the_engine_refusal_audits_no_malformed_name(
             await deps.core.dual_role_control(engine, scoped, name, "start", role="source")
         assert refused.value.status_code == 403, name
     assert sorted(await _denials(engine, actor), key=str) == sorted([None, None, THEIRS], key=str)
+    # The bound is in the audit helper itself, so every refusal that writes the row holds it,
+    # whichever branch or handler called it: here the seam's own callback, as a console route and
+    # a core handler such as the purge call it.
+    other = "helper-caller"
+    helper_scoped = Identity.build(
+        user_id="helper-caller-id",
+        username=other,
+        auth_provider=AuthProvider.LOCAL,
+        roles=[Role.OPERATOR],
+        allowed_channels=frozenset({MINE}),
+    )
+    for name in ("A" * 5000, "IB_BAD/NAME", THEIRS):
+        await deps.core.audit_channel_denied(engine, helper_scoped, name, None)
+    rows = await engine.store.list_audit(limit=50, action="auth.channel_denied", actor=other)
+    assert sorted((r["channel_id"] for r in rows), key=str) == sorted([None, None, THEIRS], key=str)
+    # The detail carries no copy of the refused name either.
+    assert all("A" * 64 not in str(r["detail"]) for r in rows)

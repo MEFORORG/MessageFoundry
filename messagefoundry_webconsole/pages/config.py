@@ -10,7 +10,7 @@ dry-run diff here; authoring lives in the VS Code extension. Every value is esca
 
 from __future__ import annotations
 
-from messagefoundry.api.models import ConfigProvenance, ReloadResult
+from messagefoundry.api.models import RELOAD_REFUSED_CHANNEL_SCOPED, ConfigProvenance, ReloadResult
 
 from .._html import Markup, el, page, register_nav, rows_table, text
 from .approvals import approvals_link
@@ -43,6 +43,18 @@ def _provenance_badge(prov: ConfigProvenance | None) -> Markup:
     return el("p", text(f"Running config: {ident} "), pill, text(note), class_="muted")
 
 
+def _next_step(refused: str) -> str:
+    """What a refused caller can do about it, for the refusals this page knows."""
+    if refused == RELOAD_REFUSED_CHANNEL_SCOPED:
+        # The default, an account nobody has scoped, is refused too, and its holder may not think of
+        # it as scoped.
+        return (
+            " An account with no channel scope set counts as channel-scoped. An administrator can"
+            " grant it the all-channels scope."
+        )
+    return ""
+
+
 def config_page(prov: ConfigProvenance | None = None) -> Markup:
     """The config-deploy page: a single 'Reload configuration' action (server's startup dir only), with
     a read-only provenance badge (running commit + clean/DRIFTED) when available (ADR 0041 D1).
@@ -52,7 +64,11 @@ def config_page(prov: ConfigProvenance | None = None) -> Markup:
     re-auth and spend the step-up for a 403. The engine computes the rule; this page only reads it."""
     refused = prov.reload_refused if prov is not None else None
     reload_form: Markup = (
-        el("p", text(f"Reload is not available to you: {refused}."), class_="banner")
+        el(
+            "p",
+            text(f"Reload is not available to you: {refused}.{_next_step(refused)}"),
+            class_="banner",
+        )
         if refused is not None
         else el(
             "form",

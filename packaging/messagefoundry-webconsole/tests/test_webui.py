@@ -3700,7 +3700,7 @@ def test_users_page_hides_the_scope_columns_from_a_reader_who_is_not_shown_scope
     "reaches nothing", so for such a reader it must drop both scope columns rather than print that
     beside every account. It reads the engine's flag, and does not re-derive the rule."""
     from messagefoundry.api.auth_models import UserSummary
-    from messagefoundry_webconsole.pages.admin import _scope_cell, users_page
+    from messagefoundry_webconsole.pages.admin import _scope_cell, _scope_source_text, users_page
 
     def _u(withheld: bool) -> UserSummary:
         return UserSummary(
@@ -3716,6 +3716,11 @@ def test_users_page_hides_the_scope_columns_from_a_reader_who_is_not_shown_scope
     assert "Channel scope" not in hidden and "Scope source" not in hidden
     assert "(none)" not in hidden
     assert _scope_cell(_u(True)) == "not shown"
+    assert _scope_source_text(_u(True)) == "not shown"
+    # A mixed list keeps the columns, as the Lock column does, and a withheld cell still never
+    # reads "(none)".
+    mixed = str(users_page([_u(True), _u(False)]))
+    assert "<th>Channel scope</th>" in mixed and mixed.count("not shown") == 2
     # The control: the same null scope, not withheld, is a scope that denies, and both columns show.
     shown = str(users_page([_u(False)]))
     assert "<th>Channel scope</th>" in shown and "<th>Scope source</th>" in shown

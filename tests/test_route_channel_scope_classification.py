@@ -183,7 +183,11 @@ ROUTES: dict[str, tuple[str, str]] = {
         SCOPED,
         "#3189: a scoped caller cannot reload, a dry run included; a reload spans every channel",
     ),
-    "GET /config/provenance": (NOT_CHANNEL_BEARING, "a fingerprint and a commit, no connection"),
+    "GET /config/provenance": (
+        NOT_CHANNEL_BEARING,
+        "a fingerprint and a commit, no connection; reload_refused reads only whether the caller "
+        "is all-channels, never a channel (BACKLOG #3189)",
+    ),
     # --- messages -------------------------------------------------------------------------------
     "GET /messages": (SCOPED, "allowed_channels on the store read"),
     "GET /messages/search": (SCOPED, "allowed_channels on the store read"),

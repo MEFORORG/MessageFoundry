@@ -802,48 +802,70 @@ class ApprovalGate:
         rows = await self._verified_rows(
             await self._store.list_pending_approvals(now=self._clock())
         )
-        return [await self._queue_entry(r, caller_user_id) for r in rows]
+        # One authority read per requester for the whole listing, however many requests they hold.
+        authority: dict[str, Identity | str] = {}
+        return [await self._queue_entry(r, caller_user_id, authority) for r in rows]
 
     async def list_interrupted(self, *, caller_user_id: str | None = None) -> list[dict[str, Any]]:
         """Releases cut off mid-run and awaiting an operator's record of what happened
         (:meth:`resolve_interrupted`). They do not expire. ``caller_user_id`` as for
         :meth:`list_pending`."""
         rows = await self._verified_rows(await self._store.list_interrupted_approvals())
-        return [await self._queue_entry(r, caller_user_id) for r in rows]
+        return [await self._queue_entry(r, caller_user_id, {}) for r in rows]
 
-    async def _release_blocked(
+    def _release_blocked(
         self, r: ApprovalRow, params: dict[str, Any] | None
-    ) -> tuple[ReleaseBlocked | None, str | None]:
+    ) -> ReleaseBlocked | None:
         """Why :meth:`approve` would refuse this request whoever approves it, or ``None`` (vault
         BACKLOG #3192). approve() refuses on exactly these, so the queue cannot predict a refusal
         the gate does not make; :class:`~messagefoundry.api.models.PendingApprovalInfo` states
-        what each value means and what ``None`` does not promise.
-
-        The second value is :meth:`_requester_standing`'s reason slug when the first is
-        ``requester_not_authorized``, for the refusal's audit row and alert, and ``None`` otherwise.
-        The requester's standing is read here, after every other test passes, so a held request
-        whose requester has lost the authority it needs, such as a reload whose requester has since
-        been channel-scoped, is predicted and refused through this one read (BACKLOG #3189)."""
+        what each value means and what ``None`` does not promise. The requester's standing is the
+        one reason not tested here: :meth:`_queue_release_blocked` adds it for the queue, and
+        approve() reads it after the dwell floor."""
         if not r.requester_user_id:
-            return "no_requester_id", None
-        op = self._ops.get(r.operation)
-        if op is None:
-            return "operation_unavailable", None
+            return "no_requester_id"
+        if r.operation not in self._ops:
+            return "operation_unavailable"
         if not self.gates(r.operation):
-            return "not_gated", None
+            return "not_gated"
         if params is None:
-            return "params_unreadable", None
-        standing = await self._requester_standing(r.requester_user_id, op, params)
-        if standing is not None:
-            return "requester_not_authorized", standing
-        return None, None
+            return "params_unreadable"
+        return None
 
-    async def _queue_entry(self, r: ApprovalRow, caller_user_id: str | None) -> dict[str, Any]:
+    async def _queue_release_blocked(
+        self, r: ApprovalRow, params: dict[str, Any] | None, authority: dict[str, Identity | str]
+    ) -> ReleaseBlocked | None:
+        """:meth:`_release_blocked`, then the requester's standing by the rule approve() refuses on
+        (BACKLOG #3189), so a held reload or purge whose requester has since been channel-scoped is
+        marked ``requester_not_authorized``. ``authority`` caches each requester's read for one
+        listing. A read that fails predicts nothing for that request rather than failing the whole
+        queue, so the operator can still reach Reject on every other row; approve() reads it again."""
+        blocked = self._release_blocked(r, params)
+        if blocked is not None or not r.requester_user_id or params is None:
+            return blocked
+        op = self._ops[r.operation]
+        requester_user_id = r.requester_user_id
+        try:
+            if requester_user_id not in authority:
+                authority[requester_user_id] = await self._requester_authority(requester_user_id)
+            standing = self._standing_of(authority[requester_user_id], op, params)
+        except Exception:  # noqa: BLE001 - every store backend raises its own type
+            log.exception("approval %s: the requester's standing could not be read", r.id)
+            return None
+        return None if standing is None else "requester_not_authorized"
+
+    async def _queue_entry(
+        self, r: ApprovalRow, caller_user_id: str | None, authority: dict[str, Identity | str]
+    ) -> dict[str, Any]:
         operation = r.operation
         params = _stored_params(r.id, r.params)
         # Only a pending row can be approved; an interrupted one is resolved instead, so its
         # requester's standing is not read.
-        blocked = (await self._release_blocked(r, params))[0] if r.status == "pending" else None
+        blocked = (
+            await self._queue_release_blocked(r, params, authority)
+            if r.status == "pending"
+            else None
+        )
         return {
             # BACKLOG #2460: keyed on the immutable id, like the refusals it predicts (#1540), so a
             # page can hide Approve from the requester. A row with no id never matches; approve
@@ -916,7 +938,7 @@ class ApprovalGate:
         params = _stored_params(approval_id, row.params)
         # vault BACKLOG #3192: the refusals no approver can get past are tested once, in
         # _release_blocked, which the queue reads too, so the page's prediction cannot drift.
-        blocked, standing = await self._release_blocked(row, params)
+        blocked = self._release_blocked(row, params)
         if blocked == "no_requester_id":
             # Fail closed. A request with no recorded requester id cannot be checked for
             # self-approval, and the stored NAME is not a usable fallback -- after a rename it may
@@ -959,15 +981,9 @@ class ApprovalGate:
             )
             raise ApprovalError(409, "request parameters are unreadable; reject it instead")
         op = self._ops.get(operation)
-        if (
-            blocked not in (None, "requester_not_authorized")
-            or not requester_user_id
-            or op is None
-            or params is None
-        ):
-            # Unreachable while every reason has its arm above, or, for
-            # requester_not_authorized, below the dwell floor. Fail closed if one is added without
-            # one, rather than release past a refusal the queue already predicts.
+        if blocked is not None or not requester_user_id or op is None or params is None:
+            # Unreachable while every reason has its arm above. Fail closed if one is added
+            # without one, rather than release past a refusal the queue already predicts.
             raise ApprovalError(409, f"this request cannot be released ({blocked})")
         # ASVS 2.4.2: the FLOOR on the request's age, beside the expiry CEILING in _require_pending.
         # Here, inside approve(), because every release path calls this method, so no caller can skip
@@ -1031,15 +1047,15 @@ class ApprovalGate:
         # account, so a directory-side change counts once it reaches that copy (module docstring). Checked
         # BEFORE the transition, so a refused request stays pending, like a removed operation above.
         # It can still be rejected, or released later if the requester's authority is restored.
-        # Read once, by _release_blocked above, which the queue reads too (BACKLOG #3189), and
-        # refused here, after the dwell floor, where this refusal has always been.
-        if blocked == "requester_not_authorized":
+        # The queue reads the same rule, as requester_not_authorized (BACKLOG #3189).
+        reason = await self._requester_standing(requester_user_id, op, params)
+        if reason is not None:
             await self._refuse_stale_requester(
                 approval_id,
                 operation=op,
                 approver=approver,
                 requester=row.requester,
-                reason=standing or "requester_unverifiable",
+                reason=reason,
                 client=client,
             )
             raise ApprovalError(
@@ -1486,6 +1502,12 @@ class ApprovalGate:
         Existence and the disabled flag come from the store row, not from the resolved identity. The
         resolver deliberately resolves a disabled user too (it also serves the permission inspector),
         so it cannot say "disabled" on its own."""
+        return self._standing_of(await self._requester_authority(requester_user_id), op, params)
+
+    async def _requester_authority(self, requester_user_id: str) -> Identity | str:
+        """The requester's live identity, or the reason slug that refuses every operation they
+        requested. The half of :meth:`_requester_standing` that reads the store, so the queue can
+        read it once per requester."""
         user = await self._store.get_user(requester_user_id)
         if user is None:
             return "requester_missing"
@@ -1496,9 +1518,18 @@ class ApprovalGate:
         identity = await self._resolve_identity(requester_user_id)
         if identity is None:  # deleted between the two reads, or no auth service is bound
             return "requester_unverifiable"
-        if not identity.has(op.permission):
+        return identity
+
+    @staticmethod
+    def _standing_of(
+        authority: Identity | str, op: _Operation, params: Mapping[str, Any]
+    ) -> str | None:
+        """:meth:`_requester_standing` from an already-read :meth:`_requester_authority`."""
+        if isinstance(authority, str):
+            return authority
+        if not authority.has(op.permission):
             return "requester_lacks_permission"
-        if op.in_scope is not None and not op.in_scope(identity, params):
+        if op.in_scope is not None and not op.in_scope(authority, params):
             return "requester_out_of_scope"
         return None
 

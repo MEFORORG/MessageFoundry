@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 from fastapi import HTTPException, Request
 
 from messagefoundry.api.security import client_ip
+from messagefoundry.connection_names import is_connection_name
 from messagefoundry.store.cell_tag import CellTagError
 
 if TYPE_CHECKING:
@@ -42,7 +43,15 @@ async def audit_channel_denied(
     ``client`` (ADR 0150) is the caller's address — a denial is exactly the record an investigator
     wants a host for. It is OPTIONAL because this helper is also handed to the console seam as a bare
     callback (``audit_channel_denied=``), which has no request in hand; there it stays NULL rather than
-    inheriting some other caller's address."""
+    inheriting some other caller's address.
+
+    A ``channel`` that fails the connection-name rule is recorded as no channel (BACKLOG #3031).
+    Some callers pass a caller-chosen name, and at least the core handlers the console seam calls
+    take any string, so the bound is held here, where every refusal passes: ``audit_log.channel_id``
+    never holds caller text of unbounded length. The loader registers no connection under such a
+    name, so it is never in a scope, and the actor and host still identify the attempt."""
+    if channel is not None and not is_connection_name(channel):
+        channel = None
     await engine.store.record_audit(
         "auth.channel_denied",
         actor=identity.username,

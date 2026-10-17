@@ -1869,8 +1869,9 @@ the same permission set on the same method reds CI until it is listed here.
 > actor's own scope, for example one a reload removed. Read such a row as a miss, not a probe.
 > A name that fails the connection-name rule is never in a scope, and its denial row carries no
 > channel, so `audit_log.channel_id` never holds a caller-chosen string of unbounded length. The
-> console checks the rule before it calls in, and the engine's own refusal checks it again for
-> any caller of the handler (BACKLOG #3031).
+> console checks the rule before it calls in, and `audit_channel_denied` in
+> `messagefoundry/api/message_scope.py`, which writes every `auth.channel_denied` row the API and
+> the console seam record, checks it again (BACKLOG #3031).
 > On a deployment with more than one engine shard the same row has a second cause. Each engine
 > shard's graph holds only its own inbounds, and each serves its own API port. So a scoped caller
 > who asks one engine shard about an in-scope inbound that another owns gets the 403 and a denial
@@ -2104,8 +2105,9 @@ on directly, so where it names a reason the two cannot disagree. It names at lea
 no requester id, an operation no longer registered, one dual control no longer gates, unreadable
 parameters, and a requester who no longer holds the authority the operation needs, such as a held
 reload or purge whose requester has since been channel-scoped (`requester_not_authorized`, BACKLOG
-#3189). The requester's standing is read when the queue is listed, so a change after the listing
-is met only at release. A `null` does not promise a release: at least the self-approval refusal,
+#3189). The requester's standing is read when the queue is listed, by the rule the release
+applies, so a change after the listing, or a standing the listing could not read, is met only at
+release. A `null` does not promise a release: at least the self-approval refusal,
 the expiry, the dwell floor, the row's seal and the operation's own refusals are met only then.
 `PendingApprovalInfo` in `messagefoundry/api/models.py` lists the values. The console's Approvals
 page keys on it, and offers a blocked request only Reject, or Withdraw on the requester's own row,

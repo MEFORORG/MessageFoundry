@@ -375,7 +375,7 @@ from messagefoundry.config.wiring import (
     revocation_attested_hops,
     unverified_generic_db_hops,
 )
-from messagefoundry.connection_names import inbound_name_of, is_connection_name
+from messagefoundry.connection_names import inbound_name_of
 from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.integrity import run_startup_attestation
 from messagefoundry.last_resort import install_loop_exception_handler
@@ -963,6 +963,13 @@ def _cross_channel_in_scope(identity: Identity) -> bool:
     runs the config's Python, and even its dry run describes every channel (BACKLOG #3189). Read by
     each route, its core and the approval gate, like :func:`_replay_in_scope`."""
     return identity.allowed_channels is None
+
+
+def _reload_refusal(identity: Identity) -> str | None:
+    """The refusal ``POST /config/reload`` gives ``identity`` whatever it proves, or ``None``. The
+    reload's core refuses on it and ``GET /config/provenance`` reports it as ``reload_refused``, so
+    the console's form cannot disagree with the refusal (BACKLOG #3189)."""
+    return None if _cross_channel_in_scope(identity) else RELOAD_REFUSED_CHANNEL_SCOPED
 
 
 def _purge_hold_params(name: str, scope: str) -> dict[str, Any]:
@@ -4128,14 +4135,9 @@ def create_app(
         # The one refusal a channel-scoped caller gets for a connection it may not reach. It names
         # no reason on purpose: a body naming "shared outbound" would tell an outbound apart from an
         # out-of-scope inbound or a name that exists nowhere (BACKLOG #2551).
-        #
-        # BACKLOG #3031: a name that fails the connection-name rule is audited with no channel. The
-        # JSON routes bound the name on the path, and the console checks it before it calls in, but
-        # the core handlers take any string, so the bound is held here too: no caller of this
-        # refusal can write an unbounded name to audit_log.channel_id. Such a name is never in a
-        # scope, and the actor and host still identify the attempt.
-        channel = name if is_connection_name(name) else None
-        await _audit_channel_denied(engine, identity, channel, client)
+        # A name that fails the connection-name rule is recorded with no channel by the audit
+        # helper itself (BACKLOG #3031).
+        await _audit_channel_denied(engine, identity, name, client)
         raise HTTPException(403, "not authorized for this connection")
 
     async def _resolve_connection(
@@ -5614,9 +5616,10 @@ def create_app(
         the params are captured here."""
         # BACKLOG #3189: here rather than in the route, so the console's path is refused too. The
         # refusal names no channel, so its audit row carries none.
-        if not _cross_channel_in_scope(user):
+        refusal = _reload_refusal(user)
+        if refusal is not None:
             await _audit_channel_denied(engine, user, None, client_ip(request))
-            raise HTTPException(403, RELOAD_REFUSED_CHANNEL_SCOPED)
+            raise HTTPException(403, refusal)
         # Hold a real (non-dry-run) reload for a second approver when dual-control gates it. A dry_run
         # is a read-only pre-flight (no swap), so it is never held. The guard runs AFTER the caller's
         # own step-up + config:deploy check (in reload_config, or the console's own gate) — the second
@@ -8118,9 +8121,9 @@ def create_app(
         compares it to the loaded baseline; it degrades to clean when the baseline is missing or the
         config dir is unreadable, so a read never raises.
 
-        ``reload_refused`` is read off :func:`_cross_channel_in_scope`, the rule the reload itself
-        refuses on, so the console's Reload form follows the engine (BACKLOG #3189)."""
-        reload_refused = None if _cross_channel_in_scope(_user) else RELOAD_REFUSED_CHANNEL_SCOPED
+        ``reload_refused`` is :func:`_reload_refusal`, the rule the reload itself refuses on, so the
+        console's Reload form follows the engine (BACKLOG #3189)."""
+        reload_refused = _reload_refusal(_user)
         loaded = engine.loaded_config_fingerprint
         fp = loaded.get("fingerprint") if loaded else None
         if not isinstance(fp, str) or not fp:
