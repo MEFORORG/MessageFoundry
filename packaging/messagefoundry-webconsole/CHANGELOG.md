@@ -78,6 +78,11 @@ this line.**
 - **Seam only: `/status` names the FHIR lookups that failed to start.** `EngineInfo` gains
   `fhir_lookups_failed` (vault `BACKLOG #3008`). The console does not show it yet, but the field
   is on the seam it pins, so the supported digest moved.
+- **Each group input on the AD group page shows an example full DN.** The placeholder reads
+  `CN=MF-Admins,OU=Groups,DC=example,DC=com`, since both maps refuse a short name. Nothing is
+  stored from it. The page's two save forms now trim only a space, a tab and a line break from a
+  group, as the engine route does, so a group ending in a no-break space is refused with the
+  route's 400 rather than trimmed. (vault `BACKLOG #3222`)
 
 ### Fixed
 
