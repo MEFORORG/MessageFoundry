@@ -3651,20 +3651,27 @@ Facts that are easy to get wrong, stated plainly first:
   `[store].warm_pool_timeout` default 15 s) size the pool; they are not a deadline.
 
   **What it covers, stated as a scope rather than a completeness claim.** On **SQL Server**
-  `_acquire` is the sole borrow site, so it bounds every store call. On **Postgres** it bounds at
+  `_borrow` is the sole borrow site for store calls (the start-up warm-up borrows on its own), and
+  it bounds every store call except the two session writes below. On **Postgres** it bounds at
   least the message-pipeline borrows — the transactional claim/handoff sites and the internal
   `_fetchall` / `_fetchone` / `_execute` helpers, which were routed through the same chokepoint for
   that reason. Take the scope as written; the two backends reach it differently and this setting is
   not a statement about every code path that can touch a pool.
 
-  **Two Postgres session writes wait without the bound, on purpose (BACKLOG #2283).**
-  `rotate_session` and `revoke_user_sessions` mostly run after their caller's own change has
-  committed: a password reset, a disable, a role change, a completed second factor. Nothing retries
-  them, so they wait for a free connection rather than fail after that change. Callers with no
-  earlier write, such as "sign out everywhere else", wait the same way. On SQL Server both stay
-  bounded, because `_acquire` is that backend's sole borrow site. There, at the limit, the request
-  fails after the change has committed. A revoke then leaves the account's other sessions
-  unrevoked. A rotation leaves the session on its old token, now carrying the factor it just proved.
+  **Two session writes wait without the bound on both server backends, on purpose (BACKLOG #2283
+  on Postgres, #3023 on SQL Server).** `rotate_session` and `revoke_user_sessions` mostly run after
+  their caller's own change has committed: a password reset, a disable, a role change, a completed
+  second factor. Nothing retries them, so they wait for a free connection rather than fail after
+  that change. Callers with no earlier write, such as "sign out everywhere else", wait the same
+  way. Waiting finishes the write only for a pool shortage: `[store].command_timeout` still bounds
+  the statement unless it is set to 0, and a lost connection still fails it. An HTTP request's own
+  deadline still cancels the wait, and a cancelled wait writes nothing and records nothing. A revoke that fails then leaves the
+  account's other sessions unrevoked, and the change's own audit row and notice are lost with it. A
+  rotation that fails is answered as a lost session: the old session is revoked, best effort, an
+  `auth.session_rotation_failed` row with reason `store_error` records in `revokes_landed` whether
+  every revoke landed,
+  and the caller signs in again. The same callers make other bounded writes after their change
+  commits, such as stamps and audit rows, and those can still fail at the limit.
 
   **Behaviour at the store-pool acquire limit.** The borrow raises `StoreAcquireTimeout` with a
   numeric, PHI-free message naming the backend and the knob. It is an ordinary `Exception`, so it

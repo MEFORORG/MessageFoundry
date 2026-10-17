@@ -972,7 +972,8 @@ class StoreSettings(_Section):
     # a transient stage failure (retry / dead-letter) — see docs/CONNECTIONS.md "Behaviour at the
     # store-pool acquire limit". 30 s matches the connector tier's per-connection `acquire_timeout` and
     # sits far above a healthy wait; watch p95/p99 in the pool_status acquire-wait histogram before
-    # lowering it. Must be > 0: the point of the knob is that the wait is always bounded.
+    # lowering it. Must be > 0: the point of the knob is a bounded wait. Two session writes that
+    # follow a committed auth change wait without it on purpose (docs/CONNECTIONS.md).
     acquire_timeout: float = 30.0
     # POSTGRES ONLY, refused on the other backends (see _db_schema_backend). 'db_schema' avoids
     # shadowing BaseModel.schema; env: MEFOR_STORE_DB_SCHEMA.
@@ -1074,7 +1075,7 @@ class StoreSettings(_Section):
         # No "0 disables" escape hatch, unlike command_timeout: an unbounded pool wait is the defect
         # this setting exists to remove, so there is deliberately no way to configure it back.
         if value <= 0:
-            raise ValueError("acquire_timeout must be > 0 (the pool wait is always bounded)")
+            raise ValueError("acquire_timeout must be > 0 (it bounds the pool wait)")
         return value
 
     @field_validator("warm_pool_target")

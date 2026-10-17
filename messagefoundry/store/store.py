@@ -14970,10 +14970,11 @@ class MessageStore:
 
     async def add_webauthn_credential(self, cred: WebAuthnCredential) -> None:
         """Persist one enrolled passkey. Public keys are plaintext by design (see the
-        ``_CIPHER_COLUMNS`` note). A duplicate ``(user_id, label)`` raises the backend's
-        IntegrityError — the caller renders it as the same "label already in use" error as its
-        pre-check (the concurrent-enroll race, ADR 0068 §4). The account is re-sealed over its new
-        passkey digest in the same transaction (BACKLOG #2592)."""
+        ``_CIPHER_COLUMNS`` note). sqlite3.IntegrityError is raised for at least a duplicate
+        ``(user_id, label)``, a credential id already held and an account that does not exist; the
+        caller tells them apart by re-reading, as ``AuthService.finish_webauthn_registration`` says
+        (ADR 0068 §4, BACKLOG #2733). The account is re-sealed over its new passkey digest in the
+        same transaction (BACKLOG #2592)."""
         async with _writer_guard(self._db, self._lock):
             await self._write_passkeys(cred.user_id, _WEBAUTHN_INSERT, webauthn_insert_params(cred))
             await self._commit()
