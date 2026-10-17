@@ -1212,9 +1212,9 @@ async def test_the_gate_says_the_directory_could_not_confirm_the_account(
 
 
 def test_the_directory_refusal_names_both_fixes() -> None:
-    """BACKLOG #3082, the console's half. An outage clears on a later try. A role lost in the
-    directory (``directory_roles_demoted``) never does, and a new sign-in, which takes the roles the
-    current groups grant, does. The engine hands the console the same
+    """BACKLOG #3082, the console's half. Which fix clears which cause, an outage or a role lost in
+    the directory (``directory_roles_demoted``), is stated once in docs/SECURITY.md (BACKLOG
+    #2240). The engine hands the console the same
     ``Elevation(directory_unconfirmed=True)`` for both causes and keeps the cause on the audit row,
     so this one text is what a demoted operator and an operator meeting an outage both see; the gate
     test above shows it on the page. The engine's half drives the real refusal for each cause:

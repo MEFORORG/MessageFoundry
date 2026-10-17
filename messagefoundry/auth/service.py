@@ -6670,8 +6670,9 @@ class AuthService:
           loop forfeits for an account the reconciler revokes, as for the breaker. A pass with a
           referral marks every candidate, so an account that pass itself revokes forfeits too.
 
-        At least these take an account out: it signs out, idles out or reaches the session cap, the
-        reconciler revokes it, an operator disables it locally, or its row is deleted. The cost is a
+        At least these take an account out: it signs out or reaches the session cap, the reconciler
+        revokes it, an operator disables it locally, its row is deleted, or the session reaper deletes
+        its idle sessions (an idle row stays a candidate until then, BACKLOG #2283). The cost is a
         missed clear when an account leaves for an ordinary reason while the evidence is pending. A trip
         or a referral marks every candidate unconfirmed, healthy ones too, so a sign-out during a
         long trip or referral forfeits its clear. This is one process's memory: what leaves across
