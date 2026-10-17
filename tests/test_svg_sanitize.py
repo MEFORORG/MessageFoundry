@@ -12,6 +12,7 @@ input would fail here: the drawing tests are the negative control.
 from __future__ import annotations
 
 import gzip
+import random
 import re
 import time
 import zlib
@@ -355,7 +356,7 @@ def test_svgz_at_the_bound_renders_and_one_over_is_refused(monkeypatch: pytest.M
     """The control for the refusal above: an SVGZ that inflates to exactly the bound is still
     sanitized and served, after a trial pass at the bound. The bounds are shrunk so the document is
     cheap to sanitize; the head stays smaller than the bound, as it is in production."""
-    monkeypatch.setattr(svg_sanitize, "_GZIP_SNIFF_BYTES", 1024)
+    monkeypatch.setattr(svg_sanitize, "_HEAD_BYTES", 1024)
     monkeypatch.setattr(svg_sanitize, "_MAX_SVG_BYTES", 4096)
     head, tail = b'<svg xmlns="http://www.w3.org/2000/svg"><rect width="1"/>', b"</svg>"
     at_bound = head + b" " * (4096 - len(head) - len(tail)) + tail
@@ -379,7 +380,7 @@ def test_a_large_body_whose_head_is_only_noise_is_cleared_by_its_first_content_b
     served as stored, as it was before the trial pass, unless the head past that noise holds an
     ``svg`` start tag. Changed on purpose by BACKLOG #3257: the noise does not use up the head, so
     padding cannot push the tag out of the scan's reach."""
-    monkeypatch.setattr(svg_sanitize, "_GZIP_SNIFF_BYTES", 1024)
+    monkeypatch.setattr(svg_sanitize, "_HEAD_BYTES", 1024)
     monkeypatch.setattr(svg_sanitize, "_MAX_SVG_BYTES", 4096)
     body = _gz(b" " * 2048 + b"%PDF-1.4 synthetic" + b"A" * 8192)
     assert sanitize_if_svg("application/gzip", body) is body
@@ -732,18 +733,45 @@ _DICOM_SHAPED = (
 )
 
 
+def _starts_as_markup(data: bytes) -> bool:
+    """Whether the first byte past leading noise is ``<``, as the sanitizer reads it."""
+    return svg_sanitize._plain_head(data) is None
+
+
+#: A large binary: several MiB of PDF-shaped bytes, with a stray ``svg`` start tag well past the
+#: 64 KiB head. The tag scan reads only the head, so it is served, and it never takes the hop.
+_LARGE_PDF_WITH_A_LATE_TAG = (
+    _PDF_SHAPED + bytes(range(256)) * (4 * 4096) + b" <svg onload=x> " + bytes(range(256)) * 64
+)
+
+
 @pytest.mark.parametrize(
-    "data", [_PDF_SHAPED, _PNG_SHAPED, _DICOM_SHAPED], ids=["pdf", "png", "dicom"]
+    "data",
+    [_PDF_SHAPED, _PNG_SHAPED, _DICOM_SHAPED, _LARGE_PDF_WITH_A_LATE_TAG],
+    ids=["pdf", "png", "dicom", "large-pdf-tag-past-the-head"],
 )
 @pytest.mark.parametrize("label", ["image/svg+xml", "application/pdf", "application/octet-stream"])
-def test_binaries_without_an_svg_tag_are_served_plain_and_gzipped(label: str, data: bytes) -> None:
+def test_binaries_without_an_svg_tag_in_their_head_are_served_plain_and_gzipped(
+    label: str, data: bytes
+) -> None:
     """The control for BACKLOG #3257's tag scan: a binary that is not markup and holds no ``svg``
-    start tag is served as stored, plain or gzipped, whatever its label."""
+    start tag in its head is served as stored, plain or gzipped, whatever its label. The pre-check
+    clears the plain body, so the route serves it without the thread hop. What lies past the head
+    rests on the content-type allow-list, plain as gzipped (the Manager's amendment)."""
     assert b"<" in data
-    assert not svg_sanitize._is_markup(data)
+    assert not _starts_as_markup(data)
+    assert not may_be_svg(data)
     assert sanitize_if_svg(label, data) is data
     gz = _gz(data)
     assert sanitize_if_svg(label, gz) is gz
+
+
+def test_the_large_binary_holds_its_tag_past_the_head() -> None:
+    """Control for the large case above: the tag is really there, and really past the head."""
+    data = _LARGE_PDF_WITH_A_LATE_TAG
+    assert len(data) > 4 * 1024 * 1024
+    assert svg_sanitize._has_svg_tag(data)
+    assert data.index(b"<svg") > svg_sanitize._HEAD_BYTES
 
 
 #: Leading Japanese text, then ``<s ESC ( B vg``, which an ISO-2022-JP decoder reads as ``<svg``.
@@ -790,7 +818,7 @@ def test_an_svg_tag_past_leading_text_is_refused_plain_and_gzipped(
     """BACKLOG #3257, the positive control. A body whose first byte past leading noise is not ``<``
     used to be served as stored even when it carried ``<svg onload=...>`` further on, under an SVG
     label too. It is refused now, plain and gzipped, and the pre-check sends it to the sanitizer."""
-    assert not svg_sanitize._is_markup(data)
+    assert not _starts_as_markup(data)
     assert may_be_svg(data)
     with pytest.raises(SvgRejected, match="svg start tag"):
         sanitize_if_svg(label, data)
@@ -801,13 +829,13 @@ def test_an_svg_tag_past_leading_text_is_refused_plain_and_gzipped(
 def test_a_gzip_tag_scan_reads_the_head_from_the_first_content_byte(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The gzip head scan covers :data:`_GZIP_SNIFF_BYTES` from the first byte past leading noise,
+    """The gzip head scan covers :data:`_HEAD_BYTES` from the first byte past leading noise,
     so leading whitespace does not shorten it: the head pass reads on to twice the head, and never
     to the bound (BACKLOG #1129). A tag that ends inside that window is refused, and one just past
     it is served, which is the recorded trade (BACKLOG #3257). A tag the window's end cuts is judged
     on what the window holds: ``<svg`` is refused as if the tag went on, ``<sv`` is past the head.
     The bounds are shrunk so the bodies stay small; the trade is the same at 64 KiB."""
-    monkeypatch.setattr(svg_sanitize, "_GZIP_SNIFF_BYTES", 1024)
+    monkeypatch.setattr(svg_sanitize, "_HEAD_BYTES", 1024)
     lead = b" " * 900 + b"%PDF-1.4 "
 
     def at_the_end(tail: bytes, rest: bytes) -> bytes:
@@ -829,6 +857,58 @@ def test_a_gzip_tag_scan_reads_the_head_from_the_first_content_byte(
     assert sanitize_if_svg("application/gzip", cut) is cut
 
 
+def test_a_plain_tag_scan_reads_the_same_head_as_gzip(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A plain body that is not markup is scanned over the same head as a gzip body: the
+    :data:`_HEAD_BYTES` from the first byte past leading noise. Each body below gets the same
+    verdict plain and gzipped, and the pre-check agrees with it. The bound is shrunk so the bodies
+    stay small."""
+    monkeypatch.setattr(svg_sanitize, "_HEAD_BYTES", 1024)
+    lead = b" " * 900 + b"%PDF-1.4 "
+
+    def at_the_end(tail: bytes, rest: bytes) -> bytes:
+        return lead + b"A" * (1024 - 9 - len(tail)) + tail + rest + b"A" * 4096
+
+    for refused in (at_the_end(b"<svg onload=", b"x>"), at_the_end(b"<svg", b"z/>")):
+        assert may_be_svg(refused)
+        for body in (refused, _gz(refused)):
+            with pytest.raises(SvgRejected, match="svg start tag"):
+                sanitize_if_svg("application/pdf", body)
+    for served in (
+        lead + b"A" * 1024 + b"<svg onload=x>" + b"A" * 4096,
+        at_the_end(b"<sv", b"g onload=x>"),
+    ):
+        assert not may_be_svg(served)
+        for body in (served, _gz(served)):
+            assert sanitize_if_svg("application/pdf", body) is body
+
+
+def _random_bodies() -> list[bytes]:
+    """Synthetic bodies for the pairing test: seeded random bytes of several sizes, with and
+    without a planted tag at several offsets, and the shaped binaries."""
+    rng = random.Random(3257)
+    bodies = [_PDF_SHAPED, _PNG_SHAPED, _DICOM_SHAPED, _LARGE_PDF_WITH_A_LATE_TAG]
+    for size in (0, 1, 100, 70_000, 300_000):
+        noise = rng.randbytes(size).replace(b"<", b"(")
+        bodies.append(b"%" + noise)
+        for at in (0, size // 2, size):
+            bodies.append(b"%" + noise[:at] + b"<svg onload=x>" + noise[at:])
+    return bodies
+
+
+@pytest.mark.parametrize("data", _random_bodies(), ids=lambda data: f"{len(data)}-bytes")
+def test_a_pre_check_false_never_hides_a_refusal(data: bytes) -> None:
+    """``may_be_svg`` lets the route skip the sanitizer, so its ``False`` must mean the sanitizer
+    would serve the body unchanged under any label, and a refusal must always follow a ``True``."""
+    for label in ("image/svg+xml", "application/pdf", None):
+        try:
+            served = sanitize_if_svg(label, data)
+        except SvgRejected:
+            assert may_be_svg(data)
+        else:
+            if not may_be_svg(data):
+                assert served is data
+
+
 def test_a_gzip_whose_content_starts_too_near_the_bound_is_refused(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -836,7 +916,7 @@ def test_a_gzip_whose_content_starts_too_near_the_bound_is_refused(
     lies so near the bound that no full head fits past it, the tag scan cannot see a full head, so
     the body is refused rather than cleared (BACKLOG #3257). The control starts its content early
     enough to leave a full head, and is served."""
-    monkeypatch.setattr(svg_sanitize, "_GZIP_SNIFF_BYTES", 1024)
+    monkeypatch.setattr(svg_sanitize, "_HEAD_BYTES", 1024)
     monkeypatch.setattr(svg_sanitize, "_MAX_SVG_BYTES", 4096)
     near = _gz(b" " * 4000 + b"%PDF-1.4 " + b"A" * 8192)
     with pytest.raises(SvgRejected, match="before a full head"):
@@ -871,6 +951,18 @@ def test_the_pre_check_misses_no_markup_and_clears_binaries(data: bytes, expecte
 
 def test_the_pre_check_reads_past_any_amount_of_leading_whitespace() -> None:
     assert may_be_svg(b" " * (70 * 1024) + b"<svg/>")
+
+
+def test_the_pre_check_leaves_noise_past_a_head_to_the_thread() -> None:
+    """The pre-check runs on the event loop, so it reads at most a head of leading noise. A body
+    whose noise runs past that goes to the sanitizer, which serves it when its head is clean; one
+    that is noise to its end within a head is cleared on the spot (BACKLOG #3257)."""
+    long_noise = b"\x00" * (svg_sanitize._HEAD_BYTES + 1) + b"%PDF-1.4 synthetic"
+    assert may_be_svg(long_noise)
+    assert sanitize_if_svg("application/pdf", long_noise) is long_noise
+    short_noise = b"\x00" * 128
+    assert not may_be_svg(short_noise)
+    assert sanitize_if_svg("application/pdf", short_noise) is short_noise
 
 
 #: ASVS 1.5.3's shared hostile corpus (``tests/test_xml_parser_consistency.py``), with each document's
