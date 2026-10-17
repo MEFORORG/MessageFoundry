@@ -16,6 +16,7 @@ supposed to succeed, and the session registry is a throwaway home.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -27,7 +28,6 @@ import pytest
 
 from tests.test_worktree_remove_path import (
     _ENV,
-    _REPO,
     SCRIPT,
     Rig,
     _claim,
@@ -60,17 +60,19 @@ def _target(route: str, wt: Path) -> list[str]:
 
 #: Whether the deny bound, asked of .NET directly, and NOT of the script's helper: a helper that
 #: swallowed access-denied would otherwise answer "listed" and turn its own regression into a skip.
-#: Only an UnauthorizedAccessException counts as bound (exit 3); any other throw is exit 5, so an
-#: unrelated error cannot pass for ACL coverage. The script's own helper is then called on the
-#: script's walk root, for the report only, with the script's $ErrorActionPreference.
+#: The call is the one the helper makes. Only an UnauthorizedAccessException counts as bound (exit 3);
+#: any other throw is exit 5, so an unrelated error cannot pass for ACL coverage. What the script's
+#: helper did with the directory is in the script's own output, which a failure prints.
 #:
 #: It runs as a -File script, the way the rig runs remove.ps1. Under -Command, pwsh appends the
 #: arguments to the command text and leaves $args empty: the first version of this probe was such a
 #: one-liner, threw on every directory, never skipped, and so the ACL tests failed on a runner where
-#: the deny does not bind (engine PR 2371, the run on head 2d369bff).
+#: the deny does not bind (engine PR 2371, the run on head 2d369bff). whoami is named by its full
+#: path, because under the CI leg's Git Bash a bare one resolves to MSYS's, which has no /priv.
 _PROBE = r"""
-param([string]$Script, [string]$Dir, [string]$WalkRoot, [switch]$Recurse)
+param([string]$Dir)
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $opts = [System.IO.EnumerationOptions]::new()
 $opts.IgnoreInaccessible = $false
 $opts.AttributesToSkip = [System.IO.FileAttributes]0
@@ -84,34 +86,22 @@ try {
     if ($x) { $code = 3; Write-Output "PROBE: .NET was denied '$Dir': $($x.Message)" }
     else { $code = 5; Write-Output "PROBE: .NET failed on '$Dir', not denied: $($_.Exception.GetType().FullName): $($_.Exception.Message)" }
 }
-$ast = [System.Management.Automation.Language.Parser]::ParseFile($Script, [ref]$null, [ref]$null)
-$fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-    $n.Name -eq 'Get-EntriesOrThrow' }, $true)
-if (-not $fn) { Write-Output "PROBE: no Get-EntriesOrThrow in '$Script'"; $code = 4 }
-else {
-    . ([scriptblock]::Create($fn.Extent.Text))
-    try { Write-Output "PROBE: the script's helper listed $(@(Get-EntriesOrThrow $WalkRoot 'probe entries' -Recurse:$Recurse).Count) entries under '$WalkRoot'" }
-    catch { Write-Output "PROBE: the script's helper: $($_.Exception.Message)" }
-}
 Write-Output "PROBE: whoami /priv of this pwsh:"
-whoami /priv | Out-String | Write-Output
+try { & (Join-Path $env:SystemRoot 'System32\whoami.exe') /priv | Out-String | Write-Output }
+catch { Write-Output "PROBE: whoami /priv failed: $($_.Exception.Message)" }
 exit $code
 """
 
 
-def _run_probe(
-    root: Path, directory: Path, walk_root: Path, *, recurse: bool = False
-) -> subprocess.CompletedProcess[str]:
-    """The probe, run the way the rig runs remove.ps1: a pwsh -File child with the rig's env."""
+def _run_probe(root: Path, directory: Path) -> subprocess.CompletedProcess[str]:
+    """The probe, run as the rig runs remove.ps1: a pwsh -File child, from root, with the rig's env."""
     probe_file = root / "probe-listing.ps1"
     probe_file.write_text(_PROBE, encoding="utf-8")
-    argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(probe_file), str(SCRIPT)]
-    argv += [str(directory), str(walk_root), *(["-Recurse"] if recurse else [])]
-    # whoami /priv text is localized and arrives in the console's OEM code page.
     return subprocess.run(
-        argv,
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(probe_file), str(directory)],
+        cwd=str(root),
         capture_output=True,
-        encoding="oem",
+        encoding="utf-8",
         errors="replace",
         check=False,
         timeout=120,
@@ -128,19 +118,105 @@ def _explain(
     )
 
 
+#: The privileges that let a process read past a deny ACE. .NET opens a directory with
+#: FILE_FLAG_BACKUP_SEMANTICS, which honours SeBackupPrivilege when it is ENABLED in the token.
+_BYPASS_PRIVILEGES = ("SeBackupPrivilege", "SeRestorePrivilege")
+
+
 @contextmanager
-def _denied_listing(
-    rig: Rig, directory: Path, walk_root: Path, *, recurse: bool = False
-) -> Iterator[subprocess.CompletedProcess[str]]:
-    """Deny this user the right to list ``directory``, and give it back afterwards. ``walk_root`` and
-    ``recurse`` are where and how remove.ps1 walks to reach it, for the probe's report.
+def _privileges_disabled(names: tuple[str, ...] = _BYPASS_PRIVILEGES) -> Iterator[int]:
+    """Disable ``names`` in this process's token while the block runs, then put back what was on.
+    Child processes copy the token as it stands, so pwsh and remove.ps1 started inside see them off.
+    Yields how many were on. A privilege the token does not hold is left alone.
+
+    Why: the CI leg runs pytest under Git Bash, and the MSYS runtime is believed to ENABLE backup and
+    restore privileges at start when the token holds them, as an elevated runneradmin's does. Not
+    measured on the runner; the probe's whoami /priv is how a skip there reports it.
+    """
+    if sys.platform != "win32":
+        yield 0
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    class Luid(ctypes.Structure):
+        _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+    class LuidAndAttributes(ctypes.Structure):
+        _fields_ = [("Luid", Luid), ("Attributes", wintypes.DWORD)]
+
+    class TokenPrivileges(ctypes.Structure):
+        _fields_ = [
+            ("PrivilegeCount", wintypes.DWORD),
+            ("Privileges", LuidAndAttributes * len(names)),
+        ]
+
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    advapi.OpenProcessToken.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    advapi.LookupPrivilegeValueW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        ctypes.POINTER(Luid),
+    ]
+    advapi.AdjustTokenPrivileges.argtypes = [
+        wintypes.HANDLE,
+        wintypes.BOOL,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    token = wintypes.HANDLE()
+    # TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY
+    if not advapi.OpenProcessToken(
+        kernel.GetCurrentProcess(), 0x0020 | 0x0008, ctypes.byref(token)
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        off = TokenPrivileges(len(names))
+        for i, name in enumerate(names):
+            if not advapi.LookupPrivilegeValueW(None, name, ctypes.byref(off.Privileges[i].Luid)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            off.Privileges[i].Attributes = 0
+        was = TokenPrivileges()
+        size = wintypes.DWORD()
+        if not advapi.AdjustTokenPrivileges(
+            token,
+            False,
+            ctypes.byref(off),
+            ctypes.sizeof(was),
+            ctypes.byref(was),
+            ctypes.byref(size),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            # PreviousState lists only the privileges this call changed, so these were enabled.
+            yield int(was.PrivilegeCount)
+        finally:
+            if was.PrivilegeCount:
+                advapi.AdjustTokenPrivileges(token, False, ctypes.byref(was), 0, None, None)
+    finally:
+        kernel.CloseHandle(token)
+
+
+@contextmanager
+def _denied_listing(rig: Rig, directory: Path) -> Iterator[subprocess.CompletedProcess[str]]:
+    """Deny this user the right to list ``directory``, with the bypass privileges off, and give both
+    back afterwards. Run the script inside the block.
 
     The deny must take effect, or the test proves nothing. On the hosted windows-2025 runner the
     script went on listing the directory after this deny, as runneradmin (engine PR 2371, run
-    39005284295). Why was not measured; the probe prints its pwsh's privileges, so a skip there says.
-    A skip there leaves the access-denied branch undriven on that runner: the planted-file test
-    drives a different exception, and the static pin reads two strings. It is driven only where the
-    deny binds, such as a non-elevated developer box.
+    39005284295). Turning the bypass privileges off is the fix for the cause believed above. If the
+    deny still does not bind, the test skips and the skip prints the probe's privileges. A skip
+    leaves the access-denied branch undriven on that runner: the planted-file test drives a different
+    exception, and the static pin reads two strings.
     """
     who = subprocess.run(
         ["whoami"], capture_output=True, text=True, check=False, timeout=30
@@ -155,11 +231,15 @@ def _denied_listing(
     if not who or made.returncode != 0:
         pytest.skip(f"could not deny access with icacls: {made.stdout} {made.stderr}")
     try:
-        probe = _run_probe(rig.root, directory, walk_root, recurse=recurse)
-        if probe.returncode == 0:
-            pytest.skip(f"{who} can still list {directory} after the deny.\n{_out(probe)}")
-        assert probe.returncode == 3, f"the probe did not see a denial:\n{_out(probe)}"
-        yield probe
+        with _privileges_disabled() as were_on:
+            probe = _run_probe(rig.root, directory)
+            if probe.returncode == 0:
+                pytest.skip(
+                    f"{who} can still list {directory} after the deny, with {were_on} bypass "
+                    f"privilege(s) turned off.\n{_out(probe)}"
+                )
+            assert probe.returncode == 3, f"the probe did not see a denial:\n{_out(probe)}"
+            yield probe
     finally:
         subprocess.run(
             ["icacls", str(directory), "/remove:d", who],
@@ -461,7 +541,7 @@ def test_a_claims_directory_that_cannot_be_listed_refuses(rig: Rig, route: str) 
     claims = _common(rig) / "mefor-coord" / "claims"
     claims.mkdir(parents=True)
 
-    with _denied_listing(rig, claims, claims) as probe:
+    with _denied_listing(rig, claims) as probe:
         proc = rig.run(*_target(route, wt), "-Force")
     assert proc.returncode != 0, _explain(claims, probe, proc)
     assert "claims are unknown" in _out(proc), _explain(claims, probe, proc)
@@ -508,20 +588,38 @@ def test_the_listing_probe_tells_listed_from_failed_for_another_reason(tmp_path:
     planted = tmp_path / "planted"
     planted.write_text("not a directory\n", encoding="utf-8")
 
-    ok = _run_probe(tmp_path, listable, listable)
+    ok = _run_probe(tmp_path, listable)
     assert ok.returncode == 0, _out(ok)
-    assert "the script's helper listed 1 entries" in _out(ok), _out(ok)
-    assert "PROBE: whoami /priv of this pwsh:" in _out(ok), _out(ok)
-    bad = _run_probe(tmp_path, planted, planted)
+    assert f".NET listed '{listable}'" in _out(ok), _out(ok)
+    # A privilege name, which whoami does not localize: proof the Windows whoami ran, not MSYS's.
+    assert "SeChangeNotifyPrivilege" in _out(ok), _out(ok)
+    bad = _run_probe(tmp_path, planted)
     assert bad.returncode == 5, _out(bad)
-    assert "probe entries are unknown" in _out(bad), _out(bad)
+    assert "not denied: System.IO.IOException" in _out(bad), _out(bad)
+
+
+def test_turning_a_privilege_off_reaches_a_child_process() -> None:
+    """What the ACL tests rely on to make the deny bind under an elevated token: a privilege turned
+    off in this process is off in a child started afterwards, and is back on once the block ends.
+    Driven with SeChangeNotifyPrivilege, which every token holds enabled."""
+    whoami = [str(Path(os.environ["SYSTEMROOT"], "System32", "whoami.exe")), "/priv"]
+
+    def state() -> str:
+        out = subprocess.run(whoami, capture_output=True, text=True, check=True, timeout=30).stdout
+        return next(line for line in out.splitlines() if line.startswith("SeChangeNotifyPrivilege"))
+
+    assert state().rstrip().endswith("Enabled"), state()
+    with _privileges_disabled(("SeChangeNotifyPrivilege",)) as were_on:
+        assert were_on == 1
+        assert state().rstrip().endswith("Disabled"), state()
+    assert state().rstrip().endswith("Enabled"), state()
 
 
 def test_the_listing_helper_does_not_skip_what_it_may_not_read() -> None:
     """.NET's EnumerationOptions defaults IgnoreInaccessible to TRUE, and then an unlistable directory
     lists as empty, which is the fail-open these refusals exist to stop. The ACL tests drive this
     only where a deny binds, so the setting is pinned here as well, on every runner."""
-    text = (_REPO / "scripts" / "worktree" / "remove.ps1").read_text(encoding="utf-8")
+    text = SCRIPT.read_text(encoding="utf-8")
     body = text[text.index("function Get-EntriesOrThrow") :]
     body = body[: body.index("\n}\n")]
     assert "$opts.IgnoreInaccessible = $false" in body, body
@@ -538,8 +636,7 @@ def test_an_allocation_directory_that_cannot_be_listed_refuses(rig: Rig, route: 
     hidden = _common(rig) / "mefor-coord" / "alloc" / "backlog"
     hidden.mkdir(parents=True)
 
-    # The script walks the whole alloc directory recursively and meets this one on the way down.
-    with _denied_listing(rig, hidden, hidden.parent, recurse=True) as probe:
+    with _denied_listing(rig, hidden) as probe:
         proc = rig.run(*_target(route, wt), "-Force")
     assert proc.returncode != 0, _explain(hidden, probe, proc)
     assert "allocations are unknown" in _out(proc), _explain(hidden, probe, proc)
