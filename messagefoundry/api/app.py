@@ -220,6 +220,7 @@ from messagefoundry.api.outlive import OutlivingOperations
 from messagefoundry.api.paging import page_total
 from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
+    AUTH_NOT_CONFIGURED,
     AuthenticatedBeforeBodyRoute,
     ExportStopped,
     alert_sink_for,
@@ -9883,8 +9884,9 @@ def create_managed_app(
     ``synchronous``) as a SQLite shortcut. ``config_dir`` loads the code-first Connection/Router/
     Handler graph. ``auth_settings`` attaches an :class:`AuthService` and seeds the built-in roles;
     it creates no account (ADR 0183). With no ``auth_settings`` every protected route is refused
-    (503) unless the caller passes ``allow_no_auth=True``, the same opt-in :func:`create_app` takes;
-    beside ``auth_settings`` that opt-in raises ``ValueError``.
+    (503) unless the caller passes ``allow_no_auth=True``, the same opt-in :func:`create_app` takes,
+    and the build logs one WARNING saying so; beside ``auth_settings`` that opt-in raises
+    ``ValueError``.
     The store is opened via the
     backend-agnostic :func:`~messagefoundry.store.open_store`. ``api_listener`` is the engine's own
     ``(host, port)`` (from ``[api]``), reserved so no inbound listener can be wired onto the API's port
@@ -9909,6 +9911,16 @@ def create_managed_app(
         raise ValueError(
             "create_managed_app: allow_no_auth=True was passed beside auth_settings; pass the "
             "opt-in only with no auth_settings, since settings always require sign-in"
+        )
+    elif auth_settings is None and not allow_no_auth:
+        # Vault BACKLOG #2731 item 1: no settings means no service ever attaches, so this fails
+        # closed. Said here and not in create_app, which every managed app calls with auth=None
+        # before the lifespan attaches a service.
+        _log.warning(
+            "create_managed_app: no auth_settings and allow_no_auth is not set, so every protected "
+            "route will answer 503 (%s); pass auth_settings to require sign-in, or "
+            "allow_no_auth=True for the open mode",
+            AUTH_NOT_CONFIGURED,
         )
 
     @asynccontextmanager
