@@ -3,6 +3,7 @@
 import * as assert from "assert";
 import * as fs from "fs";
 import * as path from "path";
+import * as ts from "typescript";
 
 import { alertEditorScript } from "../../alertEditorWebview";
 import { codeSetEditorScript } from "../../codeSetEditorWebview";
@@ -55,7 +56,7 @@ const openWindows: JsdomWindow[] = [];
 /** A panel shell: the banners, then `panelScript` as the panel's own script when one is given. */
 function shell(
   options: { runScripts: boolean; panelScript?: string },
-): { hidden(id: string): boolean; errors: unknown[] } {
+): { hidden(id: string): boolean; banner(id: string): DomNode; document: DomNode; errors: unknown[] } {
   const errors: unknown[] = [];
   const virtualConsole = new VirtualConsole();
   virtualConsole.on("jsdomError", (e: unknown) => errors.push(e));
@@ -74,14 +75,38 @@ function shell(
     },
   });
   openWindows.push(dom.window);
+  const banner = (id: string): DomNode => {
+    const el = dom.window.document.getElementById(id);
+    assert.ok(el, `the shell has no #${id}`);
+    return el;
+  };
   return {
     errors,
-    hidden(id: string): boolean {
-      const el = dom.window.document.getElementById(id);
-      assert.ok(el, `the shell has no #${id}`);
-      return el.hidden === true;
-    },
+    banner,
+    document: dom.window.document,
+    hidden: (id: string): boolean => banner(id).hidden === true,
   };
+}
+
+/** `webviewMessaging.ts` parsed, so a pin reads code and never a comment that mentions it. */
+function helperSyntax(): ts.SourceFile {
+  const file = path.join(SRC, "webviewMessaging.ts");
+  return ts.createSourceFile(file, fs.readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true);
+}
+
+function walk(node: ts.Node, visit: (node: ts.Node) => void): void {
+  visit(node);
+  ts.forEachChild(node, (child) => walk(child, visit));
+}
+
+/** The name of the function declaration a node sits in, or "(module)". */
+function enclosingFunction(node: ts.Node): string {
+  for (let n: ts.Node | undefined = node.parent; n !== undefined; n = n.parent) {
+    if (ts.isFunctionDeclaration(n)) {
+      return n.name?.text ?? "(anonymous)";
+    }
+  }
+  return "(module)";
 }
 
 function productionSources(): { rel: string; text: string }[] {
@@ -148,48 +173,129 @@ suite("startup banners: what the user sees", () => {
     assert.strictEqual(page.hidden(CSP_BANNER_ID), false);
   });
 
-  test("the canary is un-nonced, and the banners need no script or stylesheet to read", () => {
+  test("the canary is un-nonced", () => {
     // The script COUNT is parsed, not pattern-matched: a parser finds a script element however
-    // its tag is spelled. (The checks further down still read the markup as text.) Scripts are
-    // off here, so nothing in the markup runs.
-    const parsed = new JSDOM(`<!DOCTYPE html><body>${STARTUP_BANNERS}</body>`).window;
-    openWindows.push(parsed);
-    const scripts = [...parsed.document.querySelectorAll("script")] as DomNode[];
+    // its tag is spelled. Scripts are off here, so nothing in the markup runs.
+    const page = shell({ runScripts: false });
+    const scripts = [...page.document.querySelectorAll("script")] as DomNode[];
     // Exactly one script, with no attribute at all. A nonce here would run the canary under an
     // enforcing engine and raise the warning on every healthy panel.
     assert.deepStrictEqual(
       scripts.map((s) => s.getAttributeNames()),
       [[]],
+      "the banners carry other than one attribute-less script",
     );
-    // Nothing in the helper writes a value into script text with a bare JSON.stringify, which
-    // leaves "<" unescaped. embedJson is the one place that call may appear.
-    const helper = fs.readFileSync(path.join(SRC, "webviewMessaging.ts"), "utf8");
-    assert.ok(helper.includes("${embedJson(SCRIPT_BANNER_ID)}"));
-    assert.ok(helper.includes("${embedJson(CSP_BANNER_ID)}"));
-    assert.strictEqual(helper.split("JSON.stringify(").length - 1, 1, "a bare JSON.stringify");
-    assert.ok(STARTUP_BANNERS.includes(`id="${SCRIPT_BANNER_ID}" role="alert" style=`));
-    assert.ok(STARTUP_BANNERS.includes(`id="${CSP_BANNER_ID}" role="alert" hidden style=`));
-    // The script banner must not start hidden, by attribute or by inline style.
-    const scriptBanner = STARTUP_BANNERS.split("</div>")[0];
-    assert.ok(!/\shidden[\s>]/.test(scriptBanner) && !/display\s*:\s*none/.test(STARTUP_BANNERS));
-    // It is held back for one second by CSS alone, so a healthy re-render does not flash it. The
+    assert.deepStrictEqual(page.errors.map(String), []);
+  });
+
+  test("the banners need no script or stylesheet to read", () => {
+    const page = shell({ runScripts: false });
+    const scriptBanner = page.banner(SCRIPT_BANNER_ID);
+    const cspBanner = page.banner(CSP_BANNER_ID);
+    for (const el of [scriptBanner, cspBanner]) {
+      assert.strictEqual(el.getAttribute("role"), "alert", `#${el.id} is not announced`);
+      // A display:none would keep a banner down even once its `hidden` attribute is cleared.
+      assert.notStrictEqual(el.style.display, "none", `#${el.id} is display:none`);
+    }
+    // The script banner must not start hidden; only the canary may reveal the CSP banner.
+    assert.strictEqual(scriptBanner.hasAttribute("hidden"), false, "the script banner starts hidden");
+    assert.strictEqual(cspBanner.hasAttribute("hidden"), true, "the CSP banner starts shown");
+    assert.deepStrictEqual(page.errors.map(String), []);
+  });
+
+  test("the script banner waits by CSS alone, then shows the full banner box and every word", () => {
+    const page = shell({ runScripts: false });
+    const scriptBanner = page.banner(SCRIPT_BANNER_ID);
+    const waiting: string = scriptBanner.getAttribute("style");
+    // Held back for one second by CSS alone, so a healthy re-render does not flash it. The
     // keyframes the delay names must ship with it, or the banner would stay invisible for good.
-    const delay = /visibility:hidden;animation:([\w-]+) 0s linear 1s forwards/.exec(scriptBanner);
+    const delay = /visibility:hidden;animation:([\w-]+) 0s linear 1s forwards/.exec(waiting);
     assert.ok(delay, "the script banner has no CSS delay");
-    const frames = new RegExp(`@keyframes ${delay[1]} \\{ to \\{([^}]*)\\} \\}`).exec(STARTUP_BANNERS);
+    const styles = [...page.document.querySelectorAll("style")] as DomNode[];
+    const frames = new RegExp(`@keyframes ${delay[1]} \\{ to \\{([^}]*)\\} \\}`).exec(
+      styles.map((s) => s.textContent).join("\n"),
+    );
     assert.ok(frames, "the keyframes the delay names are missing");
-    assert.ok(/visibility: visible;/.test(frames[1]));
-    // While it waits it takes no room, and the keyframes give back every length it zeroed. A
-    // length left at zero would show a clipped or borderless banner on a panel that needs it.
-    const zeroed = [...scriptBanner.matchAll(/(max-height|padding-top|padding-bottom|border-width|margin):0;/g)];
+    const shown = page.document.createElement("div").style;
+    shown.cssText = frames[1];
+    assert.strictEqual(shown.visibility, "visible", "the keyframes never make the banner visible");
+
+    // While it waits it takes no room.
+    const zeroed = [...waiting.matchAll(/(max-height|padding-top|padding-bottom|border-width|margin):0;/g)];
     assert.deepStrictEqual(
       zeroed.map((m) => m[1]),
       ["max-height", "padding-top", "padding-bottom", "border-width", "margin"],
+      "the waiting banner does not collapse every length it should",
     );
-    for (const [, property] of zeroed) {
-      assert.ok(new RegExp(`${property}: [1-9]`).test(frames[1]) || property === "margin", property);
+    // Once shown it has the CSP banner's box, which is the plain banner style. Both are read from
+    // the rendered markup, so a keyframe value that drifts from the banner style fails here.
+    const box = page.banner(CSP_BANNER_ID);
+    for (const side of ["Top", "Right", "Bottom", "Left"]) {
+      assert.strictEqual(shown[`margin${side}`], box.style[`margin${side}`], `margin-${side.toLowerCase()}`);
     }
-    assert.ok(/margin: 0 0 8px;/.test(frames[1]));
+    for (const side of ["Top", "Bottom"]) {
+      assert.strictEqual(shown[`padding${side}`], box.style[`padding${side}`], `padding-${side.toLowerCase()}`);
+    }
+    // jsdom does not expand a `border` shorthand that holds var(), so its width is read as text.
+    const border = /(?:^|;)border:(\d[^\s;]*)\s/.exec(box.getAttribute("style"));
+    assert.ok(border, "the banner style has no border width");
+    for (const side of ["Top", "Right", "Bottom", "Left"]) {
+      assert.strictEqual(shown[`border${side}Width`], border[1], `border-${side.toLowerCase()}-width`);
+    }
+
+    // overflow:hidden and a length cap stay on the shown banner, so the cap must hold every word:
+    // two em per character covers one character per line at a line height up to 2, and
+    // overflow-wrap:anywhere keeps a long word from being cut off at the side.
+    assert.strictEqual(scriptBanner.style.overflowWrap, "anywhere", "a long word can be clipped");
+    const cap = /^(\d+(?:\.\d+)?)em$/.exec(shown.maxHeight);
+    assert.ok(cap, `the shown cap is not an em length: ${shown.maxHeight}`);
+    const chars = String(scriptBanner.textContent).length;
+    assert.ok(Number(cap[1]) >= 2 * chars, `a ${cap[1]}em cap can clip ${chars} characters`);
+  });
+});
+
+suite("startup banners: the ids reach script text through embedJson", () => {
+  // Read from the parsed source, so a comment that names a call can neither trip a pin nor satisfy
+  // one. A DOM cannot tell the two spellings apart: these constant ids hold no "<", so a bare
+  // JSON.stringify and embedJson render the same script.
+
+  test("each banner's script reads its id through embedJson", () => {
+    const spans = new Map<string, string[]>();
+    walk(helperSyntax(), (node) => {
+      if (
+        ts.isVariableDeclaration(node) &&
+        ts.isIdentifier(node.name) &&
+        node.initializer !== undefined &&
+        ts.isTemplateExpression(node.initializer)
+      ) {
+        spans.set(
+          node.name.text,
+          node.initializer.templateSpans.map((s) => s.expression.getText()),
+        );
+      }
+    });
+    const mark = spans.get("SCRIPT_STARTED_MARK") ?? [];
+    const banners = spans.get("STARTUP_BANNERS") ?? [];
+    assert.ok(
+      mark.includes("embedJson(SCRIPT_BANNER_ID)"),
+      `SCRIPT_STARTED_MARK interpolates ${JSON.stringify(mark)}, not embedJson(SCRIPT_BANNER_ID)`,
+    );
+    assert.ok(
+      banners.includes("embedJson(CSP_BANNER_ID)"),
+      `STARTUP_BANNERS interpolates ${JSON.stringify(banners)}, not embedJson(CSP_BANNER_ID)`,
+    );
+  });
+
+  test("embedJson is the only code in the helper that touches JSON", () => {
+    // Every reference to JSON counts, not only a call, so an alias such as
+    // `const s = JSON.stringify` fails here too. A bare JSON.stringify leaves "<" unescaped.
+    const uses: string[] = [];
+    walk(helperSyntax(), (node) => {
+      if (ts.isIdentifier(node) && node.text === "JSON") {
+        uses.push(`${enclosingFunction(node)}: ${node.parent.parent.getText()}`);
+      }
+    });
+    assert.deepStrictEqual(uses, ["embedJson: JSON.stringify(value ?? null)"], "JSON outside embedJson");
   });
 });
 
