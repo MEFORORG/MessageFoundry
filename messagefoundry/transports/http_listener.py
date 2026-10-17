@@ -859,7 +859,8 @@ class HttpSource(SourceConnector):
 
     @property
     def tls_handshake_failures(self) -> int:
-        """Failed TLS handshakes this listener has seen since it was built (vault BACKLOG #3302)."""
+        """Failed TLS handshakes this listener has seen since it was built, outside its stop()s
+        (vault BACKLOG #3302)."""
         return self._tls_failures.count
 
     def _note_tls_failure(self, cause: str) -> None:

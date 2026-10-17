@@ -26,7 +26,7 @@ with ``do_handshake()``. Both treat any ``ssl.SSLError`` from it as a failed han
 exactly that set and re-raises unchanged, so the loop's own handling does not move. No server or
 protocol class is replaced.
 
-**What it cannot see, stated so it is not over-read.**
+**What it cannot see, at least, stated so it is not over-read.**
 
 * **The peer's address.** A TLS object holds two memory buffers and no socket, so these reports
   name no peer. A trailing report for several failures names none anyway.
@@ -37,6 +37,9 @@ protocol class is replaced.
   a TLS port all raise, so all are counted.
 * **A peer that hangs up mid-handshake.** Not counted, deliberately, as on MLLP since #2613: that is
   what a load balancer's TCP health check does.
+* **A failure outside ``do_handshake``**, such as one in ``wrap_bio`` itself, and any context driven
+  through ``wrap_socket`` rather than by an event loop, which is how the DICOM SCP runs its
+  handshakes.
 
 Stdlib only, so the API can import it without pulling in a transport.
 """
@@ -59,6 +62,10 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+# Whether a fault in a recorder has been logged at WARNING yet. Later ones go to DEBUG, so a recorder
+# that fails on every call cannot turn a handshake flood into the log flood the throttle prevents.
+_recorder_fault_logged = False
 
 #: Seconds between two reports from one listener. Per listener, not per peer: the peer's address
 #: is the caller's choice, so a per-peer window would let one host rotating addresses write a row
@@ -230,5 +237,12 @@ class _WatchedSSLObject(ssl.SSLObject):
             # A recording fault must never turn a failed handshake into a different error inside
             # the loop's protocol, so it is logged and the handshake's own error goes on.
             except Exception as fault:  # noqa: BLE001
-                logger.warning("recording a failed TLS handshake failed: %s", type(fault).__name__)
+                _log_recorder_fault(fault)
             raise
+
+
+def _log_recorder_fault(fault: Exception) -> None:
+    global _recorder_fault_logged
+    level = logging.DEBUG if _recorder_fault_logged else logging.WARNING
+    _recorder_fault_logged = True
+    logger.log(level, "recording a failed TLS handshake failed: %s", type(fault).__name__)

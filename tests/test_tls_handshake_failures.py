@@ -138,23 +138,32 @@ def test_the_hook_reports_a_failed_handshake_and_not_a_completed_one(tmp_path: P
 
 
 def test_a_fault_in_the_recorder_does_not_change_the_handshake_error(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The first fault is a WARNING and later ones DEBUG, so a recorder failing on every call
+    cannot turn a handshake flood into a log flood."""
+    import messagefoundry.tls_handshake_failures as thf
+
+    monkeypatch.setattr(thf, "_recorder_fault_logged", False)
     server_ctx, _cert_path = _server_ctx(tmp_path)
 
     def broken(_cause: str) -> None:
         raise RuntimeError("recorder fault")
 
     watch_loop_handshakes(server_ctx, broken)
-    s_in, s_out = ssl.MemoryBIO(), ssl.MemoryBIO()
-    s_in.write(_PLAINTEXT)
-    server = server_ctx.wrap_bio(s_in, s_out, server_side=True)
-    with (
-        caplog.at_level(logging.WARNING, logger="messagefoundry.tls_handshake_failures"),
-        pytest.raises(ssl.SSLError),  # the handshake's own error, not the recorder's
-    ):
-        server.do_handshake()
-    assert "recording a failed TLS handshake failed: RuntimeError" in caplog.text
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.tls_handshake_failures"):
+        for _ in range(3):
+            s_in, s_out = ssl.MemoryBIO(), ssl.MemoryBIO()
+            s_in.write(_PLAINTEXT)
+            server = server_ctx.wrap_bio(s_in, s_out, server_side=True)
+            with pytest.raises(ssl.SSLError):  # the handshake's own error, not the recorder's
+                server.do_handshake()
+    faults = [
+        r.levelno
+        for r in caplog.records
+        if r.getMessage() == "recording a failed TLS handshake failed: RuntimeError"
+    ]
+    assert faults == [logging.WARNING, logging.DEBUG, logging.DEBUG]
 
 
 def test_the_cause_keeps_only_an_openssl_mnemonic() -> None:
@@ -200,22 +209,24 @@ async def test_a_report_due_now_disarms_the_trailing_timer() -> None:
     async def emit(peer_host: str | None, reason: str) -> None:
         sent.append((peer_host, reason))
 
-    failures = HandshakeFailures(emit, window=0.3)
+    # A window far longer than the test, so no step of it can fall outside one by being slow.
+    failures = HandshakeFailures(emit, window=60.0)
     failures.note_soon(None, "SSLError")
     failures.note_soon(None, "SSLError")  # held: arms the trailing timer
     stale = failures._timer
     assert stale is not None
     assert failures._reported_at is not None
-    failures._reported_at -= 1.0  # the window has passed, and the timer has not run yet
+    failures._reported_at -= 61.0  # the window has passed, and the timer has not run yet
     failures.note_soon(None, "SSLError")
     assert stale.cancelled()
     await _until(lambda: len(sent) == 2, "the due report was not sent")
     assert sent[1] == (None, "2 failed handshake(s) since the last event; last cause SSLError")
     failures.note_soon(None, "SSLError")  # inside the new window: a new timer
-    assert failures._timer is not None
+    fresh = failures._timer
+    assert fresh is not None and fresh is not stale
     failures.cancel()
-    await asyncio.sleep(0.5)
-    assert len(sent) == 2  # neither timer fired
+    assert fresh.cancelled() and failures._timer is None
+    assert len(sent) == 2
 
 
 # --- the HTTP intake listener -----------------------------------------------------------------
@@ -373,6 +384,7 @@ def test_serve_records_a_failed_api_handshake(
     """The context serve hands uvicorn, served the way uvicorn serves it (``loop.create_server``
     with ``ssl=``). The first failure is a WARNING at once; a second inside the window is held and
     logged when uvicorn returns."""
+    import messagefoundry.api.tls as api_tls
     from messagefoundry.__main__ import main
     from messagefoundry.api_tls_source import GENERATED_CERT_NAME
     from messagefoundry.store.crypto import generate_key
@@ -381,6 +393,14 @@ def test_serve_records_a_failed_api_handshake(
     collect = _Collect()
     tls_log = logging.getLogger("messagefoundry.api.tls")
     during: dict[str, Any] = {}
+    records: list[ApiHandshakeRecord] = []
+
+    class _Seen(ApiHandshakeRecord):
+        def __init__(self, ctx: ssl.SSLContext) -> None:
+            super().__init__(ctx)
+            records.append(self)
+
+    monkeypatch.setattr(api_tls, "ApiHandshakeRecord", _Seen)
 
     async def scenario(ctx: ssl.SSLContext) -> None:
         loop = asyncio.get_running_loop()
@@ -395,7 +415,7 @@ def test_serve_records_a_failed_api_handshake(
             await _until(lambda: bool(_api_records(collect.records)), "no WARNING line")
             during["after_failure"] = _api_records(collect.records)
             assert await asyncio.to_thread(_refuse_the_certificate, port)
-            await asyncio.sleep(0.2)
+            await _until(lambda: records[0].failures.count == 2, "the refusal was not counted")
             during["held"] = _api_records(collect.records)
         finally:
             server.close()
