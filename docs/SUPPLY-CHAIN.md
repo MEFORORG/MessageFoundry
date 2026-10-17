@@ -151,8 +151,10 @@ Facts the labels leave out:
   too, and until every upload `publish-pypi` runs has succeeded. With `PUBLISH_HARNESS` unset,
   that is the toolkit and the engine only. A separate job publishes it last, so no
   job adds an asset to a published release. The console's release is a draft too, until its wheel
-  is on PyPI. With `PUBLISH_WEBCONSOLE` unset, the console upload is skipped, and the console's
-  release stays a draft.
+  is on PyPI. With `PUBLISH_WEBCONSOLE` unset, the console upload is skipped and the console's
+  release is still published, as the engine's is with `PUBLISH_HARNESS` unset. With either variable
+  set, its draft publisher reads it again when it runs and refuses to publish unless that run's
+  upload ran, so a re-run that reused an earlier reading of the variable cannot skip the upload.
 - **The provenance gate.** The tagged commit must be on `main`, and each required check's latest
   run on it must have passed. A red run after the merge blocks the tag even if the merge-queue run
   passed. To clear it, re-run the failed job on that commit, then re-run the release. A check

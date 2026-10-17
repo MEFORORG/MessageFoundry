@@ -210,11 +210,14 @@ def test_a_hand_start_with_no_stderr_does_not_run_under_either_variable(
 @pytest.mark.timeout(120)
 def test_pythonw_dash_m_with_inherited_handles_runs_under_either_variable(tmp_path: Path) -> None:
     """The contrast: ``pythonw -m`` that inherits this process's handles has a stderr and runs
-    under each variable. Skipped where this process has no handles to hand on."""
-    (tmp_path / f"{_STAND_IN}.py").write_text(_STAND_IN_SOURCE, encoding="utf-8")
+    under each variable. Skipped where this process has no handles to hand on. Each start gets its
+    own folder, so a marker an earlier start wrote cannot stand in for a start that never ran."""
     command = [_pythonw(), "-m", _STAND_IN]
     for variable in (None, *_NEEDS_A_STDERR):
-        outcome = _run(command, tmp_path, variable, inherit=True)
+        cwd = tmp_path / (variable or "control")
+        cwd.mkdir()
+        (cwd / f"{_STAND_IN}.py").write_text(_STAND_IN_SOURCE, encoding="utf-8")
+        outcome = _run(command, cwd, variable, inherit=True)
         if variable is None and outcome == _RAN_WITH_NO_STDERR:
             pytest.skip("this process has no stderr to hand on")
         assert outcome == _RAN_WITH_A_STDERR, f"under {variable}: {outcome}"

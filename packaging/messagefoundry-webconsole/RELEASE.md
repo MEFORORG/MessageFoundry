@@ -93,7 +93,9 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
 
 - [ ] Configure a `messagefoundry-webconsole` **PyPI Trusted Publisher** (pending publisher for the repo
       + `release.yml`) and a `PUBLISH_WEBCONSOLE`-style gate variable, so the job builds + attaches on
-      every release but only publishes to PyPI once you flip the flag (mirrors the harness gating).
+      every release but only publishes to PyPI once you flip the flag. This mirrors the harness
+      gating: the variable gates the upload step alone, so with it unset the release still goes
+      public, and with it set the release goes public only once the upload has run.
 
 ## 6. Tag + publish (the button)
 
@@ -101,7 +103,9 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
       `release-webconsole` job, and its engine floor gate, run only on that tag namespace.
 - [ ] Publish to **PyPI** via the gated Trusted-Publishing job. The console's GitHub release is a
       draft until that upload succeeds; `publish-github-release-webconsole` then publishes it. With
-      `PUBLISH_WEBCONSOLE` unset, it stays a draft.
+      `PUBLISH_WEBCONSOLE` unset, the upload is skipped and the release is published once the `pypi`
+      approval is given. Set, the publish refuses while the upload has not run, which is what a
+      "Re-run failed jobs" after setting it would do; re-run all jobs instead.
 
 ## 7. Post-publish verification
 

@@ -66,9 +66,13 @@
 # exactly as before while reading as a control that is not there. Keep the name `pypi`.
 # Keep PUBLISH_HARNESS and PUBLISH_WEBCONSOLE off the environment, as repository variables only. A
 # job's `if:` is read before its environment applies, and a step's inside it after, so a copy on
-# the environment would let two gates read different values. So each is read once, outside the
-# environment: PUBLISH_WEBCONSOLE by its publish job's `if:`, and PUBLISH_HARNESS by
-# `release-harness`, which hands it to the harness upload step as a job output (vault BACKLOG #2975).
+# the environment would let two gates read different values. So each is read outside the
+# environment, the same way: its build job (`release-harness`, `release-webconsole`) hands it to the
+# upload step as a job output, and the job that takes the release out of draft reads it again when
+# it runs. That second read is the control for a re-run: "Re-run failed jobs" reuses the build job's
+# earlier output, so a variable set since then would skip the upload. The draft publisher refuses
+# to publish while the variable is 'true' and the upload's outcome is not success (vault BACKLOG
+# #2975). Unset, the upload step is skipped and the release still goes public, for both.
 #
 # THE HAND-OVER. Each build job records the digests once its last gate has passed, and its last
 # step uploads the files. Neither step has an `if:`, so any earlier failure skips both. In `release`
@@ -1237,6 +1241,11 @@ jobs:
     needs: [release, release-harness]
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Whether the harness upload ran: `success`, or `skipped` when its gate was off. Read by
+    # publish-github-release, which refuses to publish while PUBLISH_HARNESS is 'true' and this is
+    # not `success` (vault BACKLOG #2975; the header says why).
+    outputs:
+      upload-outcome: ${{ steps.harness-upload.outcome }}
     # The ONLY kind of job that names the `pypi` environment, and it builds nothing (vault BACKLOG
     # #2631, limb 1). No checkout: it runs no repository code, only the pinned actions below.
     environment: pypi
@@ -1331,8 +1340,11 @@ jobs:
       # no-op until the owner configures the messagefoundry-harness PyPI Trusted Publisher AND sets
       # repo variable PUBLISH_HARNESS=true. The build + version-check in release-harness still run
       # every release. The variable comes through release-harness, read outside this environment,
-      # so an environment copy of it cannot change what this step sees (the header says why).
+      # so an environment copy of it cannot change what this step sees (the header says why). A
+      # re-run of this job alone reuses that earlier reading; publish-github-release reads the
+      # variable again and refuses to publish if this step was skipped while it is 'true'.
       - name: Publish messagefoundry-harness to PyPI (Trusted Publishing / OIDC)
+        id: harness-upload
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && needs.release-harness.outputs.publish-harness == 'true' }}
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
@@ -1359,9 +1371,11 @@ jobs:
     needs: [tag-provenance]
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # What publish-pypi-webconsole checks its download against (vault BACKLOG #2631, limb 1).
+    # What publish-pypi-webconsole checks its download against (vault BACKLOG #2631, limb 1), and
+    # the console upload's gate, read here, outside the `pypi` environment (vault BACKLOG #2975).
     outputs:
       pypi-digests: ${{ steps.pypi-digests.outputs.sha256 }}
+      publish-webconsole: ${{ vars.PUBLISH_WEBCONSOLE }}
     permissions:
       contents: write   # gh release create (the console's draft release, with its wheel)
       # No id-token: the PyPI publish moved to publish-pypi-webconsole (vault BACKLOG #2631).
@@ -1729,13 +1743,21 @@ jobs:
           if-no-files-found: error
           retention-days: ${{ github.event_name == 'push' && 30 || 1 }}
 
-  # PUBLISH THE CONSOLE TO PYPI, FROM A JOB THAT ONLY PUBLISHES (vault BACKLOG #2631, limb 1). The
-  # variable gate sits on the job, so the environment is never asked for while the publish is off.
+  # PUBLISH THE CONSOLE TO PYPI, FROM A JOB THAT ONLY PUBLISHES (vault BACKLOG #2631, limb 1).
+  #
+  # THE VARIABLE GATE IS ON THE UPLOAD STEP, NOT THE JOB, as the harness upload's is (vault BACKLOG
+  # #2975): a skipped job here would skip publish-github-release-webconsole and leave the draft. So
+  # this job runs on every console tag, the `pypi` approval is asked for even while the upload is
+  # off, and with the variable unset the release goes public once that approval is given.
   publish-pypi-webconsole:
-    if: github.repository == 'MEFORORG/MessageFoundry' && startsWith(github.ref_name, 'webconsole-') && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_WEBCONSOLE == 'true'
+    if: github.repository == 'MEFORORG/MessageFoundry' && startsWith(github.ref_name, 'webconsole-') && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     needs: release-webconsole
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Whether the console upload ran; publish-github-release-webconsole reads it, as
+    # publish-github-release reads publish-pypi's (the header says why).
+    outputs:
+      upload-outcome: ${{ steps.webconsole-upload.outcome }}
     # The ONLY kind of job that names the `pypi` environment, and it builds nothing (vault BACKLOG
     # #2631, limb 1). No checkout: it runs no repository code, only the pinned actions below.
     environment: pypi
@@ -1771,16 +1793,17 @@ jobs:
           fi
           echo "verified $(grep -c . "$manifest") file(s) against the build job's digests"
 
-      # GATED, by this job's `if:`, on repo variable PUBLISH_WEBCONSOLE=true, and that gate is armed:
-      # the owner set the variable on 2026-07-29 (read with `gh variable list`, 2026-09-28), and the
-      # first webconsole-v* release through this step claimed the PyPI name that day (BACKLOG #1944).
-      # Unset the variable and this job is skipped, while the build + version-check above still run
-      # on every console tag; the console's release then stays a draft (vault BACKLOG #2975).
-      # The variable is read ONCE, by the job's `if:`, not again here: read here too, inside the
-      # environment, an environment copy could skip this step in a job that still succeeds, and
-      # publish-github-release-webconsole would then publish a release PyPI lacks (vault BACKLOG #2975).
+      # GATED on repo variable PUBLISH_WEBCONSOLE=true, and that gate is armed: the owner set the
+      # variable on 2026-07-29 (read with `gh variable list`, 2026-09-28), and the first
+      # webconsole-v* release through this step claimed the PyPI name that day (BACKLOG #1944).
+      # Unset the variable and this step is skipped, while the build + version-check above still run
+      # on every console tag, and the console's release still goes public. The variable comes
+      # through release-webconsole, read outside this environment, so an environment copy of it
+      # cannot change what this step sees; publish-github-release-webconsole reads it again and
+      # refuses to publish if this step was skipped while it is 'true' (vault BACKLOG #2975).
       - name: Publish messagefoundry-webconsole to PyPI (Trusted Publishing / OIDC)
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+        id: webconsole-upload
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && needs.release-webconsole.outputs.publish-webconsole == 'true' }}
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: webconsole-dist/
@@ -1792,8 +1815,8 @@ jobs:
   # before the `pypi` approval was even asked for, and a refused approval left a public release with
   # no PyPI upload. Now the release is a draft, and this job takes it public after
   # publish-pypi-webconsole succeeds. No status function in its `if:`: a failed or refused upload
-  # leaves the draft. So does an unset PUBLISH_WEBCONSOLE, which skips the upload job: the release
-  # then stays a draft until the variable is set and the jobs re-run, or an owner publishes it.
+  # leaves the draft. An unset PUBLISH_WEBCONSOLE skips only the upload step, so the release still
+  # goes public, as it did before #2975 and as the engine's does with PUBLISH_HARNESS unset.
   publish-github-release-webconsole:
     # The event-and-ref pair sits on the job, so a dispatch never schedules it at all.
     if: github.repository == 'MEFORORG/MessageFoundry' && startsWith(github.ref_name, 'webconsole-') && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
@@ -1808,9 +1831,18 @@ jobs:
       - name: Publish the draft console GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          PUBLISH_GATE: ${{ vars.PUBLISH_WEBCONSOLE }}
+          GATE_NAME: PUBLISH_WEBCONSOLE
+          UPLOAD_OUTCOME: ${{ needs.publish-pypi-webconsole.outputs.upload-outcome }}
+          DISTRIBUTION: messagefoundry-webconsole
           GH_REPO: ${{ github.repository }}
         run: |
           tag="${GITHUB_REF_NAME}"
+          # The variable is read again here, when this job runs; the header says why (vault BACKLOG #2975).
+          if [ "$PUBLISH_GATE" = "true" ] && [ "$UPLOAD_OUTCOME" != "success" ]; then
+            echo "::error::$GATE_NAME is 'true', but this run did not upload $DISTRIBUTION (outcome '$UPLOAD_OUTCOME'). A re-run of failed jobs reuses the earlier reading of the variable; re-run all jobs, or unset it. The release stays a draft."
+            exit 1
+          fi
           is_draft=$(gh release view "$tag" --json isDraft --jq .isDraft)
           if [ "$is_draft" = "true" ]; then
             gh release edit "$tag" --draft=false
@@ -1916,9 +1948,9 @@ jobs:
           /tmp/harnesssmoke/bin/pip install --quiet "packaging==$PKG_PIN"
           # --no-deps IS LOAD-BEARING, NOT AN OPTIMISATION. messagefoundry-harness depends on
           # messagefoundry[harness], so a full install would resolve the ENGINE AND PySide6 FROM PYPI
-          # inside a job holding contents: write — and the engine may not be on PyPI yet, since
-          # publish-pypi runs beside this job, so it would also be a live index round-trip on the
-          # release path. Install the
+          # inside a job holding contents: write — and the engine is not on PyPI yet, since
+          # publish-pypi waits on this job, so it would also fail or reach an older engine, by a
+          # live index round-trip on the release path. Install the
           # built wheel alone; the import below is chosen to need nothing else.
           /tmp/harnesssmoke/bin/pip install --quiet --no-deps harness-dist/*.whl
           # A failure inside this command substitution fails the step: Actions runs the block as
@@ -2187,13 +2219,15 @@ jobs:
           retention-days: ${{ github.event_name == 'push' && 30 || 1 }}
 
   # PUBLISH THE ENGINE'S GITHUB RELEASE LAST, ONCE EVERY ASSET IS ON IT (vault BACKLOG #2631, limb 6;
-  # the header says why). Its `needs:` is every job that attaches an asset to the engine release. A
-  # job added later that attaches one must be upstream of it, directly or through another need;
-  # tests/test_release_pipeline.py fails until it is.
-  # It also needs `publish-pypi`, so the toolkit, the engine and (with PUBLISH_HARNESS set) the
+  # the header says why). Every job that attaches an asset to the engine release must be upstream of
+  # it, directly or through another need; tests/test_release_pipeline.py fails until it is. Its
+  # `needs:` names `release` and `release-harness` directly although `publish-pypi` already needs
+  # both: redundant on purpose, so the order holds even if that need moves.
+  # It needs `publish-pypi`, so the toolkit, the engine and (with PUBLISH_HARNESS set) the
   # harness are on PyPI before the release goes public, as the engine was when its publish sat
-  # inside `release` (limb 1). A refused `pypi` approval on an engine tag leaves a draft. No need
-  # here is gated on a variable; `publish-pypi` says why (vault BACKLOG #2975).
+  # inside `release` (limb 1). A refused `pypi` approval on an engine tag leaves a draft. No job
+  # upstream of it is gated on a variable; `publish-pypi` says why (vault BACKLOG #2975). Its step
+  # refuses to publish while PUBLISH_HARNESS is 'true' and the harness upload did not run.
   #
   # If `release-harness` or `publish-pypi` fails, this job is skipped and the release stays a draft.
   # Re-running the failed jobs finishes the release. A draft is never published with an asset missing.
@@ -2211,9 +2245,18 @@ jobs:
       - name: Publish the draft GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          PUBLISH_GATE: ${{ vars.PUBLISH_HARNESS }}
+          GATE_NAME: PUBLISH_HARNESS
+          UPLOAD_OUTCOME: ${{ needs.publish-pypi.outputs.upload-outcome }}
+          DISTRIBUTION: messagefoundry-harness
           GH_REPO: ${{ github.repository }}
         run: |
           tag="${GITHUB_REF_NAME}"
+          # The variable is read again here, when this job runs; the header says why (vault BACKLOG #2975).
+          if [ "$PUBLISH_GATE" = "true" ] && [ "$UPLOAD_OUTCOME" != "success" ]; then
+            echo "::error::$GATE_NAME is 'true', but this run did not upload $DISTRIBUTION (outcome '$UPLOAD_OUTCOME'). A re-run of failed jobs reuses the earlier reading of the variable; re-run all jobs, or unset it. The release stays a draft."
+            exit 1
+          fi
           is_draft=$(gh release view "$tag" --json isDraft --jq .isDraft)
           if [ "$is_draft" = "true" ]; then
             gh release edit "$tag" --draft=false
