@@ -725,7 +725,9 @@ below that, at 1 s, because M is an average and some people are faster. The comm
   ([SECURITY-LOOSENING.md](SECURITY-LOOSENING.md)). A value `oidc_mfa_amr_values` also accepts is
   refused at load while the claim gate is on. Each exempted pass records the matched values as
   `callback_floor_exempt_amr`: under `evidence` on the `auth.login_success` row of a sign-in, and at
-  the top of the `auth.reauth` row of a step-up. With the list set, a too-early step-up's code is
+  the top of the `auth.reauth` row of a step-up. A pass the exemption let through that is then
+  refused carries it too, at the top of its refusal row, except a lock refusal, whose row
+  keeps the exact text that hides it (BACKLOG #3220). With the list set, a too-early step-up's code is
   redeemed before the refusal, because only the exchange yields the `amr`. The exemption lifts
   only the floor. While `oidc_require_mfa_claim` is on, the token must still carry another `amr`
   in `oidc_mfa_amr_values` or an `acr` in `oidc_required_acr_values`, so an IdP that sends only
