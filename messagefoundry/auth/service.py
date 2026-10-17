@@ -320,18 +320,24 @@ _UNREACHED_DIRECTORY = (ConnectionError, TimeoutError, socket.gaierror)
 #: these no ``ConnectionError`` subclass, so a type test alone read an unreachable host as a FAULT,
 #: which pages. Read by name, because the values differ by platform and a platform may lack one.
 #: On Windows these names carry the Winsock values (``ENETUNREACH`` is ``WSAENETUNREACH``).
-_UNREACHED_ERRNOS: Final = frozenset(
-    code
-    for name in ("ENETUNREACH", "EHOSTUNREACH", "ENETDOWN", "EHOSTDOWN")
-    if (code := getattr(errno, name, None)) is not None
+_UNREACHED_ERRNOS: Final[frozenset[int]] = frozenset(
+    getattr(errno, name)
+    for name in ("ENETUNREACH", "EHOSTUNREACH", "ENETDOWN", "EHOSTDOWN", "ENETRESET")
+    if hasattr(errno, name)
 )
+#: The Win32 codes for the same failures. An error raised from Win32 rather than Winsock carries
+#: one in ``winerror`` and only ``EINVAL`` in ``errno``. ERROR_NETWORK_UNREACHABLE and
+#: ERROR_HOST_UNREACHABLE.
+_UNREACHED_WINERRORS: Final = frozenset({1231, 1232})
 
 
 def _unreached_directory(exc: Exception) -> bool:
     """Whether ``exc`` means the directory was not reached, rather than an engine fault."""
     if isinstance(exc, _UNREACHED_DIRECTORY):
         return True
-    return isinstance(exc, OSError) and exc.errno in _UNREACHED_ERRNOS
+    if not isinstance(exc, OSError):
+        return False
+    return exc.errno in _UNREACHED_ERRNOS or getattr(exc, "winerror", None) in _UNREACHED_WINERRORS
 
 
 #: Outcomes the directory itself gave. Any of them ends a logged outage.

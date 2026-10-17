@@ -22,8 +22,10 @@ import errno
 import json
 import logging
 import sqlite3
+import sys
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
 
@@ -1197,26 +1199,37 @@ async def test_one_principal_that_raises_no_longer_ends_the_pass(
 
 _NETWORK_ERRNOS = [
     name
-    for name in ("ENETUNREACH", "EHOSTUNREACH", "ENETDOWN", "EHOSTDOWN")
+    for name in ("ENETUNREACH", "EHOSTUNREACH", "ENETDOWN", "EHOSTDOWN", "ENETRESET")
     if hasattr(errno, name)
 ]
 
 
+def _os_error(code: int, winerror: int | None = None) -> Callable[[], Exception]:
+    # Built inside the test, so a raised instance does not outlive it holding the service.
+    return lambda: OSError(code, "synthetic: directory probe", None, winerror)
+
+
 @pytest.mark.parametrize(
-    ("exc", "outage"),
+    ("make_exc", "outage"),
     [
-        (TimeoutError("synthetic: read timed out"), True),
+        pytest.param(lambda: TimeoutError("synthetic: read timed out"), True, id="TimeoutError"),
         # Python gives these errnos no ConnectionError subclass, so a type test alone read an
-        # unreachable network as a probe fault, which pages (BACKLOG #3100 follow-up).
-        *[(OSError(getattr(errno, n), "synthetic: unreachable"), True) for n in _NETWORK_ERRNOS],
-        # The control: the errno set is narrow. A missing file is the engine failing, not the
-        # directory, so it still reads as FAULT.
-        (OSError(errno.ENOENT, "synthetic: no such file"), False),
+        # unreachable network as a probe fault, which would page (BACKLOG #3100 follow-up).
+        *[pytest.param(_os_error(getattr(errno, n)), True, id=n) for n in _NETWORK_ERRNOS],
+        # Raised from Win32 rather than Winsock: errno is only EINVAL, winerror names the cause.
+        pytest.param(
+            _os_error(errno.EINVAL, 1231),
+            True,
+            id="ERROR_NETWORK_UNREACHABLE",
+            marks=pytest.mark.skipif(sys.platform != "win32", reason="winerror is Windows-only"),
+        ),
+        # The control: the set is narrow. A missing file is the engine failing, not the
+        # directory, so it still reads as FAULT and still pages.
+        pytest.param(_os_error(errno.ENOENT), False, id="ENOENT"),
     ],
-    ids=lambda v: v if isinstance(v, bool) else f"{type(v).__name__}-{getattr(v, 'errno', None)}",
 )
-async def test_an_os_error_escaping_the_directory_layer_is_still_an_outage(
-    exc: Exception, outage: bool
+async def test_an_os_error_escaping_the_directory_layer_reads_by_its_cause(
+    make_exc: Callable[[], Exception], outage: bool
 ) -> None:
     """BACKLOG #3100, the review's ask. A socket fault ldap.py did not wrap is the directory not
     being reached. Read as a probe fault, a network blip would page and open an alert that nothing
@@ -1230,13 +1243,15 @@ async def test_an_os_error_escaping_the_directory_layer_is_still_an_outage(
         await service.initialize()
         await _signed_in_ad_user(service, store, "jdoe")
 
-        ldap.broken["jdoe"] = exc
+        ldap.broken["jdoe"] = make_exc()
         plan = await service.reconcile_directory_sessions()
         if outage:
             assert plan.directory_outage and plan.faulted == () and plan.unavailable == 1
             assert service.directory_reconcile_fault is None
         else:
+            assert not plan.directory_outage
             assert len(plan.faulted) == 1 and plan.unavailable == 0
+            assert service.directory_reconcile_fault is not None
     finally:
         await store.close()
 

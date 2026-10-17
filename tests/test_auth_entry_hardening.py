@@ -407,9 +407,8 @@ def test_limiter_with_no_global_gate_keeps_no_global_window(
     # BACKLOG #2714 follow-up. With the global gate off, nothing reads the global window, so an
     # admitted call must not add to it; it used to hold every call of the last window.
     # RED when: a call admitted with ``glob=0`` lands in ``_global_hits``.
-    clock = [1000.0]
     monkeypatch.setattr(
-        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: 1000.0)
     )
     per_key_only = SlidingWindowRateLimiter(per_key=5, glob=0, window_seconds=60.0)
     for n in range(500):

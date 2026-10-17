@@ -98,7 +98,8 @@ class SlidingWindowRateLimiter:
         :meth:`would_allow` sells. Dropping the prune would compare against stale counts.
         """
         cutoff = now - self._window
-        self._prune(self._global_hits, cutoff)
+        if self._global:  # with the gate off ``allow`` records no global hits
+            self._prune(self._global_hits, cutoff)
         self._evict_aged(cutoff)
         bucket = self._hits.get(key)
         if bucket is not None:

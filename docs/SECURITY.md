@@ -4203,8 +4203,9 @@ estate is still reconciled. A pass with any fault logs one ERROR naming no accou
 `probe_fault`, under its own source `directory-reconciler-probe-fault`. If every probe faults or
 fails, the pass judges nothing and revokes nothing, like an outage, but it still pages. A
 connection, timeout or name-lookup error that escapes the directory layer is still read as
-unreachable, and so is an operating-system error saying the network or host is unreachable or
-down. **The cost:** while a fault repeats, that account's sessions are never revoked by the
+unreachable, and so is at least an operating-system error saying the network or host is
+unreachable, down or reset. Another network-class error can still read as a probe fault and page.
+**The cost:** while a fault repeats, that account's sessions are never revoked by the
 reconciler, so they run to the absolute cap. That cap is the only bound; the alert makes the gap
 visible and limits nothing. A pass with a fault marks no alert clear. When it resolves is stated once, in
 [CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-two-alerts-resolve-themselves). Step-up
