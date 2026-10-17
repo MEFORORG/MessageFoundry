@@ -59,10 +59,16 @@ from uuid import uuid4
 
 async def _open(target):
     if target == "sqlserver":
-        from messagefoundry.config.settings import load_settings
+        from messagefoundry.config.settings import insecure_tls_allowed, load_settings
+        from messagefoundry.config.tls_policy import HopPosture
         from messagefoundry.store.sqlserver import SqlServerStore
 
-        return await SqlServerStore.open(load_settings(environ=os.environ).store)
+        # The parent's warn posture is a contextvar (tests/conftest.py,
+        # _warn_posture_for_the_server_db_legs), which a child does not inherit. Without it the
+        # CI container's self-signed certificate is refused as weakened TLS, so state the same
+        # posture here, on the escape the parent's fixture also requires.
+        posture = HopPosture(enforcing=False) if insecure_tls_allowed() else None
+        return await SqlServerStore.open(load_settings(environ=os.environ).store, posture=posture)
     from messagefoundry.store.store import MessageStore
 
     return await MessageStore.open(Path(target))
@@ -148,8 +154,10 @@ def race_repeat_requests(
         for proc, err_path in zip(procs, errs, strict=True):
             ready = _readline_within(proc, 20.0)
             if ready.strip() != "READY":
+                # The exit code says whether the child died (and how) or hung and was killed.
                 raise AssertionError(
-                    f"a child never opened its store: {ready!r}\n{_tail(err_path)}"
+                    f"a child never opened its store: {ready!r}, exit code {proc.poll()}; "
+                    f"its stderr:\n{_tail(err_path)}"
                 )
         # Both stores are open. The first round starts a little ahead, so both children have
         # read the schedule by then. Written whole and renamed, so no child reads half of it.
