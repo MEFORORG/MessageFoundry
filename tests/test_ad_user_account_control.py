@@ -2252,6 +2252,9 @@ async def test_a_forfeited_breaker_logs_once_on_a_new_trip_and_not_on_each_pass(
                 plan = await _alerted_pass(service, sink)
                 assert plan.aborted == "mass_revoke_breaker" and not plan.breaker_clear
                 assert _said(caplog, _TRIPPED_AGAIN) == 1
+                directory.down = True  # an outage between the two judges nothing, and ends nothing
+                assert (await _alerted_pass(service, sink)).directory_outage
+                directory.down = False
         assert ABORTED in await _open_alerts(store)
 
 
@@ -2280,6 +2283,9 @@ async def test_a_forfeited_hold_logs_once_on_each_new_engagement_and_not_on_each
                     plan = await _alerted_pass(service, sink)
                     assert plan.hold and not plan.hold_clear
                     assert _said(caplog, _HELD_AGAIN) == said
+                    directory.down = True  # an outage between the two ends nothing
+                    assert (await _alerted_pass(service, sink)).directory_outage
+                    directory.down = False
                 directory.uac.update({"v1": ENABLED, "v2": ENABLED})
                 plan = await _alerted_pass(service, sink)
                 assert not plan.hold and not plan.hold_clear
@@ -2563,17 +2569,18 @@ async def test_a_forfeited_referral_logs_a_later_referral_while_held_accounts_st
                 assert _said(caplog, _REFERRED_AGAIN) == 1
 
 
-async def test_a_forfeited_hold_logs_a_new_hold_beside_an_account_still_on_record(
+async def test_a_forfeited_hold_logs_a_new_hold_beside_an_account_outside_it(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A lone undetermined account is held while nothing readable sits beside it, then strikes on
-    a pass that reads another account. Its answer stays undetermined on record, but the hold over
-    it has ended, so a later wave of two others is a new hold and is said.
+    """A lone undetermined account is held, then reads clean, which ends that hold. Another lone
+    account then reads undetermined beside readable ones: it strikes, and no hold engages. A later
+    wave of two more is a new hold, and is said, though an undetermined answer stood on record
+    the whole time.
 
     RED when: whether a hold is open reads the whole outcome record, not the hold's own accounts."""
-    names = ["u1", "u2", "ok1", "x", "d", "v1", "v2"]
+    names = ["u1", "u2", "ok1", "x", "y", "d", "v1", "v2"]
     async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
-        await _expire(store, ["x", "d", "v1", "v2"])
+        await _expire(store, ["x", "y", "d", "v1", "v2"])
         sink = NotifierAlertSink([], store=store)
         with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
             directory.uac.update({"u1": ABSENT, "u2": ABSENT})
@@ -2590,16 +2597,83 @@ async def test_a_forfeited_hold_logs_a_new_hold_beside_an_account_still_on_recor
             assert plan.hold and plan.readable == 0  # x alone, with nothing readable beside it
             assert _said(caplog, _HELD_AGAIN) == 1
 
-            await _sign_in(service, ["ok1"])
+            await _sign_in(service, ["ok1", "y"])
+            directory.uac.update({"x": ENABLED, "y": ABSENT})
             plan = await _alerted_pass(service, sink)
-            assert not plan.hold and plan.readable == 1  # x strikes beside ok1
-            x_id = await _id(store, "x")
-            assert service._reconcile_outcomes[x_id] is ProbeOutcome.UNDETERMINED
+            assert not plan.hold and plan.readable == 2  # x reads clean; y strikes beside it
+            y_id = await _id(store, "y")
+            assert service._reconcile_outcomes[y_id] is ProbeOutcome.UNDETERMINED
 
             await _sign_in(service, ["v1", "v2"])
             directory.uac.update({"v1": ABSENT, "v2": ABSENT})
             assert (await _alerted_pass(service, sink)).hold
             assert _said(caplog, _HELD_AGAIN) == 2
+
+
+async def test_a_forfeited_hold_that_flaps_on_one_account_is_said_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A lone undetermined account is held on passes where its one neighbour is absent, and
+    strikes on passes where the neighbour reads clean. Its answer never changes, so this is one
+    hold however often it engages again, and it is said once.
+
+    RED when: any answer for the account, an undetermined one too, ends its part of a hold."""
+    names = ["u1", "u2", "ok1", "x"]
+    async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
+        sink = NotifierAlertSink([], store=store)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+            assert (await _alerted_pass(service, sink)).hold
+            await _expire(store, ["u1", "u2"])
+            assert not (await _alerted_pass(service, sink)).hold  # releases the latch
+            assert service._reconcile_hold_standing == "forfeit"
+
+            directory.uac["x"] = ABSENT
+            ok1 = directory.ids["ok1"]
+            held = 0
+            for _ in range(4):
+                directory.delete("ok1")
+                held += (await _alerted_pass(service, sink)).hold  # x alone: held
+                directory.ids["ok1"] = ok1
+                assert not (await _alerted_pass(service, sink)).hold  # x strikes beside ok1
+            assert held == 4
+            assert _said(caplog, _HELD_AGAIN) == 1
+
+
+async def test_a_new_trip_on_the_pass_that_forfeits_after_the_last_one_ended_is_said(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A trip ends: its accounts read clean, and a held pair is probed. The pair stays unconfirmed,
+    so when one of it signs out the breaker forfeits. On that same pass twelve new accounts trip
+    the breaker. The forfeit line is about the ended trip, so the new trip is said as well.
+
+    RED when: a standing that forfeits on a pass never logs a new trip on that pass."""
+    names = ["ok1", "ok2", "u1", "u2"] + [f"gone{i}" for i in range(10)]
+    later = [f"back{i}" for i in range(12)]
+    async with _signed_in_estate(
+        monkeypatch, names + later, ad_session_recheck_strikes=1
+    ) as estate:
+        directory, service, store, _tokens = estate
+        await _expire(store, later)
+        sink = NotifierAlertSink([], store=store)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+            ids = {name: directory.ids[name] for name in names[4:]}
+            for name in names[4:]:
+                directory.delete(name)
+            assert (await _alerted_pass(service, sink)).aborted == "mass_revoke_breaker"
+            directory.ids.update(ids)  # the search base is fixed
+            plan = await _alerted_pass(service, sink)
+            assert plan.aborted is None and plan.hold  # the trip ends; the pair is held
+            assert service._reconcile_breaker_standing == "tripped"
+
+            await _expire(store, ["u1"])
+            await _sign_in(service, later)
+            for name in later:
+                directory.delete(name)
+            assert (await _alerted_pass(service, sink)).aborted == "mass_revoke_breaker"
+            assert _said(caplog, _GAVE_UP_ON_A_TRIP) == 1
+            assert _said(caplog, _TRIPPED_AGAIN) == 1
 
 
 async def test_a_trip_that_forfeits_on_its_own_pass_is_not_also_said_as_a_new_trip(

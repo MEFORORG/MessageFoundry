@@ -859,9 +859,11 @@ reason, such as a sign-out, while the evidence is still pending.
 
 Once an engine has given up resolving the breaker's `ad_reconcile_aborted` instance, the referral's
 instance or `ad_reconcile_held`, it logs a warning when a later trip, referral or hold opens, saying
-it will not resolve that one either, and that a restart will not. It logs once per condition, not
-once per pass. A condition counts as new once every account behind the last one has left, or has
-been probed on a pass that did not see it. The probe fault's instance logs no such warning.
+it will not resolve that one either. It logs when the condition opens, not on every pass while it
+stands. A condition counts as new once every account behind the last one has left, or has been
+answered for on a pass that judged accounts and did not see the condition. For a hold, the answer
+must not be undetermined. A directory outage, or a probe that gets no answer, ends nothing. The
+probe fault's instance logs no such warning.
 
 **They never resolve themselves on a `[cluster]` node or in an engine that runs more than one engine
 shard.** Another engine's reconciler may still hold the condition there, so an operator resolves the
