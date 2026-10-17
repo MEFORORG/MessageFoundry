@@ -1833,7 +1833,8 @@ a restart for a file that is not in effect yet, it also says not to restart befo
 **A start checks each CRL's signature too (vault BACKLOG #2905).** When a hop builds its TLS context,
 the engine checks each CRL in the file against the CA certificates that hop already lists. It refuses
 the file in one case only, where it has proof. Three things all hold then. A listed CA has the
-CRL's issuer name, compared exactly. The CRL names that CA's key by its key identifier. The engine
+CRL's issuer name, compared as OpenSSL compares it for the case of ASCII letters and exactly
+otherwise (the first bullet below says what that leaves out). The CRL names that CA's key by its key identifier. The engine
 ran the signature check with that key, and the check failed. Where several listed CAs share that
 name, the check must run and fail for each of them that the engine finds to fit the CRL's
 authority key identifier. A handshake that OpenSSL judges by such a CRL fails with
@@ -1853,13 +1854,15 @@ such a file was measured to pass its handshakes. Remove the bad copy.
 Anything short of that proof loads, and the engine logs one WARNING for the file. At least these
 three cases warn:
 
-- The engine matches the CRL to no CA the hop lists. It compares the issuer name exactly, and then
-  the CRL's authority key identifier, where it carries one. This is the usual case when the peer
+- The engine matches the CRL to no CA the hop lists. It compares the issuer name exactly but for
+  the case of ASCII letters, which it folds as OpenSSL does (vault BACKLOG #3543), and then the
+  CRL's authority key identifier, where it carries one. This is the usual case when the peer
   sends the intermediate CA that issued the CRL. A CA in a CA directory reads the same way until a
   handshake first uses it. So does a listed CA whose name differs from the CRL's issuer name only
-  in letter case. Where the letters that differ are ASCII, OpenSSL was measured to treat the two
-  names as one, so it still judges peers by that CRL. A badly signed CRL of that kind started with
-  the WARNING, and then failed its handshake with `CRL signature failure`.
+  in white space around a value. OpenSSL was measured to treat those two names as one, so it
+  still judges peers by that CRL, and a badly signed CRL of that kind starts with the WARNING and
+  then fails its handshake with `CRL signature failure`. A name that differs in a letter outside
+  ASCII, case included, is another name to OpenSSL too.
 - A listed CA has the CRL's issuer name and does not verify it, but the CRL names no key. A CA that
   renewed its key can read this way while handshakes still pass. That was measured for one chain
   shape, where the peer sends the renewed CA certified by the old key.

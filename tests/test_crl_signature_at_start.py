@@ -570,50 +570,101 @@ def test_a_judgment_that_fails_warns_once_and_does_not_stop_the_start(
 
 # --- vault BACKLOG #3506: the texts claim no more than the code does ----------------------------
 
-#: The twins' name with its letter case changed. ``cryptography`` compares names exactly, and
-#: OpenSSL folds case, so a CRL under this name is ``unlisted`` and still judges the twins' leaf.
+#: The twins' name with its ASCII letter case changed. OpenSSL folds that case when it compares
+#: names, and since vault BACKLOG #3543 the engine does too.
 _NAME_IN_OTHER_CASE = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "MEFOR-2905-TWIN-CA")])
 
 
-def test_the_unlisted_words_are_true_of_a_listed_ca_whose_name_differs_only_in_case(
+def _named_crl(twins: _Twins, signer: ec.EllipticCurvePrivateKey, name: x509.Name) -> bytes:
+    """A CRL from ``name`` that names the twins' new key and revokes their leaf."""
+    pem = _crl(signer, names=twins.new_key, name=name, revoke=twins.leaf_serial)
+    twins.crl.write_bytes(pem)
+    return pem
+
+
+def test_a_crl_under_the_listed_cas_name_in_other_ascii_case_is_judged_by_that_ca(
     twins: _Twins, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The hop lists a CA that has the CRL's issuer name, as OpenSSL reads it, and the key the
-    CRL names. The engine still reads ``unlisted``. The warning used to say no listed CA "has
-    that name", which is the wrong cause here. This pins the words, not the matching: if the
-    matching ever folds case, change both."""
-
-    def write(signer: ec.EllipticCurvePrivateKey, *, revoke: bool = False) -> bytes:
-        serial = twins.leaf_serial if revoke else None
-        pem = _crl(signer, names=twins.new_key, name=_NAME_IN_OTHER_CASE, revoke=serial)
-        twins.crl.write_bytes(pem)
-        return pem
-
+    """Vault BACKLOG #3543 item 2, and the remainder of #2905 closing item 1. The hop lists a CA
+    whose subject differs from the CRL's issuer name only in ASCII letter case, and the CRL names
+    that CA's key. The engine now takes that CA for the issuer, as OpenSSL does."""
     server = twins.server(sends_renewed=False)
-    words = _UNCONFIRMED_SIGNATURE["unlisted"]
-    assert "letter case" in words and "has that name" not in words
 
-    pem = write(twins.new_key, revoke=True)
+    pem = _named_crl(twins, twins.new_key, _NAME_IN_OTHER_CASE)
+    assert [s.state for s in judge_crl_signatures(pem, _ders(twins.new_ca))] == ["verified"]
+    assert crl_signature_refusal(pem, _ders(twins.new_ca)) is None
+    with caplog.at_level("WARNING"):
+        hop = twins.hop("new")
+    assert _warnings(caplog) == []
+    # The premise, on this interpreter's OpenSSL: it takes that CA for the CRL's issuer, and
+    # judges the peer by the CRL. Control: the next CRL, from the exact name, revokes nothing.
+    with pytest.raises(ssl.SSLError, match="revoked"):
+        _handshake(hop, server)
+    twins.write_crl("new", "new")
+    _handshake(twins.hop("new"), server)  # raises if refused
+
+    # The badly signed one: proven bad, so the start refuses it. Before #3543 it started with a
+    # warning. Control: OpenSSL loads the same bytes and then fails the handshake.
+    pem = _named_crl(twins, twins.stranger, _NAME_IN_OTHER_CASE)
+    assert [s.state for s in judge_crl_signatures(pem, _ders(twins.new_ca))] == ["bad"]
+    with pytest.raises(ssl.SSLError, match="CRL signature failure"):
+        _handshake(_raw_hop(twins.new_ca, twins.crl), server)
+    with pytest.raises(ValueError, match="does not verify the CRL's signature"):
+        twins.hop("new")
+    verdict = crl_signature_refusal(pem, _ders(twins.new_ca))
+    assert verdict is not None and verdict[1] is True  # the reload's BAD_SIGNATURE case
+
+
+#: Names OpenSSL does NOT take for the twins' ``mefor-2905-twin-ca``. One differs in a letter. The
+#: other is the twins' name made of non-ASCII letters, Cyrillic look-alikes in capitals: RFC 5280
+#: would fold their case, but OpenSSL folds ASCII alone, and so does the engine.
+_GENUINELY_OTHER = [
+    pytest.param("mefor-2905-twin-cb", id="another-letter"),
+    pytest.param("mefor-2905-twin-СА", id="non-ascii-capitals"),
+]
+
+
+@pytest.mark.parametrize("common_name", _GENUINELY_OTHER)
+def test_a_name_that_genuinely_differs_is_still_unlisted(
+    twins: _Twins, caplog: pytest.LogCaptureFixture, common_name: str
+) -> None:
+    """The fold must loosen nothing else. A CRL that names the listed CA's key, badly signed,
+    under a name OpenSSL takes for another issuer, stays ``unlisted``: it warns at a start and
+    never refuses it."""
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+    pem = _named_crl(twins, twins.stranger, name)
+
+    assert [s.state for s in judge_crl_signatures(pem, _ders(twins.new_ca))] == ["unlisted"]
+    with caplog.at_level("WARNING"):
+        hop = twins.hop("new")  # loads: no proof
+    (line,) = _warnings(caplog)
+    assert _UNCONFIRMED_SIGNATURE["unlisted"] in line
+    verdict = crl_signature_refusal(pem, _ders(twins.new_ca))
+    assert verdict is not None and verdict[1] is False  # the reload's NO_ISSUER case
+    # The premise: OpenSSL finds no CRL for the leaf's issuer in this file, so it does not judge
+    # the peer by it, and a leaf-checking hop fails for want of one, not on the signature.
+    with pytest.raises(ssl.SSLError, match="unable to get certificate CRL"):
+        _handshake(hop, twins.server(sends_renewed=False))
+
+
+def test_a_name_that_differs_only_in_white_space_is_unlisted_though_openssl_matches_it(
+    twins: _Twins, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The residual :func:`messagefoundry.pki._issuer_name_key` names, measured. OpenSSL drops
+    white space around a value when it compares names, and the engine does not. So this CRL reads
+    ``unlisted`` and starts with the warning, while OpenSSL judges the peer by it. The words of
+    that warning say the engine compares white space, so they stay true here."""
+    spaced = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, " mefor-2905-twin-ca ")])
+    pem = _named_crl(twins, twins.stranger, spaced)
+
     assert [s.state for s in judge_crl_signatures(pem, _ders(twins.new_ca))] == ["unlisted"]
     with caplog.at_level("WARNING"):
         hop = twins.hop("new")
     (line,) = _warnings(caplog)
-    assert words in line
-    # The reload gives the same state the same words, so the two cannot drift apart.
-    verdict = crl_signature_refusal(pem, _ders(twins.new_ca))
-    assert verdict is not None and verdict[1] is False and words in verdict[0]
-
-    # The premise, on this interpreter's OpenSSL: it takes that CA for the CRL's issuer, and
-    # judges the peer by the CRL. Control: the same hop passes with a CRL that revokes nothing.
-    with pytest.raises(ssl.SSLError, match="revoked"):
-        _handshake(hop, server)
-    write(twins.new_key)
-    _handshake(twins.hop("new"), server)  # raises if refused
-    # What the configuration guide says was measured: a badly signed CRL of this kind starts,
-    # and then fails its handshake.
-    write(twins.stranger)
+    words = _UNCONFIRMED_SIGNATURE["unlisted"]
+    assert words in line and "white space included" in words
     with pytest.raises(ssl.SSLError, match="CRL signature failure"):
-        _handshake(twins.hop("new"), server)
+        _handshake(hop, twins.server(sends_renewed=False))
 
 
 _SHA256_WITH_RSA = bytes.fromhex("06092a864886f70d01010b")
