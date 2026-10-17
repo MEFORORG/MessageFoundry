@@ -159,7 +159,8 @@ async def test_the_totp_second_factor_elevates_the_pre_mfa_token_in_place(
     when the legitimate user completes the second factor.
 
     BOTH of ``verify_mfa``'s stamps are still asserted, now against the NEW token. #1146 names the
-    ordering trap — every session UPDATE but ``revoke_session``/``rotate_session`` is rowcount-blind —
+    ordering trap — a session stamp UPDATE is rowcount-blind (which single-session UPDATEs report
+    what they changed is ``AuthStore.rotate_session``'s docstring to say) —
     so a stamp written AFTER the rotation writes nothing and reports success. Reading the elevated
     state off the new token is what catches that: it is only there if both stamps landed first.
     """

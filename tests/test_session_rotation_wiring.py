@@ -153,8 +153,8 @@ async def test_the_elevated_state_is_readable_on_the_new_token(
 ) -> None:
     """RED when: any stamp moves AFTER the rotation — the ORDERING INVARIANT, pinned.
 
-    Every session UPDATE but rotate_session and supersede_session is rowcount-blind (see
-    AuthStore.rotate_session; revoke_session is blind too), so a stamp written after the re-key
+    Every single-session UPDATE is rowcount-blind except the ones AuthStore.rotate_session's
+    docstring names (revoke_session is blind too), so a stamp written after the re-key
     silently writes nothing and still reports success. The only way to see that is from the NEW
     session: it would read back unelevated. Asserted on both stamps verify_mfa makes.
     """
