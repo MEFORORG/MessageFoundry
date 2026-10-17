@@ -58,7 +58,7 @@ _SCHANNEL_AEAD = re.compile("GCM|CCM|CHACHA20_POLY1305")
 #: the guard, PowerShell exits 1 there, which it also does for a cmdlet that ran and failed.
 _NO_CMDLET_EXIT = 64
 #: The warning and verbose streams are silenced first: Windows PowerShell 5.1 writes their lines to
-#: a redirected stdout, where they would read as suite names.
+#: a redirected stdout, where they would fail the suite-name check and make the reading an ERROR.
 _SUITES_COMMAND = (
     "$WarningPreference = 'SilentlyContinue'; $VerbosePreference = 'SilentlyContinue'; "
     "if (Get-Command Get-TlsCipherSuite -ErrorAction SilentlyContinue) "
@@ -77,6 +77,8 @@ _OPENSSL_ENV = ("OPENSSL_CONF", "OPENSSL_CONF_INCLUDE", "OPENSSL_MODULES", "OPEN
 _POLICY_KEYS = {key.lower(): key for key in ("CipherString", "Ciphersuites", "MinProtocol")}
 _SECTION_HEADER = re.compile(r"^\s*\[\s*([^\]]*?)\s*\]")
 _ASSIGNMENT = re.compile(r"^\s*([^\s=#]+)\s*=(.*)$")
+#: ``.include path``, ``.include = path`` and the ``.pragma`` forms.
+_DIRECTIVE = re.compile(r"^\s*(\.include|\.pragma)(?![\w.])")
 #: The names OpenSSL follows from the default section to the system-default policy section.
 _SYSTEM_DEFAULT_CHAIN = ("openssl_conf", "ssl_conf", "system_default")
 _TLS12_OR_HIGHER = frozenset({"TLSv1.2", "TLSv1.3"})
@@ -164,9 +166,11 @@ def _windows_enabled_suites() -> list[str]:
     if proc.returncode == _NO_CMDLET_EXIT:
         raise ProbeUnavailable("Get-TlsCipherSuite not found")
     lines = _stdout_lines("powershell.exe", proc)
-    odd = next((line for line in lines if not _SCHANNEL_SUITE_NAME.fullmatch(line)), None)
-    if odd is not None:
-        raise ProbeFailed(f"powershell.exe printed a line that is not a suite name: {odd[:80]!r}")
+    for line in lines:
+        if not _SCHANNEL_SUITE_NAME.fullmatch(line):
+            raise ProbeFailed(
+                f"powershell.exe printed a line that is not a suite name: {line[:80]!r}"
+            )
     return lines
 
 
@@ -287,9 +291,8 @@ def _config_sections(text: str) -> dict[str, list[tuple[str, str]]]:
     sections: dict[str, list[tuple[str, str]]] = {"default": []}
     current = sections["default"]
     for line in text.splitlines():
-        directive = line.strip().split("=")[0].split()
-        if directive and directive[0] in (".include", ".pragma"):
-            raise _not_followed(directive[0])
+        if directive := _DIRECTIVE.match(line):
+            raise _not_followed(directive[1])
         if line.rstrip().endswith("\\"):
             raise _not_followed("a line continued with a backslash")
         if header := _SECTION_HEADER.match(line):

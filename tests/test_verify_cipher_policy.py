@@ -190,8 +190,7 @@ def _powershell_returns(
 def test_suite_names_are_read_one_per_line(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = _powershell_returns(monkeypatch, 0, "TLS_AES_256_GCM_SHA384\n\n SSL_CK_RC4_X \n")
     assert cipher_policy._windows_enabled_suites() == ["TLS_AES_256_GCM_SHA384", "SSL_CK_RC4_X"]
-    assert "Get-TlsCipherSuite" in calls[0][-1]
-    assert "$WarningPreference = 'SilentlyContinue'" in calls[0][-1]
+    assert calls[0][-1] == cipher_policy._SUITES_COMMAND
 
 
 @pytest.mark.parametrize("odd", ["WARNING: module loaded late", "AVERTISSEMENT : x", "TLS AES"])
@@ -312,12 +311,23 @@ _CHAIN = (
 )
 
 
+def _point_openssl_conf_at(monkeypatch: pytest.MonkeyPatch, cnf: Path, text: str) -> None:
+    cnf.write_text(text, encoding="utf-8")
+    monkeypatch.setenv("OPENSSL_CONF", str(cnf))
+
+
 def _read_cnf(
     monkeypatch: pytest.MonkeyPatch, cnf: Path, text: str
 ) -> tuple[Path, str | None, list[tuple[str, str]]]:
-    cnf.write_text(text, encoding="utf-8")
-    monkeypatch.setenv("OPENSSL_CONF", str(cnf))
+    _point_openssl_conf_at(monkeypatch, cnf, text)
     return cipher_policy._openssl_policy_lines()
+
+
+def _linux_from_file(monkeypatch: pytest.MonkeyPatch, cnf: Path, text: str) -> CheckResult:
+    """The whole Linux row over a real file, with the suite probe stubbed healthy."""
+    _point_openssl_conf_at(monkeypatch, cnf, text)
+    monkeypatch.setattr(cipher_policy, "_openssl_suites", lambda: _SSL_AEAD)
+    return cipher_policy.read_host_cipher_policy("linux")
 
 
 def test_policy_lines_read_the_openssl_conf_file(
@@ -409,10 +419,7 @@ def test_a_file_using_what_the_check_does_not_follow_is_manual(
 ) -> None:
     """Each can change the lines OpenSSL applies, so the row must never PASS on what it read."""
     cnf = tmp_path / "openssl.cnf"
-    cnf.write_text(text, encoding="utf-8")
-    monkeypatch.setenv("OPENSSL_CONF", str(cnf))
-    monkeypatch.setattr(cipher_policy, "_openssl_suites", lambda: _SSL_AEAD)
-    r = cipher_policy.read_host_cipher_policy("linux")
+    r = _linux_from_file(monkeypatch, cnf, text)
     assert r.status is Status.MANUAL, r.detail
     assert construct in r.detail
     assert str(cnf) in r.detail
@@ -427,13 +434,11 @@ def test_a_dollar_outside_the_read_lines_is_not_refused(
 
 
 def test_a_quoted_min_protocol_passes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    _read_cnf(
+    r = _linux_from_file(
         monkeypatch,
         tmp_path / "openssl.cnf",
         _CHAIN + '[system_default_sect]\nCipherString = "ECDHE+AESGCM"\nMinProtocol = "TLSv1.2"\n',
     )
-    monkeypatch.setattr(cipher_policy, "_openssl_suites", lambda: _SSL_AEAD)
-    r = cipher_policy.read_host_cipher_policy("linux")
     assert r.status is Status.PASS, r.detail
 
 
