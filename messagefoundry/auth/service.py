@@ -7476,11 +7476,11 @@ class AuthService:
         ``auth.ad_username_refreshed`` and ``auth.ad_username_refresh_conflict`` rows; those name
         the account as ``actor``. **A failed write here does not end the pass.** If it raised, the
         pass would return no plan, and the lifespan task would raise no alert for the revocations
-        already applied, nor for the hold, the breaker or the referral. It would also skip every
-        account after this one. So a store refusal is logged at ERROR, naming the action and the
-        actor, and the pass goes on. The log line is then the only record of that row: nothing
-        retries it. A revocation or rename it records has already committed, and any notice or
-        alert it was due still goes.
+        already applied, nor for the hold, the breaker, the referral or the probe fault. It would
+        also skip every account after this one. So a store refusal is logged at ERROR, naming the
+        action and the actor, and the pass goes on. The log line is then the only record of that
+        row: nothing retries it. A revocation or rename it records has already committed, and any
+        notice or alert it was due still goes.
 
         A defect is raised, not passed over (:data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS`).
         """
