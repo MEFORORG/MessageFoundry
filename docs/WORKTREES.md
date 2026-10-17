@@ -182,7 +182,7 @@ nothing prompts.
 
 | Route | Reaches | Refuses, before it removes anything |
 |---|---|---|
-| `-Name <dir>` | The `<repo>-<dir>` sibling of the checkout that copy of the script lives in | Uncommitted tracked changes. A detached HEAD no ref holds. An unlanded ledger number. |
+| `-Name <dir>` | The `<repo>-<dir>` sibling of the checkout that copy of the script lives in | Uncommitted tracked changes. A detached HEAD no ref holds. An unlanded ledger number. A held claim, git or working-tree activity in six hours, and a nested worktree, whatever `-Force` says. |
 | `-Path <path>` | Any registered linked worktree that is not under `.claude/worktrees` | Everything `-Name` refuses, and the list in the next section. |
 | `-List` | Nothing. It is read-only. | It prints each worktree, its class, and which route reaches it. |
 
@@ -228,10 +228,11 @@ is a copy for readers and can lag it.
   replaced by an amend counts, although the branch's own reflog still holds it.
 - A tree the session registry records a session in.
 - Any tree at all, when the session registry cannot be read.
-- A tree that still holds a work claim, or any tree when a claim file cannot be read. So this
-  route never releases a claim: the work lands, or the claim is released, first.
+- A tree that still holds a work claim, or any tree when a claim file cannot be read. Neither route
+  releases a claim; release with `claim.ps1 -Release`, which records it.
 - A tree whose own git directory was written to in the last six hours, by a commit, a checkout, a
   merge or a fetch.
+- A tree whose working tree was written to in six hours.
 
 Without `-Force` it also refuses uncommitted tracked changes, untracked files, ignored files, and
 files flagged skip-worktree or assume-unchanged. **One exception:** an *ignored directory* named
@@ -268,13 +269,17 @@ case: the sessions sit under `.claude/worktrees` and the work sits in sibling tr
 the first version of this route found that the registry check alone would have removed trees of a
 running batch.
 
-So `-Path` also refuses on a held **claim** and on **recent git activity**, the last two entries in
-the list above. A claim names the worktree that took it, whoever launched the session. Git activity
-is read from the tree's own git directory. Neither is proof that a tree is free:
+So `-Path` also refuses on a held **claim** and on **recent activity**, the last three entries in
+the list above. `-Name` refuses on the same three. A claim names the worktree that took it,
+whoever launched the session. Git activity is read from the tree's own git directory. Working-tree
+activity is read from the tree's top folder, each entry directly under it, and `.pytest_cache` and
+`.ruff_cache`. None is proof that a tree is free:
 
-- Work that was never claimed, in a tree nobody has committed to for six hours, passes both.
-- The six hours are a judgement. A long test run after a last commit can outlast them.
-- A tree that passes both is still removed only if it is clean.
+- Work that was never claimed, in a tree nobody has committed to or written in for six hours,
+  passes all three.
+- The six hours are a judgement. A test run still in progress has not yet written its cache, so it
+  can outlast them.
+- A tree that passes all three is still removed only if it is clean.
 
 **The occupancy check is on `-Path` only.** `-Name` has none, and it also keeps its blanket
 `git worktree prune`, which `-Path` does not run because a blanket prune drops other worktrees'
