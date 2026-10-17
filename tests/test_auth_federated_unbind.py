@@ -92,6 +92,8 @@ async def test_unbind_clears_the_pair_revokes_sessions_and_audits_the_count(
             "issuer": issuer,
             "subject": "S-1-alice",
             "sessions_revoked": 1,
+            "totp_enrolled": False,
+            "webauthn_enrolled": False,
         }
     finally:
         await store.close()

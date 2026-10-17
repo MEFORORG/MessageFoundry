@@ -3198,7 +3198,8 @@ class AuthSettings(_Section):
     # population — the signature of a misconfiguration, not of offboarding. Below the floor the breaker
     # cannot distinguish the two cases and revokes.
     #
-    # `_refuse_a_breaker_that_cannot_trip` refuses the settings under which that AND can never hold.
+    # Where that AND can never hold, `_refuse_a_dead_breaker_fraction` refuses a 1.0 fraction and
+    # `breaker_budget_warning` warns of a budget at or below the cap (BACKLOG #3085).
     #
     # A service account that loses read on `userAccountControl` ALONE is NOT this breaker's case any
     # more (ADR 0195, BACKLOG #2039). Those accounts read UNDETERMINED, not "not found", and the
@@ -3720,11 +3721,15 @@ class AuthSettings(_Section):
     @field_validator("ad_session_revoke_max_fraction")
     @classmethod
     def _check_ad_revoke_fraction(cls, value: float) -> float:
-        # A 0.0 fraction would make the breaker absolute-only: any revocation exceeds it. A 1.0
-        # fraction is the opposite, never exceeded, so it disables the whole breaker;
-        # `_refuse_a_breaker_that_cannot_trip` refuses that while the reconciler can run (#3085).
+        # At 0.0 any revocation exceeds the proportional half, so every pass above the absolute cap
+        # trips on any estate, a genuine offboarding wave included; refused. At 1.0 it is never
+        # exceeded, so the whole breaker is dead; `_refuse_a_dead_breaker_fraction` refuses that
+        # while the reconciler can run (#3085).
         if not 0.0 < value <= 1.0:
-            raise ValueError("ad_session_revoke_max_fraction must be > 0.0 and <= 1.0")
+            raise ValueError(
+                "ad_session_revoke_max_fraction must be > 0.0 and <= 1.0, and below 1.0 while the "
+                "directory reconciler runs"
+            )
         return value
 
     @property
@@ -3801,37 +3806,51 @@ class AuthSettings(_Section):
             )
         return self
 
+    @property
+    def reconciler_configured(self) -> bool:
+        """Whether the directory session reconciler is set to run: AD on and a non-zero interval.
+        ``AuthService.directory_reconcile_enabled`` also needs an LDAP client, which settings
+        cannot see."""
+        return self.ad_enabled and self.ad_session_recheck_seconds > 0
+
     @model_validator(mode="after")
-    def _refuse_a_breaker_that_cannot_trip(self) -> AuthSettings:
-        """BACKLOG #3085. Refuse the two settings under which the mass-revoke breaker never trips.
+    def _refuse_a_dead_breaker_fraction(self) -> AuthSettings:
+        """BACKLOG #3085. Refuse a fraction under which the mass-revoke breaker never trips.
 
         ``breaker_tripped`` in ``auth/reconcile.py`` trips only when a pass's revocations exceed
-        BOTH thresholds. A pass judges at most ``ad_session_recheck_max_users`` accounts and revokes
-        no more than it judged. So a budget at or below ``ad_session_revoke_max`` never exceeds the
-        absolute half, and a 1.0 fraction never exceeds the proportional half. Either one leaves the
-        whole breaker dead, and a site would not be told. Checked only while the reconciler can run;
-        with AD off or the interval at 0 these knobs are inert, and the shipped defaults pass.
+        BOTH thresholds. A pass never revokes more accounts than it probed, so a 1.0 fraction is never
+        exceeded and the whole breaker is dead. Checked only while the reconciler can run. A budget
+        at or below the cap also leaves it dead, and is warned of rather than refused (owner ruling
+        2026-10-17); :meth:`breaker_budget_warning` says why. At least one more dead case is
+        neither: an estate with no more signed-in directory users than the cap.
         """
-        if not (self.ad_enabled and self.ad_session_recheck_seconds > 0):
-            return self
-        problems: list[str] = []
-        if self.ad_session_revoke_max_fraction >= 1.0:
-            problems.append(
-                "ad_session_revoke_max_fraction must be below 1.0 (a pass never revokes more "
-                "accounts than it probed)"
-            )
-        if self.ad_session_recheck_max_users <= self.ad_session_revoke_max:
-            problems.append(
-                "ad_session_recheck_max_users must be greater than ad_session_revoke_max (a pass "
-                "probes at most ad_session_recheck_max_users accounts)"
-            )
-        if problems:
+        if self.reconciler_configured and self.ad_session_revoke_max_fraction >= 1.0:
             raise ValueError(
-                "while the directory reconciler runs, "
-                + "; and ".join(problems)
-                + ", or the mass-revoke breaker can never trip"
+                "ad_session_revoke_max_fraction must be below 1.0 while the directory reconciler "
+                "runs: a pass never revokes more accounts than it probed, so at 1.0 the mass-revoke "
+                "breaker can never trip"
             )
         return self
+
+    def breaker_budget_warning(self) -> str | None:
+        """The start-up warning for a budget at or below the revoke cap, or ``None`` (BACKLOG #3085).
+
+        A pass probes at most ``ad_session_recheck_max_users`` accounts, so it can never revoke more
+        than ``ad_session_revoke_max`` of them, and with the AND in ``breaker_tripped`` the breaker
+        never trips. Warned of, not refused (owner ruling 2026-10-17): refusing it would force a
+        small-budget site to a cap so low that every revoking pass trips, and revocation stops."""
+        if not self.reconciler_configured:
+            return None
+        if self.ad_session_recheck_max_users > self.ad_session_revoke_max:
+            return None
+        return (
+            f"[auth].ad_session_recheck_max_users ({self.ad_session_recheck_max_users}) is at or "
+            f"below [auth].ad_session_revoke_max ({self.ad_session_revoke_max}): a pass probes at "
+            "most that many accounts, so it can never revoke more than the cap, and the "
+            "mass-revoke circuit breaker can never trip. Revocation still works. To arm the "
+            "breaker, raise ad_session_recheck_max_users above ad_session_revoke_max. Lowering "
+            "the cap instead makes a pass that revokes its whole small sample trip."
+        )
 
     @property
     def oidc_private_key_jwt(self) -> bool:

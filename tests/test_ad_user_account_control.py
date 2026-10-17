@@ -65,6 +65,7 @@ from messagefoundry.config.settings import (
     SecurityEnforcement,
     SecuritySettings,
     StoreSettings,
+    load_settings,
 )
 from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
@@ -271,44 +272,49 @@ def _settings(**over: Any) -> AuthSettings:
     return AuthSettings(**base)
 
 
-# A small per-pass budget needs a revoke cap below it, or the breaker could never trip and the load
-# refuses the pair (BACKLOG #3085). These tests revoke nothing, so a low cap changes no outcome.
-def _budget(users: int) -> dict[str, Any]:
-    return {"ad_session_recheck_max_users": users, "ad_session_revoke_max": users - 1}
-
-
-_BUDGET_OF_ONE = _budget(1)
-_BUDGET_OF_TWO = _budget(2)
-
-
 # --- BACKLOG #3085: settings under which the mass-revoke breaker could never trip ---------------
 
 
-@pytest.mark.parametrize(
-    ("override", "message"),
-    [
-        ({"ad_session_revoke_max_fraction": 1.0}, "must be below 1.0"),
-        ({"ad_session_recheck_max_users": 5}, "must be greater than ad_session_revoke_max"),
-        (
-            {"ad_session_recheck_max_users": 3, "ad_session_revoke_max": 10},
-            "must be greater than ad_session_revoke_max",
-        ),
-        (
-            {"ad_session_revoke_max_fraction": 1.0, "ad_session_recheck_max_users": 5},
-            "below 1.0 .*; and ad_session_recheck_max_users must be greater",
-        ),
-    ],
-    ids=["fraction-1.0", "budget-equals-cap", "budget-below-cap", "both-in-one-message"],
-)
-def test_a_breaker_that_cannot_trip_is_refused_at_load(
-    override: dict[str, Any], message: str
-) -> None:
-    """A pass judges at most the budget and revokes no more than it judged. With the AND in
-    ``breaker_tripped``, a 1.0 fraction or a budget at or below the cap leaves it unable to trip.
+def test_a_fraction_of_one_is_refused_while_the_reconciler_runs() -> None:
+    """A pass never revokes more accounts than it probed, so with the AND in ``breaker_tripped`` a
+    1.0 fraction leaves the whole breaker unable to trip.
 
-    RED when: either combination loads, and a site has no breaker without being told."""
-    with pytest.raises(ValidationError, match=message):
-        _settings(**override)
+    RED when: 1.0 loads with the reconciler on, and a site has no breaker without being told."""
+    with pytest.raises(ValidationError, match="must be below 1.0"):
+        _settings(ad_session_revoke_max_fraction=1.0)
+
+
+@pytest.mark.parametrize("users", [5, 1], ids=["budget-equals-cap", "budget-below-cap"])
+def test_a_budget_at_or_below_the_cap_loads_and_names_the_dead_breaker(users: int) -> None:
+    """Warned of, not refused (owner ruling 2026-10-17): the setting loads with the default cap of
+    5, revocation keeps working, and the warning names the settings and what to set.
+
+    RED when: the pair is refused, or loads with no warning."""
+    note = _settings(ad_session_recheck_max_users=users).breaker_budget_warning()
+    assert note is not None
+    assert "can never trip" in note
+    assert "raise ad_session_recheck_max_users above ad_session_revoke_max" in note
+
+
+def test_a_budget_one_above_the_cap_does_not_warn() -> None:
+    """The boundary control: at cap + 1 a pass can revoke more than the cap, so the breaker can
+    trip and nothing is warned of."""
+    assert _settings(ad_session_recheck_max_users=6).breaker_budget_warning() is None
+
+
+def test_serve_logs_the_dead_breaker_warning_once_logging_is_configured() -> None:
+    """``serve`` loads its settings before ``configure_logging``, so the warning is logged after it,
+    or it would reach bare stderr only. Read from the source, as the unread-variable replay test in
+    tests/test_settings_env_keys.py does, because running ``serve`` that far starts an engine."""
+    import inspect
+
+    from messagefoundry import __main__ as cli
+
+    source = inspect.getsource(cli._serve)
+    checked = source.index("if _logging_refused is not None:")
+    warned = source.index("settings.auth.breaker_budget_warning()")
+    assert source.index("_load_service_settings(") < checked < warned
+    assert "breaker_budget_warning" not in inspect.getsource(load_settings)
 
 
 @pytest.mark.parametrize(
@@ -323,21 +329,21 @@ def test_the_breaker_settings_check_waits_for_a_reconciler_that_can_run(
     override: dict[str, Any],
 ) -> None:
     """With AD off, or the interval at 0, the reconciler never runs, so these knobs are inert."""
-    _settings(ad_session_recheck_seconds=0, **override)
-    AuthSettings(**override)
+    assert _settings(ad_session_recheck_seconds=0, **override).breaker_budget_warning() is None
+    assert AuthSettings(**override).breaker_budget_warning() is None
 
 
 def test_the_shipped_breaker_defaults_pass_with_the_reconciler_on() -> None:
-    """The control: the defaults (200, 5, 0.34) load and can trip, and a budget one above its cap
-    and a fraction just below 1.0 both load."""
+    """The control: the defaults (200, 5, 0.34) load with no warning and can trip, and a fraction
+    just below 1.0 loads."""
     defaults = _settings()
+    assert defaults.breaker_budget_warning() is None
     assert breaker_tripped(
         revoke_count=defaults.ad_session_recheck_max_users,
         probed=defaults.ad_session_recheck_max_users,
         max_absolute=defaults.ad_session_revoke_max,
         max_fraction=defaults.ad_session_revoke_max_fraction,
     ), "the shipped defaults leave the breaker unable to trip"
-    _settings(**_BUDGET_OF_ONE)
     _settings(ad_session_revoke_max_fraction=0.99)
 
 
@@ -780,7 +786,7 @@ async def test_two_undetermined_accounts_in_different_samples_are_both_held(
     Counted per pass each would look single, and would be struck and revoked. Counted from each
     candidate's latest probe, the pass that sees the second one engages the hold, and it stays."""
     names = ["n1", "n2", "n3", "n4"]
-    async with _signed_in_estate(monkeypatch, names, **_BUDGET_OF_TWO) as estate:
+    async with _signed_in_estate(monkeypatch, names, ad_session_recheck_max_users=2) as estate:
         directory, service, store, tokens = estate
         # select_candidates takes never-probed accounts first, ties broken on user_id, so the id
         # order fixes the samples: the first two on pass 1, the other two on pass 2.
@@ -1545,13 +1551,13 @@ async def test_a_fresh_process_does_not_release_a_hold_its_budget_has_not_reache
     """With a budget of two, a fresh process's first pass reads only half the estate. The held
     accounts are in the other half, so a clean first half is no evidence the hold has gone."""
     names = ["n1", "n2", "n3", "n4"]
-    async with _signed_in_estate(monkeypatch, names, **_BUDGET_OF_TWO) as estate:
+    async with _signed_in_estate(monkeypatch, names, ad_session_recheck_max_users=2) as estate:
         directory, _service, store, _tokens = estate
         by_id = sorted([(u.id, u.username) for u in await store.list_users()])
         order = [name for _id, name in by_id if name in names]
         directory.uac.update(dict.fromkeys(order[2:], ABSENT))  # the second sample only
         await _left_open_by_an_earlier_run(store)
-        service = _held_before(_fresh_process(store, **_BUDGET_OF_TWO))
+        service = _held_before(_fresh_process(store, ad_session_recheck_max_users=2))
         await service.initialize()
         sink = NotifierAlertSink([], store=store)
         first = await _alerted_pass(service, sink)
@@ -1589,13 +1595,13 @@ async def test_a_fresh_process_does_not_release_a_hold_on_a_pass_that_read_nothi
     the deleted one. The record still holds the first pass's PRESENT answer, but the second pass
     read nothing that says ``userAccountControl`` is readable now, so it releases no hold."""
     names = ["n1", "n2"]
-    async with _signed_in_estate(monkeypatch, names, **_BUDGET_OF_ONE) as estate:
+    async with _signed_in_estate(monkeypatch, names, ad_session_recheck_max_users=1) as estate:
         directory, _service, store, _tokens = estate
         by_id = sorted([(u.id, u.username) for u in await store.list_users()])
         order = [name for _id, name in by_id if name in names]
         await _left_open_by_an_earlier_run(store)
         directory.delete(order[1])  # the second sample only
-        service = _held_before(_fresh_process(store, **_BUDGET_OF_ONE))
+        service = _held_before(_fresh_process(store, ad_session_recheck_max_users=1))
         await service.initialize()
         sink = NotifierAlertSink([], store=store)
         first = await _alerted_pass(service, sink)
@@ -2230,7 +2236,7 @@ async def test_an_account_that_leaves_after_it_read_present_does_not_forfeit_the
     names = ["jdoe", "asmith"]
     settings = {
         "ad_group_search_base": "OU=Groups,DC=other,DC=invalid",
-        **_BUDGET_OF_ONE,  # one probe per pass, so the two are read in turn
+        "ad_session_recheck_max_users": 1,  # one probe per pass, so the two are read in turn
     }
     async with _signed_in_estate(monkeypatch, names, **settings) as estate:
         directory, service, store, _tokens = estate

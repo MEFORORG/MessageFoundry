@@ -273,6 +273,8 @@ async def test_bind_rebind_and_unbind_each_leave_an_audit_row_naming_the_actor(
             "issuer": ISSUER,
             "subject": "S-1-a",
             "sessions_revoked": 1,
+            "totp_enrolled": False,
+            "webauthn_enrolled": False,
         }
         assert r.json()["detail"] == "federated identity bound; revoked 1 session(s)"
         ended = await engine.store.get_session("t-jdoe")
@@ -303,6 +305,8 @@ async def test_bind_rebind_and_unbind_each_leave_an_audit_row_naming_the_actor(
             "previous_issuer": ISSUER,
             "previous_subject": "S-1-a",
             "sessions_revoked": 1,
+            "totp_enrolled": False,
+            "webauthn_enrolled": False,
         }
         gone = await engine.store.get_session("t-jdoe-2")
         assert gone is not None and gone.revoked_at is not None

@@ -883,6 +883,8 @@ async def test_the_admin_bind_audits_and_notifies_and_a_login_never_does(
             "issuer": "https://idp.example",
             "subject": "S-1-alice",
             "sessions_revoked": 0,
+            "totp_enrolled": False,
+            "webauthn_enrolled": False,
         }
         bound = [e for e in notifier.events if e.event_type == FEDERATED_IDENTITY_BOUND]
         assert len(bound) == 1 and bound[0].username == "jdoe"
