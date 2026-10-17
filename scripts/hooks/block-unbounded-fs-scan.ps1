@@ -155,7 +155,7 @@ function Deny {
 # heredoc written with no space before it (`cat<<EOF`) is therefore missed, which costs a possible
 # false DENY on a heredoc whose body quotes this rule -- visible and reportable, never a hole.
 function Hide-HeredocBodies([string]$Text, [string]$Masked) {
-    # This hook runs as a fresh pwsh on EVERY shell tool call, so the common case pays for the
+    # This hook runs on EVERY shell tool call, so the common case pays for the
     # uncommon one unless it is short-circuited. Almost no command contains a heredoc.
     if ($Masked.IndexOf('<<') -lt 0) { return $Masked }
     $rawLines = $Text.Split([char]10)
@@ -373,7 +373,7 @@ try {
     $cmd = [string]$j.tool_input.command
     if (-not $cmd) { exit 0 }
 
-    # THE EARLY OUT, AND IT CARRIES THE COST OF THIS WHOLE FILE. A fresh pwsh runs this on every
+    # THE EARLY OUT, AND IT CARRIES THE COST OF THIS WHOLE FILE. This runs on every
     # Bash and PowerShell call -- about 19 a turn on this repo -- and almost none of them can deny.
     # Every deny below needs a program token of find or grep, and neither blanking pass ever
     # INTRODUCES a character (they only overwrite with spaces), so a raw substring test is a strict
