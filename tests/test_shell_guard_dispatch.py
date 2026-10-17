@@ -23,6 +23,7 @@ from typing import Any
 
 import pytest
 
+from tests._spawn_lock import run_single, spawn_burst
 from tests.test_blanket_stage_guard import bash
 from tests.test_claude_settings_contract import (
     _PLACEHOLDER,
@@ -67,19 +68,22 @@ def _wired_guards() -> list[Path]:
     return [Path(a) for a in after]
 
 
-def _proc(argv: list[str], raw: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(argv, input=raw, capture_output=True, text=True, timeout=120)
+def _proc(argv: list[str], raw: str, *, burst: bool = False) -> subprocess.CompletedProcess[str]:
+    # A single launch takes the shared side of the pwsh spawn lock (BACKLOG #1304). Inside a
+    # burst, which already holds the exclusive side, it must not wait on its own burst.
+    launch = subprocess.run if burst else run_single
+    return launch(argv, input=raw, capture_output=True, text=True, timeout=120)
 
 
-def _run(argv: list[str], raw: str) -> str:
-    proc = _proc(argv, raw)
+def _run(argv: list[str], raw: str, *, burst: bool = False) -> str:
+    proc = _proc(argv, raw, burst=burst)
     # Fail-open is the contract: a non-zero exit is a hook error, which lets the command run.
     assert proc.returncode == 0, f"{argv[-1]} exited {proc.returncode}: {proc.stderr}"
     return proc.stdout
 
 
-def _standalone(guard: Path, raw: str) -> str:
-    return _run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(guard)], raw)
+def _standalone(guard: Path, raw: str, *, burst: bool = False) -> str:
+    return _run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(guard)], raw, burst=burst)
 
 
 def _dispatch_argv(guards: list[Path]) -> list[str]:
@@ -87,8 +91,8 @@ def _dispatch_argv(guards: list[Path]) -> list[str]:
     return argv + [str(g) for g in guards]
 
 
-def _dispatch(guards: list[Path], raw: str) -> str:
-    return _run(_dispatch_argv(guards), raw)
+def _dispatch(guards: list[Path], raw: str, *, burst: bool = False) -> str:
+    return _run(_dispatch_argv(guards), raw, burst=burst)
 
 
 def _decision(stdout: str) -> dict[str, Any] | None:
@@ -163,17 +167,29 @@ def test_the_dispatcher_decides_exactly_what_the_guards_decide_standalone() -> N
     """Byte-for-byte: the dispatcher's stdout is the first non-empty stdout of the guards run
     standalone, in the settings file's order -- or nothing, when every guard allows."""
     guards = _wired_guards()
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        standalone = {(raw, g): pool.submit(_standalone, g, raw) for raw in _CORPUS for g in guards}
-        dispatched = {raw: pool.submit(_dispatch, guards, raw) for raw in _CORPUS}
-        mismatches = []
-        for raw in _CORPUS:
-            expected = next(
-                (out for g in guards if (out := standalone[(raw, g)].result()).strip()), ""
-            )
-            got = dispatched[raw].result()
-            if got != expected:
-                mismatches.append((raw[:120], expected[:200], got[:200]))
+    # Six concurrent pwsh launches are a storm, so each chunk holds the exclusive side of the spawn
+    # lock (BACKLOG #1304). The test flaked once in a parallel suite run, with its detail lost; the
+    # storm is the likely cause, not a measured one. A few chunks rather than one burst: a single
+    # hold over about 100 launches would make every other worker's locked launch wait it out, and
+    # each burst can first wait up to 15 s for in-flight launches, so the chunks stay few.
+    mismatches = []
+    with ThreadPoolExecutor(6) as pool:
+        for start in range(0, len(_CORPUS), 9):
+            chunk = _CORPUS[start : start + 9]
+            with spawn_burst("test_shell_guard_dispatch equivalence"):
+                standalone = {
+                    (raw, g): pool.submit(_standalone, g, raw, burst=True)
+                    for raw in chunk
+                    for g in guards
+                }
+                dispatched = {raw: pool.submit(_dispatch, guards, raw, burst=True) for raw in chunk}
+                for raw in chunk:
+                    expected = next(
+                        (out for g in guards if (out := standalone[(raw, g)].result()).strip()), ""
+                    )
+                    got = dispatched[raw].result()
+                    if got != expected:
+                        mismatches.append((raw[:120], expected[:200], got[:200]))
     assert not mismatches, mismatches
 
 

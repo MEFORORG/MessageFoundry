@@ -18,12 +18,12 @@ from __future__ import annotations
 
 import json
 import shutil
-import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from tests._spawn_lock import run_single
 from tests.test_blanket_stage_guard import assert_allowed, bash
 from tests.test_worktree_gate import assert_denied
 
@@ -36,7 +36,7 @@ pytestmark = pytest.mark.skipif(
 
 def run_guard(payload: dict[str, Any] | str) -> dict[str, Any] | None:
     raw = payload if isinstance(payload, str) else json.dumps(payload)
-    proc = subprocess.run(
+    proc = run_single(
         ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(GUARD)],
         input=raw,
         capture_output=True,
