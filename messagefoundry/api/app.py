@@ -274,7 +274,12 @@ from messagefoundry.audit_write import write_audit_soft
 # app.state.ui_ws_authorize, app.state.ui_connections_render (read by the always-on middleware/routes).
 from messagefoundry.auth import Identity, Permission, Role
 from messagefoundry.auth.audit_visibility import reads_audit_copies_in_the_log
-from messagefoundry.auth.reconcile import HOLD_REASON, REFERRAL_ABORT, ReconcilePlan
+from messagefoundry.auth.reconcile import (
+    HOLD_REASON,
+    PROBE_FAULT_ABORT,
+    REFERRAL_ABORT,
+    ReconcilePlan,
+)
 from messagefoundry.auth.service import (
     STEP_UP_ACTION_CONFIG_RELOAD,
     STEP_UP_ACTION_CONNECTION_PURGE,
@@ -9455,6 +9460,9 @@ async def _directory_reconciler(
 #: from the breaker's ``directory-reconciler``, so each has its own instance, throttle and detail,
 #: and an alert rule can match one source without the other.
 _REFERRAL_ALERT_SOURCE = "directory-reconciler-referral"
+#: The source label of the probe fault's own ``ad_reconcile_aborted`` instance (BACKLOG #3100), apart
+#: from the breaker's and the referral's for the same reasons.
+_PROBE_FAULT_ALERT_SOURCE = "directory-reconciler-probe-fault"
 
 
 def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSink) -> None:
@@ -9475,6 +9483,12 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     standing referral must not silence a later breaker trip, and each keeps its own detail. An
     ``[alerts]`` rule keyed on the event type alone still matches both.
 
+    A probe fault (BACKLOG #3100) is not an outage either: the engine could not read what the
+    directory returned for an account, and that account is left unrevoked while it lasts. Any pass
+    with a faulted probe is ``auth.ad_reconcile_faulted`` and becomes one ``ad_reconcile_aborted``
+    alert with reason ``probe_fault``, under its own source label
+    (:data:`_PROBE_FAULT_ALERT_SOURCE`). It has no inverse: an operator resolves it.
+
     Reads the RETURNED plan, so it sees only a pass that finished. A failed write of the pass's own
     held, aborted, skipped, referred or unkeyed-binding row no longer ends the pass (BACKLOG #2137):
     the service logs it at ERROR and returns the plan, so these alerts still fire. A pass that raised
@@ -9494,8 +9508,9 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     ``_mark_reconcile_clears`` states that rule once."""
     if plan.directory_outage:
         return
-    if plan.aborted is not None and not plan.directory_referral:
+    if plan.aborted is not None and not plan.directory_referral and not plan.probe_fault:
         # A breaker trip. A pass of referrals only is not one: its one alert is the referral's below.
+        # Nor is a pass of faults only (BACKLOG #3100): its one alert is the fault's below.
         sink.ad_reconcile_aborted(
             "directory-reconciler",
             reason=plan.aborted,
@@ -9512,6 +9527,14 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
             reason=REFERRAL_ABORT,
             probed=plan.probed,
             detail=auth.directory_reconcile_referral or REFERRAL_ABORT,
+        )
+    if plan.faulted:
+        # BACKLOG #3100. Beside the referral's, in the same order the service records them.
+        sink.ad_reconcile_aborted(
+            _PROBE_FAULT_ALERT_SOURCE,
+            reason=PROBE_FAULT_ABORT,
+            probed=plan.probed,
+            detail=auth.directory_reconcile_fault or PROBE_FAULT_ABORT,
         )
     if plan.hold:
         # After the breaker and the revocations, matching the auth service's order: a sink that
