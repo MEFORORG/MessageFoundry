@@ -6,7 +6,6 @@ step-up-to-unlock primitive (BACKLOG #75 phases 1 and 3)."""
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
@@ -30,28 +29,6 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
-
-#: The synthetic patterns the registry tests below register. None is a real console action.
-_TEST_ONLY_PATTERNS = (r"^/ui/alerts/[^/?#]+/ack$", r"^/ui/users/create$", r"^/ui/bad$")
-
-
-@pytest.fixture(autouse=True)
-def _drop_test_only_ui_actions() -> Iterator[None]:
-    """Take this file's synthetic registrations back out of the process-wide registry.
-
-    ``register_ui_action`` appends to ``_auth._UI_WRITE_ACTIONS`` for the life of the worker. While
-    these tests sat in the one large ``test_webui.py``, that file held its worker for nearly the whole
-    step, so ``test_golden_surface.py`` never ran after them. Split out (BACKLOG #2509), this file ends
-    early and the golden can follow it on the same worker, where it would see these rows. Only the
-    synthetic patterns are removed: a module-level registration fired during a test stays."""
-    yield
-    from messagefoundry_webconsole import _auth
-
-    synthetic = {*_TEST_ONLY_PATTERNS, _UNLOCK_PAT}
-    _auth._UI_WRITE_ACTIONS[:] = [
-        a for a in _auth._UI_WRITE_ACTIONS if a.path_re.pattern not in synthetic
-    ]
-
 
 # --- L1a: read-only monitoring pages (alerts + event log), BACKLOG #75 phase 1 ----------------
 
