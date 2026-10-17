@@ -3183,19 +3183,6 @@ class AuthService:
                     "If another provision-admin run is in progress, let it finish. Then run the "
                     "command again"
                 )
-        if notify_email is not None:
-            # Unconditional rather than fresh-path-only, because the invariant "the supplied address
-            # always lands" is simpler than the case analysis. On the fresh path `create_user` already
-            # seeded the same value; on a REPAIRED row an earlier run created the account, so this
-            # write is the only one that carries it.
-            await self._store.set_user_notify_email(user_id, email=notify_email)
-        await self._store.set_user_roles(user_id, [Role.ADMINISTRATOR.value], assigned_by=actor)
-        if repaired:
-            # AGAIN, after the role (ADR 0197 Amendment A, AC-A5). The earlier holder's password
-            # still worked until ``set_password`` above, so a sign-in in that window minted a session
-            # the first revoke never saw, and roles are re-read on every request. Revoking once more
-            # here ends it before it can act as an Administrator.
-            await self._store.revoke_user_sessions(user_id)
         # BACKLOG #2019: a repair can take over an account somebody else holds -- one an administrator
         # created with no roles, say -- so its earlier holder is told, at the address they held.
         # The repair is not refused outright, because an address is no sign of a second holder: a
@@ -3204,6 +3191,17 @@ class AuthService:
         # exists to complete. BACKLOG #2288 asks for the address instead: `_existing_row_refusal`
         # declines such a row until --email is given, and the crashed run's own command already
         # carries it, so the same command run again completes the row.
+        #
+        # BACKLOG #2915: the notice goes out HERE, after the last refusal above and BEFORE the address
+        # write below. After the address write, a crash before the role left the operator's address
+        # on a roleless row, and the re-run read it as the earlier holder's, so the earlier holder
+        # was never told. An earlier slot would tell them of a takeover that a later refusal leaves
+        # unfinished. A refusal above, on the repair branch, has still cleared their factors and
+        # sessions and tells nobody; that predates #2915 and is shipped open.
+        # Two at-least-once costs remain, and no state records a sent notice. A crash between this
+        # notice and the address write sends the earlier holder a second notice on the re-run. A
+        # crash after the address write makes the re-run send one to the operator's own address,
+        # and its audit row then records that notice, not the earlier holder's.
         #
         # The notice goes out BEFORE the audit row, so the row records its real outcome rather than a
         # forecast: `_notify_security` swallows a notifier failure, and a row written first would then
@@ -3227,6 +3225,19 @@ class AuthService:
                 holder_notice = HOLDER_NOTICE_DISPATCHED
             else:
                 holder_notice = HOLDER_NOTICE_NO_CHANNEL
+        if notify_email is not None:
+            # Unconditional rather than fresh-path-only, because the invariant "the supplied address
+            # always lands" is simpler than the case analysis. On the fresh path `create_user` already
+            # seeded the same value; on a REPAIRED row an earlier run created the account, so this
+            # write is the only one that carries it.
+            await self._store.set_user_notify_email(user_id, email=notify_email)
+        await self._store.set_user_roles(user_id, [Role.ADMINISTRATOR.value], assigned_by=actor)
+        if repaired:
+            # AGAIN, after the role (ADR 0197 Amendment A, AC-A5). The earlier holder's password
+            # still worked until ``set_password`` above, so a sign-in in that window minted a session
+            # the first revoke never saw, and roles are re-read on every request. Revoking once more
+            # here ends it before it can act as an Administrator.
+            await self._store.revoke_user_sessions(user_id)
         await self._audit(
             "auth.first_administrator_provisioned",
             actor=actor,
@@ -12320,6 +12331,9 @@ class AuthService:
         ASVS 6.3.7, as on the bind: the holder's federated sign-in stopped working and their
         sessions ended. The account is read for its address only AFTER the clear, and only for that;
         every audited field comes out of the clear's transaction.
+
+        That includes ``totp_enrolled`` and ``webauthn_enrolled`` (vault BACKLOG #2711 step 3): whether
+        the account still held each engine factor when its federated binding went.
         """
         await self._audit(
             "auth.federated_subject_unbound",
@@ -12331,6 +12345,8 @@ class AuthService:
                     "issuer": outcome.issuer,
                     "subject": outcome.subject,
                     "sessions_revoked": outcome.sessions_revoked,
+                    "totp_enrolled": outcome.totp_enrolled,
+                    "webauthn_enrolled": outcome.webauthn_enrolled,
                 }
             ),
         )
@@ -12400,6 +12416,13 @@ class AuthService:
 
         Emits ``auth.federated_subject_bound`` or ``auth.federated_subject_rebound`` naming the
         actor, and notifies the account holder naming the issuer but not the subject (ASVS 6.3.7).
+
+        **The row's ``totp_enrolled`` and ``webauthn_enrolled`` come from the CLEAR's transaction**
+        (vault BACKLOG #2711 step 3), not the bind's, because the clear is the one that returns a
+        record. So they can be stale by one gap: a factor enrolled or removed between the clear and
+        the write is not reflected. At least these can make that change: a session still live on a
+        first bind, a Windows SSO session minted in the gap on a rebind (the row is unbound then),
+        and an administrator's MFA reset. This is the one place the gap is described.
         """
         issuer = self._settings.oidc_issuer
         if not issuer:
@@ -12557,6 +12580,9 @@ class AuthService:
             "issuer": issuer,
             "subject": subject,
             "sessions_revoked": revoked,
+            # Vault BACKLOG #2711 step 3, from the clear's transaction (see the docstring).
+            "totp_enrolled": cleared.totp_enrolled,
+            "webauthn_enrolled": cleared.webauthn_enrolled,
         }
         if rebind:
             detail.update(
@@ -13079,8 +13105,9 @@ class AuthService:
         for every lock before this runs, so the newest one is always the current lock and a 15-minute
         campaign would look mailed forever. So a due notice writes its OWN row,
         ``auth.lock_notice``, with the closed-set lock kind as detail, and the next lock reads the
-        newest of those through ``list_audit``, as the first-seen login-address check reads its
-        baseline. No column needed.
+        newest of those through ``list_audit``. No column needed. (The first-seen login-address
+        check no longer reads its baseline this way: it reads the account's known-address record,
+        vault BACKLOG #2145 and #2947.)
 
         **With no notifier wired the row is still written, as ``mailed: false`` with
         ``reason: no_notifier``, and nothing is throttled** (BACKLOG #1131, owner ruling 2026-09-28).
