@@ -10370,6 +10370,10 @@ class AuthService:
             if await self._mfa_lock_refused(user, client=client):
                 return Elevation(locked=True)
             now = time.time()
+            # The secret cell this code is checked against: the factor write below lands only while
+            # the row still holds it, as the enrolment confirm does (BACKLOG #3025). The compare is
+            # on ciphertext, so a store-key rotation inside the check refuses too, which fails closed.
+            verified_cell = user.totp_secret_cell
             if await self._verify_second_factor(user, code, client=client, arrived=arrived):
                 # BACKLOG #3068: the verify awaited (a recovery-code walk is argon2 work off the
                 # loop), and a revocation or a disable needs no queue to land. So the session, the
@@ -10384,9 +10388,11 @@ class AuthService:
                 )
                 if isinstance(fresh, Elevation):
                     return fresh
-                # A self-service disable takes no queue, so the factor this code proved may be gone.
-                # The code is spent by now, so the refusal is audited with its reason.
-                if not fresh.totp_enabled:
+                # A self-service disable takes no queue, so the factor this code proved may be gone,
+                # or turned off and enrolled again with a new secret. Either way the code proved a
+                # factor the row no longer holds. It is spent by now, so the refusal is audited with
+                # its reason.
+                if not fresh.totp_enabled or fresh.totp_secret_cell != verified_cell:
                     await self._audit(
                         "auth.mfa_failed",
                         actor=fresh.username,
@@ -10394,11 +10400,14 @@ class AuthService:
                         client=client,
                     )
                     return Elevation()
+                # Carried on with the fresh row, so the success audits below name the account as
+                # it is now, not a name a rename replaced during the verify (BACKLOG #2291 class).
+                user = fresh
                 # The temporary-credential deadline is asked again on that fresh row, since it can
                 # pass during the verify too. This ask guards the writes below; the rotation asks
                 # once more. It awaits only when it ends the session.
-                if fresh.must_change_password and await self._mfa_lapsed(
-                    token, fresh, client=client, factor_checked=True
+                if user.must_change_password and await self._mfa_lapsed(
+                    token, user, client=client, factor_checked=True
                 ):
                     return Elevation(session_lost=True)
                 # ORDER-CRITICAL: this whole write group lands against the OLD hash, and only then
@@ -10588,8 +10597,10 @@ class AuthService:
     async def _mfa_lock_refused(
         self, user: UserRecord, *, client: str | None, event: str = "auth.mfa_failed"
     ) -> bool:
-        """Whether :meth:`verify_mfa` must refuse ``user`` as locked, auditing the refusal as
-        ``event`` if so. :meth:`_factor_holder_current` passes the passkey leg's event too.
+        """Whether a second-factor leg must refuse ``user`` as locked, auditing the refusal as
+        ``event`` if so. :meth:`verify_mfa` calls it with the default event.
+        :meth:`finish_webauthn_assertion` calls it directly with ``auth.webauthn_failed``, and
+        :meth:`_factor_holder_current` passes whichever leg's event it was handed.
 
         Per-account lockout covers the SECOND factor too: a run of wrong codes locks the account, so
         MFA guessing isn't bounded only by the shared per-IP login limiter (which IP-rotation can
@@ -10701,9 +10712,9 @@ class AuthService:
         **FAILS CLOSED, UNLIKE THE RECONCILER.** The reconciler REVOKES, so it fails open on an
         unreachable directory and wants two strikes for an ambiguous answer. This GRANTS, so any
         answer short of a present, enabled account refuses: absent, disabled, undetermined,
-        unavailable and referred (BACKLOG #2538) alike. The directory step-up legs already refuse this way: ``_reauth_ad`` on a
-        failed bind, and the federated step-up on ``directory_unavailable``. A refusal revokes
-        nothing, so the next attempt asks again. An AD row on an engine with no directory
+        unavailable and referred (BACKLOG #2538) alike. The directory step-up legs already refuse
+        this way: ``_reauth_ad`` on a failed bind, and the federated step-up on
+        ``directory_unavailable``. A refusal revokes nothing, so the next attempt asks again. An AD row on an engine with no directory
         configured is refused as ``not_configured``, because nothing can confirm it.
 
         **A row with no ``directory_object_id`` is refused unasked, whether or not it holds a
@@ -11374,7 +11385,18 @@ class AuthService:
         if not await self._store.update_webauthn_sign_count(
             cred.credential_id_hash, expected=cred.sign_count, new=new_count, used_at=now
         ):
-            # CAS miss: a concurrent assertion consumed the same counter — the clone signal.
+            # CAS miss. Either a concurrent assertion consumed the same counter, which is the clone
+            # signal, or the passkey was deleted after it was read: a self-service delete takes no
+            # queue. A passkey gone is refused as the factor-removed check below refuses it, so a
+            # delete raises no false clone alarm (BACKLOG #3068).
+            if not await self._passkey_still_held(user, cred):
+                await self._audit(
+                    "auth.webauthn_failed",
+                    actor=user.username,
+                    detail=_json({"reason": "factor_removed"}),
+                    client=client,
+                )
+                return Elevation()
             await self._audit(
                 "auth.webauthn_clone_suspected",
                 actor=user.username,
@@ -11397,14 +11419,8 @@ class AuthService:
             return fresh
         user = fresh
         # The code leg's TOTP-off check, for a passkey: a self-service delete takes no queue, so the
-        # passkey that signed may be gone. Asked of the set its seal covers (BACKLOG #2592).
-        still_held = await self._verified_passkeys(user)
-        # Every credential compared, each in constant time (ASVS 11.2.4, as the delete path does).
-        matches = [
-            constant_time_equal(c.credential_id_hash, cred.credential_id_hash)
-            for c in still_held or ()
-        ]
-        if not any(matches):
+        # passkey that signed may be gone.
+        if not await self._passkey_still_held(user, cred):
             await self._audit(
                 "auth.webauthn_failed",
                 actor=user.username,
@@ -11441,6 +11457,17 @@ class AuthService:
             # vault BACKLOG #2145, as in verify_mfa.
             await self._mark_login_address_known(user.id, client)
         return elevation
+
+    async def _passkey_still_held(self, user: VerifiedUser, cred: WebAuthnCredential) -> bool:
+        """Whether ``user`` still holds passkey ``cred``, asked of the set its seal covers (BACKLOG
+        #2592), so a set that fails its seal holds nothing. :meth:`finish_webauthn_assertion` asks
+        it after a sign-count miss and again before the factor write (BACKLOG #3068). Every
+        credential is compared, each in constant time (ASVS 11.2.4, as the delete path does)."""
+        matches = [
+            constant_time_equal(c.credential_id_hash, cred.credential_id_hash)
+            for c in await self._verified_passkeys(user) or ()
+        ]
+        return any(matches)
 
     async def _assertion_expired(self, user: UserRecord, client: str | None) -> Elevation:
         """The refusal :meth:`finish_webauthn_assertion` gives when no ceremony of this account's

@@ -41,6 +41,8 @@ from tests._fake_directory import FakeDirectory as _Directory
 
 _T0 = 1_700_000_000.0
 _T1 = _T0 + totp.DEFAULT_PERIOD
+# Synthetic base32, a second secret for a factor enrolled again during a code check.
+_REPLACING_SECRET = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
 
 _PRINCIPAL = AdPrincipal(
     username="jdoe",
@@ -437,7 +439,7 @@ async def test_a_lock_set_during_the_lookup_is_honoured(
     assert session is not None and session.reauth_at is None
 
 
-@pytest.mark.parametrize("change", ["lock", "revoke", "disable", "factor-off"])
+@pytest.mark.parametrize("change", ["lock", "revoke", "disable", "factor-off", "factor-replaced"])
 @pytest.mark.parametrize("account", ["directory", "local"])
 async def test_what_lands_during_the_code_check_stops_the_factor_write(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, change: str, account: str
@@ -446,7 +448,8 @@ async def test_what_lands_during_the_code_check_stops_the_factor_write(
     land, and the code check awaits, so the session, the account and its lock are read again right
     before the factor is written, for every account. RED when: a change that lands during a good
     code's check does not stop the write, which would then mark the factor, stamp the window and
-    clear the lockout counters."""
+    clear the lockout counters. ``factor-replaced`` turns TOTP off and enrols it again with a new
+    secret, so the row holds a factor again but not the one the code proved."""
     if account == "directory":
         e = await _enrolled_directory_session(store, monkeypatch)
         service, token, user_id, code = e.service, e.token, e.user_id, totp.totp(e.secret, now=_T1)
@@ -480,6 +483,12 @@ async def test_what_lands_during_the_code_check_stops_the_factor_write(
             await store.set_user_disabled(user_id, disabled=True)
         else:
             await store.disable_totp(user_id)
+            if change == "factor-replaced":
+                cell = await store.set_totp_secret(user_id, secret=_REPLACING_SECRET)
+                assert cell is not None
+                assert await store.enable_totp(
+                    user_id, recovery_code_hashes=[], expected_secret_cell=cell
+                )
         return good
 
     monkeypatch.setattr(service, "_verify_second_factor", _verify_while_something_lands)
@@ -489,7 +498,8 @@ async def test_what_lands_during_the_code_check_stops_the_factor_write(
     assert refused.ok is False
     assert refused.session_lost is (change in ("revoke", "disable"))
     assert refused.locked is (change == "lock")
-    reason = {"lock": "locked", "factor-off": "factor_removed"}.get(change, "session_lost")
+    gone = ("factor-off", "factor-replaced")
+    reason = "factor_removed" if change in gone else {"lock": "locked"}.get(change, "session_lost")
     assert {"reason": reason} in await _audited_mfa_failures(store)
     session = await store.get_session(hash_token(token))
     assert session is not None
@@ -497,6 +507,29 @@ async def test_what_lands_during_the_code_check_stops_the_factor_write(
     if change == "lock":
         user = await store.get_user(user_id)
         assert user is not None and user.second_step_locked_until is not None  # not cleared
+
+
+async def test_a_rename_during_the_code_check_is_audited_under_the_new_name(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3068 (the #2291 class). A directory rename needs no account queue to land, so the
+    success is filed under the name the row holds when the factor is written. RED when: the
+    ``auth.mfa_verified`` row names the account as it was before the rename."""
+    e = await _enrolled_directory_session(store, monkeypatch)
+    real_verify = e.service._verify_second_factor
+
+    async def _verify_while_renamed(*args: Any, **kwargs: Any) -> bool:
+        good = await real_verify(*args, **kwargs)
+        assert await store.set_user_username(e.user_id, "jdoe-renamed", expected_username="jdoe")
+        return good
+
+    monkeypatch.setattr(e.service, "_verify_second_factor", _verify_while_renamed)
+
+    verified = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
+
+    assert verified.ok
+    rows = await store.list_audit(action="auth.mfa_verified")
+    assert [r["actor"] for r in rows] == ["jdoe-renamed"]
 
 
 async def _more_sessions(e: _Enrolled, count: int) -> list[str]:
