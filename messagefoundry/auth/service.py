@@ -6871,8 +6871,8 @@ class AuthService:
             # returns first. On the LOGIN path they can still differ, when a pass wrote between the
             # sign-in's read and this one. So each ``_refuse`` call passes the name the row held,
             # never ``old_username``: passing that would bring back the #2291 defect on the login
-            # path, an audit row naming an account that no longer exists. ``row_gone`` is the one
-            # exception, since no row is left to hold a name.
+            # path, an audit row naming an account that no longer exists. The one exception is the
+            # ``row_gone`` refusal at the pre-read, where no row was read to hold a name.
             await self._audit(
                 "auth.ad_username_refresh_conflict",
                 actor=holds,
@@ -6895,12 +6895,14 @@ class AuthService:
                 return
             if held_by is None:
                 # The write lost to another writer, but the re-read found no row holding the name
-                # now. Nothing is locked out, and the next sign-in or pass copies the name down
-                # again, so the lockout warning below would be false (BACKLOG #2291).
+                # now. Nothing is locked out, and a later sign-in or a pass that probes the account
+                # copies the name down again, so the lockout warning below would be false (BACKLOG
+                # #2291).
                 _log.warning(
                     "AD account %s was renamed in the directory but the write lost to another "
                     "writer (detected %s), and no row holds the new name now; nothing was written, "
-                    "and the next sign-in or reconcile pass retries it (BACKLOG #2291)",
+                    "and the account's next sign-in, or a later reconcile pass that probes it, "
+                    "retries it (BACKLOG #2291)",
                     scrub_log_argument(holds),
                     detected,
                 )
@@ -7066,10 +7068,10 @@ class AuthService:
         #     this same row wrote first (BACKLOG #2290). That caller audits and notifies, so this one
         #     does neither. It is not a conflict either, because no other row holds anything. The
         #     first writer wins, so when two refreshes carry DIFFERENT new names and both read the
-        #     row before either wrote, the stored one can be the older of the two until the next
-        #     sign-in or pass copies the directory's name down again. The BACKLOG #3069 skip above
-        #     does not order these: it stops only a reconciler plan that a write overtook before
-        #     this pre-read. Logged at INFO so the skipped write is visible without paging anyone.
+        #     row before either wrote, the stored one can be the older of the two until a later
+        #     read copies the directory's name down again. The BACKLOG #3069 skip above, which
+        #     names when that read comes, does not order these: it stops only a reconciler plan
+        #     that a write overtook before this pre-read. Logged at INFO so the skipped write is visible without paging anyone.
         if not written:
             after = await self._load_user(user_id)
             if after is None:
@@ -10231,9 +10233,9 @@ class AuthService:
                 reason = "secret_replaced"
             else:
                 # The row still holds the verified cell with TOTP off, so the write lost to some
-                # other concurrent write to the row. A plain retry gets a 401, because the session
-                # was revoked above and this code's step is consumed; the user signs in again and
-                # confirms with a code from a later step.
+                # other concurrent write to the row. The session is revoked above, so a plain
+                # retry is a lost session; recovery is as for a session lost before the rotation
+                # (the ROTATE BEFORE ENABLING comment above).
                 reason = "write_lost"
             await self._audit(
                 "auth.mfa_enroll_refused",
