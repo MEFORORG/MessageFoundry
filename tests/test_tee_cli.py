@@ -13,6 +13,7 @@ import os
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -393,6 +394,7 @@ def test_export_out_is_created_owner_only(tmp_path: Path) -> None:
 
 
 _OUT_COMMANDS = ["anonymize-captures", "export", "compare"]
+_WHAT = {"anonymize-captures": "dataset", "export": "export", "compare": "report"}
 
 
 def _write_out(
@@ -440,19 +442,16 @@ def test_out_is_lf_on_every_platform(
     assert b"\r\n" not in data
 
 
-@pytest.mark.parametrize(
-    ("command", "what"), [("anonymize-captures", "dataset"), ("export", "export")]
-)
+@pytest.mark.parametrize("command", ["anonymize-captures", "export"])
 def test_out_that_cannot_be_written_is_an_error_line(
     command: str,
-    what: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     out = tmp_path / "no-such-dir" / "out.json"
     assert _write_out(command, tmp_path, monkeypatch, out) == 1
-    assert f"error: could not write the {what}" in capsys.readouterr().err
+    assert f"error: could not write the {_WHAT[command]}" in capsys.readouterr().err
     assert not out.parent.exists()
 
 
@@ -506,8 +505,9 @@ def _harden(path: Path, grant: str) -> None:
 
 @_WINDOWS_ACLS
 @pytest.mark.parametrize("command", _OUT_COMMANDS)
+@pytest.mark.parametrize("trailing_separator", [False, True], ids=["plain", "trailing-separator"])
 def test_out_keeps_the_access_list_of_a_hardened_target_on_windows(
-    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    command: str, trailing_separator: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A file renamed over the target would take the folder's inherited access list, so an export
     # or dataset an operator had hardened would lose that hardening in a looser folder.
@@ -521,7 +521,10 @@ def test_out_keeps_the_access_list_of_a_hardened_target_on_windows(
     sibling.write_text("x\n", encoding="utf-8")
     # Control: the hardening really differs from what a new file in this folder gets.
     assert hardened != _sddl_of(sibling, scratch)
-    assert _write_out(command, tmp_path, monkeypatch, out) == 0
+    # A str, since Path itself would drop a trailing separator before the CLI saw it; main's
+    # write_text went through Path and wrote the file.
+    named = str(out) + os.sep if trailing_separator else str(out)
+    assert _write_out(command, tmp_path, monkeypatch, named) == 0
     assert _sddl_of(out, scratch) == hardened
     data = out.read_bytes()
     assert b"stale" not in data
@@ -596,9 +599,6 @@ def test_out_through_a_symlink_keeps_the_hardened_target_on_windows(
     assert b"\r\n" not in data
 
 
-_WHAT = {"anonymize-captures": "dataset", "export": "export", "compare": "report"}
-
-
 @_WINDOWS_ACLS
 @pytest.mark.parametrize("command", _OUT_COMMANDS)
 @pytest.mark.parametrize("name", ["plain", "second-hard-link", "trailing-separator"])
@@ -629,3 +629,61 @@ def test_out_refuses_a_target_hardened_against_this_account_writing_on_windows(
     assert _sddl_of(out, scratch) == hardened
     assert out.read_text(encoding="utf-8") == "untouched\n"
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_out_creates_a_missing_target_through_mkstemp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # On every platform, Windows included, a name that is not there is made by mkstemp and renamed
+    # into place, never opened in place.
+    import tee.__main__ as tee_main
+
+    calls: list[str] = []
+    real = tempfile.mkstemp
+
+    def spy(*args: object, **kwargs: object) -> tuple[int, str]:
+        fd, name = real(*args, **kwargs)  # type: ignore[call-overload]
+        calls.append(name)
+        return fd, name
+
+    out = tmp_path / "out.json"
+    monkeypatch.setattr(tempfile, "mkstemp", spy)
+    tee_main._write_owner_only(str(out), "new\n")
+    monkeypatch.undo()
+    assert len(calls) == 1
+    assert out.read_bytes() == b"new\n"
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+@_WINDOWS_ACLS
+def test_out_that_appears_after_the_check_is_written_in_place_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A hardened file created between the existence check and the rename keeps its list: the
+    # rename refuses it and the writer falls back to the in-place write.
+    import tee.__main__ as tee_main
+
+    scratch = tmp_path / "acl"
+    out = tmp_path / "out.json"
+    out.write_text("stale\n", encoding="utf-8")
+    _harden(out, "F")
+    hardened = _sddl_of(out, scratch)
+    monkeypatch.setattr(os.path, "lexists", lambda path: False)
+    tee_main._write_owner_only(str(out), "new\n")
+    monkeypatch.undo()
+    assert _sddl_of(out, scratch) == hardened
+    assert out.read_bytes() == b"new\n"
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+@_WINDOWS_ACLS
+def test_out_through_a_dangling_symlink_creates_its_target_on_windows(tmp_path: Path) -> None:
+    # write_text on main followed a dangling link and created the file it names; so does the tee.
+    target = tmp_path / "sub" / "made-through-link.json"
+    target.parent.mkdir()
+    out = tmp_path / "out.json"
+    _symlink_or_skip(out, target)
+    assert not target.exists()  # control: the link really dangles
+    assert _export_to(tmp_path, out) == 0
+    assert out.is_symlink()
+    assert target.read_bytes().endswith(b"}\n")

@@ -491,7 +491,8 @@ def _write_owner_only(path: str, text: str) -> None:
     flushed to disk, then renamed to ``path``. A failed write leaves no temp file. On Windows the
     0600 mode means nothing and the new file takes its directory's access list, the stance
     :mod:`tee.store` takes for the capture DB; the tee imports nothing from ``messagefoundry``, so
-    the engine's ``restricted_file`` is out of reach.
+    the engine's ``restricted_file`` is out of reach. There the rename refuses a name that appeared
+    since the check, and that name is then written in place as below rather than replaced.
 
     On POSIX an existing ``path`` gets the same treatment: a regular file, or a link, is replaced
     rather than written into, so neither its owner nor its mode carries over, and a reader holding
@@ -501,29 +502,27 @@ def _write_owner_only(path: str, text: str) -> None:
     this account owns; any other non-regular file falls to the replace.
 
     On Windows an existing ``path`` of any kind -- a regular file, one with a second hard link, a
-    symlink, even a dangling one -- is opened with ``open(path, "w")``, as ``write_text`` did for
-    ``export`` and ``anonymize-captures`` on main before #3166, and written through the name as that
-    open resolves it, so a link's target is the file written (or created, for a dangling link). A
-    renamed-in file would take the folder's access list, so a hardened export, dataset or report in
-    a looser folder would lose its hardening; written in place, the file keeps its access list and
-    owner. Existence is read from the name as ``Path`` normalises it, so a trailing separator on an
-    existing file still takes this branch, and the open then fails as it did on main. A target this
-    open refuses -- one this account may not write, a read-only one, or one carrying the Hidden or
-    System attribute -- raises, and the command prints its error line and exits 1; it never falls
-    back to a replace.
+    symlink, even a dangling one -- is opened for writing through ``Path(path)``, as
+    ``Path.write_text`` did for ``export`` and ``anonymize-captures`` on main before #3166, so a
+    link's target is the file written (or created, for a dangling link). A renamed-in file would
+    take the folder's access list, so a hardened export, dataset or report in a looser folder would
+    lose its hardening; written in place, the file keeps its access list and owner. A target the
+    open refuses raises, and the command prints its error line and exits 1; it never falls back to
+    a replace. The open refuses at least a file this account may not write, a read-only one, one
+    with the Hidden or System attribute, a directory, and one another process holds open without
+    write sharing.
 
-    For ``export`` and ``anonymize-captures`` three known properties match ``write_text`` on main
-    and are not new: the list is kept whatever it holds, so a target another account pre-created
-    stays that account's, with its access list; the write is not atomic and not fsynced, so an
-    OSError or an interruption part way, or a crash after it, would leave the file truncated or
-    partly written; and a Hidden or System target is refused. For ``compare`` all three are new on
-    Windows, since main replaced its file there.
+    For ``export`` and ``anonymize-captures`` these known properties, at least, match ``write_text``
+    on main and are not new: the list is kept whatever it holds, so a target another account
+    pre-created stays that account's; the write is not atomic and not fsynced, so an OSError or an
+    interruption part way, or a crash after it, would leave the file truncated or partly written;
+    and the refusals above. ``compare`` replaced its file on main, so on Windows all of the
+    above is new for it, including that a link at ``--out`` is followed and a second hard link
+    receives the report.
     """
     target = Path(path)
-    in_place = os.path.lexists(target) if os.name == "nt" else _is_named_stream(path)
-    if in_place:
-        with open(path, "w", encoding="utf-8", newline="\n") as stream:
-            stream.write(text)
+    if os.path.lexists(target) if os.name == "nt" else _is_named_stream(path):
+        _write_through(target, text)
         return
     fd, temp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
     try:
@@ -536,10 +535,23 @@ def _write_owner_only(path: str, text: str) -> None:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp, target)
+        if os.name != "nt":
+            os.replace(temp, target)
+            return
+        try:
+            os.rename(temp, target)  # on Windows it refuses an existing name; os.replace would not
+        except FileExistsError:
+            Path(temp).unlink()
+            _write_through(target, text)
     except BaseException:
         Path(temp).unlink(missing_ok=True)
         raise
+
+
+def _write_through(target: Path, text: str) -> None:
+    """Open ``target`` for writing and write ``text`` as LF, the way ``Path.write_text`` does."""
+    with target.open("w", encoding="utf-8", newline="\n") as stream:
+        stream.write(text)
 
 
 def _is_named_stream(path: str) -> bool:
