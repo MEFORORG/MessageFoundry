@@ -335,6 +335,21 @@ would be exactly the thing it exists to prevent.
 `cancelled` leg. A **`skipped`** leg counts as a **pass** — that is what lets a path-gated leg stay off
 an unrelated PR without turning the gate red.
 
+**One path-gated leg is deliberately outside the roll-up.** `postgres store (windows-2022)` and
+`postgres store (windows-2025)` (job `postgres-store-windows` in `ci.yml`) run the same Postgres
+store test files as `postgres store`, on hosted Windows, the only supported v1 deployment platform.
+They use the PostgreSQL that the runner image preinstalls: 14 on windows-2022 and 17 on
+windows-2025 at the time of writing, against 16 on the ubuntu leg. They run on the same triggers as
+`postgres store`, on this repository only. **They are not required, and `CI gate` does not `need`
+them, so a red there blocks no merge.** A red one still turns the workflow run red, so a red nightly
+opens the usual `nightly-notice.yml` issue. `tests/test_ci_postgres_windows_leg.py` pins both
+halves and keeps their test files equal to the ubuntu leg's. Making them blocking is a decision
+that moves that test.
+
+There is no SQL Server leg on hosted Windows. The runner images ship no SQL Server instance, and
+the only engine on them, the LocalDB runtime that comes with Visual Studio, cannot be reached by
+the store's `SERVER=host,port` connection string. A self-hosted SQL Server runner is deferred.
+
 > ### The required-but-absent trap
 > A **required** status check that never reports **blocks every PR forever**. So before you stop a job
 > from running on PRs (path-gate it, or make it schedule-only), make sure it is **not** in the required

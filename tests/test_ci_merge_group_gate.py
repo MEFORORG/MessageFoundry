@@ -81,6 +81,7 @@ _SELF_GATED_ON_QUEUE = {
     "webconsole",
     "sqlserver-store",
     "postgres-store",
+    "postgres-store-windows",
     "load-test",
     "load-test-sqlserver",
     "windows-service-smoke",
@@ -143,14 +144,15 @@ _NAMES_MERGE_GROUP_NOWHERE = {
 #: gone false for the named job. Both are checked, because non-emptiness alone is a weaker pin than
 #: the count this module already threw out for holding while membership moved.
 #:
-#: sqlserver-store and postgres-store carry `serverdb` in their job `if:`; `test` and `webconsole`
-#: carry `code` in their STEP `if:` lines, which ci.yml's `code` row calls belt-and-braces -- so the
+#: sqlserver-store, postgres-store and postgres-store-windows carry `serverdb` in their job `if:`;
+#: `test` and `webconsole` carry `code` in their STEP `if:` lines, which ci.yml's `code` row calls belt-and-braces -- so the
 #: tidy-up that empties this set is an invited edit, not a contrived one.
 _SELF_GATED_AND_GATED = {
     "test",
     "webconsole",
     "sqlserver-store",
     "postgres-store",
+    "postgres-store-windows",
 }
 
 # The relation BETWEEN the three pins above is checked, not claimed in prose, by
@@ -401,7 +403,7 @@ def test_the_arm_decides_before_the_step_ever_runs_git(workdir: Path, tmp_path: 
 def test_the_jobs_that_run_on_a_queue_entry_regardless_are_pinned() -> None:
     """`serverdb=false` above does NOT mean the heavy legs are off in the queue.
 
-    Seven jobs name merge_group in their own `if:` and so ignore what `changes` emits. The arm's
+    Eight jobs name merge_group in their own `if:` and so ignore what `changes` emits. The arm's
     comment says this; without a check, that comment is free to go stale while reading as current --
     and a reader who believes it would size the queue's cost at a fraction of the truth.
 

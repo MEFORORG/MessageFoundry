@@ -2622,19 +2622,19 @@ jobs:
           # THE VALUES BELOW ARE THE BEHAVIOUR THAT WAS ALREADY RUNNING, written down rather than
           # inferred. They are deliberately NOT the whole of what a queue entry runs: `test` and
           # `webconsole` name merge_group in their own step `if:` (so `code` here is belt-and-braces
-          # for them), and sqlserver-store, postgres-store, load-test, load-test-sqlserver and
-          # windows-service-smoke name it in their JOB `if:`, which is why `serverdb=false` here does
-          # not stop them. THE JOBS GATED ON AN OUTPUT OF THIS STEP THAT NAME merge_group NOWHERE are
+          # for them), and sqlserver-store, postgres-store, postgres-store-windows, load-test,
+          # load-test-sqlserver and windows-service-smoke name it in their JOB `if:`, which is why
+          # `serverdb=false` here does not stop them. THE JOBS GATED ON AN OUTPUT OF THIS STEP THAT NAME merge_group NOWHERE are
           # decided by that output and by nothing else -- docker-smoke, ide, tooling and
           # packaging-build, via `docker`, `ide`, `tooling` and `packaging` below.
           #
           # BOTH HALVES OF THAT PREDICATE ARE LOAD-BEARING, because dropping either changes the
-          # answer. "Names merge_group nowhere" ALONE is true of SEVEN of this file's 14 jobs -- it
+          # answer. "Names merge_group nowhere" ALONE is true of SEVEN of this file's 15 jobs -- it
           # also takes in `changes` and `crypto-operations`, which have no `if:` at all, and
           # `ci-gate`, which is `always()` and reads no output of this step. None of the three is
-          # decided by anything emitted here. Scanned over all 14 job blocks rather than sampled, and
+          # decided by anything emitted here. Scanned over all 15 job blocks rather than sampled, and
           # tests/test_ci_merge_group_gate.py pins the sides of that scan BY MEMBERSHIP, not by count:
-          # the SEVEN jobs whose own job-level or step-level `if:` names merge_group, the SEVEN of
+          # the EIGHT jobs whose own job-level or step-level `if:` names merge_group, the SEVEN of
           # this paragraph, and the FOUR named above.
           # THE COUNTS IN THIS PARAGRAPH ARE NOT WHAT IS PINNED -- that module held a count until
           # 2026-09-22 and a count sits at six while a job key is renamed underneath it. It also
@@ -2693,7 +2693,8 @@ jobs:
           # `if:` of the shape `... || github.event_name == 'merge_group' || needs.changes.outputs.X ==
           # 'true'` is NOT diff-sensitive in the queue: the merge_group arm is the only one that can be
           # true there, so the job is unconditionally forced and the X arm decides nothing.
-          # `sqlserver-store` and `postgres-store` both have exactly that shape today.
+          # `sqlserver-store`, `postgres-store` and `postgres-store-windows` all have exactly that
+          # shape today.
           #
           # NOT FIXED HERE, AND #1830 CARRIES WHY IT IS NOT A ONE-LINE CHANGE. Reading the base from
           # `github.event.merge_group.base_sha` makes EVERY filter real at once, and that is not a
@@ -3560,6 +3561,145 @@ jobs:
         # nowhere. This leg connects as `postgres`, a SUPERUSER owning the database, so it is the
         # standing POSITIVE control; the both-directions case additionally creates a purpose-made
         # least-privilege role and asserts the probe stays SILENT on it.
+        run: >-
+          pytest -v
+          tests/test_store_privilege_preflight.py
+          tests/test_store_privilege_schema_split.py
+
+  # The Postgres store suite on HOSTED WINDOWS, the only supported v1 deployment platform (owner
+  # ruling 2026-10-16). `postgres-store` above runs on ubuntu only, so before this job the store
+  # backend had no automatic leg on the OS v1 ships on. Same triggers, same test files, same
+  # MEFOR_STORE_* connection env as that job; only the server differs.
+  #
+  # THE SERVER IS THE ONE THE RUNNER IMAGE PREINSTALLS, not a container: hosted Windows runners
+  # cannot run Linux service containers. The runner-images readmes
+  # (images/windows/Windows2022-Readme.md and Windows2025-Readme.md in actions/runner-images, read
+  # 2026-10-17) list PostgreSQL 14.24 on windows-2022 and 17.11 on windows-2025, service
+  # `postgresql-x64-<major>`, ServiceStatus Stopped, ServiceStartType Disabled, PGBIN/PGROOT/PGDATA
+  # set, superuser `postgres` with password `root`. So the matrix also spans two Postgres majors,
+  # neither of them the 16 the ubuntu leg pins. The image moves with GitHub's weekly rebuilds and is
+  # NOT pinned the way the ubuntu leg's service image is; the first step prints the version it got.
+  #
+  # NOT A REQUIRED CONTEXT, AND DELIBERATELY NOT IN `ci-gate`'s `needs`. `CI gate` is required, so a
+  # need there is a merge blocker in all but name. This leg is new and unmeasured, so it reports and
+  # blocks nothing: a red here is read, never gated on. tests/test_ci_postgres_windows_leg.py pins
+  # both halves and pins its test files to the ubuntu job's, so an appended suite cannot drift.
+  #
+  # Fork guard as on windows-service-smoke: 2x-billed Windows minutes are free here (public) and
+  # billed to a fork's owner.
+  postgres-store-windows:
+    name: postgres store (${{ matrix.os }})
+    needs: changes
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || needs.changes.outputs.serverdb == 'true') && github.repository == 'MEFORORG/MessageFoundry'
+    runs-on: ${{ matrix.os }}
+    # A GUESS, stated as one: the ubuntu job has no job cap and no measured duration to size from.
+    # This bounds a hang below GitHub's 6-hour default and should be re-sized from the first runs.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    defaults:
+      run:
+        shell: bash  # Git Bash, so the pytest steps read as the ubuntu job's do
+    # The ubuntu job's step env, once. The password is a throwaway set by the first step below.
+    env:
+      MEFOR_TEST_POSTGRES: "1"
+      MEFOR_STORE_BACKEND: postgres
+      MEFOR_STORE_SCHEMA_MANAGEMENT: auto  # #305: CI builds its own schema as the runtime login
+      MEFOR_STORE_SERVER: localhost
+      MEFOR_STORE_PORT: "5432"
+      MEFOR_STORE_DATABASE: messagefoundry
+      MEFOR_STORE_USERNAME: postgres
+      MEFOR_STORE_PASSWORD: mefor
+      # The preinstalled server is reached over loopback without TLS, as the ubuntu container is, so
+      # the same trusted-network dev/test escape applies.
+      MEFOR_STORE_ENCRYPT: "false"
+      MEFOR_ALLOW_INSECURE_TLS: "1"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Start the preinstalled PostgreSQL and create the database
+        shell: pwsh
+        timeout-minutes: 5
+        env:
+          # The image's documented superuser password. The image also sets PGUSER/PGPASSWORD
+          # machine-wide; after the ALTER below that PGPASSWORD is stale, so a connect that falls
+          # back to it fails authentication rather than reaching the server.
+          PGPASSWORD: root
+        run: |
+          $svc = @(Get-Service -Name 'postgresql-x64-*')
+          if ($svc.Count -ne 1) { throw "expected one postgresql-x64-* service, found $($svc.Count)" }
+          Set-Service -InputObject $svc[0] -StartupType Manual
+          Start-Service -InputObject $svc[0]
+          & "$env:PGBIN\pg_isready.exe" -h localhost -p 5432 -t 60
+          if ($LASTEXITCODE -ne 0) { throw "pg_isready exited $LASTEXITCODE" }
+          & "$env:PGBIN\psql.exe" -h localhost -p 5432 -U postgres -d postgres -v ON_ERROR_STOP=1 `
+            -c "SELECT version()" `
+            -c "CREATE DATABASE messagefoundry" `
+            -c "ALTER ROLE postgres PASSWORD 'mefor'"
+          if ($LASTEXITCODE -ne 0) { throw "psql exited $LASTEXITCODE" }
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          cache-dependency-glob: |
+            pyproject.toml
+            requirements.lock
+
+      - name: Install project (dev + postgres extras)
+        run: uv pip install --system --constraint constraints.lock -e ".[dev,postgres]"
+
+      - name: Run the Postgres store suite (against the real DB)
+        run: pytest tests/test_postgres_store.py tests/test_adr0157_postgres_fence.py -v
+
+      - name: Run the failover-LOAD test (two nodes, kill the primary mid-load, against the real DB)
+        run: pytest tests/test_load_failover_postgres.py -v
+
+      - name: Run the throughput-lever backend invariants on real Postgres
+        run: >-
+          pytest -v
+          tests/test_inline_fast_path.py
+          tests/test_batch_claim_fifo.py
+          tests/test_batch_claim_worker.py
+          tests/test_batch_claim_locking.py
+          tests/test_claim_fifo_heads.py
+          tests/test_seq_only_fifo.py
+          tests/test_fifo_index_migration.py
+          tests/test_per_lane_wake.py
+          tests/test_stage_dispatcher.py
+          tests/test_pooled_rider.py
+          tests/test_uploads_shard_quota_interleave.py
+
+      - name: Run the connection-scale pool-wait smoke on real Postgres (B11 wall #2, tiny pool)
+        env:
+          # Why 4, and not smaller: the ubuntu job's step of the same name.
+          MEFOR_STORE_POOL_SIZE: "4"
+        run: pytest tests/test_connscale_postgres.py -v
+
+      - name: Run the RTE capture / re-ingress loop on real Postgres (ADR 0013/0016)
+        run: pytest -v tests/test_x12_rte.py
+
+      - name: Run the failover + engine-shard recovery suites on real Postgres
+        run: >-
+          pytest -v
+          tests/test_cluster_failover_postgres.py
+          tests/test_shard_recovery_postgres.py
+
+      - name: Run the DR seed-gate + backup suites on real Postgres
+        run: >-
+          pytest -v
+          tests/test_dr_server_seed_gate_postgres.py
+          tests/test_backup_runner_server_db_postgres.py
+          tests/test_dr7_server_config_only_backup_postgres.py
+
+      - name: Run the store-principal privilege preflight on real Postgres
         run: >-
           pytest -v
           tests/test_store_privilege_preflight.py
