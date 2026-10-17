@@ -2921,6 +2921,81 @@ async def test_a_stale_held_row_is_not_a_conflict_when_this_row_already_has_the_
         await store.close()
 
 
+async def _refresh_with_stale_held(service: AuthService, store: MessageStore, user_id: str) -> None:
+    """Run the refresh as the reconciler does, with a ``held`` naming ``gone-holder``: a record of
+    another row that held the name when the caller read it, and holds it no more (BACKLOG #3070)."""
+    row = await store.get_user(user_id)
+    assert row is not None
+    await service._refresh_cached_username(
+        user_id=user_id,
+        old_username="jdoe",
+        new_username="jdoe-married",
+        held=replace(row, id="gone-holder", username="jdoe-married"),
+        from_plan=True,
+    )
+
+
+async def test_a_stale_held_row_that_let_the_name_go_files_no_conflict(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #3070. The reconciler's ``held`` named another row, and by the refresh no row holds
+    the name. The rename writes, audits and notifies once, and nothing warns of a lockout. Before
+    #3070 this filed a ``pre_check`` conflict naming ``gone-holder``."""
+    store, _ldap, service, notifier, user_id = await _renamed_service()
+    try:
+        caplog.set_level(logging.INFO, logger="messagefoundry.auth.service")
+        caplog.clear()
+
+        await _refresh_with_stale_held(service, store, user_id)
+
+        after = await store.get_user(user_id)
+        assert after is not None and after.username == "jdoe-married"
+        assert [a["action"] for a in await _rename_audits(store)] == [
+            "auth.ad_username_refreshed"
+        ], "a stale held row filed a conflict for a name nobody holds"
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+            "a stale held row warned of a lockout nobody faces"
+        )
+        assert len([e for e in notifier.sent if e.event_type == USERNAME_CHANGED]) == 1
+    finally:
+        await store.close()
+
+
+async def test_a_stale_held_row_refusal_names_the_row_that_holds_the_name_now(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #3070, the control. The reconciler's ``held`` named ``gone-holder``, and a different
+    row holds the name now. The refresh still refuses, and the audit and the warning name the
+    current holder, not the stale ``held``."""
+    store, _ldap, service, notifier, user_id = await _renamed_service()
+    try:
+        await store.create_user(
+            user_id="holder-row",
+            username="jdoe-married",
+            auth_provider="ad",
+            password_generated=False,
+        )
+        caplog.set_level(logging.INFO, logger="messagefoundry.auth.service")
+        caplog.clear()
+
+        await _refresh_with_stale_held(service, store, user_id)
+
+        after = await store.get_user(user_id)
+        assert after is not None and after.username == "jdoe"
+        [conflict] = await _rename_audits(store)
+        assert conflict["action"] == "auth.ad_username_refresh_conflict"
+        detail = json.loads(conflict["detail"])
+        assert detail["detected"] == "pre_check"
+        assert detail["held_by_user_id"] == "holder-row", (
+            "the conflict audit named the caller's stale holder, not the current one"
+        )
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert ["holder-row" in r.getMessage() for r in warnings] == [True]
+        assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+    finally:
+        await store.close()
+
+
 async def test_a_row_gone_refusal_does_not_warn_of_a_lockout(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

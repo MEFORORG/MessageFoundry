@@ -6793,14 +6793,15 @@ class AuthService:
         both must resolve the collision case the same way. Two copies of this decision would be two
         policies, and the one that ran less often would be the one nobody noticed drifting.
 
-        ``held`` is the row currently holding ``new_username``, read by the caller. Passed rather than
-        re-read for the reason :meth:`_upsert_ad_user` gives about ``by_name``: it puts the dependency
-        in the signature instead of only in prose, and here it also saves a query the login caller
-        **provably** already has the answer to. ``_complete_ad_login`` reads that exact row before it
-        calls down, and refuses outright when it exists with a different id -- so the login path
-        reaches this method only with ``held=None``, and the collision branch below is reachable from
-        the **reconciler alone**, which probes an account it has already identified and has no such
-        guard.
+        ``held`` is the row holding ``new_username`` when the caller read it. It is a hint, not the
+        verdict: a ``held`` naming another row is re-read after this method's own read of the row,
+        and only the fresh holder is refused and audited (BACKLOG #3070), because the caller's read
+        is older and the holder may have let the name go since. ``held=None`` costs no read, which
+        is what it saves the login caller, which **provably** already has the answer.
+        ``_complete_ad_login`` reads that exact row before it calls down, and refuses outright when
+        it exists with a different id -- so the login path reaches this method only with
+        ``held=None``, and the collision branch below is reachable from the **reconciler alone**,
+        which probes an account it has already identified and has no such guard.
 
         **THE CHECK-THEN-ACT RACE IS REAL AND IS ABSORBED BELOW, NOT PREVENTED BY THE STORE.** This
         docstring used to say the store's in-statement guard made "a row claiming the name between
@@ -6985,8 +6986,14 @@ class AuthService:
             )
             return
         if held is not None and held.id != user_id:
-            await _refuse(held.id, "pre_check", before.username)
-            return
+            # BACKLOG #3070. The caller read ``held`` before ``before``, so the holder may have let
+            # the name go since. Filing on that read would audit a conflict and warn of a lockout
+            # nobody faces, so a conflict is re-read here, after ``before``, and the refusal names
+            # the row that holds the name now. One extra read, on the conflict path only.
+            current = await self._load_user_by_username(new_username)
+            if current is not None and current.id != user_id:
+                await _refuse(current.id, "pre_check", before.username)
+                return
         try:
             # BACKLOG #2290. A compare-and-set on the name just read, so of two refreshes of this
             # row running at once only one writes.
