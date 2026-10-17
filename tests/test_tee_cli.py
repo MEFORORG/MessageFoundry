@@ -437,13 +437,14 @@ def test_out_goes_through_the_owner_only_writer(
 def test_out_newline(command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # The dataset is JSONL, read back line by line by the harness corpus, so the in-place commands
     # write LF everywhere. compare keeps main's text-layer default, CRLF on Windows (vault BACKLOG
-    # #3166). Either way this discriminates on win32.
+    # #3166). The CRLF count discriminates on win32 for all three commands.
     newline = b"\n" if command in _IN_PLACE_COMMANDS else os.linesep.encode()
     out = tmp_path / "out.json"
     assert _write_out(command, tmp_path, monkeypatch, out) == 0
     data = out.read_bytes()
     assert data.endswith(b"}" + newline)  # control: the file really has a line ending
-    assert data.count(newline) == data.count(b"\n")
+    crlf = data.count(b"\r\n")
+    assert crlf == (data.count(b"\n") if newline == b"\r\n" else 0)
 
 
 @pytest.mark.parametrize("command", _IN_PLACE_COMMANDS)
@@ -700,17 +701,17 @@ def test_out_through_a_dangling_symlink_creates_its_target_on_windows(tmp_path: 
 
 
 @_WINDOWS_ACLS
+@pytest.mark.parametrize("grant", ["F", "R"])
 def test_compare_out_replaces_a_hardened_target_on_windows(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    grant: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # compare replaced an existing --out on main, so a file another account pre-created in a
-    # shared folder does not keep its owner and access list and go on receiving the report. It
-    # still does (vault BACKLOG #3166): the report takes the folder's list.
+    # compare replaced an existing --out on main, so the report takes the folder's access list
+    # rather than the old file's, even one that denied this account writing. It still does
+    # (vault BACKLOG #3166).
     scratch = tmp_path / "acl"
     out = tmp_path / "out.json"
-    # Longer than any report, so a write that skipped the truncate would leave stale bytes behind.
-    out.write_text("stale\n" * 4000, encoding="utf-8")
-    _harden(out, "F")
+    out.write_text("stale\n", encoding="utf-8")
+    _harden(out, grant)
     hardened = _sddl_of(out, scratch)
     sibling = tmp_path / "fresh.json"
     sibling.write_text("x\n", encoding="utf-8")
@@ -721,5 +722,5 @@ def test_compare_out_replaces_a_hardened_target_on_windows(
     assert _sddl_of(out, scratch) == folders
     data = out.read_bytes()
     assert b"stale" not in data
-    assert json.loads(data)["summary"]["matched"] >= 0
+    assert json.loads(data)["summary"]["matched"] == 1
     assert not list(tmp_path.glob("*.tmp"))

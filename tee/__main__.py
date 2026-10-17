@@ -484,12 +484,14 @@ def _write_owner_only(path: str, text: str, *, in_place_on_windows: bool) -> Non
     umask, world-readable under 022, beside a capture DB that :mod:`tee.store` keeps at 0600.
 
     ``in_place_on_windows`` is True for ``export`` and ``anonymize-captures``, and False for
-    ``compare``. False is ``compare``'s writer on main, unchanged on every OS: newlines are the
-    platform's (CRLF on Windows), a named stream is written through, and anything else, an
-    existing file or link on Windows included, is replaced by the ``mkstemp`` file below with
-    ``os.replace``, so a report another account pre-created on Windows takes the folder's access
-    list and owner, a link is replaced rather than followed, and the write stays atomic. The rest
-    of this docstring describes True.
+    ``compare``. False keeps ``compare``'s writer on main, unchanged on every OS: newlines are the
+    platform's (CRLF on Windows), a named stream is written through, and anything else is replaced
+    by a ``mkstemp`` file with ``os.replace``, an existing file or link on Windows included. There
+    the report takes the folder's access list, whatever list the old file had, even one that
+    denied this account writing; a link is replaced rather than followed; and the write is atomic.
+    A folder's list can itself let another account read the report, and the replace does not stop
+    that. The POSIX paragraph below applies to both values; the paragraphs on Windows describe
+    True.
 
     With True, newlines are written as LF on every platform. The text layer's default would write
     CRLF on Windows, and the dataset is JSONL that the harness corpus reads back line by line.
