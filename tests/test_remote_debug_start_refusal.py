@@ -26,17 +26,27 @@ from messagefoundry.remotedebug import (
     RemoteDebugPosture,
     remote_debug_refusal,
 )
+from messagefoundry.startupcode import InterpreterLaunch, StartupPosture
 
 # The suite stands this gate down for every other test (tests/conftest.py); these test it.
 pytestmark = pytest.mark.usefixtures("remote_debug_start_gate")
 
 _SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
-_REFUSAL = "remote debugging (PEP 768) is enabled in this process"
+#: Only the refusal says this; the loosening entries share its first half.
+_REFUSAL = "enabled in this process, so a process the operating system lets attach"
 _ON = RemoteDebugPosture(interpreter_enabled=True, guard_installed=True)
 _OFF = RemoteDebugPosture(interpreter_enabled=False, guard_installed=False)
 
 
 def _environment(monkeypatch: pytest.MonkeyPatch, *, warn: bool, accept: bool) -> None:
+    # The start-up code check runs just before this gate and reads the real process, so it is
+    # pinned to a clean reading, as tests/test_startup_code_inventory.py pins it.
+    hardened = StartupPosture(
+        launch=InterpreterLaunch(
+            isolated=True, safe_path=True, ignore_environment=True, no_user_site=True
+        )
+    )
+    monkeypatch.setattr("messagefoundry.startupcode.startup_posture", lambda: hardened)
     if warn:
         monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")
     else:
@@ -78,7 +88,7 @@ def test_the_refusal_follows_the_interpreter_reading_only() -> None:
 def test_the_refusal_names_the_launch_that_fixes_it_and_the_acceptance() -> None:
     refused = remote_debug_refusal(_ON)
     assert refused is not None
-    assert "python -I -X disable-remote-debug -m messagefoundry" in refused
+    assert "python -X disable-remote-debug -m messagefoundry" in refused
     assert "PYTHON_DISABLE_REMOTE_DEBUG=1" in refused
     assert f"{REMOTE_DEBUG_ACCEPTANCE} = true" in refused
     assert REMOTE_DEBUG_ACCEPTANCE.removeprefix("[security].") in SecuritySettings.model_fields
@@ -89,9 +99,9 @@ def test_serve_refuses_under_enforce_with_remote_debugging_on(
 ) -> None:
     assert _serve(tmp_path, monkeypatch, _ON) == 2
     err = capsys.readouterr().err
-    assert f"refusing to start: the interpreter's {_REFUSAL}" in err
+    assert "refusing to start: the interpreter's remote debugging" in err and _REFUSAL in err
     # This gate, and not the at-rest gate after it, stopped the start, before any side effect.
-    assert "store key" not in err
+    assert "no MEFOR_STORE_ENCRYPTION_KEY" not in err
     assert not any(tmp_path.iterdir()), sorted(p.name for p in tmp_path.iterdir())
 
 
@@ -158,8 +168,10 @@ def test_supervise_refuses_under_enforce_before_it_starts_an_engine_shard(
     rc, spawned = _supervise(tmp_path, monkeypatch, _ON)
     err = capsys.readouterr().err
     assert rc == 2 and not spawned
-    assert f"refusing to start the fleet: the interpreter's {_REFUSAL}" in err
-    assert "store key" not in err
+    assert (
+        "refusing to start the fleet: the interpreter's remote debugging" in err and _REFUSAL in err
+    )
+    assert "no MEFOR_STORE_ENCRYPTION_KEY" not in err
 
 
 @pytest.mark.parametrize(
@@ -209,3 +221,4 @@ def test_a_real_start_with_disable_remote_debug_gets_past_this_gate(tmp_path: Pa
     proc = _real_serve(tmp_path, "-X", "disable-remote-debug")
     assert _REFUSAL not in proc.stderr
     assert proc.returncode == 2, proc.stderr[-2000:]
+    assert "no MEFOR_STORE_ENCRYPTION_KEY" in proc.stderr, proc.stderr[-2000:]

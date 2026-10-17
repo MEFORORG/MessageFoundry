@@ -38,7 +38,9 @@ export function buildServeInvocation(opts: {
 }): { command: string; args: string[] } {
   return {
     command: opts.python,
-    args: ["-m", "messagefoundry", "serve", "--config", opts.configDir],
+    // Vault BACKLOG #2700: under the default enforce, serve refuses to start with the
+    // interpreter's remote debugging on.
+    args: ["-X", "disable-remote-debug", "-m", "messagefoundry", "serve", "--config", opts.configDir],
   };
 }
 

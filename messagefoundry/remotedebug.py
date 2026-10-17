@@ -331,8 +331,9 @@ def remote_debug_refusal(posture: RemoteDebugPosture) -> str | None:
     return (
         "the interpreter's remote debugging (PEP 768) is enabled in this process, so a process "
         "the operating system lets attach to it could run Python inside the engine. Start the "
-        "interpreter as `python -I -X disable-remote-debug -m messagefoundry ...`, as the shipped "
-        "service launches do; a console-script start such as `messagefoundry serve` cannot pass "
+        "interpreter as `python -X disable-remote-debug -m messagefoundry ...`; the shipped "
+        "service launches add -I as well. A console-script start such as `messagefoundry serve` "
+        "cannot pass "
         "the option, and takes PYTHON_DISABLE_REMOTE_DEBUG=1 instead, which -I and -E ignore. To "
         f"accept the interface on, set {REMOTE_DEBUG_ACCEPTANCE} = true, which is reported as a "
         "loosening. See docs/SECURITY-LOOSENING.md"

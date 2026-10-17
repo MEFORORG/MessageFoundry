@@ -480,7 +480,8 @@ What that changes for you:
 - **`messagefoundry serve` from a prompt refuses to start under `enforce`**, because remote
   debugging is on in it (vault BACKLOG #2700, owner ruling 2026-10-16). Run by hand what the
   service runs, the command above. A developer loop that needs the console script sets
-  `[security].allow_remote_debugging = true`, which is reported as a loosening
+  `PYTHON_DISABLE_REMOTE_DEBUG=1`, or, failing that, `[security].allow_remote_debugging = true`,
+  which is reported as a loosening
   ([`SECURITY-LOOSENING.md`](SECURITY-LOOSENING.md)). Such a start is not isolated either, and
   the engine says so (`interpreter_not_isolated`, `remote_debug_enabled`).
 - **The engine's Python children are not isolated.** The sandbox worker and each engine shard

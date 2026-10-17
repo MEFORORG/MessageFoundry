@@ -1010,7 +1010,7 @@ export function registerEngineStatusBar(context: vscode.ExtensionContext): Engin
       // BRAND-NEW empty database with no account in it, forking the user's engine. Handing them
       // the command lets them run it where they mean to. No --db/--env overrides: the service TOML is
       // the authority on which store and which environment this engine is.
-      const cmd = `python -m messagefoundry serve --config ${configDir()}`;
+      const cmd = `python -X disable-remote-debug -m messagefoundry serve --config ${configDir()}`;
       await vscode.env.clipboard.writeText(cmd);
       logAction("copy start command", cmd);
       void vscode.window.showInformationMessage(

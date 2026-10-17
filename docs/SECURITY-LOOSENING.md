@@ -1819,8 +1819,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 - **A start through the console script would refuse under `enforce`.** `messagefoundry serve` runs
   through a console-script launcher, which cannot pass an interpreter option, so the interface
   stays on. That launch can set `PYTHON_DISABLE_REMOTE_DEBUG=1` instead; the interpreter ignores
-  the variable under `-I` or `-E`. A developer loop that wants the interface on, for an attach
-  debugger, sets `[security].allow_remote_debugging = true`, the next section. Do not use
+  the variable under `-I` or `-E`. A developer loop that cannot do either sets
+  `[security].allow_remote_debugging = true`, the next section. It does not let an attach
+  debugger in: the hook still refuses its script. Do not use
   `enforcement = warn` for this: it relaxes every gate, not this one. The CI legs that start the
   engine under `enforce` start it as `python -I -X disable-remote-debug -m messagefoundry serve`.
 - **The two shipped service launches report neither entry** (vault BACKLOG #2701). The Windows
@@ -1849,9 +1850,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   the interface on, and keep only the residual that section lists: a script injected before the
   hook goes in runs, and a process that can write the engine's memory can run code in it by other
   means.
-- **When acceptable:** a developer's own start through the console script, or with an attach
-  debugger. Never for a deployment: the shipped service launches turn the interface off, so they
-  need nothing here.
+- **When acceptable:** a developer's own start through the console script, where neither the
+  option nor the variable fits. Never for a deployment: the shipped service launches turn the
+  interface off, so they need nothing here.
 - **It is never silent:** an entry here and in `GET /security/posture` for `serve`, and a WARNING
   line at each `supervise` start. The `remote_debug_enabled` entry still
   reports the interface itself.

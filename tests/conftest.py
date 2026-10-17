@@ -588,9 +588,9 @@ def _remote_debug_start_gate_stood_down() -> Iterator[Callable[..., bool]]:
     """Stand down the start-up refusal for remote debugging (vault BACKLOG #2700) in the
     in-process ``serve`` and ``supervise`` runs, and yield the real gate.
 
-    That gate reads the PROCESS, and pytest's process has the interpreter's remote debugging on
-    however the suite was started, so under the shipped ``enforce`` every in-process start would
-    stop there, whatever gate the test is about. Autouse for that reason, like the config-source
+    That gate reads the PROCESS, and a plain ``pytest`` run has the interpreter's remote
+    debugging on, so under the shipped ``enforce`` every in-process start would stop there,
+    whatever gate the test is about. Autouse for that reason, like the config-source
     read above: it is a fact about the test runner, not about any scenario. A test whose subject
     is the gate takes :func:`remote_debug_start_gate`. A subprocess start is not covered."""
     from messagefoundry import __main__ as cli

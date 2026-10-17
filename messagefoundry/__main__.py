@@ -27,6 +27,7 @@ from messagefoundry.remotedebug import (
     install_remote_debug_guard,
     remote_debug_loosening,
     remote_debug_posture,
+    remote_debug_refusal,
 )
 
 # Vault BACKLOG #2742: the hook that refuses an injected script goes in HERE, at import, ahead of
@@ -2486,8 +2487,6 @@ def _remote_debug_refused(
 ) -> bool:
     """True, with the reason printed, when :func:`messagefoundry.remotedebug.remote_debug_refusal`
     refuses ``posture`` and nothing lifts it (vault BACKLOG #2700). ``what`` is what is refused."""
-    from messagefoundry.remotedebug import remote_debug_refusal
-
     if not enforcing or settings.security.allow_remote_debugging:
         return False
     refused = remote_debug_refusal(posture)

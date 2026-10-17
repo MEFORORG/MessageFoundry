@@ -60,7 +60,7 @@ interpreter it starts.
   writable. Code planted there would run at every interpreter start. Uid 10001 owns only
   `/var/lib/mefor`; `/config` is root-owned too.
 
-Two things undo this, and the engine reports both:
+Two things undo this, and the engine refuses or reports each:
 
 - **Overriding the entry point** (`--entrypoint messagefoundry`, or a `command:` that replaces it
   in Kubernetes) starts the engine without the options. Under `enforce` it then refuses to
