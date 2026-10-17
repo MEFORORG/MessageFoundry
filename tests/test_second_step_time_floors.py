@@ -420,8 +420,8 @@ async def test_a_pending_sessions_passkey_registration_is_refused_for_its_factor
             )
 
         assert not await service.mfa_satisfied(token)
-        failed = await _audit_rows(store, "auth.webauthn_failed")
-        assert _reasons(failed) == ["factor_present"] and _phases(failed) == ["enroll"]
+        assert await _audit_rows(store, "auth.webauthn_failed") == []  # no too_early row
+        assert len(await _audit_rows(store, "auth.mfa_denied")) == 1
         assert await store.list_webauthn_credentials(identity.user_id) == []
         user = await store.get_user(identity.user_id)
         assert user is not None and user.second_step_failed_attempts == 0, "it charged the lockout"

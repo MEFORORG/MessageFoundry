@@ -698,12 +698,6 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         ),
     ) -> Response:
         assert_same_origin(request)
-        # BACKLOG #3014: ui_mfa_verify's per-actor budget, after the gate's admin-write charge (that
-        # order is BACKLOG #2652's, left alone). JSON, so the page's fetch can read `error`.
-        client = client_ip(request)
-        if not allow_reauth_attempt(service, identity, client):
-            exc = _rate_limited(request, "passkey-enroll")
-            return JSONResponse({"ok": False, "error": exc.detail}, status_code=exc.status_code)
         rp = webauthn_rp(request)
         if rp is None:
             return JSONResponse({"ok": False, "error": "rp_unavailable"}, status_code=409)
@@ -716,6 +710,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             label = str(body.get("label", ""))
         except (ValueError, KeyError, TypeError):
             return JSONResponse({"ok": False, "error": "malformed request"}, status_code=400)
+        # BACKLOG #3014: ui_mfa_verify's per-actor budget, charged only on a request that reaches
+        # the ceremony, and after the gate's admin-write charge (that order is BACKLOG #2652's, left
+        # alone). JSON, so the page's fetch can read `error`.
+        client = client_ip(request)
+        if not allow_reauth_attempt(service, identity, client):
+            exc = _rate_limited(request, "passkey-enroll")
+            return JSONResponse({"ok": False, "error": exc.detail}, status_code=exc.status_code)
         try:
             elevation = await service.finish_webauthn_registration(
                 identity,

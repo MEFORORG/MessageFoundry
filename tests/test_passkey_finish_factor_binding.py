@@ -116,8 +116,9 @@ async def _finish(service: AuthService, identity: Identity, token: str, response
 async def test_a_ceremony_staged_before_totp_enrolment_cannot_finish_after_it(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, require_mfa: bool
 ) -> None:
-    """RED when: ``finish_webauthn_registration`` does not ask ``_factor_binding_is_blocked``, asks
-    it before taking the challenge, or persists anything on the refusal."""
+    """RED when: ``finish_webauthn_registration`` does not ask ``_factor_binding_is_blocked``,
+    asks it before the "ceremony expired" answer, leaves the stale ceremony in flight, or persists
+    anything on the refusal."""
     t0 = time.time()
     pin_totp_clock(monkeypatch, t0)
     service = await _service(store, require_mfa=require_mfa)
@@ -133,13 +134,17 @@ async def test_a_ceremony_staged_before_totp_enrolment_cannot_finish_after_it(
     assert await service.mfa_satisfied(token) is False
     session = await store.get_session(hash_token(token))
     assert session is not None and session.mfa_verified_at is None
-    rows = await store.list_audit(action="auth.webauthn_failed")
-    assert {"phase": "enroll", "reason": "factor_present"} in [
-        json.loads(r["detail"]) for r in rows
-    ]
+    # Audited as the begin gate's refusal of a pending session is.
+    rows = await store.list_audit(action="auth.mfa_denied")
+    assert {"path": "finish_webauthn_registration"} in [json.loads(r["detail"]) for r in rows]
     # The refusal took the challenge, so the stale ceremony is dead, not waiting for a retry.
     with pytest.raises(ValueError, match="ceremony expired"):
         await _finish(service, identity, token, response)
+    # "Ceremony expired" still answers first: a second pending session that staged nothing gets it,
+    # not the factor refusal, so the refusal cannot be had without a staged ceremony.
+    other_identity, other = await _sign_in(service)
+    with pytest.raises(ValueError, match="ceremony expired"):
+        await _finish(service, other_identity, other, response)
 
 
 async def test_a_session_revoked_mid_ceremony_is_answered_as_lost_not_as_owing_a_factor(
@@ -156,7 +161,7 @@ async def test_a_session_revoked_mid_ceremony_is_answered_as_lost_not_as_owing_a
 
     assert lost.session_lost is True and lost.ok is False
     assert await store.list_webauthn_credentials(identity.user_id) == []
-    assert await store.list_audit(action="auth.webauthn_failed") == []
+    assert await store.list_audit(action="auth.mfa_denied") == []
 
 
 async def test_a_session_that_proves_the_existing_factor_first_still_finishes(

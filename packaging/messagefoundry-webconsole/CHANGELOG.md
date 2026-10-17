@@ -92,6 +92,9 @@ this line.**
 
 ### Security
 
+- **The passkey registration finish draws on the per-actor ceremony budget.**
+  `POST /ui/account/webauthn/verify` now charges the same budget as `POST /ui/account/mfa/verify`,
+  and answers a throttle with a JSON 429 the page can show. No seam change. (BACKLOG #3014)
 - **The audit page shows where each entry came from.** `/ui/audit` has a Client column, which
   shows the address the engine recorded for the entry, or a dash when no client was in scope.
   An operator tracing a run of refused sign-ins can now see their source on the page, not only in

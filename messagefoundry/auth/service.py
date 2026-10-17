@@ -10928,7 +10928,8 @@ class AuthService:
         **So the login-to-MFA floor covers it too** (BACKLOG #2389): see
         :meth:`_enrolment_too_early`. A registration that would satisfy a pending session too soon
         after sign-in fails as a failed verification, before the challenge is popped, so the
-        ceremony stays in flight."""
+        ceremony stays in flight. A pending session on an account that already holds a factor never
+        reaches the floor: it is refused first, at any elapsed time, and its ceremony is ended."""
         arrived_at = time.time()  # the floor's clock, read before any await
         user = await self._load_user(identity.user_id)
         if user is None:
@@ -10947,19 +10948,16 @@ class AuthService:
         # BACKLOG #3014: re-asked at finish, since a factor may have been bound since begin and the
         # console's finish route rides the action-less gate. After the peek, so "ceremony expired"
         # still answers first; before the floor, so this refusal reads the same at any elapsed time.
-        # It kills the stale ceremony. Read-then-act: a factor bound between here and the stamp below
-        # is not caught, as the begin gate's check is not.
+        # It kills the stale ceremony, and is audited as the begin gate's refusal is. Read-then-act:
+        # a factor bound between here and the stamp below is not caught, as the begin gate's is not.
+        # The session is read first because the check fails closed on a dead one, which is a lost
+        # session to the caller, not a factor it owes.
+        if await self._load_session(hash_token(token)) is None:
+            self._webauthn_challenges.pop((hash_token(token), "register"))
+            return Elevation(session_lost=True)
         if await self._factor_binding_is_blocked(token, STEP_UP_ACTION_WEBAUTHN_ENROLL):
             self._webauthn_challenges.pop((hash_token(token), "register"))
-            session = await self._load_session(hash_token(token))
-            if session is None or session.revoked_at is not None:
-                return Elevation(session_lost=True)  # the check fails closed on a dead session
-            await self._audit(
-                "auth.webauthn_failed",
-                actor=identity.username,
-                detail=_json({"phase": "enroll", "reason": "factor_present"}),
-                client=client,
-            )
+            await self.audit_mfa_denied(identity, "finish_webauthn_registration", client=client)
             raise ValueError(self._FACTOR_PRESENT)
         if await self._enrolment_too_early(
             token, user, arrived_at, event="auth.webauthn_failed", client=client
