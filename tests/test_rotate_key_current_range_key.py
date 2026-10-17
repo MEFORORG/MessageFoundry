@@ -171,3 +171,13 @@ def test_rotate_key_and_audit_verify_agree_when_the_current_ranges_key_is_droppe
     captured = capsys.readouterr()
     assert "OK:" not in captured.out and "PARTIAL:" in captured.out, captured.out
     assert "not configured" in captured.err, captured.err
+
+    # BACKLOG #3181: the rotation stamp is written last, so a failed audit step writes none.
+    async def stamp() -> object:
+        store = await MessageStore.open(db, cipher=make_cipher(b))
+        try:
+            return (await store.get_secret_rotation_meta()).get("MEFOR_STORE_ENCRYPTION_KEY")
+        finally:
+            await store.close()
+
+    assert asyncio.run(stamp()) is None

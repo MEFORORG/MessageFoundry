@@ -644,9 +644,10 @@ step that follows the first faster than a person can:
 | Sign-in, then a TOTP or recovery code, or a passkey, on the MFA-pending session, including an enrolment that would satisfy it: `POST /me/mfa/confirm` or a passkey registration (BACKLOG #2389) | `[auth].mfa_verify_min_elapsed_seconds`, from the session's mint | 1 s | the leg's ordinary failure, at least: `401 invalid code` on `POST /auth/mfa-verify`, `400 invalid code` on `POST /me/mfa/confirm`, the console's gate page with `400` and "That code wasn't accepted" on `POST /ui/mfa`, the re-authentication page with `Invalid code.` on `POST /ui/reauth` with a code, the console's `Invalid code.` page on its TOTP confirm, and `400 passkey verification failed` on the console's passkey assertion (`POST /ui/reauth/webauthn`) and its passkey registration, except a pending session on an account that already holds a factor, which the factor-binding refusal answers first at any elapsed time, audited `auth.mfa_denied`, ending its ceremony (BACKLOG #3014); audited `auth.mfa_failed` or `auth.webauthn_failed` with `reason=too_early`, and `phase=enroll` on an enrolment |
 | A federated start, then its callback: the step-up always, the sign-in only when `auth_time` falls inside the flow. A callback whose verified `amr` names a value in `oidc_callback_floor_exempt_amr` is exempt (BACKLOG #2388) | `[auth].oidc_callback_min_elapsed_seconds`, from the flow's start on the flow cache's clock | 1 s | `federated sign-in failed`, audited `auth.login_failed`, or the generic step-up refusal, audited `auth.reauth`; both with `reason=too_early` |
 
-Neither response says anything about timing. On most legs a wrong code gets the same answer either
-side of the floor, so a caller that does not know whether its proof is good cannot tell the refusal
-from a wrong code or a failed IdP proof. The exceptions are listed below. A caller that does know,
+Neither response's text says anything about timing. On most legs a wrong code gets the same answer
+either side of the floor, so by the answer alone a caller that does not know whether its proof is
+good cannot tell the refusal from a wrong code or a failed IdP proof. The exceptions are listed
+below, and response time is a separate tell, also below. A caller that does know,
 such as a script holding the TOTP secret or the authenticator, learns from its first refused proof
 that the floor fired. The floors hide nothing from that caller; they only make it wait. The MFA
 floor charges no lockout and spends no code or passkey challenge, so the person simply submits
@@ -671,6 +672,11 @@ answers also differ either side of the floor, whatever the proof:
   running the floor, and only then consuming the challenge, so a floor refusal still leaves the
   ceremony in flight. That is a change to `finish_webauthn_registration` that BACKLOG #3194 left
   open.
+
+Response time can tell the floor fired where the answer does not, at least on the federated
+step-up. That leg is not padded, and while `oidc_callback_floor_exempt_amr` is empty a too-early
+callback is refused before its code is redeemed, so it answers faster than a refusal after the
+exchange.
 
 The floor
 applies only while the session still owes its factor. A step-up code on a satisfied session is not
@@ -761,8 +767,10 @@ tracks that gap.
 
 So on the console, an operator action's own audit row is its only record. **At least these operator
 mutations commit that row in the same transaction as the change they record (vault BACKLOG #2624):**
-message replay, dead-letter replay (inline and released), an inline purge, resend, edit-and-resubmit
-(direct and re-route), and the uploaded-log inject. A released purge is not in the set; see
+message replay, dead-letter replay (inline and released), a purge (inline and released), resend,
+edit-and-resubmit (direct and re-route), the uploaded-log inject, and alert acknowledge, resolve,
+suspend and resume (vault BACKLOG #3217). A released purge that skips writes no
+`connection_purge` row, and its `approval.approved` row records the skip; see
 [Dual-control approval](#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235). That holds on all three store backends. A crash between the
 change and its row, or a failed append, now keeps both or neither. Before, each row was a second write
 after the commit, so a crash between the two would have kept a console action with no row in the
@@ -993,7 +1001,7 @@ crossing that needs an operator relaxation is a recorded delta, not the default 
 
 | Hop | Module and symbol | Transport | Gate | Under `enforce` | Cleartext on the shipped default |
 |---|---|---|---|---|---|
-| Store, SQL Server | `store/sqlserver.py` `connection_string`, which every pool, probe and sync connect calls | ODBC Driver 18, `Encrypt=yes`, verification on | weakened-TLS refusal through `weakened_tls_escape_permitted` | refuses `encrypt=false` or `trust_server_certificate=true`; `MEFOR_ALLOW_INSECURE_TLS` is inert because `serve` passes the posture | No |
+| Store, SQL Server | `store/sqlserver.py` `connection_string`, which every pool, probe and sync connect calls | ODBC Driver 18, `Encrypt=yes`, verification on; `Encrypt=strict` with the `[store].ssl_root_cert` pin | weakened-TLS refusal through `weakened_tls_escape_permitted` | refuses `encrypt=false` or `trust_server_certificate=true`; `MEFOR_ALLOW_INSECURE_TLS` is inert because `serve` passes the posture | No |
 | Store, PostgreSQL | `store/postgres.py` `_build_ssl`, `_per_connection_ssl_connect` | asyncpg with an engine-built verifying `SSLContext` | the same weakened-TLS refusal, plus `RevocationHopGuard` | refuses as above; also refuses an off-loopback hop with no revocation check unless `[store].ssl_crl_file` loads | No |
 | Store, opened by a CLI command | `__main__.py` `_admin_unlock`, `_admin_set_notify_email`, `_audit_verify`, `_audit_anchor`, `_rotate_key`, `_backup`; `support/bundle.py`; `verify/checks.py`; `verify/smoke.py` | the two store drivers above | the same refusal; these call `open_store` with no posture, and no posture fails closed | refuses whatever the dial says. CORRECTED: at `bca583f2a7` this row read *"the escape is **not** clamped"*; that was true then, and the shared predicate now refuses the escape when no posture is known | No |
 | Cluster coordination | `pipeline/cluster.py` `DbCoordinator`, `pipeline/cluster_sqlserver.py` `SqlServerCoordinator` | the store's own pool; opens no connection of its own | inherits the store rows above | as the store | No |
@@ -2136,6 +2144,17 @@ refusal or cancellation whose own row then fails, and an unexpected fault in the
 alone. The 503 has the same two lost-COMMIT exceptions as the gate's, listed above, where the
 attempt row may have committed after all.
 
+**A reload's `config_reload_failed` row names why in `reason`.** At least these values are
+written: `trust_anchor`, `invalid_config`, `not_found`, `unreadable`, `digest_mismatch`,
+`no_approved_digest`, `digest_unavailable` and `store_unavailable`. A trust-anchor check that the
+store stops, by refusing the `auth.trust_anchor` audit read or write it needs, is
+`store_unavailable` (BACKLOG #3091). The checks of the file run before any store call, so this
+reason is written only for an anchor that passed them. An anchor they refuse is still
+`trust_anchor` when its audit row then fails, and so is an anchor file that cannot be read.
+Such a refusal may then have no `auth.trust_anchor` row behind it, so the engine log is the record
+of it. An inline reload answers **503** for `store_unavailable`; a released one answers 422, as
+every refused release does. The engine log carries the store's error.
+
 **An inline or released reload's `config_reload` row names that reload's own config (vault
 BACKLOG #2257).** It is built from the reload's own result: its directory, connection counts and
 the digest it took before the swap. The row is written after the swap, so a second reload or a
@@ -2214,8 +2233,10 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
 
 Unlike a reload, a released dead-letter replay fails closed (vault BACKLOG #2624). Its `dead_letter_replay` row
 commits in the same transaction as the re-queue. So when that row fails, nothing is re-queued, the
-request moves to `failed`, and `approval.failed` names the error type. A released purge still writes
-no `connection_purge` row of its own; its count is only in `approval.approved`.
+request moves to `failed`, and `approval.failed` names the error type. A released purge does the
+same with its `connection_purge` row, which names the outbound, the scope and the count and is
+attributed to the requester (vault BACKLOG #3217). A released purge that skips because the outbound
+is running or owned by another engine shard cancels nothing and writes no `connection_purge` row.
 
 **An audit or store outage that refuses writes answers a mapped status on at least these approval
 paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own audit row fails still
@@ -3456,7 +3477,7 @@ slack.
 | Instance environment posture × claimed AI data scope | `[ai].derived_posture()` (from `[ai].environment` and `[security].production_instance`; an unresolved posture defaults to the **strictest** ceiling) re-resolved server-side through `resolve_effective_policy` on every `POST /ai/chat` | the effective mode is not `managed_endpoint`, or the request's `data_scope` exceeds the server-enforced ceiling (the engine-broker MVP enforces `code_only` regardless of what the caller claims) | **DENY** — **409** on the mode mismatch, **403** on scope excess; each audited `ai.assist` with PHI-safe metadata only | `mode = byo`, `data_scope = code_only` | `[ai].mode`, `[ai].data_scope`, `[ai].environment`, `[security].production_instance` |
 | Gated operation × requester-vs-approver identity × hold age | the pending-approval record: the operation name, the requesting identity, and the hold's creation time | `[approvals].enabled` **and** the operation is in `[approvals].operations` and has no approved unexpired release; the approver is the requester; the hold is older than `expiry_hours`; the hold is younger than `min_dwell_seconds` | **DENY** the immediate execution — **202** hold + `approval.requested` audit; the same **202** and id + `approval.request_repeated` audit for the same requester's repeat of an open hold; **403** on self-approval; **409** once expired or already decided; **409** + `approval.too_early` audit while younger than the floor (the hold stays pending); **409** + `approval.no_longer_gated` audit once dual control no longer gates the operation (the hold stays pending) | off; `['connection_purge','dead_letter_replay']`; 72 h; 2 s | `[approvals].enabled`, `operations`, `expiry_hours`, `min_dwell_seconds` |
 | mTLS client-certificate subject | the subject DN of the loaded CA certificate whose key directly signed the peer certificate, and the peer's qualified subject-RDN / SAN names | exact match of the name under the map entry for that verifying CA's DN (BACKLOG #2237), in a deny-by-default map (empty map = feature off). The same subject from another CA matches nothing. A client-sent intermediate, and two loaded CAs sharing one DN with different keys, name no issuer | **ALLOW** — resolve the mapped account **id** (BACKLOG #2238; never a username, which a rename can hand to another account) to its Identity (RBAC then authorizes); an unknown or disabled account grants none. A directory account is also asked about in the directory on every request and fails closed: anything short of a present, enabled account grants none, and the Identity keeps only the stored roles and channels its current groups still map to. One exception: when none of its groups is in the scope map, a scope an administrator set stays as stored (BACKLOG #2316) | `{}` = off | `[api].tls_client_cert_identities` (requires `tls_client_ca_file`) |
-| Operator-listener peer client certificate | the TLS peer certificate presented at the API / `/ui` handshake | `[api].tls_client_ca_file` set (requires `tls_cert_file`) → `ssl.CERT_REQUIRED` plus strict RFC 5280 verify flags (`api/tls.py:47-50`); no client certificate, or one not issued by that CA | **DENY** — the TLS handshake fails, so the request never reaches the ASGI stack at all: no middleware runs, no route matches, no identity is resolved, and no 403 body is produced | unset = off (server-only TLS, no peer-certificate decision on the control plane) | `[api].tls_client_ca_file` |
+| Operator-listener peer client certificate | the TLS peer certificate presented at the API / `/ui` handshake | `[api].tls_client_ca_file` set (requires `tls_cert_file`) → `ssl.CERT_REQUIRED` plus strict RFC 5280 verify flags (`build_api_ssl_context` in `api/tls.py`); no client certificate, or one not issued by that CA | **DENY** — the TLS handshake fails, so the request never reaches the ASGI stack at all: no middleware runs, no route matches, no identity is resolved, and no 403 body is produced. The failure is logged as a WARNING, the first at once and then one a minute carrying the count, naming no peer (vault BACKLOG #3302) | unset = off (server-only TLS, no peer-certificate decision on the control plane) | `[api].tls_client_ca_file` |
 | Declared token class of a federated assertion | the `typ` JOSE header, and the presence of an `events` claim, on a **signature-verified** JWS | `typ` present and — normalised `.strip().lower()` then `application/`-stripped — not `jwt`, so `at+jwt` (RFC 9068 access token), `logout+jwt` and `secevent+jwt` are refused while an **absent** `typ` is allowed (RFC 7519 §5.1 makes the header advisory); or the claim set carries `events`, i.e. an RFC 8417 security event token. Every such token is minted by the **same issuer under the same key**, so no signature or key rung distinguishes it | **DENY** the sign-in — `ClaimsError("wrong_token_type")` at the key-selection rung, `ClaimsError("unexpected_events_claim")` ahead of the nonce compare (a logout token carries no nonce, so a later check would misreport it as a browser-binding failure) | on | (no knob) |
 | Federated authentication-context claims (`amr` / `acr`) | the `amr` list / `acr` string of a **signature-verified** `id_token` | `oidc_require_mfa_claim` on **and** neither an `amr` value in `[auth].oidc_mfa_amr_values` (default `["mfa"]`) nor an `acr` in `oidc_required_acr_values` (default `[]`, so the `amr` arm alone decides) | **DENY** the sign-in — `ClaimsError("mfa_claim_missing")`. An IdP **assertion**, never a proof | on, `["mfa"]` / `[]` | `[auth].oidc_require_mfa_claim`, `oidc_mfa_amr_values`, `oidc_required_acr_values` |
 | Time since the IdP authentication event | the `auth_time` of a **signature-verified** `id_token`, requested by the `max_age` the engine sends on **every** authorization request (OIDC Core makes `auth_time` REQUIRED once `max_age` is sent) | `auth_time` absent or null; or older than `[auth].oidc_max_age_seconds` (no clock-skew grace on this side, so no session is minted already dead); or further in the future than the clock skew. A conforming IdP re-authenticates only when its own sign-in is older than `max_age`, so single sign-on is untouched for every user inside the window | **DENY** the sign-in — `ClaimsError("auth_time_missing")` / `("auth_time_stale")` (a future value is `issued_in_future`). An accepted sign-in is also capped: the session ends at `auth_time + oidc_max_age_seconds` if that is sooner than `id_token.exp` and the absolute cap. There is **no off switch**: `0` and any value outside the documented range ([CONFIGURATION.md](CONFIGURATION.md)) are refused at load, and omitting the key gives the default. An IdP that does not return `auth_time` refuses **every** federated sign-in. `auth_time` is IdP wall clock, so the bound is only as good as the IdP's clock | 43200 s (12 h) | `[auth].oidc_max_age_seconds` |
@@ -3506,7 +3527,7 @@ listen source. The refusal action differs materially per listener, so each has i
 | **X12** | peer socket address | not in `source_ip_allowlist` | **DENY** — as MLLP (refuse, log, `peer_not_allowlisted` event); BACKLOG #1665 |
 | **HTTP** | peer socket address | not in `source_ip_allowlist` | **DENY** — a real `403 {"error":"forbidden"}` is written to the peer, then close; WARNING log + `peer_not_allowlisted` event |
 | **DICOM C-STORE SCP** | peer socket address at accept; `event.assoc.requestor.address` in the C-STORE backstop | not in `source_ip_allowlist` | **DENY** — the connection is closed at accept, before any TLS handshake or association; WARNING log naming the peer IP, at most one line per address per 60 s and at most 20 addresses per 60 s in all; **no connection event**. The backstop answers DIMSE status **`0x0124` (Not Authorized)** **before any durable commit** and logs each refusal with the calling AE; [DICOM.md](DICOM.md) section 3 says why a sender should not see it |
-| **MLLP / HTTP / DICOM** — peer client certificate | the TLS peer certificate presented at handshake | `tls = true` **and** `tls_ca_file` set → `ssl.CERT_REQUIRED` plus strict RFC 5280 verify flags; no client certificate, or one not issued by that CA | **DENY** — the TLS handshake fails. On MLLP and HTTP the connection **never reaches the accept path**, so there is **no** connection event and no allow-list evaluation. The DICOM SCP accepts the connection first, checks its allow-list, and only then runs the handshake, so a peer outside the list is refused before any handshake; a failed handshake writes **no** connection event there either. `tls_ca_file` unset → server-only TLS and no peer-certificate decision. TCP and X12 have no inbound TLS at this release |
+| **MLLP / HTTP / DICOM** — peer client certificate | the TLS peer certificate presented at handshake | `tls = true` **and** `tls_ca_file` set → `ssl.CERT_REQUIRED` plus strict RFC 5280 verify flags; no client certificate, or one not issued by that CA | **DENY** — the TLS handshake fails. On HTTP, and on MLLP where the event loop runs the handshake (uvloop), the connection **never reaches the accept path**, so there is no allow-list evaluation. On MLLP on the standard asyncio loop the allow-list and both connection caps run BEFORE the handshake (BACKLOG #1606). Either way the only connection event is a throttled `tls_handshake_failed`: the first failure at once, then one per listener per minute with the count (vault BACKLOG #2613, #3302). The DICOM SCP accepts the connection first, checks its allow-list, and only then runs the handshake, so a peer outside the list is refused before any handshake; a failed handshake writes **no** connection event there either. `tls_ca_file` unset → server-only TLS and no peer-certificate decision. TCP and X12 have no inbound TLS at this release |
 | **HTTP** — intake authentication (`intake_auth`, ADR 0154 D6) | the credential a peer presents: the `intake_api_key_header` header (default `x-api-key`) under `api_key`, `Authorization: Bearer` under `bearer`, or the verified client certificate's `CN:` / `SAN:` names under `mtls_subject` | `intake_auth` is not `none` and the key or token is missing or wrong, or the certificate's names are not in `intake_client_subjects`. **The default is `intake_auth = "none"`, which checks no credential: a default HTTP inbound admits any peer the rows above admit.** Under `api_key` / `bearer`, `GET`/`HEAD` probes are inside the check unless `intake_auth_health = "allow"`. Under `mtls_subject` the certificate is checked at accept, before the method is known, so no probe is exempt. A peer with no certificate from `tls_ca_file` never reaches this row: it fails the handshake in the peer-client-certificate row above | **DENY** — `401` for a missing or wrong key or token (read before any body byte), `400` for a credential header sent more than once, even with identical copies, and with `_` read as `-` in the header name, since the engine would keep the last copy while a front end may read the first (BACKLOG #2051; refused before any comparison, charged to the failed-attempt budget and audited `intake.auth_failed`), `403` for a verified certificate with an unlisted subject; nothing is committed. Audited `intake.auth_failed` / `intake.auth_subject_denied`, plus a connection event |
 | **HTTP** — intake failed-attempt budget (ADR 0154 D6) | the peer address, and the listener's failed-attempt count across all peers | the peer has spent `intake_auth_rate_limit` failed attempts in the window, or all peers together have spent `intake_auth_rate_limit_global` (defaults and the `0`/`None` off switch in [CONNECTIONS.md](CONNECTIONS.md)). A peer that authenticated inside the window is exempt from the global budget, so a flood cannot lock out a working partner. Counted in-process, so each engine shard keeps its own count | **THROTTLE** — `429` + `Retry-After: 60` before any credential is compared; audited `intake.auth_rate_limited`. A successful authentication never spends budget |
 | **HTTP** — peer-control start gate (ADR 0154 D7) | the listener's bind host × the presence of an **effective** peer control | non-loopback bind, `[security].enforcement = enforce` (the default), and **no** effective peer control: `intake_auth` is `none`, and `source_ip_allowlist` is unset or has an entry wider than a /8 (IPv4) or a /32 (IPv6), so `0.0.0.0/0` does not count. `tls` + `tls_ca_file` alone does not count either, because it binds no subject | **DENY at start** (`WiringError`); the connection degrades per ADR 0031 startup fault isolation. Loopback binds are exempt |
@@ -4655,12 +4676,13 @@ until restart (`AuthService.kerberos_available` in `auth/service.py`). `oidc` is
 `[auth].oidc_enabled` **and** a directory to resolve roles against, `AuthService.oidc_enabled`) **and** the last IdP
 interaction not having failed. That second term is deliberately **advisory and non-sticky**, and
 *no login path gates on it* (`AuthService.oidc_available`). A transport failure, where no answer
-arrived, sets it, and the next success clears it. Any status the token endpoint answers with, a
+arrived, sets it, and the next code exchange that yields a verified token clears it. Any status the token endpoint answers with, a
 5xx included, leaves it alone, because a caller's bad code can draw one (BACKLOG #1948). So an IdP
 behind a proxy that answers its outage with a 503 keeps the link showing.
 [ADR 0142](adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)
-Amendment E is the source of record for which failures count and what each is audited as. It also
-names the residuals, at least a firewall reset a caller provokes and a misframed JWKS reply. Neither
+Amendment E, as Amendment G narrows it, is the source of record for which failures count and what
+each is audited as. Together they name the residuals, at least a firewall reset a caller provokes.
+Neither
 flag consults `settings.api.serve_ui`, so the route can still advertise `oidc: true` on a console-less
 engine that registers no OIDC route. The mTLS plane is deliberately absent from it, because it is not a
 sign-in offer.
@@ -5664,7 +5686,9 @@ reads the file again by path, on its own schedule. The SMTP hop reads it at ever
 swapped between reloads would be trusted by the next send. A connection that falls back to the
 internal CA reads it when the connection is built, and the syslog forwarder reads it once, at start.
 Those keep the old bytes until they are built again, and a reload writes a `changed` row but no
-`restart_required` row for them. A changed syslog CA takes effect only at a restart.
+`restart_required` row for them. A changed syslog CA takes effect only at a restart. The reload
+response's `restart_required` field lists none of these dialling CAs, so an empty list there does
+not mean a changed one is applied (BACKLOG #3015).
 
 At least four readers sit before or outside the check. At start, the syslog forwarder and the alert
 notifier are built before the check runs, so an alert sent during startup, or the first forwarded
