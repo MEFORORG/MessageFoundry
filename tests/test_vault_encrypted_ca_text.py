@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.auth.trust_anchors import ENCRYPTION_HEADER_SCOPE
+from messagefoundry.auth.trust_anchors import _ENCRYPTION_HEADER_SCOPE
 from messagefoundry.config.tls_policy import InsecureHopRefused
 from tests._encrypted_pem_probe import ENCRYPTION_HEADERS as _HEADERS
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
@@ -144,7 +144,7 @@ def test_encrypted_ca_text_is_refused_before_any_tls_load(proxied: bool, text: s
     assert type(refusal.value) is _strict().VaultHopRefused, "not the hop's marked type"
     assert made == [], "a TLS context was built for CA text the hop refuses"
     assert "Vault test hop" in str(refusal.value)
-    assert ENCRYPTION_HEADER_SCOPE in str(refusal.value), "the hop's copy of the scope drifted"
+    assert _ENCRYPTION_HEADER_SCOPE in str(refusal.value)
     assert "SYNTHETICBODYMARKER" not in str(refusal.value), "the refusal echoed the CA text"
     assert "AES-256-CBC" not in str(refusal.value), "the refusal echoed the CA text"
 

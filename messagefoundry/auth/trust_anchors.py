@@ -260,10 +260,11 @@ _PEM_END = b"-----END "
 _PEM_TRUSTED = b"-----BEGIN TRUSTED CERTIFICATE-----"
 #: The RFC 1421 headers of an encrypted PEM block, lower-cased (BACKLOG #2270, :func:`anchor_cadata`).
 _PEM_ENCRYPTION_HEADERS = ("proc-type:", "dek-info:")
-#: What :func:`has_encryption_header` matches, in the words every refusal built on it uses (BACKLOG
-#: #3105). It names no block on purpose: the check models none. ``strict_requests`` keeps its own
-#: copy, since its refusals may only use that module's literals, and a test holds the two equal.
-ENCRYPTION_HEADER_SCOPE = (
+#: What :func:`has_encryption_header` matches, in the words :func:`anchor_cadata`'s refusal uses
+#: (BACKLOG #3105). It names no block on purpose: the check models none. ``strict_requests`` keeps
+#: an identical literal, since its marked refusals may interpolate only that module's own
+#: literals; ``tests/test_trust_anchors.py`` compares the two exactly.
+_ENCRYPTION_HEADER_SCOPE = (
     "names an encryption header (Proc-Type or DEK-Info) somewhere after the first -----BEGIN in "
     "its PEM text, even outside a block, as in a comment"
 )
@@ -329,7 +330,7 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     that the text loads, not that a certificate in it is a CA; a leaf still loads here.
 
     **An encryption header name after the first BEGIN refuses, before that load** (BACKLOG
-    #2270), inside a block or in a comment between or after the blocks. A
+    #2270), whether or not it sits inside a block. A
     ``Proc-Type: 4,ENCRYPTED`` header sends OpenSSL to its password callback, and ``cadata=`` sets
     none, so OpenSSL falls back to its default one, which reads the terminal. The POSIX terminal run
     was done later, off-version (BACKLOG #3090, 2026-10-12): on CPython 3.12.3 / OpenSSL 3.0.13 on
@@ -347,8 +348,8 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     block encrypted in that legacy header format beside a certificate loads through ``cadata=``,
     and refuses here, and so does the header name in a comment between two blocks or after the
     last one. A PKCS#8 ``ENCRYPTED PRIVATE KEY`` block has no such header and is not refused. The
-    same header in a comment above the first block still passes, unless that comment itself holds
-    ``-----BEGIN ``. The check reads the text the load would get, so a comment line that is not
+    same header in a comment above the first block still passes, unless a ``-----BEGIN `` comes
+    anywhere before it, on its own line or an earlier one. The check reads the text the load would get, so a comment line that is not
     ASCII, dropped above, is not checked."""
     kept: list[bytes] = []
 
@@ -387,7 +388,7 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
         ) from exc
     if has_encryption_header(text):
         raise TrustAnchorError(
-            f"{spec.setting}: the trust anchor {spec.path!r} {ENCRYPTION_HEADER_SCOPE}. An "
+            f"{spec.setting}: the trust anchor {spec.path!r} {_ENCRYPTION_HEADER_SCOPE}. An "
             "encrypted certificate carries one, as does a private key encrypted in the legacy PEM "
             "format. A trust anchor needs only plain "
             "CERTIFICATE blocks, and loading an encrypted one can make the TLS library wait for a "

@@ -2108,8 +2108,9 @@ def _byte_order_mark_before_the_block() -> bytes:
 
 
 def _encrypted_key_beside_the_certificate() -> bytes:
-    """Manager decision: a key block refuses too, though cadata= loads the certificate beside it.
-    A trust anchor has no use for a key, and the header is refused in a block of any label."""
+    """Manager decision: a key block with a legacy encryption header refuses too, though cadata=
+    loads the certificate beside it, since the header is refused in a block of any label. A PKCS#8
+    ENCRYPTED PRIVATE KEY block, or a plain key block, has no such header and is not refused."""
     label = b"RSA PRIVATE" + b" KEY"  # split, so the secret scanner does not read a real key
     key = b"-----BEGIN " + label + b"-----\n" + _ENCRYPTED + b"AAAA\n-----END " + label + b"-----\n"
     return _real_ca("crl-test-ca")[0] + key
@@ -2186,7 +2187,7 @@ def test_an_encrypted_pem_block_refuses_before_the_tls_load(
     monkeypatch.setattr(ta, "ssl", _NoTlsLoad)
     with pytest.raises(TrustAnchorError) as err:
         ta.anchor_cadata(shape(), spec)
-    assert ta.ENCRYPTION_HEADER_SCOPE in str(err.value)
+    assert ta._ENCRYPTION_HEADER_SCOPE in str(err.value)
 
 
 def test_an_encryption_header_outside_a_block_still_passes() -> None:
@@ -2217,8 +2218,9 @@ async def test_the_preflight_refuses_an_encrypted_anchor_as_the_consumer_does(
 
 # --- BACKLOG #3105: the repr sites engine PR 2063 left without a test -----------------------------
 #
-# Each test runs on every platform: the icacls call and the POSIX stat are stood in, and the chain
-# walks take their host reads as arguments.
+# The icacls call and the POSIX stat are stood in, but each runs only on its own platform: patching
+# os.name would hand pytest the wrong pathlib flavour (see the note above the DACL pin test). The
+# chain walks take their host reads as arguments and run everywhere.
 
 
 def test_the_encryption_header_refusal_quotes_the_path(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2229,11 +2231,27 @@ def test_the_encryption_header_refusal_quotes_the_path(monkeypatch: pytest.Monke
     _quoted(str(err.value))
 
 
-class _Ran:
-    """What the stood-in ``subprocess.run`` returns."""
+def test_the_vault_hop_states_the_same_scope() -> None:
+    """strict_requests keeps its own copy of the scope sentence (its marked refusals may use only
+    its own literals), so the two are compared exactly here. Read from the source, so this runs on
+    a leg without the [vault] extra."""
+    import ast
 
-    def __init__(self, returncode: int, stdout: str | None, stderr: str = "") -> None:
-        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+    import messagefoundry.transports as transports
+
+    source = (Path(transports.__file__).parent / "strict_requests.py").read_text(encoding="utf-8")
+    (value,) = [
+        stmt.value.value
+        for stmt in ast.parse(source).body
+        if isinstance(stmt, ast.Assign)
+        and any(isinstance(n, ast.Name) and n.id == "_ENCRYPTED_CA_TEXT" for n in stmt.targets)
+        and isinstance(stmt.value, ast.Constant)
+    ]
+    assert value == ta._ENCRYPTION_HEADER_SCOPE
+
+
+def _ran(returncode: int, stdout: str | None, stderr: str = "") -> Any:
+    return subprocess.CompletedProcess([], returncode, stdout, stderr)
 
 
 def _icacls_fails() -> Any:
@@ -2244,19 +2262,18 @@ def _icacls_fails() -> Any:
     "ran",
     [
         pytest.param(_icacls_fails, id="icacls could not run"),
-        pytest.param(lambda: _Ran(0, None), id="no readable output"),
+        pytest.param(lambda: _ran(0, None), id="no readable output"),
         pytest.param(
-            lambda: _Ran(5, "", f"{_CONTROL_PATH}: Access is denied."), id="exit non-zero"
+            lambda: _ran(5, "", f"{_CONTROL_PATH}: Access is denied."), id="exit non-zero"
         ),
-        pytest.param(lambda: _Ran(0, "this is not icacls output\n"), id="no readable ACE"),
+        pytest.param(lambda: _ran(0, "this is not icacls output\n"), id="no readable ACE"),
     ],
 )
+@_windows_only
 def test_each_icacls_log_branch_quotes_the_path(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, ran: Any
 ) -> None:
-    """The non-zero exit is the control: a real icacls on Windows already reached it."""
-    monkeypatch.setattr(os, "name", "nt")
-    monkeypatch.setattr(ta, "_system_exe", lambda exe: "C:\\Windows\\System32\\" + exe)
+    """The non-zero exit is the control: a real icacls already reached it."""
     monkeypatch.setattr(subprocess, "run", lambda *_a, **_k: ran())
     with caplog.at_level("WARNING", logger=ta.log.name):
         assert dacl_is_owner_only(_CONTROL_PATH) is None
@@ -2264,6 +2281,7 @@ def test_each_icacls_log_branch_quotes_the_path(
     _quoted(record.getMessage())
 
 
+@_posix_only
 def test_the_posix_stat_log_quotes_the_path(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -2274,7 +2292,6 @@ def test_the_posix_stat_log_quotes_the_path(
         def stat(self) -> Any:
             raise OSError(13, "denied")
 
-    monkeypatch.setattr(os, "name", "posix")
     monkeypatch.setattr(ta, "Path", _Unstatable)
     with caplog.at_level("WARNING", logger=ta.log.name):
         assert dacl_is_owner_only(_CONTROL_PATH) is None
@@ -2296,7 +2313,7 @@ def test_the_volume_cause_quotes_the_root() -> None:
     _no_raw_control(cause)
 
 
-def test_the_unreadable_link_target_quotes_the_link() -> None:
+def test_a_link_to_a_path_the_check_does_not_read_quotes_the_link() -> None:
     from messagefoundry.auth import anchor_path as ap
 
     def probe(p: str) -> tuple[str, str | None]:

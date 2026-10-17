@@ -699,10 +699,10 @@ def _unverifiable_proxy_leg(connector: str) -> str:
     )
 
 
-#: What the encrypted-CA-text refusal says the check matches. It is
-#: ``trust_anchors.ENCRYPTION_HEADER_SCOPE`` word for word, held equal by
-#: ``tests/test_vault_encrypted_ca_text.py``. A copy, not an import, because a marked refusal may
-#: interpolate only this module's own string literals (``tests/test_vault_hop_refusal_marker.py``).
+#: What the encrypted-CA-text refusal says the check matches: ``trust_anchors``'s
+#: ``_ENCRYPTION_HEADER_SCOPE`` word for word, compared exactly by ``tests/test_trust_anchors.py``.
+#: A copy, not an import, because a marked refusal may interpolate only this module's own string
+#: literals (``tests/test_vault_hop_refusal_marker.py``).
 _ENCRYPTED_CA_TEXT = (
     "names an encryption header (Proc-Type or DEK-Info) somewhere after the first -----BEGIN in "
     "its PEM text, even outside a block, as in a comment"
