@@ -9431,7 +9431,9 @@ async def _directory_reconciler(
     # just before that pass. None until a read succeeds, and every clear is dropped until then. An
     # instance a pass of this process opened while the read kept failing then counts as inherited:
     # a missed clear, never a false one.
-    inherited: frozenset[int] | None = None if alert_state is not None else frozenset()
+    # A reconciler that may share its store raises no clear at all, so it never reads alert state.
+    reads_alert_state = alert_state is not None and sole_reconciler
+    inherited: frozenset[int] | None = None if reads_alert_state else frozenset()
     while True:
         await asyncio.sleep(interval)
         try:
@@ -9442,9 +9444,11 @@ async def _directory_reconciler(
                     # Once, at the read that fixes the set (BACKLOG #3084): every clear of these
                     # instances is dropped for this process's life, and without this line only
                     # docs/CONFIGURATION.md would say so. Keys only; an instance carries no PHI.
+                    # "When this process first read", not "before its first pass": a first read
+                    # that failed lets this process's own early trip or hold land in the set.
                     _log.warning(
-                        "directory reconcile: %s already open before this process's first pass, "
-                        "so this process will not resolve %s itself; an operator resolves it",
+                        "directory reconcile: %s already open when this process first read alert "
+                        "state, so this process will not resolve %s itself; an operator resolves it",
                         ", ".join(
                             f"{event} ({source})" for source, event in sorted(found.values())
                         ),
@@ -9576,8 +9580,8 @@ _RECONCILE_CLEAR_RESOLVES: Final[Mapping[str, tuple[str, str]]] = {
 
 
 #: The bound on one read of reconcile alert state, in seconds (BACKLOG #3084). A read that runs
-#: past it fails as any other failed read does, so it drops clears and never delays a pass's pages
-#: or revocations for longer than this.
+#: past it fails as any other failed read does, so it drops clears. A pass makes at most two such
+#: reads, one before it reconciles and one before it pages, so each waits at most this long.
 _RECONCILE_ALERT_READ_TIMEOUT: Final[float] = 10.0
 
 

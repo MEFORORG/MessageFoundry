@@ -6755,7 +6755,7 @@ class AuthService:
             _log.warning(
                 "directory reconcile: an account whose userAccountControl read undetermined left "
                 "%s, so this process will not resolve ad_reconcile_held itself until it restarts; "
-                "an operator resolves it once the attribute reads clean",
+                "an operator resolves any open instance once the attribute reads clean",
                 "before this process released its hold"
                 if current == "held"
                 else "before any pass here had held, and an earlier run's hold may still cover it",

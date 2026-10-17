@@ -818,7 +818,8 @@ while the engine is down. So an operator resolves an alert the last run left ope
 engine resolves the next trip or hold on its own.
 
 - The hold resolves when no answer is undetermined and this pass read `userAccountControl` at
-  least once. An account the pass just revoked still counts as an answer here.
+  least once. An account the pass just revoked still counts as an answer here, but a pass that
+  revokes every signed-in account resolves nothing.
 - An engine can also give up resolving the hold. That happens when an account whose last answer
   was undetermined leaves, unless the engine has released a hold and has not held since. The
   reconciler may revoke it, or its sessions may end some other way. The engine then resolves no

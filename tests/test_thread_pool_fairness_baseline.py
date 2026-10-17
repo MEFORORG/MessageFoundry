@@ -420,20 +420,24 @@ def _sync_streaming_bodies(source: str, where: str) -> dict[str, str]:
     Starlette steps a body that is not an ``AsyncIterable`` through ``iterate_in_threadpool``, one
     worker-thread hop per chunk (``starlette.responses.StreamingResponse.__init__``). The one shape
     this reads as async is a call to a function whose every definition in the module is an
-    ``async def`` that yields. Anything else is named, including a body it cannot resolve, so the
-    guard fails closed: a list, a name bound earlier, a sync generator, a call through an attribute.
-    An aliased import and a subclass are named too, because either would hide a call from the walk.
+    ``async def`` that yields. Anything else it sees is named, including a body it cannot resolve:
+    a list, a name bound earlier, a sync generator, a call through an attribute. An aliased import
+    and a subclass are named too, because either would hide a call from the walk.
+
+    It reads names, not bindings, so at least these pass unseen: ``StreamingResponse`` bound to
+    another name by assignment and called through it, a body function rebound by assignment beside
+    an ``async def`` of the same name, and a decorator that turns an async generator into a sync
+    iterator.
     """
     tree = parse_source(source)
     found: dict[str, str] = {}
     for node in ast.walk(tree):
-        at = f"{where}:{getattr(node, 'lineno', 0)}"
         if isinstance(node, ast.ImportFrom | ast.Import):
             for alias in node.names:
                 if alias.name.rpartition(".")[2] == "StreamingResponse" and alias.asname:
-                    found[at] = f"imported as {alias.asname}"
+                    found[f"{where}:{node.lineno}"] = f"imported as {alias.asname}"
         elif isinstance(node, ast.ClassDef) and any(map(_names_streaming_response, node.bases)):
-            found[at] = f"class {node.name} subclasses StreamingResponse"
+            found[f"{where}:{node.lineno}"] = f"class {node.name} subclasses StreamingResponse"
     for call in call_sites(tree, "StreamingResponse"):
         at = f"{where}:{call.lineno}"
         content = call.args[0] if call.args else None

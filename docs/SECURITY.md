@@ -2612,11 +2612,11 @@ not the permissions they grant. So a move from one role to another refuses, even
 grants more. A lookup whose groups map to no role refuses every directory account that holds a
 role. The refusal writes no roles; the next reconciliation pass, when it runs, or the next sign-in
 re-syncs them. Otherwise it behaves as the refusals above, audited with the outcome
-`directory_roles_demoted`. Channel scope is not compared on these legs. The caller is told what
-the refusals above tell it, because it sees the one directory refusal and not its cause, so those
-words name both fixes (BACKLOG #3082): try again later, and if it is still refused, sign out and
-sign in again, or ask an administrator. A retry clears an outage. Only a new sign-in clears a
-demotion, because it takes the roles the current groups grant. The words name no group or role.
+`directory_roles_demoted`. Channel scope is not compared on these legs. The caller sees the one
+directory refusal and not its cause, so its words name a later try and a new sign-in both
+(BACKLOG #3082; the text is `_DIRECTORY_UNCONFIRMED_DETAIL` in `api/auth_routes.py`). A later try
+clears an outage. A demotion clears on a later try only once the roles are re-synced or the groups
+restored; a new sign-in re-syncs them at once. The words name no group or role.
 
 **The IdP step-up leg makes the same role test (BACKLOG #2154).** `complete_oidc_step_up` already
 looks the account up by its directory object id. It now maps the groups that lookup returns to

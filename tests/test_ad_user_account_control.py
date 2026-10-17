@@ -2518,8 +2518,16 @@ def _script_reads(
         (["hang", "real"], False),
         (["real", "fail"], False),
         (["real", "hang"], False),
+        (["real", "fail", "real"], True),
     ],
-    ids=["control", "first-read-fails", "first-read-hangs", "later-read-fails", "later-read-hangs"],
+    ids=[
+        "control",
+        "first-read-fails",
+        "first-read-hangs",
+        "later-read-fails",
+        "later-read-hangs",
+        "one-later-read-fails",
+    ],
 )
 async def test_a_pass_whose_alert_read_fails_or_runs_long_drops_its_clears(
     monkeypatch: pytest.MonkeyPatch, script: list[str], resolves: bool
@@ -2531,11 +2539,14 @@ async def test_a_pass_whose_alert_read_fails_or_runs_long_drops_its_clears(
     first pass opens are this process's own, and the control resolves both. Until a first read
     succeeds the loop cannot tell inherited instances from its own, so what is open at the first
     read that succeeds counts as inherited, including the trip and hold this process opened
-    meanwhile.
+    meanwhile. One failed later read costs only its own pass's clears: the next pass that reads
+    resolves them (``one-later-read-fails``).
 
     RED when a failed later read keeps the pass's clears (``later-read-fails``), or when either read
     has no bound: a hung read then stalls the loop, and the pass count is never reached."""
-    monkeypatch.setattr(app_module, "_RECONCILE_ALERT_READ_TIMEOUT", 0.01)
+    # Short enough that four hung passes finish quickly, long enough that a real :memory: read on a
+    # loaded runner does not time out and turn the control red.
+    monkeypatch.setattr(app_module, "_RECONCILE_ALERT_READ_TIMEOUT", 0.25)
     store = await MessageStore.open(":memory:")
     try:
         done = _script_reads(monkeypatch, store, script)
@@ -2544,6 +2555,40 @@ async def test_a_pass_whose_alert_read_fails_or_runs_long_drops_its_clears(
         assert done[: len(script)] == script, f"the scripted reads did not all run: {done}"
         monkeypatch.undo()
         assert await _open_alerts(store) == (set() if resolves else {ABORTED, HELD})
+    finally:
+        await store.close()
+
+
+async def test_a_reconciler_that_may_share_its_store_never_reads_alert_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reconciler that may share its store raises no clear, so the read that tells inherited
+    instances from its own has no use there. It must not run: each would cost a pass up to the read
+    bound before its revocations, and log an inherited-alert line about clears it never makes
+    (BACKLOG #3084)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        done = _script_reads(monkeypatch, store, ["fail"])
+        auth = _ScriptedAuth([_BOTH_CLEAR], {})
+        task = asyncio.create_task(
+            _directory_reconciler(
+                auth,  # type: ignore[arg-type]
+                0.001,
+                NotifierAlertSink([], store=store),
+                sole_reconciler=False,
+                alert_state=store,
+            )
+        )
+        try:
+            for _ in range(2000):
+                if auth.passes >= 3:
+                    break
+                await asyncio.sleep(0.005)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        assert auth.passes >= 3
+        assert done == []
     finally:
         await store.close()
 
