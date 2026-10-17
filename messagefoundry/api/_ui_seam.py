@@ -412,10 +412,8 @@ from typing import Any
 #: BACKLOG #3015: ``ReloadResult`` gained ``restart_required``, the settings trust anchors a
 #: restart must apply. The console's reload result and approval pages read it by attribute, so it
 #: forces a bump. Re-derived on batch/b260-c, the tree merged with BACKLOG #3091, #3105 and #2731,
-#: none of which moved it. The value below covers all four.
-#:
-#: 2026-10-17, batch 263 sync 2: the digest below was recomputed on the tree merged from both
-#: entries above (#2954 on the batch, #3015 on main), so it covers both.
+#: none of which moved it, and again on the tree merged with vault BACKLOG #2954 (the entry above),
+#: which did. The value below covers every entry above.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
