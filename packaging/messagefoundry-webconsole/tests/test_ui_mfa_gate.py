@@ -1187,7 +1187,7 @@ async def test_a_directory_account_still_gets_the_directory_refusal(
         assert r.status_code == 400 and "managed in AD" in r.text
 
 
-# --- the enrol-first bounce keys on the session, not the account rule (BACKLOG #3116) -----------
+# --- the enrol-first bounce keys on the session as well as the account rule (BACKLOG #3116) -----
 
 
 _STEP_UP_NEXT = "/ui/account/mfa/disable"  # a full-step-up action (require_ui_step_up_action)
@@ -1198,7 +1198,8 @@ async def test_a_directory_non_admin_is_sent_to_enrol_not_to_an_unpassable_reaut
     engine: Engine, enrolled: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """RED when: either /ui/reauth handler, or the account page, keys the enrol-first decision on
-    ``mfa_status().required`` rather than on ``mfa_satisfied``.
+    ``mfa_status().required`` alone, without ``mfa_satisfied``; or POST asks the per-actor budget
+    before the bounce.
 
     Under ``require_mfa_scope = "administrators"`` the account rule calls a directory non-admin with
     no factor exempt (``required`` False), while the directory floor leaves its session unsatisfied,
@@ -1219,13 +1220,22 @@ async def test_a_directory_non_admin_is_sent_to_enrol_not_to_an_unpassable_reaut
             headers={"origin": "http://t"},
         )
         account = await c.get("/ui/account")
+        # The bounce comes before the per-actor budget, so a spent budget never turns it into a 429.
+        monkeypatch.setattr(service, "allow_reauth_attempt", lambda _actor: False)
+        spent = await c.post(
+            "/ui/reauth",
+            data={"next": _STEP_UP_NEXT, "password": "irrelevant"},
+            headers={"origin": "http://t"},
+        )
     if enrolled:
+        assert spent.status_code == 429
         assert got.status_code == 200 and 'name="password"' in got.text
         assert 'name="code"' in got.text
         assert posted.status_code == 200 and 'name="code"' in posted.text  # asked for the code
     else:
         assert got.status_code == 303 and got.headers["location"] == _ENROL_FIRST
         assert posted.status_code == 303 and posted.headers["location"] == _ENROL_FIRST
+        assert spent.status_code == 303 and spent.headers["location"] == _ENROL_FIRST
         assert account.status_code == 200 and "REQUIRES MFA" in account.text
         # The bounce must lead somewhere: enrolment is step_up=False, so its re-auth renders.
         async with _client(engine, service) as c:

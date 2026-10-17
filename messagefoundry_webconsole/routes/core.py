@@ -129,13 +129,14 @@ def _directory_unconfirmed(elevation: Elevation) -> bool:
     return bool(getattr(elevation, "directory_unconfirmed", False))
 
 
-def _enrol_before_step_up(satisfied: bool, mfa: MfaStatus, step_up: bool) -> bool:
+def _enrol_before_step_up(mfa: MfaStatus, *, satisfied: bool, step_up: bool) -> bool:
     """Whether the password ``/ui/reauth`` sends this session to enrol instead of rendering its form.
 
     True for a full-step-up action when the account holds no factor of EITHER kind (ADR 0068
-    decision 1(a)) and a factor is owed, by the account rule (``mfa.required``) OR by the session
-    (``satisfied`` is ``mfa_satisfied``): the form could only loop straight back. The session half is
-    BACKLOG #3116. ``AuthService._unverified_session_owes_factor`` says when a session owes a factor
+    decision 1(a)) and a factor is owed. The session half (``satisfied`` is ``mfa_satisfied``) is a
+    deadlock guard: such a session can never pass the step-up, so the form would loop straight back
+    (BACKLOG #3116). The account-rule half (``mfa.required``) is policy, not a deadlock: it sends a
+    required-but-unenrolled account to enrol even when a stamp leaves its session satisfied. ``AuthService._unverified_session_owes_factor`` says when a session owes a factor
     the account rule does not. Enrolment itself is ``step_up=False``, so it never bounces here."""
     if not step_up or mfa.enabled or mfa.webauthn_enrolled:
         return False
@@ -1616,9 +1617,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             if mfa.enabled or mfa.webauthn_enrolled:
                 return RedirectResponse("/ui/mfa", status_code=303)
             if step_up:
-                # Keyed on "not satisfied", not on the account rule mfa.required; see
-                # _enrol_before_step_up.
-                return RedirectResponse("/ui/account?m=enroll_first", status_code=303)
+                # Session only, unlike _enrol_before_step_up: an IdP-claim session is satisfied
+                # with no engine factor while mfa.required holds, and must pass (docstring above).
+                return RedirectResponse(ENROL_FIRST_PAGE, status_code=303)
         return reauth_idp_response(deps, auth, next_, continues=continues)
 
     async def _mfa_gate_deadline(auth: AuthService, identity: Identity) -> float | None:
@@ -1767,7 +1768,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # Ahead of the enroll-first bounce; _reauth_idp_page says why.
             return await _reauth_idp_page(auth, token, mfa, next_, action.step_up, continues)
         satisfied = await auth.mfa_satisfied(token)
-        if _enrol_before_step_up(satisfied, mfa, action.step_up):
+        if _enrol_before_step_up(mfa, satisfied=satisfied, step_up=action.step_up):
             return RedirectResponse(ENROL_FIRST_PAGE, status_code=303)
         # The rendering splits BY FACTOR (decision 1(b)): the TOTP code field renders iff
         # TOTP is enrolled (a required-but-unenrolled account can never produce a code —
@@ -1816,9 +1817,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # continues_after_reauth is asked of `token` at each use, not once here: the code leg below
         # rotates it and re-keys the issued continuation onto the new token.
         satisfied = await auth.mfa_satisfied(token)
-        if _enrol_before_step_up(satisfied, mfa, action.step_up):
+        if _enrol_before_step_up(mfa, satisfied=satisfied, step_up=action.step_up):
             # Checked BEFORE the rate limiter so a correct password isn't burned into a 429 (the
-            # review's silent-loop finding; the ordering pin covers the generalized condition too).
+            # review's silent-loop finding). test_ui_mfa_gate.py pins the order for the session half
+            # with the budget denied.
             return RedirectResponse(ENROL_FIRST_PAGE, status_code=303)
         if not satisfied and not mfa.enabled and mfa.webauthn_enrolled:
             # ADR 0068 decision 1(d): a WebAuthn-ONLY user's password form can never satisfy
