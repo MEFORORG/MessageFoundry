@@ -9373,9 +9373,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
         # that key now destroys it. So the command fails, and the rotation stamp was not written.
         print(
             f"error: {uploads.skipped} uploaded file(s) were NOT fully re-sealed -- part of each "
-            "may still be under the prior key. It could not be read or written, or no configured "
-            "key opens it: a prior key was not supplied, or the file is damaged. The log names each "
-            "file and its cause. Fix the cause and re-run rotate-key BEFORE retiring any prior key "
+            "may still be under the prior key. It could not be read, written or decrypted. The "
+            "causes include at least a prior key that was not supplied, a damaged file, and a value "
+            "sealed by another cipher. The log names each file and its cause. Fix the cause and re-run rotate-key BEFORE retiring any prior key "
             "(MEFOR_STORE_ENCRYPTION_KEYS_RETIRED). No key will ever open a damaged file, so restore "
             "that upload, or remove its two files from the uploads directory, before the re-run. "
             "This run did not stamp the key's rotation date; "

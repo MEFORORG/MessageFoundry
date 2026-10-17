@@ -704,7 +704,7 @@ def test_rotate_key_fails_when_no_key_opens_an_uploaded_file(
     captured = capsys.readouterr()
     assert "rotation aborted" not in captured.err
     assert "1 uploaded file(s) were NOT fully re-sealed" in captured.err
-    assert "no configured key" in captured.err
+    assert "could not be read, written or decrypted" in captured.err
     assert "OK:" not in captured.out
     assert "note: audit chain" in captured.out  # the audit step still ran, and is not an OK line
     assert _key_id_and_stamp(db, key_b)[1] is None

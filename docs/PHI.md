@@ -649,8 +649,8 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`). **Rotation** = set the new active key, keep the prior key in
    `…_RETIRED`, run **`messagefoundry rotate-key`** (offline) to re-encrypt every value under the new
    key, then drop the retired key. `rotate-key` also opens a new range of the audit chain under the new
-   key and verifies the chain first; do not drop the retired key until it has printed its audit line
-   without an error ([ADR 0193](adr/0193-audit-chain-key-ranges-survive-a-store-key-rotation.md),
+   key and verifies the chain first; do not drop the retired key until it exits 0 and prints its audit
+   line as `OK:` ([ADR 0193](adr/0193-audit-chain-key-ranges-survive-a-store-key-rotation.md),
    BACKLOG #1904). Keep the retired key through the engine's first start after the rotation too. The
    secret-rotation watcher keys its fingerprints off the store key, and that start re-keys them. With
    the retired key in hand, a secret changed in the same window still reads as rotated. Without it,

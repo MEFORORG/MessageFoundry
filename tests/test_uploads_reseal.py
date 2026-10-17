@@ -195,8 +195,7 @@ async def test_one_corrupt_body_does_not_abort_the_pass(
     assert result == ResealResult(resealed=3, skipped=1)
     assert blob.read_text(encoding="utf-8") == damaged  # nothing written over it
     assert any(
-        bad in r.getMessage() and "no configured key opens it" in r.getMessage()
-        for r in caplog.records
+        bad in r.getMessage() and "could not be decrypted" in r.getMessage() for r in caplog.records
     )
     dropped = _keyed_store(root, key_b)
     assert (await dropped.read_bytes(good)).decode() == _ADT

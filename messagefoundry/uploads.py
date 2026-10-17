@@ -1693,8 +1693,9 @@ class UploadStore:
                 try:
                     sealed = _reencrypt_value(cipher, stored, aad)
                 except _UnopenableValueError as exc:
-                    # No configured key opens it: a prior key was not supplied, or the value is
-                    # damaged. Nothing is written, so the file is left exactly as it was, and it is a
+                    # It could not be decrypted. The causes include at least a prior key that was
+                    # not supplied, a damaged value, and a marker this cipher does not read, so the
+                    # log names the class and not one cause. Nothing is written, so the file is left exactly as it was, and it is a
                     # skip, which fails the command and withholds the rotation stamp (BACKLOG
                     # #3181). One bad upload used to abort the whole pass, and the CLI then blamed
                     # a missing prior key for what may be one damaged file. An encrypt-side refusal
@@ -1703,7 +1704,7 @@ class UploadStore:
                     # the cipher's message can carry a piece of a damaged or planted file.
                     pair_skipped = True
                     _log.warning(
-                        "uploaded file %s (%s): skipped, no configured key opens it (%s)",
+                        "uploaded file %s (%s): skipped, it could not be decrypted (%s)",
                         fid,
                         kind,
                         type(exc.__cause__ or exc).__name__,
@@ -2361,7 +2362,7 @@ class UploadRetentionRunner:
 
 
 class _UnopenableValueError(CipherError):
-    """No configured key opens a stored upload value. The reseal skips that file and goes on (BACKLOG
+    """A stored upload value could not be decrypted. The reseal skips that file and goes on (BACKLOG
     #3181). Raised only from the DECRYPT half of :func:`_reencrypt_value`, so an encrypt-side refusal,
     such as the AES-GCM invocation ceiling, still stops the whole pass as a plain ``CipherError``."""
 
