@@ -15,6 +15,7 @@ These pin the service half. The store half, on every backend, is
 from __future__ import annotations
 
 import ast
+import asyncio
 import re
 import sqlite3
 import time
@@ -283,6 +284,60 @@ async def test_the_lapsed_credential_revoke_does_not_follow_the_lineage(
     rotated = await _elevate(service, prior)
     await service._end_lapsed_session(hash_token(prior), "op", at="session", client=None)
     assert await _live(service, rotated)
+
+
+async def test_the_reaper_purges_links_by_the_window_it_is_given(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The lifespan hands the reaper the service's window, and the reaper must pass it to the purge,
+    # or no link is ever deleted.
+    from messagefoundry.api import app as api_app
+
+    monkeypatch.setattr(api_app, "_SESSION_REAP_INTERVAL", 0)
+    monkeypatch.setattr(api_app, "_SESSION_REAP_FIRST_DELAY", 0)
+    seen: list[float | None] = []
+    done = asyncio.Event()
+
+    class _Store:
+        async def purge_expired_sessions(
+            self,
+            *,
+            now: float | None = None,
+            idle_seconds: float | None = None,
+            lineage_seconds: float | None = None,
+        ) -> None:
+            seen.append(lineage_seconds)
+            done.set()
+
+    task = asyncio.create_task(
+        api_app._session_reaper(_Store(), idle_seconds=60.0, lineage_seconds=420.0)  # type: ignore[arg-type]
+    )
+    try:
+        await asyncio.wait_for(done.wait(), timeout=5)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert seen[0] == 420.0
+
+
+def test_the_lifespan_hands_the_reaper_the_supersession_window() -> None:
+    source = (Path(__file__).resolve().parents[1] / "messagefoundry/api/app.py").read_text(
+        encoding="utf-8"
+    )
+    reapers = [c for c in ast.walk(parse_source(source)) if isinstance(c, ast.Call)]
+    passing = [
+        c
+        for c in reapers
+        if isinstance(c.func, ast.Name)
+        and c.func.id == "_session_reaper"
+        and any(
+            k.arg == "lineage_seconds"
+            and isinstance(k.value, ast.Attribute)
+            and k.value.attr == "supersession_lineage_seconds"
+            for k in c.keywords
+        )
+    ]
+    assert len(passing) == 1, "the lifespan no longer passes the window to the reaper"
 
 
 # --- the shared walk, with no database: a rotation that lands mid-walk, and the hop bound ----------

@@ -4481,7 +4481,9 @@ links; the supersession is their one reader. For the length of the bound, a reti
 power: presented at a sign-in that succeeds, it ends the session it became. That power is new, and
 it can only end a session, never open or extend one. Whoever held that token before the elevation
 could already end the session with `POST /auth/logout`; the link lets them do it for the length of
-the bound after the elevation too, and only through a sign-in with a credential that passes. A wall
+the bound after the elevation too, through a sign-in whose first credential passes; with MFA
+required, the supersession runs when the password-only session is minted, before the second factor,
+so a password alone is enough. A wall
 clock that stepped forward at the elevation, or back before the sign-in, lengthens that time by the
 step; the reaper's clock-step guard covers its own purge, not this. The links are not under the session integrity seal (BACKLOG #2592): a forged link can only direct a
 revoke, and a revoke needs no key on any backend.

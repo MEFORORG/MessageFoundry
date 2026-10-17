@@ -376,8 +376,11 @@ async def test_postgres_post_commit_session_writes_wait_out_a_busy_pool(
     assert not task.done(), f"{name} gave up on a busy pool after its caller's write committed"
     pool.gate.set()
     assert await asyncio.wait_for(task, timeout=5) == expected
-    # The rotation's lineage link (vault BACKLOG #3028) follows its re-key on the same borrow.
     assert any(s.startswith("UPDATE sessions") for s in pool.statements), pool.statements
+    if name == "rotate_session":
+        # The rotation's lineage link (vault BACKLOG #3028) follows its re-key on the same borrow:
+        # the stand-in pool hands out one connection, and it recorded both statements.
+        assert pool.statements[-1].startswith("INSERT INTO session_lineage"), pool.statements
 
 
 async def test_sqlserver_store_releases_a_healthy_borrow() -> None:
