@@ -9063,3 +9063,78 @@ def test_a_new_address_continuation_never_drops_a_query_or_overflows() -> None:
     assert _new_address_continuation(req("GET", long_name), landing=land) == land
     assert _new_address_continuation(req("GET", "/ui/audit"), landing=land) == land
     assert _new_address_continuation(req("POST", "/ui/messages"), landing=land) == land
+
+
+async def test_the_continuation_cap_is_the_reauth_pages_own(engine: Engine) -> None:
+    """RED when: ``_REAUTH_NEXT_MAX`` and ``GET /ui/reauth``'s own cap on ``next`` drift apart
+    (vault BACKLOG #3052 item 18). The unit test above reads the constant, so a refused PHI read
+    whose continuation fits it could still be answered 422, with no form, by the page it is sent
+    to. A query-tolerant unlock target exactly at the cap renders; one character over is refused."""
+    from messagefoundry_webconsole._auth import _REAUTH_NEXT_MAX, is_unlock_action
+
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    base = "/ui/messages?channel_id="
+    at_cap = base + "c" * (_REAUTH_NEXT_MAX - len(base))
+    assert len(at_cap) == _REAUTH_NEXT_MAX and is_unlock_action(at_cap)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        assert (await c.get("/ui/reauth", params={"next": at_cap})).status_code == 200
+        assert (await c.get("/ui/reauth", params={"next": at_cap + "c"})).status_code == 422
+
+
+async def test_a_cross_site_write_from_a_new_address_writes_no_row(engine: Engine) -> None:
+    """RED when: ``require_ui`` asks the new-address question before its same-origin check (vault
+    BACKLOG #3052 item 11). In that order a cross-site page holding a replayed cookie would make
+    the engine write ``auth.admin_action_new_ip`` and send the notice before the write is refused.
+
+    The write carries no ``Sec-Fetch-Site`` and a foreign ``Origin``, as an older browser's would:
+    the fetch-metadata middleware lets an absent header through, so the refusal under test is
+    ``require_ui``'s own. The same-origin write from the same address is the control: it is sent
+    to ``/ui/reauth`` and writes the row, so the zero above it is not a signal that cannot fire."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client_from(engine, service, "10.0.0.1") as a:
+        await _cookie_login(a, "op")
+        tok = a.cookies.get("mf_session")
+        assert tok is not None
+    async with _client_from(engine, service, "10.9.9.9") as b:
+        b.cookies.set("mf_session", tok)
+        r = await b.post("/ui/statistics/reset", headers={"Origin": "https://attacker.example"})
+        # require_ui's own refusal, by its detail, so an earlier gate cannot pass this vacuously.
+        assert (r.status_code, r.json().get("detail")) == (403, "cross-origin request rejected")
+        assert await engine.store.list_audit(action="auth.admin_action_new_ip", limit=10) == []
+        r = await b.post("/ui/statistics/reset", headers={"Sec-Fetch-Site": "same-origin"})
+        assert (r.status_code, r.headers["location"]) == (303, "/ui/reauth?next=/ui")
+    assert len(await engine.store.list_audit(action="auth.admin_action_new_ip", limit=10)) == 1
+
+
+async def test_a_refused_write_without_monitoring_read_lands_on_the_account_page(
+    engine: Engine,
+) -> None:
+    """RED when: a write refused for a new address continues to ``/ui`` for a session without
+    ``monitoring:read`` (vault BACKLOG #3052 item 12). ``/ui`` would refuse that session, so after
+    the re-auth it would land on a 403. A custom role holding ``monitoring:diagnose`` alone can
+    make the write; the Operator in ``test_a_cookie_replayed_from_a_second_address_is_sent_to_reauth``
+    is the control that lands on ``/ui``."""
+    service = await _service(engine)
+    role = await service.create_custom_role(
+        display_name="Counter Resetter",
+        description=None,
+        permissions=["monitoring:diagnose"],
+        actor="test",
+    )
+    await _add_with_role_ids(service, "resetter", [role.id])
+    same = {"Sec-Fetch-Site": "same-origin"}
+    async with _client_from(engine, service, "10.0.0.1") as a:
+        await _cookie_login(a, "resetter")
+        tok = a.cookies.get("mf_session")
+        assert tok is not None
+        # The control at the sign-in address: the role may make this write, so it is not refused.
+        # Where its success lands is not this test's subject.
+        r = await a.post("/ui/statistics/reset", headers=same)
+        assert r.status_code == 303 and not r.headers["location"].startswith("/ui/reauth")
+    async with _client_from(engine, service, "10.9.9.9") as b:
+        b.cookies.set("mf_session", tok)
+        r = await b.post("/ui/statistics/reset", headers=same)
+        assert (r.status_code, r.headers["location"]) == (303, "/ui/reauth?next=/ui/account")

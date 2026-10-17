@@ -3055,6 +3055,14 @@ alone:
    rolling 60 s, sized by `[auth].login_rate_limit_per_ip` and `login_rate_limit_window_seconds`.
    So on a first deployment a client that must re-verify more often than that would spend it.
    While it is spent, a password re-verification through either route would be refused with 429.
+   **A code at `POST /auth/mfa-verify` re-anchors too, and it draws a different budget.** On any
+   session but an `oidc` one, a correct TOTP or recovery code from the new address re-anchors the
+   session there and clears the refusal. That route draws the sign-in window, not the per-actor
+   ceremony budget ([the route-to-limiter map](#route--limiter-map) has its row), and it carries the
+   sign-in route's other conditions, such as the second-step lock. That window is per address and
+   also engine-wide, so moving frequent re-verification onto this route would spend the sign-in
+   budget every user shares. The console refusal sends the
+   browser to `/ui/reauth` instead, which draws the ceremony budget.
    Until the session re-verifies, its requests from the new address would still get the refusals
    above, so it would read no message and make none of those writes. Where the changing address
    belongs to a reverse proxy, declare that proxy in `[api].trusted_proxies`, so the engine
