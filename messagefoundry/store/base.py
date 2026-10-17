@@ -1513,7 +1513,8 @@ class QueueStore(StoreLifecycle, Protocol):
         and its slot would otherwise consume the uploader's budget forever. A row with no activity
         for longer than ``stale_after`` seconds is reset to zero before the add. Activity is an
         applied reserve or any release, and both move the row's clock to now, never backwards, so a
-        host whose clock lags cannot age a row a sibling keeps fresh. A release of zero
+        host whose clock lags cannot age a row a sibling keeps fresh. Which clock "now" is, per
+        backend, is stated in ``messagefoundry.uploads.UploadQuotaError`` (BACKLOG #3256). A release of zero
         files and zero bytes is therefore a pure touch, which is how a live save keeps its slot
         past ``stale_after`` (BACKLOG #2648). So the reset normally reclaims only slots no live
         process holds. When it does reclaim a live one, it can only restore the pre-ledger
@@ -2638,7 +2639,8 @@ class AuthStore(Protocol):
         cleared, and a pair read by a separate ``get_user`` is a pair a concurrent unbind-and-rebind
         can have replaced before this transaction runs — the audit row would then name a binding this
         call never touched, which is worse than no record at all. Reading it inside the same
-        transaction makes the reported pair the one the UPDATE actually cleared.
+        transaction makes the reported pair the one the UPDATE actually cleared. The same holds
+        for the factor fields; see :class:`FederatedUnbind`.
 
         **An already-unbound account writes NOTHING and revokes nothing**, reporting a NULL pair and
         0 sessions. The check is in here rather than above so it is atomic with the write: an unbind

@@ -144,7 +144,9 @@ transport = "mllp"
   of the wrong kind — `port = "2576"`, `persistent = "yes"` — is refused at load naming the setting and
   the type it wanted. A quoted TOML value is always a string, so write the number or `true`/`false`
   without quotes. An `env()` reference is also accepted, but give it a `cast` for a non-string setting:
-  an environment value arrives as text and an **uncast** ref hands the connector that text. An inline
+  an environment value arrives as text and an **uncast** ref hands the connector that text. A
+  boolean setting is mostly the exception: it is read strictly whatever the cast (vault BACKLOG
+  #3234; [CONFIGURATION.md](CONFIGURATION.md) gives the spellings and the settings it misses). An inline
   `default =` is held to the setting's type here, because a default is **not** converted by `cast`.
   The one exception is `cast = "bool"`, which reads a default's spelling as it reads the value's.
   **A numeric cap reads the text `"0"` exactly as it reads the number `0`** (BACKLOG #1872): where a

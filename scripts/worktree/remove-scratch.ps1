@@ -22,7 +22,9 @@
     pattern deletes whatever happens to match on the day it runs. Let your shell expand the pattern
     and read the dry run first.
 
-    THE CHECKS, in the order the receipt prints them. The first refusal stops that target.
+    THE CHECKS, in the order the receipt prints them. The first refusal stops that target. THIS LIST
+    IS THE ONE SOURCE for what each check refuses: docs/WORKTREES.md points here without naming them.
+    Its own table of whose folder waits how long repeats the idle windows, so change both.
 
       spelling    The path must be drive-absolute and spelled plainly. Refused: a UNC or device path,
                   a relative path, a '.' or '..' component, a component ending in a dot or a space
@@ -64,7 +66,9 @@
                   caller's own scratchpad, 60 minutes for everything else under the temp root.
                   Creation time counts as well as write time, because an extracted or copied tree
                   keeps old write times. A stamp in the future refuses, and so does a stamp that
-                  cannot be read at all. -IdleMinutes can raise a window and never lower it.
+                  cannot be read at all: one past the year 9999, or one before 1980, which is what a
+                  zeroed stamp (read as 1601) looks like. -IdleMinutes can raise a window and never
+                  lower it.
       in-use      -Delete only. The folder is renamed to <name>.removing-<id> before anything is
                   deleted. Windows refuses that rename while any process holds a handle anywhere in
                   the tree, so a refusal here changes nothing on disk.
@@ -145,6 +149,7 @@ $ReparseFlag = [IO.FileAttributes]::ReparsePoint
 $DirectoryFlag = [IO.FileAttributes]::Directory
 $OwnScratchpadIdleMinutes = 10
 $OtherIdleMinutes = 60
+$StampFloor = [datetime]::new(1980, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
 
 # Split a caller-supplied path into components, refusing every spelling that could name a different
 # directory than the one written. Nothing here touches the disk.
@@ -208,11 +213,18 @@ function Test-BareShape([string[]]$Names) {
 # the year 9999). PowerShell then returns $null from the property and raises nothing, and $null
 # compares as older than every date. Reading it that way let a file stamped far in the future pass
 # the idle check, measured 2026-10-04 with FILETIME 0x7FFF000000000000. So the caller refuses on $null.
+#
+# NOR IS A ZEROED STAMP. FILETIME 0 reads as 1601-01-01, the oldest date there is, so a zeroed stamp
+# would pass as ancient. Any stamp before $StampFloor is read as unreadable too: 1980 is the earliest
+# date a FAT or zip (DOS) stamp can hold, so no ordinary copy or extraction writes one earlier.
+#
+# A function, not inlined, so the root and every entry share one refusal rule.
 function Get-NewerStamp($Entry) {
     $made = $null
     $written = $null
     try { $made = $Entry.CreationTimeUtc; $written = $Entry.LastWriteTimeUtc } catch { return $null }
     if (($made -isnot [datetime]) -or ($written -isnot [datetime])) { return $null }
+    if (($made -lt $StampFloor) -or ($written -lt $StampFloor)) { return $null }
     if ($made -gt $written) { return $made }
     return $written
 }
@@ -286,7 +298,9 @@ function Remove-TreeNoFollow([string]$Dir, [System.Collections.Generic.List[stri
     catch { $Failures.Add("$Dir ($($_.Exception.Message))") }
 }
 
-# Everything still under $Dir, listed without following a reparse point.
+# Everything still under $Dir, listed without following a reparse point. $null when $Dir itself is
+# gone: a folder that is gone holds nothing, and listing it anyway would count its own could-not-list
+# line as a remaining entry. Gone means the listing said "not found"; any other failure is not gone.
 function Get-Remains([string]$Dir) {
     $out = [System.Collections.Generic.List[string]]::new()
     $stack = [System.Collections.Generic.Stack[string]]::new()
@@ -299,9 +313,33 @@ function Get-Remains([string]$Dir) {
                 if (($e.Attributes -band $DirectoryFlag) -and -not ($e.Attributes -band $ReparseFlag)) { $stack.Push($e.FullName) }
             }
         }
+        catch [IO.DirectoryNotFoundException] {
+            if ($d -eq $Dir) { return $null }
+            $out.Add("$d (could not list: $($_.Exception.Message))")
+        }
         catch { $out.Add("$d (could not list: $($_.Exception.Message))") }
     }
-    return $out
+    # The comma keeps an empty list a list: unrolled, it would come back as $null and read as gone.
+    return , $out
+}
+
+# Whether $Name is in $Dir, found by a lookup of that one name rather than a listing of $Dir. A lookup
+# can also match a short (8.3) name, so only the long name counts.
+function Test-NameIn([string]$Dir, [string]$Name) {
+    $hits = @([IO.DirectoryInfo]::new($Dir).GetFileSystemInfos($Name) | Where-Object { $_.Name -ieq $Name })
+    return $hits.Count -gt 0
+}
+
+# Whether a directory above a target is a git checkout or a bare repository: the refusal text, or ''.
+# Each name is looked up directly, so a folder above a target is never listed in full: the temp root,
+# which every target shares, can hold thousands of entries. Nothing is kept between targets either. A
+# -Delete run can take minutes, and a checkout made above a later target meanwhile must still refuse it.
+function Get-GitShapeAbove([string]$Dir) {
+    if (Test-NameIn $Dir '.git') { return "the target sits inside the git checkout at '$Dir'" }
+    if (Test-BareShape @(@('HEAD', 'objects', 'refs') | Where-Object { Test-NameIn $Dir $_ })) {
+        return "the target sits inside the bare git repository at '$Dir'"
+    }
+    return ''
 }
 
 function Test-Inside([string]$Child, [string]$Parent) {
@@ -519,11 +557,10 @@ function Invoke-Checks([string]$Raw, $receipt, $out) {
     # temp root is not this script's business: the temp root is disposable whatever sits over it.
     $up = Split-Path $full -Parent
     while ($up -and (($up -ieq $realRoot) -or (Test-Inside $up $realRoot))) {
-        $names = @()
-        try { $names = @([IO.DirectoryInfo]::new($up).GetFileSystemInfos() | ForEach-Object { $_.Name }) }
+        $why = ''
+        try { $why = Get-GitShapeAbove $up }
         catch { Fail 'git' "could not look for a git checkout at '$up': $($_.Exception.Message)"; return }
-        if ($names -contains '.git') { Fail 'git' "the target sits inside the git checkout at '$up'"; return }
-        if (Test-BareShape $names) { Fail 'git' "the target sits inside the bare git repository at '$up'"; return }
+        if ($why) { Fail 'git' $why; return }
         $up = Split-Path $up -Parent
     }
     $norm = ConvertTo-Norm $full
@@ -627,11 +664,17 @@ foreach ($raw in $Path) {
             $gone = ($failures.Count -eq 0) -and -not [IO.Directory]::Exists($tomb)
             # What remains is listed whether or not the delete threw: a throw is when it matters most.
             if (-not $gone) {
-                try { $remains = @(Get-Remains $tomb) }
+                $listed = $false
+                $found = $null
+                try { $found = Get-Remains $tomb; $listed = $true }
                 catch { $failures.Add("what remains could not be listed: $($_.Exception.Message)") }
+                # Gone by the time it was listed, with nothing failed on the way, is a clean delete.
+                if ($listed -and ($null -eq $found)) { $gone = $failures.Count -eq 0 }
+                elseif ($listed) { $remains = @($found) }
             }
             if (-not $gone) {
-                $verdict = "PARTIAL $($res.Full): the delete stopped part-way. The tree was renamed to '$tomb' and $($remains.Count) entr$(if ($remains.Count -eq 1) { 'y remains' } else { 'ies remain' }) under it."
+                $where = if (-not $listed) { 'could not be listed' } elseif ($null -eq $found) { "is gone, but $($failures.Count) failure(s) were recorded on the way" } else { "holds $($remains.Count) entr$(if ($remains.Count -eq 1) { 'y' } else { 'ies' })" }
+                $verdict = "PARTIAL $($res.Full): the delete stopped part-way. The tree was renamed to '$tomb', which $where."
                 $counts.partial++
             }
             else {

@@ -85,6 +85,7 @@ from uuid import uuid4
 
 import aiosqlite
 
+from messagefoundry.childenv import system_tool_environment
 from messagefoundry.config.models import RetryPolicy
 
 # The captured-reply record lives in the (store-free) config layer so a sandbox worker child — which
@@ -1967,6 +1968,13 @@ class FederatedUnbind:
     #: written and nothing revoked. ``issuer``/``subject`` are then the pair the row holds now, which
     #: this call did NOT clear. A caller must test this before treating the pair as cleared.
     changed: bool = False
+    #: Vault BACKLOG #2711 step 3. Whether the account held each engine factor, read in this same
+    #: transaction after the row lock, so the bind and unbind audit rows can say whether the account
+    #: holds engine factors. TOTP counts only once enabled; a passkey counts when the table or the
+    #: sealed ``cred_digest`` names one. Both stay ``False`` when ``changed`` is
+    #: set: that arm writes nothing, and no caller audits these fields from it.
+    totp_enrolled: bool = False
+    webauthn_enrolled: bool = False
 
 
 @dataclass(frozen=True)
@@ -2409,6 +2417,7 @@ _WEBAUTHN_DELETE_ONE: Final = (
     "DELETE FROM webauthn_credentials WHERE user_id=? AND credential_id_hash=?"
 )
 _WEBAUTHN_DELETE_ALL: Final = "DELETE FROM webauthn_credentials WHERE user_id=?"
+_WEBAUTHN_ANY_FOR_USER: Final = "SELECT 1 FROM webauthn_credentials WHERE user_id=? LIMIT 1"
 
 # The role write (BACKLOG #2592), every column in `RoleRow` field order. SQLite only: Postgres
 # carries a `$n` twin and SQL Server a MERGE. Used only by `_write_role`; tests/test_role_seal.py
@@ -5185,6 +5194,7 @@ def _secure_file(path: Path) -> None:
             result = subprocess.run(  # nosec B603 B607
                 [_system_exe("icacls.exe"), str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
                 check=False,
+                env=system_tool_environment(),  # the platform's start-up names only (#2716)
                 capture_output=True,
                 text=True,
                 # icacls echoes the path in the OEM code page. Neither the cp1252 locale default nor
@@ -5222,6 +5232,7 @@ def _grant_read(path: Path, principal: str) -> None:
         result = subprocess.run(  # nosec B603 B607
             [_system_exe("icacls.exe"), str(path), "/grant", f"{principal}:(R)"],
             check=False,
+            env=system_tool_environment(),  # the platform's start-up names only (#2716)
             capture_output=True,
             text=True,
             encoding="oem",  # icacls's piped output; see _secure_file for why "replace"
@@ -14990,9 +15001,7 @@ class MessageStore:
     async def has_webauthn_credentials(self, user_id: str) -> bool:
         """True when the user has at least one enrolled passkey (the second-factor predicate)."""
         async with self._read() as db:
-            cur = await db.execute(
-                "SELECT 1 FROM webauthn_credentials WHERE user_id=? LIMIT 1", (user_id,)
-            )
+            cur = await db.execute(_WEBAUTHN_ANY_FOR_USER, (user_id,))
             return (await cur.fetchone()) is not None
 
     async def any_webauthn_credentials(self) -> bool:
@@ -15499,7 +15508,9 @@ class MessageStore:
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
             cur = await self._db.execute(
-                "SELECT username, oidc_issuer, oidc_subject FROM users WHERE id=?", (user_id,)
+                "SELECT username, oidc_issuer, oidc_subject, totp_enabled, cred_digest FROM users"
+                " WHERE id=?",
+                (user_id,),
             )
             row = await cur.fetchone()
             if row is None:
@@ -15515,6 +15526,11 @@ class MessageStore:
                     sessions_revoked=0,
                     changed=True,
                 )
+            # Vault BACKLOG #2711 step 3: read under the same writer lock as the pair. A passkey
+            # counts when either the table or the sealed digest names one, as the service reads it.
+            totp_enrolled = bool(row["totp_enabled"])
+            cur = await self._db.execute(_WEBAUTHN_ANY_FOR_USER, (user_id,))
+            webauthn_enrolled = (await cur.fetchone()) is not None or bool(row["cred_digest"])
             if issuer is None and subject is None:
                 # Already unbound: write NOTHING. Falling through would revoke this account's live
                 # sessions for a no-op change, and an unbind of nothing must not sign anybody out.
@@ -15522,7 +15538,12 @@ class MessageStore:
                 # the residual column with no admin path to remove it (see FederatedUnbind).
                 await self._db.rollback()
                 return FederatedUnbind(
-                    username=row["username"], issuer=None, subject=None, sessions_revoked=0
+                    username=row["username"],
+                    issuer=None,
+                    subject=None,
+                    sessions_revoked=0,
+                    totp_enrolled=totp_enrolled,
+                    webauthn_enrolled=webauthn_enrolled,
                 )
             await self._write_user(user_id, lambda r: federated_unbind(r, now))
             revoked = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
@@ -15532,6 +15553,8 @@ class MessageStore:
                 issuer=issuer,
                 subject=subject,
                 sessions_revoked=int(revoked.rowcount),
+                totp_enrolled=totp_enrolled,
+                webauthn_enrolled=webauthn_enrolled,
             )
 
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
