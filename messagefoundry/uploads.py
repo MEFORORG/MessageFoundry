@@ -2409,7 +2409,7 @@ def _log_unaudited(what: str, tally: _SweepTally, *, exc: BaseException | None =
 async def _wait_to_completion[T](
     fut: asyncio.Future[T],
     *,
-    cancel_bound: float | None = None,
+    cancel_bound: float | Callable[[], float] | None = None,
     on_cancel: Callable[[], None] | None = None,
 ) -> T:
     """Await ``fut``; on a cancellation, wait for it to finish, then raise ``CancelledError``.
@@ -2427,7 +2427,9 @@ async def _wait_to_completion[T](
     takes, which the save's thread needs, since a thread cannot be stopped. A ledger call waits on
     the store, which may not be bounded at all. At the bound this raises with ``fut`` still
     running, and the caller decides what to do with it. Under an anyio scope, the scope cancels
-    again on every loop pass, so the wait costs CPU, and the bound limits that too.
+    again on every loop pass, so the wait costs CPU, and the bound limits that too. A callable
+    bound is read when the cancellation arrives, for a caller whose bound is the time some other
+    wait has left (BACKLOG #3157); one at or below zero raises at once.
 
     **A caller already cancelled at entry gets the bound as well.** That is a ``finally`` running
     after an earlier wait absorbed the cancellation: the release after a cancelled write. Without
@@ -2438,7 +2440,13 @@ async def _wait_to_completion[T](
     task = asyncio.current_task()
     already = task is not None and task.cancelling() > 0
     cancelled = False
-    deadline = None if not already or cancel_bound is None else loop.time() + cancel_bound
+
+    def _deadline() -> float | None:
+        if cancel_bound is None:
+            return None
+        return loop.time() + (cancel_bound() if callable(cancel_bound) else cancel_bound)
+
+    deadline = _deadline() if already else None
     if already and on_cancel is not None:
         on_cancel()  # the caller is already on its way out, so ask the work to stop now
     while not fut.done():
@@ -2448,8 +2456,8 @@ async def _wait_to_completion[T](
         try:
             await asyncio.wait((fut,), timeout=remaining)
         except asyncio.CancelledError:
-            if not (cancelled or already) and cancel_bound is not None:
-                deadline = loop.time() + cancel_bound
+            if not (cancelled or already):
+                deadline = _deadline()
             if not (cancelled or already) and on_cancel is not None:
                 on_cancel()  # once, at the first cancellation: a sweep's abort (BACKLOG #2261)
             cancelled = True

@@ -27,13 +27,19 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Coroutine
+from contextvars import ContextVar
 from typing import Any
 
 from messagefoundry.api.approvals import _outlive_caller
 from messagefoundry.pipeline.dr import _HOOK_REAP_SECONDS
 from messagefoundry.redaction import safe_exc
 
-__all__ = ["CANCEL_GRACE_SECONDS", "DRAIN_TIMEOUT_SECONDS", "OutlivingOperations"]
+__all__ = [
+    "CANCEL_GRACE_SECONDS",
+    "DRAIN_TIMEOUT_SECONDS",
+    "OutlivingOperations",
+    "cancel_grace_left",
+]
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +59,23 @@ DRAIN_TIMEOUT_SECONDS = 0.5
 #: when they are idle, so at least a takeover hook that takes most of its reap can still be rolling
 #: back when the store closes, and the drain logs it.
 CANCEL_GRACE_SECONDS = _HOOK_REAP_SECONDS + 1.0
+
+#: The holder of the operation running in this context. Set only around the task's creation in
+#: :meth:`OutlivingOperations.run`, so the task's copy of the context carries it and its caller's
+#: does not.
+_running_in: ContextVar[OutlivingOperations | None] = ContextVar("_running_in", default=None)
+
+
+def cancel_grace_left() -> float | None:
+    """Seconds left of the grace :meth:`OutlivingOperations.drain` gave the operation running in
+    this context, or ``None`` outside a drain's grace or outside such an operation.
+
+    It is the drain's own ``grace``, the share of the shutdown budget a lifespan handed it (BACKLOG
+    #3191), counted from when the drain cancelled. A cancellation arm that waits on work of its
+    own bounds that wait by it, so the drain does not give up on an arm still waiting (BACKLOG
+    #3157). At or below zero, the drain has already stopped waiting."""
+    holder = _running_in.get()
+    return None if holder is None else holder.grace_left()
 
 
 def _log_orphan_outcome(task: asyncio.Future[Any], label: str) -> None:
@@ -81,6 +104,8 @@ class OutlivingOperations:
         # The event loop keeps only a weak reference to a running task, and a caller that was
         # cancelled no longer holds one, so this map is what keeps the operation alive.
         self._inflight: dict[asyncio.Future[Any], str] = {}
+        # The loop time the drain's grace ends, set when the drain cancels (cancel_grace_left).
+        self._grace_ends: float | None = None
 
     @property
     def inflight(self) -> list[str]:
@@ -93,7 +118,11 @@ class OutlivingOperations:
         A cancellation delivered while this awaits reaches the caller at once, and the operation
         goes on. Its result or error is then logged once, with ``label``, which names the operation
         and nothing from the request body."""
-        task = asyncio.ensure_future(coro)
+        token = _running_in.set(self)
+        try:
+            task = asyncio.ensure_future(coro)
+        finally:
+            _running_in.reset(token)
         self._inflight[task] = label
         task.add_done_callback(self._forget)
         try:
@@ -113,6 +142,13 @@ class OutlivingOperations:
 
     def _forget(self, task: asyncio.Future[Any]) -> None:
         self._inflight.pop(task, None)
+
+    def grace_left(self) -> float | None:
+        """Seconds left of the grace the drain gave its cancelled operations, or ``None`` before a
+        drain has cancelled any (:func:`cancel_grace_left`)."""
+        if self._grace_ends is None:
+            return None
+        return self._grace_ends - asyncio.get_running_loop().time()
 
     async def drain(
         self,
@@ -139,6 +175,8 @@ class OutlivingOperations:
             timeout,
             ", ".join(cancelled),
         )
+        # Set before the cancels, so an arm reading cancel_grace_left() as its cancel lands sees it.
+        self._grace_ends = asyncio.get_running_loop().time() + grace
         for task in left:
             task.cancel()
         _done, stuck = await asyncio.wait(left, timeout=grace)

@@ -216,7 +216,11 @@ from messagefoundry.api.multipart import (
     MultipartTooLargeError,
     parse_single_file_upload,
 )
-from messagefoundry.api.outlive import CANCEL_GRACE_SECONDS, OutlivingOperations
+from messagefoundry.api.outlive import (
+    CANCEL_GRACE_SECONDS,
+    OutlivingOperations,
+    cancel_grace_left,
+)
 from messagefoundry.api.outlive import DRAIN_TIMEOUT_SECONDS as OUTLIVING_DRAIN_SECONDS
 from messagefoundry.api.paging import page_total
 from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
@@ -1789,12 +1793,14 @@ async def _reload_and_record(
     return outcome, failures
 
 
-#: How long a cancel waits for a reload's audit row to land (:func:`_write_through_cancel`). A store
-#: write may have no bound of its own, and engine.stop() awaits a cancelled convergence reload
-#: without one, so a hung write must not hold the shutdown. It is not held inside the shutdown
-#: budget's shares (BACKLOG #3191): the drain's grace (_app_drain_steps) can be shorter, and one
-#: convergence reload's wait can spend all of engine.stop()'s _ENGINE_STOP_RESERVE_SECONDS.
-_ROW_CANCEL_WAIT_SECONDS: Final = 3.0
+#: The most a cancel waits for a reload's audit row to land (:func:`_write_through_cancel`). A
+#: store write may have no bound of its own, so a hung write must not hold the shutdown. Under a
+#: shutdown drain the wait is also cut to what is left of the drain's grace (cancel_grace_left).
+#: Nothing hands engine.stop() a remaining time, and it awaits a cancelled convergence reload with
+#: no bound, so this cap is what holds that wait inside the shutdown budget (BACKLOG #3191): below
+#: the smallest grace _app_drain_steps hands the drain (1.2 s, at the step's 2.0 s floor), and a
+#: third of _ENGINE_STOP_RESERVE_SECONDS. tests/test_dual_control_reload.py pins both.
+_ROW_CANCEL_WAIT_SECONDS: Final = 1.0
 
 #: Row writes still running after the cancel bound. The event loop keeps only a weak reference to a
 #: task, so this set keeps each alive until it ends and its outcome is logged.
@@ -1809,11 +1815,12 @@ async def _write_through_cancel(
     At least :meth:`OutlivingOperations.drain` cancels a reload still running at shutdown, and the
     cancel can land while the reload's own outcome row is being written. Cancelling that write
     would lose the row with no ERROR line, since a cancel is no ``Exception``. So the write runs as
-    its own task, and a cancel waits up to :data:`_ROW_CANCEL_WAIT_SECONDS` for it to land, through
-    the uploads module's ``_wait_to_completion``. Past the bound the cancel goes on and the write is
-    left to finish on its own. At shutdown the drain can stop waiting first
-    (:data:`_ROW_CANCEL_WAIT_SECONDS` says why), so a write still running then can meet the store
-    engine.stop() closes, and is logged as below.
+    its own task, and a cancel waits for it to land, through the uploads module's
+    ``_wait_to_completion``, for up to :data:`_ROW_CANCEL_WAIT_SECONDS`, and under a shutdown drain
+    for no longer than the drain's grace has left (:func:`_row_cancel_wait`, BACKLOG #3191). With
+    none left it does not wait. Past the bound the cancel goes on, so the
+    reload's task ends while the drain still waits for it, and the write is left to finish on its
+    own. A write that then meets the store engine.stop() closes is logged as below.
 
     Not :meth:`ApprovalGate._shielded`'s shape, which re-raises at once and leaves the gate's own
     drain to wait for the write. Nothing would drain this one once the reload's task has ended. A
@@ -1824,7 +1831,7 @@ async def _write_through_cancel(
     task = asyncio.ensure_future(write)
     write_cancelled = False
     try:
-        await _wait_to_completion(task, cancel_bound=_ROW_CANCEL_WAIT_SECONDS)
+        await _wait_to_completion(task, cancel_bound=_row_cancel_wait)
     except asyncio.CancelledError:
         current = asyncio.current_task()
         if not (task.cancelled() and (current is None or current.cancelling() == 0)):
@@ -1841,6 +1848,16 @@ async def _write_through_cancel(
         # Raised after the handler, so the caught cancellation rides neither __cause__ nor
         # __context__.
         raise RuntimeError("the audit row's write was cancelled")
+
+
+def _row_cancel_wait() -> float:
+    """The wait :func:`_write_through_cancel` gives a row once its cancel lands: the cap, or less
+    when a shutdown drain's grace has less left. :data:`_CUT_GRACE_SECONDS` of that grace is kept
+    back for the reload's task to unwind, so the drain sees it end rather than timing out with it."""
+    left = cancel_grace_left()
+    if left is None:
+        return _ROW_CANCEL_WAIT_SECONDS
+    return min(_ROW_CANCEL_WAIT_SECONDS, left - _CUT_GRACE_SECONDS)
 
 
 def _log_unlanded_row(task: asyncio.Future[Any], lost: Callable[[], str]) -> None:

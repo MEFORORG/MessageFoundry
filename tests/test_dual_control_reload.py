@@ -1975,3 +1975,88 @@ async def test_a_reload_row_that_fails_after_a_drain_cancel_is_logged(
     [lost] = [r for r in caplog.records if "after its operation was cancelled" in r.getMessage()]
     assert f"Lost row: action={action} actor=alice" in lost.getMessage()
     assert lost.exc_info is not None and isinstance(lost.exc_info[1], sqlite3.OperationalError)
+
+
+class _HeldAudit(_SlowAudit):
+    """An audit log whose write holds until ``release`` is set, then fails, as one would on the
+    store engine.stop() closes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+
+    async def record_audit(self, action: str, **_kw: Any) -> None:
+        self.entered.set()
+        await self.release.wait()
+        raise sqlite3.ProgrammingError("PROBE: the store is closed")
+
+
+@pytest.mark.parametrize("writer", ["refusal", "reload"])
+async def test_a_row_wait_ends_inside_the_grace_the_drain_has_left(
+    writer: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3157 against #3191: the drain's grace is a share of the shutdown budget, and can be
+    shorter than the row wait's cap. The wait is cut to what the grace has left, so the reload's
+    task ends while the drain still waits for it, and the row it could not land is logged at
+    ERROR rather than holding the shutdown."""
+    from messagefoundry.api.outlive import OutlivingOperations
+
+    store = _HeldAudit()
+    op, action = _slow_writer(writer, store)
+    outliving = OutlivingOperations()
+    caller = asyncio.create_task(outliving.run(op, "config reload"))
+    await asyncio.wait_for(store.entered.wait(), 5.0)
+    with caplog.at_level(logging.ERROR):
+        loop = asyncio.get_running_loop()
+        began = loop.time()
+        assert await outliving.drain(timeout=0.0, grace=0.3) == ["config reload"]
+        assert loop.time() - began < 0.3 + 0.2
+        assert outliving.inflight == []
+        assert not [r for r in caplog.records if "finished rolling back" in r.getMessage()]
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        store.release.set()  # the write left running now meets the closed store
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if any("after its operation was cancelled" in r.getMessage() for r in caplog.records):
+                break
+    [lost] = [r for r in caplog.records if "after its operation was cancelled" in r.getMessage()]
+    assert f"Lost row: action={action} actor=alice" in lost.getMessage()
+    assert store.rows == []
+
+
+async def test_a_row_wait_with_no_grace_left_does_not_wait() -> None:
+    """The bound is read when the cancel lands. With none of the drain's grace left, the cancel
+    goes on at once and the write is left running."""
+    from messagefoundry.uploads import _wait_to_completion
+
+    reads: list[float] = []
+
+    def _left() -> float:
+        reads.append(0.0)
+        return 0.0
+
+    write = asyncio.ensure_future(asyncio.sleep(10))
+    waiter = asyncio.ensure_future(_wait_to_completion(write, cancel_bound=_left))
+    await asyncio.sleep(0)
+    assert reads == []  # not read before the cancel
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(waiter, 1.0)
+    assert reads == [0.0] and not write.done()
+    write.cancel()
+
+
+def test_the_row_wait_cap_fits_inside_the_shutdown_budget() -> None:
+    """Nothing hands engine.stop() a remaining time, so the cap alone bounds a cancelled convergence
+    reload's row wait there. It stays below the smallest grace _app_drain_steps hands the drain,
+    at the long-operations step's floor, and well inside engine.stop()'s reserve (BACKLOG #3191)."""
+    from messagefoundry.api import app as app_module
+    from messagefoundry.api.outlive import DRAIN_TIMEOUT_SECONDS
+
+    fake = cast(Any, SimpleNamespace(state=SimpleNamespace(outliving_operations=None)))
+    [step] = app_module._app_drain_steps(fake, None, None, owns_auth=False)
+    share = step.floor * app_module._INNER_SHARE
+    smallest_grace = share - min(DRAIN_TIMEOUT_SECONDS, share / 4)
+    assert smallest_grace > app_module._ROW_CANCEL_WAIT_SECONDS
+    assert app_module._ROW_CANCEL_WAIT_SECONDS <= app_module._ENGINE_STOP_RESERVE_SECONDS / 3
