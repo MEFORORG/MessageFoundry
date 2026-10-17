@@ -751,6 +751,12 @@ def test_a_cancelled_dependency_floors_nightly_opens_an_issue(
     run id), and a job that hits `timeout-minutes` concludes `cancelled`. So a hung install would be
     a red that reaches nobody if `cancelled` took the no-op path here as it does for every other
     watched workflow."""
+    # The premise, pinned: only a pull-request run is ever superseded.
+    concurrency = _load(_WORKFLOWS / "dependency-floors.yml")["concurrency"]
+    assert "github.run_id" in str(concurrency["group"]), concurrency
+    assert str(concurrency["cancel-in-progress"]).replace(" ", "") == (
+        "${{github.event_name=='pull_request'}}"
+    ), concurrency
     workflow = _floors_workflow()
     run = _run_notice(tmp_path, workflow=workflow, conclusion=conclusion, open_issues={})
     _ok(run)
@@ -773,18 +779,21 @@ def test_a_skipped_dependency_floors_run_writes_nothing(tmp_path: Path) -> None:
     assert _writes(run) == [], f"a {conclusion!r} run wrote something{_diagnostic(run)}"
 
 
+@pytest.mark.parametrize("conclusion", ["cancelled", "timed_out"])
 @pytest.mark.parametrize(
     "workflow",
     [w for w in _on(_load(_NOTICE))["workflow_run"]["workflows"] if w != _floors_workflow()],
 )
-def test_a_cancelled_nightly_of_any_other_watched_workflow_writes_nothing(
-    workflow: str, tmp_path: Path
+def test_a_stopped_nightly_of_any_other_watched_workflow_writes_nothing(
+    workflow: str, conclusion: str, tmp_path: Path
 ) -> None:
     """The exception is `dependency floors` alone: elsewhere a cancelled nightly is usually a
     superseded or manually-stopped run."""
-    run = _run_notice(tmp_path, workflow=workflow, conclusion="cancelled", open_issues={})
+    run = _run_notice(tmp_path, workflow=workflow, conclusion=conclusion, open_issues={})
     _ok(run)
-    assert _writes(run) == [], f"a cancelled {workflow!r} run wrote something{_diagnostic(run)}"
+    assert _writes(run) == [], (
+        f"a {conclusion!r} {workflow!r} run wrote something{_diagnostic(run)}"
+    )
 
 
 def test_a_workflow_with_no_case_arm_still_gets_a_readable_body(tmp_path: Path) -> None:

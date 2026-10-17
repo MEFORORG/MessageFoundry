@@ -93,7 +93,7 @@ def check(
         if floor is None:
             failures.append(
                 f"{name}: declares no floor this check can read; write it as >=X, "
-                "with no other line for this name excluding X"
+                "with no specifier for this name excluding X"
             )
         elif found is None:
             failures.append(f"{name}: declared >={floor} but not installed")

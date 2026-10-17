@@ -266,11 +266,12 @@ jobs:
 
           - The install failed: a declared floor no longer installs on Python 3.14, for example no
             wheel and an sdist that does not build. Raise that floor in \`pyproject.toml\`.
-          - The floor check failed: a runtime dependency landed off its floor. A yanked floor lands
-            here, not in the install, because the resolver skips it. Raise that floor in \`pyproject.toml\`.
+          - The floor check failed: a runtime dependency landed off its floor. A yanked >= floor
+            usually lands here, because the resolver skips it. Raise that floor in \`pyproject.toml\`.
           - The floor check said a dependency \`declares no floor this check can read\`: give it a
-            \`>=X\` lower bound that no other line for the same name excludes.
-          - The run concluded cancelled or timed out: the job hit its \`timeout-minutes\`, most likely
+            \`>=X\` lower bound that no specifier for the same name excludes.
+          - The run concluded cancelled or timed out, so no step shows red and this issue still says
+            failed: the job hit its \`timeout-minutes\`, most likely
             an install that hung or a build from source, unless someone stopped it by hand. Read the
             install step.
           - A guard failed: the engine does not work at its declared floors. Fix the code or raise

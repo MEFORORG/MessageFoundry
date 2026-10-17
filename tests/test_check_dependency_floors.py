@@ -108,7 +108,7 @@ def test_each_verdict() -> None:
         "raised-below: installed 1.9, BELOW the declared floor 2.0",
         "stale-raise: listed as raised but installed at its floor 1.0; drop it from --raised",
         "unreadable: declares no floor this check can read; write it as >=X, "
-        "with no other line for this name excluding X",
+        "with no specifier for this name excluding X",
         "unknown: listed as raised but declares no floor that applies here",
     ]
 
