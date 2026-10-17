@@ -26,13 +26,13 @@ pytest.importorskip("webauthn")
 
 from webauthn.helpers import base64url_to_bytes  # noqa: E402
 
-from messagefoundry.auth import totp  # noqa: E402
+from messagefoundry.auth import reconcile, totp  # noqa: E402
 from messagefoundry.auth.identity import Identity  # noqa: E402
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProbe  # noqa: E402
 from messagefoundry.auth.service import AuthService, Elevation  # noqa: E402
 from messagefoundry.auth.tokens import hash_token  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
-from messagefoundry.store.store import MessageStore  # noqa: E402
+from messagefoundry.store.store import MessageStore, UserRecord  # noqa: E402
 from tests._soft_webauthn import SoftAuthenticator  # noqa: E402
 from tests._totp_clock import pin_totp_clock  # noqa: E402
 
@@ -185,3 +185,41 @@ async def test_a_session_that_proves_the_existing_factor_first_still_finishes(
 
     assert enrolled.ok is True
     assert len(await store.list_webauthn_credentials(identity.user_id)) == 1
+
+
+async def test_a_totp_bound_during_the_directory_lookup_stops_the_passkey_finish(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3061: the directory lookup at finish is a network round trip, AFTER the factor
+    check above. A TOTP confirmed on another session during it must still stop the registration.
+    RED when: ``finish_webauthn_registration`` does not ask ``_factor_binding_is_blocked`` again
+    once the lookup returns, so the passkey binds and the session is promoted without proving the
+    factor the account now holds."""
+    t0 = time.time()
+    pin_totp_clock(monkeypatch, t0)
+    service = await _service(store, require_mfa=False)
+    identity, token = await _sign_in(service)
+    response = await _stage_passkey(service, identity, token)
+    real_probe = service._probe_principal
+    confirmed: list[str] = []
+
+    async def _probe_while_totp_confirms(user: UserRecord) -> reconcile.Probe:
+        # Restored first: the confirm below runs its own lookup through the same seam.
+        monkeypatch.setattr(service, "_probe_principal", real_probe)
+        confirmed.append(await _enrol_totp_elsewhere(service, t0))
+        return await real_probe(user)
+
+    monkeypatch.setattr(service, "_probe_principal", _probe_while_totp_confirms)
+
+    with pytest.raises(ValueError, match="already has a second factor"):
+        await _finish(service, identity, token, response)
+
+    assert len(confirmed) == 1  # the injection ran inside the lookup, not before it
+    assert await store.list_webauthn_credentials(identity.user_id) == []
+    session = await store.get_session(hash_token(token))
+    assert session is not None and session.mfa_verified_at is None
+    assert await service.mfa_satisfied(token) is False
+    rows = await store.list_audit(action="auth.mfa_denied")
+    assert {"path": "finish_webauthn_registration"} in [json.loads(r["detail"]) for r in rows]
+    # Refused as the earlier check refuses: the ceremony is ended, not left for a retry.
+    assert service._webauthn_challenges.peek((hash_token(token), "register")) is None

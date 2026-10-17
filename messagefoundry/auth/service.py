@@ -11741,8 +11741,9 @@ class AuthService:
         # BACKLOG #3014: re-asked at finish, since a factor may have been bound since begin and the
         # console's finish route rides the action-less gate. After the peek, so "ceremony expired"
         # still answers first; before the floor, so this refusal reads the same at any elapsed time.
-        # It kills the stale ceremony, and is audited as the begin gate's refusal is. Read-then-act:
-        # a factor bound between here and the stamp below is not caught, as the begin gate's is not.
+        # It kills the stale ceremony, and is audited as the begin gate's refusal is. It is asked
+        # once more after the directory lookup below. Read-then-act: a factor bound between that
+        # second ask and the stamp below is not caught, as the begin gate's is not.
         # The session is read first because the check fails closed on a dead one, which is a lost
         # session to the caller, not a factor it owes.
         if await self._load_session(hash_token(token)) is None:
@@ -11774,6 +11775,14 @@ class AuthService:
                 self._webauthn_challenges.pop((hash_token(token), "register"))
             return current
         user = current
+        # Asked again (BACKLOG #3061): the floor and the directory lookup above await, the lookup a
+        # network round trip, and a TOTP confirmed on another session meanwhile would otherwise let
+        # this passkey bind and promote a session that never proved that factor. Refused exactly
+        # as the check above refuses.
+        if await self._factor_binding_is_blocked(token, STEP_UP_ACTION_WEBAUTHN_ENROLL):
+            self._webauthn_challenges.pop((hash_token(token), "register"))
+            await self.audit_mfa_denied(identity, "finish_webauthn_registration", client=client)
+            raise ValueError(self._FACTOR_PRESENT)
         pending = self._webauthn_challenges.pop((hash_token(token), "register"))
         if pending is None or pending.user_id != user.id:
             raise ValueError(self._CEREMONY_EXPIRED)

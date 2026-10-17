@@ -470,6 +470,23 @@ async def test_a_directory_account_with_no_directory_configured_is_refused_the_p
     await _assert_passkey_refused_and_unspent(p, "not_configured")
 
 
+async def test_the_passkey_registration_lookup_comes_after_the_floor(store: MessageStore) -> None:
+    """A floored registration costs no lookup, as a floored TOTP confirm costs none. RED when the
+    lookup moves ahead of the floor in ``finish_webauthn_registration``."""
+    s = await _directory_sign_in(store, settings=_settings(require_mfa=True))
+    s.service._settings = _settings(require_mfa=True, mfa_verify_min_elapsed_seconds=60)
+    p = await _passkey_staged(s)
+    s.directory.answer = DirectoryAnswer.DISABLED  # a lookup ahead of the floor would refuse
+
+    floored = await _register(p)
+
+    assert floored.ok is False and floored.directory_unconfirmed is False
+    assert s.directory.probes == []
+    assert await store.list_webauthn_credentials(s.identity.user_id) == []
+    # The floor refusal leaves the ceremony in flight.
+    assert s.service._webauthn_challenges.peek((hash_token(s.token), "register")) is not None
+
+
 async def test_a_disable_during_the_lookup_is_a_lost_passkey_registration(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
