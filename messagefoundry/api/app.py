@@ -220,6 +220,7 @@ from messagefoundry.api.outlive import OutlivingOperations
 from messagefoundry.api.paging import page_total
 from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
+    AUTH_NOT_CONFIGURED,
     AuthenticatedBeforeBodyRoute,
     ExportStopped,
     alert_sink_for,
@@ -9906,8 +9907,9 @@ def create_managed_app(
     ``synchronous``) as a SQLite shortcut. ``config_dir`` loads the code-first Connection/Router/
     Handler graph. ``auth_settings`` attaches an :class:`AuthService` and seeds the built-in roles;
     it creates no account (ADR 0183). With no ``auth_settings`` every protected route is refused
-    (503) unless the caller passes ``allow_no_auth=True``, the same opt-in :func:`create_app` takes;
-    beside ``auth_settings`` that opt-in raises ``ValueError``.
+    (503) unless the caller passes ``allow_no_auth=True``, the same opt-in :func:`create_app` takes,
+    and a build with neither logs one WARNING. Beside ``auth_settings`` that opt-in raises
+    ``ValueError``.
     The store is opened via the
     backend-agnostic :func:`~messagefoundry.store.open_store`. ``api_listener`` is the engine's own
     ``(host, port)`` (from ``[api]``), reserved so no inbound listener can be wired onto the API's port
@@ -10707,7 +10709,7 @@ def create_managed_app(
 
     # Settings never select the open mode: only the caller's opt-in, checked at the top, does
     # (vault BACKLOG #2611, #2825).
-    return create_app(
+    app = create_app(
         lifespan=lifespan,
         # Build the opt-in uploaded-logs store in the SERVE path too (previously only the direct/test
         # path passed store_settings, so `serve` never wired it): the ASVS 5.2.4 retention runner above
@@ -10734,3 +10736,15 @@ def create_managed_app(
         phi_read_hop_secure=phi_read_hop_secure,
         configured_log_level=configured_log_level,
     )
+    if auth_settings is None and not allow_no_auth:
+        # Vault BACKLOG #2731 item 1: no settings means no service attaches, so this app fails closed.
+        # Said here, once create_app has accepted the build, and not in create_app, which every
+        # managed app calls with auth=None before the lifespan attaches a service.
+        _log.warning(
+            "create_managed_app: built with no auth_settings and without allow_no_auth, so no "
+            "service attaches and the permission-gated routes are refused (%s). auth_settings "
+            "attaches sign-in; allow_no_auth=True instead answers those routes to any caller as the "
+            "full-access system identity",
+            AUTH_NOT_CONFIGURED,
+        )
+    return app
