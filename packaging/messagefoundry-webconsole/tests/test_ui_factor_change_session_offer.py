@@ -45,7 +45,7 @@ OFFER = f'action="{REVOKE_OTHERS}"'
 
 async def _service(engine: Engine) -> AuthService:
     # MFA off, so a fresh login is not diverted to enrolment, and the two human-timing floors off,
-    # so the suite can drive a ceremony at machine speed (the test_webui.py shape, BACKLOG #2301).
+    # so the suite can drive a ceremony at machine speed (the _webui_support.py shape, BACKLOG #2301).
     service = AuthService(
         engine.store,
         AuthSettings(

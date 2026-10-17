@@ -235,6 +235,44 @@ def test_a_blank_acr_request_is_not_sent() -> None:
     assert _acr_param(" phr  phrh ") == ["phr phrh"]  # the control: a real request still goes
 
 
+# --- BACKLOG #3221: the prompt request, by the acr_values rule ------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "loaded"),
+    [("   ", None), ("\t\n", None), (" login  consent ", "login consent"), (None, None)],
+)
+def test_the_prompt_request_is_normalised(raw: str | None, loaded: str | None) -> None:
+    """A whitespace-only prompt names no value, so it loads as None and is never sent."""
+    assert _oidc(oidc_prompt=raw).oidc_prompt == loaded
+
+
+def _prompt_param(prompt: str | None, *, step_up: bool = False) -> list[str] | None:
+    url = oidc.build_authorization_url(
+        authorization_endpoint="https://idp.test.invalid/authorize",
+        client_id="mefor-console",
+        redirect_uri="https://ops.test.invalid/ui/oidc/callback",
+        state="st",
+        nonce="no",
+        code_challenge="ch",
+        scopes=["openid", "profile"],
+        max_age=43200,
+        prompt=prompt,
+        step_up=step_up,
+    )
+    return urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get("prompt")
+
+
+def test_a_blank_prompt_request_is_not_sent() -> None:
+    assert _prompt_param("   ") is None
+    assert _prompt_param(None) is None
+    assert _prompt_param(" login  consent ") == ["login consent"]  # the control
+    # A blank prompt is no prompt, so a step-up takes it and sends its own.
+    assert _prompt_param(" ", step_up=True) == ["login"]
+    with pytest.raises(ValueError, match="sends prompt=login"):
+        _prompt_param("consent", step_up=True)
+
+
 # --- the check note no longer overclaims -----------------------------------------------------------
 
 

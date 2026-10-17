@@ -80,7 +80,7 @@ _COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 _BASELINE: dict[str, int] = {
     "packaging/messagefoundry-webconsole/tests/test_ui_csp_canary.py": 1,
     "packaging/messagefoundry-webconsole/tests/test_ui_mfa_gate.py": 1,
-    "packaging/messagefoundry-webconsole/tests/test_webui.py": 1,
+    "packaging/messagefoundry-webconsole/tests/test_webui_oidc.py": 1,
     "tests/test_adaptive_attributes_doc_drift.py": 1,
     "tests/test_adr0071_fused_callables_sqlserver.py": 1,
     "tests/test_ai_provenance_claims.py": 1,
