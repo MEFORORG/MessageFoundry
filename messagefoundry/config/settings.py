@@ -104,7 +104,11 @@ from messagefoundry.controlchars import has_control_char, has_lone_surrogate
 from messagefoundry.domainshape import domain_shape_problem, is_canonical_ipv4
 from messagefoundry.logging_setup import LOG_LEVELS
 from messagefoundry.redaction import json_loads_or_refusal
-from messagefoundry.remotedebug import RemoteDebugPosture, remote_debug_loosening
+from messagefoundry.remotedebug import (
+    REMOTE_DEBUG_ACCEPTANCE_LOOSENING,
+    RemoteDebugPosture,
+    remote_debug_loosening,
+)
 from messagefoundry.service_status import is_safe_service_name
 from messagefoundry.serviceenv import ServiceEnvPosture, service_env_loosenings
 from messagefoundry.startupcode import StartupPosture, startup_loosenings
@@ -6648,6 +6652,14 @@ class SecuritySettings(_Section):
     # audit row, and a security_loosenings() entry. DIRECT-READ by the serve lifespan, not desugared.
     allow_over_granted_store_principal: bool = False
 
+    # ── Interpreter remote debugging (PEP 768, vault BACKLOG #2700) ──
+    # The named acceptance that lifts the refusal `serve` and `supervise` make under enforcement =
+    # enforce when the interpreter's remote debugging is enabled in their process (owner ruling
+    # 2026-10-16; messagefoundry/remotedebug.py remote_debug_refusal). For the developer loop.
+    # Default FALSE. Setting it TRUE is a LOOSENING and security_loosenings() names it. DIRECT-READ
+    # by the start gates.
+    allow_remote_debugging: bool = False
+
     # ── Backend credentials (ASVS 13.2.1, BACKLOG #1182) ─────────────
     # OPT-IN REFUSAL of every backend hop that presents an unchanging credential or none. Default
     # FALSE by owner decision (2026-09-23): "Opt-in, off". When TRUE, `serve` refuses to start while
@@ -9356,6 +9368,8 @@ def security_loosenings(
                 "preflight would otherwise raise is acknowledged away",
             )
         )
+    if sec.allow_remote_debugging:
+        out.append(REMOTE_DEBUG_ACCEPTANCE_LOOSENING)  # vault BACKLOG #2700
     # BACKLOG #1182: while the opt-in static-credential refusal is ON, each per-hop opt-out is a
     # deliberate departure from it, so the opt-outs are the loosening. With the refusal OFF (the shipped
     # default, owner decision 2026-09-23) nothing is refused and an opt-out is inert, so it is not

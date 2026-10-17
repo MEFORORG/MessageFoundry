@@ -23,7 +23,8 @@ export function preflightArgs(): string[] {
 
 /**
  * The command the pill's Start action runs. Deliberately identical to the command ADR 0110 shipped for the
- * clipboard — `python -m messagefoundry serve --config <configDir>` — with NO `--db`/`--env`/`--port`
+ * clipboard — `python -X disable-remote-debug -m messagefoundry serve --config <configDir>`, the option
+ * added for vault BACKLOG #2700 — with NO `--db`/`--env`/`--port`
  * overrides: the service TOML is the authority on which store, which environment and which port this engine
  * is (ADR 0110 rejected a `messagefoundry.engineEnv` setting for exactly this reason). The only change from
  * "copy" to "run" is that `python` is the resolved workspace interpreter, not whatever the user's terminal
@@ -38,7 +39,9 @@ export function buildServeInvocation(opts: {
 }): { command: string; args: string[] } {
   return {
     command: opts.python,
-    args: ["-m", "messagefoundry", "serve", "--config", opts.configDir],
+    // Vault BACKLOG #2700: under the default enforce, serve refuses to start with the
+    // interpreter's remote debugging on.
+    args: ["-X", "disable-remote-debug", "-m", "messagefoundry", "serve", "--config", opts.configDir],
   };
 }
 

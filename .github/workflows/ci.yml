@@ -3685,7 +3685,9 @@ jobs:
           rig_pw="$(python -c 'import secrets; print(secrets.token_hex(24))')"
           echo "::add-mask::$rig_pw"
           MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" python -m harness.load.rigadmin provision --db ./load-ci.db
-          python -m messagefoundry serve --config harness/config/load --env dev --db ./load-ci.db \
+          # Vault BACKLOG #2700: this leg runs under `enforce`, which refuses a start with the
+          # interpreter's remote debugging on. Start the interpreter as the service does.
+          python -I -X disable-remote-debug -m messagefoundry serve --config harness/config/load --env dev --db ./load-ci.db \
             --host 127.0.0.1 --port 8765 > engine.log 2>&1 &
           engine_pid=$!
           # The certificate is minted during startup, so a miss on the first turns is ordinary --
