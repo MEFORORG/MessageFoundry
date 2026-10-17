@@ -337,6 +337,15 @@ _LOGIN_ADDRESS_KEY_MAX = 256
 # One ``login_new_ip`` notice per account and address per this many seconds, in each engine process
 # (see ``_login_new_ip_notice_due``). The audit row is not debounced.
 _LOGIN_NEW_IP_NOTICE_SECONDS = 900.0
+# The one row an administrator's password or MFA reset leaves in the account's known-address record
+# (vault BACKLOG #2946). It is the baseline for an account that has never stamped ``last_login_at``,
+# so the next sign-in after the reset is judged NEW rather than failed open as no-baseline. It is
+# never a match: it is stamped at the epoch, outside every lookback, and the first real write's prune
+# removes it. A space keeps it apart from any address text.
+_LOGIN_ADDRESS_RESET_MARKER = "cleared by reset"
+# Larger than any ``last_seen`` the record can hold, so a prune with it deletes every row. Finite,
+# because SQL Server's FLOAT cannot hold an infinity.
+_LOGIN_ADDRESS_FOREVER = 1e18
 
 
 class _LoginAddress(Enum):
@@ -9515,7 +9524,8 @@ class AuthService:
         ``last_login_at`` and no row of any age. Both are needed. A first sign-in finished through
         factor enrolment writes a row but never stamps ``last_login_at``, so an account that did that
         and then sat idle past the lookback still has a baseline, and its next sign-in is judged
-        rather than failed open. That case costs the one extra read, outside the lookback.
+        rather than failed open. That case costs the one extra read, outside the lookback. The row
+        :meth:`_clear_login_addresses` leaves after a reset is such a baseline, and never a match.
 
         A failed read fails open as ``UNEVALUATED_READ_FAILED``. The exception classes differ per
         store backend (sqlite3, asyncpg, pyodbc), none of which ``auth/`` may import, so the catch
@@ -9630,6 +9640,33 @@ class AuthService:
             # sign-in disables the record's only retention, and must not read as a passing warning.
             _log.exception(
                 "could not prune old known sign-in addresses; the address itself was recorded"
+            )
+
+    async def _clear_login_addresses(self, user_id: str) -> None:
+        """Empty the account's known-address record after an administrator's password or MFA reset
+        (vault BACKLOG #2946, owner ruling 2026-10-16), so an address learned before the reset, by
+        the holder or by whoever the reset shuts out, reads NEW at the next sign-in. Revoking every
+        session does not call this, because revoking is routine.
+
+        It leaves one row, ``_LOGIN_ADDRESS_RESET_MARKER``, stamped at the epoch so the lookback
+        read never returns it. An account that never stamped ``last_login_at`` would otherwise read
+        as having no baseline, and its next sign-in would fail open as ``UNEVALUATED_NO_BASELINE``
+        rather than be judged NEW. Only the prune after a later write removes the marker, and that
+        write has just added a real row. Every reset leaves it, an account that never signed in
+        included, as the ruling asks.
+
+        Best-effort and never raising, for the reason :meth:`_mark_login_address_known` gives: the
+        reset has committed, and its reply carries the one-time credential. A failure is logged at
+        ERROR, and the reset stands with the record as the failure left it."""
+        try:
+            await self._store.forget_login_addresses(user_id, before=_LOGIN_ADDRESS_FOREVER)
+            # Stamped at the epoch, so the lookback read never returns it and only the any-age
+            # baseline read sees it.
+            await self._store.remember_login_address(user_id, _LOGIN_ADDRESS_RESET_MARKER, now=0.0)
+        except Exception:
+            _log.exception(
+                "could not clear the known sign-in addresses after a reset; the reset stands, and "
+                "the next sign-in may read an address seen before it as known, or find no baseline"
             )
 
     def _login_new_ip_notice_due(self, user_id: str, client: str | None) -> bool:
@@ -10847,6 +10884,7 @@ class AuthService:
                 ),
             )
         await self._store.revoke_user_sessions(user_id)
+        await self._clear_login_addresses(user_id)
         await self._audit(
             "auth.mfa_reset",
             actor=actor,
@@ -11879,6 +11917,7 @@ class AuthService:
             password_generated=True,
         )
         await self._store.revoke_user_sessions(user_id)  # invalidate any live sessions on reset
+        await self._clear_login_addresses(user_id)
         await self._audit(
             "auth.password_reset",
             actor=actor,

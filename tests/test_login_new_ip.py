@@ -1165,3 +1165,100 @@ async def test_a_programming_error_in_the_record_does_not_lose_the_enrolment_rep
         assert any(r.exc_info and r.exc_info[0] is fault for r in caplog.records)
     finally:
         await store.close()
+
+
+@pytest.mark.parametrize("client", ["10.1.1.1", service_module._LOGIN_ADDRESS_RESET_MARKER])
+@pytest.mark.parametrize("reset", ["admin_reset_password", "admin_reset_mfa"])
+async def test_an_admin_reset_clears_the_known_address_record(reset: str, client: str) -> None:
+    """vault BACKLOG #2946, owner ruling 2026-10-16: a password or MFA reset empties the record, so
+    the next sign-in from an address seen before the reset is challenged as NEW. The reset leaves
+    only its marker row, and a client whose text names the marker is not known either."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, _FakeNotifier())
+        uid = await _operator(service)
+        assert (await service.login("oper", PW, client="10.1.1.1")).ok
+        assert "10.1.1.1" in await store.list_known_login_addresses(uid, since=0.0)
+        issued = await getattr(service, reset)(uid, actor="boss")
+        assert issued is not None
+        assert await store.list_known_login_addresses(uid, since=0.0) == [
+            service_module._LOGIN_ADDRESS_RESET_MARKER
+        ]
+        out = await service.login("oper", issued.password, client=client)
+        assert out.ok and not await _seeded(store, out.token)
+        assert len(await store.list_audit(actor="oper", action="auth.login_new_ip")) == 1
+    finally:
+        await store.close()
+
+
+async def test_revoke_all_keeps_the_known_address_record() -> None:
+    """Revoking every session is routine, so it clears nothing (owner ruling 2026-10-16)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, _FakeNotifier())
+        uid = await _operator(service)
+        assert (await service.login("oper", PW, client="10.1.1.1")).ok
+        assert await service.revoke_sessions_for_user(uid, actor="boss") >= 1
+        out = await service.login("oper", PW, client="10.1.1.1")
+        assert out.ok and await _seeded(store, out.token)
+        assert await store.list_audit(actor="oper", action="auth.login_new_ip") == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("reset", ["admin_reset_password", "admin_reset_mfa"])
+async def test_a_cleared_account_with_no_last_login_is_judged_new_not_no_baseline(
+    reset: str,
+) -> None:
+    """An account whose record came only from an enrolment never stamped ``last_login_at``. Emptied
+    and left at that, its next sign-in would fail open as ``no_baseline``. The reset's marker row
+    keeps a baseline, so the old address is judged NEW (vault BACKLOG #2946)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, _FakeNotifier())
+        uid = await _operator(service)
+        await store.remember_login_address(uid, "10.1.1.1", now=time.time())
+        user = await store.get_user(uid)
+        assert user is not None and user.last_login_at is None
+        issued = await getattr(service, reset)(uid, actor="boss")
+        assert issued is not None
+        out = await service.login("oper", issued.password, client="10.1.1.1")
+        assert out.ok
+        assert len(await store.list_audit(actor="oper", action="auth.login_new_ip")) == 1
+        assert await store.list_audit(actor="oper", action="auth.login_address_unevaluated") == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("reset", ["admin_reset_password", "admin_reset_mfa"])
+@pytest.mark.parametrize("method", ["forget_login_addresses", "remember_login_address"])
+async def test_a_failed_clear_logs_and_does_not_refuse_the_reset(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    reset: str,
+    method: str,
+) -> None:
+    """A failed clear is logged at ERROR, and the reset still returns its credential and audits
+    (owner ruling 2026-10-16)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, _FakeNotifier())
+        uid = await _operator(service)
+        assert (await service.login("oper", PW, client="10.1.1.1")).ok
+
+        async def _broken(*_a: object, **_kw: object) -> None:
+            raise OSError("synthetic store fault")
+
+        monkeypatch.setattr(store, method, _broken)
+        with caplog.at_level(logging.ERROR, logger=service_module._log.name):
+            issued = await getattr(service, reset)(uid, actor="boss")
+        assert issued is not None and issued.password
+        assert any(
+            r.levelno == logging.ERROR
+            and "could not clear the known sign-in addresses" in r.getMessage()
+            for r in caplog.records
+        )
+        action = "auth.password_reset" if reset == "admin_reset_password" else "auth.mfa_reset"
+        assert len(await store.list_audit(action=action)) == 1
+    finally:
+        await store.close()
