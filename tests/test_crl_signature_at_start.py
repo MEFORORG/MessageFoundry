@@ -694,7 +694,7 @@ def test_a_name_that_differs_only_in_white_space_is_unlisted_though_openssl_matc
         hop = twins.hop("new")
     (line,) = _warnings(caplog)
     words = _UNCONFIRMED_SIGNATURE["unlisted"]
-    assert words in line and "white space included" in words
+    assert words in line and "white space exactly" in words
     with pytest.raises(ssl.SSLError, match="CRL signature failure"):
         _handshake(hop, twins.server(sends_renewed=False))
 

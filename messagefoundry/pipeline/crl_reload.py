@@ -836,6 +836,10 @@ def _pending() -> tuple[dict[str, _Change], list[ReloadOutcome]]:
         except Exception as exc:
             _failed(key, exc)
             continue
+        if verdict is None:
+            # The file was judged, so a failure on it has ended: the first-sight clear reads
+            # this record as "not judged", and the same failure later is a new streak.
+            _FAILED.pop(key, None)
         if isinstance(verdict, ReloadRefusal):
             # A verdict the reload treats as final is not judged again, so the count is taken
             # here: the contexts that do not hold the refused bytes.
@@ -1000,7 +1004,8 @@ class CrlReloadRunner:
         self._node = node
         # Per path key, the refusal already alerted. A pass returns a refused outcome every
         # minute, so this is what spaces the alert to its reminders. It is also the set of
-        # alerts this runner has open. Touched only on the event loop.
+        # alerts this runner has open, and of the clears for an earlier run it still owes, which
+        # carry no refusal (:meth:_clear_on_first_sight). Touched only on the event loop.
         self._alerted: dict[str, _Alerted] = {}
         # The sink calls now failing, as (what, path key): one WARNING per failing streak of each,
         # not one a pass.
@@ -1084,15 +1089,17 @@ class CrlReloadRunner:
             # with the running loop, and off the loop that write is dropped without an error.
             self._guarded("report", functools.partial(self._report, outcomes))
             # After the report, so a refusal this pass recorded counts as standing.
-            self._guarded("first-sight clear", self._clear_on_first_sight)
+            if isinstance(outcomes, list):  # a pass that raised is no evidence about any file
+                self._guarded("first-sight clear", self._clear_on_first_sight)
 
     def _clear_on_first_sight(self) -> None:
         """Resolve, once per held file, an alert a process that died before this one left open.
 
         For each CRL file a hop holds that this runner has not judged yet, with no refusal
         standing and no alert of this runner's open: raise ``crl_reload_applied`` for its subject.
-        Every context was built from the file as it is, and the pass found nothing to refuse, so a
-        refusal alert left open under this subject is false. A copy from a CA bundle is left out,
+        Every context was built from the file as it is, and the pass read the file and found
+        nothing to refuse, so a refusal alert left open under this subject is false. A file the pass
+        could not read or failed on is no evidence, so it waits for a pass that judged it. A copy from a CA bundle is left out,
         as the pass leaves it out (:func:`_held_by_path`): no refusal is ever raised for one. A
         clear the sink refuses stays open, so the next pass or the stop tries it again.
 
@@ -1101,7 +1108,11 @@ class CrlReloadRunner:
         unseen = {
             held.path_key: held.file_path
             for _ctx, held in held_contexts()
-            if not held.ca_bundle and held.path_key not in self._seen_held
+            if not held.ca_bundle
+            and held.path_key not in self._seen_held
+            # Only a file this pass judged: one it could not read, or failed on, is no evidence.
+            and held.path_key not in _UNREADABLE
+            and held.path_key not in _FAILED
         }
         if not unseen:
             return
@@ -1130,7 +1141,7 @@ class CrlReloadRunner:
             seen = f"{type(exc).__name__}: {exc}"
             if self._report_failing.get(step) != seen:
                 self._report_failing[step] = seen
-                log.exception("crl_reload: reporting a pass failed; will retry next interval")
+                log.exception("crl_reload: the %s step failed; will retry next interval", step)
             return
         self._report_failing.pop(step, None)
 

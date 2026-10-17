@@ -554,8 +554,9 @@ def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bo
             # two together.
             unlisted = unlisted or (
                 f"{signature.where}: the engine matched it to no CA certificate this hop lists "
-                "(it compares the issuer name exactly but for the case of ASCII letters, white "
-                "space included, and then the CRL's authority key identifier, where it carries one)"
+                "(it compares the issuer name with the case of ASCII letters folded, as OpenSSL "
+                "does, and white space exactly, and then the CRL's authority key identifier, "
+                "where it carries one)"
             )
         elif signature.state != "verified":
             return (
@@ -601,7 +602,9 @@ def _akid_fit(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool
         for name in akid.authority_cert_issuer or ()
         if isinstance(name, x509.DirectoryName)
     ]
-    # By the name test the issuer match uses, for OpenSSL compares this name the same way.
+    # By the name test the issuer match uses, since OpenSSL compares this name by the same
+    # canonical form. OpenSSL reads only the first directory name here; any one counts here,
+    # as it did before vault BACKLOG #3543.
     fits = not names or _issuer_name_key(ca.issuer) in {_issuer_name_key(n) for n in names}
     return names_key if fits else None
 

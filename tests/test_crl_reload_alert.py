@@ -561,16 +561,17 @@ async def test_a_report_that_raises_does_not_end_the_loop(
         reads.append(1)
         raise RuntimeError("the record could not be read")
 
-    monkeypatch.setattr(crl_reload, "reload_refusals", broken_record)
     with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.crl_reload"):
         runner.start()
         try:
-            await until(lambda: len(reads) >= 3, "three reports that raised")
-            assert runner._task is not None and not runner._task.done(), "the loop lives on"
+            # Its own context, so leaving it undoes this patch alone and not the fixture's.
+            with monkeypatch.context() as patched:
+                patched.setattr(crl_reload, "reload_refusals", broken_record)
+                await until(lambda: len(reads) >= 3, "three reports that raised")
+                assert runner._task is not None and not runner._task.done(), "the loop lives on"
         finally:
-            monkeypatch.undo()
             await runner.stop()
-    logged = [r for r in caplog.records if "reporting a pass failed" in r.getMessage()]
+    logged = [r for r in caplog.records if "step failed" in r.getMessage()]
     assert len(logged) == 1, "once per failing streak, not once a pass"
     assert bool(passes) is not idle, "the control: which branch reported"
 
@@ -1091,6 +1092,33 @@ async def test_a_first_sight_clear_the_sink_refuses_is_retried(
     assert sink.kinds() == ["applied"], "retried, then sent once, and the file judged once"
     failures = [r for r in caplog.records if "could not be resolved" in r.getMessage()]
     assert len(failures) == 1, "one WARNING for the streak"
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_the_first_sight_clear_waits_for_a_pass_that_judged_the_file(
+    pki: _Pki, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only on evidence, as every other clear: a pass that failed on the file, or could not
+    read it, says nothing about whether a refusal would stand, so it clears nothing."""
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    runner = _runner(sink)
+
+    def boom(*_args: object) -> None:
+        raise RuntimeError("the triage failed")
+
+    def unreadable(_path: str) -> tuple[int, int, int]:
+        raise PermissionError(13, "Permission denied")
+
+    for name, broken in (("_triage", boom), ("_stamp", unreadable)):
+        with monkeypatch.context() as patched:
+            patched.setattr(crl_reload, name, broken)
+            assert _pass(runner) == []
+            runner._clear_on_first_sight()
+            assert sink.events == [], f"no clear while {name} fails"
+    _pass(runner)
+    runner._clear_on_first_sight()
+    assert sink.kinds() == ["applied"], "the control: a pass that judged it clears"
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 

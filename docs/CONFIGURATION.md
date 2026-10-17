@@ -1967,7 +1967,9 @@ stands. Neither acknowledging the alert nor resolving it by hand stops the remin
 it mutes their pages. While the engine cannot read the file, a
 reminder is still sent for a refusal the engine treats as final, such as `fix_file`. One it judges
 again every pass, such as `wait` or one that carries `start_refuses`, can name a time that has
-passed, so it is not reminded about until the engine can read the file again. The notifier's cooldown still applies while the alert is open: a second
+passed, so it is not reminded about until the engine can read the file again. A read that hangs
+rather than fails, such as on a share that stops answering, holds the whole reload loop, so no
+reminder is sent while it hangs. The notifier's cooldown still applies while the alert is open: a second
 refused version, or a reminder, inside `[alerts].realert_seconds` of the last page updates the open
 alert and does not page again. So a page can name an older class than the alert list shows, until
 the next reminder pages. A cooldown longer than five minutes throttles some reminders. When the

@@ -563,11 +563,12 @@ def _refuse_crl_count(loaded: int, blocks: Sequence[CrlBlock], *, label: str) ->
 _UNCONFIRMED_SIGNATURE = {
     "unlisted": (
         "the engine matched it to no CA certificate this hop lists (it compares the issuer name "
-        "exactly but for the case of ASCII letters, white space included, and then the CRL's "
-        "authority key identifier, where it carries one)"
+        "with the case of ASCII letters folded, as OpenSSL does, and white space exactly, and "
+        "then the CRL's authority key identifier, where it carries one)"
     ),
     "unproven": (
-        "a listed CA has that name and its key does not verify the CRL, but the CRL does not "
+        "a listed CA has that name, ASCII letter case aside, and its key does not "
+        "verify the CRL, but the CRL does not "
         "name that CA's key, so a renewed CA key could explain it"
     ),
     "uncheckable": "the engine cannot check its signature with the listed CA's key",
