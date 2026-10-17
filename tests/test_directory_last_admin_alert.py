@@ -26,6 +26,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.api.security import DIRECTORY_GRANTED_BY
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProbe
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import NO_ENABLED_ADMINISTRATOR_ACTION, AuthService
@@ -34,7 +35,11 @@ from messagefoundry.config.settings import (
     _ALERT_EVENT_TYPES,
     AuthSettings,
 )
-from messagefoundry.pipeline.alerts import LoggingAlertSink, no_enabled_administrator_alert
+from messagefoundry.pipeline.alerts import (
+    LoggingAlertSink,
+    administrator_granted_alert,
+    no_enabled_administrator_alert,
+)
 from messagefoundry.store.store import MessageStore
 
 ADMINS = "cn=mf-admins,dc=test,dc=invalid"
@@ -75,10 +80,12 @@ class _FakeLdap:
 
 
 class _Rig:
-    def __init__(self, store: MessageStore) -> None:
+    def __init__(self, store: MessageStore, **overrides: Any) -> None:
         self.store = store
         self.ldap = _FakeLdap()
         self.alerts: list[tuple[str, str]] = []
+        #: What the vault BACKLOG #3141 grant callable was handed, ``(username, via)``.
+        self.grants: list[tuple[str, str]] = []
         settings = AuthSettings(
             ad_enabled=True,
             ad_server="ldaps://dc.test.invalid",
@@ -86,12 +93,14 @@ class _Rig:
             ad_bind_dn="CN=svc-mefor,OU=Service,DC=test,DC=invalid",
             ad_bind_password="synthetic",
             ad_session_recheck_seconds=60,
+            **overrides,
         )
         self.service = AuthService(
             store,
             settings,
             ldap=self.ldap,  # type: ignore[arg-type]
             admin_loss_alert=lambda username, via: self.alerts.append((username, via)),
+            admin_grant_alert=lambda username, via: self.grants.append((username, via)),
         )
 
     async def start(self) -> None:
@@ -322,3 +331,155 @@ async def test_a_loss_after_a_regrant_is_not_held_back_by_the_cooldown() -> None
     losses = [e["connection"] for e in transport.events if e["type"] == "no_enabled_administrator"]
     assert losses.count("user:jdoe") == 2
     assert losses.count("user:asmith") == 1
+
+
+# --- vault BACKLOG #3141: a reconcile pass that newly grants Administrator pages ----------------
+#
+# The reconciler's role re-diff can give an account Administrator. It raised only
+# ad_session_revoked, and the account's next sign-in then found the role already written and
+# gained nothing, so no administrator_granted ever fired. The pass now raises it right after the
+# role write, judged on the roles read through the account's seal at apply time.
+
+#: The ``via`` a reconcile pass's grant reports.
+RECONCILE_VIA = "directory_reconcile"
+
+
+async def test_a_reconcile_pass_that_newly_grants_administrator_pages_once(rig: _Rig) -> None:
+    """RED before #3141: the pass raised no grant, and the next sign-in gains nothing."""
+    rig.ldap.present["jdoe"] = _principal("jdoe", OPERATORS)
+    await rig.sign_in("jdoe")
+
+    await rig.directory_change("jdoe", ADMINS, via="ad-reconcile")
+
+    assert await rig.roles("jdoe") == [Role.ADMINISTRATOR.value]
+    assert rig.grants == [("jdoe", RECONCILE_VIA)]
+    assert rig.alerts == []
+    # The pass after it finds nothing to change, so it pages nothing more.
+    assert (await rig.service.reconcile_directory_sessions()).revocations == ()
+    assert rig.grants == [("jdoe", RECONCILE_VIA)]
+
+
+async def test_a_reconcile_change_to_an_account_that_held_administrator_is_quiet(
+    rig: _Rig,
+) -> None:
+    """Negative control: Administrator held before the write, so nothing was granted."""
+    rig.ldap.present["jdoe"] = _principal("jdoe", ADMINS)
+    await rig.sign_in("jdoe")
+
+    await rig.directory_change("jdoe", ADMINS, OPERATORS, via="ad-reconcile")
+
+    assert sorted(await rig.roles("jdoe")) == sorted(
+        [Role.ADMINISTRATOR.value, Role.OPERATOR.value]
+    )
+    assert rig.grants == []
+
+
+async def test_a_reconcile_gain_of_another_role_only_is_quiet(rig: _Rig) -> None:
+    """Negative control: a role was gained, but not Administrator."""
+    rig.ldap.present["jdoe"] = _principal("jdoe")
+    await rig.sign_in("jdoe")
+
+    await rig.directory_change("jdoe", OPERATORS, via="ad-reconcile")
+
+    assert await rig.roles("jdoe") == [Role.OPERATOR.value]
+    assert rig.grants == []
+
+
+async def test_the_grant_is_judged_on_the_roles_read_at_apply_time_not_the_plans(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sign-in that lands between the pass's read and its write has already written
+    Administrator, and paged for it. The write then adds nothing, so the pass must not page again.
+    RED when the before-set is taken from the plan, which read the roles before that sign-in."""
+    rig.ldap.present["jdoe"] = _principal("jdoe", OPERATORS)
+    await rig.sign_in("jdoe")
+    rig.ldap.present["jdoe"] = _principal("jdoe", ADMINS)
+    real = rig.service._apply_reconcile_revocation
+
+    async def a_sign_in_lands_first(revocation: Any) -> bool:
+        await rig.store.set_user_roles(
+            revocation.user_id, [Role.ADMINISTRATOR.value], assigned_by="ad-sync"
+        )
+        return await real(revocation)
+
+    monkeypatch.setattr(rig.service, "_apply_reconcile_revocation", a_sign_in_lands_first)
+
+    plan = await rig.service.reconcile_directory_sessions()
+
+    assert [(r.username, r.reason) for r in plan.revocations] == [("jdoe", "roles_changed")]
+    assert rig.grants == []
+
+
+async def test_a_pass_the_breaker_aborts_grants_nothing_and_pages_nothing() -> None:
+    """An aborted pass writes no roles, so there is no grant to page (ADR 0079 mechanism 2)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        # One revocation of one probed account trips a breaker this tight.
+        rig = _Rig(store, ad_session_revoke_max=0, ad_session_revoke_max_fraction=0.01)
+        await rig.start()
+        rig.ldap.present["jdoe"] = _principal("jdoe", OPERATORS)
+        await rig.sign_in("jdoe")
+        rig.ldap.present["jdoe"] = _principal("jdoe", ADMINS)
+
+        plan = await rig.service.reconcile_directory_sessions()
+
+        assert plan.aborted == "mass_revoke_breaker"
+        assert await rig.roles("jdoe") == [Role.OPERATOR.value]
+        assert rig.grants == []
+    finally:
+        await store.close()
+
+
+async def test_a_raising_grant_callable_still_ends_the_sessions(rig: _Rig) -> None:
+    """Only the production wrapper promises not to raise, so the service contains a raise: the
+    session revocation after the role write still runs."""
+
+    def raising(username: str, via: str) -> None:
+        raise RuntimeError("synthetic: the alert path is down")
+
+    rig.service._admin_grant_alert = raising
+    rig.ldap.present["jdoe"] = _principal("jdoe", OPERATORS)
+    await rig.sign_in("jdoe")
+
+    await rig.directory_change("jdoe", ADMINS, via="ad-reconcile")
+
+    assert await rig.roles("jdoe") == [Role.ADMINISTRATOR.value]
+    actions = [r["action"] for r in await rig.store.list_audit()]
+    assert "auth.ad_session_revoked" in actions
+
+
+def test_the_grant_callable_keys_on_the_account_and_never_raises() -> None:
+    raised: list[tuple[str, str, str]] = []
+
+    class _Sink(LoggingAlertSink):
+        def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
+            raised.append((name, via, granted_by))
+
+    administrator_granted_alert(_Sink(), granted_by=DIRECTORY_GRANTED_BY)("jdoe", RECONCILE_VIA)
+    assert raised == [("user:jdoe", RECONCILE_VIA, DIRECTORY_GRANTED_BY)]
+
+    class _Broken(LoggingAlertSink):
+        def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
+            raise RuntimeError("synthetic: the sink is down")
+
+    administrator_granted_alert(_Broken(), granted_by=DIRECTORY_GRANTED_BY)("jdoe", RECONCILE_VIA)
+
+
+async def test_a_loss_after_a_reconciler_regrant_is_not_held_back_by_the_cooldown() -> None:
+    """The #3229 cooldown pop, through the reconciler's own grant callable: the second loss is
+    sent."""
+    from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+    from tests.test_alert_sinks import _drain, _RecordingTransport
+
+    transport = _RecordingTransport("webhook")
+    sink = NotifierAlertSink([transport])  # the default cooldown, far longer than this test
+    lose = no_enabled_administrator_alert(sink)
+    regrant = administrator_granted_alert(sink, granted_by=DIRECTORY_GRANTED_BY)
+
+    lose("jdoe", "ad-reconcile")
+    regrant("jdoe", RECONCILE_VIA)
+    lose("jdoe", "ad-reconcile")
+    await _drain(sink)
+
+    losses = [e["connection"] for e in transport.events if e["type"] == "no_enabled_administrator"]
+    assert losses.count("user:jdoe") == 2

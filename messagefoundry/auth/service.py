@@ -2356,6 +2356,7 @@ class AuthService:
         hop_posture: HopPosture | None = None,
         integrity_alert: Callable[[str], None] | None = None,
         admin_loss_alert: Callable[[str, str], None] | None = None,
+        admin_grant_alert: Callable[[str, str], None] | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
@@ -2365,6 +2366,9 @@ class AuthService:
         # Vault BACKLOG #3229: called with (username, via) when a directory-driven role change leaves
         # no enabled Administrator. Injected by the API lifespan, as above. None logs only.
         self._admin_loss_alert = admin_loss_alert
+        # Vault BACKLOG #3141: called with (username, via) when a reconcile pass's role write newly
+        # gives an account Administrator. Injected by the API lifespan, as above. None logs only.
+        self._admin_grant_alert = admin_grant_alert
         # Session token-hash prefix -> monotonic time its seal failure was last reported, so one
         # bad row presented on every request writes one audit row and one alert per interval.
         self._seal_failures_reported = SealFailureThrottle()
@@ -7332,6 +7336,12 @@ class AuthService:
             await self._report_directory_admin_loss(
                 user, before=user.role_ids, after=revocation.role_ids, via="ad-reconcile"
             )
+            # Vault BACKLOG #3141. The gain side, from the same sealed read and at the same point,
+            # so a later step's failure cannot lose the page. The next sign-in finds the role
+            # already written and gains nothing, so this pass is the only chance to raise it.
+            self._report_directory_admin_grant(
+                user, before=user.role_ids, after=revocation.role_ids
+            )
         revoked = await self._store.revoke_user_sessions(revocation.user_id)
         await self._audit(
             "auth.ad_session_revoked",
@@ -7397,6 +7407,32 @@ class AuthService:
                 detail={"reason": revocation.reason, "source": "directory"},
             )
         return True
+
+    def _report_directory_admin_grant(
+        self, user: UserRecord, *, before: Iterable[str], after: Iterable[str]
+    ) -> None:
+        """Raise ``administrator_granted`` when a reconcile pass's role write newly gave ``user``
+        the Administrator role (vault BACKLOG #3141).
+
+        The sign-in rule (vault BACKLOG #2610): only a role this write ADDED pages, so an account
+        that already held Administrator raises nothing. ``before`` is the account's roles as read
+        through its seal just before the write, never the plan's, which can be a pass old. Only an
+        applied revocation reaches here, and only a pass that did not abort applies one. The alert
+        pops the account's ``no_enabled_administrator`` cooldown in the sink, which is intended:
+        a later loss of the role pages again.
+
+        Never raises, a defect in the callable included: it runs between the role write and the
+        session revocation, and a raise would skip the revocation (see
+        :meth:`_report_directory_admin_loss`)."""
+        admin = Role.ADMINISTRATOR.value
+        if admin in set(before) or admin not in set(after):
+            return
+        _log.warning("a directory reconcile pass gave an account the Administrator role")
+        if self._admin_grant_alert is not None:
+            try:
+                self._admin_grant_alert(user.username, "directory_reconcile")
+            except Exception:  # noqa: BLE001 -- logged with its traceback; see the docstring
+                _log.exception("the administrator_granted alert callable raised")
 
     async def _report_directory_admin_loss(
         self,

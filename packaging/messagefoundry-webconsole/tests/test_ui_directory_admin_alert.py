@@ -105,6 +105,13 @@ async def _service(engine: Engine, *, held: Role | None, bind: bool) -> AuthServ
     return service
 
 
+async def _jdoe_holds_administrator(engine: Engine) -> bool:
+    """Whether the role write landed: a refused-after-sync test proves nothing without it."""
+    jdoe = await engine.store.get_user_by_username("jdoe")
+    assert jdoe is not None
+    return Role.ADMINISTRATOR.value in await engine.store.get_user_role_ids(jdoe.id)
+
+
 def _client(engine: Engine, service: AuthService, sink: _Sink) -> httpx.AsyncClient:
     app = create_app(engine, auth=service, serve_ui=True, public_origin="https://ops.example")
     app.state.notifier = sink
@@ -208,6 +215,7 @@ async def test_ui_sso_refused_after_the_role_write_still_raises_the_alert(
     page."""
     sink = await _sso(engine, monkeypatch, held=Role.OPERATOR, bind_lands_mid_login=True)
     assert sink.events == [_grant("directory_sign_in_sso")]
+    assert await _jdoe_holds_administrator(engine)
 
 
 async def test_ui_oidc_that_newly_grants_administrator_raises_one_alert(
@@ -231,3 +239,4 @@ async def test_ui_oidc_refused_after_the_role_write_still_raises_the_alert(
     failed, and a later sign-in gains nothing, so this refusal is the one chance to page."""
     sink = await _oidc(engine, monkeypatch, held=None, bind_lands_mid_login=True)
     assert sink.events == [_grant("directory_sign_in_oidc")]
+    assert await _jdoe_holds_administrator(engine)

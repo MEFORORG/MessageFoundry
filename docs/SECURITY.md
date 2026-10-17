@@ -2402,7 +2402,7 @@ What the engine does instead is make the cheap routes loud. It refuses none of t
 | Signal | When | Where it goes |
 |---|---|---|
 | `approval.approver_provenance` audit row and `approval_approver_provenance` alert | A release goes ahead and the approver's account was created, had its password changed, or enrolled TOTP **after** the request was made. A resolution of an `interrupted` release does the same for the resolver's account (BACKLOG #2125) | Audit row against the approver or resolver, with their `client` address (ADR 0150). Its `act` field is `release` or `resolve`. Alert keyed `approval:<id>` for a release and `approval:<id>:resolve` for a resolution, carrying the changed facts only |
-| `administrator_granted` alert | `POST /users` creates an account with the Administrator role, `PUT /users/{id}/roles` adds it, `PUT /ad-group-map` newly maps a group to it, or a directory sign-in's role sync newly gives an account the role (vault BACKLOG #2610) | Alert keyed `user:<username>` or `ad-group:<group>`, naming the granting administrator, or `<directory>` for a directory sign-in |
+| `administrator_granted` alert | `POST /users` creates an account with the Administrator role, `PUT /users/{id}/roles` adds it, `PUT /ad-group-map` newly maps a group to it, or a directory sign-in's role sync or a directory reconcile pass newly gives an account the role (vault BACKLOG #2610, #3141) | Alert keyed `user:<username>` or `ad-group:<group>`, naming the granting administrator, or `<directory>` for a directory sign-in or reconcile pass |
 | `client` on the `user.created` audit row | An account created through `POST /users` or `POST /users/directory` (BACKLOG #2021) | The creating administrator's address, like the approval rows |
 | `account_created` notice | An account created through `POST /users` or `POST /users/directory`, neither of which creates one without a notification address (BACKLOG #2018, #2021) | The new account's own notification address |
 
@@ -2425,15 +2425,16 @@ with no page.
   `account_created` notice.
 - **A directory grant.** An account can get Administrator because the *directory* added it to a
   group already mapped to Administrator. The engine sees that grant in one of the two places below,
-  whichever comes first. A sign-in that sees it first raises `administrator_granted`, unless that
-  sign-in fails with a server error after the role write; the retry then gains nothing. A reconciler
-  pass that sees it first raises `ad_session_revoked`, which does not name the role. The later
-  sign-in then gains nothing, so it raises no `administrator_granted`. An account that never signs
-  in again and holds no live session raises nothing. So watch membership of the mapped group in the
-  directory itself.
+  whichever comes first. Either one raises `administrator_granted`, unless a sign-in that sees it
+  first fails with a server error after the role write; the retry then gains nothing. An account
+  that never signs in again and holds no live session raises nothing. So watch membership of the
+  mapped group in the directory itself.
   **CORRECTED 2026-10-01:** this read "raises no alert. The engine never sees that grant."
   **CORRECTED 2026-10-06:** this read "raises no `administrator_granted` alert", and the sign-in
   case below read "It raises no alert." Vault BACKLOG #2610 added the sign-in alert.
+  **CORRECTED 2026-10-16:** this read "A reconciler pass that sees it first raises
+  `ad_session_revoked`, which does not name the role. The later sign-in then gains nothing, so it
+  raises no `administrator_granted`." Vault BACKLOG #3141 added the reconciler's alert.
   - **At the account's next sign-in.** The engine writes an `auth.ad_roles_resynced` audit row
     with the old and new roles. It also sends a best-effort roles-changed notice to that
     account's own notification address, when the account has one and security notices are set
@@ -2447,8 +2448,12 @@ with no page.
     [directory reconciler](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2)
     that completes stores the new roles and revokes the session. It writes
     `auth.ad_session_revoked` with the new roles, sends the same notice, and raises
-    `ad_session_revoked` with reason `roles_changed`. The next sign-in then writes no
-    `auth.ad_roles_resynced` row. That section lists when a pass revokes or alerts nothing.
+    `ad_session_revoked` with reason `roles_changed`. Right after the role write it raises
+    `administrator_granted`, keyed `user:<username>`, with `granted_by` set to `<directory>` and
+    `via` set to `directory_reconcile`. That alert clears the account's `no_enabled_administrator`
+    cooldown, as a sign-in's does. An account that already held Administrator raises nothing. The
+    next sign-in then writes no `auth.ad_roles_resynced` row and raises no second
+    `administrator_granted`. That section lists when a pass revokes or alerts nothing.
     No pass runs at `[auth].ad_session_recheck_seconds = 0`. A pass probes at most
     `ad_session_recheck_max_users` accounts (200 by default), least recently probed first. When more
     directory accounts than that hold live sessions, an account can wait several passes.

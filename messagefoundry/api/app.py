@@ -220,6 +220,7 @@ from messagefoundry.api.outlive import OutlivingOperations
 from messagefoundry.api.paging import page_total
 from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
+    DIRECTORY_GRANTED_BY,
     AuthenticatedBeforeBodyRoute,
     ExportStopped,
     alert_sink_for,
@@ -399,6 +400,7 @@ from messagefoundry.pipeline.alert_sinks import EmailTransport, notifier_from_se
 from messagefoundry.pipeline.alerts import (
     AlertSink,
     LoggingAlertSink,
+    administrator_granted_alert,
     authority_seal_alert,
     no_enabled_administrator_alert,
     store_cipher_refusal_forwarder,
@@ -10360,6 +10362,11 @@ def create_managed_app(
                     # Vault BACKLOG #3229: a directory role change that leaves no enabled
                     # Administrator is applied, and raises no_enabled_administrator here.
                     admin_loss_alert=no_enabled_administrator_alert(notifier or LoggingAlertSink()),
+                    # Vault BACKLOG #3141: a reconcile pass that newly grants Administrator raises
+                    # administrator_granted here, as a directory sign-in does in its route.
+                    admin_grant_alert=administrator_granted_alert(
+                        notifier or LoggingAlertSink(), granted_by=DIRECTORY_GRANTED_BY
+                    ),
                 )
                 # Started only once the service is built, so a constructor refusal starts no task.
                 if security_notifier is not None:
