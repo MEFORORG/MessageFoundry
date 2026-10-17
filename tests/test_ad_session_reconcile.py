@@ -3896,7 +3896,8 @@ async def _absent_pass_with_sessions_gone_first(
     monkeypatch: pytest.MonkeyPatch,
     *,
     other_reconciler_row: bool,
-    planted: Literal["before_pass", "before_pass_fast_clock", "during_listing"] | None = None,
+    planted: Literal["before_pass", "before_pass_fast_clock", "before_listing", "during_listing"]
+    | None = None,
 ) -> tuple[reconcile.ReconcilePlan, list[dict[str, Any]], list[str], list[Any]]:
     """Run one pass over ``jdoe``, now absent, whose sessions end between the plan and the apply.
 
@@ -3904,8 +3905,9 @@ async def _absent_pass_with_sessions_gone_first(
     own ``auth.ad_session_revoked`` row first. Without it the user signed out mid-pass, and no
     other pass revoked anything. ``planted`` writes one more matching row: a minute before the pass
     starts; before the pass starts but stamped 30 seconds ahead, as another engine whose clock runs
-    fast would stamp it; or while the pass lists the account's sessions. Returns the plan, the revoked rows, the
-    notices and the ``ad_session_revoked`` alerts."""
+    fast would stamp it; after the pass starts but before it lists the account's sessions; or
+    while it lists them. Returns the plan, the revoked rows, the notices and the
+    ``ad_session_revoked`` alerts."""
     store = await MessageStore.open(":memory:")
     try:
         ldap = _FakeLdap({"jdoe": _principal("jdoe")})
@@ -3938,6 +3940,15 @@ async def _absent_pass_with_sessions_gone_first(
             await store.record_audit(
                 "auth.ad_session_revoked", actor="jdoe", detail=absent_row, now=time.time() + 30
             )
+        elif planted == "before_listing":
+            real_load = service._load_users
+
+            async def row_after_loading() -> Any:
+                loaded = await real_load()
+                await store.record_audit("auth.ad_session_revoked", actor="jdoe", detail=absent_row)
+                return loaded
+
+            monkeypatch.setattr(service, "_load_users", row_after_loading)
         elif planted == "during_listing":
             real_list = store.list_sessions
             written: list[bool] = []
@@ -4020,6 +4031,21 @@ async def test_a_row_from_before_the_pass_stamped_by_a_fast_clock_does_not_silen
     so the revocation reports. A window on ``ts`` read from this engine's clock went quiet here."""
     plan, rows, notices, alerts = await _absent_pass_with_sessions_gone_first(
         monkeypatch, other_reconciler_row=False, planted="before_pass_fast_clock"
+    )
+    assert [r.reason for r in plan.revocations] == ["directory_absent"]
+    assert [r["sessions"] for r in rows] == [0, 1]
+    assert notices == [DIRECTORY_SESSIONS_ENDED]
+    assert len(alerts) == 1
+
+
+async def test_a_row_written_after_the_pass_started_but_before_the_listing_does_not_silence_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The window is per account. A matching row written after the pass started, but before it
+    listed the account's sessions, came before the session that listing saw, so it is not a repeat
+    of this revocation. The revocation reports. A watermark read once per pass went quiet here."""
+    plan, rows, notices, alerts = await _absent_pass_with_sessions_gone_first(
+        monkeypatch, other_reconciler_row=False, planted="before_listing"
     )
     assert [r.reason for r in plan.revocations] == ["directory_absent"]
     assert [r["sessions"] for r in rows] == [0, 1]
@@ -4247,7 +4273,7 @@ async def test_a_defect_reading_earlier_revocations_still_writes_the_row_and_rep
         async def broken(**kwargs: Any) -> list[Any]:
             if kwargs.get("action") == "auth.ad_session_revoked" and "actor" in kwargs:
                 if defect == "KeyError":
-                    return [{"id": 7}]  # no "detail" column
+                    return [{"id": 10**9}]  # above any watermark, with no "detail" column
                 if defect == "TypeError":
                     return [("positional",)]  # a row that cannot be indexed by name
                 raise NotImplementedError("synthetic: backend bug")
