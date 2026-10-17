@@ -180,7 +180,7 @@ def test_validate_config_reports_an_unexpected_toml_loader_failure_as_a_diagnost
     """BACKLOG #1653 step 2: whatever the TOML loader fails to wrap becomes a diagnostic.
 
     ``validate_config``'s contract is to return ALL problems and raise none; the ``*.py`` arm cannot
-    break it (``_exec_module`` wraps whatever a module raises) but the TOML arm could, and an escape
+    break it (``_exec_module`` converts whatever a module raises) but the TOML arm could, and an escape
     took the other diagnostics with it. Monkeypatched rather than driven through a real bad file so
     the test pins the ARM, not whichever loader gap happens to be open today.
     """
@@ -200,7 +200,11 @@ def test_validate_config_reports_an_unexpected_toml_loader_failure_as_a_diagnost
     (d / "feed.py").write_text("raise RuntimeError('module fell over too')\n", encoding="utf-8")
     messages = [x.message for x in validate_config(d)]
     assert len(messages) == 2, f"a prior diagnostic was lost: {messages!r}"
-    assert any("module fell over too" in m for m in messages), "the *.py diagnostic did not survive"
+    # The *.py diagnostic names the module and the exception type, never its text (vault BACKLOG
+    # #3249), so it is found by the file name rather than by the message the module raised.
+    py_diag = [m for m in messages if "config module feed.py" in m]
+    assert len(py_diag) == 1, "the *.py diagnostic did not survive"
+    assert "RuntimeError" in py_diag[0] and "module fell over too" not in py_diag[0]
     unexpected = [m for m in messages if "unexpected RuntimeError" in m]
     assert len(unexpected) == 1 and "loader fell over" in unexpected[0]
 
