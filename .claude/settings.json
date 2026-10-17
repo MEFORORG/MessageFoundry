@@ -114,34 +114,13 @@
               "-NoProfile",
               "-NonInteractive",
               "-File",
-              "${CLAUDE_PROJECT_DIR}/scripts/hooks/block-api-burn.ps1"
-            ],
-            "timeout": 15,
-            "statusMessage": "Checking for GitHub API polling"
-          },
-          {
-            "type": "command",
-            "command": "pwsh",
-            "args": [
-              "-NoProfile",
-              "-NonInteractive",
-              "-File",
+              "${CLAUDE_PROJECT_DIR}/scripts/hooks/shell-guard-dispatch.ps1",
+              "${CLAUDE_PROJECT_DIR}/scripts/hooks/block-blanket-git-stage.ps1",
+              "${CLAUDE_PROJECT_DIR}/scripts/hooks/block-api-burn.ps1",
               "${CLAUDE_PROJECT_DIR}/scripts/hooks/block-unbounded-fs-scan.ps1"
             ],
-            "timeout": 15,
-            "statusMessage": "Checking for an unbounded filesystem scan"
-          },
-          {
-            "type": "command",
-            "command": "pwsh",
-            "args": [
-              "-NoProfile",
-              "-NonInteractive",
-              "-File",
-              "${CLAUDE_PROJECT_DIR}/scripts/hooks/block-blanket-git-stage.ps1"
-            ],
-            "timeout": 15,
-            "statusMessage": "Checking for a blanket git stage"
+            "timeout": 45,
+            "statusMessage": "Checking for a blanket git stage, GitHub API polling, or an unbounded filesystem scan"
           }
         ]
       }
