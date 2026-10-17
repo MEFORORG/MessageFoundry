@@ -5774,11 +5774,14 @@ What each control leaves open, what counts as expected start-up code, which entr
 start reports and how to clear each are stated once, in
 [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#interpreter_not_isolated-startup_code_unexpected-and-startup_directory_writable-what-runs-in-the-interpreter-before-the-engine-does).
 
-**The engine's Python children are not isolated.** The sandbox worker and each engine shard start
-with `-P -X disable-remote-debug`, and the engine hands them the `PYTHON*` variables it holds,
-by name (`messagefoundry/childenv.py`). So a `PYTHONPATH` in the service's environment that the
-engine ignores would still reach an engine shard. The engine reports that case as
-`python_variables_reach_children`, and its inventory searches the entries a child would inherit.
+**The engine's Python children repeat its isolation.** The sandbox worker and each engine shard
+start with `-P -X disable-remote-debug`, after the engine's own `-I`, or its `-E` and `-s`
+(`messagefoundry/childenv.py`, vault BACKLOG #2701). Under the shipped service launch they are
+isolated, so a `PYTHONPATH` in the service's environment reaches neither the engine nor a child.
+An engine that reads the `PYTHON*` variables, such as `messagefoundry serve` from a prompt, hands
+its children the same variables by name, and the absolute `PYTHONPATH` entries it imports from
+itself. That is a stated limit: a child gets no `PYTHONPATH` entry its parent lacks, so the
+start-up code inventory searches the engine's own import path and covers the children's with it.
 
 ### HIPAA §164.312 alignment
 

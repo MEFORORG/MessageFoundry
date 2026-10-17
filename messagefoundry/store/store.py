@@ -85,6 +85,7 @@ from uuid import uuid4
 
 import aiosqlite
 
+from messagefoundry.childenv import system_tool_environment
 from messagefoundry.config.models import RetryPolicy
 
 # The captured-reply record lives in the (store-free) config layer so a sandbox worker child — which
@@ -5185,6 +5186,7 @@ def _secure_file(path: Path) -> None:
             result = subprocess.run(  # nosec B603 B607
                 [_system_exe("icacls.exe"), str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
                 check=False,
+                env=system_tool_environment(),  # the platform's start-up names only (#2716)
                 capture_output=True,
                 text=True,
                 # icacls echoes the path in the OEM code page. Neither the cp1252 locale default nor
@@ -5222,6 +5224,7 @@ def _grant_read(path: Path, principal: str) -> None:
         result = subprocess.run(  # nosec B603 B607
             [_system_exe("icacls.exe"), str(path), "/grant", f"{principal}:(R)"],
             check=False,
+            env=system_tool_environment(),  # the platform's start-up names only (#2716)
             capture_output=True,
             text=True,
             encoding="oem",  # icacls's piped output; see _secure_file for why "replace"

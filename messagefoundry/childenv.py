@@ -5,8 +5,13 @@
 A process started with no ``env=`` gets a copy of its parent's whole environment. The engine's own
 environment holds its secrets by design: the store key, the store password and every ``env()``
 connection secret arrive as ``MEFOR_*`` variables. So each spawn site names what its child gets,
-through one of the three builders here, and ``tests/test_child_process_environment.py`` fails a
+through one of the four builders here, and ``tests/test_child_process_environment.py`` fails a
 process start whose environment does not come from one of them.
+
+* :func:`system_tool_environment` is the platform's start-up names and **nothing else**, for a
+  fixed operating-system tool the engine runs by its absolute path, such as ``icacls`` or ``sc``
+  (vault BACKLOG #2716). Such a tool reads no engine setting, so it gets no ``MEFOR_*`` variable,
+  no interpreter variable and nothing an operator added.
 
 * :func:`worker_environment` is an **allowlist**, for a child that runs code the engine does not
   fully trust (the sandbox worker). It carries what the platform and the interpreter need to start,
@@ -46,9 +51,11 @@ __all__ = [
     "ENGINE_SECRETS_OUTSIDE_THE_PREFIX",
     "engine_environment",
     "hook_environment",
+    "inherited_interpreter_flags",
     "outside_engine_namespace",
     "python_child_argv",
     "python_module_argv",
+    "system_tool_environment",
     "worker_environment",
 ]
 
@@ -65,6 +72,7 @@ ENGINE_ENV_PREFIX: Final = "MEFOR_"
 #: ``-X disable-remote-debug`` starts the child with the interpreter's remote debugging disabled.
 #: The option is spelled with hyphens; the interpreter accepts and ignores other spellings, which is
 #: why ``tests/test_child_process_environment.py`` reads the result off a real child.
+#: :func:`inherited_interpreter_flags` adds the parent's own isolation ahead of these.
 CHILD_INTERPRETER_FLAGS: Final = ("-P", "-X", "disable-remote-debug")
 
 #: The script a Python child is started through. Its docstring says where it puts this package on
@@ -183,11 +191,14 @@ def _key(name: str) -> str:
     return name.upper() if sys.platform == "win32" else name
 
 
+def _platform_names() -> frozenset[str]:
+    """What this platform needs to start a process, read at call time as :func:`_key` is."""
+    return _WINDOWS_NAMES if sys.platform == "win32" else _POSIX_NAMES
+
+
 def _allowed_for_a_worker(name: str, extra_names: Collection[str]) -> bool:
     key = _key(name)
-    if key in extra_names or key in _INTERPRETER_NAMES:
-        return True
-    return key in (_WINDOWS_NAMES if sys.platform == "win32" else _POSIX_NAMES)
+    return key in extra_names or key in _INTERPRETER_NAMES or key in _platform_names()
 
 
 def outside_engine_namespace(name: str) -> bool:
@@ -200,20 +211,59 @@ def outside_engine_namespace(name: str) -> bool:
     )
 
 
-def _flags(extra_flags: Sequence[str]) -> list[str]:
-    """``extra_flags`` ahead of :data:`CHILD_INTERPRETER_FLAGS`."""
+def inherited_interpreter_flags() -> tuple[str, ...]:
+    """The isolation options this interpreter was started with, which each Python child repeats.
+
+    ``-I`` when this process is isolated. Otherwise ``-E`` when it ignores the ``PYTHON*``
+    variables, and ``-s`` when its user site directory is off (vault BACKLOG #2701, #2724). **A
+    child honours ``PYTHONPATH`` and the other interpreter variables exactly when its parent
+    does.** Two behaviours a child that ignores the variables would otherwise lose ride along:
+    ``-B`` when this process writes no bytecode, and ``-u`` when ``PYTHONUNBUFFERED`` is set. The
+    container image sets that variable for the children of an engine it starts with ``-I``. Both shipped service launches pass ``-I``, so the engine's children there are isolated
+    too, and a ``PYTHON*`` variable in the service's environment reaches neither. A parent that
+    reads the variables, such as a developer's ``messagefoundry serve`` from a prompt, hands its
+    children the absolute ``PYTHONPATH`` entries it imports from itself. That is a stated limit: it
+    gives a child no ``PYTHONPATH`` entry its parent lacks. The bootstrap still adds the folder
+    above this package, as :data:`_BOOTSTRAP` says.
+
+    Repeated rather than forced, so a sandbox worker imports the way ``[sandbox].mode = "off"``
+    does in the engine process. ``-I`` would also drop the user site directory, which a parent
+    that is not isolated may be reading."""
+    flags = sys.flags
+    out: list[str] = []
+    if flags.isolated:
+        out.append("-I")
+    else:
+        out += ["-E"] if flags.ignore_environment else []
+        out += ["-s"] if flags.no_user_site else []
+    out += ["-B"] if flags.dont_write_bytecode else []
+    ignores_variables = flags.isolated or flags.ignore_environment
+    out += ["-u"] if ignores_variables and os.environ.get("PYTHONUNBUFFERED") else []
+    return tuple(out)
+
+
+def _flags(extra_flags: Sequence[str], inherit: bool) -> list[str]:
+    """``extra_flags``, then :func:`inherited_interpreter_flags` not already among them when
+    ``inherit``, then :data:`CHILD_INTERPRETER_FLAGS`."""
     if isinstance(extra_flags, str):
         # A bare string is a sequence of its characters, so "-E" would arrive as "-" and "E".
         raise TypeError("extra_flags takes a sequence of options, not one string")
-    return [*extra_flags, *CHILD_INTERPRETER_FLAGS]
+    own = inherited_interpreter_flags() if inherit else ()
+    inherited = [flag for flag in own if flag not in extra_flags]
+    return [*extra_flags, *inherited, *CHILD_INTERPRETER_FLAGS]
 
 
 def python_child_argv(
-    module: str, *, executable: str | None = None, extra_flags: Sequence[str] = ()
+    module: str,
+    *,
+    executable: str | None = None,
+    extra_flags: Sequence[str] = (),
+    inherit: bool = True,
 ) -> list[str]:
     """The command line that runs ``module`` in a child interpreter, as ``python -m`` would.
 
-    Two differences from ``python -m``. The child starts with :data:`CHILD_INTERPRETER_FLAGS`.
+    Two differences from ``python -m``. The child starts with :data:`CHILD_INTERPRETER_FLAGS`,
+    after this interpreter's own isolation (:func:`inherited_interpreter_flags`).
     And it starts through :data:`_BOOTSTRAP`, which hands it the package location. A script start
     does not search the working directory, which is where ``python -m`` found the package in a
     source checkout that is not installed. Pass the result of :func:`worker_environment` or
@@ -221,15 +271,22 @@ def python_child_argv(
     working directory on the child's import path.
 
     ``extra_flags`` go ahead of the shared flags, for one caller's own options. The tray's login
-    command passes ``-E`` this way (vault BACKLOG #2852).
+    command passes ``-E`` this way (vault BACKLOG #2852). ``inherit=False`` leaves this process's
+    own isolation out, for a command line that is stored and run later by someone else, such as
+    the tray's login command.
     """
-    return [executable or sys.executable, *_flags(extra_flags), _BOOTSTRAP, module]
+    return [executable or sys.executable, *_flags(extra_flags, inherit), _BOOTSTRAP, module]
 
 
 def python_module_argv(
-    module: str, *, executable: str | None = None, extra_flags: Sequence[str] = ()
+    module: str,
+    *,
+    executable: str | None = None,
+    extra_flags: Sequence[str] = (),
+    inherit: bool = True,
 ) -> list[str]:
-    """``python -m module`` with :data:`CHILD_INTERPRETER_FLAGS`, and no bootstrap.
+    """``python -m module`` with :data:`CHILD_INTERPRETER_FLAGS`, after this interpreter's own
+    isolation (:func:`inherited_interpreter_flags`), and no bootstrap.
 
     Shorter than :func:`python_child_argv`, and only for a package the interpreter can import on
     its own, from site-packages or a ``.pth`` entry. ``-P`` drops the working directory from a
@@ -237,9 +294,9 @@ def python_module_argv(
     pins this build either: the first ``messagefoundry`` on the import path answers. The tray's
     login command is the one user. It passes ``-E`` in ``extra_flags``, so an absolute
     ``PYTHONPATH`` entry naming another copy does not answer that start (vault BACKLOG #2852). The
-    tray it relaunches still reads the user's ``PYTHONPATH``, less any empty or relative entry.
+    tray it relaunches repeats that ``-E`` (:func:`inherited_interpreter_flags`).
     """
-    return [executable or sys.executable, *_flags(extra_flags), "-m", module]
+    return [executable or sys.executable, *_flags(extra_flags, inherit), "-m", module]
 
 
 def _without_working_directory_entries(env: dict[str, str]) -> dict[str, str]:
@@ -260,7 +317,10 @@ def _source(environ: Mapping[str, str] | None) -> Mapping[str, str]:
 
 
 def worker_environment(
-    environ: Mapping[str, str] | None = None, *, extra_names: Collection[str] = ()
+    environ: Mapping[str, str] | None = None,
+    *,
+    extra_names: Collection[str] = (),
+    defaults: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """The environment for a Python child that runs code the engine does not fully trust.
 
@@ -272,15 +332,41 @@ def worker_environment(
     decision its parent already made, and the names an operator listed in
     ``[sandbox].pass_environment``. Never a secret: whatever is named here is in the environment of
     the code this builder exists to keep secrets from. Settings load refuses the engine's own.
+
+    ``defaults`` are values for names the result does not already hold, so a value the operator
+    passed through ``extra_names`` wins. They are set here, not on the returned dict, because
+    ``tests/test_child_process_environment.py`` trusts a builder's result only while nothing
+    writes to it (vault BACKLOG #2724). A default in the engine's own namespace is refused, as
+    ``[sandbox].pass_environment`` refuses one: a builder call is all the spawn guard checks.
     """
     if isinstance(extra_names, str):
         # A bare string is a collection of its characters, so no name would cross and nothing
         # would say why.
         raise TypeError("extra_names takes a collection of names, not one string")
     extras = frozenset(_key(name) for name in extra_names)
-    return _without_working_directory_entries(
+    env = _without_working_directory_entries(
         {n: v for n, v in _source(environ).items() if _allowed_for_a_worker(n, extras)}
     )
+    present = {_key(name) for name in env}
+    for name, value in (defaults or {}).items():
+        if not outside_engine_namespace(name):
+            raise ValueError(f"defaults may not name the engine's own variable {name!r}")
+        if _key(name) in _INTERPRETER_NAMES:
+            # The worker's import path is the inherited one, filtered above, and nothing else.
+            raise ValueError(f"defaults may not set the interpreter's variable {name!r}")
+        if _key(name) not in present:
+            env[name] = value
+    return env
+
+
+def system_tool_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The environment for a fixed operating-system tool: the platform's start-up names only.
+
+    For a tool the engine runs by its absolute path, with an argument list and no shell, that
+    reads none of the engine's settings: ``icacls`` and ``sc`` (vault BACKLOG #2716). It gets what
+    the platform needs to start a process and find its temp and profile directories, and nothing
+    else. No interpreter variable crosses, because the tool is not Python."""
+    return {n: v for n, v in _source(environ).items() if _key(n) in _platform_names()}
 
 
 def hook_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:

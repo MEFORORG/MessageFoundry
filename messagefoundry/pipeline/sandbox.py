@@ -202,8 +202,12 @@ def graph_shape(registry: Any) -> GraphShape:
         handlers=frozenset(registry.handlers),
         accepts=frozenset(registry.handler_accepts),
         outbound=frozenset(registry.outbound),
+        code_digest=registry.code_digest,
     )
 
+
+#: How a refusal names a difference in the config modules' bytes alone.
+_CONTENT_DIFFERS: Final = "config module content"
 
 #: How many names a refusal lists per side of one part of the graph.
 _NAMES_SHOWN: Final = 3
@@ -223,7 +227,10 @@ def graph_differences(engine: GraphShape, worker: GraphShape) -> list[str]:
 
     ``bindings`` is compared over the inbounds the ENGINE holds. An engine shard holds only its
     own, while its worker loads the whole config, so the worker's other bindings are not a
-    difference."""
+    difference. ``code_digest`` is compared whenever the engine has one: a config module whose
+    bytes changed on disk since the engine loaded it differs there even when every name is the
+    same (vault BACKLOG #2724). A worker of the same build with no digest could not read its own
+    modules, so that is a difference too, never a pass."""
     found: list[str] = []
     sets = {
         "inbound connections": (engine.inbound, worker.inbound),
@@ -245,6 +252,17 @@ def graph_differences(engine: GraphShape, worker: GraphShape) -> list[str]:
     }
     if rebound:
         found.append(f"router bindings (of inbound: {_shown(rebound)})")
+    # Plain comparison: both are public digests of the config's bytes, so there is nothing to time,
+    # and the constant-time helper would add a crypto operation to this module's inventory.
+    if engine.code_digest is not None and worker.code_digest != engine.code_digest:
+        # The worker's digest is checked as hex by the codec, so it needs no scrub here.
+        worker_side = (
+            worker.code_digest[:12] if worker.code_digest else "none: it could not read them"
+        )
+        found.append(
+            f"{_CONTENT_DIFFERS} (the engine loaded {engine.code_digest[:12]}, the worker loaded "
+            f"{worker_side})"
+        )
     return found
 
 
@@ -624,20 +642,25 @@ class SandboxSession:
         # switch, not a secret, and every spelling of it the parent's check read crosses, so
         # the child's check reads the same variables. The operator's
         # ``[sandbox].pass_environment`` names cross with them.
+        # At most one glibc malloc arena besides the main one, where the worker's memory cap is
+        # RLIMIT_DATA. An arena keeps its peak writable size counted in VmData after its threads
+        # exit, so with one per thread, the threads a Handler starts would spend [sandbox].mem_mb
+        # for the worker's whole life (vault BACKLOG #3133 part 2). Ignored by other allocators. An
+        # operator's own value, named in pass_environment, wins. Passed to the builder rather than
+        # set on its result, which the spawn guard trusts only unwritten (vault BACKLOG #2724).
+        arena = (
+            {"MALLOC_ARENA_MAX": "2"}
+            if self.policy.mem_mb is not None and sys.platform.startswith("linux")
+            else {}
+        )
         env = worker_environment(
             extra_names=(
                 INSECURE_CONFIG_SOURCE_ESCAPE_ENV,
                 *security_enforcement_env_names(),
                 *self.policy.pass_environment,
-            )
+            ),
+            defaults=arena,
         )
-        # At most one glibc malloc arena besides the main one, where the worker's memory cap is
-        # RLIMIT_DATA. An arena keeps its peak writable size counted in VmData after its threads
-        # exit, so with one per thread, the threads a Handler starts would spend [sandbox].mem_mb
-        # for the worker's whole life (vault BACKLOG #3133 part 2). Ignored by other allocators. An
-        # operator's own value, named in pass_environment, wins.
-        if self.policy.mem_mb is not None and sys.platform.startswith("linux"):
-            env.setdefault("MALLOC_ARENA_MAX", "2")
         # Fixed argv (this interpreter + our own worker module), no shell, no
         # untrusted input in the command line — so B603 does not apply. ``start_new_session`` puts the
         # worker in its own POSIX process group so ``_kill`` can ``killpg`` its whole tree; it is a
@@ -727,14 +750,19 @@ class SandboxSession:
                 # FAIL CLOSED. A worker that loaded a different graph would answer for this inbound
                 # from that graph, and nothing in its answers would say so.
                 self._kill(proc)
+                causes = (
+                    "The config files changed on disk since the engine loaded them: reload the "
+                    "config."
+                    if differing == [d for d in differing if d.startswith(_CONTENT_DIFFERS)]
+                    else "Two things cause this. The config files changed on disk since the "
+                    "engine loaded them: reload the config. Or config code reads an environment "
+                    "variable the worker is not given, because the worker loads the config again "
+                    "under an allowlisted environment: name each such variable in "
+                    "[sandbox].pass_environment and restart."
+                )
                 refusal = (
                     f"sandbox worker for inbound {self._inbound!r} was refused: the graph it loaded "
-                    f"differs from the one the engine is serving. {'. '.join(differing)}. Two "
-                    "things cause this. The config files changed on disk since the engine loaded "
-                    "them: reload the config. Or config code reads an environment variable the "
-                    "worker is not given, because the worker loads the config again under an "
-                    "allowlisted environment: name each such variable in "
-                    "[sandbox].pass_environment and restart."
+                    f"differs from the one the engine is serving. {'. '.join(differing)}. {causes}"
                 )
                 self._refused = (engine_graph, refusal)
                 raise SandboxError(refusal)
