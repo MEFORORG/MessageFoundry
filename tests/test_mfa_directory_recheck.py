@@ -400,9 +400,11 @@ async def test_a_directory_account_not_demoted_still_renews(
 async def test_the_role_test_judges_the_roles_read_after_the_lookup(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #3081 item 8. A sign-in that re-synced the roles during the lookup's round trip is
-    judged on what it wrote. RED when the role test compares the roles read before the lookup:
-    those still hold the role the directory took away, so the re-synced account would be refused."""
+    """BACKLOG #3081 item 8: the role test judges the roles of the row read AFTER the lookup. Pinned
+    by a bare role write during the lookup, with no session revocation. That is an instrument, not
+    a production interleaving: every production role writer also revokes the account's sessions.
+    RED when the test compares the roles read before the lookup, which still hold the role the
+    directory took away."""
     e = await _mapped_session(store, monkeypatch, _OPERATORS, _VIEWERS)
     e.directory.principal = replace(_PRINCIPAL, groups=frozenset({_VIEWERS}))
     original = e.service._directory_presence

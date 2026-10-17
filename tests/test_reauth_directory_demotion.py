@@ -18,9 +18,12 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from pathlib import Path
 
+import httpx
 import pytest
 
+from messagefoundry.api import create_app
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import (
@@ -30,7 +33,8 @@ from messagefoundry.auth.service import (
     _DirectoryRebind,
 )
 from messagefoundry.auth.tokens import hash_token
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
+from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
 from tests._fake_directory import RebindDirectory
 
@@ -156,9 +160,11 @@ async def test_a_directory_account_not_demoted_still_steps_up_by_re_bind(
 async def test_the_re_bind_judges_the_roles_read_after_the_bind(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #3081 item 8. A sign-in that re-synced the roles during the bind's round trip is
-    judged on what it wrote. RED when the leg compares the roles it read before the bind: those
-    still hold the role the directory took away, so the re-synced account would be refused."""
+    """BACKLOG #3081 item 8: the leg judges the roles of the row read AFTER the bind, as the other
+    legs do. Pinned by a bare role write during the bind, with no session revocation. That is an
+    instrument, not a production interleaving: every production role writer also revokes the
+    account's sessions. RED when the leg compares the roles it read before the bind, which still
+    hold the role the directory took away."""
     s = await _signed_in(store, _OPERATORS, _VIEWERS)
     s.directory.bound = _principal(_VIEWERS)
     original = s.service._reauth_ad
@@ -173,3 +179,64 @@ async def test_the_re_bind_judges_the_roles_read_after_the_bind(
     elevation = await s.service.reauth(s.identity, _GOOD, token=s.token)
 
     assert elevation.ok and elevation.token is not None
+
+
+async def test_a_row_re_pointed_during_the_bind_is_refused_not_judged(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bind's groups vouch only for the object it was keyed on. A row whose directory object id
+    moved during the round trip is refused as ``directory_identity_conflict``, uncharged, rather
+    than judged on another object's groups. RED when the leg compares the moved row's roles with
+    those groups: here they still grant every role, so it would step up."""
+    s = await _signed_in(store, _OPERATORS, _VIEWERS)
+    original = s.service._reauth_ad
+
+    async def bind_then_repoint(
+        username: str, password: str, *, object_id: str
+    ) -> _DirectoryRebind:
+        rebind = await original(username, password, object_id=object_id)
+        await store._db.execute(
+            "UPDATE users SET directory_object_id = ? WHERE id = ?",
+            ("9c8b7a6f-5e4d-4c3b-8a2f-1e0d9c8b7a6f", s.identity.user_id),
+        )
+        await store._db.commit()
+        return rebind
+
+    monkeypatch.setattr(s.service, "_reauth_ad", bind_then_repoint)
+
+    elevation = await s.service.reauth(s.identity, _GOOD, token=s.token)
+
+    assert not elevation.ok and elevation.token is None and elevation.directory_unconfirmed
+    user = await store.get_user(s.identity.user_id)
+    assert user is not None and user.failed_attempts == 0
+    assert any('"reason": "directory_identity_conflict"' in d for d in await _reauth_reasons(store))
+
+
+async def test_the_reauth_route_answers_a_demoted_account_as_unconfirmed(
+    tmp_path: Path,
+) -> None:
+    """The caller-facing half SECURITY.md states: ``POST /me/reauth`` answers a right password on a
+    demoted account 403 with the directory words, never "re-verification failed". RED when the
+    demotion stops setting ``directory_unconfirmed``."""
+    engine = await Engine.create(
+        tmp_path / "reauth_demoted.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        assert isinstance(engine.store, MessageStore)
+        s = await _signed_in(engine.store, _OPERATORS, _VIEWERS)
+        s.directory.bound = _principal(_VIEWERS)
+        transport = httpx.ASGITransport(
+            app=create_app(engine, auth=s.service), client=("127.0.0.1", 123)
+        )
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            r = await c.post(
+                "/me/reauth",
+                json={"password": _GOOD},
+                headers={"Authorization": f"Bearer {s.token}"},
+            )
+        assert r.status_code == 403
+        assert "directory could not confirm this account" in r.json()["detail"]
+    finally:
+        await engine.stop()
