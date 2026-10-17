@@ -673,7 +673,7 @@ def status(
             ["Allow keeping PHI indefinitely", _sec("allow_keeping_phi_indefinitely")],
             # The per-tier retention acknowledgements (BACKLOG #1967, #2280). The switch above covers
             # the auto-bounded tiers only, so each of these is its own row. A literal list because a
-            # client may not import the engine's classification; test_webui.py pins it to that
+            # client may not import the engine's classification; test_webui_bulk.py pins it to that
             # classification instead, so a tier given a switch there reds until it has a row here.
             [
                 "Allow keeping transform state indefinitely",
