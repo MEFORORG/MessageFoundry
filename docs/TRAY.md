@@ -39,6 +39,11 @@ point already resolves to it. The tray needs no elevation to run (service contro
 elevation per-action — see below). It is Windows-only at runtime; on any other OS `main()` prints a
 friendly note and exits.
 
+**A tray you start by hand may exit at once, with no message**, if your environment sets
+`PYTHONFAULTHANDLER` or `PYTHONDEVMODE`. Both hand starts above run `pythonw.exe` without `-E`.
+Start it once with neither variable set, then turn on **Start at Login**, whose command carries
+`-E`. `docs/DANGEROUS-FUNCTIONALITY.md` section 3 gives the measurement and what it did not cover.
+
 To **start it automatically at login**, use the tray's **Start at Login** menu item (opt-in, off by
 default). It writes an `HKCU\…\Run` entry pinning the absolute `pythonw.exe` you launched with, so it
 keeps resolving after a reboot. The entry carries the interpreter options the engine's own Python

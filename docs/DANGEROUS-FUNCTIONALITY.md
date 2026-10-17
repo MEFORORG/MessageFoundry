@@ -235,8 +235,23 @@ in its place. That holds whether or not the relaunch then works. The process als
 tray itself in at least three cases. Branding is unavailable, the relaunch cannot start, or the
 branded child exits within a short grace window. `_CHILD_STARTUP_GRACE_S` in `tray/branding.py`
 sets that window. **A tray started by hand gets neither the script nor the options, by decision,
-and that limit is open.** The `messagefoundry-tray` command is a launcher the installer writes. It was not
-run to measure this, because it starts a real tray. Its console twin from the same install,
+and that limit is open.**
+
+**A hand start may also exit before any code runs (vault BACKLOG #2914).** It gets no `-E`, so the
+user's `PYTHON*` variables reach it. Started with no standard handles, both a GUI-script launcher
+of the kind pip writes and `pythonw -m`, each running a stand-in for the tray, exited 1 under
+`PYTHONFAULTHANDLER=1` and under `PYTHONDEVMODE=1`, and ran under neither. Measured 2026-10-16 on
+Windows, Python 3.14.7, by `tests/test_tray_hand_start.py`. A start from Explorer or a Start-menu
+shortcut was not measured. `docs/TRAY.md` tells an operator whose tray does not appear to start
+it once with neither variable set and then turn on Start at Login, whose command carries `-E`;
+the menu item is unreachable from a tray that exited. Shipping a hand start that carries `-E`
+was rejected.
+A GUI-script launcher passes no interpreter options: the installer writes its first line from the
+interpreter's path. A second command for the operator to type, `pythonw -E -P -m
+messagefoundry.tray`, would be a hand-written copy of what Start at Login already writes, with
+the same costs, such as dropping `PYTHONHOME`.
+
+The `messagefoundry-tray` command is a launcher the installer writes. Its console twin from the same install,
 `messagefoundry.exe`, has the same form: a small program with the entry-point script archived
 inside it. Run from a working directory holding a decoy `messagefoundry` package,
 `messagefoundry.exe --version` loaded the real package, while `python -m messagefoundry --version`
