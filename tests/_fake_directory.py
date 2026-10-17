@@ -5,6 +5,10 @@
 Shared by ``tests/test_mfa_directory_recheck.py`` (the TOTP leg, BACKLOG #2023) and
 ``tests/test_passkey_directory_recheck.py`` (the passkey leg, BACKLOG #2239), which each carried a
 copy until BACKLOG #3068. All directory data a caller passes in is synthetic.
+
+``DirectoryOf`` confirms several accounts by name. Since BACKLOG #3061 the two enrolment legs ask
+the directory about a directory account too, so a test that enrols one needs a directory that
+says yes.
 """
 
 from __future__ import annotations
@@ -34,3 +38,19 @@ class FakeDirectory:
         if self.answer is DirectoryAnswer.FOUND:
             return DirectoryProbe(DirectoryAnswer.FOUND, self.principal)
         return DirectoryProbe(self.answer)
+
+
+class DirectoryOf:
+    """Answers ``probe_principal`` with the principal registered under the username, as present
+    and enabled, and with an absent answer for any other name. Records every probe."""
+
+    def __init__(self, *principals: AdPrincipal) -> None:
+        self.principals = {p.username: p for p in principals}
+        self.probes: list[tuple[str, str | None]] = []
+
+    def probe_principal(self, username: str, *, object_id: str | None = None) -> DirectoryProbe:
+        self.probes.append((username, object_id))
+        principal = self.principals.get(username)
+        if principal is None:
+            return DirectoryProbe(DirectoryAnswer.NOT_FOUND)
+        return DirectoryProbe(DirectoryAnswer.FOUND, principal)

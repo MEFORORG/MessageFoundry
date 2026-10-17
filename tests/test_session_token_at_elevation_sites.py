@@ -294,9 +294,12 @@ async def test_the_passkey_registration_elevates_the_enrolling_token_in_place() 
     A directory account is never covered, and its Kerberos session mints unstamped, so it is the
     not-yet-satisfied token a registration can still elevate.
     """
+    from tests._fake_directory import DirectoryOf
     from tests.test_mfa_access_gate import _principal
 
     store, service = await _service()
+    # BACKLOG #3061: the enrolment legs ask the directory about a directory account first.
+    service._ldap = DirectoryOf(_principal("adrotate"))  # type: ignore[assignment]
     try:
         await service.initialize()
         out = await service._complete_ad_login(_principal("adrotate"), None, mfa_verified=False)

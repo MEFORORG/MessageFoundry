@@ -43,6 +43,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStore
 from messagefoundry.store.store import WebAuthnCredential
 from tests._admin_account import create_admin, create_local_user_chosen
+from tests._fake_directory import DirectoryOf
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 
@@ -58,10 +59,15 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
     await eng.stop()
 
 
-async def _service(engine: Engine, settings: AuthSettings | None = None) -> AuthService:
+async def _service(
+    engine: Engine, settings: AuthSettings | None = None, *, ldap: DirectoryOf | None = None
+) -> AuthService:
+    """``ldap`` for a test that enrols a directory account: since BACKLOG #3061 the enrolment
+    legs ask the directory first, and with none wired they refuse."""
     service = AuthService(
         engine.store,
         settings or AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False),
+        ldap=ldap,  # type: ignore[arg-type]
     )
     await service.initialize()
     return service
@@ -918,7 +924,7 @@ async def test_a_directory_account_is_still_told_its_password_lives_in_the_direc
     (BACKLOG #1144) is left to the handler too: its 400 changes nothing, so a 403 asking for the
     factor would only spend a code to learn the same answer.
     """
-    service = await _service(engine)
+    service = await _service(engine, ldap=DirectoryOf(_principal("aduser9")))
     if enrolled:
         setup = await service._complete_ad_login(_principal("aduser9"), None, mfa_verified=False)
         assert setup.identity is not None and setup.token is not None
@@ -1067,6 +1073,9 @@ async def test_the_status_and_last_factor_guards_skip_the_directory_floor_the_ga
             login_rate_limit_enabled=False,
             require_mfa_scope="administrators",
             mfa_recovery_code_count=1,  # this test never spends one; fewer argon2 hashes
+        ),
+        ldap=DirectoryOf(
+            _principal("adview"), _principal("adadmin", groups=frozenset({"CN=MF-Admins,DC=x"}))
         ),
     )
     await service.set_ad_group_map([("CN=MF-Admins,DC=x", "administrator")], actor="test")
@@ -1243,7 +1252,7 @@ async def test_a_directory_session_minted_at_the_minimum_is_confined_until_it_en
     enrollment ceremony and satisfy the gate (otherwise the mint is a lockout, not a control). Either
     half alone passes trivially; asserting both is what pins them together.
     """
-    service = await _service(engine)
+    service = await _service(engine, ldap=DirectoryOf(_principal("aduser4")))
     out = await service._complete_ad_login(_principal("aduser4"), None, mfa_verified=False)
     assert out.ok and out.token is not None and out.identity is not None
     async with _client(engine, service) as c:

@@ -159,8 +159,9 @@ _VALID_ROLE_IDS = {role.value for role in Role}
 
 _log = logging.getLogger(__name__)
 
-#: What ``/auth/mfa-verify`` and ``/me/reauth`` say when ``Elevation.directory_unconfirmed`` is set
-#: (BACKLOG #2023, #2027): the directory could not vouch for the account, so the proof was never
+#: What ``/auth/mfa-verify``, ``/me/reauth`` and ``/me/mfa/confirm`` say when
+#: ``Elevation.directory_unconfirmed`` is set (BACKLOG #2023, #2027, #3061): the directory could
+#: not vouch for the account, so the proof was never
 #: checked. It names no directory internals; the precise reason is on the audit row.
 _DIRECTORY_UNCONFIRMED_DETAIL = (
     "the directory could not confirm this account; try again later, or ask an administrator"
@@ -872,7 +873,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         identity: Identity = Depends(require_reauth_only_action(STEP_UP_ACTION_MFA_CONFIRM)),
     ) -> MfaConfirmResponse:
         """Confirm a staged enrollment by proving a live TOTP code; activates MFA and returns the
-        single-use recovery codes (shown **once** — save them). A wrong code is a 400. Gated by a fresh
+        single-use recovery codes (shown **once** — save them). A wrong code is a 400, and a
+        directory account the directory could not confirm a 403 (BACKLOG #3061). Gated by a fresh
         password step-up BOUND to this confirm action (ADR 0077), independent of the enroll grant."""
         # Post-session ceremony (enrolling a factor while signed in): per-ACTOR budget.
         if not service.allow_reauth_attempt(identity.user_id):
@@ -889,6 +891,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         if elevation.token is None:
             if elevation.session_lost:
                 raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session ended; sign in again")
+            if elevation.directory_unconfirmed:
+                # BACKLOG #3061: the code was never checked, so "invalid code" would be false. The
+                # same 403 and words as /auth/mfa-verify's directory refusal.
+                raise HTTPException(status.HTTP_403_FORBIDDEN, _DIRECTORY_UNCONFIRMED_DETAIL)
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid code")
         # The body now carries BOTH the one-time recovery codes and a live session token; the route's
         # CredentialReply model keeps the reply out of every cache (BACKLOG #2372).

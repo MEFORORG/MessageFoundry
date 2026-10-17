@@ -542,6 +542,11 @@ def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> N
     refusal and exempts nothing, and the Lockout asymmetry paragraph says so. The behaviour the rows
     rest on (a directory account's wrong code feeds the lockout, and its lock is checked before the
     lookup) is pinned in ``tests/test_mfa_directory_recheck.py``, not by this AST read.
+
+    Since BACKLOG #3061 the two enrolment legs call the same helper, so a directory account is
+    asked before an enrolment marks its factor. That too only adds a refusal: a confirmed directory
+    account still enrols TOTP or a passkey, which ``tests/test_enrolment_directory_recheck.py``
+    pins. The begin legs still read no provider, and the finish legs read none themselves.
     """
 
     # Since BACKLOG #3068 the one provider branch lives in the shared helper both second-factor legs
@@ -575,6 +580,12 @@ def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> N
         assert not _reads_auth_provider(func), (
             f"{func.__qualname__} now reads auth_provider. The pathway rows say a directory account "
             "can enrol TOTP or a passkey and that its TOTP leg feeds the lockout; re-derive both."
+        )
+    # BACKLOG #3061: the provider branch the finish legs have is the shared helper's, nothing more.
+    for func in (AuthService.confirm_mfa_enrollment, AuthService.finish_webauthn_registration):
+        assert "_directory_vouches_for_factor" in _attrs(func), (
+            f"{func.__qualname__} no longer asks the directory; the TOTP and passkey pathway rows "
+            "say both enrolment legs do (BACKLOG #3061)."
         )
     verify_tree = ast.parse(textwrap.dedent(inspect.getsource(AuthService.verify_mfa)))
     assert any(
@@ -1754,6 +1765,9 @@ _FALLBACK_CITES = frozenset(
         "_login_local",
         "verify_mfa",
         "finish_webauthn_assertion",
+        # BACKLOG #3061: the enrolment sentences of the TOTP and passkey rows.
+        "confirm_mfa_enrollment",
+        "finish_webauthn_registration",
         "_authenticate_kerberos",
         "_complete_ad_login",
         "_unverified_session_owes_factor",
@@ -4394,6 +4408,61 @@ def test_the_thirteenth_sweep_phi_says_built_is_not_on() -> None:
     assert forward_rows, "docs/PHI.md names [logging].forward_* nowhere, so this reads nothing"
     misdirected = [c for c in forward_rows if re.search(r"§11|#11-hardening", c)]
     assert not misdirected, f"docs/PHI.md sends forward_* to section 11 again: {misdirected}"
+
+
+def test_the_enrolment_legs_ask_the_directory_and_the_doc_says_so() -> None:
+    """BACKLOG #3061. The passkey row said registering a passkey marks the factor "and the engine
+    does not ask the directory there", which was true until both enrolment legs gained the check
+    the two second-factor legs share. This pins the calls, refuses the old sentence, and asks the
+    rows and the step-up paragraph for the new citation. The behaviour (refused before the step,
+    the recovery codes, the challenge and the stored passkey, nothing charged) is pinned in
+    ``tests/test_enrolment_directory_recheck.py``, not by this AST read."""
+    for name in ("confirm_mfa_enrollment", "finish_webauthn_registration"):
+        assert _called(_service_func(name), "_directory_vouches_for_factor"), (
+            f"{name} no longer asks the directory; the pathway rows and the step-up section say it "
+            "does (BACKLOG #3061)."
+        )
+    text = " ".join(_doc_text().split())
+    assert "and the engine does not ask the directory there" not in text, (
+        "docs/SECURITY.md says passkey registration does not ask the directory again; it does."
+    )
+    recency = next(
+        (
+            t
+            for t in _tables(_doc_text())
+            if t[0][:2] == ["Leg", "What reaches the engine about strength or recency"]
+        ),
+        None,
+    )
+    assert recency is not None, "docs/SECURITY.md lost the recency-and-strength table"
+    rows = {r[0]: " ".join(r) for r in recency[1:]}
+    for leg, method in (
+        ("**Engine TOTP or recovery code**", "`AuthService.confirm_mfa_enrollment`"),
+        ("**WebAuthn passkey**", "`AuthService.finish_webauthn_registration`"),
+    ):
+        assert leg in rows, f"the recency table lost its {leg} row"
+        assert "BACKLOG #3061" in rows[leg] and method in rows[leg], (
+            f"the {leg} row must cite BACKLOG #3061 and name {method}"
+        )
+    paragraph = next(
+        (
+            " ".join(p.split())
+            for p in re.split(r"\n\s*\n", _doc_text())
+            if p.startswith("**The two enrolment legs ask the same question")
+        ),
+        None,
+    )
+    assert paragraph is not None, "the step-up section lost the enrolment legs' directory paragraph"
+    for token in (
+        "`auth.mfa_failed`",
+        "`auth.webauthn_failed`",
+        "`reason=directory_unconfirmed`",
+        "`phase=enroll`",
+        "mints no recovery codes",
+        "stores no passkey",
+        "ceremony in flight",
+    ):
+        assert token in paragraph, f"the enrolment legs' directory paragraph must name {token}"
 
 
 def test_the_passkey_leg_asks_the_directory_and_the_doc_says_so() -> None:

@@ -10648,7 +10648,14 @@ class AuthService:
 
         **So the login-to-MFA floor covers it too** (BACKLOG #2389): see
         :meth:`_enrolment_too_early`. A confirm that would satisfy a pending session too soon after
-        sign-in is refused as a wrong code, before the code is checked, so no TOTP step is spent."""
+        sign-in is refused as a wrong code, before the code is checked, so no TOTP step is spent.
+
+        **A directory account must be confirmed by the directory first** (BACKLOG #3061), through
+        the same :meth:`_directory_vouches_for_factor` :meth:`verify_mfa` calls, so an account
+        disabled, gone or demoted in the directory cannot clear the MFA gate by enrolling. It asks
+        after the floor and before the code is checked. A refusal returns ``directory_unconfirmed``
+        (or, when the session or account went during the lookup, ``session_lost``), spends no TOTP
+        step, mints no recovery codes, and leaves MFA off with the staged secret in place."""
         arrived_at = time.time()  # the floor's clock, read before any await
         user = await self._load_user(identity.user_id)
         if user is None:
@@ -10664,6 +10671,18 @@ class AuthService:
             token, user, arrived_at, event="auth.mfa_failed", client=client
         ):
             return Elevation()
+        # BACKLOG #3061: a good code below marks the session's factor met, so a DIRECTORY account
+        # must still be in the directory, with its roles, first, as verify_mfa asks (#2023). After
+        # the floor, so a floored confirm costs no lookup; before the code is checked, so a refusal
+        # spends no TOTP step, mints no recovery codes and enables nothing. A local account is not
+        # asked. The secret and its cell stay the ones read above: the enable below is a
+        # compare-and-set on that cell (#3025), so a begin that lands during the lookup still loses.
+        current = await self._directory_vouches_for_factor(
+            token, user, event="auth.mfa_failed", client=client, report_lock=False, phase="enroll"
+        )
+        if isinstance(current, Elevation):
+            return current
+        user = current
         # Verify the enrollment proof under the SAME configured clock-skew window as a login (BACKLOG
         # #187): default 0 = strict current-step only. Enrolling under the same window a login uses
         # avoids the trap of a skewed-clock authenticator that confirms enrollment yet then fails every
@@ -11030,12 +11049,15 @@ class AuthService:
     ) -> bool:
         """Whether a second factor arrived too soon after sign-in, auditing the refusal if so.
 
-        The ASVS 2.4.2 floor on the login-then-MFA pair (BACKLOG #2301). It applies only while the
-        session's factor is PENDING, measured from the session's mint, which is the sign-in. A
-        step-up on a session whose factor is already satisfied is not floored. The caller answers
-        with its leg's ordinary failure, so the refusal says nothing about timing, and nothing is
-        charged: no lockout count, no TOTP step, no recovery code, no passkey challenge. The floor
-        and why it sits where it does: ``[auth].mfa_verify_min_elapsed_seconds``.
+        The ASVS 2.4.2 floor on the login-then-MFA pair (BACKLOG #2301), measured from the session's
+        mint, which is the sign-in. It never applies with the floor at ``0``, or to a session whose
+        factor is already satisfied, so a step-up there is not floored. Those are not the only
+        exemptions: through :meth:`_enrolment_too_early` an enrolment leg also skips it on a session
+        that owes no factor. The caller answers with its leg's ordinary failure, so the refusal says
+        nothing about timing. The caller spends and charges nothing it would have spent past the
+        floor, such as a lockout count, a TOTP step, a recovery code, a passkey challenge, a
+        directory lookup, or on an enrolment leg minted recovery codes or a stored credential. The
+        floor and why it sits where it does: ``[auth].mfa_verify_min_elapsed_seconds``.
 
         Called by :meth:`verify_mfa` and :meth:`finish_webauthn_assertion`, the legs that prove an
         ENROLLED factor, and through :meth:`_enrolment_too_early` by the two enrolment legs,
@@ -11156,6 +11178,7 @@ class AuthService:
         event: str,
         client: str | None,
         report_lock: bool,
+        phase: str | None = None,
     ) -> Elevation | VerifiedUser:
         """The directory check a leg runs before it marks a DIRECTORY account's factor met, with
         the re-read that must follow the lookup. Returns the refusal to hand back, or the account
@@ -11170,34 +11193,47 @@ class AuthService:
         authenticates. A confirmed lookup was a network round trip, so the session, the account
         and its second-step lock are then read again through :meth:`_factor_holder_current`.
 
-        **Calling it from another leg (BACKLOG #3061 names the two enrolment legs).** Pass the
-        caller's session ``token`` and the account it loaded through :meth:`_load_user`; no session
-        object is needed, because the re-read loads it from the token. That suits
-        :meth:`confirm_mfa_enrollment`, which holds an identity and a token but no session. Pass
-        the leg's own failure ``event`` (``auth.mfa_failed`` on the TOTP legs,
+        **Its callers.** :meth:`verify_mfa` and :meth:`finish_webauthn_assertion`, which prove an
+        enrolled factor, and the two enrolment legs, :meth:`confirm_mfa_enrollment` and
+        :meth:`finish_webauthn_registration` (BACKLOG #3061). Each passes its session ``token`` and
+        the account it loaded through :meth:`_load_user`. No session object is needed, because the
+        re-read loads the session from the token; :meth:`confirm_mfa_enrollment` holds no session.
+        Each passes its own failure ``event`` (``auth.mfa_failed`` on the TOTP legs,
         ``auth.webauthn_failed`` on the passkey legs). ``report_lock`` sets ``locked`` on a lock
-        refusal, which only :meth:`verify_mfa` reports. Call it before anything the refusal must
-        not spend (a challenge, a TOTP step, a stored credential), and after the cheap local
-        refusals, so a caller already refused costs no lookup. Note that the re-read refuses a
-        second-step-locked account, and that a caller's own detail fields, such as
-        ``phase=enroll``, are not added to the refusal row."""
+        refusal, which only :meth:`verify_mfa` reports. ``phase``, which the enrolment legs pass as
+        ``enroll`` as their own wrong-proof rows carry it, is added to the ``directory_unconfirmed``
+        and ``session_lost`` rows. It is not added to the lock row, whose detail is the shared
+        constant an exclusion matches exactly (#1131). Call it before anything the refusal must not
+        spend (a challenge, a TOTP step, recovery codes, a stored credential), and after the cheap
+        local refusals, so a caller already refused costs no lookup. Note that the re-read refuses
+        a second-step-locked account."""
         if user.auth_provider != AuthProvider.AD.value:
             return user
         refusal = await self._directory_step_up_refusal(user)
         if refusal is not None:
-            await self._audit(
-                event,
-                actor=user.username,
-                detail=_json({"reason": DIRECTORY_UNCONFIRMED, "outcome": refusal}),
-                client=client,
-            )
+            detail = {"reason": DIRECTORY_UNCONFIRMED, "outcome": refusal}
+            if phase is not None:
+                detail["phase"] = phase
+            await self._audit(event, actor=user.username, detail=_json(detail), client=client)
             return Elevation(directory_unconfirmed=True)
         return await self._factor_holder_current(
-            token, actor=user.username, event=event, client=client, report_lock=report_lock
+            token,
+            actor=user.username,
+            event=event,
+            client=client,
+            report_lock=report_lock,
+            phase=phase,
         )
 
     async def _factor_holder_current(
-        self, token: str, *, actor: str, event: str, client: str | None, report_lock: bool
+        self,
+        token: str,
+        *,
+        actor: str,
+        event: str,
+        client: str | None,
+        report_lock: bool,
+        phase: str | None = None,
     ) -> Elevation | VerifiedUser:
         """Read the session, its account and the second-step lock again, and return the account,
         or the refusal when any of them no longer allows the factor to be marked.
@@ -11211,8 +11247,10 @@ class AuthService:
         with ``reason=session_lost``, filed under ``actor`` (the account name the caller last
         read), because the proof may already be spent. A live second-step lock is audited as
         ``event`` with the shared locked detail, and returns a wrong-proof refusal, with
-        ``locked`` set when ``report_lock`` is. Only revocation is asked of the session, not its
-        expiry; the rotation that follows a factor write refuses an expired one."""
+        ``locked`` set when ``report_lock`` is. ``phase``, when given, is added to the
+        ``session_lost`` row only, for the reason :meth:`_directory_vouches_for_factor` states. Only
+        revocation is asked of the session, not its expiry; the rotation that follows a factor write
+        refuses an expired one."""
         session = await self._load_session(hash_token(token))
         user = (
             None
@@ -11220,9 +11258,10 @@ class AuthService:
             else (await self._load_user(session.user_id))
         )
         if user is None or user.disabled:
-            await self._audit(
-                event, actor=actor, detail=_json({"reason": "session_lost"}), client=client
-            )
+            lost = {"reason": "session_lost"}
+            if phase is not None:
+                lost["phase"] = phase
+            await self._audit(event, actor=actor, detail=_json(lost), client=client)
             return Elevation(session_lost=True)
         if await self._mfa_lock_refused(user, client=client, event=event):
             return Elevation(locked=report_lock)
@@ -11231,9 +11270,10 @@ class AuthService:
     async def _directory_step_up_refusal(self, user: UserRecord) -> str | None:
         """Why the directory cannot vouch for directory account ``user`` before :meth:`verify_mfa`
         renews its step-up window (BACKLOG #2023) or :meth:`finish_webauthn_assertion` marks its
-        factor met (BACKLOG #2239), or ``None`` when it can. Both reach it through
-        :meth:`_directory_vouches_for_factor`, which calls it only for an AD row; a local account is
-        never asked.
+        factor met (BACKLOG #2239), or before :meth:`confirm_mfa_enrollment` or
+        :meth:`finish_webauthn_registration` marks it met on a first enrolment (BACKLOG #3061), or
+        ``None`` when it can. All four reach it through :meth:`_directory_vouches_for_factor`, which
+        calls it only for an AD row; a local account is never asked.
 
         Without this, an account disabled in the directory kept renewing its window with a good code
         until the reconciliation pass revoked its sessions. The engine row's ``disabled`` flag is
@@ -11666,7 +11706,13 @@ class AuthService:
         :meth:`_enrolment_too_early`. A registration that would satisfy a pending session too soon
         after sign-in fails as a failed verification, before the challenge is popped, so the
         ceremony stays in flight. A pending session on an account that already holds a factor never
-        reaches the floor: it is refused first, at any elapsed time, and its ceremony is ended."""
+        reaches the floor: it is refused first, at any elapsed time, and its ceremony is ended.
+
+        **A directory account must be confirmed by the directory first** (BACKLOG #3061), as on
+        :meth:`confirm_mfa_enrollment`. It asks after the floor and before the challenge is popped,
+        so a refusal (``directory_unconfirmed``, or ``session_lost`` when the session or account went
+        during the lookup) verifies no attestation, stores no passkey and leaves the ceremony in
+        flight."""
         arrived_at = time.time()  # the floor's clock, read before any await
         user = await self._load_user(identity.user_id)
         if user is None:
@@ -11700,6 +11746,21 @@ class AuthService:
             token, user, arrived_at, event="auth.webauthn_failed", client=client
         ):
             return Elevation()
+        # BACKLOG #3061: as on confirm_mfa_enrollment, a directory account must still be in the
+        # directory, with its roles, before a new passkey marks its factor met. Before the challenge
+        # is popped, so a refusal leaves the ceremony in flight and stores no credential. A local
+        # account is not asked.
+        current = await self._directory_vouches_for_factor(
+            token,
+            user,
+            event="auth.webauthn_failed",
+            client=client,
+            report_lock=False,
+            phase="enroll",
+        )
+        if isinstance(current, Elevation):
+            return current
+        user = current
         pending = self._webauthn_challenges.pop((hash_token(token), "register"))
         if pending is None or pending.user_id != user.id:
             raise ValueError(self._CEREMONY_EXPIRED)

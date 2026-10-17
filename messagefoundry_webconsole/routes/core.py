@@ -108,10 +108,11 @@ _CLEAR_SITE_DATA_LOGIN_CODES = frozenset({"expired", "loggedout", "pwchanged"})
 #: truncated to a count. The reports are attacker-influenceable, so the log line is bounded.
 _CSP_REPORT_SUMMARY_MAX = 5
 
-#: What the MFA gate and the re-auth form say when ``verify_mfa``, ``reauth`` or
-#: ``finish_webauthn_assertion`` refused a directory account the directory did not confirm (BACKLOG
-#: #2023, #2027, #2239). The code, password or passkey was never checked, so "invalid code",
-#: "incorrect password" or "passkey verification failed" would be false.
+#: What the MFA gate, the re-auth form and the account page's two enrolment finishes say when
+#: ``verify_mfa``, ``reauth``, ``finish_webauthn_assertion``, ``confirm_mfa_enrollment`` or
+#: ``finish_webauthn_registration`` refused a directory account the directory did not confirm
+#: (BACKLOG #2023, #2027, #2239, #3061). The code, password or passkey was never checked, so
+#: "invalid code", "incorrect password" or "passkey verification failed" would be false.
 _DIRECTORY_UNCONFIRMED_ERROR = (
     "The directory could not confirm your account. Try again later, or ask an administrator."
 )

@@ -14,6 +14,9 @@ No test sleeps. The wall clock the service and the store read is held, so no tim
 the sign-in and the early attempt however slow the runner is, and the clock then moves only forward.
 A clock that stepped behind a session's own stamps would end the session.
 
+The last two tests pin what the same two routes say when the service refuses a directory account
+the directory did not confirm (BACKLOG #3061), which is not a floor refusal.
+
 Each test names the mutation that must turn it RED.
 """
 
@@ -35,8 +38,8 @@ from _ui_clients import (
     ui_client,
 )
 
-from messagefoundry.auth.ldap import AdPrincipal
-from messagefoundry.auth.service import TOO_EARLY, AuthService
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProbe
+from messagefoundry.auth.service import TOO_EARLY, AuthService, Elevation
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
@@ -45,8 +48,20 @@ FLOOR = AuthSettings().mfa_verify_min_elapsed_seconds
 assert FLOOR > 0, "the floor ships off, so these tests would test nothing"
 
 
+class _PresentDirectory:
+    """A directory that confirms ``principal`` as present and enabled. Since BACKLOG #3061 the
+    passkey registration asks the directory about a directory account after the floor, so the
+    control half of the passkey test needs one that says yes. Synthetic data only."""
+
+    def __init__(self, principal: AdPrincipal) -> None:
+        self.principal = principal
+
+    def probe_principal(self, username: str, *, object_id: str | None = None) -> DirectoryProbe:
+        return DirectoryProbe(DirectoryAnswer.FOUND, self.principal)
+
+
 async def _floored_service(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, *, ldap: object | None = None
 ) -> tuple[AuthService, list[float]]:
     """A service with the floor at its shipped default and require_mfa on, so a fresh sign-in owes
     its factor, and the held clock it reads. The admin-write pacing floor and the sign-in rate
@@ -56,6 +71,7 @@ async def _floored_service(
     service = AuthService(
         engine.store,
         AuthSettings(admin_write_min_interval_seconds=0, login_rate_limit_enabled=False),
+        ldap=ldap,  # type: ignore[arg-type]
     )
     await service.initialize()
     return service, now
@@ -135,7 +151,6 @@ async def test_a_console_passkey_registration_inside_the_floor_is_a_failed_verif
     from _soft_webauthn import SoftAuthenticator
     from webauthn.helpers import base64url_to_bytes
 
-    service, now = await _floored_service(engine, monkeypatch)
     principal = AdPrincipal(
         username="adfloor",
         display_name=None,
@@ -144,6 +159,7 @@ async def test_a_console_passkey_registration_inside_the_floor_is_a_failed_verif
         groups=frozenset(),
         directory_object_id=str(uuid.uuid5(uuid.NAMESPACE_URL, "adfloor")),
     )
+    service, now = await _floored_service(engine, monkeypatch, ldap=_PresentDirectory(principal))
     out = await service._complete_ad_login(principal, None, mfa_verified=False)
     assert out.ok and out.token is not None and out.identity is not None
     assert not await service.mfa_satisfied(out.token), "the session must owe its factor"
@@ -176,3 +192,76 @@ async def test_a_console_passkey_registration_inside_the_floor_is_a_failed_verif
         served = await c.post("/ui/account/webauthn/verify", json=body, headers=SAME_ORIGIN)
         assert served.status_code == 200 and served.json()["ok"] is True, served.text
     assert len(await service.store.list_webauthn_credentials(out.identity.user_id)) == 1
+
+
+# --- what the two enrolment routes say for a directory refusal (BACKLOG #3061) -----------------
+
+_DIRECTORY_UNCONFIRMED_TEXT = "The directory could not confirm your account."
+
+
+@pytest.mark.parametrize("unconfirmed", [True, False], ids=["directory-refused", "wrong-code"])
+async def test_the_console_totp_confirm_says_the_directory_could_not_confirm_the_account(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, unconfirmed: bool
+) -> None:
+    """``confirm_mfa_enrollment`` asks the directory before it checks a directory account's code,
+    so a refusal never judged the code. The service answer is stubbed; the refusal itself is pinned
+    in tests/test_enrolment_directory_recheck.py.
+
+    RED when: ``/ui/account/mfa/verify`` drops the directory_unconfirmed branch (the refused arm then
+    reads "Invalid code."), or applies it to an ordinary wrong code (the control arm)."""
+    service, _now = await _floored_service(engine, monkeypatch)
+    await provision(service, "op", ["operator"])
+
+    async def _refused(*_args: object, **_kwargs: object) -> Elevation:
+        return Elevation(directory_unconfirmed=unconfirmed)
+
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "op")
+        await mint_bound_proof(c, "/ui/account/mfa/enroll")
+        assert (await c.post("/ui/account/mfa/enroll", headers=SAME_ORIGIN)).status_code == 200
+        await mint_bound_proof(c, "/ui/account/mfa/confirm")
+        monkeypatch.setattr(service, "confirm_mfa_enrollment", _refused)
+        r = await c.post("/ui/account/mfa/verify", data={"code": "123456"}, headers=SAME_ORIGIN)
+    assert r.status_code == 400
+    banner = _banner(r.text)
+    assert banner is not None
+    assert (_DIRECTORY_UNCONFIRMED_TEXT in banner) is unconfirmed
+    assert (banner == "Invalid code.") is not unconfirmed
+
+
+@pytest.mark.parametrize("unconfirmed", [True, False], ids=["directory-refused", "bad-attestation"])
+async def test_the_console_passkey_finish_says_the_directory_could_not_confirm_the_account(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, unconfirmed: bool
+) -> None:
+    """As above, for ``finish_webauthn_registration``. The service answer is stubbed.
+
+    RED when: ``/ui/account/webauthn/verify`` drops the directory_unconfirmed branch (the refused
+    arm then reads "passkey verification failed"), or applies it to an ordinary failed attestation."""
+    principal = AdPrincipal(
+        username="adwords",
+        display_name=None,
+        email=None,
+        dn="CN=adwords,DC=x",
+        groups=frozenset(),
+        directory_object_id=str(uuid.uuid5(uuid.NAMESPACE_URL, "adwords")),
+    )
+    service, _now = await _floored_service(engine, monkeypatch, ldap=_PresentDirectory(principal))
+    out = await service._complete_ad_login(principal, None, mfa_verified=False)
+    assert out.ok and out.token is not None
+    await service.store.mark_session_reauthed(hash_token(out.token))
+
+    async def _refused(*_args: object, **_kwargs: object) -> Elevation:
+        return Elevation(directory_unconfirmed=unconfirmed)
+
+    monkeypatch.setattr(service, "finish_webauthn_registration", _refused)
+    async with ui_client(engine, service, webauthn_rp_from_request=True) as c:
+        c.cookies.set("mf_session", out.token)
+        r = await c.post(
+            "/ui/account/webauthn/verify",
+            json={"label": "key", "response": {}},
+            headers=SAME_ORIGIN,
+        )
+    assert r.status_code == 400, r.text
+    error = r.json()["error"]
+    assert (_DIRECTORY_UNCONFIRMED_TEXT in error) is unconfirmed
+    assert (error == "passkey verification failed") is not unconfirmed
