@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import logging
 import random
 import textwrap
 import threading
@@ -59,6 +58,7 @@ from messagefoundry.pipeline import ingress_guards, wiring_runner
 from messagefoundry.pipeline.dryrun import dry_run, split_messages
 from messagefoundry.pipeline.dryrun_trace import trace_dry_run
 from messagefoundry.store import MessageStatus, MessageStore
+from messagefoundry.transports import remotefile as remotefile_mod
 from messagefoundry.transports.base import NegativeAckError
 from messagefoundry.transports.file import FileSource
 from messagefoundry.transports.mllp import MLLPDestination
@@ -856,23 +856,26 @@ async def test_a_stop_before_the_first_message_hands_nothing_over_and_still_prun
 
         monkeypatch.setattr(src, "_hand_off", _flag_the_batch)
         monkeypatch.setattr(asyncio.futures, "wrap_future", _held_wrap_future)
-    remotefile_log = "messagefoundry.transports.remotefile"
-    caplog.set_level("WARNING", logger=remotefile_log)
+    connector_log = remotefile_mod.logger  # the object _poll_once's failure arm logs through
+    caplog.set_level("WARNING", logger=connector_log.name)
     await _settle(src)
     caplog.clear()
+    # A capture that could not see the connector's logger would pass the absence check below on
+    # nothing. So a marker goes through that same logger, at the same level, on each side of the
+    # poll, and both must be captured.
+    markers = ("BACKLOG #2967 capture marker, before", "BACKLOG #2967 capture marker, after")
+    connector_log.warning(markers[0])
     await src._poll_once()
+    connector_log.warning(markers[1])
+    assert len(caplog.records) >= 2, "the capture missed a marker: it cannot see the connector"
+    seen = {r.getMessage() for r in caplog.records if r.name == connector_log.name}
+    assert set(markers) <= seen, "the capture missed a marker sent through the connector's logger"
     # _poll_once catches a failed hand-off, logs it and goes on, so a _hand_off that raised once the
     # stop was set would leave the assertions below green. The connector logs no failure this poll.
-    # A capture that could not see the connector's logger would pass that check on nothing, so a
-    # marker sent through the same logger at the same level must arrive first.
-    marker = "BACKLOG #2967 capture marker"
-    logging.getLogger(remotefile_log).warning(marker)
-    assert len(caplog.records) >= 1
-    assert caplog.records[-1].getMessage() == marker
     failures = [
         r.getMessage()
         for r in caplog.records
-        if r.name == remotefile_log and r.getMessage() != marker
+        if r.name == connector_log.name and r.getMessage() not in markers
     ]
     assert failures == []
     # a.hl7 was handed over and recorded; b.hl7 met the stop before its first message.
