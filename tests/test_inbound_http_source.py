@@ -505,6 +505,57 @@ async def test_read_request_rejects_declared_oversize() -> None:
     assert exc.value.status == 413 and exc.value.kind == "frame_oversize"
 
 
+def _http_source(**over: Any) -> HttpSource:
+    ic = build_inbound_connection("IB_HTTP", Http(port=0, **over), router="r")
+    return HttpSource(_source_config(ic, "127.0.0.1", {}))
+
+
+def _body_cap_off_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "max_body_bytes is off" in r.getMessage()
+    ]
+
+
+@pytest.mark.parametrize("off", [0, None, "0"], ids=["zero", "none", "zero-text"])
+def test_http_source_warns_once_when_max_body_bytes_is_off(
+    off: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #2749: off is documented and allowed, but never silent. The line names the
+    connection and the setting, and withholds the value.
+
+    Red mutation: drop the warning from ``HttpSource.__init__``. No record is found."""
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
+        src = _http_source(max_body_bytes=off)
+    assert src.max_body_bytes is None
+    [record] = _body_cap_off_warnings(caplog)
+    assert "IB_HTTP" in record.getMessage()
+
+
+async def test_http_source_default_max_body_bytes_warns_nothing_and_still_refuses_oversize(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The control for the warning above, through the running listener: the shipped default says
+    nothing, and a body declared one byte past it is refused ``413`` before a body byte is sent."""
+    ic = build_inbound_connection(
+        "IB_HTTP", Http(port=0), router="r", content_type=ContentType.TEXT
+    )
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
+        src = await _start_source(store, ic)
+    try:
+        assert _body_cap_off_warnings(caplog) == []
+        declared = DEFAULT_MAX_BODY_BYTES + 1
+        head = f"POST /ingest HTTP/1.1\r\nHost: localhost\r\nContent-Length: {declared}\r\n\r\n"
+        resp = await _http(src.sockport, raw_override=head.encode("ascii"))
+    finally:
+        await src.stop()
+    assert resp.status == 413
+    cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
+    row = await cur.fetchone()
+    assert row is not None and row["n"] == 0  # refused before any ingress row
+
+
 async def test_read_request_rejects_chunked() -> None:
     raw = b"POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"
     with pytest.raises(HttpRequestError) as exc:

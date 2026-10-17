@@ -90,6 +90,7 @@ from types import (
 from typing import Any
 
 __all__ = [
+    "RepeatedKeyError",
     "clamp_untrusted",
     "codec_safe_line",
     "codec_safe_str",
@@ -99,6 +100,7 @@ __all__ = [
     "prints_a_codec_error",
     "redact",
     "redact_untrusted",
+    "refuse_repeated_keys",
     "safe_error",
     "safe_exc",
     "safe_name",
@@ -3178,7 +3180,7 @@ def json_loads_or_refusal(
     ``UnicodeDecodeError`` on bytes, or json's depth-limit ``RecursionError``, which is a
     ``RuntimeError`` a ``ValueError`` arm does not reach -- BACKLOG #1600). A ``ValueError``
     subclass that ``object_pairs_hook`` raises comes back as its class name too, so a caller can
-    tell its own refusal apart (vault BACKLOG #2804 refuses a repeated key that way).
+    tell its own refusal apart: :func:`refuse_repeated_keys` refuses a repeated key that way.
 
     It returns rather than raises so a caller's refusal is raised outside any handler (BACKLOG
     #2048). The decode error holds the WHOLE input (``JSONDecodeError.doc``,
@@ -3193,3 +3195,21 @@ def json_loads_or_refusal(
     except (ValueError, RecursionError) as exc:
         refusal = type(exc).__name__
     return None, refusal
+
+
+class RepeatedKeyError(ValueError):
+    """A JSON object repeats a key. Carries neither the key nor any value, so its class name, the
+    hint :func:`json_loads_or_refusal` returns for it, is content-free."""
+
+
+def refuse_repeated_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """An ``object_pairs_hook`` for :func:`json_loads_or_refusal` that refuses a repeated key at any
+    depth, raising :class:`RepeatedKeyError`.
+
+    ``json.loads`` keeps the LAST of two equal keys; a server may keep the first. A body the engine
+    gates on one value and forwards verbatim would then be read two ways (vault BACKLOG #2804 for a
+    Bundle, #2812 for a single FHIR resource), so it is refused rather than canonicalised."""
+    obj = dict(pairs)
+    if len(obj) != len(pairs):
+        raise RepeatedKeyError
+    return obj
