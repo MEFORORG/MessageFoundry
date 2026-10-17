@@ -1229,3 +1229,40 @@ async def test_a_refused_convergence_logs_no_warning_beside_the_runners_error(
     assert refusals, "control: the refusal was logged"
     assert {r.levelno for r in refusals} == {logging.DEBUG}
     assert len(failed) == 1
+
+
+async def test_a_convergence_refused_for_a_store_fault_logs_no_warning_either(
+    tmp_path: Path,
+    cfg: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    alerts: list[dict[str, Any]],
+) -> None:
+    """vault BACKLOG #3109 meets BACKLOG #3091: a trust-anchor check the store stops is refused as
+    ``store_unavailable``, and on a convergence reload that refusal also logs at DEBUG. Stood in for
+    by the WiringError the settings preflight raises, caused by AnchorStoreUnavailable."""
+    from messagefoundry.auth.trust_anchors import AnchorStoreUnavailable
+
+    async def _store_fault(self: Engine, *a: Any, **kw: Any) -> Any:
+        raise WiringError("synthetic: a trust-anchor check") from AnchorStoreUnavailable(
+            "synthetic: the store refused the audit read"
+        )
+
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        with (
+            caplog.at_level(logging.DEBUG, logger="messagefoundry.api.app"),
+            monkeypatch.context() as patch,
+        ):
+            patch.setattr(Engine, "reload_detail", _store_fault)
+            for _ in range(2):
+                with pytest.raises(WiringError):
+                    await engine._converge_reload(2)
+        failed = await engine.store.list_audit(action="config_reload_failed")
+    refusals = [
+        r for r in caplog.records if r.getMessage().startswith("config reload failed (store")
+    ]
+    assert refusals, "control: the refusal was logged"
+    assert {r.levelno for r in refusals} == {logging.DEBUG}
+    assert [json.loads(r["detail"])["reason"] for r in failed] == ["store_unavailable"]

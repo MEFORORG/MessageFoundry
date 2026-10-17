@@ -70,7 +70,8 @@ async def test_reload_endpoint_applies_config(client: httpx.AsyncClient, tmp_pat
     # Compared WHOLE rather than field-by-field on purpose: this is the shape contract the shipped
     # apiclient and console read. BACKLOG #1111 added `degraded` and `failures`, and their values
     # here are the clean-reload NEGATIVE CONTROL -- a route that reported every apply as degraded
-    # would satisfy the degraded-path test and only fail here.
+    # would satisfy the degraded-path test and only fail here. BACKLOG #3015 added
+    # `restart_required`: an empty list on a real reload with no settings anchor to restart for.
     assert r.json() == {
         "inbound": 1,
         "outbound": 1,
@@ -80,6 +81,7 @@ async def test_reload_endpoint_applies_config(client: httpx.AsyncClient, tmp_pat
         "dry_run": False,
         "degraded": False,
         "failures": [],
+        "restart_required": [],
     }
 
 
