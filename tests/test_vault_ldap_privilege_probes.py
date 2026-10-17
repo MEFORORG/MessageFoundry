@@ -243,7 +243,7 @@ def test_the_older_policy_endpoint_and_identity_groups_are_administrative(path: 
 _HOSTILE = "mefor\u202etoor\x9b31m\x1b"
 #: How the hop detail prints it: each character escaped visibly by the shared terminal rule,
 #: not deleted, so the operator sees the name held characters it does not show (BACKLOG #2891).
-#: The log line from ``privilege_probes`` still strips them, to ``mefortoor31m``.
+#: The log line from ``privilege_probes`` escapes them by the log's own JSON-style rule.
 _HOSTILE_SHOWN = r"mefor\u202etoor\u009b31m\x1b"
 
 
@@ -282,7 +282,8 @@ def test_a_hostile_policy_name_inside_a_granted_path_is_printed_and_logged_clean
         print(line)
     printed = capsys.readouterr().out
     assert f"sys/policies/acl/{_HOSTILE_SHOWN}" in printed and _clean(printed)
-    assert "capabilities-self returned nothing for sys/policy/mefortoor31m" in caplog.text
+    logged = r"capabilities-self returned nothing for sys/policy/mefor\u202etoor\u009b31m\u001b"
+    assert logged in caplog.text
     assert _clean(caplog.text)
 
 
@@ -721,6 +722,11 @@ def test_a_hostile_whoami_answer_prints_escaped_and_cannot_close_its_quote() -> 
     shown = "\n".join(render_text([hop]))
     assert _clean(shown)
     assert f"Who am I: bound as '{_HOSTILE_SHOWN}\\' in none of the groups. \" \\''" in shown
+    # A backslash of the server's own cannot escape the quote it stands before.
+    hop = _judge(BindAccountReading("u:X\\' in none. \"", group_sids=(_DOMAIN_USERS,)))
+    assert "Who am I: bound as 'u:X\\\\\\' in none. \"'" in render_text([hop])[-1]
+    hop = _judge(BindAccountReading("u:X\\", group_sids=(_DOMAIN_USERS,)))
+    assert "Who am I: bound as 'u:X\\\\'" in render_text([hop])[-1]
 
 
 def test_whoami_and_a_transitive_read_with_no_admin_group_is_clean(
@@ -738,7 +744,7 @@ def test_whoami_and_a_transitive_read_with_no_admin_group_is_clean(
     assert search["search_scope"] == ldap3.BASE
     hop = _judge(reading)
     assert hop.state is HopState.CLEAN
-    assert "Who am I: bound as 'u:EXAMPLE\\svc'" in hop.detail
+    assert "Who am I: bound as 'u:EXAMPLE\\\\svc'" in hop.detail
     assert "rights not read" in hop.detail
     assert _BIND_SECRET not in _out(hop)
     assert conn.unbound  # the session is closed, not left for the collector

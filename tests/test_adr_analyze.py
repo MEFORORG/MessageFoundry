@@ -527,7 +527,9 @@ def test_the_agreement_check_fails_when_the_shared_terminal_rule_diverges(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Control: a shared rule that stopped escaping the line separator reaches the toolkit line,
-    which keeps printable Unicode. check-privileges is strict, so it still escapes everything past
-    ASCII, and the check says only what diverged."""
+    and the check-privileges text, which both keep printable Unicode, and the check names both."""
     monkeypatch.setattr(terminal_text, "CONTROL_CATEGORIES", CONTROL_CATEGORIES - {"Zl"})
-    assert _disagreements() == ["the toolkit line does not escape Zl"]
+    assert _disagreements() == [
+        "the toolkit line does not escape Zl",
+        "the check-privileges text does not escape Zl",
+    ]

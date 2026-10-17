@@ -10,7 +10,7 @@ console cannot encode stops the print. :func:`escape_for_terminal` is the rule a
 ``samples/send_mllp.py``, ``harness/load/rigadmin.py`` ``get``, the harness ``--scenario`` and
 ``--load`` lines, the ``shardcert`` two-box engine-error lines, the ``--fuzz`` setup and failure
 lines, the reconcile text report, the ``messagefoundry verify`` console summary, the
-``check-privileges`` Vault and LDAP hop detail and the ``messagefoundry-toolkit`` report print by,
+``check-privileges`` text report and the ``messagefoundry-toolkit`` report print by,
 so a later hardening applies to all of them at once (BACKLOG #2891). It is not every such tool: at
 least ``tee`` imports nothing from this package by design. ``privilege_check.printable`` still
 STRIPS the characters in :data:`CONTROL_CATEGORIES`, for one job this rule cannot do, judging
