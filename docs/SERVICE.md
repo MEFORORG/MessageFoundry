@@ -480,9 +480,9 @@ What that changes for you:
 - **`messagefoundry serve` from a prompt still works**, for development. It is not isolated, and
   the engine says so at start (`interpreter_not_isolated`, `remote_debug_enabled`). To run by hand
   what the service runs, use the command above.
-- **The engine's Python children are not isolated.** The sandbox worker and each engine shard
-  still read the `PYTHON*` variables the engine hands them. Keep those variables out of the
-  service's environment; the engine reports one it finds (`python_variables_reach_children`).
+- **The engine's Python children are isolated when the engine is.** The sandbox worker and each
+  engine shard repeat the engine's `-I`, so a `PYTHON*` variable in the service's environment
+  reaches none of them. A `serve` from a prompt is not isolated, and neither are its children.
 
 **Read it back.** `GET /security/posture` carries an `interpreter` block: `isolated` should be
 `true` and `remote_debug_enabled` `false`. The status page of the web console shows the same two

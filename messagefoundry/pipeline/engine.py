@@ -2627,6 +2627,8 @@ class Engine:
             raise WiringError("connection flag direction must be 'inbound' or 'outbound'")
         # Vault BACKLOG #2622 item 1: the validate callback reads this from the worker thread, so the
         # runner's listening set is snapshotted here, on the loop. None = the offline test.
+        # Outside the runner's reload lock, on purpose: listener_bind_predicate says why the
+        # window is accepted (vault BACKLOG #3063 item 5).
         live = self._registry_runner
         binds_listener = live.listener_bind_predicate() if live is not None else None
 

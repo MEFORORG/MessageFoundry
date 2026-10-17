@@ -332,6 +332,10 @@ log = logging.getLogger(__name__)
 _FIFO_HEADS_LANE_CHUNK = 500
 # ADR 0066 §3.1: release_claimed id-chunk bound (ids per UPDATE statement).
 _RELEASE_CHUNK = 500
+# BACKLOG #3256: the database server's clock as epoch seconds, the unit `upload_quota.since` holds.
+# statement_timestamp() is one value for the whole statement, so every reference agrees. The cluster
+# lease reads clock_timestamp() inline (pipeline/cluster.py), which moves within a statement.
+_PG_EPOCH_NOW = "EXTRACT(EPOCH FROM statement_timestamp())::double precision"
 # BACKLOG #1169: rows per batch for the `attachment_chunk` at-rest migration. Every OTHER cipher pass
 # batches 500 because its rows are kilobyte-shaped; one attachment_chunk row is a whole
 # DETACH_CHUNK_BYTES (1 MiB) slice, ~1.33 MiB once base64+GCM sealed. 16 keeps a batch near 21 MiB,
@@ -8480,46 +8484,48 @@ class PostgresStore:
 
         One statement carries the budget predicate into the ``DO UPDATE``, so no other connection can
         land between the read and the write. ``RETURNING`` (absent on a refusal) discriminates applied
-        from refused."""
-        now = time.time()
+        from refused.
+
+        "Now" is the database server's clock, ``_PG_EPOCH_NOW`` (BACKLOG #3256;
+        ``uploads.UploadQuotaError`` says why)."""
         if files <= 0:
             # RELEASE — unconditional, clamped at zero (a double release cannot mint budget).
             await self._execute(
                 "UPDATE upload_quota SET"
                 " inflight_files = GREATEST(0, inflight_files + $2),"
                 " inflight_bytes = GREATEST(0, inflight_bytes + $3),"
-                " since = GREATEST(since, $4)"  # never backwards (BACKLOG #2648)
+                f" since = GREATEST(since, {_PG_EPOCH_NOW})"  # never backwards (BACKLOG #2648)
                 " WHERE uploader_id = $1",
                 uploader_id,
                 int(files),
                 int(size_bytes),
-                now,
             )
             return True
         if files > max_files or size_bytes > max_total_bytes:
             # Fail closed before touching the row: the insert branch applies unconditionally.
             return False
-        stale = now - max(0.0, stale_after)
+        stale = f"({_PG_EPOCH_NOW} - $4)"
         row = await self._fetchone(
             "INSERT INTO upload_quota (uploader_id, inflight_files, inflight_bytes, since)"
-            " VALUES ($1,$2,$3,$4)"
+            f" VALUES ($1,$2,$3,{_PG_EPOCH_NOW})"
             " ON CONFLICT (uploader_id) DO UPDATE SET"
             " inflight_files ="
-            " CASE WHEN upload_quota.since <= $5 THEN 0 ELSE upload_quota.inflight_files END + $2,"
+            f" CASE WHEN upload_quota.since <= {stale} THEN 0"
+            " ELSE upload_quota.inflight_files END + $2,"
             " inflight_bytes ="
-            " CASE WHEN upload_quota.since <= $5 THEN 0 ELSE upload_quota.inflight_bytes END + $3,"
+            f" CASE WHEN upload_quota.since <= {stale} THEN 0"
+            " ELSE upload_quota.inflight_bytes END + $3,"
             # Every applied reserve refreshes it, never backwards (BACKLOG #2648).
-            " since = GREATEST(upload_quota.since, $4)"
-            " WHERE (CASE WHEN upload_quota.since <= $5 THEN 0"
-            " ELSE upload_quota.inflight_files END) + $2 <= $6"
-            " AND (CASE WHEN upload_quota.since <= $5 THEN 0"
-            " ELSE upload_quota.inflight_bytes END) + $3 <= $7"
+            f" since = GREATEST(upload_quota.since, {_PG_EPOCH_NOW})"
+            f" WHERE (CASE WHEN upload_quota.since <= {stale} THEN 0"
+            " ELSE upload_quota.inflight_files END) + $2 <= $5"
+            f" AND (CASE WHEN upload_quota.since <= {stale} THEN 0"
+            " ELSE upload_quota.inflight_bytes END) + $3 <= $6"
             " RETURNING 1 AS applied",
             uploader_id,
             int(files),
             int(size_bytes),
-            now,
-            stale,
+            float(max(0.0, stale_after)),
             int(max_files),
             int(max_total_bytes),
         )

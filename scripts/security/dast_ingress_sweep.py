@@ -312,19 +312,14 @@ def reference_frames(plane: str, data: bytes, cap: int) -> tuple[list[bytes], bo
     return frames, False
 
 
-def _alphanumeric_field_separator(payload: bytes) -> bool:
-    return payload[:3] == b"MSH" and payload[3:4].isalnum()
-
-
 #: Known engine defects, each recognised by a NARROW structural condition on the frames a case sent,
 #: never by an exception type or a case name alone (a mutation can reproduce one by chance). Which of
 #: these a run tolerates is the policy's ``known_defects`` list; tests/test_dast_ingress_sweep.py holds
 #: a strict xfail per entry, so the day a defect is fixed its entry has to come out. Each is matched
 #: against every frame a case sent and explains each frame it matches. None is a handler fault: the
 #: one that was (a blank segment, BACKLOG #1594) is fixed, so a handler-fault NAK is never tolerated.
-KNOWN_DEFECT_DISCRIMINATORS: dict[str, Callable[[bytes], bool]] = {
-    "alphanumeric-field-separator": _alphanumeric_field_separator,
-}
+#: Empty while no defect is open: the alphanumeric field separator was fixed by BACKLOG #2875.
+KNOWN_DEFECT_DISCRIMINATORS: dict[str, Callable[[bytes], bool]] = {}
 #: The only detectors a known defect may silence. A liveness, time, resource or log finding on the
 #: same case is never tolerated: those would be a SECOND defect riding on the known one.
 KNOWN_DEFECT_DETECTORS = frozenset({"reply", "count_and_log"})

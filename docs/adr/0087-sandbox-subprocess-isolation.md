@@ -536,6 +536,12 @@ it is the constraint any proposal to make `subprocess` a *default* has to clear 
   and what the setting refuses. **The comparison is of names.** Two graphs with one shape can
   still differ in what a function of the same name does, and a variable read inside a Router or
   Handler body is never compared.
+
+  **Amended 2026-10-16 (vault BACKLOG #2724).** The comparison also covers a digest of the bytes
+  of every `*.py` in the config directory, as each side's load read them. So a config file
+  edited on disk since the engine loaded it refuses the next worker that starts, though every
+  name matches, until a reload. A variable read inside a body is still not compared: the bytes
+  match on both sides.
 - **The boundary confines the address space, not the machine.** `os`/`subprocess`/`ctypes`/`sqlite3`/
   `http.client` are importable inside the sandbox, so a Handler can still read and write files, open
   network connections, and spawn processes **as the service account**. The forbidden-import guard
