@@ -37,6 +37,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.keywrap import load_checked_cert_chain
 from messagefoundry.redaction import log_timestamp
+from messagefoundry.tls_handshake_failures import HandshakeFailures, watch_loop_handshakes
 
 if TYPE_CHECKING:
     from messagefoundry.pki import SelfSignedFacts
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "GENERATED_PAIR_REPLACED",
+    "ApiHandshakeRecord",
     "ApiTlsPlan",
     "ApiTlsSource",
     "GeneratedPairReplaced",
@@ -122,6 +124,39 @@ def build_api_ssl_context(api: ApiSettings, *, enforcing: bool = True) -> ssl.SS
         if api.tls_client_crl_file:
             harden_crl_check(ctx, api.tls_client_crl_file, setting="[api].tls_client_crl_file")
     return ctx
+
+
+class ApiHandshakeRecord:
+    """A throttled WARNING line for each failed TLS handshake on the API (vault BACKLOG #3302).
+
+    uvicorn hands the context to the loop, which runs every handshake and records a failed one at
+    DEBUG at most, so before #3302 nothing an operator reads showed a peer failing them again and
+    again. The API has no connection to carry an event, so the record is a log line: the first
+    failure at once, then one per minute carrying the count since the last. It names the count and
+    a cause, never the peer's bytes or certificate; the peer's address is not known where the hook
+    runs (see :mod:`messagefoundry.tls_handshake_failures`). Serve calls :meth:`close` once uvicorn
+    returns, so what the trailing line still held is logged rather than lost with the loop.
+    """
+
+    def __init__(self, ctx: ssl.SSLContext) -> None:
+        # A plain emitter, so a line is logged at once and never waits on a task that uvicorn's
+        # closing loop could cancel before it ran.
+        self.failures = HandshakeFailures(_log_api_handshake_failures)
+        watch_loop_handshakes(ctx, self._note)
+
+    def _note(self, cause: str) -> None:
+        self.failures.note_soon(None, cause)
+
+    def close(self) -> None:
+        """Disarm the trailing line and log what it still held. Needs no running loop."""
+        self.failures.cancel()
+        held = self.failures.take_held()
+        if held is not None:
+            _log_api_handshake_failures(*held)
+
+
+def _log_api_handshake_failures(_peer_host: str | None, reason: str) -> None:
+    log.warning("TLS handshake failed on the API listener: %s", reason)
 
 
 def _attach_issuer_index(ctx: ssl.SSLContext, cadata: str, cert_map: Mapping[str, object]) -> None:
