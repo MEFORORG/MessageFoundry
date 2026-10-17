@@ -211,7 +211,10 @@ def _tolerate_logging_on_closed_capture_streams() -> Iterator[None]:
         logging.raiseExceptions = prior_raise
 
 
-_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+#: The methods the stand-in leaves alone. Only GET, because ``assert_same_origin`` and
+#: ``require_ui`` treat every other method, HEAD and OPTIONS included, as a write, and a browser
+#: sends ``Sec-Fetch-Site`` on those too.
+_SAFE_METHODS = frozenset({"GET"})
 
 
 @pytest.fixture(scope="session", autouse=True)

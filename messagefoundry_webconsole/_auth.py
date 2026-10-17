@@ -16,7 +16,7 @@ import os
 import re
 import time
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from urllib.parse import quote, urlsplit
 
@@ -654,6 +654,17 @@ def _origin_matches(app_state: object, origin: str, host: str | None) -> bool:
     return host is not None and urlsplit(origin).netloc.lower() == host.lower()
 
 
+def _fetch_site_lines_disagree(values: Sequence[str]) -> bool:
+    """Whether a request's ``Sec-Fetch-Site`` lines carry more than one value.
+
+    The one statement of "disagree", used by :func:`_sec_fetch_site` and by
+    :class:`._security.UiFetchMetadataMiddleware`, so the two cannot drift apart on it. Values are
+    compared exactly as received: no trimming, no case folding, and a comma-joined value folded
+    into one line by an intermediary is one value, judged by the rules for any other value.
+    """
+    return len(set(values)) > 1
+
+
 def _sec_fetch_site(request: Request) -> str | None:
     """The request's one ``Sec-Fetch-Site`` value, or ``None`` when it carries no such line.
 
@@ -664,7 +675,7 @@ def _sec_fetch_site(request: Request) -> str | None:
     middleware refuses the same requests, so the two now agree on every request either one sees.
     """
     values = request.headers.getlist("sec-fetch-site")
-    if len(set(values)) > 1:
+    if _fetch_site_lines_disagree(values):
         raise HTTPException(status.HTTP_403_FORBIDDEN, _CONFLICTING_FETCH_SITE)
     return values[0] if values else None
 
@@ -772,7 +783,9 @@ def assert_same_origin(request: Request) -> None:
     # present line decides, empty included: the pre-#1116 rule, unchanged.
     settled_by_site = bool(site) if write else site is not None
     if settled_by_site:
-        assert_not_cross_site(request)
+        # assert_not_cross_site's test, on the value already read.
+        if site in _CROSS_ORIGIN_FETCH:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "cross-site request rejected")
         # An ALLOW set on a write, not only the two refused values above. The Fetch Metadata
         # values are four exact lowercase tokens; anything else (an unknown token, another case,
         # padding) is not a browser naming this request same-origin, so it fails closed.

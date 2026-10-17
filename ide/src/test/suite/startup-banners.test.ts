@@ -111,12 +111,12 @@ function enclosingFunction(node: ts.Node): string {
 
 function productionSources(): { rel: string; text: string }[] {
   const out: { rel: string; text: string }[] = [];
-  const walk = (dir: string): void => {
+  const walkDir = (dir: string): void => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         if (entry.name !== "test") {
-          walk(full);
+          walkDir(full);
         }
       } else if (entry.name.endsWith(".ts")) {
         out.push({
@@ -126,7 +126,7 @@ function productionSources(): { rel: string; text: string }[] {
       }
     }
   };
-  walk(SRC);
+  walkDir(SRC);
   return out;
 }
 
@@ -197,6 +197,9 @@ suite("startup banners: what the user sees", () => {
       // A display:none would keep a banner down even once its `hidden` attribute is cleared.
       assert.notStrictEqual(el.style.display, "none", `#${el.id} is display:none`);
     }
+    // And nowhere else in the markup either: a display:none in the <style> element (a selector
+    // or the keyframes) would hide a banner that the inline check above never sees.
+    assert.ok(!/display\s*:\s*none/i.test(STARTUP_BANNERS), "STARTUP_BANNERS sets display:none");
     // The script banner must not start hidden; only the canary may reveal the CSP banner.
     assert.strictEqual(scriptBanner.hasAttribute("hidden"), false, "the script banner starts hidden");
     assert.strictEqual(cspBanner.hasAttribute("hidden"), true, "the CSP banner starts shown");

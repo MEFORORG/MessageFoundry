@@ -398,7 +398,8 @@ async def test_disagreeing_sec_fetch_site_lines_are_refused_by_both_checks(metho
 @pytest.mark.parametrize("value", ["same-origin", "none", "cross-site"])
 async def test_repeated_sec_fetch_site_lines_with_one_value_are_that_value(value: str) -> None:
     """Only DISAGREEMENT is refused. Two lines carrying one value are judged as that value by both
-    checks, so a proxy that repeats the line changes nothing."""
+    checks, so a proxy that repeats the line as a second line changes nothing. One that folds the
+    lines into a single comma-joined value sends one value, judged like any other."""
     twice = origin_check_request(
         "POST", [("host", "t"), ("sec-fetch-site", value), ("sec-fetch-site", value)]
     )
@@ -420,8 +421,10 @@ async def test_repeated_sec_fetch_site_lines_with_one_value_are_that_value(value
 async def test_a_sign_in_post_with_disagreeing_sec_fetch_site_lines_is_refused(
     engine: Engine,
 ) -> None:
-    """Over HTTP, through the mounted middleware and the route: refused, and nothing is minted.
-    The control is the same POST with the two lines agreeing, which signs in."""
+    """Over HTTP, through the mounted console: refused, and nothing is minted. The middleware
+    answers first (plain text), so the route's own refusal is not reached here; the direct calls
+    in the test above cover it. The control is the same POST with the two lines agreeing, which
+    signs in."""
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
@@ -430,6 +433,7 @@ async def test_a_sign_in_post_with_disagreeing_sec_fetch_site_lines_is_refused(
             r = await c.post("/ui/login", data=_creds(), headers=headers)
             assert r.status_code == 403, (lines, r.status_code)
             assert _CONFLICTING in r.text, (lines, r.text)
+            assert r.headers["content-type"].startswith("text/plain"), (lines, r.headers)
             assert "set-cookie" not in {k.lower() for k in r.headers}
         same = [("Sec-Fetch-Site", "same-origin"), ("Sec-Fetch-Site", "same-origin")]
         ok = await c.post("/ui/login", data=_creds(), headers=same)

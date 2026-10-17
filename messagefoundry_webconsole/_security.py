@@ -233,6 +233,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from ._auth import (
     _CONFLICTING_FETCH_SITE,
     _CROSS_ORIGIN_FETCH,
+    _fetch_site_lines_disagree,
     browser_hardening_enabled,
     security_headers_context,
 )
@@ -412,22 +413,21 @@ class UiFetchMetadataMiddleware:
             return
         # Read from the raw scope rather than building a Request: this runs for every /ui asset, and
         # header names on the wire are lower-cased bytes by ASGI contract.
-        site = mode = dest = user = None
-        conflicting_site = False
+        mode = dest = user = None
+        sites: list[str] = []
         for key, value in scope.get("headers") or ():
             if key == b"sec-fetch-site":
-                line = value.decode("latin-1")
-                conflicting_site = conflicting_site or (site is not None and line != site)
-                site = line
+                sites.append(value.decode("latin-1"))
             elif key == b"sec-fetch-mode":
                 mode = value.decode("latin-1")
             elif key == b"sec-fetch-dest":
                 dest = value.decode("latin-1")
             elif key == b"sec-fetch-user":
                 user = value.decode("latin-1")
-        if conflicting_site:
+        if _fetch_site_lines_disagree(sites):
             await PlainTextResponse(_CONFLICTING_FETCH_SITE, status_code=403)(scope, receive, send)
             return
+        site = sites[0] if sites else None
         if site is None or site not in _CROSS_ORIGIN_FETCH:
             await self.app(scope, receive, send)
             return

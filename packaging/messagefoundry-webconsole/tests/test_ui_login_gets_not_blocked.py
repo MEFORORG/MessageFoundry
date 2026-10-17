@@ -207,8 +207,9 @@ def test_the_sign_in_gets_are_derived_from_the_routes() -> None:
     """The sign-in GETs are an enumeration, and it was restated by hand in several places with
     nothing deriving it (vault BACKLOG #3316). It is derived here: every GET the sign-in route
     modules register is one this file drives, and the ``Origin`` row of ``docs/BROWSER-SUPPORT.md``,
-    the one place the list is written for a reader, names exactly those routes. A new sign-in GET
-    therefore fails here until it is tested and listed."""
+    the one place the list is written for a reader, names exactly those routes and says how many.
+    A new GET in either module therefore fails here until it is tested and listed. A sign-in GET
+    registered anywhere else is outside what this reads."""
     routes = Path(messagefoundry_webconsole.__file__).parent / "routes"
     derived: set[str] = set()
     for name in _SIGN_IN_MODULES:
@@ -224,6 +225,7 @@ def test_the_sign_in_gets_are_derived_from_the_routes() -> None:
     assert driven >= _SIGN_IN_GETS, sorted(_SIGN_IN_GETS - driven)
     row = " | ".join(_row_for("`Origin` on a form POST"))
     listed = set(re.findall(r"`GET (/ui/[^`\s]+)`", row))
+    assert len(_SIGN_IN_GETS) == 3 and "**Three sign-in GETs" in row, row[:200]
     assert listed == _SIGN_IN_GETS, (
         f"docs/BROWSER-SUPPORT.md lists {sorted(listed)} as the sign-in GETs; the code "
         f"registers {sorted(_SIGN_IN_GETS)}"

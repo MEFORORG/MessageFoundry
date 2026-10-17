@@ -112,7 +112,9 @@ def _canonical(name: str) -> str:
 # --- request headers: names derived from the code --------------------------------------------------
 
 _FETCH_KEY_RE = re.compile(r'b"(sec-fetch-[a-z]+)"')
-_HEADER_READ_RE = re.compile(r"""headers\.get\(\s*["']((?i:sec-fetch-[a-z]+|origin))["']""")
+_HEADER_READ_RE = re.compile(
+    r"""headers\.(?:get|getlist)\(\s*["']((?i:sec-fetch-[a-z]+|origin))["']"""
+)
 
 
 def _middleware_fetch_headers() -> set[str]:
@@ -123,7 +125,7 @@ def _middleware_fetch_headers() -> set[str]:
 def _request_headers_read() -> set[str]:
     """Every ``Sec-Fetch-*`` or ``Origin`` header the console package or the engine's WebSocket gate
     reads off a request. The middleware's raw-scope reads are the bytes spelling; everything else is
-    a ``headers.get`` call."""
+    a ``headers.get`` or ``headers.getlist`` call."""
     names = _middleware_fetch_headers()
     sources = [p.read_text(encoding="utf-8") for p in sorted(_PACKAGE_DIR.rglob("*.py"))]
     sources.append(Path(engine_security.__file__ or "").read_text(encoding="utf-8"))

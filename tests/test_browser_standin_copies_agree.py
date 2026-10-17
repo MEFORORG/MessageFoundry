@@ -72,7 +72,7 @@ def test_the_two_stand_in_wrappers_are_the_same_code() -> None:
 
 def test_the_two_copies_name_the_same_methods_and_opt_out_key() -> None:
     methods = _constant(_ENGINE_CONFTEST, "_SAFE_METHODS")
-    assert methods == frozenset({"GET", "HEAD", "OPTIONS"}), methods
+    assert methods == frozenset({"GET"}), methods
     assert methods == _constant(_CONSOLE_CONFTEST, "_SAFE_METHODS")
     key = _constant(_ENGINE_CONFTEST, "HEADERLESS_UI_REQUEST")
     assert isinstance(key, str) and key, key

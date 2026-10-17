@@ -893,7 +893,10 @@ def _provision_admin_enrols_a_synthetic_authenticator() -> Iterator[None]:
 #: under the console's own, where it would re-add the header a refusal test left off.
 #: ``test_browser_standin_copies_agree.py`` holds this value and the wrapper to the console's copy.
 HEADERLESS_UI_REQUEST = "mf_headerless_ui_request"
-_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+#: The methods the stand-in leaves alone. Only GET, because ``assert_same_origin`` and
+#: ``require_ui`` treat every other method, HEAD and OPTIONS included, as a write, and a browser
+#: sends ``Sec-Fetch-Site`` on those too.
+_SAFE_METHODS = frozenset({"GET"})
 
 
 @pytest.fixture(scope="session", autouse=True)
