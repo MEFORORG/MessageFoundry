@@ -256,7 +256,7 @@ def test_windows_reads_the_launcher_command_back_as_the_child_command_line(
     child = (
         [pythonw, *CHILD_INTERPRETER_FLAGS, "-m", "messagefoundry.tray"]
         if installed
-        else python_child_argv("messagefoundry.tray", executable=pythonw)
+        else python_child_argv("messagefoundry.tray", executable=pythonw, inherit=False)
     )
     expected = [pythonw, "-E", *child[1:]]
     assert _windows_argv(launcher_command(pythonw, installed=installed)) == expected

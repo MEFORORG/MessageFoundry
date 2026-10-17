@@ -469,6 +469,17 @@ async def test_require_mfa_admin_is_not_bootstrap_locked_out(engine: Engine) -> 
         assert status["enabled"] is True and status["required"] is True
 
 
+def _hold_auth_wall_clock(monkeypatch: pytest.MonkeyPatch, now: list[float]) -> None:
+    """Hold the wall clock the service and the store read at ``now[0]``; ``monotonic()`` stays real.
+
+    Both, because the store stamps the session's mint and the service reads the floor against it.
+    One held clock makes the elapsed time the test's own choice, however slow the runner is
+    (BACKLOG #3194), and it never falls behind a stamp, which would end the session."""
+    held = SimpleNamespace(time=lambda: now[0], monotonic=time.monotonic)
+    monkeypatch.setattr("messagefoundry.auth.service.time", held)
+    monkeypatch.setattr("messagefoundry.store.store.time", held)
+
+
 async def test_a_confirm_inside_the_login_to_mfa_floor_is_an_ordinary_invalid_code(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -477,15 +488,18 @@ async def test_a_confirm_inside_the_login_to_mfa_floor_is_an_ordinary_invalid_co
     # its single-use password step-up before the service runs, so the retry needs a fresh one, which
     # is what docs/SECURITY.md says. The service-level cases are in test_second_step_time_floors.py.
     #
-    # A 30 s floor on the real clock, rather than a faked one held just inside 1 s: a session whose
-    # clock steps BACK behind its own stamps is ended, so the clock here only ever moves forward.
-    floor = 30.0
-    service = await _service(
-        engine, AuthSettings(mfa_verify_min_elapsed_seconds=floor, login_rate_limit_enabled=False)
-    )
+    # The shipped floor, on a held clock (BACKLOG #3194): no time passes between the sign-in and the
+    # early confirm however slow the runner is, and the clock then moves only forward.
+    floor = AuthSettings().mfa_verify_min_elapsed_seconds
+    assert floor > 0
+    now = [time.time()]
+    _hold_auth_wall_clock(monkeypatch, now)
+    service = await _service(engine, AuthSettings(login_rate_limit_enabled=False))
     await _add(service, "adm", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
         tok = (await _login(c, "adm")).json()["token"]
+        minted = await engine.store.get_session(hash_token(tok))
+        assert minted is not None and minted.created_at == now[0], "the mint is off the held clock"
         _r, tok = await _reauth(c, tok, purpose="mfa_enroll")
         secret = (await c.post("/me/mfa/enroll", headers=_auth(tok))).json()["secret"]
         _r, tok = await _reauth(c, tok, purpose="mfa_confirm")
@@ -501,10 +515,7 @@ async def test_a_confirm_inside_the_login_to_mfa_floor_is_an_ordinary_invalid_co
         assert retry.status_code == 403 and retry.headers.get("X-Step-Up-Required") == "1"
 
         # Past the floor: a genuinely wrong code gets the very answer the early good code got.
-        monkeypatch.setattr(
-            "messagefoundry.auth.service.time",
-            SimpleNamespace(time=lambda: time.time() + floor, monotonic=time.monotonic),
-        )
+        now[0] += floor + 0.001
         _r, tok = await _reauth(c, tok, purpose="mfa_confirm")
         wrong = str((int(good) + 1) % 1_000_000).zfill(6)
         refused = await c.post("/me/mfa/confirm", headers=_auth(tok), json={"code": wrong})

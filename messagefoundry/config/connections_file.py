@@ -504,8 +504,9 @@ def _factory_signature(factory: Callable[..., ConnectionSpec]) -> inspect.Signat
     examined nothing is worse than no check, because it is reported as coverage.
 
     Cached because the resolve costs ~0.4 ms and every connection needs one. The key set is CLOSED --
-    the values of :data:`_TRANSPORTS`, eleven module-level functions that are immortal anyway, so the
-    cache retains nothing new. Never call this with a closure or a ``partial``: an unbounded cache
+    the values of :data:`_TRANSPORTS`, plus the settings factories ``wiring._bool_settings`` scans
+    (vault BACKLOG #3234), all module-level functions that are immortal anyway, so the cache retains
+    nothing new. Never call this with a closure or a ``partial``: an unbounded cache
     keyed on a per-call callable would retain every one and hit on none."""
     try:
         return inspect.signature(factory, eval_str=True)

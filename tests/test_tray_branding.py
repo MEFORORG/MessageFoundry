@@ -113,6 +113,8 @@ def test_relaunch_hands_over_to_a_child_started_like_every_other_python_child(
         return _Alive()
 
     monkeypatch.setattr(subprocess, "Popen", _popen)
+    # This interpreter's own isolation is repeated ahead of these (vault BACKLOG #2701); none here.
+    monkeypatch.setattr(childenv, "inherited_interpreter_flags", lambda: ())
     assert branding.relaunch_branded() is True  # still alive → the child owns the tray
 
     [(argv, kwargs)] = started
