@@ -54,16 +54,57 @@ from messagefoundry.transports.bounded_read import (
     AmbiguousFramingError,
     EgressReplyError,
     NoRedirectHandler,
+    TruncatedResponseError,
     build_strict_opener,
     read_reply_body,
     reply_framing_fault,
 )
 
-__all__ = ["build_idp_opener", "jwks_fetcher"]
+__all__ = [
+    "IdpReplyCutShortError",
+    "IdpReplyError",
+    "IdpReplyUnusableError",
+    "build_idp_opener",
+    "is_idp_transport_http_exception",
+    "jwks_fetcher",
+]
 
 #: Wall-clock bound for a single IdP HTTP round trip. Deliberately short: both legs run inside a
 #: browser request, and a hung IdP must degrade the federated login, never pin a worker thread.
 DEFAULT_IDP_TIMEOUT_SECONDS = 10.0
+
+
+class IdpReplyError(http.client.HTTPException):
+    """A JWKS reply this module refused while reading it (BACKLOG #3221). The two subclasses say
+    whether an answer arrived, which is the line ADR 0142 Amendment E draws for the IdP flag.
+
+    An ``http.client.HTTPException``, so every arm that already catches http.client's own reply
+    faults catches it. NOT a :class:`~messagefoundry.auth.oidc.jwks.JwksError`, because
+    ``claims.py`` would retype that as ``ClaimsError('unknown_kid')``, a token-verification reject."""
+
+
+class IdpReplyUnusableError(IdpReplyError):
+    """A reply arrived, but its framing makes it unusable, or it could not be read whole for a
+    reason other than being cut short. The IdP answered, so this does not mark it unavailable. A
+    body over the size bound is not refused here: ``JwksCache`` refuses it as a ``JwksError``."""
+
+
+class IdpReplyCutShortError(IdpReplyError):
+    """The reply stopped before its declared end: the connection closed mid-body. A transport
+    failure, as the token leg's ``TruncatedResponseError`` arm reads one."""
+
+
+def is_idp_transport_http_exception(exc: http.client.HTTPException) -> bool:
+    """Whether an ``http.client`` exception from an IdP leg means no whole answer arrived
+    (BACKLOG #3221, ADR 0142 Amendment G).
+
+    True for :class:`IdpReplyCutShortError`, ``BadStatusLine`` (which covers
+    ``RemoteDisconnected``, a close before any status line) and ``IncompleteRead``. Every other one
+    is a reply that arrived and could not be used, such as a header line over the length limit
+    (``LineTooLong``), or a fault on the engine's own side of the connection, so it is not."""
+    return isinstance(
+        exc, (IdpReplyCutShortError, http.client.BadStatusLine, http.client.IncompleteRead)
+    )
 
 
 class _NoRedirectHandler(NoRedirectHandler):
@@ -156,10 +197,11 @@ def jwks_fetcher(
     cannot make the engine buffer an unbounded body before the cache's own check runs. ``JwksCache``
     re-checks the same bound — deliberate defence in depth, since ``fetch`` is injectable.
 
-    Errors are left as raw ``urllib``/``OSError``/``http.client.HTTPException`` exceptions: the caller
-    (``auth/service.py``) maps any IdP-reachability failure onto a degraded login plus an audited
-    ``auth.login_error``. Nothing here
-    logs the URI's response body.
+    Errors from the opener are left as raw ``urllib``/``OSError``/``http.client.HTTPException``
+    exceptions. A reply this function refuses while reading it raises an :class:`IdpReplyError`
+    subclass that says whether an answer arrived (BACKLOG #3221). The caller (``auth/service.py``)
+    maps each onto a degraded login plus an audited ``auth.login_error``. Nothing here logs the
+    URI's response body.
     """
 
     def fetch() -> bytes:
@@ -168,24 +210,25 @@ def jwks_fetcher(
         )
         with opener.open(req, timeout=timeout) as resp:  # noqa: S310 — see above
             # BACKLOG #1125 (ASVS 4.2.1): refuse ambiguous length framing before reading, by the
-            # rule read_bounded applies to connector replies. An HTTPException, the type
-            # http.client raises for its own protocol faults, so the login that triggered the fetch
-            # records an unavailable IdP. A JwksError would be retyped by claims.py as
-            # ClaimsError('unknown_kid'), a token-verification reject. Logins inside the refetch
-            # floor after this see the cache's throttle, as after any failed fetch.
+            # rule read_bounded applies to connector replies. A reply arrived, so it is an answer
+            # and does not mark the IdP (BACKLOG #3221). Logins inside the refetch floor after this
+            # see the cache's throttle, as after any failed fetch.
             if reply_framing_fault(resp) is not None:
-                raise http.client.HTTPException("JWKS response framed its body length ambiguously")
+                raise IdpReplyUnusableError("JWKS response framed its body length ambiguously")
             # BACKLOG #1979: the strict reader under read_bounded. Not read_bounded itself, because
-            # JwksCache judges the length and expects the extra byte. Refusals are retyped to
-            # HTTPException for the reason above, outside the handler so nothing chains to them.
+            # JwksCache judges the length and expects the extra byte. Refusals are retyped to an
+            # IdpReplyError, outside the handler so nothing chains to them.
+            failure: type[IdpReplyError] = IdpReplyUnusableError
             try:
                 body = read_reply_body(
                     resp, _MAX_JWKS_BYTES + 1, connector="OIDC jwks_uri endpoint"
                 )
             except AmbiguousFramingError:
-                failure = "JWKS response framed its body length ambiguously"
+                message = "JWKS response framed its body length ambiguously"
+            except TruncatedResponseError:
+                failure, message = IdpReplyCutShortError, "JWKS response was cut short"
             except EgressReplyError:  # the family, so a later sibling is retyped too
-                failure = "JWKS response could not be read whole"
+                message = "JWKS response could not be read whole"
             else:
                 # The declared-length check read_bounded makes, which read_reply_body leaves to its
                 # caller. Skipped past the bound, where JwksCache refuses the size itself.
@@ -194,7 +237,8 @@ def jwks_fetcher(
                     isinstance(remaining, int) and remaining > 0
                 ):
                     return body
-                failure = "JWKS response ended before its declared length"
-            raise http.client.HTTPException(failure)
+                failure = IdpReplyCutShortError
+                message = "JWKS response ended before its declared length"
+            raise failure(message)
 
     return fetch
