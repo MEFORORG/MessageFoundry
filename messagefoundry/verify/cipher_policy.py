@@ -64,19 +64,27 @@ _NO_CMDLET_EXIT = 64
 #: as that module's exported command object, never looked up by name. So a script on ``PATH`` or
 #: a module in the account's own Documents folder that defines a ``Get-TlsCipherSuite`` cannot
 #: answer instead. ``$PSHOME`` is the folder of the pinned ``powershell.exe``. This does not guard
-#: against a change to that system folder, which takes an administrator.
+#: against a change to that system folder, which takes an administrator. Only a missing module
+#: folder or a module without the cmdlet exits with the "not on this host" status; a module that
+#: is there and fails to import stops the command, which exits 1, an ERROR. Output is UTF-8, so a
+#: localized error line reaches the ERROR detail readable.
 _SUITES_COMMAND = (
+    "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
     "$WarningPreference = 'SilentlyContinue'; $VerbosePreference = 'SilentlyContinue'; "
-    "$m = Import-Module -Name (Join-Path $PSHOME 'Modules\\TLS') -PassThru "
-    "-ErrorAction SilentlyContinue; "
-    "if ($m -and $m.ExportedCommands.ContainsKey('Get-TlsCipherSuite')) "
-    "{ (& $m.ExportedCommands['Get-TlsCipherSuite']).Name } "
-    f"else {{ exit {_NO_CMDLET_EXIT} }}"
+    "$p = Join-Path $PSHOME 'Modules\\TLS'; "
+    f"if (-not (Test-Path -LiteralPath $p)) {{ exit {_NO_CMDLET_EXIT} }}; "
+    "$m = Import-Module -Name $p -PassThru -ErrorAction Stop; "
+    f"if (-not $m.ExportedCommands.ContainsKey('Get-TlsCipherSuite')) {{ exit {_NO_CMDLET_EXIT} }}; "
+    "(& $m.ExportedCommands['Get-TlsCipherSuite']).Name"
 )
 #: The shape of an SChannel suite name. ``SSL_`` is there so an older host's SSL 2 suite is
 #: counted, and fails. Any other line is not a reading this check understands, so it is an ERROR
 #: rather than being dropped: a dropped line could be a suite.
 _SCHANNEL_SUITE_NAME = re.compile(r"(?:TLS|SSL)_[A-Za-z0-9_]+")
+
+#: The shape of an ``openssl ciphers -s -v`` line: name, version, then the Kx, Au, Enc and Mac
+#: fields. Any other line is an ERROR, as on Windows.
+_OPENSSL_SUITE_LINE = re.compile(r"\S+\s+\S+\s+Kx=\S+\s+Au=\S+\s+Enc=\S+\s+Mac=\S+")
 
 _OPENSSL_CNF = Path("/etc/ssl/openssl.cnf")
 #: The variables OpenSSL reads to find its configuration. They cross to the probe on top of what
@@ -140,6 +148,18 @@ def _stdout_lines(program: str, proc: subprocess.CompletedProcess[str]) -> list[
     return [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
 
 
+def _every_entry_shaped(
+    source: str, entries: list[str], shape: re.Pattern[str], what: str
+) -> list[str]:
+    """``entries``, when each has ``shape``; otherwise :class:`ProbeFailed` naming the first that
+    does not. An entry this check does not understand is neither counted nor dropped, because a
+    dropped entry could be a suite."""
+    for entry in entries:
+        if not shape.fullmatch(entry):
+            raise ProbeFailed(f"{source}: {entry[:80]!r} is not {what}")
+    return entries
+
+
 # Each probe makes its own subprocess.run call rather than sharing one helper that takes an
 # environment: tests/test_child_process_environment.py trusts env= only as a builder call at the
 # start itself, and the two probes need different builders.
@@ -177,12 +197,7 @@ def _windows_enabled_suites() -> list[str]:
     if proc.returncode == _NO_CMDLET_EXIT:
         raise ProbeUnavailable("Get-TlsCipherSuite not found in the system TLS module")
     lines = _stdout_lines("powershell.exe", proc)
-    for line in lines:
-        if not _SCHANNEL_SUITE_NAME.fullmatch(line):
-            raise ProbeFailed(
-                f"powershell.exe printed a line that is not a suite name: {line[:80]!r}"
-            )
-    return lines
+    return _every_entry_shaped("powershell.exe", lines, _SCHANNEL_SUITE_NAME, "a suite name")
 
 
 def _hklm_value(subkey: str, name: str) -> tuple[object, int] | None:
@@ -213,18 +228,24 @@ def _schannel_client_enabled(version: str) -> int | None:
 
 
 def _schannel_policy_order() -> list[str] | None:
-    """The suite list Group Policy's "SSL Cipher Suite Order" sets, or ``None`` when it sets none."""
+    """The suite list Group Policy's "SSL Cipher Suite Order" sets, or ``None`` when it sets none.
+
+    Split on commas in either string form, and every entry must be a suite name, so an entry that
+    joins a CBC and a GCM suite some other way is an ERROR, never one AEAD suite."""
     found = _hklm_value(_POLICY_ORDER_KEY, "Functions")
     if found is None:
         return None
     value, kind = found
     if kind == _REG_SZ and isinstance(value, str):
-        names = value.split(",")
+        items = [value]
     elif kind == _REG_MULTI_SZ and isinstance(value, list):
-        names = [str(item) for item in value]
+        items = [str(item) for item in value]
     else:
         raise ProbeFailed(f"the policy suite order holds registry type {kind}, not strings")
-    return [name.strip() for name in names if name.strip()]
+    names = [name.strip() for item in items for name in item.split(",") if name.strip()]
+    return _every_entry_shaped(
+        "the policy suite order", names, _SCHANNEL_SUITE_NAME, "a suite name"
+    )
 
 
 def _openssl_suites() -> list[str]:
@@ -248,7 +269,8 @@ def _openssl_suites() -> list[str]:
             check=False,
             creationflags=_NO_WINDOW,
         )
-    return _stdout_lines("openssl", proc)
+    lines = _stdout_lines("openssl", proc)
+    return _every_entry_shaped("openssl", lines, _OPENSSL_SUITE_LINE, "a suite line")
 
 
 def _config_value(raw: str) -> str:
@@ -301,7 +323,9 @@ def _config_sections(text: str) -> dict[str, list[tuple[str, str]]]:
     PASS on lines OpenSSL does not apply. These are the constructs known here, not all of them."""
     sections: dict[str, list[tuple[str, str]]] = {"default": []}
     current = sections["default"]
-    for line in text.splitlines():
+    # OpenSSL ends a line only at a newline; splitlines() would also break at a form feed and
+    # other separators, showing this reader a line OpenSSL never sees.
+    for line in text.split("\n"):
         if directive := _DIRECTIVE.match(line):
             raise _not_followed(directive[1])
         if line.rstrip().endswith("\\"):

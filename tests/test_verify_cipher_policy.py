@@ -9,6 +9,7 @@ Windows-only test runs the real PowerShell command."""
 from __future__ import annotations
 
 import ast
+import shutil
 import subprocess
 import sys
 from collections.abc import Mapping
@@ -198,10 +199,14 @@ def test_the_command_runs_the_system_tls_modules_own_cmdlet() -> None:
     the module is imported by its ``$PSHOME`` path and its exported command object is run, so the
     name is never looked up through command discovery."""
     command = cipher_policy._SUITES_COMMAND
-    assert "Import-Module -Name (Join-Path $PSHOME 'Modules\\TLS') -PassThru" in command
+    assert "$p = Join-Path $PSHOME 'Modules\\TLS'" in command
+    assert "$m = Import-Module -Name $p -PassThru -ErrorAction Stop" in command
     assert "(& $m.ExportedCommands['Get-TlsCipherSuite']).Name" in command
     # Every mention of the name is inside a lookup on the imported module, never a bare call.
     assert command.count("Get-TlsCipherSuite") == command.count("ExportedCommands")
+    # Only an absent module folder or cmdlet exits "not on this host"; a failed import stops.
+    assert command.count(f"exit {cipher_policy._NO_CMDLET_EXIT}") == 2
+    assert "Test-Path -LiteralPath $p" in command
 
 
 @pytest.mark.parametrize("odd", ["WARNING: module loaded late", "AVERTISSEMENT : x", "TLS AES"])
@@ -236,12 +241,17 @@ def test_the_powershell_command_runs_on_this_host() -> None:
     assert cipher_policy._windows_enabled_suites()
 
 
+_A, _B = _WIN_AEAD
+
+
 @pytest.mark.parametrize(
     ("found", "expect"),
     [
         (None, None),
-        (("A, B,,C", 1), ["A", "B", "C"]),
-        ((["A", " B "], 7), ["A", "B"]),
+        ((f"{_A}, {_WIN_CBC},,{_B}", 1), [_A, _WIN_CBC, _B]),
+        (([_A, f" {_B} "], 7), [_A, _B]),
+        # A list element that itself joins names with commas is split too.
+        (([f"{_WIN_CBC},{_A}"], 7), [_WIN_CBC, _A]),
     ],
 )
 def test_policy_order_parses_both_string_forms(
@@ -249,6 +259,16 @@ def test_policy_order_parses_both_string_forms(
 ) -> None:
     monkeypatch.setattr(cipher_policy, "_hklm_value", lambda subkey, name: found)
     assert cipher_policy._schannel_policy_order() == expect
+
+
+@pytest.mark.parametrize("value", [f"{_WIN_CBC};{_A}", f"{_WIN_CBC} {_A}"])
+def test_a_policy_entry_that_is_not_a_suite_name_is_a_failed_read(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """An entry joining a CBC and a GCM suite would otherwise read as one AEAD suite."""
+    monkeypatch.setattr(cipher_policy, "_hklm_value", lambda subkey, name: ([value], 7))
+    with pytest.raises(ProbeFailed, match="is not a suite name"):
+        cipher_policy._schannel_policy_order()
 
 
 def test_policy_order_of_another_type_is_a_failed_read(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -413,6 +433,8 @@ def test_config_values_are_read_as_openssl_reads_them(raw: str, value: str) -> N
 
 
 _HEALTHY_SECTION = "[system_default_sect]\nCipherString = ECDHE+AESGCM\nMinProtocol = TLSv1.2\n"
+#: Spelled as an escape, so no editor can strip the character unseen.
+_BOM = "\N{ZERO WIDTH NO-BREAK SPACE}"
 
 
 @pytest.mark.parametrize(
@@ -428,7 +450,7 @@ _HEALTHY_SECTION = "[system_default_sect]\nCipherString = ECDHE+AESGCM\nMinProto
             _CHAIN + _HEALTHY_SECTION + "[other]\nsystem_default_sect::MinProtocol = TLSv1\n",
             "section::name",
         ),
-        ("﻿.include /etc/ssl/more.cnf\n" + _CHAIN + _HEALTHY_SECTION, ".include"),
+        (_BOM + ".include /etc/ssl/more.cnf\n" + _CHAIN + _HEALTHY_SECTION, ".include"),
     ],
 )
 def test_a_file_using_what_the_check_does_not_follow_is_manual(
@@ -457,7 +479,7 @@ def test_a_byte_order_mark_is_dropped_as_openssl_drops_it(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A BOM before ``openssl_conf`` must not break the chain into a false FAIL."""
-    text = "﻿" + _CHAIN + _HEALTHY_SECTION
+    text = _BOM + _CHAIN + _HEALTHY_SECTION
     assert _read_cnf(monkeypatch, tmp_path / "openssl.cnf", text)[1] == "system_default_sect"
 
 
@@ -492,6 +514,56 @@ def test_without_openssl_conf_the_system_file_is_read(
         "system_default_sect",
         [("MinProtocol", "TLSv1.2")],
     )
+
+
+def test_a_form_feed_does_not_end_a_line(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """OpenSSL reads one invalid MinProtocol value here and applies no floor, so this must not
+    read as a second, healthy MinProtocol line."""
+    text = (
+        _CHAIN
+        + "[system_default_sect]\nCipherString = X\nMinProtocol = TLSv1\fMinProtocol = TLSv1.2\n"
+    )
+    r = _linux_from_file(monkeypatch, tmp_path / "openssl.cnf", text)
+    assert r.status is Status.FAIL, r.detail
+
+
+def _openssl_returns(monkeypatch: pytest.MonkeyPatch, stdout: str) -> None:
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+
+def test_openssl_suite_lines_are_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    _openssl_returns(monkeypatch, "\n".join(_SSL_AEAD) + "\n")
+    assert cipher_policy._openssl_suites() == _SSL_AEAD
+
+
+def test_an_openssl_line_that_is_not_a_suite_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A notice line would otherwise be counted as a suite and named as one that is not AEAD."""
+    _openssl_returns(monkeypatch, "Using configuration from /etc/ssl/openssl.cnf\n" + _SSL_AEAD[0])
+    with pytest.raises(ProbeFailed, match="is not a suite line"):
+        cipher_policy._openssl_suites()
+
+
+@pytest.mark.skipif(shutil.which("openssl") is None, reason="no openssl on PATH")
+def test_the_openssl_command_runs_on_this_host() -> None:
+    """Every line a real ``openssl ciphers -s -v`` prints has the suite-line shape, so the shape
+    check does not turn a healthy host into an ERROR."""
+    assert cipher_policy._openssl_suites()
+
+
+def test_an_unforeseen_exception_is_an_error_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The verify contract: a broken check returns ERROR rather than ending the run."""
+
+    def boom(platform: str | None = None) -> CheckResult:
+        raise ValueError("unexpected")
+
+    monkeypatch.setattr(checks, "_can_import", lambda module: True)
+    monkeypatch.setattr(cipher_policy, "read_host_cipher_policy", boom)
+    r = checks.check_host_cipher_policy()
+    assert (r.id, r.status) == ("host.ciphers", Status.ERROR)
+    assert "ValueError: unexpected" in r.detail
 
 
 # ---- the probe runner and the platform gates --------------------------------------------------

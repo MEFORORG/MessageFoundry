@@ -812,7 +812,9 @@ It runs the commands of this step. It differs from them in at least the ways nam
   `system_default`, which is `[system_default_sect]` on the stock Ubuntu file measured above. A file
   where that chain leads nowhere sets no policy, and reads FAIL. It matches the three names without
   regard to case, as OpenSSL does. It accepts an indented line, removes quotes around a value,
-  drops a `#` comment outside quotes, and drops a leading byte-order mark. It does not follow at
+  drops a `#` comment outside quotes, and drops a leading byte-order mark. It ends a line only at a
+  newline, as OpenSSL does. Any `openssl ciphers` output line not shaped like a suite line makes
+  the row ERROR, as on Windows. It does not follow at
   least these: an `.include` or `.pragma` line, a line that ends in a backslash, a
   `section::name` assignment, or a `$name` value. A file with any of the first four anywhere, or
   with `$` in a `CipherString` or `MinProtocol` value or in the section chain, reads MANUAL. So does
@@ -826,8 +828,8 @@ It runs the commands of this step. It differs from them in at least the ways nam
 |---|---|
 | PASS | The control is above 0 and every enabled suite is AEAD. On Windows, both `Enabled` values read `0`, and every suite in a Group Policy suite order is AEAD. On Linux, the system-default section holds one `CipherString` line and its last `MinProtocol` is `TLSv1.2` or `TLSv1.3`. |
 | FAIL | Any of those does not hold. The row names the suites that are not AEAD. An `Enabled` value that is not set fails too, as on the stock host measured above. |
-| ERROR | A reading was attempted and gave no usable answer. At least these: a command ran and failed or timed out; PowerShell printed a line that is not a suite name; a suite list, enabled or Group Policy, read empty; a registry value could not be read or held the wrong type; the OpenSSL file could not be read. An empty list is a control of 0, so it never reads as healthy. |
-| MANUAL | The row cannot take the reading here. At least these: no Windows PowerShell, no system TLS module or `Get-TlsCipherSuite` cmdlet in it, no `openssl`, no OpenSSL file at the path read, an empty `OPENSSL_CONF`, or an OpenSSL file that uses what the row does not follow (above). Run the commands above by hand. |
+| ERROR | A reading was attempted and gave no usable answer. At least these: a command ran and failed or timed out; the system TLS module is there but did not import; PowerShell or `openssl` printed a line, or the Group Policy order held an entry, that is not a suite; a suite list, enabled or Group Policy, read empty; a registry value could not be read or held the wrong type; the OpenSSL file could not be read. An empty list is a control of 0, so it never reads as healthy. |
+| MANUAL | The row cannot take the reading here. At least these: no Windows PowerShell, no system TLS module folder or no `Get-TlsCipherSuite` cmdlet in it, no `openssl`, no OpenSSL file at the path read, an empty `OPENSSL_CONF`, or an OpenSSL file that uses what the row does not follow (above). Run the commands above by hand. |
 | SKIP | `pyodbc` is not installed in the Python that runs `verify`, so no ODBC Driver 18 hop can run from it. Or the host is neither Windows nor Linux. |
 
 When readings disagree, the row takes the worst: FAIL, then ERROR, then MANUAL, then PASS. So a

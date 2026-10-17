@@ -140,7 +140,15 @@ def check_host_cipher_policy() -> CheckResult:
             "pyodbc is not installed in this Python, so no ODBC hop runs from it; run verify "
             "from the engine's own environment to read the policy",
         )
-    return cipher_policy.read_host_cipher_policy()
+    try:
+        return cipher_policy.read_host_cipher_policy()
+    except Exception as exc:  # a reading the probe mapping did not foresee: the check broke
+        return CheckResult(
+            cipher_policy.RID,
+            cipher_policy.TITLE,
+            Status.ERROR,
+            f"the policy read raised {type(exc).__name__}: {codec_safe_str(exc)}",
+        )
 
 
 def _asyncpg_has_connect_hook() -> bool | None:
