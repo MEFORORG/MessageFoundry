@@ -2462,9 +2462,12 @@ What a site needs to know:
   captured. The capture outcome comes from the entry's `response.outcome`.
 - If a server answers 2xx while the entry's own `response.status` failed, the message is classified on
   that entry status, like any other HTTP status. An entry status that does not read as an HTTP code is
-  logged as a warning, and the 2xx reply counts as delivered. So does a non-empty reply that is not a
-  readable FHIR resource, including one that repeats a JSON key: its entry status is not read at all, and
-  the capture outcome is `unparseable`.
+  logged as a warning, and the 2xx reply counts as delivered.
+- A reply in which a JSON object repeats a key, anywhere in it, is read one way by the engine and maybe
+  another by the server, so the engine does not judge it. The update is a permanent refusal, code
+  `reply-repeats-a-key`, in either capture mode, and it is not sent again. It is not recorded as
+  delivered, even when every reading of the reply is a success, as with a reply over the byte bound
+  below (vault BACKLOG #2812).
 - A reply body over the byte bound is not kept, so the engine cannot see the entry's status. The
   update is then a permanent refusal, code `reply-too-large`, in either capture mode, and it is not
   sent again. It is not recorded as delivered. See *A 2xx reply over the byte bound* under [REST](#rest--rest).

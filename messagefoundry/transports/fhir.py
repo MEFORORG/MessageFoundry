@@ -396,6 +396,17 @@ def _screen_bundle(payload: str, interaction: str, screen: _EntryScreen) -> None
         )
 
 
+#: The ``code`` of the permanent refusal for a wrapped update's 2xx reply that repeats a JSON key.
+_REPLY_REPEATS_A_KEY_CODE = "reply-repeats-a-key"
+
+
+def _repeats_a_key(body: str) -> bool:
+    """Whether parsing ``body`` stops at a repeated JSON key. Run only after :class:`FhirPeek`
+    refused it, to tell that refusal apart from a body that is not JSON at all."""
+    _, hint = json_loads_or_refusal(body.lstrip(_BOM), object_pairs_hook=refuse_repeated_keys)
+    return hint == RepeatedKeyError.__name__
+
+
 def _bundle_refusal(payload: str, interaction: str, screen: _EntryScreen) -> str | None:
     """Why :func:`_screen_bundle` refuses ``payload``, or None when every entry passes."""
     # A repeated key is refused, so the screen and the server can never read two different
@@ -646,21 +657,30 @@ def _unwrap_transaction_reply(
     end in a 412 and a false dead-letter. PHI-safe: only the code is named, never the entry's
     ``status`` text or ``outcome``.
 
+    A reply that repeats a JSON key is a permanent refusal, code ``reply-repeats-a-key``, and is not
+    recorded as delivered (vault BACKLOG #2812). Its entry status could read either way, so, like a
+    reply over the byte bound, it fails closed; the refusal names neither the key nor a value.
+
     The entry's ``etag``/``location``/``lastModified`` describe the updated resource, so a field the
     entry carries suppresses the reply header of the same name, which describes the Bundle, even
     when the entry's value is then dropped. A value carrying a control character, or longer than a
     header value may be, is dropped: it came from a JSON body, which, unlike an HTTP header line,
     bounds neither. The rest are offered to the #154 allow-list."""
     try:
-        peek = FhirPeek.parse(body)
+        peek: FhirPeek | None = FhirPeek.parse(body)
     except FhirPeekError:
-        # Among them a reply that repeats a key (vault BACKLOG #2812): the entry status cannot be
-        # read either way, so, like an unreadable status below, the 2xx counts as delivered. Said
-        # aloud, because a failed entry hides behind it. An empty reply is send()'s no_reply.
-        if body.strip():
-            logger.warning(
-                "FHIR transaction-response is not a readable FHIR resource; taking the 2xx reply "
-                "as delivered without its entry status"
+        peek = None
+    # Judged outside the handler, so nothing rides on the refusal's __context__ (BACKLOG #2048).
+    if peek is None:
+        if _repeats_a_key(body):
+            # Vault BACKLOG #2812: the reply reads two ways, and json alone would take the last.
+            # Like a reply over the byte bound (#2180), it is needed and unreadable, so the update
+            # fails closed rather than counting as delivered.
+            raise NegativeAckError(
+                f"{_REPLY_REPEATS_A_KEY_CODE}, not sent again. A 2xx reply body repeats a JSON key "
+                "and is needed here. Check the partner before a replay (FHIR destination)",
+                code=_REPLY_REPEATS_A_KEY_CODE,
+                permanent=True,
             )
         return headers, "unparseable"
     entries = peek.obj.get("entry") if peek.resource_type == "Bundle" else None

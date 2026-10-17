@@ -790,33 +790,68 @@ async def test_an_outgoing_body_with_one_of_each_key_is_sent() -> None:
     assert len(opener.requests) == 1
 
 
-@pytest.mark.parametrize(
-    ("response", "outcome"),
-    [
-        ('{"status": "404 Not Found", "status": "200 OK"}', "unparseable"),
-        ('{"status": "200 OK", "status": "404 Not Found"}', "unparseable"),
-        ('{"status": "200 OK"}', "accepted"),  # control
-    ],
-    ids=["failure-first", "failure-last", "control"],
-)
-async def test_a_wrapped_update_reply_that_repeats_a_key_captures_as_unparseable(
-    response: str, outcome: str, caplog: pytest.LogCaptureFixture
-) -> None:
-    # The two orders read differently by which key a reader keeps, so the peek refuses the reply
-    # and the entry status is not read in either. The 2xx then counts as delivered, as an
-    # unreadable entry status does, and a warning says so. Before #2812 the failure-last order
-    # dead-lettered on the 404 and the failure-first order was delivered.
-    reply = (
-        '{"resourceType": "Bundle", "type": "transaction-response", "entry": [{"response": '
+def _reply_with(response: str, *, meta: str = "{}") -> bytes:
+    """A transaction-response written by hand, since json.dumps cannot repeat a key."""
+    return (
+        '{"resourceType": "Bundle", "type": "transaction-response", "meta": '
+        + meta
+        + ', "entry": [{"response": '
         + response
         + "}]}"
-    )
-    dest = _dest(interaction="update", capture_response=True)
-    dest._opener = _FakeOpener(body=reply.encode())  # type: ignore[assignment]
-    with caplog.at_level("WARNING", logger="messagefoundry.transports.fhir"):
-        resp = await dest.send(UPDATE_1965)
-    assert isinstance(resp, DeliveryResponse) and resp.outcome == outcome
-    assert ("without its entry status" in caplog.text) is (outcome == "unparseable")
+    ).encode()
+
+
+@pytest.mark.parametrize("capture", [True, False], ids=["capture", "no-capture"])
+@pytest.mark.parametrize(
+    "reply",
+    [
+        # Keeping the last key, as json does, reads the 404 and dead-letters, which the #2180
+        # control did before #2812; refusing the reply must not turn it into a delivery.
+        _reply_with('{"status":"200 OK","status":"404 Not Found"}'),
+        _reply_with('{"status": "404 Not Found", "status": "200 OK"}'),
+        # A repeat away from the status still makes the reply read two ways.
+        _reply_with(
+            '{"status": "400 Bad Request"}', meta='{"tag": 1, "tag": "' + PHI_CANARY + '"}'
+        ),
+        _reply_with('{"status": "200 OK", "status": "201 Created"}'),
+        # Not a transaction-response at all: refused the same way, since it too reads two ways.
+        b'{"resourceType": "OperationOutcome", "issue": [{"severity": "information", '
+        b'"severity": "information"}]}',
+    ],
+    ids=[
+        "measured-failure-last",
+        "failure-first",
+        "elsewhere",
+        "both-succeed",
+        "not-a-transaction-response",
+    ],
+)
+async def test_a_wrapped_update_reply_that_repeats_a_key_is_dead_lettered(
+    reply: bytes, capture: bool
+) -> None:
+    # Vault BACKLOG #2812: fails closed, like a reply over the byte bound (#2180). It is never
+    # recorded as delivered, whichever order the keys come in.
+    dest = _dest(interaction="update", capture_response=capture)
+    dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send(UPDATE_1965)
+    assert ei.value.permanent is True
+    assert ei.value.code == "reply-repeats-a-key"
+    text = str(ei.value)
+    for word in ("status", "tag", "Not Found", "Bad Request", PHI_CANARY):
+        assert word not in text
+
+
+@pytest.mark.parametrize("capture", [True, False], ids=["capture", "no-capture"])
+async def test_a_wrapped_update_reply_with_one_of_each_key_is_delivered(capture: bool) -> None:
+    # Control for the refusal above.
+    dest = _dest(interaction="update", capture_response=capture)
+    dest._opener = _FakeOpener(body=_reply_with('{"status": "200 OK"}'))  # type: ignore[assignment]
+    resp = await dest.send(UPDATE_1965)
+    if capture:
+        assert isinstance(resp, DeliveryResponse) and resp.outcome == "accepted"
+    else:
+        assert resp is None
 
 
 async def test_reply_that_is_not_a_transaction_response_is_delivered() -> None:
