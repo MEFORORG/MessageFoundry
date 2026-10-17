@@ -1136,7 +1136,9 @@ class EngineClient:
 
     def confirm_mfa(self, code: str) -> list[str]:
         """Confirm enrollment with a live TOTP code; activates MFA and returns the one-time recovery
-        codes (shown **once**). Raises :class:`ApiError` (400) on a wrong code.
+        codes (shown **once**). Raises :class:`ApiError` (400) on a wrong code, and (403, with no
+        ``X-Step-Up-Required`` header) when the directory could not confirm a directory account
+        (BACKLOG #3061), whose code was then never checked.
 
         Confirming an enrolment elevates the session, so it also re-keys it (ASVS 7.2.4) and the new
         token is adopted here — the caller keeps getting just the codes.

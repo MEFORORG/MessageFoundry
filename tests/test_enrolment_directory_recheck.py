@@ -293,6 +293,74 @@ async def test_the_totp_enrolment_lookup_comes_after_the_floor(
     assert s.directory.probes == []
 
 
+async def test_a_slow_lookup_does_not_push_a_good_enrolment_code_out_of_its_step(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lookup is a network round trip before the code is checked, so the code is judged as of
+    the request's arrival, as verify_mfa judges it (BACKLOG #1943). RED when the confirm reads the
+    clock after the lookup: a lookup that ends past the step boundary then refuses a good code."""
+    t = await _totp_staged(await _directory_sign_in(store), monkeypatch)
+    real_probe = t.signed.service._probe_principal
+
+    async def _probe_past_the_step(user: UserRecord) -> reconcile.Probe:
+        pin_totp_clock(monkeypatch, _T0 + 2 * totp.DEFAULT_PERIOD)
+        return await real_probe(user)
+
+    monkeypatch.setattr(t.signed.service, "_probe_principal", _probe_past_the_step)
+
+    served = await t.signed.service.confirm_mfa_enrollment(
+        t.signed.identity, t.code, token=t.signed.token
+    )
+
+    assert served.ok is True
+
+
+async def _lock_second_step(store: MessageStore, user_id: str) -> None:
+    await store.increment_login_failure(
+        user_id,
+        counter="second_step",
+        threshold=1,
+        lockout_seconds=900.0,
+        max_lockout_seconds=86_400.0,
+    )
+
+
+async def test_a_second_step_locked_directory_account_cannot_enrol(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The re-read after a confirmed lookup refuses a live second-step lock, so neither leg lets a
+    locked directory account enrol, and neither spends anything. Pinned so the asymmetry with a
+    local account, which is not lock-checked at enrolment, is a decision and not an accident."""
+    t = await _totp_staged(await _directory_sign_in(store), monkeypatch)
+    await _lock_second_step(store, t.signed.identity.user_id)
+
+    refused = await t.signed.service.confirm_mfa_enrollment(
+        t.signed.identity, t.code, token=t.signed.token
+    )
+
+    assert refused.ok is False and refused.directory_unconfirmed is False
+    assert t.minted == []
+    user = await store.get_user(t.signed.identity.user_id)
+    assert user is not None and not user.totp_enabled
+    assert {"reason": "locked"} in await _audited(store, "auth.mfa_failed")
+
+
+async def test_a_second_step_locked_directory_account_cannot_register_a_passkey(
+    store: MessageStore,
+) -> None:
+    """As above, on the passkey leg: nothing stored, the ceremony left in flight."""
+    p = await _passkey_staged(await _directory_sign_in(store))
+    await _lock_second_step(store, p.signed.identity.user_id)
+
+    refused = await _register(p)
+
+    assert refused.ok is False and refused.directory_unconfirmed is False
+    assert await store.list_webauthn_credentials(p.signed.identity.user_id) == []
+    key = (hash_token(p.signed.token), "register")
+    assert p.signed.service._webauthn_challenges.peek(key) is not None
+    assert {"reason": "locked"} in await _audited(store, "auth.webauthn_failed")
+
+
 async def test_a_local_account_is_never_probed_on_totp_enrolment(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -423,6 +491,9 @@ async def test_a_disable_during_the_lookup_is_a_lost_passkey_registration(
     assert {"reason": "session_lost", "phase": "enroll"} in await _audited(
         store, "auth.webauthn_failed"
     )
+    # A dead session can never finish the ceremony, so the lost answer ends it.
+    key = (hash_token(p.signed.token), "register")
+    assert p.signed.service._webauthn_challenges.peek(key) is None
 
 
 async def test_a_local_account_is_never_probed_on_passkey_registration(

@@ -2665,7 +2665,13 @@ place. The passkey leg asks before it takes the challenge, so a refusal verifies
 stores no passkey and leaves the ceremony in flight. Each refusal is audited as the leg's own
 failure event, `auth.mfa_failed` or `auth.webauthn_failed`, with `reason=directory_unconfirmed`,
 the lookup's outcome and `phase=enroll`. After a confirmed lookup each leg reads the session, the
-account and its lock again, and a session or account gone meanwhile is a lost session.
+account and its lock again, and a session or account gone meanwhile is a lost session, which
+also ends a staged passkey ceremony. That re-read refuses a second-step lock too, so a locked
+directory account cannot enrol a factor, while a local account is not lock-checked at enrolment.
+The TOTP leg judges the code as of the request's arrival, so a slow lookup does not push a good code
+out of its step. A refusal is not free: the route in front of each leg has already drawn its
+per-actor attempt budget, and `POST /me/mfa/confirm` and `/ui/account/mfa/verify` have spent their
+single-use password step-up, so each retry costs a password re-proof.
 `POST /me/mfa/confirm` answers **403** with the words `POST /auth/mfa-verify` uses, and the
 account page's two enrolment finishes show the words `/ui/mfa` shows. A local account is never
 looked up.
@@ -2762,7 +2768,9 @@ recovery code. A session that still owes its factor could not clear it with a co
 it could not renew its window. The same outage blocks the password re-bind and the IdP step-up leg, so a
 directory operator would have no way to open a window until the directory returned. The passkey leg
 asks the directory too (BACKLOG #2239), so a directory session that still owes its factor could not
-clear it by verifying a passkey either. Local accounts are not
+clear it by verifying a passkey either. Both enrolment legs ask as well (BACKLOG #3061), so such a
+session could not clear its factor by enrolling TOTP or a passkey, and no directory account could
+enrol one, until the directory returned. Local accounts are not
 refused, so a local administrator keeps step-up through the outage. Each attempt costs one directory
 lookup: a service bind and a search, plus a group search. The route's rate limiter paces it while
 `[auth].login_rate_limit_enabled` is on; with it off, nothing does. A directory that accepts connections but never answers

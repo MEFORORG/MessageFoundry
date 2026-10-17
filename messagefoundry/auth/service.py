@@ -915,7 +915,9 @@ class Elevation:
     #: could not judge the password, for at least these causes: no directory, no enabled entry for
     #: the row's id, an unreachable one, a row with no id, or an entry that is not provably the
     #: row's own (BACKLOG #2027). Set by :meth:`AuthService.finish_webauthn_assertion` on the same
-    #: answers as ``verify_mfa`` (BACKLOG #2239). In every case the proof was never checked and
+    #: answers as ``verify_mfa`` (BACKLOG #2239), and by :meth:`AuthService.confirm_mfa_enrollment`
+    #: and :meth:`AuthService.finish_webauthn_registration` on them too (BACKLOG #3061). In every
+    #: case the proof was never checked and
     #: nothing was charged. It qualifies the wrong-proof state: the token still authenticates, and
     #: the caller must say the directory could not confirm the account rather than call the code,
     #: the password or the passkey wrong. The cause goes to the audit row (``reason`` on
@@ -10655,8 +10657,14 @@ class AuthService:
         disabled, gone or demoted in the directory cannot clear the MFA gate by enrolling. It asks
         after the floor and before the code is checked. A refusal returns ``directory_unconfirmed``
         (or, when the session or account went during the lookup, ``session_lost``), spends no TOTP
-        step, mints no recovery codes, and leaves MFA off with the staged secret in place."""
+        step, mints no recovery codes, and leaves MFA off with the staged secret in place. Since the
+        re-read after the lookup refuses a second-step lock, a locked directory account cannot enrol
+        either; a local account is not lock-checked here. The code is judged as of the request's
+        arrival, so a slow lookup cannot push a good code out of its step."""
         arrived_at = time.time()  # the floor's clock, read before any await
+        # The TOTP clock at arrival: the directory lookup below can cross a step boundary, so the
+        # code is judged as of now, as verify_mfa judges it (BACKLOG #1943, #3061).
+        arrived = totp.wall_clock()
         user = await self._load_user(identity.user_id)
         if user is None:
             raise ValueError("no such user")
@@ -10694,7 +10702,7 @@ class AuthService:
         # enable atomic: a step that no longer advances the high-water mark fails on the same
         # phase=enroll branch and MFA is not enabled.
         matched_step = totp.verify_totp_step(
-            secret, code.strip(), window=self._settings.totp_skew_steps
+            secret, code.strip(), window=self._settings.totp_skew_steps, now=arrived
         )
         if matched_step is None or not await self._store.consume_totp_step(
             identity.user_id, matched_step
@@ -11710,9 +11718,11 @@ class AuthService:
 
         **A directory account must be confirmed by the directory first** (BACKLOG #3061), as on
         :meth:`confirm_mfa_enrollment`. It asks after the floor and before the challenge is popped,
-        so a refusal (``directory_unconfirmed``, or ``session_lost`` when the session or account went
-        during the lookup) verifies no attestation, stores no passkey and leaves the ceremony in
-        flight."""
+        so a refusal verifies no attestation and stores no passkey. A ``directory_unconfirmed``
+        refusal leaves the ceremony in flight; a ``session_lost`` one, when the session or account
+        went during the lookup, ends it. Since the re-read after the lookup refuses a second-step
+        lock, a locked directory account cannot enrol a passkey; a local account is not lock-checked
+        here."""
         arrived_at = time.time()  # the floor's clock, read before any await
         user = await self._load_user(identity.user_id)
         if user is None:
@@ -11759,6 +11769,9 @@ class AuthService:
             phase="enroll",
         )
         if isinstance(current, Elevation):
+            if current.session_lost:
+                # A dead session can never finish this ceremony; end it as the branch above does.
+                self._webauthn_challenges.pop((hash_token(token), "register"))
             return current
         user = current
         pending = self._webauthn_challenges.pop((hash_token(token), "register"))
