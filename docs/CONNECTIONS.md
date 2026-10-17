@@ -482,7 +482,7 @@ the bytes.
 | `host` | out | — (required) | the downstream peer to dial. **Inbound takes no host** (wiring error) — listeners bind the service-level `[inbound].bind_host`. |
 | `port` | both | — (required) | bind/connect port |
 | `framing` | both | `"stx_etx"` | framing **preset**: `"stx_etx"` (`0x02`/`0x03`, no trailer) or `"vt_fs"`/`"mllp"` (`0x0B`/`0x1C`/`0x0D`). Pass `framing=None` to use explicit bytes instead. |
-| `start` / `end` / `trailer` | both | — | explicit delimiter **byte ints** (use with `framing=None`; `trailer` optional). Specifying these *and* a preset is a config error. |
+| `start` / `end` / `trailer` | both | — | explicit delimiter **byte ints** (use with `framing=None`; `trailer` optional). Specifying these *and* a preset is a config error. `start` and `end` must differ, and neither may be `0x20` (a space); the connection is refused when it is built. A `0x20` `trailer` is allowed. Why: `FrameCodec` in [`messagefoundry/framing.py`](../messagefoundry/framing.py). |
 | `encoding` | both | `utf-8` | charset used to encode/decode the framed payload |
 | `max_connections` | in | `256` | cap on concurrent client connections (flood guard). `None`/`0` = unlimited. |
 | `receive_timeout` | in | `60.0` | close a client idle this many seconds (slowloris). `None`/`0` = no timeout. |
