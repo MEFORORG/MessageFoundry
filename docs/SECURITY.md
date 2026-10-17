@@ -4110,10 +4110,11 @@ revocations end no session and change no role. Each still writes its row, with `
 absent, that revocation still alerts and sends its notice, as when the user signed out mid-pass
 (owner ruling 2026-10-17). It is quiet, with no alert and no notice, only when another pass already
 revoked the account. The evidence is an `auth.ad_session_revoked` row with the same username and
-reason, written at or after this pass started. An older row does not count. If reading that
-evidence fails for any reason, the reconciler logs it at ERROR and the revocation reports, so a
-failed read does not cost the row. The rule, and a caveat about clock skew between engines, are
-stated in full in `AuthService._already_revoked_elsewhere`. Any other revocation that ends nothing
+reason, written after this pass started. The pass reads the newest audit row id when it starts,
+and only a row above that id counts, so a row's `ts`, and clock skew between engines, play no
+part. An older row does not count. If reading that id or that evidence fails for any reason, the
+reconciler logs it at ERROR and the revocation reports, so a failed read does not cost the row.
+The rule is stated in full in `AuthService._already_revoked_elsewhere`. Any other revocation that ends nothing
 is quiet too. So when two reconcilers on one store revoke one account in turn, the second only audits. If both read
 the old roles, or both apply before either writes its row, both still report. If the first
 reconciler's pass ended before it alerted, the second's quiet revocation means that account pages
