@@ -2102,6 +2102,11 @@ _SCHEMA: list[str] = [
     # key is at most 772 bytes (actor 512, action 256, id 4), inside the 1700-byte nonclustered limit.
     """IF INDEXPROPERTY(OBJECT_ID('audit_log'),'ix_audit_actor','IndexID') IS NULL
         CREATE INDEX ix_audit_actor ON audit_log(actor, action, id)""",
+    # One account's rows of any action, newest first: GET /audit?actor=, its export pages and
+    # /me/security-events (vault BACKLOG #3120). The SQLite `_SCHEMA` says why ix_audit_actor alone
+    # is not enough there. The key is at most 516 bytes (actor 512, id 4).
+    """IF INDEXPROPERTY(OBJECT_ID('audit_log'),'ix_audit_actor_id','IndexID') IS NULL
+        CREATE INDEX ix_audit_actor_id ON audit_log(actor, id)""",
     # No table beside audit_log says where its keying starts: the process that holds the key decides,
     # and the chain's own row at sequence number 1 (the genesis row) names the first range's key.
     # Per-key AES-GCM invocation bound (ASVS 11.3.4) — see the SQLite `_SCHEMA` for the

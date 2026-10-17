@@ -6752,6 +6752,10 @@ CREATE INDEX IF NOT EXISTS ix_audit_action ON audit_log(action, id);
 -- One account's rows of one action, newest first: the lock notice's 24-hour throttle read, vault
 -- BACKLOG #3120. Without it that read walks every recent row of the action, for every account.
 CREATE INDEX IF NOT EXISTS ix_audit_actor ON audit_log(actor, action, id);
+-- One account's rows of any action, newest first: GET /audit?actor=, its export pages and
+-- /me/security-events, vault BACKLOG #3120. ix_audit_actor alone made the planner seek the actor
+-- there and then sort every one of its rows to read the newest few.
+CREATE INDEX IF NOT EXISTS ix_audit_actor_id ON audit_log(actor, id);
 
 -- There is no table beside audit_log that says where its keying starts. Whether a chain is keyed is
 -- decided by the process that holds the key, and the first range's key is named by the chain's own

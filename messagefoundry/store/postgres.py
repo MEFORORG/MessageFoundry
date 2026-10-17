@@ -728,6 +728,11 @@ _SCHEMA: list[str] = [
     # prefix and then on the whole value, so the planner can seek it. 200 characters is at most
     # 800 bytes.
     "CREATE INDEX IF NOT EXISTS ix_audit_actor ON audit_log(left(actor, 200), action, id)",
+    # One account's rows of any action, newest first: GET /audit?actor=, its export pages and
+    # /me/security-events (vault BACKLOG #3120). The SQLite `_SCHEMA` says why ix_audit_actor alone
+    # is not enough there. The same actor prefix, for the same reason; `_audit_where` and
+    # `_security_events_where_pg` both filter on it.
+    "CREATE INDEX IF NOT EXISTS ix_audit_actor_id ON audit_log(left(actor, 200), id)",
     # No table beside audit_log says where its keying starts: the process that holds the key decides,
     # and the chain's own row at sequence number 1 (the genesis row) names the first range's key.
     # Per-key AES-GCM invocation bound (ASVS 11.3.4) — see the SQLite `_SCHEMA` for the
@@ -10431,10 +10436,13 @@ def _pg_cutoff_case(
 def _security_events_where_pg(username: str, until: float | None) -> tuple[str, list[Any]]:
     """The ``$N`` ``WHERE`` text and values for one user's security-event page and its total
     (BACKLOG #2438), shared so the two count one set. The SQLite builder states the rule, including
-    the lower bound at the account's ``created_at`` (BACKLOG #1152)."""
+    the lower bound at the account's ``created_at`` (BACKLOG #1152).
+
+    The actor prefix term lets the planner seek ``ix_audit_actor_id``, which is keyed on that
+    prefix, as ``_audit_where`` does (vault BACKLOG #3120); the whole-value term decides the match."""
     params: list[Any] = [username]
     clause = (
-        " WHERE actor = $1 AND action LIKE 'auth.%'"
+        " WHERE left(actor, 200) = left($1::text, 200) AND actor = $1 AND action LIKE 'auth.%'"
         " AND ts >= (SELECT created_at FROM users WHERE username = $1)"
     )
     if until is not None:
