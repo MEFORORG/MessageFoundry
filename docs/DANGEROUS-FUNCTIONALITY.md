@@ -54,7 +54,7 @@ on its own.
 | 1 | Executing your Python | Routers and Handlers | In-process, no isolation |
 | 2 | Loading config by file path | Config loader | Loads every non-`_` module it finds |
 | 3 | Loading a module by name or path | Two provider seams, the publish guard's scanner, the child-process bootstrap | Seams: off unless you name an external provider. Bootstrap, engine: only with `[sandbox].mode = "subprocess"` or under `messagefoundry supervise`. Bootstrap, tray: each time autostart starts the tray from a checkout, and each time the tray can build its branded launcher |
-| 4 | Starting processes | 11 modules | Varies, see below |
+| 4 | Starting processes | 12 modules | Varies, see below |
 | 5 | Calling native libraries | 19 modules, mostly Windows-only paths | On where the platform needs it |
 | 6 | Changing thread identity | Windows alternate credentials | Off unless configured |
 | 7 | Parsing hostile input | Message payloads, partner replies, uploads, browser requests, archives, the VS Code extension | On -- this is the product |
@@ -247,7 +247,7 @@ debugging on, because a launcher passes no interpreter option.
 
 ## 4. The engine starts processes
 
-11 modules start a process. The reason differs at each, and so does the form of the start:
+12 modules start a process. The reason differs at each, and so does the form of the start:
 
 | Module | What it runs | When | Form |
 |---|---|---|---|
@@ -259,6 +259,7 @@ debugging on, because a launcher passes no interpreter option.
 | `auth/trust_anchors.py` | `icacls.exe`, read-only | Checking a trust anchor file's permissions | argument list |
 | `store/store.py` | `icacls.exe` | Setting owner-only permissions on store files, which hold no key | argument list |
 | `checks.py` | `ruff` and `mypy`, found on `PATH` | `messagefoundry check`, when they are installed | argument list |
+| `verify/cipher_policy.py` | `powershell.exe` running `Get-TlsCipherSuite` on Windows; `openssl ciphers`, found on `PATH`, on Linux | `messagefoundry verify --section host`, when `pyodbc` imports | argument list |
 | `tray/actions.py` | VS Code, the default browser, the default viewer | Tray menu actions | argument list, browser, os.startfile |
 | `tray/app.py` | The default editor | Opening `tray.toml` from the tray | os.startfile |
 | `tray/branding.py` | The tray again, under its branded launcher | Tray startup | argument list |
@@ -280,10 +281,13 @@ system tool, the code pins its absolute path under the system directory, so a sa
 planted in the working directory cannot run instead. The security lint marks the reviewed sites with
 a `nosec` note naming the rule it answers.
 
-Two argument-list starts are not pinned that way:
+Three argument-list starts are not pinned that way:
 
 - `checks.py` is a developer tool. It runs `ruff` and `mypy` by bare name, so Windows may find a
   copy in the working directory before the one on `PATH`.
+- `verify/cipher_policy.py` runs `openssl` by bare name on Linux, as the manual check in
+  [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) section 5.4 does, so the `PATH` the operator runs
+  `verify` with picks the copy. On Windows it runs Windows PowerShell by its system-directory path.
 - `tray/actions.py` opens a folder in VS Code. It finds the `code` command, which on Windows is a
   batch file, `code.cmd`, and Windows runs a batch file through `cmd.exe`, which re-reads the whole
   command line. So the tray does not start that file where it can avoid it. `resolve_vscode` looks

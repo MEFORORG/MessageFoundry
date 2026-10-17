@@ -601,7 +601,8 @@ context exists for the engine to narrow or check
 18*). The engine's own checks on these hops cover whether the hop is encrypted and whether the server
 certificate is validated. They do not cover cipher suites, so the engine would not notice a host that
 still allows a CBC suite. The owner declined a startup check that reads the host policy, so nothing in
-the engine would warn about a missed step.
+the engine would warn about a missed step at start. `messagefoundry verify` runs the checks below when
+an operator runs it; see *Both platforms: the `host.ciphers` verify row*.
 
 **How far the statements below are proven.** The load-bearing ones carry one of three labels:
 
@@ -656,6 +657,8 @@ and drop the values a hardening baseline put there. The commands in steps 1 and 
 take effect on the next boot." Restarting the engine service is not enough for the suite change.
 
 **4. Check it, after the reboot.** Both checks read state and change nothing.
+`messagefoundry verify --section host` runs both, with the control, as its `host.ciphers` row; see
+*Both platforms: the `host.ciphers` verify row*. The commands stay here so you can run them by hand.
 
 ```powershell
 # Control for check 1: the number of enabled suites. It must be above 0.
@@ -728,7 +731,9 @@ Keep the `@SECLEVEL=2` part, which the stock line carried. The `Ciphersuites` li
 its 256-bit suites. The AEAD floor does not need it. Then restart the engine service, so the
 driver reads the file again.
 
-**Check it (measured).** Run these as the account the engine runs as, with the same environment:
+**Check it (measured).** Run these as the account the engine runs as, with the same environment.
+`messagefoundry verify --section host`, run the same way, runs all three as its `host.ciphers` row;
+see *Both platforms: the `host.ciphers` verify row*. By hand:
 
 ```bash
 openssl ciphers -s -v | grep -c .        # every suite on offer: must be above 0
@@ -766,6 +771,40 @@ too. That variable replaces the system file for the driver (measured, last table
 - The engine process itself. The rig drove the driver through `sqlcmd`, not through the engine.
 - `dialect="generic"` with another vendor's ODBC driver. Which TLS stack and which rules that driver
   follows was not run, so this step does not cover it.
+
+#### Both platforms: the `host.ciphers` verify row
+
+`messagefoundry verify --section host` runs the checks of this step as one row, `host.ciphers`
+([`testing/VERIFY.md`](testing/VERIFY.md)). It reports and changes nothing. It is not part of
+`messagefoundry serve`, so it never refuses or delays an engine start. Run it as the account the
+engine runs as, with the same environment, after the reboot on Windows.
+
+It runs the commands of this step, not a substitute for them:
+
+- Windows: `(Get-TlsCipherSuite).Name` through Windows PowerShell at its `System32` path, with the
+  name filter of check 1 applied in Python, and the two `Enabled` values of check 2 read from the
+  registry.
+- Linux: `openssl ciphers -s -v` from the `PATH`, and the `CipherString`, `Ciphersuites` and
+  `MinProtocol` lines of `/etc/ssl/openssl.cnf`. Where `OPENSSL_CONF` is set in the environment it
+  reads the file that variable names instead, which is the file `openssl` itself loaded. A line may
+  be indented, and a trailing `#` comment is dropped.
+
+| Status | When |
+|---|---|
+| PASS | The control is above 0 and every enabled suite is AEAD. On Windows, both `Enabled` values read `0`. On Linux, the file holds one `CipherString` line and its last `MinProtocol` is `TLSv1.2` or `TLSv1.3`. |
+| FAIL | Any of those does not hold. The row names the suites that are not AEAD. An `Enabled` value that is not set fails too, as on the stock host measured above. |
+| ERROR | A command ran and failed or timed out, or the suite list read empty. An empty list is a control of 0, so it never reads as healthy. |
+| MANUAL | The instrument is not on the host: no Windows PowerShell, no `openssl`, or no OpenSSL file at the path read. Run the commands above by hand. |
+| SKIP | `pyodbc` does not import, so no ODBC Driver 18 hop can run in this environment. Or the host is neither Windows nor Linux. |
+
+A FAIL makes `verify` exit 1, like any other FAIL row. It reads what the commands above read, so the
+limits listed under each platform hold for it too.
+
+**Measured** on 2026-10-17, on a stock Windows 11 host with no policy set, calling the row's reading
+directly because that host has no `pyodbc`: 18 of 28 suites not AEAD and both `Enabled` values unset,
+so FAIL. The manual Windows checks on the same host printed `28`, 18 names, and nothing. Its healthy
+reading is **unmeasured** on a real host; the tests cover it with the probes stubbed. The Linux branch
+is **unmeasured** on Linux.
 
 #### Both platforms: what to expect afterwards
 
