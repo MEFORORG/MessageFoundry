@@ -327,7 +327,7 @@ _GATE_READS: dict[str, frozenset[str]] = {
     "list_pending": frozenset({"list_pending_approvals"}),
     "list_interrupted": frozenset({"list_interrupted_approvals"}),
     "rejoin": frozenset({"list_pending_approvals"}),
-    "reconcile_after_restart": frozenset({"list_executing_approvals"}),
+    "_reconcile": frozenset({"list_executing_approvals"}),
 }
 
 
@@ -370,7 +370,7 @@ def test_the_gate_reads_requests_through_its_seal_check() -> None:
     # `_load` checks what it reads itself; every other read goes through `_verified_rows`, except
     # the one reconcile read that only logs.
     unchecked = sorted((f, r) for f, r, checked in calls if not checked and f != "_load")
-    assert unchecked == [("reconcile_after_restart", "list_executing_approvals")], unchecked
+    assert unchecked == [("_reconcile", "list_executing_approvals")], unchecked
 
 
 #: Where each backend may write ``pending_approvals``: each module-level statement and the one
