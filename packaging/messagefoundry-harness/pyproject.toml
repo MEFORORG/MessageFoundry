@@ -57,10 +57,10 @@ dependencies = [
     # the engine it names carry the same string BY CONSTRUCTION. A range would be a claim about which
     # engines work; `==` is the fact that they ship together.
     #
-    # SO A VERSION BUMP MOVES THIS LINE, with __version__, the toolkit pin and the install-guide pins.
-    # The full list is in CONTRIBUTING.md, *Bumping the engine version*, and only there. PEP 621 `dependencies`
-    # is static (there is no metadata hook in this repository, and adding a build backend surface just
-    # for one string is not worth it), so nothing derives this for you. `tests/test_packaging.py`
+    # SO A VERSION BUMP MOVES THIS LINE. Every edit a bump makes is listed in CONTRIBUTING.md,
+    # *Bumping the engine version*, and only there. PEP 621 `dependencies` is static (there is no
+    # metadata hook in this repository, and adding a build backend surface just for one string is not
+    # worth it), so nothing derives this for you. `tests/test_packaging.py`
     # ::test_the_harness_pins_the_engine_at_the_version_it_ships_with is the gate, and it names both
     # files in its failure.
     "messagefoundry[harness]==0.5.1",

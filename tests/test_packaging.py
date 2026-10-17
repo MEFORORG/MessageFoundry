@@ -557,23 +557,28 @@ def test_every_build_system_pins_its_backend_exactly_and_they_agree() -> None:
 
 _HARNESS_PYPROJECT = _REPO / "packaging" / "messagefoundry-harness" / "pyproject.toml"
 
-# The one place the complete list of a version bump's edits lives (vault BACKLOG #2732). The pin
-# failures below point at it rather than counting the edits, because the count they used to give
-# ("at least three") left out the install guides and release PR 1895 went red on them.
 _CONTRIBUTING = _REPO / "CONTRIBUTING.md"
 _BUMP_HEADING = "## Bumping the engine version"
-_BUMP_LIST = f"{_CONTRIBUTING.name}, *{_BUMP_HEADING.removeprefix('## ')}*"
+_BUMP_LIST = "CONTRIBUTING.md, *Bumping the engine version*"
+_BUMP_NOT_MOVED = "\nWhat an engine bump does not move:"
+# Splits the list into the paths it names: on whitespace, and on the Markdown around a path.
+_BUMP_TOKEN_SEP = re.compile(r"[\s`*()\[\],;:]+")
 
 
+@functools.cache
 def _bump_section() -> str:
-    """The body of CONTRIBUTING.md's bump list, from its heading to the next ``## `` heading."""
+    """CONTRIBUTING.md's list of a bump's edits, from its heading to *does not move*.
+
+    It stops at the next ``## `` heading if that paragraph is gone. The *does not move* paragraph
+    names files too, and a file named only there is not on the list.
+    """
     text = _CONTRIBUTING.read_text(encoding="utf-8")
     assert _BUMP_HEADING in text.splitlines(), (
         f"{_CONTRIBUTING.name} has no {_BUMP_HEADING!r} heading, so every failure that points a "
         f"version bump at {_BUMP_LIST} points at nothing"
     )
     body = text.split(f"\n{_BUMP_HEADING}\n", 1)[1]
-    return body.split("\n## ", 1)[0]
+    return body.split("\n## ", 1)[0].split(_BUMP_NOT_MOVED, 1)[0]
 
 
 @pytest.mark.parametrize(
@@ -585,18 +590,22 @@ def _bump_section() -> str:
         "docs/INSTALL-GUIDE.md",
         "docs/EARLY-ADOPTER-GUIDE.md",
         "docs/USER-GUIDE.md",
+        "README.md",
+        "packaging/messagefoundry-webconsole/README.md",
         "tests/test_install_docs_pin_the_current_version.py",
         "scripts/release/changelog_fragments.py",
     ],
 )
 def test_the_bump_list_names_every_file_a_version_bump_moves(path: str) -> None:
-    """Each file a pin gate reads, and the changelog step, is named in the bump list.
+    """Each file that carries an engine pin, and the changelog step, is named in the bump list.
 
-    The list is prose, so this cannot prove it complete. It proves the files whose pins a test
-    already holds to ``__version__`` are not dropped from it, which is the omission that went red.
+    The list is prose, so this cannot prove it complete. It proves the files known to pin the
+    engine are not dropped from it: the old "at least three edits" count left out the install
+    guides, and release PR 1895 went red on them (vault BACKLOG #2732). A path must appear as a
+    whole token, so ``README.md`` is not satisfied by ``packaging/messagefoundry-webconsole/README.md``.
     """
     assert (_REPO / path).is_file(), f"{path} no longer exists; re-derive the bump list"
-    assert path in _bump_section(), f"{_BUMP_LIST} does not name `{path}`"
+    assert path in _BUMP_TOKEN_SEP.split(_bump_section()), f"{_BUMP_LIST} does not name `{path}`"
 
 
 def _version_literal(module: Path) -> str:
@@ -709,10 +718,9 @@ def test_the_harness_pins_the_engine_at_the_version_it_ships_with() -> None:
         f"  {root.relative_to(_REPO).as_posix()} says: {shipped}\n"
         f"  {_HARNESS_PYPROJECT.relative_to(_REPO).as_posix()} pins: {pinned}\n"
         f"A VERSION BUMP MOVES THIS PIN WITH THE OTHERS; {_BUMP_LIST} has the full list. "
-        f"PEP 621 `dependencies` is "
-        f"static and nothing in this repository "
-        f"generates it, so set that table to `messagefoundry[harness]=={shipped}` in the same commit "
-        f"that moves __version__."
+        f"PEP 621 `dependencies` is static and nothing in this repository generates it, so set "
+        f"that table to `messagefoundry[harness]=={shipped}` in the same commit that moves "
+        f"__version__."
     )
 
 
