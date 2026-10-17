@@ -23,10 +23,9 @@ The text is every such string that holds a space or spells the variable, so a ba
 ``""`` default of ``os.environ.get`` is not a message. That text must name the posture, and a
 phrase that wraps or is split across ``+`` still counts.
 
-**What the prose scans see** (vault BACKLOG #3099). Docstrings in ``_DOCSTRING_FILES``, and
-the one docstring of each function in ``_DOCSTRING_FUNCTIONS``, one paragraph at a time: a
-paragraph that spells the variable must name the posture, so a mention cannot ride on the
-posture in another paragraph. Two mentions inside one paragraph are judged
+**What the prose scans see** (vault BACKLOG #3099, #3753). Every docstring in the packages, one
+paragraph at a time: a paragraph that spells the variable must name the posture, so a mention
+cannot ride on the posture in another paragraph. Two mentions inside one paragraph are judged
 together. Comments in ``_COMMENT_FILES``: own-line comments on consecutive
 lines are one comment, and a comment after code is read alone. A comment names the escape when it
 spells the variable. A comment in a ``def`` signature also names it when it says "the escape",
@@ -35,21 +34,19 @@ because a factory's parameter comments are the help text the connection editor s
 name that one some other way. The editor joins a parameter's comments by its own rules, and this
 scan does not copy them: it reads each trailing comment alone, which is stricter.
 
-**The docstring files are a pinned list, not the tree.** At least ``_reject_unknown_env_keys`` and
-``weakened_tls_escape_permitted`` in ``config/settings.py`` name the variable to list it or to
-define the rule, so a scan of every docstring flags some text that misleads nobody. The list is
-the files brought into line so far, and it is not every file that needs it. Where a file cannot be
-held whole, ``_DOCSTRING_FUNCTIONS`` holds single functions to the rule, at least
-``insecure_tls_allowed`` in ``config/settings.py``. Every other docstring in that file goes unread,
-and so do the docstrings in at least ``config/tls_policy.py``, ``config/ai_policy.py`` and
-``pipeline/wiring_runner.py`` that spell the variable.
+**The docstring scan reads the tree; ``_DOCSTRING_FILES`` is its pinned control.** Until vault
+BACKLOG #3753 it read only a pinned list, because some docstrings named the variable to list it or
+to define the rule without the posture. Those now name it too, so a docstring that names the
+variable anywhere in the packages is held to the rule. Each pinned file must hold at least one
+such docstring, and each one, with the posture struck out, must be flagged in every paragraph that
+names the variable, so a walk that silently skips a file cannot pass.
 
 **What none of them sees**, at least: a message built in a variable before the call; the variable
 imported under another name; a message with no space that only interpolates the variable, such
 as ``f"{INSECURE_TLS_ESCAPE_ENV}=1:refused"``; a call lent through ``+``, as in
 ``(_("set %s") + "...") % NAME``; a method called on the template, as in
 ``"set %s".strip() % NAME``; the variable handed through a nested call, as in
-``"set %s" % str(NAME)``; a docstring or comment outside the pinned files; and prose that
+``"set %s" % str(NAME)``; a comment outside the pinned files; and prose that
 says "the dev escape" without the variable. A lent call that spells the variable itself is counted
 twice, once on its own and once in the call around it. A ``.format`` call is also judged on its
 own, by its arguments and without its template, so a spaced argument beside the variable is
@@ -70,7 +67,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV
-from tests._ast_sites import named_func, parse_source
+from tests._ast_sites import parse_source
 
 _REPO = Path(__file__).resolve().parent.parent
 #: Every shipped Python package ci.yml type-checks. The engine is ``messagefoundry``; the others
@@ -102,21 +99,27 @@ _MUST_FIND = frozenset(
     }
 )
 
-#: Files whose docstrings are held to the rule. Each must hold at least one docstring that names
-#: the escape, for the same reason ``_MUST_FIND`` is pinned.
-_DOCSTRING_FILES = (
-    "messagefoundry/config/wiring.py",
-    "messagefoundry/store/postgres.py",
-    "messagefoundry/transports/database.py",
-    "messagefoundry/transports/direct.py",
-    "messagefoundry/transports/email.py",
-    "messagefoundry/transports/mllp.py",
-    "messagefoundry/transports/remotefile.py",
-    "messagefoundry/transports/rest.py",
+#: Files the docstring walk must judge. Each must hold at least one docstring that names the
+#: escape, for the same reason ``_MUST_FIND`` is pinned.
+_DOCSTRING_FILES = frozenset(
+    {
+        "messagefoundry/config/ai_policy.py",
+        "messagefoundry/config/settings.py",
+        "messagefoundry/config/tls_policy.py",
+        "messagefoundry/config/wiring.py",
+        "messagefoundry/pipeline/reference_sync.py",
+        "messagefoundry/pipeline/wiring_runner.py",
+        "messagefoundry/store/postgres.py",
+        "messagefoundry/transports/database.py",
+        "messagefoundry/transports/direct.py",
+        "messagefoundry/transports/email.py",
+        "messagefoundry/transports/mllp.py",
+        "messagefoundry/transports/remotefile.py",
+        "messagefoundry/transports/rest.py",
+    }
 )
-#: Single functions held to the rule, in a file that cannot be held whole. Each docstring must name
-#: the escape, so a rewrite that drops it fails instead of passing with nothing to judge.
-_DOCSTRING_FUNCTIONS = (("messagefoundry/config/settings.py", "insecure_tls_allowed"),)
+#: The posture as source spells it, wrapped or not, so the planted control can strike it out.
+_POSTURE_IN_SOURCE = re.compile(r"\[security\]\.enforcement\s+=\s+warn")
 #: Files whose comments are held to it. The authoring factories live here, and their parameter
 #: comments reach an operator as help text.
 _COMMENT_FILES = ("messagefoundry/config/wiring.py",)
@@ -423,9 +426,6 @@ def test_the_prose_scans_flag_a_text_that_omits_the_posture() -> None:
     # The posture two paragraphs up does not cover the last paragraph, and line 14 is where that
     # paragraph spells the variable, not where it starts.
     assert docstrings_without_posture(_PROSE_THAT_OMITS_THE_POSTURE) == ([1, 14], 2)
-    # One function alone, as _DOCSTRING_FUNCTIONS reads it: the module docstring is not its text.
-    factory = named_func(parse_source(_PROSE_THAT_OMITS_THE_POSTURE), "factory")
-    assert _docstring_without_posture(factory) == ([14], 1)
     assert comments_without_posture(_PROSE_THAT_OMITS_THE_POSTURE) == ([6, 7, 16], 3)
 
 
@@ -462,25 +462,42 @@ def _text(rel: str) -> str:
     return (_REPO / rel).read_text(encoding="utf-8")
 
 
+def _docstring_scans() -> Iterator[tuple[str, tuple[list[int], int]]]:
+    """Each package file whose source spells the variable, with its docstring scan."""
+    for root in (_REPO / name for name in _PACKAGES):
+        for path in sorted(root.rglob("*.py")):
+            source = path.read_text(encoding="utf-8")
+            if INSECURE_TLS_ESCAPE_ENV in source:
+                yield path.relative_to(_REPO).as_posix(), docstrings_without_posture(source)
+
+
+def test_the_docstring_walk_flags_a_pinned_file_whose_posture_is_struck_out() -> None:
+    """Vault BACKLOG #3753's planted control. Each pinned file, with the posture struck out of its
+    source, has every paragraph that names the variable flagged, so a docstring that loses the
+    posture fails the walk, and a pinned file the walk reads as clean is one it really judged."""
+    for rel in sorted(_DOCSTRING_FILES):
+        source = _text(rel)
+        _, seen = docstrings_without_posture(source)
+        struck, count = _POSTURE_IN_SOURCE.subn("[security].enforcement", source)
+        assert count, f"{rel} spells no posture to strike out"
+        unposted, seen_struck = docstrings_without_posture(struck)
+        assert seen_struck == seen, rel
+        assert len(unposted) == seen, f"{rel}: {len(unposted)} of {seen} paragraphs flagged"
+
+
 def test_every_authoring_text_naming_the_escape_names_the_posture() -> None:
     failures: list[str] = []
-    silent: list[str] = []
-    results = (
-        [("docstring", rel, docstrings_without_posture(_text(rel))) for rel in _DOCSTRING_FILES]
-        + [
-            (
-                "docstring",
-                f"{rel}:{name}",
-                _docstring_without_posture(named_func(parse_source(_text(rel)), name)),
-            )
-            for rel, name in _DOCSTRING_FUNCTIONS
-        ]
-        + [("comment", rel, comments_without_posture(_text(rel))) for rel in _COMMENT_FILES]
-    )
-    for kind, rel, (unposted, seen) in results:
+    found: set[str] = set()
+    for rel, (unposted, seen) in _docstring_scans():
+        if seen:
+            found.add(rel)
+        failures.extend(f"{rel}:{line} (docstring)" for line in unposted)
+    silent = [f"{rel} (docstrings)" for rel in sorted(_DOCSTRING_FILES - found)]
+    for rel in _COMMENT_FILES:
+        unposted, seen = comments_without_posture(_text(rel))
         if not seen:
-            silent.append(f"{rel} ({kind}s)")
-        failures.extend(f"{rel}:{line} ({kind})" for line in unposted)
+            silent.append(f"{rel} (comments)")
+        failures.extend(f"{rel}:{line} (comment)" for line in unposted)
     assert not silent, f"the scan found no text naming the escape in {silent}"
     assert not failures, (
         f"these docstrings and comments name {INSECURE_TLS_ESCAPE_ENV}, or say "

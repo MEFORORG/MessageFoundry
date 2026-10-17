@@ -153,7 +153,8 @@ async def _load_database_source(
 
     ``posture`` is the instance hop posture (vault BACKLOG #2354). A sync runs after start, outside
     every ``active_hop_posture`` scope, so without it the weakened-TLS refusal in ``_build_dsn`` read
-    no posture and fell back to the UNCLAMPED ``MEFOR_ALLOW_INSECURE_TLS`` escape. Under ``enforce``
+    no posture and fell back to the then-UNCLAMPED ``MEFOR_ALLOW_INSECURE_TLS`` escape, which the clamp
+    now honours only at ``[security].enforcement = warn``. Under ``enforce``
     that let a DatabaseRef with ``encrypt=false`` cross in the clear, where the ``db_lookup`` twin
     refuses the same hop. ``None`` keeps the ambient posture, so a caller already inside a scope is
     unchanged. ``name`` is the reference set, so a refusal or an attestation line names it."""
