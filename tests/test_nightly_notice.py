@@ -28,6 +28,7 @@ report; a test asserting the config text and not the behaviour would be the same
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import shlex
@@ -733,6 +734,54 @@ def test_a_dast_run_that_did_not_fail_writes_nothing(conclusion: str, tmp_path: 
     run = _run_notice(tmp_path, workflow="DAST", conclusion=conclusion, open_issues={})
     _ok(run)
     assert _writes(run) == [], f"a {conclusion!r} run wrote something{_diagnostic(run)}"
+
+
+@functools.cache
+def _floors_workflow() -> str:
+    """`dependency floors`, read from its own file so a rename cannot leave these rows matching an
+    exception the shipped gate no longer names."""
+    return str(_load(_WORKFLOWS / "dependency-floors.yml")["name"])
+
+
+def test_a_cancelled_dependency_floors_nightly_opens_an_issue(tmp_path: Path) -> None:
+    """BACKLOG #3177. That workflow's scheduled run is never superseded (its concurrency group is the
+    run id), and a job that hits `timeout-minutes` concludes `cancelled`. So a hung install would be
+    a red that reaches nobody if `cancelled` took the no-op path here as it does for every other
+    watched workflow."""
+    workflow = _floors_workflow()
+    run = _run_notice(tmp_path, workflow=workflow, conclusion="cancelled", open_issues={})
+    _ok(run)
+    creates = [c for c in run.calls if c[:2] == ["issue", "create"]]
+    assert len(creates) == 1, f"a cancelled {workflow!r} nightly opened no issue{_diagnostic(run)}"
+    body = _opt(creates[0], "--body")
+    assert _arm_lines()[workflow] <= {line.strip() for line in body.splitlines()}, _diagnostic(run)
+    # Pinned as text: the two remedies this row added, which the subset check cannot hold in place.
+    assert "declares no floor this check can read" in body, _diagnostic(run)
+    assert "The run concluded cancelled" in body, _diagnostic(run)
+
+
+@pytest.mark.parametrize("conclusion", ["skipped", "timed_out"])
+def test_a_dependency_floors_run_that_did_not_fail_or_cancel_writes_nothing(
+    conclusion: str, tmp_path: Path
+) -> None:
+    """The exception is `cancelled` alone, not every non-failure conclusion."""
+    run = _run_notice(tmp_path, workflow=_floors_workflow(), conclusion=conclusion, open_issues={})
+    _ok(run)
+    assert _writes(run) == [], f"a {conclusion!r} run wrote something{_diagnostic(run)}"
+
+
+@pytest.mark.parametrize(
+    "workflow",
+    [w for w in _on(_load(_NOTICE))["workflow_run"]["workflows"] if w != _floors_workflow()],
+)
+def test_a_cancelled_nightly_of_any_other_watched_workflow_writes_nothing(
+    workflow: str, tmp_path: Path
+) -> None:
+    """The exception is `dependency floors` alone: elsewhere a cancelled nightly is usually a
+    superseded or manually-stopped run."""
+    run = _run_notice(tmp_path, workflow=workflow, conclusion="cancelled", open_issues={})
+    _ok(run)
+    assert _writes(run) == [], f"a cancelled {workflow!r} run wrote something{_diagnostic(run)}"
 
 
 def test_a_workflow_with_no_case_arm_still_gets_a_readable_body(tmp_path: Path) -> None:

@@ -156,7 +156,11 @@ jobs:
 
           # `cancelled` and `skipped` are not failures: a cancelled nightly is usually a superseded or
           # manually-stopped run, and reporting it as a break would train the reader to ignore this.
-          if [ "$CONCLUSION" != "failure" ]; then
+          # ONE EXCEPTION, `dependency floors`: its scheduled run has a concurrency group of its own, so
+          # nothing supersedes it, and a job that hits its `timeout-minutes` concludes `cancelled`.
+          # There a cancelled run is most likely a hung install, which is a red nobody else sees.
+          if [ "$CONCLUSION" != "failure" ] \
+             && ! { [ "$WF_NAME" = "dependency floors" ] && [ "$CONCLUSION" = "cancelled" ]; }; then
             echo "nightly concluded '$CONCLUSION' — not a failure, nothing to do"
             exit 0
           fi
@@ -262,6 +266,10 @@ jobs:
             yanked release. Raise that floor in \`pyproject.toml\`.
           - The floor check failed: a runtime dependency landed off its floor, or a \`--raised\`
             entry in \`.github/workflows/dependency-floors.yml\` is no longer needed.
+          - The floor check said a dependency \`declares no floor this check can read\`: write that
+            dependency's specifier in \`pyproject.toml\` with a \`>=X\` lower bound.
+          - The run concluded cancelled: the job hit its \`timeout-minutes\`, most likely an install
+            that hung or a build from source, unless someone stopped it by hand. Read the install step.
           - A guard failed: the engine does not work at its declared floors. Fix the code or raise
             the floor; the failure names the missing FastAPI symbol when that is the cause."
               ;;
