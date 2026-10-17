@@ -774,31 +774,37 @@ too. That variable replaces the system file for the driver (measured, last table
 
 #### Both platforms: the `host.ciphers` verify row
 
-`messagefoundry verify --section host` runs the checks of this step as one row, `host.ciphers`
-([`testing/VERIFY.md`](testing/VERIFY.md)). It reports and changes nothing. It is not part of
+`messagefoundry verify` runs the checks of this step as one row of its host section, `host.ciphers`
+([`testing/VERIFY.md`](testing/VERIFY.md)). The host section runs by default, and
+`--section host` runs it alone. It reports and changes nothing. It is not part of
 `messagefoundry serve`, so it never refuses or delays an engine start. Run it as the account the
 engine runs as, with the same environment, after the reboot on Windows.
 
-It runs the commands of this step, not a substitute for them:
+It runs the commands of this step, with the differences named here:
 
 - Windows: `(Get-TlsCipherSuite).Name` through Windows PowerShell at its `System32` path, with the
   name filter of check 1 applied in Python, and the two `Enabled` values of check 2 read from the
-  registry.
+  registry. **It also reads one thing the manual checks do not.** Where Group Policy sets **SSL
+  Cipher Suite Order**, it reads that list from the registry value the policy writes, and applies
+  the same filter to it. Which of the two lists SChannel uses when they differ is **unmeasured**, so
+  a suite that is not AEAD in either list is a FAIL.
 - Linux: `openssl ciphers -s -v` from the `PATH`, and the `CipherString`, `Ciphersuites` and
-  `MinProtocol` lines of `/etc/ssl/openssl.cnf`. Where `OPENSSL_CONF` is set in the environment it
-  reads the file that variable names instead, which is the file `openssl` itself loaded. A line may
-  be indented, and a trailing `#` comment is dropped.
+  `MinProtocol` lines of `/etc/ssl/openssl.cnf`. **Three differences from the manual `grep`:**
+  where `OPENSSL_CONF` is set in the environment, it reads the file that variable names, which is
+  the file `openssl` itself loaded; it matches the three names without regard to case, as OpenSSL
+  does; and it accepts an indented line and drops a trailing `#` comment. So where `OPENSSL_CONF` is
+  set, the row and the manual `grep` read different files.
 
 | Status | When |
 |---|---|
-| PASS | The control is above 0 and every enabled suite is AEAD. On Windows, both `Enabled` values read `0`. On Linux, the file holds one `CipherString` line and its last `MinProtocol` is `TLSv1.2` or `TLSv1.3`. |
+| PASS | The control is above 0 and every enabled suite is AEAD. On Windows, both `Enabled` values read `0`, and every suite in a Group Policy suite order is AEAD. On Linux, the file holds one `CipherString` line and its last `MinProtocol` is `TLSv1.2` or `TLSv1.3`. |
 | FAIL | Any of those does not hold. The row names the suites that are not AEAD. An `Enabled` value that is not set fails too, as on the stock host measured above. |
 | ERROR | A command ran and failed or timed out, or the suite list read empty. An empty list is a control of 0, so it never reads as healthy. |
 | MANUAL | The instrument is not on the host: no Windows PowerShell, no `openssl`, or no OpenSSL file at the path read. Run the commands above by hand. |
 | SKIP | `pyodbc` does not import, so no ODBC Driver 18 hop can run in this environment. Or the host is neither Windows nor Linux. |
 
-A FAIL makes `verify` exit 1, like any other FAIL row. It reads what the commands above read, so the
-limits listed under each platform hold for it too.
+A FAIL makes `verify` exit 1, like any other FAIL row. Apart from the differences above, it reads
+what the commands above read, so the limits listed under each platform hold for it too.
 
 **Measured** on 2026-10-17, on a stock Windows 11 host with no policy set, calling the row's reading
 directly because that host has no `pyodbc`: 18 of 28 suites not AEAD and both `Enabled` values unset,

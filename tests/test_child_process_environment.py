@@ -844,7 +844,7 @@ _MUST_CHOOSE = frozenset(
         ("service.py", "service_state", "subprocess.run"),
         ("service_status.py", "_query", "subprocess.run"),
         # verify's host cipher policy probes (BACKLOG #3277): PowerShell by its pinned path takes
-        # the start-up names; openssl takes the hook environment, since OpenSSL reads OPENSSL_CONF.
+        # the start-up names; openssl adds only the OPENSSL_* names it reads (OPENSSL_CONF).
         ("verify/cipher_policy.py", "_windows_enabled_suites", "subprocess.run"),
         ("verify/cipher_policy.py", "_openssl_suites", "subprocess.run"),
     }

@@ -134,7 +134,8 @@ def check_host_cipher_policy() -> CheckResult:
             cipher_policy.RID,
             cipher_policy.TITLE,
             Status.SKIP,
-            "pyodbc not importable, so no ODBC hop runs here",
+            "pyodbc does not import in this Python, so no ODBC hop runs from it; run verify "
+            "from the engine's own environment to read the policy",
         )
     return cipher_policy.read_host_cipher_policy()
 

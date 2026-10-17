@@ -7,6 +7,7 @@ and a failing policy reading, and the control-is-zero case, which must never rea
 
 from __future__ import annotations
 
+import ast
 import subprocess
 import sys
 from collections.abc import Mapping
@@ -41,10 +42,14 @@ def _give[T](value: T | Exception) -> T:
 def _windows(
     monkeypatch: pytest.MonkeyPatch,
     suites: list[str] | Exception,
-    enabled: Mapping[str, int | None] | Exception,
+    enabled: Mapping[str, int | None | Exception] | Exception,
+    order: list[str] | None | Exception = None,
 ) -> CheckResult:
     monkeypatch.setattr(cipher_policy, "_windows_enabled_suites", lambda: _give(suites))
-    monkeypatch.setattr(cipher_policy, "_schannel_client_enabled", lambda v: _give(enabled)[v])
+    monkeypatch.setattr(
+        cipher_policy, "_schannel_client_enabled", lambda v: _give(_give(enabled)[v])
+    )
+    monkeypatch.setattr(cipher_policy, "_schannel_policy_order", lambda: _give(order))
     return cipher_policy.read_host_cipher_policy("win32")
 
 
@@ -122,7 +127,50 @@ def test_windows_failed_probes_are_errors(monkeypatch: pytest.MonkeyPatch) -> No
 def test_a_finding_outranks_a_broken_reading(monkeypatch: pytest.MonkeyPatch) -> None:
     r = _windows(monkeypatch, [_WIN_CBC], ProbeFailed("registry"))
     assert r.status is Status.FAIL
-    assert "protocol switches not read" in r.detail
+    assert "TLS 1.0 client Enabled not read" in r.detail
+
+
+def test_a_broken_read_keeps_the_other_versions_finding(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TLS 1.0 left on, then the TLS 1.1 key unreadable: the TLS 1.0 finding must survive."""
+    enabled: dict[str, int | None | Exception] = {"TLS 1.0": 1, "TLS 1.1": ProbeFailed("denied")}
+    r = _windows(monkeypatch, _WIN_AEAD, enabled)
+    assert r.status is Status.FAIL
+    assert "TLS 1.0 client Enabled=1" in r.detail
+    assert "TLS 1.1 client Enabled not read: denied" in r.detail
+
+
+@pytest.mark.parametrize(
+    ("order", "status"),
+    [(_WIN_AEAD, Status.PASS), ([*_WIN_AEAD, _WIN_CBC], Status.FAIL), ([], Status.ERROR)],
+)
+def test_a_group_policy_suite_order_is_checked_too(
+    monkeypatch: pytest.MonkeyPatch, order: list[str], status: Status
+) -> None:
+    """A trimmed local table must not read as a PASS beneath a policy that still lists CBC."""
+    r = _windows(monkeypatch, _WIN_AEAD, _OFF, order=order)
+    assert r.status is status, r.detail
+    assert "Group Policy suite-order suites" in r.detail
+
+
+@pytest.mark.parametrize(
+    ("found", "expect"),
+    [
+        (None, None),
+        (("A, B,,C", 1), ["A", "B", "C"]),
+        ((["A", " B "], 7), ["A", "B"]),
+    ],
+)
+def test_policy_order_parses_both_string_forms(
+    monkeypatch: pytest.MonkeyPatch, found: tuple[object, int] | None, expect: list[str] | None
+) -> None:
+    monkeypatch.setattr(cipher_policy, "_hklm_value", lambda subkey, name: found)
+    assert cipher_policy._schannel_policy_order() == expect
+
+
+def test_policy_order_of_another_type_is_a_failed_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cipher_policy, "_hklm_value", lambda subkey, name: (5, 4))
+    with pytest.raises(ProbeFailed, match="registry type 4"):
+        cipher_policy._schannel_policy_order()
 
 
 # ---- Linux ------------------------------------------------------------------------------------
@@ -138,7 +186,7 @@ def test_linux_non_aead_suite_fails_and_is_named(monkeypatch: pytest.MonkeyPatch
     r = _linux(monkeypatch, [*_SSL_AEAD, _SSL_CBC], _HEALTHY_CNF)
     assert r.status is Status.FAIL
     assert "1 of 3 enabled suites are not AEAD" in r.detail
-    assert r.evidence.startswith("not AEAD: ECDHE-RSA-AES256-SHA384")
+    assert r.evidence.startswith("not AEAD in the enabled suites: ECDHE-RSA-AES256-SHA384")
 
 
 def test_linux_empty_suite_list_is_not_a_pass(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -187,13 +235,19 @@ def test_policy_lines_read_the_openssl_conf_file(
         "# CipherString = commented out\n"
         "CipherString = ECDHE+AESGCM  # trailing comment\n"
         "  MinProtocol = TLSv1.2\n"
-        "Options = ServerPreference\n",
+        "Options = ServerPreference\n"
+        "minprotocol = TLSv1\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("OPENSSL_CONF", str(cnf))
     path, settings = cipher_policy._openssl_policy_lines()
     assert path == cnf
-    assert settings == [("CipherString", "ECDHE+AESGCM"), ("MinProtocol", "TLSv1.2")]
+    # OpenSSL matches a command name without case, so the last line is the floor in effect.
+    assert settings == [
+        ("CipherString", "ECDHE+AESGCM"),
+        ("MinProtocol", "TLSv1.2"),
+        ("MinProtocol", "TLSv1"),
+    ]
 
 
 # ---- the probe runner and the platform gates --------------------------------------------------
@@ -240,6 +294,11 @@ def test_other_platforms_skip() -> None:
     assert cipher_policy.read_host_cipher_policy("darwin").status is Status.SKIP
 
 
+def test_the_default_platform_is_read_at_call_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "platform", "darwin")
+    assert cipher_policy.read_host_cipher_policy().detail.endswith("not darwin")
+
+
 def _hide_pyodbc(monkeypatch: pytest.MonkeyPatch) -> None:
     real = checks._can_import
     monkeypatch.setattr(checks, "_can_import", lambda module: module != "pyodbc" and real(module))
@@ -248,7 +307,7 @@ def _hide_pyodbc(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_no_odbc_driver_means_skip(monkeypatch: pytest.MonkeyPatch) -> None:
     """Without pyodbc no ODBC hop can run here, so the policy is not this host's concern."""
 
-    def must_not_run(platform: str = sys.platform) -> CheckResult:
+    def must_not_run(platform: str | None = None) -> CheckResult:
         raise AssertionError("the policy was read with no ODBC hop possible")
 
     _hide_pyodbc(monkeypatch)
@@ -270,19 +329,48 @@ def test_host_section_carries_the_row(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert "host.ciphers" in {r.id for r in results}
 
 
-def test_only_verify_reads_the_policy() -> None:
-    """Report only: owner ruling R3 declined a startup check, so nothing outside ``verify/`` may
-    reach the probe, directly or through the host checks that run it."""
+#: Modules that can reach the probe: the verify package itself and the ones it calls through.
+_PROBE_MODULES = frozenset(
+    {
+        "messagefoundry.verify",
+        "messagefoundry.verify.runner",
+        "messagefoundry.verify.checks",
+        "messagefoundry.verify.cipher_policy",
+    }
+)
+
+
+def _reaches_the_probe(node: ast.AST) -> bool:
+    if isinstance(node, ast.ImportFrom):
+        names = {f"{node.module}.{alias.name}" for alias in node.names}
+        return node.module in _PROBE_MODULES or bool(names & _PROBE_MODULES)
+    return isinstance(node, ast.Import) and any(a.name in _PROBE_MODULES for a in node.names)
+
+
+def test_only_the_verify_command_reaches_the_policy() -> None:
+    """Report only: owner ruling R3 declined a startup check. Outside ``verify/``, the only import
+    of a module that runs the probe is in the ``verify`` subcommand's own handler."""
     root = Path(cipher_policy.__file__).resolve().parents[2]
-    names = ("cipher_policy", "check_host_cipher_policy", "run_host_checks")
-    reachers = {
-        p.relative_to(root).as_posix()
-        for package in ("messagefoundry", "messagefoundry_webconsole", "messagefoundry_toolkit")
-        for p in (root / package).rglob("*.py")
-        if any(name in p.read_text(encoding="utf-8", errors="replace") for name in names)
-    }
-    assert reachers == {
-        "messagefoundry/verify/checks.py",
-        "messagefoundry/verify/cipher_policy.py",
-        "messagefoundry/verify/runner.py",
-    }
+    reachers: set[tuple[str, str]] = set()
+    for package in ("messagefoundry", "messagefoundry_webconsole", "messagefoundry_toolkit"):
+        for path in (root / package).rglob("*.py"):
+            rel = path.relative_to(root).as_posix()
+            if rel.startswith("messagefoundry/verify/"):
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for top in tree.body:
+                name = getattr(top, "name", "<module>")
+                if any(_reaches_the_probe(node) for node in ast.walk(top)):
+                    reachers.add((rel, name))
+    assert reachers == {("messagefoundry/__main__.py", "_verify")}
+
+
+def test_the_reach_detector_fires() -> None:
+    assert _reaches_the_probe(
+        ast.parse("from messagefoundry.verify.runner import run_verify").body[0]
+    )
+    assert _reaches_the_probe(ast.parse("from messagefoundry.verify import checks").body[0])
+    assert _reaches_the_probe(ast.parse("import messagefoundry.verify.cipher_policy").body[0])
+    assert not _reaches_the_probe(
+        ast.parse("from messagefoundry.verify.model import Status").body[0]
+    )

@@ -11,10 +11,11 @@ delays an engine start. Owner ruling R3 declined a startup check of this policy,
 Every reading carries its control. A suite list that reads empty, or an instrument that is missing
 or fails, is never a PASS, because a zero non-AEAD count over an empty list proves nothing.
 
-Windows reads two things. The enabled SChannel suites come from ``Get-TlsCipherSuite``, which has no
-registry or API equivalent in the standard library, so it runs through Windows PowerShell with a
-fixed argument list and no host data in it. The TLS 1.0 and 1.1 client switches come from the
-registry through stdlib ``winreg``, which needs no subprocess. Linux runs the ``openssl`` command
+Windows reads three things. The enabled SChannel suites come from ``Get-TlsCipherSuite``, which has
+no registry or API equivalent in the standard library, so it runs through Windows PowerShell with a
+fixed argument list and no host data in it. The suite order Group Policy sets, where it sets one,
+and the TLS 1.0 and 1.1 client switches come from the registry through stdlib ``winreg``, which
+needs no subprocess. Linux runs the ``openssl`` command
 rather than Python's ``ssl`` module: section 5.4 measured that the CLI offers what the driver
 offers, and Python sets its own default cipher string over the host's ``CipherString``.
 """
@@ -30,9 +31,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from messagefoundry.childenv import hook_environment, system_tool_environment
+from messagefoundry.childenv import system_tool_environment, worker_environment
 from messagefoundry.redaction import codec_safe_str
-from messagefoundry.service_status import _system_exe
+from messagefoundry.service_status import _NO_WINDOW, _system_exe
 from messagefoundry.verify.model import CheckResult, Status
 
 RID = "host.ciphers"
@@ -40,16 +41,26 @@ TITLE = "Host cipher policy (ODBC hops)"
 
 #: Windows PowerShell can take several seconds to start cold, so the budget is generous.
 _PROBE_TIMEOUT_S = 30.0
-#: CREATE_NO_WINDOW off Windows is 0, and the probe there is openssl, which opens no console anyway.
-_NO_WINDOW: int = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+#: Registry value types, as ``winreg`` numbers them; named here so no import of ``winreg`` is
+#: needed off Windows.
+_REG_SZ, _REG_DWORD, _REG_MULTI_SZ = 1, 4, 7
 _SCHANNEL_PROTOCOLS = r"SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols"
+#: Where Group Policy's "SSL Cipher Suite Order" setting writes its list.
+_POLICY_ORDER_KEY = r"SOFTWARE\Policies\Microsoft\Cryptography\Configuration\SSL\00010002"
 _LEGACY_VERSIONS: tuple[str, ...] = ("TLS 1.0", "TLS 1.1")
 #: Section 5.4's check 1 pattern for an AEAD suite name in SChannel's naming.
 _SCHANNEL_AEAD = re.compile("GCM|CCM|CHACHA20_POLY1305")
 
 _OPENSSL_CNF = Path("/etc/ssl/openssl.cnf")
-_POLICY_LINE = re.compile(r"^\s*(CipherString|Ciphersuites|MinProtocol)\s*=\s*([^#]*)")
+#: The variables OpenSSL reads to find its configuration; only these cross to the probe beyond
+#: the platform's start-up names.
+_OPENSSL_ENV = ("OPENSSL_CONF", "OPENSSL_CONF_INCLUDE", "OPENSSL_MODULES", "OPENSSL_ENGINES")
+_POLICY_KEYS = {key.lower(): key for key in ("CipherString", "Ciphersuites", "MinProtocol")}
+#: OpenSSL matches a file-form command name without case, so this does too.
+_POLICY_LINE = re.compile(
+    r"^\s*(CipherString|Ciphersuites|MinProtocol)\s*=\s*([^#]*)", re.IGNORECASE
+)
 _TLS12_OR_HIGHER = frozenset({"TLSv1.2", "TLSv1.3"})
 
 _SEE_DOC = "see DEPLOY-SERVER-DB.md section 5.4"
@@ -97,6 +108,11 @@ def _stdout_lines(program: str, proc: subprocess.CompletedProcess[str]) -> list[
     return [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
 
 
+# Each probe makes its own subprocess.run call rather than sharing one helper that takes an
+# environment: tests/test_child_process_environment.py trusts env= only as a builder call at the
+# start itself, and the two probes need different builders.
+
+
 def _windows_enabled_suites() -> list[str]:
     """The enabled SChannel suite names, as section 5.4's check 1 reads them.
 
@@ -126,37 +142,59 @@ def _windows_enabled_suites() -> list[str]:
     return _stdout_lines("powershell.exe", proc)
 
 
-def _schannel_client_enabled(version: str) -> int | None:
-    """The DWORD ``Enabled`` under ``<version>\\Client``, or ``None`` when the key or value is unset."""
+def _hklm_value(subkey: str, name: str) -> tuple[object, int] | None:
+    """``(value, registry type)`` of an HKLM value, or ``None`` when the key or value is unset."""
     if sys.platform != "win32":
         raise ProbeUnavailable("the Windows registry is not available on this platform")
     import winreg
 
     try:
-        with winreg.OpenKey(
-            winreg.HKEY_LOCAL_MACHINE, rf"{_SCHANNEL_PROTOCOLS}\{version}\Client"
-        ) as key:
-            value, kind = winreg.QueryValueEx(key, "Enabled")
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, subkey) as key:
+            value, kind = winreg.QueryValueEx(key, name)
     except FileNotFoundError:
         return None
     except OSError as exc:
-        raise ProbeFailed(f"{version} client key could not be read: {codec_safe_str(exc)}") from exc
-    if kind != winreg.REG_DWORD or not isinstance(value, int):
+        raise ProbeFailed(f"{subkey}\\{name} could not be read: {codec_safe_str(exc)}") from exc
+    return value, kind
+
+
+def _schannel_client_enabled(version: str) -> int | None:
+    """The DWORD ``Enabled`` under ``<version>\\Client``, or ``None`` when the key or value is unset."""
+    found = _hklm_value(rf"{_SCHANNEL_PROTOCOLS}\{version}\Client", "Enabled")
+    if found is None:
+        return None
+    value, kind = found
+    if kind != _REG_DWORD or not isinstance(value, int):
         raise ProbeFailed(f"{version} client Enabled holds registry type {kind}, not a DWORD")
     return value
+
+
+def _schannel_policy_order() -> list[str] | None:
+    """The suite list Group Policy's "SSL Cipher Suite Order" sets, or ``None`` when it sets none."""
+    found = _hklm_value(_POLICY_ORDER_KEY, "Functions")
+    if found is None:
+        return None
+    value, kind = found
+    if kind == _REG_SZ and isinstance(value, str):
+        names = value.split(",")
+    elif kind == _REG_MULTI_SZ and isinstance(value, list):
+        names = [str(item) for item in value]
+    else:
+        raise ProbeFailed(f"the policy suite order holds registry type {kind}, not strings")
+    return [name.strip() for name in names if name.strip()]
 
 
 def _openssl_suites() -> list[str]:
     """``openssl ciphers -s -v``: one line per suite this host's OpenSSL configuration allows.
 
-    Found on ``PATH`` by bare name, as section 5.4's own command is. It gets everything outside the
-    engine's namespace and its secrets: OpenSSL reads ``OPENSSL_CONF`` and its siblings from the
-    environment, and section 5.4 asks for the check to run with the engine's environment, so the
-    start-up names alone would read a different policy from the one the driver takes."""
+    Found on ``PATH`` by bare name, as section 5.4's own command is. Beyond the start-up names it
+    gets only the variables OpenSSL reads to find its configuration: section 5.4 asks for the
+    check to run with the engine's environment, and without ``OPENSSL_CONF`` it would read a
+    different policy from the one the driver takes."""
     with _probe_errors("openssl"):
         proc = subprocess.run(  # nosec B603 B607 - argv list (no shell), fixed arguments
             ["openssl", "ciphers", "-s", "-v"],
-            env=hook_environment(),
+            env=worker_environment(extra_names=_OPENSSL_ENV),
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -179,46 +217,80 @@ def _openssl_policy_lines() -> tuple[Path, list[tuple[str, str]]]:
     path = Path(named) if named else _OPENSSL_CNF
     text = path.read_text(encoding="utf-8", errors="replace")
     matches = (_POLICY_LINE.match(line) for line in text.splitlines())
-    return path, [(m[1], m[2].strip()) for m in matches if m]
+    return path, [(_POLICY_KEYS[m[1].lower()], m[2].strip()) for m in matches if m]
 
 
-def _suite_reading(probe: Callable[[], list[str]], is_aead: Callable[[str], bool]) -> _Reading:
+def _suite_reading(
+    what: str, probe: Callable[[], list[str]], is_aead: Callable[[str], bool]
+) -> _Reading:
     try:
         lines = probe()
     except ProbeUnavailable as exc:
-        return _Reading(Status.MANUAL, f"suites not read ({exc}); run the commands by hand")
+        return _Reading(Status.MANUAL, f"{what} not read ({exc}); run the commands by hand")
     except ProbeFailed as exc:
-        return _Reading(Status.ERROR, f"suites not read: {exc}")
+        return _Reading(Status.ERROR, f"{what} not read: {exc}")
     if not lines:
         return _Reading(
             Status.ERROR,
-            "the enabled-suite list read empty, so its control is 0 and a count of non-AEAD "
-            "suites over it proves nothing",
+            f"the {what} read empty, so its control is 0 and a count of non-AEAD suites over it "
+            "proves nothing",
         )
     weak = [line.split()[0] for line in lines if not is_aead(line)]
     if weak:
         return _Reading(
             Status.FAIL,
-            f"{len(weak)} of {len(lines)} enabled suites are not AEAD",
-            evidence="not AEAD: " + ", ".join(weak),
+            f"{len(weak)} of {len(lines)} {what} are not AEAD",
+            evidence=f"not AEAD in the {what}: " + ", ".join(weak),
         )
-    return _Reading(Status.PASS, f"all {len(lines)} enabled suites are AEAD")
+    return _Reading(Status.PASS, f"all {len(lines)} {what} are AEAD")
 
 
-def _windows_protocol_reading() -> _Reading:
-    problems: list[str] = []
+def _is_schannel_aead(name: str) -> bool:
+    return bool(_SCHANNEL_AEAD.search(name))
+
+
+def _windows_policy_order_readings() -> list[_Reading]:
+    """Group Policy's suite order, checked as well where it is set.
+
+    Which list SChannel takes when the policy and the local table disagree was not measured, so a
+    suite that is not AEAD in either is a FAIL. That keeps a trimmed local table from reading as a
+    PASS beneath a policy that still lists CBC suites."""
+    try:
+        order = _schannel_policy_order()
+    except ProbeUnavailable as exc:
+        return [_Reading(Status.MANUAL, f"Group Policy suite order not read ({exc})")]
+    except ProbeFailed as exc:
+        return [_Reading(Status.ERROR, f"Group Policy suite order not read: {exc}")]
+    if order is None:
+        return []
+    return [_suite_reading("Group Policy suite-order suites", lambda: order, _is_schannel_aead)]
+
+
+def _windows_protocol_readings() -> list[_Reading]:
+    """One reading per legacy version, so a broken read never hides a finding on the other."""
+    readings: list[_Reading] = []
     for version in _LEGACY_VERSIONS:
         try:
             value = _schannel_client_enabled(version)
-        except (ProbeUnavailable, ProbeFailed) as exc:
-            return _Reading(Status.ERROR, f"protocol switches not read: {exc}")
+        except ProbeUnavailable as exc:
+            readings.append(_Reading(Status.MANUAL, f"{version} client Enabled not read ({exc})"))
+            continue
+        except ProbeFailed as exc:
+            readings.append(_Reading(Status.ERROR, f"{version} client Enabled not read: {exc}"))
+            continue
         if value is None:
-            problems.append(f"{version} client Enabled is not set")
+            readings.append(
+                _Reading(
+                    Status.FAIL, f"{version} client Enabled is not set (section 5.4 asks for 0)"
+                )
+            )
         elif value != 0:
-            problems.append(f"{version} client Enabled={value}")
-    if problems:
-        return _Reading(Status.FAIL, "; ".join(problems) + " (section 5.4 asks for Enabled=0)")
-    return _Reading(Status.PASS, " and ".join(_LEGACY_VERSIONS) + " client Enabled=0")
+            readings.append(
+                _Reading(Status.FAIL, f"{version} client Enabled={value} (section 5.4 asks for 0)")
+            )
+        else:
+            readings.append(_Reading(Status.PASS, f"{version} client Enabled=0"))
+    return readings
 
 
 def _linux_policy_reading() -> _Reading:
@@ -260,17 +332,22 @@ def _combine(*taken: _Reading) -> CheckResult:
     return CheckResult(RID, TITLE, status, detail, evidence=evidence)
 
 
-def read_host_cipher_policy(platform: str = sys.platform) -> CheckResult:
-    """Run section 5.4's checks for this platform. Never raises; never refuses a start."""
+def read_host_cipher_policy(platform: str | None = None) -> CheckResult:
+    """Run section 5.4's checks for ``platform`` (default: this one, read at call time).
+
+    Never raises; never refuses a start."""
+    platform = platform or sys.platform
     if platform == "win32":
         return _combine(
-            _suite_reading(_windows_enabled_suites, lambda name: bool(_SCHANNEL_AEAD.search(name))),
-            _windows_protocol_reading(),
+            _suite_reading("enabled suites", _windows_enabled_suites, _is_schannel_aead),
+            *_windows_policy_order_readings(),
+            *_windows_protocol_readings(),
         )
     if platform.startswith("linux"):
         # Section 5.4's check is `grep -v AEAD` over each `openssl ciphers -v` line.
         return _combine(
-            _suite_reading(_openssl_suites, lambda line: "AEAD" in line), _linux_policy_reading()
+            _suite_reading("enabled suites", _openssl_suites, lambda line: "AEAD" in line),
+            _linux_policy_reading(),
         )
     return CheckResult(
         RID, TITLE, Status.SKIP, f"section 5.4 covers Windows and Linux hosts, not {platform}"

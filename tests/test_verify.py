@@ -25,12 +25,21 @@ from messagefoundry.__main__ import main
 from messagefoundry.config.settings import StoreBackend, StoreSettings
 from messagefoundry.store.base import open_store
 from messagefoundry.store.store import MessageStatus
-from messagefoundry.verify import checks, smoke
+from messagefoundry.verify import checks, cipher_policy, smoke
 from messagefoundry.verify.model import CheckResult, Status
 from messagefoundry.verify.report import exit_code, render_console, render_json, render_markdown
 from messagefoundry.verify.runner import ALL_SECTIONS, run_verify
 
 # ---- host checks ------------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _no_host_cipher_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Where pyodbc imports, ``host.ciphers`` reads the real host TLS policy (BACKLOG #3277), so the
+    exit-code and no-ERROR assertions below would depend on the box. Its own tests stub the probes
+    in tests/test_verify_cipher_policy.py; here the row is a fixed SKIP."""
+    skip = CheckResult("host.ciphers", "Host cipher policy (ODBC hops)", Status.SKIP, "stubbed")
+    monkeypatch.setattr(cipher_policy, "read_host_cipher_policy", lambda platform=None: skip)
 
 
 def test_run_host_checks_never_errors(tmp_path: Path) -> None:
