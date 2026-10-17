@@ -221,7 +221,13 @@ Four files implement it:
   bundle; the DTO field sets, closed over nested models; and the enum member sets and `Literal` value
   sets those DTOs expose. Field names alone are not the contract — the console indexes a dict by
   `UploadedFileList.scope`, so a renamed literal would `KeyError` at runtime while a
-  field-name-only snapshot stayed byte-identical.
+  field-name-only snapshot stayed byte-identical. It also records what the console installs on
+  the app, its route gates above all (BACKLOG #2709; the reason is the #2709 entry in
+  `messagefoundry/api/_ui_seam.py`). That section is read from a live mount of the console with
+  stub handlers, and the script refuses to run when the imported console is not this
+  repository's. `console_route_gates` in the script lists at least what it covers and what it
+  misses: for example, a helper a gate calls by name is not covered, nor is a route's endpoint
+  body.
 - [`tests/golden/webconsole_seam.snapshot`](../tests/golden/webconsole_seam.snapshot) — the checked-in
   golden.
 - [`tests/test_webconsole_seam_snapshot.py`](../tests/test_webconsole_seam_snapshot.py) — regenerates the
@@ -242,7 +248,7 @@ surface `seam_discovery.py` finds, so it exists only once the change is made and
 When you deliberately change the injected contract (add/rename a `CoreHandlers`/`AdminHandlers` field,
 change an `api.security` dep signature, rename a rendered DTO field or one of its `Literal` values,
 add/remove an `app.state` hook or a consumed `AuthService` member, rename a name the console imports
-from `auth.service`):
+from `auth.service`, add a console route or change a route's gate, BACKLOG #2709):
 
 1. Make the contract change in the engine (and the matching consumer change in the package).
 2. Regenerate the engine side:
@@ -360,9 +366,12 @@ Option B decouples **development, test, and release**. It does **not** buy deplo
   package), resolving the previous latent JS-vs-endpoint split.
 - The `/ui` CSP is co-versioned with the `app.js`/`app.css` it governs (via the `ui_csp` hook), so a
   client-asset CSP change ships package-only.
-- Console-internal changes — presentation, client JS, `app.js` CSP tweaks, new routes that reuse
-  already-injected handlers and already-rendered DTOs, new step-up actions over existing handlers — ship
-  as a **package-only** release.
+- Console-internal changes — presentation, client JS, `app.js` CSP tweaks — ship as a
+  **package-only** release. A change that adds a console route or changes a route's gate does not,
+  since BACKLOG #2709: the seam digest records each route's gate, so the change moves the seam and
+  needs an engine that ships the new value. That is the point: a console released from a tree
+  whose route gates differ in what the digest records pins a different digest, and is refused at
+  mount. Section 3 says where the list of what it records, and misses, is kept.
 
 **Residual coupling (unchanged by the extraction)**
 
