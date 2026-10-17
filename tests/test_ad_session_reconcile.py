@@ -4143,15 +4143,16 @@ async def test_a_failed_read_of_earlier_revocations_reports(
         await store.close()
 
 
-@pytest.mark.parametrize("defect", ["NotImplementedError", "KeyError"])
+@pytest.mark.parametrize("defect", ["NotImplementedError", "KeyError", "TypeError"])
 async def test_a_defect_reading_earlier_revocations_still_writes_the_row_and_reports(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, defect: str
 ) -> None:
     """A defect in the evidence read is not raised. The caller has not yet written this
     revocation's row, so a raise would lose it, end the pass, and leave the account, with no
     session left, unrevisited. It fails toward reporting: the row is written, the revocation
-    reports, and the read is logged at ERROR with the exception's type. ``KeyError`` is a store
-    shape defect, a row with no ``detail``, which must not pass as an unreadable row."""
+    reports, and the read is logged at ERROR with the exception's type. ``KeyError`` and
+    ``TypeError`` are store shape defects, a row with no ``detail`` and a row that cannot be
+    indexed by name. Neither may pass as an unreadable row."""
     store, _, service, _ = await _scoped_service(_GRP_A)
     try:
         notifier = _CapturingNotifier()
@@ -4164,6 +4165,8 @@ async def test_a_defect_reading_earlier_revocations_still_writes_the_row_and_rep
             if kwargs.get("action") == "auth.ad_session_revoked" and "since" in kwargs:
                 if defect == "KeyError":
                     return [{"id": 7}]  # no "detail" column
+                if defect == "TypeError":
+                    return [("positional",)]  # a row that cannot be indexed by name
                 raise NotImplementedError("synthetic: backend bug")
             return await real_list(**kwargs)
 

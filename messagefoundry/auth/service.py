@@ -7562,8 +7562,11 @@ class AuthService:
                 limit=_REVOKED_ROW_PAGE,
             )
             for row in rows:
+                # Outside the inner try: a row that cannot be indexed is a store shape defect, not
+                # an unreadable row, so it takes the ERROR path below.
+                raw = row["detail"]
                 try:
-                    detail = json.loads(row["detail"] or "{}")
+                    detail = json.loads(raw or "{}")
                 except (TypeError, ValueError) as exc:
                     _log.warning(
                         "directory reconcile: auth.ad_session_revoked row %s for %s is unreadable "
