@@ -9985,8 +9985,11 @@ class AuthService:
         followed by a prune of the account's rows older than the lookback, the record's only
         retention, in its own call, so a failed prune never reads as a lost write.
 
-        The catches are broad for the reason :meth:`_classify_login_address` states, except that a
-        programming error (``AttributeError``, ``TypeError``) is re-raised rather than logged."""
+        The catches are broad for the reason :meth:`_classify_login_address` states, and they cover a
+        programming error too: this helper never raises. Its callers run it after the ceremony has
+        committed, and some still hold a reply to send, such as the rotated token and the recovery
+        codes an enrolment returns. A raise here would lose that reply (vault BACKLOG #2964). The
+        logged traceback is how a programming error surfaces instead."""
         if not client:
             return
         try:
@@ -10004,8 +10007,6 @@ class AuthService:
                 return
             now = time.time()
             await self._store.remember_login_address(user_id, key, now=now)
-        except (AttributeError, TypeError):
-            raise
         except Exception:
             _log.exception(
                 "could not record a known sign-in address; the ceremony it records stands"
@@ -10015,12 +10016,11 @@ class AuthService:
             await self._store.forget_login_addresses(
                 user_id, before=now - _LOGIN_ADDRESS_LOOKBACK_SECONDS
             )
-        except (AttributeError, TypeError):
-            raise
         except Exception:
-            _log.warning(
-                "could not prune old known sign-in addresses; the address itself was recorded",
-                exc_info=True,
+            # ERROR with the traceback, as the write logs: a fault here that repeats at every
+            # sign-in disables the record's only retention, and must not read as a passing warning.
+            _log.exception(
+                "could not prune old known sign-in addresses; the address itself was recorded"
             )
 
     def _login_new_ip_notice_due(self, user_id: str, client: str | None) -> bool:
@@ -10620,8 +10620,8 @@ class AuthService:
         )
         # vault BACKLOG #2145: a first sign-in under require_mfa finishes HERE, so without this it
         # left no baseline and the account's next sign-in failed open again. Not for a NEW
-        # address: see _mark_login_address_known. Last, after the audit row and the notice, so a
-        # programming error it re-raises cannot drop either.
+        # address: see _mark_login_address_known. Last, after the audit row, so no address is known
+        # for an enrolment with no row; tests/test_login_new_ip.py pins the order (BACKLOG #2964).
         await self._mark_login_address_known(identity.user_id, client, enrolment=user)
         return elevation
 
@@ -13252,8 +13252,9 @@ class AuthService:
         one channel that reaches both of those accounts, so the label has to be written where it reads.
 
         The row is written whether or not a notifier is wired, for that reason. It is written BEFORE
-        the notice, and the action is resolved before either, so the notifier's "the event is still in
-        the audit log" is true when it says it and an unknown kind fails before any side effect.
+        the notice, and the action is resolved before either, so for this event the notifier's "the
+        event is usually still in the audit log" always holds, and an unknown kind fails before any
+        side effect.
 
         **``audit_detail`` MIRRORS THE ATTEMPT'S OWN ROW, never ``notice_detail``.** The failure count
         goes in the notice only. The audit row carries no more than the ``auth.login_failed``,

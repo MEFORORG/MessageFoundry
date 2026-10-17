@@ -575,10 +575,14 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
             # **Never for a lock notice** (BACKLOG #1131, LOG_SILENT_EVENT_TYPES): the line would show
             # a logs:view reader when a lock landed. The users:manage-only ``auth.lock_notice`` row
             # records ``mailed: false`` for that account instead.
+            #
+            # "Usually" in the line, not "always" (BACKLOG #3018): the directory reconciler's audit
+            # write is soft, so a store that refuses it still lets the notice reach here with no row.
             if event.event_type not in LOG_SILENT_EVENT_TYPES:
                 log.warning(
                     "security notice %s for %s dropped: the account has no notification address on "
-                    "file, so it was not told out of band (the event is still in the audit log)",
+                    "file, so it was not told out of band (the event is usually still in the audit "
+                    "log)",
                     event.event_type,
                     event.username,
                 )
@@ -609,7 +613,8 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         try:
             await asyncio.to_thread(self._send, event)
         except Exception:
-            # Best-effort: a failed send must never propagate. The event is also in the audit log.
+            # Best-effort: a failed send must never propagate. The event is usually also in the audit
+            # log; a refused directory-reconciler audit write leaves no row (BACKLOG #3018).
             # A lock notice fails silently here (BACKLOG #1131, LOG_SILENT_EVENT_TYPES): a line per
             # failed lock mail would show a logs:view reader when a lock landed. A relay that is down
             # still shows, on every other kind of notice.
