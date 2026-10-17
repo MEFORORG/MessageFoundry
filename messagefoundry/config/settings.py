@@ -941,6 +941,10 @@ class StoreSettings(_Section):
     #     CA-bundle pin (chain + hostname still verified).
     #   * SQL SERVER — the ODBC Driver 18.1+ `ServerCertificate` keyword pins the server's certificate by
     #     file (a leaf/exact-cert match, brace-quoted STORE-5-safe); requires ODBC Driver 18.1 or newer.
+    #     It goes out with `Encrypt=strict`: Driver 18 enforced the pin with strict and did not with
+    #     `Encrypt=yes` (vault BACKLOG #2223). Strict is TDS 8.0, so it needs SQL Server 2022 or later,
+    #     the supported floor; an older server refuses the connection. The match is exact, so a CA file
+    #     does not match (pin the server's own certificate), and it is not a revocation control.
     # REJECTED for SQLite (no TLS at all). A path, not a secret — it may live in the config file /
     # connections.toml. Empty = use the system trust store (the secure default). Existence is checked at load
     # (a missing file fails loud here, not confusingly at connect).
@@ -1139,8 +1143,9 @@ class StoreSettings(_Section):
     def _ssl_root_cert_backend(self) -> StoreSettings:
         """``ssl_root_cert`` pins the DB server certificate for verification (#45). Both server-DB
         backends honor it — Postgres as an asyncpg SSLContext CA-bundle, SQL Server via the ODBC Driver
-        18.1+ ``ServerCertificate`` keyword — but SQLite uses no TLS, so setting it there is a silent
-        no-op: fail loud instead of leaving the operator thinking a private CA is pinned."""
+        18.1+ ``ServerCertificate`` keyword under ``Encrypt=strict`` — but SQLite uses no TLS, so
+        setting it there is a silent no-op: fail loud instead of leaving the operator thinking a
+        private CA is pinned."""
         if self.ssl_root_cert and self.backend is StoreBackend.SQLITE:
             raise ValueError(
                 "[store].ssl_root_cert requires a server-DB backend (postgres or sqlserver); "

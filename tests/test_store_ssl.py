@@ -4,8 +4,8 @@
 
 Pure unit tests (no DB, no asyncpg / aioodbc required) — always run in CI. They assert:
   * Postgres ``_build_ssl`` honors a private CA file (asyncpg SSLContext, still fully verifying).
-  * SQL Server ``connection_string`` emits the ODBC Driver 18.1+ ``ServerCertificate`` keyword on the
-    secure posture, and NOT on a weakened / escaped posture.
+  * SQL Server ``connection_string`` emits the ODBC Driver 18.1+ ``ServerCertificate`` keyword with
+    ``Encrypt=strict`` on the secure posture, and neither on a weakened / escaped posture.
   * ``ssl_root_cert`` is accepted for both server-DB backends but rejected for SQLite (no TLS) and when
     the path does not exist (fail loud at load, #45).
 """
@@ -275,20 +275,67 @@ async def test_pool_connect_hook_is_absent_on_the_weakened_escapes(
 # --- SQL Server (the #45 slice) ----------------------------------------------
 
 
-def test_connection_string_emits_server_certificate_on_secure_posture(tmp_path: object) -> None:
+def test_connection_string_pins_with_strict_encryption(tmp_path: object) -> None:
+    """The pin travels with ``Encrypt=strict``: Driver 18 enforced ``ServerCertificate`` with strict
+    and did not with ``Encrypt=yes``, where a pin naming the wrong certificate still connected (vault
+    BACKLOG #2223; measured under #3009)."""
     ca = _ca_file(tmp_path)
     dsn = connection_string(_ss(ssl_root_cert=ca))
     # The ODBC Driver 18.1+ ServerCertificate keyword pins the cert by file, brace-quoted (STORE-5).
     # Match the standalone keyword (a leading ';') so it isn't confused with TrustServerCertificate.
     assert f";ServerCertificate={{{ca}}}" in dsn
-    # It only tightens verification — the last-wins secure tail is unchanged.
-    assert dsn.rstrip(";").endswith("Encrypt=yes;TrustServerCertificate=no")
+    # The TLS keywords stay the last-wins tail, and Encrypt=yes appears nowhere in the string.
+    assert dsn.rstrip(";").endswith("Encrypt=strict;TrustServerCertificate=no")
+    assert "Encrypt=yes" not in dsn
+    assert dsn.index(";ServerCertificate=") < dsn.index(";Encrypt=strict")
 
 
 def test_connection_string_no_server_certificate_when_unset() -> None:
-    # Byte-identical to before #45 when ssl_root_cert is unset (the standalone keyword is absent;
-    # TrustServerCertificate= is a different keyword and stays).
-    assert ";ServerCertificate=" not in connection_string(_ss())
+    # Unchanged when ssl_root_cert is unset: Encrypt=yes, and no standalone ServerCertificate keyword
+    # (TrustServerCertificate= is a different keyword and stays).
+    dsn = connection_string(_ss())
+    assert ";ServerCertificate=" not in dsn
+    assert "Encrypt=strict" not in dsn
+    assert dsn.rstrip(";").endswith("Encrypt=yes;TrustServerCertificate=no")
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"trust_server_certificate": True}, id="verify-off"),
+        pytest.param({"encrypt": False}, id="plaintext"),
+    ],
+)
+def test_connection_string_pin_does_not_lift_the_weakened_refusal(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch, overrides: dict[str, object]
+) -> None:
+    """A pin is no way around the weakened-TLS refusal: with no escape the string is still refused."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with pytest.raises(ValueError, match="SQL Server TLS is weakened"):
+        connection_string(_ss(ssl_root_cert=_ca_file(tmp_path), **overrides))
+
+
+@pytest.mark.parametrize(
+    ("overrides", "tail"),
+    [
+        pytest.param(
+            {"trust_server_certificate": True},
+            "Encrypt=yes;TrustServerCertificate=yes",
+            id="verify-off",
+        ),
+        pytest.param({"encrypt": False}, "Encrypt=no;TrustServerCertificate=no", id="plaintext"),
+    ],
+)
+def test_connection_string_escaped_posture_sends_no_pin_and_no_strict(
+    tmp_path: object, escape_at_warn: None, overrides: dict[str, object], tail: str
+) -> None:
+    """On an escaped dev posture the pin is dropped and strict is not sent. Microsoft documents that
+    strict ignores ``TrustServerCertificate``, so sending it would quietly re-enable verification the
+    operator switched off, and plaintext cannot be strict at all."""
+    dsn = connection_string(_ss(ssl_root_cert=_ca_file(tmp_path), **overrides))
+    assert ";ServerCertificate=" not in dsn
+    assert "Encrypt=strict" not in dsn
+    assert dsn.rstrip(";").endswith(tail)
 
 
 def test_connection_string_server_certificate_brace_neutralizes_injection(tmp_path: object) -> None:

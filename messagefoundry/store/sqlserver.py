@@ -2619,13 +2619,21 @@ def connection_string(settings: StoreSettings, *, posture: HopPosture | None = N
     if settings.multi_subnet_failover:
         parts.append("MultiSubnetFailover=Yes")
     # Pin the DB server's certificate by file WITHOUT a machine-wide trust import (#45), via the ODBC
-    # Driver 18.1+ `ServerCertificate` keyword — only on the SECURE posture (Encrypt=yes, verify on; the
-    # weakened branch above already refused/escaped). Brace-quoted (STORE-5). It names a cert file to
-    # match the server against; it can only tighten verification, never downgrade the last-wins
-    # Encrypt/TrustServerCertificate tail that still follows.
-    if settings.ssl_root_cert and settings.encrypt and not settings.trust_server_certificate:
-        parts.append(f"ServerCertificate={_odbc_brace(settings.ssl_root_cert)}")
-    parts.append(f"Encrypt={'yes' if settings.encrypt else 'no'}")
+    # Driver 18.1+ `ServerCertificate` keyword — only on the SECURE posture (encrypt on, verify on; the
+    # weakened branch above already refused/escaped). Brace-quoted (STORE-5). The pin goes out with
+    # Encrypt=strict: Driver 18 enforced it with strict and did NOT with Encrypt=yes, where a pin of the
+    # wrong certificate still connected (vault BACKLOG #2223, measured under #3009). Strict is TDS 8.0,
+    # so a server older than SQL Server 2022 refuses the connection; there is no fall back to an
+    # unenforced pin. Not a revocation control. Both keywords stay inside the last-wins tail.
+    pin = (
+        settings.ssl_root_cert
+        if settings.encrypt and not settings.trust_server_certificate
+        else None
+    )
+    if pin:
+        parts.append(f"ServerCertificate={_odbc_brace(pin)}")
+    encrypt = "strict" if pin else ("yes" if settings.encrypt else "no")
+    parts.append(f"Encrypt={encrypt}")
     parts.append(f"TrustServerCertificate={'yes' if settings.trust_server_certificate else 'no'}")
     return ";".join(parts) + ";"
 
