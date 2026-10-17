@@ -468,6 +468,14 @@ Two read/diagnostic endpoints back the console's connection view (auth + per-cha
 > before parsing if it exceeds **16 MiB** or **10,000 segments** (`ERROR` disposition + AR NAK),
 > bounding both the tolerant peek and the strict (hl7apy) validation paths.
 
+> **One message per outbound frame.** An MLLP delivery refuses a payload that opens with `MSH` and
+> holds a second `MSH` line, CR or LF line ends alike: a Handler that returned two messages in one
+> `Send`. It is a permanent failure with code `multiple-messages`, dead-lettered at once, with text
+> that carries no message content. A batch member holding two messages is dead-lettered alone, and
+> a shadow (`simulate`) outbound records the same. To send a batch, use outbound batch aggregation
+> (ADR 0082), whose `BHS` envelope this rule never refuses. See
+> [ADR 0209](adr/0209-mllp-and-tcp-deliveries-refuse-a-payload-holding-more-than-one-msh.md).
+
 ### Raw TCP — `Tcp(...)`
 
 A raw-TCP transport (source **and** destination) with **configurable delimiter framing**, built to
@@ -520,8 +528,14 @@ inbound("TCP-IN_PARTNER_X12", Tcp(port=9100, framing="stx_etx",
   ingress commit, so a Handler's return value never reaches that connection. Reply to a partner by
   returning `Send("<outbound>", payload)`; returning the payload bare is an authoring error and
   raises (ERROR / dead-letter, replayable) rather than delivering.
-- **Opaque relay.** Bytes in = bytes out (delimiters stripped/added) — no transformation,
-  validation, or content sniffing in the connector.
+- **Opaque relay.** Bytes in = bytes out (delimiters stripped/added) — no transformation or
+  validation in the connector. An outbound delivery looks inside in at least two ways: it refuses a
+  payload holding its codec's own frame bytes (ADR 0205), and one that opens with `MSH` and holds a
+  second `MSH` line, as MLLP does, with the permanent code `multiple-messages`
+  ([ADR 0209](adr/0209-mllp-and-tcp-deliveries-refuse-a-payload-holding-more-than-one-msh.md)). A
+  payload not led by `MSH`, an X12 interchange included, is never read for the second. A TCP
+  outbound has no batch aggregation (that is MLLP only), so a partner that takes several HL7
+  messages per frame cannot be fed them from one `Send`.
 - **At-least-once / duplicates.** An outbound send (and its framed reply, when expected) may be
   retried, so the receiver may see a duplicate — **the receiver must be idempotent.**
 - **Egress allowlist.** A `Tcp(...)` destination is gated by `[egress].allowed_tcp` (host or
