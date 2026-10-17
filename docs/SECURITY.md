@@ -761,8 +761,10 @@ tracks that gap.
 
 So on the console, an operator action's own audit row is its only record. **At least these operator
 mutations commit that row in the same transaction as the change they record (vault BACKLOG #2624):**
-message replay, dead-letter replay (inline and released), an inline purge, resend, edit-and-resubmit
-(direct and re-route), and the uploaded-log inject. A released purge is not in the set; see
+message replay, dead-letter replay (inline and released), a purge (inline and released), resend,
+edit-and-resubmit (direct and re-route), the uploaded-log inject, and alert acknowledge, resolve,
+suspend and resume (vault BACKLOG #3217). A released purge that skips writes no
+`connection_purge` row, and its `approval.approved` row records the skip; see
 [Dual-control approval](#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235). That holds on all three store backends. A crash between the
 change and its row, or a failed append, now keeps both or neither. Before, each row was a second write
 after the commit, so a crash between the two would have kept a console action with no row in the
@@ -999,7 +1001,7 @@ crossing that needs an operator relaxation is a recorded delta, not the default 
 
 | Hop | Module and symbol | Transport | Gate | Under `enforce` | Cleartext on the shipped default |
 |---|---|---|---|---|---|
-| Store, SQL Server | `store/sqlserver.py` `connection_string`, which every pool, probe and sync connect calls | ODBC Driver 18, `Encrypt=yes`, verification on | weakened-TLS refusal through `weakened_tls_escape_permitted` | refuses `encrypt=false` or `trust_server_certificate=true`; `MEFOR_ALLOW_INSECURE_TLS` is inert because `serve` passes the posture | No |
+| Store, SQL Server | `store/sqlserver.py` `connection_string`, which every pool, probe and sync connect calls | ODBC Driver 18, `Encrypt=yes`, verification on; `Encrypt=strict` with the `[store].ssl_root_cert` pin | weakened-TLS refusal through `weakened_tls_escape_permitted` | refuses `encrypt=false` or `trust_server_certificate=true`; `MEFOR_ALLOW_INSECURE_TLS` is inert because `serve` passes the posture | No |
 | Store, PostgreSQL | `store/postgres.py` `_build_ssl`, `_per_connection_ssl_connect` | asyncpg with an engine-built verifying `SSLContext` | the same weakened-TLS refusal, plus `RevocationHopGuard` | refuses as above; also refuses an off-loopback hop with no revocation check unless `[store].ssl_crl_file` loads | No |
 | Store, opened by a CLI command | `__main__.py` `_admin_unlock`, `_admin_set_notify_email`, `_audit_verify`, `_audit_anchor`, `_rotate_key`, `_backup`; `support/bundle.py`; `verify/checks.py`; `verify/smoke.py` | the two store drivers above | the same refusal; these call `open_store` with no posture, and no posture fails closed | refuses whatever the dial says. CORRECTED: at `bca583f2a7` this row read *"the escape is **not** clamped"*; that was true then, and the shared predicate now refuses the escape when no posture is known | No |
 | Cluster coordination | `pipeline/cluster.py` `DbCoordinator`, `pipeline/cluster_sqlserver.py` `SqlServerCoordinator` | the store's own pool; opens no connection of its own | inherits the store rows above | as the store | No |
@@ -2231,8 +2233,10 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
 
 Unlike a reload, a released dead-letter replay fails closed (vault BACKLOG #2624). Its `dead_letter_replay` row
 commits in the same transaction as the re-queue. So when that row fails, nothing is re-queued, the
-request moves to `failed`, and `approval.failed` names the error type. A released purge still writes
-no `connection_purge` row of its own; its count is only in `approval.approved`.
+request moves to `failed`, and `approval.failed` names the error type. A released purge does the
+same with its `connection_purge` row, which names the outbound, the scope and the count and is
+attributed to the requester (vault BACKLOG #3217). A released purge that skips because the outbound
+is running or owned by another engine shard cancels nothing and writes no `connection_purge` row.
 
 **An audit or store outage that refuses writes answers a mapped status on at least these approval
 paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own audit row fails still

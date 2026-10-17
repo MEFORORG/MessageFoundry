@@ -602,7 +602,9 @@ def _mllp_ssl_context(
     ``tls_ca_file`` opts into mTLS (require + verify a client cert). **Outbound** (``server=False``):
     verify the peer's cert against ``tls_ca_file`` (or the system trust store) with hostname checking,
     and optionally present ``tls_cert_file`` for mTLS. ``tls_verify=False`` (outbound) is MITM-able and
-    refused unless ``insecure_tls_allowed()``, with a loud warning — exactly as LDAPS / SQL Server.
+    refused unless ``weakened_tls_escape_permitted_here()``: ``MEFOR_ALLOW_INSECURE_TLS`` set on an
+    instance at ``[security].enforcement = warn``, as for the SQL Server store's weakened TLS. A hop
+    it lets through logs a loud warning.
 
     ``trust_anchor_policy`` (#190, ADR 0093, OUTBOUND verify path only) supplies the instance ``[tls]``
     internal-CA fallback: when the connection names no ``tls_ca_file`` of its own, an internal hop
@@ -925,7 +927,7 @@ class MLLPDestination(DestinationConnector):
         return f"{name}: {' '.join(extras)}" if extras else name
 
     def check_frame(self, payload: str, *, rewrite: bool = True) -> None:
-        """ADR 0205 rule 1 on ``payload`` without sending it: raise the permanent
+        """ADR 0205 rule 1 and ADR 0209 on ``payload`` without sending it: raise the permanent
         :class:`NegativeAckError` :meth:`send` would. With ``rewrite`` it checks the payload as
         :meth:`send` frames it, after the same delimiter rewrites, which drop a frame byte at either
         end; a payload those rewrites refuse raises their permanent ``reencode`` refusal, as

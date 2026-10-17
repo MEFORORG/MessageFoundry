@@ -2101,6 +2101,8 @@ _ISSUE_ROW_KEYS: Final[Mapping[str, str]] = MappingProxyType(
 CREDENTIAL_ISSUE_REFUSED_ACTION: Final = "auth.credential_issue_refused"
 #: The ``op`` values that row carries, one per issuing operation.
 CredentialIssueOp = Literal["create", "password_reset", "mfa_reset"]
+#: What :meth:`AuthService.logout` reports, and what its ``auth.logout`` row's ``outcome`` records.
+LogoutOutcome = Literal["revoked", "nothing_to_revoke"]
 _ISSUE_ROW_EARLY_SECONDS: Final = 5.0
 _ISSUE_ROW_LATE_SECONDS: Final = 60.0
 _ISSUE_ROW_PAGE: Final = 200
@@ -8836,12 +8838,42 @@ class AuthService:
             return None
         return await self._build_identity(user)
 
-    async def logout(self, token: str | None, *, actor: str | None = None) -> None:
-        if token:
-            await self._store.revoke_session(hash_token(token))
-            # Emit the documented auth.logout event (SECURITY.md, ASVS 16.3.3) — previously the
-            # session was revoked silently, contradicting the doc and leaving a gap in the trail.
-            await self._audit("auth.logout", actor=actor)
+    async def logout(self, token: str | None, *, actor: str | None = None) -> LogoutOutcome:
+        """End the session ``token`` names, audit ``auth.logout`` saying whether one ended, and
+        return that same outcome.
+
+        The revoke is :meth:`AuthStore.supersede_session`, which reports whether it matched a row,
+        rather than a blind revoke by hash (BACKLOG #3029). The hash can name no unrevoked session
+        for at least these reasons: a rotation re-keyed the session after the caller read it, a
+        concurrent revoke ended it first, or the token was stale or never valid (``/ui/logout``
+        has no auth dependency). The outcome is then ``nothing_to_revoke`` rather than a revoke
+        that did not happen. ``revoked`` means an unrevoked row was revoked, which may be one
+        already over its idle or absolute limit. Ending the session under a rotated token is not
+        attempted here; that is BACKLOG #3028.
+
+        The return is for the caller's own logic and tests, NOT for the client (a Manager ruling on
+        BACKLOG #3029). ``POST /auth/logout`` answers 200 and ``/ui/logout`` redirects whatever it
+        says, so sign-out stays idempotent. ``/ui/logout`` has no auth dependency, so a different
+        answer there would tell an unauthenticated caller whether a cookie value was live; ``POST
+        /auth/logout`` already refuses a dead token at its dependency, and keeps one answer for
+        consistency. The audit row carries the outcome. With no token there is nothing to look up,
+        so this returns ``nothing_to_revoke`` and writes no row.
+
+        The row's actor is ``actor`` when given (``POST /auth/logout`` passes the signed-in
+        caller). Otherwise it is the OWNER of the row the revoke ended, so a console sign-out, which
+        has no auth dependency to name a caller, still lands in that user's ``/me/security-events``
+        feed; with nothing ended there is no owner, and the actor stays NULL."""
+        if not token:
+            return "nothing_to_revoke"
+        ended = await self._store.supersede_session(hash_token(token), now=time.time())
+        outcome: LogoutOutcome = "nothing_to_revoke" if ended is None else "revoked"
+        if actor is None and ended is not None:
+            owner = await self._load_user(ended.user_id)
+            actor = owner.username if owner is not None else None
+        # Emit the documented auth.logout event (SECURITY.md, ASVS 16.3.3) even when nothing
+        # ended, so the trail still records the sign-out request.
+        await self._audit("auth.logout", actor=actor, detail=_json({"outcome": outcome}))
+        return outcome
 
     async def _supersede_session_hash(self, prior_hash: str, *, client: str | None) -> bool:
         """End the session a browser presented at a fresh sign-in (ASVS 7.2.4, login side).
@@ -8937,7 +8969,12 @@ class AuthService:
         records no ownership a caller could not already learn. The write is soft with no defect
         re-raised, for the reason ``api.auth_routes._refuse_if_self`` gives: a raise would replace
         the answer the caller is owed. ``client`` is required, as on
-        :meth:`audit_self_target_refused`, because both planes call this from a request."""
+        :meth:`audit_self_target_refused`, because both planes call this from a request.
+
+        Also ``False``, with no audit row, when the revoke matched no unrevoked row (BACKLOG #3029):
+        at least a rotation that re-keyed the session after the read, which leaves it live under
+        its new id, or a concurrent revoke that ended it first. The revoke reports whether it
+        matched, so neither the return nor the trail claims a revoke that did not happen."""
         session = await self._load_session(session_id)
         if session is None or session.user_id != identity.user_id:
             # The console passes the id as plain text, so only an id-shaped one is copied into the
@@ -8956,7 +8993,8 @@ class AuthService:
                 defects=(),
             )
             return False
-        await self._store.revoke_session(session_id)
+        if await self._store.supersede_session(session_id, now=time.time()) is None:
+            return False
         await self._audit(
             "auth.session_revoked",
             actor=actor,

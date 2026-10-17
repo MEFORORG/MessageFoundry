@@ -24,6 +24,7 @@ from _pace_probe import install_pace_probe
 from messagefoundry.config.models import BatchConfig, ConnectorType, Destination, RetryPolicy
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Registry
+from messagefoundry.framing import MLLP_CODEC
 from messagefoundry.parsing.split import split_batch
 from messagefoundry.pipeline import stage_dispatcher, wiring_runner
 from messagefoundry.pipeline.alerts import LoggingAlertSink
@@ -534,9 +535,9 @@ async def _enqueue_bodies(store: Any, bodies: Sequence[str]) -> list[str]:
     ]
 
 
-async def _run_one_batch(store: Any, *, simulate: bool, **field: Any) -> _MllpRecorder:
+async def _run_one_batch(store: Any, *, simulate: bool, dest: Any = None, **field: Any) -> Any:
     runner = _runner(store)
-    rec = _MllpRecorder(**field)
+    rec = _MllpRecorder(**field) if dest is None else dest
     _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
     runner._simulate[DEST] = simulate
     head = await store.claim_next_fifo(DEST)
@@ -624,6 +625,57 @@ async def test_a_member_is_judged_as_it_sits_in_the_envelope_not_after_a_rewrite
         (envelope,) = rec.sent
         assert [m.split("|")[9] for m in split_batch(envelope)] == ["MSG1", "MSG3"]
     assert await _states(store, mids) == [DELIVERED, DEAD_LETTERED, DELIVERED]
+
+
+@pytest.mark.parametrize("at", [0, 1], ids=["head", "middle"])
+@pytest.mark.parametrize("simulate", [False, True], ids=["live", "shadow"])
+async def test_a_member_holding_two_messages_is_dead_lettered_alone(
+    store: Any, simulate: bool, at: int
+) -> None:
+    # ADR 0209: a member is judged as stored, before the envelope exists. Before it, the member's
+    # second MSH went into the envelope, and BTS-1 counted one message fewer than the batch held.
+    # Refused at the head, the envelope's BHS-11 comes from the first member that survived.
+    bodies = [_msg(1), _msg(3)]
+    bodies.insert(at, _msg(2) + _msg(4))
+    mids = await _enqueue_bodies(store, bodies)
+    rec = await _run_one_batch(store, simulate=simulate)
+    if simulate:
+        assert rec.sent == []
+    else:
+        (envelope,) = rec.sent
+        assert [m.split("|")[9] for m in split_batch(envelope)] == ["MSG1", "MSG3"]
+        assert envelope.endswith("BTS|2\r")
+        assert envelope.split("\r")[0].split("|")[10] == "MSG1"  # BHS-11, the first kept member
+    expected = [DELIVERED, DELIVERED]
+    expected.insert(at, DEAD_LETTERED)
+    assert await _states(store, mids) == expected
+    (row,) = await store.outbox_for(mids[at])
+    error = str(row["last_error"])
+    assert "more than one MSH segment" in error and "DOE" not in error and "MSG" not in error
+
+
+async def test_the_batch_envelope_still_goes_out_through_the_real_send(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ADR 0209 refuses an MSH-led payload holding a second MSH. The envelope holds N of them, and
+    # it leads with BHS, so the real send() frames it: this is the ADR 0082 batch path unharmed.
+    sent: list[bytes] = []
+
+    async def record(wire: bytes, sent_control_id: str | None) -> None:
+        sent.append(wire)
+
+    dest = MLLPDestination(
+        Destination(name=DEST, type=ConnectorType.MLLP, settings={"host": "127.0.0.1", "port": 1})
+    )
+    monkeypatch.setattr(dest, "_send_once", record)
+    mids = await _enqueue(store, 3)
+    await _run_one_batch(store, simulate=False, dest=dest)
+    (wire,) = sent
+    (frame,) = list(MLLP_CODEC.decoder().feed(wire))
+    envelope = frame.decode("utf-8")
+    assert envelope.startswith("BHS|") and envelope.endswith("BTS|3\r")
+    assert [m.split("|")[9] for m in split_batch(envelope)] == ["MSG1", "MSG2", "MSG3"]
+    assert await _states(store, mids) == [DELIVERED, DELIVERED, DELIVERED]
 
 
 async def test_a_non_hl7_member_is_not_rewritten_per_member(store: Any) -> None:
