@@ -99,7 +99,9 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
 
 - [ ] Tag the release `webconsole-vA.B.C`, the console's own scheme (independent cadence). The
       `release-webconsole` job, and its engine floor gate, run only on that tag namespace.
-- [ ] Publish to **PyPI** via the gated Trusted-Publishing job.
+- [ ] Publish to **PyPI** via the gated Trusted-Publishing job. The console's GitHub release is a
+      draft until that upload succeeds; `publish-github-release-webconsole` then publishes it. With
+      `PUBLISH_WEBCONSOLE` unset, it stays a draft.
 
 ## 7. Post-publish verification
 

@@ -573,7 +573,8 @@ def test_readme_does_not_claim_signing_coverage_the_release_workflow_does_not_pr
     # POSITIVE CONTROLS, both directions: the parse found the jobs, and the detector can SEE signing
     # where signing exists. Without these a broken job-splitter yields an empty unsigned set and this
     # test passes while measuring nothing.
-    assert len(jobs) >= 3, f"the release-job parse found {len(jobs)} publish jobs; expected 3+"
+    # Two since vault BACKLOG #2975 folded the harness publish into `publish-pypi`.
+    assert len(jobs) >= 2, f"the release-job parse found {len(jobs)} publish jobs; expected 2+"
     assert signed, (
         "no publish job appears to sign -- the detector matched nothing, so its silence is meaningless"
     )
