@@ -528,6 +528,47 @@ async def test_an_outcome_the_report_cannot_read_stops_nothing_else(
     assert any("could not report a refused file" in r.getMessage() for r in caplog.records)
 
 
+@pytest.mark.parametrize("idle", [False, True], ids=["after-a-pass", "idle-branch"])
+async def test_a_report_that_raises_does_not_end_the_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    idle: bool,
+) -> None:
+    """Vault BACKLOG #3543 item 6: the guard around the whole report came back. Each outcome is
+    guarded inside, but the clears read the refusal record, and that read raising must not end
+    the loop that applies revocations to running hops. Both places the loop reports from."""
+    path = str(tmp_path / "a.pem")
+    refusal = ReloadRefusal((1, 2), "why", RESTART)
+    loaded_crls.record_reload_refusal(path, refusal)
+    sink = _Sink()
+    passes: list[int] = []
+
+    def reload() -> list[ReloadOutcome]:
+        passes.append(1)
+        return [ReloadOutcome(path, 0, refusal, 1)]
+
+    runner = _runner(sink, interval_seconds=0.01, reload=reload, skip_when_idle=idle)
+    runner._report([ReloadOutcome(path, 0, refusal, 1)])  # one open alert, so clears read
+    reads: list[int] = []
+
+    def broken_record() -> dict[str, ReloadRefusal]:
+        reads.append(1)
+        raise RuntimeError("the record could not be read")
+
+    monkeypatch.setattr(crl_reload, "reload_refusals", broken_record)
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.crl_reload"):
+        runner.start()
+        try:
+            await until(lambda: len(reads) >= 3, "three reports that raised")
+            assert runner._task is not None and not runner._task.done(), "the loop lives on"
+        finally:
+            monkeypatch.undo()
+            await runner.stop()
+    assert any("reporting a pass failed" in r.getMessage() for r in caplog.records)
+    assert bool(passes) is not idle, "the control: which branch reported"
+
+
 async def test_a_streak_ends_once_its_call_is_no_longer_owed(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

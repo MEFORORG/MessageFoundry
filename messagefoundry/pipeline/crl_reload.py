@@ -1028,7 +1028,7 @@ class CrlReloadRunner:
                 _forget_all()
                 # No pass runs, so nothing else would resolve an alert for a file no hop holds
                 # now. Read from the record all the same: _forget_all skips a held pass lock.
-                self._resolve_cleared()
+                self._guarded(self._resolve_cleared)
                 continue
             outcomes: object = None
             try:
@@ -1041,7 +1041,20 @@ class CrlReloadRunner:
                 return
             # After the await, so on the event loop: a notifier schedules its alert-state write
             # with the running loop, and off the loop that write is dropped without an error.
-            self._report(outcomes)
+            self._guarded(functools.partial(self._report, outcomes))
+
+    @staticmethod
+    def _guarded(report: Callable[[], None]) -> None:
+        """Run one report step so that nothing it raises ends the loop (vault BACKLOG #3543).
+
+        Broad on purpose, as for the pass: the loop is what applies revocations to running hops,
+        and a report is only about them. Each outcome and each sink call is guarded inside the
+        report already; this catches the rest, such as a failure reading the refusal record. The
+        next pass reports again."""
+        try:
+            report()
+        except Exception:
+            log.exception("crl_reload: reporting a pass failed; will retry next interval")
 
     def _report(self, outcomes: object) -> None:
         """Raise ``crl_reload_refused`` for each refusal in ``outcomes`` not alerted yet, then
