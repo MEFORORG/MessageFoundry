@@ -1149,6 +1149,9 @@ class _RecordingConn:
     def __exit__(self, *exc: object) -> None:
         return None
 
+    def unbind(self) -> None:
+        """The lookups release the service connection explicitly (BACKLOG #3010)."""
+
     def search(self, **kwargs: Any) -> None:
         self.searches.append(kwargs)
         # Only the FIRST search (the user lookup) may match, and only when this double was given an

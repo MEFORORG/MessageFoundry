@@ -277,6 +277,7 @@ from messagefoundry.auth import Identity, Permission, Role
 from messagefoundry.auth.audit_visibility import reads_audit_copies_in_the_log
 from messagefoundry.auth.reconcile import (
     HOLD_REASON,
+    MISCONFIGURED_ABORT,
     PROBE_FAULT_ABORT,
     REFERRAL_ABORT,
     ReconcilePlan,
@@ -9465,6 +9466,9 @@ _REFERRAL_ALERT_SOURCE = "directory-reconciler-referral"
 #: The source label of the probe fault's own ``ad_reconcile_aborted`` instance (BACKLOG #3100), apart
 #: from the breaker's and the referral's for the same reasons.
 _PROBE_FAULT_ALERT_SOURCE = "directory-reconciler-probe-fault"
+#: The source label of the configuration refusal's own ``ad_reconcile_aborted`` instance (BACKLOG
+#: #3010), apart from the others for the same reasons.
+_MISCONFIGURED_ALERT_SOURCE = "directory-reconciler-misconfigured"
 
 
 def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSink) -> None:
@@ -9491,8 +9495,22 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     alert with reason ``probe_fault``, under its own source label
     (:data:`_PROBE_FAULT_ALERT_SOURCE`). It has no inverse: an operator resolves it.
 
+    A search the directory refused for its configuration (BACKLOG #3010) is not an outage either: a
+    search base that was deleted or moved, or that the service account may not read, ends every
+    search with noSuchObject, invalidDNSyntax or insufficientAccessRights on every pass. Any pass
+    with such a refusal is ``auth.ad_reconcile_misconfigured`` and becomes one
+    ``ad_reconcile_aborted`` alert with reason ``directory_misconfigured``, under its own source
+    label (:data:`_MISCONFIGURED_ALERT_SOURCE`). Like the fault's, it has no inverse. Before #3010
+    such a base read as "not found" for every account, so it tripped the breaker on an estate
+    large enough; read as an outage, it would page nobody.
+
+    The breaker's alert counts the accounts the pass judged, its denominator. The referral's, the
+    refusal's and the fault's count the probes the pass asked, which leaves out an id-less row
+    (BACKLOG #3170): only a probe that was sent can be referred, refused or raise a fault.
+
     Reads the RETURNED plan, so it sees only a pass that finished. A failed write of the pass's own
-    held, aborted, skipped, referred or unkeyed-binding row no longer ends the pass (BACKLOG #2137):
+    held, aborted, skipped, referred, misconfigured, faulted or unkeyed-binding row no longer ends
+    the pass (BACKLOG #2137):
     the service logs it at ERROR and returns the plan, so these alerts still fire. A pass that raised
     part-way for another reason, such as inside one revocation, has already audited the revocations
     it applied before that point; those rows stand, and no alert is raised for them.
@@ -9510,9 +9528,9 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     ``_mark_reconcile_clears`` states that rule once."""
     if plan.directory_outage:
         return
-    if plan.aborted is not None and not plan.directory_referral and not plan.probe_fault:
-        # A breaker trip. A pass of referrals only is not one: its one alert is the referral's below.
-        # Nor is a pass of faults only (BACKLOG #3100): its one alert is the fault's below.
+    if plan.aborted is not None and not plan.judged_nothing:
+        # A breaker trip. A pass that judged nothing is not one: its alerts are the referral's, the
+        # refusal's or the fault's below (BACKLOG #2538, #3010, #3100), and an outage has none.
         sink.ad_reconcile_aborted(
             "directory-reconciler",
             reason=plan.aborted,
@@ -9527,17 +9545,24 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         sink.ad_reconcile_aborted(
             _REFERRAL_ALERT_SOURCE,
             reason=REFERRAL_ABORT,
-            # The probes ASKED (BACKLOG #3170): an UNKEYED row was never sent, so no referral
-            # could answer it. The breaker's count above stays its judged denominator.
+            # The probes ASKED, as the refusal's and the fault's below (BACKLOG #3170).
             probed=plan.asked,
             detail=auth.directory_reconcile_referral or REFERRAL_ABORT,
         )
+    if plan.misconfigured:
+        # BACKLOG #3010. Beside the referral's, in the same order the service records them.
+        sink.ad_reconcile_aborted(
+            _MISCONFIGURED_ALERT_SOURCE,
+            reason=MISCONFIGURED_ABORT,
+            probed=plan.asked,
+            detail=auth.directory_reconcile_misconfigured or MISCONFIGURED_ABORT,
+        )
     if plan.faulted:
-        # BACKLOG #3100. Beside the referral's, in the same order the service records them.
+        # BACKLOG #3100.
         sink.ad_reconcile_aborted(
             _PROBE_FAULT_ALERT_SOURCE,
             reason=PROBE_FAULT_ABORT,
-            probed=plan.probed,
+            probed=plan.asked,
             detail=auth.directory_reconcile_fault or PROBE_FAULT_ABORT,
         )
     if plan.hold:

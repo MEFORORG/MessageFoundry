@@ -60,6 +60,7 @@ from messagefoundry.auth.ldap import (
     LdapAuthenticator,
     LdapError,
     LdapReferralError,
+    LdapUnansweredError,
     kerberos_principal,
     normalise_object_guid,
 )
@@ -296,6 +297,7 @@ _CERT_DIRECTORY_OUTAGES = frozenset(
     {
         reconcile.ProbeOutcome.UNAVAILABLE.value,
         reconcile.ProbeOutcome.REFERRED.value,
+        reconcile.ProbeOutcome.MISCONFIGURED.value,
         CERT_PROBE_SATURATED,
     }
 )
@@ -2626,6 +2628,10 @@ class AuthService:
         #: Latched probe fault (BACKLOG #3100): set on a pass in which a probe faulted, and released
         #: by the next pass that judged something with no fault (`_record_reconcile_fault`).
         self._reconcile_fault_alert: str | None = None
+        #: Latched configuration refusal (BACKLOG #3010), on the probe fault's rule: set on a pass in
+        #: which the directory refused a probe for its configuration, and released by the next pass
+        #: that judged something with no such refusal (`_record_reconcile_misconfigured`).
+        self._reconcile_misconfigured_alert: str | None = None
         #: user_ids a breaker trip has not yet seen read PRESENT on a pass that was not aborted
         #: (BACKLOG #2136). `_mark_reconcile_clears` reports no breaker clear while one is signed in.
         self._reconcile_unconfirmed: set[str] = set()
@@ -6210,6 +6216,13 @@ class AuthService:
         return self._reconcile_fault_alert
 
     @property
+    def directory_reconcile_misconfigured(self) -> str | None:
+        """The standing configuration refusal's operator message, or ``None`` (BACKLOG #3010).
+        Latches until a pass judges something with no such refusal
+        (:meth:`_record_reconcile_misconfigured`)."""
+        return self._reconcile_misconfigured_alert
+
+    @property
     def directory_reconcile_hold(self) -> str | None:
         """The engaged undetermined-wave hold's operator message, or ``None`` (ADR 0195). Latches
         while the hold is engaged, so an operator who missed the log line still sees it."""
@@ -6269,13 +6282,27 @@ class AuthService:
                 user.id, user.username, reconcile.ProbeOutcome.REFERRED, detail=str(exc)
             )
         except LdapError as exc:
+            if isinstance(exc, LdapUnansweredError) and exc.configuration:
+                # BACKLOG #3010. A deleted or moved search base, or one the service account may not
+                # read, refuses every probe on every pass. Read as UNAVAILABLE it would stop
+                # revocation without a page; MISCONFIGURED alerts instead, and never strikes or
+                # revokes this account. DEBUG here, as for a referral: the reconciler logs one
+                # ERROR per pass carrying the first refusal's text. That text is the engine's own,
+                # naming the operation and the code, never the directory's diagnostic message.
+                _log.debug("directory probe of %s was refused: %s", user.username, exc)
+                return reconcile.Probe(
+                    user.id, user.username, reconcile.ProbeOutcome.MISCONFIGURED, detail=str(exc)
+                )
             # FAIL OPEN, for the reconciler. verify_mfa reads the same UNAVAILABLE as a refusal and
             # fails closed, because it grants rather than revokes (BACKLOG #2023). It writes an audit
             # row per refusal, so it adds no log line here either.
             # An unreachable DC must never revoke: a fail-closed re-check would turn a
             # directory blip into a total console outage during exactly the incident when operators
             # need the console. Debug-level — a flapping DC must not flood the log at one line per
-            # user per pass; the pass-level summary below reports the count at WARNING.
+            # user per pass; the pass-level summary below reports the count at WARNING. A result
+            # code that is not an answer, or a response ldap3 could not decode, is also reported
+            # at WARNING by ldap.py itself, once per operation and code or fault type (BACKLOG
+            # #3010), in engine text that never quotes the directory's diagnostic message.
             _log.debug("directory probe failed for %s: %s", user.username, exc)
             return reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.UNAVAILABLE)
         except _UNREACHED_DIRECTORY as exc:
@@ -6364,7 +6391,8 @@ class AuthService:
 
         * a probe that could not reach the directory contributes nothing (fail-open);
         * a probe the directory referred contributes nothing either, and the pass alerts, while
-          every other account is still judged (BACKLOG #2538);
+          every other account is still judged (BACKLOG #2538). So does a probe the directory
+          refused for its configuration, such as a deleted search base (BACKLOG #3010);
         * a principal must come back absent, disabled, undetermined or unkeyed
           ``ad_session_recheck_strikes`` passes running;
         * a PRESENT principal whose directory groups would change its roles, or withdraw or narrow
@@ -6546,18 +6574,23 @@ class AuthService:
                 uid for uid, outcome in plan.outcomes.items() if outcome is present
             )
         referral = next((p for p in probes if p.outcome is reconcile.ProbeOutcome.REFERRED), None)
+        refusal = next(
+            (p for p in probes if p.outcome is reconcile.ProbeOutcome.MISCONFIGURED), None
+        )
         if plan.aborted is not None:
-            if not plan.directory_referral and not plan.probe_fault:
+            if plan.directory_outage or not plan.judged_nothing:
+                # The outage's skipped row, or the breaker's trip. A pass that judged nothing for
+                # any other reason is recorded only by the recorders below, as a referral (#2538),
+                # a configuration refusal (#3010) or a fault (#3100), and never as a trip.
                 await self._abort_reconcile_pass(plan)
             if not plan.directory_outage:
-                # A pass of referrals only is recorded as a referral and nothing else (#2538), and
-                # a pass of faults only as a fault and nothing else (#3100).
                 await self._record_reconcile_referral(plan, first=referral)
+                await self._record_reconcile_misconfigured(plan, first=refusal)
                 await self._record_reconcile_fault(plan)
             if not plan.judged_nothing:
                 # A held pass writes its own row even when the breaker also aborts it (ADR 0195 rule
-                # item 9). An outage or a pass of referrals only judged nothing, so it leaves the
-                # hold's message alone and marks no clear (BACKLOG #2538).
+                # item 9). A pass that judged nothing (an outage, or one whose every answer went
+                # unjudged) leaves the hold's message alone and marks no clear (BACKLOG #2538).
                 await self._record_reconcile_hold(plan)
                 plan = self._mark_reconcile_clears(plan, users)
             await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
@@ -6608,7 +6641,8 @@ class AuthService:
         # BACKLOG #2538. After the revocations, like the hold below: the referred accounts were left
         # unjudged, and every other account's revocation above has already been applied.
         await self._record_reconcile_referral(plan, first=referral)
-        # BACKLOG #3100. After the revocations too, for the same reason as the referral's.
+        # BACKLOG #3010 and #3100. After the revocations too, for the same reason as the referral's.
+        await self._record_reconcile_misconfigured(plan, first=refusal)
         await self._record_reconcile_fault(plan)
         # ADR 0195. After the revocations, so a held-row audit write that fails cannot stop a
         # genuine disable or demotion in the same pass from being applied. And that failure is
@@ -6657,9 +6691,9 @@ class AuthService:
 
         * All three need an answer on record, from this process, for every signed-in account the
           pass did not just revoke. A probe that could not reach the directory leaves none.
-        * A pass in which any probe was referred marks none of the three (BACKLOG #2538). A
-          referred account has no answer from this pass, and an older one on record may predate
-          the referral.
+        * A pass in which any probe was referred, faulted or refused for its configuration marks
+          none of the three (BACKLOG #2538, #3100, #3010). Such an account has no answer from this
+          pass, and an older one on record may predate the referral, fault or refusal.
         * The referral's own instance is clear when, on top of the first test, every account signed
           in at the last referral has since read PRESENT on a pass with no referral
           (``_reconcile_referred``), and ``_reconcile_referral_standing`` is ``"referred"``: a
@@ -6720,11 +6754,18 @@ class AuthService:
         revoked_undetermined = undetermined in (self._reconcile_outcomes.get(u) for u in revoked)
         ids = [uid for uid in users if uid not in revoked]
         outcomes = [self._reconcile_outcomes.get(uid) for uid in ids]
-        # A faulted account, like a referred one, keeps an older answer that may predate the fault
-        # (BACKLOG #3100), so a pass with either marks no clear.
-        covered = bool(ids) and None not in outcomes and not plan.referred and not plan.faulted
+        # A faulted or refused account, like a referred one, keeps an older answer that may predate
+        # the fault or the refusal (BACKLOG #3100, #3010), so a pass with any of them marks no clear.
+        covered = (
+            bool(ids)
+            and None not in outcomes
+            and not plan.referred
+            and not plan.faulted
+            and not plan.misconfigured
+        )
         settled = covered and undetermined not in outcomes
-        # Called only on a pass that judged something, so a pass of referrals only never gets here.
+        # Called only on a pass that judged something, so a pass that judged nothing never gets
+        # here.
         referral_clear = (
             covered
             and self._reconcile_referral_standing == "referred"
@@ -7290,8 +7331,8 @@ class AuthService:
             )
             return
         # The ceiling is taken over the breaker's own denominator, which counts held probes (ADR
-        # 0195 amendment 2026-10-11, BACKLOG #2138). A pass of referrals only never reaches here: it
-        # is not a trip (BACKLOG #2538).
+        # 0195 amendment 2026-10-11, BACKLOG #2138). No other pass that judged nothing reaches
+        # here: none of them is a trip (BACKLOG #2538, #3010, #3100).
         ceiling = reconcile.breaker_ceiling(
             probed=plan.judged,
             max_absolute=self._settings.ad_session_revoke_max,
@@ -7324,8 +7365,9 @@ class AuthService:
     ) -> None:
         """Latch, log and audit a pass in which the directory referred probes.
 
-        BACKLOG #2538. Called on every pass that judged something, and on a pass of referrals
-        only; an outage pass does not call it. On one with a referral,
+        BACKLOG #2538. Called on every pass but an outage, the same as
+        :meth:`_record_reconcile_misconfigured` and :meth:`_record_reconcile_fault`. On one with a
+        referral,
         whatever else the pass did, it latches the message, logs it at ERROR with the first
         referral's search and hosts, and writes an ``auth.ad_reconcile_referred`` row. Its own audit
         action, because a pass with a referral beside other answers is not an aborted one, and an
@@ -7351,15 +7393,7 @@ class AuthService:
             if plan.aborted is not None
             else "Accounts that answered without a referral were judged as usual."
         )
-        if plan.faulted:
-            # BACKLOG #3100. Counted here too, and recorded as a fault of their own.
-            others = f"{len(plan.faulted)} raised a probe fault. {others}"
-        if plan.unavailable:
-            # A pass of referrals and failures is recorded here and not as an outage, so the
-            # failures are counted here, or a near-total outage would read as a search-base fault.
-            others = (
-                f"{plan.unavailable} could not be read (the directory was unreachable). {others}"
-            )
+        others = self._unjudged_others(plan, others, faults=True, refusals=True)
         self._reconcile_referral_alert = (
             "LDAP referral: check [auth].ad_user_search_base and, for nested groups, "
             "[auth].ad_group_search_base; one names a base in another domain of the forest. "
@@ -7408,10 +7442,12 @@ class AuthService:
         later breaker trip or referral. **Nothing resolves that instance automatically**: an
         operator resolves it once the fault is gone.
 
-        Called on every pass that judged something, and on a pass of referrals or faults only; an
-        outage pass does not call it. A pass with no fault that judged something releases the
-        latched message. The message and the row carry counts and no username; the per-probe
-        WARNING in :meth:`_probe_principal` names each account and the exception type.
+        Called on every pass but an outage. Whatever else a pass did, one with no fault that judged
+        something releases the latched message, and one that judged nothing leaves it as it was.
+        The message, the row and the alert count the faults over the probes ASKED, as the
+        referral's do (BACKLOG #3170): an UNKEYED row was never sent, so it cannot fault. The
+        message and the row carry counts and no username; the per-probe WARNING in
+        :meth:`_probe_principal` names each account and the exception type.
         """
         if not plan.faulted:
             if not plan.judged_nothing:
@@ -7422,12 +7458,7 @@ class AuthService:
             if plan.aborted is not None
             else "Accounts that answered were judged as usual."
         )
-        if plan.unavailable:
-            # Counted here, as the referral's message does: a pass of faults and failures is
-            # recorded as a fault and not as an outage, so the outage would otherwise go unsaid.
-            others = (
-                f"{plan.unavailable} could not be read (the directory was unreachable). {others}"
-            )
+        others = self._unjudged_others(plan, others)
         # The pointer to the account comes first: the store keeps only the first 200 characters
         # of an alert instance's reason, as `_record_reconcile_referral` says.
         self._reconcile_fault_alert = (
@@ -7445,18 +7476,100 @@ class AuthService:
                     "reason": reconcile.PROBE_FAULT_ABORT,
                     "faulted": len(plan.faulted),
                     "unavailable": plan.unavailable,
-                    "probed": plan.probed,
+                    "asked": plan.asked,
                     "aborted": plan.aborted,
                 }
             ),
         )
 
+    async def _record_reconcile_misconfigured(
+        self, plan: reconcile.ReconcilePlan, *, first: reconcile.Probe | None
+    ) -> None:
+        """Latch, log and audit a pass in which the directory refused a probe for its configuration.
+
+        BACKLOG #3010. A search that ends with noSuchObject, invalidDNSyntax or
+        insufficientAccessRights says the configured base, or the service account's right to read
+        it, is wrong, not that the account is gone (:attr:`~reconcile.ProbeOutcome.MISCONFIGURED`).
+        It leaves that account unjudged: no strike and no revocation. A deleted or moved search base
+        refuses every account on every pass, so while it lasts nothing is revoked and the sessions
+        run to the absolute cap. Before #3010 such a search read as "not found", which tripped the
+        mass-revoke breaker on a large enough estate, and a plain outage would page nobody. So
+        every pass with such a refusal latches the message, logs it at ERROR with the first
+        refusal's text, and writes an ``auth.ad_reconcile_misconfigured`` row, and the lifespan
+        task raises it as ``ad_reconcile_aborted`` with reason ``directory_misconfigured`` under its
+        own source label, for the reasons :meth:`_record_reconcile_fault` gives. Like the fault's,
+        **nothing resolves that instance automatically**, and the latched message follows the
+        fault's rule.
+
+        Called on every pass but an outage. The message, the row and the alert count over the
+        probes ASKED (BACKLOG #3170). They carry counts and no username; the refusal's text names
+        the operation and the code, never the directory's diagnostic message, and
+        :meth:`_probe_principal` names each refused account at DEBUG.
+        """
+        if not plan.misconfigured:
+            if not plan.judged_nothing:
+                self._reconcile_misconfigured_alert = None
+            return
+        others = (
+            "The pass revoked nothing."
+            if plan.aborted is not None
+            else "Accounts that answered were judged as usual."
+        )
+        others = self._unjudged_others(plan, others)
+        # The settings to change come first: the store keeps only the first 200 characters of an
+        # alert instance's reason, as `_record_reconcile_referral` says.
+        self._reconcile_misconfigured_alert = (
+            "LDAP configuration refused: check [auth].ad_user_search_base, "
+            "[auth].ad_group_search_base and the read rights of [auth].ad_bind_dn. "
+            f"{len(plan.misconfigured)} of {plan.asked} signed-in directory account(s) asked were "
+            f"refused for the configuration and left unjudged. {others} A refused account is "
+            "never revoked while the refusal lasts, so its sessions run to "
+            "[auth].session_absolute_hours. The ERROR log line for each such pass names the code."
+        )
+        _log.error(
+            "directory reconcile: %s First refusal: %s",
+            self._reconcile_misconfigured_alert,
+            first.detail if first is not None else "?",
+        )
+        await self._audit_reconciler_row(
+            "auth.ad_reconcile_misconfigured",
+            detail=_json(
+                {
+                    "reason": reconcile.MISCONFIGURED_ABORT,
+                    "misconfigured": len(plan.misconfigured),
+                    "unavailable": plan.unavailable,
+                    "asked": plan.asked,
+                    "aborted": plan.aborted,
+                }
+            ),
+        )
+
+    @staticmethod
+    def _unjudged_others(
+        plan: reconcile.ReconcilePlan, others: str, *, faults: bool = False, refusals: bool = False
+    ) -> str:
+        """``others`` led by the counts of the pass's other unjudged probes, for a latched message.
+
+        A pass whose every answer went unjudged is recorded by its referral, refusal or fault and
+        not as an outage, so its failures are counted here, or a near-total outage would read as a
+        configuration fault. ``faults`` and ``refusals`` add those counts too: the referral's
+        message carries both, since either is recorded under its own alert as well."""
+        if faults and plan.faulted:
+            others = f"{len(plan.faulted)} raised a probe fault. {others}"
+        if refusals and plan.misconfigured:
+            others = f"{len(plan.misconfigured)} were refused for the configuration. {others}"
+        if plan.unavailable:
+            others = (
+                f"{plan.unavailable} could not be read (the directory was unreachable). {others}"
+            )
+        return others
+
     async def _audit_reconciler_row(self, action: str, *, detail: str) -> bool:
         """Write one of the reconcile pass's own rows, and say whether it was written.
 
         BACKLOG #2137. These rows are the held row, the breaker's aborted row, the outage's skipped
-        row, the referral's row (BACKLOG #2538), the probe fault's row (BACKLOG #3100) and the
-        unkeyed-binding report. Each is written
+        row, the referral's row (BACKLOG #2538), the probe fault's row (BACKLOG #3100), the
+        configuration refusal's row (BACKLOG #3010) and the unkeyed-binding report. Each is written
         after the pass's revocations, or on a pass that applies none. **A failed write here does
         not end the pass.** If it raised, the pass would return no plan, and the lifespan task
         would raise no alert for the revocations already applied, nor for the hold, the breaker or

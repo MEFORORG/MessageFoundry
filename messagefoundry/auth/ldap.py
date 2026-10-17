@@ -137,6 +137,15 @@ class LdapUnansweredError(LdapError):
         self.code = code
         self.code_name = code_name
 
+    @property
+    def configuration(self) -> bool:
+        """Whether the code points at the configuration rather than at a passing load
+        (:data:`_CONFIGURATION_CODES`): noSuchObject (32), invalidDNSyntax (34) and
+        insufficientAccessRights (50). Such a code recurs on every attempt until the configuration
+        changes, so the session reconciler reads it as misconfigured, which alerts, and not as
+        unavailable, which pages nobody (BACKLOG #3010)."""
+        return self.code in _CONFIGURATION_CODES
+
 
 class LdapUndecodableError(LdapError):
     """ldap3 could not decode the directory's response to an operation (BACKLOG #3010).
@@ -768,8 +777,14 @@ def _refuse_referral(conn: Any, operation: str) -> None:
         "the forest; use a base in this domain controller's own domain, or a global catalog, "
         "which carries universal-group membership only (ADR 0180 Amendment F)."
     )
+    raise _referral_error(operation, message)
+
+
+def _referral_error(operation: str, message: str) -> LdapReferralError:
+    """The referral refusal for ``operation``, warned once per operation, whether ldap3 decoded the
+    referral (:func:`_refuse_referral`) or could not (:func:`_referred_bind`)."""
     _warn_once(f"referral: {operation}", "%s Reported once per operation.", message)
-    raise LdapReferralError(message)
+    return LdapReferralError(message)
 
 
 #: What a refused code most likely means, where the code points at the configuration rather than at
@@ -782,6 +797,11 @@ _UNANSWERED_HINTS: dict[int, str] = {
     "or DOMAIN\\user.",
     50: " insufficientAccessRights means the service account may not read it.",
 }
+
+#: The codes that point at the configuration rather than at a passing load
+#: (:attr:`LdapUnansweredError.configuration`). Kept apart from the hints on purpose: a hint added
+#: for a transient code must not make it page as a misconfiguration.
+_CONFIGURATION_CODES = frozenset({32, 34, 50})
 
 
 def _refuse_unanswered(conn: Any, operation: str, *, answers: frozenset[int] | None = None) -> None:
@@ -807,18 +827,17 @@ def _refuse_unanswered(conn: Any, operation: str, *, answers: frozenset[int] | N
     read as absence it would read every account absent at once, which the reconciler's mass-revoke
     breaker does not stop at or under its floor.
 
-    **What each caller makes of it.** The session reconciler reads an :class:`LdapError` as
-    unavailable, which never strikes; a sign-in writes ``auth.login_error``; the nested group search
-    raising means no caller sees a shorter group list.
+    **What each caller makes of it.** The session reconciler reads one of the configuration codes
+    (:attr:`LdapUnansweredError.configuration`) as misconfigured and any other as unavailable.
+    Neither strikes. A sign-in writes ``auth.login_error``; the nested group search raising means
+    no caller sees a shorter group list.
 
-    **The cost, named.** Unavailable never revokes, so a code that recurs on every pass, such as a
-    deleted search base, stops offboarding and the role re-diff for as long as it lasts, and nothing
-    latches an alert for it. Making a standing one visible is #3010's item 4, which the batch
-    deferred to vault BACKLOG #3100's item 3. As filed, that item names the reconciler's broad
-    ``except Exception`` arm, which this error does not reach, so it must widen to cover the
-    ``except LdapError`` arm before the deferral holds. This warns once per operation and code, and
-    the text carries no directory text: the code, ldap3's name for it and the operation, never the
-    diagnostic message the directory sent.
+    **The cost, named.** Neither reading revokes, so a code that recurs on every pass, such as a
+    deleted search base, stops offboarding and the role re-diff for as long as it lasts. A
+    configuration code alerts on every pass it answers, and a pass where nothing else answered
+    aborts as ``directory_misconfigured``. Any other code reads as an outage, which pages nobody.
+    This warns once per operation and code, and the text carries no directory text: the code,
+    ldap3's name for it and the operation, never the diagnostic message the directory sent.
 
     **A result that is not a dict is let through.** ldap3's synchronous strategy, the only one built
     here, reads ``self.result['type']`` straight after every search, so a real search cannot return
@@ -876,7 +895,8 @@ def _search(conn: Any, operation: str, **kwargs: Any) -> None:
 #: What ldap3 raises, other than its own ``LDAPException``, when a response it reads is malformed.
 #: ldap3 2.9.1's default fast decoder indexes the BER it reads without checking it: a context tag a
 #: response may not carry is ``KeyError(tag)`` (``utils/asn1.py``, ``decode_sequence``), so a bind
-#: response carrying a referral raises ``KeyError(3)``; a result code outside its table is
+#: response carrying a referral raises ``KeyError(3)``, which :func:`_ldap3_call` refuses as a
+#: referral (:func:`_is_bind_referral`); a result code outside its table is
 #: ``KeyError(code)`` (``ldap_result_to_dict_fast``, ``operation/bind.py``,
 #: ``operation/extended.py``); a paged results control with no value is ``TypeError`` and one with no
 #: cookie is ``IndexError`` (``strategy/base.py``, ``decode_control_fast``); a bind response whose
@@ -945,15 +965,20 @@ def _ldap3_call(operation: str, *, close: bool = False) -> Iterator[None]:
     debug level (:func:`_reading_connection` says how the two are told apart). An ``LDAPException``
     passes through untouched, for its own handler.
 
+    **One fault is a referral, not an undecodable response.** ldap3's decoder has no field for the
+    referral a bind response may carry, so it raises ``KeyError(3)`` on one. That becomes
+    :class:`LdapReferralError`, as a referral ldap3 could decode does (:func:`_refuse_referral`),
+    so the session reconciler reads it as referred and alerts (BACKLOG #2538).
+    :func:`_is_bind_referral` says how it is told apart, again by origin.
+
     ``close`` closes the socket the failed read was on, where nothing else will. Only the service
     account's bind passes it: its ``auto_bind`` runs inside ldap3's ``Connection`` constructor, so
-    when it raises no caller holds the connection to unbind. A search does not (BACKLOG #3010).
-    ``authenticate`` and ``probe_principal`` hold the service connection in ldap3's own ``with``,
-    and ldap3 2.9.1's ``Connection.__exit__`` reopens a connection that was open on entry and is
-    closed on exit. So a close there shut the failed socket and then cost one more connect for a
-    fresh, unbound one. The cost of not closing: after an undecodable search response, those two
-    callers' connection stays open and bound, on a stream that may be out of step, until it is
-    collected. ``read_bind_account`` unbinds its own in a ``finally``.
+    when it raises no caller holds the connection to unbind. A search does not (BACKLOG #3010): its
+    caller holds the connection, and every caller here releases it, an undecodable response
+    included. ``authenticate`` and ``probe_principal`` release theirs through :func:`_released`, and
+    ``read_bind_account`` in a ``finally``. None relies on ldap3's own ``with``, whose 2.9.1
+    ``Connection.__exit__`` neither unbinds a connection that was bound on entry, as ``auto_bind``
+    makes every one here, nor leaves one closed that was open on entry.
     """
     import ldap3
 
@@ -974,7 +999,52 @@ def _ldap3_call(operation: str, *, close: bool = False) -> Iterator[None]:
                 logger.debug(
                     "AD socket close after an undecodable response: %s", _type_name(failed)
                 )
+        if _is_bind_referral(exc):
+            raise _referred_bind(operation) from exc
         raise _undecodable(operation, exc) from exc
+
+
+#: The context tag of the ``referral`` field of an LDAPResult (RFC 4511 section 4.1.9).
+_REFERRAL_TAG = 3
+
+
+def _is_bind_referral(exc: BaseException) -> bool:
+    """Whether ``exc`` is ldap3's decoder meeting the referral field of a bind response.
+
+    Decided by ORIGIN and decoder state, never by the exception's value alone: the innermost frame is
+    ldap3's ``decode_sequence`` reading a bind response's fields (its ``context_decoders`` is
+    ``BIND_RESPONSE_CONTEXT``, which has no entry for the field) at the referral's tag. A
+    ``KeyError(3)`` from anywhere else, such as a stray tag [3] in some other response or engine
+    code, is not this. A test pins the ldap3 names this reads.
+    """
+    if not isinstance(exc, KeyError):
+        return False
+    from ldap3.utils import asn1  # lazy, like every ldap3 import here
+
+    tb = exc.__traceback__
+    if tb is None:
+        return False
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    frame = tb.tb_frame
+    return (
+        frame.f_globals.get("__name__") == asn1.__name__
+        and frame.f_code.co_name == "decode_sequence"
+        and frame.f_locals.get("context_decoders") is asn1.BIND_RESPONSE_CONTEXT
+        and frame.f_locals.get("ber_type") == _REFERRAL_TAG
+    )
+
+
+def _referred_bind(operation: str) -> LdapReferralError:
+    """The refusal for a bind answered with a referral ldap3 could not decode, warned once per
+    operation. The referred hosts were in the part that could not be read, so none is named."""
+    message = (
+        f"AD answered the {operation} with a referral, whose hosts ldap3 cannot decode in a bind "
+        "response; the engine does not follow referrals (BACKLOG #2530, #3010). This usually "
+        "means a configured DN or search base lies in another domain of the forest; use one in "
+        "this domain controller's own domain, or a global catalog."
+    )
+    return _referral_error(operation, message)
 
 
 def _undecodable(operation: str, exc: BaseException) -> LdapUndecodableError:
@@ -1624,7 +1694,10 @@ class LdapAuthenticator:
         if not password:  # never allow an empty password (it triggers an anonymous bind)
             return DirectoryBind(None)
         try:
-            with self._service_conn() as svc:
+            # Released explicitly (BACKLOG #3010): ldap3's own ``with`` never unbinds a connection
+            # that was bound on entry, so the session stayed open until it was collected.
+            svc = self._service_conn()
+            with _released(svc):
                 found = (
                     self._lookup_by_object_id(svc, object_id, fallback_username=username)
                     if object_id is not None
@@ -1739,7 +1812,8 @@ class LdapAuthenticator:
         if object_id is not None and tie_break_object_id is not None:
             raise ValueError("pass object_id or tie_break_object_id, not both")
         try:
-            with self._service_conn() as svc:
+            svc = self._service_conn()
+            with _released(svc):  # not ldap3's own ``with``: see ``authenticate``
                 found = (
                     self._lookup_by_object_id(svc, object_id, fallback_username=username)
                     if object_id is not None

@@ -540,20 +540,23 @@ class AlertSink(Protocol):
         which leaves the referred accounts unjudged and may sit beside revocations the pass applied;
         or one or more probes raised a fault the engine could not read (``probe_fault``, BACKLOG
         #3100, the ``auth.ad_reconcile_faulted`` row), which leaves those accounts unjudged the same
-        way. The type's name predates the second and third cases. Read ``reason`` before naming the
-        cause.
+        way; or the directory refused one or more probes with a result code that points at the
+        configuration, such as a deleted or moved search base (``directory_misconfigured``, BACKLOG
+        #3010, the ``auth.ad_reconcile_misconfigured`` row), which leaves those accounts unjudged the
+        same way. The type's name predates every case but the first. Read ``reason`` before naming
+        the cause.
 
         ``name`` labels the source: ``"directory-reconciler"`` for the breaker,
-        ``"directory-reconciler-referral"`` for a referral, and
-        ``"directory-reconciler-probe-fault"`` for a probe fault, so each is its own instance and
-        throttle. ``reason`` is one of those three closed-set slugs. ``probed`` is, for the breaker,
-        how many principals the pass judged, its denominator; for a probe fault, the same total of
-        candidates the pass took up, asked or not, which counts the faulted accounts it left
-        unjudged and any id-less row; and for a referral how many probes the pass sent to the
-        directory, which leaves out an id-less row (BACKLOG #3170). ``detail`` is the operator-facing explanation the auth service
-        latches. No PHI. Emitted by the API-lifespan reconciler task, never from ``auth/``. A
-        whole-directory outage is NOT this event: it is
-        audited as ``auth.ad_reconcile_skipped`` and pages nothing, because the accounts are fine."""
+        ``"directory-reconciler-referral"`` for a referral, ``"directory-reconciler-probe-fault"``
+        for a probe fault, and ``"directory-reconciler-misconfigured"`` for a configuration refusal,
+        so each is its own instance and throttle. ``reason`` is one of those four closed-set slugs.
+        ``probed`` is, for the breaker, how many principals the pass judged, its denominator; for
+        each of the other three, how many probes the pass sent to the directory, which leaves out
+        an id-less row (BACKLOG #3170). ``detail`` is the operator-facing explanation the auth
+        service latches. No PHI. Emitted by the API-lifespan reconciler task, never from ``auth/``.
+        A whole-directory outage is NOT this event: it is audited as ``auth.ad_reconcile_skipped``
+        and pages nothing, because the accounts are fine. A pass where every probe fails and none is
+        referred, refused or faults is such an outage."""
         ...
 
     def ad_reconcile_held(self, name: str, *, reason: str, undetermined: int, detail: str) -> None:

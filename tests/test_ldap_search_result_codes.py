@@ -64,15 +64,17 @@ from messagefoundry.auth.ldap import (
     LdapUnansweredError,
 )
 from messagefoundry.auth.permissions import Role
-from messagefoundry.auth.reconcile import ProbeOutcome
+from messagefoundry.auth.reconcile import MISCONFIGURED_ABORT, ProbeOutcome
 from messagefoundry.auth.service import AuthService
 from messagefoundry.store.store import MessageStore
 from tests.test_ad_user_account_control import _alive, _audited, _pass, _signed_in_estate
+from tests.test_approval_requester_recheck import _Sink
 from tests.test_ldap_referrals import (
     _BIND_REQUEST,
     _BIND_RESPONSE,
     _SEARCH_DONE,
     _SEARCH_REQUEST,
+    _UNBIND_REQUEST,
     _read_message,
     _tlv,
 )
@@ -308,27 +310,28 @@ def test_a_group_search_the_directory_did_not_finish_is_an_outage_not_fewer_grou
 
 
 @pytest.mark.parametrize(
-    ("code", "partial"),
+    ("code", "partial", "outcome"),
     [
-        (RESULT_BUSY, False),
-        (RESULT_ADMIN_LIMIT_EXCEEDED, False),
-        (RESULT_NO_SUCH_OBJECT, False),
-        (RESULT_SIZE_LIMIT_EXCEEDED, True),
+        (RESULT_BUSY, False, ProbeOutcome.UNAVAILABLE),
+        (RESULT_ADMIN_LIMIT_EXCEEDED, False, ProbeOutcome.UNAVAILABLE),
+        (RESULT_NO_SUCH_OBJECT, False, ProbeOutcome.MISCONFIGURED),
+        (RESULT_SIZE_LIMIT_EXCEEDED, True, ProbeOutcome.UNAVAILABLE),
     ],
     ids=["busy", "adminLimitExceeded", "noSuchObject", "sizeLimit-partial"],
 )
 async def test_a_directory_that_did_not_answer_never_revokes_a_present_account(
-    monkeypatch: pytest.MonkeyPatch, code: int, partial: bool
+    monkeypatch: pytest.MonkeyPatch, code: int, partial: bool, outcome: ProbeOutcome
 ) -> None:
     """The row's defect, end to end. One signed-in account, under the breaker's floor, whose user
     search the directory answers with ``code`` on every pass. Before the fix the user search read
-    ABSENT and the account would be revoked at the strike threshold. Now each probe is unavailable
-    and the session survives. The group search has its own test below, which also reads roles."""
+    ABSENT and the account would be revoked at the strike threshold. Now each probe is unavailable,
+    or misconfigured for a code that points at the configuration, and the session survives. The
+    group search has its own test below, which also reads roles."""
     async with _signed_in_estate(monkeypatch, ["jdoe"]) as (_directory, service, store, tokens):
         _answer_with(monkeypatch, code, when=_user_search, keep_entries=partial)
         user = await store.get_user_by_username("jdoe")
         assert user is not None
-        assert (await service._probe_principal(user)).outcome is ProbeOutcome.UNAVAILABLE
+        assert (await service._probe_principal(user)).outcome is outcome
         for _ in range(5):  # far past ad_session_recheck_strikes
             assert (await _pass(service)).revocations == ()
         assert await _alive(service, tokens) == {"jdoe"}
@@ -348,6 +351,64 @@ async def test_an_account_that_left_the_directory_is_still_revoked(
         revoked = [r.username for _ in range(5) for r in (await _pass(service)).revocations]
         assert revoked == ["jdoe"]
         assert await _alive(service, tokens) == set()
+
+
+@pytest.mark.parametrize(
+    ("code", "paged"),
+    [
+        (RESULT_NO_SUCH_OBJECT, True),
+        (RESULT_INVALID_DN_SYNTAX, True),
+        (RESULT_INSUFFICIENT_ACCESS_RIGHTS, True),
+        # THE CONTROLS: a transient code is a plain outage, which pages nobody.
+        (RESULT_BUSY, False),
+        (RESULT_UNAVAILABLE, False),
+    ],
+    ids=[
+        "32-noSuchObject",
+        "34-invalidDNSyntax",
+        "50-insufficientAccess",
+        "51-busy",
+        "52-unavailable",
+    ],
+)
+async def test_a_refused_user_search_base_above_the_breaker_floor_pages_and_never_revokes(
+    monkeypatch: pytest.MonkeyPatch, code: int, paged: bool
+) -> None:
+    """D3b, #3010 limb 5, through the real authenticator. Eight signed-in accounts, above the
+    breaker's floor, whose user search base the directory refuses on every pass. Before #3010 a
+    deleted base read "not found", struck all eight and tripped the breaker; with #3010 alone it
+    read as an outage that paged nobody. A configuration code now aborts every pass as
+    ``directory_misconfigured`` and pages under its own source, counted over the probes asked. It
+    never revokes, and it is never the breaker's trip.
+
+    RED before D3b for the three configuration codes: each pass is a plain outage."""
+    names = [f"user{i:02d}" for i in range(8)]
+    async with _signed_in_estate(monkeypatch, names) as (_directory, service, store, tokens):
+        _answer_with(monkeypatch, code, when=_user_search)
+        sink = _Sink()
+        for _ in range(4):  # far past ad_session_recheck_strikes
+            plan = await _pass(service, sink)
+            assert plan.revocations == ()
+            if paged:
+                assert plan.aborted == MISCONFIGURED_ABORT
+            else:
+                assert plan.directory_outage
+        assert await _alive(service, tokens) == set(names)
+        assert await _audited(store, "auth.ad_session_revoked") == []
+        assert await _audited(store, "auth.ad_reconcile_aborted") == []
+        refused = await _audited(store, "auth.ad_reconcile_misconfigured")
+        assert len(refused) == (4 if paged else 0)
+        assert all(_LEAK not in str(dict(r)["detail"]) for r in refused)
+        pages = [
+            (e[1], e[2]["reason"], e[2]["probed"])
+            for e in sink.events
+            if e[0] == "ad_reconcile_aborted"
+        ]
+        expected = ("directory-reconciler-misconfigured", MISCONFIGURED_ABORT, len(names))
+        assert pages == ([expected] * 4 if paged else [])
+        detail = service.directory_reconcile_misconfigured
+        assert (detail is not None) is paged
+        assert detail is None or _LEAK not in detail
 
 
 async def test_a_busy_account_beside_a_departed_one_is_left_alone_while_the_other_is_revoked(
@@ -739,7 +800,8 @@ class _ScriptedDc:
     answered by ``bind_reply(raw request)``, or with success where that is absent or returns
     ``None``; an extended operation such as Who am I is answered with ``extended_reply``, or ends
     with ``extended_code``; each search is answered by ``answer(raw request)``. ``searches`` holds every search request's bytes, and
-    ``ended`` is set when a client's socket closes."""
+    ``ended`` is set when a client's socket closes. ``opened`` counts the sessions accepted, and
+    ``unbound`` the sessions a client ended with an unbind request."""
 
     def __init__(
         self,
@@ -752,6 +814,9 @@ class _ScriptedDc:
         self._extended_reply = extended_reply
         self.searches: list[bytes] = []
         self.ended = threading.Event()
+        self.opened = 0
+        self.unbound = 0
+        self._count_lock = threading.Lock()
         self._listener = socket.create_server(("127.0.0.1", 0))
         self.port: int = self._listener.getsockname()[1]
         threading.Thread(target=self._accept, daemon=True).start()
@@ -765,6 +830,8 @@ class _ScriptedDc:
             threading.Thread(target=self._session, args=(sock,), daemon=True).start()
 
     def _session(self, sock: socket.socket) -> None:
+        with self._count_lock:
+            self.opened += 1
         try:
             with sock, contextlib.suppress(OSError):
                 sock.settimeout(10)
@@ -784,6 +851,9 @@ class _ScriptedDc:
                         self.searches.append(raw)
                         replies = self._answer(raw)
                     else:  # unbind, or anything this server does not speak
+                        if op == _UNBIND_REQUEST:
+                            with self._count_lock:
+                                self.unbound += 1
                         return
                     for reply, controls in replies:
                         sock.sendall(_tlv(0x30, message_id + reply + controls))

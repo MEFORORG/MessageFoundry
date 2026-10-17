@@ -21,7 +21,9 @@ fault. An exception the engine raises propagates, whatever its value.
 from __future__ import annotations
 
 import ast
+import contextlib
 import inspect
+import time
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
@@ -29,10 +31,14 @@ from typing import Any
 import ldap3
 import pytest
 from ldap3.core.results import RESULT_CODES, RESULT_SUCCESS
+from ldap3.utils import asn1
 from ldap3.utils.asn1 import decode_sequence
 
 from messagefoundry.auth import ldap as ldap_module
-from messagefoundry.auth.ldap import LdapError, LdapUndecodableError
+from messagefoundry.auth.ldap import LdapError, LdapReferralError, LdapUndecodableError
+from messagefoundry.auth.reconcile import ProbeOutcome
+from messagefoundry.auth.service import AuthService
+from messagefoundry.store.store import MessageStore
 from tests._ast_sites import callee_name, parse_source
 from tests.test_ldap_referrals import _BIND_PASSWORD, _BIND_RESPONSE, _SEARCH_DONE, _tlv
 from tests.test_ldap_search_result_codes import (
@@ -47,6 +53,7 @@ from tests.test_ldap_search_result_codes import (
     _scripted_dc,
     _service_conn,
 )
+from tests.test_ldap_timeouts import _ad_settings
 
 #: Stands for text the directory sends: it must never reach an error, a log line or an audit row.
 _REFERRED = "ldap://dc9.synthetic-leak-3010.invalid/DC=other"
@@ -68,13 +75,12 @@ def _result(tag: int, code: int, *, matched: bytes | None = None, extra: bytes =
     return _tlv(tag, _tlv(0x0A, _enumerated(code)) + matched_dn + _tlv(0x04, b"") + extra)
 
 
+#: A bind response carrying a referral, which ldap3's decoder cannot read (``KeyError(3)``). It is
+#: refused as a referral, not as an undecodable response (D3b, BACKLOG #3010 and #2538).
+_REFERRAL_BIND = _result(_BIND_RESPONSE, 10, extra=_tlv(0xA3, _tlv(0x04, _REFERRED.encode())))
+
 #: Malformed bind responses: the reply, and what ldap3's decoder raises on it.
 _BAD_BINDS = [
-    pytest.param(
-        _result(_BIND_RESPONSE, 10, extra=_tlv(0xA3, _tlv(0x04, _REFERRED.encode()))),
-        KeyError,
-        id="referral-KeyError-3",
-    ),
     pytest.param(
         _result(_BIND_RESPONSE, RESULT_SUCCESS, extra=_tlv(0x96, b"synthetic")),
         KeyError,
@@ -201,6 +207,151 @@ def test_a_user_bind_ldap3_cannot_decode_fails_a_present_and_an_absent_account_a
             _assert_undecodable(refused.value, "user bind", fault)
             texts.append(str(refused.value))
     assert texts[0] == texts[1]
+
+
+# --- a bind response carrying a referral is a referral (D3b) --------------------------------------
+
+
+def _assert_referred_bind(exc: BaseException, operation: str) -> None:
+    """The refusal is a referral naming the operation, with no host: the hosts are in the part
+    ldap3 could not decode, and a value the directory sent never reaches the text."""
+    assert isinstance(exc, LdapReferralError), repr(exc)
+    text = str(exc)
+    assert f"AD answered the {operation} with a referral" in text
+    assert "could not decode" not in text and "result code" not in text
+    assert _REFERRED not in text and "synthetic-leak" not in text, "a referred host leaked"
+    assert isinstance(exc.__cause__, KeyError) and exc.__cause__.args == (3,)
+
+
+def test_a_service_bind_answered_with_a_referral_is_a_referral() -> None:
+    """Before D3b it read as an undecodable response, an outage the reconciler pages nobody for.
+    THE PREMISE first: the bare ldap3 bind raises ``KeyError(3)``. The socket is still closed."""
+    with _scripted_dc(lambda _raw: [], bind_reply=lambda _raw: (_REFERRAL_BIND, b"")) as (
+        dc,
+        authenticator,
+    ):
+        with pytest.raises(KeyError) as bare:
+            _bare_bind(dc.port)
+        assert bare.value.args == (3,)
+        _reading_connection(bare.value).strategy.close()
+        assert dc.ended.wait(_CLOSE_WAIT)
+        dc.ended.clear()
+        with pytest.raises(LdapReferralError) as refused:
+            authenticator.probe_principal("alice")
+        _assert_referred_bind(refused.value, "service-account bind")
+        assert dc.searches == []
+        assert dc.ended.wait(_CLOSE_WAIT), "the referred bind's socket was left open"
+
+
+def test_a_user_bind_answered_with_a_referral_fails_a_present_and_an_absent_account_alike() -> None:
+    """The decoy bind meets the same referral, so the two branches refuse with one text."""
+
+    def bind(raw: bytes) -> _Reply | None:
+        is_user = b"CN=alice" in raw or b"mf-nonexistent-timing-equalizer" in raw
+        return (_REFERRAL_BIND, b"") if is_user else None
+
+    texts = []
+    with _scripted_dc(_alice, bind_reply=bind) as (_dc, authenticator):
+        for username in ("alice", "nobody"):
+            with pytest.raises(LdapReferralError) as refused:
+                authenticator.authenticate(username, "synthetic-user-pw")
+            _assert_referred_bind(refused.value, "user bind")
+            texts.append(str(refused.value))
+    assert texts[0] == texts[1]
+
+
+async def test_the_reconciler_reads_a_referred_service_bind_as_referred() -> None:
+    """So the probe reaches the referral's alert path (BACKLOG #2538), not the outage's."""
+    with _scripted_dc(lambda _raw: [], bind_reply=lambda _raw: (_REFERRAL_BIND, b"")) as (
+        dc,
+        authenticator,
+    ):
+        store = await MessageStore.open(":memory:")
+        try:
+            settings = _ad_settings(
+                ad_server=f"ldap://127.0.0.1:{dc.port}", ad_allow_insecure_ldap=True
+            )
+            service = AuthService(store, settings, ldap=authenticator)
+            user = SimpleNamespace(id="u-1", username="alice", directory_object_id=None)
+            probe = await service._probe_principal(user)  # type: ignore[arg-type]
+        finally:
+            await store.close()
+    assert probe.outcome is ProbeOutcome.REFERRED
+    assert probe.detail is not None and _REFERRED not in probe.detail
+
+
+def test_a_referral_in_a_who_am_i_response_is_still_undecodable() -> None:
+    """THE CONTROL: only a BIND response's referral field is read as a referral. ldap3's decoder
+    raises the same ``KeyError(3)`` on an extended response carrying one, and that stays an
+    undecodable response, because the origin check reads which response was being decoded."""
+    reply = (
+        _result(_EXTENDED_RESPONSE, 10, extra=_tlv(0xA3, _tlv(0x04, _REFERRED.encode()))),
+        b"",
+    )
+    with _scripted_dc(lambda _raw: [_done(RESULT_SUCCESS)], extended_reply=reply) as (
+        _dc,
+        authenticator,
+    ):
+        with _service_conn(authenticator) as conn, pytest.raises(KeyError) as bare:
+            conn.extend.standard.who_am_i()
+        assert bare.value.args == (3,)
+        reading = authenticator.read_bind_account()
+    assert reading.whoami_error is not None
+    assert "Who am I with a response ldap3 could not decode (KeyError)" in reading.whoami_error
+
+
+# --- the service connection is released by every lookup (D3b) ------------------------------------
+
+
+def _groups_answered(raw: bytes) -> list[_Reply]:
+    """The user search finds alice; the nested group search ends with success and no group."""
+    return [_done(RESULT_SUCCESS)] if _IN_CHAIN in raw else _alice(raw)
+
+
+def _group_search_busy(raw: bytes) -> list[_Reply]:
+    return [_done(51)] if _IN_CHAIN in raw else _alice(raw)
+
+
+def _group_page_undecodable(raw: bytes) -> list[_Reply]:
+    no_value = _tlv(0x30, _tlv(0x04, _OID))  # ldap3 raises TypeError on it
+    return [_bad_page(no_value)] if _IN_CHAIN in raw else _alice(raw)
+
+
+def _probe(name: str) -> Callable[[Any], object]:
+    return lambda authenticator: authenticator.probe_principal(name)
+
+
+def _sign_in(name: str) -> Callable[[Any], object]:
+    return lambda authenticator: authenticator.authenticate(name, "synthetic-user-pw")
+
+
+@pytest.mark.parametrize(
+    ("answer", "call", "sessions"),
+    [
+        pytest.param(_groups_answered, _probe("alice"), 1, id="probe-present"),
+        pytest.param(_groups_answered, _probe("nobody"), 1, id="probe-absent"),
+        pytest.param(_group_search_busy, _probe("alice"), 1, id="probe-group-search-busy"),
+        pytest.param(_group_page_undecodable, _probe("alice"), 1, id="probe-undecodable-page"),
+        pytest.param(_groups_answered, _sign_in("alice"), 2, id="sign-in-present"),
+        pytest.param(_groups_answered, _sign_in("nobody"), 2, id="sign-in-absent-decoy"),
+        pytest.param(_group_search_busy, _sign_in("alice"), 2, id="sign-in-group-search-busy"),
+    ],
+)
+def test_every_directory_session_a_lookup_opens_is_ended(
+    answer: Callable[[bytes], list[_Reply]], call: Callable[[Any], object], sessions: int
+) -> None:
+    """D3b, a finding of BACKLOG #3010's review. ``authenticate`` and ``probe_principal`` held the
+    service connection in ldap3's own ``with``, which never unbinds a connection bound on entry,
+    so every lookup left one directory session open until the connection was collected. Counted
+    at the loopback server, by the unbind requests it receives, whatever the lookup answered."""
+    with _scripted_dc(answer) as (dc, authenticator):
+        with contextlib.suppress(LdapError):
+            call(authenticator)
+        assert dc.opened == sessions, "the lookup did not open the sessions this case names"
+        deadline = time.monotonic() + _CLOSE_WAIT
+        while dc.unbound < dc.opened and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert dc.unbound == dc.opened, f"{dc.opened} session(s) opened, {dc.unbound} ended"
 
 
 # --- the nested group search: a malformed paged results control ---------------------------------
@@ -397,6 +548,9 @@ def test_the_ldap3_methods_the_origin_check_names_still_exist() -> None:
     assert readers["ldap3.extend."] == {"decode_response", "populate_result", "set_response"}
     assert {"decode_response", "set_response"} <= set(vars(ExtendedOperation))
     assert "populate_result" in vars(WhoAmI)
+    # What _is_bind_referral reads (D3b): the decoder's locals, and a bind table with no referral.
+    assert {"context_decoders", "ber_type"} <= set(asn1.decode_sequence.__code__.co_varnames)
+    assert ldap_module._REFERRAL_TAG not in asn1.BIND_RESPONSE_CONTEXT
 
 
 def test_an_unbind_error_never_replaces_the_refusal() -> None:
