@@ -224,6 +224,7 @@ tests/test_worktree_prune_merged.py
 tests/test_worktree_remove_path.py
 tests/test_worktree_remove.py
 tests/test_worktree_remove_scratch.py
+tests/test_worktree_rescue.py
 tests/test_worktree_selfheal_wiring.py
 tests/test_worktree_venv_constraint.py
 tests/test_worktree_venv_extras_parity.py

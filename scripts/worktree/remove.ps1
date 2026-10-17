@@ -98,7 +98,10 @@ param(
     # \A..\z for the reason given in new.ps1's param block; keep all four copies identical.
     # Position 0, and -RepoRoot position 1, are what this script bound before it had parameter sets:
     # `remove.ps1 alerts` must keep working.
-    [Parameter(Mandatory = $true, Position = 0, ParameterSetName = 'ByName')]
+    # NOT Mandatory, ON PURPOSE: any call without -Name, -Path or -List binds this default set (a bare
+    # call, or -Force alone, for example), and a Mandatory prompt there hangs a caller with stdin open
+    # (tests/_no_prompt.py, vault BACKLOG #3627). The refusal is right after this param block.
+    [Parameter(Position = 0, ParameterSetName = 'ByName')]
     [ValidatePattern('\A[A-Za-z0-9._-]+\z')]
     [string]$Name,
 
@@ -137,6 +140,11 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# No target: refuse by name, before anything is read or removed. See $Name.
+if ($PSCmdlet.ParameterSetName -eq 'ByName' -and -not $Name) {
+    throw "remove.ps1 needs -Name <dir>, -Path <path>, or -List. Nothing was removed."
+}
 
 $byPath = $PSCmdlet.ParameterSetName -eq 'ByPath'
 $listing = $PSCmdlet.ParameterSetName -eq 'List'

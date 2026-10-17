@@ -42,6 +42,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._no_prompt import run_holding_stdin_open
+
 _REPO = Path(__file__).resolve().parents[1]
 SCRIPT = _REPO / "scripts" / "worktree" / "remove.ps1"
 
@@ -565,3 +567,19 @@ def test_the_override_is_NOT_Force(fx: Fixture) -> None:
     allowed = run(fx, "-Name", "alpha", "-AllowOrphanedAllocations")
     assert allowed.returncode == 0, allowed.stderr
     assert not fx.is_registered(wt)
+
+
+@pytest.mark.parametrize("args", [(), ("-Force",)], ids=["bare", "force-only"])
+def test_a_call_without_a_target_refuses_instead_of_prompting(
+    fx: Fixture, args: tuple[str, ...]
+) -> None:
+    """Vault BACKLOG #3627: the default ``ByName`` set bound without ``-Name``. Red pre-fix."""
+    wt = fx.add("alpha")
+    rc, err = run_holding_stdin_open(
+        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-RepoRoot", str(fx.primary), *args],
+        cwd=fx.primary,
+    )
+    assert rc != 0, "a removal naming no worktree must be refused"
+    assert "-Name" in err, err
+    assert fx.is_registered(wt)
+    assert fx.branch_exists("alpha")
