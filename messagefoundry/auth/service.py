@@ -11778,7 +11778,11 @@ class AuthService:
         # Asked again (BACKLOG #3061): the floor and the directory lookup above await, the lookup a
         # network round trip, and a TOTP confirmed on another session meanwhile would otherwise let
         # this passkey bind and promote a session that never proved that factor. Refused exactly
-        # as the check above refuses.
+        # as the check above refuses, and with the same dead-session guard in front, since the
+        # check fails closed on a session revoked meanwhile (a local account's floor re-reads none).
+        if await self._load_session(hash_token(token)) is None:
+            self._webauthn_challenges.pop((hash_token(token), "register"))
+            return Elevation(session_lost=True)
         if await self._factor_binding_is_blocked(token, STEP_UP_ACTION_WEBAUTHN_ENROLL):
             self._webauthn_challenges.pop((hash_token(token), "register"))
             await self.audit_mfa_denied(identity, "finish_webauthn_registration", client=client)

@@ -33,6 +33,7 @@ from messagefoundry.auth.service import AuthService, Elevation  # noqa: E402
 from messagefoundry.auth.tokens import hash_token  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
 from messagefoundry.store.store import MessageStore, UserRecord  # noqa: E402
+from tests._admin_account import login_admin  # noqa: E402
 from tests._soft_webauthn import SoftAuthenticator  # noqa: E402
 from tests._totp_clock import pin_totp_clock  # noqa: E402
 
@@ -222,4 +223,31 @@ async def test_a_totp_bound_during_the_directory_lookup_stops_the_passkey_finish
     rows = await store.list_audit(action="auth.mfa_denied")
     assert {"path": "finish_webauthn_registration"} in [json.loads(r["detail"]) for r in rows]
     # Refused as the earlier check refuses: the ceremony is ended, not left for a retry.
+    assert service._webauthn_challenges.peek((hash_token(token), "register")) is None
+
+
+async def test_a_session_revoked_between_the_two_asks_is_lost_not_owing_a_factor(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The second ask fails closed on a dead session, as the first does, so it carries the same
+    session guard. RED when: a session revoked after the first ask is told the account "already
+    has a second factor" (it holds none) and an ``auth.mfa_denied`` row is written for it. A LOCAL
+    account, because a directory account's lookup re-reads the session and answers it lost first."""
+    service = await _service(store, require_mfa=False)
+    identity, token, _password = await login_admin(service)
+    response = await _stage_passkey(service, identity, token)
+    real_floor = service._enrolment_too_early
+
+    async def _floor_while_revoked(*args: object, **kwargs: object) -> bool:
+        await store.revoke_session(hash_token(token))
+        return await real_floor(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(service, "_enrolment_too_early", _floor_while_revoked)
+
+    lost = await _finish(service, identity, token, response)
+
+    assert lost.session_lost is True and lost.ok is False
+    assert await store.list_webauthn_credentials(identity.user_id) == []
+    assert await store.list_audit(action="auth.mfa_denied") == []
+    # A dead session can never finish the ceremony, so the lost answer ends it.
     assert service._webauthn_challenges.peek((hash_token(token), "register")) is None
