@@ -668,6 +668,10 @@ def test_out_that_appears_after_the_check_is_written_in_place_on_windows(
     out.write_text("stale\n", encoding="utf-8")
     _harden(out, "F")
     hardened = _sddl_of(out, scratch)
+    sibling = tmp_path / "fresh.json"
+    sibling.write_text("x\n", encoding="utf-8")
+    # Control: a file renamed into this folder would get a different list, so a replace fails this.
+    assert hardened != _sddl_of(sibling, scratch)
     monkeypatch.setattr(os.path, "lexists", lambda path: False)
     tee_main._write_owner_only(str(out), "new\n")
     monkeypatch.undo()

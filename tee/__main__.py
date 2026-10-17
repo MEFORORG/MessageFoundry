@@ -521,7 +521,8 @@ def _write_owner_only(path: str, text: str) -> None:
     receives the report.
     """
     target = Path(path)
-    if os.path.lexists(target) if os.name == "nt" else _is_named_stream(path):
+    in_place = os.path.lexists(target) if os.name == "nt" else _is_named_stream(path)
+    if in_place:
         _write_through(target, text)
         return
     fd, temp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
@@ -549,7 +550,8 @@ def _write_owner_only(path: str, text: str) -> None:
 
 
 def _write_through(target: Path, text: str) -> None:
-    """Open ``target`` for writing and write ``text`` as LF, the way ``Path.write_text`` does."""
+    """Open ``target`` for writing in place, as ``Path.write_text`` does, and write ``text`` with LF
+    newlines; ``write_text`` without ``newline=`` would write CRLF on Windows."""
     with target.open("w", encoding="utf-8", newline="\n") as stream:
         stream.write(text)
 
@@ -612,8 +614,8 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
 
     Fail-closed: the salt must come from the environment (never a flag/commit), and if ANY message
     still carries a forbidden token after anonymization the whole dataset is refused — a dataset
-    holding a message that failed is never written, though on Windows an I/O failure part way can
-    leave a truncated one (see :func:`_write_owner_only`). Never echoes a body to stdout/stderr
+    holding a message that failed is never written, though an existing target on Windows can be
+    left truncated or partly written (:func:`_write_owner_only` says when). Never echoes a body to stdout/stderr
     (only counts).
     """
     salt = os.environ.get(args.salt_env, "")
