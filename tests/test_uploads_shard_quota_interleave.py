@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -93,9 +94,9 @@ async def _race_stale_scan(
     armed = False
     scans = 0
 
-    def _a_scan() -> list[UploadedFileMeta]:
+    def _a_scan(held: list[Any] | None = None) -> list[UploadedFileMeta]:
         nonlocal scans
-        out = real_a_scan()
+        out = real_a_scan(held)
         if armed:
             scans += 1
             if scans == 2:  # 1 = the pre-reserve scan, 2 = the scan inside _build_and_write
@@ -276,3 +277,70 @@ async def test_a_leaked_slot_is_reclaimed_while_the_uploader_stays_active(
         for name in ("b", "c"):
             await shard_c.release_upload_quota(f"{uploader_id}-{name}")
         assert await shard_c.upload_quota_in_flight(uploader_id) == (0, 0)
+
+
+class _HostClockAhead:
+    """A store module's ``time``, with ``time()`` a decade ahead and everything else passed through:
+    an engine host whose clock is badly wrong."""
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
+
+    def time(self) -> float:
+        return time.time() + 10 * 365 * 86_400
+
+
+@pytest.mark.parametrize(
+    ("pair", "module"),
+    [
+        pytest.param(
+            _BACKENDS[1].values[0],
+            "messagefoundry.store.postgres",
+            id="postgres",
+            marks=_BACKENDS[1].marks,
+        ),
+        pytest.param(
+            _BACKENDS[2].values[0],
+            "messagefoundry.store.sqlserver",
+            id="sqlserver",
+            marks=_BACKENDS[2].marks,
+        ),
+    ],
+)
+async def test_the_server_backends_stamp_since_with_the_database_clock(
+    tmp_path: Path, pair: _Pair, module: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3256 item 1. ``since`` was stamped from the engine host's clock, so one host a
+    decade ahead stamped a reservation no sibling could age for a decade. The reserve and the touch
+    now read the database server's clock, on each reservation's own row (vault BACKLOG #3180).
+    Shard A's host runs a decade ahead and its slot leaks. Shard B, on a host with a true clock,
+    then reserves with ``stale_after=0``, which reclaims anything stamped at or before now: A's
+    leaked slot goes. Red before the fix: A's stamp is a decade ahead, nothing is reclaimed, and B
+    counts two slots."""
+    import importlib
+
+    uploader_id = f"u-3256-{uuid.uuid4().hex}"
+    store_module = importlib.import_module(module)
+    async with pair(tmp_path) as (shard_a, shard_b):
+
+        async def _reserve(store: Any, name: str, stale_after: float = 300.0) -> bool:
+            return bool(
+                await store.reserve_upload_quota(
+                    uploader_id,
+                    f"{uploader_id}-{name}",
+                    size_bytes=10,
+                    max_files=10,
+                    max_total_bytes=1000,
+                    stale_after=stale_after,
+                )
+            )
+
+        with monkeypatch.context() as m:
+            m.setattr(store_module, "time", _HostClockAhead())
+            assert await _reserve(shard_a, "a")  # shard A, never released
+            await shard_a.touch_upload_quota(f"{uploader_id}-a")
+        await asyncio.sleep(0.05)  # past A's stamp on the server's own clock
+        assert await _reserve(shard_b, "b", stale_after=0.0)
+        assert await shard_b.upload_quota_in_flight(uploader_id) == (1, 10)
+        await shard_b.release_upload_quota(f"{uploader_id}-b")
+        assert await shard_b.upload_quota_in_flight(uploader_id) == (0, 0)

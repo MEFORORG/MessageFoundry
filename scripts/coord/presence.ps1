@@ -41,10 +41,27 @@
     prune-merged.ps1 (which DELETES a worktree, so it must reach the same verdict this roster does).
     This script only labels and renders what that returns.
 
+    -FLEET, AND WHAT IT STILL CANNOT PROVE
+    --------------------------------------
+    The default roster is scoped to ONE repository family, so a seat working another repo is absent
+    from it, and that absence reads as "that seat is not running". -Fleet scans every repository the
+    session records name, plus the caller's own, and joins the results.
+
+    A -Fleet roster that lacks a seat does NOT prove the seat absent. At least these stay unlisted:
+      * a session whose cwd lies outside git. It names no repository to scan.
+      * a session whose cwd is gone, with no checkout above it. A gone sibling worktree such as
+        <primary>-<slug> is this shape. Its repository is scanned only if something else names it.
+      * a session on another machine. No form of this roster can see it.
+    The caller's own repository is always scanned, so its fence still reports the shapes
+    occupancy.ps1 names: a gone sibling worktree named <primary>-<slug>, and a deregistered checkout
+    still on disk. A gone checkout of it elsewhere is in neither shape and goes unreported. A named
+    repository that cannot be scanned makes the roster UNAVAILABLE rather than dropping out of it.
+
 .EXAMPLE
     pwsh -NoProfile -File scripts\coord\presence.ps1
     pwsh -NoProfile -File scripts\coord\presence.ps1 -All        # include stale/dead entries
     pwsh -NoProfile -File scripts\coord\presence.ps1 -Json       # machine-readable
+    pwsh -NoProfile -File scripts\coord\presence.ps1 -Fleet      # every repository the records name
 #>
 [CmdletBinding()]
 param(
@@ -57,6 +74,9 @@ param(
     [switch]$Json,
     # Repo to scope to. Defaults to the current worktree's repo family (all worktrees sharing one .git).
     [string]$Repo,
+    # Scan every repository the session records name, not just this one. See the -Fleet note in the
+    # description for what a -Fleet roster still cannot prove.
+    [switch]$Fleet,
     # Treat this pid as "me" so the roster can mark the calling session. Defaults to auto-detection by
     # ancestry (see Get-SelfPids) -- 0 means "work it out", which is what every real invocation wants.
     [int]$SelfPid = 0,
@@ -114,8 +134,164 @@ function Get-SelfPids([int]$Override) {
     return $chain
 }
 
+# --- Which repositories -Fleet scans ----------------------------------------------------------
+# One -Repo hint per distinct git common dir, with the caller's repository seeded first.
+#
+# THE SEED IS THE ENGINE'S DEPARTURE FROM KORUS efd7b428db. Korus scanned the caller's repository
+# only when no record named any repository. A record whose cwd is gone often names no repository on
+# disk. So when a repository's only record was gone, korus never scanned it. The third unplaceable
+# shape in occupancy.ps1 then could not fire, and -Fleet called the fence available. Seeding the
+# caller's repository keeps that fault visible for the repository the caller works in.
+#
+# The .git pointer is read first, because it costs no process and survives deregistration; rev-parse
+# runs only where the pointer says nothing. Results are memoised by cwd.
+#
+# Returns Hints (common dir -> hint), OwnFound, and Unreadable (record files that did not parse).
+function Get-FleetRepoHints([string]$OwnRepo, [string[]]$Roots, [hashtable]$Memo = @{}) {
+    $hints = [ordered]@{}
+    $own = Get-RepoCommonDir $OwnRepo
+    if ($own) { $hints[$own] = $OwnRepo }
+    $unreadable = @()
+    $records = @()
+    $readError = ''
+    try { $records = @(Get-SessionRecords -ConfigRoot $Roots -IncludeUnreadable) }
+    catch { $readError = $_.Exception.Message }
+    $memo = $Memo
+    foreach ($rec in $records) {
+        if ($rec.Unreadable) { $unreadable += $rec.File; continue }
+        # Get-SessionRecords returns a WRAPPER (Root, File, Record, ...), so the session's fields
+        # live under .Record. Reading .cwd off the wrapper is null for every record, and korus
+        # measured that collapsing -Fleet to one repository.
+        $cwd = [string]$rec.Record.cwd
+        if (-not $cwd) { continue }
+        if (-not $memo.ContainsKey($cwd)) {
+            # A cwd on a drive that no longer exists makes Join-Path throw. It names no repository.
+            $common = ''
+            try {
+                $common = Get-OwningGitCommonDir $cwd
+                if (-not $common -and (Test-Path -LiteralPath $cwd)) { $common = Get-RepoCommonDir $cwd }
+            }
+            catch { $common = '' }
+            $memo[$cwd] = $common
+        }
+        $common = $memo[$cwd]
+        # The common dir itself is the hint. git runs inside a git directory, and the common dir
+        # still exists when the session's checkout does not.
+        if ($common -and -not $hints.Contains($common)) { $hints[$common] = $common }
+    }
+    return [pscustomobject]@{
+        Hints = $hints; OwnFound = [bool]$own; Unreadable = $unreadable; ReadError = $readError; Memo = $memo
+    }
+}
+
+# One repository's scan, turned into a failed scan rather than a throw or a silent drop. Either of
+# those would leave the joined fence reading available on a repository it never read.
+function Get-FleetScan([string]$Common, [string]$Hint) {
+    try {
+        $one = Get-WorktreeOccupancy -Repo $Hint -ConfigRoot $ConfigRoot -StartSkewMinutes $StartSkewMinutes
+        if ($one.RepoFound) { return $one }
+        $why = "git could not list the worktrees of $Common, so that repository was not scanned"
+    }
+    catch { $why = "the scan of $Common failed: $($_.Exception.Message)" }
+    return [pscustomobject]@{
+        RepoFound = $false; Available = $false; Detail = $why
+        RootsExamined = 0; RecordsExamined = 0; UnplaceableFiles = @(); PrimaryPath = ''; Sessions = @()
+    }
+}
+
 # --- Collect ------------------------------------------------------------------------------------
-$occ = Get-WorktreeOccupancy -Repo $Repo -ConfigRoot $ConfigRoot -StartSkewMinutes $StartSkewMinutes
+# EVERY REPO, OR ONE. -Fleet calls Get-WorktreeOccupancy once per repository and joins the results.
+# That keeps ONE definition of 'live' and 'unplaceable', which prune-merged.ps1 and sessions.ps1
+# depend on. Any repository that cannot account for its records makes the joined fence unavailable.
+$scopeLabel = 'this repo'
+$ownPrimary = ''
+if ($Fleet) {
+    $plan = Get-FleetRepoHints -OwnRepo $Repo -Roots $ConfigRoot
+    $scans = @($plan.Hints.Keys | ForEach-Object { Get-FleetScan -Common $_ -Hint $plan.Hints[$_] })
+    $found = @($scans | Where-Object { $_.RepoFound })
+    if ($plan.OwnFound) { $ownPrimary = $scans[0].PrimaryPath }
+    $unplaceable = @($found | ForEach-Object { $_.UnplaceableFiles } | Select-Object -Unique)
+
+    $problems = @()
+    # A -Repo the caller named, and git cannot resolve, is a repository this roster never read.
+    if ($plan.ReadError) {
+        $problems += "the session registry could not be read to choose repositories: $($plan.ReadError)"
+    }
+    if ($Repo -and -not $plan.OwnFound) {
+        $problems += "the repository named by -Repo ($Repo) could not be resolved, so it was not scanned"
+    }
+    # A record that did not parse named no repository when they were chosen. If the scans still saw
+    # it unparseable they already fault it; one that parsed by then may name a repository not scanned.
+    $healed = @($plan.Unreadable | Where-Object {
+            $f = $_
+            -not @($unplaceable | Where-Object { $_.StartsWith("$f -- ") }).Count
+        })
+    if ($healed.Count -gt 0) {
+        $problems += "$($healed.Count) record(s) parsed only after repositories were chosen, so their repositories may be unscanned: $($healed -join '; ')"
+    }
+    # Each scan re-reads the registry. A record that appears in between names a repository nobody
+    # chose, so choose again and compare. The memo from the first pass keeps the second one cheap.
+    $late = @((Get-FleetRepoHints -OwnRepo $Repo -Roots $ConfigRoot -Memo $plan.Memo).Hints.Keys |
+            Where-Object { -not $plan.Hints.Contains($_) })
+    if ($late.Count -gt 0) {
+        $problems += "a session record naming another repository appeared during the scan: $($late -join '; ')"
+    }
+    if ($unplaceable.Count -gt 0) {
+        $problems += "$($unplaceable.Count) session record(s) could not be placed, so the roster is incomplete: $($unplaceable -join '; ')"
+    }
+    # Failed scans and scans unavailable for a reason other than an unplaceable record.
+    $problems += @($scans | Where-Object { -not $_.Available -and @($_.UnplaceableFiles).Count -eq 0 } |
+            ForEach-Object { $_.Detail } | Select-Object -Unique)
+
+    # A session inside a repository nested in another's checkout is placed by both scans. Keep the
+    # more specific placement, the longer worktree path. The occurrence index keeps two identical
+    # records within one scan apart, since every scan walks the registry in the same order.
+    $byRecord = [ordered]@{}
+    foreach ($scan in $found) {
+        $seenHere = @{}
+        foreach ($s in $scan.Sessions) {
+            $base = "$($s.Root)|$($s.SessionId)|$($s.Pid)|$($s.Cwd)"
+            $n = [int]$seenHere[$base]
+            $seenHere[$base] = $n + 1
+            $key = "$base|$n"
+            $s | Add-Member -NotePropertyName Repo -NotePropertyValue $scan.PrimaryPath -Force
+            $prev = $byRecord[$key]
+            if (-not $prev -or $s.WorktreePath.Length -gt $prev.WorktreePath.Length) { $byRecord[$key] = $s }
+        }
+    }
+    $occ = [pscustomobject]@{
+        # Any repository attempted counts, so a failed scan reaches the UNAVAILABLE receipt with its
+        # reason rather than the generic "not inside a git repository".
+        RepoFound       = ($scans.Count -gt 0)
+        Available       = ($found.Count -gt 0 -and $problems.Count -eq 0)
+        Detail          = ($problems -join '; ')
+        # Every scan reads the same registry, so the max is the honest single figure.
+        RootsExamined   = [int]($found | Measure-Object -Property RootsExamined -Maximum).Maximum
+        RecordsExamined = [int]($found | Measure-Object -Property RecordsExamined -Maximum).Maximum
+        Sessions        = @($byRecord.Values)
+    }
+    $noun = if ($scans.Count -eq 1) { 'repository' } else { 'repositories' }
+    $scopeLabel = "the FLEET of $($scans.Count) $noun"
+}
+else {
+    $occ = Get-WorktreeOccupancy -Repo $Repo -ConfigRoot $ConfigRoot -StartSkewMinutes $StartSkewMinutes
+    $ownPrimary = $occ.PrimaryPath
+}
+
+# EVERY HUMAN RUN STATES WHAT ITS ROSTER CANNOT PROVE, the empty one included, since "nobody is
+# here" is the reading a narrow roster most often corrupts. The default is scoped to one repository.
+# -Fleet is wider, and a seat missing from it is still not proven absent.
+function Write-ScopeWarning {
+    Write-Host ""
+    if ($Fleet) {
+        Write-Host "  A seat missing from this roster is NOT proven absent. At least these are not listed:" -ForegroundColor Yellow
+        Write-Host "  sessions whose cwd is outside git or gone with no checkout above it, and sessions on another machine." -ForegroundColor Yellow
+        return
+    }
+    Write-Host "  SCOPED TO THIS REPOSITORY. A seat working another repo is not listed above." -ForegroundColor Yellow
+    Write-Host "  Before writing that any seat is absent:  pwsh -NoProfile -File scripts\coord\presence.ps1 -Fleet" -ForegroundColor Yellow
+}
+
 if (-not $occ.RepoFound) {
     # THE STDERR RECEIPT BELONGS HERE TOO, and its absence was a hole in the control this script
     # already documents. The -Json block further down emits an UNAVAILABLE receipt so that "the fence
@@ -135,6 +311,7 @@ $selfPids = Get-SelfPids $SelfPid
 
 $rows = @()
 foreach ($s in $occ.Sessions) {
+    $repoOf = if ($s.PSObject.Properties['Repo']) { $s.Repo } else { $ownPrimary }
     $rows += [pscustomobject]@{
         State     = $s.State
         Detail    = $s.Detail
@@ -145,9 +322,17 @@ foreach ($s in $occ.Sessions) {
         Pid       = $s.Pid
         Cwd       = $s.Cwd
         Worktree  = $s.Worktree
+        # The repository's primary checkout. Under -Fleet it is what tells two repos' rows apart.
+        Repo      = $repoOf
+        IsOwnRepo = ((ConvertTo-Norm $repoOf) -eq (ConvertTo-Norm $ownPrimary))
         IsPrimary = $s.IsPrimary
         Branch    = $s.Branch
         Kind      = $s.Kind
+        # Kind cannot tell a scheduled-task run from a person's session; the transcript can. Only read
+        # for a row the default view keeps, since the filter below drops the rest.
+        Scheduled = if ($All -or (Test-OccupancyVeto $s.State)) {
+            Test-ScheduledTaskSession -Root $s.Root -SessionId $s.SessionId
+        } else { $false }
         IsSelf    = ($selfPids -contains [int]$s.Pid)
         StartedAt = $s.StartedAt
     }
@@ -177,18 +362,25 @@ if ($rows.Count -eq 0) {
     # "Nobody is here" and "I could not look" produce the same empty list, so say which one it is.
     if (-not $occ.Available) {
         Write-Host "Roster UNAVAILABLE -- $($occ.Detail)." -ForegroundColor Yellow
-        Write-Host "  This is NOT 'nobody is live'. Nothing was examined, so nothing can be concluded." -ForegroundColor Yellow
+        Write-Host "  This is NOT 'nobody is live'. An empty list from a fence that could not look proves nothing." -ForegroundColor Yellow
     }
     else {
-        Write-Host "No live sessions found for this repo." -ForegroundColor DarkGray
+        Write-Host "No live sessions found in $scopeLabel." -ForegroundColor DarkGray
         Write-Host "  (fence: $($occ.RootsExamined) config root(s), $($occ.RecordsExamined) record(s) examined.)" -ForegroundColor DarkGray
     }
     Write-Host "(Add -All to include stale/dead registry entries.)" -ForegroundColor DarkGray
+    Write-ScopeWarning
     exit 0
 }
 
 Write-Host ""
-Write-Host "Live Claude sessions in this repo ($($rows.Count)):"
+# A PARTIAL ROSTER MUST NOT RENDER AS A COMPLETE ONE. Under -Fleet one repository's unplaceable record
+# sits beside another's live rows, so a non-empty table is no evidence that the fence could look.
+if (-not $occ.Available) {
+    Write-Host "Roster INCOMPLETE -- $($occ.Detail)." -ForegroundColor Yellow
+    Write-Host "  What follows is what could be placed. There may be sessions it does not show." -ForegroundColor Yellow
+}
+Write-Host "Live Claude sessions in $scopeLabel ($($rows.Count)):"
 # NAME EVERY COLUMN (BACKLOG #1098). The leading token is an 8-hex REGISTRY SESSION ID and reads exactly
 # like an abbreviated commit SHA: session-context.ps1's banner, which points readers here, prints a real
 # one in the same shape (`git worktree list` = path, sha, branch). Unlabelled, a reader resolves it
@@ -198,12 +390,16 @@ Write-Host "Live Claude sessions in this repo ($($rows.Count)):"
 Write-Host ("  {0,-8} {1,-7} {2,-34} {3}" -f "sess-id", "surface", "worktree", "branch")
 foreach ($r in $rows) {
     $me = if ($r.IsSelf) { "  <-- THIS session" } else { "" }
-    $warn = if ($r.IsPrimary -and -not $r.IsSelf) { "  [in the SHARED PRIMARY]" } else { "" }
+    # Only the caller's own primary is the SHARED PRIMARY; another repo's trunk is no collision here.
+    $shared = $r.IsPrimary -and $r.IsOwnRepo -and -not $r.IsSelf
+    $warn = if ($shared) { "  [in the SHARED PRIMARY]" } else { "" }
     $state = if ($r.State -eq "LIVE") { "" } else { "  [$($r.State): $($r.Detail)]" }
-    Write-Host ("  {0,-8} {1,-7} {2,-34} {3}" -f $r.Short, $r.Surface, $r.Worktree, $r.Branch)
+    $where = if ($Fleet -and $r.Repo) { "$(Split-Path $r.Repo -Leaf)/$($r.Worktree)" } else { $r.Worktree }
+    Write-Host ("  {0,-8} {1,-7} {2,-34} {3}" -f $r.Short, $r.Surface, $where, $r.Branch)
     if ($me -or $warn -or $state) { Write-Host ("           {0}{1}{2}" -f $me.TrimStart(), $warn, $state) }
 }
 Write-Host ""
 Write-Host "  See what they are building:  pwsh -NoProfile -File scripts\coord\claim.ps1 -List"
+Write-ScopeWarning
 Write-Host ""
 exit 0

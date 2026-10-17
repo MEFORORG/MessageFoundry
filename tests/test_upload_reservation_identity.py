@@ -374,30 +374,23 @@ async def test_a_straggler_that_ends_after_the_drain_returned_starts_no_release(
     assert not store._drain_cancelled, "the drain still holds a task that ended"
 
 
-def test_the_straggler_drain_fits_inside_the_retention_runner_stop() -> None:
-    """The managed lifespan runs the two side by side, so the drain adds nothing to NSSM's 15 s
-    graceful-stop window only while its two bounds fit inside the runner's (review round two)."""
-    assert (
-        uploads_mod._STRAGGLER_DRAIN_SECONDS + uploads_mod._STRAGGLER_CANCEL_GRACE_SECONDS
-        <= uploads_mod._DEFAULT_STOP_TIMEOUT_SECONDS
-    )
-
-
-async def test_the_managed_teardown_drains_beside_the_retention_runner_stop(
+async def test_the_managed_teardown_hands_the_straggler_drain_a_share_of_its_step_bound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Run in turn, the drain's bounds added to the runner's in the shutdown budget. The fake stop
-    waits for the drain to begin, so a sequential teardown would time out here."""
+    """The drain is one step of the teardown, under its one budget (BACKLOG #3191). Its own two
+    waits together fit inside the share of the step's bound it is handed, so it cancels what is
+    left before the teardown cuts the step, and neither wait exceeds the drain's own default."""
+    from messagefoundry.api import app as app_module
     from messagefoundry.api import create_managed_app
 
-    drain_started = asyncio.Event()
-    calls: list[str] = []
+    bounds: list[float] = []
+    real_invoke = app_module._invoke
 
-    async def _stop(self: Any) -> None:
-        calls.append("runner")
-        await asyncio.wait_for(drain_started.wait(), 5)
+    async def _invoke(run: Any, bound: float) -> object:
+        bounds.append(bound)
+        return await real_invoke(run, bound)
 
-    monkeypatch.setattr(uploads_mod.UploadRetentionRunner, "stop", _stop)
+    monkeypatch.setattr(app_module, "_invoke", _invoke)
     app = create_managed_app(
         store_settings=StoreSettings(
             path=str(tmp_path / "managed.db"),
@@ -406,14 +399,51 @@ async def test_the_managed_teardown_drains_beside_the_retention_runner_stop(
         ),
         egress_settings=EgressSettings(deny_by_default=False),
     )
+    waits: list[tuple[float, float]] = []
     async with app.router.lifespan_context(app):
+        bounds.clear()  # only the teardown's steps
 
-        async def _drain(*_args: Any, **_kwargs: Any) -> None:
-            drain_started.set()
-            calls.append("uploads")
+        async def _drain(timeout: float, *, grace: float) -> None:
+            waits.append((timeout, grace))
+            bounds.append(-1.0)  # marks which step's bound precedes it
 
         app.state.upload_store.drain_stragglers = _drain
-    assert sorted(calls) == ["runner", "uploads"]
+    [(timeout, grace)] = waits
+    bound = bounds[bounds.index(-1.0) - 1]
+    assert timeout + grace <= bound * app_module._INNER_SHARE + 1e-9
+    assert timeout <= uploads_mod.STRAGGLER_DRAIN_SECONDS
+    assert grace <= uploads_mod.STRAGGLER_CANCEL_GRACE_SECONDS
+    assert grace > 0.0
+
+
+async def test_the_embedded_teardown_drains_the_upload_stragglers(tmp_path: Path) -> None:
+    """``create_app(engine=...)`` runs the same drains as the managed lifespan
+    (``_app_drain_steps``), the upload store's included, so a caller that stops its engine after
+    the app has shut down closes no store under a running ledger call."""
+    from messagefoundry.api import create_app
+    from messagefoundry.pipeline.engine import Engine
+
+    engine = await Engine.create(
+        tmp_path / "embedded.db", egress_settings=EgressSettings(deny_by_default=False)
+    )
+    try:
+        app = create_app(engine)
+        calls: list[str] = []
+
+        class _Uploads:
+            async def drain_stragglers(self, timeout: float, *, grace: float) -> None:
+                calls.append("uploads")
+
+        async def _outliving(timeout: float = 0.0, *, grace: float = 0.0) -> list[str]:
+            calls.append("outliving")
+            return []
+
+        async with app.router.lifespan_context(app):
+            app.state.upload_store = _Uploads()
+            app.state.outliving_operations.drain = _outliving
+        assert calls == ["outliving", "uploads"]
+    finally:
+        await engine.stop()
 
 
 async def test_the_old_per_uploader_ledger_table_is_dropped_at_open(tmp_path: Path) -> None:

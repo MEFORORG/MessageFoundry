@@ -38,6 +38,7 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -78,8 +79,8 @@ def _shard_result(
             )
             real_scan = uploads._scan_metas_sync
 
-            def _slow_scan() -> list[UploadedFileMeta]:
-                out = real_scan()
+            def _slow_scan(held: list[Any] | None = None) -> list[UploadedFileMeta]:
+                out = real_scan(held)
                 time.sleep(_SCAN_OVERLAP_SECONDS)  # widen the scan -> write window
                 return out
 
@@ -327,6 +328,92 @@ def test_the_heartbeat_stops_at_its_lifetime_cap(
 
     with caplog.at_level("WARNING", logger=uploads_mod._log.name):
         asyncio.run(_run())
+
+
+class _StuckTouchLedger:
+    """A ledger whose reserve and release answer at once and whose touch never returns: a store
+    that stalls on exactly the statement the heartbeat sends."""
+
+    def __init__(self) -> None:
+        self.touches = 0
+        self.cut_off = 0
+
+    async def reserve_upload_quota(
+        self,
+        uploader_id: str,
+        reservation_id: str,
+        *,
+        size_bytes: int,
+        max_files: int,
+        max_total_bytes: int,
+        stale_after: float = 0.0,
+    ) -> bool:
+        return True
+
+    async def release_upload_quota(self, reservation_id: str) -> None:
+        return None
+
+    async def touch_upload_quota(self, reservation_id: str) -> None:
+        self.touches += 1
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cut_off += 1
+            raise
+
+    async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
+        return (1, 5)
+
+
+def test_a_stuck_heartbeat_touch_no_longer_holds_the_heartbeat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3256 item 3. The heartbeat awaited its touch with no time bound, so one touch stuck
+    on the store held the heartbeat, and its lifetime cap, for as long as the store stalled. The
+    wait is bounded now and the touch is left running, never cancelled, and never doubled. Red
+    before the fix: the heartbeat never reached its cap."""
+    monkeypatch.setattr(uploads_mod, "_RESERVATION_HEARTBEAT_SECONDS", 0.02)
+    monkeypatch.setattr(uploads_mod, "_RESERVATION_TOUCH_WAIT_SECONDS", 0.01)
+    monkeypatch.setattr(uploads_mod, "_RESERVATION_HEARTBEAT_MAX_SECONDS", 0.3)
+    ledger = _StuckTouchLedger()
+
+    async def _run() -> None:
+        uploads = UploadStore(
+            tmp_path / "uploads", make_cipher(generate_key()), max_bytes=4096, store=ledger
+        )
+        entered, gate = threading.Event(), threading.Event()
+        real_encrypt = uploads._encrypt_blob
+
+        def _held(data: bytes, file_id: str) -> str:
+            entered.set()
+            gate.wait(timeout=30)
+            return real_encrypt(data, file_id)
+
+        uploads._encrypt_blob = _held  # type: ignore[method-assign]
+        save = asyncio.ensure_future(
+            uploads.save(data=b"slow\n", filename="a.txt", uploader="alice", uploader_id="u-alice")
+        )
+        try:
+            assert await asyncio.to_thread(entered.wait, 30), "the save never reached its write"
+            for _ in range(250):
+                if "no longer refreshed" in caplog.text:
+                    break
+                await asyncio.sleep(0.02)
+            assert "no longer refreshed" in caplog.text, "a stuck touch held the heartbeat"
+            await asyncio.sleep(0.05)  # the task leaves the set on its done callback
+            assert not uploads._heartbeats
+            # The stuck touch was left running, held, and never doubled or cancelled.
+            assert (ledger.touches, ledger.cut_off) == (1, 0)
+            assert uploads._stragglers, "the stuck touch was dropped instead of held"
+        finally:
+            gate.set()
+            await asyncio.gather(save, return_exceptions=True)
+            for held in set(uploads._stragglers):
+                held.cancel()  # stands in for asyncio.run's shutdown, which would cancel it
+
+    with caplog.at_level("WARNING", logger=uploads_mod._log.name):
+        asyncio.run(_run())
+    assert "did not finish within" in caplog.text
 
 
 def test_a_lagging_clock_never_moves_the_row_backwards(tmp_path: Path) -> None:

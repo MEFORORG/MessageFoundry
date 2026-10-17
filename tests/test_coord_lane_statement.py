@@ -53,6 +53,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._no_prompt import run_holding_stdin_open
+
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "coord" / "lane.ps1"
 
 
@@ -142,3 +144,19 @@ def test_the_two_arms_disagree(repo: Path) -> None:
         f"past rc={past.returncode} future rc={future.returncode} -- the two arms agree, so the "
         "guard is not discriminating on the sign of the offset at all"
     )
+
+
+@pytest.mark.parametrize(
+    "args",
+    [(), ("-Free", "1")],
+    ids=["bare", "free-only"],
+)
+def test_a_statement_missing_a_number_refuses_instead_of_prompting(
+    repo: Path, args: tuple[str, ...]
+) -> None:
+    """Vault BACKLOG #3627: the default ``State`` set bound without both numbers. Red pre-fix."""
+    rc, err = run_holding_stdin_open(["pwsh", "-NoProfile", "-File", str(_SCRIPT), *args], cwd=repo)
+    assert rc != 0, "a statement without both numbers must be refused, not written"
+    assert "-Free" in err and "-InFlight" in err, err
+    # Refused means NOTHING written: the lanes directory is created on the write path.
+    assert not (repo / ".git" / "mefor-coord" / "lanes").exists()

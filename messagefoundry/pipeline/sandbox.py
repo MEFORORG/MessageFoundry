@@ -118,6 +118,7 @@ __all__ = [
     "SandboxPolicy",
     "SandboxSession",
     "SandboxSessionClosed",
+    "SandboxWorkerRefused",
     "GraphShape",
     "graph_shape",
     "graph_differences",
@@ -202,8 +203,12 @@ def graph_shape(registry: Any) -> GraphShape:
         handlers=frozenset(registry.handlers),
         accepts=frozenset(registry.handler_accepts),
         outbound=frozenset(registry.outbound),
+        code_digest=registry.code_digest,
     )
 
+
+#: How a refusal names a difference in the config modules' bytes alone.
+_CONTENT_DIFFERS: Final = "config module content"
 
 #: How many names a refusal lists per side of one part of the graph.
 _NAMES_SHOWN: Final = 3
@@ -223,7 +228,10 @@ def graph_differences(engine: GraphShape, worker: GraphShape) -> list[str]:
 
     ``bindings`` is compared over the inbounds the ENGINE holds. An engine shard holds only its
     own, while its worker loads the whole config, so the worker's other bindings are not a
-    difference."""
+    difference. ``code_digest`` is compared whenever the engine has one: a config module whose
+    bytes changed on disk since the engine loaded it differs there even when every name is the
+    same (vault BACKLOG #2724). A worker of the same build with no digest could not read its own
+    modules, so that is a difference too, never a pass."""
     found: list[str] = []
     sets = {
         "inbound connections": (engine.inbound, worker.inbound),
@@ -245,6 +253,17 @@ def graph_differences(engine: GraphShape, worker: GraphShape) -> list[str]:
     }
     if rebound:
         found.append(f"router bindings (of inbound: {_shown(rebound)})")
+    # Plain comparison: both are public digests of the config's bytes, so there is nothing to time,
+    # and the constant-time helper would add a crypto operation to this module's inventory.
+    if engine.code_digest is not None and worker.code_digest != engine.code_digest:
+        # The worker's digest is checked as hex by the codec, so it needs no scrub here.
+        worker_side = (
+            worker.code_digest[:12] if worker.code_digest else "none: it could not read them"
+        )
+        found.append(
+            f"{_CONTENT_DIFFERS} (the engine loaded {engine.code_digest[:12]}, the worker loaded "
+            f"{worker_side})"
+        )
     return found
 
 
@@ -534,6 +553,32 @@ class SandboxSessionClosed(SandboxError):
     BACKLOG #2772)."""
 
 
+class SandboxWorkerRefused(SandboxError):
+    """A worker was refused because the graph it loaded differs from the one the engine serves.
+
+    ``first`` is True only on the spawn that compared the two graphs. A later dispatch for the same
+    engine graph is refused from the session's cached refusal with ``first`` False, so the runner
+    raises its ``sandbox_worker_refused`` alert once per refusal, not once per message (vault
+    BACKLOG #2724, owner ruling 2026-10-16). ``content_only`` is True when the config modules'
+    bytes are the only difference, so the cause is an edit on disk with no reload. ``graph`` is
+    the engine graph the worker was compared with, so the runner can tell a refusal against a
+    graph it no longer serves. The defaults exist only so that a copy or an unpickle, which
+    passes the message alone, still builds."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        first: bool = False,
+        content_only: bool = False,
+        graph: GraphShape | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.first = first
+        self.content_only = content_only
+        self.graph = graph
+
+
 class SandboxSession:
     """A persistent per-inbound sandbox worker (the parent-side handle).
 
@@ -563,8 +608,8 @@ class SandboxSession:
         self._graph = graph
         # The last refusal, and the engine graph it was for. A mismatch cannot clear while that
         # graph is being served, so a later spawn for it is refused at once, without paying for an
-        # interpreter start and a whole config load per message.
-        self._refused: tuple[GraphShape, str] | None = None
+        # interpreter start and a whole config load per message. The flag is ``content_only``.
+        self._refused: tuple[GraphShape, str, bool] | None = None
         # Required, with no default, deliberately: this is what attributes a relayed stderr line to a
         # feed (ADR 0176), and a default would silently reinstate the unattributable relay for every
         # future caller. Parent-side only -- it is not marshalled, on the same rule as ``_env`` below.
@@ -611,7 +656,9 @@ class SandboxSession:
         self._kill(self._proc)
         engine_graph = self._graph() if self._graph is not None else None
         if self._refused is not None and self._refused[0] is engine_graph:
-            raise SandboxError(self._refused[1])
+            raise SandboxWorkerRefused(
+                self._refused[1], first=False, content_only=self._refused[2], graph=engine_graph
+            )
         # A fresh response queue per spawn so a prior (killed) worker's trailing EOF can't leak into
         # this generation's reads.
         self._responses = queue.Queue()
@@ -624,20 +671,25 @@ class SandboxSession:
         # switch, not a secret, and every spelling of it the parent's check read crosses, so
         # the child's check reads the same variables. The operator's
         # ``[sandbox].pass_environment`` names cross with them.
+        # At most one glibc malloc arena besides the main one, where the worker's memory cap is
+        # RLIMIT_DATA. An arena keeps its peak writable size counted in VmData after its threads
+        # exit, so with one per thread, the threads a Handler starts would spend [sandbox].mem_mb
+        # for the worker's whole life (vault BACKLOG #3133 part 2). Ignored by other allocators. An
+        # operator's own value, named in pass_environment, wins. Passed to the builder rather than
+        # set on its result, which the spawn guard trusts only unwritten (vault BACKLOG #2724).
+        arena = (
+            {"MALLOC_ARENA_MAX": "2"}
+            if self.policy.mem_mb is not None and sys.platform.startswith("linux")
+            else {}
+        )
         env = worker_environment(
             extra_names=(
                 INSECURE_CONFIG_SOURCE_ESCAPE_ENV,
                 *security_enforcement_env_names(),
                 *self.policy.pass_environment,
-            )
+            ),
+            defaults=arena,
         )
-        # At most one glibc malloc arena besides the main one, where the worker's memory cap is
-        # RLIMIT_DATA. An arena keeps its peak writable size counted in VmData after its threads
-        # exit, so with one per thread, the threads a Handler starts would spend [sandbox].mem_mb
-        # for the worker's whole life (vault BACKLOG #3133 part 2). Ignored by other allocators. An
-        # operator's own value, named in pass_environment, wins.
-        if self.policy.mem_mb is not None and sys.platform.startswith("linux"):
-            env.setdefault("MALLOC_ARENA_MAX", "2")
         # Fixed argv (this interpreter + our own worker module), no shell, no
         # untrusted input in the command line — so B603 does not apply. ``start_new_session`` puts the
         # worker in its own POSIX process group so ``_kill`` can ``killpg`` its whole tree; it is a
@@ -727,17 +779,31 @@ class SandboxSession:
                 # FAIL CLOSED. A worker that loaded a different graph would answer for this inbound
                 # from that graph, and nothing in its answers would say so.
                 self._kill(proc)
-                refusal = (
-                    f"sandbox worker for inbound {self._inbound!r} was refused: the graph it loaded "
-                    f"differs from the one the engine is serving. {'. '.join(differing)}. Two "
-                    "things cause this. The config files changed on disk since the engine loaded "
+                # Only an edit on disk when the worker read its modules: a worker that could not
+                # read them reports no digest, and that is not an edit.
+                content_only = worker_graph.code_digest is not None and all(
+                    d.startswith(_CONTENT_DIFFERS) for d in differing
+                )
+                causes = (
+                    "The config files changed on disk since the engine loaded them: reload the "
+                    "config."
+                    if content_only
+                    else "Most often the config files changed on disk since the engine loaded "
                     "them: reload the config. Or config code reads an environment variable the "
                     "worker is not given, because the worker loads the config again under an "
                     "allowlisted environment: name each such variable in "
                     "[sandbox].pass_environment and restart."
                 )
-                self._refused = (engine_graph, refusal)
-                raise SandboxError(refusal)
+                # Short before the differences: a dead-lettered message keeps about the first 200
+                # characters of this, behind its stage prefix and the exception's type name.
+                refusal = (
+                    f"sandbox worker for inbound {self._inbound!r} refused: its graph differs from "
+                    f"the engine's. {'. '.join(differing)}. {causes}"
+                )
+                self._refused = (engine_graph, refusal, content_only)
+                raise SandboxWorkerRefused(
+                    refusal, first=True, content_only=content_only, graph=engine_graph
+                )
         self._refused = None
         self._proc = proc
 

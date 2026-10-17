@@ -327,6 +327,19 @@ log = logging.getLogger(__name__)
 _FIFO_HEADS_LANE_CHUNK = 500
 # ADR 0066 §3.1: release_claimed id-chunk bound (ids per UPDATE statement).
 _RELEASE_CHUNK = 500
+# BACKLOG #3256: the database server's clock as epoch seconds, the unit `upload_reservation.since` holds.
+# Microseconds since the epoch fit a BIGINT for about 292,000 years. Each reference to
+# SYSUTCDATETIME() is read on its own, so two references in one statement can disagree: two
+# SYSDATETIME() calls in one INSERT ... VALUES row differed in 122 of 100,000 rows (Louis Davidson,
+# "Row-wise system function calls, always the same?", Simple Talk, 2018). So each statement here
+# references it once: the quota touch reads it into a DECLARE @now, and the reserve's stale delete
+# and its insert each name it once. The cluster lease has its own copy at millisecond grain
+# (pipeline/cluster_sqlserver.py `_DB_NOW`). Making this one the canonical copy for both is a
+# pipeline change outside BACKLOG #3256.
+_MSSQL_EPOCH_NOW = (
+    "(CAST(DATEDIFF_BIG(MICROSECOND, CAST('1970-01-01' AS DATETIME2), SYSUTCDATETIME()) AS FLOAT)"
+    " / 1000000.0)"
+)
 # BACKLOG #1169: rows per batch for the `attachment_chunk` at-rest migration. Every OTHER cipher pass
 # batches 500 because its rows are kilobyte-shaped; one attachment_chunk row is a whole
 # DETACH_CHUNK_BYTES (1 MiB) slice, ~1.33 MiB once base64+GCM sealed. 16 keeps a batch near 21 MiB,
@@ -727,6 +740,10 @@ _MSSQL_SESSION_RESEAL: Final = (
 _MSSQL_REVOKE_USER_SESSIONS_SQL: Final = (
     "UPDATE sessions SET revoked_at=?, seal='' OUTPUT inserted.token_hash"
     " WHERE user_id=? AND revoked_at IS NULL"
+)
+#: Whether the account holds at least one passkey.
+_MSSQL_WEBAUTHN_ANY_FOR_USER: Final = (
+    "SELECT TOP (1) 1 AS present FROM webauthn_credentials WHERE user_id=?"
 )
 #: store.py's ``_USER_INSERT``, the sealed user record's one INSERT (BACKLOG #2592). Spelled here
 #: rather than imported so this module's own text shows it writes ``users``, whose ``totp_secret``
@@ -12130,12 +12147,14 @@ class SqlServerStore:
         A per-uploader applock serializes the reserves of one uploader across every engine shard. Under
         RCSI each statement reads what committed before it began, and the previous holder committed
         before it let the applock go, so the sums read here hold its row. ``OUTPUT`` reports the
-        insert, which a session-wide ``SET NOCOUNT ON`` cannot hide (BACKLOG #2283)."""
+        insert, which a session-wide ``SET NOCOUNT ON`` cannot hide (BACKLOG #2283).
+
+        "Now" is the database server's clock, ``_MSSQL_EPOCH_NOW``, referenced once per statement:
+        once in the stale delete's cutoff and once in the insert's stamp (BACKLOG #3256;
+        ``uploads.UploadQuotaError`` says why)."""
         if max_files < 1 or size_bytes > max_total_bytes:
             # Fail closed before touching the store: a headroom that cannot hold one slot.
             return False
-        now = time.time()
-        stale = now - max(0.0, stale_after)
         async with self._acquire() as conn:
             try:
                 async with self._cursor(conn) as cur:
@@ -12149,14 +12168,15 @@ class SqlServerStore:
                     await cur.fetchall()
                     await self._applock(cur, _upload_quota_lock(uploader_id))
                     await cur.execute(
-                        "DELETE FROM upload_reservation WHERE uploader_id = ? AND since <= ?",
-                        (uploader_id, stale),
+                        "DELETE FROM upload_reservation WHERE uploader_id = ?"
+                        f" AND since <= {_MSSQL_EPOCH_NOW} - ?",
+                        (uploader_id, float(max(0.0, stale_after))),
                     )
                     await cur.execute(
                         "INSERT INTO upload_reservation"
                         " (reservation_id, uploader_id, size_bytes, since)"
                         " OUTPUT inserted.reservation_id"
-                        " SELECT ?, ?, ?, ?"
+                        f" SELECT ?, ?, ?, {_MSSQL_EPOCH_NOW}"
                         " WHERE (SELECT COUNT(*) FROM upload_reservation WHERE uploader_id = ?)"
                         " + 1 <= ?"
                         " AND (SELECT COALESCE(SUM(size_bytes), 0) FROM upload_reservation"
@@ -12165,7 +12185,6 @@ class SqlServerStore:
                             reservation_id,
                             uploader_id,
                             int(size_bytes),
-                            now,
                             uploader_id,
                             int(max_files),
                             uploader_id,
@@ -12218,12 +12237,14 @@ class SqlServerStore:
                 raise
 
     async def touch_upload_quota(self, reservation_id: str) -> None:
-        """See :meth:`messagefoundry.store.base.Store.touch_upload_quota`."""
-        now = time.time()
+        """See :meth:`messagefoundry.store.base.Store.touch_upload_quota`. "Now" is the database
+        server's clock, read once into ``@now`` so the CASE's test and its result are the same
+        instant (BACKLOG #3256)."""
         await self._execute(
-            "UPDATE upload_reservation SET since = CASE WHEN since > ? THEN since ELSE ? END"
+            f"DECLARE @now FLOAT = {_MSSQL_EPOCH_NOW};"
+            " UPDATE upload_reservation SET since = CASE WHEN since > @now THEN since ELSE @now END"
             " WHERE reservation_id = ?",
-            (now, now, reservation_id),
+            (reservation_id,),
         )
 
     async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
@@ -13217,9 +13238,7 @@ class SqlServerStore:
 
     async def has_webauthn_credentials(self, user_id: str) -> bool:
         """True when the user has at least one enrolled passkey (the second-factor predicate)."""
-        d = await self._fetchone(
-            "SELECT TOP (1) 1 AS present FROM webauthn_credentials WHERE user_id=?", (user_id,)
-        )
+        d = await self._fetchone(_MSSQL_WEBAUTHN_ANY_FOR_USER, (user_id,))
         return d is not None
 
     async def any_webauthn_credentials(self) -> bool:
@@ -13756,7 +13775,7 @@ class SqlServerStore:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
-                    "SELECT username, oidc_issuer, oidc_subject FROM users"
+                    "SELECT username, oidc_issuer, oidc_subject, totp_enabled, cred_digest FROM users"
                     " WITH (UPDLOCK, ROWLOCK) WHERE id=?",
                     (user_id,),
                 )
@@ -13767,6 +13786,8 @@ class SqlServerStore:
                     await conn.rollback()
                     return None
                 username, issuer, subject = rows[0][0], rows[0][1], rows[0][2]
+                totp_enrolled = bool(rows[0][3])
+                digest_names_passkey = bool(rows[0][4])
                 if (issuer, subject) != (expected_issuer, expected_subject):
                     # Compared under the UPDLOCK above, so no other write to the row can land
                     # between this and the UPDATE. Nothing written; the rollback frees the lock.
@@ -13778,13 +13799,24 @@ class SqlServerStore:
                         sessions_revoked=0,
                         changed=True,
                     )
+                # Vault BACKLOG #2711 step 3. A statement of its own AFTER the UPDLOCK: under RCSI
+                # it reads a fresh statement snapshot, so it sees a passkey whose write (which
+                # re-seals this row) committed while the lock above waited. A passkey counts when
+                # either the table or the sealed digest names one, as the service reads it.
+                await cur.execute(_MSSQL_WEBAUTHN_ANY_FOR_USER, (user_id,))
+                webauthn_enrolled = bool(await cur.fetchall()) or digest_names_passkey
                 if issuer is None and subject is None:
                     # Already unbound: write NOTHING, so a no-op cannot sign the account out. The
                     # rollback releases the UPDLOCK taken above; there is nothing else to undo.
                     # AND, not OR: a half row has something to clear (see FederatedUnbind).
                     await conn.rollback()
                     return FederatedUnbind(
-                        username=username, issuer=None, subject=None, sessions_revoked=0
+                        username=username,
+                        issuer=None,
+                        subject=None,
+                        sessions_revoked=0,
+                        totp_enrolled=totp_enrolled,
+                        webauthn_enrolled=webauthn_enrolled,
                     )
                 await self._write_user(cur, user_id, lambda r: federated_unbind(r, now))
                 await cur.execute(
@@ -13801,6 +13833,8 @@ class SqlServerStore:
             issuer=issuer,
             subject=subject,
             sessions_revoked=int(count) if count is not None else 0,
+            totp_enrolled=totp_enrolled,
+            webauthn_enrolled=webauthn_enrolled,
         )
 
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:

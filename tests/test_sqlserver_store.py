@@ -976,6 +976,17 @@ async def test_federated_binding_service_contract(store) -> None:
     await _assert_federated_binding_service_contract(store)
 
 
+async def test_bind_audit_factor_state_contract(store) -> None:
+    """Vault BACKLOG #2711 step 3 on real SQL Server: the clear reads the factor state after its
+    ``UPDLOCK``, with a passkey probe on the same cursor. The shared body is the one the SQLite and
+    Postgres suites run."""
+    from tests._federated_binding_service_contract import (
+        _assert_bind_audit_names_factors_contract,
+    )
+
+    await _assert_bind_audit_names_factors_contract(store)
+
+
 async def test_session_binding_guard_store_contract(store) -> None:
     """BACKLOG #1474 ``create_session(require_federated_subject=...)`` on real SQL Server.
 

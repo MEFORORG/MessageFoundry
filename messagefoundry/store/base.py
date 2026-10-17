@@ -1524,8 +1524,9 @@ class QueueStore(StoreLifecycle, Protocol):
         Before the add, every reservation of this uploader whose own clock is older than
         ``stale_after`` seconds is deleted. Each reservation has its own clock, which only its own
         reserve and :meth:`touch_upload_quota` move, so a leaked slot is reclaimed once its window
-        passes however active the uploader stays. A live save keeps its slot by touching it
-        (BACKLOG #2648). When the reclaim does take a live slot, it can only restore the pre-ledger
+        passes however active the uploader stays. Which clock "now" is, per backend, is stated in
+        ``messagefoundry.uploads.UploadQuotaError`` (BACKLOG #3256). A live save keeps its slot by
+        touching it (BACKLOG #2648). When the reclaim does take a live slot, it can only restore the pre-ledger
         behaviour (an overshoot bounded by the number of concurrent writers), never something
         worse."""
         ...
@@ -2661,7 +2662,8 @@ class AuthStore(Protocol):
         cleared, and a pair read by a separate ``get_user`` is a pair a concurrent unbind-and-rebind
         can have replaced before this transaction runs — the audit row would then name a binding this
         call never touched, which is worse than no record at all. Reading it inside the same
-        transaction makes the reported pair the one the UPDATE actually cleared.
+        transaction makes the reported pair the one the UPDATE actually cleared. The same holds
+        for the factor fields; see :class:`FederatedUnbind`.
 
         **An already-unbound account writes NOTHING and revokes nothing**, reporting a NULL pair and
         0 sessions. The check is in here rather than above so it is atomic with the write: an unbind

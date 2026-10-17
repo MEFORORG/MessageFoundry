@@ -975,19 +975,24 @@ def role_form_page(
 
 # --- AD group mappings -----------------------------------------------------------
 
+#: The example full DN each group input shows. A placeholder only: nothing is stored from it.
+_GROUP_DN_EXAMPLE = "CN=MF-Admins,OU=Groups,DC=example,DC=com"
+
 
 def _map_rows(
-    first_name: str,
     pairs: Sequence[tuple[str, Markup]],
     blank: Markup,
     blanks: int = 3,
 ) -> list[object]:
-    """Rows of paired inputs (existing entries + a few blank rows; empty rows are ignored on save)."""
+    """Rows of an ``ad_group`` input and its partner (existing entries + a few blank rows; empty
+    rows are ignored on save).
+
+    Each group input shows an example full DN, because both group maps refuse a short name
+    (BACKLOG #2610, #3222)."""
     rows: list[object] = []
-    for value, partner in pairs:
-        rows.append(el("div", el("input", name=first_name, value=value), partner, class_="maprow"))
-    for _ in range(blanks):
-        rows.append(el("div", el("input", name=first_name, value=""), blank, class_="maprow"))
+    for value, partner in [*pairs, *[("", blank)] * blanks]:
+        group = el("input", name="ad_group", value=value, placeholder=_GROUP_DN_EXAMPLE)
+        rows.append(el("div", group, partner, class_="maprow"))
     return rows
 
 
@@ -1011,7 +1016,6 @@ def ad_groups_page(
     exist to add entries without any client-side scripting (CSP: no inline JS).
     """
     role_rows = _map_rows(
-        "ad_group",
         [(e.ad_group, _role_select(roles, e.role)) for e in map_entries],
         _role_select(roles),
     )
@@ -1024,7 +1028,6 @@ def ad_groups_page(
         class_="ctl",
     )
     scope_rows = _map_rows(
-        "ad_group",
         [
             (e.ad_group, el("input", name="channel", value=e.channel, placeholder="channel or *"))
             for e in scope_entries
