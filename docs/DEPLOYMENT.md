@@ -274,9 +274,12 @@ was retired in [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-i
 
 ## Container deployment (Docker / Kubernetes)
 
-The **headless engine** ships as an OCI image (ADR 0017 "container fast-follow") — a complement to the
-Windows-service/NSSM path ([`SERVICE.md`](SERVICE.md)), not a replacement. A container is just another
-way to bind off-loopback, so it inherits the controls above unchanged. The operator console is the
+> **Not supported for v1.** The image runs Linux
+> ([why](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target)).
+
+The **headless engine** builds as an OCI image (ADR 0017 "container fast-follow"), a development and CI
+artifact; deploy v1 as a Windows service ([`SERVICE.md`](SERVICE.md)). In a container the code applies
+the controls above unchanged. The operator console is the
 **browser web console the engine serves in-process at `/ui`** (ADR 0065), but its optional
 `messagefoundry-webconsole` wheel is **not in the image** — neither hash-locked profile installs it, so a
 stock container soft-degrades to a **JSON-API-only serve** (with a warning) until you add the wheel to a
@@ -284,7 +287,7 @@ derived image. Full build/run/ops guide:
 [`../docker/README.md`](../docker/README.md); the scoping analysis is in
 [`CONTAINER-EXPOSURE-EVALUATION.md`](CONTAINER-EXPOSURE-EVALUATION.md).
 
-Container-specific essentials (all detailed in [`../docker/README.md`](../docker/README.md)):
+Container-specific essentials, for that unsupported image (all detailed in [`../docker/README.md`](../docker/README.md)):
 
 - **Two variants:** slim default (core + SQLite) and `-sqlserver` (adds the OS-level MS ODBC Driver 18
   for the SQL Server store / `db_lookup`). Non-root uid 10001; read-only root fs; per-profile hash-locked deps.
@@ -443,7 +446,8 @@ MEFOR designs for the VIP and exposes the health-check/role endpoints, but **doe
 balancer** — you stand it up (keepalived, HAProxy, F5, a cloud NLB, …). Single-node deployments need
 none of this.
 
-**Cloud / Kubernetes HA:** for a multi-replica, Postgres-backed HA deployment on k8s — the copyable
+**Cloud / Kubernetes HA** (runs the Linux image, so
+[not supported for v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target)): for a multi-replica, Postgres-backed HA deployment on k8s — the copyable
 `replicas: 3` manifest, the L4-NLB-per-MLLP-port recipe (primary-only health check, no L7/HPA for MLLP),
 and the hybrid edge-relay topology — see [`CLOUD-DEPLOYMENT.md`](CLOUD-DEPLOYMENT.md); for the cloud PHI /
 HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`](CLOUD-PHI-HIPAA.md)
