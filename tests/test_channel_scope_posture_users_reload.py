@@ -45,8 +45,8 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline import Engine
 from tests._admin_account import create_local_user_chosen
+from tests._approval_queue import release_blocked as _release_blocked
 from tests._bound_proof import reproving_transport
-from tests.test_approval_requester_recheck import _release_blocked
 from tests.test_dual_control_reload import _write_valid_config
 
 PW = "a-strong-test-passphrase"
@@ -457,5 +457,8 @@ async def test_the_engine_refusal_audits_no_malformed_name(
         await deps.core.audit_channel_denied(engine, helper_scoped, name, None)
     rows = await engine.store.list_audit(limit=50, action="auth.channel_denied", actor=other)
     assert sorted((r["channel_id"] for r in rows), key=str) == sorted([None, None, THEIRS], key=str)
-    # The detail carries no copy of the refused name either.
+    # The detail carries no copy of the refused name either, and marks the two malformed ones,
+    # so a probe is told apart from a refusal that names no channel by design.
     assert all("A" * 64 not in str(r["detail"]) for r in rows)
+    marked = [json.loads(str(r["detail"])).get("malformed_name", False) for r in rows]
+    assert sorted(marked) == [False, True, True]

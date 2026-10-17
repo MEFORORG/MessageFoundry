@@ -111,7 +111,7 @@ _BLOCKED: dict[ReleaseBlocked, str] = {
     "params_unreadable": "Its parameters are unreadable, so it cannot be approved. {verb} it.",
     "requester_not_authorized": (
         "The requester no longer holds the authority this operation requires, so it cannot be "
-        "approved while that lasts. It can be approved once their authority is restored. "
+        "approved while that lasts. If their authority is restored, it can be approved then. "
         "Otherwise, {verb} it, and have an authorized user request it again if it is still needed."
     ),
 }

@@ -1871,7 +1871,8 @@ the same permission set on the same method reds CI until it is listed here.
 > channel, so `audit_log.channel_id` never holds a caller-chosen string of unbounded length. The
 > console checks the rule before it calls in, and `audit_channel_denied` in
 > `messagefoundry/api/message_scope.py`, which writes every `auth.channel_denied` row the API and
-> the console seam record, checks it again (BACKLOG #3031).
+> the console seam record, checks it again. Its detail then carries `"malformed_name": true`, so
+> such a row is told apart from a refusal that names no channel by design (BACKLOG #3031).
 > On a deployment with more than one engine shard the same row has a second cause. Each engine
 > shard's graph holds only its own inbounds, and each serves its own API port. So a scoped caller
 > who asks one engine shard about an in-scope inbound that another owns gets the 403 and a denial
@@ -2019,7 +2020,9 @@ the same permission set on the same method reds CI until it is listed here.
 >   `reload_refused`, the refusal the reload gives this caller, read off the same rule, and the
 >   console's configuration page shows that reason in place of its Reload form.
 >
-> `tests/test_channel_scope_posture_users_reload.py` pins all three.
+> `tests/test_channel_scope_posture_users_reload.py` pins at least the three routes' rules, the
+> queue's prediction for a held reload and purge, `reload_refused`, and the bound on a malformed
+> name in a denial row.
 
 > **`/config/reload` executes Python** from the target directory in-process, so it is constrained
 > beyond the `config:deploy` permission: the directory must resolve **within** an allowed root —

@@ -46,6 +46,7 @@ from messagefoundry.pipeline.alerts import LoggingAlertSink
 
 # The provisioning helpers are shared with the gate's own suite rather than copied, so a change to
 # what a provisioned operator is (scope grant, rotation clear) lands once.
+from tests._approval_queue import release_blocked as _release_blocked
 from tests.test_alert_sinks import _drain, _RecordingTransport
 from tests.test_approvals import ON, _add, _service, _token
 
@@ -116,13 +117,6 @@ async def _hold_replay(
     r = await c.post("/dead-letters/replay", headers=headers, json=body or {})
     assert r.status_code == 202, r.text
     return str(r.json()["approval_id"])
-
-
-async def _release_blocked(c: httpx.AsyncClient, approval_id: str, headers: dict[str, str]) -> Any:
-    r = await c.get("/approvals", headers=headers)
-    assert r.status_code == 200, r.text
-    [entry] = [e for e in r.json()["approvals"] if e["id"] == approval_id]
-    return entry["release_blocked"]
 
 
 async def _assert_refused(
@@ -290,6 +284,7 @@ async def test_the_queue_reads_each_requester_once_and_survives_one_whose_read_f
         ("maker", maker, "IB_B"),
         ("viewer", viewer, "IB_A"),
         ("broken", broken, "IB_A"),
+        ("broken", broken, "IB_B"),
     ):
         approval_id = await gate.guard(
             "dead_letter_replay", {"channel_id": channel}, requester=name, requester_user_id=uid
@@ -303,8 +298,10 @@ async def test_the_queue_reads_each_requester_once_and_survives_one_whose_read_f
         held["maker:IB_B"]: None,
         held["viewer:IB_A"]: "requester_not_authorized",  # VIEWER holds no messages:replay
         held["broken:IB_A"]: None,  # unread, so nothing is predicted
+        held["broken:IB_B"]: None,
     }
-    assert sorted(calls) == sorted([maker, viewer, broken])  # once each, not once per request
+    # Once each, not once per request, a failed read included.
+    assert sorted(calls) == sorted([maker, viewer, broken])
 
 
 async def test_the_live_purge_registration_requires_an_unscoped_requester(engine: Engine) -> None:

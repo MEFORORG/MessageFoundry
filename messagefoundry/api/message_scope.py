@@ -49,14 +49,18 @@ async def audit_channel_denied(
     Some callers pass a caller-chosen name, and at least the core handlers the console seam calls
     take any string, so the bound is held here, where every refusal passes: ``audit_log.channel_id``
     never holds caller text of unbounded length. The loader registers no connection under such a
-    name, so it is never in a scope, and the actor and host still identify the attempt."""
+    name, so it is never in a scope, and the actor and host still identify the attempt. The detail
+    then carries ``"malformed_name": true``, so such a probe is told apart from a refusal that names
+    no channel by design."""
+    detail: dict[str, object] = {"channel": channel}
     if channel is not None and not is_connection_name(channel):
         channel = None
+        detail = {"channel": None, "malformed_name": True}
     await engine.store.record_audit(
         "auth.channel_denied",
         actor=identity.username,
         channel_id=channel,
-        detail=json.dumps({"channel": channel}),
+        detail=json.dumps(detail),
         client=client,
     )
 

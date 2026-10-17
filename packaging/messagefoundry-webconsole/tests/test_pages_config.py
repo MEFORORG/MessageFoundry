@@ -82,3 +82,28 @@ def test_config_page_offers_no_reload_the_engine_will_refuse() -> None:
     offered = str(config_page(ConfigProvenance(loaded=False, reload_refused=None)))
     assert 'action="/ui/config/reload"' in offered
     assert RELOAD_REFUSED_CHANNEL_SCOPED not in offered
+
+
+def test_a_refused_caller_is_told_what_a_reload_needs_and_not_to_reload() -> None:
+    """BACKLOG #3189: the banner names both halves a reload needs, so it never reads as "widen my
+    scope and it will work" for a caller who also lacks config:deploy. A drifted badge beside it
+    does not say "reload to apply". The control: with no refusal the badge still says it."""
+
+    def _drifted(refused: str | None) -> str:
+        return str(
+            config_page(
+                ConfigProvenance(
+                    loaded=True,
+                    fingerprint="a" * 64,
+                    git_head="c" * 40,
+                    files=3,
+                    drift=True,
+                    reload_refused=refused,
+                )
+            )
+        )
+
+    refused = _drifted(RELOAD_REFUSED_CHANNEL_SCOPED)
+    assert "config:deploy" in refused and "all-channels scope" in refused
+    assert "reload to apply" not in refused
+    assert "reload to apply" in _drifted(None)

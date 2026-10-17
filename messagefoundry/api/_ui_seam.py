@@ -437,7 +437,7 @@ from typing import Any
 #: console built before it shared this engine's digest and passed the handshake. Such a console
 #: rendered "(none)" for a withheld scope, never rendered the posture's ``loosenings_scope`` line on
 #: ``/ui/status``, and skipped the name check on a channel-scoped actor's bulk selection, which
-#: ``_deny_connection`` now bounds itself. Moving the digest refuses that console at mount, which
+#: ``audit_channel_denied`` in ``message_scope.py`` now bounds itself. Moving the digest refuses that console at mount, which
 #: closes all three. Re-derived with ``--write``.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is

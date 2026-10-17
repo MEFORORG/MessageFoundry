@@ -35,11 +35,13 @@ def _provenance_badge(prov: ConfigProvenance | None) -> Markup:
         "DRIFTED" if drifted else "clean",
         class_=f"status status-{'error' if drifted else 'running'}",
     )
-    note = (
-        " — the config on disk differs from the running graph; reload to apply"
-        if drifted
-        else " — the running graph matches the config on disk"
-    )
+    if not drifted:
+        note = " — the running graph matches the config on disk"
+    elif prov.reload_refused is None:
+        note = " — the config on disk differs from the running graph; reload to apply"
+    else:
+        # The page says this caller cannot reload, so the badge does not tell them to.
+        note = " — the config on disk differs from the running graph"
     return el("p", text(f"Running config: {ident} "), pill, text(note), class_="muted")
 
 
@@ -49,8 +51,8 @@ def _next_step(refused: str) -> str:
         # The default, an account nobody has scoped, is refused too, and its holder may not think of
         # it as scoped.
         return (
-            " An account with no channel scope set counts as channel-scoped. An administrator can"
-            " grant it the all-channels scope."
+            " An account with no channel scope set counts as channel-scoped. A reload needs both"
+            " the all-channels scope and the config:deploy permission."
         )
     return ""
 

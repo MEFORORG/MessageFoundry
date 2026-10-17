@@ -556,8 +556,9 @@ class PendingApprovalInfo(BaseModel):
     ``params_unreadable``, and ``requester_not_authorized``, which the gate raises after the dwell
     floor: the requester no longer holds the authority the operation needs, read when the queue is
     listed (BACKLOG #3189). A held reload or purge whose requester has since been channel-scoped is
-    one. The listing writes no audit row; only an approve refused on it writes
-    ``approval.stale_requester``. ``None`` does not promise a release. At least the self-approval
+    one. The listing writes no ``approval.stale_requester`` row; only an approve refused on it
+    does. The read can still report a requester account whose integrity seal fails, as any read
+    of that account does. ``None`` does not promise a release. At least the self-approval
     refusal, the expiry, the dwell floor, a change to the requester's standing after the listing, a
     standing the listing could not read, the row's seal and the operation's own refusals, such as a
     held reload with no config digest, are met only at release. It lets a page offer only the reject. It is ``None`` on

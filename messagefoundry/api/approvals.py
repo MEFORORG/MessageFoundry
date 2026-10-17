@@ -803,7 +803,7 @@ class ApprovalGate:
             await self._store.list_pending_approvals(now=self._clock())
         )
         # One authority read per requester for the whole listing, however many requests they hold.
-        authority: dict[str, Identity | str] = {}
+        authority: dict[str, Identity | str | None] = {}
         return [await self._queue_entry(r, caller_user_id, authority) for r in rows]
 
     async def list_interrupted(self, *, caller_user_id: str | None = None) -> list[dict[str, Any]]:
@@ -833,29 +833,44 @@ class ApprovalGate:
         return None
 
     async def _queue_release_blocked(
-        self, r: ApprovalRow, params: dict[str, Any] | None, authority: dict[str, Identity | str]
+        self,
+        r: ApprovalRow,
+        params: dict[str, Any] | None,
+        authority: dict[str, Identity | str | None],
     ) -> ReleaseBlocked | None:
         """:meth:`_release_blocked`, then the requester's standing by the rule approve() refuses on
         (BACKLOG #3189), so a held reload or purge whose requester has since been channel-scoped is
         marked ``requester_not_authorized``. ``authority`` caches each requester's read for one
-        listing. A read that fails predicts nothing for that request rather than failing the whole
-        queue, so the operator can still reach Reject on every other row; approve() reads it again."""
+        listing, a failed read as ``None``. A read that fails predicts nothing for that requester's
+        requests rather than failing the whole queue, so the operator can still reach Reject on
+        every other row; approve() reads it again."""
         blocked = self._release_blocked(r, params)
+        # The last two tests only narrow the types: _release_blocked returned None, so both hold.
         if blocked is not None or not r.requester_user_id or params is None:
             return blocked
         op = self._ops[r.operation]
         requester_user_id = r.requester_user_id
-        try:
-            if requester_user_id not in authority:
+        if requester_user_id not in authority:
+            try:
                 authority[requester_user_id] = await self._requester_authority(requester_user_id)
-            standing = self._standing_of(authority[requester_user_id], op, params)
-        except Exception:  # noqa: BLE001 - every store backend raises its own type
+            except Exception:  # noqa: BLE001 - every store backend raises its own type
+                log.exception("approval %s: the requester's standing could not be read", r.id)
+                authority[requester_user_id] = None
+        read = authority[requester_user_id]
+        if read is None:
+            return None
+        try:
+            standing = self._standing_of(read, op, params)
+        except Exception:  # noqa: BLE001 - an operation's own scope check; approve() reads it again
             log.exception("approval %s: the requester's standing could not be read", r.id)
             return None
         return None if standing is None else "requester_not_authorized"
 
     async def _queue_entry(
-        self, r: ApprovalRow, caller_user_id: str | None, authority: dict[str, Identity | str]
+        self,
+        r: ApprovalRow,
+        caller_user_id: str | None,
+        authority: dict[str, Identity | str | None],
     ) -> dict[str, Any]:
         operation = r.operation
         params = _stored_params(r.id, r.params)
