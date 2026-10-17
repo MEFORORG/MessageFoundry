@@ -196,10 +196,13 @@ async def test_a_directory_the_account_is_not_confirmed_in_refuses_the_renewal(
     ("raised", "outcome"),
     [
         (LdapReferralError("synthetic: AD answered the user search with a referral"), "referred"),
-        (KeyError("userAccountControl"), "unavailable"),
-        (ValueError("synthetic: malformed objectGUID"), "unavailable"),
+        # BACKLOG #3100: a fault, not an outage, so the audit row says which.
+        (KeyError("userAccountControl"), "probe_fault"),
+        (ValueError("synthetic: malformed objectGUID"), "probe_fault"),
+        # A network-class error that escaped the directory layer is still unreachable.
+        (TimeoutError("synthetic: read timed out"), "unavailable"),
     ],
-    ids=["referral", "key-error", "value-error"],
+    ids=["referral", "key-error", "value-error", "timeout"],
 )
 async def test_a_lookup_that_raises_refuses_the_renewal_rather_than_failing(
     store: MessageStore,

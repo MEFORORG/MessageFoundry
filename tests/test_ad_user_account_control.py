@@ -38,6 +38,7 @@ import pytest
 from messagefoundry.api import app as app_module
 from messagefoundry.api import create_managed_app
 from messagefoundry.api.app import (
+    _PROBE_FAULT_ALERT_SOURCE,
     _RECONCILE_CLEAR_RESOLVES,
     _REFERRAL_ALERT_SOURCE,
     _alert_reconcile_plan,
@@ -50,6 +51,7 @@ from messagefoundry.auth.ldap import DirectoryAnswer, LdapAuthenticator, _accoun
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.reconcile import (
     HOLD_REASON,
+    PROBE_FAULT_ABORT,
     REFERRAL_ABORT,
     ProbeOutcome,
     ReconcilePlan,
@@ -854,11 +856,12 @@ class _InverseSink(_Sink):
         self.events.append(("ad_reconcile_hold_released", name, {}))
 
 
-#: Stands in for the auth service: the alerting reads only these two latched messages from it.
+#: Stands in for the auth service: the alerting reads only these latched messages from it.
 _AUTH = SimpleNamespace(
     directory_reconcile_alert=None,
     directory_reconcile_hold=None,
     directory_reconcile_referral=None,
+    directory_reconcile_fault=None,
 )
 
 #: The referral's own source label (BACKLOG #2538), apart from the breaker's.
@@ -943,6 +946,54 @@ def test_a_referral_pages_and_clears_under_its_own_source(
     sink = _InverseSink()
     _alert_reconcile_plan(plan, _AUTH, sink)  # type: ignore[arg-type]
     assert [(e[0], e[1]) for e in sink.events] == expected
+
+
+_FAULT_PAGE = ("ad_reconcile_aborted", _PROBE_FAULT_ALERT_SOURCE)
+
+
+@pytest.mark.parametrize(
+    ("plan", "expected"),
+    [
+        (
+            # A fault beside an applied revocation: the revocation, then the fault's page.
+            ReconcilePlan(
+                probed=3,
+                faulted=("a",),
+                revocations=(SessionRevocation("b", "bwong", reason="directory_absent"),),
+            ),
+            [("ad_session_revoked", "bwong"), _FAULT_PAGE],
+        ),
+        (
+            # A pass of faults only: the fault's page alone, never the breaker's instance.
+            ReconcilePlan(probed=2, faulted=("a", "b"), aborted=PROBE_FAULT_ABORT),
+            [_FAULT_PAGE],
+        ),
+        (
+            # A pass of referrals and faults only: one page on each of their instances.
+            ReconcilePlan(probed=2, referred=("a",), faulted=("b",), aborted=REFERRAL_ABORT),
+            [("ad_reconcile_aborted", _REFERRAL_SOURCE), _FAULT_PAGE],
+        ),
+        (
+            # A breaker trip beside a fault: one page on each instance.
+            ReconcilePlan(probed=12, faulted=("a",), aborted="mass_revoke_breaker"),
+            [("ad_reconcile_aborted", "directory-reconciler"), _FAULT_PAGE],
+        ),
+    ],
+    ids=["beside-a-revocation", "faults-only", "beside-a-referral", "beside-a-trip"],
+)
+def test_a_probe_fault_pages_under_its_own_source(
+    plan: ReconcilePlan, expected: list[tuple[str, str]]
+) -> None:
+    """BACKLOG #3100 items 1 and 3. A probe fault used to read as unavailable, and a pass of them
+    as an outage, which pages nobody. It pages on every pass with a fault, under its own source,
+    so an acknowledged fault never silences a breaker trip or a referral.
+
+    RED when: a pass of faults only pages nothing, or pages the breaker's instance."""
+    sink = _InverseSink()
+    _alert_reconcile_plan(plan, _AUTH, sink)  # type: ignore[arg-type]
+    assert [(e[0], e[1]) for e in sink.events] == expected
+    faulted = [e for e in sink.events if (e[0], e[1]) == _FAULT_PAGE]
+    assert faulted and all(e[2]["reason"] == PROBE_FAULT_ABORT for e in faulted)
 
 
 def test_the_inverses_resolve_their_alerts_and_are_not_rule_targetable() -> None:
