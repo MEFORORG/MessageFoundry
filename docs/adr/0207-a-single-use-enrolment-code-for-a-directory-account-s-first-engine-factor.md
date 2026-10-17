@@ -85,7 +85,7 @@ federated sign-in on a site that turned the claim gate off.
    first code is stamped all the same. This gap is in the shared step, so it reaches every account
    type. The Lander's review of this record says it goes to the maintainer ledger as its own row.
 
-   *Note (2026-10-16).* The shared-step fix was built under BACKLOG #3025, on branch `b259-3025`:
+   *Note (2026-10-16).* The shared-step fix was built under BACKLOG #3025 (first pushed as branch `b259-3025`):
    `enable_totp` turns TOTP on only while the row still holds the secret cell the confirm
    verified, and `set_totp_secret` writes only where TOTP is off. This item describes the code as
    it stood when this record was drafted.

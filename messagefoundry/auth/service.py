@@ -6512,6 +6512,7 @@ class AuthService:
                 old_username=refresh.old_username,
                 new_username=refresh.new_username,
                 held=await self._load_user_by_username(refresh.new_username),
+                from_plan=True,
             )
         # BACKLOG #2538. After the revocations, like the hold below: the referred accounts were left
         # unjudged, and every other account's revocation above has already been applied.
@@ -6778,8 +6779,15 @@ class AuthService:
         new_username: str,
         held: UserRecord | None,
         client: str | None = None,
+        from_plan: bool = False,
     ) -> None:
         """Copy a directory-reported rename down onto a row's cached ``username`` (BACKLOG #1532).
+
+        ``from_plan`` is True for the reconciler, whose ``new_username`` comes from a probe made
+        earlier in the pass and can be older than a rename a sign-in wrote since. Only then does a
+        row that holds neither name mean the request is stale (BACKLOG #3069). The login caller's
+        name comes from the bind it just made, so it is the newest the engine has, and it still
+        writes over whatever the row holds.
 
         **ONE implementation for two callers, deliberately.** The login path
         (:meth:`_upsert_ad_user`) and the ADR 0079 reconciler pass both reach a renamed account and
@@ -6860,9 +6868,9 @@ class AuthService:
             # ``old_username`` (BACKLOG #2291). The reconciler captured that at plan time, and a
             # sign-in may have renamed the row since, so it can name an account that no longer
             # exists. The audit actor and the warning both use the name an operator would find.
-            # Since BACKLOG #3069 skips a plan whose old name the row no longer holds, every caller
-            # past the pre-read passes a name equal to ``old_username``; the parameter is kept so
-            # the audit's source stays the row as read, not the plan.
+            # Since BACKLOG #3069 the reconciler's stale plan is skipped before any refusal, so on
+            # that path the two names agree. On the login path they can still differ, when a pass
+            # wrote between the sign-in's read and this one.
             await self._audit(
                 "auth.ad_username_refresh_conflict",
                 actor=holds,
@@ -6912,9 +6920,9 @@ class AuthService:
         # read.
         #
         # A row that already carries the new name has nothing to change, so it gets no second audit
-        # row and no second notice. A row that carries neither name was renamed by someone else
-        # since the caller read it, so the plan is stale and is skipped (BACKLOG #3069); past that
-        # check the row holds the caller's old name, so the notice and every refusal name it.
+        # row and no second notice. On the reconciler's path, a row that carries neither name was
+        # renamed by someone else since the plan, so the plan is stale and is skipped (BACKLOG
+        # #3069). The notice and every refusal name what the row held.
         # The write below compares on this name (BACKLOG #2290), so a refresh that read it just
         # before another refresh of this row wrote cannot write as well. And each refusal after
         # this read audits under this name (BACKLOG #2291), so the read comes BEFORE the ``held``
@@ -6945,23 +6953,31 @@ class AuthService:
                 user_id,
             )
             return
-        if before.username != old_username:
-            # BACKLOG #3069. The row holds neither the caller's old name nor its new one, so another
-            # writer renamed it after the caller read it: a sign-in after the reconciler planned, in
-            # the case that motivated this. The compare-and-set below compares on the name just
-            # read, so it would match and write this caller's older name over the newer one. Skip
-            # instead, and let the next pass or sign-in plan from a fresh read. Nothing was
-            # attempted, so no audit row, no conflict and no notice; INFO says why.
+        if from_plan and before.username != old_username:
+            # BACKLOG #3069. The row holds neither the plan's old name nor its new one, so another
+            # writer renamed it after the reconciler planned, most likely a sign-in carrying a
+            # newer directory name. The compare-and-set below compares on the name just read, so it
+            # would match and write the plan's older name over the newer one. Skip instead, and let
+            # the next pass plan from a fresh read. Nothing was attempted, so no audit row, no
+            # conflict and no notice; INFO says why.
+            #
+            # RECONCILER ONLY. A sign-in's name comes from the bind it just made. Skipping it here
+            # would keep a name the reconciler wrote from an older probe, the inverse of the point.
+            #
+            # NOT A VERSION CHECK. Name equality cannot see a directory that renamed the account
+            # away and back (jdoe -> jdoe-married -> jdoe): the row still holds the plan's old name,
+            # so the plan writes. The next pass's probe copies the directory's name down again.
             #
             # AFTER the already-applied check, because a row that holds the new name is the no-op
             # above, not a skip. BEFORE the ``held`` pre-check, because a stale plan is not a
             # collision: filing one would send an operator looking for a holder this caller has no
             # current claim against.
             _log.info(
-                "AD account %s was renamed by another writer after this rename refresh was "
-                "planned (now %s), so the stale plan wrote nothing and sends no audit row or "
-                "notice (BACKLOG #3069)",
+                "AD account %s was renamed by another writer after this reconciler pass planned "
+                "its rename to %s (now %s), so the stale plan wrote nothing and sends no audit "
+                "row or notice (BACKLOG #3069)",
                 user_id,
+                scrub_log_argument(new_username),
                 scrub_log_argument(before.username),
             )
             return
@@ -7039,9 +7055,9 @@ class AuthService:
         #     does neither. It is not a conflict either, because no other row holds anything. The
         #     first writer wins, so when two refreshes carry DIFFERENT new names and both read the
         #     row before either wrote, the stored one can be the older of the two until the next
-        #     sign-in or pass copies the directory's name down again. In sequence the BACKLOG #3069
-        #     skip above stops the older one before it writes. Logged at INFO so the skipped write
-        #     is visible without paging anyone.
+        #     sign-in or pass copies the directory's name down again. The BACKLOG #3069 skip above
+        #     does not order these: it stops only a reconciler plan that a write overtook before
+        #     this pre-read. Logged at INFO so the skipped write is visible without paging anyone.
         if not written:
             after = await self._load_user(user_id)
             if after is None:

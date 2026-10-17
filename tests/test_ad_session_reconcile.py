@@ -2599,8 +2599,8 @@ async def test_a_rename_already_applied_by_another_caller_is_not_told_twice(
     case in sequence. When both refreshes read the old name at once, the store's compare-and-set
     stops the second one instead (BACKLOG #2290,
     ``test_two_refreshes_of_one_rename_at_once_write_audit_and_notify_once``).
-    Driven on the method directly, with ``held`` set as the reconciler reads it, because the pass
-    offers no hook between its plan and its apply.
+    Driven on the method directly, with ``held`` set as the reconciler reads it, so the sign-in
+    lands exactly between the plan and the apply.
     """
     store, _ldap, service, notifier, user_id = await _renamed_service()
     try:
@@ -2634,8 +2634,8 @@ async def _rename_audits(store: MessageStore) -> list[aiosqlite.Row]:
     """Every audit row a rename refresh writes, success or refusal."""
     return [
         a
-        for a in await store.list_audit()
-        if a["action"] in ("auth.ad_username_refreshed", "auth.ad_username_refresh_conflict")
+        for action in ("auth.ad_username_refreshed", "auth.ad_username_refresh_conflict")
+        for a in await store.list_audit(action=action, limit=10_000)
     ]
 
 
@@ -2690,6 +2690,33 @@ async def test_a_stale_plan_does_not_overwrite_a_newer_sign_in_rename(
         await store.close()
 
 
+async def test_a_sign_in_rename_is_not_skipped_when_a_pass_wrote_an_older_name_first() -> None:
+    """BACKLOG #3069, the other caller. A pass applies its plan ``jdoe`` -> ``jdoe-married`` between
+    a sign-in's read of the row (still ``jdoe``) and its refresh, which carries the directory's
+    newer ``jdoe-remarried``. The sign-in's name comes from the bind it just made, so it wins: the
+    stale-plan skip is the reconciler's alone, and the login writes, audits and notifies once."""
+    store, _ldap, service, notifier, user_id = await _renamed_service()
+    try:
+        assert await store.set_user_username(user_id, "jdoe-married", expected_username="jdoe")
+
+        await service._refresh_cached_username(
+            user_id=user_id, old_username="jdoe", new_username="jdoe-remarried", held=None
+        )
+
+        after = await store.get_user(user_id)
+        assert after is not None and after.username == "jdoe-remarried", (
+            "a sign-in's current directory name lost to an older name a pass wrote"
+        )
+        [refreshed] = [
+            a for a in await _rename_audits(store) if a["action"] == "auth.ad_username_refreshed"
+        ]
+        assert refreshed["actor"] == "jdoe-remarried"
+        [notice] = [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+        assert notice.detail["old_username"] == "jdoe-married"
+    finally:
+        await store.close()
+
+
 async def test_a_stale_plan_is_skipped_not_filed_as_a_conflict_when_another_row_holds_the_name(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -2714,7 +2741,11 @@ async def test_a_stale_plan_is_skipped_not_filed_as_a_conflict_when_another_row_
         caplog.clear()
 
         await service._refresh_cached_username(
-            user_id=user_id, old_username="jdoe", new_username="jdoe-married", held=held
+            user_id=user_id,
+            old_username="jdoe",
+            new_username="jdoe-married",
+            held=held,
+            from_plan=True,
         )
 
         after = await store.get_user(user_id)
@@ -2766,12 +2797,15 @@ async def test_a_refused_rename_is_audited_under_the_name_the_row_holds(shape: s
     """BACKLOG #2291. Every refusal is audited under the name the row holds, as the refresh read it,
     so the audit names an account an operator can find.
 
-    Since BACKLOG #3069 a refusal runs only when the row holds the caller's old name (a row
-    renamed since the plan is skipped first), so the row here holds the plan's ``jdoe``. What this
-    pins: each refusal shape reaches its branch, files one conflict under that name, and sends no
-    notice."""
+    The row is renamed to ``jdoe-interim`` first and the refresh is passed the stale ``jdoe``.
+    Since BACKLOG #3069 that shape reaches a refusal only on the LOGIN caller's path (a pass that
+    wrote between the sign-in's read and the refresh's): the reconciler's stale plan is skipped
+    first. So this is driven as the login calls it, with ``from_plan`` left False. One case per way
+    the refresh refuses after it has read the row; each is asserted to have refused, so none passes
+    by never reaching the branch."""
     store, _ldap, service, notifier, user_id = await _renamed_service()
     try:
+        assert await store.set_user_username(user_id, "jdoe-interim", expected_username="jdoe")
         held: UserRecord | None = None
         if shape == "pre_check":
             await store.create_user(
@@ -2824,8 +2858,8 @@ async def test_a_refused_rename_is_audited_under_the_name_the_row_holds(shape: s
             if a["action"] == "auth.ad_username_refresh_conflict"
         ]
         assert json.loads(conflict["detail"])["detected"] == shape
-        assert conflict["actor"] == "jdoe", (
-            f"a {shape} refusal was not audited under the name the row held"
+        assert conflict["actor"] == "jdoe-interim", (
+            f"a {shape} refusal audited the caller's stale name, not the one the row held"
         )
         assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
     finally:
