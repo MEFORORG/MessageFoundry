@@ -3070,7 +3070,8 @@ def _serve(args: argparse.Namespace) -> int:
     # messages say why.
     from messagefoundry.config.settings import uvicorn_trusted_hosts
 
-    # What uvicorn's forwarded_allow_ips is handed, computed once so the log below names it too.
+    # What uvicorn's forwarded_allow_ips is handed, computed here so a refused entry stops serve
+    # before any startup side effect. The log below names the CONFIGURED list instead.
     forwarded_allow_ips = uvicorn_trusted_hosts(settings.api.trusted_proxies)
     if not settings.api.is_loopback:
         if settings.api.tls_enabled:
@@ -3084,9 +3085,9 @@ def _serve(args: argparse.Namespace) -> int:
             # declared proxies (the validator guarantees trusted_proxies is set here).
             logging.getLogger(__name__).info(
                 "API on non-loopback host %r behind a TLS-terminating proxy; trusting forwarded "
-                "headers from %s.",
+                "headers from %s (each IPv4 address an entry names is trusted plain and ::ffff:-mapped).",
                 settings.api.host,
-                forwarded_allow_ips,
+                settings.api.trusted_proxies,
             )
         elif insecure_bind_ok and not enforcing:
             # The engine goes on to serve https on the minted placeholder (ADR 0172), which

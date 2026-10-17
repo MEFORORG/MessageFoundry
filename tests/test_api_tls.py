@@ -1158,7 +1158,18 @@ def test_serve_allows_non_loopback_with_upstream_tls(
     # without --allow-insecure-bind, and uvicorn trusts XFF only from the proxy (no ssl context).
     from messagefoundry.store.crypto import generate_key
 
+    class _Keep(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__(logging.INFO)
+            self.messages: list[str] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            self.messages.append(record.getMessage())
+
     captured: dict[str, Any] = {}
+    # On serve's own logger, not caplog: serve's configure_logging replaces the root handlers.
+    serve_logger = logging.getLogger("messagefoundry.__main__")
+    kept = _Keep()
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
@@ -1174,11 +1185,24 @@ def test_serve_allows_non_loopback_with_upstream_tls(
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n',
         encoding="utf-8",
     )
-    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
+    old_level = serve_logger.level
+    serve_logger.addHandler(kept)
+    serve_logger.setLevel(logging.INFO)
+    try:
+        assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
+    finally:
+        serve_logger.removeHandler(kept)
+        serve_logger.setLevel(old_level)
     assert "refusing to serve" not in capsys.readouterr().err
     # XFF trusted only from the proxy, in both its spellings (BACKLOG #3042).
     assert captured["forwarded_allow_ips"] == ["10.0.0.7", "::ffff:10.0.0.7"]
     assert "ssl_context_factory" not in captured  # TLS is at the proxy, not in-process
+    # The startup line names the CONFIGURED list, not uvicorn's doubled one: logging the
+    # uvicorn_trusted_hosts result raised a CodeQL clear-text-logging alert on PR 2380.
+    proxy_lines = [m for m in kept.messages if "TLS-terminating proxy" in m]
+    assert len(proxy_lines) == 1
+    assert "['10.0.0.7']" in proxy_lines[0]
+    assert "::ffff:10.0.0.7" not in proxy_lines[0]
 
 
 def test_serve_forwarded_allow_ips_empty_when_no_proxy(
