@@ -106,7 +106,7 @@ import urllib3.poolmanager
 import urllib3.util
 from urllib3.util.ssl_ import resolve_cert_reqs
 
-from messagefoundry.auth.trust_anchors import has_encryption_header
+from messagefoundry.auth.trust_anchors import ENCRYPTION_HEADER_SCOPE, has_encryption_header
 from messagefoundry.config.tls_policy import (
     HopDisposition,
     HopPosture,
@@ -322,9 +322,9 @@ def _narrowed_pool_classes(
             if isinstance(self.ca_cert_data, str) and has_encryption_header(self.ca_cert_data):
                 # Fixed text: it names no part of the CA text it refuses.
                 raise VaultHopRefused(
-                    f"{connector}: the CA text for this hop holds a PEM block with an encryption "
-                    "header (Proc-Type or DEK-Info). Loading it can make the TLS library wait for "
-                    "a password; refusing to load it (BACKLOG #3090)"
+                    f"{connector}: the CA text for this hop {ENCRYPTION_HEADER_SCOPE}. Loading "
+                    "an encrypted block can make the TLS library wait for a password; refusing to "
+                    "load it (BACKLOG #3090)"
                 )
 
         def _narrow_the_proxy_leg(self) -> ssl.SSLContext | None:

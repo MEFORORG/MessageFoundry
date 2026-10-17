@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.auth.trust_anchors import ENCRYPTION_HEADER_SCOPE
 from messagefoundry.config.tls_policy import InsecureHopRefused
 from tests._encrypted_pem_probe import ENCRYPTION_HEADERS as _HEADERS
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
@@ -120,6 +121,16 @@ def _connection(factory: Any, *, proxied: bool, **ca: Any) -> Any:
             _PLAIN.replace(_BEGIN, _BEGIN + "proc-type: 4,ENCRYPTED\n\n"), id="lower case"
         ),
         pytest.param(_PLAIN + _PLAIN.replace(_BEGIN, _BEGIN + _HEADERS), id="second block"),
+        # Red under a search from the last BEGIN (BACKLOG #3105).
+        pytest.param(_PLAIN.replace(_BEGIN, _BEGIN + _HEADERS) + _PLAIN, id="then a plain block"),
+        # Red under a BEGIN counted only at a line start, and under a search from the last one.
+        pytest.param(
+            "#" * 254 + _PLAIN.replace(_BEGIN, _BEGIN + _HEADERS) + _PLAIN,
+            id="BEGIN after 254 bytes, then a plain block",
+        ),
+        # The check errs wide on purpose, as in anchor_cadata, and the text says so (#3105).
+        pytest.param(_PLAIN + "Proc-Type: noted\n" + _PLAIN, id="comment between blocks"),
+        pytest.param(_PLAIN + "# DEK-Info: noted\n", id="after the last END"),
     ],
 )
 def test_encrypted_ca_text_is_refused_before_any_tls_load(proxied: bool, text: str) -> None:
@@ -133,6 +144,7 @@ def test_encrypted_ca_text_is_refused_before_any_tls_load(proxied: bool, text: s
     assert type(refusal.value) is _strict().VaultHopRefused, "not the hop's marked type"
     assert made == [], "a TLS context was built for CA text the hop refuses"
     assert "Vault test hop" in str(refusal.value)
+    assert ENCRYPTION_HEADER_SCOPE in str(refusal.value)
     assert "SYNTHETICBODYMARKER" not in str(refusal.value), "the refusal echoed the CA text"
     assert "AES-256-CBC" not in str(refusal.value), "the refusal echoed the CA text"
 

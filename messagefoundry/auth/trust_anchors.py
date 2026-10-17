@@ -260,6 +260,12 @@ _PEM_END = b"-----END "
 _PEM_TRUSTED = b"-----BEGIN TRUSTED CERTIFICATE-----"
 #: The RFC 1421 headers of an encrypted PEM block, lower-cased (BACKLOG #2270, :func:`anchor_cadata`).
 _PEM_ENCRYPTION_HEADERS = ("proc-type:", "dek-info:")
+#: What :func:`has_encryption_header` matches, in the words every refusal built on it uses (BACKLOG
+#: #3105). It names no block on purpose: the check models none.
+ENCRYPTION_HEADER_SCOPE = (
+    "names an encryption header (Proc-Type or DEK-Info) after its first PEM BEGIN marker, inside a "
+    "block or in a comment between or after the blocks"
+)
 #: The source-location tail CPython appends to an ``ssl.SSLError`` message, dropped from a refusal.
 _SSL_WHERE = re.compile(r"\s*\(_ssl\.c:\d+\)$")
 
@@ -321,7 +327,8 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     certificate and no CRL, so that file still passes. The throwaway context is discarded. It checks
     that the text loads, not that a certificate in it is a CA; a leaf still loads here.
 
-    **An encryption header inside a block refuses, before that load** (BACKLOG #2270). A
+    **An encryption header name after the first BEGIN refuses, before that load** (BACKLOG
+    #2270), inside a block or in a comment between or after the blocks. A
     ``Proc-Type: 4,ENCRYPTED`` header sends OpenSSL to its password callback, and ``cadata=`` sets
     none, so OpenSSL falls back to its default one, which reads the terminal. The POSIX terminal run
     was done later, off-version (BACKLOG #3090, 2026-10-12): on CPython 3.12.3 / OpenSSL 3.0.13 on
@@ -376,11 +383,12 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
         ) from exc
     if has_encryption_header(text):
         raise TrustAnchorError(
-            f"{spec.setting}: the trust anchor {spec.path!r} holds a PEM block with an encryption "
-            "header (Proc-Type or DEK-Info), such as an encrypted certificate or private key. A "
-            "trust anchor needs only plain CERTIFICATE blocks, and loading an encrypted one can make "
-            "the TLS library wait for a password. Remove the encrypted block, or export the CA "
-            "certificate as a plain CERTIFICATE block"
+            f"{spec.setting}: the trust anchor {spec.path!r} {ENCRYPTION_HEADER_SCOPE}. An "
+            "encrypted certificate carries one, as does a private key encrypted in the legacy PEM "
+            "format. A trust anchor needs only plain "
+            "CERTIFICATE blocks, and loading an encrypted one can make the TLS library wait for a "
+            "password. Remove the encrypted block and any comment that names one of those headers, "
+            "or export the CA certificate as a plain CERTIFICATE block"
         )
     try:
         ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=text)
