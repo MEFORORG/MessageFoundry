@@ -8092,9 +8092,10 @@ class AuthService:
         the role at once. This adds the ``no_enabled_administrator`` alert and a
         :data:`NO_ENABLED_ADMINISTRATOR_ACTION` row, so the operators learn of it. The cost the
         ruling accepts: an all-directory Administrator set can end up with no Administrator, noted
-        with vault BACKLOG #2711, the open recovery row for such a set. Until the directory grants
-        the role again at a sign-in, the way back is ``provision-admin`` at the host, which runs
-        once no enabled Administrator exists (docs/SECURITY.md, *Keep a local Administrator*).
+        with vault BACKLOG #2711, the recovery row for such a set. Until the directory grants the
+        role again at a sign-in, the way back is ``provision-admin`` at the host. Since #2711 step 1
+        it runs whenever no enabled local Administrator has a usable password, which a set left with
+        no Administrator always meets (docs/SECURITY.md, *Keep a local Administrator*).
 
         It fires only when this write took Administrator from an enabled account and none is left.
         The count is read after the write, so when two directory demotions race, the later read

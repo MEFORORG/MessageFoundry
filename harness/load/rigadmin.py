@@ -8,9 +8,13 @@ provisions one Administrator in the store before the engine starts, signs in onc
 reads the API with that session.
 
 ``provision-admin`` reads its password from a terminal and has no other input, on purpose. A rig has
-no terminal. So :func:`provision` runs the shipped command in a child process with that one read
-replaced by a value the rig holds. Settings, the at-rest gate, the store open, the password policy
-and the account write are the shipped code path. ``scripts/service/measure-store-access.ps1`` does
+no terminal. So :func:`provision` runs the shipped command in a child process with that read
+replaced by a value the rig holds. The child also wraps the command's
+``_build_provision_auth_service``, so the service's ``provision_refusal`` and
+``provision_first_administrator`` refuse a store whose enabled Administrators all need an outside
+service (vault BACKLOG #2711, :func:`_keep_the_narrow_rule`). That only narrows the command.
+Settings, the at-rest gate, the store open, the password policy and the account write are the
+shipped code path. ``scripts/service/measure-store-access.ps1`` does
 the same on Windows; this is that recipe for every platform.
 
 **This is test tooling.** It adds no flag, no environment switch and no password path to any shipped

@@ -1003,7 +1003,9 @@ password from a terminal and takes it no other way. A test rig has no terminal. 
 `load/rigadmin.py` imports the engine's command module and replaces its `_read_new_password`
 function with one that returns a password the rig holds. It also wraps the command's
 `_build_provision_auth_service`, so the service it builds refuses any store that holds an enabled
-Administrator (vault BACKLOG #2711). That only narrows the command. It then calls the shipped
+Administrator (vault BACKLOG #2711). On that service it replaces `provision_refusal` and
+`provision_first_administrator` with wrappers that ask the shipped check first. That only narrows
+the command. It then calls the shipped
 command's `main`. The rest of `provision-admin` runs as shipped.
 
 What holds it:
