@@ -2775,13 +2775,14 @@ inside the same window, the confirm turns nothing on and returns no recovery cod
 confirm ends the session it just rotated and answers as a lost session: `401` on
 `POST /me/mfa/confirm`, and the sign-in page in the web console. It is audited
 `auth.mfa_enroll_refused`. The `reason` values it records include `account_gone`, `already_enabled`,
-`secret_cleared`, `secret_replaced` and `write_lost`, each read from the row after the refusal,
-so it points an operator at the likely cause rather than proving it. The compare is on the stored
-ciphertext, so at least a store-key rotation that re-encrypts the column inside the window refuses
-too, and reads as `secret_replaced` although no second enrolment started; signing in again and
-confirming with a later code succeeds.
+`secret_cleared`, `secret_replaced` and `write_lost`. Each is read from the row after the refusal,
+so a `reason` points an operator at the likely cause rather than proving it. The compare is on the
+stored ciphertext, so at least a store-key rotation that re-encrypts the column inside the window
+refuses too. That refusal reads as `secret_replaced` although no second enrolment started.
 `write_lost` means the row still held the verified secret with TOTP off, so the enable lost to
-some other concurrent write, and a retry confirms. With
+some other concurrent write. A plain retry of a refused confirm gets a `401`, because the session
+is ended and the code's TOTP step is spent. After a `write_lost` or a store-key rotation, the user
+signs in again and confirms with a code from a later step. With
 `[security].require_mfa` on — **the default since BACKLOG #187 (secure-by-default, including the
 loopback bind)** — **every account** must satisfy MFA under the default scope,
 `every_local_account` (a value now wider than its name, BACKLOG #1144). Setting the scope to
