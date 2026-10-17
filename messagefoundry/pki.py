@@ -480,21 +480,15 @@ def _issuer_name_key(name: x509.Name) -> _NameKey:
     not, so a CA whose name differs only there still reads ``unlisted``, the warning arm, while
     OpenSSL judges its peers by the CRL. Folding that too would close the same gap for spacing;
     it is left open on purpose, as a change of its own."""
-    return tuple(
-        tuple(
-            sorted(
-                (
-                    attribute.oid.dotted_string,
-                    isinstance(attribute.value, bytes),
-                    attribute.value.translate(_ASCII_FOLD)
-                    if isinstance(attribute.value, str)
-                    else attribute.value,
-                )
-                for attribute in rdn
-            )
-        )
-        for rdn in name.rdns
-    )
+    return tuple(tuple(sorted(map(_attribute_key, rdn))) for rdn in name.rdns)
+
+
+def _attribute_key(attribute: x509.NameAttribute[str | bytes]) -> tuple[str, bool, str | bytes]:
+    """One attribute as :func:`_issuer_name_key` compares it. The flag keeps a ``bytes`` value
+    (``x500UniqueIdentifier``) from being ordered against a ``str`` one."""
+    value = attribute.value
+    folded = value.translate(_ASCII_FOLD) if isinstance(value, str) else value
+    return attribute.oid.dotted_string, isinstance(value, bytes), folded
 
 
 def _signature_state(

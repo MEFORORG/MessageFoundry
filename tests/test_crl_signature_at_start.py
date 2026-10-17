@@ -641,6 +641,8 @@ def test_a_name_that_genuinely_differs_is_still_unlisted(
     assert _UNCONFIRMED_SIGNATURE["unlisted"] in line
     verdict = crl_signature_refusal(pem, _ders(twins.new_ca))
     assert verdict is not None and verdict[1] is False  # the reload's NO_ISSUER case
+    # The reload gives the same state the same words, so the two cannot drift apart.
+    assert _UNCONFIRMED_SIGNATURE["unlisted"] in verdict[0]
     # The premise: OpenSSL finds no CRL for the leaf's issuer in this file, so it does not judge
     # the peer by it, and a leaf-checking hop fails for want of one, not on the signature.
     with pytest.raises(ssl.SSLError, match="unable to get certificate CRL"):

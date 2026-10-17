@@ -1056,12 +1056,13 @@ async def test_a_first_sight_clear_the_sink_refuses_is_retried(
     with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.crl_reload"):
         for _ in range(3):
             runner._clear_on_first_sight()
-            runner._report([])
+            runner._report([])  # each pass's report retries the clear
         sink.down = False
+        runner._report([])
         runner._clear_on_first_sight()
-        runner._clear_on_first_sight()
-    assert sink.kinds() == ["applied"], "retried, then sent once"
-    failures = [r for r in caplog.records if "an earlier run" in r.getMessage()]
+        runner._report([])
+    assert sink.kinds() == ["applied"], "retried, then sent once, and the file judged once"
+    failures = [r for r in caplog.records if "could not be resolved" in r.getMessage()]
     assert len(failures) == 1, "one WARNING for the streak"
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
