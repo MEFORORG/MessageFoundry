@@ -400,8 +400,11 @@ class AlertSink(Protocol):
         (ADR 0044) **auto-resolves** the open ``crl_reload_refused`` instance for the same
         ``name``. Raised for an alert this runner raised once the refusal is gone from the record:
         a pass that could not read the file, or that failed, clears nothing. Also raised once
-        per held file with no refusal standing, for an alert a run of this process that died
-        without stopping left open (vault BACKLOG #3543); any other stays open for an operator."""
+        per held file with no refusal standing, at the first pass that judges it, whether or not
+        any alert is open, so a call soon after start can have nothing to resolve. That call
+        clears an alert a run under the same identity left open when it died without stopping
+        (vault BACKLOG #3543). One raised under another identity, such as an unpinned cluster
+        node's, stays open for an operator."""
         ...
 
     def secret_rotation_due(
