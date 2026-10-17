@@ -14,7 +14,8 @@ they cannot be outrun the same way:
 
 * every case carries every sentinel, in a real secret field where the case allows one and in an
   ignored extra key where it does not, so each case would show a leak of any of them;
-* the cases enumerate the refusals in ``_require_ad_fields``, ``_require_oidc_fields`` and the
+* the cases enumerate the refusals in at least ``_require_ad_fields``,
+  ``_refuse_a_breaker_that_cannot_trip``, ``_require_oidc_fields`` and the
   ``ServiceSettings`` cross-section checks, plus generic field, type and section-shape errors;
 * a sweep refuses every section with a non-mapping value, so a section added later is covered
   without anyone adding a case for it;

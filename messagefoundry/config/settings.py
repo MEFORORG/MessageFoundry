@@ -3818,12 +3818,12 @@ class AuthSettings(_Section):
         if self.ad_session_revoke_max_fraction >= 1.0:
             problems.append(
                 "ad_session_revoke_max_fraction must be below 1.0 (a pass never revokes more "
-                "accounts than it judged)"
+                "accounts than it probed)"
             )
         if self.ad_session_recheck_max_users <= self.ad_session_revoke_max:
             problems.append(
                 "ad_session_recheck_max_users must be greater than ad_session_revoke_max (a pass "
-                "judges at most ad_session_recheck_max_users accounts)"
+                "probes at most ad_session_recheck_max_users accounts)"
             )
         if problems:
             raise ValueError(
