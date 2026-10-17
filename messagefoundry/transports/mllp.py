@@ -602,7 +602,8 @@ def _mllp_ssl_context(
     ``tls_ca_file`` opts into mTLS (require + verify a client cert). **Outbound** (``server=False``):
     verify the peer's cert against ``tls_ca_file`` (or the system trust store) with hostname checking,
     and optionally present ``tls_cert_file`` for mTLS. ``tls_verify=False`` (outbound) is MITM-able and
-    refused unless ``insecure_tls_allowed()``, with a loud warning — exactly as LDAPS / SQL Server.
+    refused unless ``weakened_tls_escape_permitted_here()``, which needs the dev escape on an instance
+    at ``[security].enforcement = warn``, as the SQL Server store's weakened TLS does.
 
     ``trust_anchor_policy`` (#190, ADR 0093, OUTBOUND verify path only) supplies the instance ``[tls]``
     internal-CA fallback: when the connection names no ``tls_ca_file`` of its own, an internal hop

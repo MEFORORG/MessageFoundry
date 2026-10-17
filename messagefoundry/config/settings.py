@@ -444,15 +444,17 @@ INSECURE_TLS_ESCAPE_ENV = "MEFOR_ALLOW_INSECURE_TLS"
 
 
 def insecure_tls_allowed() -> bool:
-    """Whether the dev escape for insecure TLS overrides is present in the environment (ASVS 12.3.2).
+    """Whether the dev escape for insecure TLS overrides is SET to a true value (ASVS 12.3.2).
 
-    Present is not honoured. Certificate-validation overrides (``trust_server_certificate=true`` for
-    SQL Server, for one) are MITM-able, so they **refuse** at startup unless
+    Set is not honoured. Certificate-validation overrides (``trust_server_certificate=true`` for
+    SQL Server, for one) are MITM-able, so the escape lets one through only when
     ``MEFOR_ALLOW_INSECURE_TLS`` is set on an instance at ``[security].enforcement = warn``. The cells
     ask :func:`weakened_tls_escape_permitted` or :func:`hop_insecure_escape_downgrades`, which add
     that condition. Under ``enforce``, the default, or where the code knows no posture, the escape
-    changes nothing. Some credential hops refuse even at ``warn``; docs/SECURITY-LOOSENING.md, *No
-    escape sends a credential to an unverified peer*, names them and the ones that still cross."""
+    changes nothing. Some connections have a per-hop way across that needs neither the escape nor the
+    dial, such as ``tls_hop_attested``. Some credential hops refuse even at ``warn``;
+    docs/SECURITY-LOOSENING.md, *No escape sends a credential to an unverified peer*, names them and
+    the ones that still cross."""
     return os.environ.get(INSECURE_TLS_ESCAPE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 
@@ -464,14 +466,15 @@ def hop_insecure_escape_downgrades(*, enforcing: bool) -> bool:
     ENFORCE it is **inert** — it can NEVER satisfy an enforcing hop (a deliberate behaviour change from
     the pre-#200 global escape, which silenced the refusal in every environment).
 
-    **Scope after ADR 0153 (decision 5): the TRANSPORT cells no longer consult this at all.** The
+    **Scope after ADR 0153 (decision 5): no CLEARTEXT transport cell consults this.** The
     cleartext-hop authority lost its ``audited_opt_out`` parameter, so the variable cannot influence a
     connection's cleartext-hop decision; the per-connection ``cleartext_accepted`` declaration replaced
     it there. This clamp survives for the two **non-connection** cells that still key on the escape and
     have nowhere to carry a per-hop declaration — the ``[logging]`` forwarder
     (:func:`forward_hop_disposition`) and the API PHI-read serve hop
-    (:func:`~messagefoundry.config.tls_policy.phi_read_hop_disposition`) — plus the verify-off cells via
-    :func:`weakened_tls_escape_permitted`. On a connection, ``tls_hop_attested`` (ALLOW) or
+    (:func:`~messagefoundry.config.tls_policy.phi_read_hop_disposition`) — plus the verify-off cells,
+    via :func:`weakened_tls_escape_permitted` or, for the HTTP family's ``verify_tls=false``, directly
+    (``transports.rest._shipped_strict_disposition``). On a connection, ``tls_hop_attested`` (ALLOW) or
     ``cleartext_accepted`` (WARN + audit) is now the only way across an enforcing hop."""
     return insecure_tls_allowed() and not enforcing
 

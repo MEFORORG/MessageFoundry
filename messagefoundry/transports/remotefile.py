@@ -1620,7 +1620,8 @@ class _RefuseUnknownHostKey:
 class _SftpClient(_RemoteClient):
     """SFTP client over paramiko. Host-key verification is ON by default (system known_hosts + an
     optional ``known_hosts`` file, paramiko ``RejectPolicy``); an unknown key is refused unless the
-    explicit dev escape is set, in which case ``AutoAddPolicy`` is used and a warning is logged. A
+    dev escape ``MEFOR_ALLOW_INSECURE_TLS`` is set on an instance at ``[security].enforcement =
+    warn``, in which case ``AutoAddPolicy`` is used and a warning is logged. A
     login that sends a ``password`` never takes the escape (vault BACKLOG #3230): its unknown host
     key is refused by :class:`_RefuseUnknownHostKey`, whatever the posture."""
 

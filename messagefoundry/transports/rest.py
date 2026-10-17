@@ -16,11 +16,12 @@ Standard library only (``urllib.request``) — no new dependency (ADR 0003). Red
 (a 3xx could divert PHI to an unintended host) and the scheme is constrained to http/https, mirroring
 the alert-webhook hardening (ASVS 15.3.2 / 1.3.6); the `[egress].allowed_http` allowlist is the
 fail-closed host gate (enforced by the runner at load/reload/start). Per-connection
-``verify_tls=False`` on an ``https`` URL is refused, with no escape, when its settings send a
-credential (:func:`refuse_verify_off`). Without one it is allowed to a loopback host or with
-``tls_hop_attested``, and refused otherwise. The dev escape ``MEFOR_ALLOW_INSECURE_TLS`` turns that
-refusal into a loud warning only on an instance at ``[security].enforcement = warn``; under
-``enforce``, the default, it changes nothing, as for the SQL Server backend.
+``verify_tls=False`` on an ``https`` URL is refused, with no escape, when it sends a credential the
+refusal can see (:func:`refuse_verify_off`; docs/SECURITY-LOOSENING.md, *No escape sends a
+credential to an unverified peer*, names what it cannot see). Otherwise it is allowed to a loopback
+host or with ``tls_hop_attested``, and refused elsewhere. The dev escape ``MEFOR_ALLOW_INSECURE_TLS``
+turns that refusal into a loud warning only on an instance at ``[security].enforcement = warn``;
+under ``enforce``, the default, it changes nothing.
 
 There is **no REST source yet** — a non-HL7 source needs the payload-agnostic ingress decided in
 ADR 0003 (its own follow-up ADR). This is the first non-HL7 connector.
@@ -444,8 +445,8 @@ _NO_REDIRECT_OPENER = _no_redirect_opener()
 def _insecure_opener(
     *extra_handlers: urllib.request.BaseHandler,
 ) -> urllib.request.OpenerDirector:
-    """A no-redirect opener that does **not** verify TLS — built only when the dev escape is set. Threads
-    any ``extra_handlers`` (e.g. a forward-proxy handler, ADR 0126) into the same per-connection opener."""
+    """A no-redirect opener that does **not** verify TLS — built only for a ``verify_tls=false`` hop
+    that :func:`refuse_verify_off` let through. Threads any ``extra_handlers`` (e.g. a forward-proxy handler, ADR 0126) into the same per-connection opener."""
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
