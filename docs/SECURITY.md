@@ -5593,7 +5593,9 @@ reads the file again by path, on its own schedule. The SMTP hop reads it at ever
 swapped between reloads would be trusted by the next send. A connection that falls back to the
 internal CA reads it when the connection is built, and the syslog forwarder reads it once, at start.
 Those keep the old bytes until they are built again, and a reload writes a `changed` row but no
-`restart_required` row for them. A changed syslog CA takes effect only at a restart.
+`restart_required` row for them. A changed syslog CA takes effect only at a restart, and the
+reload response's `restart_required` field does not list it, or either of the other two (BACKLOG
+#3015).
 
 At least four readers sit before or outside the check. At start, the syslog forwarder and the alert
 notifier are built before the check runs, so an alert sent during startup, or the first forwarded
