@@ -3199,18 +3199,18 @@ class AuthSettings(_Section):
     # --- mass-revoke circuit breaker ---
     # A search base that names the wrong OU, an OU reorganisation that moves the users out of it, or
     # a service account that lost read rights on the entries while it can still read the base returns
-    # "not found" for EVERY user — indistinguishable from "everyone was deleted". A base that was
-    # deleted or moved, or that the service account may not read at all, usually ends the search with
-    # a result code instead (noSuchObject, invalidDNSyntax, insufficientAccessRights): a configuration
-    # refusal (BACKLOG #3010). A refused account is neither struck nor revoked, but it stays in this
-    # breaker's denominator, the accounts probed. A pass whose every directory answer is a refusal, a
-    # fault or a failure, with at least one refusal and no referral, judges no account it asked about
-    # and pages as `ad_reconcile_aborted` with reason `directory_misconfigured` before reaching this
-    # breaker; a refusal beside other answers alerts, and the rest of the pass reaches it. Without a
-    # brake the reconciler would sign out the entire estate during exactly the incident when
-    # operators need the console. A pass that would revoke more than BOTH of these thresholds aborts,
+    # "not found" for EVERY user — indistinguishable from "everyone was deleted". Without a brake
+    # the reconciler would sign out the entire estate during exactly the incident when operators need
+    # the console. A pass that would revoke more than BOTH of these thresholds aborts,
     # revokes nothing, and raises a loud operator-visible alert (log ERROR + an
     # `auth.ad_reconcile_aborted` audit row).
+    #
+    # A base that was deleted or moved, or that the service account may not read at all, usually ends
+    # the search with a result code instead (noSuchObject, invalidDNSyntax, insufficientAccessRights):
+    # a configuration refusal (BACKLOG #3010). It alerts on its own `ad_reconcile_aborted` source.
+    # The refused account is neither struck nor revoked, but it stays in this breaker's denominator,
+    # the accounts probed (`ReconcilePlan.probed`). When such a pass aborts before the breaker runs
+    # is stated once in docs/SECURITY.md.
     #
     # BOTH must be exceeded to trip, deliberately: the absolute floor stops the breaker firing on a tiny
     # estate where any proportion is meaningless (3 of 3 genuine offboardings is 100 %), and the
