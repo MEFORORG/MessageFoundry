@@ -1670,32 +1670,16 @@ whatever matches on the day it runs. Let your shell expand the pattern, and read
 
 ### The checks, in the order the receipt prints them
 
-The first refusal stops that target.
+There are nine: `spelling`, `temp-root`, `exists`, `reparse`, `git`, `cwd`, `sessions`, `idle` and
+`in-use`. The first refusal stops that target.
 
-| Check | What it refuses |
-|---|---|
-| `spelling` | Anything but a plain drive-absolute path: a UNC or device path, a relative path, `.` or `..`, a component ending in a dot or a space, an 8.3 short name, a colon after the drive letter, a wildcard, a reserved device name. Forward slashes are accepted. |
-| `temp-root` | A target that is not strictly inside the temp root. Under `<root>\claude`, anything but the inside of a session scratchpad. |
-| `exists` | A path that does not exist, a single file, and a name that is stored under a different spelling. |
-| `reparse` | A reparse point (junction, symbolic link, mount point, cloud placeholder) on the path from the drive root down, or anywhere inside the tree. The script never follows one. |
-| `git` | A `.git` entry at any depth, a bare repository, a folder inside either, and any overlap with a registered worktree. |
-| `cwd` | A target the calling shell is standing in. |
-| `sessions` | A registry the script cannot read, a session working inside the target, and any other session's scratchpad. |
-| `idle` | A tree with anything created or modified inside the idle window. |
-| `in-use` | With `-Delete` only: a folder that cannot be renamed, because some process holds a handle inside it. |
+**What each one refuses is written once, in the comment block at the top of
+[`remove-scratch.ps1`](../scripts/worktree/remove-scratch.ps1)**, under *THE CHECKS*. This page does
+not repeat the list, so the two cannot drift apart.
 
-**The temp root is `<LocalApplicationData>\Temp`, read from the known-folder API.** It is not read
-from `TEMP` or `TMP`. Those are environment variables, and `[IO.Path]::GetTempPath()` follows a
-forged `TMP`. When `TEMP` is spelled any other way, the script prints a note and refuses every
-target. That includes a machine with a redirected temp folder, and a machine whose `TEMP` is an 8.3
-spelling of the same folder.
-
-**Under `<root>\claude`, only `claude\<project>\<session id>\scratchpad\<name>` or deeper can pass.**
-The scratchpad folder itself, a session folder and a project folder are refused.
-
-**A scratchpad worktree goes through [`remove.ps1`](../scripts/worktree/remove.ps1), never this
-script.** The worktrees compared are those of the repository the script lives in, and of every root
-in the worktree gate's own list.
+Two results surprise people. The script refuses every target while `TEMP` is spelled differently
+from the temp root, a redirected or 8.3-spelled `TEMP` included. And a scratchpad worktree goes
+through [`remove.ps1`](../scripts/worktree/remove.ps1), never this script.
 
 ### Whose folder it is
 
@@ -1716,10 +1700,8 @@ scratchpad is refused too.
 session family, and the caller cannot list its own workers. That is why its own scratchpad still
 waits ten minutes.
 
-`-IdleMinutes` can raise a window. It can never lower one. The idle check reads creation time as
-well as write time, because a copied or extracted tree keeps old write times. A stamp in the future
-refuses. So does a stamp the script cannot read at all, such as a time past the year 9999: an
-unreadable stamp is not an old one.
+`-IdleMinutes` can raise a window. It can never lower one. Which stamps the `idle` check reads, and
+which it refuses as unreadable, is in the header with the other checks.
 
 ### What it cannot see
 

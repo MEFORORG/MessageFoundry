@@ -1032,7 +1032,7 @@ def test_a_delete_that_stops_part_way_lists_exactly_what_remains(rig: Rig) -> No
         assert r.code == 3, r.out
         b = r.block(victim)
         assert b.verdict.startswith(f"PARTIAL {victim}: the delete stopped part-way"), r.out
-        assert "2 entries remain" in b.verdict, r.out
+        assert "which holds 2 entries" in b.verdict, r.out
         assert "partial=1" in r.summary and "deleted=0" in r.summary, r.out
         left = list(rig.root.iterdir())
         assert len(left) == 1 and re.fullmatch(r"victim\.removing-[0-9a-f]{8}", left[0].name), left
@@ -1055,7 +1055,7 @@ def test_a_delete_that_stops_part_way_lists_exactly_what_remains(rig: Rig) -> No
 
 # --- a check or a delete that throws -------------------------------------------------------------
 #
-# Nothing in the script throws on demand, so these three tests plant one line in a COPY of it. The
+# Nothing in the script throws on demand, so the tests below plant one line in a COPY of it. The
 # copy lives in a throwaway repository under tmp_path, because the script lists the worktrees of the
 # repository it sits in. The real script is never written to.
 
@@ -1130,7 +1130,7 @@ def test_a_delete_that_throws_after_the_rename_still_says_where_the_tree_went(ri
     assert len(left) == 1 and re.fullmatch(r"boom\.removing-[0-9a-f]{8}", left[0].name), left
     tomb = left[0]
     assert b.verdict.startswith(f"PARTIAL {boom}: the delete stopped part-way"), r.out
-    assert f"renamed to '{tomb}' and 3 entries remain" in b.verdict, r.out
+    assert f"renamed to '{tomb}', which holds 3 entries" in b.verdict, r.out
     assert "failed: the delete threw: planted delete failure" in b.extra, r.out
     remains = sorted(line[len("remains: ") :] for line in b.extra if line.startswith("remains: "))
     assert remains == [str(tomb / "a.txt"), str(tomb / "sub"), str(tomb / "sub" / "b.bin")], r.out
@@ -1157,3 +1157,55 @@ def test_a_delete_that_records_a_failure_is_never_reported_as_deleted(rig: Rig) 
     assert "failed: planted failure note" in b.extra, r.out
     assert "deleted=0" in r.summary and "partial=1" in r.summary, r.out
     assert list(rig.root.iterdir()) == []
+    # BACKLOG #2963 (j): the renamed folder is gone, so nothing remains. Listing it anyway once
+    # counted its own could-not-list line as "1 entry remains".
+    assert "which is gone, but 1 failure(s) were recorded on the way" in b.verdict, r.out
+    assert not [line for line in b.extra if line.startswith("remains: ")], r.out
+
+
+def test_the_folders_above_the_targets_are_listed_once_per_run(rig: Rig) -> None:
+    """BACKLOG #2963 (h). The git walk up to the temp root listed each folder on the way once per
+    target. The temp root is shared by every target and can hold thousands of entries.
+
+    A planted line logs each listing the walk makes. Three targets share every folder above them."""
+    rig.caller()
+    targets = [rig.tree(rig.root / name) for name in ("one", "two", "three")]
+    log = rig.base / "listed.log"
+    script = _planted_copy(
+        rig.base,
+        "    if ($gitShapeAbove.ContainsKey($Dir)) { return $gitShapeAbove[$Dir] }",
+        f"    Add-Content -LiteralPath '{log}' -Value $Dir",
+    )
+
+    r = rig.run(*targets, delete=False, script=script)
+
+    assert r.code == 0, r.out
+    listed = log.read_text(encoding="utf-8").splitlines()
+    assert listed.count(str(rig.anchor)) == 1, listed
+    assert str(rig.root) in listed, listed
+    assert len(listed) == len(set(listed)), listed
+
+
+@pytest.mark.parametrize("which", ["write time", "creation time"])
+def test_a_zeroed_stamp_is_unreadable_not_ancient(rig: Rig, which: str) -> None:
+    """BACKLOG #2963 (i). FILETIME 0 reads as the year 1601, which once counted as very old.
+
+    ``SetFileTime`` treats a FILETIME of 0 as "leave this time alone", so the rig plants the smallest
+    stamp it can set, one tick after 1601-01-01. The script reads it exactly as it would a zero."""
+    rig.caller()
+    victim = rig.tree(rig.root / "victim")
+    control = rig.tree(rig.root / "control")
+    marked = victim / "sub" / "b.bin"
+    old = time.time() - 36000
+    if which == "write time":
+        _stamp(marked, old, written_ticks=1)
+    else:
+        _stamp(marked, old, created_ticks=1)
+
+    r = rig.run(victim, control)
+
+    assert r.code == 1, r.out
+    b = r.refused(victim, "idle", "could not be read, so the tree cannot be shown idle")
+    assert f"'{marked}'" in b.receipt["idle"], r.out
+    r.deleted(control)
+    assert _snapshot(victim) == ["a.txt [5]", "sub", "sub\\b.bin [7]"]
