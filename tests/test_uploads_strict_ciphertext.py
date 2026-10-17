@@ -615,6 +615,26 @@ async def test_a_body_the_engine_could_not_have_written_is_never_read(tmp_path: 
     assert (root / f"{fid}.blob").exists()
 
 
+async def test_a_sidecar_undecodable_only_past_the_class_read_is_still_classed(
+    tmp_path: Path,
+) -> None:
+    """The listing read of the whole sidecar fails, but the class check reads only its head, which
+    decodes. The quota and the prune still class it, as the separate unsealable scan did before the
+    two walks were folded into one (BACKLOG #3184), so it ages out rather than sit forever."""
+    root = tmp_path / "uploads"
+    fid = await _unsealable_upload(root, _remove)
+    sidecar = root / f"{fid}.meta"
+    # Well past the owner read and the decoder's chunk after it, then one byte that is not UTF-8.
+    sidecar.write_bytes(sidecar.read_bytes() + b" " * (4 * 64 * 1024) + b"\xff")
+    store = UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20, retention_days=30)
+    held: list[_UnsealableUpload] = []
+    assert store._scan_metas_sync(held) == []
+    # The owner is not read from a sidecar that was not read whole.
+    assert [(h.file_id, h.uploader_id, h.size) for h in held] == [(fid, "", 0)]
+    assert (await store.prune_expired(now=10**12)).pruned == []  # no body, so no row
+    assert _files(root) == []
+
+
 def test_rotate_key_notes_an_unsealable_upload_and_does_not_warn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

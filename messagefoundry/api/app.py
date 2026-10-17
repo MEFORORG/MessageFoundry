@@ -1049,10 +1049,9 @@ async def _reconcile_approvals_after_restart(gate: ApprovalGate) -> None:
 #: BACKLOG #3191: the wall-clock budget of everything the managed lifespan does after its yield,
 #: engine.stop() included. NSSM sends Ctrl+C and escalates after AppStopMethodConsole, 15000 ms
 #: (scripts/service/install-service.ps1). Before the lifespan sees the shutdown, uvicorn drains the
-#: open connections. BACKLOG #3256 is to bound that drain where serve calls uvicorn.run; it was not on
-#: main when this was written, so until it is that drain is unbounded. This budget plus that
-#: bound, plus a cut step's grace (below) for each step cut, must stay inside the window with room
-#: left for the interpreter to exit.
+#: open connections, for at most ``__main__._UVICORN_DRAIN_SECONDS``, the bound serve passes
+#: uvicorn.run (BACKLOG #3256). This budget plus that bound, plus a cut step's grace (below) for
+#: each step cut, must stay inside the window with room left for the interpreter to exit.
 _SHUTDOWN_BUDGET_SECONDS: Final = 10.0
 #: The share of that budget kept back for engine.stop(). Reserved, never a bound: the stop is not cut
 #: short, because it ends in store.close(), and a store left open keeps a non-daemon worker thread
@@ -1077,8 +1076,10 @@ class _TeardownStep:
 
     ``floor`` is the time the step is guaranteed whatever the steps before it took. ``run`` is given
     the step's bound and returns what to await. A step that does not apply is left out of the list,
-    which frees its floor. ``bounded=False`` runs the step to completion and is never cut; only
-    engine.stop() is run that way, and its ``floor`` is the reserve the steps before it leave it."""
+    which frees its floor. ``bounded=False`` runs the step to completion and is never cut. At least
+    two steps run that way: the reap of the managed lifespan's store-reading tasks, since a task left
+    running would meet the closed store, and engine.stop(), whose ``floor`` is the reserve the steps
+    before it leave it."""
 
     label: str
     floor: float
@@ -1229,7 +1230,12 @@ def _app_drain_steps(
 
     async def _outliving(bound: float) -> None:
         # At most a quarter of it waiting: the grace after is what lets a cancelled operation's
-        # rollback arm record 'interrupted' before the store closes.
+        # rollback arm record 'interrupted' before the store closes. That grace is shorter than
+        # CANCEL_GRACE_SECONDS, and shorter than the DR hook reap inside it, with the managed
+        # lifespan's full set of steps: under 3 s when the steps before this one are quick. The
+        # budget cannot hold the reap, since the NSSM window leaves it no room (see
+        # _SHUTDOWN_BUDGET_SECONDS). So at least a cancelled DR takeover whose killed hook takes
+        # most of its reap can still be rolling back when the store closes, and the drain logs it.
         wait = min(OUTLIVING_DRAIN_SECONDS, bound * _INNER_SHARE / 4)
         await outliving.drain(wait, grace=min(CANCEL_GRACE_SECONDS, bound * _INNER_SHARE - wait))
 
@@ -10817,11 +10823,14 @@ def create_managed_app(
 
             steps: list[_TeardownStep] = []
             if upload_retention_runner is not None:
+                # Handed part of its bound, so the runner's own wait ends, names any unaudited
+                # file and cancels the sweep before the teardown cuts it. That bound is about 2 s
+                # with every step present, so the runner's own 5 s wait never runs in full here.
                 steps.append(
                     _TeardownStep(
                         "the upload retention runner's stop",
                         0.5,
-                        lambda _b: upload_retention_runner.stop(),
+                        lambda b: upload_retention_runner.stop(timeout=b * _INNER_SHARE),
                     )
                 )
             # return_exceptions absorbs both our cancellation AND any exception a task that died

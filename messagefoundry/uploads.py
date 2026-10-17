@@ -829,9 +829,11 @@ class UploadStore:
         and the cipher refuses plaintext, each refused sidecar that is an upload ``rotate-key``
         cannot seal is appended to it, from this same directory walk, so a quota check walks the
         directory once rather than twice. Nothing that lists or serves an upload passes it, so the
-        strict read is not loosened. Only a sidecar the cipher refused is classed. A sidecar it
-        decrypted is sealed, and :meth:`_unsealable_sync` would decline it anyway. The class is keyed
-        by the PATH id, never by the id in a sidecar's JSON.
+        strict read is not loosened. Only a sidecar the cipher refused, or one that could not be
+        read whole, is classed; the second covers a plaintext sidecar that is not UTF-8 only past
+        the head :meth:`_unsealable_sync` reads. A sidecar the cipher decrypted is sealed, and
+        :meth:`_unsealable_sync` would decline it anyway. The class is keyed by the PATH id, never
+        by the id in a sidecar's JSON.
 
         The cipher's own message is safe to log — every ``CipherError`` carries only key ids,
         marker versions and algorithm names, never a decrypted value. The malformed-shape branch
@@ -843,6 +845,7 @@ class UploadStore:
         for fid, entry in self._iter_sidecars():
             if sink is not None:
                 bodies.add(f"{fid}{_BLOB_SUFFIX}")
+            unread = False
             try:
                 out.append(self._decrypt_meta(entry.read_text(encoding="utf-8"), fid))
             except CipherError as exc:
@@ -850,20 +853,24 @@ class UploadStore:
                 # another cell, or the refusal of an unmarked (legacy, planted or downgraded)
                 # sidecar. Named on its own so these can be told apart from a damaged file.
                 _log.warning("uploaded-file sidecar %s: cipher declined it: %s", fid, exc)
-                if sink is not None:
-                    lost = self._unsealable_sync(fid, entry)
-                    if lost is not None:
-                        sink.append(lost)
+                unread = True
             except (OSError, UnicodeDecodeError) as exc:
                 # The bytes never reached the cipher — unreadable file, or not valid UTF-8.
                 _log.warning(
                     "uploaded-file sidecar %s: unreadable on disk: %s", fid, codec_safe_str(exc)
                 )
+                # Classed too: a plaintext sidecar that is not UTF-8 only past the head the class
+                # check reads is still one rotate-key can never seal.
+                unread = True
             except (ValueError, TypeError, KeyError) as exc:
                 # Decrypted, but the JSON is malformed or a field will not coerce. Type only.
                 _log.warning(
                     "uploaded-file sidecar %s: malformed metadata (%s)", fid, type(exc).__name__
                 )
+            if unread and sink is not None:
+                lost = self._unsealable_sync(fid, entry)
+                if lost is not None:
+                    sink.append(lost)
         if sink is not None:
             # Forget the checks of uploads that are gone, so the cache cannot outgrow the directory.
             # A copy, because a scan on another worker thread may be writing to it.
@@ -1233,8 +1240,8 @@ class UploadStore:
         def _missed(touch: asyncio.Future[Any]) -> None:
             if not touch.cancelled() and touch.exception() is not None:
                 _log.warning(
-                    "could not refresh the cross-shard upload reservation for %s; it may be "
-                    "reclaimed if the upload outlasts the staleness window",
+                    "could not refresh the upload reservation %s holds across engine shards; it "
+                    "may be reclaimed if the upload outlasts the staleness window",
                     uploader_id,
                     exc_info=touch.exception(),
                 )
@@ -1249,8 +1256,8 @@ class UploadStore:
                     except TimeoutError:
                         if time.monotonic() >= deadline:
                             _log.warning(
-                                "an upload by %s is still writing after %gs; its cross-shard "
-                                "reservation is no longer refreshed and may be reclaimed",
+                                "an upload by %s is still writing after %gs; its reservation "
+                                "across engine shards is no longer refreshed and may be reclaimed",
                                 uploader_id,
                                 _RESERVATION_HEARTBEAT_MAX_SECONDS,
                             )
@@ -1273,8 +1280,9 @@ class UploadStore:
                             stopped.cancel()
                         if not touch.done() and not stop.is_set():
                             _log.warning(
-                                "a cross-shard upload reservation touch for %s did not finish "
-                                "within %gs; it was left running, and the next waits for it",
+                                "a touch of the upload reservation %s holds across engine "
+                                "shards did not finish within %gs; it was left running, and the "
+                                "next waits for it",
                                 uploader_id,
                                 _RESERVATION_TOUCH_WAIT_SECONDS,
                             )
@@ -2074,7 +2082,9 @@ _DEFAULT_PRUNE_INTERVAL_SECONDS = 3600.0
 # How long ``UploadRetentionRunner.stop`` waits for a sweep already in flight to finish and write its
 # audit rows. The sweep stops at its next file once asked, so this bounds a hung filesystem call, a
 # sidecar scan already under way, and the audit writes for what the sweep had deleted. The runner
-# stops FIRST in the API lifespan's teardown, and engine.stop() still has to run after it.
+# stops FIRST in the API lifespan's teardown, and engine.stop() still has to run after it. It is an
+# upper limit: that teardown passes ``stop(timeout=...)`` a share of the step's bound in one shutdown
+# budget (``_SHUTDOWN_BUDGET_SECONDS`` in ``api/app.py``, BACKLOG #3191), which is shorter.
 #
 # It shares NSSM's 15 s graceful-stop window (AppStopMethodConsole in
 # scripts/service/install-service.ps1) with uvicorn's connection drain, which runs BEFORE the
@@ -2188,14 +2198,16 @@ class UploadRetentionRunner:
             self._interval,
         )
 
-    async def stop(self) -> None:
+    async def stop(self, timeout: float | None = None) -> None:
         """Signal the loop and await its exit, audit rows included (idempotent).
 
         **The loop is asked to stop, not cancelled (BACKLOG #2065).** A sweep deletes files in a
         worker thread, and cancelling the task that awaits it leaves the thread deleting while the
         result naming those files is dropped, so no ``upload.prune`` row is ever written for them.
         Instead the sweep is told to stop at its next file, and this waits for it to return and for
-        its audit rows to land, up to ``stop_timeout_seconds``.
+        its audit rows to land, up to ``stop_timeout_seconds``, or ``timeout`` when that is shorter.
+        A caller with a shutdown budget of its own passes ``timeout``, so this wait ends, and cancels
+        the sweep, before the caller cuts it.
 
         A sweep can outlast that bound: one stuck filesystem call, the sidecar scan or orphan sweep
         already under way, or one stuck audit write. The task is then cancelled. The sweep writes
@@ -2220,12 +2232,13 @@ class UploadRetentionRunner:
         tally = self._tally
         tally.abort(self._abort)
         self._abort = threading.Event()
+        wait = self._stop_timeout if timeout is None else min(self._stop_timeout, timeout)
         try:
             # shield: a timeout must not cancel the task mid-audit; the branches below decide that.
-            await asyncio.wait_for(asyncio.shield(task), self._stop_timeout)
+            await asyncio.wait_for(asyncio.shield(task), wait)
             return
         except TimeoutError:
-            why = f"did not finish within {self._stop_timeout:g}s of shutdown"
+            why = f"did not finish within {wait:g}s of shutdown"
         except asyncio.CancelledError:
             why = "was still running when shutdown itself was cancelled"
         # Read before the cancel. Every id is logged, since these lines are the only record of them.

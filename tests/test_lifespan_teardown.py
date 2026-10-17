@@ -243,10 +243,8 @@ def test_the_shutdown_budget_fits_the_nssm_stop_window() -> None:
     window = int(match.group(1)) / 1000.0
     import messagefoundry.__main__ as cli
 
-    # Read through getattr: the bound is #3256's, built beside this in the same batch. Until it is
-    # on main, this checks the budget alone.
-    uvicorn_drain = float(getattr(cli, "_UVICORN_DRAIN_SECONDS", 0.0))
-    assert app_module._SHUTDOWN_BUDGET_SECONDS + uvicorn_drain + 1.0 <= window
+    shutdown = app_module._SHUTDOWN_BUDGET_SECONDS + cli._UVICORN_DRAIN_SECONDS
+    assert shutdown + 1.0 <= window
     assert app_module._ENGINE_STOP_RESERVE_SECONDS < app_module._SHUTDOWN_BUDGET_SECONDS
 
 
