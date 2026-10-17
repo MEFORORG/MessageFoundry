@@ -489,6 +489,7 @@ def test_a_gate_body_or_a_helper_it_calls_moves_the_rendering(
     probe.write_text("def gate():\n    return 1\n", encoding="utf-8")
     monkeypatch.syspath_prepend(str(tmp_path))
     imported = importlib.import_module("e2709_gate_probe")
+    monkeypatch.setitem(sys.modules, "e2709_gate_probe", sys.modules.pop("e2709_gate_probe"))
     before = module._render_callable(imported.gate, {})
 
     probe.write_text("def gate():\n    # a comment\n    return 1\n", encoding="utf-8")
@@ -509,10 +510,12 @@ def test_a_gate_body_or_a_helper_it_calls_moves_the_rendering(
 def test_a_rebound_engine_function_or_a_wrapped_body_moves_the_rendering(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Two holes a review of #2709 found. A gate's global name rebound to a different ENGINE
-    function changed nothing, because engine functions were dropped without their name. Two
-    functions behind one ``functools.wraps`` decorator share the wrapper's code object, so a cache
-    keyed by code served the first one's source for the second."""
+    """Holes a review of #2709 found. A gate's global name rebound to a different ENGINE function
+    changed nothing, because engine functions were dropped without their name. Two functions behind
+    one ``functools.wraps`` decorator share the wrapper's code object, so a cache keyed by code
+    served the first one's source for the second. And a helper the WRAPPER calls, rather than the
+    function it wraps, must be collected too. A standard-library name is not recorded, since it
+    can differ by platform."""
     module = _load_script(monkeypatch, "_seam_gen_rebind")
     probe = tmp_path / "e2709_rebind_probe.py"
     probe.write_text(
@@ -520,9 +523,12 @@ def test_a_rebound_engine_function_or_a_wrapped_body_moves_the_rendering(
         "from messagefoundry.api.security import client_ip as helper\n"
         "def gate(request):\n"
         "    return helper(request)\n"
+        "from messagefoundry.api.security import client_ip as check\n"
+        "from os.path import basename\n"
         "def wrap(fn):\n"
         "    @functools.wraps(fn)\n"
         "    def wrapper(*args):\n"
+        "        check(*args)\n"
         "        return fn(*args)\n"
         "    return wrapper\n"
         "@wrap\n"
@@ -530,11 +536,15 @@ def test_a_rebound_engine_function_or_a_wrapped_body_moves_the_rendering(
         "    return x == 'ok'\n"
         "@wrap\n"
         "def lax(x):\n"
-        "    return True\n",
+        "    return True\n"
+        "def named(x):\n"
+        "    return basename(x)\n",
         encoding="utf-8",
     )
     monkeypatch.syspath_prepend(str(tmp_path))
     imported = importlib.import_module("e2709_rebind_probe")
+    # Re-entered through monkeypatch, so teardown removes the probe module along with its path.
+    monkeypatch.setitem(sys.modules, "e2709_rebind_probe", sys.modules.pop("e2709_rebind_probe"))
     from messagefoundry.api import security
 
     before = module._render_callable(imported.gate, {})
@@ -544,6 +554,14 @@ def test_a_rebound_engine_function_or_a_wrapped_body_moves_the_rendering(
 
     assert imported.strict.__code__ is imported.lax.__code__  # the shape that collided
     assert module._normalized_source(imported.strict) != module._normalized_source(imported.lax)
+
+    wrapped = module._render_callable(imported.strict, {})
+    monkeypatch.setattr(imported, "check", security.route_declaration_of)
+    assert module._render_callable(imported.strict, {}) != wrapped
+
+    helpers: dict[str, Any] = {}
+    module._console_helpers(imported.named, helpers)
+    assert helpers == {}  # os.path:basename is ntpath or posixpath by platform, so it is skipped
 
 
 def _import_console_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:

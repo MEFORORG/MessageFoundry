@@ -433,12 +433,17 @@ from typing import Any
 #: ca9d9d31c1e53c1b, #3015 to fe903ffc23dbda0d on main). The value below was re-derived with
 #: ``--write`` on the merged tree, so it covers both.
 #:
+#: Vault BACKLOG #2709, second review repair: every layer of a ``functools.wraps`` chain is read,
+#: its own body and the helpers it calls, and a function outside the engine and console packages
+#: is no longer recorded, since a standard-library name can differ by platform. The digest moved
+#: from the merged value 6d97ea22c90b73a4.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "6d97ea22c90b73a4"
+ENGINE_UI_SEAM: str = "0b41a33c5d9e66b8"
 
 
 @dataclass(frozen=True, slots=True)
