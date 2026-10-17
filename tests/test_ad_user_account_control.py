@@ -2222,9 +2222,9 @@ async def test_a_forfeited_breaker_logs_once_on_a_new_trip_and_not_on_each_pass(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The ten accounts behind a trip leave, so the process forfeits the breaker's clear. A pass
-    that is not aborted ends that trip. Ten other accounts then read absent and the breaker trips
-    again: one WARNING says this process will not resolve it, and the next tripped pass of the
-    same trip says nothing more.
+    that is not aborted probes the two that remain, which ends that trip. Ten other accounts then
+    read absent and the breaker trips again: one WARNING says this process will not resolve it,
+    and the next tripped pass of the same trip says nothing more.
 
     RED when: the line is removed, or it is said on every tripped pass."""
     names = ["ok1", "ok2"] + [f"gone{i}" for i in range(10)]
@@ -2292,7 +2292,7 @@ async def test_a_forfeited_referral_logs_once_on_each_new_referral_and_not_on_ea
     """The referral's standing, by the same rule (BACKLOG #2538). A referred account signs out, so
     the process forfeits the referral's clear. A later referral says once that this process will
     not resolve it, and not again on the next referred pass. A referral ends once every account
-    signed in at it has read PRESENT on a pass with no referral, or left. An outage between two
+    signed in at it has been probed on a pass with no referral, or left. An outage between two
     referred passes does not end it.
 
     RED when: the line is removed, or it is said on every referred pass."""
@@ -2409,10 +2409,11 @@ async def test_a_forfeited_referral_is_not_said_while_a_rotating_sample_misses_i
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """One probe per pass. Two held accounts never reach the group search, so a pass that samples
-    one sees no referral, and that is no sign the referral has gone. Only a PRESENT read ends one.
-    This referral opened before the forfeit, so it is never said, however the samples rotate.
+    one sees no referral, and that is no sign the referral has gone: it ends only that account's
+    part, and the next referred pass marks every candidate again. This referral opened before the
+    forfeit, so it is never said, however the samples rotate.
 
-    RED when: any pass that judged something without a referral ends it."""
+    RED when: any pass that judged something without a referral ends the whole referral."""
     names = ["a", "b", "c", "h1", "h2"]
     settings = {
         "ad_group_search_base": "OU=Groups,DC=other,DC=invalid",
@@ -2442,7 +2443,7 @@ async def test_a_forfeited_breaker_is_not_said_when_a_sample_of_new_accounts_mis
     them: not aborted, but it read none of the trip's accounts. The pass after samples those
     again and trips. That is the same trip, so nothing more is said.
 
-    RED when: any pass that was not aborted ends a trip."""
+    RED when: any pass that was not aborted ends the whole trip."""
     names = ["ok1", "ok2"] + [f"gone{i}" for i in range(10)]
     later = [f"new{i}" for i in range(12)]
     async with _signed_in_estate(
@@ -2473,7 +2474,7 @@ async def test_a_forfeited_hold_is_said_once_while_a_rotating_sample_misses_its_
     but the undetermined answer stays on record. So the hold is said once, not every time the
     rotation comes back to it.
 
-    RED when: any judged pass that does not hold ends a hold."""
+    RED when: any judged pass that does not hold ends the whole hold."""
     names = ["u1", "u2", "x", "ok1", "ok2"]
     async with _signed_in_estate(monkeypatch, names, ad_session_recheck_max_users=1) as estate:
         directory, service, store, _tokens = estate
@@ -2492,6 +2493,143 @@ async def test_a_forfeited_hold_is_said_once_while_a_rotating_sample_misses_its_
                 held += (await _alerted_pass(service, sink)).hold
             assert held >= 2  # the rotation came back to it
             assert _said(caplog, _HELD_AGAIN) == 1
+
+
+_GAVE_UP_ON_A_TRIP = "an account signed in at the last breaker trip left"
+
+
+async def test_a_forfeited_breaker_logs_a_later_trip_while_held_accounts_stay_signed_in(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Two held accounts never read PRESENT and never leave. A pass that is not aborted and probes
+    them still ends the trip they were signed in at, so a later trip of other accounts is a new
+    one, and the forfeited process says it will not resolve it.
+
+    RED when: only a PRESENT read or leaving ends a trip, so the held pair keeps it open."""
+    names = ["ok1", "ok2", "u1", "u2"] + [f"gone{i}" for i in range(10)]
+    later = [f"back{i}" for i in range(10)]
+    async with _signed_in_estate(monkeypatch, names + later) as estate:
+        directory, service, store, _tokens = estate
+        await _expire(store, later)
+        sink = NotifierAlertSink([], store=store)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+            for name in names[4:]:
+                directory.delete(name)
+            await _alerted_pass(service, sink)  # strike 1, and the pair is held
+            assert (await _alerted_pass(service, sink)).aborted == "mass_revoke_breaker"
+            await _expire(store, names[4:])
+            plan = await _alerted_pass(service, sink)
+            assert plan.aborted is None and plan.hold  # probes the held pair: ends the trip
+            assert service._reconcile_breaker_standing == "forfeit"
+
+            await _sign_in(service, later)
+            for name in later:
+                directory.delete(name)
+            assert (await _alerted_pass(service, sink)).aborted is None  # strike 1
+            assert _said(caplog, _TRIPPED_AGAIN) == 0
+            for _ in range(2):  # the new trip, then a later pass of the same trip
+                assert (await _alerted_pass(service, sink)).aborted == "mass_revoke_breaker"
+                assert _said(caplog, _TRIPPED_AGAIN) == 1
+
+
+async def test_a_forfeited_referral_logs_a_later_referral_while_held_accounts_stay_signed_in(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The referral's half of the test above. The held pair never reaches the group search, so it
+    never reads PRESENT, but a pass with no referral that probes it ends the referral it was
+    signed in at. A later referral is a new one, and is said once.
+
+    RED when: only a PRESENT read or leaving ends a referral."""
+    names = ["jdoe", "asmith", "u1", "u2"]
+    groups = {"ad_group_search_base": "OU=Groups,DC=other,DC=invalid"}
+    async with _signed_in_estate(monkeypatch, names, **groups) as estate:
+        directory, service, store, _tokens = estate
+        sink = NotifierAlertSink([], store=store)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+            directory.refer_groups = True
+            assert (await _alerted_pass(service, sink)).referred
+            await _expire(store, ["jdoe"])
+            directory.refer_groups = False
+            plan = await _alerted_pass(service, sink)
+            assert plan.referred == () and plan.hold  # ends the first referral
+            assert service._reconcile_referral_standing == "forfeit"
+            assert _said(caplog, _REFERRED_AGAIN) == 0
+
+            directory.refer_groups = True
+            for _ in range(2):  # the new referral, then a later pass of the same referral
+                assert (await _alerted_pass(service, sink)).referred
+                assert _said(caplog, _REFERRED_AGAIN) == 1
+
+
+async def test_a_forfeited_hold_logs_a_new_hold_beside_an_account_still_on_record(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A lone undetermined account is held while nothing readable sits beside it, then strikes on
+    a pass that reads another account. Its answer stays undetermined on record, but the hold over
+    it has ended, so a later wave of two others is a new hold and is said.
+
+    RED when: whether a hold is open reads the whole outcome record, not the hold's own accounts."""
+    names = ["u1", "u2", "ok1", "x", "d", "v1", "v2"]
+    async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
+        await _expire(store, ["x", "d", "v1", "v2"])
+        sink = NotifierAlertSink([], store=store)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+            assert (await _alerted_pass(service, sink)).hold
+            await _expire(store, ["u1", "u2"])
+            assert not (await _alerted_pass(service, sink)).hold  # releases the latch
+            assert service._reconcile_hold_standing == "forfeit"
+
+            await _expire(store, ["ok1"])
+            await _sign_in(service, ["x", "d"])
+            directory.uac["x"] = ABSENT
+            directory.delete("d")
+            plan = await _alerted_pass(service, sink)
+            assert plan.hold and plan.readable == 0  # x alone, with nothing readable beside it
+            assert _said(caplog, _HELD_AGAIN) == 1
+
+            await _sign_in(service, ["ok1"])
+            plan = await _alerted_pass(service, sink)
+            assert not plan.hold and plan.readable == 1  # x strikes beside ok1
+            x_id = await _id(store, "x")
+            assert service._reconcile_outcomes[x_id] is ProbeOutcome.UNDETERMINED
+
+            await _sign_in(service, ["v1", "v2"])
+            directory.uac.update({"v1": ABSENT, "v2": ABSENT})
+            assert (await _alerted_pass(service, sink)).hold
+            assert _said(caplog, _HELD_AGAIN) == 2
+
+
+async def test_a_trip_that_forfeits_on_its_own_pass_is_not_also_said_as_a_new_trip(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Everyone behind a trip leaves, and on the same pass other accounts sign in and trip it
+    again. The forfeit's own warning has just said this process will not resolve the trip, so the
+    pass does not say it twice. The next tripped pass says nothing more.
+
+    RED when: a pass that forfeits also logs its trip as a new one."""
+    names = ["ok1", "ok2"] + [f"gone{i}" for i in range(10)]
+    later = [f"back{i}" for i in range(12)]
+    async with _signed_in_estate(
+        monkeypatch, names + later, ad_session_recheck_strikes=1
+    ) as estate:
+        directory, service, store, _tokens = estate
+        await _expire(store, later)
+        sink = NotifierAlertSink([], store=store)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            for name in names[2:]:
+                directory.delete(name)
+            assert (await _alerted_pass(service, sink)).aborted == "mass_revoke_breaker"
+            await _expire(store, names)
+            await _sign_in(service, later)
+            for name in later:
+                directory.delete(name)
+            for _ in range(2):
+                assert (await _alerted_pass(service, sink)).aborted == "mass_revoke_breaker"
+                assert _said(caplog, _GAVE_UP_ON_A_TRIP) == 1
+                assert _said(caplog, _TRIPPED_AGAIN) == 0
 
 
 async def test_an_account_that_leaves_after_it_read_present_does_not_forfeit_the_referral(

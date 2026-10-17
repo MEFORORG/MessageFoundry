@@ -855,9 +855,13 @@ A pass judges only accounts that hold a session, and nothing reads an account ag
 left. An account leaves at least when it signs out, reaches the session cap, is revoked by the
 reconciler, is disabled locally, or is deleted. The give-up rules above stop an alert resolving
 on the accounts that remain. The cost is a missed resolve when an account leaves for an ordinary
-reason, such as a sign-out, while the evidence is still pending. Once an engine has given up resolving
-one of these alerts, it logs one more warning each time a new condition of that same kind opens,
-saying it will not resolve that one either.
+reason, such as a sign-out, while the evidence is still pending.
+
+Once an engine has given up resolving the breaker's `ad_reconcile_aborted` instance, the referral's
+instance or `ad_reconcile_held`, it logs a warning when a later trip, referral or hold opens, saying
+it will not resolve that one either, and that a restart will not. It logs once per condition, not
+once per pass. A condition counts as new once every account behind the last one has left, or has
+been probed on a pass that did not see it. The probe fault's instance logs no such warning.
 
 **They never resolve themselves on a `[cluster]` node or in an engine that runs more than one engine
 shard.** Another engine's reconciler may still hold the condition there, so an operator resolves the
