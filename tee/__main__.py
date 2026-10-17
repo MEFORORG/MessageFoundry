@@ -500,11 +500,13 @@ def _write_owner_only(path: str, text: str) -> None:
     Windows has no POSIX mode, and the tee imports nothing from ``messagefoundry``, so the engine's
     ``restricted_file`` is out of reach. A NEW file there takes its directory's access list, the
     stance :mod:`tee.store` takes for the capture DB. An existing regular file is instead written in
-    place, so an access list an operator set on it is kept: a file renamed over it would take the
-    folder's list, and a hardened export or dataset in a looser folder would lose its hardening.
-    That write is not atomic, so a failure part way leaves the file truncated or partly written;
-    the command still prints its error line and exits 1. :func:`_write_in_place_on_windows` says
-    which files fall to the replace instead.
+    place, as ``write_text`` did before vault BACKLOG #3166, so its access list and owner are kept:
+    a file renamed over it would take the folder's list, and a hardened export or dataset in a
+    looser folder would lose its hardening. The list is kept whatever it holds, so a target looser
+    than its folder stays looser, and a file another account created stays that account's. That
+    write is not atomic, so a failure part way leaves the file truncated or partly written; the
+    command still prints its error line and exits 1. :func:`_write_in_place_on_windows` says which
+    files fall to the replace instead.
     """
     if _is_named_stream(path):
         with open(path, "w", encoding="utf-8", newline="\n") as stream:
@@ -533,28 +535,44 @@ def _write_owner_only(path: str, text: str) -> None:
 def _write_in_place_on_windows(path: str, text: str) -> bool:
     """Write ``text`` into the existing regular file at ``path``, keeping its access list.
 
-    ``False``, having written nothing, when ``path`` is missing, is not a regular file, is a reparse
-    point (a symlink or a junction), or has a second hard link; the caller then replaces it. The
-    file is opened without truncating and checked against the name's ``lstat`` before a byte is
-    written, so a name swapped for a link in between is refused rather than followed.
+    ``False``, having written nothing, when ``path`` is missing, is not a regular file, is a link
+    or junction (a name-surrogate reparse point), has a second hard link, or cannot be opened for
+    writing; the caller then replaces it. The file is opened without truncating and checked against
+    the name's ``lstat`` before a byte is written. A name swapped for a link in between is opened
+    through that link, but nothing is written to it: the check raises before the truncate.
     """
+    data = text.encode("utf-8")  # before the open, so a failure here leaves the old file whole
     try:
         named = os.lstat(path)
     except FileNotFoundError:
         return False
     reparse = getattr(named, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
-    if not stat.S_ISREG(named.st_mode) or reparse or named.st_nlink != 1:
+    # Only a name surrogate points somewhere else. A dedup or compressed file carries another tag
+    # and is still the file at this name.
+    surrogate = reparse and getattr(named, "st_reparse_tag", 0) & _REPARSE_TAG_NAME_SURROGATE
+    if not stat.S_ISREG(named.st_mode) or surrogate or named.st_nlink != 1:
         return False
-    fd = os.open(path, os.O_WRONLY | getattr(os, "O_BINARY", 0))
-    with os.fdopen(fd, "wb") as handle:
+    try:
+        fd = os.open(path, os.O_WRONLY | getattr(os, "O_BINARY", 0))
+    except (FileNotFoundError, PermissionError):
+        return False
+    try:
+        handle = os.fdopen(fd, "wb")
+    except BaseException:
+        os.close(fd)  # nothing owns the descriptor yet
+        raise
+    with handle:
         opened = os.fstat(handle.fileno())
         if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino) or opened.st_nlink != 1:
             raise OSError(f"{path} changed while it was being opened; nothing was written")
         handle.truncate(0)
-        handle.write(text.encode("utf-8"))
+        handle.write(data)
         handle.flush()
         os.fsync(handle.fileno())
     return True
+
+
+_REPARSE_TAG_NAME_SURROGATE = 0x20000000  # IsReparseTagNameSurrogate: a symlink or mount point
 
 
 def _is_named_stream(path: str) -> bool:
@@ -614,8 +632,10 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
     """Read captured bodies, de-identify them, and write a de-identified JSONL dataset (#36, ADR 0030).
 
     Fail-closed: the salt must come from the environment (never a flag/commit), and if ANY message
-    still carries a forbidden token after anonymization the whole dataset is refused — a partial,
-    possibly-leaky file is never written. Never echoes a body to stdout/stderr (only counts).
+    still carries a forbidden token after anonymization the whole dataset is refused — a dataset
+    holding a message that failed is never written, though on Windows an I/O failure part way can
+    leave a truncated one (see :func:`_write_owner_only`). Never echoes a body to stdout/stderr
+    (only counts).
     """
     salt = os.environ.get(args.salt_env, "")
     if not salt:

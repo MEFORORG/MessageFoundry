@@ -464,8 +464,9 @@ def _win_run(exe: str, *args: str) -> str:
     from messagefoundry.service_status import _system_exe
 
     done = subprocess.run(
-        [_system_exe(exe), *args], capture_output=True, text=True, check=True, encoding="mbcs"
+        [_system_exe(exe), *args], capture_output=True, text=True, check=False, encoding="mbcs"
     )
+    assert done.returncode == 0, f"{exe} {args}: {done.stderr or done.stdout}"
     return done.stdout
 
 
@@ -494,7 +495,8 @@ def test_out_keeps_the_access_list_of_a_hardened_target_on_windows(
     # or dataset an operator had hardened would lose that hardening in a looser folder.
     scratch = tmp_path / "acl"
     out = tmp_path / "out.json"
-    out.write_text("stale\n", encoding="utf-8")
+    # Longer than any output, so a write that skipped the truncate would leave stale bytes behind.
+    out.write_text("stale\n" * 4000, encoding="utf-8")
     _win_run("icacls.exe", str(out), "/inheritance:r", "/grant:r", f"*{_own_sid()}:F")
     hardened = _sddl_of(out, scratch)
     sibling = tmp_path / "fresh.json"
@@ -510,10 +512,7 @@ def test_out_keeps_the_access_list_of_a_hardened_target_on_windows(
     assert not list(tmp_path.glob("*.tmp"))
 
 
-@_WINDOWS_ACLS
-def test_out_replaces_a_second_hard_link_on_windows(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_out_replaces_a_second_hard_link(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Writing in place through a name with a second link would also rewrite the other name.
     other = tmp_path / "elsewhere.json"
     other.write_text("untouched\n", encoding="utf-8")
@@ -522,3 +521,22 @@ def test_out_replaces_a_second_hard_link_on_windows(
     assert _export_to(tmp_path, out) == 0
     assert other.read_text(encoding="utf-8") == "untouched\n"
     assert b"untouched" not in out.read_bytes()
+
+
+@_WINDOWS_ACLS
+def test_out_is_refused_when_the_name_changes_while_it_is_opened_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The lstat names one file and the open reaches another, as a name swapped for a link between
+    # the two would: nothing is written and the command fails with its error line.
+    out = tmp_path / "out.json"
+    out.write_text("untouched\n", encoding="utf-8")
+    decoy = tmp_path / "decoy.json"
+    decoy.write_text("x\n", encoding="utf-8")
+    real_lstat = os.lstat
+    monkeypatch.setattr(
+        os, "lstat", lambda path, *a, **k: real_lstat(decoy if str(path) == str(out) else path)
+    )
+    assert _export_to(tmp_path, out) == 1
+    assert "error: could not write the export" in capsys.readouterr().err
+    assert out.read_text(encoding="utf-8") == "untouched\n"
