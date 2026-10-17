@@ -474,8 +474,6 @@ from messagefoundry.transports.base import (
     TestNotSupportedError,
 )
 from messagefoundry.uploads import (
-    STRAGGLER_CANCEL_GRACE_SECONDS,
-    STRAGGLER_DRAIN_SECONDS,
     UploadContentError,
     UploadedFileMeta,
     UploadNotFoundError,
@@ -1302,18 +1300,17 @@ def _app_drain_steps(
     steps = [_TeardownStep("the long-operations drain", 2.0, _outliving)]
     uploads: UploadStore | None = getattr(app.state, "upload_store", None)
     if uploads is not None:
-
-        async def _uploads(bound: float) -> None:
-            # Two thirds of its share waiting, the rest the grace for what it then cancels, each
-            # capped at the drain's own defaults, so it cancels its ledger calls and save-time
-            # sweeps before the teardown cuts the step.
-            share = bound * _INNER_SHARE
-            wait = min(STRAGGLER_DRAIN_SECONDS, share * 2 / 3)
-            await uploads.drain_stragglers(
-                wait, grace=min(STRAGGLER_CANCEL_GRACE_SECONDS, share - wait)
+        # The smallest floor a drain here has: it usually returns at once, and every floor comes
+        # out of the earlier steps' bounds, the long-operations drain's rollback grace among them.
+        # What it fails to drain costs a quota slot that goes stale, never a lost audit row of a
+        # DR operation. Handed a share of its bound, so it cancels what it owns before the cut.
+        steps.append(
+            _TeardownStep(
+                "the upload straggler drain",
+                0.25,
+                lambda b: uploads.drain_stragglers_within(b * _INNER_SHARE),
             )
-
-        steps.append(_TeardownStep("the upload straggler drain", 0.5, _uploads))
+        )
     gate: ApprovalGate | None = getattr(app.state, "approval_gate", None)
     if gate is not None:
         steps.append(

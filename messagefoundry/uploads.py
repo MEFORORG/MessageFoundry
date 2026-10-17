@@ -112,8 +112,10 @@ _RESERVATION_HEARTBEAT_SECONDS = 100.0
 # bounded by ``max_upload_bytes`` (512 MiB at most), so an hour is far past any healthy save.
 _RESERVATION_HEARTBEAT_MAX_SECONDS = 3600.0
 # How long the heartbeat waits for one touch before it goes on without it (BACKLOG #3256). The
-# touch is left running, never cancelled, so a slow touch that lands still refreshes the row. Well
-# under the interval, so the wait never delays the next beat by much.
+# heartbeat leaves the touch running and never cancels it, so a slow touch that lands still
+# refreshes the reservation. One still running when the heartbeat ends is held as a straggler, so
+# it is cancelled at ``_LEDGER_STRAGGLER_MAX_SECONDS`` or by the shutdown drain (vault BACKLOG
+# #3180). Well under the interval, so the wait never delays the next beat by much.
 _RESERVATION_TOUCH_WAIT_SECONDS = 10.0
 
 # How long a ledger call a cancelled save left running may run before it is cancelled (vault
@@ -125,11 +127,11 @@ _LEDGER_STRAGGLER_MAX_SECONDS = 60.0
 # How long :meth:`UploadStore.drain_stragglers` waits at shutdown for the calls and save-time sweeps
 # a cancelled save left running, then how long it waits for the ones it cancels (vault BACKLOG
 # #3180). These are upper limits. Both lifespans run the drain as one step of the API teardown,
-# under its one shutdown budget (``api.app._SHUTDOWN_BUDGET_SECONDS``, BACKLOG #3191), and hand it a
-# share of that step's bound, so the drain's own waits end, and cancel what is left, before the
-# teardown cuts the step.
-STRAGGLER_DRAIN_SECONDS = 2.0
-STRAGGLER_CANCEL_GRACE_SECONDS = 1.0
+# under its one shutdown budget (``api.app._SHUTDOWN_BUDGET_SECONDS``, BACKLOG #3191), through
+# :meth:`UploadStore.drain_stragglers_within`, which fits both waits inside a share of that step's
+# bound, so the drain's own waits end, and cancel what is left, before the teardown cuts the step.
+_STRAGGLER_DRAIN_SECONDS = 2.0
+_STRAGGLER_CANCEL_GRACE_SECONDS = 1.0
 
 # How much of a refused plaintext sidecar the quota reads to find the uploader it bills (BACKLOG
 # #2322). A sidecar the engine wrote is a few hundred bytes. Past this the owner counts as unknown.
@@ -259,11 +261,12 @@ class UploadQuotaError(UploadError):
       cancelled there; a reserve whose statement commits after its call was cancelled; and a call
       the shutdown drain cancels. The module logs each at WARNING. **On Postgres and SQL Server the
       stamp and the staleness test both read the database server's clock (BACKLOG #3256),** so an
-      engine host's skew no longer moves either. A server clock stepped forward still holds a
-      leaked slot longer by the step, since the stamp never moves backwards, and so does a failover
-      to a replica whose clock lags the old primary's; a replica whose clock runs ahead can reclaim
-      a live slot early. So the database servers' own time sync now carries what each engine
-      host's did. SQLite reads the engine host's clock, and only one host ever writes a SQLite
+      engine host's skew no longer moves either. A server clock that ran ahead and is stepped
+      back still holds a slot it stamped meanwhile longer by the step, since the stamp never moves
+      backwards, and so does a failover to a replica whose clock lags the old primary's. A server
+      clock stepped forward, or a failover to a replica whose clock runs ahead, makes every slot
+      look older by the step, so it can reclaim a live slot early (the next bullet). So the
+      database servers' own time sync now carries what each engine host's did. SQLite reads the engine host's clock, and only one host ever writes a SQLite
       store, because ``require_unified_store`` refuses SQLite for more than one engine shard.
     * **A reclaimed live reservation (BACKLOG #2648).** The store reclaims a reservation with no
       activity for ``UPLOAD_RESERVATION_STALE_AFTER``, and it cannot tell a dead holder from a slow
@@ -272,8 +275,9 @@ class UploadQuotaError(UploadError):
       reclaimed in at least these cases: its holder lands no touch for the whole window while it is
       alive (a suspended process or VM, an event loop starved for minutes, or a store this shard
       cannot reach while a sibling can); its save outlives ``_RESERVATION_HEARTBEAT_MAX_SECONDS``;
-      its touches stall on the store for the whole window; or one touch never returns, since no
-      second touch starts while one runs (BACKLOG #3256). A sibling then counts neither that file
+      its touches stall on the store for the whole window; one touch never returns, since no
+      second touch starts while one runs (BACKLOG #3256); or the database server's clock steps
+      forward by a large part of the window. A sibling then counts neither that file
       nor its slot until the file lands. The holder's later release deletes only its own row, so
       the undercount ends with that save. That restores the N-1 bound above while it lasts, never
       worse than the pre-#1112 behaviour. Host clock skew is not one of these cases on the server
@@ -1449,11 +1453,21 @@ class UploadStore:
 
         fut.add_done_callback(_done)
 
+    async def drain_stragglers_within(self, budget: float) -> None:
+        """:meth:`drain_stragglers` with both of its waits fitted inside ``budget`` seconds, the
+        form a shutdown step under one teardown budget calls (BACKLOG #3191). Two thirds of it
+        waiting and the rest the grace for what it then cancels, each capped at the drain's own
+        default."""
+        wait = max(0.0, min(_STRAGGLER_DRAIN_SECONDS, budget * 2 / 3))
+        await self.drain_stragglers(
+            wait, grace=max(0.0, min(_STRAGGLER_CANCEL_GRACE_SECONDS, budget - wait))
+        )
+
     async def drain_stragglers(
         self,
-        timeout: float = STRAGGLER_DRAIN_SECONDS,
+        timeout: float = _STRAGGLER_DRAIN_SECONDS,
         *,
-        grace: float = STRAGGLER_CANCEL_GRACE_SECONDS,
+        grace: float = _STRAGGLER_CANCEL_GRACE_SECONDS,
     ) -> None:
         """Let what a cancelled save left running finish before the store closes (vault BACKLOG
         #3180): the ledger calls, the late releases they spawn, and the save-time sweeps. The

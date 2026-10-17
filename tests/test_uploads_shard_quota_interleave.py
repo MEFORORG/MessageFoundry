@@ -313,8 +313,8 @@ async def test_the_server_backends_stamp_since_with_the_database_clock(
     """BACKLOG #3256 item 1. ``since`` was stamped from the engine host's clock, so one host a
     decade ahead stamped a reservation no sibling could age for a decade. The reserve and the touch
     now read the database server's clock, on each reservation's own row (vault BACKLOG #3180).
-    Shard A's host runs a decade ahead and its slot leaks. Shard B, on a host with a true clock,
-    then reserves with ``stale_after=0``, which reclaims anything stamped at or before now: A's
+    Engine shard A's host runs a decade ahead and its slot leaks. Engine shard B, on a host with a
+    true clock, then reserves with ``stale_after=0``, which reclaims anything stamped at or before now: A's
     leaked slot goes. Red before the fix: A's stamp is a decade ahead, nothing is reclaimed, and B
     counts two slots."""
     import importlib

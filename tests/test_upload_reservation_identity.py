@@ -411,9 +411,29 @@ async def test_the_managed_teardown_hands_the_straggler_drain_a_share_of_its_ste
     [(timeout, grace)] = waits
     bound = bounds[bounds.index(-1.0) - 1]
     assert timeout + grace <= bound * app_module._INNER_SHARE + 1e-9
-    assert timeout <= uploads_mod.STRAGGLER_DRAIN_SECONDS
-    assert grace <= uploads_mod.STRAGGLER_CANCEL_GRACE_SECONDS
+    assert timeout <= uploads_mod._STRAGGLER_DRAIN_SECONDS
+    assert grace <= uploads_mod._STRAGGLER_CANCEL_GRACE_SECONDS
     assert grace > 0.0
+
+
+@pytest.mark.parametrize(
+    ("budget", "expected"),
+    [(0.3, (0.2, 0.1)), (10.0, (2.0, 1.0)), (0.0, (0.0, 0.0))],
+)
+async def test_drain_stragglers_within_fits_both_waits_inside_the_budget(
+    tmp_path: Path, budget: float, expected: tuple[float, float]
+) -> None:
+    store = _uploads(tmp_path, None)
+    waits: list[tuple[float, float]] = []
+
+    async def _drain(timeout: float, *, grace: float) -> None:
+        waits.append((timeout, grace))
+
+    store.drain_stragglers = _drain  # type: ignore[method-assign,assignment]
+    await store.drain_stragglers_within(budget)
+    [(timeout, grace)] = waits
+    assert (timeout, grace) == pytest.approx(expected)
+    assert timeout + grace <= budget + 1e-9
 
 
 async def test_the_embedded_teardown_drains_the_upload_stragglers(tmp_path: Path) -> None:
@@ -431,7 +451,7 @@ async def test_the_embedded_teardown_drains_the_upload_stragglers(tmp_path: Path
         calls: list[str] = []
 
         class _Uploads:
-            async def drain_stragglers(self, timeout: float, *, grace: float) -> None:
+            async def drain_stragglers_within(self, budget: float) -> None:
                 calls.append("uploads")
 
         async def _outliving(timeout: float = 0.0, *, grace: float = 0.0) -> list[str]:
