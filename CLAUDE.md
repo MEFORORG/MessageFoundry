@@ -350,18 +350,20 @@ In both, re-read the head SHA right before arming, and check that the review cov
 is a push after arming that merges with no review. GitHub's docs name at least two events that
 disable auto-merge: a push by an account *"without write permissions"*, and a base-branch switch.
 A write-access push is neither, so auto-merge stays armed. The vault's `main` needs no approval. On
-the engine, arming while required checks are pending sets a deferred request. That request is not
-yet a queue entry, so the same window opens.
+the engine, arming at a moment GitHub will not enqueue the PR sets a deferred request instead.
+That happened at least while required checks were pending, on a BEHIND PR, and while a non-required
+leg was still running. That request is not yet a queue entry, so the same window opens.
 
-1. Arm only once required checks are green. On the engine, run `gh pr merge <N>
-   --match-head-commit <sha>` only once the branch is up to date with `main` AND every check on the
-   head has finished, required or not. **Green required checks are not enough:** on a BEHIND PR,
-   and while a non-required leg was still running, the same command set a deferred auto-merge
-   request instead of a queue entry, which reopens the window (measured twice, Lander comments on
-   engine PR 2232, 2026-10-11). Then read back that the PR has a `mergeQueue` entry and that
-   `autoMergeRequest` is null; a non-null `autoMergeRequest` is the deferred request, so disarm it
-   and wait. On the vault, add `--auto` and the merge-method flag, because gh refuses a no-queue
-   merge without one when no terminal is attached.
+1. Arm only once checks allow it. On the vault, that is once required checks are green; add
+   `--auto` and the merge-method flag, because gh refuses a no-queue merge without one when no
+   terminal is attached. On the engine, green required checks are **not enough**: run `gh pr merge
+   <N> --match-head-commit <sha>` only once the branch is up to date with `main` AND every check on
+   the head has finished, required or not. On a BEHIND PR, and while a non-required leg was still
+   running, that command set a deferred auto-merge request instead of a queue entry (measured
+   twice, Lander comments on engine PR 2232, 2026-10-11). Then read back, through GraphQL, that the
+   PR's `mergeQueueEntry` is non-null and its `autoMergeRequest` is null. Do not read
+   `PullRequest.mergeQueue`, which names the target queue whether or not the PR is in it. A
+   non-null `autoMergeRequest` is the deferred request, so disarm it and wait.
 2. Pin the full 40-character SHA of the head you re-read, since gh refuses a short one. If you
    updated the branch, wait for the new head, and confirm it adds only a clean merge of `main`.
    Post the pinned SHA on the PR as a comment. On both paths, gh 2.93.0 sends it as
