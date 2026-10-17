@@ -4921,6 +4921,11 @@ _ALERT_EVENT_TYPES = frozenset(
         # several engine processes share the store, which no connection can be named. It has no
         # inverse: a refusal is an event, not a state that clears.
         "remote_debug_refused",
+        # vault BACKLOG #2724 (owner ruling 2026-10-16): a [sandbox].mode = "subprocess" worker was
+        # refused because the graph it loaded differs from the engine's, most often a config file
+        # edited on disk with no reload. Keyed by the inbound's name, once per refusal. Not in
+        # _ALERT_CONTROL_EVENT_TYPES: a restart reloads nothing, so it cannot clear the cause.
+        "sandbox_worker_refused",
         # NOTE: the INVERSE events (leadership_lost / dr_released / intake_resumed /
         # ad_reconcile_breaker_cleared / ad_reconcile_hold_released) are auto-resolve-only
         # (alert_sinks _AUTO_RESOLVE), NOT rule-targetable alert types -- a step-down, a fail-back,

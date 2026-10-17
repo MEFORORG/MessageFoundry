@@ -28,6 +28,7 @@ import functools
 import json
 import logging
 import math
+import threading
 import time
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from concurrent.futures import CancelledError as FutureCancelledError
@@ -181,6 +182,7 @@ from messagefoundry.pipeline.sandbox import (
     SandboxPolicy,
     SandboxSession,
     SandboxSessionClosed,
+    SandboxWorkerRefused,
     graph_shape,
 )
 from messagefoundry.pipeline.saturation import SaturationDetector
@@ -1289,6 +1291,10 @@ class RegistryRunner:
         self._sandbox_config_source = sandbox_config_source
         self._sandbox_sessions: dict[str, SandboxSession] = {}
         self._sandbox_graph_shape: tuple[Registry, GraphShape] | None = None
+        # Sessions read that cache from their worker threads. Two building it at once would each
+        # get their own object, and a session matches its cached refusal by identity, so it would
+        # start a worker and alert again for the same refusal (vault BACKLOG #2724).
+        self._sandbox_graph_shape_lock = threading.Lock()
         # ADR 0013 Increment 2: the loop-prevention cap for re-ingress. A re-ingressed message at this
         # correlation depth still routes; the next hop (depth+1) dead-letters its work-row and ERRORs the
         # origin. Coarse by design (bounds total work, not topology). From [pipeline] max_correlation_depth.
@@ -5393,10 +5399,12 @@ class RegistryRunner:
         graph, so one per session would cost the square of the connection count. A session calls
         this at each worker spawn, from its worker thread, so it always compares with the registry
         being served then, whichever way ``self.registry`` was last swapped."""
-        cached = self._sandbox_graph_shape
-        if cached is None or cached[0] is not self.registry:
-            cached = self._sandbox_graph_shape = (self.registry, graph_shape(self.registry))
-        return cached[1]
+        with self._sandbox_graph_shape_lock:
+            cached = self._sandbox_graph_shape
+            registry = self.registry
+            if cached is None or cached[0] is not registry:
+                cached = self._sandbox_graph_shape = (registry, graph_shape(registry))
+            return cached[1]
 
     async def _close_sandbox_sessions(self) -> None:
         """Drop every sandbox session and close its worker, off the loop: each ``close()`` waits on
@@ -5474,21 +5482,41 @@ class RegistryRunner:
         then). Raising also starts no session for an inbound the reload removed. The caller lets the
         exception past its internal-error policy to the worker's fault arm, which re-pends the row
         (per-lane #1611, pooled ADR 0070 T17), and the next claim reads the registry, the inbound and
-        the session afresh. Either way the message is not dead-lettered for the close."""
+        the session afresh. Either way the message is not dead-lettered for the close.
+
+        A worker refused for a graph mismatch raises the ``sandbox_worker_refused`` alert here, on
+        the loop, before the exception goes on to the internal-error policy unchanged (vault BACKLOG
+        #2724, owner ruling 2026-10-16: alert, keep dead-letter). Only the refusal that compared the
+        graphs raises it; the session's cached refusals for later messages do not."""
         try:
-            return await asyncio.to_thread(
-                fn, registry, *args, sandbox=self._sandbox_for(name), **kwargs
-            )
-        except SandboxSessionClosed:
-            if self._stop.is_set() or self.registry is not registry:
-                raise
-            log.info(
-                "inbound %r: its sandbox worker was recycled mid-dispatch; retrying",
-                name,
-            )
-            return await asyncio.to_thread(
-                fn, registry, *args, sandbox=self._sandbox_for(name), **kwargs
-            )
+            try:
+                return await asyncio.to_thread(
+                    fn, registry, *args, sandbox=self._sandbox_for(name), **kwargs
+                )
+            except SandboxSessionClosed:
+                if self._stop.is_set() or self.registry is not registry:
+                    raise
+                log.info(
+                    "inbound %r: its sandbox worker was recycled mid-dispatch; retrying",
+                    name,
+                )
+                return await asyncio.to_thread(
+                    fn, registry, *args, sandbox=self._sandbox_for(name), **kwargs
+                )
+        except SandboxWorkerRefused as exc:
+            # Not for a refusal computed against a graph a reload has since replaced: the reload
+            # is the remedy, so the alert would stay open with nothing left to fix. The graph the
+            # worker was compared with is checked, not ``registry``: a reload that swapped and
+            # then rolled back leaves ``registry`` served though the comparison used the other.
+            if exc.first and (exc.graph is None or exc.graph is self._engine_graph_shape()):
+                # The whole refusal, once: what differs and both digests. A dead-lettered message
+                # keeps only the first 200 characters of it. Config names and digests, no message.
+                log.warning("inbound %r: %s", name, exc)
+                try:
+                    self._alert_sink.sandbox_worker_refused(name, content_only=exc.content_only)
+                except Exception:
+                    log.exception("alert sink raised on sandbox_worker_refused for %r", name)
+            raise
 
     async def stop(
         self,
