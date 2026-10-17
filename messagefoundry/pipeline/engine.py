@@ -259,9 +259,9 @@ class ReloadOutcome:
     ``restart_required`` names each settings trust anchor the settings preflight found changed on
     disk since its consumer loaded it. The reload checked the new file but does not apply it, so
     those take a restart (BACKLOG #2185, #3015). ``None`` means not checked: a dry run skips the
-    preflight. An empty tuple means no anchor the preflight covers changed, including when no
-    preflight is configured; :class:`~messagefoundry.api.models.ReloadResult` says what it never
-    covers."""
+    preflight. An empty tuple means no anchor the preflight reports on changed, including when no
+    preflight is configured. It covers this process only, and never at least the anchors whose
+    consumer records no loaded fingerprint, such as the dialling settings CAs."""
 
     registry: Registry
     applied: bool

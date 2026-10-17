@@ -615,19 +615,20 @@ class ReloadResult(BaseModel):
     (``config_fingerprint``, ``reference_sync``, ``cluster_propagate``, and ``audit`` when the
     ``config_reload`` audit row failed after the swap, BACKLOG #1940).
 
-    ``restart_required`` names each settings trust anchor (for example
-    ``[auth].ad_tls_ca_cert_file``) whose file changed on disk since the engine loaded it. The
+    ``restart_required`` names each settings trust anchor whose consumer loaded its bytes at start
+    (for example ``[auth].ad_tls_ca_cert_file``) and whose file has changed on disk since. The
     reload checked the new file and passed it, but no reload rebuilds the consumer that loaded the
     old one, so the engine keeps trusting the old CA until it restarts (BACKLOG #2185, #3015).
     ``None`` means **not checked**: a dry run skips the settings preflight, so it cannot say.
 
     An empty list is narrower than "no restart needed". It means no anchor this field covers
-    changed, including when none is configured. It covers only the node that answered, so in a
-    cluster each node that converges on the reload reports its own anchors in its log and audit
-    trail, not here. It never lists at least the dialling settings CAs (``[tls].internal_ca_file``,
-    ``[alerts].email_tls_ca_file``, ``[logging].forward_tls_ca_file``): their hops load the file by
-    path and record no fingerprint to compare with. A changed one can still need a restart or a
-    rebuild of the connections that use it; ``docs/SECURITY.md`` says which."""
+    changed, including when none is configured. It covers only the engine process that answered:
+    another engine shard, or a cluster node that converges on the reload, reports its own anchors
+    only in its own log, as the audit row names no node. It never lists at least the dialling
+    settings CAs (``[tls].internal_ca_file``, ``[alerts].email_tls_ca_file``,
+    ``[logging].forward_tls_ca_file``): their hops load the file by path and record no fingerprint
+    to compare with. A changed one can still need a restart or a rebuild of the connections that
+    use it; ``docs/SECURITY.md`` says which."""
 
     inbound: int
     outbound: int
