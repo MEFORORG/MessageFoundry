@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Iterator
 from contextlib import contextmanager
 from string import ascii_letters, digits
@@ -72,7 +73,7 @@ def _paths_keeping(text: str, *values: str) -> list[str]:
 def _rule_off() -> Iterator[None]:
     """The redactor as it was before BACKLOG #3318: every field run scrubbed as main scrubs it."""
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(redaction, "_glued_value", lambda text, run: None)
+        patch.setattr(redaction, "_glued_value", lambda *args: None)
         yield
 
 
@@ -238,6 +239,65 @@ def test_the_mask_keeps_main_length_and_class(
     assert value in safe_text(text, limit=limit)
 
 
+#: ``(an answer's input, text a caller glues straight after it, a value main hid)``: found by code
+#: review round 1. Each printed on the head before that repair, and main hides each.
+_GLUED_AFTER = {
+    "segment-id head": (
+        "bad A^B^C,PatientName: ZqMSH",
+        "*^~\\&*A*B\rPID*1**DOEX$JANEX",
+        "DOEX",
+    ),
+    "short segment-id head": ("bad A^B^C,PatientName: ZqM", "SH*^~\\&*A*B\rPID*1**DOEX", "DOEX"),
+    "backstop opener head": (
+        "bad A^B^C,PatientName: Zqnon",
+        "numeric port: 'hunterpw@host'",
+        "hunterpw",
+    ),
+    "digits before a stripped space": ("bad A^B^C,PatientName: 1980 ", "0505 retry", "0505"),
+}
+
+
+@pytest.mark.parametrize("name", list(_GLUED_AFTER))
+def test_text_glued_after_an_answer_prints_nothing_main_hid(name: str) -> None:
+    text, after, value = _GLUED_AFTER[name]
+    assert value not in _through_the_chain(safe_exc(ValueError(text)) + after)
+    with _rule_off():
+        assert value not in _through_the_chain(safe_exc(ValueError(text)) + after)
+
+
+def test_the_bundle_marker_head_is_refused() -> None:
+    """The support bundle reads ``mfb64:v1:`` with no boundary before it."""
+    line = _through_the_chain(safe_exc(ValueError("bad A^B^C,PatientName: mfb"))) + "64:v1:QUJDREVG"
+    assert "QUJDREVG" not in redact_log_line(line)
+
+
+def test_the_boundary_free_heads_are_what_guard_glued_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE POSITIVE CONTROL: without the heads, a masked ``ZqMSH`` no longer declares the caller's
+    delimiters, and the field it scrubbed prints."""
+    text, after, value = _GLUED_AFTER["segment-id head"]
+    monkeypatch.setattr(redaction, "_UNBOUNDED_HEADS", frozenset())
+    assert value in _through_the_chain(safe_exc(ValueError(text)) + after)
+
+
+def test_a_run_over_declared_delimiters_masks_a_glued_value() -> None:
+    text = 'MSH*^~\\&*A*B\r x*y*z,"name":"Zqxdoe Vandtjane"}'
+    assert "Vandtjane" not in redact(text)
+    with _rule_off():
+        assert "Vandtjane" in redact(text)
+
+
+def test_a_top_level_value_key_is_not_masked() -> None:
+    """``value`` is PHI only under ``identifier`` or ``telecom``, as the structured pass reads it."""
+    text = 'bad x|y|z,"value":"Retry later please"} ok'
+    with _rule_off():
+        main = redact(text)
+    assert redact(text) == main
+
+
+def test_a_short_unquoted_value_is_masked() -> None:
+    assert redact("bad A^B^C,mrn= 12 x") == "bad [redacted] 00 x"
+
+
 def test_a_clamped_record_still_gets_the_rule() -> None:
     text = _SHAPES["compact-json"][0] + " " + "w " * redaction._REDACT_WINDOW
     assert "Vandtjane" not in redaction.redact_untrusted(text)
@@ -257,11 +317,17 @@ def test_the_glued_labels_spell_the_structured_vocabulary() -> None:
     """The glued-label patterns spell the vocabulary out for the ReDoS scanner, so they are pinned to
     the sets the structured passes read: a key added there and missed here fails this."""
     vocabulary = redaction._PHI_LEAF_KEYS | redaction._PHI_VALUE_KEYS
-    for key in vocabulary | {"value"}:
+    for key in vocabulary:
         assert redaction._GLUED_QUOTED_LABEL.search(f'"{key}":"')
+    assert redaction._GLUED_QUOTED_LABEL.search('"identifier":{"value":"')
     for key in vocabulary:
         assert redaction._GLUED_XML_LABEL.fullmatch(f"<{key}>Zq")
         assert redaction._XML_PHI_ELEMENT.match(f"<{key}>")
+    # And the other way: every word the patterns spell is one the structured passes read.
+    for pattern in (redaction._GLUED_QUOTED_LABEL, redaction._GLUED_XML_LABEL):
+        spelled = re.search(r"\(\?:([a-zA-Z|]+)\|0010|\(\?:([a-zA-Z|]+)\)>", pattern.pattern)
+        assert spelled is not None
+        assert set((spelled.group(1) or spelled.group(2)).split("|")) == vocabulary
 
 
 def test_the_word_screen_holds_the_words_the_passes_spell() -> None:

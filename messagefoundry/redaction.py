@@ -1860,6 +1860,10 @@ _STRUCTURED_ROUNDS = 8
 # * Nothing in it may be read LITERALLY: no word that is, or begins, a word a pass here or a filter
 #   after it spells (:data:`_ANCHOR_PREFIXES`), and no date (:data:`_DATE_RUN`, which reads ``19``).
 #   A masked ``MRN`` or ``bearer`` would switch off a gate main's answer kept on.
+# * A value that ends the answer, trailing whitespace aside, is one a caller can glue text onto, so
+#   its last word must be letters (a caller's digits would join a date arm main's digits fed), and
+#   must not end in the head of a word read with no boundary before it (:data:`_UNBOUNDED_HEADS`):
+#   main's ``...ZqMSH`` plus a caller's ``*^~\&*`` declares delimiters, and a mask would not.
 #
 # Where any of that fails, the token is scrubbed exactly as main scrubs it. Residuals, at least these:
 # a value holding punctuation, a non-ASCII letter or one of those words; a value longer than
@@ -1871,7 +1875,7 @@ _STRUCTURED_ROUNDS = 8
 #: a Python repr, an array or an ``identifier``'s ``value`` member between), or a ``Patient...``
 #: label. Searched in a window ending at the token's last quote, so ``\Z`` is that quote.
 _GLUED_QUOTED_LABEL = re.compile(
-    r"""(?:(["'])(?:family|given|name|birthDate|address|identifier|telecom|value|0010[0-9A-Fa-f]{4})"""
+    r"""(?:(["'])(?:family|given|name|birthDate|address|identifier|telecom|0010[0-9A-Fa-f]{4})"""
     r"""\1:[\[{]?(?:(["'])value\2:)?|(?<!\w)Patient[A-Za-z]*+['"]?[=:])["']\Z"""
 )
 #: The tail of a token that ends inside an XML element's text: a vocabulary start tag, then text.
@@ -1895,6 +1899,9 @@ _GLUED_BARE_VALUE = re.compile(r" ++[A-Za-z0-9]{1,64}+(?= |\Z)")
 #: the word before the quote a label.
 _QUOTE_FOLLOWERS = frozenset(",;}])>/<")
 _GLUED_WORD = re.compile(r"[A-Za-z0-9]++")
+#: Something a glued label needs in its token, searched before the per-run work: a quote, a tag, or
+#: an unquoted label's last character.
+_GLUED_HINT = re.compile(r"""["'<]|[:=#)]\Z|(?i:mrn)\Z""")
 _SHAPE = str.maketrans(ascii_uppercase + ascii_lowercase + digits, "X" * 26 + "x" * 26 + "0" * 10)
 #: Every prefix of every word that a pass here, or a filter after it, reads literally, lower-cased.
 #: Taken from the patterns' own sources, so a word added there is refused here; the regex syntax they
@@ -1915,9 +1922,17 @@ _ANCHOR_PREFIXES = frozenset(
     for word in re.findall(r"[a-z]{2,}", source.lower())
     for end in range(1, len(word) + 1)
 )
+#: Every prefix of a word some pass reads with no word boundary before it, so a caller's text glued
+#: after a masked word could complete it: at least the segment ids :data:`_MSH_DELIMITERS` sniffs,
+#: the backstop's opener, and the support bundle's ``mfb64:`` marker (spelled here, as above).
+_UNBOUNDED_HEADS = frozenset(
+    word[:end]
+    for word in ("msh", "bhs", "fhs", "nonnumeric", "mfb")
+    for end in range(1, len(word) + 1)
+)
 
 
-def _glued_value(text: str, run: re.Match[str]) -> str | None:
+def _glued_value(text: str, run: re.Match[str], field_run: re.Pattern[str]) -> str | None:
     """The rest of a PHI value that the field run ``run`` cut through, when it is safe to mask: the
     text after the token, up to the value's terminator. ``None`` leaves the token as main scrubs it."""
     token, end = run.group(), run.end()
@@ -1947,30 +1962,33 @@ def _glued_value(text: str, run: re.Match[str]) -> str | None:
     words = _GLUED_WORD.findall(rest.lower())
     if not words or any(word in _ANCHOR_PREFIXES for word in words) or _DATE_RUN.search(rest):
         return None
-    if stop == len(text) and not words[-1].isalpha():
-        return None  # a caller may append digits, which a date arm would join to the masked ones
-    # A last word glued to the terminator: two letters there can be a string prefix (``b"``, ``rb"``),
-    # and a run through the terminator's token would start inside the mask.
-    if not rest.endswith(" ") and (
-        len(words[-1]) <= 2 or _HL7_FIELD_RUN.match(text, stop - len(words[-1])) is not None
+    last = words[-1]
+    if not text[stop:].strip() and (
+        not last.isalpha() or any(last[i:] in _UNBOUNDED_HEADS for i in range(len(last)))
     ):
+        return None  # it ends the answer, and a caller's glued text could read it
+    # A last word glued to a quote or a tag: two letters there can be a string prefix (``b"``,
+    # ``rb"``), and a run through the terminator's token would start inside the mask.
+    glued = not rest.endswith(" ") and text[stop : stop + 1] not in ("", " ")
+    if glued and (len(last) <= 2 or field_run.match(text, stop - len(last)) is not None):
         return None
     return rest
 
 
-def _scrub_field_runs(text: str) -> str:
-    """:data:`_HL7_FIELD_RUN` replaced by the placeholder, and the rest of a PHI value a run cut
-    through masked in place (:func:`_glued_value`)."""
+def _scrub_field_runs(text: str, field_run: re.Pattern[str] = _HL7_FIELD_RUN) -> str:
+    """``field_run`` replaced by the placeholder, and the rest of a PHI value a run cut through
+    masked in place (:func:`_glued_value`)."""
     if _USERINFO_OPENER in text:
-        return _HL7_FIELD_RUN.sub(_REDACTED, text)
+        return field_run.sub(_REDACTED, text)
     out: list[str] = []
     pos = 0
-    for run in _HL7_FIELD_RUN.finditer(text):
+    for run in field_run.finditer(text):
         out.append(text[pos : run.start()])
         out.append(_REDACTED)
         pos = run.end()
-        # Every value it masks opens with a space, so most runs skip the call.
-        rest = _glued_value(text, run) if text.startswith(" ", pos) else None
+        # Every value it masks opens with a space, and its token holds a hint, so most runs skip it.
+        candidate = text.startswith(" ", pos) and _GLUED_HINT.search(text, run.start(), pos)
+        rest = _glued_value(text, run, field_run) if candidate else None
         if rest is not None:
             out.append(rest.translate(_SHAPE))
             pos += len(rest)
@@ -2018,7 +2036,7 @@ def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
     if not declared <= _DEFAULT_DELIMITERS:
         segment, field_run = _delimiter_patterns(declared | _DEFAULT_DELIMITERS)
         scrubbed = segment.sub(lambda m: f"{m.group(1)}{m.group(2)}{_REDACTED}", scrubbed)
-        scrubbed = field_run.sub(_REDACTED, scrubbed)
+        scrubbed = _scrub_field_runs(scrubbed, field_run)
     # Before the name run, which would otherwise take the label of `PATIENT MRN 12345` and leave the
     # number behind (BACKLOG #2079).
     if widened:
