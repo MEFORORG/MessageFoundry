@@ -1677,7 +1677,8 @@ The first refusal stops that target.
 
 **What each one refuses is written once, in the comment block at the top of
 [`remove-scratch.ps1`](../scripts/worktree/remove-scratch.ps1)**, under *THE CHECKS*. This page does
-not repeat the list, so the two cannot drift apart.
+not repeat that list. The table under *Whose folder it is* below does repeat the idle windows, so a
+change to a window changes both.
 
 Two results surprise people. The script refuses every target while `TEMP` is spelled differently
 from the temp root, a redirected or 8.3-spelled `TEMP` included. And a scratchpad worktree goes

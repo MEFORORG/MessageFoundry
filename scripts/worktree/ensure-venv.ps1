@@ -104,7 +104,7 @@ def same_tree(a, b):
 for name in ('messagefoundry', 'messagefoundry_webconsole'):
     try:
         spec = importlib.util.find_spec(name)
-    except Exception as exc:
+    except (ImportError, ValueError) as exc:
         print(name, 'BAD it could not be located:', repr(exc))
         continue
     if spec is None or not spec.submodule_search_locations:
@@ -118,12 +118,25 @@ for name in ('messagefoundry', 'messagefoundry_webconsole'):
         print(name, 'OK copy-matching-source', where)
     else:
         print(name, 'BAD it imports from', where, 'which is not', source, 'or a current copy of it')
+
+# -Sqlserver asks for an extra the package checks cannot see. aioodbc is the one package it adds.
+if sys.argv[2] == 'sqlserver':
+    if importlib.util.find_spec('aioodbc') is None:
+        print('aioodbc BAD the [sqlserver] extra is not installed')
+    else:
+        print('aioodbc OK installed')
 '@
 
 function Get-ImportState {
-    $lines = @($importCheck | & $venvPy -I -X utf8 - $root 2>&1 | ForEach-Object { "$_" })
-    if ($LASTEXITCODE -ne 0 -or $lines.Count -ne 2) {
-        throw "The venv interpreter could not run the import check (exit $LASTEXITCODE): $($lines -join ' | '). Delete $venv and run this script again."
+    $want = if ($Sqlserver) { 3 } else { 2 }
+    $mode = if ($Sqlserver) { 'sqlserver' } else { 'base' }
+    $out = @($importCheck | & $venvPy -I -X utf8 - $root $mode 2>&1 | ForEach-Object { "$_" })
+    $code = $LASTEXITCODE
+    # Only the verdict lines count. A leftover .pth that fails at startup writes a traceback to stderr
+    # and still lets the check run, so other lines are not a reason to throw.
+    $lines = @($out | Where-Object { $_ -match '\A(messagefoundry|messagefoundry_webconsole|aioodbc) (OK|BAD) ' })
+    if ($code -ne 0 -or $lines.Count -ne $want) {
+        throw "The venv interpreter could not run the import check (exit $code): $($out -join ' | '). Delete $venv and run this script again."
     }
     return $lines
 }
@@ -147,16 +160,14 @@ $extras = if ($Sqlserver) { "dev,harness,fhir,dicom,x12,xml,webauthn,vault,sftp,
 if (Test-Path -LiteralPath $venvPy) {
     $state = Get-ImportState
     $bad = @(Select-Bad $state)
-    if ($bad.Count -eq 0 -and -not $Sqlserver) {
+    if ($bad.Count -eq 0) {
         Write-Host "venv already present and both packages import from this checkout, nothing to do: $venvPy" -ForegroundColor Green
         $state | ForEach-Object { Write-Host "  $_" }
         return
     }
     # The one install line below reinstalls both. pip always reinstalls an editable requirement, and
     # a second declaration of the line is the drift the two text tests in the header exist to catch.
-    # -Sqlserver asks for an extra the import check cannot see, so it always takes the install.
-    if ($bad.Count -eq 0) { Write-Host "venv already present; installing .[$extras] for -Sqlserver:" -ForegroundColor Yellow }
-    else { Write-Host "venv already present, but it imports a package from outside this checkout; reinstalling .[$extras] and the web console:" -ForegroundColor Yellow }
+    Write-Host "venv already present, but a check failed; reinstalling .[$extras] and the web console:" -ForegroundColor Yellow
     $bad | ForEach-Object { Write-Host "  $_" }
 }
 else {

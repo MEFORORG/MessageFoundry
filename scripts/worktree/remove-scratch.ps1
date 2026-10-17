@@ -324,9 +324,8 @@ function Get-Remains([string]$Dir) {
 }
 
 # Whether a directory above a target is a git checkout or a bare repository: the refusal text, or ''.
-# Only the temp root's answer is kept for the run: every target shares it and it can hold thousands of
-# entries. A folder below it is listed fresh for each target, because a -Delete run can take minutes
-# and a checkout made there meanwhile must still refuse. A listing that throws is not kept.
+# Kept for the whole run, so the temp root, which every target shares and which can hold thousands of
+# entries, is listed once per run rather than once per target. A listing that throws is not kept.
 $gitShapeAbove = @{}
 function Get-GitShapeAbove([string]$Dir) {
     if ($gitShapeAbove.ContainsKey($Dir)) { return $gitShapeAbove[$Dir] }
@@ -334,7 +333,7 @@ function Get-GitShapeAbove([string]$Dir) {
     $why = ''
     if ($names -contains '.git') { $why = "the target sits inside the git checkout at '$Dir'" }
     elseif (Test-BareShape $names) { $why = "the target sits inside the bare git repository at '$Dir'" }
-    if ($Dir -ieq $realRoot) { $gitShapeAbove[$Dir] = $why }
+    $gitShapeAbove[$Dir] = $why
     return $why
 }
 
@@ -660,15 +659,16 @@ foreach ($raw in $Path) {
             $gone = ($failures.Count -eq 0) -and -not [IO.Directory]::Exists($tomb)
             # What remains is listed whether or not the delete threw: a throw is when it matters most.
             if (-not $gone) {
-                $found = @()
-                try { $found = Get-Remains $tomb }
+                $listed = $false
+                $found = $null
+                try { $found = Get-Remains $tomb; $listed = $true }
                 catch { $failures.Add("what remains could not be listed: $($_.Exception.Message)") }
                 # Gone by the time it was listed, with nothing failed on the way, is a clean delete.
-                if ($null -eq $found) { $gone = $failures.Count -eq 0 }
-                else { $remains = @($found) }
+                if ($listed -and ($null -eq $found)) { $gone = $failures.Count -eq 0 }
+                elseif ($listed) { $remains = @($found) }
             }
             if (-not $gone) {
-                $where = if ($null -eq $found) { "is gone, but $($failures.Count) failure(s) were recorded on the way" } else { "holds $($remains.Count) entr$(if ($remains.Count -eq 1) { 'y' } else { 'ies' })" }
+                $where = if (-not $listed) { 'could not be listed' } elseif ($null -eq $found) { "is gone, but $($failures.Count) failure(s) were recorded on the way" } else { "holds $($remains.Count) entr$(if ($remains.Count -eq 1) { 'y' } else { 'ies' })" }
                 $verdict = "PARTIAL $($res.Full): the delete stopped part-way. The tree was renamed to '$tomb', which $where."
                 $counts.partial++
             }

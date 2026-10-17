@@ -155,6 +155,20 @@ def test_it_is_a_no_op_when_both_packages_import_from_the_checkout(
     assert "reinstalling" not in proc.stdout
 
 
+def test_startup_noise_on_stderr_does_not_fail_a_current_venv(
+    tmp_path: Path, _template_venv: Path
+) -> None:
+    """A leftover .pth whose import fails prints a traceback at startup and lets the check run. Only
+    the verdict lines count, so the noise must not read as a broken venv."""
+    root, site = _venv_checkout(tmp_path, _template_venv)
+    (site / "zz_leftover.pth").write_text("import no_such_module_xyz\n", encoding="utf-8")
+
+    proc = _run("-Path", str(root))
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "nothing to do" in proc.stdout
+
+
 def test_a_web_console_copy_that_matches_the_source_is_accepted(
     tmp_path: Path, _template_venv: Path
 ) -> None:
@@ -196,7 +210,7 @@ def test_sqlserver_takes_the_install_even_when_both_packages_are_current(
 
     assert proc.returncode != 0, proc.stdout
     assert "nothing to do" not in proc.stdout
-    assert "for -Sqlserver" in proc.stdout
+    assert "aioodbc BAD the [sqlserver] extra is not installed" in proc.stdout
     assert "No module named pip" in proc.stdout + proc.stderr
 
 
@@ -216,7 +230,7 @@ def test_a_stale_copy_shadowing_the_checkout_is_reinstalled(
 
     assert proc.returncode != 0, proc.stdout
     assert "nothing to do" not in proc.stdout
-    assert "imports a package from outside this checkout; reinstalling" in proc.stdout
+    assert "a check failed; reinstalling" in proc.stdout
     assert f"{name} BAD it imports from {site / name}" in proc.stdout
     assert "No module named pip" in proc.stdout + proc.stderr
 
