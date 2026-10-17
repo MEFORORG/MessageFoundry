@@ -470,6 +470,14 @@ Two read/diagnostic endpoints back the console's connection view (auth + per-cha
 > before parsing if it exceeds **16 MiB** or **10,000 segments** (`ERROR` disposition + AR NAK),
 > bounding both the tolerant peek and the strict (hl7apy) validation paths.
 
+> **One message per outbound frame.** An MLLP delivery refuses a payload that opens with `MSH` and
+> holds a second `MSH` line, CR or LF line ends alike: a Handler that returned two messages in one
+> `Send`. It is a permanent failure with code `multiple-messages`, dead-lettered at once, with text
+> that carries no message content. A batch member holding two messages is dead-lettered alone, and
+> a shadow (`simulate`) outbound records the same. To send a batch, use outbound batch aggregation
+> (ADR 0082), whose `BHS` envelope this rule never refuses. See
+> [ADR 0209](adr/0209-mllp-and-tcp-deliveries-refuse-a-payload-holding-more-than-one-msh.md).
+
 ### Raw TCP — `Tcp(...)`
 
 A raw-TCP transport (source **and** destination) with **configurable delimiter framing**, built to
@@ -522,8 +530,14 @@ inbound("TCP-IN_PARTNER_X12", Tcp(port=9100, framing="stx_etx",
   ingress commit, so a Handler's return value never reaches that connection. Reply to a partner by
   returning `Send("<outbound>", payload)`; returning the payload bare is an authoring error and
   raises (ERROR / dead-letter, replayable) rather than delivering.
-- **Opaque relay.** Bytes in = bytes out (delimiters stripped/added) — no transformation,
-  validation, or content sniffing in the connector.
+- **Opaque relay.** Bytes in = bytes out (delimiters stripped/added) — no transformation or
+  validation in the connector. An outbound delivery looks inside in at least two ways: it refuses a
+  payload holding its codec's own frame bytes (ADR 0205), and one that opens with `MSH` and holds a
+  second `MSH` line, as MLLP does, with the permanent code `multiple-messages`
+  ([ADR 0209](adr/0209-mllp-and-tcp-deliveries-refuse-a-payload-holding-more-than-one-msh.md)). A
+  payload not led by `MSH`, an X12 interchange included, is never read for the second. A TCP
+  outbound has no batch aggregation (that is MLLP only), so a partner that takes several HL7
+  messages per frame cannot be fed them from one `Send`.
 - **At-least-once / duplicates.** An outbound send (and its framed reply, when expected) may be
   retried, so the receiver may see a duplicate — **the receiver must be idempotent.**
 - **Egress allowlist.** A `Tcp(...)` destination is gated by `[egress].allowed_tcp` (host or
@@ -2391,6 +2405,13 @@ source (`Http()`, File, a `Loopback` re-ingress) as a `RawMessage`.
 per entry); the engine never orchestrates cross-entry atomicity. The engine does screen every entry first,
 as [A Bundle connection screens every entry](#a-bundle-connection-screens-every-entry) says.
 
+On every interaction but `transaction` and `batch`, a body in which a JSON object repeats a key is refused
+before a byte is sent, for the reason rule 2 of
+[the Bundle screen](#a-bundle-connection-screens-every-entry) gives: a permanent refusal, code
+`bad-body` (vault BACKLOG #2812). A Bundle that repeats a key is refused by the screen instead, code
+`bundle-entry-refused`. `FhirPeek.parse` raises `FhirPeekError` on such a body, so a Router that peeks one
+takes the error path, and so does a `fhir_lookup` whose reply repeats a key.
+
 **Conditional knobs (idempotency / concurrency).** FHIR's native answer to the at-least-once duplicate
 problem — opt-in, off by default: `if-none-exist` (create only if no match; the search rides the
 `If-None-Exist` **header**), `conditional-update` (the server resolves which resource to update; the search
@@ -2458,6 +2479,15 @@ What a site needs to know:
 - If a server answers 2xx while the entry's own `response.status` failed, the message is classified on
   that entry status, like any other HTTP status. An entry status that does not read as an HTTP code is
   logged as a warning, and the 2xx reply counts as delivered.
+- A reply in which a JSON object repeats a key is read twice, once keeping the first value of each key
+  and once keeping the last (vault BACKLOG #2812). When the two readings reach the same judgment and
+  agree on what a delivery takes, and no occurrence of a key repeated three or more times differs
+  from both its first and last value, the reply is judged as above. Otherwise the update is a permanent
+  refusal, code `reply-repeats-a-key`, in either capture mode. It is not sent again and not recorded
+  as delivered, as with a reply over the byte bound below. The full rule, with what counts as
+  agreement and its costs, is in
+  [ADR 0095](adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md), Amendment B.1,
+  the 2026-10-17 entry.
 - A reply body over the byte bound is not kept, so the engine cannot see the entry's status. The
   update is then a permanent refusal, code `reply-too-large`, in either capture mode, and it is not
   sent again. It is not recorded as delivered. See *A 2xx reply over the byte bound* under [REST](#rest--rest).
@@ -3929,7 +3959,7 @@ reading this page already applies to a file the scan never opened.
 
 | Service/hop | Timeout setting + default | Release procedure | Failure handling | Retry posture |
 |---|---|---|---|---|
-| MLLP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds how long a frame may take to complete, on the clock the `receive_timeout` bullet under [Resource management & limits](#resource-management--limits-asvs-1312--1313--1326) describes, which is what reaches a peer that trickles bytes and is therefore never idle; the ACK **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. That write bound is not operator-configurable — an ACK is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against. With `tls = true`, a new connection has a fixed 10 s to finish its TLS handshake or the listener aborts it, and a connection the listener closes has a fixed 5 s for the TLS close exchange (on stop, the socket is closed as soon as its close notice is sent, except under uvloop, below). On the stdlib event loop (always on Windows), `source_ip_allowlist`, `max_connections` and `max_connections_per_host` apply **before** the handshake (BACKLOG #1606): the listener accepts plain TCP, refuses or admits the socket exactly as a plaintext listener does, and only then starts TLS. So a socket still in its handshake holds a real slot, and a peer outside the allowlist never gets a handshake. **Under uvloop the loop still runs the handshake, and all three apply only after it**, so there the handshake bound limits how long such a socket lives, not how many a peer can open. The engine runs on uvloop wherever it is installed, which the engine's own `uvloop` dependency does for CPython outside Windows. Neither TLS bound is operator-configurable: both are engine-fixed work with nothing partner-sized in them | the client handler's outer `finally` closes the writer, with a 5 s shutdown grace; stop also closes a socket still in its TLS handshake. Under uvloop, whose server offers no `close_clients()`, stop leaves such a socket to the 10 s bound and refuses it unread if it finishes the handshake after stop began, and stop can also wait up to the 5 s close-exchange bound for a peer that does not answer its close notice | a TLS handshake over its bound, or one that fails, is aborted with a DEBUG line only and no connection event, and gives its slot back; a decode/parse/validate failure NAKs synchronously and records `ERROR` before any ingress row; a frame over its deadline closes with a `frame_deadline` reason, having received nothing to drop; an ACK over its write bound drops the connection as a `peer_reset`; a fault inside the inbound handler, such as a store outage at the ingress commit, is answered with a fixed-text `AE` (`CE` in enhanced mode), then the connection closes and the event is `handler_error`; an inbound that sends no replies keeps the socket and sends nothing. That NAK has no message row, so the ACK capture stream does not hold it; the `handler_error` event is its record (BACKLOG #1619) | n/a — the sender retries |
+| MLLP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds how long a frame may take to complete, on the clock the `receive_timeout` bullet under [Resource management & limits](#resource-management--limits-asvs-1312--1313--1326) describes, which is what reaches a peer that trickles bytes and is therefore never idle; the ACK **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. That write bound is not operator-configurable — an ACK is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against. With `tls = true`, a new connection has a fixed 10 s to finish its TLS handshake or the listener aborts it, and a connection the listener closes has a fixed 5 s for the TLS close exchange (on stop, the socket is closed as soon as its close notice is sent, except under uvloop, below). On the stdlib event loop (always on Windows), `source_ip_allowlist`, `max_connections` and `max_connections_per_host` apply **before** the handshake (BACKLOG #1606): the listener accepts plain TCP, refuses or admits the socket exactly as a plaintext listener does, and only then starts TLS. So a socket still in its handshake holds a real slot, and a peer outside the allowlist never gets a handshake. **Under uvloop the loop still runs the handshake, and all three apply only after it**, so there the handshake bound limits how long such a socket lives, not how many a peer can open. The engine runs on uvloop wherever it is installed, which the engine's own `uvloop` dependency does for CPython outside Windows. Neither TLS bound is operator-configurable: both are engine-fixed work with nothing partner-sized in them | the client handler's outer `finally` closes the writer, with a 5 s shutdown grace; stop also closes a socket still in its TLS handshake. Under uvloop, whose server offers no `close_clients()`, stop leaves such a socket to the 10 s bound and refuses it unread if it finishes the handshake after stop began, and stop can also wait up to the 5 s close-exchange bound for a peer that does not answer its close notice | a TLS handshake over its bound, or one that fails, is aborted; on the standard asyncio loop with a DEBUG line, giving its slot back, and under uvloop before any slot is taken. A failed one is recorded as a throttled `tls_handshake_failed` connection event on any loop (vault BACKLOG #2613, #3302; PHI.md section 7 row 7 says how). Under uvloop a handshake that only runs past its bound is not counted, and the event names no peer; a decode/parse/validate failure NAKs synchronously and records `ERROR` before any ingress row; a frame over its deadline closes with a `frame_deadline` reason, having received nothing to drop; an ACK over its write bound drops the connection as a `peer_reset`; a fault inside the inbound handler, such as a store outage at the ingress commit, is answered with a fixed-text `AE` (`CE` in enhanced mode), then the connection closes and the event is `handler_error`; an inbound that sends no replies keeps the socket and sends nothing. That NAK has no message row, so the ACK capture stream does not hold it; the `handler_error` event is its record (BACKLOG #1619) | n/a — the sender retries |
 | MLLP destination | `connect_timeout` 10 s, `timeout_seconds` 30 s (drain + ACK read) | the socket is closed per delivery, or reused and aged out via `idle_timeout_seconds` / `max_connection_age_seconds` when `persistent` | transient errors re-queue; a `NegativeAckError` (AR) dead-letters immediately | `RetryPolicy` — **default `retry_max_attempts` is 100, finite**; lower it, or set `None` to retry forever |
 | Raw TCP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds one frame on the same clock as MLLP's (vault BACKLOG #2606 and #2847), which is what reaches a peer that trickles bytes; the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable — a reply is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; a reply over its write bound drops the connection as a `peer_reset` | n/a |
 | X12 listener (inbound) | `receive_timeout` 60 s; `max_frame_seconds` 60 s bounds how long one interchange may take to complete, on the same clock as MLLP's (vault BACKLOG #2606); `max_interchange_bytes` bounds one ISA/IEA frame; the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable, for the same reason as the raw-TCP row | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; an allow-list refusal emits `peer_not_allowlisted` plus a WARNING log, and a capacity refusal emits `at_capacity`; a reply over its write bound drops the connection on a logged warning **and** the `peer_reset` its release path already carries. This listener emits the same seven kinds as the raw-TCP row above (BACKLOG #1665) | n/a |

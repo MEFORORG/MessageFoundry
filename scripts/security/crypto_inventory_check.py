@@ -294,6 +294,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #1352 / #1171: every private-key TLS load goes through keywrap.load_checked_cert_chain,
     # which checks the key's passphrase wrap and then calls load_cert_chain; ssl for that one call.
     "messagefoundry/keywrap.py": frozenset({"ssl"}),
+    # Vault BACKLOG #3302: subclasses ssl.SSLObject to OBSERVE a failed inbound handshake the event
+    # loop ran, and installs it as a server context's sslobject_class. It re-raises unchanged, and
+    # builds no context, loads no key and chooses no algorithm, so section 4 gains no row.
+    "messagefoundry/tls_handshake_failures.py": frozenset({"ssl"}),
     # ASVS 12.1.1: the startup TLS-floor probe. Client contexts ONLY, and deliberately weakened ones —
     # a withdrawn-version offer (minimum==maximum==TLSv1/1.1) at ALL:@SECLEVEL=0 with CERT_NONE, so the
     # ClientHello is actually sent and an untrusted internal CA cannot abort before the version is
@@ -911,6 +915,11 @@ INVENTORY: dict[str, frozenset[str]] = {
 #: limits, and they are the most useful lines in this table: each is a first-party crypto decision
 #: that no call-pattern instrument can see.
 IMPORT_ONLY: dict[str, str] = {
+    "messagefoundry/tls_handshake_failures.py": (
+        "subclasses ssl.SSLObject to observe a failed handshake and re-raise it, and sets a "
+        "server context's sslobject_class; the contexts it watches are built in transports/mllp.py "
+        "and api/tls.py, which are inventoried"
+    ),
     "messagefoundry/pipeline/dr.py": (
         "names HopPosture, a value type, to hand the engine's posture to the cold-seed verify; "
         "that verify runs in pipeline/dr_backup.py, which is inventoried"

@@ -444,31 +444,38 @@ INSECURE_TLS_ESCAPE_ENV = "MEFOR_ALLOW_INSECURE_TLS"
 
 
 def insecure_tls_allowed() -> bool:
-    """Whether the explicit dev escape to permit insecure TLS overrides is set (ASVS 12.3.2).
+    """Whether the dev escape for insecure TLS overrides is SET to a true value (ASVS 12.3.2).
 
-    Certificate-validation overrides (``trust_server_certificate=true`` for SQL Server, for one) are
-    MITM-able, so they now **refuse** at startup unless ``MEFOR_ALLOW_INSECURE_TLS`` is truthy. This means a production deployment can't silently disable
-    server-cert validation; an operator must opt in loudly for a trusted-network dev/test bind."""
+    Set is not honoured. Certificate-validation overrides (``trust_server_certificate=true`` for
+    SQL Server, for one) are MITM-able, so the escape lets one through only when
+    ``MEFOR_ALLOW_INSECURE_TLS`` is set on an instance at ``[security].enforcement = warn``. The
+    cells ask :func:`weakened_tls_escape_permitted` or :func:`hop_insecure_escape_downgrades`, which
+    add that condition. Under ``enforce``, the default, or where the code knows no posture, the
+    escape changes nothing. Some connections have a per-hop way across that needs neither the escape
+    nor the dial, such as ``tls_hop_attested``. Some credential hops refuse even at ``warn``;
+    docs/SECURITY-LOOSENING.md, *No escape sends a credential to an unverified peer*, names them
+    and the ones that still cross."""
     return os.environ.get(INSECURE_TLS_ESCAPE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def hop_insecure_escape_downgrades(*, enforcing: bool) -> bool:
-    """Whether ``MEFOR_ALLOW_INSECURE_TLS`` may downgrade an insecure-hop REFUSE→WARN here (#200).
+    """Whether ``MEFOR_ALLOW_INSECURE_TLS`` may downgrade an insecure-hop REFUSE→WARN here (#200):
+    only on an instance at ``[security].enforcement = warn``.
 
     The **clamp** on the blunt global escape for the posture-keyed hop refusal (ADR 0092, decision 2):
     the escape may only relax a hop REFUSE to WARN when the security dial is **not enforcing**. Under
     ENFORCE it is **inert** — it can NEVER satisfy an enforcing hop (a deliberate behaviour change from
     the pre-#200 global escape, which silenced the refusal in every environment).
 
-    **Scope after ADR 0153 (decision 5): the TRANSPORT cells no longer consult this at all.** The
-    cleartext-hop authority lost its ``audited_opt_out`` parameter, so the variable cannot influence a
-    connection's cleartext-hop decision; the per-connection ``cleartext_accepted`` declaration replaced
-    it there. This clamp survives for the two **non-connection** cells that still key on the escape and
-    have nowhere to carry a per-hop declaration — the ``[logging]`` forwarder
-    (:func:`forward_hop_disposition`) and the API PHI-read serve hop
-    (:func:`~messagefoundry.config.tls_policy.phi_read_hop_disposition`) — plus the verify-off cells via
-    :func:`weakened_tls_escape_permitted`. On a connection, ``tls_hop_attested`` (ALLOW) or
-    ``cleartext_accepted`` (WARN + audit) is now the only way across an enforcing hop."""
+    **Scope after ADR 0153 (decision 5).** The cleartext-hop authority
+    (:func:`~messagefoundry.config.tls_policy.insecure_hop_disposition`) lost its
+    ``audited_opt_out`` parameter, so the variable no longer reaches a hop that authority decides as
+    cleartext; the per-connection ``cleartext_accepted`` declaration replaced it there. This clamp
+    is still called by at least the ``[logging]`` forwarder (:func:`forward_hop_disposition`), the
+    API PHI-read serve hop, and the HTTP family's ``verify_tls=false`` cell
+    (``transports.rest._shipped_strict_disposition``). :func:`weakened_tls_escape_permitted` applies
+    the same clamp to at least the other verify-off cells and the Direct and Email cleartext SMTP
+    hops."""
     return insecure_tls_allowed() and not enforcing
 
 
@@ -3335,7 +3342,7 @@ class AuthSettings(_Section):
     # with no non-blank required value is refused at load (BACKLOG #2032), and so is setting it
     # while oidc_require_mfa_claim is off (BACKLOG #2325). A whitespace-only value loads as None.
     oidc_acr_values: str | None = None
-    oidc_prompt: str | None = None  # requested `prompt` authorize param
+    oidc_prompt: str | None = None  # requested `prompt` authorize param; blank loads as None
     oidc_jwks_ttl_seconds: int = 3600
     oidc_jwks_min_refetch_seconds: int = 300  # the amplification bound
     oidc_flow_ttl_seconds: int = 300  # single-use flow window; validator-capped 30..1800
@@ -3604,12 +3611,12 @@ class AuthSettings(_Section):
         # lists compared with a token claim; a non-string item is left for the type check to refuse.
         return _normalise_claim_value_list(v)
 
-    @field_validator("oidc_acr_values")
+    @field_validator("oidc_acr_values", "oidc_prompt")
     @classmethod
-    def _normalise_oidc_acr_values(cls, v: str | None) -> str | None:
-        # BACKLOG #2325: the request is space-separated (OIDC Core, the authentication request). A whitespace-only
-        # value names no class, so it becomes None and the authorization request carries no
-        # acr_values at all, rather than the raw blanks it used to send.
+    def _normalise_space_separated_request(cls, v: str | None) -> str | None:
+        # BACKLOG #2325, and #3221 for prompt: both requests are space-separated (OIDC Core, the
+        # authentication request). A whitespace-only value names nothing, so it becomes None and the
+        # authorization request does not carry it, rather than the raw blanks it used to send.
         if v is None:
             return None
         return " ".join(v.split()) or None
@@ -6625,12 +6632,13 @@ class SecuritySettings(_Section):
     # contradiction is reported on GET /security/posture.
     memory_encryption_operator_declared: bool = False
     # OPT-IN ENFORCEMENT of the declaration above. Default FALSE, and that default is load-bearing:
-    # an exposed PHI instance with no declaration WARNS, it never refuses, so nothing that boots
-    # today stops booting on upgrade. The property is a HOST property no operator can satisfy on
-    # Windows (the read-out is always null there), so a refusal keyed on it by default would
-    # hard-stop working dev/staging/prod deployments over a platform fact they cannot change — the
-    # outcome ADR 0151 avoided by scoping its companion refusal to its own opt-in, and the reason the
-    # Posture-B widening warns on the recommended loopback-behind-proxy topology. Set TRUE to turn
+    # an exposed PHI instance with no declaration WARNS, it never refuses. The property is a HOST
+    # property the engine cannot observe on Windows (the read-out reports nothing there), and many
+    # Windows hosts cannot provide it (which can: ADR 0152, Amendment 2026-10-17). So a refusal by
+    # default would leave an operator on such a host two choices: do not start, or declare a
+    # property the host does not have. ADR 0151 scoped its companion refusal to its own opt-in, and
+    # the Posture-B widening warns on the recommended loopback-behind-proxy topology; this follows
+    # both. Set TRUE to turn
     # that warning into a refusal for an estate that has standardized on confidential-computing
     # hosts; the refuse/warn dial ([security].enforcement, ADR 0148) still applies on top, so
     # enforcement=warn keeps it a warning even when this is set. Not a loosening (it tightens).

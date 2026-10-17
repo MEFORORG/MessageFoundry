@@ -105,11 +105,22 @@ RESOLVE_OUTCOMES: Mapping[str, str] = {
 }
 
 
-#: How long :meth:`ApprovalGate.drain` waits for outcome writes still running at shutdown. It shares
-#: NSSM's 15 s graceful-stop window (AppStopMethodConsole in scripts/service/install-service.ps1)
-#: with the upload runner's 5 s stop, which runs first, and engine.stop() still has to run after it.
-#: One outcome write is a status update and an audit row, so a few seconds is ample.
+#: How long :meth:`ApprovalGate.drain` waits for the gate's writes still running at shutdown, at
+#: least the outcome writes and the request writes (vault BACKLOG #3193). It shares NSSM's 15 s
+#: graceful-stop window (AppStopMethodConsole in scripts/service/install-service.ps1) with the
+#: upload runner's 5 s stop, which runs first, and engine.stop() still has to run after it. Each
+#: write is a status change or a new row with its audit row, plus at most a read-back, so a few
+#: seconds is ample.
 DRAIN_TIMEOUT_SECONDS = 3.0
+
+
+def named_requester(params: Mapping[str, Any]) -> str | None:
+    """The requester's name a hold's params carry, or ``None`` when it is missing or not a non-empty
+    string (vault BACKLOG #3217). One test for the executors that need the name and for the queue's
+    ``params_no_requester`` prediction, so the two cannot drift."""
+    requester = params.get("requester")
+    return requester if isinstance(requester, str) and requester else None
+
 
 #: The claim owner of an engine that is neither an engine shard nor a cluster node (BACKLOG #1562).
 #: Fixed, so a plain ``serve`` recognises its own claims after a restart. Two such engines over one
@@ -264,6 +275,9 @@ class _Operation:
     permission: Permission
     #: Optional scope predicate over the captured params, re-checked at release beside ``permission``.
     in_scope: ScopeCheck | None = None
+    #: The executor refuses params whose ``requester`` is not a non-empty string (vault BACKLOG
+    #: #3217), so :meth:`ApprovalGate._release_blocked` predicts that refusal before the claim.
+    requires_requester: bool = False
 
 
 class ApprovalError(Exception):
@@ -310,7 +324,8 @@ class ApprovalGate:
         # release (fail closed) rather than executing on authority it could not check.
         self._resolve_identity = resolve_identity
         self._alert_sink: AlertSink = alert_sink if alert_sink is not None else LoggingAlertSink()
-        # Outcome writes started by _shielded, mapped to their approval id. Held here because a
+        # Writes started by _shielded, at least the outcome and request writes (vault BACKLOG
+        # #3193), mapped to their approval id. Held here because a
         # caller that was cancelled no longer holds one, and the event loop keeps only a weak
         # reference to a running task. Per gate rather than per module (BACKLOG #2087), so drain()
         # sees only this gate's writes and no set outlives the loop its tasks ran on.
@@ -352,7 +367,9 @@ class ApprovalGate:
         return self._claim_owner_value
 
     async def drain(self, timeout: float = DRAIN_TIMEOUT_SECONDS) -> list[str]:
-        """Wait up to ``timeout`` seconds for outcome writes still running (BACKLOG #2087).
+        """Wait up to ``timeout`` seconds for the gate's writes still running (BACKLOG #2087): every
+        write :meth:`_shielded` started, at least the outcome writes and the request writes (vault
+        BACKLOG #3193).
 
         The managed lifespan calls this before ``engine.stop()`` closes the store. A write whose
         caller was cancelled, such as by a request timeout, then lands instead of meeting a closed
@@ -501,11 +518,20 @@ class ApprovalGate:
         *,
         permission: Permission,
         in_scope: ScopeCheck | None = None,
+        requires_requester: bool = False,
     ) -> None:
         """Register an approvable operation. ``permission`` is REQUIRED, so no operation can become
-        approvable without naming the authority its requester must still hold at release."""
+        approvable without naming the authority its requester must still hold at release.
+        ``requires_requester`` declares that ``execute`` refuses params whose ``requester`` is not a
+        non-empty string, so the gate refuses such a request before it claims it and the queue
+        marks it ``params_no_requester``."""
         self._ops[key] = _Operation(
-            key=key, label=label, execute=execute, permission=permission, in_scope=in_scope
+            key=key,
+            label=label,
+            execute=execute,
+            permission=permission,
+            in_scope=in_scope,
+            requires_requester=requires_requester,
         )
 
     @property
@@ -824,12 +850,17 @@ class ApprovalGate:
         approve() reads it after the dwell floor."""
         if not r.requester_user_id:
             return "no_requester_id"
-        if r.operation not in self._ops:
+        op = self._ops.get(r.operation)
+        if op is None:
             return "operation_unavailable"
         if not self.gates(r.operation):
             return "not_gated"
         if params is None:
             return "params_unreadable"
+        # The executor's own test, read here so the refusal comes before the claim (vault BACKLOG
+        # #3217): past the claim it was compensated to 'failed' while the queue offered Approve.
+        if op.requires_requester and named_requester(params) is None:
+            return "params_no_requester"
         return None
 
     async def _queue_release_blocked(
@@ -933,7 +964,8 @@ class ApprovalGate:
 
         **The writes on this path answer a mapped status in a store outage (vault BACKLOG #2255).** A
         refusal's own audit row (at least ``approval.too_early``, ``approval.stale_requester``,
-        ``approval.no_longer_gated`` and ``approval.params_unreadable``) that fails to write is
+        ``approval.no_longer_gated``, ``approval.params_unreadable`` and
+        ``approval.params_no_requester``) that fails to write is
         logged and the refusal still answers 409, since it runs nothing. A release whose approver account changed after the request
         writes ``approval.approver_provenance``. That row is soft too, and pages if it fails. It is
         written whether the operation succeeded, failed or was cut off. Many failed writes on this path also page
@@ -995,6 +1027,25 @@ class ApprovalGate:
                 context="the release was refused",
             )
             raise ApprovalError(409, "request parameters are unreadable; reject it instead")
+        if blocked == "params_no_requester":
+            # The executor would refuse it after the claim, compensated to 'failed' (vault BACKLOG
+            # #3217). Refused here instead, so it stays pending for a reject, as the queue
+            # predicts. Audited, and soft, like the unreadable-params refusal above.
+            await self._record_audit_soft(
+                approval_id,
+                "approval.params_no_requester",
+                actor=approver,
+                detail=json.dumps(
+                    {"approval_id": approval_id, "operation": operation, "requester": row.requester}
+                ),
+                client=client,  # ADR 0150: the approver's address, matching this row's actor
+                context="the release was refused",
+            )
+            raise ApprovalError(
+                409,
+                "this request's parameters record no requester, so the operation could not name "
+                "who ran it; reject it and request the operation again",
+            )
         op = self._ops.get(operation)
         if blocked is not None or not requester_user_id or op is None or params is None:
             # Unreachable while every reason has its arm above. Fail closed if one is added

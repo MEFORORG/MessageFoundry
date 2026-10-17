@@ -448,9 +448,13 @@ def test_a_blank_configured_value_matches_no_blank_amr() -> None:
     """Load drops a blank, and the helper ignores one from any other constructor."""
     service = AuthService.__new__(AuthService)
     service._settings = AuthSettings.model_construct(oidc_callback_floor_exempt_amr=["", " "])
-    assert service._oidc_callback_floor_exemption(("", " ")) == ()
+    values = service._oidc_callback_floor_exempt_values()
+    assert service._oidc_callback_floor_exemption(values, ("", " ")) == ()
+    # A set that skipped the filter: the helper refuses its blanks itself.
+    assert service._oidc_callback_floor_exemption(frozenset({"", " "}), ("", " ")) == ()
     service._settings = AuthSettings.model_construct(oidc_callback_floor_exempt_amr=[EXEMPT])
-    assert service._oidc_callback_floor_exemption(("pwd", EXEMPT)) == (EXEMPT,)  # the control
+    values = service._oidc_callback_floor_exempt_values()
+    assert service._oidc_callback_floor_exemption(values, ("pwd", EXEMPT)) == (EXEMPT,)
 
 
 # --- an exempt value the MFA gate also accepts -----------------------------------------------------
@@ -484,5 +488,73 @@ async def test_an_opted_in_too_early_step_up_whose_proof_fails_reports_that_fail
         clock[0] += FLOOR - 0.001
         out = await _return_from_idp(service, monkeypatch, rsa_key, flow_id, amr=["pwd"])
         assert not out.elevation.ok and out.reason == "mfa_claim_missing"
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #3221: a verified token clears the IdP flag, and the step-up's generic text ----------
+
+#: The step-up leg's generic refusal line, which `too_early` and `token_refused` both read as, so a
+#: caller cannot tell from the text whether the callback floor fired.
+GENERIC_STEP_UP_TEXT = "The identity provider could not confirm it's you."
+
+
+async def test_a_too_early_sign_in_after_a_verified_exchange_clears_the_idp_flag(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The IdP answered with a verified token, so it is reachable, whatever the floor then says."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, clock = await _floored(store, rsa_key, monkeypatch)
+        service.mark_oidc_unavailable("TimeoutError")
+        assert service.oidc_available is False
+        early = await _sign_in_too_early(service, clock, ("pwd", "mfa"))
+        assert not early.ok and early.reason == TOO_EARLY
+        assert service.oidc_available is True
+    finally:
+        await store.close()
+
+
+async def test_a_too_early_step_up_after_a_verified_exchange_clears_the_idp_flag(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The opted-in site redeems the code before the floor refuses, so the IdP has answered."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, clock, token = await _signed_in(
+            store, rsa_key, monkeypatch, oidc_callback_floor_exempt_amr=[EXEMPT]
+        )
+        flow_id, _url = await _begin(service, token)
+        clock[0] += FLOOR - 0.001
+        service.mark_oidc_unavailable("TimeoutError")
+        out = await _return_from_idp(service, monkeypatch, rsa_key, flow_id, amr=["pwd", "mfa"])
+        assert not out.elevation.ok and out.reason == TOO_EARLY
+        assert out.error == GENERIC_STEP_UP_TEXT
+        assert service.oidc_available is True
+    finally:
+        await store.close()
+
+
+async def test_a_too_early_step_up_refused_before_the_exchange_leaves_the_idp_flag(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control: with the list empty the floor refuses before the code is redeemed, so no
+    answer arrived and the flag stays as it was. The text is the generic line."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, clock, token = await _signed_in(store, rsa_key, monkeypatch)
+        flow_id, _url = await _begin(service, token)
+        flow = _staged(service, flow_id)
+        clock[0] += FLOOR - 0.001
+        service.mark_oidc_unavailable("TimeoutError")
+        out = await service.complete_oidc_step_up(
+            flow_id=flow_id,
+            state=flow.state,
+            code=AUTH_CODE,
+            client="10.0.0.9",
+            public_origin=ORIGIN,
+        )
+        assert out.reason == TOO_EARLY and out.error == GENERIC_STEP_UP_TEXT
+        assert service.oidc_available is False
     finally:
         await store.close()

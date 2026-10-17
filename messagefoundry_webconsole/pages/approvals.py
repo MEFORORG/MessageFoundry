@@ -109,6 +109,10 @@ _BLOCKED: dict[ReleaseBlocked, str] = {
         "if it is still needed, run it again, without a second approver."
     ),
     "params_unreadable": "Its parameters are unreadable, so it cannot be approved. {verb} it.",
+    "params_no_requester": (
+        "Its parameters record no requester, so the operation could not name who ran it and it "
+        "cannot be approved. {verb} it; if it is still needed, request it again."
+    ),
     "requester_not_authorized": (
         "The requester no longer holds the authority this operation requires, so it cannot be "
         "approved while that lasts. If their authority is restored, it can be approved then. "

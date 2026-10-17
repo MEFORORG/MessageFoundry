@@ -4234,19 +4234,20 @@ def _serve(args: argparse.Namespace) -> int:
     # operator to DECLARE it ([security].memory_encryption_operator_declared).
     #
     # WARN BY DEFAULT; REFUSE ONLY ON AN OPT-IN. This is the load-bearing scoping decision and it is
-    # not a softening — it is the only shape that does not hard-stop deployments that boot today:
+    # not a softening — it is the only shape that does not refuse an engine over a host property:
     #   * every instance carries patient data (BACKLOG #1279, after ADR 0148 GIVEN 1 made every
     #     built-in environment name derive PHI), so an exposed dev/test instance that declared
     #     nothing at all is in scope and nothing can declare it out;
     #   * "exposed" includes the loopback-behind-proxy topology OFF-LOOPBACK-DEPLOYMENT.md actually
     #     RECOMMENDS (it declares tls_terminated_upstream), which the Posture-B gate 400 lines above
     #     deliberately spares from its own refusal for exactly this reason;
-    #   * on Windows — the primary deployment platform — the read-out is ALWAYS null, so no host can
-    #     ever clear such a gate by being correctly configured.
-    # A default refusal would therefore stop a working dev/staging/prod service from booting on
-    # upgrade over a platform property nobody can satisfy on Windows. That is the outcome ADR 0151
-    # avoided by scoping its companion refusal to its own opt-in ("only fire on the opt-in, so it
-    # cannot break an existing deployment"). Same rule here: the warning is the default; the refusal
+    #   * on Windows — the primary deployment platform — the read-out reports nothing, so the
+    #     engine can never see the property there, and many Windows hosts cannot provide it (which
+    #     can: ADR 0152, Amendment 2026-10-17).
+    # A default refusal would therefore leave an operator on such a host two choices: do not start,
+    # or declare a property the host does not have. ADR 0151 scoped its companion refusal to its own
+    # opt-in ("only fire on the opt-in, so it cannot break an existing deployment"), and the same
+    # rule applies here: the warning is the default; the refusal
     # requires [security].require_memory_encryption_declaration = true, which nothing has set. The
     # ADR 0148 refuse/warn dial then applies on top of the opt-in, as it does everywhere else.
     #
@@ -4668,8 +4669,9 @@ def _serve(args: argparse.Namespace) -> int:
         "ws": floored_ws,
         "timeout_graceful_shutdown": _UVICORN_DRAIN_SECONDS,  # BACKLOG #3256; see the constant
     }
-    from messagefoundry.api.tls import build_api_ssl_context
+    from messagefoundry.api.tls import ApiHandshakeRecord, build_api_ssl_context
 
+    api_handshakes: ApiHandshakeRecord | None = None
     if _material is not None:
         _cert, _key = _material
         # _key is None when the operator embedded the private key in the cert PEM (tls_key_file is
@@ -4690,6 +4692,8 @@ def _serve(args: argparse.Namespace) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         run_kwargs["ssl_context_factory"] = lambda config, default_factory: ctx
+        # Vault BACKLOG #3302: the loop runs every API handshake, so a failed one left no record.
+        api_handshakes = ApiHandshakeRecord(ctx)
         # ADR 0083 activation: only when in-process mTLS (client CA) AND a cert-identity map are BOTH
         # configured, swap in the scope-populating HTTP protocol so a verified peer cert reaches
         # resolve_client_cert_identity. Gated on both so a mutual-auth-only bind (console mTLS, no map)
@@ -4717,6 +4721,9 @@ def _serve(args: argparse.Namespace) -> int:
     except Exception as exc:  # last-resort: log an abnormal server exit PHI-redacted, then re-raise
         logging.getLogger(__name__).critical("server exited abnormally: %s", safe_exc(exc))
         raise
+    finally:
+        if api_handshakes is not None:
+            api_handshakes.close()
     return 0
 
 
