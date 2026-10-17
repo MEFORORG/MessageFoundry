@@ -1422,8 +1422,9 @@ def _build_approval_gate(
         # auditor filtering on the action name sees the released replays too.
         channel_id = p.get("channel_id")
         destination_name = p.get("destination_name")
-        # `.get`, never p["requester"] the way _config_reload reads it below: a request persisted
-        # before the guard started capturing that key carries none. The actor is the REQUESTER,
+        # `.get` with no refusal, unlike _purge and _config_reload below, which refuse a hold naming
+        # no requester (named_requester): a request persisted before the guard started capturing
+        # that key carries none. The actor is the REQUESTER,
         # matching the inline row; no `client` accompanies it, per _record_reload_audit's docstring
         # (ADR 0150).
         requester = p.get("requester")

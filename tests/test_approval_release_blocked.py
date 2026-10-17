@@ -108,6 +108,8 @@ async def _rows(store: MessageStore) -> dict[str, ReleaseBlocked | None]:
         await _row(store, params="[1]"): "params_unreadable",
         await _row(store, params="{}"): "params_no_requester",
         await _row(store, params=json.dumps({"requester": ""})): "params_no_requester",
+        # Both reasons hold; the params test comes first, in the queue and in approve() alike.
+        await _row(store, params=json.dumps({"out_of_scope": True})): "params_no_requester",
         await _row(
             store, params=json.dumps({"out_of_scope": True, "requester": "maker"})
         ): "requester_not_authorized",
@@ -141,6 +143,11 @@ async def test_the_prediction_matches_the_refusal(store: MessageStore) -> None:
     # The requester refusal is still the stale-requester refusal, with its own reason slug.
     [stale] = await store.list_audit(action="approval.stale_requester")
     assert json.loads(str(stale["detail"]))["reason"] == "requester_out_of_scope"
+    # Each row predicted params_no_requester was refused on it, the combined row included.
+    unnamed = await store.list_audit(action="approval.params_no_requester")
+    assert sorted(json.loads(str(r["detail"]))["approval_id"] for r in unnamed) == sorted(
+        k for k, v in expected.items() if v == "params_no_requester"
+    )
 
 
 async def test_an_unreadable_params_refusal_writes_its_audit_row(store: MessageStore) -> None:

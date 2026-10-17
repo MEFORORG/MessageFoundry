@@ -1943,7 +1943,8 @@ the same permission set on the same method reds CI until it is listed here.
 > scope, and `control_target` is unset or in it.
 > `tests/test_channel_rbac.py` pins the six routes, not that list.
 > `tests/test_object_scope_flag_and_alert_rules.py` pins the flag route and the rules. The console's
-> `test_webui.py` pins the bulk page's 403 for an in-scope name no connection uses, on both roles.
+> `test_webui_bulk.py` pins the bulk page's 403 for an in-scope name no connection uses, on both
+> roles.
 
 > **Single-route data rules: at least these routes narrow or refuse by scope or owner, each in its
 > own way (BACKLOG #1151).** Their route rows above point here. A *scoped caller* is any

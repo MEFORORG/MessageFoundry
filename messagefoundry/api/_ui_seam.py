@@ -476,19 +476,19 @@ from typing import Any
 #: main's #3029 (digests 0cd684e3f53d2469 and 344979df3bd2c662). The value below was re-derived
 #: with ``--write`` on the merged tree, so it covers every entry above.
 #:
-#: Vault BACKLOG #3192 review repair: ``ReleaseBlocked`` gained ``params_no_requester``, a held
-#: purge or reload whose params name no requester, which the gate now refuses before its claim
-#: (vault BACKLOG #3217). The Approvals page keys a note on every value, so an older console on this
-#: engine is refused at mount rather than meeting a value it has no note for. Re-derived with
-#: ``--write`` from 71c27581e7c9f921.
-#:
 #: Vault BACKLOG #3189 and #3031 merged with the #3192 branch, whose digest was 0cd684e3f53d2469,
-#: and with main: re-derived with ``--write`` on the merged tree, so the value below covers every
-#: entry above.
+#: and with main: re-derived with ``--write`` on that merged tree. The #3189 branch stood at
+#: 1246ce9b2b511c9e before the last merge below.
 #:
-#: Vault BACKLOG #3189 and #3031 merged again with the #3192 branch after its review repair
-#: (6d7dcabe1103f08d, ``params_no_requester``) and with main: re-derived with ``--write`` on the
-#: merged tree.
+#: Vault BACKLOG #3192 review repair, on the #3192 branch: ``ReleaseBlocked`` gained
+#: ``params_no_requester``, a held purge or reload whose params name no requester, which the gate
+#: now refuses before its claim (vault BACKLOG #3217). The Approvals page keys a note on every
+#: value, so an older console on this engine is refused at mount rather than meeting a value it
+#: has no note for. Re-derived with ``--write`` from 71c27581e7c9f921 to 6d7dcabe1103f08d.
+#:
+#: Vault BACKLOG #3189 and #3031 (at 1246ce9b2b511c9e) merged again with the #3192 branch after
+#: its review repair (at 6d7dcabe1103f08d), then with main: re-derived with ``--write`` on the
+#: merged tree, so the value below covers every entry above.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the

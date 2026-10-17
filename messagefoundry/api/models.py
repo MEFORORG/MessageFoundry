@@ -555,7 +555,8 @@ class PendingApprovalInfo(BaseModel):
     order it raises them: ``no_requester_id`` (the row predates requester-id attribution),
     ``operation_unavailable`` (no such operation is registered), ``not_gated`` (as ``gated`` above),
     ``params_unreadable``, ``params_no_requester`` (the operation's executor needs the requester's
-    name and the parameters carry none, as a purge's and a reload's do; vault BACKLOG #3217), and
+    name, as at least a held purge's and reload's do, and these parameters carry none; vault
+    BACKLOG #3217), and
     ``requester_not_authorized``, which the gate raises after the dwell floor: the requester no longer holds the authority the operation needs, read when the queue is
     listed (BACKLOG #3189). A held reload or purge whose requester has since been channel-scoped is
     one. The listing writes no ``approval.stale_requester`` row; only an approve refused on it
