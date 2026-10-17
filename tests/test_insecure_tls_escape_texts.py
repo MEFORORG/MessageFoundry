@@ -23,9 +23,10 @@ The text is every such string that holds a space or spells the variable, so a ba
 ``""`` default of ``os.environ.get`` is not a message. That text must name the posture, and a
 phrase that wraps or is split across ``+`` still counts.
 
-**What the prose scans see** (vault BACKLOG #3099). Docstrings in ``_DOCSTRING_FILES``, one
-paragraph at a time: a paragraph that spells the variable must name the posture, so a mention
-cannot ride on the posture in another paragraph. Two mentions inside one paragraph are judged
+**What the prose scans see** (vault BACKLOG #3099). Docstrings in ``_DOCSTRING_FILES``, and
+the one docstring of each function in ``_DOCSTRING_FUNCTIONS``, one paragraph at a time: a
+paragraph that spells the variable must name the posture, so a mention cannot ride on the
+posture in another paragraph. Two mentions inside one paragraph are judged
 together. Comments in ``_COMMENT_FILES``: own-line comments on consecutive
 lines are one comment, and a comment after code is read alone. A comment names the escape when it
 spells the variable. A comment in a ``def`` signature also names it when it says "the escape",
@@ -39,7 +40,9 @@ scan does not copy them: it reads each trailing comment alone, which is stricter
 define the rule, so a scan of every docstring flags some text that misleads nobody. The list is
 the files brought into line so far, and it is not every file that needs it. Where a file cannot be
 held whole, ``_DOCSTRING_FUNCTIONS`` holds single functions to the rule, at least
-``insecure_tls_allowed`` in ``config/settings.py``. Every other docstring in that file goes unread.
+``insecure_tls_allowed`` in ``config/settings.py``. Every other docstring in that file goes unread,
+and so do the docstrings in at least ``config/tls_policy.py``, ``config/ai_policy.py`` and
+``pipeline/wiring_runner.py`` that spell the variable.
 
 **What none of them sees**, at least: a message built in a variable before the call; the variable
 imported under another name; a message with no space that only interpolates the variable, such
@@ -107,6 +110,7 @@ _DOCSTRING_FILES = (
     "messagefoundry/transports/database.py",
     "messagefoundry/transports/direct.py",
     "messagefoundry/transports/email.py",
+    "messagefoundry/transports/mllp.py",
     "messagefoundry/transports/remotefile.py",
     "messagefoundry/transports/rest.py",
 )
@@ -465,8 +469,8 @@ def test_every_authoring_text_naming_the_escape_names_the_posture() -> None:
         [("docstring", rel, docstrings_without_posture(_text(rel))) for rel in _DOCSTRING_FILES]
         + [
             (
-                f"{name} docstring",
-                rel,
+                "docstring",
+                f"{rel}:{name}",
                 _docstring_without_posture(named_func(parse_source(_text(rel)), name)),
             )
             for rel, name in _DOCSTRING_FUNCTIONS

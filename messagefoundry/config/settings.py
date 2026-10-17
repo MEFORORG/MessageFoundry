@@ -448,34 +448,34 @@ def insecure_tls_allowed() -> bool:
 
     Set is not honoured. Certificate-validation overrides (``trust_server_certificate=true`` for
     SQL Server, for one) are MITM-able, so the escape lets one through only when
-    ``MEFOR_ALLOW_INSECURE_TLS`` is set on an instance at ``[security].enforcement = warn``. The cells
-    ask :func:`weakened_tls_escape_permitted` or :func:`hop_insecure_escape_downgrades`, which add
-    that condition. Under ``enforce``, the default, or where the code knows no posture, the escape
-    changes nothing. Some connections have a per-hop way across that needs neither the escape nor the
-    dial, such as ``tls_hop_attested``. Some credential hops refuse even at ``warn``;
-    docs/SECURITY-LOOSENING.md, *No escape sends a credential to an unverified peer*, names them and
-    the ones that still cross."""
+    ``MEFOR_ALLOW_INSECURE_TLS`` is set on an instance at ``[security].enforcement = warn``. The
+    cells ask :func:`weakened_tls_escape_permitted` or :func:`hop_insecure_escape_downgrades`, which
+    add that condition. Under ``enforce``, the default, or where the code knows no posture, the
+    escape changes nothing. Some connections have a per-hop way across that needs neither the escape
+    nor the dial, such as ``tls_hop_attested``. Some credential hops refuse even at ``warn``;
+    docs/SECURITY-LOOSENING.md, *No escape sends a credential to an unverified peer*, names them
+    and the ones that still cross."""
     return os.environ.get(INSECURE_TLS_ESCAPE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def hop_insecure_escape_downgrades(*, enforcing: bool) -> bool:
-    """Whether ``MEFOR_ALLOW_INSECURE_TLS`` may downgrade an insecure-hop REFUSE→WARN here (#200).
+    """Whether ``MEFOR_ALLOW_INSECURE_TLS`` may downgrade an insecure-hop REFUSE→WARN here (#200):
+    only on an instance at ``[security].enforcement = warn``.
 
     The **clamp** on the blunt global escape for the posture-keyed hop refusal (ADR 0092, decision 2):
     the escape may only relax a hop REFUSE to WARN when the security dial is **not enforcing**. Under
     ENFORCE it is **inert** — it can NEVER satisfy an enforcing hop (a deliberate behaviour change from
     the pre-#200 global escape, which silenced the refusal in every environment).
 
-    **Scope after ADR 0153 (decision 5): no CLEARTEXT transport cell consults this.** The
-    cleartext-hop authority lost its ``audited_opt_out`` parameter, so the variable cannot influence a
-    connection's cleartext-hop decision; the per-connection ``cleartext_accepted`` declaration replaced
-    it there. This clamp survives for the two **non-connection** cells that still key on the escape and
-    have nowhere to carry a per-hop declaration — the ``[logging]`` forwarder
-    (:func:`forward_hop_disposition`) and the API PHI-read serve hop
-    (:func:`~messagefoundry.config.tls_policy.phi_read_hop_disposition`) — plus the verify-off cells,
-    via :func:`weakened_tls_escape_permitted` or, for the HTTP family's ``verify_tls=false``, directly
-    (``transports.rest._shipped_strict_disposition``). On a connection, ``tls_hop_attested`` (ALLOW) or
-    ``cleartext_accepted`` (WARN + audit) is now the only way across an enforcing hop."""
+    **Scope after ADR 0153 (decision 5).** The cleartext-hop authority
+    (:func:`~messagefoundry.config.tls_policy.insecure_hop_disposition`) lost its
+    ``audited_opt_out`` parameter, so the variable no longer reaches a hop that authority decides as
+    cleartext; the per-connection ``cleartext_accepted`` declaration replaced it there. This clamp
+    is still called by at least the ``[logging]`` forwarder (:func:`forward_hop_disposition`), the
+    API PHI-read serve hop, and the HTTP family's ``verify_tls=false`` cell
+    (``transports.rest._shipped_strict_disposition``). :func:`weakened_tls_escape_permitted` applies
+    the same clamp to at least the other verify-off cells and the Direct and Email cleartext SMTP
+    hops."""
     return insecure_tls_allowed() and not enforcing
 
 
