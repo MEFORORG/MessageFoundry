@@ -22,6 +22,7 @@ deferred per-command so a quick `validate`/`hl7schema`/`lens schema` call doesn'
 from __future__ import annotations
 
 from messagefoundry.remotedebug import (
+    REMOTE_DEBUG_ACCEPTANCE,
     REMOTE_DEBUG_ACCEPTANCE_LOOSENING,
     RemoteDebugPosture,
     install_remote_debug_guard,
@@ -2486,11 +2487,23 @@ def _remote_debug_refused(
     settings: ServiceSettings, posture: RemoteDebugPosture, *, enforcing: bool, what: str
 ) -> bool:
     """True, with the reason printed, when :func:`messagefoundry.remotedebug.remote_debug_refusal`
-    refuses ``posture`` and nothing lifts it (vault BACKLOG #2700). ``what`` is what is refused."""
-    if not enforcing or settings.security.allow_remote_debugging:
+    refuses ``posture`` and nothing lifts it (vault BACKLOG #2700). ``what`` is what is refused.
+
+    Where the acceptance lifts a refusal that would fire, it writes a WARNING-level ``AUDIT:``
+    line, as the sibling acceptances of an enforced start gate do, so the lift is never silent."""
+    if not enforcing:
         return False
     refused = remote_debug_refusal(posture)
     if refused is None:
+        return False
+    if settings.security.allow_remote_debugging:
+        logging.getLogger(__name__).warning(
+            "AUDIT: permitted to %s under enforcement = enforce with the interpreter's remote "
+            "debugging (PEP 768) enabled in this process, because %s = true. See "
+            "docs/SECURITY-LOOSENING.md.",
+            what,
+            REMOTE_DEBUG_ACCEPTANCE,
+        )
         return False
     print(f"error: refusing to {what}: {refused}.", file=sys.stderr)
     return True

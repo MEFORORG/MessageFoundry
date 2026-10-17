@@ -12,6 +12,7 @@ reading is the interpreter's own.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import subprocess
 import sys
@@ -124,6 +125,39 @@ def test_serve_does_not_stop_at_this_gate(
     assert _REFUSAL not in capsys.readouterr().err
 
 
+def _audit_lines(caplog: pytest.LogCaptureFixture, what: str) -> list[str]:
+    """The AUDIT lines the gate wrote where the acceptance lifted its refusal to ``what``."""
+    prefix = f"AUDIT: permitted to {what} under enforcement"
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == cli.__name__ and r.getMessage().startswith(prefix)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("posture", "warn", "audited"),
+    [(_ON, False, True), (_OFF, False, False), (_ON, True, False)],
+    ids=["lifts-a-refusal", "interface-off", "enforcement-warn"],
+)
+def test_the_acceptance_writes_an_audit_line_only_where_it_lifts_a_refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    posture: RemoteDebugPosture,
+    warn: bool,
+    audited: bool,
+) -> None:
+    """As the sibling acceptances do (allow_single_factor_admin_when_exposed,
+    allow_over_granted_store_principal): a WARNING-level ``AUDIT:`` line where the acceptance
+    lifts a refusal that would fire, and none where there was nothing to lift."""
+    with caplog.at_level(logging.WARNING, logger=cli.__name__):
+        _serve(tmp_path, monkeypatch, posture, warn=warn, accept=True)
+    lines = _audit_lines(caplog, "start")
+    assert len(lines) == int(audited), lines
+    assert all(REMOTE_DEBUG_ACCEPTANCE in line for line in lines)
+
+
 def test_the_acceptance_is_named_as_a_loosening() -> None:
     from tests.test_security_posture_defaults import _names
 
@@ -186,6 +220,16 @@ def test_supervise_does_not_stop_at_this_gate(
 ) -> None:
     _supervise(tmp_path, monkeypatch, posture, accept=accept)
     assert _REFUSAL not in capsys.readouterr().err
+
+
+def test_supervise_writes_the_audit_line_where_the_acceptance_lifts_its_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger=cli.__name__):
+        # It may stop at a later gate (no store key is set); the line comes before those.
+        _supervise(tmp_path, monkeypatch, _ON, accept=True)
+    lines = _audit_lines(caplog, "start the fleet")
+    assert len(lines) == 1 and REMOTE_DEBUG_ACCEPTANCE in lines[0], lines
 
 
 # --- a real interpreter, started both ways ---------------------------------------------------------

@@ -1858,8 +1858,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   option nor the variable fits. Never for a deployment: the shipped service launches turn the
   interface off, so they need nothing here.
 - **It is never silent:** an entry here and in `GET /security/posture` for `serve`, and a WARNING
-  line at each `supervise` start. The `remote_debug_enabled` entry still
-  reports the interface itself.
+  line at each `supervise` start. Where it lifts a refusal that would fire, `serve` and
+  `supervise` also write a WARNING-level `AUDIT:` line, as the other acceptances of an enforced
+  start gate do. The `remote_debug_enabled` entry still reports the interface itself.
 - **What it does not do:** it does not turn the hook off, and under `enforcement = warn` it has
   nothing to lift.
 - **How to turn it off:** remove it, and start the interpreter with `-X disable-remote-debug`.
