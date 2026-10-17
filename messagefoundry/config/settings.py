@@ -3721,11 +3721,15 @@ class AuthSettings(_Section):
     @field_validator("ad_session_revoke_max_fraction")
     @classmethod
     def _check_ad_revoke_fraction(cls, value: float) -> float:
-        # A 0.0 fraction would make the breaker absolute-only: any revocation exceeds it. A 1.0
-        # fraction is the opposite, never exceeded, so it disables the whole breaker;
-        # `_refuse_a_dead_breaker_fraction` refuses that while the reconciler can run (#3085).
+        # At 0.0 any revocation exceeds the proportional half, so every pass above the absolute cap
+        # trips on any estate, a genuine offboarding wave included; refused. At 1.0 it is never
+        # exceeded, so the whole breaker is dead; `_refuse_a_dead_breaker_fraction` refuses that
+        # while the reconciler can run (#3085).
         if not 0.0 < value <= 1.0:
-            raise ValueError("ad_session_revoke_max_fraction must be > 0.0 and <= 1.0")
+            raise ValueError(
+                "ad_session_revoke_max_fraction must be > 0.0 and <= 1.0, and below 1.0 while the "
+                "directory reconciler runs"
+            )
         return value
 
     @property
@@ -3805,7 +3809,8 @@ class AuthSettings(_Section):
     @property
     def reconciler_configured(self) -> bool:
         """Whether the directory session reconciler is set to run: AD on and a non-zero interval.
-        ``AuthService.should_reconcile`` also needs an LDAP client, which settings cannot see."""
+        ``AuthService.directory_reconcile_enabled`` also needs an LDAP client, which settings
+        cannot see."""
         return self.ad_enabled and self.ad_session_recheck_seconds > 0
 
     @model_validator(mode="after")
@@ -3814,9 +3819,10 @@ class AuthSettings(_Section):
 
         ``breaker_tripped`` in ``auth/reconcile.py`` trips only when a pass's revocations exceed
         BOTH thresholds. A pass never revokes more accounts than it probed, so a 1.0 fraction is never
-        exceeded and the whole breaker is dead. Checked only while the reconciler can run. The other
-        dead-breaker setting, a budget at or below the cap, is warned of rather than refused (owner
-        ruling 2026-10-17); :meth:`breaker_budget_warning` says why.
+        exceeded and the whole breaker is dead. Checked only while the reconciler can run. A budget
+        at or below the cap also leaves it dead, and is warned of rather than refused (owner ruling
+        2026-10-17); :meth:`breaker_budget_warning` says why. At least one more dead case is
+        neither: an estate with no more signed-in directory users than the cap.
         """
         if self.reconciler_configured and self.ad_session_revoke_max_fraction >= 1.0:
             raise ValueError(
@@ -3842,7 +3848,8 @@ class AuthSettings(_Section):
             f"below [auth].ad_session_revoke_max ({self.ad_session_revoke_max}): a pass probes at "
             "most that many accounts, so it can never revoke more than the cap, and the "
             "mass-revoke circuit breaker can never trip. Revocation still works. To arm the "
-            "breaker, set ad_session_revoke_max below ad_session_recheck_max_users."
+            "breaker, raise ad_session_recheck_max_users above ad_session_revoke_max. Lowering "
+            "the cap instead makes a pass that revokes its whole small sample trip."
         )
 
     @property
@@ -9658,10 +9665,6 @@ def load_settings(
     # AFTER the CLI merge, so a `--host` that moved the socket off-box is reported as the posture
     # loosening it is. One-way: it only ever ADDS a loosening. See the helper for why.
     _reconcile_effective_bind(settings)
-    if (breaker_note := settings.auth.breaker_budget_warning()) is not None:
-        # A warning, not a refusal (owner ruling 2026-10-17, BACKLOG #3085). Logged here, once per
-        # resolve, like the VIP note below, rather than from a validator that runs at every build.
-        _log.warning("%s", breaker_note)
     if settings.cluster.vip.enabled:
         # Configuration only in this build (ADR 0056). Say so, or an operator who switched it on finds
         # out at the first failover that the address never moved.

@@ -292,27 +292,29 @@ def test_a_budget_at_or_below_the_cap_loads_and_names_the_dead_breaker(users: in
     RED when: the pair is refused, or loads with no warning."""
     note = _settings(ad_session_recheck_max_users=users).breaker_budget_warning()
     assert note is not None
-    assert "can never trip" in note and "set ad_session_revoke_max below" in note
+    assert "can never trip" in note
+    assert "raise ad_session_recheck_max_users above ad_session_revoke_max" in note
 
 
-def test_load_settings_logs_the_dead_breaker_warning(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """The warning reaches the log at start, from ``load_settings``, the path ``serve`` resolves."""
-    config = tmp_path / "messagefoundry.toml"
-    config.write_text(
-        "[auth]\n"
-        "ad_enabled = true\n"
-        'ad_server = "ldaps://dc.test.invalid"\n'
-        'ad_user_search_base = "OU=Staff,DC=test,DC=invalid"\n'
-        'ad_bind_dn = "CN=svc-mefor,OU=Service,DC=test,DC=invalid"\n'
-        "ad_session_recheck_max_users = 3\n",
-        encoding="utf-8",
-    )
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.config.settings"):
-        load_settings(config_path=config, environ={"MEFOR_AUTH_AD_BIND_PASSWORD": "synthetic"})
-    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    assert any("mass-revoke circuit breaker can never trip" in m for m in warned), warned
+def test_a_budget_one_above_the_cap_does_not_warn() -> None:
+    """The boundary control: at cap + 1 a pass can revoke more than the cap, so the breaker can
+    trip and nothing is warned of."""
+    assert _settings(ad_session_recheck_max_users=6).breaker_budget_warning() is None
+
+
+def test_serve_logs_the_dead_breaker_warning_once_logging_is_configured() -> None:
+    """``serve`` loads its settings before ``configure_logging``, so the warning is logged after it,
+    or it would reach bare stderr only. Read from the source, as the unread-variable replay test in
+    tests/test_settings_env_keys.py does, because running ``serve`` that far starts an engine."""
+    import inspect
+
+    from messagefoundry import __main__ as cli
+
+    source = inspect.getsource(cli._serve)
+    checked = source.index("if _logging_refused is not None:")
+    warned = source.index("settings.auth.breaker_budget_warning()")
+    assert source.index("_load_service_settings(") < checked < warned
+    assert "breaker_budget_warning" not in inspect.getsource(load_settings)
 
 
 @pytest.mark.parametrize(
