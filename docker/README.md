@@ -63,8 +63,10 @@ interpreter it starts.
 Two things undo this, and the engine reports both:
 
 - **Overriding the entry point** (`--entrypoint messagefoundry`, or a `command:` that replaces it
-  in Kubernetes) starts the engine without the options. It then reports
-  `interpreter_not_isolated` and `remote_debug_enabled`.
+  in Kubernetes) starts the engine without the options. Under `enforce` it then refuses to
+  start, because remote debugging is on (vault BACKLOG #2700). Under `warn`, or with
+  `[security].allow_remote_debugging`, it reports `interpreter_not_isolated` and
+  `remote_debug_enabled`.
 - **A derived image that leaves the venv owned by uid 10001.** Install extra packages as root and
   switch back: `USER root`, then `RUN /opt/venv/bin/pip install ...`, then `USER 10001`. The engine
   reports `startup_directory_writable` when its account can write there.
