@@ -1868,6 +1868,12 @@ _PasskeyHeld = Literal["held", "removed", "unverified", "account_gone"]
 _TotpEnrolment = tuple[float | None, str | None]
 
 
+def _log_totp_undecryptable(username: str) -> None:
+    """Log an account whose TOTP cell does not open under this store key, naming the account and
+    never the value."""
+    _log.warning("the TOTP secret of account %r does not decrypt under this store key", username)
+
+
 def _same_totp_enrolment(a: _TotpEnrolment, b: _TotpEnrolment) -> bool:
     """Whether two :data:`_TotpEnrolment` readings name one enrolment. The secret digests are
     compared in constant time (ASVS 11.2.4); the stamps are not secret."""
@@ -1895,9 +1901,7 @@ async def _totp_secret_usable(store: AdminStore, user: UserRecord) -> bool:
     try:
         secret = await store.get_totp_secret(user.id)
     except CipherError:
-        _log.warning(
-            "the TOTP secret of account %r does not decrypt under this store key", user.username
-        )
+        _log_totp_undecryptable(user.username)
         return False
     if not secret:
         return False
@@ -8146,14 +8150,12 @@ class AuthService:
     def _totp_enrolment(self, user: VerifiedUser) -> _TotpEnrolment | None:
         """``user``'s TOTP enrolment as :meth:`verify_mfa` compares it across a code check (BACKLOG
         #3068): the enrolment stamp and a digest of the opened secret, so the plaintext is not held
-        across the check. ``None`` when the cell does not open, logged as
-        :func:`_totp_secret_usable` logs it, naming the account and never the value."""
+        across the check. ``None`` when the cell does not open, logged by
+        :func:`_log_totp_undecryptable`."""
         try:
             secret = self._totp_secret(user)
         except CipherError:
-            _log.warning(
-                "the TOTP secret of account %r does not decrypt under this store key", user.username
-            )
+            _log_totp_undecryptable(user.username)
             return None
         return user.totp_enrolled_at, None if secret is None else hash_token(secret)
 
@@ -10411,15 +10413,6 @@ class AuthService:
             # compared too, so two enrolments sharing a stamp still differ. Neither moves under a
             # store-key rotation, which re-encrypts the cell, so a rotation refuses nothing.
             verified_enrolment = self._totp_enrolment(user)
-            if verified_enrolment is None:
-                # A secret that does not open checks no code. Refused before any code is spent.
-                await self._audit(
-                    "auth.mfa_failed",
-                    actor=user.username,
-                    detail=_json({"reason": "factor_unverified"}),
-                    client=client,
-                )
-                return Elevation()
             if await self._verify_second_factor(user, code, client=client, arrived=arrived):
                 # BACKLOG #3068: the verify awaited (a recovery-code walk is argon2 work off the
                 # loop), and a revocation or a disable needs no queue to land. So the session, the
@@ -10445,7 +10438,7 @@ class AuthService:
                 refusal: str | None = None
                 if not fresh.totp_enabled:
                     refusal = "factor_removed"
-                elif enrolment_now is None:
+                elif verified_enrolment is None or enrolment_now is None:
                     refusal = "factor_unverified"
                 elif not _same_totp_enrolment(verified_enrolment, enrolment_now):
                     refusal = "factor_replaced"
@@ -11453,6 +11446,15 @@ class AuthService:
             # cannot suppress the signal. A set whose seal fails proves nothing either way, so it
             # keeps the signal.
             standing = await self._passkey_held(user, cred)
+            if standing in ("held", "unverified"):
+                # Written now, under the name loaded before the write, so an exception in the
+                # re-read below cannot drop the signal.
+                await self._audit(
+                    "auth.webauthn_clone_suspected",
+                    actor=user.username,
+                    detail=_json({"label": cred.label}),
+                    client=client,
+                )
         # BACKLOG #3068: the passkey read and the sign-count write awaited since the session, the
         # account and its lock were last read, so a revocation, a disable or a lock that landed in
         # between must stop the factor write, as on verify_mfa. Asked on both paths, so each
@@ -11464,15 +11466,6 @@ class AuthService:
             client=client,
             report_lock=False,
         )
-        if standing in ("held", "unverified"):
-            # Written whatever the re-read found, under the name the row holds now when it still
-            # loads (the BACKLOG #2291 class).
-            await self._audit(
-                "auth.webauthn_clone_suspected",
-                actor=user.username if isinstance(fresh, Elevation) else fresh.username,
-                detail=_json({"label": cred.label}),
-                client=client,
-            )
         if isinstance(fresh, Elevation):
             return fresh
         user = fresh
