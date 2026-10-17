@@ -174,7 +174,7 @@ function warnAboutUnanchoredTargets(facts: ApiTlsFacts | undefined): void {
  * as "cannot verify" until the next 15-second poll, on every window open.
  */
 export function registerEngineTrust(context: vscode.ExtensionContext): void {
-  void refreshThenRecheck();
+  void refreshEngineTrustThenRecheck();
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (
@@ -182,13 +182,15 @@ export function registerEngineTrust(context: vscode.ExtensionContext): void {
         e.affectsConfiguration("messagefoundry.environments") ||
         e.affectsConfiguration("messagefoundry.serviceConfig")
       ) {
-        void refreshThenRecheck();
+        void refreshEngineTrustThenRecheck();
       }
     }),
   );
 }
 
-async function refreshThenRecheck(): Promise<void> {
+/** Re-learn the engine certificate, and re-probe if what the client trusts changed. Exported for the
+ *  workspace-trust grant, which activation cannot re-run (vault BACKLOG #3166). */
+export async function refreshEngineTrustThenRecheck(): Promise<void> {
   if (!(await refreshEngineTrust())) {
     return; // nothing changed about what we trust, so nothing to re-probe
   }
