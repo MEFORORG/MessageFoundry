@@ -367,7 +367,7 @@ _LOCK_CLASS_OUTBOUND_LANE = 4
 # Vault BACKLOG #2779: one lock for every last-administrator guarded write, so two of them, from any
 # shard, cannot both read the same two administrators and both remove one.
 _LOCK_CLASS_ADMIN_GUARD = 5
-# Vault BACKLOG #3180: one lock per uploader, so two shards' upload reserves for the same
+# Vault BACKLOG #3180: one lock per uploader, so two engine shards' upload reserves for the same
 # uploader cannot both read the same in-flight sums and both insert a slot.
 _LOCK_CLASS_UPLOAD_QUOTA = 6
 _AUDIT_LOCK = "mefor_audit_chain"
@@ -8499,16 +8499,21 @@ class PostgresStore:
         :meth:`messagefoundry.store.base.Store.reserve_upload_quota` for the contract, and the SQLite
         twin for the statement shape.
 
-        A per-uploader advisory lock serializes the reserves of one uploader across every shard, so
-        the sums each one reads already hold the previous holder's committed row: under READ
-        COMMITTED a statement sees what committed before it began. ``RETURNING`` (absent on a
+        A per-uploader advisory lock serializes the reserves of one uploader across every engine
+        shard, so the sums each one reads already hold the previous holder's committed row: under
+        READ COMMITTED a statement sees what committed before it began. The transaction pins READ
+        COMMITTED, because a REPEATABLE READ server default would take the snapshot when the lock
+        statement starts, before it waits, and two reserves would read the same sums. ``RETURNING`` (absent on a
         refusal) discriminates applied from refused."""
         if max_files < 1 or size_bytes > max_total_bytes:
             # Fail closed before touching the store: a headroom that cannot hold one slot.
             return False
         now = time.time()
         stale = now - max(0.0, stale_after)
-        async with self._timed_acquire(record=False) as conn, conn.transaction():
+        async with (
+            self._timed_acquire(record=False) as conn,
+            conn.transaction(isolation="read_committed"),
+        ):
             await self._advisory_lock(conn, _LOCK_CLASS_UPLOAD_QUOTA, f"upload_quota:{uploader_id}")
             await conn.execute(
                 "DELETE FROM upload_reservation WHERE uploader_id = $1 AND since <= $2",

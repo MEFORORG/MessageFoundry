@@ -87,6 +87,35 @@ async def test_a_reserve_that_raises_after_its_commit_is_released_by_its_id(
     assert not (tmp_path / "uploads").exists() or not list((tmp_path / "uploads").iterdir())
 
 
+async def test_a_late_release_is_cancelled_at_its_cap_rather_than_absorbed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The cap must reach the store call itself. A held wrapper that waited on the call absorbed
+    the cancellation for ``_LEDGER_CANCEL_WAIT_SECONDS`` and then held the call again under a fresh
+    cap (found in code review), so a stalled release outlived its cap several times over."""
+    monkeypatch.setattr(uploads_mod, "_LEDGER_STRAGGLER_MAX_SECONDS", 0.2)
+
+    class _ReserveFailsReleaseStalls:
+        async def reserve_upload_quota(self, *args: Any, **kwargs: Any) -> bool:
+            raise ConnectionError("store unreachable")
+
+        async def release_upload_quota(self, reservation_id: str) -> None:
+            await asyncio.Event().wait()
+
+        async def touch_upload_quota(self, reservation_id: str) -> None:
+            return None
+
+        async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
+            return (0, 0)
+
+    store = _uploads(tmp_path, _ReserveFailsReleaseStalls())
+    with pytest.raises(ConnectionError):
+        await store.save(data=b"x\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        assert await _settled(store, 2.0), "the late release outlived its cap"
+    assert "release for u-op was cancelled before it finished" in caplog.text, caplog.text
+
+
 async def test_a_ledger_call_left_running_is_cancelled_at_its_cap(
     tmp_path: Path,
     ledger_db: MessageStore,

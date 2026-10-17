@@ -107,7 +107,8 @@ _LEDGER_CANCEL_WAIT_SECONDS = 5.0
 _RESERVATION_HEARTBEAT_SECONDS = 100.0
 # How long a save keeps touching its row at most. A write that never finishes would otherwise pin
 # the row, and any leaked slot in it, for as long as the process lives. Past this the heartbeat
-# stops with a WARNING, and the row goes stale unless other activity keeps it fresh. A write is
+# stops with a WARNING, and the reservation goes stale; no other activity keeps it fresh (vault
+# BACKLOG #3180). A write is
 # bounded by ``max_upload_bytes`` (512 MiB at most), so an hour is far past any healthy save.
 _RESERVATION_HEARTBEAT_MAX_SECONDS = 3600.0
 
@@ -1030,7 +1031,7 @@ class UploadStore:
         # The cancel handler sits outside the release, so it also catches a cancellation that lands
         # in the release await, after the write returned, and INSIDE the lock, so no other save in
         # this process scans the disk while a pair about to be removed is still on it (vault BACKLOG
-        # #3180; that scan answered a spurious 409 at the quota edge). A sibling shard's scan between
+        # #3180; that scan answered a spurious 409 at the quota edge). A sibling engine shard's scan between
         # the release and the removal over-counts the pair, which can refuse it but never admits one
         # too many. The reserve and the release each get a bounded wait to finish before a
         # cancellation propagates, so a cancelled save normally pays its slot back (BACKLOG #2263).
@@ -1089,7 +1090,8 @@ class UploadStore:
             meta_path.unlink(missing_ok=True)
         except OSError as exc:
             _log.error(
-                "upload %s was cancelled after its file landed and was not fully removed; what "
+                "upload %s was cancelled after its file landed, or its upload.create row failed, "
+                "and it was not fully removed; what "
                 "remains has no upload.create audit row: %s",
                 file_id,
                 exc,
@@ -1106,7 +1108,8 @@ class UploadStore:
         in-process check raises, so the API's 409 + ``upload.reject_quota`` audit is unchanged; the
         message differs on purpose, so an operator can tell the two causes apart. A ledger error is
         NOT swallowed: the store being unreachable fails the upload closed. It may have committed
-        before it raised, so the reservation is released by its id first (vault BACKLOG #3180).
+        before it raised, so a release of the reservation by its id is started before the error
+        propagates (vault BACKLOG #3180). Nothing waits for it.
 
         **This is not the quota decision (BACKLOG #1941).** ``save`` makes that after reserving, from
         a read of the ledger plus a fresh disk scan; :class:`UploadQuotaError` says why the order
@@ -1159,15 +1162,10 @@ class UploadStore:
             raise
         except Exception:
             # Its outcome is unknown, and a release by id pays back exactly what it took, if
-            # anything. Held rather than awaited: a failing store would otherwise make this error
-            # path wait out a second store call while every queued save waits on _quota_lock, and
-            # an unpaid slot only makes the quota stricter until it goes stale.
-            self._hold(
-                asyncio.ensure_future(
-                    self._release_across_shards(reservation=reservation, uploader_id=uploader_id)
-                ),
-                cap=_LEDGER_STRAGGLER_MAX_SECONDS,
-            )
+            # anything. Started, not awaited: a failing store would otherwise make this error path
+            # wait out a second store call while every queued save waits on _quota_lock, and an
+            # unpaid slot only makes the quota stricter until it goes stale.
+            self._release_later(reservation, uploader_id)
             raise
         if not ok:
             raise self._shard_refusal(
@@ -1254,32 +1252,34 @@ class UploadStore:
         )
 
         def _done(done: asyncio.Future[Any]) -> None:
-            if what == "reserve":
-                if not self._reserve_may_hold_a_slot(done, uploader_id):
-                    return
-                if self._draining:
-                    _log.warning(
-                        "shutdown: a slot the cross-shard upload reserve for %s may have taken "
-                        "is not released; it is reclaimed once it goes stale",
-                        uploader_id,
-                    )
-                    return
-                self._hold(
-                    asyncio.ensure_future(
-                        self._release_across_shards(
-                            reservation=reservation, uploader_id=uploader_id
-                        )
-                    ),
-                    cap=_LEDGER_STRAGGLER_MAX_SECONDS,
-                )
-            elif done.cancelled():
-                _log.warning(
-                    "the cross-shard upload release for %s was cancelled before it finished; its "
-                    "slot is reclaimed once it goes stale",
-                    uploader_id,
-                )
+            if what != "reserve":
+                _log_release_cancelled(done, uploader_id)
+            elif self._reserve_may_hold_a_slot(done, uploader_id):
+                self._release_later(reservation, uploader_id)
 
         self._hold(fut, _done, cap=_LEDGER_STRAGGLER_MAX_SECONDS)
+
+    def _release_later(self, reservation: str, uploader_id: str) -> None:
+        """Start a release of ``reservation`` that nobody waits for, held for at most
+        ``_LEDGER_STRAGGLER_MAX_SECONDS`` (vault BACKLOG #3180). The held task is the store call
+        itself, so the cap or the shutdown drain cancels the call, not a wrapper that would absorb
+        the cancellation. While the store is draining it starts nothing: the store is about to
+        close, and the slot is reclaimed once it goes stale."""
+        ledger = self._ledger
+        if ledger is None:
+            return
+        if self._draining:
+            _log.warning(
+                "shutdown: a slot the cross-shard upload reserve for %s may have taken is not "
+                "released; it is reclaimed once it goes stale",
+                uploader_id,
+            )
+            return
+        self._hold(
+            asyncio.ensure_future(_release_reservation(ledger, reservation, uploader_id)),
+            functools.partial(_log_release_cancelled, uploader_id=uploader_id),
+            cap=_LEDGER_STRAGGLER_MAX_SECONDS,
+        )
 
     def _hold(
         self,
@@ -1319,29 +1319,33 @@ class UploadStore:
         new starts against a store about to close; a slot it may have taken goes stale. A sweep it
         cancels logs each file it removed with no row, as a shutdown cancel always has."""
         self._draining = True
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        while self._stragglers and (remaining := deadline - loop.time()) > 0:
-            await asyncio.wait(set(self._stragglers), timeout=remaining)
-        left = set(self._stragglers) | set(self._heartbeats)
-        if not left:
-            return
-        if self._stragglers:
-            _log.warning(
-                "shutdown: cancelling %d upload ledger call(s) or save-time sweep(s) still "
-                "running after %gs",
-                len(self._stragglers),
-                timeout,
-            )
-        for task in left:
-            task.cancel()
-        _done, stuck = await asyncio.wait(left, timeout=grace)
-        if stuck:
-            _log.error(
-                "shutdown: %d cancelled upload task(s) had not finished after %gs",
-                len(stuck),
-                grace,
-            )
+        try:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout
+            while self._stragglers and (remaining := deadline - loop.time()) > 0:
+                await asyncio.wait(set(self._stragglers), timeout=remaining)
+            left = set(self._stragglers) | set(self._heartbeats)
+            if not left:
+                return
+            if self._stragglers:
+                _log.warning(
+                    "shutdown: cancelling %d upload ledger call(s) or save-time sweep(s) still "
+                    "running after %gs",
+                    len(self._stragglers),
+                    timeout,
+                )
+            for task in left:
+                task.cancel()
+            _done, stuck = await asyncio.wait(left, timeout=grace)
+            if stuck:
+                _log.error(
+                    "shutdown: %d cancelled upload task(s) had not finished after %gs",
+                    len(stuck),
+                    grace,
+                )
+        finally:
+            # An app whose lifespan runs again on this store releases normally again.
+            self._draining = False
 
     def _shard_refusal(
         self, *, uploader: str, observed_files: int, observed_bytes: int
@@ -1399,21 +1403,7 @@ class UploadStore:
         ledger = self._ledger
         if ledger is None:
             return
-
-        # The log sits inside the task, so a failure is reported in this module's words whether or
-        # not the caller is being cancelled, and the task never ends in an error of its own.
-        async def _release() -> None:
-            try:
-                await ledger.release_upload_quota(reservation)
-            except Exception:  # noqa: BLE001 — a release failure must not fail an upload that landed
-                _log.warning(
-                    "could not release the cross-shard upload reservation for %s; it will be "
-                    "reclaimed when it goes stale",
-                    uploader_id,
-                    exc_info=True,
-                )
-
-        release = asyncio.ensure_future(_release())
+        release = asyncio.ensure_future(_release_reservation(ledger, reservation, uploader_id))
         try:
             await _wait_to_completion(release, cancel_bound=_LEDGER_CANCEL_WAIT_SECONDS)
         except asyncio.CancelledError:
@@ -2336,6 +2326,33 @@ def _log_unaudited(what: str, tally: _SweepTally, *, exc: BaseException | None =
             first + len(chunk),
             ", ".join(chunk),
             exc_info=exc if first == 0 else None,
+        )
+
+
+async def _release_reservation(
+    ledger: UploadQuotaLedger, reservation: str, uploader_id: str
+) -> None:
+    """Release ``reservation`` on ``ledger``. The log sits inside the task, so a failure is reported
+    in this module's words whether or not anyone still waits, and the task never ends in an error
+    of its own; a release failure must not fail an upload that landed."""
+    try:
+        await ledger.release_upload_quota(reservation)
+    except Exception:  # noqa: BLE001 — logged; the slot is reclaimed once it goes stale
+        _log.warning(
+            "could not release the cross-shard upload reservation for %s; it will be "
+            "reclaimed when it goes stale",
+            uploader_id,
+            exc_info=True,
+        )
+
+
+def _log_release_cancelled(done: asyncio.Future[Any], uploader_id: str) -> None:
+    """Name a release that was cancelled before it finished; its slot then goes stale."""
+    if done.cancelled():
+        _log.warning(
+            "the cross-shard upload release for %s was cancelled before it finished; its slot is "
+            "reclaimed once it goes stale",
+            uploader_id,
         )
 
 

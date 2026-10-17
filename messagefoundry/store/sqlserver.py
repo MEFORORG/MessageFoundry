@@ -12111,7 +12111,7 @@ class SqlServerStore:
         :meth:`messagefoundry.store.base.Store.reserve_upload_quota` for the contract, and the SQLite
         twin for the statement shape.
 
-        A per-uploader applock serializes the reserves of one uploader across every shard. Under
+        A per-uploader applock serializes the reserves of one uploader across every engine shard. Under
         RCSI each statement reads what committed before it began, and the previous holder committed
         before it let the applock go, so the sums read here hold its row. ``OUTPUT`` reports the
         insert, which a session-wide ``SET NOCOUNT ON`` cannot hide (BACKLOG #2283)."""
