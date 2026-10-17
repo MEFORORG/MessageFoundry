@@ -10,8 +10,7 @@ Section 6 is not a compare. It covers the store cipher's keyring fallback, which
 key with no early exit, and it counts decrypt calls rather than spying on a helper.
 
 The web console's session-list route is pinned beside its existing tests in
-``packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py``, because its fixtures live
-there.
+``packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py``.
 
 Synthetic data only: random keys, made-up hashes, a throwaway PEM-shaped file.
 """

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """/ui content search and audit view, WebAuthn passkeys (ADR 0068), off-loopback hardening, AD password
-and Kerberos SSO login, and the web-console parity closeout (BACKLOG #75)."""
+and Kerberos SSO login, account sessions, and the web-console parity closeout (BACKLOG #75)."""
 
 from __future__ import annotations
 

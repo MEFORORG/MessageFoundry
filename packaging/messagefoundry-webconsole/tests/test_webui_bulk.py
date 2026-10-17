@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""/ui terminate re-proof, and the server-side bulk connection controls: bulk-control, reset-many and
-bulk purge."""
+"""/ui terminate re-proof, dead-letter replay-all, the events kind filter, the status page (retention
+rows, the update banner, failed inbounds), the connections fragment and nav-status, and the
+server-side bulk connection controls: bulk-control, reset-many and bulk purge."""
 
 from __future__ import annotations
 

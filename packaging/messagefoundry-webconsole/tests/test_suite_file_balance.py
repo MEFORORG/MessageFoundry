@@ -58,7 +58,7 @@ def _oversized(counts: dict[str, int], max_share: float) -> list[str]:
 def _suite_counts() -> dict[str, int]:
     return {
         p.name: _count_tests(p.read_text(encoding="utf-8"))
-        for p in sorted(_TESTS.glob("test_*.py"))
+        for p in sorted({*_TESTS.glob("test_*.py"), *_TESTS.glob("*_test.py")})
     }
 
 

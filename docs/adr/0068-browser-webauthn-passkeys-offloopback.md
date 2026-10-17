@@ -257,7 +257,7 @@ amendment of that date.*
 - **AC-1** — WHILE a session is MFA-pending (no step-up freshness — WP-14), WHEN it POSTs
   `/ui/account/webauthn/enroll`, THE SYSTEM SHALL 303 to `/ui/reauth` and permit enrollment only
   after the password-only re-proof (a stolen pre-MFA cookie can never bind a passkey).
-  → `tests/test_webui_search_sso.py::test_webauthn_enroll_requires_password_reproof`
+  → `packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py::test_webauthn_enroll_requires_password_reproof`
 - **AC-2** — WHEN a passkey assertion verifies at `POST /ui/reauth/webauthn`, THE SYSTEM SHALL stamp
   `mfa_verified_at` ONLY (no `reauth_at`, no client re-anchor); the subsequent password leg SHALL
   stamp `reauth_at` and re-anchor the client IP.
@@ -266,7 +266,7 @@ amendment of that date.*
   THE SYSTEM SHALL render the reauth page with the passkey prompt (never divert to
   `enroll_first`, never demand a TOTP code), and the generalized anti-loop check SHALL run before
   the login rate limiter.
-  → `tests/test_webui_search_sso.py::test_webauthn_browser_enroll_and_stepup_e2e`
+  → `packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py::test_webauthn_browser_enroll_and_stepup_e2e`
 - **AC-4** — IF an assertion reports a `sign_count` at or below the stored nonzero counter, THEN THE
   SYSTEM SHALL reject it and audit `auth.webauthn_clone_suspected`; WHILE both counters are 0
   (synced passkey), THE SYSTEM SHALL accept repeatedly.
@@ -282,14 +282,14 @@ amendment of that date.*
   is off-loopback), THE SYSTEM SHALL fail WebAuthn ceremonies closed with a legible notice on every
   affected surface (409 on endpoints; explanatory text on `/ui/account` and `/ui/reauth` — never a
   redirect loop, never a request-Host-derived rp_id).
-  → `tests/test_webui_search_sso.py::test_webauthn_rp_fail_closed_legible`
+  → `packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py::test_webauthn_rp_fail_closed_legible`
 - **AC-8** — WHEN a request presents a bearer `Authorization` header without the `mf_session` cookie
   to a `/ui` WebAuthn JSON route, THE SYSTEM SHALL reject it; the ADR 0065 AC-2 inverse (cookie
   alone on a JSON API route → 401) SHALL keep passing untouched.
-  → `tests/test_webui_search_sso.py::test_webauthn_json_endpoints_reject_bearer_without_cookie`
+  → `packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py::test_webauthn_json_endpoints_reject_bearer_without_cookie`
 - **AC-9** — WHEN any new `/ui` POST (enroll, verify, delete, `/ui/reauth/webauthn`) receives a
   cross-site request, THE SYSTEM SHALL reject it with 403.
-  → `tests/test_webui_users.py::test_all_admin_posts_reject_cross_site`
+  → `packaging/messagefoundry-webconsole/tests/test_webui_users.py::test_all_admin_posts_reject_cross_site`
 - **AC-10** — IF deleting a WebAuthn credential would remove the user's last second factor WHILE MFA
   is required for them, THEN THE SYSTEM SHALL refuse with "enroll another factor first".
   → `tests/test_webauthn.py::test_last_factor_delete_refused_while_required`
@@ -298,7 +298,7 @@ amendment of that date.*
   → `tests/test_webauthn.py::test_admin_reset_mfa_clears_webauthn_credentials`
 - **AC-12** — WHILE `exposure_protected` is true, THE SYSTEM SHALL set the session cookie `Secure`
   and emit HSTS regardless of the per-request scheme.
-  → `tests/test_webui_search_sso.py::test_forced_secure_cookie_and_hsts_when_protected`
+  → `packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py::test_forced_secure_cookie_and_hsts_when_protected`
 - **AC-13** — WHEN `GET /ui/sso` is requested without an `Authorization` header, THE SYSTEM SHALL
   respond 401 + `WWW-Authenticate: Negotiate` without consuming a rate-limit slot; IF the
   token-bearing leg exhausts `allow_login_attempt` (checked FIRST, so it bounds every downstream
@@ -309,13 +309,13 @@ amendment of that date.*
   reason, THE SYSTEM SHALL audit with the `<kerberos>` sentinel and 303 to `/ui/login?e=sso_failed`
   — never a second 401; WHEN `Sec-Fetch-Mode` is present and not `navigate` on the token leg, THE
   SYSTEM SHALL reject and audit likewise, WHILE cross-site top-level navigations SHALL be allowed.
-  → `tests/test_webui_search_sso.py::test_sso_challenge_and_single_leg_failure` +
-  `tests/test_webui_search_sso.py::test_sso_rate_limits_token_leg_only` +
-  `tests/test_webui_search_sso.py::test_sso_cross_site_hygiene`
+  → `packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py::test_sso_challenge_and_single_leg_failure` +
+  `packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py::test_sso_rate_limits_token_leg_only` +
+  `packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py::test_sso_cross_site_hygiene`
 - **AC-14** — WHEN a browser Kerberos SSO session is minted, THE SYSTEM SHALL issue it with
   `seed_reauth=False` (first sensitive action forces the directory-password step-up), WHILE
   AD-password login and the JSON `/auth/negotiate` keep seeding reauth (regression-pinned).
-  → `tests/test_webui_search_sso.py::test_sso_session_not_reauth_seeded`
+  → `packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py::test_sso_session_not_reauth_seeded`
 - **AC-15** — THE SYSTEM SHALL exercise the `webauthn_credentials` store contract (multi-row CRUD,
   CAS under each backend's row-lock idiom, 1023-byte credential-id round-trip, duplicate-label
   IntegrityError) on SQLite, Postgres, and SQL Server via an extra-free contract module.
@@ -323,7 +323,7 @@ amendment of that date.*
 - **AC-16** — WHILE the `[webauthn]` extra is not installed AND a user has enrolled credentials, THE
   SYSTEM SHALL log a startup advisory naming `admin_reset_mfa` and render a legible
   "passkeys unavailable on this install" notice at reauth — never a silent loop.
-  → `tests/test_webui_search_sso.py::test_webauthn_extra_less_renders_notice` + `tests/test_webui_search_sso.py::test_reauth_extra_less_with_credentials_renders_notice`
+  → `packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py::test_webauthn_extra_less_renders_notice` + `packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py::test_reauth_extra_less_with_credentials_renders_notice`
 - **AC-17** — IF an operator targets their OWN account on `POST /users/{user_id}/reset-mfa`, THEN
   THE SYSTEM SHALL refuse (400) and direct them to the self-service MFA settings; cross-user reset
   is unaffected and remains the recovery path of §2. AC-10 and AC-18 refuse the last-factor case on
@@ -344,8 +344,7 @@ amendment of that date.*
   pinning the carve-out) +
   `tests/test_api_auth.py::test_disabling_the_LAST_second_factor_is_a_400_not_a_500` +
   `packaging/messagefoundry-webconsole/tests/test_webui_account.py::test_disabling_the_LAST_factor_renders_the_page_not_raw_json`
-  — that last path is spelled in full on purpose: the web console suite moved under `packaging/`,
-  so the bare `tests/test_webui_*.py` paths this section uses elsewhere do not resolve.
+  — the web console suite moved under `packaging/`, so its paths are spelled in full.
 
 ## Options considered
 
