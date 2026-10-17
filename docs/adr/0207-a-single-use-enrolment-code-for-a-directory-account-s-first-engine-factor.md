@@ -313,6 +313,9 @@ problems. This command is not #2711's answer.
   help there: using one needs a session, and a Kerberos session needs the directory.
 - This command changes no rule of ADR 0183. `provision-admin` still refuses while any enabled
   Administrator exists, and #2711's step 1 still owes its own decision on that.
+  *(Amended 2026-10-16: step 1 is decided, by owner ruling B258-R4. `provision-admin` now refuses
+  only while an enabled local Administrator has a usable password; see ADR 0183 Amendment E. This
+  command is still not #2711's answer.)*
 - The documented advice stands: keep a local Administrator (`docs/SECURITY.md`, "Keep a local
   Administrator"). A site that does so issues codes from that account and never needs this command.
 

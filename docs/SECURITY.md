@@ -328,8 +328,12 @@ Four properties are load-bearing rather than incidental:
 - **The password is read from a terminal.** There is deliberately no `--password` and no
   `--password-file`: either would put a standing Administrator credential in argv or on disk, so
   unattended provisioning is refused rather than given a hatch.
-- **It refuses when an enabled Administrator already exists** — not merely when the table is empty,
-  because a directory sign-in can fill the table without producing an administrator.
+- **It refuses when an enabled local Administrator with a usable password already exists** — not
+  merely when the table is empty, because a directory sign-in can fill the table without producing
+  an administrator. A directory or federated Administrator does not block it, and neither does a
+  local one with no password or an expired temporary one (vault BACKLOG #2711, [ADR
+  0183](adr/0183-provision-the-first-administrator-offline-no-default-account-at-first-run.md)
+  Amendment E).
 - **The password is the operator's own from creation**, read at the terminal and screened by the
   active password policy, so the account is not flagged `must_change_password` and is an ordinary
   administrator from birth.
@@ -391,16 +395,25 @@ was written, because every request re-reads the account's roles.
 
 #### Keep a local Administrator
 
-**Create a local Administrator before you need one.** `provision-admin` refuses while any enabled
-Administrator exists, and a directory or federated account counts. So if every Administrator signs
-in through Active Directory or an identity provider, and that service goes down, no host command
-gets you back in. `admin-unlock` clears a local lockout only (vault BACKLOG #2711).
+**Create a local Administrator before you need one.** If every Administrator signs in through
+Active Directory or an identity provider, and that service goes down, no Administrator can reach
+the web console. Then `provision-admin` at the host is the way back in. It runs whenever no enabled
+local Administrator has a usable password. A directory or federated Administrator does not block
+it (vault BACKLOG #2711). `admin-unlock` clears a local lockout only. Make the account before the
+outage anyway: the command needs the engine stopped and someone at the host with the store's
+credentials. While the directory is up, create it from the web console instead.
+
+The command can now add an Administrator beside directory ones that still sign in. Its
+`auth.first_administrator_provisioned` audit row lists, in `administrators_at_check`, every
+enabled Administrator the run found. No alert goes to them, so read that row.
 
 - Keep at least one enabled local Administrator with a password, held by someone who can reach the
   host during an outage.
 - At start, the engine checks for this. When every enabled Administrator needs an outside service,
   it logs a WARNING naming them and writes one `auth.no_local_administrator` audit row. It never
-  refuses the start.
+  refuses the start. The warning and `provision-admin` read the same check. Whenever the warning
+  names accounts, those accounts do not block the command, under the same settings. The command
+  can still refuse for its own reasons, such as the password policy.
 - The `auth.federated_subject_bound`, `auth.federated_subject_rebound` and
   `auth.federated_subject_unbound` audit rows carry `totp_enrolled` and `webauthn_enrolled`. They
   say whether the account held each engine factor when the binding changed. A bind first removes
@@ -429,8 +442,9 @@ The engine then tells the operators in two ways:
 
 Only a role change raises them. When the directory disables or deletes the account instead, the
 reconciler ends its sessions but leaves its stored role, so the account still counts as an enabled
-Administrator. No `no_enabled_administrator` alert fires, and `provision-admin` still refuses. On
-PostgreSQL and SQL Server, a console removal that races a directory role change can leave no enabled
+Administrator. No `no_enabled_administrator` alert fires. Since vault BACKLOG #2711, that account
+does not block `provision-admin`; only an enabled local Administrator with a usable password does.
+On PostgreSQL and SQL Server, a console removal that races a directory role change can leave no enabled
 Administrator with no `no_enabled_administrator` alert and no `auth.no_enabled_administrator` audit
 row. The directory's role write does not take the console guard's lock. At least one more path
 raises no `no_enabled_administrator` alert: if the engine cannot read whether an enabled
@@ -438,8 +452,9 @@ Administrator remains, it logs the fault at ERROR and writes no `auth.no_enabled
 row. That fault does not stop the caller's role write or session revocation.
 
 The cost is that a site whose Administrators all come from the directory can end up with none
-(vault BACKLOG #2711). With no enabled Administrator left, `provision-admin` runs again at the host,
-or the directory can grant the role back at the next sign-in. A local Administrator, as above,
+(vault BACKLOG #2711). With no enabled local Administrator holding a usable password,
+`provision-admin` runs again at the host, or the directory can grant the role back at the next
+sign-in. A local Administrator, as above,
 keeps a site out of this state.
 
 ### Admin password reset (WP-L3-12, ASVS 6.4.6)
@@ -3810,8 +3825,8 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   client needs a local account, or a directory account with no binding.
 - **Keep one local, unbound Administrator, and create it before you need it.** A bound account
   has no Windows SSO fallback during an IdP outage. If every enabled Administrator is bound,
-  no Administrator can sign in to unbind one, and `provision-admin` will not rescue the site: it refuses
-  while any enabled Administrator exists, and a bound one counts.
+  no Administrator can sign in to unbind one. Since vault BACKLOG #2711, `provision-admin` at the
+  host can make a local Administrator then, because a bound one does not block it.
 - **Limits of the session sweep.** On the SQL Server store, a session whose token is rotated
   in the instant the sweep runs can be missed, and it then lasts until it expires. The same
   holds on that store for an unbind and for an administrator's revoke of a user's sessions,
@@ -5886,9 +5901,12 @@ engine ignores would still reach an engine shard. The engine reports that case a
   clinician can reach a *patient's record* when normal authorisation would refuse it. This engine
   holds no point-of-care record: it routes and transforms messages in transit, and the record of
   authority lives in the systems on either side, which is where an emergency-access path belongs.
-  `messagefoundry provision-admin` is **not** a break-glass mechanism either: it creates the first
-  Administrator and refuses once an enabled one exists (see
-  [Provisioning the first administrator](#provisioning-the-first-administrator-asvs-632)).
+  `messagefoundry provision-admin` is **not** a patient-record break-glass either. It is a
+  host-gated way to regain *administrative* access to the engine: it creates a local
+  Administrator, and refuses once an enabled local one with a usable password exists. It also
+  runs during a directory or identity-provider outage (see
+  [Provisioning the first administrator](#provisioning-the-first-administrator-asvs-632) and
+  *Keep a local Administrator*).
 
 ---
 

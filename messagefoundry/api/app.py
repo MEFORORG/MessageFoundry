@@ -9235,8 +9235,10 @@ async def _assert_security_notice_is_deliverable(
     **The refusal says which half failed, because the fix differs (ADR 0183 Amendment A).** The
     engine creates no account on its own since Wave 2, so a store nobody has provisioned holds no
     enabled Administrator at all. That half names ``provision-admin``, which succeeds against such a
-    store (AC-11). An Administrator with no address is the other half; ``provision-admin`` refuses
-    there, so it names the offline setter ``admin-set-notify-email`` and the audited waiver (AC-16).
+    store (AC-11). An Administrator with no address is the other half. ``provision-admin`` refuses
+    there when a local Administrator with a usable password exists, and a directory one with no
+    address is fixed by its own address, not by another account (vault BACKLOG #2711). So this half
+    names the offline setter ``admin-set-notify-email`` and the audited waiver (AC-16).
 
     **It is also where a skipped gate still says that no enabled Administrator exists (AC-12).** With
     sign-in required, notices off or waived in writing, and no enabled Administrator, the engine
