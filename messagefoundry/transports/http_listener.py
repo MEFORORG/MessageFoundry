@@ -775,6 +775,15 @@ class HttpSource(SourceConnector):
         # connections and bound the wait (mirrors MLLPSource, review H-2 / #55).
         self._clients: set[asyncio.StreamWriter] = set()
         self._client_tasks: set[asyncio.Task[None]] = set()
+        if self.max_body_bytes is None:
+            # Turning the body cap off is documented, so it is allowed, but never silent (BACKLOG
+            # #2749, as FileSource does for its caps). Logged after every check in this constructor,
+            # so a source it refuses has not logged it. The line names the setting, never its value.
+            logger.warning(
+                "HTTP source %s: max_body_bytes is off, so a request body of any declared size is "
+                "read whole; set a positive value to bound it",
+                config.name or f"{self.host}:{self.port}",
+            )
 
     async def start(
         self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None
