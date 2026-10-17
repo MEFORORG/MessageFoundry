@@ -11090,6 +11090,11 @@ class AuthService:
             # driver's message: that text can echo the operator-chosen label.
             if await self._load_user(user.id) is None:
                 raise ValueError("no such user") from exc
+            # BACKLOG #2733: the credential-id primary key fires too, when the same authenticator
+            # enrols concurrently (on this account or another). Told apart the same way: a row now
+            # holding this credential id is that refusal, whatever label it carries.
+            if await self._store.get_webauthn_credential(credential_id_hash) is not None:
+                raise ValueError("this passkey is already enrolled") from exc
             raise ValueError("label already in use") from exc
         # Parity with confirm_mfa_enrollment: the enrolling session is now MFA-verified (it just
         # proved possession of the freshly-bound authenticator). Stamped against the OLD hash, then
