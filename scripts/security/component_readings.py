@@ -63,6 +63,7 @@ the tiers change and the readings do not.
 from __future__ import annotations
 
 import argparse
+import collections
 import datetime as dt
 import http.client
 import json
@@ -191,7 +192,14 @@ HIT_KINDS = (ADAPTED, COPIED_LINES, PROSE)
 CONTROL_RULES = ("directory", "licence file", "data", "words")
 #: What the record's ``search`` entry must state: the lists as lists, the rules as text.
 SEARCH_LISTS = ("directories", "words", "suffixes", "cannot_see")
-SEARCH_RULES = ("directory_rule", "top_level_rule", "licence_rule", "size_rule", "word_rule")
+SEARCH_RULES = (
+    "directory_rule",
+    "top_level_rule",
+    "licence_rule",
+    "size_rule",
+    "module_rule",
+    "word_rule",
+)
 
 
 class Advisory(TypedDict):
@@ -667,6 +675,38 @@ def _entries(value: object) -> list[Mapping[str, Any]]:
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
+def _iso_day(value: object) -> dt.date | None:
+    """The day a recorded field gives in the hyphenated form ``YYYY-MM-DD``, or ``None``.
+
+    ``date.fromisoformat`` also reads the basic form ``YYYYMMDD``. The record and the page give
+    every day hyphenated, so a value in another form is a slip in the hand-made record, and is
+    refused rather than read.
+    """
+    text = str(value)
+    if len(text) != 10 or text[4] != "-" or text[7] != "-":
+        return None
+    try:
+        return dt.date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _counted(value: object) -> bool:
+    """Whether a recorded field is a whole number above zero. A JSON ``true`` is not one."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _repeated(items: Iterable[str]) -> list[str]:
+    """The items that occur more than once, each named once."""
+    return sorted(item for item, n in collections.Counter(items).items() if n > 1)
+
+
+def _wheel_files(wheel: Mapping[str, Any]) -> list[str]:
+    """The wheel files, as opposed to source distributions, that an answer names as read."""
+    files = (str(f.get("file", "")) for f in _entries(wheel.get("files_read")))
+    return [file for file in files if file.endswith(".whl")]
+
+
 def _file_pin(file: str) -> tuple[str, str]:
     """The distribution name, canonical, and the exact version a wheel or sdist file name states.
 
@@ -703,7 +743,11 @@ def survey_problems(
     The record must state its search under ``search``, and name a control wheel outside the
     survey with a path for each rule in ``CONTROL_RULES`` that fired on it. Each file the word
     search hit is recorded with a kind in ``HIT_KINDS``, and the files recorded as adapted modules
-    must be the ones ``adapted_modules`` names. A wheel nobody fetched can record neither.
+    must be the ones ``adapted_modules`` names. A wheel nobody fetched can record neither, nor a
+    second release line of its own. No file may be named twice among a wheel's files read, its
+    hits or its adapted modules. Every day is given as ``YYYY-MM-DD``: the search's ``run``, each
+    answer's two dates and a read route's ``date``. The search's ``wheels_searched`` and
+    ``wheel_files_searched`` must be the counts ``files_read`` gives.
     """
     problems: list[str] = []
     search = survey.get("search")
@@ -712,6 +756,19 @@ def survey_problems(
         _said(search.get(key)) for key in SEARCH_RULES
     ):
         problems.append(f"the survey does not state its search: {SEARCH_LISTS + SEARCH_RULES}")
+    if _iso_day(search.get("run")) is None:
+        problems.append("the survey's search gives no day it was run, as YYYY-MM-DD")
+    # The two figures count the wheels, and the wheel files, that the answers name as read. The
+    # word search ran over exactly those, so each figure follows from ``files_read``.
+    per_wheel = [_wheel_files(wheel) for wheel in survey["wheels"]]
+    fetched, listed_files = sum(map(bool, per_wheel)), sum(map(len, per_wheel))
+    for key, want in (("wheels_searched", fetched), ("wheel_files_searched", listed_files)):
+        given = search.get(key)
+        # A JSON ``true`` equals 1 and ``39.0`` equals 39, and neither is a count.
+        if not (isinstance(given, int) and not isinstance(given, bool) and given == want):
+            problems.append(
+                f"the search gives {key} as {search.get(key)!r}, the answers name {want}"
+            )
     listed = search.get("words")
     words = {str(word) for word in listed} if isinstance(listed, list) else set()
     control = survey.get("control")
@@ -748,15 +805,14 @@ def survey_problems(
         pinned = str(wheel.get("pinned"))
         if name in pins and pinned != pins[name]:
             problems.append(f"{name}: surveyed at {pinned}, the snapshot reads {pins[name]}")
-        try:
-            dt.date.fromisoformat(str(wheel.get("surveyed")))
-        except ValueError:
-            problems.append(f"{name}: no date is recorded for the answer")
+        surveyed = _iso_day(wheel.get("surveyed"))
+        if surveyed is None:
+            problems.append(f"{name}: no date is recorded for the answer, as YYYY-MM-DD")
         carries, kind = wheel.get("carries"), wheel.get("evidence_kind")
         projects = wheel.get("projects") or []
         read = _entries(wheel.get("files_read"))
         files = [str(f.get("file", "")) for f in read]
-        wheels_named = sum(f.endswith(".whl") for f in files)
+        wheels_named = len(_wheel_files(wheel))
         if carries not in CARRIES:
             problems.append(f"{name}: the answer {carries!r} is not one of {CARRIES}")
         if kind not in EVIDENCE_KINDS or not _said(wheel.get("evidence")):
@@ -781,6 +837,9 @@ def survey_problems(
             problems.append(f"{name}: the files read do not match the evidence kind {kind!r}")
         if not all(_SHA256.fullmatch(str(f.get("sha256", ""))) for f in read):
             problems.append(f"{name}: a file read has no sha256 recorded")
+        twice = _repeated(file for file in files if file)
+        if twice:
+            problems.append(f"{name}: the files read name a file more than once: {twice}")
         for form in FORMS[1:]:
             answer = form_answer(wheel, form)
             said, named = answer.get("carries"), answer.get("projects") or []
@@ -794,18 +853,17 @@ def survey_problems(
             # A file list is what shows source or data, so an answer needs a wheel that was read.
             if said != "not established" and not wheels_named:
                 problems.append(f"{name}: a {form} answer of {said!r} names no wheel it listed")
-        try:
-            forms_day = dt.date.fromisoformat(str(wheel.get("forms_surveyed")))
-        except ValueError:
-            problems.append(f"{name}: no date is recorded for the source and data answers")
-        else:
-            # An unreadable ``surveyed`` is reported above, and is not reported again here.
-            try:
-                early = forms_day < dt.date.fromisoformat(str(wheel.get("surveyed")))
-            except ValueError:
-                early = False
-            if early:
-                problems.append(f"{name}: the source and data answers are dated before the first")
+        forms_day = _iso_day(wheel.get("forms_surveyed"))
+        if forms_day is None:
+            problems.append(
+                f"{name}: no date is recorded for the source and data answers, as YYYY-MM-DD"
+            )
+        # An unreadable ``surveyed`` is reported above, and is not reported again here. A compiled
+        # answer made again later is meant to go red here: the source and data answers rest on the
+        # same ``files_read``, so they are made again with it.
+        elif surveyed is not None and forms_day < surveyed:
+            problems.append(f"{name}: the source and data answers are dated before the first")
+        problems += [f"{name}: {problem}" for problem in _own_line_problems(wheel, wheels_named)]
         problems += [f"{name}: {problem}" for problem in _hit_problems(wheel, words, wheels_named)]
         route = wheel.get("route")
         if not _needs_route(wheel, labels):
@@ -814,18 +872,57 @@ def survey_problems(
         elif route not in ROUTES or not _said(wheel.get("route_reason")):
             problems.append(f"{name}: not designated and not shown to carry no code, with no route")
         elif route == "read" and not all(
-            _said(_entries([wheel.get("read")])[0].get(field)) for field in READ_FIELDS
+            (_iso_day if field == "date" else _said)(_entries([wheel.get("read")])[0].get(field))
+            for field in READ_FIELDS
         ):
-            problems.append(f"{name}: a read route must record {READ_FIELDS}")
+            problems.append(
+                f"{name}: a read route must record {READ_FIELDS}, the date as YYYY-MM-DD"
+            )
     return problems
 
 
 def _projects_named(projects: object) -> bool:
-    """Whether ``projects`` is a list whose every entry is a mapping with a name and a version."""
+    """Whether ``projects`` is a list whose every entry is a mapping with a name and a version.
+
+    A ``display``, where one is recorded, is the whole phrase the page prints, so it must be text.
+    """
     return isinstance(projects, list) and all(
-        isinstance(p, Mapping) and _said(p.get("name")) and _said(p.get("version"))
+        isinstance(p, Mapping)
+        and _said(p.get("name"))
+        and _said(p.get("version"))
+        and ("display" not in p or (isinstance(p["display"], str) and _said(p["display"])))
         for p in projects
     )
+
+
+#: What a second release line of the wheel's own project records. The page prints each of them.
+OWN_LINE_FIELDS = ("path", "files", "version")
+
+
+def _own_line_problems(wheel: Mapping[str, Any], wheels_named: int) -> list[str]:
+    """Where a wheel's ``own_release_lines`` is not recorded as the page prints it.
+
+    The field is optional. Where it is recorded it is a list, and each line names its path, its
+    version and a count of files above zero. Only a file list shows such a line, so a wheel that
+    was not fetched records none.
+    """
+    if "own_release_lines" not in wheel:
+        return []
+    lines = wheel["own_release_lines"]
+    if lines and not wheels_named:
+        return ["a wheel that was not fetched records a second release line of its own"]
+    if not isinstance(lines, list) or not all(
+        _counted(line.get(field)) if field == "files" else _said(line.get(field))
+        for line in _entries(lines)
+        for field in OWN_LINE_FIELDS
+    ):
+        return [f"a second release line of its own does not record {OWN_LINE_FIELDS}"]
+    return []
+
+
+def _line_numbers(value: object) -> bool:
+    """Whether a hit's recorded ``lines`` is a list of line numbers, with at least one."""
+    return isinstance(value, list) and bool(value) and all(map(_counted, value))
 
 
 def _hit_problems(wheel: Mapping[str, Any], words: set[str], wheels_named: int) -> list[str]:
@@ -835,6 +932,7 @@ def _hit_problems(wheel: Mapping[str, Any], words: set[str], wheels_named: int) 
     ``HIT_KINDS``, and says what the hit is. Each adapted module names its file, the project the
     file names and the words that say so. The files recorded as adapted modules must be the same
     in both lists, so neither can be edited alone. A wheel that was not fetched records none.
+    A hit's ``lines``, where recorded, are line numbers. No file is named twice in either list.
     """
     hits, modules = wheel.get("word_hits"), wheel.get("adapted_modules")
     if not isinstance(hits, list) or not isinstance(modules, list):
@@ -850,8 +948,23 @@ def _hit_problems(wheel: Mapping[str, Any], words: set[str], wheels_named: int) 
             and {str(word) for word in named or []} <= words
             and hit.get("kind") in HIT_KINDS
             and _said(hit.get("says"))
+            # The line numbers, where recorded, are figures the page does not print. Their shape is
+            # all that can be checked without the wheel.
+            and ("lines" not in hit or _line_numbers(hit["lines"]))
         ):
             problems.append(f"a word-search hit is not fully recorded: {hit.get('files')!r}")
+    # A file named twice would inflate the page's count of files the search hit.
+    twice = _repeated(
+        str(file)
+        for hit in _entries(hits)
+        if isinstance(hit.get("files"), list)
+        for file in hit["files"]
+    )
+    if twice:
+        problems.append(f"the word-search hits name a file more than once: {twice}")
+    twice = _repeated(str(m["file"]) for m in _entries(modules) if _said(m.get("file")))
+    if twice:
+        problems.append(f"the adapted modules name a file more than once: {twice}")
     if not all(
         _said(m.get(key)) for m in _entries(modules) for key in ("file", "project", "words")
     ):
@@ -913,8 +1026,14 @@ def _carried(wheel: Mapping[str, Any], forms: Iterable[str] = ("compiled",)) -> 
 
 
 def _days(days: Iterable[object]) -> str:
-    """One day, or the span of days where some answers were made again later."""
-    span = sorted({str(day) for day in days})
+    """One day, or the span of days where some answers were made again later.
+
+    Sorted as days, not as text. A value that is not a hyphenated day is left out here, and
+    ``survey_problems`` reports it.
+    """
+    span = sorted({day for day in map(_iso_day, days) if day is not None})
+    if not span:
+        return "on no recorded day"
     return f"on {span[0]}" if len(span) == 1 else f"between {span[0]} and {span[-1]}"
 
 
@@ -922,7 +1041,7 @@ def _form_evidence(wheel: Mapping[str, Any], form: str) -> str:
     """The kind of evidence behind one form's answer, for a table cell."""
     if form == "compiled":
         return str(wheel.get("evidence_kind"))
-    listed = any(str(f.get("file", "")).endswith(".whl") for f in _entries(wheel.get("files_read")))
+    listed = bool(_wheel_files(wheel))
     # The source and data search lists the wheel and opens files in it, so it is more than a list.
     return "wheel file list and files opened" if listed else "wheel not fetched"
 
@@ -940,10 +1059,12 @@ def survey_counts(wheels: Iterable[Mapping[str, Any]], form: str) -> str:
     )
 
 
-def _listed_count(search: Mapping[str, Any], key: str) -> str:
-    """How many entries the record's search lists under ``key``, or that it lists none."""
+def _listed_count(search: Mapping[str, Any], key: str, one: str, many: str) -> str:
+    """How many entries the record's search lists under ``key``, with the noun that agrees."""
     listed = search.get(key)
-    return str(len(listed)) if isinstance(listed, list) and listed else "no recorded"
+    if not (isinstance(listed, list) and listed):
+        return f"no recorded {many}"
+    return _count(len(listed), one, many)
 
 
 def _listed_names(search: Mapping[str, Any], key: str) -> str:
@@ -971,22 +1092,28 @@ def hit_counts(wheels: Iterable[Mapping[str, Any]]) -> dict[str, int]:
     return counts
 
 
+def _own_files(files: object) -> str:
+    """A second release line's count of files, with the noun that agrees."""
+    return _count(files, "file", "files") if isinstance(files, int) else f"{files} files"
+
+
 def _render_adapted(wheels: list[Mapping[str, Any]], labels: Mapping[str, str]) -> list[str]:
     """What the word search hit: its counts, the adapted modules, and a wheel's own second line."""
     counts = hit_counts(wheels)
-    searched = sum(
-        any(str(f.get("file", "")).endswith(".whl") for f in _entries(w.get("files_read")))
-        for w in wheels
-    )
+    searched = sum(bool(_wheel_files(w)) for w in wheels)
     out = [
         "",
-        f"The word search ran over the {searched} wheels that were fetched. It hit "
+        "The word search ran over the "
+        + _count(searched, "wheel that was fetched", "wheels that were fetched")
+        + ". It hit "
         + _count(sum(counts.values()), "file", "files")
         + f". Counted in files: {_count(counts[ADAPTED], 'holds', 'hold')} a single module "
         f"adapted from another project, {_count(counts[COPIED_LINES], 'holds', 'hold')} lines "
         f"copied into a wheel's own module, and {_count(counts[PROSE], 'holds', 'hold')} prose "
         "that marks no copy, such as a project's own licence header. The record lists each hit "
-        "under its wheel.",
+        "under its wheel. Each hit was sorted into its kind by hand. No test runs the search "
+        "again: the wheels are not kept in this repository, so the counts of files hit are not "
+        "checked against them.",
     ]
     rows = [
         f"| `{w['name']}` | `{m.get('file')}` | {m.get('project')} | "
@@ -1014,7 +1141,7 @@ def _render_adapted(wheels: list[Mapping[str, Any]], labels: Mapping[str, str]) 
             out += [
                 "",
                 f"`{wheel['name']}` also holds a second release line of its own project: "
-                f"`{line.get('path')}`, {line.get('files')} files, version {line.get('version')}. "
+                f"`{line.get('path')}`, {_own_files(line.get('files'))}, version {line.get('version')}. "
                 "That is the same project, so it is not counted as another project's source. An "
                 f"advisory against that line would name `{wheel['name']}`, at that line's own "
                 "version numbers. The reading above asks OSV for every advisory recorded under "
@@ -1050,8 +1177,13 @@ def _render_survey(survey: Mapping[str, Any], labels: Mapping[str, str]) -> list
         SURVEY_HEADING,
         "",
         "The vulnerability-history test reads advisories by PyPI name. This survey asks what "
-        f"that test cannot: whether each of the {size} pinned wheels carries a bundled copy of "
-        "another separately distributed project, and in what form. The "
+        "that test cannot: whether "
+        + (
+            "the 1 pinned wheel carries"
+            if size == 1
+            else f"each of the {size} pinned wheels carries"
+        )
+        + " a bundled copy of another separately distributed project, and in what form. The "
         f"compiled-code answers were made by hand {_days(w.get('surveyed') for w in wheels)}, "
         f"and the source and data answers {_days(w.get('forms_surveyed') for w in wheels)}, "
         "against the pins the snapshot reads. The evidence, the files read and their hashes are "
@@ -1135,12 +1267,14 @@ def _render_survey(survey: Mapping[str, Any], labels: Mapping[str, str]) -> list
         "Linux x86_64 wheel where the lock carries more than one.",
         "",
         "The source and data answers rest on the same wheels, fetched again. The search looked "
-        f"for a directory with one of {_listed_count(search, 'directories')} vendoring names, a "
+        "for a directory with one of "
+        f"{_listed_count(search, 'directories', 'vendoring name', 'vendoring names')}, a "
         "top-level name beyond the project's own, a licence file named for another project, a "
         "large file that is not a Python module, and any of "
-        f"{_listed_count(search, 'words')} marker words. The words were looked for in each file "
-        f"outside `.dist-info` whose name ends in one of {_listed_count(search, 'suffixes')} "
-        f"suffixes: {_listed_names(search, 'suffixes')}. The record gives "
+        f"{_listed_count(search, 'words', 'marker word', 'marker words')}. The words were looked "
+        "for in each file outside `.dist-info` whose name ends in one of "
+        f"{_listed_count(search, 'suffixes', 'suffix', 'suffixes')}: "
+        f"{_listed_names(search, 'suffixes')}. The record gives "
         "the names, the size and the words under `search`. A Python module was opened as a "
         "possible table only where its name or size suggested one, which is a judgement and "
         "not an exact rule. Not every large module was opened. Under `cannot_see`, the record "
