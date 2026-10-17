@@ -15,6 +15,7 @@ from messagefoundry.config.settings import (
     hop_insecure_escape_downgrades,
     hop_posture_from_ai,
     insecure_tls_allowed,
+    weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import HopPosture, current_hop_posture
 from messagefoundry.config.wiring import (
@@ -44,6 +45,33 @@ def test_escape_clamp_false_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     assert hop_insecure_escape_downgrades(enforcing=False) is False
     assert hop_insecure_escape_downgrades(enforcing=True) is False
+
+
+_ESCAPE_VALUES = (None, "", "0", "false", "no", "1", "true", "yes", "on", " TRUE ", "On")
+_ESCAPE_HONOURED = {"1", "true", "yes", "on"}
+
+
+@pytest.mark.parametrize("escape", _ESCAPE_VALUES)
+@pytest.mark.parametrize(
+    "posture",
+    [None, HopPosture(enforcing=True), HopPosture(enforcing=False)],
+    ids=["unknown", "enforce", "warn"],
+)
+def test_weakened_tls_escape_agrees_with_the_hop_clamp(
+    monkeypatch: pytest.MonkeyPatch, escape: str | None, posture: HopPosture | None
+) -> None:
+    # Vault BACKLOG #3753 item 1: weakened_tls_escape_permitted applies hop_insecure_escape_downgrades
+    # rather than a copy of it. The expected value is spelled out here, not derived from either
+    # function, so a change to the shared clamp fails this table too.
+    if escape is None:
+        monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    else:
+        monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", escape)
+    is_set = escape is not None and escape.strip().lower() in _ESCAPE_HONOURED
+    expected = is_set and posture is not None and not posture.enforcing
+    assert weakened_tls_escape_permitted(posture) is expected
+    if posture is not None:
+        assert hop_insecure_escape_downgrades(enforcing=posture.enforcing) is expected
 
 
 # --- decision 3: the per-connection attestation model field, load-validated --------------------

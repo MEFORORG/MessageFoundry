@@ -508,7 +508,7 @@ def weakened_tls_escape_permitted(posture: HopPosture | None) -> bool:
     The clamp used to require an enforcing **PHI** hop. Every instance carries patient data now
     (BACKLOG #1279), so the second conjunct could not vary and is gone: under ``enforce`` the blunt
     escape is inert, full stop."""
-    return insecure_tls_allowed() and posture is not None and not posture.enforcing
+    return posture is not None and hop_insecure_escape_downgrades(enforcing=posture.enforcing)
 
 
 def weakened_tls_escape_permitted_here() -> bool:
