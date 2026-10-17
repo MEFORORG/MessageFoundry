@@ -308,6 +308,15 @@ that list; see its amendment below.
    record of what was found.
 2. **An alphanumeric MSH-1 gets an unreadable ACK.** The message is accepted, and the ACK echoes the
    letter separator, so MSA-1 (itself letters) cannot be read back.
+
+   **Amendment 2026-10-16, defect 2 FIXED by BACKLOG #2875.** `build_ack` in
+   `messagefoundry/mllpcodec.py` now answers an inbound whose MSH-1 or MSH-2 holds a character of
+   the ACK's own fixed text, or whose delimiters share a character, under `|^~\&`, and the vendored
+   `tee/mllp.py` does the same. A letter the ACK never writes, such as `D`, is still echoed, because
+   the ACK reads back under it; `_ack_echo` holds the rule and what it does not cover. The strict
+   xfail became a plain test. The `alphanumeric-field-separator` policy entry and its discriminator
+   came out in the same change, so `known_defects` is empty and the run tolerates nothing. The
+   `letter-field-separator` catalogue case stays on as a regression case.
 3. **The raw-TCP and X12 listeners have no frame deadline.** A peer trickling inside
    `receive_timeout` holds its slot indefinitely. `max_frame_seconds` is MLLP-only. This one is kept
    out of the run's catalogue and lives only as a strict xfail.

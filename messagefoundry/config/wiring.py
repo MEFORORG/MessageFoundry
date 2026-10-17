@@ -48,9 +48,10 @@ import urllib.parse
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from functools import cache
 from pathlib import Path
-from types import ModuleType
-from typing import Any, Final, Literal, TypeIs
+from types import MappingProxyType, ModuleType
+from typing import Any, Final, Literal, NamedTuple, TypeIs
 
 from messagefoundry.config.code_sets import (
     CODESETS_DIR_NAME,
@@ -94,7 +95,7 @@ from messagefoundry.connection_names import (
     inbound_record_name,
     is_connection_name,
 )
-from messagefoundry.controlchars import scrub_control_chars
+from messagefoundry.controlchars import scrub_control_chars, scrub_log_argument
 from messagefoundry.credential import CERT_NAME_PREFIXES
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
 from messagefoundry.redaction import safe_name
@@ -265,6 +266,18 @@ class EnvRef:
                     f"({', '.join(sorted(_BOOL_SPELLINGS))}, or True/False; value withheld)"
                 ) from None
 
+    def __repr__(self) -> str:
+        # The generated repr printed the ``_UNSET`` sentinel and a function cast by address, which
+        # changes every run (vault BACKLOG #3234 item 3). Name both instead, so the text is stable.
+        default = "<unset>" if self.default is _UNSET else repr(self.default)
+        cast = None if self.cast is None else _cast_name(self.cast)
+        return f"EnvRef(key={self.key!r}, default={default}, cast={cast})"
+
+
+def _cast_name(cast: Callable[[Any], Any]) -> str:
+    """How a cast is named to an operator: its ``__name__``, else its type's. Never its address."""
+    return getattr(cast, "__name__", None) or type(cast).__name__
+
 
 def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = None) -> EnvRef:
     """Reference an environment-specific value, resolved per running instance (DEV/PROD).
@@ -287,9 +300,11 @@ def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = 
     resolve time naming the setting and the key. A TOML ``true``/``false`` (or ``1``/``0``) from
     ``environments/<env>.toml`` passes through. The builtin ``bool`` would read every non-empty
     string as True. A ``default=`` with ``cast=bool`` is read the same way when the reference is
-    made, and an unreadable one is refused then. Any other callable runs as given, so
-    ``cast=lambda s: bool(s)`` keeps the builtin's trap, and an uncast ``env()`` hands a boolean
-    setting text, which a connector reads as true when it is non-empty."""
+    made, and an unreadable one is refused then. Any other callable runs as given. On a setting whose
+    factory parameter is annotated ``bool``, :func:`resolve_env_settings` then reads the result the
+    same strict way, so an uncast or ``str``-cast ``env()`` there cannot hand the connector the text
+    ``"false"`` (vault BACKLOG #3234). A cast that itself returns a ``bool`` is trusted:
+    ``cast=lambda s: bool(s)`` still keeps the builtin's trap."""
     return EnvRef(key=key.lower(), default=default, cast=cast)
 
 
@@ -1238,6 +1253,94 @@ def FhirLookup(
 _NON_BLANK_ENV_SETTINGS = frozenset({"tls_ca_file"})
 
 
+#: The return annotations, as TEXT (``from __future__ import annotations``), that mark a factory whose
+#: keyword parameters are settings :func:`resolve_env_settings` sees. Matched before anything is
+#: evaluated, so a helper with an annotation that will not resolve is never touched.
+#: ``DatabaseLookup`` registers rather than returns, so it is named.
+_SETTINGS_FACTORY_RETURNS: Final = frozenset(
+    {"ConnectionSpec", "FhirLookupSpec", "ReferenceSourceSpec"}
+)
+_SETTINGS_FACTORY_NAMES: Final = frozenset({"DatabaseLookup"})
+
+
+class _BoolSettings(NamedTuple):
+    """What :func:`_bool_settings` found. ``defaults`` maps each strict setting to the default its
+    factories give it, or ``None`` where they disagree; ``dropped`` names any setting that is ``bool``
+    on one factory and anything else on another, and ``split_defaults`` any whose factories give it
+    different defaults. ``tests/test_env_uncast_bool_setting.py`` pins both sets empty."""
+
+    defaults: Mapping[str, bool | None]
+    dropped: frozenset[str]
+    split_defaults: frozenset[str]
+
+
+@cache
+def _bool_settings() -> _BoolSettings:
+    """Every setting name a factory in this module annotates ``bool`` (vault BACKLOG #3234).
+
+    :func:`resolve_env_settings` reads these strictly. It sees a settings mapping and not the factory
+    that built it, and its callers include lookups, reference sources and trust anchors as well as
+    connections, so it keys on the NAME. That is sound only while a name means one thing, so a name
+    that is ``bool`` on one factory and anything else on another is dropped.
+
+    The factories are found by their return annotation rather than listed: ``_TRANSPORTS`` names only
+    the connection factories ``connections.toml`` offers, and this needs the lookup and reference
+    factories too. The annotation is read the way the ``connections.toml`` type check reads it, through
+    the same resolver and classifier, so the two cannot disagree on which settings are boolean.
+    Composers in other modules (``with_smart_backend``'s ``enabled``, stored as ``smart_enabled``)
+    are NOT covered: their parameter names are not their settings keys.
+    Cached: the key set is closed, and the annotations are fixed once the module is imported."""
+    from messagefoundry.config.connections_file import _classify, _factory_signature
+
+    defaults: dict[str, set[object]] = {}
+    other_names: set[str] = set()
+    for obj in globals().values():
+        if not inspect.isfunction(obj) or obj.__module__ != __name__:
+            continue
+        if (
+            obj.__annotations__.get("return") not in _SETTINGS_FACTORY_RETURNS
+            and obj.__name__ not in _SETTINGS_FACTORY_NAMES
+        ):
+            continue
+        signature = _factory_signature(obj)
+        if signature is None:
+            # Raised, not skipped: a skip would quietly read one factory's flags as text again.
+            # A WiringError, so every caller's existing handling of a bad config applies.
+            raise WiringError(f"factory {obj.__name__} has annotations that do not resolve")
+        for param in signature.parameters.values():
+            if param.kind is not inspect.Parameter.KEYWORD_ONLY:
+                continue
+            accepted = _classify(param.annotation)
+            if (
+                accepted is not None
+                and accepted.scalars == {bool}
+                and not accepted.mapping_values
+                and not accepted.sequence_items
+            ):
+                defaults.setdefault(param.name, set()).add(param.default)
+            else:
+                other_names.add(param.name)
+    strict: dict[str, bool | None] = {}
+    for name, seen in defaults.items():
+        if name in other_names:
+            continue
+        only = next(iter(seen)) if len(seen) == 1 else None
+        strict[name] = only if isinstance(only, bool) else None
+    return _BoolSettings(
+        defaults=MappingProxyType(strict),
+        dropped=frozenset(defaults) & frozenset(other_names),
+        split_defaults=frozenset(name for name, seen in defaults.items() if len(seen) != 1),
+    )
+
+
+def _read_bool_setting(value: Any, default: bool | None) -> bool | None:
+    """One boolean setting, read strictly: ``None`` takes the setting's own ``default``, as
+    :func:`~messagefoundry.config.models.bool_setting` does, so a connector that reads the flag with
+    plain ``bool()`` cannot turn a default-on check off on a ``None``. Anything else is
+    :func:`_cast_bool`, which raises ``ValueError`` with the value withheld."""
+    return default if value is None else _cast_bool(value)
+
+
 def resolve_env_settings(
     settings: Mapping[str, Any], values: Mapping[str, Any], *, connection: str | None = None
 ) -> dict[str, Any]:
@@ -1247,7 +1350,9 @@ def resolve_env_settings(
     refused in the same error, naming the setting, the key and ``connection`` when given.
 
     Resolution order per ref: the environment value (cast if a ``cast`` was given), else its
-    ``default``, else it's *missing*. Raises a single :class:`WiringError` listing **all** problems
+    ``default``, else it's *missing*. A setting a factory annotates ``bool`` is then read with the
+    strict spelling cast, from either source (vault BACKLOG #3234). Raises a single
+    :class:`WiringError` listing **all** problems
     at once — both missing keys and values that fail their ``cast`` (naming the setting and the key,
     NEVER the value — BACKLOG #1183) — so
     the failure is loud and actionable, not a raw traceback that names nothing and aborts on the
@@ -1258,57 +1363,79 @@ def resolve_env_settings(
     missing: list[str] = []
     bad: list[str] = []
     blank: list[str] = []
+    bool_defaults = _bool_settings().defaults
+    bad_defaults: list[str] = []
     for name, value in settings.items():
         if isinstance(value, EnvRef):
             if value.key in values:
-                raw = values[value.key]
-                if value.cast is None:
-                    resolved[name] = raw
-                else:
-                    try:
-                        resolved[name] = value.cast(raw)
-                    except Exception as exc:
-                        # BACKLOG #1656 limb 2: `Exception`, not `(ValueError, TypeError)`. A cast is
-                        # an arbitrary callable, so it can raise anything -- a `KeyError` from a
-                        # lookup-table cast was the measured case -- and a non-(ValueError, TypeError)
-                        # escaped this handler RAW, carrying the secret value in its own exception
-                        # text. That re-opened, for every other exception type, exactly the leak
-                        # BACKLOG #1183 closed for the ValueError arm. The redaction below is the
-                        # whole point of catching it, so it has to cover every way a cast can fail.
-                        # NEVER `BaseException`: a KeyboardInterrupt or SystemExit is not a cast
-                        # failure and must keep propagating.
-                        #
-                        # NEVER the raw value: a MEFOR_VALUE_* env() setting carries store passwords
-                        # and connector keys, and this string is raised at startup into the operator
-                        # log, the support bundle and GET /logs/tail (BACKLOG #1183). The value used to
-                        # appear TWICE here -- once from this f-string and once inside the cast's own
-                        # ValueError text ("invalid literal for int() with base 10: '<value>'") -- so
-                        # dropping only the f-string half would still have leaked it. Name the setting,
-                        # the key and the expected TYPE, which is the whole diagnostic an operator
-                        # needs to go fix the value they already hold.
-                        #
-                        # The WiringError below is raised OUTSIDE this block ON PURPOSE, so it
-                        # carries neither `__cause__` nor `__context__`. Chaining it (`raise ... from
-                        # exc`) would put the redacted-away text back within reach: a rendered
-                        # traceback prints the chained exception in full, and that traceback goes to
-                        # the same operator log, support bundle and GET /logs/tail this handler
-                        # exists to keep the value out of. Do not "improve" the diagnostic by
-                        # chaining -- it re-opens BACKLOG #1183 through the traceback.
-                        want = getattr(value.cast, "__name__", None) or type(value.cast).__name__
-                        bad.append(
-                            f"setting {name!r} (env {value.key!r}): value is not a valid {want} "
-                            f"({type(exc).__name__}; value withheld)"
-                        )
+                got, source, cast = values[value.key], "value", value.cast
             elif value.default is not _UNSET:
-                resolved[name] = value.default
+                # A default is never cast: env() reads a bool-cast default when the ref is made.
+                got, source, cast = value.default, "default", None
             else:
                 missing.append(value.key)
-            got = resolved.get(name)
+                continue
+            # Vault BACKLOG #3234: a setting a factory annotates bool is read with the strict spelling
+            # cast AFTER the ref's own cast, whatever that was. An uncast or str-cast ref would
+            # otherwise hand the connector the text "false", which its bool()/truthiness read takes
+            # as True. One read here rather than in each connector, so no reader can be missed.
+            # None becomes the setting's own default (_read_bool_setting says why).
+            want = "bool"
+            try:
+                if cast is not None:
+                    want = _cast_name(cast)
+                    got = cast(got)
+                if name in bool_defaults:
+                    want = "bool"
+                    got = _read_bool_setting(got, bool_defaults[name])
+            except Exception as exc:
+                # BACKLOG #1656 limb 2: `Exception`, not `(ValueError, TypeError)`. A cast is
+                # an arbitrary callable, so it can raise anything -- a `KeyError` from a
+                # lookup-table cast was the measured case -- and a non-(ValueError, TypeError)
+                # escaped this handler RAW, carrying the secret value in its own exception
+                # text. That re-opened, for every other exception type, exactly the leak
+                # BACKLOG #1183 closed for the ValueError arm. The redaction below is the
+                # whole point of catching it, so it has to cover every way a cast can fail.
+                # NEVER `BaseException`: a KeyboardInterrupt or SystemExit is not a cast
+                # failure and must keep propagating.
+                #
+                # NEVER the raw value: a MEFOR_VALUE_* env() setting carries store passwords
+                # and connector keys, and this string is raised at startup into the operator
+                # log, the support bundle and GET /logs/tail (BACKLOG #1183). The value used to
+                # appear TWICE here -- once from this f-string and once inside the cast's own
+                # ValueError text ("invalid literal for int() with base 10: '<value>'") -- so
+                # dropping only the f-string half would still have leaked it. Name the setting,
+                # the key and the expected TYPE, which is the whole diagnostic an operator
+                # needs to go fix the value they already hold.
+                #
+                # The WiringError below is raised OUTSIDE this block ON PURPOSE, so it
+                # carries neither `__cause__` nor `__context__`. Chaining it (`raise ... from
+                # exc`) would put the redacted-away text back within reach: a rendered
+                # traceback prints the chained exception in full, and that traceback goes to
+                # the same operator log, support bundle and GET /logs/tail this handler
+                # exists to keep the value out of. Do not "improve" the diagnostic by
+                # chaining -- it re-opens BACKLOG #1183 through the traceback.
+                problem = (
+                    f"setting {name!r} (env {value.key!r}): {source} is not a valid {want} "
+                    f"({type(exc).__name__}; value withheld)"
+                )
+                # A default is written in the config, so it is reported apart from the
+                # environment values, whose advice would send the author to the wrong place.
+                if source == "default":
+                    owner = f" of connection {connection!r}" if connection else ""
+                    bad_defaults.append(problem.replace(" (env ", f"{owner} (env ", 1))
+                else:
+                    bad.append(problem)
+                continue
+            resolved[name] = got
             if name in _NON_BLANK_ENV_SETTINGS and isinstance(got, str) and not got.strip():
                 # No ":" or "=" after the name: the log scrubber reads "LABEL: value" as a secret.
                 owner = f" of connection {connection!r}" if connection else ""
                 blank.append(f"setting {name!r}{owner} (env {value.key!r}) pins nothing")
         else:
+            # A literal is NOT read here, even on a bool setting: every pre-resolve reader (the
+            # loosening registers, the build-time capture checks) reads spec.settings, so changing
+            # a literal only in this copy would split one setting into two readings.
             resolved[name] = value
     problems: list[str] = []
     if missing:
@@ -1317,12 +1444,20 @@ def resolve_env_settings(
         problems.append("uncastable: " + "; ".join(bad))
     if blank:
         problems.append("blank: " + "; ".join(blank))
+    parts: list[str] = []
+    if bad_defaults:
+        # Still one error, batched with any environment problems.
+        parts.append(
+            "env() default(s) unusable, fix them in the config — " + "; ".join(bad_defaults)
+        )
     if problems:
-        raise WiringError(
+        parts.append(
             "environment value(s) unusable — "
             + "; ".join(problems)
             + " — set/fix them in this environment's values (environments/<env>.toml or MEFOR_VALUE_*)"
         )
+    if parts:
+        raise WiringError("; ".join(parts))
     return resolved
 
 
@@ -5266,6 +5401,11 @@ class Registry:
     # an operator reload from another root the workers load the root the running graph came from,
     # not the startup dir (vault BACKLOG #3094). Carried with the graph, so it swaps atomically.
     source_dir: Path | None = None
+    # A digest of the config modules' bytes as this load read them
+    # (:func:`config_code_digest`), or
+    # None for a graph built in code or a module that could not be read. A sandbox worker loads the
+    # directory again, and the engine refuses one whose digest differs (vault BACKLOG #2724).
+    code_digest: str | None = None
 
     def inbound_names(self) -> frozenset[str]:
         """Every inbound connection NAME in the deployment — the pinned unfiltered set when this is one
@@ -7385,6 +7525,44 @@ def handler(
 # --- loader ------------------------------------------------------------------
 
 
+#: The scheme of :func:`config_code_digest`, apart from the config fingerprint's because it
+#: hashes a different set of files.
+_CODE_DIGEST_SCHEME: Final = b"mefor-config-code:v1\n"
+
+
+def config_code_digest(directory: Path) -> str | None:
+    """A SHA-256 over every config module a load of ``directory`` may run, ``_`` helpers included:
+    each file's name and the digest of its bytes, in :func:`config_py_files` order (vault BACKLOG
+    #2724).
+
+    The loader records it on the graph, and a sandbox worker's load records its own; the engine
+    refuses a worker whose digest differs. Python modules only: ``connections.toml`` changes the
+    graph's names, which are compared anyway, and the worker serves the code sets the engine hands
+    it, not its own read. None when a module cannot be read, which is logged.
+
+    Kept here rather than built on :mod:`messagefoundry.config.fingerprint`: importing that module
+    would give every importer of the loader its comparison and hash operations in the crypto
+    inventory (``scripts/security/crypto_inventory_check.py``)."""
+    digest = hashlib.sha256(_CODE_DIGEST_SCHEME)
+    try:
+        for path in config_py_files(directory):
+            if not path.is_file():
+                continue
+            digest.update(path.name.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(hashlib.sha256(path.read_bytes()).digest())
+            digest.update(b"\0")
+    except OSError as exc:
+        _logger.warning(
+            "config module digest unavailable for %s, so a sandbox worker's config code is not "
+            "compared with this load's: %s",
+            scrub_log_argument(str(directory)),
+            scrub_log_argument(str(exc)),
+        )
+        return None
+    return digest.hexdigest()
+
+
 def config_py_files(directory: Path) -> list[Path]:
     """Every ``*.py`` in ``directory`` the loader may run or import, sorted: dot-named files excluded.
 
@@ -7824,7 +8002,8 @@ def load_config(directory: str | Path, *, allow_empty: bool = False) -> Registry
         raise FileNotFoundError(f"config directory not found: {directory}")
     _assert_safe_config_source(directory)
     # Resolved, so a worker that spawns later loads this target even if a link in the path moves.
-    registry = Registry(source_dir=directory.resolve())
+    # The digest is read just before the modules run (vault BACKLOG #2724).
+    registry = Registry(source_dir=directory.resolve(), code_digest=config_code_digest(directory))
     # Load the bundle's reference tables (codesets/ relative to the config dir) BEFORE importing the
     # config modules, so a module-top-level code_set(...) capture resolves. A bad/duplicate table is a
     # WiringError here (fail loud), like a bad env value; a missing codesets/ dir is fine (no tables).
@@ -7836,6 +8015,9 @@ def load_config(directory: str | Path, *, allow_empty: bool = False) -> Registry
         for path in config_py_files(directory):
             if not path.name.startswith("_"):
                 _exec_module(path, helpers)
+        if registry.code_digest is not None:
+            # Inside the block, so a refusal discards this load's modules like any failed load.
+            _require_unchanged_code(directory, registry.code_digest)
     # Connections may also be authored as data (ADR 0007): merge connections.toml into the SAME
     # registry the code-first inbound()/outbound() calls populated, before validating the whole graph.
     # Imported lazily to avoid a wiring<->connections_file import cycle. A name in both surfaces is a
@@ -7852,6 +8034,23 @@ def load_config(directory: str | Path, *, allow_empty: bool = False) -> Registry
         load_connections_file(conn_file, registry)
     registry.validate(allow_empty=allow_empty)
     return registry
+
+
+def _require_unchanged_code(directory: Path, before: str) -> None:
+    """Refuse a load whose config modules changed on disk while it ran (vault BACKLOG #2724).
+
+    The digest was read before the modules ran. A module rewritten in between ran bytes the digest
+    does not describe, and a sandbox worker would then pass the comparison with edited code."""
+    after = config_code_digest(directory)
+    if after is None:
+        raise WiringError(
+            f"config modules in {directory} could not be read again after the load, so what ran "
+            "cannot be shown to match what was read; load again"
+        )
+    if after != before:  # both are public digests of public bytes; nothing to time
+        raise WiringError(
+            f"config modules in {directory} changed on disk while they were loading; load again"
+        )
 
 
 # Group-write (0o020) | world-write (0o002): a writable bit for anyone but the owner.

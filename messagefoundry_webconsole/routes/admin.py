@@ -173,6 +173,15 @@ def _refusal_status(exc: Exception) -> int:
     return status.HTTP_400_BAD_REQUEST
 
 
+def _group_keys(pairs: list[tuple[str, str]]) -> list[str]:
+    """The form's AD group values, trimmed of a space, a tab and a line break only.
+
+    The engine route trims the same set and refuses a key that still starts or ends with other
+    white space (BACKLOG #3222). A bare ``strip()`` here took a no-break space too, so the console
+    stored a key the API would have refused."""
+    return [v.strip(" \t\r\n") for k, v in pairs if k == "ad_group"]
+
+
 def register(app: FastAPI, deps: UiDeps) -> None:
     """L4a admin surface (ADR 0065; #75 phase 4): user, role, and AD-group-mapping /ui pages + actions. Clients of the injected JSON handlers (called directly, re-asserting each gate via require_ui*)."""
     admin = deps.admin
@@ -974,7 +983,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # Paired row inputs, zipped positionally (browsers submit fields in DOM order); a row with
         # an empty group or unselected role is a blank filler row — dropped. The PUT-equivalent JSON
         # handler replaces the whole map, so the surviving rows ARE the new map.
-        groups = [v.strip() for k, v in pairs if k == "ad_group"]
+        groups = _group_keys(pairs)
         role_ids = [v.strip() for k, v in pairs if k == "role"]
         try:
             body = AdGroupMap(
@@ -1000,7 +1009,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> Response:
         assert_same_origin(request)
         pairs = await _form_pairs(request)
-        groups = [v.strip() for k, v in pairs if k == "ad_group"]
+        groups = _group_keys(pairs)
         channels = [v.strip() for k, v in pairs if k == "channel"]
         try:
             body = AdGroupScopeMap(

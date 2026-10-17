@@ -12,6 +12,11 @@ on its own and writes its own outcome row. A DR retry meets the coordinator's lo
 first call's outcome, not a half-applied state. A config reload retry is a second reload: it waits
 on the runner's reload lock and then runs again.
 
+The uploaded-log routes use it too (vault BACKLOG #3178). An upload's ``upload.create`` row is
+written as an outliving operation once the file is stored, and a row that fails removes the file.
+A delete runs its unlink and its ``upload.delete`` row as one. So a deadline no longer leaves a
+stored file with no creation row, or a removed one with no delete row.
+
 It is the same shape as :func:`~messagefoundry.api.approvals._outlive_caller`, which it reuses, rather
 than an exemption from the deadline: an exempt route would hold its worker for as long as it ran,
 which is the thing the deadline exists to stop. The web console's ``/ui`` routes call the same
@@ -38,17 +43,20 @@ __all__ = ["CANCEL_GRACE_SECONDS", "DRAIN_TIMEOUT_SECONDS", "OutlivingOperations
 log = logging.getLogger(__name__)
 
 #: How long :meth:`OutlivingOperations.drain` lets a running operation finish at shutdown before it
-#: cancels it. It shares NSSM's 15 s graceful-stop window with the upload runner's stop and the
-#: approval gate's drain, so it is short; an operation it cancels records ``interrupted``.
+#: cancels it. It shares NSSM's 15 s graceful-stop window with the other shutdown steps, so it is
+#: short; an operation it cancels records ``interrupted``. The API lifespans pass at most this, and
+#: less when their shutdown budget is short (``_SHUTDOWN_BUDGET_SECONDS`` in ``api/app.py``).
 DRAIN_TIMEOUT_SECONDS = 0.5
 
 #: How long the drain then waits for the cancelled operations' rollback arms to finish, so their
 #: interrupted rows reach the store before ``engine.stop()`` closes it. Longer than the drain itself
 #: because at least one arm waits on a process: a cancelled DR takeover hook is killed and reaped
 #: for up to ``_HOOK_REAP_SECONDS`` before the activation's arm writes its row, so this is that
-#: bound plus a second for the write. Every shutdown bound together (the upload runner's stop, this
-#: drain and grace, the approval gate's drain) comes close to NSSM's 15 s window only when all of
-#: them are busy at once.
+#: bound plus a second for the write. It is an upper limit: the API lifespans hand the drain a share
+#: of one shutdown budget (``_SHUTDOWN_BUDGET_SECONDS`` in ``api/app.py``, BACKLOG #3191). With the
+#: managed lifespan's full set of steps that share is below this, and below the reap alone, even
+#: when they are idle, so at least a takeover hook that takes most of its reap can still be rolling
+#: back when the store closes, and the drain logs it.
 CANCEL_GRACE_SECONDS = _HOOK_REAP_SECONDS + 1.0
 
 
@@ -131,7 +139,7 @@ class OutlivingOperations:
             return []
         cancelled = sorted(self._inflight.get(task, "?") for task in left)
         log.warning(
-            "shutdown: cancelling %d operation(s) still running after %.0fs: %s",
+            "shutdown: cancelling %d operation(s) still running after %.1fs: %s",
             len(left),
             timeout,
             ", ".join(cancelled),
@@ -141,7 +149,7 @@ class OutlivingOperations:
         _done, stuck = await asyncio.wait(left, timeout=grace)
         if stuck:
             log.error(
-                "shutdown: %d cancelled operation(s) had not finished rolling back after %.0fs",
+                "shutdown: %d cancelled operation(s) had not finished rolling back after %.1fs",
                 len(stuck),
                 grace,
             )

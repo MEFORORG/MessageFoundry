@@ -996,6 +996,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # secret from the CSPRNG, the code by HMAC and a constant-time compare), before any store write.
     "messagefoundry/__main__.py": frozenset(
         {
+            "hash:via messagefoundry.config.wiring",  # vault BACKLOG #2724: load_config's digest
             "sign_verify:via messagefoundry.logging_setup",
             "compare:via messagefoundry.api.tls",  # BACKLOG #1167: evaluate_anchor's pin compare
             "compare:via messagefoundry.auth.totp",
@@ -1029,6 +1030,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # so no operation row names it; the import row above records the dependency.
     "messagefoundry/api/app.py": frozenset(
         {
+            "hash:via messagefoundry.config.wiring",  # vault BACKLOG #2724: load_config's digest
             "compare:via messagefoundry.auth.trust_anchors",  # BACKLOG #1167: the pin compare
             "compare:via messagefoundry.config.fingerprint",
             "hash:via messagefoundry.auth.trust_anchors",
@@ -1311,6 +1313,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     "messagefoundry/pipeline/engine.py": frozenset(
         {
+            "hash:via messagefoundry.config.wiring",  # vault BACKLOG #2724: load_config's digest
             "compare:via messagefoundry.pipeline.secret_rotation",
             # Vault BACKLOG #2597: set_connection_flag compares two public config digests with
             # fingerprint_matches (constant time), as the provenance route in api/app.py does.
@@ -1354,6 +1357,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "key_cert:cryptography.x509.Name.from_rfc4514_string",
             "key_cert:cryptography.x509.load_der_x509_certificate",
             "key_cert:cryptography.x509.load_pem_x509_certificate",
+            # Vault BACKLOG #2223: load_pinned_server_certificate counts the certificates in a SQL
+            # Server pin file, so a bundle is refused at load. Public certificates only.
+            "key_cert:cryptography.x509.load_pem_x509_certificates",
             "key_cert:cryptography.x509.load_pem_x509_crl",
             "key_cert:cryptography.x509.random_serial_number",
             "key_cert:via messagefoundry.keywrap",
@@ -1486,6 +1492,14 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:hashlib.sha256",
             "hash:via messagefoundry.store.store",
             "kdf:via messagefoundry.store.crypto",
+            # Vault BACKLOG #2223: connection_string parses the [store].ssl_root_cert pin (public
+            # certificate only) through pki.load_pinned_server_certificate to refuse one outside its
+            # validity period, since Encrypt=strict leaves that check to the engine.
+            "key_cert:via messagefoundry.pki",
+            # Vault BACKLOG #2223: the same pin takes the trust-anchor preflight (enforce_anchor), which
+            # fingerprints the public file (SHA-256). No pin is configured for it, so no compare runs.
+            "compare:via messagefoundry.auth.trust_anchors",
+            "hash:via messagefoundry.auth.trust_anchors",
             "mac:via messagefoundry.store.store",
             # BACKLOG #2592: the session write helper checks a row's seal before it re-seals it.
             "sign_verify:via messagefoundry.store.store",
@@ -1706,6 +1720,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     "messagefoundry/verify/smoke.py": frozenset(
         {
+            "hash:via messagefoundry.config.wiring",  # vault BACKLOG #2724: load_config's digest
             "tls_context:.check_hostname = True",
             "tls_context:.minimum_version = TLSv1_2",
             "tls_context:.wrap_socket()",
@@ -1790,6 +1805,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     "harness/load/shardcert.py": frozenset(
         {
+            "hash:via messagefoundry.config.wiring",  # vault BACKLOG #2724: load_config's digest
             "key_cert:via harness.load.tlsmat",
             "sign_verify:via harness.load.tlsmat",
             "tls_context:via harness.load.tlsmat",
@@ -1822,7 +1838,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via messagefoundry.auth.oidc_http",
         }
     ),
-    "messagefoundry/verify/runner.py": frozenset({"tls_context:via messagefoundry.verify.smoke"}),
+    "messagefoundry/verify/runner.py": frozenset(
+        {"hash:via messagefoundry.verify.smoke", "tls_context:via messagefoundry.verify.smoke"}
+    ),
     # ADR 0197 Amendment A (AC-A9): the lockable-account census computes one TOTP code per enabled
     # secret (HMAC, via auth.service -> auth.totp) only to prove the secret is usable; the code is
     # discarded and never compared. ``check_credential_generation`` (Manager decision 2026-09-29)
@@ -1839,6 +1857,31 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     "messagefoundry_webconsole/routes/core.py": frozenset({"hash:via messagefoundry.auth.tokens"}),
     "scripts/security/dast_auth_sweep.py": frozenset({"csprng:via scripts.security.dast_target"}),
+    # Vault BACKLOG #2724: load_config hashes the config modules' bytes (config_code_digest),
+    # so every caller of the loader hashes through it.
+    "messagefoundry/checks.py": frozenset({"hash:via messagefoundry.config.wiring"}),
+    # Vault BACKLOG #2724: load_config hashes the config modules' bytes (config_code_digest),
+    # so every caller of the loader hashes through it.
+    "messagefoundry/config/codeset_edit.py": frozenset({"hash:via messagefoundry.config.wiring"}),
+    # Vault BACKLOG #2724: load_config hashes the config modules' bytes (config_code_digest),
+    # so every caller of the loader hashes through it.
+    "messagefoundry/pipeline/_config_preflight.py": frozenset(
+        {"hash:via messagefoundry.config.wiring"}
+    ),
+    # Vault BACKLOG #2724: load_config hashes the config modules' bytes (config_code_digest),
+    # so every caller of the loader hashes through it.
+    "messagefoundry/pipeline/_sandbox_worker.py": frozenset(
+        {"hash:via messagefoundry.config.wiring"}
+    ),
+    # Vault BACKLOG #2724: load_config hashes the config modules' bytes (config_code_digest),
+    # so every caller of the loader hashes through it.
+    "messagefoundry/pipeline/supervisor.py": frozenset({"hash:via messagefoundry.config.wiring"}),
+    # Vault BACKLOG #2724: load_config hashes the config modules' bytes (config_code_digest),
+    # so every caller of the loader hashes through it.
+    "messagefoundry/support/bundle.py": frozenset({"hash:via messagefoundry.config.wiring"}),
+    # Vault BACKLOG #2724: load_config hashes the config modules' bytes (config_code_digest),
+    # so every caller of the loader hashes through it.
+    "scripts/bench/sandbox_dispatch.py": frozenset({"hash:via messagefoundry.config.wiring"}),
 }
 
 

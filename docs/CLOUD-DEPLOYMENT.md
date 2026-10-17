@@ -109,7 +109,9 @@ mechanism against a SQL Server store with **Always On Availability Groups** for 
   has no ODBC.
 - Trust the DB CA via the host **machine trust store** (the CA-chain path, recommended for rotation), or
   pin the server cert by file with `[store].ssl_root_cert` (ODBC Driver **18.1+** `ServerCertificate`, a
-  leaf pin — rotate in lockstep). See [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §5.
+  leaf pin — rotate in lockstep). The engine sends the pin with `Encrypt=strict`, which needs SQL Server
+  2022 or later. It matches one exact certificate, so on an AG every replica must present that same
+  certificate, or a failover refuses every store connection. See [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §5.
 - Everything else (the leader lease, graph gating, the LB recipe below) is identical — both backends run
   the same active-passive coordinator.
 

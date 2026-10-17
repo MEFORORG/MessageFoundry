@@ -933,14 +933,17 @@ class StoreSettings(_Section):
     schema_management: SchemaManagement | None = None
     encrypt: bool = True
     trust_server_certificate: bool = False
-    # Optional certificate file to verify the DB server certificate against a PRIVATE / self-signed CA (the
-    # common hospital-estate posture) WITHOUT installing it box-globally into the OS trust store. Honored by
-    # BOTH server-DB backends (#45), on the SECURE posture only (encrypt=true, trust_server_certificate=false)
-    # — it NEVER disables verification:
+    # Optional certificate file to verify the DB server WITHOUT installing anything box-globally into the OS
+    # trust store (the common hospital-estate posture is a PRIVATE / self-signed CA). Honored by BOTH
+    # server-DB backends (#45), on the SECURE posture only (encrypt=true, trust_server_certificate=false),
+    # and never applied on a weakened one. The two backends read it differently:
     #   * POSTGRES — asyncpg takes an SSLContext, so this loads ssl.create_default_context(cafile=...), a
     #     CA-bundle pin (chain + hostname still verified).
-    #   * SQL SERVER — the ODBC Driver 18.1+ `ServerCertificate` keyword pins the server's certificate by
-    #     file (a leaf/exact-cert match, brace-quoted STORE-5-safe); requires ODBC Driver 18.1 or newer.
+    #   * SQL SERVER — the ODBC Driver 18.1+ `ServerCertificate` keyword pins the server's OWN certificate
+    #     by file (an exact-cert match, brace-quoted STORE-5-safe), so a CA file matches nothing. It goes
+    #     out with `Encrypt=strict`: on the Driver 18.7 build tested, the pin was enforced with strict and
+    #     not with `Encrypt=yes` (vault BACKLOG #2223). Strict is TDS 8.0, so it needs SQL Server 2022 or
+    #     later, the supported floor; an older server refuses the connection. Not a revocation control.
     # REJECTED for SQLite (no TLS at all). A path, not a secret — it may live in the config file /
     # connections.toml. Empty = use the system trust store (the secure default). Existence is checked at load
     # (a missing file fails loud here, not confusingly at connect).
@@ -1139,13 +1142,24 @@ class StoreSettings(_Section):
     def _ssl_root_cert_backend(self) -> StoreSettings:
         """``ssl_root_cert`` pins the DB server certificate for verification (#45). Both server-DB
         backends honor it — Postgres as an asyncpg SSLContext CA-bundle, SQL Server via the ODBC Driver
-        18.1+ ``ServerCertificate`` keyword — but SQLite uses no TLS, so setting it there is a silent
-        no-op: fail loud instead of leaving the operator thinking a private CA is pinned."""
+        18.1+ ``ServerCertificate`` keyword under ``Encrypt=strict`` — but SQLite uses no TLS, so
+        setting it there is a silent no-op: fail loud instead of leaving the operator thinking a
+        private CA is pinned."""
         if self.ssl_root_cert and self.backend is StoreBackend.SQLITE:
             raise ValueError(
                 "[store].ssl_root_cert requires a server-DB backend (postgres or sqlserver); "
                 "SQLite uses no TLS, so pinning a certificate has no effect."
             )
+        sends_pin = self.encrypt and not self.trust_server_certificate  # as the store decides
+        if self.ssl_root_cert and self.backend is StoreBackend.SQLSERVER and sends_pin:
+            # Vault BACKLOG #2223: on SQL Server the file is an exact-match pin, so a bundle or a CA
+            # certificate would refuse every connect. Say so at load, naming the setting. The file
+            # holds only a public certificate, and no part of it goes into the message.
+            from messagefoundry.pki import read_pinned_server_certificate
+
+            problem = read_pinned_server_certificate(self.ssl_root_cert)
+            if isinstance(problem, str):
+                raise ValueError(f"[store].ssl_root_cert {self.ssl_root_cert!r} {problem}")
         return self
 
     @field_validator("ssl_crl_file")
@@ -1834,7 +1848,7 @@ class InboundSettings(_Section):
     # Default ACK timing for every inbound (staged pipeline, ADR 0001): INGEST = ACK-on-receipt
     # (the message is ACKed once durably committed to the ingress stage). A connection's own
     # ack_after= overrides this. Step A supports only INGEST; 'delivered' (defer the ACK until
-    # delivery) is not yet implemented and is rejected at engine start.
+    # delivery) is not yet implemented and is refused at load (_ack_after_is_built).
     ack_after: AckAfter = AckAfter.INGEST
 
     # Very-large-document streaming in-flight budget (#149, ADR 0105 Phase 1a) — the OPT-IN aggregate DoS
@@ -1882,6 +1896,19 @@ class InboundSettings(_Section):
     def _non_negative_depth(cls, value: int) -> int:
         if value < 0:
             raise ValueError("max_staged_depth must be >= 0 (0 = off)")
+        return value
+
+    @field_validator("ack_after")
+    @classmethod
+    def _ack_after_is_built(cls, value: AckAfter) -> AckAfter:
+        # Vault BACKLOG #3063 item 9: refused here, at load, as a connection's own
+        # ack_after='delivered' is refused at wiring. Listener start refused only the inherited
+        # value, so `messagefoundry check` said OK and serve came up with every listener isolated.
+        if value == AckAfter.DELIVERED:
+            raise ValueError(
+                "ack_after = 'delivered' (defer the ACK until delivery) is not yet implemented; "
+                "use 'ingest', the default (ACK-on-receipt)"
+            )
         return value
 
 
@@ -3198,6 +3225,9 @@ class AuthSettings(_Section):
     # population — the signature of a misconfiguration, not of offboarding. Below the floor the breaker
     # cannot distinguish the two cases and revokes.
     #
+    # Where that AND can never hold, `_refuse_a_dead_breaker_fraction` refuses a 1.0 fraction and
+    # `breaker_budget_warning` warns of a budget at or below the cap (BACKLOG #3085).
+    #
     # A service account that loses read on `userAccountControl` ALONE is NOT this breaker's case any
     # more (ADR 0195, BACKLOG #2039). Those accounts read UNDETERMINED, not "not found", and the
     # reconciler holds them without revoking under the rule ADR 0195 states (`hold_engaged` in
@@ -3718,12 +3748,14 @@ class AuthSettings(_Section):
     @field_validator("ad_session_revoke_max_fraction")
     @classmethod
     def _check_ad_revoke_fraction(cls, value: float) -> float:
-        # A 0.0 fraction can never be exceeded by a non-negative count in the AND-form trip test, which
-        # would silently disable the proportional half of the breaker; refuse it rather than pretend.
+        # At 0.0 any revocation exceeds the proportional half, so every pass above the absolute cap
+        # trips on any estate, a genuine offboarding wave included; refused. At 1.0 it is never
+        # exceeded, so the whole breaker is dead; `_refuse_a_dead_breaker_fraction` refuses that
+        # while the reconciler can run (#3085).
         if not 0.0 < value <= 1.0:
             raise ValueError(
-                "ad_session_revoke_max_fraction must be > 0.0 and <= 1.0 (1.0 = the proportional "
-                "half of the breaker never trips; the absolute ad_session_revoke_max still applies)"
+                "ad_session_revoke_max_fraction must be > 0.0 and <= 1.0, and below 1.0 while the "
+                "directory reconciler runs"
             )
         return value
 
@@ -3800,6 +3832,52 @@ class AuthSettings(_Section):
                 "principals through the same LDAP service-account bind)"
             )
         return self
+
+    @property
+    def reconciler_configured(self) -> bool:
+        """Whether the directory session reconciler is set to run: AD on and a non-zero interval.
+        ``AuthService.directory_reconcile_enabled`` also needs an LDAP client, which settings
+        cannot see."""
+        return self.ad_enabled and self.ad_session_recheck_seconds > 0
+
+    @model_validator(mode="after")
+    def _refuse_a_dead_breaker_fraction(self) -> AuthSettings:
+        """BACKLOG #3085. Refuse a fraction under which the mass-revoke breaker never trips.
+
+        ``breaker_tripped`` in ``auth/reconcile.py`` trips only when a pass's revocations exceed
+        BOTH thresholds. A pass never revokes more accounts than it probed, so a 1.0 fraction is never
+        exceeded and the whole breaker is dead. Checked only while the reconciler can run. A budget
+        at or below the cap also leaves it dead, and is warned of rather than refused (owner ruling
+        2026-10-17); :meth:`breaker_budget_warning` says why. At least one more dead case is
+        neither: an estate with no more signed-in directory users than the cap.
+        """
+        if self.reconciler_configured and self.ad_session_revoke_max_fraction >= 1.0:
+            raise ValueError(
+                "ad_session_revoke_max_fraction must be below 1.0 while the directory reconciler "
+                "runs: a pass never revokes more accounts than it probed, so at 1.0 the mass-revoke "
+                "breaker can never trip"
+            )
+        return self
+
+    def breaker_budget_warning(self) -> str | None:
+        """The start-up warning for a budget at or below the revoke cap, or ``None`` (BACKLOG #3085).
+
+        A pass probes at most ``ad_session_recheck_max_users`` accounts, so it can never revoke more
+        than ``ad_session_revoke_max`` of them, and with the AND in ``breaker_tripped`` the breaker
+        never trips. Warned of, not refused (owner ruling 2026-10-17): refusing it would force a
+        small-budget site to a cap so low that every revoking pass trips, and revocation stops."""
+        if not self.reconciler_configured:
+            return None
+        if self.ad_session_recheck_max_users > self.ad_session_revoke_max:
+            return None
+        return (
+            f"[auth].ad_session_recheck_max_users ({self.ad_session_recheck_max_users}) is at or "
+            f"below [auth].ad_session_revoke_max ({self.ad_session_revoke_max}): a pass probes at "
+            "most that many accounts, so it can never revoke more than the cap, and the "
+            "mass-revoke circuit breaker can never trip. Revocation still works. To arm the "
+            "breaker, raise ad_session_recheck_max_users above ad_session_revoke_max. Lowering "
+            "the cap instead makes a pass that revokes its whole small sample trip."
+        )
 
     @property
     def oidc_private_key_jwt(self) -> bool:
@@ -4894,6 +4972,11 @@ _ALERT_EVENT_TYPES = frozenset(
         # several engine processes share the store, which no connection can be named. It has no
         # inverse: a refusal is an event, not a state that clears.
         "remote_debug_refused",
+        # vault BACKLOG #2724 (owner ruling 2026-10-16): a [sandbox].mode = "subprocess" worker was
+        # refused because the graph it loaded differs from the engine's, most often a config file
+        # edited on disk with no reload. Keyed by the inbound's name, once per refusal. Not in
+        # _ALERT_CONTROL_EVENT_TYPES: a restart reloads nothing, so it cannot clear the cause.
+        "sandbox_worker_refused",
         # NOTE: the INVERSE events (leadership_lost / dr_released / intake_resumed /
         # ad_reconcile_breaker_cleared / ad_reconcile_hold_released) are auto-resolve-only
         # (alert_sinks _AUTO_RESOLVE), NOT rule-targetable alert types -- a step-down, a fail-back,
