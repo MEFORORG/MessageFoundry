@@ -94,7 +94,11 @@ from messagefoundry.auth.notifications import (
     notice_kind_log_label,
 )
 from messagefoundry.auth.oidc import PendingFlow
-from messagefoundry.auth.oidc_http import build_idp_opener, jwks_fetcher
+from messagefoundry.auth.oidc_http import (
+    build_idp_opener,
+    is_idp_transport_http_exception,
+    jwks_fetcher,
+)
 from messagefoundry.auth.passwords import hash_password, needs_rehash, verify_password
 from messagefoundry.auth.permissions import (
     CUSTOM_ROLE_ID_PREFIX,
@@ -168,7 +172,6 @@ from messagefoundry.store.store import (
     session_sealed_by_retired_key,
     user_seal_ok,
 )
-from messagefoundry.transports.bounded_read import EgressReplyError
 from messagefoundry.transports.email import envelope_address_problem
 from messagefoundry.transports.rest import opener_tls_context
 
@@ -780,13 +783,15 @@ FLOW_PURPOSE_MISMATCH = "flow_purpose_mismatch"
 
 #: The audit reason for a second step refused under its ASVS 2.4.2 minimum-elapsed floor (BACKLOG
 #: #2301): an MFA code or passkey too soon after sign-in, or an IdP callback too soon after its flow
-#: started. Audit only. The caller sees its leg's ordinary failure, which says nothing about timing.
+#: started. Audit only. The caller sees its leg's ordinary failure, whose TEXT says nothing about
+#: timing. Its response time can: the federated step-up leg is not padded, so a floor refusal made
+#: before the code exchange returns sooner than a refusal after the IdP round trip (BACKLOG #3221).
 TOO_EARLY = "too_early"
 
 #: The reason for a federated failure that is neither a transport failure nor a token-endpoint
 #: answer (BACKLOG #1948): at least a status from the JWKS fetch, and the engine's own token request
-#: refused over the length bound before it was sent. Neither marks the IdP unavailable. Distinct
-#: from ``idp_error``, which is the IdP's own ``error=`` on the callback.
+#: refused over the length bound before it was sent, an operator configuration fault. Neither marks
+#: the IdP unavailable. Distinct from ``idp_error``, which is the IdP's own ``error=`` on the callback.
 IDP_ANSWER_UNUSABLE = "idp_answer_unusable"
 
 #: Operator-readable text for the step-up leg's refusals. None of it echoes anything the IdP sent.
@@ -820,12 +825,16 @@ _STEP_UP_ERRORS: Final[Mapping[str, str]] = MappingProxyType(
         "idp_unavailable": "The identity provider is unavailable. Try again later.",
         # `token_refused` is deliberately NOT listed: it reads as the generic line, as `too_early`
         # does, so a junk code's answer cannot show whether the callback floor fired (SECURITY.md,
-        # the second-step floors). Its audit row carries the status (BACKLOG #1948).
+        # the second-step floors). So does the engine's own client credential refused with a 401,
+        # an operator fault. Its audit row carries the status, which is where the operator tells
+        # the two apart (BACKLOG #1948, #3221). IDP_ANSWER_UNUSABLE can be an operator fault too,
+        # so its text sends a repeat to an administrator rather than saying "try again later".
         IDP_ANSWER_UNUSABLE: (
-            "The identity provider could not complete the confirmation. Try again later."
+            "The identity provider could not complete the confirmation. Try again. If it repeats,"
+            " ask an administrator."
         ),
         "not_configured": "Federated sign-in is not configured.",
-        "idp_error": "The identity provider did not complete the sign-in. Try again.",
+        "idp_error": "The identity provider did not complete the confirmation. Try again.",
         "malformed_callback": "The identity provider's answer was incomplete. Try again.",
         "not_in_directory": (
             "Your directory account could not be found or is disabled. Ask an administrator."
@@ -2057,14 +2066,16 @@ def _is_idp_transport_failure(exc: BaseException) -> bool:
     unavailable (BACKLOG #1948). ADR 0142 Amendment E is the source of record for the rule, its
     reason, and the residuals it leaves.
 
-    In code: a ``TokenEndpointUnreachableError``, an ``http.client`` exception such as
-    ``BadStatusLine``, or an ``OSError`` that is not an ``HTTPError``."""
+    In code: a ``TokenEndpointUnreachableError``, an ``http.client`` exception that
+    :func:`~messagefoundry.auth.oidc_http.is_idp_transport_http_exception` names (a JWKS reply cut
+    short, ``BadStatusLine`` or ``IncompleteRead``; ADR 0142 Amendment G, BACKLOG #3221), or an
+    ``OSError`` that is not an ``HTTPError``. Every other ``http.client`` exception is not one: a
+    reply that arrived, ``MalformedReplyHeadError`` and a JWKS reply refused for its framing among
+    them, or a fault on the engine's own side of the connection."""
     if isinstance(exc, oidc.TokenEndpointUnreachableError):
         return True
     if isinstance(exc, http.client.HTTPException):
-        # MalformedReplyHeadError is an HTTPException too, raised for a reply whose header block
-        # did not parse, as from the JWKS fetch. A reply arrived, so it is an answer.
-        return not isinstance(exc, EgressReplyError)
+        return is_idp_transport_http_exception(exc)
     # HTTPError is an OSError subclass that carries a received status, as from the JWKS fetch.
     return isinstance(exc, OSError) and not isinstance(exc, urllib.error.HTTPError)
 
@@ -2127,6 +2138,8 @@ _ISSUE_ROW_KEYS: Final[Mapping[str, str]] = MappingProxyType(
 CREDENTIAL_ISSUE_REFUSED_ACTION: Final = "auth.credential_issue_refused"
 #: The ``op`` values that row carries, one per issuing operation.
 CredentialIssueOp = Literal["create", "password_reset", "mfa_reset"]
+#: What :meth:`AuthService.logout` reports, and what its ``auth.logout`` row's ``outcome`` records.
+LogoutOutcome = Literal["revoked", "nothing_to_revoke"]
 _ISSUE_ROW_EARLY_SECONDS: Final = 5.0
 _ISSUE_ROW_LATE_SECONDS: Final = 60.0
 _ISSUE_ROW_PAGE: Final = 200
@@ -2982,10 +2995,11 @@ class AuthService:
 
         **Deliberately NOT the same shape as** :attr:`kerberos_available`, which is boot-once and
         sticky-until-restart (ADR 0068 §9). This flag is **advisory and non-sticky**: it is set by a
-        failed login and cleared by the next successful one, and *no login path gates on it* — the
-        start leg always attempts. That is what satisfies AC-8's "SHALL recover without an engine
-        restart"; a copy of the Kerberos latch would leave one IdP blip disabling federated login
-        until a restart, which is exactly what AC-8 forbids. It exists to drive the login-page link
+        failed login and cleared by the next code exchange that yields a verified token, on either
+        leg, whether or not a later check then refuses the attempt (BACKLOG #3221). *No login path
+        gates on it* — the start leg always attempts. That is what satisfies AC-8's "SHALL recover
+        without an engine restart"; a copy of the Kerberos latch would leave one IdP blip disabling
+        federated login until a restart, which is exactly what AC-8 forbids. It exists to drive the login-page link
         and ``/auth/providers``, nothing more. Do not "fix" the asymmetry with the Kerberos twin.
 
         "A failed login" means a TRANSPORT failure and nothing else (BACKLOG #1948): see
@@ -4595,7 +4609,8 @@ class AuthService:
             # answer one with a 5xx. It must not mark the IdP unavailable: that flag hides the
             # federated link on /ui/login and in /auth/providers for everyone, so marking here
             # would let any caller switch federated sign-in off. Nor does it clear the flag, as
-            # no sign-in succeeded. It is a FlowError, so this arm must stay above the outage arm.
+            # no token was verified (BACKLOG #3221). It is a FlowError, so this arm must stay
+            # above the outage arm.
             # Audited with the client address, as the outage arm is: a spray of junk codes is the
             # abuse this arm exists for, and the operator needs to see where it comes from. The
             # status is the only other thing recorded, and it is what tells a spray (400) from the
@@ -4649,6 +4664,7 @@ class AuthService:
             return LoginOutcome(
                 ok=False, error="identity provider unavailable", reason="idp_unavailable"
             )
+        self.clear_oidc_unavailable()  # a verified token: the IdP answered (BACKLOG #3221)
         # BACKLOG #2301 (ASVS 2.4.2): the minimum-elapsed floor, only when the person signed in at
         # the IdP during THIS flow, which the verified auth_time says. An IdP holding a live single
         # sign-on session answers with no human step, so there is nothing to floor, and flooring it
@@ -4661,7 +4677,9 @@ class AuthService:
         # in oidc_callback_floor_exempt_amr) is exempt. Recorded on the success row, below, and on
         # each refusal after this point, a lock refusal excepted (BACKLOG #3220).
         floor_exempt_amr = (
-            self._oidc_callback_floor_exemption(principal_claims.amr)
+            self._oidc_callback_floor_exemption(
+                self._oidc_callback_floor_exempt_values(), principal_claims.amr
+            )
             if signed_in_during_flow and arrived_too_early
             else ()
         )
@@ -4844,7 +4862,6 @@ class AuthService:
             )
         max_expires_at = min(recency_deadline, max_expires_at)
 
-        self.clear_oidc_unavailable()
         # ASVS 6.3.4, the one directory leg the engine can actually verify. Keyed on the SETTING, not
         # on mech == "oidc": when the claim gate is on (default), _check_mfa_gate has already refused
         # any token lacking a configured amr/acr, so a principal reaching this line provably carried
@@ -4958,14 +4975,19 @@ class AuthService:
         flows = self._oidc_flows
         return floor > 0 and flows is not None and flows.age(flow) < floor
 
-    def _oidc_callback_floor_exemption(self, amr: Sequence[str]) -> tuple[str, ...]:
-        """The ``[auth].oidc_callback_floor_exempt_amr`` values a signature-verified ``amr`` carries,
-        sorted (BACKLOG #2388). Empty means the callback floor applies.
+    @staticmethod
+    def _oidc_callback_floor_exemption(
+        exempt_values: frozenset[str], amr: Sequence[str]
+    ) -> tuple[str, ...]:
+        """The ``exempt_values`` a signature-verified ``amr`` carries, sorted (BACKLOG #2388). Empty
+        means the callback floor applies. The caller passes in what
+        :meth:`_oidc_callback_floor_exempt_values` returned, which a step-up callback reads once
+        (BACKLOG #3221). The set is filtered again here, so a set built any other way is safe too.
 
         It returns configured values only, never the token's own, so the result is a closed set
         an audit row may carry. A blank or non-string value matches nothing, whoever built the
         settings, by the same rule the MFA gate applies."""
-        return tuple(sorted(self._oidc_callback_floor_exempt_values() & set(amr)))
+        return tuple(sorted(oidc.accepted_claim_values(tuple(exempt_values)) & set(amr)))
 
     def _oidc_callback_floor_exempt_values(self) -> frozenset[str]:
         """``[auth].oidc_callback_floor_exempt_amr`` as the values that can match (BACKLOG #2388)."""
@@ -5089,7 +5111,10 @@ class AuthService:
         # amr, which only the exchange yields, so an opted-in site pays for the exchange and the
         # refusal waits for it below. With the list empty (the default) nothing changes here.
         arrived_too_early = self._oidc_callback_too_early(flow)
-        if arrived_too_early and not self._oidc_callback_floor_exempt_values():
+        exempt_values = (
+            self._oidc_callback_floor_exempt_values() if arrived_too_early else frozenset()
+        )
+        if arrived_too_early and not exempt_values:
             return await self._step_up_refused(
                 TOO_EARLY, actor=actor, client=client, return_to=return_to
             )
@@ -5131,8 +5156,11 @@ class AuthService:
                 return_to=return_to,
                 extra=_idp_error_fields(exc),
             )
+        self.clear_oidc_unavailable()  # a verified token: the IdP answered (BACKLOG #3221)
         floor_exempt_amr = (
-            self._oidc_callback_floor_exemption(principal_claims.amr) if arrived_too_early else ()
+            self._oidc_callback_floor_exemption(exempt_values, principal_claims.amr)
+            if arrived_too_early
+            else ()
         )
         # BACKLOG #3220: every refusal past the floor carries the marker when the exemption applied,
         # so a failed exempted step-up is as visible to the loosening's review as a served one.
@@ -5330,7 +5358,6 @@ class AuthService:
         if purpose is not None and not grant_refused and elevation.token is not None:
             # (3) The purpose-bound grant, against the NEW hash.
             self._grant_action_step_up(hash_token(elevation.token), purpose)
-        self.clear_oidc_unavailable()
         # BACKLOG #2160: the start leg staged its caller's address, and the session is re-anchored
         # to the callback's above. Record whether the address moved mid-ceremony, compared as the
         # new-address signal compares. Recorded only: refusing a move, or anchoring to the start
@@ -8886,12 +8913,42 @@ class AuthService:
             return None
         return await self._build_identity(user)
 
-    async def logout(self, token: str | None, *, actor: str | None = None) -> None:
-        if token:
-            await self._store.revoke_session(hash_token(token))
-            # Emit the documented auth.logout event (SECURITY.md, ASVS 16.3.3) — previously the
-            # session was revoked silently, contradicting the doc and leaving a gap in the trail.
-            await self._audit("auth.logout", actor=actor)
+    async def logout(self, token: str | None, *, actor: str | None = None) -> LogoutOutcome:
+        """End the session ``token`` names, audit ``auth.logout`` saying whether one ended, and
+        return that same outcome.
+
+        The revoke is :meth:`AuthStore.supersede_session`, which reports whether it matched a row,
+        rather than a blind revoke by hash (BACKLOG #3029). The hash can name no unrevoked session
+        for at least these reasons: a rotation re-keyed the session after the caller read it, a
+        concurrent revoke ended it first, or the token was stale or never valid (``/ui/logout``
+        has no auth dependency). The outcome is then ``nothing_to_revoke`` rather than a revoke
+        that did not happen. ``revoked`` means an unrevoked row was revoked, which may be one
+        already over its idle or absolute limit. Ending the session under a rotated token is not
+        attempted here; that is BACKLOG #3028.
+
+        The return is for the caller's own logic and tests, NOT for the client (a Manager ruling on
+        BACKLOG #3029). ``POST /auth/logout`` answers 200 and ``/ui/logout`` redirects whatever it
+        says, so sign-out stays idempotent. ``/ui/logout`` has no auth dependency, so a different
+        answer there would tell an unauthenticated caller whether a cookie value was live; ``POST
+        /auth/logout`` already refuses a dead token at its dependency, and keeps one answer for
+        consistency. The audit row carries the outcome. With no token there is nothing to look up,
+        so this returns ``nothing_to_revoke`` and writes no row.
+
+        The row's actor is ``actor`` when given (``POST /auth/logout`` passes the signed-in
+        caller). Otherwise it is the OWNER of the row the revoke ended, so a console sign-out, which
+        has no auth dependency to name a caller, still lands in that user's ``/me/security-events``
+        feed; with nothing ended there is no owner, and the actor stays NULL."""
+        if not token:
+            return "nothing_to_revoke"
+        ended = await self._store.supersede_session(hash_token(token), now=time.time())
+        outcome: LogoutOutcome = "nothing_to_revoke" if ended is None else "revoked"
+        if actor is None and ended is not None:
+            owner = await self._load_user(ended.user_id)
+            actor = owner.username if owner is not None else None
+        # Emit the documented auth.logout event (SECURITY.md, ASVS 16.3.3) even when nothing
+        # ended, so the trail still records the sign-out request.
+        await self._audit("auth.logout", actor=actor, detail=_json({"outcome": outcome}))
+        return outcome
 
     async def _supersede_session_hash(self, prior_hash: str, *, client: str | None) -> bool:
         """End the session a browser presented at a fresh sign-in (ASVS 7.2.4, login side).
@@ -8977,11 +9034,17 @@ class AuthService:
     async def revoke_own_session(self, identity: Identity, session_id: str, *, actor: str) -> bool:
         """Revoke one of ``identity``'s **own** sessions by id (its ``token_hash``). Returns ``False``
         if the session doesn't exist or isn't the caller's — so the API answers 404 without revealing
-        or letting a user touch another's session. Audited."""
+        or letting a user touch another's session. Audited.
+
+        Also ``False``, with no audit row, when the revoke matched no unrevoked row (BACKLOG #3029):
+        at least a rotation that re-keyed the session after the read, which leaves it live under
+        its new id, or a concurrent revoke that ended it first. The revoke reports whether it
+        matched, so neither the return nor the trail claims a revoke that did not happen."""
         session = await self._load_session(session_id)
         if session is None or session.user_id != identity.user_id:
             return False
-        await self._store.revoke_session(session_id)
+        if await self._store.supersede_session(session_id, now=time.time()) is None:
+            return False
         await self._audit(
             "auth.session_revoked",
             actor=actor,

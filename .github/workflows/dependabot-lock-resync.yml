@@ -107,7 +107,7 @@ jobs:
       - name: Mint a scoped GitHub App token
         id: app-token
         if: steps.creds.outputs.present == 'true'
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ secrets.LOCK_RESYNC_APP_ID }}
           private-key: ${{ secrets.LOCK_RESYNC_APP_PRIVATE_KEY }}
@@ -129,7 +129,7 @@ jobs:
 
       - name: Set up uv
         if: steps.creds.outputs.present == 'true'
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Re-export the lock files (DEP-1 — byte-for-byte identical flags/paths)
         if: steps.creds.outputs.present == 'true'

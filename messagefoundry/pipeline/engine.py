@@ -254,13 +254,21 @@ class ReloadOutcome:
     ``fingerprint`` is the ADR 0041 D1 digest an applied reload took of ``directory`` before its
     swap, or ``None`` when it could not take one (and always for a dry run). The reload's audit row
     reads it here rather than off :attr:`Engine.loaded_config_fingerprint`: a second reload can swap
-    the graph again before the first one's row is written (vault BACKLOG #2257)."""
+    the graph again before the first one's row is written (vault BACKLOG #2257).
+
+    ``restart_required`` names each settings trust anchor the settings preflight found changed on
+    disk since its consumer loaded it. The reload checked the new file but does not apply it, so
+    those take a restart (BACKLOG #2185, #3015). ``None`` means not checked: a dry run skips the
+    preflight. An empty tuple means no anchor the preflight reports on changed, including when no
+    preflight is configured. It covers this process only, and never at least the anchors whose
+    consumer records no loaded fingerprint, such as the dialling settings CAs."""
 
     registry: Registry
     applied: bool
     directory: Path
     failures: tuple[ReloadStepFailure, ...] = ()
     fingerprint: Mapping[str, object] | None = None
+    restart_required: tuple[str, ...] | None = None
 
     @property
     def degraded(self) -> bool:
@@ -355,7 +363,7 @@ class Engine:
         sandbox_settings: SandboxSettings | None = None,
         log_dir: str | None = None,
         registry_preflight: Callable[[Registry, Mapping[str, Any]], Awaitable[None]] | None = None,
-        settings_preflight: Callable[[], Awaitable[None]] | None = None,
+        settings_preflight: Callable[[], Awaitable[tuple[str, ...]]] | None = None,
         lane_anchor_check: LaneAnchorCheck | None = None,
     ) -> None:
         self.store = store
@@ -386,8 +394,9 @@ class Engine:
         self._lane_anchor_check = lane_anchor_check
         # An optional async check run first on EVERY real reload, whoever starts it: the reload route,
         # a held reload a second approver releases, cluster convergence, and the DR profile reload.
-        # Dry runs skip it, because it writes audit rows. It raises WiringError to refuse. `serve`
-        # passes the settings trust-anchor preflight here (BACKLOG #2034). It is a callback because
+        # Dry runs skip it, because it writes audit rows. It raises WiringError to refuse, and
+        # otherwise returns the settings a restart must apply (BACKLOG #3015). `serve` passes the
+        # settings trust-anchor preflight here (BACKLOG #2034). It is a callback because
         # those anchors are known to the API layer, which this package must never import. None = none.
         self._settings_preflight = settings_preflight
         # Cluster coordination seam (Track B Step 3). None → the no-op NullCoordinator, so single-node
@@ -484,7 +493,8 @@ class Engine:
         self._api_tls_client_cert_files = tuple(api_tls_client_cert_files)
         # BACKLOG #299: the CRL files the service settings configure (crls_from_settings), mostly for
         # OUTBOUND hops. No connection carries them, so the registry scan cannot see them, and a stale
-        # one would otherwise stay silent until the next context build failed.
+        # one would otherwise stay silent until the next context build failed. Vault BACKLOG #2223: the
+        # serve path also passes the SQL Server store pin here (certs_from_settings), a kind="cert" row.
         self._settings_crls = tuple(settings_crls)
         # The engine's own API listener (host, port), reserved so no inbound listener can steal it (it
         # would collide with uvicorn at bind). None (embedding/tests with no API socket) → nothing
@@ -2633,12 +2643,15 @@ class Engine:
             values = self._env_values if env_values is None else env_values
             await self._registry_preflight(registry, values)
 
-    async def preflight_settings(self) -> None:
-        """Run the engine's settings preflight; raises ``WiringError`` to refuse. A no-op when none
-        was configured. :meth:`reload_detail` runs it on every real reload, and a DR activation
-        runs it before it re-applies the running graph (BACKLOG #2034, vault BACKLOG #3067)."""
-        if self._settings_preflight is not None:
-            await self._settings_preflight()
+    async def preflight_settings(self) -> tuple[str, ...]:
+        """Run the engine's settings preflight; raises ``WiringError`` to refuse. Returns the
+        settings whose changed anchor takes a restart, which :attr:`ReloadOutcome.restart_required`
+        carries (BACKLOG #3015). A no-op returning ``()`` when none was configured.
+        :meth:`reload_detail` runs it on every real reload, and a DR activation runs it before it
+        re-applies the running graph and ignores the return (BACKLOG #2034, vault BACKLOG #3067)."""
+        if self._settings_preflight is None:
+            return ()
+        return await self._settings_preflight()
 
     async def reload(
         self,
@@ -2729,10 +2742,11 @@ class Engine:
         values, and so does one during a first load's runner start.
         """
         failures: list[ReloadStepFailure] = []
+        restart_required: tuple[str, ...] = ()
         if not dry_run:
             # First, so every reload route refuses a bad settings anchor at the point the reload
             # route used to, before anything is read or swapped (BACKLOG #2034).
-            await self.preflight_settings()
+            restart_required = await self.preflight_settings()
         path = await self._existing_reload_target(config_dir)
         if approval is not None:
             # Before load_config, which runs every config module's top-level code, so bytes
@@ -2999,6 +3013,7 @@ class Engine:
             directory=path,
             failures=tuple(failures),
             fingerprint=fingerprint,
+            restart_required=restart_required,
         )
 
     def _resolve_reload_target(self, config_dir: str | Path | None) -> Path:
@@ -3026,7 +3041,8 @@ class Engine:
     # The operator mutations below take a REQUIRED ``audit``: the operator's audit row commits in the
     # mutation's own transaction, so a crash cannot keep the change and lose who made it (BACKLOG
     # #2624). Required, so a caller of these wrappers must say what it records. Purge has no wrapper:
-    # the API calls ``store.cancel_queued`` directly, where ``audit`` is optional.
+    # the API calls ``store.cancel_queued`` directly, where ``audit`` is required too (vault BACKLOG
+    # #3217).
     async def replay(self, message_id: str, *, audit: OperatorAudit[int]) -> int:
         """Re-queue every delivery for a message and wake the delivery workers."""
         requeued = await self.store.replay(message_id, audit=audit)
