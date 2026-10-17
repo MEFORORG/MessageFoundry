@@ -982,7 +982,10 @@ class StoreSettings(_Section):
     # a transient stage failure (retry / dead-letter) — see docs/CONNECTIONS.md "Behaviour at the
     # store-pool acquire limit". 30 s matches the connector tier's per-connection `acquire_timeout` and
     # sits far above a healthy wait; watch p95/p99 in the pool_status acquire-wait histogram before
-    # lowering it. Must be > 0: the point of the knob is that the wait is always bounded.
+    # lowering it. Must be > 0: the point of the knob is that the wait is always bounded. The two
+    # session writes that follow a committed auth change wait without it on Postgres (BACKLOG
+    # #2283) and for a fixed multiple of it on SQL Server, longer but still bounded (BACKLOG #3023);
+    # docs/CONNECTIONS.md has both, and says what else this knob does not reach.
     acquire_timeout: float = 30.0
     # POSTGRES ONLY, refused on the other backends (see _db_schema_backend). 'db_schema' avoids
     # shadowing BaseModel.schema; env: MEFOR_STORE_DB_SCHEMA.
