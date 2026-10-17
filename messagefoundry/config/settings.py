@@ -3202,10 +3202,13 @@ class AuthSettings(_Section):
     # "not found" for EVERY user — indistinguishable from "everyone was deleted". A base that was
     # deleted or moved, or that the service account may not read at all, usually ends the search with
     # a result code instead (noSuchObject, invalidDNSyntax, insufficientAccessRights): a configuration
-    # refusal, which judges no account and pages as `ad_reconcile_aborted` with reason
-    # `directory_misconfigured` rather than reaching this breaker (BACKLOG #3010). Without a brake
-    # the reconciler would sign out the entire estate during exactly the incident when operators need
-    # the console. A pass that would revoke more than BOTH of these thresholds aborts,
+    # refusal (BACKLOG #3010). A refused account is neither struck nor revoked, but it stays in this
+    # breaker's denominator, the accounts probed. A pass whose every directory answer is a refusal, a
+    # fault or a failure, with at least one refusal and no referral, judges no account it asked about
+    # and pages as `ad_reconcile_aborted` with reason `directory_misconfigured` before reaching this
+    # breaker; a refusal beside other answers alerts, and the rest of the pass reaches it. Without a
+    # brake the reconciler would sign out the entire estate during exactly the incident when
+    # operators need the console. A pass that would revoke more than BOTH of these thresholds aborts,
     # revokes nothing, and raises a loud operator-visible alert (log ERROR + an
     # `auth.ad_reconcile_aborted` audit row).
     #
