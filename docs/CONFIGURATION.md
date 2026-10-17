@@ -1980,7 +1980,11 @@ rule's `event_type`. The engine raises it once the refusal no longer stands on t
 
 A file the engine cannot read resolves nothing, and neither does a reload pass that fails. The
 engine also resolves its open alerts when it stops, because a restart builds every hop from the
-file. An engine that dies without stopping leaves its alert open; resolve it in the alert list. A
+file. An engine that dies without stopping leaves its alert open (vault BACKLOG #3543). Its next
+start under the same identity resolves it at the first reload pass, if a hop still holds the file
+and the engine refuses nothing in it. Resolve any other in the alert list: one for a file no hop
+holds now, and one raised under an identity that changes on every start, as an unpinned cluster
+node's does. A
 rule cannot attach a `control_action` to `crl_reload_refused`, because it is not a connection-scoped
 event.
 

@@ -968,6 +968,70 @@ async def test_stop_resolves_what_is_still_open_and_pages_nobody(pki: _Pki) -> N
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
+async def test_an_alert_a_dead_process_left_open_is_resolved_once_by_the_next_run(
+    pki: _Pki,
+) -> None:
+    """Vault BACKLOG #3543 item 3. Open alerts lived only in runner memory, so a process killed
+    with one open left it open, false, with nothing to clear it. The next run of that process
+    holds the file afresh and refuses nothing, so its loop resolves the subject, once, and pages
+    nobody."""
+    hop = pki.outbound_hop()  # built from the file as it is: nothing to refuse
+    transport, store = _RecordingTransport("webhook"), _RecordingStore()
+    sink = NotifierAlertSink([transport], store=cast(Any, store))
+    passes = _CountedPasses()
+    runner = CrlReloadRunner(interval_seconds=0.01, reload=passes, alert_sink=sink, node="node:a")
+    runner.start()
+    try:
+        await passes.more(3)
+    finally:
+        await runner.stop()
+    await _drain_state(sink)
+    await _drain_transports(sink)
+
+    subject = reload_alert_subject(pki.crl, "node:a")
+    assert store.resolves == [{"event_type": "crl_reload_refused", "connection": subject}]
+    assert store.upserts == [] and transport.events == []
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_the_first_sight_clear_leaves_this_runners_own_refusal_open(pki: _Pki) -> None:
+    """The control for the test above: a file this run refuses is not cleared at first sight.
+    Its own alert stays open until its refusal ends, or the stop."""
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    passes = _CountedPasses()
+    runner = CrlReloadRunner(interval_seconds=0.01, reload=passes, alert_sink=sink)
+    pki.crl.write_bytes(_expired(pki))
+    runner.start()
+    try:
+        await passes.more(3)
+        assert sink.kinds() == ["refused"]
+    finally:
+        await runner.stop()
+    assert sink.kinds() == ["refused", "applied"], "the stop's clear, and no other"
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_a_first_sight_clear_the_sink_refuses_is_retried(
+    pki: _Pki, caplog: pytest.LogCaptureFixture
+) -> None:
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    sink.down = True
+    runner = _runner(sink)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.crl_reload"):
+        for _ in range(3):
+            runner._clear_on_first_sight()
+            runner._report([])
+        sink.down = False
+        runner._clear_on_first_sight()
+        runner._clear_on_first_sight()
+    assert sink.kinds() == ["applied"], "retried, then sent once"
+    failures = [r for r in caplog.records if "an earlier run" in r.getMessage()]
+    assert len(failures) == 1, "one WARNING for the streak"
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
 async def test_a_runner_started_again_raises_a_refusal_that_still_stands(pki: _Pki) -> None:
     hop = pki.outbound_hop()
     sink = _Sink()

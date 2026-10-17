@@ -902,8 +902,14 @@ def reload_replaced_crls(
 #: The reminder clock, a module name so a test can move it without moving the event loop's.
 _monotonic = time.monotonic
 
+#: The sink call :meth:`CrlReloadRunner._clear_on_first_sight` makes, as its failure names it.
+_CLEARED_FOR_A_DEAD_PROCESS = "resolved for an earlier run of this process"
+
 #: What tries a failed sink call again, where it is not the next pass or the stop.
-_RETRIED_BY = {"sent as a reminder": "the next reminder tries again"}
+_RETRIED_BY = {
+    "sent as a reminder": "the next reminder tries again",
+    _CLEARED_FOR_A_DEAD_PROCESS: "the next pass tries again",
+}
 
 
 class _Alerted(NamedTuple):
@@ -949,8 +955,16 @@ class CrlReloadRunner:
     gone from the record (:func:`~messagefoundry.config.loaded_crls.reload_refusals`). That is
     when the file was applied, when it was put back to the bytes the hops hold, and when no hop
     holds it any more. :meth:`stop` resolves what is still open, because a restart rebuilds
-    every context from the file and nothing later would clear it. A process that dies without
-    stopping leaves its alerts open, for an operator to resolve in the alert list."""
+    every context from the file and nothing later would clear it.
+
+    **A process that died without stopping is cleared up after, where it can be (vault BACKLOG
+    #3543).** Its alerts were open in the alert list and in no runner's memory. A process with
+    the same identity builds every context afresh, from the file as it is then. So the first
+    time this runner's loop sees a held file with no refusal standing, it resolves that file's
+    subject, once (:meth:`_clear_on_first_sight`). That reaches only a file this process still
+    holds, under a subject it still uses. An alert for a file no hop holds now, or one raised
+    under an identity that changes on every start (an unpinned cluster node), stays open for an
+    operator to resolve in the alert list."""
 
     def __init__(
         self,
@@ -981,6 +995,9 @@ class CrlReloadRunner:
         # The sink calls now failing, as (what, path key): one WARNING per failing streak of each,
         # not one a pass.
         self._sink_failing: set[tuple[str, str]] = set()
+        # Path keys the loop has seen held and judged for an alert a dead process left open
+        # (:meth:`_clear_on_first_sight`), each once.
+        self._seen_held: set[str] = set()
 
     def start(self) -> None:
         """Spawn the loop (idempotent)."""
@@ -1054,6 +1071,37 @@ class CrlReloadRunner:
             # After the await, so on the event loop: a notifier schedules its alert-state write
             # with the running loop, and off the loop that write is dropped without an error.
             self._guarded(functools.partial(self._report, outcomes))
+            # After the report, so a refusal this pass recorded counts as standing.
+            self._guarded(self._clear_on_first_sight)
+
+    def _clear_on_first_sight(self) -> None:
+        """Resolve, once per held file, an alert a process that died before this one left open.
+
+        For each CRL file a hop holds that this runner has not judged yet, with no refusal
+        standing and no alert of this runner's open: raise ``crl_reload_applied`` for its subject.
+        Every context was built from the file as it is, and the pass found nothing to refuse, so a
+        refusal alert left open under this subject is false. A copy from a CA bundle is left out,
+        as the pass leaves it out (:func:`_held_by_path`): no refusal is ever raised for one. A
+        clear the sink refuses is tried again at the next pass."""
+        standing = reload_refusals()
+        for _ctx, held in held_contexts():
+            key = held.path_key
+            if held.ca_bundle or key in self._seen_held:
+                continue
+            if key in standing or key in self._alerted:
+                # This runner's own refusal: its own raise and clear cover the subject.
+                self._seen_held.add(key)
+                continue
+            try:
+                self._alert_sink.crl_reload_applied(
+                    reload_alert_subject(key, self._node), path=held.file_path
+                )
+            except Exception:
+                # Broad on purpose, as in _resolve. Not marked seen, so the next pass retries it.
+                self._sink_failed(_CLEARED_FOR_A_DEAD_PROCESS, key)
+                continue
+            self._sink_failing.discard((_CLEARED_FOR_A_DEAD_PROCESS, key))
+            self._seen_held.add(key)
 
     @staticmethod
     def _guarded(report: Callable[[], None]) -> None:
@@ -1098,14 +1146,18 @@ class CrlReloadRunner:
             return
         standing = reload_refusals()
         cleared = [key for key in self._alerted if key not in standing]
+
         # End a streak whose call is no longer owed, so the next failure for that file is logged
         # again. A raise or a reminder is owed while the refusal stands; a clear while its alert
-        # awaits one.
-        self._sink_failing = {
-            (what, key)
-            for what, key in self._sink_failing
-            if (key in cleared if what == "resolved" else key in standing)
-        }
+        # awaits one; a clear for an earlier run until the file is judged for it.
+        def owed(what: str, key: str) -> bool:
+            if what == "resolved":
+                return key in cleared
+            if what == _CLEARED_FOR_A_DEAD_PROCESS:
+                return key not in self._seen_held
+            return key in standing
+
+        self._sink_failing = {(what, key) for what, key in self._sink_failing if owed(what, key)}
         self._resolve(cleared, "the refusal no longer stands")
         self._remind(standing)
 
