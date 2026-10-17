@@ -698,9 +698,11 @@ class Engine:
         # vault BACKLOG #3109: the same for a convergence reload that raised, called with the fault
         # and the shared version it was converging on, and answering whether its row landed. The
         # runner retries that version every tick, so it is called until a row lands for that
-        # version, not once per tick; _convergence_failure_reported is the version whose row did.
+        # version and kind of fault, not once per tick. _convergence_failure_reported is the
+        # version, fault type and cause type whose row did: a version refused first as a bad
+        # config and then by a trust anchor gets a row for each (vault BACKLOG #3109).
         self.convergence_reload_failed: Callable[[Exception, int], Awaitable[bool]] | None = None
-        self._convergence_failure_reported: int | None = None
+        self._convergence_failure_reported: tuple[int, type, type] | None = None
 
     @classmethod
     async def create(
@@ -2322,16 +2324,18 @@ class Engine:
         later start compared against the wrong digest. A fault in that writer is logged and goes no
         further: the graph has swapped, and a raise would make the runner retry a reload that already
         ran. A reload that raises is passed to :attr:`convergence_reload_failed` until its row for
-        ``version`` lands, and then re-raised, so the runner still retries it. A row the store
-        refused is tried again on the next failure of the same version."""
+        ``version`` and that kind of fault lands, and then re-raised, so the runner still retries
+        it. A row the store refused is tried again on the next failure of the same version."""
         try:
             outcome = await self.reload_detail(propagate=False)
         except Exception as exc:
             hook = self.convergence_reload_failed
-            if hook is not None and version != self._convergence_failure_reported:
+            # The cause tells a trust-anchor refusal from a bad config: both are WiringError.
+            failure = (version, type(exc), type(exc.__cause__))
+            if hook is not None and failure != self._convergence_failure_reported:
                 try:
                     if await hook(exc, version):
-                        self._convergence_failure_reported = version
+                        self._convergence_failure_reported = failure
                 except Exception:  # noqa: BLE001 - the reload's own fault is the one to raise
                     log.exception("cluster: a convergence reload failed, and so did its audit")
             raise

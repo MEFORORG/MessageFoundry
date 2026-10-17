@@ -533,7 +533,7 @@ async def test_a_snapshot_that_cannot_be_taken_never_blocks_the_start(
     assert row["degraded"] is True and row["failed_steps"] == ["start_snapshot"]
     assert "fingerprint" not in row, "the reloaded digest is not named as the start's"
     assert (row["dir"], row["inbound"], row["outbound"], row["loosenings"]) == (None,) * 4
-    # A null shard reads as a whole-graph start on a --shard process (vault BACKLOG #3076 item 6).
+    # A null engine-shard id reads as a whole-graph start on a --shard process (#3076 item 6).
     assert "shard" not in row
 
     rows = await _start(tmp_path, cfg)

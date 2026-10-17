@@ -3257,8 +3257,10 @@ async def test_an_embedders_attached_service_supplies_the_auth_limits(
 ) -> None:
     """Vault BACKLOG #3215: ``create_app(engine, auth=service)`` stashes no ``[auth]`` settings, so
     the route read the defaults and named none of the embedder's loosened limits. It now reads the
-    limits off the attached service, which is what enforces them. The control keeps the default
-    and must name nothing, so the loosened arm is not reporting a stash it found elsewhere."""
+    limits off the attached service, which is what enforces them. The control keeps
+    ``totp_skew_steps`` at its default and must not name it, so the loosened arm is not reporting
+    a stash it found elsewhere. Both arms loosen other limits the sign-in needs; only this one is
+    asserted."""
     from messagefoundry.auth import Role
     from tests.test_api_auth import _DEFAULT_PEER, _add, _auth, _login
 

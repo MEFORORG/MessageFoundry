@@ -1592,8 +1592,8 @@ async def _record_reload_audit(
     start passes the snapshot it took at its first load, or ``None`` when it could not take one
     (vault BACKLOG #2838); see :class:`_LoadedConfig`. ``None`` names nothing: the directory and
     counts are ``null``, and the row has no ``shard`` key and no digest keys, since a ``null``
-    shard would read as a whole-graph start on a ``--shard`` process (vault BACKLOG #3076). No row
-    reads these at the write.
+    engine-shard id would read as a whole-graph start on a ``--shard`` process (vault BACKLOG
+    #3076). No row reads these at the write.
 
     A reload passes its :class:`~messagefoundry.pipeline.ReloadOutcome`, and the row names what
     that reload loaded (vault BACKLOG #2257), with the shared cluster ``config_version`` it carries
@@ -2183,9 +2183,10 @@ async def _record_start_audit(
 
     ``loaded`` is the snapshot the caller took at the first load and compared (vault BACKLOG
     #2838). The row names that, so the digest it records is the one the comparison used. When the
-    caller could not take one, ``loaded`` is ``None``. The row then claims nothing, with no live
-    read, since a reload may already have swapped the graph: no directory, counts, shard or digest
-    (see :func:`_record_reload_audit`), and ``loosenings`` ``None`` for the same reason. It is
+    caller could not take one, ``loaded`` is ``None``. The row then names nothing it loaded, with
+    no live read, since a reload may already have swapped the graph: no directory, counts,
+    engine-shard id or digest (see :func:`_record_reload_audit`), and ``loosenings`` ``None`` for
+    the same reason. It still records the comparison its caller made. It is
     degraded with the ``start_snapshot`` step and marked :data:`_BASELINE_UNCHECKED`, whatever
     ``outcome`` says.
 

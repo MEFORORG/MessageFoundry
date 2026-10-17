@@ -1226,7 +1226,7 @@ async def test_engine_convergence_reload_does_not_propagate(tmp_path: Path) -> N
 
 
 async def test_a_convergence_reload_hands_its_hooks_the_version_it_converged_on(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """vault BACKLOG #3109: ``_converge_reload`` hands the audit hook its outcome carrying the
     shared version it converged on. A reload that raises hands the failure hook the fault and that
@@ -1284,6 +1284,20 @@ async def test_a_convergence_reload_hands_its_hooks_the_version_it_converged_on(
             with pytest.raises(WiringError):
                 await eng._converge_reload(7)
         assert failed[3:] == [(WiringError, 7), (WiringError, 7)], "lost once, then written"
+
+        # A different kind of fault for the same version gets its own row: a trust-anchor
+        # refusal is a WiringError too, told apart by its cause.
+        causes: list[BaseException | None] = [None, None, OSError("synthetic anchor fault")]
+
+        async def _refuse(*_a: object, **_kw: object) -> ReloadOutcome:
+            cause = causes.pop(0)
+            raise WiringError("synthetic refusal") from cause
+
+        monkeypatch.setattr(eng, "reload_detail", _refuse)
+        for _ in range(3):
+            with pytest.raises(WiringError):
+                await eng._converge_reload(8)
+        assert failed[5:] == [(WiringError, 8), (WiringError, 8)], "one row per kind of fault"
     finally:
         await eng.stop()
 
