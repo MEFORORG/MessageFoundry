@@ -20,7 +20,7 @@ one environment:
 
 ```
 pip install "messagefoundry==0.5.1" "messagefoundry-webconsole==0.4.0"
-# or from a checkout, for development:
+# or, for development, beside an engine installed from the same checkout:
 pip install -e packaging/messagefoundry-webconsole
 ```
 

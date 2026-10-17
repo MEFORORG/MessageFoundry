@@ -557,55 +557,9 @@ def test_every_build_system_pins_its_backend_exactly_and_they_agree() -> None:
 
 _HARNESS_PYPROJECT = _REPO / "packaging" / "messagefoundry-harness" / "pyproject.toml"
 
-_CONTRIBUTING = _REPO / "CONTRIBUTING.md"
-_BUMP_HEADING = "## Bumping the engine version"
+# Where the pin failures below send a version bump. The list itself is guarded in
+# tests/test_install_docs_pin_the_current_version.py, which the docs-only CI lane runs.
 _BUMP_LIST = "CONTRIBUTING.md, *Bumping the engine version*"
-_BUMP_NOT_MOVED = "\nWhat an engine bump does not move:"
-# Splits the list into the paths it names: on whitespace, and on the Markdown around a path.
-_BUMP_TOKEN_SEP = re.compile(r"[\s`*()\[\],;:]+")
-
-
-@functools.cache
-def _bump_section() -> str:
-    """CONTRIBUTING.md's list of a bump's edits, from its heading to *does not move*.
-
-    It stops at the next ``## `` heading if that paragraph is gone. The *does not move* paragraph
-    names files too, and a file named only there is not on the list.
-    """
-    text = _CONTRIBUTING.read_text(encoding="utf-8")
-    assert _BUMP_HEADING in text.splitlines(), (
-        f"{_CONTRIBUTING.name} has no {_BUMP_HEADING!r} heading, so every failure that points a "
-        f"version bump at {_BUMP_LIST} points at nothing"
-    )
-    body = text.split(f"\n{_BUMP_HEADING}\n", 1)[1]
-    return body.split("\n## ", 1)[0].split(_BUMP_NOT_MOVED, 1)[0]
-
-
-@pytest.mark.parametrize(
-    "path",
-    [
-        "messagefoundry/__init__.py",
-        "packaging/messagefoundry-harness/pyproject.toml",
-        "packaging/messagefoundry-toolkit/pyproject.toml",
-        "docs/INSTALL-GUIDE.md",
-        "docs/EARLY-ADOPTER-GUIDE.md",
-        "docs/USER-GUIDE.md",
-        "README.md",
-        "packaging/messagefoundry-webconsole/README.md",
-        "tests/test_install_docs_pin_the_current_version.py",
-        "scripts/release/changelog_fragments.py",
-    ],
-)
-def test_the_bump_list_names_every_file_a_version_bump_moves(path: str) -> None:
-    """Each file that carries an engine pin, and the changelog step, is named in the bump list.
-
-    The list is prose, so this cannot prove it complete. It proves the files known to pin the
-    engine are not dropped from it: the old "at least three edits" count left out the install
-    guides, and release PR 1895 went red on them (vault BACKLOG #2732). A path must appear as a
-    whole token, so ``README.md`` is not satisfied by ``packaging/messagefoundry-webconsole/README.md``.
-    """
-    assert (_REPO / path).is_file(), f"{path} no longer exists; re-derive the bump list"
-    assert path in _BUMP_TOKEN_SEP.split(_bump_section()), f"{_BUMP_LIST} does not name `{path}`"
 
 
 def _version_literal(module: Path) -> str:

@@ -233,11 +233,12 @@ own; `git update-index --skip-worktree .claude/settings.json` keeps that local.
 
 ## Bumping the engine version
 
-This is the complete list of what an engine version bump edits, and it is kept here only. The
-comments in the harness and toolkit `pyproject.toml` files, ADR 0201 and the pin failures in
-`tests/test_packaging.py` point here. Nothing performs these edits for you, and CI fails a release
-pull request that makes some of them and leaves the rest for later, so make them all in the
-pull request that moves the version.
+This is the one list of what an engine version bump edits, and it is kept here only. It holds
+at least these edits; if a bump needs one it does not name, add it here. The comments in the
+harness and toolkit `pyproject.toml` files, ADR 0201, `.github/workflows/release.yml` and the pin
+failures in `tests/test_packaging.py` point here. Nothing performs these edits for you. CI fails a
+release pull request that leaves a test-held pin behind (items 2 to 4), but not one that skips
+item 5, so make them all in the pull request that moves the version.
 
 1. `messagefoundry/__init__.py`: `__version__`. Every other engine pin below must match it.
 2. `packaging/messagefoundry-harness/pyproject.toml`: the `messagefoundry[harness]==` pin.
@@ -259,12 +260,13 @@ pull request that moves the version.
 
    The test sweeps all six documents `docs/README.md` lists under *Start here*, so a pin added to
    any of them is held too. Run it after the bump.
-5. The engine pin in the console pairing install line of `README.md` and of
-   `packaging/messagefoundry-webconsole/README.md`, and the engine versions the prose beside it
-   names as sharing the console's seam. No test reads these two, so edit them by hand.
-6. The changelog: `python scripts/release/changelog_fragments.py assemble`, then rename
-   `[Unreleased]` to the version. [changelog.d/README.md](changelog.d/README.md), *At release*,
-   gives the order.
+5. The console pairing prose: the engine pin in the pairing install line of `README.md` and of
+   `packaging/messagefoundry-webconsole/README.md`, the engine versions that prose names as
+   sharing the console's seam, and the engine version in the *Admin console* section of
+   `docs/SERVICE.md`. No test holds these versions, so edit them by hand.
+6. `CHANGELOG.md`: run `python scripts/release/changelog_fragments.py assemble`, then rename
+   `[Unreleased]` to the version and add a fresh, empty `[Unreleased]` above it.
+   [changelog.d/README.md](changelog.d/README.md), *At release*, gives the order.
 
 What an engine bump does not move:
 
@@ -279,9 +281,8 @@ What an engine bump does not move:
 
 **Check the UI seam as well.** If `ENGINE_UI_SEAM` has moved since the console last released, the
 published console refuses the new engine, so the release needs a console release beside it
-([docs/WEBCONSOLE-PACKAGE.md](docs/WEBCONSOLE-PACKAGE.md)). That release moves the console version
-in the two files of item 5 and in the *Admin console* section of `docs/SERVICE.md`, which no test
-reads either.
+([docs/WEBCONSOLE-PACKAGE.md](docs/WEBCONSOLE-PACKAGE.md)). That release also moves the console
+version in the three files of item 5.
 
 ## PHI / safety
 
