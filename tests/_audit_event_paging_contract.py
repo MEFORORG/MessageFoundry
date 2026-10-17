@@ -18,6 +18,7 @@ What each check guards:
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from messagefoundry.store.audit_exclusion import AuditExclusion
@@ -198,3 +199,27 @@ async def check_connection_event_paging(store: Any, tag: str) -> None:
     assert await store.connection_event_extent(
         connection=f"IB_{tag}_none", since=since, allowed_channels=None
     ) == (0, 0)
+
+
+async def check_audit_watermark(store: Any, tag: str) -> None:
+    """The newest audit row id is a watermark that ignores ``ts`` (BACKLOG #3085, owner ruling
+    2026-10-17).
+
+    The directory reconciler reads ``list_audit(limit=1)[0]["id"]`` when its pass starts, and
+    counts only rows above it as written during the pass. That needs three things of every
+    backend: the newest-first listing's first row carries the largest committed id, the id is an
+    integer, and a row written later gets a larger id whatever ``ts`` its writer stamped. Here the
+    earlier row is stamped 30 seconds ahead and the later one a minute behind, as two engines whose
+    clocks disagree would stamp them, so a store that ordered by ``ts`` fails both ways."""
+    who = f"w3085-{tag}"
+    now = time.time()
+    await store.record_audit("auth.ad_session_revoked", actor=who, detail=None, now=now + 30.0)
+    (earlier,) = await store.list_audit(actor=who, limit=10)
+    (newest,) = await store.list_audit(limit=1)
+    watermark = newest["id"]
+    assert isinstance(watermark, int) and not isinstance(watermark, bool), type(watermark)
+    assert earlier["id"] <= watermark
+    await store.record_audit("auth.ad_session_revoked", actor=who, detail=None, now=now - 60.0)
+    later, again = await store.list_audit(actor=who, limit=10)
+    assert again["id"] == earlier["id"]
+    assert later["id"] > watermark
