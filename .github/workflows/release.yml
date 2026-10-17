@@ -66,13 +66,17 @@
 # exactly as before while reading as a control that is not there. Keep the name `pypi`.
 # Keep PUBLISH_HARNESS and PUBLISH_WEBCONSOLE off the environment, as repository variables only. A
 # job's `if:` is read before its environment applies, and a step's inside it after, so a copy on
-# the environment would let two gates read different values. So each is read outside the
-# environment, the same way: its build job (`release-harness`, `release-webconsole`) hands it to the
-# upload step as a job output, and the job that takes the release out of draft reads it again when
-# it runs. That second read is the control for a re-run: "Re-run failed jobs" reuses the build job's
-# earlier output, so a variable set since then would skip the upload. The draft publisher refuses
-# to publish while the variable is 'true' and the upload's outcome is not success (vault BACKLOG
-# #2975). Unset, the upload step is skipped and the release still goes public, for both.
+# the environment would let two gates read different values. So each is read three times, the
+# same way for both (vault BACKLOG #2975). Its build job (`release-harness`, `release-webconsole`)
+# reads it outside the environment and hands it in as a job output. The upload step runs only when
+# that output AND its own read are 'true': the output keeps an environment copy from turning the
+# upload on, and the fresh read keeps an unset made after the build job ran from being ignored by
+# a re-run. The job that takes the release out of draft, outside the environment, reads it again,
+# compared as Actions compares (ignoring case), and refuses while it is 'true' and the upload did
+# not run. That last read covers a variable set after the build job read it, whether by a re-run of
+# failed jobs reusing the build job's output or while the upload waited for its approval; re-running
+# the build job, which re-runs the jobs after it, reads it afresh. Unset, the upload step is
+# skipped and the release still goes public.
 #
 # THE HAND-OVER. Each build job records the digests once its last gate has passed, and its last
 # step uploads the files. Neither step has an `if:`, so any earlier failure skips both. In `release`
@@ -1339,13 +1343,11 @@ jobs:
       # and the GitHub release stays a draft; `skip-existing` lets a re-run finish it. GATED: a
       # no-op until the owner configures the messagefoundry-harness PyPI Trusted Publisher AND sets
       # repo variable PUBLISH_HARNESS=true. The build + version-check in release-harness still run
-      # every release. The variable comes through release-harness, read outside this environment,
-      # so an environment copy of it cannot change what this step sees (the header says why). A
-      # re-run of this job alone reuses that earlier reading; publish-github-release reads the
-      # variable again and refuses to publish if this step was skipped while it is 'true'.
+      # every release. The variable is read through release-harness's output and again here; the
+      # header says why both, and why publish-github-release reads it a third time.
       - name: Publish messagefoundry-harness to PyPI (Trusted Publishing / OIDC)
         id: harness-upload
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && needs.release-harness.outputs.publish-harness == 'true' }}
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && needs.release-harness.outputs.publish-harness == 'true' && vars.PUBLISH_HARNESS == 'true' }}
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: harness-dist/
@@ -1797,13 +1799,12 @@ jobs:
       # variable on 2026-07-29 (read with `gh variable list`, 2026-09-28), and the first
       # webconsole-v* release through this step claimed the PyPI name that day (BACKLOG #1944).
       # Unset the variable and this step is skipped, while the build + version-check above still run
-      # on every console tag, and the console's release still goes public. The variable comes
-      # through release-webconsole, read outside this environment, so an environment copy of it
-      # cannot change what this step sees; publish-github-release-webconsole reads it again and
-      # refuses to publish if this step was skipped while it is 'true' (vault BACKLOG #2975).
+      # on every console tag, and the console's release still goes public. The variable is read
+      # through release-webconsole's output and again here; the header says why both, and why
+      # publish-github-release-webconsole reads it a third time (vault BACKLOG #2975).
       - name: Publish messagefoundry-webconsole to PyPI (Trusted Publishing / OIDC)
         id: webconsole-upload
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && needs.release-webconsole.outputs.publish-webconsole == 'true' }}
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && needs.release-webconsole.outputs.publish-webconsole == 'true' && vars.PUBLISH_WEBCONSOLE == 'true' }}
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: webconsole-dist/
@@ -1831,20 +1832,21 @@ jobs:
       - name: Publish the draft console GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          PUBLISH_GATE: ${{ vars.PUBLISH_WEBCONSOLE }}
+          PUBLISH_GATE: ${{ vars.PUBLISH_WEBCONSOLE == 'true' }}
           GATE_NAME: PUBLISH_WEBCONSOLE
           UPLOAD_OUTCOME: ${{ needs.publish-pypi-webconsole.outputs.upload-outcome }}
           DISTRIBUTION: messagefoundry-webconsole
+          BUILD_JOB: release-webconsole
           GH_REPO: ${{ github.repository }}
         run: |
           tag="${GITHUB_REF_NAME}"
-          # The variable is read again here, when this job runs; the header says why (vault BACKLOG #2975).
-          if [ "$PUBLISH_GATE" = "true" ] && [ "$UPLOAD_OUTCOME" != "success" ]; then
-            echo "::error::$GATE_NAME is 'true', but this run did not upload $DISTRIBUTION (outcome '$UPLOAD_OUTCOME'). A re-run of failed jobs reuses the earlier reading of the variable; re-run all jobs, or unset it. The release stays a draft."
-            exit 1
-          fi
           is_draft=$(gh release view "$tag" --json isDraft --jq .isDraft)
           if [ "$is_draft" = "true" ]; then
+            # The variable is read again here, when this job runs; the header says why (vault BACKLOG #2975).
+            if [ "$PUBLISH_GATE" = "true" ] && [ "$UPLOAD_OUTCOME" != "success" ]; then
+              echo "::error::$GATE_NAME is 'true', but this run did not upload $DISTRIBUTION (outcome '$UPLOAD_OUTCOME'): $BUILD_JOB read the variable before it was set, and a re-run of failed jobs reuses that reading. Re-run the $BUILD_JOB job, which re-runs the jobs after it, or unset the variable. The release stays a draft."
+              exit 1
+            fi
             gh release edit "$tag" --draft=false
             echo "Published release $tag."
           else
@@ -1948,9 +1950,9 @@ jobs:
           /tmp/harnesssmoke/bin/pip install --quiet "packaging==$PKG_PIN"
           # --no-deps IS LOAD-BEARING, NOT AN OPTIMISATION. messagefoundry-harness depends on
           # messagefoundry[harness], so a full install would resolve the ENGINE AND PySide6 FROM PYPI
-          # inside a job holding contents: write — and the engine is not on PyPI yet, since
-          # publish-pypi waits on this job, so it would also fail or reach an older engine, by a
-          # live index round-trip on the release path. Install the
+          # inside a job holding contents: write — and on a first run the engine is not on PyPI
+          # yet, since publish-pypi waits on this job (a re-run of this job may follow its upload),
+          # so it would also be a live index round-trip on the release path. Install the
           # built wheel alone; the import below is chosen to need nothing else.
           /tmp/harnesssmoke/bin/pip install --quiet --no-deps harness-dist/*.whl
           # A failure inside this command substitution fails the step: Actions runs the block as
@@ -2230,7 +2232,9 @@ jobs:
   # refuses to publish while PUBLISH_HARNESS is 'true' and the harness upload did not run.
   #
   # If `release-harness` or `publish-pypi` fails, this job is skipped and the release stays a draft.
-  # Re-running the failed jobs finishes the release. A draft is never published with an asset missing.
+  # Re-running the failed jobs finishes the release, unless PUBLISH_HARNESS was set after
+  # `release-harness` read it: then this job refuses, and its error names the job to re-run. A
+  # draft is never published with an asset missing.
   publish-github-release:
     # The event-and-ref pair sits on the job, so a dispatch never schedules it at all.
     if: github.repository == 'MEFORORG/MessageFoundry' && !startsWith(github.ref_name, 'webconsole-') && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
@@ -2245,20 +2249,21 @@ jobs:
       - name: Publish the draft GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          PUBLISH_GATE: ${{ vars.PUBLISH_HARNESS }}
+          PUBLISH_GATE: ${{ vars.PUBLISH_HARNESS == 'true' }}
           GATE_NAME: PUBLISH_HARNESS
           UPLOAD_OUTCOME: ${{ needs.publish-pypi.outputs.upload-outcome }}
           DISTRIBUTION: messagefoundry-harness
+          BUILD_JOB: release-harness
           GH_REPO: ${{ github.repository }}
         run: |
           tag="${GITHUB_REF_NAME}"
-          # The variable is read again here, when this job runs; the header says why (vault BACKLOG #2975).
-          if [ "$PUBLISH_GATE" = "true" ] && [ "$UPLOAD_OUTCOME" != "success" ]; then
-            echo "::error::$GATE_NAME is 'true', but this run did not upload $DISTRIBUTION (outcome '$UPLOAD_OUTCOME'). A re-run of failed jobs reuses the earlier reading of the variable; re-run all jobs, or unset it. The release stays a draft."
-            exit 1
-          fi
           is_draft=$(gh release view "$tag" --json isDraft --jq .isDraft)
           if [ "$is_draft" = "true" ]; then
+            # The variable is read again here, when this job runs; the header says why (vault BACKLOG #2975).
+            if [ "$PUBLISH_GATE" = "true" ] && [ "$UPLOAD_OUTCOME" != "success" ]; then
+              echo "::error::$GATE_NAME is 'true', but this run did not upload $DISTRIBUTION (outcome '$UPLOAD_OUTCOME'): $BUILD_JOB read the variable before it was set, and a re-run of failed jobs reuses that reading. Re-run the $BUILD_JOB job, which re-runs the jobs after it, or unset the variable. The release stays a draft."
+              exit 1
+            fi
             gh release edit "$tag" --draft=false
             echo "Published release $tag."
           else

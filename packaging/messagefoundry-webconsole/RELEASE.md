@@ -105,7 +105,8 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
       draft until that upload succeeds; `publish-github-release-webconsole` then publishes it. With
       `PUBLISH_WEBCONSOLE` unset, the upload is skipped and the release is published once the `pypi`
       approval is given. Set, the publish refuses while the upload has not run, which is what a
-      "Re-run failed jobs" after setting it would do; re-run all jobs instead.
+      "Re-run failed jobs" after setting it would do; re-run the `release-webconsole` job instead,
+      which re-runs the jobs after it.
 
 ## 7. Post-publish verification
 

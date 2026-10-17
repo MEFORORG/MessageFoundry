@@ -153,8 +153,10 @@ Facts the labels leave out:
   job adds an asset to a published release. The console's release is a draft too, until its wheel
   is on PyPI. With `PUBLISH_WEBCONSOLE` unset, the console upload is skipped and the console's
   release is still published, as the engine's is with `PUBLISH_HARNESS` unset. With either variable
-  set, its draft publisher reads it again when it runs and refuses to publish unless that run's
-  upload ran, so a re-run that reused an earlier reading of the variable cannot skip the upload.
+  set, its draft publisher reads it again when it runs and refuses to publish the release while
+  that run skipped the upload. A re-run that reused an earlier reading of the variable can still
+  skip the upload, and on an engine tag the toolkit and engine are on PyPI by then; the release
+  stays a draft until the build job is re-run.
 - **The provenance gate.** The tagged commit must be on `main`, and each required check's latest
   run on it must have passed. A red run after the merge blocks the tag even if the merge-queue run
   passed. To clear it, re-run the failed job on that commit, then re-run the release. A check
