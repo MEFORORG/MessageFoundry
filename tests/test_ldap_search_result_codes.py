@@ -739,7 +739,8 @@ class _ScriptedDc:
     answered by ``bind_reply(raw request)``, or with success where that is absent or returns
     ``None``; an extended operation such as Who am I is answered with ``extended_reply``, or ends
     with ``extended_code``; each search is answered by ``answer(raw request)``. ``searches`` holds every search request's bytes, and
-    ``ended`` is set when a client's socket closes."""
+    ``ended`` is set when a client's socket closes. A reply that is already a whole LDAPMessage is
+    sent as written, under its own messageID."""
 
     def __init__(
         self,
@@ -790,7 +791,8 @@ class _ScriptedDc:
                         # as written, so a test can send one under another messageID, such as an
                         # unsolicited notification under 0. No protocolOp tag is 0x30.
                         if reply[:1] == b"\x30":
-                            sock.sendall(reply + controls)
+                            assert not controls, "a whole LDAPMessage carries its own controls"
+                            sock.sendall(reply)
                         else:
                             sock.sendall(_tlv(0x30, message_id + reply + controls))
         finally:

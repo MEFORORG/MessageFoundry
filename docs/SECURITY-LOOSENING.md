@@ -860,8 +860,9 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   of addresses the attacker holds. With the ceremony limit off, a session holder guessing a password at
   re-auth meets no rate limit, only the per-session cap and the account's lockout (each failed re-proof
   counts toward it), and a second factor at the console's sign-in step is guessed at no set rate. An
-  AD re-bind the DC ends with an outage code, such as busy, is charged to neither, so nothing in the
-  engine bounds those re-binds (BACKLOG #3169).
+  AD re-bind the DC ends with an outage code, such as busy, is charged to neither the per-session cap
+  nor the lockout, so nothing in the engine bounds those re-binds (BACKLOG #3169). Each value in the
+  table above that turns the ceremony limit off has the same effect.
 - **When acceptable:** load testing on a host no untrusted client can reach. A reverse proxy or web
   application firewall in front of the engine can replace the per-address and all-clients limits, but it
   cannot replace the per-user ceremony limit, which keys on the signed-in user. A modest raise for a

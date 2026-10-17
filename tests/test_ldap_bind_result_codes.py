@@ -12,8 +12,9 @@ would have charged a user who typed the right password. Now the bind raises
 
 Driven at three depths: the REAL ``LdapAuthenticator`` over the ldap3 doubles of
 ``tests/test_ldap_timeouts.py``; a REAL ldap3 stack decoding a bindResponse from the loopback server
-of ``tests/test_ldap_search_result_codes.py``, for each code, plus a Notice of Disconnection carrying
-52, which ldap3 raises as a session the server ended and never hands to the code check; and the REAL ``AuthService`` step-up re-bind over the
+of ``tests/test_ldap_search_result_codes.py``, for each code, plus a Notice of Disconnection
+carrying 52, which ldap3 raises as a session the server ended and never hands to the code check;
+and the REAL ``AuthService`` step-up re-bind over the
 doubles of ``tests/test_ad_user_account_control.py``, read where a caller meets it: the outcome, the
 engine lockout counter, the per-session re-proof budget and the ``auth.reauth`` audit row. Each
 refusal has a control on the same doubles: 49 still counts. Every other code keeps its reading from
@@ -47,7 +48,13 @@ from messagefoundry.auth.ldap import (
 )
 from tests.test_ad_user_account_control import _signed_in_estate
 from tests.test_ldap_referrals import _BIND_RESPONSE, _tlv
-from tests.test_ldap_search_result_codes import _done, _Reply, _scripted_dc
+from tests.test_ldap_search_result_codes import (
+    _EXTENDED_RESPONSE,
+    _done,
+    _enumerated,
+    _Reply,
+    _scripted_dc,
+)
 from tests.test_ldap_timeouts import _ad_settings, _install_fakes
 
 #: The codes the row names. None judged the password.
@@ -57,6 +64,8 @@ _UNJUDGED = [
     pytest.param(RESULT_UNAVAILABLE, "unavailable", id="52-unavailable"),
     pytest.param(RESULT_UNWILLING_TO_PERFORM, "unwillingToPerform", id="53-unwillingToPerform"),
 ]
+
+_UNJUDGED_CODES = [p.values[0] for p in _UNJUDGED]
 
 _PASSWORD = "synthetic-user-pw-3169"
 
@@ -88,7 +97,7 @@ def _search_finds_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_the_codes_are_ldap3s() -> None:
     """The set is spelled in literals, because every ldap3 import in the module is lazy."""
-    assert frozenset(p.values[0] for p in _UNJUDGED) == ldap_module._UNJUDGED_BIND_CODES
+    assert frozenset(_UNJUDGED_CODES) == ldap_module._UNJUDGED_BIND_CODES
     assert RESULT_INVALID_CREDENTIALS not in ldap_module._UNJUDGED_BIND_CODES
 
 
@@ -122,7 +131,7 @@ def test_every_other_refused_bind_still_judged_the_found_account(
     assert bind.answer is DirectoryAnswer.FOUND and bind.principal is None
 
 
-@pytest.mark.parametrize("code", [*(p.values[0] for p in _UNJUDGED), RESULT_INVALID_CREDENTIALS])
+@pytest.mark.parametrize("code", [*_UNJUDGED_CODES, RESULT_INVALID_CREDENTIALS])
 def test_the_decoy_bind_keeps_the_lookups_answer_whatever_its_code(
     monkeypatch: pytest.MonkeyPatch, code: int
 ) -> None:
@@ -161,7 +170,7 @@ def _alice(_raw: bytes) -> list[_Reply]:
     return [(_tlv(0x64, _tlv(0x04, _ALICE) + _tlv(0x30, attrs)), b""), _done(0)]
 
 
-@pytest.mark.parametrize("code", [*(p.values[0] for p in _UNJUDGED), RESULT_INVALID_CREDENTIALS])
+@pytest.mark.parametrize("code", [*_UNJUDGED_CODES, RESULT_INVALID_CREDENTIALS])
 def test_real_ldap3_leaves_the_bind_code_where_the_refusal_reads_it(code: int) -> None:
     """ldap3 decodes the bindResponse and leaves its code on ``conn.result``, so the refusal sees
     it, for each of the four codes and the 49 control. RED if a future ldap3 cleared or moved it:
@@ -229,8 +238,8 @@ _NOTICE_OF_DISCONNECTION = _tlv(
     0x30,
     _tlv(0x02, bytes([0]))  # messageID 0: unsolicited
     + _tlv(
-        0x78,
-        _tlv(0x0A, bytes([RESULT_UNAVAILABLE]))
+        _EXTENDED_RESPONSE,
+        _tlv(0x0A, _enumerated(RESULT_UNAVAILABLE))
         + _tlv(0x04, b"")
         + _tlv(0x04, b"")
         + _tlv(0x8A, b"1.3.6.1.4.1.1466.20036"),
@@ -242,17 +251,38 @@ def test_real_ldap3_reads_a_notice_of_disconnection_at_the_bind_as_an_outage() -
     """A DC may answer the bind with a Notice of Disconnection, carrying 52, instead of a
     bindResponse. ldap3 never hands that code to the refusal: it raises
     ``LDAPSessionTerminatedByServerError`` from the bind, which ``authenticate`` maps to a plain
-    :class:`LdapError`, not :class:`LdapUnansweredError`. The step-up re-bind reads any
-    ``LdapError`` as ``directory_unavailable``, so this too is an outage, not a wrong password.
-    RED if it ever read as a refused password on the found entry."""
+    :class:`LdapError`, not :class:`LdapUnansweredError`, as measured on ldap3 2.9.1. RED if it
+    ever read as a refused password on the found entry; the step-up arm below drives the re-bind."""
 
     def bind_reply(raw: bytes) -> _Reply | None:
         return (_NOTICE_OF_DISCONNECTION, b"") if _ALICE in raw else None
 
     with (
         _scripted_dc(_alice, bind_reply=bind_reply) as (_dc, authenticator),
-        pytest.raises(LdapError, match="session terminated by server") as caught,
+        pytest.raises(LdapError) as caught,
     ):
         authenticator.authenticate("alice", _PASSWORD)
-    assert not isinstance(caught.value, LdapUnansweredError)
     assert isinstance(caught.value.__cause__, LDAPSessionTerminatedByServerError)
+
+
+async def test_a_re_bind_ended_by_a_notice_of_disconnection_is_not_counted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The step-up re-bind over the same doubles as the four codes, with the bind raising what
+    ldap3 raises on a Notice of Disconnection. RED when it charges the row or the session."""
+    async with _signed_in_estate(monkeypatch, ["alice"]) as (_directory, service, store, tokens):
+
+        def bind(self: Any) -> bool:
+            raise LDAPSessionTerminatedByServerError("session terminated by server")
+
+        monkeypatch.setattr(ldap3.Connection, "bind", bind)
+        identity = await service.identity_for_token(tokens["alice"])
+        assert identity is not None
+        elevation = await service.reauth(identity, _PASSWORD, token=tokens["alice"])
+        row = await store.get_user(identity.user_id)
+        assert row is not None
+        details = [str(dict(r)["detail"]) for r in await store.list_audit(action="auth.reauth")]
+        assert not elevation.ok and elevation.directory_unconfirmed is True
+        assert row.failed_attempts == 0
+        assert len(service._reproof_session_failures) == 0
+        assert any('"reason": "directory_unavailable"' in d for d in details), details
