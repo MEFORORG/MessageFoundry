@@ -2271,7 +2271,9 @@ class AuthStore(Protocol):
         ...
 
     # --- The first-seen sign-in address baseline (BACKLOG #288, vault BACKLOG #2145) ---
-    # One row per (account id, host key). The caller folds the address to its host key; the store
+    # One row per (account id, host key), plus, after an administrator's reset, one marker row that
+    # holds no host (auth/service.py ``_LOGIN_ADDRESS_RESET_MARKER``, vault BACKLOG #2946). The
+    # caller folds the address to its host key; the store
     # compares it byte for byte. Both reads and writes go through the (user_id, address) primary key.
     #
     # The host keys recorded for the account with ``last_seen >= since``, in no order.
