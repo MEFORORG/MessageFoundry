@@ -13188,9 +13188,9 @@ class SqlServerStore:
         material, not a secret — excluded from cipher + rekey). pyodbc's IntegrityError is raised
         for at least a duplicate ``(user_id, label)`` (``ux_webauthn_label``), a credential id
         already held (the primary key) and an account that does not exist
-        (``fk_webauthn_credentials_user``, BACKLOG #2733); the caller tells them apart by re-reading,
-        as ``AuthService.finish_webauthn_registration`` says. The account is re-sealed over its new passkey digest in the same transaction (BACKLOG
-        #2592)."""
+        (``fk_webauthn_credentials_user``, BACKLOG #2733); the caller tells them apart by
+        re-reading, as ``AuthService.finish_webauthn_registration`` says. The account is re-sealed
+        over its new passkey digest in the same transaction (BACKLOG #2592)."""
         await self._write_passkeys_txn(
             cred.user_id, _WEBAUTHN_INSERT, webauthn_insert_params(cred), counted=False
         )
@@ -13423,6 +13423,11 @@ class SqlServerStore:
     @staticmethod
     async def _delete_user_rows(cur: Any, user_id: str) -> None:
         """Delete the account and every row keyed to it, inside the caller's transaction."""
+        # BACKLOG #2733: hold the account row first, as every passkey write does
+        # (_read_user_record). Otherwise an enrolment committing between the passkey delete and the
+        # users delete below would fail fk_webauthn_credentials_user and the whole delete with it.
+        await cur.execute("SELECT id FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?", (user_id,))
+        await cur.fetchall()
         await cur.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
         await cur.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
         await cur.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))

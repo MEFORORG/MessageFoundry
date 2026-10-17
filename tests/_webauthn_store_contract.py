@@ -4,7 +4,8 @@
 
 Deliberately **extra-free** (ADR 0068 §4 / decision 4): this module imports NOTHING from the
 optional ``webauthn`` extra — it exercises only ``AuthStore`` methods and the
-``WebAuthnCredential`` record — so the live Postgres/SQL Server suites can import it *inside their
+``WebAuthnCredential`` record, and judges a refusal with the service's own extra-free
+``_is_integrity_refusal`` — so the live Postgres/SQL Server suites can import it *inside their
 test functions* and run the parity contract on CI legs that install ``.[dev,postgres]`` /
 ``.[dev,sqlserver]`` **without** the webauthn extra. (A module-level
 ``pytest.importorskip("webauthn")`` anywhere on this path would silently skip parity on exactly
