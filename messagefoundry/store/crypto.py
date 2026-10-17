@@ -398,8 +398,9 @@ class _UnmarkedPolicy:
             cause = "a plaintext upload stored before the key was enabled, or a planted one"
             fix = (
                 "an operator may seal it by running 'messagefoundry rotate-key' with the engine "
-                "stopped; if rotate-key leaves it unsealed for good, it can only be deleted, by an "
-                "operator or by the retention prune once it expires"
+                "stopped; if rotate-key leaves it unsealed for good, an operator may delete it, or "
+                "the retention prune may remove it once it expires, where either can; docs/PHI.md "
+                "section 3 lists the uploads neither can remove"
             )
         else:
             cause = "a stripped marker or a planted row"
