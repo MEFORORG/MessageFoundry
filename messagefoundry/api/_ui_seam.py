@@ -404,12 +404,26 @@ from typing import Any
 #: surface grew. An older console on this engine is refused at mount; a newer console on an older
 #: engine would call a method that does not exist.
 #:
+#: Vault BACKLOG #2709: the digest now covers each console route's gate. The vault BACKLOG #2581
+#: entry above records the gap: the console calls ``dr_activate`` and ``dr_release`` in process,
+#: which never runs their gates, so the console route's own gate is the only one on that path. That
+#: change moved the gate and not the digest, so a console wheel that kept the session-only gate
+#: pinned the same digest and passed the handshake. The snapshot now records what the console
+#: installs on the app: each route's top-level dependencies, gates included, with their own source
+#: and the values they captured, and its mounts, middleware and ``app.state`` hooks.
+#: ``console_route_gates`` in ``scripts/webconsole_seam_snapshot.py`` lists at least what that
+#: misses, such as a helper a gate calls by name. A change to a route's gate moves the digest, so a
+#: console built before it is refused at mount. A new console route moves it too, so a console
+#: change that adds or re-gates a route now needs an engine with the new seam. The released console
+#: 0.4.0 was already refused before this change, by unrelated seam moves; this is the guard against
+#: the next gate change that moves nothing else.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "1b9da0aae75dbd52"
+ENGINE_UI_SEAM: str = "589456358a5fe441"
 
 
 @dataclass(frozen=True, slots=True)
