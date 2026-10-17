@@ -680,7 +680,8 @@ def test_the_rig_provisions_only_into_a_store_with_no_enabled_administrator(
     refused = subprocess.run(
         [*argv, "--db", str(directory)], env=env, cwd=tmp_path, capture_output=True, text=True
     )
-    assert refused.returncode == rigadmin.EXIT_EXISTS, refused.stdout + refused.stderr
+    # A failure, not EXIT_EXISTS: the rig could not sign in to this store either.
+    assert refused.returncode == 1, refused.stdout + refused.stderr
     assert rigadmin._RIG_REFUSAL in refused.stderr
     assert _engine_view(directory, key, admin.username)[1] is False, "nothing was provisioned"
 
@@ -692,6 +693,60 @@ def test_the_rig_provisions_only_into_a_store_with_no_enabled_administrator(
     assert _engine_view(empty, key, admin.username)[1] is True
     for run in (refused, done):
         assert admin.password not in run.stdout + run.stderr
+
+
+async def test_the_rig_guard_refuses_the_write_too_and_keeps_the_shipped_words() -> None:
+    """The write is the control, so the guard wraps it as well as the pre-prompt refusal. Where a
+    local Administrator counts, both keep the shipped refusal, so a kept store still exits
+    :data:`~harness.load.rigadmin.EXIT_EXISTS`."""
+    from types import SimpleNamespace
+
+    from messagefoundry.auth.identity import AuthProvider
+    from messagefoundry.auth.permissions import Role
+    from messagefoundry.auth.service import AuthService, FirstAdministratorRefused
+    from messagefoundry.config.settings import AuthSettings
+    from messagefoundry.store.store import MessageStore
+    from tests._admin_account import create_admin, provision_totp
+
+    store = await MessageStore.open(":memory:")
+    try:
+        cli = SimpleNamespace(
+            _build_provision_auth_service=lambda: AuthService(store, AuthSettings())
+        )
+        rigadmin._keep_the_narrow_rule(cli)
+        service = cli._build_provision_auth_service()
+        address = rigadmin._NOTIFY_ADDRESS
+        # CONTROL: an empty store passes both.
+        assert await service.provision_refusal("rig-operator", notify_email=address) is None
+
+        await store.create_user(
+            user_id="id-dir-a",
+            username="dir-a",
+            auth_provider=AuthProvider.AD.value,
+            password_hash=None,
+            password_generated=False,
+        )
+        await service.initialize()
+        await store.set_user_roles("id-dir-a", [Role.ADMINISTRATOR.value], assigned_by="test")
+        refusal = await service.provision_refusal("rig-operator", notify_email=address)
+        assert refusal == rigadmin._RIG_REFUSAL
+        with pytest.raises(FirstAdministratorRefused) as refused:
+            await service.provision_first_administrator(
+                username="rig-operator",
+                password=rigadmin._new_password(),
+                notify_email=address,
+                actor="test",
+                **provision_totp(),
+            )
+        assert str(refused.value) == rigadmin._RIG_REFUSAL
+        assert await store.get_user_by_username("rig-operator") is None
+
+        await create_admin(service)  # a local Administrator with a usable password
+        refusal = await service.provision_refusal("rig-operator", notify_email=address)
+        assert refusal is not None and rigadmin._ADMIN_EXISTS in refusal
+        assert refusal != rigadmin._RIG_REFUSAL
+    finally:
+        await store.close()
 
 
 # --- the poller's client -----------------------------------------------------
