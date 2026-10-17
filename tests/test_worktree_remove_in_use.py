@@ -16,6 +16,7 @@ supposed to succeed, and the session registry is a throwaway home.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -67,12 +68,31 @@ def _denied_listing(directory: Path) -> Iterator[None]:
     )
     if not who or made.returncode != 0:
         pytest.skip(f"could not deny access with icacls: {made.stdout} {made.stderr}")
-    try:
-        yield
-    finally:
+
+    def restore() -> None:
         subprocess.run(
             ["icacls", str(directory), "/remove:d", who], capture_output=True, check=False
         )
+
+    # THE DENY MUST TAKE EFFECT, OR THIS TEST PROVES NOTHING. On a hosted windows-2025 runner the
+    # account (runneradmin) still listed the directory after this deny, and the script then rightly
+    # found nothing to refuse (engine PR 2371, run 39005284295). os.listdir asks Windows the same
+    # FindFirstFile question the script's .NET walk asks. The planted-file tests below fail the
+    # listing on every runner, so a skip here cannot hide a regression in the script.
+    try:
+        os.listdir(directory)
+    except PermissionError:
+        pass
+    else:
+        restore()
+        pytest.skip(
+            f"{who} can still list {directory} after a deny of list rights, for example an "
+            "administrator token with a backup privilege, so the condition cannot be produced"
+        )
+    try:
+        yield
+    finally:
+        restore()
 
 
 # --- vault BACKLOG #2988: -Name has the claim and quiet-period refusals ------------------------------
@@ -373,6 +393,29 @@ def test_a_claims_directory_that_cannot_be_listed_refuses(rig: Rig, route: str) 
     assert "claims are unknown" in _out(proc), _out(proc)
     assert wt.exists()
 
+    proc = rig.run(*_target(route, wt))
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
+
+@pytest.mark.parametrize("route", ROUTES)
+@pytest.mark.parametrize("registry", ["claims", "alloc"])
+def test_a_registry_path_whose_listing_throws_refuses(rig: Rig, route: str, registry: str) -> None:
+    """The guard the ACL tests above lean on when a runner cannot be denied: a FILE where the claims
+    or allocation directory belongs. The script sees something there, and listing it throws. Red
+    before the fix: Get-ChildItem listed the file as no records, and the tree went."""
+    wt = _sibling(rig, "planted")
+    planted = _common(rig) / "mefor-coord" / registry
+    planted.parent.mkdir(parents=True, exist_ok=True)
+    planted.write_text("not a directory\n", encoding="utf-8")
+
+    proc = rig.run(*_target(route, wt), "-Force")
+    assert proc.returncode != 0, _out(proc)
+    noun = "claims" if registry == "claims" else "allocations"
+    assert f"{noun} are unknown" in _out(proc), _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+
+    planted.unlink()
     proc = rig.run(*_target(route, wt))
     assert proc.returncode == 0, _out(proc)
     assert not wt.exists()
