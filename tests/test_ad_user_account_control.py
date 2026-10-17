@@ -2201,6 +2201,137 @@ async def test_a_referral_does_not_resolve_when_a_referred_account_signs_out(
         assert not (await _alerted_pass(service, sink)).referral_clear
 
 
+# --- a forfeited standing says so once per new trip, hold or referral (BACKLOG #3083) ------------
+#
+# The forfeit itself is kept until a restart (`AuthService._forfeit_clears_on_attrition` says why).
+# What these pin is the log line a later trip, hold or referral in that process gives: once when
+# it opens, not on every pass while it stands, which would flood the log.
+
+
+def _said(caplog: pytest.LogCaptureFixture, phrase: str) -> int:
+    """How many WARNING lines from the auth service carry ``phrase``."""
+    return sum(
+        1
+        for r in caplog.records
+        if r.name == "messagefoundry.auth.service"
+        and r.levelno == logging.WARNING
+        and phrase in r.getMessage()
+    )
+
+
+_TRIPPED_AGAIN = "the breaker tripped again after this process gave up"
+_HELD_AGAIN = "hold engaged again after this process gave up"
+_REFERRED_AGAIN = "referral opened again after this process gave up"
+
+
+async def test_a_forfeited_breaker_logs_once_on_a_new_trip_and_not_on_each_pass(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The ten accounts behind a trip leave, so the process forfeits the breaker's clear. A pass
+    that is not aborted ends that trip. Ten other accounts then read absent and the breaker trips
+    again: one WARNING says this process will not resolve it, and the next tripped pass of the
+    same trip says nothing more.
+
+    RED when: the line is removed, or it is said on every tripped pass."""
+    names = ["ok1", "ok2"] + [f"gone{i}" for i in range(10)]
+    later = [f"back{i}" for i in range(10)]
+    async with _signed_in_estate(monkeypatch, names + later) as estate:
+        directory, service, store, _tokens = estate
+        await _expire(store, later)
+        sink = NotifierAlertSink([], store=store)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            for name in names[2:]:
+                directory.delete(name)
+            await _alerted_pass(service, sink)  # strike 1
+            assert (await _alerted_pass(service, sink)).aborted == "mass_revoke_breaker"
+            assert _said(caplog, _TRIPPED_AGAIN) == 0  # the first trip is not a forfeited one
+            await _expire(store, names[2:])
+            assert (await _alerted_pass(service, sink)).aborted is None  # ends the first trip
+            assert service._reconcile_breaker_standing == "forfeit"
+            assert _said(caplog, _TRIPPED_AGAIN) == 0
+
+            await _sign_in(service, later)
+            for name in later:
+                directory.delete(name)
+            assert (await _alerted_pass(service, sink)).aborted is None  # strike 1
+            assert _said(caplog, _TRIPPED_AGAIN) == 0
+            for _ in range(2):  # the new trip, then a later pass of the same trip
+                plan = await _alerted_pass(service, sink)
+                assert plan.aborted == "mass_revoke_breaker" and not plan.breaker_clear
+                assert _said(caplog, _TRIPPED_AGAIN) == 1
+        assert ABORTED in await _open_alerts(store)
+
+
+async def test_a_forfeited_hold_logs_once_on_each_new_engagement_and_not_on_each_pass(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The two accounts a hold holds leave, so the process forfeits the hold's release. A later
+    hold of other accounts says once that this process will not resolve it, and not again on the
+    next held pass. Released and engaged once more, it says so once more.
+
+    RED when: the line is removed, or it is said on every held pass."""
+    names = ["u1", "u2", "v1", "v2", "ok1", "ok2", "ok3"]
+    async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
+        sink = NotifierAlertSink([], store=store)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+            assert (await _alerted_pass(service, sink)).hold
+            await _expire(store, ["u1", "u2"])
+            assert not (await _alerted_pass(service, sink)).hold  # releases the latch
+            assert service._reconcile_hold_standing == "forfeit"
+            assert _said(caplog, _HELD_AGAIN) == 0
+
+            for said in (1, 2):
+                directory.uac.update({"v1": ABSENT, "v2": ABSENT})
+                for _ in range(2):  # the new engagement, then a later pass of the same hold
+                    plan = await _alerted_pass(service, sink)
+                    assert plan.hold and not plan.hold_clear
+                    assert _said(caplog, _HELD_AGAIN) == said
+                directory.uac.update({"v1": ENABLED, "v2": ENABLED})
+                plan = await _alerted_pass(service, sink)
+                assert not plan.hold and not plan.hold_clear
+        assert HELD in await _open_alerts(store)
+
+
+async def test_a_forfeited_referral_logs_once_on_each_new_referral_and_not_on_each_pass(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The referral's standing, by the same rule (BACKLOG #2538). A referred account signs out, so
+    the process forfeits the referral's clear. A later referral says once that this process will
+    not resolve it, and not again on the next referred pass. Its latched message is never released
+    once forfeited, so a pass that judged something with no referral is what ends one referral.
+    An outage between two referred passes does not.
+
+    RED when: the line is removed, or it is said on every referred pass."""
+    names = ["jdoe", "asmith"]
+    groups = {"ad_group_search_base": "OU=Groups,DC=other,DC=invalid"}
+    async with _signed_in_estate(monkeypatch, names, **groups) as estate:
+        directory, service, store, _tokens = estate
+        sink = NotifierAlertSink([], store=store)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            directory.refer_groups = True
+            assert (await _alerted_pass(service, sink)).referred
+            await _expire(store, ["jdoe"])
+            directory.refer_groups = False
+            assert (await _alerted_pass(service, sink)).referred == ()  # ends the first referral
+            assert service._reconcile_referral_standing == "forfeit"
+            assert _said(caplog, _REFERRED_AGAIN) == 0
+
+            for said in (1, 2):
+                directory.refer_groups = True
+                assert (await _alerted_pass(service, sink)).referred  # the new referral
+                assert _said(caplog, _REFERRED_AGAIN) == said
+                directory.down = True
+                assert (await _alerted_pass(service, sink)).directory_outage
+                directory.down = False
+                assert (await _alerted_pass(service, sink)).referred  # the same referral
+                assert _said(caplog, _REFERRED_AGAIN) == said
+                directory.refer_groups = False
+                plan = await _alerted_pass(service, sink)
+                assert plan.referred == () and not plan.referral_clear
+        assert REFERRAL in await _open_alerts(store)
+
+
 async def test_an_account_that_leaves_after_it_read_present_does_not_forfeit_the_referral(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

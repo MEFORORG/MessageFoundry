@@ -830,7 +830,8 @@ engine resolves the next trip or hold on its own.
   it reads clean. Reading clean means a pass that did not abort found the account present and
   enabled. A held read, or one that adds a strike, does not count. The reconciler revoking the
   account counts as leaving. The engine then resolves no trip until its
-  next restart. The engine logs a warning when it gives up any resolve.
+  next restart. The engine logs a warning when it gives up any resolve, and one more on each new
+  trip, hold or referral it then will not resolve, not one on every pass.
 - An LDAP referral opens its own `ad_reconcile_aborted` instance, with reason `directory_referral`
   and source `directory-reconciler-referral` (BACKLOG #2538). It follows the same rule: the engine
   resolves it only after a pass of its own saw a referral. It resolves once every account signed
