@@ -1361,7 +1361,7 @@ def alert_store_cipher_refusal(sink: AlertSink, table: str, column: str) -> None
             "the key was enabled, or a planted one. An operator may seal it by running 'messagefoundry "
             "rotate-key' with the engine stopped. If rotate-key leaves it unsealed for good, an "
             "operator may delete it, or the retention prune may remove it once it expires, where "
-            "either can. docs/PHI.md section 3 lists the uploads neither can remove"
+            "either can. docs/PHI.md section 3 names at least some kinds neither can remove"
         )
     else:
         subject = STORE_CIPHER_SUBJECT

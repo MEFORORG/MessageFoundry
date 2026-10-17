@@ -400,7 +400,7 @@ class _UnmarkedPolicy:
                 "an operator may seal it by running 'messagefoundry rotate-key' with the engine "
                 "stopped; if rotate-key leaves it unsealed for good, an operator may delete it, or "
                 "the retention prune may remove it once it expires, where either can; docs/PHI.md "
-                "section 3 lists the uploads neither can remove"
+                "section 3 names at least some kinds neither can remove"
             )
         else:
             cause = "a stripped marker or a planted row"

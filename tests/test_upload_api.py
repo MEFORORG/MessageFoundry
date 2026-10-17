@@ -1514,5 +1514,5 @@ async def test_a_refused_upload_read_through_a_route_alerts_without_promising_a_
         assert name == UPLOAD_CIPHER_SUBJECT
         assert "may seal it" in reason and "with the engine stopped" in reason
         assert "unsealed for good, an operator may delete it" in reason
-        assert "docs/PHI.md section 3 lists the uploads neither can remove" in reason
+        assert "docs/PHI.md section 3 names at least some kinds neither can remove" in reason
         assert "until" not in reason and "acme" not in reason and fid not in reason

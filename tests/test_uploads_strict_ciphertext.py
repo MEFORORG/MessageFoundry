@@ -652,7 +652,7 @@ async def test_an_upload_refusal_offers_rotate_key_and_promises_nothing(
         assert "rotate-key" in text and "may seal it" in text, text
         assert "with the engine stopped" in text, text
         assert "unsealed for good, an operator may delete it" in text, text
-        assert "docs/PHI.md section 3 lists the uploads neither can remove" in text, text
+        assert "docs/PHI.md section 3 names at least some kinds neither can remove" in text, text
         assert "can only be deleted" not in text, text
         assert "retention prune" in text, text
         assert "until" not in text and "to seal it" not in text, text
