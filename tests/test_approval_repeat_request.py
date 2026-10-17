@@ -19,6 +19,7 @@ import sqlite3
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
@@ -204,7 +205,7 @@ async def test_repeats_racing_from_two_processes_file_one_request(tmp_path: Path
     above cannot show this, because the store's own lock serializes it first."""
     path = tmp_path / "two_process.db"
     await (await MessageStore.open(path)).close()  # the schema exists before either child opens
-    answers = await asyncio.to_thread(race_repeat_requests, str(path), tmp_path)
+    answers = await asyncio.to_thread(race_repeat_requests, str(path), tmp_path, uuid4().hex)
     store = await MessageStore.open(path)
     try:
         await assert_one_request_per_round(store, answers)

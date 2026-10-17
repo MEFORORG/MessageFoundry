@@ -906,16 +906,19 @@ async def test_approval_repeats_racing_from_two_processes_file_one_request(store
     across processes only the read under the audit applock does."""
     from tests._approval_repeat_two_process import (
         assert_one_request_per_round,
+        filed_for,
+        open_requests,
         race_repeat_requests,
     )
 
-    answers = await asyncio.to_thread(race_repeat_requests, "sqlserver", tmp_path)
+    nonce = uuid4().hex
     try:
+        answers = await asyncio.to_thread(race_repeat_requests, "sqlserver", tmp_path, nonce)
         await assert_one_request_per_round(store, answers)
     finally:
-        # The fixture does not clear pending_approvals, so a failed run must not leave its open
-        # requests behind for a later test that lists the queue.
-        for approval_id in {each for answered in answers for each in answered}:
+        # The fixture does not clear pending_approvals, so a run that fails anywhere, the race
+        # itself included, must not leave its open requests behind for a later test.
+        for approval_id in filed_for(nonce, await open_requests(store)):
             await store.decide_pending_approval(
                 approval_id, status="rejected", approver="race-cleanup", decided_at=1_100.0
             )

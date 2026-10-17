@@ -2056,18 +2056,17 @@ the approver, whose `reason` says which (`approvals_disabled` or `operation_not_
 runs. The request stays pending until an approver rejects it or it expires. The refusal's wording
 tells the approver to reject it and, if the operation is still needed, to run it again, which now
 runs it without a second approver. `GET /approvals` marks such a request `gated: false`, read from
-the same settings test at listing time, and the console's Approvals page offers it only Reject,
-with that advice beside it.
+the same settings test at listing time, and gives it a `release_blocked` reason, below, which the
+console's Approvals page keys on.
 
 **`GET /approvals` names a release the gate refuses whoever approves it (vault BACKLOG #3192).**
-Each request's `release_blocked` is one of `no_requester_id`, `operation_unavailable`,
-`not_gated` and `params_unreadable`, read from the same tests the release refuses on, in the same
-order, or `null`. `null` is not a promise: at least the self-approval refusal, the dwell floor,
-the requester's standing and the operation's own refusals are met only at release. The console's Approvals page offers a blocked
-request only Reject, or Withdraw on the requester's own row, with a note saying why. A release
+Each pending request carries `release_blocked`, which the release refuses on directly, so the
+two cannot disagree. `PendingApprovalInfo` in `messagefoundry/api/models.py` lists its values and
+what `null` does not promise. The console's Approvals page keys on it, and offers a blocked request
+only Reject, or Withdraw on the requester's own row, with a note saying why. A release
 refused for unreadable parameters writes an `approval.params_unreadable` row against the
-approver, which carries no parameters. The other two refusals the field names that are not
-already audited, `no_requester_id` and `operation_unavailable`, still write no row.
+approver, which carries no parameters. A refusal for a request with no requester id, or for an
+operation no longer registered, still writes no row.
 
 **Each state change and its audit row are one write (vault BACKLOG #2255).** The store
 moves the request and appends its audit row in one transaction, so the two commit or roll back
@@ -2209,12 +2208,14 @@ least these paths. The alert is keyed `approval:<id>` and carries the row's acti
 - a claim, a rejection or a resolution that answers 503, and a claim whose approve was cancelled.
   The log line carries the exception, not the row's detail.
 
-For some failed writes the gate logs at ERROR and pages nothing. At least these two:
+For some failed writes the gate logs at ERROR and pages nothing. At least this one: a restart
+cannot move a leftover `executing` row to `interrupted`. The row stays `executing`, and the next
+start tries again.
 
-- a restart cannot move a leftover `executing` row to `interrupted`. The row stays `executing`,
-  and the next start tries again;
-- an outcome's combined write fails, and the status write that follows finds the row already
-  moved. The combined write most likely committed, and only its reply was lost.
+An outcome's combined write can fail while the status write that follows finds the row already
+moved. The combined write most likely committed, and only its reply was lost, so the gate writes
+no second row. It logs at ERROR and pages, because the store writes a row's off-box copy only
+after a commit it saw succeed (vault BACKLOG #3193).
 
 A call can be cancelled mid-write, for example by the request timeout. The gate then writes no
 ERROR line and no alert for at least two writes: a rejection, and a refusal's row. The gate

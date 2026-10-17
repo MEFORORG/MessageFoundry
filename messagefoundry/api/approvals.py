@@ -168,16 +168,36 @@ def _audit_detail(fields: Mapping[str, Any]) -> str:
         return json.dumps(fields, default=str)
     except Exception:  # noqa: BLE001 - any encoding failure here would strand a settled row
         safe: dict[str, Any] = {}
+        degraded: list[str] = []
         for key, value in fields.items():
             try:
                 json.dumps(value, default=str)
             except Exception:  # noqa: BLE001 - as above
+                degraded.append(str(key))
                 try:
                     value = str(value)
                 except Exception:  # noqa: BLE001 - as above
                     value = f"<unencodable {type(value).__name__}>"
             safe[str(key)] = value
+        # Field names only, never values: a value is what could not be encoded.
+        log.warning(
+            "approvals: an audit detail could not be encoded as JSON, so these fields are "
+            "written as text: %s",
+            scrub_log_argument(", ".join(degraded)),
+        )
         return json.dumps(safe, default=str)
+
+
+def _encodable_result(result: dict[str, Any]) -> dict[str, Any]:
+    """An executor's ``result`` in a form JSON can carry (vault BACKLOG #3193). Unchanged when it
+    already is; otherwise each top-level field json cannot encode is its text, as
+    :func:`_audit_detail` writes it."""
+    try:
+        json.dumps(result)
+    except Exception:  # noqa: BLE001 - normalised below, and logged there
+        loaded = json.loads(_audit_detail(result))
+        return loaded if isinstance(loaded, dict) else {"result": loaded}
+    return result
 
 
 def _log_orphaned_write(task: asyncio.Future[Any], approval_id: str) -> None:
@@ -356,7 +376,8 @@ class ApprovalGate:
                 break
         if stuck:
             log.error(
-                "approvals: %d outcome write(s) still running after %.1fs at shutdown, so they may "
+                "approvals: %d request or outcome write(s) still running after %.1fs at "
+                "shutdown, so they may "
                 "fail when the store closes; approval ids: %s",
                 len(stuck),
                 timeout,
@@ -657,11 +678,13 @@ class ApprovalGate:
                     # the forwarded audit stream lacks this row and nothing else reports the gap.
                     self._alert_lost_audit(approval_id, "approval.requested")
                     return approval_id
-                state = (
-                    "Reading it back found no such request, so most likely nothing is held"
-                    if landed == "absent"
-                    else "It could not be read back, so it may be held with that row or not at all"
-                )
+                state = {
+                    "absent": "Reading it back found no such request, so most likely nothing is held",
+                    "unsealed": "It is held but failed its integrity check, so it can never be "
+                    "released",
+                    "unknown": "It could not be read back, so it may be held with that row or not "
+                    "at all",
+                }[landed]
             log.exception(
                 "approval %s: the write carrying its %s audit row failed. %s. Lost detail: "
                 "actor=%s operation=%s",
@@ -682,18 +705,20 @@ class ApprovalGate:
             )
         return held
 
-    async def _read_back_request(self, approval_id: str) -> Literal["held", "absent", "unknown"]:
+    async def _read_back_request(
+        self, approval_id: str
+    ) -> Literal["held", "absent", "unsealed", "unknown"]:
         """Whether a request whose write reported an error is in the store (vault BACKLOG #3193).
-        ``unknown`` when the read fails, logged here, or the row fails its seal, which
-        :meth:`_verified` reports. Such a row can never be released, so a retry cannot make a
-        second releasable copy of it."""
+        ``unsealed`` when it is there but fails its seal, which :meth:`_verified` reports: such a
+        row can never be released, so a retry cannot make a second releasable copy of it.
+        ``unknown`` when the read fails, logged here."""
         try:
             found = await self._store.get_pending_approval(approval_id)
             if found is None:
                 return "absent"
             # Inside the try: a row the checker cannot even parse must still end in the caller's
             # ERROR line and page, not escape them.
-            return "held" if await self._verified(found) is not None else "unknown"
+            return "held" if await self._verified(found) is not None else "unsealed"
         except Exception:  # noqa: BLE001 - every store backend raises its own type
             log.exception(
                 "approval %s: reading back a request whose write failed failed too", approval_id
@@ -1079,7 +1104,9 @@ class ApprovalGate:
         if not claimed:
             raise ApprovalError(409, "request was already decided")
         try:
-            result = await op.execute(params)
+            # Encodable once, here, so the audit row and the caller's answer carry one form, and
+            # an unencodable result cannot turn a release that ran into a 500 (vault BACKLOG #3193).
+            result = _encodable_result(await op.execute(params))
         except asyncio.CancelledError:
             # BACKLOG #1562. The approve was cancelled while the executor ran -- at least a request
             # timeout (RequestTimeoutMiddleware) does this. The executor may have finished none, some
@@ -1274,11 +1301,14 @@ class ApprovalGate:
                 # in the log, and writing another would duplicate the outcome with a false flag.
                 log.error(
                     "approval %s: %s; the combined write most likely committed, so no second %s "
-                    "row is written. Check the audit log for it",
+                    "row is written. Check the audit log for it. Its off-box copy was not written",
                     approval_id,
                     context,
                     action,
                 )
+                # Paged, as a request that reads back as held is (vault BACKLOG #3193): the store
+                # tees off-box only after a commit it saw succeed, so nothing else reports the gap.
+                self._alert_lost_audit(approval_id, action)
                 return
         else:
             if moved:

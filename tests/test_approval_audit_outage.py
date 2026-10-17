@@ -25,6 +25,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.api.approvals import ApprovalError, ApprovalGate
+from messagefoundry.api.models import ApprovalDecisionResult
 from messagefoundry.auth.permissions import Permission
 from messagefoundry.config.settings import (
     _ALERT_CONTROL_EVENT_TYPES,
@@ -292,6 +293,8 @@ async def test_a_combined_outcome_write_whose_reply_is_lost_writes_no_second_row
     await gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)
     assert runs == ["ran"] and await _status(store, approval_id) == "approved"
     assert len(await store.list_audit(action="approval.approved")) == 1
+    # Paged (vault BACKLOG #3193): the store teed nothing, so the row's off-box copy is missing.
+    assert sink.lost == [(f"approval:{approval_id}", "approval.approved")]
 
 
 async def test_an_unencodable_result_still_settles_the_release(store: MessageStore) -> None:
@@ -580,8 +583,13 @@ async def test_an_unencodable_result_key_still_settles_the_release(store: Messag
 
     gate.register("dead_letter_replay", "op", _execute, permission=Permission.MESSAGES_REPLAY)
     approval_id = await _request(gate)
-    await gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)
+    outcome = await gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)
     assert await _status(store, approval_id) == "approved"
     [row] = await store.list_audit(action="approval.approved")
     result = json.loads(str(row["detail"]))["result"]
-    assert isinstance(result, str) and "(1, 2)" in result and "'requeued': 4" in result
+    # Only the fields json cannot encode become text; the count survives as a number.
+    assert result["requeued"] == 4 and "(1, 2)" in result["by_pair"]
+    assert isinstance(result["loop"], str)
+    # The caller's answer carries the same form, so the route can serialize it rather than 500.
+    assert outcome["result"] == result
+    ApprovalDecisionResult(**outcome).model_dump_json()
