@@ -151,6 +151,19 @@ async def _assert_webauthn_store_contract(store: Any) -> None:
     assert await store.get_webauthn_credential("h3") is None
     assert await store.has_webauthn_credentials("wa-u2") is False
 
+    # BACKLOG #2733: a passkey for an account that does not exist is refused by the user foreign
+    # key on every backend. SQL Server lacked the key, so this write once committed an orphan there.
+    try:
+        await store.add_webauthn_credential(_cred("wa-u2", "orphan", id_hash="h-orphan"))
+    except Exception as exc:  # noqa: BLE001 - each backend raises its own integrity class
+        name = type(exc).__name__ + "".join(t.__name__ for t in type(exc).__mro__)
+        assert "Integrity" in name or "ForeignKeyViolation" in name, (
+            f"a passkey for a deleted account raised {type(exc).__name__}, not a key violation"
+        )
+    else:
+        raise AssertionError("a passkey for an account that does not exist was accepted")
+    assert await store.get_webauthn_credential("h-orphan") is None
+
 
 async def _assert_totp_contract(store: Any) -> None:
     """The TOTP store contract (WP-14) — backfilled so the server backends' row-lock paths

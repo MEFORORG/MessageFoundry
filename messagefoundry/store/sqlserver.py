@@ -2414,6 +2414,14 @@ _SCHEMA: list[str] = [
         CREATE INDEX ix_webauthn_credentials_user ON webauthn_credentials(user_id)""",
     """IF INDEXPROPERTY(OBJECT_ID('webauthn_credentials'),'ux_webauthn_label','IndexID') IS NULL
         CREATE UNIQUE INDEX ux_webauthn_label ON webauthn_credentials(user_id, label)""",
+    # BACKLOG #2733: the user foreign key SQLite and Postgres already declare, so a passkey can
+    # never be written for an account that does not exist. No cascade, as on those two: every
+    # user delete clears the account's passkeys first, in _delete_user_rows. WITH NOCHECK so a
+    # store already holding an orphaned passkey row still opens; the key refuses every later one.
+    # ix_webauthn_credentials_user above serves the key's check on a user delete.
+    """IF OBJECT_ID('fk_webauthn_credentials_user','F') IS NULL
+        ALTER TABLE webauthn_credentials WITH NOCHECK
+            ADD CONSTRAINT fk_webauthn_credentials_user FOREIGN KEY (user_id) REFERENCES users(id)""",
     # The first-seen sign-in address baseline (BACKLOG #288, vault BACKLOG #2145) -- mirrors the SQLite
     # `known_login_addresses` table (store/store.py), whose comment gives the reasons, the cascade's
     # among them. The primary key serves the signal's one read. `address` is BIN2 so key equality is
