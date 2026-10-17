@@ -29,20 +29,43 @@ state of somebody's DNS.
 line, so counting those would let one worker fail another. And a test about leaked processes must not
 leak any: the fixture tears down by the same token it asserts on. The sleeper's duration carries the
 token too, because ``exec`` replaces the wrapper and a bare ``sleep 900`` would be untraceable.
+
+**AND THIS FILE DID LEAK, MEASURED 2026-10-17.** Orphaned, SUSPENDED ``git update-ref
+refs/mefor/durability/r<token>/main``, ``git push --quiet --force priv ...`` and ``git-receive-pack``
+processes, 5 to 12 hours old, every one carrying this file's ``r<token>`` repository name or its
+temporary directory. Two routes, both closed here:
+
+* **The owner died before teardown.** An xdist worker that hits the per-test timeout leaves by
+  ``os._exit`` (``--timeout-method=thread``), and no fixture runs. Reproduced the same day: a worker
+  went "node down" and the wedge's transport shell outlived it. So on Windows every ``git commit``
+  that can fire the hook starts SUSPENDED, joins a kill-on-close job (``messagefoundry.proctree``),
+  and only then runs. Everything the hook detaches is in that job, so it dies with the worker by
+  any route.
+* **Teardown killed a shell mid-spawn.** The old teardown killed whatever it found in one pass, in
+  PID order. Killing an MSYS shell between its ``CreateProcess(CREATE_SUSPENDED)`` and the resume
+  leaves the child suspended forever with a dead parent -- the state measured -- and a shell killed
+  after the pass can still have spawned the next statement. Teardown now ends the jobs, which
+  kills every member at once, a child created suspended included; then it sweeps until two passes
+  in a row find nothing, and FAILS the test if anything survives.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import shutil
 import subprocess
+import sys
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from pathlib import Path
+from types import ModuleType
 
 import psutil
 import pytest
+
+from tests._proc_tree import alive, cmdline_of, kill_all, tree_of, wait_until
 
 ROOT = Path(__file__).resolve().parents[1]
 #: Overridable so this file can be run red-first against a pre-fix hook, the control the sibling
@@ -69,47 +92,35 @@ LAND_WAIT = 10.0
 #: going to follow the timed-out capture, it would start within that. The ordering test's worst case
 #: is LAND_WAIT + LAND_WAIT + APPEAR_WAIT + DISCARD_WATCH, which must stay under the 60s watchdog.
 DISCARD_WATCH = 12.0
-#: psutil enumerates in about 40ms in-process, so polling can be prompt without being wasteful.
-POLL = 0.2
+#: Teardown, where there is no job to end (POSIX). Against a reachable remote the hook's background
+#: work finishes well inside SETTLE, so nothing is killed mid-spawn. SWEEP bounds the kill passes.
+#: Both come out of the same 60s watchdog, so they stay small beside the budgets above.
+SETTLE = 3.0
+SWEEP = 10.0
 
 pytestmark = pytest.mark.skipif(
     shutil.which("sh") is None, reason="durability_push.sh is a /bin/sh hook and needs sh on PATH"
 )
 
 
+#: Nothing this file starts predates its import, so older processes are skipped unread: see
+#: ``_ours`` for what a full command-line walk costs on a loaded box.
+_IMPORTED = time.time() - 1.0
+
+
 def _matching(token: str) -> list[str]:
-    """Command lines of every live process carrying ``token``."""
+    """Command lines of every live process, started since this file loaded, carrying ``token``."""
     hits: list[str] = []
-    for proc in psutil.process_iter(["cmdline"]):
+    for proc in psutil.process_iter():
         try:
-            argv = proc.info["cmdline"]
-        except psutil.Error:  # pragma: no cover - the process died mid-walk
+            if proc.create_time() < _IMPORTED:
+                continue
+        except psutil.Error:  # the process died mid-walk
             continue
-        if not argv:
-            continue
-        line = " ".join(argv)
-        if token in line:
+        line = cmdline_of(proc)
+        if line and token in line:
             hits.append(line)
     return hits
-
-
-def _kill_matching(token: str) -> None:
-    for proc in psutil.process_iter(["cmdline"]):
-        try:
-            argv = proc.info["cmdline"]
-            if argv and token in " ".join(argv):
-                proc.kill()
-        except psutil.Error:  # pragma: no cover - already gone, which is the goal
-            continue
-
-
-def _wait_until(predicate: Callable[[], bool], budget: float) -> bool:
-    deadline = time.monotonic() + budget
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(POLL)
-    return False
 
 
 def git(repo: Path, *args: str) -> str:
@@ -128,18 +139,64 @@ def _arm(repo: Path) -> None:
     hook.chmod(0o755)
 
 
-def _commit(repo: Path, text: str, *extra: str) -> subprocess.CompletedProcess[str]:
+def _load_proctree() -> ModuleType:
+    """``messagefoundry/proctree.py``, loaded by path rather than imported.
+
+    It is standard library only, and this file's subject is the hook, not the engine: an import of
+    the ``messagefoundry`` package would move it off the tooling legs
+    (``tests/test_tooling_partition.py``), which do not need the engine to run it."""
+    spec = importlib.util.spec_from_file_location(
+        "_durability_test_proctree", ROOT / "messagefoundry" / "proctree.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+proctree = _load_proctree()
+
+
+def _commit(
+    jobs: list[int], repo: Path, text: str, *extra: str
+) -> subprocess.CompletedProcess[str]:
     if "--amend" not in extra:
         (repo / "a.txt").write_text(text, encoding="utf-8")
         subprocess.run(
             ["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True, timeout=TIMEOUT
         )
-    return subprocess.run(
-        ["git", "-C", str(repo), "commit", "-q", *extra, "-m", text.strip()],
-        capture_output=True,
+    return _run_in_job(jobs, ["git", "-C", str(repo), "commit", "-q", *extra, "-m", text.strip()])
+
+
+def _run_in_job(jobs: list[int], argv: list[str]) -> subprocess.CompletedProcess[str]:
+    """``subprocess.run`` for a command whose descendants must not outlive this process.
+
+    On Windows it starts suspended, joins a fresh kill-on-close job, and only then runs, so nothing
+    it starts -- the hook's detached push included -- is created outside the job; the job goes on
+    ``jobs`` for teardown to end. Elsewhere there is no job and teardown's sweep is the guard.
+    Never waits on the pipes after a kill: a detached descendant can hold them open."""
+    proc = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=TIMEOUT,
+        creationflags=proctree.ADOPT_CREATIONFLAGS,
     )
+    try:
+        job = proctree.resume_into_job(proc.pid, who="durability test commit")
+        if job is not None:
+            jobs.append(job)
+        out, err = proc.communicate(timeout=TIMEOUT)
+    except BaseException:
+        # Reap it, and close the pipes here rather than drain them: a detached descendant can hold
+        # them open, and the job teardown ends that descendant.
+        proc.kill()
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is not None:
+                pipe.close()
+        proc.wait(timeout=TIMEOUT)
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 
 def _sleep_mark(token: str) -> str:
@@ -170,37 +227,108 @@ def _wedge(repo: Path, tmp_path: Path, token: str) -> None:
     git(repo, "config", "core.sshCommand", f"sh {sleeper.as_posix()}")
 
 
-def _kill_under(root: Path) -> None:
-    """Kill any process whose working directory lies inside ``root``.
+def _ours(token: str, root: Path, since: float) -> list[psutil.Process]:
+    """Every live process this test made: created after ``since``, and either its command line
+    carries the token, the sleeper's mark or the test's temporary directory, or its working
+    directory lies inside that directory.
 
     **THE HOOK'S OWN SHELLS CARRY NO TOKEN.** Their command line is the bare
     ``sh .git/hooks/post-commit``, identical in every worker, so nothing in it ties one to THIS test.
-    The working directory does, and psutil exposes it where ``Win32_Process`` does not -- which is
-    also why a census by command line alone cannot attribute a leaked hook to a repository.
+    The working directory does, and psutil exposes it where ``Win32_Process`` does not. Those shells
+    DO leak here, against the fixed hook, on the success path: measured 2026-09-22, a passing run
+    left a pair alive with a dead parent and flat CPU, still there 95s later.
 
-    This matters because those shells DO leak here, against the fixed hook, on the success path:
-    measured 2026-09-22, a passing run left a pair alive with a dead parent and flat CPU, still there
-    95s later. That is the unexplained 2026-09-22 failure reproduced, and it is why this teardown
-    exists rather than a token match.
-    """
-    prefix = str(root).lower()
-    for proc in psutil.process_iter(["pid"]):
+    The command line is checked as well because a process frozen before it ever ran need not yield
+    a working directory. The 2026-10-17 ``update-ref`` and ``push`` carry ``r<token>``, and
+    ``git-receive-pack`` the bare repository's path.
+
+    **THE CREATION TIME GOES FIRST, BECAUSE A FULL READ IS SLOW.** Measured 2026-10-17 on a loaded
+    developer box: a walk reading every process's command line took up to 24s, and reading every
+    working directory as well added up to 21s more. psutil holds each process's creation time from
+    the walk itself, so everything older than this test is skipped before anything else is read."""
+    root_text = str(root).lower()
+    needles = (token, _sleep_mark(token), root_text, root.as_posix().lower())
+    found: list[psutil.Process] = []
+    for proc in psutil.process_iter():
         try:
-            if str(proc.cwd()).lower().startswith(prefix):
-                proc.kill()
-        except psutil.Error:  # pragma: no cover - gone, or not ours to read
+            if proc.create_time() < since:
+                continue
+            line = " ".join(proc.cmdline()).lower()
+            if any(n in line for n in needles) or str(proc.cwd()).lower().startswith(root_text):
+                found.append(proc)
+        except psutil.Error:  # gone, or not ours to read
             continue
+    return found
+
+
+def _created(proc: psutil.Process) -> float:
+    try:
+        return proc.create_time()
+    except psutil.Error:
+        return 0.0
+
+
+def _reap(
+    token: str, root: Path, since: float, jobs: list[int], *, settle: float = SETTLE
+) -> list[str]:
+    """Leave no process of this test running; return the command lines of any that stayed.
+
+    On Windows, end every job first. That kills each member at once, a child created suspended
+    mid-spawn included, so nothing is left half-started. With no job (POSIX) let the hook finish
+    instead, so no shell is killed between spawning a child and resuming it. Then sweep, oldest
+    first -- parents before the children they could still spawn -- until two passes in a row find
+    nothing. ``kill`` is ``TerminateProcess`` on Windows, which ends a suspended process without
+    resuming it, so a process frozen before it ran never runs here.
+    """
+    if jobs:
+        for job in jobs:
+            proctree.terminate_job(job)
+        jobs.clear()
+    else:
+        wait_until(lambda: not _ours(token, root, since), settle)
+    deadline = time.monotonic() + SWEEP
+    quiet = 0
+    while time.monotonic() < deadline:
+        procs = _ours(token, root, since)
+        if not procs:
+            quiet += 1
+            if quiet == 2:
+                return []
+        else:
+            quiet = 0
+            kill_all(sorted(procs, key=_created))
+        time.sleep(0.2)
+    survivors: list[str] = []
+    for proc in _ours(token, root, since):
+        try:
+            survivors.append(f"{proc.pid} [{proc.status()}] {' '.join(proc.cmdline())}")
+        except psutil.Error:
+            continue
+    return survivors
 
 
 @pytest.fixture
-def token(tmp_path: Path) -> Iterator[str]:
-    """A token unique to one test, and the teardown that leaves no process of ours running."""
+def jobs() -> list[int]:
+    """The kill-on-close jobs this test's commits joined (Windows); ``token`` ends them."""
+    return []
+
+
+@pytest.fixture
+def token(tmp_path: Path, jobs: list[int]) -> Iterator[str]:
+    """A token unique to one test, and the teardown that FAILS the test if any process of its
+    outlives it -- on failure as well as on success."""
     value = uuid.uuid4().hex[:12]
-    yield value
-    # A test about leaked processes must not leak any, including on failure.
-    _kill_matching(value)
-    _kill_matching(_sleep_mark(value))
-    _kill_under(tmp_path)
+    # A margin below now, so a process started in this same instant still counts as this test's.
+    since = time.time() - 1.0
+    try:
+        yield value
+    finally:
+        survivors = _reap(value, tmp_path, since, jobs)
+    assert not survivors, (
+        f"THIS TEST LEFT {len(survivors)} PROCESS(ES) RUNNING after its teardown -- the leak "
+        "measured 2026-10-17, suspended git processes with a dead parent, hours old:\n"
+        + "\n".join(survivors)
+    )
 
 
 @pytest.fixture
@@ -219,13 +347,13 @@ def live(tmp_path: Path, token: str) -> tuple[Path, Path]:
 
 
 def test_a_WEDGED_push_is_REAPED_rather_than_left_running_forever(
-    live: tuple[Path, Path], tmp_path: Path, token: str
+    live: tuple[Path, Path], tmp_path: Path, token: str, jobs: list[int]
 ) -> None:
     repo, _ = live
     git(repo, "config", "mefor.durabilityPushTimeout", str(BOUND))
     _wedge(repo, tmp_path, token)
 
-    proc = _commit(repo, "one\n")
+    proc = _commit(jobs, repo, "one\n")
     assert proc.returncode == 0, "THE HOOK FAILED A COMMIT\n" + proc.stdout + proc.stderr
 
     # THE NEEDLE IS THE REFNAME, NOT THE BARE TOKEN, AND THE DIFFERENCE IS A MEASURED LIMIT OF THE
@@ -236,11 +364,12 @@ def test_a_WEDGED_push_is_REAPED_rather_than_left_running_forever(
     # bound: measured on this platform, `timeout` kills `git push` and the transport helper's own
     # child outlives it, because MSYS process-group emulation does not carry a group kill to
     # grandchildren. Asserting on the bare token here would be asserting a fix that does not exist.
-    # The residue is named in the hook's own comment beside the bound, and the `token` fixture tears
-    # it down so this file leaks nothing. Widening this needle is a change to the FIX, not the test.
+    # The residue is named in the hook's own comment beside the bound; it is in the commit's job,
+    # and the `token` fixture ends that job, so this file leaks nothing. Widening this needle is a
+    # change to the FIX, not the test.
     push_needle = f"rescue/auto/r{token}"
 
-    if not _wait_until(lambda: bool(_matching(push_needle)), APPEAR_WAIT):
+    if not wait_until(lambda: bool(_matching(push_needle)), APPEAR_WAIT):
         pytest.skip(
             f"could not arm: no process carrying {push_needle!r} appeared within {APPEAR_WAIT}s, so "
             "the wedged push never started and the bound cannot be observed on this run"
@@ -265,7 +394,7 @@ def test_a_WEDGED_push_is_REAPED_rather_than_left_running_forever(
         last = _matching(push_needle)
         return not last
 
-    assert _wait_until(reaped, REAP_WAIT), (
+    assert wait_until(reaped, REAP_WAIT), (
         f"THE BOUND DID NOT FIRE. A push carrying {push_needle!r} was still running {REAP_WAIT}s "
         f"after a commit whose mefor.durabilityPushTimeout is {BOUND}s. Unbounded it outlives the "
         f"repository and the test run: measured at 40 hours on a real machine.\n" + "\n".join(last)
@@ -273,7 +402,7 @@ def test_a_WEDGED_push_is_REAPED_rather_than_left_running_forever(
 
 
 def test_a_TIMED_OUT_orphan_capture_STOPS_the_push_that_would_discard_it(
-    live: tuple[Path, Path], tmp_path: Path, token: str
+    live: tuple[Path, Path], tmp_path: Path, token: str, jobs: list[int]
 ) -> None:
     """Preserve, then discard -- and a timed-out preserve must not be followed by the discard.
 
@@ -292,7 +421,7 @@ def test_a_TIMED_OUT_orphan_capture_STOPS_the_push_that_would_discard_it(
     does. Ungated: the moving push follows it once the bound fires.
     """
     repo, _ = live
-    first = _commit(repo, "one\n")
+    first = _commit(jobs, repo, "one\n")
     assert first.returncode == 0, "THE HOOK FAILED A COMMIT\n" + first.stdout + first.stderr
 
     branch = git(repo, "symbolic-ref", "--short", "HEAD")
@@ -301,22 +430,22 @@ def test_a_TIMED_OUT_orphan_capture_STOPS_the_push_that_would_discard_it(
     moving_needle = f"rescue/auto/r{token}"
 
     # The reachable remote must land first, or there is no $LAST and the orphan path is never taken.
-    if not _wait_until(lambda: _resolves(repo, last_ref), LAND_WAIT):
+    if not wait_until(lambda: _resolves(repo, last_ref), LAND_WAIT):
         pytest.skip(
             f"could not arm: {last_ref} was never written, so the orphan path is unreachable"
         )
 
     # Quiesce, so the FIRST commit's moving push cannot be mistaken for the amend's.
-    if not _wait_until(lambda: not _matching(moving_needle), LAND_WAIT):
+    if not wait_until(lambda: not _matching(moving_needle), LAND_WAIT):
         pytest.skip("could not arm: the first commit's moving push never finished")
 
     # Now wedge the remote and rewrite, so the orphan capture is attempted and times out.
     git(repo, "config", "mefor.durabilityPushTimeout", str(BOUND))
     _wedge(repo, tmp_path, token)
-    amended = _commit(repo, "one, corrected\n", "--amend")
+    amended = _commit(jobs, repo, "one, corrected\n", "--amend")
     assert amended.returncode == 0, "THE HOOK FAILED A COMMIT\n" + amended.stdout + amended.stderr
 
-    if not _wait_until(lambda: bool(_matching(orphan_needle)), APPEAR_WAIT):
+    if not wait_until(lambda: bool(_matching(orphan_needle)), APPEAR_WAIT):
         pytest.skip(
             f"could not arm: no orphan capture carrying {orphan_needle!r} was attempted, so the "
             "preserve-then-discard path was never entered and the gate cannot be observed"
@@ -330,7 +459,7 @@ def test_a_TIMED_OUT_orphan_capture_STOPS_the_push_that_would_discard_it(
         seen = _matching(moving_needle)
         return bool(seen)
 
-    assert not _wait_until(moving_started, DISCARD_WATCH), (
+    assert not wait_until(moving_started, DISCARD_WATCH), (
         f"THE DISCARD RAN AFTER THE PRESERVE TIMED OUT. A moving-tag push carrying {moving_needle!r} "
         f"started even though the orphan capture never landed, so the tag stops covering the tip the "
         f"capture failed to preserve, and $LAST would advance past it. Preserve, then discard -- a "
@@ -348,28 +477,81 @@ def _resolves(repo: Path, ref: str) -> bool:
     return got.returncode == 0 and bool(got.stdout.strip())
 
 
-def test_the_BOUND_does_not_break_a_push_that_finishes(live: tuple[Path, Path], token: str) -> None:
+def test_the_BOUND_does_not_break_a_push_that_finishes(
+    live: tuple[Path, Path], token: str, jobs: list[int]
+) -> None:
     """Durability outranks the bound, so the ordinary path must still land its ref."""
     repo, bare = live
     git(repo, "config", "mefor.durabilityPushTimeout", str(BOUND))
-    proc = _commit(repo, "one\n")
+    proc = _commit(jobs, repo, "one\n")
     assert proc.returncode == 0, "THE HOOK FAILED A COMMIT\n" + proc.stdout + proc.stderr
 
     ref = f"refs/tags/rescue/auto/r{token}/main"
-    assert _wait_until(lambda: _resolves(bare, ref), LAND_WAIT), (
+    assert wait_until(lambda: _resolves(bare, ref), LAND_WAIT), (
         f"{ref} never reached the remote. The bound must not cost durability on a push that works."
     )
 
 
 @pytest.mark.parametrize("bad", ["", "abc", "0"])
 def test_a_MISCONFIGURED_bound_falls_back_instead_of_failing_the_commit(
-    live: tuple[Path, Path], bad: str
+    live: tuple[Path, Path], bad: str, jobs: list[int]
 ) -> None:
     """One value per arm of the hook's guard. The hook's first contract is that it never fails one."""
     repo, _ = live
     git(repo, "config", "mefor.durabilityPushTimeout", bad)
-    proc = _commit(repo, f"bad-{bad or 'empty'}\n")
+    proc = _commit(jobs, repo, f"bad-{bad or 'empty'}\n")
     assert proc.returncode == 0, (
         f"mefor.durabilityPushTimeout={bad!r} FAILED A COMMIT. The hook's first contract is that it "
         "never does.\n" + proc.stdout + proc.stderr
+    )
+
+
+# --- the teardown itself -------------------------------------------------------------------------
+
+
+def test_the_TEARDOWN_ends_a_SUSPENDED_process_frozen_before_it_ran(
+    tmp_path: Path, token: str
+) -> None:
+    """The 2026-10-17 shape: a process carrying this test's token, frozen before it ever ran, in no
+    job. On Windows it is created suspended and never resumed, which is what a shell killed between
+    ``CreateProcess(CREATE_SUSPENDED)`` and the resume leaves; elsewhere it is stopped on start. The
+    census must SEE it first, or "nothing survived" would only mean nothing was found."""
+    since = time.time() - 1.0
+    frozen = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+        [sys.executable, "-c", "import time; time.sleep(60)", token],
+        cwd=tmp_path,
+        creationflags=proctree.ADOPT_CREATIONFLAGS,
+    )
+    tree = tree_of(frozen.pid)
+    if sys.platform != "win32":
+        for proc in tree:
+            proc.suspend()
+    assert wait_until(lambda: len(_ours(token, tmp_path, since)) >= len(tree), APPEAR_WAIT), (
+        "could not arm: the teardown census did not see the frozen process"
+    )
+    # No settle: a frozen process never finishes, so waiting for it would only spend the budget.
+    assert _reap(token, tmp_path, since, [], settle=0) == []
+    frozen.wait(timeout=TIMEOUT)
+    assert not alive(tree)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the kill-on-close job object is Windows-only")
+def test_what_a_commit_DETACHES_is_in_the_job_so_it_dies_with_this_process(
+    token: str, jobs: list[int]
+) -> None:
+    """The hook detaches its push with ``( ... & )``, so nothing waits for it. Started the way
+    ``_commit`` starts a commit, a detached grandchild must still land in the job: ending the job
+    ends it, and closing the job's last handle -- what Windows does when this process dies by any
+    route -- would end it the same way."""
+    mark = _sleep_mark(token)
+    ran = _run_in_job(jobs, ["sh", "-c", f"( sleep {mark} & ) >/dev/null 2>&1"])
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    assert jobs, "could not arm: the command joined no job"
+    assert wait_until(lambda: bool(_matching(mark)), APPEAR_WAIT), (
+        "could not arm: the detached sleeper never appeared"
+    )
+    proctree.terminate_job(jobs.pop())
+    assert wait_until(lambda: not _matching(mark), REAP_WAIT), (
+        "A PROCESS THE COMMIT DETACHED ESCAPED THE JOB, so it would outlive a worker killed by the "
+        "per-test timeout:\n" + "\n".join(_matching(mark))
     )

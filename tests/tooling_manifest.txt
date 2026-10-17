@@ -69,15 +69,21 @@ tests/test_coord_fleet_fetch_clock.py
 # The four below share one SUBJECT: scripts/hooks/durability_push.sh, copied off disk and run as a
 # real post-commit hook. They are listed rather than left off because the diff that can break them is
 # a diff to that file, which trips this job's scripts/** path gate -- so the tooling job faces the
-# change that would break them. None of them reads anything under messagefoundry/** or
+# change that would break them. None of them reads its SUBJECT from messagefoundry/** or
 # packaging/messagefoundry-webconsole/**, so the reason that keeps a scanner in
-# _STAYS_WITHOUT_IMPORTING does not apply: there is no engine diff that can break them and then
-# arrive at a leg where they are deselected. The header's "when ambiguous, leave it off" is not in
-# play, because nothing here is ambiguous about which tier owns the subject.
+# _STAYS_WITHOUT_IMPORTING does not apply. One engine file IS loaded: push_bound runs each commit
+# in a kill-on-close job from messagefoundry/proctree.py, loaded by path, so a diff there could
+# break its teardown and arrive at a leg where it is deselected. The engine legs face that diff
+# through tests/test_engine_node_process_tree.py, which drives the same two calls. The header's
+# "when ambiguous, leave it off" is not in play, because nothing here is ambiguous about which
+# tier owns the subject.
 tests/test_durability_hook_provenance.py
 tests/test_durability_hook_push_bound.py
 tests/test_durability_hook_remote_guard.py
 tests/test_durability_hook_rewrite_coverage.py
+# The process-tree helpers push_bound imports. Listed so a diff to them alone still runs the
+# tooling job; the engine-leg tests that import them run on any code diff anyway.
+tests/_proc_tree.py
 tests/test_gate_ci_mirror_parity.py
 tests/test_hook_payload_cwd.py
 tests/test_hook_prose_folding.py
