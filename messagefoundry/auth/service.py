@@ -7526,13 +7526,15 @@ class AuthService:
         session, changed no role, and has a reason outside :data:`_ALWAYS_REPORTED_REASONS`
         (BACKLOG #3085, owner rulings 2026-10-16 and 2026-10-17). It still writes its
         ``auth.ad_session_revoked`` row, with ``sessions: 0`` ("audit always"), and sends no
-        notice; the caller raises no alert for it.
+        notice; the caller raises no alert for it. If that row is refused, the revocation reports
+        instead, so it is never left with neither a row nor an alert.
 
         So a disabled or absent account's revocation always reports, even one that ended nothing,
         as when the user signed out mid-pass or another reconciler revoked the account first. No
-        audit row decides it (vault BACKLOG #3750 item 33): a row this pass did not write may be
-        forged, and must not silence an alert. Two reconcilers revoking one disabled account
-        therefore both alert, and that duplicate is the accepted cost."""
+        audit row decides whether a revocation alerts (vault BACKLOG #3750 item 33): a row this
+        pass did not write may be forged, and must not silence an alert. Two reconcilers revoking
+        one disabled or absent account therefore both alert. This is the one statement of the
+        rule."""
         user = await self._load_user(revocation.user_id)
         if revocation.reason == reconcile.SCOPE_CHANGED and (
             user is None or user.channel_scope != revocation.scope_from
@@ -7579,7 +7581,7 @@ class AuthService:
         )
         # Soft (BACKLOG #3018): the writes above are already applied, so a raise would only cost
         # the notice below, the later accounts and the alerts. See `_audit_reconciler_row`.
-        await self._audit_reconciler_row(
+        written = await self._audit_reconciler_row(
             "auth.ad_session_revoked",
             actor=revocation.username,
             detail=_json(
@@ -7613,7 +7615,7 @@ class AuthService:
             scrub_log_argument(revocation.username),
             revocation.reason,
         )
-        if quiet:
+        if quiet and written:
             return "quiet"  # audited above, no notice and no alert: see the docstring
         # A directory-pushed disable or demotion is the same event to the user as a local one, so it
         # gets the same out-of-band notice the login-path re-sync sends (best-effort).

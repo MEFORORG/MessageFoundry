@@ -3951,11 +3951,10 @@ async def _absent_pass_with_sessions_gone_first(
 async def test_a_second_reconciler_revoking_one_absent_account_audits_zero_and_still_alerts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BACKLOG #3085 item 2, owner rulings 2026-10-16 ("audit always") and 2026-10-17, and vault
-    BACKLOG #3750 item 33. Another reconciler ends the account's sessions, and writes its row,
-    between this pass's plan and its apply. This pass still writes its ``auth.ad_session_revoked``
-    row, with ``sessions: 0``, and still alerts and sends its notice. The other reconciler's row is
-    not this pass's own, so it cannot silence the alert: a duplicate alert is the accepted cost."""
+    """BACKLOG #3085 item 2 and vault BACKLOG #3750 item 33. Another reconciler ends the account's
+    sessions, and writes its row, between this pass's plan and its apply. This pass still writes
+    its ``auth.ad_session_revoked`` row, with ``sessions: 0``, and still alerts and sends its
+    notice."""
     plan, rows, notices, alerts = await _absent_pass_with_sessions_gone_first(
         monkeypatch, other_reconciler_row=True
     )
@@ -3969,8 +3968,8 @@ async def test_an_absent_account_that_signs_out_mid_pass_still_alerts_and_is_tol
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Owner ruling 2026-10-17 ("Keep disable notices"). The user signs out between the plan and
-    the apply, so the revocation ends no session. An absent account's revocation still alerts and still sends its notice, the neutral one an absent
-    account gets (vault BACKLOG #2140)."""
+    the apply, so the revocation ends no session. An absent account's revocation still alerts and
+    still sends its notice, the neutral one an absent account gets (vault BACKLOG #2140)."""
     plan, rows, notices, alerts = await _absent_pass_with_sessions_gone_first(
         monkeypatch, other_reconciler_row=False
     )
@@ -3985,10 +3984,9 @@ async def test_a_foreign_revocation_row_does_not_silence_the_alert(
     monkeypatch: pytest.MonkeyPatch, planted: _Planted
 ) -> None:
     """Vault BACKLOG #3750 item 33. A matching ``auth.ad_session_revoked`` row this pass did not
-    write, planted straight into the store as a forger with write access to the database could
-    plant it, before the pass or during it. It must not silence this revocation's alert or its
-    notice: an alert never depends on an audit row this engine did not write in this pass. The
-    ``during_listing`` placement went quiet before the fix."""
+    write, before the pass or while it lists the account's sessions, does not silence the
+    revocation's alert or its notice. The ``during_listing`` placement went quiet at 4d550bd15,
+    whose evidence read counted such a row as another pass's revocation."""
     plan, rows, notices, alerts = await _absent_pass_with_sessions_gone_first(
         monkeypatch, other_reconciler_row=False, planted=planted
     )
@@ -4027,8 +4025,7 @@ async def test_a_disabled_account_that_signs_out_mid_pass_still_alerts_and_is_to
 async def test_a_repeat_revocation_of_a_disabled_or_absent_account_still_reports(
     reason: str,
 ) -> None:
-    """Vault BACKLOG #3750 item 33. The second apply finds the first's row, but no audit row
-    decides whether a disabled or absent account's revocation alerts, so both report."""
+    """Vault BACKLOG #3750 item 33. The second apply ends nothing, and still reports."""
     store, _, service, _ = await _scoped_service(_GRP_A)
     try:
         notifier = _CapturingNotifier()
@@ -4056,6 +4053,35 @@ async def test_an_undetermined_revocation_that_ends_nothing_stays_quiet() -> Non
         )
         assert await service._apply_reconcile_revocation(revocation) == "quiet"
         assert notifier.sent == []
+    finally:
+        await store.close()
+
+
+async def test_a_quiet_revocation_whose_row_is_refused_reports_instead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A quiet revocation is audited instead of alerted, so it must not lose both. When the store
+    refuses its ``auth.ad_session_revoked`` row, it reports, and the user is told. The control: the
+    same revocation with its row written is quiet."""
+    store, _, service, _ = await _scoped_service(_GRP_A)
+    try:
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        user = await _signed_out(store, "jdoe")
+        revocation = reconcile.SessionRevocation(
+            user.id, user.username, reason="directory_undetermined"
+        )
+        assert await service._apply_reconcile_revocation(revocation) == "quiet"
+        real = store.record_audit
+
+        async def refusing(name: str, **kwargs: Any) -> None:
+            if name == "auth.ad_session_revoked":
+                raise sqlite3.OperationalError("synthetic: disk I/O error")
+            await real(name, **kwargs)
+
+        monkeypatch.setattr(store, "record_audit", refusing)
+        assert await service._apply_reconcile_revocation(revocation) == "reported"
+        assert len(notifier.sent) == 1
     finally:
         await store.close()
 
