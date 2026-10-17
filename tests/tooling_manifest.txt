@@ -225,6 +225,7 @@ tests/test_worktree_remove_path.py
 tests/test_worktree_remove_in_use.py
 tests/test_worktree_remove.py
 tests/test_worktree_remove_scratch.py
+tests/test_worktree_remove_recent_work.py
 tests/test_worktree_rescue.py
 tests/test_worktree_selfheal_wiring.py
 tests/test_worktree_venv_constraint.py
