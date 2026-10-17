@@ -137,7 +137,9 @@ def shorten_with_checksum(text: str, limit: int, *, keep_tail: bool = False) -> 
         return text
     digest = f"{binascii.crc32(text.encode('utf-8', 'backslashreplace')):0{_CHECKSUM_HEX}x}"
     if keep_tail:
-        return f"~{digest}~{text[-(limit - _CHECKSUM_HEX - len('~~')) :]}"
+        # Sliced from a start index, never ``text[-n:]``: n = 0 would keep the whole text.
+        start = len(text) - max(0, limit - _CHECKSUM_HEX - len("~~"))
+        return f"~{digest}~{text[start:]}"
     return f"{text[: max(0, limit - _CHECKSUM_HEX - len('~'))]}~{digest}"
 
 

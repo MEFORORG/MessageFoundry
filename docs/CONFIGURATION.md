@@ -1961,8 +1961,13 @@ reason does, which is the rule the ERROR line follows. While a refusal stands it
 alert again as a reminder, as `intake_paused` reminds, with the same fields. A reminder goes at the
 first reload pass five minutes or more after the last try, so they come five to six minutes apart. This replaced
 the rule of one alert per file version, under which a page that was throttled, muted or resolved
-by hand was never sent again. A reminder is sent even while the engine cannot read the file, since
-the refusal still stands. The notifier's cooldown still applies while the alert is open: a second
+by hand was never sent again. Each reminder is another occurrence of the alert, as an
+`intake_paused` reminder is, so a rule's count-based `escalate` tiers climb while the refusal
+stands. Neither acknowledging the alert nor resolving it by hand stops the reminders; suspending
+it mutes their pages. While the engine cannot read the file, a
+reminder is still sent for a refusal the engine treats as final, such as `fix_file`. One it judges
+again every pass, such as `wait` or one that carries `start_refuses`, can name a time that has
+passed, so it is not reminded about until the engine can read the file again. The notifier's cooldown still applies while the alert is open: a second
 refused version, or a reminder, inside `[alerts].realert_seconds` of the last page updates the open
 alert and does not page again. So a page can name an older class than the alert list shows, until
 the next reminder pages. A cooldown longer than five minutes throttles some reminders. When the

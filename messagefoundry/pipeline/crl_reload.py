@@ -928,6 +928,10 @@ class _Alerted(NamedTuple):
     outcome: ReloadOutcome
     #: When the next reminder is due, on :data:`_monotonic`'s clock.
     remind_at: float
+    #: Whether a pass has judged the file again since the last call. A refusal the reload
+    #: judges again every pass can carry a time (a wait, ``start_refuses``) that has since
+    #: passed, so it is reminded about only from a fresh judgment.
+    fresh: bool = False
 
 
 class CrlReloadRunner:
@@ -949,7 +953,9 @@ class CrlReloadRunner:
     resolved by hand never sent again. So the runner reminds, as ``intake_paused`` does, and
     from the same constant by default
     (:data:`~messagefoundry.pipeline.alerts.REMINDER_SECONDS`). It reads the refusal record for
-    that, not the outcomes, so a pass that could not read the file still reminds. A reminder
+    that, not the outcomes, so for a verdict the reload treats as final a pass that could not
+    read the file still reminds. A verdict it judges again every pass can carry a time that has
+    since passed, so that one is reminded about only after a pass has judged it again. A reminder
     repeats the version raised, with the latest count, and only while the record holds that
     version; a newer version is raised from its own outcome instead.
 
@@ -1002,6 +1008,8 @@ class CrlReloadRunner:
         # Path keys the loop has seen held and judged for an alert a dead process left open
         # (:meth:`_clear_on_first_sight`), each once.
         self._seen_held: set[str] = set()
+        # Per report step, the failure last logged (:meth:`_guarded`).
+        self._report_failing: dict[str, str] = {}
 
     def start(self) -> None:
         """Spawn the loop (idempotent)."""
@@ -1044,8 +1052,8 @@ class CrlReloadRunner:
         if self._alerted:
             # Said here every time, whatever streak is open: no later pass will try again.
             log.warning(
-                "crl_reload: %d refused-reload alert(s) could not be resolved at stop; resolve "
-                "them in the alert list: %s",
+                "crl_reload: %d refused-reload alert(s), or clear(s) for an earlier run, could "
+                "not be resolved at stop; resolve any open in the alert list: %s",
                 len(self._alerted),
                 ", ".join(sorted(self._alerted)),
             )
@@ -1061,7 +1069,7 @@ class CrlReloadRunner:
                 _forget_all()
                 # No pass runs, so nothing else would resolve an alert for a file no hop holds
                 # now. Read from the record all the same: _forget_all skips a held pass lock.
-                self._guarded(self._follow_record)
+                self._guarded("follow the record", self._follow_record)
                 continue
             outcomes: object = None
             try:
@@ -1074,9 +1082,9 @@ class CrlReloadRunner:
                 return
             # After the await, so on the event loop: a notifier schedules its alert-state write
             # with the running loop, and off the loop that write is dropped without an error.
-            self._guarded(functools.partial(self._report, outcomes))
+            self._guarded("report", functools.partial(self._report, outcomes))
             # After the report, so a refusal this pass recorded counts as standing.
-            self._guarded(self._clear_on_first_sight)
+            self._guarded("first-sight clear", self._clear_on_first_sight)
 
     def _clear_on_first_sight(self) -> None:
         """Resolve, once per held file, an alert a process that died before this one left open.
@@ -1098,25 +1106,33 @@ class CrlReloadRunner:
         if not unseen:
             return
         standing = reload_refusals()
-        self._seen_held.update(unseen)
-        # A file this run refused is left alone: its own raise and clear cover the subject.
+        # A file this run has alerted is left alone: its own raise and clear cover the subject.
+        # One refused with no alert of its own yet, because the raise failed, is judged again at
+        # the next pass: should the refusal end first, the subject still needs this clear.
+        self._seen_held.update(key for key in unseen if key in self._alerted)
         seeded = [key for key in unseen if key not in standing and key not in self._alerted]
+        self._seen_held.update(seeded)
         for key in seeded:
             self._alerted[key] = _Alerted(ReloadOutcome(unseen[key], 0, None), math.inf)
         self._resolve(seeded, "any alert an earlier run of this process left open")
 
-    @staticmethod
-    def _guarded(report: Callable[[], None]) -> None:
+    def _guarded(self, step: str, report: Callable[[], None]) -> None:
         """Run one report step so that nothing it raises ends the loop (vault BACKLOG #3543).
 
         Broad on purpose, as for the pass: the loop is what applies revocations to running hops,
         and a report is only about them. Each outcome and each sink call is guarded inside the
         report already; this catches the rest, such as a failure reading the refusal record. The
-        next pass reports again."""
+        next pass reports again. The traceback is logged once per failing streak of each step,
+        as the runner's other failures are, and a step that succeeds ends its streak."""
         try:
             report()
-        except Exception:
-            log.exception("crl_reload: reporting a pass failed; will retry next interval")
+        except Exception as exc:
+            seen = f"{type(exc).__name__}: {exc}"
+            if self._report_failing.get(step) != seen:
+                self._report_failing[step] = seen
+                log.exception("crl_reload: reporting a pass failed; will retry next interval")
+            return
+        self._report_failing.pop(step, None)
 
     def _report(self, outcomes: object) -> None:
         """Raise ``crl_reload_refused`` for each refusal in ``outcomes`` not alerted yet, then
@@ -1174,8 +1190,15 @@ class CrlReloadRunner:
                 self._sink_failed(_RESOLVED, key)
                 continue
             self._sink_failing.discard((_RESOLVED, key))
-            del self._alerted[key]
-            log.info("crl_reload: the refused-reload alert for %s is resolved: %s", path, why)
+            raised = self._alerted.pop(key).outcome.refusal is not None
+            # A clear for an earlier run is sent for every held file, with or without an alert
+            # open, so it is not reported as resolving one.
+            log.log(
+                logging.INFO if raised else logging.DEBUG,
+                "crl_reload: the refused-reload alert for %s is resolved: %s",
+                path,
+                why,
+            )
 
     def _sink_failed(self, what: str, key: str) -> None:
         """One WARNING per failing streak of one call for one file, from inside the ``except``
@@ -1196,7 +1219,7 @@ class CrlReloadRunner:
         known = self._alerted.get(key)
         if known is not None and _version(known.outcome.refusal) == _version(refusal):
             # This version is alerted already. Keep its latest count for the next reminder.
-            self._alerted[key] = known._replace(outcome=outcome)
+            self._alerted[key] = known._replace(outcome=outcome, fresh=True)
             return
         if self._send_refused(key, outcome, refusal, _RAISED):
             self._alerted[key] = _Alerted(outcome, self._next_reminder())
@@ -1216,8 +1239,12 @@ class CrlReloadRunner:
                 continue
             if _version(standing.get(key)) != _version(refusal):
                 continue  # resolved above, or a newer version its own outcome raises
+            if not refusal.sticky and not alerted.fresh:
+                # Judged again every pass, and not judged since the last call, such as while the
+                # file cannot be read: its time may have passed. Due again once a pass judges it.
+                continue
             self._send_refused(key, alerted.outcome, refusal, _REMINDED)
-            self._alerted[key] = alerted._replace(remind_at=self._next_reminder())
+            self._alerted[key] = alerted._replace(remind_at=self._next_reminder(), fresh=False)
 
     def _next_reminder(self) -> float:
         return _monotonic() + self._reminder_seconds
@@ -1243,5 +1270,6 @@ class CrlReloadRunner:
             # retries it; a reminder is tried again at the next reminder.
             self._sink_failed(what, key)
             return False
-        self._sink_failing.discard((what, key))
+        # One sink call either way, so either success ends both streaks.
+        self._sink_failing -= {(_RAISED, key), (_REMINDED, key)}
         return True

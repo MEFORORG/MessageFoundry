@@ -570,7 +570,8 @@ async def test_a_report_that_raises_does_not_end_the_loop(
         finally:
             monkeypatch.undo()
             await runner.stop()
-    assert any("reporting a pass failed" in r.getMessage() for r in caplog.records)
+    logged = [r for r in caplog.records if "reporting a pass failed" in r.getMessage()]
+    assert len(logged) == 1, "once per failing streak, not once a pass"
     assert bool(passes) is not idle, "the control: which branch reported"
 
 
@@ -771,6 +772,32 @@ async def test_a_reminder_follows_the_record_when_the_pass_cannot_read_the_file(
     clock.now += 300
     assert _pass(runner) == [], "the control: no outcome at all"
     assert len(sink.refused()) == 2
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+async def test_a_refusal_judged_every_pass_is_not_reminded_about_unjudged(
+    pki: _Pki, clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wait names a time, which may pass while the file cannot be read. So unlike a final
+    verdict, it is reminded about only once a pass has judged it again."""
+    hop = pki.outbound_hop()
+    sink = _Sink()
+    runner = _runner(sink, reminder_seconds=300)
+    pki.crl.write_bytes(pki.crl_pem(issued=-_DAY, lasts=60 * _DAY, revoke=True))
+    (waiting,) = _pass(runner)
+    assert waiting.refusal is not None and not waiting.refusal.sticky  # the premise
+
+    def unreadable(_path: str) -> tuple[int, int, int]:
+        raise PermissionError(13, "Permission denied")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(crl_reload, "_stamp", unreadable)
+        clock.now += 900
+        _pass(runner)
+        _pass(runner)
+        assert len(sink.refused()) == 1, "no reminder from a verdict nobody judged again"
+    _pass(runner)
+    assert [p["remedy_class"] for p in sink.refused()] == ["wait", "wait"], "judged, reminded"
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
@@ -1067,6 +1094,30 @@ async def test_a_first_sight_clear_the_sink_refuses_is_retried(
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
+async def test_a_refused_file_whose_raise_failed_is_judged_again_at_first_sight(
+    pki: _Pki,
+) -> None:
+    """A file refused at first sight whose own raise failed has no alert of this run to clear
+    the subject. If the refusal ends before a raise lands, the first-sight clear must still
+    reach it, so the file is not counted as judged yet."""
+    hop = pki.outbound_hop()
+    original = pki.crl.read_bytes()
+    sink = _Sink()
+    runner = _runner(sink)
+    pki.crl.write_bytes(_expired(pki))
+    sink.down = True
+    _pass(runner)
+    runner._clear_on_first_sight()
+    assert sink.events == [] and crl_path_key(pki.crl) not in runner._seen_held
+
+    sink.down = False
+    pki.crl.write_bytes(original)  # the refusal ends before any raise landed
+    _pass(runner)
+    runner._clear_on_first_sight()
+    assert sink.kinds() == ["applied"], "the subject a dead process may have left is cleared"
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
 async def test_a_runner_started_again_raises_a_refusal_that_still_stands(pki: _Pki) -> None:
     hop = pki.outbound_hop()
     sink = _Sink()
@@ -1160,6 +1211,8 @@ def test_a_path_and_a_node_label_are_shortened_by_one_rule(tmp_path: Path) -> No
     assert len(short) == ALERT_PATH_MAX_LENGTH and short.endswith("partner-crl.pem")
     assert shorten_with_checksum(key, ALERT_PATH_MAX_LENGTH) == f"{key[:111]}~{short[1:9]}"
     assert shorten_with_checksum("short", ALERT_PATH_MAX_LENGTH, keep_tail=True) == "short"
+    # A limit with no room for a tail keeps none, rather than the whole text.
+    assert len(shorten_with_checksum(key, 10, keep_tail=True)) == 10
 
     node = "node:" + "x" * 400
     subject = process_alert_subject("crl_reload:a", node)
