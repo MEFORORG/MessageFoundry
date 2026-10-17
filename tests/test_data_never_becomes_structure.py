@@ -58,6 +58,7 @@ from messagefoundry.pipeline import ingress_guards, wiring_runner
 from messagefoundry.pipeline.dryrun import dry_run, split_messages
 from messagefoundry.pipeline.dryrun_trace import trace_dry_run
 from messagefoundry.store import MessageStatus, MessageStore
+from messagefoundry.transports import remotefile as remotefile_mod
 from messagefoundry.transports.base import NegativeAckError
 from messagefoundry.transports.file import FileSource
 from messagefoundry.transports.mllp import MLLPDestination
@@ -783,8 +784,9 @@ def test_split_batch_bytes_still_splits_an_encoding_the_byte_check_cannot_read()
     assert len(split_batch_bytes(raw, "utf-16")) == 3
 
 
+@pytest.mark.parametrize("hold_loop", [False, True], ids=["plain", "loop-held"])
 async def test_a_stop_before_the_first_message_hands_nothing_over_and_still_prunes(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, hold_loop: bool
 ) -> None:
     client = _FakeClient(
         files={"/in/a.hl7": THREE[0].encode("utf-8"), "/in/b.hl7": "".join(THREE).encode("utf-8")}
@@ -797,39 +799,98 @@ async def test_a_stop_before_the_first_message_hands_nothing_over_and_still_prun
     original = split_mod.split_batch_bytes
     loop = asyncio.get_running_loop()
     loop_thread = threading.get_ident()
-    stop_ran = threading.Event()
+    holds = 0  # loop-thread holds the forced arm has taken; always 0 in the plain arm
+    holds_at_split: list[int] = []  # read by the batch's split, once its stop has run
 
-    def _set_stop() -> None:
+    async def _set_stop() -> None:
         src._stop.set()
-        stop_ran.set()
 
     def _stop_on_the_batch(raw: bytes, encoding: str) -> list[bytes]:
         if raw.count(b"MSH") > 1:
-            if threading.get_ident() == loop_thread:
-                # A split run inline is already on the loop, where the Event lives. Waiting here
-                # would block the one thread that can run the stop.
-                _set_stop()
-            else:
-                # The split runs in a worker thread, so the stop is queued to the loop. The worker
-                # then waits until the loop has run it, because queueing alone does not order it.
-                # A worker can finish before the loop registers the future's done-callback. asyncio
-                # then completes the awaited future without yielding. The poller would read the
-                # flag while the stop is still queued.
-                loop.call_soon_threadsafe(_set_stop)
-                stop_ran.wait(30)
+            # The split runs in asyncio.to_thread's worker. Queueing the stop alone does not order it
+            # before the split's result: a worker can finish before the loop registers the future's
+            # done-callback, and asyncio then completes the awaited future without yielding, so the
+            # poller reads the flag while the stop is still queued (BACKLOG #2967). So the worker
+            # blocks until the loop has run the stop, and a bound that expires raises here rather
+            # than letting the split go on. On the loop thread nothing could run the stop, so the
+            # wait would stall the shared loop for the whole bound; fail at once instead.
+            assert threading.get_ident() != loop_thread, "the split ran on the loop thread"
+            asyncio.run_coroutine_threadsafe(_set_stop(), loop).result(timeout=30)
+            holds_at_split.append(holds)
         return original(raw, encoding)
 
     monkeypatch.setattr(
         "messagefoundry.transports.remotefile.split_batch_bytes", _stop_on_the_batch
     )
+    if hold_loop:
+        # The forced arm: while the batch is handed off, the loop thread sleeps 20 ms between
+        # submitting a worker job (the split, _hand_off's first) and registering its done-callback.
+        # That is the window in which a fire-and-forget stop lost to the split's result on every
+        # run, and the handshake above must hold the order through it. The patch reaches
+        # run_in_executor only because CPython looks wrap_future up on the module, so the split
+        # reads the hold count: an arm that stopped firing would otherwise pass as the plain one.
+        wrap_future = asyncio.futures.wrap_future
+        hand_off = src._hand_off
+        poller = asyncio.current_task()  # _poll_once runs in this test's own task
+        at_batch = False
+
+        async def _flag_the_batch(raw: bytes) -> bool:
+            nonlocal at_batch
+            at_batch = raw.count(b"MSH") > 1
+            try:
+                return await hand_off(raw)
+            finally:
+                at_batch = False
+
+        def _held_wrap_future(future: Any, *, loop: asyncio.AbstractEventLoop | None = None) -> Any:
+            nonlocal holds
+            # Only the poller's own submissions: the session loop and other threads may submit too.
+            if (
+                at_batch
+                and threading.get_ident() == loop_thread
+                and asyncio.current_task() is poller
+            ):
+                holds += 1
+                time.sleep(0.02)
+            return wrap_future(future, loop=loop)
+
+        monkeypatch.setattr(src, "_hand_off", _flag_the_batch)
+        monkeypatch.setattr(asyncio.futures, "wrap_future", _held_wrap_future)
+    connector_log = remotefile_mod.logger  # the object _poll_once's failure arm logs through
+    caplog.set_level("WARNING", logger=connector_log.name)
     await _settle(src)
+    caplog.clear()
+    # A capture that could not see the connector's logger would pass the absence check below on
+    # nothing. So a marker goes through that same logger, at the same level, on each side of the
+    # poll, and both must be captured.
+    markers = ("BACKLOG #2967 capture marker, before", "BACKLOG #2967 capture marker, after")
+    connector_log.warning(markers[0])
     await src._poll_once()
-    # The poll split b.hl7 and the stop ran. A poll that never reached b.hl7 (not settled, filtered
-    # out, or past the tick ceiling) would pass the two assertions below without this one.
-    assert stop_ran.is_set(), "the stop never ran: the poll did not split b.hl7"
+    connector_log.warning(markers[1])
+    assert len(caplog.records) >= 2, "the capture missed a marker: it cannot see the connector"
+    seen = {r.getMessage() for r in caplog.records if r.name == connector_log.name}
+    assert set(markers) <= seen, "the capture missed a marker sent through the connector's logger"
+    # _poll_once catches a failed hand-off, logs it and goes on, so a _hand_off that raised once the
+    # stop was set would leave the assertions below green. The connector logs no failure this poll.
+    failures = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == connector_log.name and r.getMessage() not in markers
+    ]
+    assert failures == []
     # a.hl7 was handed over and recorded; b.hl7 met the stop before its first message.
     assert [b.decode("utf-8").split("|")[9] for b in handler.bodies] == ["CTRL1"]
+    # b.hl7 was split once, after its stop ran, and the forced arm held that split's submission.
+    # _poll_once can skip a file on several arms, at least: not yet settled, filtered out, already
+    # ingested, quarantined, a transient retrieve failure and the tick ceiling. One that skipped
+    # b.hl7 would pass the assertion above without this one.
+    assert holds_at_split == [1 if hold_loop else 0], (
+        "b.hl7 was not split once with its stop, or the forced arm did not hold that split"
+    )
     assert len(ledger.keys) == 1 and ledger.pruned == 1
+    # Neither file was quarantined or deleted. Leave mode moves no file it finished either, so this
+    # does not tell a stop from a whole hand-off; the ledger count above does.
+    assert sorted(client.files) == ["/in/a.hl7", "/in/b.hl7"]
 
 
 # --- review repair: a separator escape means what the engine read, under the target set (#2559) ---

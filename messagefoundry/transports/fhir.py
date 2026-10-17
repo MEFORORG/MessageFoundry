@@ -1528,9 +1528,11 @@ class FhirLookupExecutor:
         egress: EgressSettings,
         trust_anchor_policy: TrustAnchorPolicy | None = None,
         failed: Mapping[str, str] | None = None,
+        warn_query_credentials: bool = True,
     ) -> None:
         # `egress` is required and every connection is checked against it before anything is built,
         # so no caller can construct an executor that reads from an unchecked host (vault BACKLOG #2605).
+        # `warn_query_credentials` drops only the warning, never a refusal (vault BACKLOG #2910).
         from messagefoundry.transports.egress import check_fhir_lookup_allowed
 
         # Vault BACKLOG #3008: the lookups the runner could not build at start, name -> reason. Each
@@ -1539,7 +1541,9 @@ class FhirLookupExecutor:
         self._failed: dict[str, str] = dict(failed or {})
 
         for cname, s in connections.items():
-            check_fhir_lookup_allowed(cname, s, egress)
+            check_fhir_lookup_allowed(
+                cname, s, egress, warn_query_credentials=warn_query_credentials
+            )
         # connections: name -> already-env-resolved settings (the runner substitutes env() first).
         # trust_anchor_policy (#1180, ADR 0093): the instance [tls] client anchor policy, threaded by
         # the runner. A FhirLookup connection has no Destination to carry it (unlike every other
