@@ -370,3 +370,56 @@ def test_the_cut_character_pattern_is_the_cut_characters() -> None:
     every = {chr(code) for code in range(0x3000)}
     matched = {char for char in every if redaction._CUT_CHAR_RE.fullmatch(char)}
     assert matched == set(redaction._CUT_CHARS)
+
+
+# --- Consumers that change the answer before they redact it again (code review, repair round 1) --
+#
+# Each printed its value on the head before this round, by the real consumer named, and printed
+# nothing on main. The consumers are the shipped ones: the support bundle's line scrubber, the JSON
+# log formatter's escaping, the audit tee's ``json.dumps``, and a call site that appends its own
+# words after an answer.
+
+_ESCAPED_TEXT = 'A^B^C<given value="PatientID="q" Plantdd tail'
+_LONG_TOKEN_TEXT = "GET /Patient?a=1&b=2&mrn= 4455/QZXRTVWBNMLKJHGFDSAPOIU failed"
+_OPEN_TEXT = 'A^B^C<given value="PatientID="'
+
+
+def _consumer_routes() -> dict[str, tuple[str, str]]:
+    """``route: (output, the value it must not print)``, by the real consumers."""
+    from messagefoundry.support.redact import redact_log_line
+
+    chained = _through_the_chain(_ESCAPED_TEXT)
+    return {
+        "audit tee": (
+            _through_the_chain(
+                json.dumps({"detail": safe_text(_ESCAPED_TEXT)}, ensure_ascii=False)
+            ),
+            "Plantdd",
+        ),
+        "json log then bundle": (
+            redact_log_line(json.dumps({"message": chained}, ensure_ascii=False)),
+            "Plantdd",
+        ),
+        "bundle line": (redact_log_line(_LONG_TOKEN_TEXT), "QZXRTVWBNMLKJHGFDSAPOIU"),
+        "appended words": (
+            _through_the_chain(f"delivery failed: {safe_exc(ValueError(_OPEN_TEXT))} for Sufxvalq"),
+            "Sufxvalq",
+        ),
+    }
+
+
+def test_no_consumer_prints_a_value_main_hid() -> None:
+    printed = [route for route, (out, value) in _consumer_routes().items() if value in out]
+    assert not printed
+    with _rule_off():
+        assert not [route for route, (out, value) in _consumer_routes().items() if value in out]
+
+
+def test_the_consumer_views_are_what_guard_them(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE POSITIVE CONTROL: with only the plain view read, no token check and no open-end check,
+    every consumer route prints its value again."""
+    monkeypatch.setattr(redaction, "_CONSUMER_VIEWS", ((str, str),))
+    monkeypatch.setattr(redaction, "_closes_what_plain_left_open", lambda out, plain: False)
+    monkeypatch.setattr(redaction, "_extends_a_token", lambda kept, start, end: False)
+    printed = {route for route, (out, value) in _consumer_routes().items() if value in out}
+    assert printed == {"audit tee", "json log then bundle", "bundle line", "appended words"}

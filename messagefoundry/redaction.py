@@ -1757,8 +1757,9 @@ def redact(text: str) -> str:
     break as visible text, so a second handler reads two lines as one, and a kept quote there closed
     an earlier value that the line end had closed on the first call. The price is large and stated: a
     traceback is many lines, so the rule never applies to one. Second, no credential shape is in the
-    input or in either answer (:func:`_holds_a_credential_shape`): the credential filters run after
-    this module, and a kept label can take theirs into its own value. That screen also matches
+    input (:func:`_holds_a_credential_shape`): the credential filters run after this module, and a
+    kept label can take theirs into its own value. The input alone is screened: a scrub only writes
+    the placeholder, and a kept label holds no credential word. That screen also matches
     ordinary words such as ``state=`` or ``session:``, and the rule is off on such a text. Third, the
     text the answer keeps, outside the labels it kept and the placeholders, is a run of text the answer
     without it also kept, in the same order (:func:`_keeps_only_what_plain_kept`). So on one call,
@@ -1793,9 +1794,11 @@ def redact(text: str) -> str:
 
 #: The longest answer the glued-label rule may give. :func:`clamp_untrusted` and :func:`safe_text`
 #: cut a text longer than :data:`_REDACT_WINDOW`, and a further call can be handed an answer with a
-#: count note and a bound note after it, so each note's room comes off. Under this, no clamp reaches
-#: an answer, or a result this module built from one, so the old answer is the only one a clamp cuts.
-_GLUED_LENGTH_CAP = _REDACT_WINDOW - 2 * _CLAMP_MARKER_BUDGET
+#: count note and a bound note after it. Under this, no clamp reaches an answer, or a result this
+#: module built from one, so the old answer is the only one a clamp cuts. It is far under the window
+#: because the check redacts each answer again several times over (:func:`_answer_holds`), on the
+#: event loop, so a long answer gets the old answer rather than that cost.
+_GLUED_LENGTH_CAP = 8 * 1024
 
 
 def _redact_answers(text: str) -> tuple[str, str, list[str]]:
@@ -2110,10 +2113,35 @@ def _answer_holds(
 
     **A pass over an answer a later bound already cut is not read here**: reading one at every cut
     would be quadratic. The refusal of an answer holding a percent-encoded run
-    (:func:`_redact_answers`) stands in for that gap, which is where the differential found it."""
+    (:func:`_redact_answers`) stands in for that gap, which is where the differential found it.
+
+    **And each reading is made over each of :data:`_CONSUMER_VIEWS` too.** A consumer can change the
+    text before its pass reads it: the JSON log formatter and the audit tee escape every quote. And a
+    call site appends its own words after an answer, which main's answer can take into a value it
+    left open (:func:`_closes_what_plain_left_open`). Found by code review on the support bundle, the
+    audit tee and appended call-site text, and reproduced with the real handler chain."""
+    # The bound note stays a note under every view: the views read the text a peer could write.
+    out, out_notes = _split_trailing_note(out, out_notes)
+    plain, plain_notes = _split_trailing_note(plain, plain_notes)
+    if _closes_what_plain_left_open(out, plain):
+        return False
+    return all(
+        _holds_over_passes(
+            view(out),
+            view(plain),
+            [label_view(label) for label in labels],
+            (out_notes, plain_notes) if index == 0 else ("", ""),
+        )
+        for index, (view, label_view) in enumerate(_CONSUMER_VIEWS)
+    )
+
+
+def _holds_over_passes(out: str, plain: str, labels: list[str], notes: tuple[str, str]) -> bool:
+    """:func:`_answer_holds` for one view: the check, then each further rule-off pass, until neither
+    answer changes."""
     for _ in range(_FURTHER_PASSES):
         if not _keeps_only_what_plain_kept(
-            out, plain, labels, out_notes=out_notes, plain_notes=plain_notes
+            out, plain, labels, out_notes=notes[0], plain_notes=notes[1]
         ):
             return False
         again, plain_again = _redact_text(out, None), _redact_text(plain, None)
@@ -2121,6 +2149,41 @@ def _answer_holds(
             return True
         out, plain = again, plain_again
     return False
+
+
+def _json_escaped(text: str) -> str:
+    """``text`` as a JSON string body: what the JSON log formatter and the audit tee hand on."""
+    return json.dumps(text, ensure_ascii=False)[1:-1]
+
+
+#: The ways a shipped consumer hands an answer on before it redacts again: as it is, and escaped as
+#: a JSON string. Each pairs the view of the answer with the view of a kept label inside it. Only
+#: the first carries the notes.
+_CONSUMER_VIEWS: tuple[tuple[Callable[[str], str], Callable[[str], str]], ...] = (
+    (str, str),
+    (_json_escaped, _json_escaped),
+)
+
+#: Words a call site could put after an answer, one after each kind of character that ends a value
+#: (none, ``;`` and a closing bracket), so a value left open takes them and a closed one does not.
+#: One lowercase word each, so no pass scrubs it for its own shape: two name-shaped words were the
+#: first form, and the name pass scrubbed them after both answers alike.
+_APPENDED = (" for qwyxvalq", "; qwyxvalq", ") qwyxvalq")
+
+
+def _leaves_open(answer: str, appended: str) -> bool:
+    """Whether a pass over ``answer`` with ``appended`` after it scrubs into ``appended``."""
+    return not _redact_text(answer + appended, None).endswith(appended)
+
+
+def _closes_what_plain_left_open(out: str, plain: str) -> bool:
+    """Whether ``plain`` leaves a value open at its end that ``out`` closes, for any of
+    :data:`_APPENDED`. A call site writes ``f"{answer} for {peer}"``, and the next pass scrubs the
+    peer after main's open answer and prints it after the new one. Found by code review on appended
+    call-site text, reproduced with the real handler chain."""
+    return any(
+        _leaves_open(plain, appended) and not _leaves_open(out, appended) for appended in _APPENDED
+    )
 
 
 def _keeps_only_what_plain_kept(
@@ -2155,7 +2218,7 @@ def _keeps_only_what_plain_kept(
     plain, plain_notes = _split_trailing_note(plain, plain_notes)
     if any(note in text for note in (_COUNT_OPENER, _BOUND_OPENER) for text in (out, plain)):
         return False
-    distinct = sorted(set(labels), key=len, reverse=True)
+    distinct = sorted(set(labels), key=lambda label: (-len(label), label))
     if len(distinct) > _MAX_DISTINCT_LABELS:
         return False
     kept = _masked(plain, (_REDACTED,))
@@ -2166,7 +2229,7 @@ def _keeps_only_what_plain_kept(
         if _KEPT_WORD.search(text) is None:
             continue
         found = kept.find(text, pos)
-        if found < 0:
+        if found < 0 or _extends_a_token(kept, found, found + len(text)):
             return False
         pos = found + len(text)
         run_start = run.start() + run.group().index(text)
@@ -2211,6 +2274,21 @@ def _survives_every_cut(
 #: One :data:`_CUT_CHARS` character, so the cut walk finds every place a cut lands at C speed.
 #: Written out so the ReDoS scanner reads it; a test pins it to :data:`_CUT_CHARS`.
 _CUT_CHAR_RE = re.compile(r"[ \t\n\r\x0b\x0c]")
+
+
+#: A character that continues a token for a pass that reads a token by its length, such as the
+#: support bundle's base64 sweep (24 characters or more).
+_TOKEN_CHAR = re.compile(r"[A-Za-z0-9+/=_-]")
+
+
+def _extends_a_token(kept: str, start: int, end: int) -> bool:
+    """Whether ``kept[start:end]`` is part of a longer token there: a pass that reads a token by its
+    length scrubbed main's whole token, and would miss the shorter run the new answer keeps. Found by
+    code review: ``mrn= 4455/QZXRTVWBNMLKJHGFDSAPOIU`` through the bundle's base64 sweep."""
+    return bool(
+        (start and _TOKEN_CHAR.match(kept, start - 1) and _TOKEN_CHAR.match(kept, start))
+        or (end < len(kept) and _TOKEN_CHAR.match(kept, end) and _TOKEN_CHAR.match(kept, end - 1))
+    )
 
 
 def _split_trailing_note(text: str, notes: str) -> tuple[str, str]:
