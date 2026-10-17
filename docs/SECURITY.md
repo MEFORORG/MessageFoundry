@@ -643,8 +643,9 @@ step that follows the first faster than a person can:
 | Sign-in, then a TOTP or recovery code, or a passkey, on the MFA-pending session, including an enrolment that would satisfy it: `POST /me/mfa/confirm` or a passkey registration (BACKLOG #2389) | `[auth].mfa_verify_min_elapsed_seconds`, from the session's mint | 1 s | the leg's ordinary failure: `401 invalid code` on `POST /auth/mfa-verify`, `400 invalid code` on `POST /me/mfa/confirm`, the console's `Invalid code.` page on its TOTP confirm, and `400 passkey verification failed` on the console's passkey registration; audited `auth.mfa_failed` or `auth.webauthn_failed` with `reason=too_early`, and `phase=enroll` on an enrolment |
 | A federated start, then its callback: the step-up always, the sign-in only when `auth_time` falls inside the flow. A callback whose verified `amr` names a value in `oidc_callback_floor_exempt_amr` is exempt (BACKLOG #2388) | `[auth].oidc_callback_min_elapsed_seconds`, from the flow's start on the flow cache's clock | 1 s | `federated sign-in failed`, audited `auth.login_failed`, or the generic step-up refusal, audited `auth.reauth`; both with `reason=too_early` |
 
-Neither response says anything about timing, so by the answer alone a caller cannot tell it from a
-wrong code or a failed IdP proof. The MFA floor charges no lockout and spends no code or passkey
+Neither response's text says anything about timing, so by the text alone a caller cannot tell it
+from a wrong code or a failed IdP proof. The federated step-up is not padded, so its response time
+can still tell a floor refusal made before the code exchange from a refusal after it. The MFA floor charges no lockout and spends no code or passkey
 challenge, so the person simply submits again. That also means a resubmission can show the floor
 fired: the same code or passkey response then succeeds, where a wrong one never would. The floor
 applies only while the session still owes its factor. A step-up code on a satisfied session is not

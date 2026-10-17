@@ -704,13 +704,15 @@ FLOW_PURPOSE_MISMATCH = "flow_purpose_mismatch"
 
 #: The audit reason for a second step refused under its ASVS 2.4.2 minimum-elapsed floor (BACKLOG
 #: #2301): an MFA code or passkey too soon after sign-in, or an IdP callback too soon after its flow
-#: started. Audit only. The caller sees its leg's ordinary failure, which says nothing about timing.
+#: started. Audit only. The caller sees its leg's ordinary failure, whose TEXT says nothing about
+#: timing. Its response time can: the federated step-up leg is not padded, so a floor refusal made
+#: before the code exchange returns sooner than a refusal after the IdP round trip (BACKLOG #3221).
 TOO_EARLY = "too_early"
 
 #: The reason for a federated failure that is neither a transport failure nor a token-endpoint
 #: answer (BACKLOG #1948): at least a status from the JWKS fetch, and the engine's own token request
-#: refused over the length bound before it was sent. Neither marks the IdP unavailable. Distinct
-#: from ``idp_error``, which is the IdP's own ``error=`` on the callback.
+#: refused over the length bound before it was sent, an operator configuration fault. Neither marks
+#: the IdP unavailable. Distinct from ``idp_error``, which is the IdP's own ``error=`` on the callback.
 IDP_ANSWER_UNUSABLE = "idp_answer_unusable"
 
 #: Operator-readable text for the step-up leg's refusals. None of it echoes anything the IdP sent.
@@ -744,12 +746,15 @@ _STEP_UP_ERRORS: Final[Mapping[str, str]] = MappingProxyType(
         "idp_unavailable": "The identity provider is unavailable. Try again later.",
         # `token_refused` is deliberately NOT listed: it reads as the generic line, as `too_early`
         # does, so a junk code's answer cannot show whether the callback floor fired (SECURITY.md,
-        # the second-step floors). Its audit row carries the status (BACKLOG #1948).
+        # the second-step floors). So does the engine's own client credential refused with a 401,
+        # an operator fault. Its audit row carries the status, which is where the operator tells
+        # the two apart (BACKLOG #1948, #3221). IDP_ANSWER_UNUSABLE promises no wait will help.
         IDP_ANSWER_UNUSABLE: (
-            "The identity provider could not complete the confirmation. Try again later."
+            "The identity provider could not complete the confirmation. Try again. If it repeats,"
+            " ask an administrator."
         ),
         "not_configured": "Federated sign-in is not configured.",
-        "idp_error": "The identity provider did not complete the sign-in. Try again.",
+        "idp_error": "The identity provider did not complete the confirmation. Try again.",
         "malformed_callback": "The identity provider's answer was incomplete. Try again.",
         "not_in_directory": (
             "Your directory account could not be found or is disabled. Ask an administrator."
@@ -2902,9 +2907,10 @@ class AuthService:
 
         **Deliberately NOT the same shape as** :attr:`kerberos_available`, which is boot-once and
         sticky-until-restart (ADR 0068 §9). This flag is **advisory and non-sticky**: it is set by a
-        failed login and cleared by the next successful one, and *no login path gates on it* — the
-        start leg always attempts. That is what satisfies AC-8's "SHALL recover without an engine
-        restart"; a copy of the Kerberos latch would leave one IdP blip disabling federated login
+        failed login and cleared by the next code exchange that yields a verified token, on either
+        leg, whether or not a later check then refuses the attempt (BACKLOG #3221). *No login path
+        gates on it* — the start leg always attempts. That is what satisfies AC-8's "SHALL recover
+        without an engine restart"; a copy of the Kerberos latch would leave one IdP blip disabling federated login
         until a restart, which is exactly what AC-8 forbids. It exists to drive the login-page link
         and ``/auth/providers``, nothing more. Do not "fix" the asymmetry with the Kerberos twin.
 
@@ -4569,6 +4575,7 @@ class AuthService:
             return LoginOutcome(
                 ok=False, error="identity provider unavailable", reason="idp_unavailable"
             )
+        self.clear_oidc_unavailable()  # a verified token: the IdP answered (BACKLOG #3221)
         # BACKLOG #2301 (ASVS 2.4.2): the minimum-elapsed floor, only when the person signed in at
         # the IdP during THIS flow, which the verified auth_time says. An IdP holding a live single
         # sign-on session answers with no human step, so there is nothing to floor, and flooring it
@@ -4581,7 +4588,9 @@ class AuthService:
         # in oidc_callback_floor_exempt_amr) is exempt. Recorded on the success row, below, and on
         # each refusal after this point, a lock refusal excepted (BACKLOG #3220).
         floor_exempt_amr = (
-            self._oidc_callback_floor_exemption(principal_claims.amr)
+            self._oidc_callback_floor_exemption(
+                self._oidc_callback_floor_exempt_values(), principal_claims.amr
+            )
             if signed_in_during_flow and arrived_too_early
             else ()
         )
@@ -4764,7 +4773,6 @@ class AuthService:
             )
         max_expires_at = min(recency_deadline, max_expires_at)
 
-        self.clear_oidc_unavailable()
         # ASVS 6.3.4, the one directory leg the engine can actually verify. Keyed on the SETTING, not
         # on mech == "oidc": when the claim gate is on (default), _check_mfa_gate has already refused
         # any token lacking a configured amr/acr, so a principal reaching this line provably carried
@@ -4878,14 +4886,18 @@ class AuthService:
         flows = self._oidc_flows
         return floor > 0 and flows is not None and flows.age(flow) < floor
 
-    def _oidc_callback_floor_exemption(self, amr: Sequence[str]) -> tuple[str, ...]:
-        """The ``[auth].oidc_callback_floor_exempt_amr`` values a signature-verified ``amr`` carries,
-        sorted (BACKLOG #2388). Empty means the callback floor applies.
+    @staticmethod
+    def _oidc_callback_floor_exemption(
+        exempt_values: frozenset[str], amr: Sequence[str]
+    ) -> tuple[str, ...]:
+        """The ``exempt_values`` (:meth:`_oidc_callback_floor_exempt_values`) a signature-verified
+        ``amr`` carries, sorted (BACKLOG #2388). Empty means the callback floor applies. The caller
+        passes the set in, so a step-up callback builds it once (BACKLOG #3221).
 
         It returns configured values only, never the token's own, so the result is a closed set
         an audit row may carry. A blank or non-string value matches nothing, whoever built the
         settings, by the same rule the MFA gate applies."""
-        return tuple(sorted(self._oidc_callback_floor_exempt_values() & set(amr)))
+        return tuple(sorted(exempt_values & set(amr)))
 
     def _oidc_callback_floor_exempt_values(self) -> frozenset[str]:
         """``[auth].oidc_callback_floor_exempt_amr`` as the values that can match (BACKLOG #2388)."""
@@ -5009,7 +5021,10 @@ class AuthService:
         # amr, which only the exchange yields, so an opted-in site pays for the exchange and the
         # refusal waits for it below. With the list empty (the default) nothing changes here.
         arrived_too_early = self._oidc_callback_too_early(flow)
-        if arrived_too_early and not self._oidc_callback_floor_exempt_values():
+        exempt_values = (
+            self._oidc_callback_floor_exempt_values() if arrived_too_early else frozenset()
+        )
+        if arrived_too_early and not exempt_values:
             return await self._step_up_refused(
                 TOO_EARLY, actor=actor, client=client, return_to=return_to
             )
@@ -5051,8 +5066,11 @@ class AuthService:
                 return_to=return_to,
                 extra=_idp_error_fields(exc),
             )
+        self.clear_oidc_unavailable()  # a verified token: the IdP answered (BACKLOG #3221)
         floor_exempt_amr = (
-            self._oidc_callback_floor_exemption(principal_claims.amr) if arrived_too_early else ()
+            self._oidc_callback_floor_exemption(exempt_values, principal_claims.amr)
+            if arrived_too_early
+            else ()
         )
         # BACKLOG #3220: every refusal past the floor carries the marker when the exemption applied,
         # so a failed exempted step-up is as visible to the loosening's review as a served one.
@@ -5250,7 +5268,6 @@ class AuthService:
         if purpose is not None and not grant_refused and elevation.token is not None:
             # (3) The purpose-bound grant, against the NEW hash.
             self._grant_action_step_up(hash_token(elevation.token), purpose)
-        self.clear_oidc_unavailable()
         # BACKLOG #2160: the start leg staged its caller's address, and the session is re-anchored
         # to the callback's above. Record whether the address moved mid-ceremony, compared as the
         # new-address signal compares. Recorded only: refusing a move, or anchoring to the start

@@ -179,6 +179,10 @@ async def test_only_a_transport_failure_marks_the_idp_on_step_up(
         status = getattr(exc, "status", getattr(exc, "code", None))
         if isinstance(status, int):
             assert row["status"] == status
+        if reason == "token_refused":
+            # BACKLOG #3221: the generic line, as `too_early` reads, so the text cannot show
+            # whether the callback floor fired.
+            assert out.error == "The identity provider could not confirm it's you."
     finally:
         await store.close()
 
