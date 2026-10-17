@@ -94,6 +94,14 @@ processed_files(
   opportunistically at the end of a poll tick only when ≥1 new file was recorded, so a stable
   read-only share (nothing new) never churns the DB.
 
+> **CORRECTION 2026-10-16 (BACKLOG #3151). The remote key above is out of date: since BACKLOG #2758
+> it also folds in the modification time the server lists, where it lists one.** The first bullet's
+> reason, that a remote listing "carries no mtime", was wrong for at least SFTP and FTP `MLSD`. A
+> listing with no mtime still keys on path + size. The `file_key` comment in the sketch above,
+> `sha256(rel-path || mtime || size)`, describes the local key only. `RemoteFileSource._file_key` in
+> `messagefoundry/transports/remotefile.py` is the source of record for the remote key, including
+> which listings carry no mtime and what each key misses.
+
 ### §3 Store-agnostic transport — a runner-injected ledger seam
 
 `transports/` must never import `store/`. The source therefore reaches the ledger through an injected

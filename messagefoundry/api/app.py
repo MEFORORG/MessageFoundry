@@ -221,6 +221,7 @@ from messagefoundry.api.outlive import DRAIN_TIMEOUT_SECONDS as OUTLIVING_DRAIN_
 from messagefoundry.api.paging import page_total
 from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
+    AUTH_NOT_CONFIGURED,
     AuthenticatedBeforeBodyRoute,
     ExportStopped,
     alert_sink_for,
@@ -292,6 +293,7 @@ from messagefoundry.auth.service import (
 )
 from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
+    AnchorStoreUnavailable,
     TrustAnchorError,
     make_lane_anchor_check,
     make_registry_anchor_preflight,
@@ -1440,6 +1442,9 @@ def _build_approval_gate(
                 "outbound": len(registry.outbound),
                 "degraded": outcome.applied and bool(failures),
                 "failures": failures,
+                # The settings anchors a restart must apply, as the inline route reports them
+                # (BACKLOG #3015).
+                "restart_required": _restart_required(outcome),
             }
 
         # A cancelled approve records 'interrupted' in the gate (#1562), and this reload goes on to
@@ -1739,6 +1744,13 @@ async def _reload_or_record_interruption(
         raise
 
 
+def _restart_required(outcome: ReloadOutcome) -> list[str] | None:
+    """:attr:`ReloadOutcome.restart_required` as :attr:`ReloadResult.restart_required` reports it:
+    a list, or ``None`` when the reload did not check (BACKLOG #3015)."""
+    names = outcome.restart_required
+    return None if names is None else list(names)
+
+
 async def _reload_and_record(
     engine: Engine,
     config_dir: str | None,
@@ -1936,7 +1948,9 @@ async def _audit_refused_reload(
     with reason ``not_found`` and answers 404. A bad graph writes ``config_reload_failed`` and
     answers 422; its reason is ``trust_anchor`` when a trust anchor refused it inside the engine,
     an inbound connection's CA (BACKLOG #1142) or a settings anchor (BACKLOG #2034), so one audit
-    filter sees both, and ``invalid_config`` otherwise. A released reload whose config is not the
+    filter sees both, and ``invalid_config`` otherwise. A trust-anchor check the store stopped, by
+    refusing its audit read or write, writes reason ``store_unavailable`` and answers 503 (BACKLOG
+    #3091); it is neither a refused anchor nor a bad graph. A released reload whose config is not the
     one its approval named writes ``config_reload_failed`` with reason ``digest_mismatch``, or
     ``no_approved_digest`` when the hold took none, with both digests, and answers 422 (vault
     BACKLOG #2596); only the executor meets it. One whose digest could not be taken now writes
@@ -2009,6 +2023,16 @@ async def _audit_refused_reload(
             else "the engine could not read the config to check it against this request's "
             "approval; see the engine log"
         )
+    elif isinstance(exc.__cause__, AnchorStoreUnavailable):
+        # BACKLOG #3091: the store refused a trust-anchor check's audit read or write. Nothing is
+        # known to be wrong with the anchor or the config, so neither of the reasons below fits.
+        _log.warning(
+            "config reload failed (store unavailable): %s",
+            scrub_log_argument(safe_exc(exc, limit=_REFUSAL_LOG_LIMIT)),
+        )
+        action, detail["reason"] = "config_reload_failed", "store_unavailable"
+        status = 503
+        answer = "the engine could not reach its store to check a trust anchor; see the engine log"
     else:
         anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
         _log.warning(
@@ -5845,6 +5869,7 @@ def create_app(
             dry_run=req.dry_run,
             degraded=outcome.applied and bool(failures),
             failures=failures,
+            restart_required=_restart_required(outcome),
         )
 
     # --- messages ------------------------------------------------------------
@@ -10106,8 +10131,9 @@ def create_managed_app(
     ``synchronous``) as a SQLite shortcut. ``config_dir`` loads the code-first Connection/Router/
     Handler graph. ``auth_settings`` attaches an :class:`AuthService` and seeds the built-in roles;
     it creates no account (ADR 0183). With no ``auth_settings`` every protected route is refused
-    (503) unless the caller passes ``allow_no_auth=True``, the same opt-in :func:`create_app` takes;
-    beside ``auth_settings`` that opt-in raises ``ValueError``.
+    (503) unless the caller passes ``allow_no_auth=True``, the same opt-in :func:`create_app` takes,
+    and a build with neither logs one WARNING. Beside ``auth_settings`` that opt-in raises
+    ``ValueError``.
     The store is opened via the
     backend-agnostic :func:`~messagefoundry.store.open_store`. ``api_listener`` is the engine's own
     ``(host, port)`` (from ``[api]``), reserved so no inbound listener can be wired onto the API's port
@@ -10911,7 +10937,7 @@ def create_managed_app(
 
     # Settings never select the open mode: only the caller's opt-in, checked at the top, does
     # (vault BACKLOG #2611, #2825).
-    return create_app(
+    app = create_app(
         lifespan=lifespan,
         # Build the opt-in uploaded-logs store in the SERVE path too (previously only the direct/test
         # path passed store_settings, so `serve` never wired it): the ASVS 5.2.4 retention runner above
@@ -10938,3 +10964,15 @@ def create_managed_app(
         phi_read_hop_secure=phi_read_hop_secure,
         configured_log_level=configured_log_level,
     )
+    if auth_settings is None and not allow_no_auth:
+        # Vault BACKLOG #2731 item 1: no settings means no service attaches, so this app fails closed.
+        # Said here, once create_app has accepted the build, and not in create_app, which every
+        # managed app calls with auth=None before the lifespan attaches a service.
+        _log.warning(
+            "create_managed_app: built with no auth_settings and without allow_no_auth, so no "
+            "service attaches and the permission-gated routes are refused (%s). auth_settings "
+            "attaches sign-in; allow_no_auth=True instead answers those routes to any caller as the "
+            "full-access system identity",
+            AUTH_NOT_CONFIGURED,
+        )
+    return app
