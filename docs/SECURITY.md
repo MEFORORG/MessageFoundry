@@ -4116,7 +4116,7 @@ such as a scope, role, undetermined or unkeyed one, is quiet, with no alert and 
 when two reconcilers on one store make one of those in turn, the second only audits. If both read
 the old roles, both still report. If the first reconciler's pass ended before it alerted, the
 second's quiet revocation means that account pages nobody. A quiet revocation whose own row is
-refused reports instead. `AuthService._apply_reconcile_revocation` states the rule.
+refused alerts instead, with no notice. `AuthService._apply_reconcile_revocation` states the rule.
 
 A pass that fails part-way keeps the audit rows for what it already revoked, but raises no alert for
 them. A refused audit write does not end the pass (BACKLOG #3018). That holds for the store errors

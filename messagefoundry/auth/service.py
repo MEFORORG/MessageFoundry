@@ -7526,8 +7526,10 @@ class AuthService:
         session, changed no role, and has a reason outside :data:`_ALWAYS_REPORTED_REASONS`
         (BACKLOG #3085, owner rulings 2026-10-16 and 2026-10-17). It still writes its
         ``auth.ad_session_revoked`` row, with ``sessions: 0`` ("audit always"), and sends no
-        notice; the caller raises no alert for it. If that row is refused, the revocation reports
-        instead, so it is never left with neither a row nor an alert.
+        notice; the caller raises no alert for it. If that row is refused, the revocation still
+        sends no notice, since nothing happened to the account, but reports, so the refusal does
+        not also cost the alert. A pass that later raises still loses that alert, as
+        :meth:`_audit_reconciler_row` says.
 
         So a disabled or absent account's revocation always reports, even one that ended nothing,
         as when the user signed out mid-pass or another reconciler revoked the account first. No
@@ -7615,8 +7617,9 @@ class AuthService:
             scrub_log_argument(revocation.username),
             revocation.reason,
         )
-        if quiet and written:
-            return "quiet"  # audited above, no notice and no alert: see the docstring
+        if quiet:
+            # No notice either way; a refused row alerts instead (see the docstring).
+            return "quiet" if written else "reported"
         # A directory-pushed disable or demotion is the same event to the user as a local one, so it
         # gets the same out-of-band notice the login-path re-sync sends (best-effort).
         #

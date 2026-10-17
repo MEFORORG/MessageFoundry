@@ -3985,8 +3985,8 @@ async def test_a_foreign_revocation_row_does_not_silence_the_alert(
 ) -> None:
     """Vault BACKLOG #3750 item 33. A matching ``auth.ad_session_revoked`` row this pass did not
     write, before the pass or while it lists the account's sessions, does not silence the
-    revocation's alert or its notice. The ``during_listing`` placement went quiet at 4d550bd15,
-    whose evidence read counted such a row as another pass's revocation."""
+    revocation's alert or its notice. The ``during_listing`` placement went quiet under PR 2366's
+    earlier evidence read, which counted such a row as another pass's revocation."""
     plan, rows, notices, alerts = await _absent_pass_with_sessions_gone_first(
         monkeypatch, other_reconciler_row=False, planted=planted
     )
@@ -4061,8 +4061,9 @@ async def test_a_quiet_revocation_whose_row_is_refused_reports_instead(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A quiet revocation is audited instead of alerted, so it must not lose both. When the store
-    refuses its ``auth.ad_session_revoked`` row, it reports, and the user is told. The control: the
-    same revocation with its row written is quiet."""
+    refuses its ``auth.ad_session_revoked`` row, it reports, and still sends no notice, since
+    nothing happened to the account. The control: the same revocation with its row written is
+    quiet."""
     store, _, service, _ = await _scoped_service(_GRP_A)
     try:
         notifier = _CapturingNotifier()
@@ -4081,7 +4082,8 @@ async def test_a_quiet_revocation_whose_row_is_refused_reports_instead(
 
         monkeypatch.setattr(store, "record_audit", refusing)
         assert await service._apply_reconcile_revocation(revocation) == "reported"
-        assert len(notifier.sent) == 1
+        assert notifier.sent == []
+        assert len(_revoked_rows(await store.list_audit())) == 1  # the control's row only
     finally:
         await store.close()
 
