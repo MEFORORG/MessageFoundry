@@ -5111,6 +5111,8 @@ class AuthService:
         # BACKLOG #3220: every refusal past the floor carries the marker when the exemption applied,
         # so a failed exempted step-up is as visible to the loosening's review as a served one.
         floor_marker = _floor_exempt_marker(floor_exempt_amr)
+        # Bound once, as the address fields are above, so a new arm cannot leave the marker out.
+        refuse = partial(refuse, extra=floor_marker)
         if arrived_too_early and not floor_exempt_amr:
             # The opted-in site's too-early callback whose amr names no exempt value (BACKLOG #2388).
             return await refuse(TOO_EARLY)
@@ -5125,10 +5127,10 @@ class AuthService:
             # stepped up, so the operator is not told "verified" and then signed out.
             or not session.is_live(now=now, idle_seconds=self.session_idle_seconds)
         ):
-            return await refuse("session_gone", lost=True, extra=floor_marker)
+            return await refuse("session_gone", lost=True)
         user = await self._load_user(session.user_id)
         if user is None or user.disabled or user.auth_provider != AuthProvider.AD.value:
-            return await refuse("session_gone", lost=True, extra=floor_marker)
+            return await refuse("session_gone", lost=True)
         if (user.oidc_issuer, user.oidc_subject) != (
             principal_claims.issuer,
             principal_claims.subject,
@@ -5141,14 +5143,14 @@ class AuthService:
             # BEFORE both freshness tests (BACKLOG #2143), so another person's answer that passed
             # the claims ladder is filed as a subject mismatch whatever its auth_time. Both tests
             # below judge this session's identity, so neither is the right name for someone else.
-            return await refuse(STEP_UP_SUBJECT_MISMATCH, extra=floor_marker)
+            return await refuse(STEP_UP_SUBJECT_MISMATCH)
         # FRESHNESS, two tests, and both must pass. max_age=0 and prompt=login ask the IdP to
         # authenticate the user afresh, so a conforming IdP's auth_time postdates this request.
         # (a) Against our clock: auth_time is IdP clock and issued_at is ours, so the floor allows
         # the configured skew for an IdP clock that runs behind.
         skew = self._settings.oidc_clock_skew_seconds
         if flow.issued_at <= 0 or principal_claims.auth_time < flow.issued_at - skew:
-            return await refuse(STEP_UP_NOT_FRESH, extra=floor_marker)
+            return await refuse(STEP_UP_NOT_FRESH)
         # (b) Against the IdP's own clock (BACKLOG #2143): auth_time must be LATER than the one the
         # session holds, which is the sign-in's or the last step-up's. No skew applies, because
         # both values come from the IdP. This closes most of what (a) alone left: an IdP that
@@ -5162,20 +5164,20 @@ class AuthService:
         # row and the operator's text say which one refused.
         held_auth_time = session.idp_auth_time
         if held_auth_time is None:
-            return await refuse(STEP_UP_IDP_AUTH_TIME_MISSING, extra=floor_marker)
+            return await refuse(STEP_UP_IDP_AUTH_TIME_MISSING)
         if principal_claims.auth_time <= held_auth_time:
-            return await refuse(STEP_UP_IDP_AUTH_TIME_NOT_LATER, extra=floor_marker)
+            return await refuse(STEP_UP_IDP_AUTH_TIME_NOT_LATER)
         # The DIRECTORY still has the account. The password re-bind this leg replaces failed for a
         # disabled or deleted AD object, and the sign-in leg refuses one as not_in_directory. An IdP
         # can still sign such a user in (sync lag, or its own credential store), so the engine asks
         # the directory itself, by the row's immutable id as the sign-in leg does (BACKLOG #1532).
         if self._ldap is None:
-            return await refuse("not_configured", extra=floor_marker)
+            return await refuse("not_configured")
         object_id = _directory_key(user)
         if object_id is None:
             # Never a name-only lookup: a directory may reissue a freed name to someone else. The
             # sign-in leg refuses such a row for the same reason (BACKLOG #2027).
-            return await refuse(DIRECTORY_OBJECT_ID_MISSING, extra=floor_marker)
+            return await refuse(DIRECTORY_OBJECT_ID_MISSING)
         try:
             principal = await asyncio.to_thread(
                 self._ldap.resolve_principal, user.username, object_id=object_id
@@ -5184,14 +5186,14 @@ class AuthService:
             _log.warning(
                 "directory lookup failed during a federated step-up: %s", type(exc).__name__
             )
-            return await refuse("directory_unavailable", extra=floor_marker)
+            return await refuse("directory_unavailable")
         if principal is None:
-            return await refuse("not_in_directory", extra=floor_marker)
+            return await refuse("not_in_directory")
         # BACKLOG #3174: the answer must name the row's own directory object before its groups are
         # trusted, by the test the sign-in leg and the AD step-up re-bind apply.
         mismatch = _directory_answer_mismatch(principal, object_id)
         if mismatch is not None:
-            return await refuse(mismatch, extra=floor_marker)
+            return await refuse(mismatch)
         # BACKLOG #2154: the account's stored roles must all be among the roles its current groups
         # map to, the same test _directory_step_up_refusal applies on the TOTP and passkey legs
         # (#2240). Inline rather than through that helper, because its probe would change this
@@ -5200,9 +5202,9 @@ class AuthService:
         # as before, through the loader (BACKLOG #2592).
         fresh = await self._load_user(user.id)
         if fresh is None:
-            return await refuse("session_gone", lost=True, extra=floor_marker)
+            return await refuse("session_gone", lost=True)
         if not set(fresh.role_ids) <= await self._ad_roles_for_groups(principal.groups):
-            return await refuse(DIRECTORY_ROLES_DEMOTED, extra=floor_marker)
+            return await refuse(DIRECTORY_ROLES_DEMOTED)
         purpose = flow.step_up_purpose
         # The password leg's three ORDER-CRITICAL steps (see :meth:`reauth`), against the hash.
         # (1) Every stamp against the OLD hash, re-anchoring the session to this client address.
