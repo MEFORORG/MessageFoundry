@@ -2729,9 +2729,19 @@ roles, and refuses when a stored role is not among them. It refuses only; the se
 was, with no window and no grant, and no roles are written. The `auth.reauth` row carries
 `reason=directory_roles_demoted`, and the refusal tells the operator to sign in again, which
 takes the roles the current groups grant.
-Channel scope is not compared on this leg either. At least the
-password re-bind (`POST /me/reauth` and the `/ui/reauth` password leg) and the enrolment legs do
-not compare roles yet.
+Channel scope is not compared on this leg either.
+
+**The password re-bind makes the same role test (BACKLOG #3081).** A good re-bind (`POST
+/me/reauth` and the `/ui/reauth` password leg) returns the account's current groups with the bind,
+so the test costs no extra directory read. The engine maps them to roles and refuses when a stored
+role is not among them, reading the stored roles after the bind returns, so a sign-in that re-synced
+them meanwhile is judged on what it wrote. The password was right, so the refusal is charged to
+neither the lockout nor the session's re-proof budget, and clears neither. No window is renewed, no
+action-bound grant is minted, and no roles are written. The `auth.reauth` row carries
+`reason=directory_roles_demoted`, and the caller gets the answer for a directory that could not
+confirm the account. Channel scope is not compared on this leg either. The enrolment legs make the
+test too, through the code leg's directory check (BACKLOG #3061). The code, passkey, IdP and
+re-bind legs call one shared comparison rather than each writing it out.
 
 **The password re-bind gives the code and passkey legs' answer when the directory could not judge
 the password (BACKLOG #2027).** That covers at least a row with no directory object id, no enabled entry for the row's

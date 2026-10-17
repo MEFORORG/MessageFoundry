@@ -3859,3 +3859,30 @@ def test_retention_gate_reader_detects_a_planted_violation() -> None:
         assert planted != section, f"doc plant {name!r} matched nothing; re-point it at the doc"
         found = _retention_doc_findings(planted, days, auto_bounded)
         assert any(expected in f for f in found), f"doc plant {name!r} was not detected: {found}"
+
+
+def test_the_password_re_bind_role_test_is_documented_and_built() -> None:
+    """BACKLOG #3081 item 8: the paragraph saying the password re-bind refuses a demoted directory
+    account is pinned to the code that does it. RED when the doc drops the paragraph or brings back
+    the old line saying the re-bind does not compare roles, or when ``_reproof_serialized`` stops
+    calling the shared comparison or refusing with ``DIRECTORY_ROLES_DEMOTED``."""
+    src = (_ROOT / "messagefoundry" / "auth" / "service.py").read_text(encoding="utf-8")
+    for name in ("_directory_roles_lost", "DIRECTORY_ROLES_DEMOTED"):
+        assert _function_references(src, "_reproof_serialized", name), (
+            f"_reproof_serialized no longer uses {name}; if the re-bind leg stopped refusing a "
+            "demoted account, docs/SECURITY.md's re-bind paragraph must change with it."
+        )
+    doc = _doc_text()
+    assert "do not compare roles yet" not in " ".join(doc.split()), (
+        "docs/SECURITY.md still says the password re-bind does not compare roles."
+    )
+    marker = "**The password re-bind makes the same role test (BACKLOG #3081).**"
+    assert marker in doc, "docs/SECURITY.md lost the re-bind role-test paragraph"
+    paragraph = " ".join(doc.split(marker, 1)[1].split("\n\n", 1)[0].split())
+    for fact in (
+        "reason=directory_roles_demoted",
+        "reading the stored roles after the bind returns",
+        "no action-bound grant is minted",
+        "charged to neither the lockout nor the session's re-proof budget",
+    ):
+        assert fact in paragraph, f"the re-bind paragraph no longer says: {fact}"
