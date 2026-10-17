@@ -69,6 +69,24 @@ def intake_pause_detail(*, reason: str, value: int, limit: int, store_kind: str)
     return f"intake paused: the staged backlog went over {limit} messages ({store_kind} store)"
 
 
+#: The longest node id :func:`config_changed_detail` quotes whole. A node id is ``host:pid:tag``,
+#: and a host name may run to 253 characters (vault BACKLOG #2944).
+_DETAIL_NODE_MAX = 56
+#: How much of a shortened node id's end :func:`_short_node` keeps: room for the ``:pid:tag``.
+_DETAIL_NODE_TAIL = 24
+
+
+def _short_node(node: str) -> str:
+    """``node`` whole when it fits :data:`_DETAIL_NODE_MAX`, else its head and its ``pid:tag`` tail
+    around ``...``, so both the host and the process it names stay readable. Not
+    ``intake_bound.process_alert_subject``'s shortening: that one must give a stable alert key, so
+    it ends in a checksum; this one is prose for a reader."""
+    if len(node) <= _DETAIL_NODE_MAX:
+        return node
+    head = _DETAIL_NODE_MAX - _DETAIL_NODE_TAIL - len("...")
+    return f"{node[:head]}...{node[-_DETAIL_NODE_TAIL:]}"
+
+
 def config_changed_detail(
     *,
     fingerprint: str,
@@ -81,11 +99,18 @@ def config_changed_detail(
 
     It must hold for a config that changed on purpose and for one node that diverged from the rest,
     so it states the two digests and where the older one came from and judges neither. Digests are
-    cut to 12 hex characters here; the event carries them whole. No path and no git commit."""
+    cut to 12 hex characters here; the event carries them whole. No path and no git commit.
+
+    The alert instance's reason column keeps only about the first 200 characters, and its cut drops
+    a token that straddles the limit whole. So the baseline's time and node lead, and a node id
+    longer than :data:`_DETAIL_NODE_MAX` is shortened here, which keeps the whole line inside the
+    cut for a baseline action name of up to 36 characters; the event carries the node whole (vault
+    BACKLOG #2944). The store's redaction replaces the ISO time in that column as date-shaped text,
+    so there it reads ``[redacted]``; the event's ``baseline_at`` carries it whole."""
+    node = _short_node(baseline_node) if baseline_node else "unknown"
     return (
-        f"this process started with config {fingerprint[:12]}; the store's baseline is config "
-        f"{previous_fingerprint[:12]} (node {baseline_node or 'unknown'}, action "
-        f"{baseline_action}, time {baseline_at or 'unknown'})"
+        f"baseline {baseline_at or 'unknown'} on node {node} ({baseline_action}): started on "
+        f"config {fingerprint[:12]}, baseline config {previous_fingerprint[:12]}"
     )
 
 
