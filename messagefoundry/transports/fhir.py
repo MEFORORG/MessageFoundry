@@ -404,52 +404,21 @@ class _ThirdReading(ValueError):
     """A key occurs with a value equal to neither its first nor its last. Carries no key or value."""
 
 
-class _BothReadings(dict[str, Any]):
-    """A keep-first JSON object that also carries its keep-last reading (``last``), so that two
-    occurrences compare equal only when both readings are equal, at every depth below them."""
-
-    __slots__ = ("last",)
-
-    def __init__(self, first: dict[str, Any], last: dict[str, Any]) -> None:
-        super().__init__(first)
-        self.last = last
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, dict):
-            return NotImplemented
-        other_last = other.last if isinstance(other, _BothReadings) else other
-        return dict.__eq__(self, other) is True and dict.__eq__(self.last, other_last) is True
-
-    def __ne__(self, other: object) -> bool:
-        equal = self.__eq__(other)
-        return equal if equal is NotImplemented else not equal
-
-
-def _same(a: Any, b: Any) -> bool:
-    """JSON-value equality: the same object (so a NaN equals itself), or equal and of one type
-    (so ``1`` and ``true`` differ)."""
-    return a is b or (type(a) is type(b) and a == b)
-
-
 def _keep_first_key(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     """An ``object_pairs_hook`` that keeps the FIRST of two equal keys, where ``json`` keeps the
-    last: the reading a server that keeps the first would make. The object it returns carries its
-    keep-last reading too (:class:`_BothReadings`). Raises :class:`_ThirdReading` when a key occurs
-    three or more times and some occurrence equals neither its first nor its last value under both
-    readings, since comparing the first and last readings would never see it."""
+    last: the reading a server that keeps the first would make. Raises :class:`_ThirdReading` when
+    a key occurs three or more times and some occurrence equals neither its first nor its last
+    value, since comparing the first and last readings would never see it."""
     first: dict[str, Any] = {}
     last: dict[str, Any] = {}
-    count: dict[str, int] = {}
     for key, value in pairs:
         first.setdefault(key, value)
         last[key] = value
-        count[key] = count.get(key, 0) + 1
     if len(first) != len(pairs) and any(
-        count[key] >= 3 and not (_same(value, first[key]) or _same(value, last[key]))
-        for key, value in pairs
+        value != first[key] and value != last[key] for key, value in pairs
     ):
         raise _ThirdReading
-    return _BothReadings(first, last)
+    return first
 
 
 def _entry_response(obj: dict[str, Any]) -> dict[str, Any] | None:
@@ -509,10 +478,9 @@ def _agreed_reading(body: str) -> dict[str, Any] | None:
     """A reply :class:`FhirPeek` refused, read once keeping the first and once keeping the last
     value of each repeated key (vault BACKLOG #2812). Returns the reading when both are JSON objects
     and :func:`_reply_reading` gives them equal tuples, or ``None`` when the plain read is not a
-    JSON object, which is judged ``unparseable`` as before. Otherwise raises the permanent
-    ``reply-repeats-a-key`` refusal, which names neither a key nor a value: also for a body only
-    the plain read can parse, and for a key whose third or later occurrence differs from both its
-    first and last value (:func:`_keep_first_key` refuses that in the same pass). ADR 0095 Amendment B.1 (the 2026-10-17 entry) states the rule and its
+    JSON object, which is judged ``unparseable`` as before. Otherwise, including a body only the
+    plain read can parse, raises the permanent ``reply-repeats-a-key`` refusal, which names neither
+    a key nor a value. ADR 0095 Amendment B.1 (the 2026-10-17 entry) states the rule and its
     costs."""
     text = body.lstrip(_BOM)
     # The plain read first: a body that is not a JSON object stops here, after one more parse.
@@ -781,8 +749,8 @@ def _unwrap_transaction_reply(
     ``status`` text or ``outcome``.
 
     A reply that repeats a JSON key is read twice, keeping the first and keeping the last value of
-    each key (vault BACKLOG #2812), and judged as any other only when the readings agree and no
-    occurrence differs from both; see :func:`_agreed_reading`.
+    each key (vault BACKLOG #2812), and judged as any other only when the readings agree; see
+    :func:`_agreed_reading`.
 
     The entry's ``etag``/``location``/``lastModified`` describe the updated resource, so a field the
     entry carries suppresses the reply header of the same name, which describes the Bundle, even

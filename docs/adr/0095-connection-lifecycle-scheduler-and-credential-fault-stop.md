@@ -435,12 +435,10 @@ a key occurs three or more times in one object, at any depth, and some occurrenc
 its first nor its last value, because the two readings alone would never see it (so
 `200 OK`, `404 Not Found`, `200 OK` dead-letters, as does such a repeat inside `meta`).
 
-With two occurrences of a key it fails closed only on disagreement, because a reply that reads one
-way under both rules carries no ambiguity to resolve, and refusing it would dead-letter an update
-that applied, which a replay of an `if-match` update turns into a 412. With three or more, the
-occurrence rule compares values rather than judgments, so it also refuses some replies every
-reading would deliver or retry; that cost is listed below and was accepted as the fail-closed
-direction. On `main` before this, `404 Not Found` then `200 OK` was delivered on the last key.
+It fails closed only on disagreement because a reply that reads one way under both rules carries
+no ambiguity to resolve, and refusing it would dead-letter an update that applied, which a replay
+of an `if-match` update turns into a 412. On `main` before this, `404 Not Found` then `200 OK` was
+delivered on the last key.
 
 **Provenance: decided 2026-10-17 under the owner's standing driver rule, by the Lander's send-back
 of engine PR 2356, and narrowed by the batch 265 Manager to compare judgments rather than status
@@ -448,11 +446,7 @@ text. The owner has not ruled on it and may overturn it.**
 
 Costs, at least these. A reply nested in the narrow band between the hook's depth limit and plain
 `json`'s is refused with this code although it may repeat no key, and its text then says it does.
-An ETag that differs with capture off refuses, though nothing reads it in that mode. A key that
-occurs three or more times with a third value refuses wherever it is, even in `meta`, and even
-when every reading reaches one judgment: `200 OK`, `201 Created`, `200 OK` is a permanent refusal
-of an update that applied, and `503`, `500`, `503` is a permanent refusal where two occurrences
-would be retried.
+An ETag that differs with capture off refuses, though nothing reads it in that mode.
 
 It is raised in `transports/fhir.py` (`_agreed_reading`, comparing `_reply_reading`), not by
 `read_2xx_reply_text`. Tests: `tests/test_fhir_transport.py`, the section headed vault BACKLOG
