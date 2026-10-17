@@ -418,28 +418,51 @@ def _entry_response(obj: dict[str, Any]) -> dict[str, Any] | None:
     return response if isinstance(response, dict) else None
 
 
-def _reply_reading(obj: dict[str, Any]) -> tuple[object, ...]:
-    """Everything :func:`_unwrap_transaction_reply` reads from a parsed reply: whether it has an
-    entry response (which the resource type and entry shape decide), then that response's
-    ``status``, its outcome's issue severities and codes, ``etag``, ``location`` and
-    ``lastModified``; for a reply with no entry response, its resource type and the capture
-    outcome of the whole body. Two readings that give equal tuples are judged identically."""
+def _entry_status(response: dict[str, Any]) -> int | None:
+    """The entry ``response.status`` as an HTTP code, or None when it does not read as one."""
+    status = response.get("status")
+    m = _ENTRY_STATUS_RE.match(str(status)) if isinstance(status, (str, int, float)) else None
+    return None if m is None else int(m.group(1))
+
+
+def _entry_verdict(obj: dict[str, Any]) -> DeliveryError | str:
+    """What :func:`_unwrap_transaction_reply` decides from a parsed reply: the classified failure
+    it raises, or the capture outcome of a delivery. An entry status that does not read as an HTTP
+    code is a delivery (the caller logs it)."""
     response = _entry_response(obj)
     if response is None:
-        return (obj.get("resourceType"), "no entry response", _capture_outcome_of(obj))
+        return _capture_outcome_of(obj)
     outcome = _as_operation_outcome(response.get("outcome"))
-    # Of an outcome, the severities set the capture outcome and the codes the retry decision.
-    issues = (
-        None
-        if outcome is None
-        else (_issue_field(outcome, "severity"), _issue_field(outcome, "code"))
+    status = _entry_status(response)
+    if status is not None:
+        failure = _classify_status(status, outcome, where="transaction entry status")
+        if failure is not None:
+            return failure
+    return _capture_outcome_of(outcome) if outcome is not None else "accepted"
+
+
+def _reply_reading(obj: dict[str, Any]) -> tuple[object, ...]:
+    """The judgment :func:`_unwrap_transaction_reply` reaches on a parsed reply, plus the values a
+    delivery takes from it: the resource type, whether there is an entry response, and the entry's
+    ``etag``, ``location`` and ``lastModified``. The judgment is a delivery with its capture
+    outcome, a retry, or a permanent refusal with its code, so two readings that differ only in a
+    status's text, such as ``200 OK`` and ``201 Created``, or ``503`` and ``500``, agree. Two
+    readings that give equal tuples are judged identically."""
+    verdict = _entry_verdict(obj)
+    judged: tuple[object, ...] = (
+        (
+            type(verdict).__name__,
+            getattr(verdict, "code", None),
+            getattr(verdict, "permanent", None),
+        )
+        if isinstance(verdict, DeliveryError)
+        else ("delivered", verdict)
     )
-    return (
-        "entry response",
-        response.get("status"),
-        issues,
-        *(response.get(field) for field in _ENTRY_RESPONSE_HEADERS.values()),
+    response = _entry_response(obj)
+    consumed = (
+        () if response is None else tuple(response.get(f) for f in _ENTRY_RESPONSE_HEADERS.values())
     )
+    return (obj.get("resourceType"), response is not None, judged, consumed)
 
 
 def _agreed_reading(body: str) -> dict[str, Any] | None:
@@ -719,9 +742,10 @@ def _unwrap_transaction_reply(
     ``status`` text or ``outcome``.
 
     A reply that repeats a JSON key is read twice, keeping the first and keeping the last value of
-    each key (vault BACKLOG #2812). When the two readings agree on everything this function reads,
-    the reply is judged as any other. When they disagree, it is a permanent refusal, code
-    ``reply-repeats-a-key``, and is not recorded as delivered (see :func:`_agreed_reading`).
+    each key (vault BACKLOG #2812). When the two readings reach the same judgment (deliver, retry,
+    or dead-letter with one code) and agree on the values a delivery takes, the reply is judged as
+    any other. Otherwise it is a permanent refusal, code ``reply-repeats-a-key``, and is not
+    recorded as delivered (see :func:`_agreed_reading`; recorded in ADR 0095 Amendment B.1).
 
     The entry's ``etag``/``location``/``lastModified`` describe the updated resource, so a field the
     entry carries suppresses the reply header of the same name, which describes the Bundle, even
@@ -738,21 +762,17 @@ def _unwrap_transaction_reply(
         obj = _agreed_reading(body)
         if obj is None:
             return headers, "unparseable"
+    verdict = _entry_verdict(obj)
+    if isinstance(verdict, DeliveryError):
+        raise verdict
     response = _entry_response(obj)
     if response is None:
-        return headers, _capture_outcome_of(obj)
-    outcome = _as_operation_outcome(response.get("outcome"))
-    status = response.get("status")
-    m = _ENTRY_STATUS_RE.match(str(status)) if isinstance(status, (str, int, float)) else None
-    if m is None:
+        return headers, verdict
+    if _entry_status(response) is None:
         logger.warning(
             "FHIR transaction-response entry carries no readable status; taking the 2xx reply "
             "as delivered"
         )
-    else:
-        failure = _classify_status(int(m.group(1)), outcome, where="transaction entry status")
-        if failure is not None:
-            raise failure
     present = {
         name: response[field]
         for name, field in _ENTRY_RESPONSE_HEADERS.items()
@@ -768,7 +788,7 @@ def _unwrap_transaction_reply(
     taken = {name.lower() for name in present}
     kept = {name: value for name, value in headers.items() if name.lower() not in taken}
     captured = {**kept, **capture_response_headers(usable, allowlist)}
-    return captured, _capture_outcome_of(outcome) if outcome is not None else "accepted"
+    return captured, verdict
 
 
 class FhirDestination(DestinationConnector):

@@ -811,7 +811,7 @@ def _reply_with(response: str, *, meta: str = "{}") -> bytes:
         _reply_with('{"status":"200 OK","status":"404 Not Found"}'),
         # json alone reads 200 here and delivers, while a first-key reader sees the 404.
         _reply_with('{"status": "404 Not Found", "status": "200 OK"}'),
-        # A disagreement in a captured entry field alone is enough.
+        # A disagreement in a value the delivery takes is enough, whatever the capture mode.
         _reply_with(
             '{"status": "200 OK", "etag": "W/\\"1\\"", "etag": "W/\\"' + PHI_CANARY + '\\""}'
         ),
@@ -820,7 +820,7 @@ def _reply_with(response: str, *, meta: str = "{}") -> bytes:
             '{"status": "200 OK", "lastModified": "2026-01-01T00:00:00Z", '
             '"lastModified": "2026-01-02T00:00:00Z"}'
         ),
-        # The outcome's severity sets the capture outcome.
+        # The outcome's severity sets the capture outcome, which is part of the judgment.
         _reply_with(
             '{"status": "200 OK", "outcome": {"resourceType": "OperationOutcome", "issue": '
             '[{"severity": "error", "severity": "information"}]}}'
@@ -828,10 +828,10 @@ def _reply_with(response: str, *, meta: str = "{}") -> bytes:
         # A repeated resourceType changes the entry shape the reply is read through.
         b'{"resourceType": "OperationOutcome", "resourceType": "Bundle", '
         b'"entry": [{"response": {"status": "404 Not Found"}}]}',
-        # Pinned as the agreement rule reads: the status TEXT must agree, so two successes, or two
-        # transient failures, that differ are refused too.
-        _reply_with('{"status": "200 OK", "status": "201 Created"}'),
-        _reply_with('{"status": "503 Service Unavailable", "status": "500 Internal Server Error"}'),
+        # Two permanent rejects with different codes are two judgments.
+        _reply_with('{"status": "404 Not Found", "status": "400 Bad Request"}'),
+        # A transient failure against a permanent one.
+        _reply_with('{"status": "503 Service Unavailable", "status": "404 Not Found"}'),
     ],
     ids=[
         "measured-200-then-404",
@@ -841,16 +841,17 @@ def _reply_with(response: str, *, meta: str = "{}") -> bytes:
         "last-modified",
         "outcome-severity",
         "resource-type",
-        "two-successes",
-        "two-transients",
+        "two-reject-codes",
+        "transient-against-reject",
     ],
 )
 async def test_a_wrapped_update_reply_whose_readings_disagree_is_dead_lettered(
     reply: bytes, capture: bool
 ) -> None:
     # Vault BACKLOG #2812: the reply is read keeping the first and keeping the last value of each
-    # key. When the two differ in anything the unwrap reads, the update fails closed, like a reply
-    # over the byte bound (#2180), and is never recorded as delivered.
+    # key. When the two reach different judgments, or differ in a value the delivery takes, the
+    # update fails closed, like a reply over the byte bound (#2180), and is never recorded as
+    # delivered.
     dest = _dest(interaction="update", capture_response=capture)
     dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
     with pytest.raises(NegativeAckError) as ei:
@@ -869,10 +870,12 @@ async def test_a_wrapped_update_reply_whose_readings_disagree_is_dead_lettered(
         # A repeat nothing reads: both readings are a 200.
         _reply_with('{"status": "200 OK"}', meta='{"tag": 1, "tag": "' + PHI_CANARY + '"}'),
         _reply_with('{"status": "200 OK", "status": "200 OK"}'),
+        # Two successes whose text differs reach one judgment: delivered.
+        _reply_with('{"status": "200 OK", "status": "201 Created"}'),
         b'{"resourceType": "OperationOutcome", "issue": [{"severity": "information", '
         b'"severity": "information"}]}',
     ],
-    ids=["in-meta", "equal-values", "not-a-transaction-response"],
+    ids=["in-meta", "equal-values", "two-successes", "not-a-transaction-response"],
 )
 async def test_a_wrapped_update_reply_whose_readings_agree_is_delivered(
     reply: bytes, capture: bool
@@ -884,6 +887,22 @@ async def test_a_wrapped_update_reply_whose_readings_agree_is_delivered(
         assert isinstance(resp, DeliveryResponse) and resp.outcome == "accepted"
     else:
         assert resp is None
+
+
+@pytest.mark.parametrize("capture", [True, False], ids=["capture", "no-capture"])
+async def test_two_transient_readings_retry_as_the_shared_classification_says(
+    capture: bool,
+) -> None:
+    # 503 and 500 both classify as transient (_classify_status), so the readings agree and the
+    # update is retried, not refused.
+    reply = _reply_with(
+        '{"status": "503 Service Unavailable", "status": "500 Internal Server Error"}'
+    )
+    dest = _dest(interaction="update", capture_response=capture)
+    dest._opener = _FakeOpener(body=reply)  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        await dest.send(UPDATE_1965)
+    assert not isinstance(ei.value, NegativeAckError)
 
 
 async def test_a_reply_the_keep_first_read_cannot_take_is_dead_lettered(

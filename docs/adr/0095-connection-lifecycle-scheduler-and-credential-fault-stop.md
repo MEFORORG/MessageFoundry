@@ -405,6 +405,27 @@ the declared length counts as cut short, so where the body is needed that messag
 once rather than being sent again. A read that times out, or one that a connection reset cuts off,
 part-way through a 2xx body is still retried, and sends the request again.
 
+**A 2xx reply to a wrapped FHIR update that repeats a JSON key, and reads two ways, is refused
+(2026-10-17, vault BACKLOG #2812).** A FHIR `update` or `if-match` goes out as a one-entry
+`transaction`, and the engine reads the entry's status in the 2xx reply to judge it. `json` keeps
+the last of two equal keys and a server may mean the first, so a reply that repeats a key is read
+twice, keeping the first value of each key and keeping the last. When both readings reach the same
+judgment (delivered with one capture outcome, retried, or dead-lettered with one code) and agree on
+the values a delivery takes (the resource type, whether there is an entry response, and the entry's
+`etag`, `location` and `lastModified`), the reply is judged as any other. So `200 OK` against
+`201 Created` is delivered, and two statuses that both classify as transient are retried. When the
+readings differ in any of those, or the keep-first read cannot parse a body the plain read takes,
+the delivery is a permanent refusal, code `reply-repeats-a-key`, not sent again and not recorded as
+delivered, as a reply the engine needs and cannot read is above. It fails closed only on
+disagreement because a reply that reads one way under both rules carries no ambiguity to resolve,
+and refusing it would dead-letter an update that applied, which a replay of an `if-match` update
+turns into a 412. On `main` before this, `404 Not Found` then `200 OK` was delivered on the last
+key. **Provenance: decided 2026-10-17 under the owner's standing driver rule, by the Lander's
+send-back of engine PR 2356, and narrowed by the batch 265 Manager to compare judgments rather
+than status text. The owner has not ruled on it and may overturn it.** It is raised in
+`transports/fhir.py` (`_agreed_reading`), not by `read_2xx_reply_text`. Tests:
+`tests/test_fhir_transport.py`, the section headed vault BACKLOG #2812.
+
 **A 407 on a bypassed request dead-letters each message, and does not stop the lane.** A 407 on a request
 that went direct reaches each send's status classification, which makes it a permanent reject of
 that one message, so a queue meeting it drains to dead-letter one row at a time. An MD5 or SHA-256
