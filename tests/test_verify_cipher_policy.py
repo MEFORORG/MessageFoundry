@@ -7,6 +7,7 @@ and a failing policy reading, and the control-is-zero case, which must never rea
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -31,23 +32,19 @@ _SSL_CBC = "ECDHE-RSA-AES256-SHA384 TLSv1.2 Kx=ECDH Au=RSA Enc=AES(256) Mac=SHA3
 _HEALTHY_CNF = [("CipherString", "ECDHE+AESGCM+AES256:@SECLEVEL=2"), ("MinProtocol", "TLSv1.2")]
 
 
+def _give[T](value: T | Exception) -> T:
+    if isinstance(value, Exception):
+        raise value
+    return value
+
+
 def _windows(
     monkeypatch: pytest.MonkeyPatch,
     suites: list[str] | Exception,
     enabled: Mapping[str, int | None] | Exception,
 ) -> CheckResult:
-    def read_suites() -> list[str]:
-        if isinstance(suites, Exception):
-            raise suites
-        return suites
-
-    def read_enabled(version: str) -> int | None:
-        if isinstance(enabled, Exception):
-            raise enabled
-        return enabled[version]
-
-    monkeypatch.setattr(cipher_policy, "_windows_enabled_suites", read_suites)
-    monkeypatch.setattr(cipher_policy, "_schannel_client_enabled", read_enabled)
+    monkeypatch.setattr(cipher_policy, "_windows_enabled_suites", lambda: _give(suites))
+    monkeypatch.setattr(cipher_policy, "_schannel_client_enabled", lambda v: _give(enabled)[v])
     return cipher_policy.read_host_cipher_policy("win32")
 
 
@@ -56,22 +53,16 @@ def _linux(
     lines: list[str] | Exception,
     settings: list[tuple[str, str]] | Exception,
 ) -> CheckResult:
-    def read_lines() -> list[str]:
-        if isinstance(lines, Exception):
-            raise lines
-        return lines
-
-    def read_settings() -> tuple[Path, list[tuple[str, str]]]:
-        if isinstance(settings, Exception):
-            raise settings
-        return Path("/etc/ssl/openssl.cnf"), settings
-
-    monkeypatch.setattr(cipher_policy, "_openssl_suites", read_lines)
-    monkeypatch.setattr(cipher_policy, "_openssl_policy_lines", read_settings)
+    monkeypatch.setattr(cipher_policy, "_openssl_suites", lambda: _give(lines))
+    monkeypatch.setattr(
+        cipher_policy,
+        "_openssl_policy_lines",
+        lambda: (cipher_policy._OPENSSL_CNF, _give(settings)),
+    )
     return cipher_policy.read_host_cipher_policy("linux")
 
 
-_OFF = {"TLS 1.0": 0, "TLS 1.1": 0}
+_OFF = dict.fromkeys(cipher_policy._LEGACY_VERSIONS, 0)
 
 
 # ---- Windows ----------------------------------------------------------------------------------
@@ -208,25 +199,33 @@ def test_policy_lines_read_the_openssl_conf_file(
 # ---- the probe runner and the platform gates --------------------------------------------------
 
 
-def test_run_lines_reads_stdout_lines() -> None:
-    out = cipher_policy._run_lines([sys.executable, "-c", "print('A'); print(); print(' B ')"])
-    assert out == ["A", "B"]
+def test_stdout_lines_drops_blank_lines() -> None:
+    done = subprocess.CompletedProcess([], 0, stdout="A\n\n B \n", stderr="")
+    assert cipher_policy._stdout_lines("tool", done) == ["A", "B"]
 
 
-def test_run_lines_missing_command_is_unavailable() -> None:
-    with pytest.raises(ProbeUnavailable):
-        cipher_policy._run_lines(["mefor-no-such-command-3277"])
+def test_stdout_lines_nonzero_exit_fails_with_stderr() -> None:
+    done = subprocess.CompletedProcess([], 3, stdout="A\n", stderr="\nboom\n")
+    with pytest.raises(ProbeFailed, match="tool exited 3: boom"):
+        cipher_policy._stdout_lines("tool", done)
 
 
-def test_run_lines_nonzero_exit_fails_with_stderr() -> None:
-    script = "import sys; sys.stderr.write('boom\\n'); sys.exit(3)"
-    with pytest.raises(ProbeFailed, match="exited 3: boom"):
-        cipher_policy._run_lines([sys.executable, "-c", script])
+@pytest.mark.parametrize(
+    ("raised", "expect"),
+    [
+        (FileNotFoundError(2, "missing"), ProbeUnavailable),
+        (subprocess.TimeoutExpired(["tool"], 30), ProbeFailed),
+        (PermissionError(13, "denied"), ProbeFailed),
+    ],
+)
+def test_probe_errors_map_a_failed_start(raised: Exception, expect: type[Exception]) -> None:
+    with pytest.raises(expect, match="tool"), cipher_policy._probe_errors("tool"):
+        raise raised
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="reads the real SChannel registry keys")
 def test_schannel_registry_read_returns_a_value_or_none() -> None:
-    for version in ("TLS 1.0", "TLS 1.1"):
+    for version in cipher_policy._LEGACY_VERSIONS:
         value = cipher_policy._schannel_client_enabled(version)
         assert value is None or isinstance(value, int)
 
@@ -272,11 +271,18 @@ def test_host_section_carries_the_row(monkeypatch: pytest.MonkeyPatch, tmp_path:
 
 
 def test_only_verify_reads_the_policy() -> None:
-    """Report only: owner ruling R3 declined a startup check, so no engine path may import this."""
-    root = Path(cipher_policy.__file__).resolve().parents[1]
-    importers = {
+    """Report only: owner ruling R3 declined a startup check, so nothing outside ``verify/`` may
+    reach the probe, directly or through the host checks that run it."""
+    root = Path(cipher_policy.__file__).resolve().parents[2]
+    names = ("cipher_policy", "check_host_cipher_policy", "run_host_checks")
+    reachers = {
         p.relative_to(root).as_posix()
-        for p in root.rglob("*.py")
-        if "cipher_policy" in p.read_text(encoding="utf-8", errors="replace")
+        for package in ("messagefoundry", "messagefoundry_webconsole", "messagefoundry_toolkit")
+        for p in (root / package).rglob("*.py")
+        if any(name in p.read_text(encoding="utf-8", errors="replace") for name in names)
     }
-    assert importers == {"verify/checks.py", "verify/cipher_policy.py"}
+    assert reachers == {
+        "messagefoundry/verify/checks.py",
+        "messagefoundry/verify/cipher_policy.py",
+        "messagefoundry/verify/runner.py",
+    }

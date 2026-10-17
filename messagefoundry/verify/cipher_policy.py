@@ -25,11 +25,14 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from messagefoundry.childenv import hook_environment
+from messagefoundry.childenv import hook_environment, system_tool_environment
+from messagefoundry.redaction import codec_safe_str
+from messagefoundry.service_status import _system_exe
 from messagefoundry.verify.model import CheckResult, Status
 
 RID = "host.ciphers"
@@ -71,17 +74,46 @@ class _Reading:
 _PRECEDENCE: tuple[Status, ...] = (Status.FAIL, Status.ERROR, Status.MANUAL, Status.PASS)
 
 
-def _run_lines(argv: list[str]) -> list[str]:
-    """The non-blank stdout lines of ``argv``; a missing command or a failed run raises.
-
-    The child gets everything outside the engine's own namespace and its secrets. OpenSSL reads
-    ``OPENSSL_CONF`` and its siblings from the environment, and section 5.4 asks for the check to
-    run with the engine's environment, so a start-up-names-only environment would read a different
-    policy from the one the driver takes."""
+@contextmanager
+def _probe_errors(program: str) -> Iterator[None]:
+    """Turn a start that could not happen into the two probe exceptions."""
     try:
-        proc = subprocess.run(  # nosec B603 B607 - argv list (no shell), fixed arguments
-            argv,
-            env=hook_environment(),
+        yield
+    except FileNotFoundError as exc:
+        raise ProbeUnavailable(f"{program} not found") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ProbeFailed(f"{program} did not finish in {_PROBE_TIMEOUT_S:.0f}s") from exc
+    except OSError as exc:
+        raise ProbeFailed(f"{program} could not run: {codec_safe_str(exc)}") from exc
+
+
+def _stdout_lines(program: str, proc: subprocess.CompletedProcess[str]) -> list[str]:
+    """The non-blank stdout lines of a finished probe; a non-zero exit raises :class:`ProbeFailed`."""
+    if proc.returncode != 0:
+        first = next((ln.strip() for ln in proc.stderr.splitlines() if ln.strip()), "")
+        raise ProbeFailed(
+            f"{program} exited {proc.returncode}" + (f": {first[:200]}" if first else "")
+        )
+    return [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+
+
+def _windows_enabled_suites() -> list[str]:
+    """The enabled SChannel suite names, as section 5.4's check 1 reads them.
+
+    ``(Get-TlsCipherSuite).Name`` and not a pipe into ``Where-Object Name``: section 5.4 measured
+    that pipe passing the whole list through unfiltered. The filtering happens here, in Python.
+    PowerShell is a fixed system tool run by its pinned path, so it takes the start-up names only
+    (vault BACKLOG #2716); it finds the TLS module without the operator's ``PSModulePath``."""
+    with _probe_errors("powershell.exe"):
+        proc = subprocess.run(  # nosec B603 - pinned tool, argv list (no shell), fixed arguments
+            [
+                _system_exe("WindowsPowerShell", "v1.0", "powershell.exe"),
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "(Get-TlsCipherSuite).Name",
+            ],
+            env=system_tool_environment(),  # the platform's start-up names only (#2716)
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -91,33 +123,7 @@ def _run_lines(argv: list[str]) -> list[str]:
             check=False,
             creationflags=_NO_WINDOW,
         )
-    except FileNotFoundError as exc:
-        raise ProbeUnavailable(f"{argv[0]} not found") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise ProbeFailed(f"{argv[0]} did not finish in {_PROBE_TIMEOUT_S:.0f}s") from exc
-    except OSError as exc:
-        raise ProbeFailed(f"{argv[0]} could not run: {exc}") from exc
-    if proc.returncode != 0:
-        first = next((ln.strip() for ln in proc.stderr.splitlines() if ln.strip()), "")
-        raise ProbeFailed(
-            f"{argv[0]} exited {proc.returncode}" + (f": {first[:200]}" if first else "")
-        )
-    return [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
-
-
-def _windows_enabled_suites() -> list[str]:
-    """The enabled SChannel suite names, as section 5.4's check 1 reads them.
-
-    ``(Get-TlsCipherSuite).Name`` and not a pipe into ``Where-Object Name``: section 5.4 measured
-    that pipe passing the whole list through unfiltered. The filtering happens here, in Python."""
-    # The absolute path, not a PATH lookup: Windows PowerShell ships with the OS, and a PATH entry
-    # ahead of System32 must not choose which program reads the policy.
-    exe = Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / (
-        r"System32\WindowsPowerShell\v1.0\powershell.exe"
-    )
-    return _run_lines(
-        [str(exe), "-NoProfile", "-NonInteractive", "-Command", "(Get-TlsCipherSuite).Name"]
-    )
+    return _stdout_lines("powershell.exe", proc)
 
 
 def _schannel_client_enabled(version: str) -> int | None:
@@ -134,15 +140,33 @@ def _schannel_client_enabled(version: str) -> int | None:
     except FileNotFoundError:
         return None
     except OSError as exc:
-        raise ProbeFailed(f"{version} client key could not be read: {exc}") from exc
+        raise ProbeFailed(f"{version} client key could not be read: {codec_safe_str(exc)}") from exc
     if kind != winreg.REG_DWORD or not isinstance(value, int):
         raise ProbeFailed(f"{version} client Enabled holds registry type {kind}, not a DWORD")
     return value
 
 
 def _openssl_suites() -> list[str]:
-    """``openssl ciphers -s -v``: one line per suite this host's OpenSSL configuration allows."""
-    return _run_lines(["openssl", "ciphers", "-s", "-v"])
+    """``openssl ciphers -s -v``: one line per suite this host's OpenSSL configuration allows.
+
+    Found on ``PATH`` by bare name, as section 5.4's own command is. It gets everything outside the
+    engine's namespace and its secrets: OpenSSL reads ``OPENSSL_CONF`` and its siblings from the
+    environment, and section 5.4 asks for the check to run with the engine's environment, so the
+    start-up names alone would read a different policy from the one the driver takes."""
+    with _probe_errors("openssl"):
+        proc = subprocess.run(  # nosec B603 B607 - argv list (no shell), fixed arguments
+            ["openssl", "ciphers", "-s", "-v"],
+            env=hook_environment(),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_PROBE_TIMEOUT_S,
+            check=False,
+            creationflags=_NO_WINDOW,
+        )
+    return _stdout_lines("openssl", proc)
 
 
 def _openssl_policy_lines() -> tuple[Path, list[tuple[str, str]]]:
@@ -154,12 +178,8 @@ def _openssl_policy_lines() -> tuple[Path, list[tuple[str, str]]]:
     named = os.environ.get("OPENSSL_CONF")
     path = Path(named) if named else _OPENSSL_CNF
     text = path.read_text(encoding="utf-8", errors="replace")
-    found: list[tuple[str, str]] = []
-    for line in text.splitlines():
-        match = _POLICY_LINE.match(line)
-        if match:
-            found.append((match.group(1), match.group(2).strip()))
-    return path, found
+    matches = (_POLICY_LINE.match(line) for line in text.splitlines())
+    return path, [(m[1], m[2].strip()) for m in matches if m]
 
 
 def _suite_reading(probe: Callable[[], list[str]], is_aead: Callable[[str], bool]) -> _Reading:
@@ -198,7 +218,7 @@ def _windows_protocol_reading() -> _Reading:
             problems.append(f"{version} client Enabled={value}")
     if problems:
         return _Reading(Status.FAIL, "; ".join(problems) + " (section 5.4 asks for Enabled=0)")
-    return _Reading(Status.PASS, "TLS 1.0 and TLS 1.1 client Enabled=0")
+    return _Reading(Status.PASS, " and ".join(_LEGACY_VERSIONS) + " client Enabled=0")
 
 
 def _linux_policy_reading() -> _Reading:
@@ -209,7 +229,7 @@ def _linux_policy_reading() -> _Reading:
             Status.MANUAL, f"no OpenSSL file at {exc.filename}; confirm MinProtocol by hand"
         )
     except OSError as exc:
-        return _Reading(Status.ERROR, f"OpenSSL file not read: {exc}")
+        return _Reading(Status.ERROR, f"OpenSSL file not read: {codec_safe_str(exc)}")
     cipher_strings = [value for key, value in settings if key == "CipherString"]
     min_protocols = [value for key, value in settings if key == "MinProtocol"]
     evidence = f"{path}: " + (
@@ -231,8 +251,7 @@ def _linux_policy_reading() -> _Reading:
     )
 
 
-def _combine(readings: Iterable[_Reading]) -> CheckResult:
-    taken = list(readings)
+def _combine(*taken: _Reading) -> CheckResult:
     status = next(s for s in _PRECEDENCE if any(r.status is s for r in taken))
     detail = "; ".join(r.text for r in taken)
     if status is not Status.PASS:
@@ -245,17 +264,13 @@ def read_host_cipher_policy(platform: str = sys.platform) -> CheckResult:
     """Run section 5.4's checks for this platform. Never raises; never refuses a start."""
     if platform == "win32":
         return _combine(
-            [
-                _suite_reading(
-                    _windows_enabled_suites, lambda name: bool(_SCHANNEL_AEAD.search(name))
-                ),
-                _windows_protocol_reading(),
-            ]
+            _suite_reading(_windows_enabled_suites, lambda name: bool(_SCHANNEL_AEAD.search(name))),
+            _windows_protocol_reading(),
         )
     if platform.startswith("linux"):
         # Section 5.4's check is `grep -v AEAD` over each `openssl ciphers -v` line.
         return _combine(
-            [_suite_reading(_openssl_suites, lambda line: "AEAD" in line), _linux_policy_reading()]
+            _suite_reading(_openssl_suites, lambda line: "AEAD" in line), _linux_policy_reading()
         )
     return CheckResult(
         RID, TITLE, Status.SKIP, f"section 5.4 covers Windows and Linux hosts, not {platform}"
