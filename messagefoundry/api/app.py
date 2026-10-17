@@ -9884,9 +9884,9 @@ def create_managed_app(
     ``synchronous``) as a SQLite shortcut. ``config_dir`` loads the code-first Connection/Router/
     Handler graph. ``auth_settings`` attaches an :class:`AuthService` and seeds the built-in roles;
     it creates no account (ADR 0183). With no ``auth_settings`` every protected route is refused
-    (503 over HTTP) unless the caller passes ``allow_no_auth=True``, the same opt-in
-    :func:`create_app` takes; a build with neither logs one WARNING. Beside ``auth_settings`` that
-    opt-in raises ``ValueError``.
+    (503) unless the caller passes ``allow_no_auth=True``, the same opt-in :func:`create_app` takes,
+    and a build with neither logs one WARNING. Beside ``auth_settings`` that opt-in raises
+    ``ValueError``.
     The store is opened via the
     backend-agnostic :func:`~messagefoundry.store.open_store`. ``api_listener`` is the engine's own
     ``(host, port)`` (from ``[api]``), reserved so no inbound listener can be wired onto the API's port
@@ -10718,9 +10718,10 @@ def create_managed_app(
         # Said here, once create_app has accepted the build, and not in create_app, which every
         # managed app calls with auth=None before the lifespan attaches a service.
         _log.warning(
-            "create_managed_app: built with no auth_settings and without allow_no_auth, so every "
-            "protected route is refused (HTTP routes answer 503, %s). auth_settings attaches "
-            "sign-in; allow_no_auth=True instead serves every route to anonymous callers",
+            "create_managed_app: built with no auth_settings and without allow_no_auth, so no "
+            "service attaches and the permission-gated routes are refused (%s). auth_settings "
+            "attaches sign-in; allow_no_auth=True instead answers those routes to any caller as the "
+            "full-access system identity",
             AUTH_NOT_CONFIGURED,
         )
     return app
