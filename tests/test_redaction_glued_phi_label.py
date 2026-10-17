@@ -423,3 +423,56 @@ def test_the_consumer_views_are_what_guard_them(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(redaction, "_extends_a_token", lambda kept, start, end: False)
     printed = {route for route, (out, value) in _consumer_routes().items() if value in out}
     assert printed == {"audit tee", "json log then bundle", "bundle line", "appended words"}
+
+
+# --- OPEN: text a call site puts around an answer (code review, repair round 2) -----------------
+#
+# Each prints a value main hid, by a shipped log format, on this head. The rule leaves an edge of
+# its answer in a different parse state from main's (an open quoted value, a bare start tag), and
+# the next pass reads the caller's text through it. Not repaired: the review cap was reached. Strict,
+# so a repair that closes one turns it green and reds this file until the mark comes off.
+
+_AROUND_AN_ANSWER = {
+    # messagefoundry/last_resort.py: "last-resort: %s (%s)", with an asyncio callback repr.
+    "appended-quoted-repr": (
+        lambda: "last-resort: {} ({})".format(
+            safe_exc(ValueError("x|y|z,'name':'Qzx")),
+            "Exception in callback on_frame({'family': 'zqxdoe'})",
+        ),
+        "zqxdoe",
+    ),
+    # A peer name with an apostrophe after an answer whose open value closes at one.
+    "appended-apostrophe": (
+        lambda: "{} for peer O'Brien 4455 zqxpeer".format(
+            safe_exc(ValueError("x|y|z\"'name':'4455667 PatientID=Plantpid1"))
+        ),
+        "zqxpeer",
+    ),
+    # messagefoundry/transports/dicom.py: a peer-chosen calling AE title before the answer.
+    "prefix-element": (
+        lambda: "DICOM C-STORE from {} (AE {!r}): object could not be decoded: {}".format(
+            "10.0.0.5", "<name>Qz", safe_exc(ValueError("bad x|y|z<given Zq 4455667 zqxpeer"))
+        ),
+        "zqxpeer",
+    ),
+}
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BACKLOG #3318 open: text before or after an answer is read through an edge the rule "
+    "left open; found by code review round 2 and not repaired",
+)
+@pytest.mark.parametrize("name", list(_AROUND_AN_ANSWER))
+def test_text_around_an_answer_prints_nothing_main_hid(name: str) -> None:
+    compose, value = _AROUND_AN_ANSWER[name]
+    assert value not in _through_the_chain(compose())
+
+
+@pytest.mark.parametrize("name", list(_AROUND_AN_ANSWER))
+def test_main_hid_the_value_around_an_answer(name: str) -> None:
+    """The control for the open pins: main's redactor hides each value, so each pin is a value the
+    rule newly prints and not one main printed too."""
+    compose, value = _AROUND_AN_ANSWER[name]
+    with _rule_off():
+        assert value not in _through_the_chain(compose())

@@ -1778,9 +1778,16 @@ def redact(text: str) -> str:
     (:data:`_GLUED_LENGTH_CAP`), since a clamp's walks are not read by the fourth check. The price of
     the last: a record clamped at the default window gets the old answer.
 
-    **What the differential does not cover, at least.** A caller that puts more than a limit's worth
-    of its own text around an answer before it bounds the whole moves the cut by its own text, which
-    the fourth check reads only as a shift; and the routes it ran are the ones it names, not every
+    **What it does not cover, at least, and some of it prints a value the old answer hid.** Text a
+    call site puts around an answer is read by the next pass through the answer's edges, and the
+    rule can leave an edge in a different state from the old answer's: a quoted value it opened,
+    which a caller's apostrophe or quoted repr then closes, or a bare start tag that a caller's
+    element prefix turns into markup. Code review reproduced both on shipped log formats, the
+    last-resort line and the DICOM C-STORE line; ``tests/test_redaction_glued_phi_label.py`` pins
+    them as strict expected failures. The probes of :func:`_closes_what_plain_left_open` hold no
+    quote, so they miss both. A caller that puts more than a limit's worth of its own text around an
+    answer before it bounds the whole moves the cut by its own text, which the fourth check reads
+    only as a shift. And the routes the differential ran are the ones it names, not every
     composition a caller can write.
 
     The rule is dropped silently where those checks refuse it, at least: a text the widened stage
@@ -2116,7 +2123,9 @@ def _answer_holds(
     (:func:`_redact_answers`) stands in for that gap, which is where the differential found it.
 
     **And each reading is made over each of :data:`_CONSUMER_VIEWS` too.** A consumer can change the
-    text before its pass reads it: the JSON log formatter and the audit tee escape every quote. And a
+    text before its pass reads it: the JSON log formatter and the audit tee escape each double quote
+    (and leave an apostrophe and ``<`` as they are, so a single-quoted or XML label reads the same
+    in both views). And a
     call site appends its own words after an answer, which main's answer can take into a value it
     left open (:func:`_closes_what_plain_left_open`). Found by code review on the support bundle, the
     audit tee and appended call-site text, and reproduced with the real handler chain."""
