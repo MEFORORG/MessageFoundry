@@ -245,4 +245,7 @@ async def test_a_sink_that_raises_does_not_break_the_sign_in(
             r = await _negotiate(c)
             assert r.status_code == 200, r.text
     assert sink.events == [_GRANT]
-    assert any("failed to emit" in rec.getMessage() for rec in caplog.records)
+    assert any(
+        rec.name == "messagefoundry.api.security" and "failed to emit" in rec.getMessage()
+        for rec in caplog.records
+    )

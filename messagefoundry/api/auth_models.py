@@ -34,6 +34,13 @@ _GROUP_MAX = 512
 # A session token is 43 URL-safe characters (auth/tokens.py); the cap only refuses absurd input.
 _TOKEN_MAX = 256
 
+#: The response header an ``oidc`` session's step-up refusal carries, set to
+#: :data:`STEP_UP_VIA_IDP`, so a client can branch on a header rather than parse the detail
+#: (BACKLOG #2158). Here, with the auth wire models, so the engine's raise sites and the
+#: FastAPI-free ``apiclient`` share one spelling (vault BACKLOG #3145 item 6).
+STEP_UP_VIA_HEADER = "X-Step-Up-Via"
+STEP_UP_VIA_IDP = "idp"
+
 
 class CredentialReply(BaseModel):
     """A response model whose body carries a live credential: a session token, a staged TOTP seed,

@@ -18,6 +18,8 @@ from __future__ import annotations
 import asyncio
 import heapq
 import inspect
+import json
+import logging
 import time
 import unicodedata
 from collections.abc import Awaitable
@@ -2485,7 +2487,12 @@ async def test_a_reset_between_rotation_and_enable_leaves_mfa_off_with_no_null_s
         rows = await store.list_audit(
             actor=ADMIN_USERNAME, action="auth.mfa_enroll_refused", limit=10
         )
-        assert len(rows) == 1 and '"reason": "secret_cleared"' in str(rows[0]["detail"])
+        # ``session_ended`` is read from the revoke's outcome, not a constant (vault BACKLOG #3113).
+        assert len(rows) == 1
+        assert json.loads(str(rows[0]["detail"])) == {
+            "reason": "secret_cleared",
+            "session_ended": True,
+        }
         actions = [e["action"] for e in await service.security_events_for(ADMIN_USERNAME)]
         assert "auth.mfa_enrolled" not in actions
     finally:
@@ -2560,6 +2567,98 @@ async def test_a_second_confirm_that_enabled_first_keeps_the_winners_codes(
             actor=ADMIN_USERNAME, action="auth.mfa_enroll_refused", limit=10
         )
         assert len(rows) == 1 and '"reason": "already_enabled"' in str(rows[0]["detail"])
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        RuntimeError("the store refused the revoke"),
+        # aiosqlite's own refusal of a closed connection, raised before sqlite3 is reached.
+        ValueError("Connection closed"),
+    ],
+    ids=["store-refusal", "closed-connection"],
+)
+async def test_a_refused_enable_whose_revoke_raises_still_writes_its_refusal_row(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, fault: Exception
+) -> None:
+    """RED when: a store refusal of the revoke skips the ``auth.mfa_enroll_refused`` row (vault
+    BACKLOG #3113 item 2), or the row claims the session ended when it did not (item 7)."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
+        identity, token, _ = await login_admin(service)
+        enroll = await service.begin_mfa_enrollment(identity)
+
+        real_enable = store.enable_totp
+
+        async def reset_then_enable(
+            user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
+        ) -> bool:
+            await store.disable_totp(user_id)
+            return await real_enable(user_id, recovery_code_hashes=recovery_code_hashes, now=now)
+
+        async def refused_revoke(token_hash: str, *, now: float | None = None) -> None:
+            raise fault
+
+        monkeypatch.setattr(store, "enable_totp", reset_then_enable)
+        monkeypatch.setattr(store, "revoke_session", refused_revoke)
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
+            refused = await service.confirm_mfa_enrollment(
+                identity, fresh_totp(enroll.secret), token=token
+            )
+        # Fails closed all the same: no token and no codes come back.
+        assert refused.ok is False and refused.session_lost is True
+        assert refused.token is None and refused.recovery_codes == ()
+        rows = await store.list_audit(
+            actor=ADMIN_USERNAME, action="auth.mfa_enroll_refused", limit=10
+        )
+        assert len(rows) == 1, "the refusal row was skipped when the revoke raised"
+        detail = json.loads(str(rows[0]["detail"]))
+        assert detail == {"reason": "secret_cleared", "session_ended": False}
+        assert any(
+            "could not end the session it rotated" in r.getMessage() for r in caplog.records
+        ), "the refused revoke was swallowed without a log line"
+    finally:
+        await store.close()
+
+
+async def test_a_refused_enable_whose_revoke_hits_a_defect_still_writes_its_refusal_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: a defect the revoke raises, which the soft write re-raises rather than logs, skips
+    the ``auth.mfa_enroll_refused`` row (vault BACKLOG #3113 item 2, round two). The defect still
+    propagates, so a bug is not passed over as a store refusal."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
+        identity, token, _ = await login_admin(service)
+        enroll = await service.begin_mfa_enrollment(identity)
+
+        real_enable = store.enable_totp
+
+        async def reset_then_enable(
+            user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
+        ) -> bool:
+            await store.disable_totp(user_id)
+            return await real_enable(user_id, recovery_code_hashes=recovery_code_hashes, now=now)
+
+        async def broken_revoke(token_hash: str, *, now: float | None = None) -> None:
+            raise NotImplementedError("a backend without the revoke")
+
+        monkeypatch.setattr(store, "enable_totp", reset_then_enable)
+        monkeypatch.setattr(store, "revoke_session", broken_revoke)
+        with pytest.raises(NotImplementedError):
+            await service.confirm_mfa_enrollment(identity, fresh_totp(enroll.secret), token=token)
+        rows = await store.list_audit(
+            actor=ADMIN_USERNAME, action="auth.mfa_enroll_refused", limit=10
+        )
+        assert len(rows) == 1, "the refusal row was skipped when the revoke raised a defect"
+        assert json.loads(str(rows[0]["detail"])) == {
+            "reason": "secret_cleared",
+            "session_ended": False,
+        }
     finally:
         await store.close()
 

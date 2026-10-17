@@ -19,6 +19,7 @@ import sys
 import time
 import types
 from collections.abc import Callable, Sequence
+from contextvars import ContextVar
 from pathlib import Path
 
 import pytest
@@ -2764,3 +2765,75 @@ def test_the_last_wrong_code_is_not_told_to_try_again(
         != 0
     )
     assert sum("did not match" in text for text in terminal.shown) == 4
+
+
+# --- vault BACKLOG #3113 item 1: the run that loses an enrolment race --------------------------
+
+#: A second synthetic base32 secret, so the two runs show different entries. Two symbols on
+#: purpose, for the reason ``_PASSWORD`` above is low-entropy: it must not look like a secret.
+_OTHER_TOTP_SECRET = "ABABABABABABABAB"
+
+
+async def test_the_run_that_loses_an_enrolment_race_is_not_told_to_remove_a_live_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two runs repair one roleless row. The second stages its secret after the first, so the
+    first run's enable turns on the SECOND run's secret, and the second run's enable is refused.
+    Its refusal must not tell its operator to remove the entry it showed: that entry is the live
+    one. This is the re-stage race of vault BACKLOG #3025, driven in a fixed order."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        await _roleless_account(store, email=None)
+        first = provision_totp()
+        second = provision_totp(_OTHER_TOTP_SECRET)
+        real_enable = store.enable_totp
+        second_at_enable = asyncio.Event()
+        first_enabled = asyncio.Event()
+        run: ContextVar[str] = ContextVar("run", default="first")
+        tasks: list[asyncio.Task[object]] = []
+
+        async def run_second() -> object:
+            run.set("second")
+            return await service.provision_first_administrator(
+                username="site-admin", password=_PASSWORD, actor="second", **second
+            )
+
+        async def racing_enable(user_id: str, *, recovery_code_hashes: list[str]) -> bool:
+            if run.get() == "first":
+                # The first run has staged its secret. The second run now stages its own over it,
+                # and stops at its own enable.
+                tasks.append(asyncio.create_task(run_second()))
+                await second_at_enable.wait()
+                try:
+                    return await real_enable(user_id, recovery_code_hashes=recovery_code_hashes)
+                finally:
+                    first_enabled.set()
+            second_at_enable.set()
+            await first_enabled.wait()
+            return await real_enable(user_id, recovery_code_hashes=recovery_code_hashes)
+
+        monkeypatch.setattr(store, "enable_totp", racing_enable)
+        won = await service.provision_first_administrator(
+            username="site-admin", password=_PASSWORD, actor="first", **first
+        )
+        assert won.repaired
+        with pytest.raises(FirstAdministratorRefused) as lost:
+            await tasks[0]
+        # The premise, measured: the secret the losing run showed is the one turned on.
+        row = await store.get_user("roleless")
+        assert row is not None and row.totp_enabled
+        assert await store.get_totp_secret("roleless") == _OTHER_TOTP_SECRET
+        # The winning run reported success over a secret it did not show. That is the race
+        # itself, vault BACKLOG #3025, pinned here as the premise and not as a wanted outcome.
+        message = str(lost.value)
+        assert "did not turn TOTP on and granted no role" in message
+        assert "remove" not in message.lower()
+        assert "keep the authenticator entry it showed" in message
+    finally:
+        # A failure above must not leave the second run running against a closed store.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await store.close()

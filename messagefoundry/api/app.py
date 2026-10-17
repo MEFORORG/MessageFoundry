@@ -222,6 +222,7 @@ from messagefoundry.api.paging import page_total
 from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
     AUTH_NOT_CONFIGURED,
+    DIRECTORY_GRANTED_BY,
     AuthenticatedBeforeBodyRoute,
     ExportStopped,
     alert_sink_for,
@@ -407,6 +408,7 @@ from messagefoundry.pipeline.alert_sinks import EmailTransport, notifier_from_se
 from messagefoundry.pipeline.alerts import (
     AlertSink,
     LoggingAlertSink,
+    administrator_granted_alert,
     authority_seal_alert,
     no_enabled_administrator_alert,
     store_cipher_refusal_forwarder,
@@ -9774,7 +9776,9 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         sink.ad_reconcile_aborted(
             _REFERRAL_ALERT_SOURCE,
             reason=REFERRAL_ABORT,
-            probed=plan.probed,
+            # The probes ASKED (BACKLOG #3170): an UNKEYED row was never sent, so no referral
+            # could answer it. The breaker's count above stays its judged denominator.
+            probed=plan.asked,
             detail=auth.directory_reconcile_referral or REFERRAL_ABORT,
         )
     if plan.faulted:
@@ -10549,7 +10553,9 @@ def create_managed_app(
                 # This process cannot vouch for a config it never checked: its flag rows say so.
                 engine.config_baseline_unchecked = start_outcome in _UNCHECKED_OUTCOMES
                 # Raised here, before engine.start(), so new bytes that make the start itself fail
-                # still page on every attempt of a crash loop. Never raises.
+                # still page on every attempt of a crash loop. Never raises. Vault BACKLOG #3145
+                # item 1 (a gate-refused restart pages on every attempt) is declined: that is this
+                # contract, pinned by test_the_alert_fires_even_when_the_start_then_fails (#2597).
                 if start_config is not None and start_config.changed:
                     _raise_config_changed(notifier or LoggingAlertSink(), engine, start_config)
             except BaseException:
@@ -10631,6 +10637,11 @@ def create_managed_app(
                     # Vault BACKLOG #3229: a directory role change that leaves no enabled
                     # Administrator is applied, and raises no_enabled_administrator here.
                     admin_loss_alert=no_enabled_administrator_alert(notifier or LoggingAlertSink()),
+                    # Vault BACKLOG #3141: a reconcile pass that newly grants Administrator raises
+                    # administrator_granted here, as a directory sign-in does in its route.
+                    admin_grant_alert=administrator_granted_alert(
+                        notifier or LoggingAlertSink(), granted_by=DIRECTORY_GRANTED_BY
+                    ),
                 )
                 # Started only once the service is built, so a constructor refusal starts no task.
                 if security_notifier is not None:
@@ -10640,7 +10651,10 @@ def create_managed_app(
                 # any connection starts rather than after. Both touch only the store: initialize()
                 # seeds the built-in roles and the gate reads the users. A refusal here also comes
                 # before the start's opt-in audit-chain walk, so that walk cannot alert on such a
-                # start. Everything else that uses the service stays below the start.
+                # start. Vault BACKLOG #3145 item 2 is declined: the walk runs inside engine.start(),
+                # and moving it ahead of this gate reorders the start whose failure paging
+                # test_the_alert_fires_even_when_the_start_then_fails pins (#2597). Everything else
+                # that uses the service stays below the start.
                 await auth.initialize()
                 app.state.auth = auth
                 await _assert_security_notice_is_deliverable(
@@ -10762,9 +10776,12 @@ def create_managed_app(
                 # ADR 0197 Amendment A, Manager decision 2026-09-29: learn at start, not at the first
                 # account creation, that the password policy leaves no credential to issue. It logs
                 # an ERROR and returns, and is guarded like the census: a policy-level fact must
-                # never refuse the start, whatever a later policy clause raises.
+                # never refuse the start, whatever a later policy clause raises. It runs off the loop
+                # (vault BACKLOG #3164): a pathological context-word list makes the generator retry
+                # its policy screens many times, and the engine's listeners and workers already run
+                # on the loop by now.
                 try:
-                    auth.probe_credential_generation()
+                    await asyncio.to_thread(auth.probe_credential_generation)
                 except Exception:  # noqa: BLE001 -- see the comment above
                     _log.exception(
                         "the credential-generation probe could not run; startup continues"

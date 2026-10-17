@@ -791,8 +791,14 @@ AD group-map and scope-map saves and the custom-role edit and delete can still e
 sessions on the login window. The row names the actor, the route as `op`, the caller's
 stored id and the caller's address. The guard refuses when the path's spelling or the stored id
 matches the caller (vault BACKLOG #3259); `_refuse_if_self` in `api/auth_routes.py` says why the
-stored id matters on the console. The `404` that `DELETE /me/sessions/{session_id}` answers for
-another account's session still writes no row of its own.
+stored id matters on the console. A self-service revoke of one session that ends nothing, the
+`404` of `DELETE /me/sessions/{session_id}` and the console's "Nothing was revoked" notice, writes
+one `auth.session_revoke_missed` row (vault BACKLOG #3260, limb 2). It names the actor, the
+caller's address and the first 12 characters of the id, and nothing else: an unknown id and
+another account's id get the same answer and the same row. The console takes the id as plain
+text, so an id that is not lower-case hex is recorded as `malformed` rather than copied. The
+write is soft: if the audit log refuses it, the answer still stands and the loss is logged at
+ERROR, so the row is the record of a miss only while the audit log accepts writes.
 
 **Delegated identity & admin device posture (#193 sibling; ASVS 13.2.1 / 13.3.2 / 8.4.2 — the delegation
 boundary).** Three controls whose enforcement is largely the deploying organization's to provide.
@@ -2446,7 +2452,7 @@ What the engine does instead is make the cheap routes loud. It refuses none of t
 | Signal | When | Where it goes |
 |---|---|---|
 | `approval.approver_provenance` audit row and `approval_approver_provenance` alert | A release goes ahead and the approver's account was created, had its password changed, or enrolled TOTP **after** the request was made. A resolution of an `interrupted` release does the same for the resolver's account (BACKLOG #2125) | Audit row against the approver or resolver, with their `client` address (ADR 0150). Its `act` field is `release` or `resolve`. Alert keyed `approval:<id>` for a release and `approval:<id>:resolve` for a resolution, carrying the changed facts only |
-| `administrator_granted` alert | `POST /users` creates an account with the Administrator role, `PUT /users/{id}/roles` adds it, `PUT /ad-group-map` newly maps a group to it, or a directory sign-in's role sync newly gives an account the role (vault BACKLOG #2610) | Alert keyed `user:<username>` or `ad-group:<group>`, naming the granting administrator, or `<directory>` for a directory sign-in |
+| `administrator_granted` alert | `POST /users` creates an account with the Administrator role, `PUT /users/{id}/roles` adds it, `PUT /ad-group-map` newly maps a group to it, or a directory sign-in's role sync or a directory reconcile pass newly gives an account the role (vault BACKLOG #2610, #3141) | Alert keyed `user:<username>` or `ad-group:<group>`, naming the granting administrator, or `<directory>` for a directory sign-in or reconcile pass |
 | `client` on the `user.created` audit row | An account created through `POST /users` or `POST /users/directory` (BACKLOG #2021) | The creating administrator's address, like the approval rows |
 | `account_created` notice | An account created through `POST /users` or `POST /users/directory`, neither of which creates one without a notification address (BACKLOG #2018, #2021) | The new account's own notification address |
 
@@ -2469,15 +2475,18 @@ with no page.
   `account_created` notice.
 - **A directory grant.** An account can get Administrator because the *directory* added it to a
   group already mapped to Administrator. The engine sees that grant in one of the two places below,
-  whichever comes first. A sign-in that sees it first raises `administrator_granted`, unless that
-  sign-in fails with a server error after the role write; the retry then gains nothing. A reconciler
-  pass that sees it first raises `ad_session_revoked`, which does not name the role. The later
-  sign-in then gains nothing, so it raises no `administrator_granted`. An account that never signs
-  in again and holds no live session raises nothing. So watch membership of the mapped group in the
-  directory itself.
+  whichever comes first. Either one raises `administrator_granted`, but at least these cases raise
+  none. A sign-in that sees it first and fails with a server error after the role write loses it;
+  the retry then gains nothing. A reconciler pass the mass-revoke breaker aborts writes no roles.
+  An account that never signs in again raises nothing when no pass reaches it: it holds no live
+  session, or `[auth].ad_session_recheck_seconds` is 0. So watch membership of the mapped group in
+  the directory itself.
   **CORRECTED 2026-10-01:** this read "raises no alert. The engine never sees that grant."
   **CORRECTED 2026-10-06:** this read "raises no `administrator_granted` alert", and the sign-in
   case below read "It raises no alert." Vault BACKLOG #2610 added the sign-in alert.
+  **CORRECTED 2026-10-16:** this read "A reconciler pass that sees it first raises
+  `ad_session_revoked`, which does not name the role. The later sign-in then gains nothing, so it
+  raises no `administrator_granted`." Vault BACKLOG #3141 added the reconciler's alert.
   - **At the account's next sign-in.** The engine writes an `auth.ad_roles_resynced` audit row
     with the old and new roles. It also sends a best-effort roles-changed notice to that
     account's own notification address, when the account has one and security notices are set
@@ -2491,8 +2500,14 @@ with no page.
     [directory reconciler](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2)
     that completes stores the new roles and revokes the session. It writes
     `auth.ad_session_revoked` with the new roles, sends the same notice, and raises
-    `ad_session_revoked` with reason `roles_changed`. The next sign-in then writes no
-    `auth.ad_roles_resynced` row. That section lists when a pass revokes or alerts nothing.
+    `ad_session_revoked` with reason `roles_changed`. Right after the role write it raises
+    `administrator_granted`, keyed `user:<username>`, with `granted_by` set to `<directory>` and
+    `via` set to `directory_reconcile`. That alert clears the account's `no_enabled_administrator`
+    cooldown, as a sign-in's does. An account that already held Administrator raises nothing. The
+    next sign-in then writes no `auth.ad_roles_resynced` row and raises no second
+    `administrator_granted`. A sign-in that runs at the same time as the pass can still raise a
+    second one, since each judges against its own read of the roles; a duplicate page is the safe
+    direction. That section lists when a pass revokes or alerts nothing.
     No pass runs at `[auth].ad_session_recheck_seconds = 0`. A pass probes at most
     `ad_session_recheck_max_users` accounts (200 by default), least recently probed first. When more
     directory accounts than that hold live sessions, an account can wait several passes.
@@ -2818,11 +2833,14 @@ way past the sign-in lock (ADR 0197 Amendment A). Such an account's first factor
 An administrator clears a
 lost authenticator via `POST /users/{id}/reset-mfa` (which also revokes the user's sessions).
 A confirm turns TOTP on only while a secret is still staged and TOTP is still off (BACKLOG
-#2224). If a reset clears the secret during the confirm, or another confirm turns TOTP on first,
-the confirm turns nothing on and returns no recovery codes. It ends the session it just rotated and
-answers as a lost session: `401` on `POST /me/mfa/confirm`, and the sign-in page in the web
-console. It is audited `auth.mfa_enroll_refused`, whose `reason` is `secret_cleared`,
-`already_enabled` or `account_gone`, read after the refusal. The check is that some secret is
+#2224). A reset can clear the secret during the confirm, or another confirm can turn TOTP on
+first. Either way the confirm turns nothing on and returns no recovery codes. It asks the store to
+end the session it just rotated, and answers as a lost session: `401` on `POST /me/mfa/confirm`,
+and the sign-in page in the web console. It is audited `auth.mfa_enroll_refused`. Its `reason` is
+`secret_cleared`, `already_enabled` or `account_gone`. That reason is read after the refusal, so a
+later write can blur it. Its `session_ended` is false when the store refused to end the rotated
+session. The token is still not handed back, and the row is written whatever the revoke raised
+(vault BACKLOG #3113). The check is that some secret is
 staged, not that it is the one the confirm verified: a second enrolment start that re-stages the
 secret inside the same window is not caught by it. With
 `[security].require_mfa` on — **the default since BACKLOG #187 (secure-by-default, including the
@@ -3926,7 +3944,14 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   `/ui/login?e=rate_limited` and a WARNING log), a return the `Sec-Fetch-Mode` check refuses
   (audited `auth.login_failed`), and any refusal at the start leg `POST /ui/reauth/oidc`. A refusal those two methods decide changes nothing and re-renders the
   step-up page with a plain message, except one that finds the session gone, which sends the operator to sign in. A refusal after the `state`
-  check is filed under the staged session's account. A cancel at the IdP returns to the same page.
+  check is filed under the staged session's account. That row, and the row of a completed step-up,
+  also carry `start_client`, the address the start leg staged on the flow, and `client_moved`,
+  whether the callback came from another host by the new-address comparison, or null when either
+  address is unknown (BACKLOG #2160, vault BACKLOG #3145). Neither is ever read from the token. A
+  refusal before the `state` check names neither, nor does a sign-in flow refused as
+  `flow_purpose_mismatch`, whose start was another ceremony. A move is recorded, never refused. Behind a proxy
+  the engine does not trust, both legs carry the proxy's address, so `client_moved` reads false
+  there. A cancel at the IdP returns to the same page.
   A callback without the flow's own `state` consumes nothing, and the flow waits for the real
   return. The sign-in callback follows the same rule, an `error=` or malformed one included
   (BACKLOG #3198). A password is
@@ -4170,7 +4195,11 @@ account's entry and write its roles onto the row. No sign-in or step-up admits s
 writes no roles, and it strikes and revokes as an absent account does, with the reason
 `directory_object_id_missing`. It is not a `userAccountControl` answer, so it never moves the ADR
 0195 hold. It is never asked, so it is no part of an outage either: a pass whose every lookup fails
-still audits `auth.ad_reconcile_skipped`, and that row's `asked` count leaves it out. Such a
+still audits `auth.ad_reconcile_skipped`, and that row's `asked` count leaves it out. Such a pass,
+and one that aborts because its lookups were only referred, faulted or failed, still strikes the
+row, because its answer never came from the directory (BACKLOG #3170). No such pass revokes it: only a pass that is not aborted can, once
+the row's strikes reach the threshold and the row is in that pass's probe budget. A referral's `auth.ad_reconcile_referred` row and alert count only
+the lookups sent too. Its revocation does count toward the mass-revoke breaker below. Such a
 row cannot take a federated binding: the bind refuses it, so every binding the bind has made since
 BACKLOG #1143 slice C sits on a row probed by its id (ADR 0184 AC-5). A binding already on an id-less
 row, made before that refusal, is **never probed by name** (BACKLOG #2027). The pass skips the row and
@@ -4184,7 +4213,8 @@ Removing the binding (`DELETE /users/{user_id}/federated-identity`) returns the 
 The pass has these safety properties, because the lookup still returns one indistinguishable "not
 found" for *deleted*, *moved out of the search base* and *the search base was never right*:
 
-- **Fail-OPEN.** An unreachable domain controller revokes **nothing** and does not even accrue a strike.
+- **Fail-OPEN.** An unreachable domain controller revokes **nothing**, and an account the pass asked
+  about accrues no strike. An id-less row, never asked, is still struck (BACKLOG #3170).
   A fail-closed re-check would turn a directory blip into a total console outage during exactly the
   incident when operators need the console.
 - **Two strikes** (`ad_session_recheck_strikes`, default 2) before any revocation.
@@ -4242,7 +4272,7 @@ refers on every pass. Read as an outage, it would stop revocation on a first dep
 page.
 
 The two bases fail differently. A referring user search base refers every probe that searches,
-so the pass judges nothing and revokes nothing, like an outage, but it still pages. A referring
+so the pass judges no account it asked about and revokes nothing, like an outage, but it still pages. A referring
 group search base
 refers only the accounts the user search found enabled. Disables and deletions still revoke, but a
 role or channel-scope change in the directory does not reach those accounts' sessions while it
@@ -4254,7 +4284,8 @@ directory outage (BACKLOG #3100). Each such probe is logged at WARNING by name, 
 estate is still reconciled. A pass with any fault logs one ERROR naming no account and audits
 `auth.ad_reconcile_faulted`. It also raises the `ad_reconcile_aborted` alert with reason
 `probe_fault`, under its own source `directory-reconciler-probe-fault`. If every probe faults or
-fails, the pass judges nothing and revokes nothing, like an outage, but it still pages. A
+fails, the pass judges no account it asked about and revokes nothing, like an outage, but it still
+pages, and it still strikes an id-less row (BACKLOG #3170). A
 connection, timeout or name-lookup error that escapes the directory layer is still read as
 unreachable. So is at least an operating-system error saying the network or host is unreachable,
 down or reset. Another network-class error can still read as a probe fault and page.
@@ -4471,14 +4502,24 @@ Users are notified of security-relevant changes to their account through **two**
   alert distribution list). Fired on: account **lockout** and the **first successful login after ≥3
   failed attempts**, or a step-up re-auth that clears such a run (suspicious-login signals, 6.3.5); and **password change**, **email change**, **role
   change**, **account disable**, and a **directory rename** of the username (credential changes,
-  6.3.7). When the directory session reconciler ends an account's sessions for a reason other than
-  a read disabled bit, it sends `directory_sessions_ended`, not `account_disabled` (vault BACKLOG
-  #2140). At least `directory_absent`, `directory_undetermined` and `directory_object_id_missing`
-  send it. The comment on `DIRECTORY_SESSIONS_ENDED` in `auth/notifications.py` says what each one
-  means. For at least `directory_object_id_missing` the engine never asks the directory (BACKLOG
-  #2434). So the notice names no directory check. It says only that the engine could not confirm
-  from the directory that the account may still sign in, which is true for each current reason. A
-  new reason must be checked against that wording (vault BACKLOG #3171).
+  6.3.7).
+  A notice for a change the directory drove names the directory, not an administrator, as what made
+  the change. It closes with "If you did not expect this change, contact your MessageFoundry
+  administrator" rather than "If this was you". That covers at least the
+  directory rename, the directory's email change, a role change applied by the session reconciler
+  or by a directory sign-in's re-sync, and the reconciler's `account_disabled` when it read the
+  account disabled (vault BACKLOG #3121). The role notice says the roles were changed to match the
+  directory's groups, not that the console played no part: those groups map to roles through the
+  group-to-role map an administrator edits. Like the disable notice, it says the sessions already
+  open on the account were ended, which both of its senders do first. When the directory session
+  reconciler ends an account's sessions for a reason other than a read disabled bit, it sends
+  `directory_sessions_ended`, not `account_disabled` (vault BACKLOG #2140). At least
+  `directory_absent`, `directory_undetermined` and `directory_object_id_missing` send it. The
+  comment on `DIRECTORY_SESSIONS_ENDED` in `auth/notifications.py` says what each one means. For at
+  least `directory_object_id_missing` the engine never asks the directory (BACKLOG #2434). So the
+  notice names no directory check. It says only that the engine could not confirm from the
+  directory that the account may still sign in, which is true for each current reason. A new
+  reason must be checked against that wording (vault BACKLOG #3171).
   The rename notice, `username_changed`, names the old and the new name, and is sent only when
   the new name was written (BACKLOG #2017). An **unreplaced temporary password** near its deadline
   (ASVS 6.4.5, BACKLOG #2007) sends two reminders, beside the operator's `initial_credential_expiring`
@@ -5251,7 +5292,7 @@ Every authentication and authorization event is written to the durable `audit_lo
 user: `auth.login_success` / `auth.login_failed` / `auth.login_locked` / `auth.logout` /
 `auth.login_new_ip` / `auth.login_address_unevaluated` (the first-seen sign-in address, BACKLOG #288;
 on a directory sign-in the row's `mech` names the leg, `kerberos` or `oidc`) /
-`auth.permission_denied` / `auth.channel_denied` / `auth.self_target_refused`, the 6.3.5 events `auth.account_locked` /
+`auth.permission_denied` / `auth.channel_denied` / `auth.self_target_refused` / `auth.session_revoke_missed`, the 6.3.5 events `auth.account_locked` /
 `auth.login_after_failures`, the re-proof rows `auth.reauth` / `auth.password_change_failed`, plus `user.created` / `user.roles_changed` /
 `user.channel_scope_changed` / `user.channel_scope_change_refused` / `user.deleted`, `ad_group_map.updated` / `ad_group_scope_map.updated`,
 and `auth.ad_scope_resynced`. PHI access (viewing a raw message or displaying patient summaries) is recorded

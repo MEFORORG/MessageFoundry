@@ -30,7 +30,7 @@ export class IdpStepUpRequiredError extends Error {
   constructor() {
     super(
       "this session signed in through the identity provider, so it confirms a sensitive action " +
-        "there, in a browser: re-authenticate in the web console at /ui/reauth, then try again",
+        "there, in a browser: repeat the action in the web console, which opens /ui/reauth for it",
     );
     this.name = "IdpStepUpRequiredError";
   }

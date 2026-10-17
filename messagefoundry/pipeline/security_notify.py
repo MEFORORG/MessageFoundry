@@ -171,6 +171,45 @@ _DESCRIPTIONS = {
     ),
 }
 
+# Vault BACKLOG #3121. The reconciler's and the sign-in re-sync's role change and disable name no
+# administrator and close with "If you did not expect this change". Each carries its own source in
+# its words, so neither takes the generic directory line: a re-sync's roles come from the
+# directory's groups through the group-to-role map, which an administrator edits in the console,
+# so "not from the MessageFoundry console" would be false for it. The disable says what the
+# reconciler did, which is end the sessions; no MessageFoundry row was disabled. Both senders
+# of the role change end the sessions already open on the account first, the reconciler's pass
+# and the sign-in re-sync alike, so the role notice says so as the disable notice does.
+_DIRECTORY_DESCRIPTIONS = {
+    ROLES_CHANGED: (
+        "MessageFoundry read your groups in your organization's directory, changed your "
+        "account's roles to match them, and ended any sessions already open on your account."
+    ),
+    ACCOUNT_DISABLED: (
+        "Your organization's directory reports your account as disabled, so MessageFoundry ended "
+        "your sessions."
+    ),
+}
+# The administrator subject says the MessageFoundry account was disabled, which is false here.
+_DIRECTORY_SUBJECTS = {
+    ACCOUNT_DISABLED: "Your MessageFoundry sessions were ended: your directory account is disabled",
+}
+
+
+def _from_directory(event: SecurityEvent) -> bool:
+    """Whether the directory, not the holder or an administrator, made this change (BACKLOG #1139,
+    #2291, vault #3121). Gated on the kind as well as the tag: the reconciler tags every notice it
+    sends, and its ``directory_sessions_ended`` must not claim the directory changed anything."""
+    return (
+        event.event_type in (EMAIL_CHANGED, USERNAME_CHANGED, *_DIRECTORY_DESCRIPTIONS)
+        and event.detail.get("source") == "directory"
+    )
+
+
+def _subject(event: SecurityEvent) -> str:
+    if _from_directory(event) and event.event_type in _DIRECTORY_SUBJECTS:
+        return _DIRECTORY_SUBJECTS[event.event_type]
+    return _SUBJECTS.get(event.event_type, "MessageFoundry security alert")
+
 
 _LOCAL_REMEDY = (
     "ask your MessageFoundry administrator for a password reset, or the host operator to run "
@@ -261,10 +300,7 @@ def _build_body(event: SecurityEvent) -> str:
     set_by_admin = (
         event.event_type == NOTIFY_EMAIL_SET and event.detail.get("set_by") == "administrator"
     )
-    # BACKLOG #1139, #2291: the directory made this change, not the holder and not the console.
-    from_directory = event.event_type in (EMAIL_CHANGED, USERNAME_CHANGED) and (
-        event.detail.get("source") == "directory"
-    )
+    from_directory = _from_directory(event)
     if moved_by_admin:
         description = (
             "An administrator changed the address that receives security notices for your account."
@@ -273,6 +309,8 @@ def _build_body(event: SecurityEvent) -> str:
         description = (
             "An administrator set this address to receive security notices about your account."
         )
+    elif from_directory and event.event_type in _DIRECTORY_DESCRIPTIONS:
+        description = _DIRECTORY_DESCRIPTIONS[event.event_type]
     else:
         description = _DESCRIPTIONS.get(
             event.event_type, "A security event occurred on your account."
@@ -378,11 +416,12 @@ def _build_body(event: SecurityEvent) -> str:
                     scrub_log_argument(event.username),
                     key,
                 )
-    if from_directory:
+    if from_directory and event.event_type not in _DIRECTORY_DESCRIPTIONS:
         # BACKLOG #1139. Say WHERE the change came from, because it changes what the reader can do
         # about it: a directory-driven change is not editable in the console, so "contact your
         # administrator" is the only action, and an unexplained change the holder cannot find a
-        # cause for reads as a compromise.
+        # cause for reads as a compromise. The vault #3121 kinds name their source in their own
+        # description instead (see ``_DIRECTORY_DESCRIPTIONS``).
         lines.append(
             "This change came from your organization's directory, not from the MessageFoundry "
             "console."
@@ -442,7 +481,9 @@ def _build_body(event: SecurityEvent) -> str:
         # and a bare "Source IP" line would read as the address of whoever made it. Measured
         # 2026-10-06, the directory notices that pass an address come from ``_upsert_ad_user``, on
         # a directory sign-in to this account, which copies the change down BEFORE the sign-in is
-        # finished: a later step can still refuse it, or it can still owe a second factor. So the
+        # finished: a later step can still refuse it, or it can still owe a second factor. Since
+        # vault BACKLOG #3121 the role re-sync in ``_complete_ad_login`` is one more such sender,
+        # and it too runs inside a directory sign-in before the session is issued. So the
         # line says a sign-in was under way, never that one succeeded. Nothing on the event says
         # the address came from a sign-in, so a new sender passing another kind of address on a
         # directory event would make this line false; such a sender must change it.
@@ -486,8 +527,10 @@ def _build_body(event: SecurityEvent) -> str:
             DIRECTORY_SESSIONS_ENDED,
         )
     ):
-        # A directory rename or email change is an administrator's act, so "if this was you"
-        # cannot apply to it (the email half is BACKLOG #2291). Nor to a federated link or unlink:
+        # The holder did not make a directory change, so "if this was you" cannot apply to a
+        # directory rename or email change (the email half is BACKLOG #2291), nor to a role
+        # change or disable the directory drove (vault BACKLOG #3121). Nor to a federated link or
+        # unlink:
         # both routes refuse an administrator changing their own account's binding. Nor to the
         # engine ending sessions on a directory answer (vault BACKLOG #2140).
         closing = "If you did not expect this change, contact your MessageFoundry administrator."
@@ -663,7 +706,7 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
             port=self._port,
             sender=self._sender,
             recipients=[event.email],
-            subject=_SUBJECTS.get(event.event_type, "MessageFoundry security alert"),
+            subject=_subject(event),
             body=_build_body(event),
             use_tls=self._use_tls,
             username=self._username,

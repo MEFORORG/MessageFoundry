@@ -27,7 +27,7 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from functools import partial
+from functools import cache, partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -3260,6 +3260,17 @@ def store_connect_errors() -> tuple[type[Exception], ...]:
     else:
         errors.append(pyodbc.Error)
     return tuple(errors)
+
+
+@cache
+def store_call_errors() -> tuple[type[Exception], ...]:
+    """What a refused store call can raise, on any backend: :func:`store_driver_errors`, plus
+    ``RuntimeError`` and ``OSError`` as that function asks a caller to add, and ``ValueError``,
+    which aiosqlite raises for a closed connection before sqlite3 is reached. A caller that must not
+    read a bug as a refusal re-raises :data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS`
+    first. Cached, because naming a server driver imports it: build it at startup, so the first
+    refusal does not run that import on the event loop (vault BACKLOG #3145, #3113)."""
+    return (RuntimeError, OSError, ValueError, *store_driver_errors())
 
 
 def store_open_errors() -> tuple[type[Exception], ...]:

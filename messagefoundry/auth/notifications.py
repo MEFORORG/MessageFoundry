@@ -50,7 +50,10 @@ PASSWORD_RESET = "password_reset"  # nosec B105 — event label, not a credentia
 TEMPORARY_CREDENTIAL_EXPIRING = "temporary_credential_expiring"
 TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER = "temporary_credential_expiring_issuer"
 EMAIL_CHANGED = "email_changed"  # 6.3.7 — the account's email address was changed
-ROLES_CHANGED = "roles_changed"  # 6.3.7 — an admin changed the account's roles
+# 6.3.7 -- the account's roles changed: an administrator's act, or a re-sync from the directory's
+# groups, which the reconciler and the sign-in re-sync tag ``detail["source"] == "directory"``
+# (vault BACKLOG #3121).
+ROLES_CHANGED = "roles_changed"
 # 6.3.7 -- the directory renamed the account and the engine copied the new name onto the row
 # (BACKLOG #2017). When it is sent is stated once, at the send site in
 # ``AuthService._refresh_cached_username``. ``detail`` carries ``old_username``, ``new_username`` and
@@ -67,7 +70,9 @@ FEDERATED_IDENTITY_UNBOUND = (
 # address the account held BEFORE the takeover, because a moved address belongs to the operator who
 # ran the command, not to the holder being told.
 FIRST_ADMINISTRATOR_TAKEOVER = "first_administrator_takeover"
-ACCOUNT_DISABLED = "account_disabled"  # 6.3.7 — an admin disabled the account
+# 6.3.7 -- an administrator disabled the account, or the reconciler read it disabled in the
+# directory, tagged ``detail["source"] == "directory"`` (vault BACKLOG #3121).
+ACCOUNT_DISABLED = "account_disabled"
 # 6.3.7 -- the directory session reconciler ended the account's sessions for a reason that is NOT a
 # read disabled bit. At least these send it: the probe could not match the account to exactly one
 # entry (``directory_absent``: not found, more than one entry, or its stored id did not match or
@@ -75,8 +80,8 @@ ACCOUNT_DISABLED = "account_disabled"  # 6.3.7 — an admin disabled the account
 # vault BACKLOG #2140), or the row carries no ``directory_object_id``, so the pass never asked the
 # directory (``directory_object_id_missing``; BACKLOG #2434). Any whole-account reason added later
 # sends it too, so the notice's one wording must be checked against that one as well (vault BACKLOG
-# #3171). ACCOUNT_DISABLED would tell the holder an administrator disabled the account, which
-# nothing established. Which reason sends which kind is decided once, in
+# #3171). ACCOUNT_DISABLED would tell the holder the account is disabled, by an administrator or in
+# the directory, which nothing established. Which reason sends which kind is decided once, in
 # ``AuthService._apply_reconcile_revocation``.
 DIRECTORY_SESSIONS_ENDED = "directory_sessions_ended"
 MFA_ENABLED = "mfa_enabled"  # 6.3.7 — a second factor (TOTP) was enrolled on the account

@@ -404,17 +404,24 @@ from typing import Any
 #: surface grew. An older console on this engine is refused at mount; a newer console on an older
 #: engine would call a method that does not exist.
 #:
+#: Vault BACKLOG #3260, limb 2: ``AuthService.revoke_own_session`` takes a required keyword
+#: ``client``, the address on its new ``auth.session_revoke_missed`` row and on its
+#: ``auth.session_revoked`` row, and ``/ui/account/sessions/{id}/revoke`` passes it. Unlike the
+#: ``AdminHandlers`` fields of #3259, an ``AuthService`` method is on the discovered surface with
+#: its signature, so the digest moved and a skew in either direction is refused at mount.
+#:
 #: BACKLOG #3015: ``ReloadResult`` gained ``restart_required``, the settings trust anchors a
 #: restart must apply. The console's reload result and approval pages read it by attribute, so it
 #: forces a bump. Re-derived on batch/b260-c, the tree merged with BACKLOG #3091, #3105 and #2731,
-#: none of which moved it. The value below covers all four.
+#: none of which moved it. The value below covers all four, and vault BACKLOG #3260 above: it was
+#: re-derived again on the batch 257 branch's merge of those changes.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "fe903ffc23dbda0d"
+ENGINE_UI_SEAM: str = "851fb3e4d3d5b825"
 
 
 @dataclass(frozen=True, slots=True)
