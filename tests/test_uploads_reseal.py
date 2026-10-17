@@ -27,6 +27,7 @@ import json
 import logging
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -319,15 +320,47 @@ async def test_a_skipped_plaintext_body_leaves_its_sidecar_untouched_and_unliste
 async def test_an_unreadable_sidecar_still_counts_its_pair_once(tmp_path: Path) -> None:
     """The other half of the unit: a readable body is sealed, and the failed sidecar adds ONE skip.
 
-    The plaintext body it sealed does not count in ``sealed_plaintext``: that field counts uploads
-    turned from refused into readable, and this one is still unreadable.
+    The plaintext body it sealed counts in ``sealed_plaintext`` too (BACKLOG #3240). It used not
+    to, and a planted plaintext body under a sealed sidecar whose read failed once was then sealed
+    without ever being counted: the next run sees no plaintext in that upload at all.
     """
     root = tmp_path / "uploads"
     fid = await _seed(_keyed_store(root, None))
     _garble(root / f"{fid}.meta")
 
     result = await _keyed_store(root, generate_key()).reseal_to_active()
-    assert result == ResealResult(resealed=1, skipped=1, sealed_plaintext=0)
+    assert result == ResealResult(resealed=1, skipped=1, sealed_plaintext=1)
+
+
+async def test_a_planted_body_under_a_sealed_sidecar_is_counted_when_its_read_fails_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3240, the case the count missed. A genuine sealed upload has its body replaced with
+    plaintext, and the first pass cannot read the sidecar. That pass seals the planted body, so the
+    second pass finds nothing plaintext. The seal must still be counted once, in the first pass."""
+    root = tmp_path / "uploads"
+    key = generate_key()
+    keyed = _keyed_store(root, key)
+    fid = await _seed(keyed)
+    plain = await _seed(_keyed_store(root / "plain", None))
+    (root / f"{fid}.blob").write_bytes((root / "plain" / f"{plain}.blob").read_bytes())
+    sidecar = root / f"{fid}.meta"
+    real_open = Path.open
+    failed = False
+
+    def _open_failing_once(self: Path, *args: Any, **kwargs: Any) -> Any:
+        nonlocal failed
+        if self == sidecar and not failed:
+            failed = True
+            raise PermissionError("held open by another process")
+        return real_open(self, *args, **kwargs)
+
+    with monkeypatch.context() as m:
+        m.setattr(Path, "open", _open_failing_once)
+        first = await _keyed_store(root, key).reseal_to_active()
+    second = await _keyed_store(root, key).reseal_to_active()
+    assert first.sealed_plaintext + second.sealed_plaintext == 1, (first, second)
+    assert first == ResealResult(resealed=1, skipped=1, sealed_plaintext=1)
 
 
 async def test_a_pair_with_both_halves_unreadable_counts_once(tmp_path: Path) -> None:

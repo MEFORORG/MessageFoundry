@@ -326,6 +326,15 @@ log = logging.getLogger(__name__)
 _FIFO_HEADS_LANE_CHUNK = 500
 # ADR 0066 §3.1: release_claimed id-chunk bound (ids per UPDATE statement).
 _RELEASE_CHUNK = 500
+# BACKLOG #3256: the database server's clock as epoch seconds, the unit `upload_quota.since` holds.
+# Microseconds since the epoch fit a BIGINT for about 292,000 years. SYSUTCDATETIME() is a runtime
+# constant, read once per query, so two references in one statement agree. The cluster lease has
+# its own copy at millisecond grain (pipeline/cluster_sqlserver.py `_DB_NOW`). Making this one the
+# canonical copy for both is a pipeline change outside BACKLOG #3256.
+_MSSQL_EPOCH_NOW = (
+    "(CAST(DATEDIFF_BIG(MICROSECOND, CAST('1970-01-01' AS DATETIME2), SYSUTCDATETIME()) AS FLOAT)"
+    " / 1000000.0)"
+)
 # BACKLOG #1169: rows per batch for the `attachment_chunk` at-rest migration. Every OTHER cipher pass
 # batches 500 because its rows are kilobyte-shaped; one attachment_chunk row is a whole
 # DETACH_CHUNK_BYTES (1 MiB) slice, ~1.33 MiB once base64+GCM sealed. 16 keeps a batch near 21 MiB,
@@ -12114,23 +12123,24 @@ class SqlServerStore:
         MERGE with HOLDLOCK is the SQL Server upsert that is safe under the concurrent opens of an
         engine-shard fleet (a bare IF EXISTS/INSERT races) — the same pattern
         :meth:`add_cipher_invocations` uses. The budget predicate rides ``WHEN MATCHED AND``, so a
-        refusal matches no rows and ``OUTPUT`` returns nothing."""
-        now = time.time()
+        refusal matches no rows and ``OUTPUT`` returns nothing.
+
+        "Now" is the database server's clock, ``_MSSQL_EPOCH_NOW``, read once in the MERGE's
+        ``USING`` row (BACKLOG #3256; ``uploads.UploadQuotaError`` says why)."""
         if files <= 0:
             # RELEASE — unconditional, clamped at zero (a double release cannot mint budget).
             await self._execute(
                 "UPDATE upload_quota SET"
                 " inflight_files = CASE WHEN inflight_files + ? < 0 THEN 0 ELSE inflight_files + ? END,"
                 " inflight_bytes = CASE WHEN inflight_bytes + ? < 0 THEN 0 ELSE inflight_bytes + ? END,"
-                " since = CASE WHEN since > ? THEN since ELSE ? END"  # never backwards (#2648)
+                # never backwards (#2648)
+                f" since = CASE WHEN since > {_MSSQL_EPOCH_NOW} THEN since ELSE {_MSSQL_EPOCH_NOW} END"
                 " WHERE uploader_id = ?",
                 (
                     int(files),
                     int(files),
                     int(size_bytes),
                     int(size_bytes),
-                    now,
-                    now,
                     uploader_id,
                 ),
             )
@@ -12138,13 +12148,14 @@ class SqlServerStore:
         if files > max_files or size_bytes > max_total_bytes:
             # Fail closed before touching the row: WHEN NOT MATCHED inserts unconditionally.
             return False
-        stale = now - max(0.0, stale_after)
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "MERGE upload_quota WITH (HOLDLOCK) AS t"
-                    " USING (SELECT ? AS uploader_id, ? AS files, ? AS size_bytes, ? AS now_ts,"
-                    " ? AS stale_ts, ? AS max_files, ? AS max_total_bytes) AS s"
+                    " USING (SELECT ? AS uploader_id, ? AS files, ? AS size_bytes,"
+                    " n.now_ts AS now_ts, n.now_ts - ? AS stale_ts,"
+                    " ? AS max_files, ? AS max_total_bytes"
+                    f" FROM (SELECT {_MSSQL_EPOCH_NOW} AS now_ts) AS n) AS s"
                     " ON t.uploader_id = s.uploader_id"
                     " WHEN MATCHED AND"
                     " (CASE WHEN t.since <= s.stale_ts THEN 0 ELSE t.inflight_files END)"
@@ -12167,8 +12178,7 @@ class SqlServerStore:
                         uploader_id,
                         int(files),
                         int(size_bytes),
-                        now,
-                        stale,
+                        float(max(0.0, stale_after)),
                         int(max_files),
                         int(max_total_bytes),
                     ),
