@@ -94,13 +94,67 @@ censored = true
 censored_by = "the 36:00 step_timeout in force when the pool was collected: this leg was killed AT the cap seven times in the window (36:08 on runs 31189317409 / 31199321840 / 31202372465, 36:07 on 30955150892 / 31094875320 / 31192717684, 36:01 on 31149117314), three of them push runs on main"
 source = "measured 2026-08-08; same pool and filter as the windows-2022 row; n=360. 35:47 is the largest step that FIT in 36:00, and 36:08 is a lower bound on the largest the suite wants. The kills were slowness, not a wedge -- run 31149117314's pytest finished GREEN (0:35:48) and the step was killed 4.85s later, and no faulthandler native-stack dump appears in any kill log."
 
-# THE THREE WEB CONSOLE ROWS WERE RE-MEASURED 2026-10-07 UTC, as the web console step-margin gate
-# re-measure of that date, after the gate reddened green suites in the merge queue. ci.yml's "THE
-# FOURTH RE-DERIVATION" note names those runs and sizes `webconsole_margin_cap` from the maxima
+# THE THREE WEB CONSOLE ROWS WERE RE-MEASURED 2026-10-17 UTC, as the web console step-margin gate
+# re-measure of that date, after the gate reddened windows-2022 with every test passing on at least
+# engine PRs 2347, 2349, 2360 and 2371 and on merge-group runs 39012965647 and 39012997644, which the queue
+# ejected. ci.yml's "THE FIFTH RE-DERIVATION" note sizes `webconsole_margin_cap` from the maxima
 # below. `find_baseline` takes the FIRST matching row and `load_baselines` refuses a second row for
-# one leg, so the rows below REPLACE the 2026-09-30 rows rather than sitting beside them.
+# one leg, so the rows below REPLACE the 2026-10-07 rows rather than sitting beside them.
 #
-# THE ROWS THEY REPLACE, measured 2026-09-30 UTC by owner request of that date, after the margin gate
+# THE ROWS THEY REPLACE, measured 2026-10-07 UTC. ci.yml's "THE FOURTH RE-DERIVATION" note cites
+# this pool, so each row is kept here whole:
+#
+#   ubuntu-latest   max_passing 4:41
+#     measured 2026-10-07 UTC (web console step-margin gate re-measure, 2026-10-07). Pool: every
+#     ci.yml run with event merge_group or pull_request created
+#     2026-09-30T19:25:00Z..2026-10-07T03:39:59Z UTC, both ends inclusive, as the runs endpoint's
+#     created=A..B filter reads them, each event listed on its own in 12-hour slices: 1042 runs
+#     (merge_group 453, pull_request 589), 2 of them pull_request runs with no web console job. It
+#     opens at the second after the 2026-09-30 pool closed, so no run is in both. Jobs fetched with
+#     ?filter=all; a row is this leg's `Web console tests (pytest)` STEP, kept when THAT STEP
+#     concluded success, duration = its completed_at minus started_at. A re-run-failed-jobs attempt
+#     re-lists the jobs it did not re-run under new ids with identical stamps; those copies are
+#     dropped (125 across the three legs). 7 runs whose web console jobs were still running when
+#     first read were re-read after they finished. Jobs were read 2026-10-07 between about 03:42Z
+#     and 04:40Z UTC; a later re-run of a run in the window adds an attempt this pool does not hold.
+#     push and workflow_dispatch are left out, as in the earlier pools. Runs created before PR 1859
+#     landed (2026-09-30T21:19Z) ran under the caps 5 / 6 / 8 and kills 9 / 10 / 12 it replaced.
+#     n=990 (merge_group 452, pull_request 538), min 2:29, median 3:42, p90 4:03, p95 4:08. Worst
+#     4:41, twice: run 37567098557 job 112617276958 (merge_group, 2026-10-07, the ejection this
+#     re-measure was cut for) and run 36891329655 job 110467534546 (merge_group, 2026-10-01); next
+#     4:31, run 37539828382. The gate went red on 5 of these success rows, all merge_group: 3 at the
+#     5:00 cap PR 1859 replaced and both 4:41 rows at 6:00. Uncensored on evidence: the longest of 3
+#     step failures (run 37374539541) stopped at 4:08, far under the 9:00 kill; 26 were cancelled,
+#     the longest at 3:34; 18 were skipped.
+#
+#   windows-2022    max_passing 5:50
+#     measured 2026-10-07 UTC (web console step-margin gate re-measure, 2026-10-07); same pool and
+#     filter as the ubuntu web-console row; n=986 (merge_group 451, pull_request 535), min 3:13,
+#     median 4:34, p90 4:55, p95 5:02. Worst 5:50, run 36795399844 job 110157635527 (merge_group,
+#     2026-10-01); next 5:49, run 36936482551 (pull_request), and 5:46, run 37262211642. The gate
+#     went red on 12 of these success rows (merge_group 10, pull_request 2), every one in a run
+#     created on 2026-09-30 under the 6:00 cap PR 1859 replaced, and on none at 8:00. Uncensored on
+#     evidence: the longest of 4 step failures (run 37562580245) stopped at 5:20, far under the
+#     11:00 kill; 29 were cancelled, the longest at 3:59; 21 were skipped.
+#
+#   windows-2025    max_passing 8:29
+#     measured 2026-10-07 UTC (web console step-margin gate re-measure, 2026-10-07); same pool and
+#     filter as the ubuntu web-console row; n=985 (merge_group 451, pull_request 534), min 3:22,
+#     median 4:56, p90 5:32, p95 5:41. Worst 8:29, run 37372541433 attempt 2 job 111993299483
+#     (pull_request, 2026-10-05): its log shows no test completing on any worker for 4:26, and
+#     attempt 3 re-ran the same tree on this leg in 4:06, so the worst is runner time; ci.yml's
+#     fourth re-derivation says why it is kept. Next 7:08, run 36892375697 job 110471030645
+#     (merge_group, 2026-10-01). The gate went red on 11 of these success rows at its 8:00 cap
+#     (merge_group 7, pull_request 4). Uncensored on evidence: the longest of 5 step failures (run
+#     37025013749) stopped at 6:39, far under the 12:00 kill; 30 were cancelled, the longest at
+#     5:36; 22 were skipped.
+#
+# THE 2026-10-07 ROWS ABOVE WERE THEMSELVES A RE-MEASURE, the web console step-margin gate
+# re-measure of that date, after the gate reddened green suites in the merge queue. ci.yml's "THE
+# FOURTH RE-DERIVATION" note names those runs and sized `webconsole_margin_cap` from their maxima.
+# They replaced the 2026-09-30 rows.
+#
+# THE 2026-09-30 ROWS, measured 2026-09-30 UTC by owner request of that date, after the margin gate
 # went red on windows-2022 with the suite green on at least PRs 1810, 1829, 1833, 1836 and 1848.
 # ci.yml's "THE THIRD RE-DERIVATION" note cites this pool, so each row is kept here whole:
 #
@@ -183,34 +237,43 @@ source = "measured 2026-08-08; same pool and filter as the windows-2022 row; n=3
 # script's `record_escalation`.
 #
 # AND A THIRD TIME UNDER THE 2026-09-30 ROWS. Those rows landed with PR 1859 at 2026-09-30T21:19Z
-# and the annotation with PR 1825 at 2026-10-01T10:10Z, so the pool below opens with about 2 hours
+# and the annotation with PR 1825 at 2026-10-01T10:10Z, so the 2026-10-07 pool opens with about 2 hours
 # of runs that had neither and about 13 more that had the rows but not the annotation. Counting only
 # runs created after the annotation landed: 17 of 785 ubuntu, 2 of 781 windows-2022 and 39 of 782
 # windows-2025 success rows have an API step duration over 4:15, 5:40 and 5:43, close rather than
 # exact for the reason above. The annotation reached those run pages, and nothing re-measured the
 # rows until, among those same runs, the gate had reddened 8 merge-group runs whose tests passed: 6
-# on windows-2025 and 2 on ubuntu. The rows below count the whole pool, so their red counts differ.
+# on windows-2025 and 2 on ubuntu. The 2026-10-07 rows count the whole pool, so their red counts
+# differ.
+#
+# AND A FOURTH TIME UNDER THE 2026-10-07 ROWS. Counting only runs created after PR 2122 put them on
+# main (2026-10-07T07:19:56Z): 269 of the 2026-10-17 pool's ubuntu, 94 of its windows-2022 and 3 of
+# its windows-2025 success rows have an API step duration over 4:41, 5:50 and 8:29, close rather
+# than exact for the reason above. Nothing re-measured the rows until, under the caps PR 2122 set,
+# the gate had reddened 23 success rows whose tests passed: 2 on ubuntu, 19 on windows-2022 and 2 on
+# windows-2025. 5 of them were merge-group runs, 1 on ubuntu and 4 on windows-2022, and each of
+# those ejected its group. The rows below count the whole pool, so their counts differ.
 
 [[baseline]]
 step = "Web console tests (pytest)"
 leg = "ubuntu-latest"
-max_passing = "4:41"
+max_passing = "6:23"
 censored = false
 censored_by = ""
-source = "measured 2026-10-07 UTC (web console step-margin gate re-measure, 2026-10-07). Pool: every ci.yml run with event merge_group or pull_request created 2026-09-30T19:25:00Z..2026-10-07T03:39:59Z UTC, both ends inclusive, as the runs endpoint's created=A..B filter reads them, each event listed on its own in 12-hour slices: 1042 runs (merge_group 453, pull_request 589), 2 of them pull_request runs with no web console job. It opens at the second after the 2026-09-30 pool closed, so no run is in both. Jobs fetched with ?filter=all; a row is this leg's `Web console tests (pytest)` STEP, kept when THAT STEP concluded success, duration = its completed_at minus started_at. A re-run-failed-jobs attempt re-lists the jobs it did not re-run under new ids with identical stamps; those copies are dropped (125 across the three legs). 7 runs whose web console jobs were still running when first read were re-read after they finished. Jobs were read 2026-10-07 between about 03:42Z and 04:40Z UTC; a later re-run of a run in the window adds an attempt this pool does not hold. push and workflow_dispatch are left out, as in the earlier pools. Runs created before PR 1859 landed (2026-09-30T21:19Z) ran under the caps 5 / 6 / 8 and kills 9 / 10 / 12 it replaced. n=990 (merge_group 452, pull_request 538), min 2:29, median 3:42, p90 4:03, p95 4:08. Worst 4:41, twice: run 37567098557 job 112617276958 (merge_group, 2026-10-07, the ejection this re-measure was cut for) and run 36891329655 job 110467534546 (merge_group, 2026-10-01); next 4:31, run 37539828382. The gate went red on 5 of these success rows, all merge_group: 3 at the 5:00 cap PR 1859 replaced and both 4:41 rows at 6:00. Uncensored on evidence: the longest of 3 step failures (run 37374539541) stopped at 4:08, far under the 9:00 kill; 26 were cancelled, the longest at 3:34; 18 were skipped."
+source = "measured 2026-10-17 UTC (web console step-margin gate re-measure, 2026-10-17). Pool: every ci.yml run with event merge_group or pull_request created 2026-10-07T03:40:00Z..2026-10-17T07:29:59Z UTC, both ends inclusive, as the runs endpoint's created=A..B filter reads them, each event listed on its own in 12-hour slices, none near the listing's 1000 cap: 987 runs (merge_group 355, pull_request 632). It opens at the second after the 2026-10-07 pool closed, so no run is in both. Jobs fetched with ?filter=all; a row is this leg's `Web console tests (pytest)` STEP, kept when THAT STEP concluded success, duration = its completed_at minus started_at, executions under 60s dropped, which removed no success row, and re-run copies with identical stamps dropped. 5 runs were still in progress when listed; every web console job in them had finished. Jobs were read 2026-10-17 after 07:30Z UTC; a later re-run of a run in the window adds an attempt this pool does not hold. push and workflow_dispatch are left out, as in the earlier pools. PR 2122 landed at 2026-10-07T07:19:56Z. Runs created before then ran under the caps 6 / 8 / 8 and kills 9 / 11 / 12 it replaced, except the merge-group runs from 06:48Z on that carried its own tree; the rest ran under 7 / 8 / 12 and 10 / 11 / 16. No row in that half-hour crosses either red line, so no count below depends on the split. n=935 (merge_group 354, pull_request 581), min 2:49, median 4:17, p90 4:53, p95 4:58, percentiles interpolated linearly. Worst 6:23, run 38117951280 job 114406695406 (pull_request, 2026-10-11); next 5:41, run 38499496637 job 115642910017 (merge_group, 2026-10-14). The gate went red on those 2 success rows, both at the 7:00 cap, and on no other. 269 success rows have an API step duration over the 4:41 row this one replaces. Uncensored on evidence: the longest of 2 step failures (run 37903034154) stopped at 4:33, far under the 10:00 kill; 22 were cancelled, the longest at 4:47 (run 38471796726); 22 were skipped."
 
 [[baseline]]
 step = "Web console tests (pytest)"
 leg = "windows-2022"
-max_passing = "5:50"
+max_passing = "7:40"
 censored = false
 censored_by = ""
-source = "measured 2026-10-07 UTC (web console step-margin gate re-measure, 2026-10-07); same pool and filter as the ubuntu web-console row; n=986 (merge_group 451, pull_request 535), min 3:13, median 4:34, p90 4:55, p95 5:02. Worst 5:50, run 36795399844 job 110157635527 (merge_group, 2026-10-01); next 5:49, run 36936482551 (pull_request), and 5:46, run 37262211642. The gate went red on 12 of these success rows (merge_group 10, pull_request 2), every one in a run created on 2026-09-30 under the 6:00 cap PR 1859 replaced, and on none at 8:00. Uncensored on evidence: the longest of 4 step failures (run 37562580245) stopped at 5:20, far under the 11:00 kill; 29 were cancelled, the longest at 3:59; 21 were skipped."
+source = "measured 2026-10-17 UTC (web console step-margin gate re-measure, 2026-10-17); same pool and filter as the ubuntu web-console row; n=935 (merge_group 355, pull_request 580), min 3:29, median 5:15, p90 5:51, p95 5:58. Worst 7:40, run 38971346969 attempt 1 job 117210331710 (pull_request, 2026-10-16): attempt 2 re-ran the same tree on this leg in 4:45, so the worst is runner time; ci.yml's fifth re-derivation says why it is kept. Next 6:39, run 39011017745, and 6:36, run 38990970158 (both pull_request, 2026-10-17). The gate went red on 19 of these success rows at the 8:00 cap (pull_request 15, merge_group 4), 18 of them in runs created on or after 2026-10-12, including merge-group runs 39012965647 (6:10) and 39012997644 (6:22), the ejections this re-measure was cut for. 95 success rows have an API step duration over the 5:50 row this one replaces. Uncensored on evidence: the one step failure (run 37903034154) stopped at 5:39, far under the 11:00 kill; 30 were cancelled, the longest at 5:39 too (run 38447080912, a different run); 21 were skipped."
 
 [[baseline]]
 step = "Web console tests (pytest)"
 leg = "windows-2025"
-max_passing = "8:29"
+max_passing = "9:47"
 censored = false
 censored_by = ""
-source = "measured 2026-10-07 UTC (web console step-margin gate re-measure, 2026-10-07); same pool and filter as the ubuntu web-console row; n=985 (merge_group 451, pull_request 534), min 3:22, median 4:56, p90 5:32, p95 5:41. Worst 8:29, run 37372541433 attempt 2 job 111993299483 (pull_request, 2026-10-05): its log shows no test completing on any worker for 4:26, and attempt 3 re-ran the same tree on this leg in 4:06, so the worst is runner time; ci.yml's fourth re-derivation says why it is kept. Next 7:08, run 36892375697 job 110471030645 (merge_group, 2026-10-01). The gate went red on 11 of these success rows at its 8:00 cap (merge_group 7, pull_request 4). Uncensored on evidence: the longest of 5 step failures (run 37025013749) stopped at 6:39, far under the 12:00 kill; 30 were cancelled, the longest at 5:36; 22 were skipped."
+source = "measured 2026-10-17 UTC (web console step-margin gate re-measure, 2026-10-17); same pool and filter as the ubuntu web-console row; n=928 (merge_group 355, pull_request 573), min 3:38, median 5:46, p90 6:34, p95 6:49. Worst 9:47, run 37580282556 job 112658191101 (pull_request, 2026-10-07, created before PR 2122 landed); next 9:36, run 37796807127 (pull_request, 2026-10-08), and 9:33, run 38754145425 (pull_request, 2026-10-15). The gate went red on 5 of these success rows: 3 in runs created before PR 2122 landed, at the 8:00 cap it replaced (merge_group 2, pull_request 1), and 2 at 12:00 (pull_request 2, the 9:36 and 9:33). 4 success rows have an API step duration over the 8:29 row this one replaces. Uncensored on evidence: the one step failure (run 37903034154, 2026-10-09) stopped at 6:27, far under the 16:00 kill then in force; 32 were cancelled, the longest at 7:46 (run 38497483677), also under 16:00; 21 were skipped."
