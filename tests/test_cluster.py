@@ -1230,8 +1230,8 @@ async def test_a_convergence_reload_hands_its_hooks_the_version_it_converged_on(
 ) -> None:
     """vault BACKLOG #3109: ``_converge_reload`` hands the audit hook its outcome carrying the
     shared version it converged on. A reload that raises hands the failure hook the fault and that
-    version, once per version however often the runner retries it, and is re-raised, so the runner
-    still retries it."""
+    version, and is re-raised, so the runner still retries it. The hook is called until its row for
+    a version lands, not on every retry; a row the store refused is tried again on the next pass."""
     coord = _BumpRecordingCoordinator()
     cfgdir = tmp_path / "cfg"
     _minimal_config(cfgdir, tmp_path)
@@ -1246,12 +1246,16 @@ async def test_a_convergence_reload_hands_its_hooks_the_version_it_converged_on(
     await eng.start()
     applied: list[int | None] = []
     failed: list[tuple[type[Exception], int]] = []
+    refuse_next_row = [False]
 
     async def _audit(outcome: ReloadOutcome) -> None:
         applied.append(outcome.config_version)
 
-    async def _failed(exc: Exception, version: int) -> None:
+    async def _failed(exc: Exception, version: int) -> bool:
         failed.append((type(exc), version))
+        landed = not refuse_next_row[0]
+        refuse_next_row[0] = False
+        return landed
 
     eng.convergence_reload_audit = _audit
     eng.convergence_reload_failed = _failed
@@ -1273,6 +1277,13 @@ async def test_a_convergence_reload_hands_its_hooks_the_version_it_converged_on(
         with pytest.raises(WiringError):
             await eng._converge_reload(6)
         assert applied == [4, 6] and failed[-1] == (WiringError, 6) and len(failed) == 3
+        # A row the store refuses leaves the version unreported, so the next pass tries again,
+        # and a row that lands stops the retries.
+        refuse_next_row[0] = True
+        for _ in range(3):
+            with pytest.raises(WiringError):
+                await eng._converge_reload(7)
+        assert failed[3:] == [(WiringError, 7), (WiringError, 7)], "lost once, then written"
     finally:
         await eng.stop()
 

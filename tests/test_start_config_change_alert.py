@@ -1116,3 +1116,45 @@ async def test_the_notifier_pages_config_changed_with_labels_only() -> None:
         "ts",
         "severity",
     }
+
+
+@pytest.mark.parametrize("fault", ["refusal", "other"])
+async def test_a_failed_convergence_row_the_store_refused_is_written_on_the_next_pass(
+    tmp_path: Path,
+    cfg: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    alerts: list[dict[str, Any]],
+    fault: str,
+) -> None:
+    """vault BACKLOG #3109: the version is marked reported only once its config_reload_failed row
+    lands. A store that refuses the first write leaves it unmarked, so the runner's next pass
+    writes it, and the pass after that writes nothing more. Before, the first pass marked it and
+    the lost row was never written. Both writers are covered: a refusal's and another fault's."""
+    real_record = MessageStore.record_audit
+    refused: list[str] = []
+
+    async def _refuse_once(self: MessageStore, action: str, *a: Any, **kw: Any) -> Any:
+        if action == "config_reload_failed" and not refused:
+            refused.append(action)
+            raise RuntimeError("synthetic: the audit store is not answering")
+        return await real_record(self, action, *a, **kw)
+
+    async def _boom(self: Engine, *a: Any, **kw: Any) -> Any:
+        raise RuntimeError("synthetic: a fault that is no reload refusal")
+
+    expected: type[Exception] = WiringError if fault == "refusal" else RuntimeError
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        (cfg / "cfg.py").write_text("this is not python (", encoding="utf-8")
+        with monkeypatch.context() as patch:
+            patch.setattr(MessageStore, "record_audit", _refuse_once)
+            if fault == "other":
+                patch.setattr(Engine, "reload_detail", _boom)
+            for _ in range(3):  # the first row is refused, the second pass writes it
+                with pytest.raises(expected):
+                    await engine._converge_reload(2)
+        failed = await engine.store.list_audit(action="config_reload_failed")
+    assert refused == ["config_reload_failed"], "control: the first write was refused"
+    assert len(failed) == 1, "written on the second pass, and not again on the third"
+    assert json.loads(failed[0]["detail"])["config_version"] == 2

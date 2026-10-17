@@ -3280,3 +3280,17 @@ async def test_an_embedders_attached_service_supplies_the_auth_limits(
     assert resp.status_code == 200, resp.text
     switches = [entry["switch"] for entry in resp.json()["loosenings"]]
     assert ("totp_skew_steps" in switches) is (skew > 0)
+
+
+async def test_the_settings_an_auth_service_hands_out_are_a_deep_copy(engine: Engine) -> None:
+    """Vault BACKLOG #3215, review finding 7: ``AuthService.settings`` is read by the posture route,
+    and the section is not frozen. Setting a field, or appending to a list field, on what it
+    returns must leave the limits the service enforces unchanged. A shallow copy shared the lists."""
+    service = AuthService(engine.store, AuthSettings())
+    handed = service.settings
+    before = list(service.settings.oidc_signing_algorithms)
+    handed.oidc_signing_algorithms.append("HS256")
+    handed.totp_skew_steps = 2
+    assert service.settings.oidc_signing_algorithms == before
+    assert service.settings.totp_skew_steps == 0
+    assert handed.oidc_signing_algorithms == [*before, "HS256"], "control: the copy did change"

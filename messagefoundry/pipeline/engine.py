@@ -258,8 +258,9 @@ class ReloadOutcome:
 
     ``config_version`` is the shared cluster config version this reload applied: the one an
     operator reload bumped the cluster to, or the one a convergence reload converged on. Both rows
-    carry it, so a follower's row names the operator act it followed (vault BACKLOG #3109). ``None``
-    on a single node, on a dry run, and when the bump failed."""
+    carry it, so a follower's row names the operator act it followed (vault BACKLOG #3109). It is
+    ``None`` at least on a single node, on a dry run, when the bump failed, and on any
+    ``propagate=False`` reload until :meth:`Engine._converge_reload` sets it."""
 
     registry: Registry
     applied: bool
@@ -695,10 +696,10 @@ class Engine:
         # engine never imports the API. None (embedding, tests) writes no row.
         self.convergence_reload_audit: Callable[[ReloadOutcome], Awaitable[None]] | None = None
         # vault BACKLOG #3109: the same for a convergence reload that raised, called with the fault
-        # and the shared version it was converging on. The runner retries that version every tick,
-        # so it is called once per version, not once per tick; _convergence_failure_reported is
-        # the last version it was called for.
-        self.convergence_reload_failed: Callable[[Exception, int], Awaitable[None]] | None = None
+        # and the shared version it was converging on, and answering whether its row landed. The
+        # runner retries that version every tick, so it is called until a row lands for that
+        # version, not once per tick; _convergence_failure_reported is the version whose row did.
+        self.convergence_reload_failed: Callable[[Exception, int], Awaitable[bool]] | None = None
         self._convergence_failure_reported: int | None = None
 
     @classmethod
@@ -2320,16 +2321,17 @@ class Engine:
         Without it, the store's newest baseline named the graph this node ran before converging, so a
         later start compared against the wrong digest. A fault in that writer is logged and goes no
         further: the graph has swapped, and a raise would make the runner retry a reload that already
-        ran. A reload that raises is passed to :attr:`convergence_reload_failed`, the first time it
-        raises for ``version`` only, and then re-raised, so the runner still retries it."""
+        ran. A reload that raises is passed to :attr:`convergence_reload_failed` until its row for
+        ``version`` lands, and then re-raised, so the runner still retries it. A row the store
+        refused is tried again on the next failure of the same version."""
         try:
             outcome = await self.reload_detail(propagate=False)
         except Exception as exc:
             hook = self.convergence_reload_failed
             if hook is not None and version != self._convergence_failure_reported:
-                self._convergence_failure_reported = version
                 try:
-                    await hook(exc, version)
+                    if await hook(exc, version):
+                        self._convergence_failure_reported = version
                 except Exception:  # noqa: BLE001 - the reload's own fault is the one to raise
                     log.exception("cluster: a convergence reload failed, and so did its audit")
             raise

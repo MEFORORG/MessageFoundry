@@ -1438,9 +1438,11 @@ class _LoadedConfig:
 
     A reload's row is built from that reload's own outcome with :meth:`of` (vault BACKLOG #2257), a
     convergence reload's included (vault BACKLOG #3076, #3109). So no row reads the engine's graph,
-    directory or digest at the write. What a row does read at the write is the cluster node id,
-    which is fixed for the life of the process, and the loaded fingerprint's identity, for the
-    ``superseded`` check, which asks about the live state on purpose."""
+    directory or digest at the write. What a row does read at the write includes at least the
+    cluster node id, which is fixed for the life of the process, and, for the ``superseded``
+    checks, which ask about the live state on purpose, the loaded fingerprint's identity (a
+    reload's row) and the live graph's identity (the start's row). The start row also reads the
+    settings the app stashed, for its loosenings; a reload changes none of them."""
 
     directory: str | None
     shard: str | None
@@ -1736,6 +1738,7 @@ async def _audit_refused_reload(
     dry_run: bool,
     client: str | None = None,
     extra: Mapping[str, object] | None = None,
+    wrote: Callable[[bool], None] | None = None,
 ) -> tuple[int, str]:
     """Write the audit row for a reload the engine refused, and return the status and detail to answer.
 
@@ -1763,7 +1766,8 @@ async def _audit_refused_reload(
 
     ``client`` follows :func:`_record_reload_audit`'s rule (ADR 0150): the executor passes none.
     ``extra`` adds keys to the row's detail; a cluster convergence reload names itself there (vault
-    BACKLOG #3109).
+    BACKLOG #3109). ``wrote``, when passed, is told whether the row landed; that reload uses it to
+    retry a row the store refused.
 
     **The row's write never raises.** A refusal changed nothing, so its answer stands whether or
     not the row lands, and a store fault here would otherwise turn it into a raw 500 (vault BACKLOG
@@ -1836,17 +1840,19 @@ async def _audit_refused_reload(
     # argument: a caller's chained refusal can still carry the directory into it, and only the
     # handler's ControlCharScrubFilter escapes that. ``defects=()`` keeps the docstring's promise
     # that this write never raises (vault BACKLOG #2260).
-    await write_audit_soft(
+    written = await write_audit_soft(
         lambda: engine.store.record_audit(action, actor=actor, detail=row, client=client),
         log=_log,
         message="a refused config reload's %s audit row failed. Lost row: actor=%s detail=%s",
         args=lambda: (action, scrub_log_argument(actor), scrub_log_argument(row)),
         defects=(),
     )
+    if wrote is not None:
+        wrote(written)
     return status, answer
 
 
-async def _audit_failed_convergence(engine: Engine, exc: Exception, version: int) -> None:
+async def _audit_failed_convergence(engine: Engine, exc: Exception, version: int) -> bool:
     """Write the ``config_reload_failed`` row for a cluster convergence reload that raised, so the
     attempt is in the audit log and not only in the engine log (vault BACKLOG #3109).
 
@@ -1859,13 +1865,22 @@ async def _audit_failed_convergence(engine: Engine, exc: Exception, version: int
     was swapped either way: the reload raises only before its swap commits, and the node keeps its
     running graph and retries.
 
-    It never raises: the write goes through :func:`write_audit_soft` with ``defects=()``."""
+    It returns whether the row landed, so the engine can try again on the next failure of the
+    same version rather than lose it. It never raises: the write goes through
+    :func:`write_audit_soft` with ``defects=()``."""
     extra = {"initiator": _CONVERGENCE_INITIATOR, "config_version": version}
     if isinstance(exc, _RELOAD_REFUSALS):
+        landed: list[bool] = []
         await _audit_refused_reload(
-            engine, exc, actor=_CONVERGENCE_ACTOR, requested=None, dry_run=False, extra=extra
+            engine,
+            exc,
+            actor=_CONVERGENCE_ACTOR,
+            requested=None,
+            dry_run=False,
+            extra=extra,
+            wrote=landed.append,
         )
-        return
+        return landed == [True]
     row = json.dumps(
         {
             "requested": None,
@@ -1875,7 +1890,7 @@ async def _audit_failed_convergence(engine: Engine, exc: Exception, version: int
             "error": type(exc).__name__,
         }
     )
-    await write_audit_soft(
+    return await write_audit_soft(
         lambda: engine.store.record_audit(
             "config_reload_failed", actor=_CONVERGENCE_ACTOR, detail=row
         ),
@@ -10309,8 +10324,8 @@ def create_managed_app(
                 },
             )
 
-        async def _audit_convergence_failure(exc: Exception, version: int) -> None:
-            await _audit_failed_convergence(engine, exc, version)
+        async def _audit_convergence_failure(exc: Exception, version: int) -> bool:
+            return await _audit_failed_convergence(engine, exc, version)
 
         engine.convergence_reload_audit = _audit_convergence_reload
         engine.convergence_reload_failed = _audit_convergence_failure
@@ -10342,6 +10357,9 @@ def create_managed_app(
                 # Inside the span too (BACKLOG #1989): a raise from add_registry is past every check
                 # above and before the teardown span below, so nothing else would close the store.
                 engine.add_registry(loaded)
+                # The runner holds the graph now. The lifespan frame lives as long as the process,
+                # so this name would pin the start's graph past every reload (vault BACKLOG #3076).
+                del loaded
                 # Right after the load, so the digest covers the bytes it read, and the provenance
                 # route has a baseline from the start on (vault BACKLOG #2597). Never raises on an
                 # unreadable bundle: it leaves the baseline empty and the start goes on.
@@ -10365,8 +10383,9 @@ def create_managed_app(
                 # not later: engine.start() has not run, so no reload can have moved it yet, and a
                 # start on changed bytes still pages through a crash loop (vault BACKLOG #3076).
                 # Its row stays no baseline, since nothing can rule out a swap before the row is
-                # written, so the next start pages again for the same change. A repeat page on
-                # a degraded start is the safe side of that trade.
+                # written. So the next start pages again for the same change, unless a flag toggle
+                # or reload row lands in between and becomes the baseline. A repeat page on a
+                # degraded start is the safe side of that trade.
                 start_outcome, start_config = await _compare_start_config(
                     engine,
                     start_loaded.fingerprint
@@ -10558,10 +10577,11 @@ def create_managed_app(
                     _upload_store, audit=_audit_upload_prune
                 )
                 upload_retention_runner.start()
-            # Back the COMPLETE loosening list on GET /security/posture: [auth] carries posture switches
-            # (ad_session_recheck_seconds) that security_loosenings() must see. Without the stash the
-            # route would fall back to AuthSettings() defaults and report a subset. Mirrors
-            # store_settings above.
+            # [auth] carries posture switches (ad_session_recheck_seconds) that security_loosenings()
+            # must see. GET /security/posture reads them off the attached service first (vault
+            # BACKLOG #3215), and this lifespan built that service from these same settings, so
+            # on this path the posture read never reaches this stash. It stays the posture read's
+            # fallback for an app that sets the stash with no service attached.
             if auth_settings is not None:
                 app.state.auth_settings = auth_settings
             # The start's config_loaded row (vault BACKLOG #2597), as early as its readers allow: the
@@ -10579,8 +10599,8 @@ def create_managed_app(
                     comparison=start_config,
                     loaded=start_loaded,
                 )
-                # Its last reader: the lifespan frame lives as long as the process, and the
-                # snapshot would hold the start's graph past every reload.
+                # Its last reader. The snapshot holds the start's graph, and the lifespan frame
+                # lives as long as the process; ``loaded`` was dropped after add_registry.
                 start_loaded = None
             # The auth_settings test adds nothing at runtime; it narrows the type for the reads below.
             if auth is not None and auth_settings is not None:

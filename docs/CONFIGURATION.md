@@ -1634,7 +1634,8 @@ started together, can each raise it; the alert list folds them into one instance
   `loosenings` are `null`, and it has no `shard` key and no `fingerprint` key at all. A start that
   could not tell whether a reload swapped its graph names its own graph, degraded with the
   `start_swap_check` step. A later start passes over both rows. So after a snapshot fault, the
-  next start raises `config_changed` again for the same change.
+  next start raises `config_changed` again for the same change, unless a flag toggle or reload row
+  lands in between and becomes the baseline.
 - A convergence reload writes its own `config_reload` row, in the shape an operator reload writes
   (vault BACKLOG #3076). Its actor is `system:cluster-convergence` and its `initiator` is
   `cluster_convergence`. So the store's newest baseline names the graph the node converged on,
