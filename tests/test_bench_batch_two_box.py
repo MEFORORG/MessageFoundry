@@ -162,14 +162,7 @@ def test_rig_copied_auth_defaults_match_the_engine_settings_model(
     package; this pin is what keeps the copy honest when an engine default moves."""
     from messagefoundry.config.settings import AuthSettings
 
-    assert constant == AuthSettings.model_fields[field].default
-
-
-def test_rig_sign_in_limits_pair_each_field_with_its_copied_default() -> None:
-    from messagefoundry.config.settings import AuthSettings
-
-    for _name, field, shipped in bb._RIG_SIGN_IN_LIMITS:
-        assert shipped == AuthSettings.model_fields[field].default, field
+    assert constant == AuthSettings.model_fields[field].get_default(call_default_factory=True)
 
 
 def _sign_ins_admitted(environ: Mapping[str, str], attempts: int) -> list[bool]:

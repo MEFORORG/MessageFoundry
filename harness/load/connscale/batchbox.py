@@ -71,28 +71,22 @@ _STOP_GRACE = 5.0
 _DEFAULT_SINK_PROCS = 6  # the >= 5-6 sink-PROCESS attribution gate
 
 
-# The engine's shipped ``[auth]`` defaults the rig compares against, copied rather than imported:
-# a harness client may not import ``messagefoundry.config`` (tests/test_dependency_boundaries.py).
-# tests/test_bench_batch_two_box.py pins each to ``AuthSettings.model_fields``, so a changed engine
-# default fails there rather than silently on the two-box rig.
+# The engine's shipped ``[auth]`` defaults the rig compares against, copied rather than imported,
+# because tests/test_dependency_boundaries.py bans a direct ``messagefoundry.config`` import here
+# without an allow-list entry. (That rule is static: this module still loads engine config
+# transitively, through runner.py.) tests/test_bench_batch_two_box.py pins each copy to the
+# ``AuthSettings`` field default, so a moved engine default fails CI there. A rig run from a checkout
+# whose engine default moved ahead of these copies would compare against the stale copy.
 SHIPPED_MAX_SESSIONS_PER_USER = 5
 SHIPPED_LOGIN_RATE_LIMIT_PER_IP = 10
 SHIPPED_LOGIN_RATE_LIMIT_GLOBAL = 60
 
 #: The ``[auth]`` limits a fleet of rig sign-ins from one address meets, as
-#: ``(env name, field, shipped default)``.
+#: ``(env name, shipped default)``.
 _RIG_SIGN_IN_LIMITS = (
-    ("MEFOR_AUTH_MAX_SESSIONS_PER_USER", "max_sessions_per_user", SHIPPED_MAX_SESSIONS_PER_USER),
-    (
-        "MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP",
-        "login_rate_limit_per_ip",
-        SHIPPED_LOGIN_RATE_LIMIT_PER_IP,
-    ),
-    (
-        "MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL",
-        "login_rate_limit_global",
-        SHIPPED_LOGIN_RATE_LIMIT_GLOBAL,
-    ),
+    ("MEFOR_AUTH_MAX_SESSIONS_PER_USER", SHIPPED_MAX_SESSIONS_PER_USER),
+    ("MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP", SHIPPED_LOGIN_RATE_LIMIT_PER_IP),
+    ("MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL", SHIPPED_LOGIN_RATE_LIMIT_GLOBAL),
 )
 
 
@@ -102,12 +96,13 @@ def rig_sign_in_env(procs: int) -> dict[str, str]:
     Each of the driver's ``procs`` ``connscale-remote`` processes signs in for itself as the one rig
     Administrator, from the one load-gen box address. At least these engine limits meet that fleet:
 
-    * the per-user session cap (shipped 5): past it a login ends the user's oldest session, so a sixth
+    * the per-user session cap (``SHIPPED_MAX_SESSIONS_PER_USER``): past it a login ends the user's oldest session, so a sixth
       process would end the first one's, which would sign in again and end the next;
-    * the per-address sign-in limit (shipped 10 attempts per 60 s window, successes counted too):
-      every process signs in at the start of the cell, inside one window, so an eleventh process
-      would be refused with HTTP 429 (BACKLOG #2795);
-    * the all-clients sign-in limit (shipped 60 per window), met by a sixty-first process.
+    * the per-address sign-in limit (``SHIPPED_LOGIN_RATE_LIMIT_PER_IP`` attempts per window,
+      successes counted too): every process signs in at the start of the cell, inside one window,
+      so one process past that limit would be refused with HTTP 429 (BACKLOG #2795);
+    * the all-clients sign-in limit (``SHIPPED_LOGIN_RATE_LIMIT_GLOBAL`` per window), met the same
+      way by one process past it.
 
     Each is raised to the fleet, doubled for a process that signs in again, plus two, and only when
     that size passes the shipped default, so a small fleet never runs below a stock engine. The
@@ -117,7 +112,7 @@ def rig_sign_in_env(procs: int) -> dict[str, str]:
     one session handed to every process would need none of this, and is not what the rig does.
     """
     size = 2 * procs + 2
-    return {name: str(size) for name, _setting, shipped in _RIG_SIGN_IN_LIMITS if size > shipped}
+    return {name: str(size) for name, shipped in _RIG_SIGN_IN_LIMITS if size > shipped}
 
 
 # --- the matrix cell ---------------------------------------------------------
