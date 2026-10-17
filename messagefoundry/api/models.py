@@ -519,6 +519,13 @@ class PendingApprovalResponse(BaseModel):
     detail: str
 
 
+#: Why the gate refuses a pending request's approve whoever approves it (vault BACKLOG #3192).
+#: ``PendingApprovalInfo`` says what each value means.
+ReleaseBlocked = Literal[
+    "no_requester_id", "operation_unavailable", "not_gated", "params_unreadable"
+]
+
+
 class PendingApprovalInfo(BaseModel):
     """One open request in the approver's queue: ``pending`` (awaiting a second approver, unexpired)
     or ``interrupted`` (released, cut off mid-run, awaiting a resolve; BACKLOG #1562). For an
@@ -536,7 +543,16 @@ class PendingApprovalInfo(BaseModel):
     is off, or the operation has left ``[approvals].operations``. The engine then refuses a
     ``pending`` request's approve with 409 (``approval.no_longer_gated``) whatever this says; it lets
     a page offer only the reject. It reads the settings at listing time, and it does not affect the
-    resolve of an ``interrupted`` row."""
+    resolve of an ``interrupted`` row.
+
+    ``release_blocked`` names why the engine refuses a ``pending`` request's approve whoever the
+    approver is, or is ``None`` (vault BACKLOG #3192). Each value is a 409 the gate raises, in the
+    order it raises them: ``no_requester_id`` (the row predates requester-id attribution),
+    ``operation_unavailable`` (no such operation is registered), ``not_gated`` (as ``gated`` above)
+    and ``params_unreadable``. ``None`` does not promise a release. At least the self-approval
+    refusal, the expiry, the dwell floor, the requester's standing, the row's seal and the
+    operation's own refusals, such as a held reload with no config digest, are met only at
+    release. It lets a page offer only the reject. It is ``None`` on an ``interrupted`` row."""
 
     id: str
     operation: str
@@ -550,6 +566,7 @@ class PendingApprovalInfo(BaseModel):
     decided_at: float | None = None
     caller_is_requester: bool = False
     gated: bool = True
+    release_blocked: ReleaseBlocked | None = None
 
 
 class ApprovalList(BaseModel):

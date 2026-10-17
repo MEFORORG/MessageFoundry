@@ -82,6 +82,15 @@ this line.**
 - **Seam only: `/status` names the FHIR lookups that failed to start.** `EngineInfo` gains
   `fhir_lookups_failed` (vault `BACKLOG #3008`). The console does not show it yet, but the field
   is on the seam it pins, so the supported digest moved.
+- **Seam only: the seam digest covers each console route's gate.** The engine's seam snapshot now
+  records what this console installs: each route's top-level dependencies, gates included, with
+  their own source and captured settings, and its mounts, middleware and WebSocket authorizer
+  (vault `BACKLOG #2709`). No console route changed, but the supported digest moved. A console
+  release that adds a route, changes a route's gate, or edits a console helper a gate calls by
+  plain name now moves the seam too, so it needs an
+  engine that ships the new value. The released 0.4.0, whose DR routes sit on the session alone,
+  passed the handshake of engines from PR 1910 up to engine PR 1940, whose unrelated seam move
+  refuses it; this change guards the next gate change that moves nothing else.
 - **Each group input on the AD group page shows an example full DN.** The placeholder reads
   `CN=MF-Admins,OU=Groups,DC=example,DC=com`, since both maps refuse a short name. Nothing is
   stored from it. The page's two save forms now trim only a space, a tab and a line break from a
@@ -98,6 +107,11 @@ this line.**
   page (`/ui/mfa`) and the forced password page used to tell the holder the password "stops
   working" at an instant already gone. They now say it stopped working then, and to ask an
   administrator to reset it. No seam change. (vault BACKLOG #2298)
+- **The Approvals page no longer offers Approve on a request the engine always refuses.** It reads
+  the engine's new `release_blocked` reason, so a request that predates requester-id attribution,
+  or whose operation is no longer registered, gets only the reject and a note saying why, as an
+  ungated or unreadable one already did. Each note names the button beside it, Withdraw or
+  Reject. Seam change: `PendingApprovalInfo` gained `release_blocked`. (vault BACKLOG #3192)
 
 ### Security
 
