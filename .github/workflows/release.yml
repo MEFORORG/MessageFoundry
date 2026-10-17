@@ -4,11 +4,15 @@
 # Cut a release:  git tag v0.1.0 && git push origin v0.1.0   (on a commit that already passed CI on main;
 #                 the `tag-provenance` job refuses any other, vault BACKLOG #2631).
 #
-#                 THE GITHUB RELEASE IS A DRAFT UNTIL EVERY ASSET IS ON IT. `release` creates it as a
-#                 draft, `release-harness` attaches to the draft, and `publish-github-release` publishes
-#                 it last. No job adds an asset to a published release, which is what lets the owner
-#                 turn on immutable releases (vault BACKLOG #2631, limb 6). A console release is made
-#                 by one call that carries its one asset.
+#                 THE GITHUB RELEASE IS A DRAFT UNTIL EVERY ASSET IS ON IT AND EVERY UPLOAD THE
+#                 RUN MAKES IS ON PYPI (with PUBLISH_HARNESS unset, the harness wheel is an asset
+#                 but is not uploaded). `release` creates it as a draft, `release-harness` attaches to the draft,
+#                 `publish-pypi` uploads the toolkit, the engine and (when PUBLISH_HARNESS is set) the
+#                 harness, and `publish-github-release` publishes the draft last. No job adds an asset
+#                 to a published release, which is what lets the owner turn on immutable releases
+#                 (vault BACKLOG #2631, limb 6). A console release is a draft made by one call that
+#                 carries its one asset, and `publish-github-release-webconsole` publishes it once
+#                 `publish-pypi-webconsole` has uploaded the wheel (vault BACKLOG #2975).
 # Dry-run:        run this workflow manually (workflow_dispatch) — it builds + SBOMs + signs and uploads
 #                 the artifacts for inspection. It does NOT create a GitHub release, does NOT publish
 #                 to PyPI and does NOT write an SLSA attestation, so the dry-run validates
@@ -25,7 +29,7 @@
 #                 "run it manually to dry-run it" invites an operator to do. Reading the old guard as
 #                 "a branch ref isn't `refs/tags/...`" is what hid this: a true sentence about the
 #                 wrong half of the trigger. The steps carrying the pair are at least the four PyPI
-#                 publishes, the three GitHub-release mutations, and the SLSA build-provenance
+#                 publishes, the GitHub-release mutations that test counts, and the SLSA build-provenance
 #                 attestation (BACKLOG #1805; the step's own comment says why). The COUNT is pinned in
 #                 tests/test_release_pipeline.py, which is its one authority — do not restate a
 #                 number here that nothing keeps in sync with that test.
@@ -62,15 +66,20 @@
 # exactly as before while reading as a control that is not there. Keep the name `pypi`.
 # Keep PUBLISH_HARNESS and PUBLISH_WEBCONSOLE off the environment, as repository variables only. A
 # job's `if:` is read before its environment applies, and a step's inside it after, so a copy on
-# the environment would let the two gates read different values.
+# the environment would let two gates read different values. So each is read once, outside the
+# environment: PUBLISH_WEBCONSOLE by its publish job's `if:`, and PUBLISH_HARNESS by
+# `release-harness`, which hands it to the harness upload step as a job output (vault BACKLOG #2975).
 #
-# THE HAND-OVER. Each build job's last two steps record the digests and upload the files, with no
-# `if:`, so any earlier failure skips both. An artifact of ONE directory is rooted at that
+# THE HAND-OVER. Each build job records the digests once its last gate has passed, and its last
+# step uploads the files. Neither step has an `if:`, so any earlier failure skips both. In `release`
+# the digests are taken right after the toolkit bundle move, the last step that touches a published
+# directory, so a later step that changed one would be refused by the publish job's check (vault
+# BACKLOG #2975). An artifact of ONE directory is rooted at that
 # directory, so its publish job downloads it back into it. A dispatch uploads the files too, which
 # exercises the upload half; no dispatch runs a publish job, so the download and the check first run
 # on a real tag. A tag keeps the files 30 days from the end of the build job, a dispatch 1 day. The
-# harness publish waits on the engine's approval and then its own, so both must land inside the 30
-# days, or a re-run of every job rebuilds them.
+# harness publishes from `publish-pypi`, under the engine's one approval (owner ruling 2026-10-16), so
+# that approval must land inside the 30 days, or a re-run of every job rebuilds the files.
 #
 # PyPI publish uses Trusted Publishing (OIDC) — no API token. OWNER PREREQ (one-time, before the first
 # tag): claim the `messagefoundry` PyPI project + configure a Trusted Publisher (a PENDING publisher works
@@ -80,7 +89,8 @@
 #
 # SECOND distribution — `messagefoundry-harness` (the synthetic test/load/failover harness,
 # packaging/messagefoundry-harness/) — is built by the `release-harness` job and published by the
-# `publish-pypi-harness` job below, in lockstep (same version, same tag). Its PyPI publish is GATED on the `PUBLISH_HARNESS` repo variable so it
+# last step of `publish-pypi`, after the engine it pins, in lockstep (same version, same tag). That
+# step is GATED on the `PUBLISH_HARNESS` repo variable so it
 # stays a no-op until the OWNER (one-time): (1) configures a `messagefoundry-harness` PyPI Trusted
 # Publisher — a PENDING publisher for repo MEFORORG/MessageFoundry + workflow `release.yml` (environment
 # `pypi`, as every publisher here should be) — then (2) sets repo variable PUBLISH_HARNESS=true. Until
@@ -1021,6 +1031,17 @@ jobs:
           python scripts/release/forbidden_members.py 'toolkit-dist/*.whl'
           ls -l toolkit-dist/ toolkit-sigstore/
 
+      # Right after the last gate on what PyPI receives (vault BACKLOG #2975); the header's THE
+      # HAND-OVER paragraph says why. No `if:`, on purpose: any earlier failure skips it.
+      - name: Record the digests of the files PyPI will receive
+        id: pypi-digests
+        run: |
+          {
+            echo 'sha256<<PYPI_DIGESTS_EOF'
+            sha256sum dist-pub/* toolkit-dist/*
+            echo 'PYPI_DIGESTS_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       # SLSA build provenance (Beyond-ASVS-L3 WP-BL3-01): a signed in-toto provenance attestation
       # (predicateType slsaprovenance v1) binding each artifact's sha256 -> this source commit + the
       # builder workflow identity, transparency-logged via the OIDC identity above. This is the
@@ -1181,17 +1202,9 @@ jobs:
             messagefoundry-vex.openvex.json.sigstore*
           if-no-files-found: ignore
 
-      # HAND THE PYPI FILES TO THE PUBLISH-ONLY JOB (vault BACKLOG #2631, limb 1). The digests leave
-      # as a job output; the header's THE HAND-OVER paragraph says the rest. No `if:`, on purpose.
-      - name: Record the digests of the files PyPI will receive
-        id: pypi-digests
-        run: |
-          {
-            echo 'sha256<<PYPI_DIGESTS_EOF'
-            sha256sum dist-pub/* toolkit-dist/*
-            echo 'PYPI_DIGESTS_EOF'
-          } >> "$GITHUB_OUTPUT"
-
+      # HAND THE PYPI FILES TO THE PUBLISH-ONLY JOB (vault BACKLOG #2631, limb 1). The digests were
+      # taken after the toolkit bundle move above; the header's THE HAND-OVER paragraph says the rest.
+      # No `if:`, on purpose.
       - name: Hand the PyPI files to the publish job
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -1202,11 +1215,26 @@ jobs:
           if-no-files-found: error
           retention-days: ${{ github.event_name == 'push' && 30 || 1 }}
 
-  # PUBLISH THE ENGINE AND THE TOOLKIT TO PYPI, FROM A JOB THAT ONLY PUBLISHES (vault BACKLOG #2631,
-  # limb 1). The header says why the publish is split from the build.
+  # PUBLISH THE TOOLKIT, THE ENGINE AND THE HARNESS TO PYPI, FROM A JOB THAT ONLY PUBLISHES (vault
+  # BACKLOG #2631, limb 1). The header says why the publish is split from the build.
+  #
+  # ONE JOB, SO ONE APPROVAL, FOR ALL THREE (vault BACKLOG #2975; owner ruling 2026-10-16: one
+  # approval of `pypi` may cover the engine and harness uploads). The harness used to publish from
+  # its own job, so an engine tag asked for two approvals in a row, and this job did not wait on
+  # `release-harness`. `publish-github-release` could not wait on that job either: it was skipped
+  # while PUBLISH_HARNESS was unset, and a skipped need skips the job that needs it, so the engine
+  # release would never have been published. So the release could go public before the harness was
+  # on PyPI. Now the harness upload is this job's last step, gated on the variable, and
+  # `publish-github-release` waits on this job, so the release goes public only after every upload.
+  #
+  # `release-harness` is a need, and its own `if:` names only this repository, so it runs whenever
+  # `release` passes here. A harness build failure therefore holds the engine's upload as well as the
+  # GitHub release. A transient one is finished by re-running the failed job. One the tagged commit
+  # causes (a lockstep pin, a version that is not the tag, a member-gate refusal) fails every re-run:
+  # fix main, delete the draft and the tag, and tag again, which is safe because nothing reached PyPI.
   publish-pypi:
     if: github.repository == 'MEFORORG/MessageFoundry' && !startsWith(github.ref_name, 'webconsole-') && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    needs: release
+    needs: [release, release-harness]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # The ONLY kind of job that names the `pypi` environment, and it builds nothing (vault BACKLOG
@@ -1221,18 +1249,31 @@ jobs:
           name: pypi-engine
           path: .
 
+      # Fetched and checked on every tag, PUBLISH_HARNESS or not: the check refuses any file it was
+      # not told about, so it reads both build jobs' digests together.
+      - name: Fetch the harness files its build job gated
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: pypi-harness
+          path: harness-dist
+
       # The same body in every publish job; tests/test_release_pipeline.py holds them identical and
       # runs it. Every file must match its digest, and no file may be present that was not listed.
       - name: The downloaded files are the ones the build job gated, byte for byte
         env:
-          EXPECTED: ${{ needs.release.outputs.pypi-digests }}
+          EXPECTED: |-
+            ${{ needs.release.outputs.pypi-digests }}
+            ${{ needs.release-harness.outputs.pypi-digests }}
         run: |
           set -o pipefail
-          if [ -z "$EXPECTED" ]; then
+          manifest="$RUNNER_TEMP/expected.sha256"
+          # Blank lines dropped: a job output may end in a newline, and joining two outputs would then
+          # leave an empty line, which `--strict` refuses as misformatted. It carries no digest.
+          printf '%s\n' "$EXPECTED" | sed '/^[[:space:]]*$/d' > "$manifest"
+          # Tested after the drop: joined, two empty outputs are a newline, never an empty string.
+          if [ ! -s "$manifest" ]; then
             echo "::error::the build job handed over no digests, so nothing proves what is about to be published"; exit 1
           fi
-          manifest="$RUNNER_TEMP/expected.sha256"
-          printf '%s\n' "$EXPECTED" > "$manifest"
           sha256sum --check --strict "$manifest"
           listed=$(sed -E 's/^[0-9a-f]{64} [ *]//' "$manifest" | sort)
           present=$(find . -type f | sed 's#^\./##' | sort)
@@ -1263,9 +1304,10 @@ jobs:
           skip-existing: true
           attestations: true
 
-      # LAST on purpose: PyPI is the one IRREVERSIBLE sink (uploads can't be replaced), so it runs
-      # after build/smoke/sign/release — this job `needs: release`, and the step's `if` has an implicit
-      # success(), so any earlier failure skips it and nothing in `release` can fail AFTER an upload.
+      # AFTER THE BUILD on purpose: PyPI is the one IRREVERSIBLE sink (uploads can't be replaced), so
+      # it runs after build/smoke/sign/release — this job needs `release` and `release-harness`, and
+      # the step's `if` has an implicit success(), so any earlier failure skips it and nothing in
+      # either build job can fail AFTER an upload. Only the harness upload follows it in this job.
       # `publish-github-release` waits on this job. Gated on a tag PUSH — the EVENT and the
       # ref, not the ref alone: a `workflow_dispatch` can be pointed at a tag, where `github.ref` is
       # `refs/tags/...` and a ref-only guard would have published (BACKLOG #1584). Reads dist-pub/ (clean wheel +
@@ -1279,6 +1321,22 @@ jobs:
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: dist-pub/
+          skip-existing: true
+          attestations: true
+
+      # AFTER THE ENGINE, which the harness pins exactly: the implicit success() skips this step if
+      # the engine upload failed, so no harness naming an engine PyPI lacks is uploaded. THIS BENDS
+      # THE RULE ABOVE the way the toolkit's order does: if this upload fails, the engine is on PyPI
+      # and the GitHub release stays a draft; `skip-existing` lets a re-run finish it. GATED: a
+      # no-op until the owner configures the messagefoundry-harness PyPI Trusted Publisher AND sets
+      # repo variable PUBLISH_HARNESS=true. The build + version-check in release-harness still run
+      # every release. The variable comes through release-harness, read outside this environment,
+      # so an environment copy of it cannot change what this step sees (the header says why).
+      - name: Publish messagefoundry-harness to PyPI (Trusted Publishing / OIDC)
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && needs.release-harness.outputs.publish-harness == 'true' }}
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: harness-dist/
           skip-existing: true
           attestations: true
 
@@ -1305,7 +1363,7 @@ jobs:
     outputs:
       pypi-digests: ${{ steps.pypi-digests.outputs.sha256 }}
     permissions:
-      contents: write   # gh release create (the console release, with its wheel)
+      contents: write   # gh release create (the console's draft release, with its wheel)
       # No id-token: the PyPI publish moved to publish-pypi-webconsole (vault BACKLOG #2631).
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1599,10 +1657,8 @@ jobs:
       # release) would fail with "release not found" on every console tag, killing the job, and with it
       # publish-pypi-webconsole, which needs it — i.e. the PyPI name could never be claimed.
       #
-      # UNLIKE THE ENGINE, THIS RELEASE IS PUBLIC BEFORE THE `pypi` APPROVAL IS ASKED FOR. The publish
-      # runs in publish-pypi-webconsole after this job ends, so a refused approval leaves a published
-      # console release with no PyPI upload. It is the same order the console had before the split
-      # (vault BACKLOG #2631, limb 1); a re-run of the publish job, once approved, finishes it.
+      # A DRAFT, LIKE THE ENGINE'S, UNTIL THE WHEEL IS ON PYPI; publish-github-release-webconsole
+      # says the rest (vault BACKLOG #2975).
       #
       # The re-run arm is equally load-bearing: v0.3.1 showed a bare `gh release create` turns a single
       # PyPI failure into a permanent retry deadlock (every re-run dies here and SKIPS the publish, so a
@@ -1624,11 +1680,11 @@ jobs:
           python scripts/release/release_notes.py notes.md \
             --full-url "https://github.com/${GITHUB_REPOSITORY}/blob/${tag}/packaging/messagefoundry-webconsole/CHANGELOG.md"
           pre_create=""; case "$ver" in *-*) pre_create="--prerelease" ;; esac
-          # ONE CALL CREATES THE RELEASE WITH ITS ONE ASSET (vault BACKLOG #2631, limb 6). So a
-          # re-run leaves a published release alone: the call that created it attached the wheel,
-          # and a re-upload to it would be refused, failing this job and skipping the publish job.
-          # `gh release create` makes a draft, uploads, then publishes, so an interrupted create can
-          # leave a DRAFT. A re-run finishes that one: attach, then publish.
+          # ONE CALL CREATES THE DRAFT WITH ITS ONE ASSET (vault BACKLOG #2631, limb 6). A re-run
+          # re-attaches to a draft, which is safe because nothing has published it, and leaves a
+          # published release alone: the call that created it attached the wheel, and a re-upload
+          # to it would be refused, failing this job and skipping the publish job. This step never
+          # takes the release out of draft; publish-github-release-webconsole does.
           err=$(mktemp)
           if ! is_draft=$(gh release view "$tag" --json isDraft --jq .isDraft 2>"$err"); then
             if ! grep -q "release not found" "$err"; then
@@ -1636,10 +1692,9 @@ jobs:
               echo "::error::could not read release $tag, and it is not reported missing; refusing to guess"
               exit 1
             fi
-            gh release create "$tag" webconsole-dist/*.whl --title "$tag" --notes-file notes.md $pre_create
+            gh release create "$tag" webconsole-dist/*.whl --draft --title "$tag" --notes-file notes.md $pre_create
           elif [ "$is_draft" = "true" ]; then
             gh release upload "$tag" webconsole-dist/*.whl --clobber
-            gh release edit "$tag" --draft=false
           else
             echo "::notice::Release $tag is already published; its assets are not changed (vault BACKLOG #2631)."
           fi
@@ -1675,8 +1730,7 @@ jobs:
           retention-days: ${{ github.event_name == 'push' && 30 || 1 }}
 
   # PUBLISH THE CONSOLE TO PYPI, FROM A JOB THAT ONLY PUBLISHES (vault BACKLOG #2631, limb 1). The
-  # variable gate sits on the job as well as the step, so the environment is never asked for while
-  # the publish is off.
+  # variable gate sits on the job, so the environment is never asked for while the publish is off.
   publish-pypi-webconsole:
     if: github.repository == 'MEFORORG/MessageFoundry' && startsWith(github.ref_name, 'webconsole-') && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_WEBCONSOLE == 'true'
     needs: release-webconsole
@@ -1701,11 +1755,14 @@ jobs:
           EXPECTED: ${{ needs.release-webconsole.outputs.pypi-digests }}
         run: |
           set -o pipefail
-          if [ -z "$EXPECTED" ]; then
+          manifest="$RUNNER_TEMP/expected.sha256"
+          # Blank lines dropped: a job output may end in a newline, and joining two outputs would then
+          # leave an empty line, which `--strict` refuses as misformatted. It carries no digest.
+          printf '%s\n' "$EXPECTED" | sed '/^[[:space:]]*$/d' > "$manifest"
+          # Tested after the drop: joined, two empty outputs are a newline, never an empty string.
+          if [ ! -s "$manifest" ]; then
             echo "::error::the build job handed over no digests, so nothing proves what is about to be published"; exit 1
           fi
-          manifest="$RUNNER_TEMP/expected.sha256"
-          printf '%s\n' "$EXPECTED" > "$manifest"
           sha256sum --check --strict "$manifest"
           listed=$(sed -E 's/^[0-9a-f]{64} [ *]//' "$manifest" | sort)
           present=$(find . -type f | sed 's#^\./##' | sort)
@@ -1714,26 +1771,63 @@ jobs:
           fi
           echo "verified $(grep -c . "$manifest") file(s) against the build job's digests"
 
-      # GATED like the harness, on repo variable PUBLISH_WEBCONSOLE=true, and that gate is armed: the
-      # owner set the variable on 2026-07-29 (read with `gh variable list`, 2026-09-28), and the first
-      # webconsole-v* release through this step claimed the PyPI name that day (BACKLOG #1944). Unset
-      # the variable and this step becomes a no-op again, while the build + version-check above still
-      # run on every console tag.
+      # GATED, by this job's `if:`, on repo variable PUBLISH_WEBCONSOLE=true, and that gate is armed:
+      # the owner set the variable on 2026-07-29 (read with `gh variable list`, 2026-09-28), and the
+      # first webconsole-v* release through this step claimed the PyPI name that day (BACKLOG #1944).
+      # Unset the variable and this job is skipped, while the build + version-check above still run
+      # on every console tag; the console's release then stays a draft (vault BACKLOG #2975).
+      # The variable is read ONCE, by the job's `if:`, not again here: read here too, inside the
+      # environment, an environment copy could skip this step in a job that still succeeds, and
+      # publish-github-release-webconsole would then publish a release PyPI lacks (vault BACKLOG #2975).
       - name: Publish messagefoundry-webconsole to PyPI (Trusted Publishing / OIDC)
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_WEBCONSOLE == 'true' }}
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: webconsole-dist/
           skip-existing: true
           attestations: true
 
+  # PUBLISH THE CONSOLE'S GITHUB RELEASE ONCE ITS WHEEL IS ON PYPI (vault BACKLOG #2975). Before this
+  # job, release-webconsole published its release in the call that made it, so the release was public
+  # before the `pypi` approval was even asked for, and a refused approval left a public release with
+  # no PyPI upload. Now the release is a draft, and this job takes it public after
+  # publish-pypi-webconsole succeeds. No status function in its `if:`: a failed or refused upload
+  # leaves the draft. So does an unset PUBLISH_WEBCONSOLE, which skips the upload job: the release
+  # then stays a draft until the variable is set and the jobs re-run, or an owner publishes it.
+  publish-github-release-webconsole:
+    # The event-and-ref pair sits on the job, so a dispatch never schedules it at all.
+    if: github.repository == 'MEFORORG/MessageFoundry' && startsWith(github.ref_name, 'webconsole-') && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [release-webconsole, publish-pypi-webconsole]
+    runs-on: ubuntu-latest
+    # One or two API calls.
+    timeout-minutes: 10
+    permissions:
+      contents: write   # gh release edit (take the console release out of draft)
+    steps:
+      # No checkout: gh reads the repository from GH_REPO, and this job runs no repository code.
+      - name: Publish the draft console GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          is_draft=$(gh release view "$tag" --json isDraft --jq .isDraft)
+          if [ "$is_draft" = "true" ]; then
+            gh release edit "$tag" --draft=false
+            echo "Published release $tag."
+          else
+            echo "::notice::Release $tag is already published (this is a re-run)."
+          fi
+
   release-harness:
     # Build + publish the SEPARATE `messagefoundry-harness` distribution (the synthetic test/load/failover
     # harness, packaging/messagefoundry-harness/) in lockstep with the engine — same version, same tag.
-    # Isolated from the `release` job so a harness-side issue can never jeopardize the engine release;
-    # `needs: release` so the engine is built (and its draft GitHub release exists) first. It holds
-    # contents:write only; its PyPI publish runs in `publish-pypi-harness` (vault BACKLOG #2631, limb 1).
-    # That publish is GATED on the `PUBLISH_HARNESS` repo variable:
+    # Its own job, but NOT isolated from the engine release: publish-pypi and publish-github-release
+    # both need it, so a harness failure holds the engine's PyPI upload and keeps its release a draft
+    # (vault BACKLOG #2975). `needs: release` so the engine is built (and its draft GitHub release
+    # exists) first. It holds
+    # contents:write only; its PyPI publish is the last step of `publish-pypi`, which waits on this job
+    # (vault BACKLOG #2631, limb 1; #2975). That publish is GATED on the `PUBLISH_HARNESS` repo variable:
     # until the owner sets up the harness Trusted Publisher AND PUBLISH_HARNESS=true (see the header note),
     # this job still BUILDS + version-checks the wheel and attaches it to the GitHub release, but nothing
     # publishes it — so a missing harness PyPI project can never red a release.
@@ -1746,12 +1840,14 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # What publish-pypi-harness checks its download against (vault BACKLOG #2631, limb 1).
+    # What publish-pypi checks the harness download against (vault BACKLOG #2631, limb 1), and the
+    # harness upload's gate, read here, outside the `pypi` environment (vault BACKLOG #2975).
     outputs:
       pypi-digests: ${{ steps.pypi-digests.outputs.sha256 }}
+      publish-harness: ${{ vars.PUBLISH_HARNESS }}
     permissions:
       contents: write   # gh release upload (attach the harness wheel)
-      # No id-token: the PyPI publish moved to publish-pypi-harness (vault BACKLOG #2631).
+      # No id-token: the PyPI publish is in publish-pypi (vault BACKLOG #2631, #2975).
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1765,7 +1861,7 @@ jobs:
       - name: Build the harness wheel (wheel-only — harness/ is force-included from the repo root)
         run: |
           # HASH-PINNED, same rationale as the engine's build step: this job also holds contents: write,
-          # and the wheel it builds is what publish-pypi-harness uploads. `build` and its
+          # and the wheel it builds is what publish-pypi uploads. `build` and its
           # transitives come from ci/locks/release-tools.lock; see that step for why no pip bootstrap.
           python -m pip install --require-hashes -r ci/locks/release-tools.lock
           # Wheel-only on purpose: the harness source (harness/) lives OUTSIDE this project dir (it is
@@ -1802,15 +1898,15 @@ jobs:
           # comes from the wheel's own METADATA, which hatchling has already normalised. On tag
           # v0.3.0-rc1 the metadata says 0.3.0rc1 while want=0.3.0-rc1, so a string compare could NEVER
           # match — this job failed on every pre-release tag by construction, whatever __version__ said.
-          # With PUBLISH_HARNESS=true the engine's publish-pypi runs beside this job, so the engine may
-          # already be on PyPI when this fails, and the failure would land half-published.
+          # publish-pypi waits on this job, so a failure here holds every PyPI upload of the tag
+          # rather than landing half-published (vault BACKLOG #2975).
           #
           # Pin DERIVED from constraints.lock + installed outside the tag guard — see the engine job's
           # wheel smoke above for the full rationale — and into a THROWAWAY VENV, not this job's
           # interpreter, which is the other half of ADR 0034's recommendation. This job holds
           # contents: write and the steps AFTER this one attach the wheel to the release and hand it
           # to the PyPI publish, so an install resolved into the main interpreter here sits
-          # beside the files that publish-pypi-harness uploads.
+          # beside the files that publish-pypi uploads.
           PKG_PIN="$(sed -n 's/^packaging==\([^ ;]*\).*/\1/p' constraints.lock | head -1)"
           if [ -z "$PKG_PIN" ]; then
             echo "::error::no packaging== pin in constraints.lock — refusing an unpinned install on the release path"; exit 1
@@ -1895,7 +1991,8 @@ jobs:
 
           # THE LOCKSTEP PIN, CHECKED ON THE BUILT ARTIFACT (BACKLOG #1585). packaging/
           # messagefoundry-harness/pyproject.toml pins messagefoundry[harness]==<engine version>, and
-          # PEP 621 `dependencies` is STATIC, so a version bump is at least three edits (the toolkit pin too). tests/test_packaging.py
+          # PEP 621 `dependencies` is STATIC, so a version bump is at least three edits (the toolkit pin
+          # too); CONTRIBUTING.md, "Bumping the engine version", lists them. tests/test_packaging.py
           # catches a drift, but NOTHING in this workflow runs that suite and a tag can be cut from a
           # commit the merge queue never gated. This is the last place the claim is checkable before
           # the PyPI upload burns the version forever, and the metadata is already open.
@@ -1912,8 +2009,9 @@ jobs:
           # carries `dev = ["messagefoundry[dev]"]`, so the first such table added here puts a SECOND
           # messagefoundry line in this wheel's metadata and the count below reads 2.
           # tests/test_packaging.py cannot catch it -- that suite reads `project.dependencies`, and an
-          # extra is not in it -- so ci.yml stays GREEN and this step, which carries `needs: release`,
-          # reds with the engine already on PyPI. Half a release, and the version burnt.
+          # extra is not in it -- so ci.yml stays GREEN and this step reds after the build. Before
+          # vault BACKLOG #2975 that was with the engine already on PyPI, half a release and the
+          # version burnt; publish-pypi now waits on this job, so it holds the whole tag instead.
           #
           # SKIPPED NARROWLY, AND THAT IS THE HALF WORTH NOT LOSING. Dropping every requirement whose
           # marker is false in this venv reads simpler and would also drop a platform- or
@@ -2088,65 +2186,14 @@ jobs:
           if-no-files-found: error
           retention-days: ${{ github.event_name == 'push' && 30 || 1 }}
 
-  # PUBLISH THE HARNESS TO PYPI, FROM A JOB THAT ONLY PUBLISHES (vault BACKLOG #2631, limb 1). It
-  # needs publish-pypi so the engine the harness pins is on PyPI first, as it was when this step
-  # sat after the engine's publish. The variable gate sits on the job too, as the console's does.
-  publish-pypi-harness:
-    if: github.repository == 'MEFORORG/MessageFoundry' && !startsWith(github.ref_name, 'webconsole-') && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_HARNESS == 'true'
-    needs: [release-harness, publish-pypi]
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    # The ONLY kind of job that names the `pypi` environment, and it builds nothing (vault BACKLOG
-    # #2631, limb 1). No checkout: it runs no repository code, only the pinned actions below.
-    environment: pypi
-    permissions:
-      id-token: write   # PyPI Trusted Publishing (OIDC) and PEP 740 attestations; nothing else
-    steps:
-      - name: Fetch the files the build job gated
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: pypi-harness
-          path: harness-dist
-
-      # The same body in every publish job; tests/test_release_pipeline.py holds them identical and
-      # runs it. Every file must match its digest, and no file may be present that was not listed.
-      - name: The downloaded files are the ones the build job gated, byte for byte
-        env:
-          EXPECTED: ${{ needs.release-harness.outputs.pypi-digests }}
-        run: |
-          set -o pipefail
-          if [ -z "$EXPECTED" ]; then
-            echo "::error::the build job handed over no digests, so nothing proves what is about to be published"; exit 1
-          fi
-          manifest="$RUNNER_TEMP/expected.sha256"
-          printf '%s\n' "$EXPECTED" > "$manifest"
-          sha256sum --check --strict "$manifest"
-          listed=$(sed -E 's/^[0-9a-f]{64} [ *]//' "$manifest" | sort)
-          present=$(find . -type f | sed 's#^\./##' | sort)
-          if [ "$listed" != "$present" ]; then
-            echo "::error::the downloaded files are not exactly the gated set. Gated: $listed. Downloaded: $present"; exit 1
-          fi
-          echo "verified $(grep -c . "$manifest") file(s) against the build job's digests"
-
-      # GATED: no-op until the owner configures the messagefoundry-harness PyPI Trusted Publisher AND sets
-      # repo variable PUBLISH_HARNESS=true. The build + version-check above still run every release.
-      - name: Publish messagefoundry-harness to PyPI (Trusted Publishing / OIDC)
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_HARNESS == 'true' }}
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
-        with:
-          packages-dir: harness-dist/
-          skip-existing: true
-          attestations: true
-
   # PUBLISH THE ENGINE'S GITHUB RELEASE LAST, ONCE EVERY ASSET IS ON IT (vault BACKLOG #2631, limb 6;
   # the header says why). Its `needs:` is every job that attaches an asset to the engine release. A
-  # job added later that attaches one must join it; tests/test_release_pipeline.py fails until it does.
-  # It also needs `publish-pypi`, so the engine is on PyPI before the release goes public, as it was
-  # when that publish sat inside `release` (limb 1). A refused `pypi` approval on an engine tag
-  # leaves a draft. It does NOT need `publish-pypi-harness`: that job is skipped while
-  # PUBLISH_HARNESS is unset, and a skipped need would skip this job too, so the release would never
-  # be published. So with PUBLISH_HARNESS set, the release can go public before the harness is on
-  # PyPI. Its wheel is already on the draft, so no asset changes later; a re-run finishes PyPI.
+  # job added later that attaches one must be upstream of it, directly or through another need;
+  # tests/test_release_pipeline.py fails until it is.
+  # It also needs `publish-pypi`, so the toolkit, the engine and (with PUBLISH_HARNESS set) the
+  # harness are on PyPI before the release goes public, as the engine was when its publish sat
+  # inside `release` (limb 1). A refused `pypi` approval on an engine tag leaves a draft. No need
+  # here is gated on a variable; `publish-pypi` says why (vault BACKLOG #2975).
   #
   # If `release-harness` or `publish-pypi` fails, this job is skipped and the release stays a draft.
   # Re-running the failed jobs finishes the release. A draft is never published with an asset missing.
