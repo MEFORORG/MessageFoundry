@@ -416,6 +416,11 @@ from typing import Any
 #: none of which moved it. The value below covers all four, and vault BACKLOG #3260 above: it was
 #: re-derived again on the batch 257 branch's merge of those changes.
 #:
+#: BACKLOG #3029: `AuthService.logout` returns a `LogoutOutcome` where it returned `None`. The
+#: console's `/ui/logout` ignores the value, but the return type is part of the discovered
+#: signature, so the digest moved on main with it. The value below covers it too: it was
+#: re-derived on the batch 257 branch's fourth merge of main.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders

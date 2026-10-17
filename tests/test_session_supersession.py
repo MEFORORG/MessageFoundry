@@ -371,6 +371,12 @@ async def test_a_rotation_racing_a_self_revoke_is_not_reported_as_a_revoke(
     assert rotated is not None and await _live(service, rotated), "the race was not driven"
     assert revoked is False, "revoke_own_session reported a revoke that did not happen"
     assert await _superseded(store, "self") == [], "an audit row recorded a revoke that missed"
+    # Vault BACKLOG #3260, limb 2: the miss answers the same 404 as an unknown id, so it writes the
+    # same miss row, naming the id the caller sent.
+    missed = await store.list_audit(action="auth.session_revoke_missed")
+    assert [(row["actor"], json.loads(str(row["detail"]))) for row in missed] == [
+        ("op", {"session": target_hash[:12]})
+    ], "the race's 404 left no miss row"
 
 
 async def test_a_self_revoke_that_lands_returns_true_and_audits_it(store: MessageStore) -> None:
