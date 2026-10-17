@@ -952,9 +952,9 @@ def _ldap3_call(operation: str, *, close: bool = False) -> Iterator[None]:
     directory's response becomes :class:`LdapUndecodableError` (its docstring says who reads it
     how). Unmapped, it would escape every ``except LdapError``, and a sign-in would fail as an
     unhandled error with no audit row. An exception from anywhere else propagates unchanged, since
-    mapped it would hide an engine defect as an outage, which the session reconciler logs only at
-    debug level (:func:`_reading_connection` says how the two are told apart). An ``LDAPException``
-    passes through untouched, for its own handler.
+    mapped it would report an engine defect as a fault in what the directory sent
+    (:func:`_reading_connection` says how the two are told apart). An ``LDAPException`` passes
+    through untouched, for its own handler.
 
     **One fault is a referral, not an undecodable response.** ldap3's decoder has no field for the
     referral a bind response may carry, so it raises ``KeyError(3)`` on one. That becomes
@@ -1051,7 +1051,7 @@ def _undecodable(operation: str, exc: BaseException) -> LdapUndecodableError:
     fault = _type_name(exc)
     message = (
         f"AD answered the {operation} with a response ldap3 could not decode ({fault}); the "
-        "engine reads it as the directory not answering (BACKLOG #3010)."
+        "engine does not read it as an answer (BACKLOG #3010)."
     )
     _warn_once(f"undecodable: {operation}: {fault}", "%s Reported once.", message)
     return LdapUndecodableError(message)

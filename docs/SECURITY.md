@@ -4238,9 +4238,11 @@ revoked. A pass with any referral audits `auth.ad_reconcile_referred` and raises
 acknowledging or suspending one does not silence the other. An `[alerts]` rule keyed on the event
 type alone matches both, and so does a source glob such as `directory-reconciler*`. To mute only
 the referral, a rule names its source exactly. The alert's text names `ad_user_search_base` and
-`ad_group_search_base`. A bind answered with a referral, the service account's included, is a
-referral too (BACKLOG #3010). ldap3 cannot decode its hosts, so the alert names none, and its text
-does not name `ad_bind_dn`, the DN that bind used. When it resolves itself is stated once, in
+`ad_group_search_base`. A bind response that carries a referral, the service account's included,
+is a referral too (BACKLOG #3010). ldap3 cannot decode its hosts, so the ERROR line names none. The
+alert's text still points at the two search bases and not at `ad_bind_dn`, the DN that bind used,
+so for this case it names the wrong setting. A bind answered with the referral code and no referral
+field is not covered: it still reads as unreachable. When it resolves itself is stated once, in
 [CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-two-alerts-resolve-themselves).
 Referred accounts stay in the mass-revoke breaker's count, as unreachable ones do. Left out, a referring group base would
 trip the breaker on any handful of genuine disables. A base in another domain of the forest
