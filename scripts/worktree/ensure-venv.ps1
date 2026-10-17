@@ -17,9 +17,12 @@
     in docs/WORKTREES.md section "Start the session in the worktree" -- stated once, there.
 
     IDEMPOTENT ON PURPOSE. A session cannot know whether its worktree already has an environment, so
-    this is safe to run unconditionally at the start of one: with a usable interpreter already
-    present it prints one line and returns, touching nothing. Nothing here removes a directory --
-    to rebuild an environment, delete .venv yourself first.
+    this is safe to run unconditionally at the start of one. With an interpreter already present it
+    asks that interpreter where `messagefoundry` and `messagefoundry_webconsole` import from. When
+    both come from this checkout it says so and returns, touching nothing. When either does not --
+    a stale web console copy, say, or an engine installed from another checkout -- it says which and
+    reinstalls both (BACKLOG #2857). Nothing here removes a directory -- to rebuild an environment,
+    delete .venv yourself first.
 
     THIS FILE OWNS THE INSTALL LINE, and two tests read it here: the extras must equal ci.yml's test
     leg (tests/test_worktree_venv_extras_parity.py) and the install must pin --constraint
@@ -62,9 +65,58 @@ if (-not (Test-Path -LiteralPath (Join-Path $root 'pyproject.toml'))) {
 $venv = Join-Path $root ".venv"
 $venvPy = Join-Path $venv "Scripts\python.exe"
 
-if (Test-Path -LiteralPath $venvPy) {
-    Write-Host "venv already present, nothing to do: $venvPy" -ForegroundColor Green
-    return
+# Where the venv imports the two packages from, judged by the venv's own interpreter (BACKLOG #2857).
+# One line per package: "<name> OK <how> <dir>" or "<name> BAD <why>".
+#
+# -I, which includes -P, so the answer cannot come from the current directory, PYTHONPATH or the
+# user site. find_spec locates a package without running its code, so a stale copy is never executed.
+#
+# THE WEB CONSOLE IS NEVER TRULY EDITABLE. Its import package lives at the repo root and its build
+# pulls it in with hatch force-include, so even `pip install -e packaging/messagefoundry-webconsole`
+# writes a COPY into site-packages. That copy sits ahead of the root the engine's editable .pth adds,
+# so it shadows the source, and it goes stale the moment the source changes. A copy is accepted only
+# while its files match the source byte for byte; the engine itself must import from the source.
+$importCheck = @'
+import hashlib, importlib.util, os, sys
+
+root = sys.argv[1]
+
+def files(top):
+    out = {}
+    for base, dirs, names in os.walk(top):
+        dirs[:] = [d for d in dirs if d != '__pycache__']
+        for n in names:
+            if not n.endswith(('.pyc', '.pyo')):
+                p = os.path.join(base, n)
+                with open(p, 'rb') as f:
+                    out[os.path.relpath(p, top)] = hashlib.sha256(f.read()).hexdigest()
+    return out
+
+for name in ('messagefoundry', 'messagefoundry_webconsole'):
+    try:
+        spec = importlib.util.find_spec(name)
+    except Exception as exc:
+        print(name, 'BAD it could not be located:', repr(exc))
+        continue
+    if spec is None or not spec.submodule_search_locations:
+        print(name, 'BAD it is not importable as a package')
+        continue
+    where = os.path.realpath(list(spec.submodule_search_locations)[0])
+    source = os.path.realpath(os.path.join(root, name))
+    if os.path.normcase(where) == os.path.normcase(source):
+        print(name, 'OK source', where)
+    elif name == 'messagefoundry_webconsole' and files(where) == files(source):
+        print(name, 'OK copy-matching-source', where)
+    else:
+        print(name, 'BAD it imports from', where, 'which is not', source, 'or a current copy of it')
+'@
+
+function Get-ImportState {
+    $lines = @($importCheck | & $venvPy -I - $root 2>&1 | ForEach-Object { "$_" })
+    if ($LASTEXITCODE -ne 0 -or $lines.Count -ne 2) {
+        throw "The venv interpreter could not run the import check (exit $LASTEXITCODE): $($lines -join ' | '). Delete $venv and run this script again."
+    }
+    return $lines
 }
 
 # EXTRAS MUST MATCH ci.yml's TEST LEG, and the reason is a FALSE GREEN rather than convenience
@@ -78,10 +130,25 @@ if (Test-Path -LiteralPath $venvPy) {
 # ruff and bandit, whose scopes were written twice and drifted until a test held them together.
 $extras = if ($Sqlserver) { "dev,harness,fhir,dicom,x12,xml,webauthn,vault,sftp,sqlserver" } else { "dev,harness,fhir,dicom,x12,xml,webauthn,vault,sftp" }
 
-Write-Host "Creating virtualenv + installing .[$extras] in $root (this can take a minute)..."
-& $Python -m venv $venv
-if ($LASTEXITCODE -ne 0) { throw "venv creation failed (is '$Python' on PATH?)" }
-& $venvPy -m pip install --upgrade pip | Out-Null
+if (Test-Path -LiteralPath $venvPy) {
+    $state = Get-ImportState
+    $bad = @($state | Where-Object { $_ -match '\A\S+ BAD ' })
+    if ($bad.Count -eq 0) {
+        Write-Host "venv already present and both packages import from this checkout, nothing to do: $venvPy" -ForegroundColor Green
+        $state | ForEach-Object { Write-Host "  $_" }
+        return
+    }
+    # The one install line below reinstalls both. pip always reinstalls an editable requirement, and
+    # a second declaration of the line is the drift the two text tests in the header exist to catch.
+    Write-Host "venv already present, but it imports a package from outside this checkout; reinstalling .[$extras] and the web console:" -ForegroundColor Yellow
+    $bad | ForEach-Object { Write-Host "  $_" }
+}
+else {
+    Write-Host "Creating virtualenv + installing .[$extras] in $root (this can take a minute)..."
+    & $Python -m venv $venv
+    if ($LASTEXITCODE -ne 0) { throw "venv creation failed (is '$Python' on PATH?)" }
+    & $venvPy -m pip install --upgrade pip | Out-Null
+}
 
 Push-Location $root
 try {
@@ -111,6 +178,10 @@ try {
 } finally {
     Pop-Location
 }
+
+# The install exits 0 and still proves nothing about where the packages import from; ask again.
+$bad = @(Get-ImportState | Where-Object { $_ -match '\A\S+ BAD ' })
+if ($bad.Count -gt 0) { throw "after the install, a package still imports from outside this checkout: $($bad -join ' | ')" }
 
 Write-Host ""
 Write-Host "venv ready: $venvPy" -ForegroundColor Green

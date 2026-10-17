@@ -32,6 +32,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -88,26 +89,83 @@ def test_it_refuses_a_checkout_that_is_not_this_project(tmp_path: Path) -> None:
     assert "not a messagefoundry checkout" in (proc.stderr + proc.stdout).lower()
 
 
-def test_it_is_a_no_op_when_a_usable_interpreter_is_already_present(tmp_path: Path) -> None:
-    """IDEMPOTENCE IS THE POINT. A session cannot know whether its worktree already has an
-    environment, so this must be safe to run unconditionally at the start of one.
+def _venv_checkout(tmp_path: Path) -> tuple[Path, Path]:
+    """A fake checkout holding both import packages, and a REAL venv with no pip in it.
 
-    The assertion is that it returns success WITHOUT installing: no network, no pip. A fake
-    ``python.exe`` stands in for a real venv precisely so that a regression here -- one that reached
-    the install path anyway -- would try to run that fake and fail, rather than quietly spending
-    minutes rebuilding a real environment."""
+    The venv is real because the script asks its interpreter where the packages import from. It has
+    no pip on purpose: a regression that reached the install path fails at once with "No module
+    named pip", rather than quietly spending minutes rebuilding an environment. A ``.pth`` file
+    stands in for the engine's editable install, which adds the checkout root to ``sys.path``.
+    """
     root = _fake_checkout(tmp_path, pyproject=True)
-    venv_py = root / ".venv" / "Scripts" / "python.exe"
-    venv_py.parent.mkdir(parents=True)
-    venv_py.write_text("", encoding="utf-8")
+    for name in ("messagefoundry", "messagefoundry_webconsole"):
+        (root / name).mkdir()
+        (root / name / "__init__.py").write_text(f"# {name} source\n", encoding="utf-8")
+    venv = root / ".venv"
+    subprocess.run(
+        [sys.executable, "-m", "venv", "--without-pip", str(venv)],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=180,
+    )
+    site = venv / "Lib" / "site-packages"
+    (site / "_editable_impl_messagefoundry.pth").write_text(f"{root}\n", encoding="utf-8")
+    return root, site
+
+
+def _plant_copy(site: Path, root: Path, name: str, *, stale: bool) -> None:
+    """A non-editable copy of ``name`` in site-packages, which sits ahead of the ``.pth`` root."""
+    (site / name).mkdir()
+    body = (root / name / "__init__.py").read_text(encoding="utf-8")
+    if stale:
+        body += "# an older build\n"
+    (site / name / "__init__.py").write_text(body, encoding="utf-8")
+
+
+def test_it_is_a_no_op_when_both_packages_import_from_the_checkout(tmp_path: Path) -> None:
+    """IDEMPOTENCE IS THE POINT. A session cannot know whether its worktree already has an
+    environment, so this must be safe to run unconditionally at the start of one."""
+    root, _site = _venv_checkout(tmp_path)
 
     proc = _run("-Path", str(root))
 
-    assert proc.returncode == 0, proc.stderr
-    assert "already present" in proc.stdout
-    assert "Creating virtualenv" not in proc.stdout, (
-        "reached the install path despite a usable interpreter being present"
-    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "both packages import from this checkout, nothing to do" in proc.stdout
+    assert f"messagefoundry OK source {root / 'messagefoundry'}" in proc.stdout
+    assert "Creating virtualenv" not in proc.stdout
+    assert "reinstalling" not in proc.stdout
+
+
+def test_a_web_console_copy_that_matches_the_source_is_accepted(tmp_path: Path) -> None:
+    """Every install of the web console is a copy (hatch force-include), so a current one passes."""
+    root, site = _venv_checkout(tmp_path)
+    _plant_copy(site, root, "messagefoundry_webconsole", stale=False)
+
+    proc = _run("-Path", str(root))
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "messagefoundry_webconsole OK copy-matching-source" in proc.stdout
+    assert "nothing to do" in proc.stdout
+
+
+@pytest.mark.parametrize("name", ["messagefoundry_webconsole", "messagefoundry"])
+def test_a_stale_copy_shadowing_the_checkout_is_reinstalled(tmp_path: Path, name: str) -> None:
+    """BACKLOG #2857. The old script returned once python.exe existed, so a stale copy in
+    site-packages went on shadowing the source, and a test read the result as a code defect.
+
+    The reinstall is asserted by its attempt. This venv has no pip, so the install line fails, and
+    that failure shows the script left the no-op path, after naming the package that sent it."""
+    root, site = _venv_checkout(tmp_path)
+    _plant_copy(site, root, name, stale=True)
+
+    proc = _run("-Path", str(root))
+
+    assert proc.returncode != 0, proc.stdout
+    assert "nothing to do" not in proc.stdout
+    assert "imports a package from outside this checkout; reinstalling" in proc.stdout
+    assert f"{name} BAD it imports from {site / name}" in proc.stdout
+    assert "No module named pip" in proc.stdout + proc.stderr
 
 
 def test_it_resolves_a_subdirectory_to_the_checkout_root(tmp_path: Path) -> None:
@@ -115,17 +173,15 @@ def test_it_resolves_a_subdirectory_to_the_checkout_root(tmp_path: Path) -> None
 
     Asserted through the no-op path so the test stays free of an install: the venv it reports as
     already present is the ROOT's, which is only reachable if the resolution worked."""
-    root = _fake_checkout(tmp_path, pyproject=True)
-    venv_py = root / ".venv" / "Scripts" / "python.exe"
-    venv_py.parent.mkdir(parents=True)
-    venv_py.write_text("", encoding="utf-8")
+    root, _site = _venv_checkout(tmp_path)
     sub = root / "messagefoundry" / "store"
     sub.mkdir(parents=True)
 
     proc = _run("-Path", str(sub))
 
-    assert proc.returncode == 0, proc.stderr
-    assert "already present" in proc.stdout
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "nothing to do" in proc.stdout
+    assert not (sub / ".venv").exists()
 
 
 def test_new_ps1_still_delegates_the_bootstrap_to_this_script() -> None:
