@@ -2908,7 +2908,7 @@ outside the store cipher, documented in the crypto inventory); the authenticator
 updated via a strict compare-and-set** — a regression or a concurrent same-counter assertion is treated
 as a **clone signal** (rejected + audited `auth.webauthn_clone_suspected`; a permanent counter of 0 is
 normal for synced passkeys). Assertion failures are audited but deliberately do **not** feed the
-account lockout (signatures aren't guessable secrets). Unless a setting turns it off (at least
+account lockout (signatures aren't guessable secrets). Unless a setting turns it off or loosens it (at least
 `[auth].login_rate_limit_enabled = false`; [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#authlogin_rate_limit_enabled--false-or-a-limit-looser-than-its-default--sign-in-attempts-go-less-paced)
 lists them), abuse is bounded instead by the **per-actor
 credential-ceremony limiter** — the sole route that finishes an assertion, `POST /ui/reauth/webauthn`,
@@ -4754,26 +4754,27 @@ is revoked on its first failed re-proof. That matters for AD, because since the 
 the step-up re-auth route is the **only** place an AD password is still bound: a rejected re-bind counts
 on the engine's own row and against the session. The engine never writes a lock to the directory
 account. Each rejected re-bind still reaches the DC, though: up to `lockout_threshold` counted ones per
-session, and uncounted ones (below) with no per-session bound. So a domain lockout policy can still lock
-the domain account if its threshold is at or below `lockout_threshold`, or if
-several sessions or engine sign-in failures add up within its observation window. A directory it cannot
-reach, or one with no such principal, is a refusal but not a counted failure. So is a bind the DC ends
-with an outage code: busy (51), unavailable (52), unwillingToPerform (53) or adminLimitExceeded (11).
-Such a bind judged no password (BACKLOG #3169). Nor is any other re-bind that ends in an `LdapError`
-counted, which the re-bind refuses as `directory_unavailable` whatever its kind. That covers at least a
-referral, which the engine never follows, so no bind judged the password; an undecodable answer (a
-code outside ldap3's table among them); a Notice of Disconnection or any other unsolicited
-notification; and a socket fault. None of these uncounted re-binds is charged to the row or the
-session, so while the DC answers that way the per-session cap does not bound them and only the
-per-actor budget does. **The settings that turn the per-actor budget off are listed once**, in
-[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#authlogin_rate_limit_enabled--false-or-a-limit-looser-than-its-default--sign-in-attempts-go-less-paced):
-any value there that turns the ceremony limit off leaves nothing in the engine bounding the uncounted
-re-binds. Every other result code ldap3 decodes
-from a refused bind is counted, strongerAuthRequired (8) included, though it judges no password either. A correct password the DC refuses anyway, for example because the domain
-account is locked or its password has expired, **is** counted. AD answers both with
-invalidCredentials (49), and the engine reads the bind's result code, never its diagnostic text. Unless
-one of those settings turns it off, the per-actor
-budget applies there; the sign-in limiter never does. AD and Kerberos brute-force resistance
+session, and, with no per-session bound, those uncounted ones below that the DC itself answered, such
+as a busy one or a referral. So a domain lockout policy can still lock the domain account if its
+threshold is at or below `lockout_threshold`, or if several sessions or engine sign-in failures add up
+within its observation window. A directory it cannot reach, or one with no such principal, is a
+refusal but not a counted failure. So is a bind the DC ends with an outage code: busy (51),
+unavailable (52), unwillingToPerform (53) or adminLimitExceeded (11). Such a bind judged no password
+(BACKLOG #3169). Nor is any other re-bind that ends in an `LdapError` counted: the re-bind refuses
+each as `directory_unavailable`, whatever its kind. That covers at least a referral, which the engine
+never follows, so no bind judged the password; an undecodable answer (a code outside ldap3's table
+among them); a Notice of Disconnection or any other unsolicited notification; and a socket fault.
+Every other refused bind is counted: each other result code ldap3 decodes, strongerAuthRequired (8)
+included, though it judges no password either, and a refused bind whose result holds no integer code.
+A correct password the DC refuses anyway, for example because the domain account is locked or its
+password has expired, **is** counted. AD answers both with invalidCredentials (49), and the engine
+reads the bind's result code, never its diagnostic text. **What bounds the uncounted re-binds:** none
+is charged to the row or the session, so while the DC answers that way the per-session cap does not
+bound them and only the per-actor budget does. The settings that turn that budget off or loosen it
+are listed once, in [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#authlogin_rate_limit_enabled--false-or-a-limit-looser-than-its-default--sign-in-attempts-go-less-paced). A value there that turns the ceremony limit off
+leaves nothing in the engine bounding the uncounted re-binds, and a looser one bounds them only as far
+as it still paces the ceremonies, which for a tiny window is hardly at all. Short of those settings,
+the per-actor budget applies to the AD re-bind; the sign-in limiter never does. AD and Kerberos brute-force resistance
 is otherwise the directory's job, so set the domain lockout/complexity policy accordingly. The engine-side
 throttle that *does* cover Kerberos and OIDC is the sliding-window sign-in limiter — **per client IP and
 globally**, not merely globally. **And it has one switch.** With
@@ -4896,7 +4897,7 @@ threshold, the switch that disables it, and — the part that matters for "not d
 |---|---|---|---|---|---|
 | 1 | **Per-account lockout**, on two counters (ADR 0197) | one account's credential-guessing, on the password **and** TOTP/recovery legs of sign-in and the **combined sign-in** (password and TOTP code in one request). The **sign-in** lock refuses a password-only sign-in and a Kerberos or OIDC sign-in, but **not** a combined one on a local account with TOTP enrolled, and **no** second-factor leg; the **second-step** lock refuses every sign-in and both second-factor legs. The step-up re-auth and password-change re-proofs feed the sign-in counter but are not refused by it; each **session** may fail `lockout_threshold` re-proofs (5 by default), and the failure that reaches it revokes that session (the note after the 6.1.3 paragraph above) | 5 consecutive failures on one counter → 15 min. The **sign-in** counter takes wrong passwords from a caller who has proved nothing, plus the re-proofs; the **second-step** counter takes failures from a caller who has proved one factor. Each count is applied by a single atomic store call, so parallel failures that reach the counter each land and a burst locks the account exactly as a serial run does. Within one API process, the sign-in and second-step checks on one account also run one at a time, and each failed sign-in holds that queue until its padded answer. So a burst of password-only sign-ins or second-step codes gets at most `lockout_threshold` guesses verified before the lock refuses the rest (BACKLOG #1943). Two cases fall outside that bound: engine shards serving their own API ports can each add one more, and the sign-in lock does not refuse a combined sign-in with both factors wrong. The owner accepted both as residuals on 2026-10-06 (BACKLOG #2284). ADR 0197 Amendment B states what bounds each, including with control 2 off. A lapsed window restarts the counter, so each lock expires on its own, and a live lock is never extended. **Each lock doubles per cycle, up to `lockout_max_minutes` (24 h), where the owner has a way past it**: the second-step lock on a local account, and the sign-in lock on a local account with TOTP enrolled. On every other lock **repetition is unbounded**: an attacker who keeps failing re-locks the account as each window lapses. **While the credential in force is engine-generated** (created, reset or factor-reset, and not yet replaced), sign-in failures count and **arm no lock** (ADR 0197 Amendment A). Signal, recovery and what to arrange in advance: below the table | **no dedicated off switch.** `lockout_minutes = 0` makes the lock expire instantly, which is the effective opt-out; `lockout_max_minutes = lockout_minutes` keeps every lock at the base length; `lockout_threshold = 0` is **not** an off switch — it locks on the *first* failure, and a session is revoked on its first failed re-proof | limiters 2 + 3 only |
 | 2 | **Sign-in sliding window** (`allow_login_attempt`) | password-spraying across many usernames, which never trips a single account's lockout | > 10 attempts per client IP **or** > 60 across all clients, per 60 s (either dimension alone refuses — `global_full or key_full`) | `[auth].login_rate_limit_enabled = false` | lockout only — **and limiter 3 disappears with it** (see below). Nothing then bounds how many sign-ins wait in one account's queue (control 1), so a flood on one username also delays that account's own sign-ins (BACKLOG #1943) |
-| 3 | **Per-actor credential-ceremony budget** (`allow_reauth_attempt`) | a session holder guessing a password at the re-proof surface, **before** the per-session cap revokes the session | > 10 ceremonies per acting **user**, per 60 s. **No global dimension** (`glob=0`) | *the same* `[auth].login_rate_limit_enabled` | the per-session cap — `POST /me/reauth` and `POST /me/password` still count each failure, and a session is revoked at `lockout_threshold` failures. Re-proofs run one at a time per account, so a burst on one session is checked one at a time against its cap, within one engine process |
+| 3 | **Per-actor credential-ceremony budget** (`allow_reauth_attempt`) | a session holder guessing a password at the re-proof surface, **before** the per-session cap revokes the session | > 10 ceremonies per acting **user**, per 60 s. **No global dimension** (`glob=0`) | *the same* `[auth].login_rate_limit_enabled`, among others ([SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#authlogin_rate_limit_enabled--false-or-a-limit-looser-than-its-default--sign-in-attempts-go-less-paced) lists every value that turns it off) | the per-session cap — `POST /me/reauth` and `POST /me/password` still count each failure, and a session is revoked at `lockout_threshold` failures. An AD re-bind the engine does not count, such as one the DC ends busy, keeps no bound at all (BACKLOG #3169). Re-proofs run one at a time per account, so a burst on one session is checked one at a time against its cap, within one engine process |
 | 4 | **argon2 concurrency cap** | executor exhaustion under a login flood | an instance semaphore sized `max(2, min(8, cpu_count))`; every hash/verify runs off the event loop | none | n/a |
 | 5 | **Request-body cap + field limits** | oversized/ambiguous auth requests | 1 MiB (the `/uploads` routes alone admit up to `[store].max_upload_bytes`), a **required** `Content-Length` for any body (a chunked body is refused **411**), and CL+TE ambiguous framing refused **400** — all as ASGI middleware ahead of every route | none | n/a |
 | 6 | **Pre-auth client-network gate** | reaching the auth surface at all from an unlisted network | membership in `[security].allowed_client_networks` | `[]` = no restriction (the default) | limiters 1–3 |
@@ -5096,7 +5097,9 @@ because a host-run replacement would leave the new seed with whoever ran it.
 > window of its own. They must never be described as independent controls. Turning that one flag off
 > leaves the per-session cap as the only bound on session-holder password guessing: `POST /me/reauth`
 > and `POST /me/password` still count each failure, and a session is revoked at `lockout_threshold`
-> failures (BACKLOG #1138).
+> failures (BACKLOG #1138). That bound covers only the re-proofs the engine counts: an AD re-bind it
+> does not count keeps none (BACKLOG #3169). The flag is not the only value that turns limiter 3
+> off; [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#authlogin_rate_limit_enabled--false-or-a-limit-looser-than-its-default--sign-in-attempts-go-less-paced) lists the others.
 
 The two limiters exist separately for a reason: limiter 2's **global** budget is shared with the
 unauthenticated sign-in surface. Anyone able to reach the login page can exhaust it without holding a

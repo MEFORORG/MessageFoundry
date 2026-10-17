@@ -73,6 +73,7 @@ from tests.test_ldap_referrals import (
     _BIND_RESPONSE,
     _SEARCH_DONE,
     _SEARCH_REQUEST,
+    _UNBIND_REQUEST,
     _read_message,
     _tlv,
 )
@@ -744,13 +745,15 @@ class _ScriptedDc:
     with ``extended_code``; each search is answered by ``answer(raw request)``. ``searches`` holds every search request's bytes, and
     ``ended`` is set when a client's socket closes. A reply that is already a whole LDAPMessage is
     sent as written, under its own messageID, and :data:`_HANG_UP` closes the socket instead of
-    answering; ``hung_up`` says whether any session did.
+    answering.
 
-    ``failures`` holds whatever a session raised other than a socket error. A failed session closes
-    its socket, and a client reads that close as the server ending the session, so a test that
-    expects exactly that would pass with the script broken. :func:`_scripted_dc` raises the first
-    failure in the test's own thread. Each is recorded before its socket closes, so a client that
-    reacted to the close is already covered by the time the test leaves the server."""
+    A client reads any close as the server ending the session, so a test that expects exactly that
+    could pass with nothing it scripted read. Two records stop that. ``closed_by_server`` is set
+    whenever a session closes its socket of its own accord: a hang-up, an operation other than an
+    unbind, or the server's own idle timeout. ``failures`` holds whatever a session raised other
+    than a socket error, recorded before its socket closes; :func:`_scripted_dc` raises the first
+    in the test's own thread, and the session thread re-raises it too, so a fault after the test
+    has left the server is still reported, as an unhandled thread exception."""
 
     def __init__(
         self,
@@ -763,7 +766,7 @@ class _ScriptedDc:
         self._extended_reply = extended_reply
         self.searches: list[bytes] = []
         self.failures: list[Exception] = []
-        self.hung_up = False
+        self.closed_by_server = False
         self.ended = threading.Event()
         self._listener = socket.create_server(("127.0.0.1", 0))
         self.port: int = self._listener.getsockname()[1]
@@ -782,10 +785,13 @@ class _ScriptedDc:
             with sock:
                 try:
                     self._serve(sock)
+                except TimeoutError:
+                    self.closed_by_server = True  # the client sent nothing for the idle timeout
                 except OSError:
                     pass  # the client went away mid-read or mid-send
-                except Exception as exc:  # any script fault; see `failures` in the class docstring
+                except Exception as exc:  # any script fault; see the class docstring
                     self.failures.append(exc)
+                    raise
         finally:
             self.ended.set()
 
@@ -806,11 +812,12 @@ class _ScriptedDc:
                 self.searches.append(raw)
                 replies = self._answer(raw)
             else:  # unbind, or anything this server does not speak
+                self.closed_by_server = op != _UNBIND_REQUEST
                 return
             for reply, controls in replies:
                 if reply == _HANG_UP[0]:
                     assert not controls, "a hang-up sends nothing"
-                    self.hung_up = True
+                    self.closed_by_server = True
                     return
                 # A reply that is already a whole LDAPMessage (a SEQUENCE, 0x30) goes out as
                 # written, so a test can send one under another messageID, such as an unsolicited

@@ -262,7 +262,7 @@ _NOTICE_OF_DISCONNECTION = _unsolicited(b"1.3.6.1.4.1.1466.20036")
 
 def _bind_answered_with(reply: _Reply) -> tuple[LdapError, bool]:
     """Answer alice's bind with ``reply`` over a real ldap3 stack; return what ``authenticate``
-    raised and whether the scripted DC hung up."""
+    raised and whether the scripted DC closed a socket of its own accord."""
 
     def bind_reply(raw: bytes) -> _Reply | None:
         return reply if _ALICE in raw else None
@@ -272,7 +272,7 @@ def _bind_answered_with(reply: _Reply) -> tuple[LdapError, bool]:
         pytest.raises(LdapError) as caught,
     ):
         authenticator.authenticate("alice", _PASSWORD)
-    return caught.value, dc.hung_up
+    return caught.value, dc.closed_by_server
 
 
 def test_real_ldap3_reads_a_notice_of_disconnection_at_the_bind_as_an_outage() -> None:
@@ -284,33 +284,37 @@ def test_real_ldap3_reads_a_notice_of_disconnection_at_the_bind_as_an_outage() -
 
     ldap3 raises the same exception, with the same text, when the server only closes the socket
     (the hang-up control below), so the exception alone cannot show the notice was decoded. What
-    shows it is that the scripted DC sent the notice and never closed: with the socket still open,
-    ldap3 never read an end of stream, so only the decoded notice can have ended the bind."""
-    refusal, hung_up = _bind_answered_with((_NOTICE_OF_DISCONNECTION, b""))
-    assert not hung_up, "the scripted DC closed the socket, so the notice was not what ldap3 read"
-    assert type(refusal) is LdapError and not isinstance(refusal, LdapUnansweredError)
+    shows it is that the scripted DC sent the notice and never closed the socket itself, by a
+    hang-up or by its own idle timeout: ldap3 never read an end of stream the server caused, so
+    only the decoded notice can have ended the bind."""
+    refusal, closed_by_server = _bind_answered_with((_NOTICE_OF_DISCONNECTION, b""))
+    assert not closed_by_server, "the scripted DC closed the socket, so ldap3 may not have read it"
+    assert type(refusal) is LdapError
     assert isinstance(refusal.__cause__, LDAPSessionTerminatedByServerError)
 
 
 def test_a_bind_the_server_hangs_up_on_reads_the_same_to_ldap3() -> None:
-    """THE CONTROL for the notice: a bare close reads the same to ldap3, and only ``hung_up``
-    differs. RED if ldap3 ever told the two apart, which would let the notice arm assert it."""
-    refusal, hung_up = _bind_answered_with(_HANG_UP)
-    assert hung_up
-    assert type(refusal) is LdapError and not isinstance(refusal, LdapUnansweredError)
+    """THE CONTROL for the notice: a bare close reads the same to ldap3, and only the scripted
+    DC's record differs. RED if ldap3 ever told the two apart, which would let the notice arm
+    assert it."""
+    refusal, closed_by_server = _bind_answered_with(_HANG_UP)
+    assert closed_by_server
+    assert type(refusal) is LdapError
     assert isinstance(refusal.__cause__, LDAPSessionTerminatedByServerError)
 
 
 def test_real_ldap3_reads_the_notifications_name_and_refuses_one_it_does_not_know() -> None:
-    """THE CONTRAST for the notice: the same message naming another OID raises
-    ``LDAPSocketReceiveError``, not a terminated session, so ldap3 reads the scripted messageID-0
-    message and its responseName rather than skipping it. Still a plain :class:`LdapError`, so the
-    re-bind reads it as ``directory_unavailable`` and does not count it."""
-    refusal, hung_up = _bind_answered_with((_unsolicited(b"1.3.6.1.4.1.32473.3169"), b""))
-    assert not hung_up
+    """THE CONTRAST for the notice: the same message naming another OID is refused by ldap3's
+    unknown-notification branch, not as a terminated session, so ldap3 reads the scripted
+    messageID-0 message and its responseName rather than skipping it. ldap3 raises the same class
+    for an invalid messageId or a failed receive, so the text, its ``last_error``, pins the branch.
+    Still a plain :class:`LdapError`, so the re-bind reads it as ``directory_unavailable`` and
+    does not count it."""
+    refusal, closed_by_server = _bind_answered_with((_unsolicited(b"1.3.6.1.4.1.32473.3169"), b""))
+    assert not closed_by_server
     assert type(refusal) is LdapError
     assert isinstance(refusal.__cause__, LDAPSocketReceiveError)
-    assert not isinstance(refusal.__cause__, LDAPSessionTerminatedByServerError)
+    assert str(refusal) == "unknown unsolicited notification from server"
 
 
 async def test_a_re_bind_ended_by_a_notice_of_disconnection_is_not_counted(
