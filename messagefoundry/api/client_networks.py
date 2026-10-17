@@ -11,7 +11,8 @@ address the SERVER reports, read through ``api.security.client_ip`` like every o
 read (BACKLOG #2289) — and parses **no forwarding header, ever**. uvicorn's
 ``ProxyHeadersMiddleware`` is the single X-Forwarded-For trust point in the process: it rewrites
 ``scope["client"]`` from XFF when, and only when, the socket peer matches ``forwarded_allow_ips``,
-which ``__main__`` feeds verbatim from ``[api].trusted_proxies``. So:
+which ``__main__`` builds from ``[api].trusted_proxies`` with ``uvicorn_trusted_hosts`` (it says
+what it adds, BACKLOG #3042). So:
 
 * **R1, direct bind, no proxy declared** — ``trusted_proxies`` is empty, ``_TrustedHosts([])`` matches
   no peer, the XFF branch never runs, and ``scope["client"]`` is the raw socket peer. An attacker's

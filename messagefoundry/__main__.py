@@ -3089,6 +3089,11 @@ def _serve(args: argparse.Namespace) -> int:
     # "a non-loopback bind REFUSES to serve until a real certificate is configured." So this gate
     # keeps keying on tls_enabled (an OPERATOR certificate) rather than on the minted pair, and the
     # messages say why.
+    from messagefoundry.config.settings import uvicorn_trusted_hosts
+
+    # What uvicorn's forwarded_allow_ips is handed, computed here so a refused entry stops serve
+    # before any startup side effect. The log below names the CONFIGURED list instead.
+    forwarded_allow_ips = uvicorn_trusted_hosts(settings.api.trusted_proxies)
     if not settings.api.is_loopback:
         if settings.api.tls_enabled:
             # WP-13a: TLS terminates in-process, so tokens + PHI are encrypted on the wire and HSTS
@@ -3101,7 +3106,7 @@ def _serve(args: argparse.Namespace) -> int:
             # declared proxies (the validator guarantees trusted_proxies is set here).
             logging.getLogger(__name__).info(
                 "API on non-loopback host %r behind a TLS-terminating proxy; trusting forwarded "
-                "headers from %s.",
+                "headers from %s (each IPv4 address an entry names is trusted plain and ::ffff:-mapped).",
                 settings.api.host,
                 settings.api.trusted_proxies,
             )
@@ -4630,9 +4635,10 @@ def _serve(args: argparse.Namespace) -> int:
         # #200 (ADR 0002): mTLS client-cert → principal allow-list, consumed by
         # security.resolve_client_cert_identity (deny-by-default; empty = cert-identity off).
         tls_client_cert_identities=settings.api.tls_client_cert_identities,
-        # The SAME list that becomes uvicorn's forwarded_allow_ips below. The client-network gate does
-        # NOT key its decision on this — it reads the scope address uvicorn already resolved — it is
-        # passed only so the address-monoculture tripwire knows whether a proxy was declared.
+        # The CONFIGURED list, not uvicorn's forwarded_allow_ips (uvicorn_trusted_hosts says what
+        # that adds). The client-network gate does NOT key its decision on
+        # this — it reads the scope address uvicorn already resolved — it is passed only so the
+        # address-monoculture tripwire knows whether a proxy was declared.
         trusted_proxies=settings.api.trusted_proxies,
         log_dir=settings.logging.log_dir,  # GET /status app-log disk metering (#50)
         # BACKLOG #171 (ADR 0130): the startup [logging].level baseline a restart returns to, reported by
@@ -4655,10 +4661,11 @@ def _serve(args: argparse.Namespace) -> int:
     # so everything shares one format/stream (and one log file under NSSM).
     # WP-15: trust X-Forwarded-For/-Proto ONLY from the declared reverse proxies, so the audit /
     # rate-limit source IP is the real client (not the proxy). Empty list = trust nothing (the secure
-    # default — the direct TCP peer is used), overriding uvicorn's loopback default.
+    # default — the direct TCP peer is used), overriding uvicorn's loopback default. The list is
+    # uvicorn_trusted_hosts' (BACKLOG #3042).
     run_kwargs: dict[str, Any] = {
         "log_config": None,
-        "forwarded_allow_ips": settings.api.trusted_proxies,
+        "forwarded_allow_ips": forwarded_allow_ips,
         # WP-L3-07 (ASVS 13.4.6): drop the `Server: uvicorn` banner so a response doesn't advertise the
         # server implementation/version to an unauthenticated caller.
         "server_header": False,
