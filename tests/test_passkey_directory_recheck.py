@@ -553,8 +553,11 @@ async def test_what_lands_before_the_factor_write_is_honoured(
         assert len(clones) == 1
         return
     assert clones == []
-    gone = ("passkey-deleted", "passkey-deleted-first")
-    reason = "factor_removed" if change in gone else {"lock": "locked"}.get(change, "session_lost")
+    reason = {
+        "lock": "locked",
+        "passkey-deleted": "factor_removed",
+        "passkey-deleted-first": "factor_removed",
+    }.get(change, "session_lost")
     assert {"reason": reason} in await _audited_assertion_failures(store)
     if change == "lock":
         user = await store.get_user(user_id)

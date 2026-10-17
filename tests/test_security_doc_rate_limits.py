@@ -2378,16 +2378,16 @@ def test_lockout_is_fed_by_two_legs_but_enforced_on_the_assertion_leg_too() -> N
     # ``second_step_locked`` (the sign-in lock guards the step the session already passed). Since
     # BACKLOG #3068 the read lives in ``_mfa_lock_refused``, which both second-factor legs call, so
     # the pin follows the call into the helper rather than reading the leg alone.
-    helper = named_func(tree, "_mfa_lock_refused")
-    reads_lock = any(
-        isinstance(n, ast.Attribute)
-        and n.attr in {"second_step_locked", "second_step_locked_until"}
-        for n in ast.walk(helper)
-    )
-    assert calls_to(assertion, {"_mfa_lock_refused"}) and reads_lock, (
+    assert calls_to(assertion, {"_mfa_lock_refused"}), (
         "finish_webauthn_assertion no longer refuses a locked account; docs/SECURITY.md says the "
         "lock is ENFORCED across every local factor."
     )
+    helper = named_func(tree, "_mfa_lock_refused")
+    assert any(
+        isinstance(n, ast.Attribute)
+        and n.attr in {"second_step_locked", "second_step_locked_until"}
+        for n in ast.walk(helper)
+    ), "_mfa_lock_refused no longer reads the second-step lock, so neither factor leg refuses it."
     assert not calls_to(assertion, {"_register_failure"}), (
         "WebAuthn assertion failures now feed the lockout; the doc's deliberate-divergence note is "
         "stale — update it in the same change."

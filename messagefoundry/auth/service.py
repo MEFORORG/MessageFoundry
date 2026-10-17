@@ -11389,13 +11389,7 @@ class AuthService:
             # signal, or the passkey was deleted after it was read: a self-service delete takes no
             # queue. A passkey gone is refused as the factor-removed check below refuses it, so a
             # delete raises no false clone alarm (BACKLOG #3068).
-            if not await self._passkey_still_held(user, cred):
-                await self._audit(
-                    "auth.webauthn_failed",
-                    actor=user.username,
-                    detail=_json({"reason": "factor_removed"}),
-                    client=client,
-                )
+            if await self._passkey_removed(user, cred, client):
                 return Elevation()
             await self._audit(
                 "auth.webauthn_clone_suspected",
@@ -11420,13 +11414,7 @@ class AuthService:
         user = fresh
         # The code leg's TOTP-off check, for a passkey: a self-service delete takes no queue, so the
         # passkey that signed may be gone.
-        if not await self._passkey_still_held(user, cred):
-            await self._audit(
-                "auth.webauthn_failed",
-                actor=user.username,
-                detail=_json({"reason": "factor_removed"}),
-                client=client,
-            )
+        if await self._passkey_removed(user, cred, client):
             return Elevation()
         # BACKLOG #2298: the passkey leg of /ui/mfa, asked as verify_mfa asks after a good code, so
         # an assertion that straddles the deadline marks nothing and clears no counter.
@@ -11458,16 +11446,28 @@ class AuthService:
             await self._mark_login_address_known(user.id, client)
         return elevation
 
-    async def _passkey_still_held(self, user: VerifiedUser, cred: WebAuthnCredential) -> bool:
-        """Whether ``user`` still holds passkey ``cred``, asked of the set its seal covers (BACKLOG
-        #2592), so a set that fails its seal holds nothing. :meth:`finish_webauthn_assertion` asks
-        it after a sign-count miss and again before the factor write (BACKLOG #3068). Every
-        credential is compared, each in constant time (ASVS 11.2.4, as the delete path does)."""
+    async def _passkey_removed(
+        self, user: VerifiedUser, cred: WebAuthnCredential, client: str | None
+    ) -> bool:
+        """Whether ``user`` no longer holds passkey ``cred``, auditing the refusal as
+        ``auth.webauthn_failed`` with ``reason=factor_removed`` if so. Asked of the set its seal
+        covers (BACKLOG #2592), so a set that fails its seal holds nothing.
+        :meth:`finish_webauthn_assertion` asks it after a sign-count miss and again before the
+        factor write (BACKLOG #3068). Every credential is compared, each in constant time (ASVS
+        11.2.4, as the delete path does)."""
         matches = [
             constant_time_equal(c.credential_id_hash, cred.credential_id_hash)
             for c in await self._verified_passkeys(user) or ()
         ]
-        return any(matches)
+        if any(matches):
+            return False
+        await self._audit(
+            "auth.webauthn_failed",
+            actor=user.username,
+            detail=_json({"reason": "factor_removed"}),
+            client=client,
+        )
+        return True
 
     async def _assertion_expired(self, user: UserRecord, client: str | None) -> Elevation:
         """The refusal :meth:`finish_webauthn_assertion` gives when no ceremony of this account's
