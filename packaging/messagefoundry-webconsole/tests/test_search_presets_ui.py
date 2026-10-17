@@ -36,7 +36,7 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 
 async def _op(engine: Engine, *, per_actor: int = 120) -> AuthService:
     # per_actor mirrors AuthSettings' default (120); pass a smaller value to exercise the per-actor
-    # PHI-read budget in a single test (see test_webui.py:616 test_edit_editor_charges_the_phi_read_budget).
+    # PHI-read budget in a single test (see test_webui_edit.py test_edit_editor_charges_the_phi_read_budget).
     service = AuthService(
         engine.store,
         AuthSettings(
