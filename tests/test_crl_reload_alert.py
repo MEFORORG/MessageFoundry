@@ -621,6 +621,40 @@ async def test_a_clear_that_fails_at_stop_is_said_at_stop(
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
+async def test_the_stop_warnings_list_of_files_survives_the_log_redaction(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Vault BACKLOG #3543 item 8, dropped on this reading. The finding: the stop's WARNING joins
+    path keys with ", ", a shape the redaction pass might rewrite, unconfirmed whether the log
+    filter applies it. Measured: the filter does apply it, and the join is not a shape it
+    rewrites, because every key after a comma starts with a separator or, on Windows, a drive
+    letter the key has folded to lower case. A path's own text can still be rewritten, as in any
+    log line that names a path; this pins only the join."""
+    from messagefoundry.logging_setup import RedactionFilter
+
+    root = Path(os.path.abspath(os.sep))
+    paths = [str(root / "pki" / "Acme"), str(root / "pki" / "Partner-CRL.pem")]
+    refusal = ReloadRefusal((1, 2), "why", RESTART)
+    sink = _Sink()
+    runner = _runner(sink)
+    for path in paths:
+        loaded_crls.record_reload_refusal(path, refusal)
+    runner._report([ReloadOutcome(path, 0, refusal, 1) for path in paths])
+    sink.down = True
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.crl_reload"):
+        await runner.stop()
+    (record,) = [r for r in caplog.records if "could not be resolved at stop" in r.getMessage()]
+    joined = ", ".join(sorted(crl_path_key(path) for path in paths))
+    assert joined in record.getMessage()
+    assert RedactionFilter().filter(record)
+    assert joined in record.getMessage(), "the filter left the list as it was"
+    # The control: the same filter does rewrite a name run, so it ran on this record.
+    control = logging.LogRecord("x", logging.WARNING, __file__, 1, "%s", ("Doe, Jane",), None)
+    RedactionFilter().filter(control)
+    assert "Jane" not in control.getMessage()
+
+
 async def test_a_refusal_after_a_clear_is_not_held_back_by_the_cooldown() -> None:
     """A refusal the notifier throttled would wait for the runner's next reminder. So the clear
     must end the cooldown, and the refusal after it pages at once."""
