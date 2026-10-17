@@ -253,6 +253,7 @@ async def test_a_touch_just_before_the_revoke_still_audits_a_live_session(
     prior_hash = hash_token(prior)
     real_supersede = store.supersede_session
     base, reads = time.time(), [0]
+    touches: list[str] = []
 
     def _stepping() -> float:
         reads[0] += 1
@@ -262,15 +263,113 @@ async def test_a_touch_just_before_the_revoke_still_audits_a_live_session(
         touched = time.time()
         assert touched > now, "the stepping clock did not separate the touch from the revoke stamp"
         await store.touch_session(token_hash, now=touched)
+        touches.append(token_hash)
         return await real_supersede(token_hash, now=now)
 
     monkeypatch.setattr(store, "supersede_session", _touched_first)
     monkeypatch.setattr(time, "time", _stepping)
     await _token(service, supersedes=prior)
+    # BACKLOG #3029, finding 2 of the review of engine PR 2028: without this, a supersession that
+    # never calls supersede_session (the old read-then-revoke body) passed with nothing touched.
+    assert touches == [prior_hash], "the injection never fired, so this measured nothing"
     assert not await _live(service, prior)
     assert await _superseded(store) == [
         {"scope": "superseded", "session": prior_hash[:12], "actor": "op"}
     ]
+
+
+async def test_a_session_live_when_the_revoke_began_is_audited_though_it_lapsed_during_it(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #3029, finding 1 of the review of engine PR 2028. The supersession judges liveness at
+    # a moment clamped between its two clock reads. Judged at the LATER read, a session still live
+    # when the revoke began, but over its idle limit by the time the call returned, would lose its
+    # audit row. The clock STEPS across the call, so the two reads straddle the idle limit; with
+    # equal reads, every placement of the moment would agree.
+    service = await _service(store, session_idle_timeout_minutes=30)
+    prior = await _token(service)
+    prior_hash = hash_token(prior)
+    real_supersede = store.supersede_session
+    real_time = time.time
+    clock = {"offset": 30 * 60 - 2.0}  # the prior session has 2 seconds of idle time left
+    steps: list[float] = []
+
+    async def _slow(token_hash: str, *, now: float) -> object:
+        if token_hash == prior_hash:
+            clock["offset"] += 4.0  # the call returns 2 seconds past the idle limit
+            steps.append(now)
+        return await real_supersede(token_hash, now=now)
+
+    monkeypatch.setattr(time, "time", lambda: real_time() + clock["offset"])
+    monkeypatch.setattr(store, "supersede_session", _slow)
+    await _token(service, supersedes=prior)
+    assert steps, "the clock never stepped inside the supersession, so this measured nothing"
+    assert not await _live(service, prior)
+    assert await _superseded(store) == [
+        {"scope": "superseded", "session": prior_hash[:12], "actor": "op"}
+    ], "a session live when the revoke began was judged at the clock read after it"
+
+
+async def test_a_logout_records_whether_it_ended_a_session(store: MessageStore) -> None:
+    # BACKLOG #3029: the auth.logout row says what happened, and a logout of a token that names no
+    # unrevoked session (a replay of a dead token) still writes its row.
+    service = await _service(store)
+    token = await _token(service)
+    await service.logout(token, actor="op")
+    await service.logout(token, actor="op")
+    assert not await _live(service, token)
+    outcomes = [
+        json.loads(str(row["detail"] or "{}")).get("outcome")
+        for row in await store.list_audit()
+        if row["action"] == "auth.logout"
+    ]
+    assert sorted(map(str, outcomes)) == ["nothing_to_revoke", "revoked"]
+
+
+async def test_a_rotation_racing_a_self_revoke_is_not_reported_as_a_revoke(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #3029. revoke_own_session reads the session by id (its hash), then revokes by that
+    # hash. A step-up on the target session that re-keys it between the two used to leave the revoke
+    # matching nothing while the call still returned True and audited a revoke. Modelled on
+    # test_a_rotation_racing_the_supersession_cannot_keep_the_session_live: the rotation runs right
+    # after the FIRST store call naming the target's hash. The return and the audit row must then
+    # say whether the session actually ended. Ending it under its rotated token is not this call's
+    # to do; that is BACKLOG #3028.
+    service = await _service(store)
+    target = await _token(service)
+    target_hash = hash_token(target)
+    caller = await service.identity_for_token(await _token(service), activity=False)
+    assert caller is not None
+    rotations: list[str | None] = []
+
+    def _inject(name: str) -> None:
+        real = getattr(store, name)
+
+        async def _then_rotate(*args: object, **kwargs: object) -> object:
+            result = await real(*args, **kwargs)
+            if args and args[0] == target_hash and not rotations:
+                rotations.append(None)  # claim the one injection before the rotation re-enters
+                rotations[0] = await service._rotate_session_token(target)
+            return result
+
+        monkeypatch.setattr(store, name, _then_rotate)
+
+    for name in ("get_session", "supersede_session"):
+        _inject(name)
+    revoked = await service.revoke_own_session(caller, target_hash, actor="op")
+
+    assert rotations, "the injection never fired, so this measured nothing"
+    rotated = rotations[0]
+    ended = rotated is None or not await _live(service, rotated)
+    assert revoked is ended, "revoke_own_session reported a revoke that did not happen"
+    self_rows = [
+        row
+        for row in await store.list_audit()
+        if row["action"] == "auth.session_revoked"
+        and json.loads(str(row["detail"])).get("scope") == "self"
+    ]
+    assert len(self_rows) == (1 if ended else 0), "the audit row disagrees with what happened"
 
 
 async def test_a_failed_sign_in_ends_nothing(store: MessageStore) -> None:

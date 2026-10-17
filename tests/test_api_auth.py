@@ -574,6 +574,49 @@ async def test_login_then_permission_enforced(engine: Engine) -> None:
         assert (await c.get("/stats", headers=_auth(token))).status_code == 401
 
 
+async def test_a_logout_raced_by_a_rotation_does_not_audit_a_revoke(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3029. ``POST /auth/logout`` reads the session in its auth dependency, then the
+    service revokes it by hash. A step-up on the same session that re-keys it between the two
+    leaves that hash naming no session. The ``auth.logout`` row used to read the same either way.
+
+    The rotation runs right after the dependency's read of the presented hash. The row's
+    ``outcome`` must then say whether the session ended. Ending it under the rotated token is not
+    this route's to do; that is BACKLOG #3028.
+    """
+    service = await _service(engine)
+    await _add(service, "u", Role.VIEWER)
+    store = engine.store
+    async with _client(engine, service) as c:
+        token = (await _login(c, "u")).json()["token"]
+        token_hash = hash_token(token)
+        rotations: list[str | None] = []
+        real_get = store.get_session
+
+        async def _then_rotate(*args: object, **kwargs: object) -> object:
+            result = await real_get(*args, **kwargs)  # type: ignore[arg-type]
+            if args and args[0] == token_hash and not rotations:
+                rotations.append(None)  # claim the one injection before the rotation re-enters
+                rotations[0] = await service._rotate_session_token(token)
+            return result
+
+        monkeypatch.setattr(store, "get_session", _then_rotate)
+        assert (await c.post("/auth/logout", headers=_auth(token))).status_code == 200
+
+    assert rotations, "the injection never fired, so this measured nothing"
+    rotated = rotations[0]
+    ended = rotated is None or await service.identity_for_token(rotated, activity=False) is None
+    outcomes = [
+        json.loads(str(row["detail"] or "{}")).get("outcome")
+        for row in await store.list_audit()
+        if row["action"] == "auth.logout"
+    ]
+    assert outcomes == ["revoked" if ended else "nothing_to_revoke"], (
+        "the auth.logout row disagrees with whether the session ended"
+    )
+
+
 async def test_cluster_endpoints_gated_by_monitoring_read(engine: Engine) -> None:
     # Track B Step 7: /cluster/status + /cluster/nodes are gated by Permission.MONITORING_READ. A VIEWER
     # holds it (200 on both); a user with NO roles lacks it (403); fail-closed for no/invalid token (401).

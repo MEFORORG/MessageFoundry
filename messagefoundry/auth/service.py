@@ -8665,11 +8665,19 @@ class AuthService:
         return await self._build_identity(user)
 
     async def logout(self, token: str | None, *, actor: str | None = None) -> None:
+        """End the session ``token`` names, and audit ``auth.logout`` saying whether one ended.
+
+        The revoke is :meth:`AuthStore.supersede_session`, which reports whether it matched a row,
+        rather than a blind revoke by hash (BACKLOG #3029). A rotation that re-keyed the session
+        after the route's auth dependency read it leaves the hash naming no session. The row's
+        ``outcome`` is then ``nothing_to_revoke`` rather than a revoke that did not happen. Ending
+        the session under its rotated token is not attempted here; that is BACKLOG #3028."""
         if token:
-            await self._store.revoke_session(hash_token(token))
-            # Emit the documented auth.logout event (SECURITY.md, ASVS 16.3.3) — previously the
-            # session was revoked silently, contradicting the doc and leaving a gap in the trail.
-            await self._audit("auth.logout", actor=actor)
+            ended = await self._store.supersede_session(hash_token(token), now=time.time())
+            # Emit the documented auth.logout event (SECURITY.md, ASVS 16.3.3) even when nothing
+            # ended, so the trail still records the sign-out request.
+            outcome = "nothing_to_revoke" if ended is None else "revoked"
+            await self._audit("auth.logout", actor=actor, detail=_json({"outcome": outcome}))
 
     async def _supersede_session_hash(self, prior_hash: str, *, client: str | None) -> bool:
         """End the session a browser presented at a fresh sign-in (ASVS 7.2.4, login side).
@@ -8755,11 +8763,16 @@ class AuthService:
     async def revoke_own_session(self, identity: Identity, session_id: str, *, actor: str) -> bool:
         """Revoke one of ``identity``'s **own** sessions by id (its ``token_hash``). Returns ``False``
         if the session doesn't exist or isn't the caller's — so the API answers 404 without revealing
-        or letting a user touch another's session. Audited."""
+        or letting a user touch another's session. Audited.
+
+        Also ``False``, with no audit row, when a rotation re-keyed the session between the read
+        and the revoke (BACKLOG #3029): the revoke reports whether it matched a row, so neither the
+        return nor the trail claims a revoke that did not happen."""
         session = await self._load_session(session_id)
         if session is None or session.user_id != identity.user_id:
             return False
-        await self._store.revoke_session(session_id)
+        if await self._store.supersede_session(session_id, now=time.time()) is None:
+            return False
         await self._audit(
             "auth.session_revoked",
             actor=actor,
