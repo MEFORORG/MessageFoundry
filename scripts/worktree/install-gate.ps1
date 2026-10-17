@@ -1148,6 +1148,40 @@ if ((Get-GateHash $GateDst) -ne $checkedSha) {
 
 $command = "pwsh -NoProfile -File `"$GateDst`""
 
+# THE SHELL MATCHER STANDS DOWN FOR A SESSION WHOSE PROJECT ALREADY RUNS THE GATE. A project whose
+# settings.json passes `--user-hook=worktree_gate` to scripts/hooks/shell-guard-dispatch.ps1 runs
+# this gate inside the one pwsh it already starts for its own guards, and records that it did in
+# <project>/.git/shell-guard-dispatch/<session id>. This entry exits only when BOTH hold: that
+# marker exists for this session, and the project's settings.json carries the same text. Otherwise
+# it starts the gate as before. Measured 2026-10-17 on mefordev01: the check costs 16-31 ms of
+# CPU, with no fork, against about 950 ms for the gate's own pwsh.
+#
+# WHY BOTH. Hooks are fixed when a session starts, so the project's settings.json alone could stand
+# the gate down for a session started before the file gained the text, whose dispatcher does not
+# run it. The marker alone could be stale after a resume onto a commit without the text, or forged
+# with one `touch` in any project, the vault included, and a session cannot undo its own hook
+# snapshot by editing settings, but it could create a file. Requiring the tracked text as well
+# means a forged marker stands the gate down only where the project's dispatcher runs it anyway,
+# or for a session started before that text landed. The dispatcher runs the gate when THIS
+# account's settings.json carries `--user-hook=worktree_gate`, which this entry does, or when the
+# session's marker already exists; so where this entry stands down, the dispatcher runs the gate.
+#
+# WHAT IT COSTS. Where the marker cannot be written (CLAUDE_PROJECT_DIR is a linked worktree, whose
+# .git is a file), both run the gate on every call. And the entry needs bash: where Claude Code
+# finds none, the hook fails, non-blocking, and the gate does not run for shell calls in any project
+# on that account.
+$gateForBash = $GateDst.Replace('\', '/')
+$shellStandDown = @(
+    "# $Marker for shell tool calls; delegates to shell-guard-dispatch.ps1 --user-hook=worktree_gate."
+    "# Exits only where this session's project dispatcher runs the gate (install-gate.ps1 says why)."
+    "read -r -d '' in"
+    "read -r -d '' ps < `"`$CLAUDE_PROJECT_DIR/.claude/settings.json`" 2>/dev/null"
+    "if [[ `$ps == *--user-hook=worktree_gate* &&"
+    "      `$in =~ \`"session_id\`"[[:space:]]*:[[:space:]]*\`"([A-Za-z0-9-]+)\`" ]] &&"
+    "   [[ -e `"`$CLAUDE_PROJECT_DIR/.git/shell-guard-dispatch/`${BASH_REMATCH[1]}`" ]]; then exit 0; fi"
+    "exec pwsh -NoProfile -File `"$gateForBash`" <<< `"`$in`""
+) -join "`n"
+
 # One matcher per rule in scripts/hooks/worktree_gate.ps1. A rule the hook implements but that is not
 # matched here NEVER FIRES -- the hook is simply not invoked for that tool, and nothing says so. Rule 3
 # shipped in exactly that state. tests/test_install_gate_wiring.py now asserts that every tool the script
@@ -1165,14 +1199,19 @@ if ($EnterWorktreeGate) {
 }
 
 $entries = foreach ($m in $matchers) {
+    $hook = [ordered]@{
+        type          = "command"
+        command       = $command
+        timeout       = 15
+        statusMessage = "Checking worktree gate"
+    }
+    if ($m -ceq "Bash|PowerShell") {
+        $hook.command = $shellStandDown
+        $hook.shell = "bash"
+    }
     [ordered]@{
         matcher = $m
-        hooks   = @([ordered]@{
-            type          = "command"
-            command       = $command
-            timeout       = 15
-            statusMessage = "Checking worktree gate"
-        })
+        hooks   = @($hook)
     }
 }
 

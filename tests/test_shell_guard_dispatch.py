@@ -15,14 +15,17 @@ first deny winning, and that one guard's scope, failure or absence cannot change
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from tests._bash_resolver import require_bash
 from tests.test_blanket_stage_guard import bash
 from tests.test_claude_settings_contract import (
     _PLACEHOLDER,
@@ -34,6 +37,14 @@ from tests.test_claude_settings_contract import (
 from tests.test_worktree_gate import assert_denied
 
 DISPATCHER = _ROOT / "scripts" / "hooks" / "shell-guard-dispatch.ps1"
+INSTALLER = _ROOT / "scripts" / "worktree" / "install-gate.ps1"
+USER_GATE = "--user-hook=worktree_gate"
+
+# HERMETIC BY DEFAULT. The dispatcher reads the running account's settings.json to decide whether
+# to run the installed worktree gate, so a test that inherited this session's CLAUDE_CONFIG_DIR
+# would run the real gate. No account directory means nothing delegates.
+_NO_ACCOUNT = _ROOT / "no-such-claude-config-dir"
+_HERMETIC = {"CLAUDE_CONFIG_DIR": str(_NO_ACCOUNT), "CLAUDE_PROJECT_DIR": str(_NO_ACCOUNT)}
 
 pytestmark = pytest.mark.skipif(
     shutil.which("pwsh") is None, reason="pwsh (PowerShell 7) not on PATH"
@@ -64,15 +75,18 @@ def _wired_guards() -> list[Path]:
     """The guard paths the settings file hands the dispatcher, in its order."""
     argv = _wired_argv()
     after = argv[argv.index(next(a for a in argv if a.endswith(DISPATCHER.name))) + 1 :]
-    return [Path(a) for a in after]
+    return [Path(a) for a in after if not a.startswith("--")]
 
 
-def _proc(argv: list[str], raw: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(argv, input=raw, capture_output=True, text=True, timeout=120)
+def _proc(
+    argv: list[str], raw: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    full = {**os.environ, **_HERMETIC, **(env or {})}
+    return subprocess.run(argv, input=raw, capture_output=True, text=True, timeout=120, env=full)
 
 
-def _run(argv: list[str], raw: str) -> str:
-    proc = _proc(argv, raw)
+def _run(argv: list[str], raw: str, env: dict[str, str] | None = None) -> str:
+    proc = _proc(argv, raw, env)
     # Fail-open is the contract: a non-zero exit is a hook error, which lets the command run.
     assert proc.returncode == 0, f"{argv[-1]} exited {proc.returncode}: {proc.stderr}"
     return proc.stdout
@@ -82,13 +96,13 @@ def _standalone(guard: Path, raw: str) -> str:
     return _run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(guard)], raw)
 
 
-def _dispatch_argv(guards: list[Path]) -> list[str]:
+def _dispatch_argv(guards: Sequence[Path | str]) -> list[str]:
     argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(DISPATCHER)]
     return argv + [str(g) for g in guards]
 
 
-def _dispatch(guards: list[Path], raw: str) -> str:
-    return _run(_dispatch_argv(guards), raw)
+def _dispatch(guards: Sequence[Path | str], raw: str, env: dict[str, str] | None = None) -> str:
+    return _run(_dispatch_argv(guards), raw, env)
 
 
 def _decision(stdout: str) -> dict[str, Any] | None:
@@ -110,6 +124,8 @@ def test_one_handler_runs_every_shell_guard_through_the_dispatcher() -> None:
     # The bounded guard first: it refuses an over-long payload unread, so a huge payload never
     # reaches the guards that parse whatever they are given. The dispatcher's header says why.
     assert names[0] == "block-blanket-git-stage.ps1", names
+    # The installed worktree gate runs before every repository guard (the dispatcher says why).
+    assert argv[5] == USER_GATE, argv
     for guard in _wired_guards():
         assert guard.is_file(), guard
 
@@ -312,3 +328,186 @@ def test_every_guard_allowing_is_an_allow(tmp_path: Path) -> None:
     raw = json.dumps(bash("git status --short"))
     assert _dispatch(_wired_guards(), raw) == ""
     assert _dispatch([], raw) == ""
+
+
+def test_a_failed_native_command_inside_a_guard_is_not_a_failed_guard(tmp_path: Path) -> None:
+    """worktree_gate.ps1 runs git, and a git call that fails leaves $LASTEXITCODE non-zero while
+    the script goes on to finish normally. Run alone that was exit 0, so it must be here too."""
+    native = _guard(
+        tmp_path,
+        "native.ps1",
+        "$null = [Console]::In.ReadToEnd(); $null = git rev-parse --verify no-such-ref 2>$null",
+    )
+    proc = _proc(_dispatch_argv([native]), json.dumps(bash("git status")))
+    assert proc.returncode == 0, (proc.returncode, proc.stderr)
+    assert proc.stdout == ""
+
+
+# ================================================================== the account's worktree gate
+
+_SID = "0f1e2d3c-aaaa-bbbb-cccc-123456789abc"
+
+
+def _account(tmp_path: Path, *, delegates: bool, gate: str | None) -> dict[str, str]:
+    """A fake home with an installed gate, and an account whose settings may delegate it."""
+    home = tmp_path / "home"
+    hooks = home / ".claude" / "hooks"
+    hooks.mkdir(parents=True)
+    if gate is not None:
+        (hooks / "worktree_gate.ps1").write_text(gate + "\n", encoding="utf-8")
+    account = tmp_path / "account"
+    account.mkdir()
+    command = f"# delegates {USER_GATE}" if delegates else "pwsh -File worktree_gate.ps1"
+    body = {
+        "hooks": {"PreToolUse": [{"matcher": "Bash|PowerShell", "hooks": [{"command": command}]}]}
+    }
+    (account / "settings.json").write_text(json.dumps(body), encoding="utf-8")
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    return {
+        "USERPROFILE": str(home),
+        "HOME": str(home),
+        "CLAUDE_CONFIG_DIR": str(account),
+        "CLAUDE_PROJECT_DIR": str(project),
+    }
+
+
+def _payload(command: str = "git status") -> str:
+    return json.dumps({**bash(command), "session_id": _SID})
+
+
+_GATE_DENIES = "$null = [Console]::In.ReadToEnd(); " + _DENY % "installed gate"
+
+
+def test_a_delegated_gate_runs_in_process_and_records_the_session(tmp_path: Path) -> None:
+    env = _account(tmp_path, delegates=True, gate=_GATE_DENIES)
+    out = _dispatch([USER_GATE], _payload(), env)
+    assert assert_denied(_decision(out)) == "installed gate"
+    marker = Path(env["CLAUDE_PROJECT_DIR"]) / ".git" / "shell-guard-dispatch" / _SID
+    assert marker.is_file(), "the account's own entry needs the marker to stand down"
+
+
+def test_an_account_that_does_not_delegate_is_not_run_twice(tmp_path: Path) -> None:
+    """The account still runs the gate itself, so running it here too would be a second launch."""
+    env = _account(tmp_path, delegates=False, gate=_GATE_DENIES)
+    assert _dispatch([USER_GATE], _payload(), env) == ""
+    assert not (Path(env["CLAUDE_PROJECT_DIR"]) / ".git" / "shell-guard-dispatch").exists()
+
+
+def test_a_session_marker_keeps_the_gate_when_the_account_file_reads_nothing(
+    tmp_path: Path,
+) -> None:
+    """The account's entry has stood down for a marked session, so a failed or changed read of the
+    account file must not leave the call with no gate at all."""
+    env = _account(tmp_path, delegates=False, gate=_GATE_DENIES)
+    markers = Path(env["CLAUDE_PROJECT_DIR"]) / ".git" / "shell-guard-dispatch"
+    markers.mkdir()
+    (markers / _SID).touch()
+    assert assert_denied(_decision(_dispatch([USER_GATE], _payload(), env))) == "installed gate"
+
+
+def test_a_delegated_gate_that_is_missing_is_reported(tmp_path: Path) -> None:
+    env = _account(tmp_path, delegates=True, gate=None)
+    proc = _proc(_dispatch_argv([USER_GATE]), _payload(), env)
+    assert proc.returncode == 1, (proc.returncode, proc.stderr)
+    assert "worktree_gate.ps1" in proc.stderr
+
+
+def test_an_unknown_option_is_reported_not_run(tmp_path: Path) -> None:
+    proc = _proc(_dispatch_argv(["--user-hook=../escape"]), _payload())
+    assert proc.returncode == 1 and "unknown option" in proc.stderr
+
+
+# ================================================================== the account's stand-down entry
+
+
+def _installed_shell_entry(tmp_path: Path, gate_dst: Path) -> dict[str, Any]:
+    """Build the installer's real Bash|PowerShell entry for a given gate path, without installing:
+    the region from the stand-down text through the entry list, run as the installer runs it."""
+    text = INSTALLER.read_text(encoding="utf-8")
+    region = text[text.index("$gateForBash = ") : text.index("# Wire (idempotently)")]
+    # The matcher list sits inside this region and reads two switches; neither is set here.
+    script = "\n".join(
+        [
+            "$ErrorActionPreference = 'Stop'",
+            "$Marker = 'worktree_gate.ps1'",
+            f"$GateDst = '{gate_dst}'",
+            f"$command = 'pwsh -NoProfile -File \"{gate_dst}\"'",
+            "$matchers = @('Write|Edit|MultiEdit|NotebookEdit', 'Bash|PowerShell')",
+            region,
+            "$entries | Where-Object { $_.matcher -ceq 'Bash|PowerShell' } |"
+            " ConvertTo-Json -Depth 6 -Compress",
+        ]
+    )
+    runner = tmp_path / "entry.ps1"
+    runner.write_text(script, encoding="utf-8")
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(runner)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    entry: dict[str, Any] = json.loads(proc.stdout)["hooks"][0]
+    return entry
+
+
+def test_the_installed_shell_entry_stands_down_only_for_a_recorded_session(
+    tmp_path: Path,
+) -> None:
+    gate = tmp_path / "hooks" / "worktree_gate.ps1"
+    gate.parent.mkdir()
+    # A stub gate that proves it ran and that the payload reached it on stdin.
+    gate.write_text(
+        "$in = [Console]::In.ReadToEnd()\n"
+        "$saw = if ($in -match '\"session_id\"') { 'saw the payload' } else { 'saw nothing' }\n"
+        + _DENY.replace("'%s'", "$saw")
+        + "\n",
+        encoding="utf-8",
+    )
+    entry = _installed_shell_entry(tmp_path, gate)
+    assert entry["shell"] == "bash"
+    assert "worktree_gate.ps1" in entry["command"], "the installer's marker finds its own entry"
+    assert USER_GATE in entry["command"], "the dispatcher's delegation check reads this text"
+
+    shell = require_bash(tmp_path)
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    (project / ".claude").mkdir()
+    settings = project / ".claude" / "settings.json"
+    settings.write_text(json.dumps({"args": [USER_GATE]}), encoding="utf-8")
+
+    def run() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [shell, "-c", entry["command"]],
+            input=_payload(),
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env={**os.environ, "CLAUDE_PROJECT_DIR": str(project)},
+        )
+
+    # No marker: the account runs the gate, and the gate sees the payload.
+    first = run()
+    assert first.returncode == 0, first.stderr
+    assert assert_denied(_decision(first.stdout)) == "saw the payload"
+
+    # Marker recorded by a dispatcher that ran the gate for this session: stand down.
+    markers = project / ".git" / "shell-guard-dispatch"
+    markers.mkdir()
+    (markers / _SID).touch()
+    second = run()
+    assert second.returncode == 0, second.stderr
+    assert second.stdout == ""
+
+    # A marker in a project whose dispatcher does not run the gate is not a reason to stand down:
+    # it may be stale, or forged with one touch.
+    settings.write_text(json.dumps({"args": []}), encoding="utf-8")
+    assert assert_denied(_decision(run().stdout)) == "saw the payload"
+    settings.write_text(json.dumps({"args": [USER_GATE]}), encoding="utf-8")
+
+    # Another session's marker is not this session's.
+    (markers / _SID).unlink()
+    (markers / "some-other-session").touch()
+    third = run()
+    assert assert_denied(_decision(third.stdout)) == "saw the payload"
