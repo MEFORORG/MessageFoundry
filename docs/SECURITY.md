@@ -4108,12 +4108,16 @@ raise the `ad_session_revoked` alert, one per revoked principal, once the pass c
 revocations end no session and change no role. Each still writes its row, with `sessions: 0`. It
 raises no alert and sends the user no notice (BACKLOG #3085, owner ruling 2026-10-16). So when two
 reconcilers on one store revoke one account in turn, the second only audits. If both read the old
-roles before either writes them, both still report. A pass that
-fails part-way keeps the audit rows for what it already revoked, but raises no alert for them. A
-refused audit write does not end the pass (BACKLOG #3018). The reconciler logs it at ERROR, naming the
-action and the account. Any notice the account was due still goes. Its alert still goes too, unless a
-later write in the same pass also fails and ends the pass. Then that account has neither its row nor
-its alert. The ERROR line is then the only record of that row, and nothing writes it later.
+roles before either writes them, both still report. If the first reconciler's pass ended before it
+alerted, the second's quiet revocation means that account pages nobody.
+
+A pass that fails part-way keeps the audit rows for what it already revoked, but raises no alert for
+them. A refused audit write does not end the pass (BACKLOG #3018), when the store reports it as one
+of the errors the reconciler treats as a refusal; any other error still ends it. The reconciler logs
+a refused row at ERROR, naming the action and the account. That line is the only record of the row,
+and nothing writes it later. Any notice the account was due still goes. Its alert still goes too,
+unless something later in the same pass raises and ends it. Then that account has neither its row
+nor its alert. A later refused audit write does not end the pass.
 
 **The probe is keyed on the directory's immutable `objectGUID`**, the same identifier a directory login
 is identified by, and a renamed account's stored username is refreshed from the directory on the same

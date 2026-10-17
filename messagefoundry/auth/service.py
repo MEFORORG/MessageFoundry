@@ -7477,12 +7477,17 @@ class AuthService:
         the account as ``actor``. **A failed write here does not end the pass.** If it raised, the
         pass would return no plan, and the lifespan task would raise no alert for the revocations
         already applied, nor for the hold, the breaker, the referral or the probe fault. It would
-        also skip every account after this one. So a store refusal is logged at ERROR, naming the
-        action and the actor, and the pass goes on. The log line is then the only record of that
-        row: nothing retries it. A revocation or rename it records has already committed, and any
-        notice it was due still goes. Its alert still goes too, unless a later write in the same
-        pass also fails and ends the pass: the earlier account then has neither its row nor its
-        alert.
+        also skip every account after this one. So a store refusal of a type
+        :func:`_audit_write_errors` names is logged at ERROR, naming the action and the actor, and
+        the pass goes on. Any other error still raises and ends the pass. The log line is the only
+        record of a refused row: nothing retries it.
+
+        A revocation or rename these rows record has already committed; the conflict row records a
+        rename that was refused. A revocation's notice is sent inline, so it still goes. **A
+        revocation's alert is raised only from the returned plan.** So if anything later in the same
+        pass raises and ends it, such as a store read or write that is not a soft audit write, an
+        earlier account whose own row was refused has neither its row nor its alert: only the
+        ERROR line. A later refused audit write does not end the pass. Renames have no alert.
 
         A defect is raised, not passed over (:data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS`).
         """
