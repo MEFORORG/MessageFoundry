@@ -48,6 +48,7 @@ from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
+from tests._fake_directory import RebindDirectory as _RebindDirectory
 
 # One account object, two spellings of the SAME identity: the 16 bytes as they arrive on the wire,
 # and the braced upper-case string ldap3's own formatter produces. Microsoft's GUID layout is
@@ -1514,38 +1515,6 @@ async def test_a_locked_mirror_row_does_not_complete_a_kerberos_login(
 # ``_reauth_ad`` finds its bind entry by the row's stored objectGUID, never by the username alone. These
 # drive ``reauth`` itself, so the refusal is read where a caller meets it: the outcome, the directory
 # round trips, the engine lockout counter and the ``auth.reauth`` audit row.
-
-
-class _RebindDirectory:
-    """A directory whose re-bind answer the test sets. ``bound`` is who a good password binds as;
-    ``refusal`` is what the bind's own lookup found when it did not bind: ``FOUND`` for an enabled
-    entry that refused the password, any other answer for no enabled entry (BACKLOG #2434).
-    ``binds`` counts password binds, and ``keys`` records the ``object_id`` each call was keyed on,
-    so a second directory read would show as a second key."""
-
-    def __init__(
-        self, bound: AdPrincipal | None, refusal: DirectoryAnswer | None = DirectoryAnswer.FOUND
-    ) -> None:
-        self.bound = bound
-        self.refusal = refusal
-        self.binds = 0
-        self.keys: list[object] = []
-
-    def authenticate(
-        self, username: str, password: str, *, object_id: str | None = None
-    ) -> DirectoryBind:
-        self.binds += 1
-        self.keys.append(object_id)
-        if password == "synthetic-good" and self.bound is not None:
-            return DirectoryBind(DirectoryAnswer.FOUND, self.bound)
-        return DirectoryBind(self.refusal)
-
-    def resolve_principal(
-        self, username: str, *, object_id: str | None = None
-    ) -> AdPrincipal | None:
-        # The re-bind no longer reads this (BACKLOG #2434); a call would show as a second key.
-        self.keys.append(object_id)
-        return self.bound if self.refusal is DirectoryAnswer.FOUND else None
 
 
 async def _reauth_session(

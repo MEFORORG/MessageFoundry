@@ -397,6 +397,28 @@ async def test_a_directory_account_not_demoted_still_renews(
     assert await e.service.has_recent_step_up(verified.token) is True
 
 
+async def test_the_role_test_judges_the_roles_read_after_the_lookup(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3081 item 8. A sign-in that re-synced the roles during the lookup's round trip is
+    judged on what it wrote. RED when the role test compares the roles read before the lookup:
+    those still hold the role the directory took away, so the re-synced account would be refused."""
+    e = await _mapped_session(store, monkeypatch, _OPERATORS, _VIEWERS)
+    e.directory.principal = replace(_PRINCIPAL, groups=frozenset({_VIEWERS}))
+    original = e.service._directory_presence
+
+    async def lookup_then_resync(user: Any) -> reconcile.Probe | str:
+        answer = await original(user)
+        await store.set_user_roles(e.user_id, ["viewer"], assigned_by="ad-sync")
+        return answer
+
+    monkeypatch.setattr(e.service, "_directory_presence", lookup_then_resync)
+
+    verified = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
+
+    assert verified.ok is True and verified.token is not None
+
+
 async def test_a_local_account_is_never_role_checked(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
