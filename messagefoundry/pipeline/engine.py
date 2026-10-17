@@ -48,6 +48,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.config.tls_policy import HopPosture, TrustAnchorPolicy
 from messagefoundry.config.wiring import (
     API_LISTENER_LABEL,
+    InboundConnection,
     Registry,
     WiringError,
     connector_secret_env_values,
@@ -141,8 +142,8 @@ _ALERT_STATE_DRAIN_SECONDS = 5.0
 
 #: How long stop waits for config writes whose callers were cancelled (vault BACKLOG #2945), so
 #: their audit rows reach the store before it closes. Short, for the same reason as above. Only
-#: when nothing drained them first: the managed API lifespan does, under its shutdown budget
-#: (BACKLOG #3191), and stop then does not wait again.
+#: when no drain ran first: the managed API lifespan runs one under its shutdown budget (BACKLOG
+#: #3191), and stop then does not wait again, even for a write that drain left running.
 _CONFIG_WRITE_DRAIN_SECONDS = 5.0
 
 #: How long a DR release waits for the staged queue to drain before it hands back anyway, leaving
@@ -697,10 +698,12 @@ class Engine:
         # (vault BACKLOG #2782); that one is blocking and is only ever taken in a worker thread.
         self._toml_write_lock = asyncio.Lock()
         # The config writes write_baseline_config has started and not finished. A caller that is
-        # cancelled stops waiting but leaves its write running, so stop() waits for these before it
-        # closes the store, or such a write would land with no row (vault BACKLOG #2945).
+        # cancelled stops waiting but leaves its write running, so drain_config_writes waits for
+        # these, bounded, before the store closes, or such a write would land with no row (vault
+        # BACKLOG #2945).
         self._config_writes: set[asyncio.Task[dict[str, object] | None]] = set()
-        # Set by stop() before it waits for them; a write that gets the lock after that is refused.
+        # Set by drain_config_writes before it waits for them; a write that gets the lock after
+        # that is refused.
         self._config_writes_closed = False
         # Background store-pool pre-warm (Workstream A — failover drain): fired on graph start/promotion
         # AFTER the on-promotion recovery, so it never competes with recovery for the pool. At most one is
@@ -2415,6 +2418,7 @@ class Engine:
         actor: str | None,
         client: str | None,
         reflect: Callable[[], None] | None = None,
+        prepare: Callable[[], None] | None = None,
     ) -> dict[str, object] | None:
         """Write a file the config digest covers, take the digest, and record the baseline row.
 
@@ -2423,6 +2427,11 @@ class Engine:
         that recorded no digest would raise ``config_changed`` at the next start for a change the
         engine itself made. ``tests/test_config_write_census.py`` fails when engine code writes a
         config file any other way, and its census says why each other writer stays outside.
+
+        ``prepare``, when given, runs first, on the event loop and under the engine lock, so a caller
+        can snapshot loop-owned state that ``write`` reads from its worker thread as of this write,
+        not as of when the caller queued for the lock. A raise there is a refusal, before anything is
+        written.
 
         ``write`` gets the running config directory. It runs on a worker thread while this engine's
         own write lock and the cross-process ``connections.toml`` edit lock are both held, so a
@@ -2437,7 +2446,8 @@ class Engine:
         and may not set a key the helper writes (:data:`_BASELINE_ROW_KEYS`); either fault raises
         before anything is written. A caller cancelled while it waits for the engine lock gets no
         write. Once the lock is held, a cancelled caller stops waiting but does not stop the write or
-        its row, and :meth:`stop` waits for such a write before it closes the store.
+        its row, and :meth:`drain_config_writes` waits for such a write, for a bounded time, before
+        the store closes.
 
         Returns the ADR 0041 D1 fingerprint the row records (vault BACKLOG #2597). When the directory
         held the loaded bytes before this write, it is the digest of the directory just written, and
@@ -2523,6 +2533,8 @@ class Engine:
                 raise WiringError(
                     "no config directory is configured, so a config write cannot persist"
                 )
+            if prepare is not None:
+                prepare()
             loaded = self.loaded_config_fingerprint
             loaded_fp = loaded.get("fingerprint") if loaded is not None else None
             after, vouched = await asyncio.to_thread(_locked_write, config_dir, loaded_fp)
@@ -2595,8 +2607,8 @@ class Engine:
         """Refuse every later config write, then wait up to ``timeout`` for the running ones.
 
         A write whose caller was cancelled is still running, and its row needs the store (vault
-        BACKLOG #2945). One still running past ``timeout`` is logged, and its row is then lost to
-        the closed store. The gate closes first, so a caller still queued for the engine lock is
+        BACKLOG #2945). One still running past ``timeout`` is logged, and its row is lost if the
+        store closes before it lands; nothing waits for it again. The gate closes first, so a caller still queued for the engine lock is
         refused once it gets the lock rather than starting a write this drain never saw. Waiting
         never cancels a write: one cut short would leave its file written with no row. Called by
         the managed API lifespan, under its shutdown budget (BACKLOG #3191), and otherwise by
@@ -2607,7 +2619,7 @@ class Engine:
         _done, pending = await asyncio.wait(set(self._config_writes), timeout=timeout)
         if pending:
             log.warning(
-                "%d config write(s) still running at stop; their audit rows may be lost",
+                "%d config write(s) still running at shutdown; their audit rows may be lost",
                 len(pending),
             )
 
@@ -2648,11 +2660,17 @@ class Engine:
         if direction not in ("inbound", "outbound"):
             raise WiringError("connection flag direction must be 'inbound' or 'outbound'")
         # Vault BACKLOG #2622 item 1: the validate callback reads this from the worker thread, so the
-        # runner's listening set is snapshotted here, on the loop. None = the offline test.
-        # Outside the runner's reload lock, on purpose: listener_bind_predicate says why the
-        # window is accepted (vault BACKLOG #3063 item 5).
-        live = self._registry_runner
-        binds_listener = live.listener_bind_predicate() if live is not None else None
+        # runner's listening set is snapshotted on the loop, by _snapshot. None = the offline test.
+        binds_listener: Callable[[InboundConnection], bool] | None = None
+
+        def _snapshot() -> None:
+            # Run by write_baseline_config under the engine lock, as the inline write it replaced
+            # did, so a toggle queued behind another write checks the listening set of its own
+            # turn. Outside the runner's reload lock, on purpose: listener_bind_predicate says why
+            # the window is accepted (vault BACKLOG #3063 item 5).
+            nonlocal binds_listener
+            live = self._registry_runner
+            binds_listener = live.listener_bind_predicate() if live is not None else None
 
         def _write(cfg_dir: Path) -> None:
             entries = connections_edit.list_connections(cfg_dir)
@@ -2688,7 +2706,8 @@ class Engine:
                     # listener this engine already accepted (vault BACKLOG #2622 item 1).
                     allow_insecure_bind=self._allow_insecure_bind,
                     # And the runner's own view of which listeners it binds, so a toggle is not
-                    # refused for one it leaves down. Taken on the loop, before the worker thread.
+                    # refused for one it leaves down. Taken on the loop, under the engine lock,
+                    # before the worker thread.
                     exposure_gated=binds_listener,
                 )
 
@@ -2713,6 +2732,7 @@ class Engine:
             actor=actor,
             client=client,
             reflect=_reflect,
+            prepare=_snapshot,
         )
 
     @property
@@ -3604,9 +3624,10 @@ class Engine:
             await asyncio.gather(self._warm_pool_task, return_exceptions=True)
             self._warm_pool_task = None
         # A config write whose caller was cancelled is still running, and its row needs the store
-        # (vault BACKLOG #2945). The managed API lifespan has already drained them under its
-        # shutdown budget (BACKLOG #3191) and closed the gate, so a second wait here would only
-        # spend time past that budget. A caller with no such lifespan gets the fixed bound.
+        # (vault BACKLOG #2945). Under the managed API lifespan a drain has already run, bounded
+        # by its shutdown budget (BACKLOG #3191), and closed the gate, so a second wait here would
+        # spend time past that budget; a write it left running may lose its row. A caller with no
+        # such lifespan gets the fixed bound.
         if not self._config_writes_closed:
             await self.drain_config_writes(_CONFIG_WRITE_DRAIN_SECONDS)
         # Clears raised on the way out are background writes: an unpinned cluster node's intake

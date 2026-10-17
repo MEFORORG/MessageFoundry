@@ -11033,12 +11033,14 @@ def create_managed_app(
             # Vault BACKLOG #2945: a config write whose caller was cancelled still writes its audit
             # row. Drained here, under the budget, rather than by the fixed wait engine.stop() runs
             # for a caller with no lifespan; draining closes the engine's gate, so engine.stop()
-            # then does not wait again. Handed part of its bound, so its wait ends before the step
-            # is cut; the wait never cancels a write.
+            # then does not wait again, and a write still running past this step's bound may lose
+            # its row. The floor is what such a write is guaranteed whatever the steps before took:
+            # a flag toggle's load and build check plus its row. Handed part of its bound, so its
+            # wait ends before the step is cut; the wait never cancels a write.
             steps.append(
                 _TeardownStep(
                     "the config-write drain",
-                    0.25,
+                    1.0,
                     lambda b: engine.drain_config_writes(b * _INNER_SHARE),
                 )
             )

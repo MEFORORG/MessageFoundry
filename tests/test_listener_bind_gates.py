@@ -10,6 +10,7 @@ satisfy the row."""
 
 from __future__ import annotations
 
+import asyncio
 import textwrap
 from datetime import UTC, datetime, time
 from pathlib import Path
@@ -188,6 +189,48 @@ async def test_the_flag_toggle_gates_a_listener_an_operator_started(tmp_path: Pa
                 await eng.set_connection_flag(
                     "OB_TOML", direction="outbound", flagged=False, actor="tester", client=None
                 )
+            assert "'IB_TOML' would be bound" in str(refused.value)
+        finally:
+            runner._sources.pop("IB_TOML")
+    finally:
+        await eng.stop()
+
+
+async def test_a_queued_toggle_checks_the_listening_set_of_its_own_turn(tmp_path: Path) -> None:
+    """The toggle's snapshot is taken under the engine's write lock (vault BACKLOG #2945 kept main's
+    placement). A toggle queued behind another write, while an operator starts IB_TOML, must see
+    that start when its turn comes. A snapshot taken when it queued would pass it."""
+    (tmp_path / "logic.py").write_text(_LOGIC_PY, encoding="utf-8")
+    (tmp_path / "connections.toml").write_text(_CONNECTIONS_TOML, encoding="utf-8")
+    eng = await Engine.create(
+        tmp_path / "flag.db",
+        poll_interval=0.02,
+        config_dir=tmp_path,
+        inbound_bind_host="0.0.0.0",
+        allow_insecure_bind=False,
+        hop_posture=HopPosture(enforcing=False),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        runner = eng.add_registry(load_config(tmp_path))
+        await runner.start()
+        assert not runner.inbound_running("IB_TOML")
+        await eng._toml_write_lock.acquire()
+        try:
+            caller = asyncio.ensure_future(
+                eng.set_connection_flag(
+                    "OB_TOML", direction="outbound", flagged=True, actor="tester", client=None
+                )
+            )
+            await asyncio.sleep(0.1)
+            assert not caller.done(), "control: the toggle is queued on the held lock"
+            # The operator start lands while the toggle waits.
+            runner._sources["IB_TOML"] = cast(SourceConnector, object())
+        finally:
+            eng._toml_write_lock.release()
+        try:
+            with pytest.raises(WiringError, match="HL7 bodies would cross") as refused:
+                await caller
             assert "'IB_TOML' would be bound" in str(refused.value)
         finally:
             runner._sources.pop("IB_TOML")

@@ -428,12 +428,22 @@ async def test_the_managed_teardown_drains_config_writes_under_its_budget(
             calls.append(("stop", None))
             await real_stop()
 
+        async def _in_flight_write() -> dict[str, object] | None:
+            # Stands in for a write whose caller went: it lands after the teardown began.
+            await asyncio.sleep(0.3)
+            calls.append(("write landed", None))
+            return None
+
+        write = asyncio.ensure_future(_in_flight_write())
+        engine._config_writes.add(write)
+        write.add_done_callback(engine._config_writes.discard)
         monkeypatch.setattr(engine, "drain_config_writes", _drain)
         monkeypatch.setattr(engine, "stop", _stop)
     step = labels.index("the config-write drain")
     assert step < labels.index("engine.stop()")
-    # One drain, the lifespan's: engine.stop() reads the closed gate and does not drain again.
-    assert [name for name, _ in calls] == ["drain", "stop"], calls
+    # The drain waited for the write before engine.stop() ran, and engine.stop() read the closed
+    # gate and did not drain again.
+    assert [name for name, _ in calls] == ["drain", "write landed", "stop"], calls
     assert calls[0][1] == pytest.approx(bounds[step] * app_module._INNER_SHARE)
     assert engine._config_writes_closed
 
@@ -444,7 +454,7 @@ async def test_the_teardown_is_bounded_when_every_drain_hangs(
     """Every drain before engine.stop() hangs, and the whole teardown still ends within the budget,
     the cut graces and what the real engine.stop() takes. The budget just covers the floors of the
     steps that apply here, as the shipped one covers the managed set's."""
-    budget = 3.5
+    budget = 4.5
     monkeypatch.setattr(app_module, "_SHUTDOWN_BUDGET_SECONDS", budget)
     monkeypatch.setattr(app_module, "_ENGINE_STOP_RESERVE_SECONDS", 0.2)
     app = _managed(tmp_path / "bounded.db")
