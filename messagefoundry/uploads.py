@@ -1334,7 +1334,8 @@ class UploadStore:
 
         It waits up to ``timeout``. A reserve that finishes inside that wait still starts its
         release, and the wait covers that release too. Then it cancels what is left, live saves'
-        heartbeats included, and waits up to ``grace`` for those to end. A reserve it cancelled
+        heartbeats included, and waits up to ``grace`` for those to end and for any release one of
+        them started meanwhile; such a release still running at ``grace`` is cancelled. A reserve it cancelled
         spawns no release when it ends, however long past ``grace`` that is, so nothing new starts
         against a store about to close; a slot it may have taken goes stale. Only those reserves
         are refused, so a lifespan that runs again on this store releases normally. A sweep it
@@ -1361,7 +1362,20 @@ class UploadStore:
             if task.cancel():
                 self._drain_cancelled.add(task)
                 task.add_done_callback(self._drain_cancelled.discard)
-        _done, stuck = await asyncio.wait(left, timeout=grace)
+        # The grace covers what a callback starts meanwhile too: a release from a reserve that
+        # finished before the cancel reached it. One still running at the bound is cancelled, so
+        # none outlives the drain into a closing store.
+        # The first wait runs even when everything in `left` is done: it is also the loop pass in
+        # which a done task's own callbacks run and start that release.
+        deadline = loop.time() + grace
+        await asyncio.wait(left, timeout=grace)
+        while (pending := {t for t in left | self._stragglers if not t.done()}) and (
+            remaining := deadline - loop.time()
+        ) > 0:
+            await asyncio.wait(pending, timeout=remaining)
+        stuck = {t for t in left | self._stragglers if not t.done()}
+        for task in stuck - left:
+            task.cancel()
         if stuck:
             _log.error(
                 "shutdown: %d cancelled upload task(s) had not finished after %gs",

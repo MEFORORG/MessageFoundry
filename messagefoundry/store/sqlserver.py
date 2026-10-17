@@ -1538,6 +1538,9 @@ _EPOCH_GUARD_RESOLVE = (
 #: and on ``mark_failed``'s retry branch with its status term (ADR 0157 Amendment A), which is NOT a
 #: fence. So the clause alone does not mean a fence is armed.
 _RESOLVE_OUTPUT = " OUTPUT inserted.id"
+#: The clause an operator alert UPDATE carries so :meth:`SqlServerStore._alert_write` reads its match
+#: from a rowset rather than ``cursor.rowcount`` (vault BACKLOG #3217; the reason is BACKLOG #2283).
+_ALERT_MATCHED = " OUTPUT inserted.id"
 
 
 class _FencedWrite(Exception):
@@ -7300,12 +7303,16 @@ class SqlServerStore:
     ) -> bool:
         """One operator alert UPDATE with its audit row, in one transaction (vault BACKLOG #3217).
         The row is appended only when the UPDATE matched, so a 404 writes nothing. The append takes
-        the audit applock at the tail, as :meth:`cancel_queued`'s does."""
+        the audit applock at the tail, as :meth:`cancel_queued`'s does.
+
+        ``sql`` carries ``OUTPUT inserted.id``, and the match is read from that rowset, never from
+        ``cursor.rowcount``: a session-wide ``SET NOCOUNT ON`` can make the count read -1, which
+        would commit a matched change with no audit row (BACKLOG #2283)."""
         async with AuditedWrite(now) as written, self._acquire() as conn:
             try:
                 async with self._cursor(conn) as cur:
                     await cur.execute(sql, params)
-                    applied = int(cur.rowcount) > 0
+                    applied = bool(await cur.fetchall())
                     await self._append_operator_audit(cur, written, if_applied(audit), applied)
                     await self._commit(conn)
             except Exception:
@@ -7320,7 +7327,7 @@ class SqlServerStore:
         now = time.time() if now is None else now
         return await self._alert_write(
             "UPDATE alert_instance SET status='acknowledged', acked_by=?, acked_at=?"
-            " WHERE id=? AND status<>'resolved'",
+            f"{_ALERT_MATCHED} WHERE id=? AND status<>'resolved'",
             (actor, now, alert_id),
             audit,
             now,
@@ -7332,7 +7339,7 @@ class SqlServerStore:
         now = time.time() if now is None else now
         return await self._alert_write(
             "UPDATE alert_instance SET status='resolved', resolved_at=?"
-            " WHERE id=? AND status<>'resolved'",
+            f"{_ALERT_MATCHED} WHERE id=? AND status<>'resolved'",
             (now, alert_id),
             audit,
             now,
@@ -7362,7 +7369,8 @@ class SqlServerStore:
         # #143 windowed suspend (NOTIFICATION-only): set suspended_until on a live instance. Refuses a
         # resolved one; returns the updated row (for the API echo + seeding the sink cache) or None.
         if not await self._alert_write(
-            "UPDATE alert_instance SET suspended_until=? WHERE id=? AND status<>'resolved'",
+            f"UPDATE alert_instance SET suspended_until=?{_ALERT_MATCHED}"
+            " WHERE id=? AND status<>'resolved'",
             (until, alert_id),
             audit,
             time.time() if now is None else now,
@@ -7375,7 +7383,8 @@ class SqlServerStore:
     ) -> AlertInstance | None:
         # #143: clear a windowed suspend. Idempotent; returns the row or None (unknown/already resolved).
         if not await self._alert_write(
-            "UPDATE alert_instance SET suspended_until=NULL WHERE id=? AND status<>'resolved'",
+            f"UPDATE alert_instance SET suspended_until=NULL{_ALERT_MATCHED}"
+            " WHERE id=? AND status<>'resolved'",
             (alert_id,),
             audit,
             time.time() if now is None else now,

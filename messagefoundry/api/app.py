@@ -1130,7 +1130,10 @@ async def _stop_upload_background(app: FastAPI, runner: UploadRetentionRunner | 
     """Stop the upload retention runner and drain the upload stragglers side by side (vault
     BACKLOG #3180). The two are independent, and run in turn their bounds added the drain's 3 s
     to NSSM's 15 s graceful-stop window; side by side they take the runner's 5 s. Neither raises
-    into the teardown, and the drain is awaited even if the runner's stop is cut short."""
+    an error into the teardown, and the drain is awaited even if the runner's stop is cut short.
+    A cancellation of the lifespan that lands while the drain is awaited does propagate, as it did
+    when the drain ran after the stop, and the managed lifespan's ``finally`` still stops the
+    engine."""
     drain = asyncio.ensure_future(_drain_upload_stragglers(app))
     try:
         if runner is not None:
@@ -1232,6 +1235,19 @@ def _build_approval_gate(
         # (running/stopping) outbound could have an INFLIGHT row cancel_queued cannot cancel, so purging
         # it would mis-fire; skip fail-closed and record cancelled=0/skipped in the approval audit. The
         # operator re-Stops (lets it quiesce) and re-requests.
+        #
+        # Vault BACKLOG #3217: the connection_purge row is attributed to the REQUESTER, so a hold
+        # whose params carry none is refused before anything runs, rather than released as a
+        # destructive purge whose row names no actor. The raise reaches the gate's compensation,
+        # which records the release as 'failed', and the route answers 409. Every hold the route
+        # files carries the key (_purge_hold_params), so this is a guard, not a migration path.
+        requester = p.get("requester")
+        if not isinstance(requester, str) or not requester:
+            raise ApprovalError(
+                409,
+                "this purge request records no requester, so its connection_purge row could not "
+                "name who ran it; it was not run",
+            )
         rr = engine.registry_runner
         if rr is not None:
             # ADR 0073: a non-owning shard's quiesced signal is vacuous (it never runs the lane), so
@@ -1243,17 +1259,15 @@ def _build_approval_gate(
                 return {"cancelled": 0, "skipped": "outbound running"}
         # Vault BACKLOG #3217: the same connection_purge row the inline route writes, committed
         # with the cancel and attributed to the REQUESTER, so a failed append cancels nothing and
-        # the gate's compensation records the release as 'failed'. `.get` as `_replay` reads it: a
-        # hold filed before the guard captured the key releases with no actor rather than a
-        # KeyError. No `client`, per _record_reload_audit's docstring.
-        requester = p.get("requester")
+        # the gate's compensation records the release as 'failed'. No `client`, per
+        # _record_reload_audit's docstring.
         scope = "top" if p.get("scope") == "top" else "all"
         cancelled = await engine.store.cancel_queued(
             None,
             str(p["name"]),
             top_only=(scope == "top"),
             audit=_connection_purge_audit(
-                actor=str(requester) if requester else None,
+                actor=requester,
                 name=str(p["name"]),
                 scope=scope,
                 client=None,

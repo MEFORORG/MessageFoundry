@@ -6087,6 +6087,38 @@ async def _nocount_reading(store: Any) -> tuple[int, int]:
     return int(row["spid"]), int(row["nocount"])
 
 
+async def test_an_alert_ack_under_nocount_still_writes_its_audit_row(store) -> None:
+    """Vault BACKLOG #3217, review round two: the alert mutations read their match from ``OUTPUT``,
+    so a session with ``SET NOCOUNT ON`` left on still appends the row for a matched change, and
+    an unmatched one still writes none. A one-connection store makes the NOCOUNT session the one
+    the ack borrows; the reading of the bit is the control that it is."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.base import AuditAppend
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    await store.upsert_alert_instance(
+        event_type="connection_error", connection="OB_NOCOUNT", severity="warning", now=100.0
+    )
+    [a] = [
+        x
+        for x in await store.list_active_alert_instances(allowed_channels=None)
+        if x.connection == "OB_NOCOUNT"
+    ]
+    action = f"test.alert.nocount.{uuid4().hex[:8]}"
+    settings = load_settings(environ=os.environ).store
+    async with SqlServerStore._one_connection_store(settings, posture=None) as one:
+        try:
+            await one._fetchall("SET NOCOUNT ON; SELECT 1 AS one")
+            _, nocount = await _nocount_reading(one)
+            assert nocount == 512, "the control: the session the ack borrows has NOCOUNT on"
+            audit = AuditAppend(action, actor="op")
+            assert await one.ack_alert_instance(a.id, actor="op", audit=audit) is True
+            assert await one.ack_alert_instance(999999999, actor="op", audit=audit) is False
+        finally:
+            await one._execute("SET NOCOUNT OFF;")
+    assert len(await store.list_audit(action=action)) == 1
+
+
 async def test_backlog_2097_nocount_persistence_probe() -> None:
     """A MEASUREMENT, reported as a warning rather than asserted, because the answer is research.
 

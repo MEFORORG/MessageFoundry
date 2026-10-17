@@ -19,6 +19,8 @@ import warnings
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from messagefoundry.config.settings import AlertRule, AlertSeverity
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
 from messagefoundry.store.crypto import MARKER_PREFIX, generate_key, make_cipher
@@ -888,3 +890,59 @@ def test_three_backend_parity_columns() -> None:
     assert _alert_table_columns_sqlite() == expected
     assert _alert_table_columns(pg._SCHEMA) == expected
     assert _alert_table_columns(ms._SCHEMA) == expected
+
+
+@pytest.mark.parametrize("matched", [True, False], ids=["matched", "unmatched"])
+async def test_sqlserver_alert_writes_read_the_match_from_output_not_rowcount(
+    matched: bool,
+) -> None:
+    """Vault BACKLOG #3217, review round two: SQL Server's alert mutations decided whether to
+    append their audit row from ``cursor.rowcount``, which a session-wide ``SET NOCOUNT ON`` can
+    make read -1, so a matched change could commit with no row. The match now comes from the
+    statement's ``OUTPUT`` rowset. A scripted cursor whose count always reads -1 stands in for the
+    server; only the hosted SQL Server leg runs the real statements."""
+    import contextlib
+
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    executed: list[str] = []
+    appended: list[bool] = []
+
+    class _Cursor:
+        rowcount = -1
+
+        async def execute(self, sql: str, params: tuple[Any, ...]) -> None:
+            executed.append(sql)
+
+        async def fetchall(self) -> list[tuple[int]]:
+            return [(7,)] if matched else []
+
+    cur = _Cursor()
+
+    @contextlib.asynccontextmanager
+    async def _acquire() -> Any:
+        yield object()
+
+    @contextlib.asynccontextmanager
+    async def _cursor(_conn: Any) -> Any:
+        yield cur
+
+    async def _append(_cur: Any, _written: Any, audit: Any, applied: bool) -> None:
+        if audit is not None and audit(applied) is not None:
+            appended.append(applied)
+
+    async def _commit(_conn: Any) -> None:
+        return None
+
+    store = SqlServerStore.__new__(SqlServerStore)
+    fakes = {
+        "_acquire": _acquire,
+        "_cursor": _cursor,
+        "_append_operator_audit": _append,
+        "_commit": _commit,
+    }
+    for name, fake in fakes.items():
+        setattr(store, name, fake)
+    assert await store.ack_alert_instance(7, actor="op", audit=ALERT_AUDIT, now=1.0) is matched
+    assert appended == ([True] if matched else [])
+    assert "OUTPUT inserted.id" in executed[0]

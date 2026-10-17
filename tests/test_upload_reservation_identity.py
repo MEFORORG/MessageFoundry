@@ -446,11 +446,13 @@ async def test_a_reserve_already_done_when_the_drain_cancels_still_pays_its_slot
 ) -> None:
     """A reserve that finished in the pass the drain's wait timed out is still in the straggler
     set, because its done callback has not run yet. The drain cannot cancel it, so it must not
-    refuse its release either (found in code review)."""
+    refuse its release either (found in code review). The drain's grace covers that release, so
+    it has ended before the drain returns and cannot run into a closing store (review round two)."""
     released: list[str] = []
 
     class _Recording(_PassThrough):
         async def release_upload_quota(self, reservation_id: str) -> None:
+            await asyncio.sleep(0.05)  # slower than one loop pass, so only a wait covers it
             released.append(reservation_id)
             await self.store.release_upload_quota(reservation_id)
 
@@ -458,9 +460,31 @@ async def test_a_reserve_already_done_when_the_drain_cancels_still_pays_its_slot
     reserve: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
     store._leave_running(reserve, what="reserve", uploader_id="u-op", reservation="r-1")
     reserve.set_result(True)  # done, with its callbacks scheduled but not yet run
-    await store.drain_stragglers(timeout=0.0, grace=1.0)
-    assert await _settled(store), "the release never finished"
-    assert released == ["r-1"]
+    await store.drain_stragglers(timeout=0.0, grace=5.0)
+    assert released == ["r-1"], "the drain returned before the release it started had ended"
+    assert not store._stragglers
+
+
+async def test_a_release_still_running_at_the_grace_is_cancelled(
+    tmp_path: Path, ledger_db: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A release a callback started during the grace and still running at its end is cancelled,
+    so nothing the drain saw outlives it."""
+
+    class _Stalls(_PassThrough):
+        async def release_upload_quota(self, reservation_id: str) -> None:
+            await asyncio.Event().wait()
+
+    store = _uploads(tmp_path, _Stalls(ledger_db))
+    reserve: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+    store._leave_running(reserve, what="reserve", uploader_id="u-op", reservation="r-1")
+    reserve.set_result(True)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        await store.drain_stragglers(timeout=0.0, grace=0.1)
+        await asyncio.sleep(0)  # the cancelled release ends one loop pass later
+        await asyncio.sleep(0)
+    assert not store._stragglers
+    assert "release for u-op was cancelled before it finished" in caplog.text, caplog.text
 
 
 async def test_discard_waits_for_the_quota_lock_before_it_removes_the_pair(

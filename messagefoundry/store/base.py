@@ -1107,8 +1107,10 @@ class QueueStore(StoreLifecycle, Protocol):
         now: float | None = None,
         audit: OperatorAudit[int],
     ) -> int:
-        """``audit`` is REQUIRED (vault BACKLOG #3217): every purge records who ran it, in the
-        cancel's own transaction, so no caller can cancel a queue and write no row."""
+        """``audit`` is REQUIRED (vault BACKLOG #3217), so every caller has to say what the purge
+        records, and the row it returns commits in the cancel's own transaction. It is not a
+        guarantee that a row is written: an :data:`OperatorAudit` may return ``None``, which records
+        nothing. The API's purge paths both return a ``connection_purge`` row for every call."""
         ...
 
     # --- read helpers (API / console) ----------------------------------------

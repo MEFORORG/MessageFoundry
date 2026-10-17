@@ -467,6 +467,24 @@ async def test_a_released_purge_whose_audit_row_fails_cancels_nothing(
     assert {r["status"] for r in await engine.store.outbox_for(mid)} == {OutboxStatus.PENDING.value}
 
 
+async def test_a_released_purge_with_no_requester_is_refused_before_it_cancels(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """Vault BACKLOG #3217: a held purge whose params carry no requester fails closed. It used to
+    run and write a connection_purge row naming no actor (found in code review). The raise is an
+    ApprovalError, so the gate's compensation records 'failed' and the route answers 409."""
+    service = await _service(engine)
+    mid = await _quiesced_outbound_with_a_pending_row(engine, tmp_path)
+    app = create_app(engine, auth=service, approvals=ON)
+    execute = app.state.approval_gate._ops["connection_purge"].execute
+    for params in ({"name": "OB", "scope": "top"}, {"name": "OB", "scope": "top", "requester": ""}):
+        with pytest.raises(ApprovalError) as info:
+            await execute(params)
+        assert info.value.status == 409
+    assert await engine.store.list_audit(action="connection_purge") == []
+    assert {r["status"] for r in await engine.store.outbox_for(mid)} == {OutboxStatus.PENDING.value}
+
+
 def test_settings_validator_rejects_unknown_operation() -> None:
     with pytest.raises(ValueError, match="unknown operation"):
         ApprovalsSettings(operations=["not_a_real_op"])
