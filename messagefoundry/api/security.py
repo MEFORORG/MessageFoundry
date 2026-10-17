@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Awaitable, Callable, Coroutine, Mapping
+from collections import Counter
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, get_args
 
@@ -30,9 +31,10 @@ from fastapi import (
     status,
 )
 from fastapi.dependencies.models import Dependant
-from fastapi.routing import APIRoute
+from fastapi.routing import APIRoute, iter_route_contexts
 from pydantic import BaseModel
 from starlette.requests import HTTPConnection
+from starlette.routing import BaseRoute
 
 from messagefoundry.api.auth_models import CredentialReply
 from messagefoundry.api.tls_client_cert import (
@@ -742,8 +744,10 @@ _REFUSALS_ATTR = "_mefor_route_refusals"
 #: refusal is always logged, and a burst costs one line a minute. Each line carries how many
 #: refusals came since the previous one. Refusals after a burst's last line are held only in the
 #: in-process tally (:func:`undeclared_route_refusals`). They reach the log only with the first
-#: refusal of that route that comes at least this long after the last line; no timer flushes them,
-#: and a restart loses them.
+#: refusal of that route that comes at least this long after the last line; no timer flushes them.
+#: That is deliberate (vault BACKLOG #2954): ``GET /security/posture`` reports the count, logged or
+#: not, through :func:`undeclared_route_refusal_counts`, which says what that walk misses. The count
+#: is not persisted, so a restart loses it, and with it the refusals no line reported.
 REFUSAL_LOG_INTERVAL_SECONDS = 60.0
 
 
@@ -765,6 +769,54 @@ def undeclared_route_refusals(route: object) -> int:
     """How many requests :func:`refuse_undeclared_route` has refused on ``route`` in this process."""
     tally = getattr(route, _REFUSALS_ATTR, None)
     return tally.total if isinstance(tally, _RefusalTally) else 0
+
+
+#: The key :func:`undeclared_route_refusal_counts` reports :data:`_UNKNOWN_ROUTE_REFUSALS` under. It
+#: cannot be mistaken for a route, because every path template starts with ``/``.
+UNKNOWN_ROUTE_KEY = "<unknown>"
+
+
+def undeclared_route_refusal_counts(routes: Sequence[BaseRoute]) -> dict[str, int]:
+    """How many requests :func:`refuse_undeclared_route` refused in this process, by path TEMPLATE.
+
+    ``routes`` is an app's top-level route list. The key is a template, never a request's path, so
+    no identifier a caller put in a URL is reported. Only counted routes appear, sorted by key, so
+    an empty result means only that this walk found no count in this process.
+
+    * FastAPI keeps a router added by ``include_router`` as one opaque entry, so the walk unpacks
+      every include and keys a route by the template it is served under, prefix included.
+    * An API route keeps its count on the route object itself. Served under several templates, by
+      two includes or by an include and a direct registration, it holds one count, keyed by those
+      templates joined with ``", "``. A router shared by two apps in one process shares its counts.
+    * An included WebSocket keeps its count on the copy FastAPI rebuilds to serve it, one copy per
+      include, so each include has its own count and key. FastAPI rebuilds the copies when the
+      router's routes change, and a rebuilt copy starts at zero.
+    * Routes that share a template but not an object, such as a GET and a POST, are summed.
+    * :data:`UNKNOWN_ROUTE_KEY` reports a refusal whose scope named no route. FastAPI sets one on
+      every route it matches, and an unmatched path never runs the refusal, so it is a fallback, not
+      a count of unmatched paths. That tally is module-wide, shared by every app in this process.
+
+    It does NOT walk, at least: a mounted application, which never runs the refusal; and the
+    low-priority routes FastAPI keeps apart, such as a frontend group, which the engine registers
+    none of (``scripts/security/route_gates.py`` refuses one). Its log line names a route's own
+    template, which for an included API route lacks the include's prefix."""
+    served: dict[int, tuple[BaseRoute, set[str]]] = {}
+    for context in iter_route_contexts(routes):
+        rebuilt = getattr(context, "starlette_route", None)
+        if isinstance(rebuilt, BaseRoute):
+            holder, path = rebuilt, getattr(rebuilt, "path", None)
+        else:
+            holder, path = context.original_route, context.path
+        _, paths = served.setdefault(id(holder), (holder, set()))
+        if path:
+            paths.add(path)
+    counts: Counter[str] = Counter()
+    for holder, paths in served.values():
+        if total := undeclared_route_refusals(holder):
+            counts[", ".join(sorted(paths)) or f"<{type(holder).__name__} with no path>"] += total
+    if _UNKNOWN_ROUTE_REFUSALS.total:
+        counts[UNKNOWN_ROUTE_KEY] += _UNKNOWN_ROUTE_REFUSALS.total
+    return dict(sorted(counts.items()))
 
 
 def _record_refusal(route: object) -> None:

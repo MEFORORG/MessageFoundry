@@ -26,9 +26,10 @@ from typing import Any
 
 import httpx
 import pytest
-from fastapi import APIRouter, Depends, FastAPI, Request, WebSocket
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, WebSocket
 from fastapi.routing import APIRoute, APIWebSocketRoute
 from pydantic import BaseModel
+from starlette.requests import HTTPConnection
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -513,6 +514,97 @@ async def test_every_refusal_is_counted_and_the_log_is_throttled_not_silenced(
     assert line.startswith("refused route /zz/undeclared:"), line
     assert "(3 refusals since the last log line, 4 in all)" in line, line
     assert "mrn" not in "".join(throttled + [line])
+
+
+async def test_the_posture_reports_every_refusal_by_template_with_the_no_route_fallback(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #2954. ``GET /security/posture`` reports the refusal count, which used to live
+    only on the route object where nothing read it. It names each route by its path template, never
+    the request path, and it folds in the tally for a refusal with no matched route, which would
+    otherwise be counted nowhere an operator can read. The throttle is pinned shut, so the refusals
+    after the first are ones no log line has reported."""
+    monkeypatch.setattr(security_module, "_UNKNOWN_ROUTE_REFUSALS", security_module._RefusalTally())
+    monkeypatch.setattr(security_module, "REFUSAL_LOG_INTERVAL_SECONDS", 3600.0)
+    app = _planted_app(engine=engine, allow_no_auth=True)
+
+    @app.get("/zz/undeclared-item/{item_id}")
+    async def undeclared_item(item_id: str) -> dict[str, str]:
+        return {"ok": item_id}
+
+    # FastAPI keeps an included router as one opaque entry in ``app.routes``, so a walk of the
+    # top-level list alone would never see this route's count.
+    prefixed = APIRouter()
+
+    @prefixed.get("/undeclared")
+    async def included_undeclared() -> dict[str, str]:
+        return {"ok": "reached"}
+
+    app.include_router(prefixed, prefix="/zz/prefixed")
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+        before = (await client.get("/security/posture")).json()
+        assert before["undeclared_route_refusals"] == {}
+        for _ in range(3):
+            assert (await client.get("/zz/undeclared?mrn=SECRET-MRN")).status_code == 403
+        assert (await client.get("/zz/undeclared-item/SECRET-MRN")).status_code == 403
+        assert (await client.get("/zz/prefixed/undeclared")).status_code == 403
+        # A refusal with no matched route in its scope: FastAPI always sets one, so this is driven
+        # straight through the dependency.
+        with pytest.raises(HTTPException):
+            await security_module.refuse_undeclared_route(HTTPConnection({"type": "http"}))
+        response = await client.get("/security/posture")
+    assert response.status_code == 200, response.text
+    assert response.json()["undeclared_route_refusals"] == {
+        security_module.UNKNOWN_ROUTE_KEY: 1,
+        "/zz/prefixed/undeclared": 1,
+        "/zz/undeclared": 3,
+        "/zz/undeclared-item/{item_id}": 1,
+    }
+    assert "SECRET-MRN" not in response.text
+
+
+def test_the_count_reads_an_included_websocket_and_a_route_served_under_two_templates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vault BACKLOG #2954. FastAPI counts an included WebSocket's refusals on the copy it rebuilds to
+    serve it, not on the route the router holds, so a walk that read only the latter would drop
+    them. A router included twice serves one route object under two templates, and that object
+    holds one count, so the key names both templates rather than crediting the first."""
+    monkeypatch.setattr(security_module, "_UNKNOWN_ROUTE_REFUSALS", security_module._RefusalTally())
+    monkeypatch.setattr(security_module, "REFUSAL_LOG_INTERVAL_SECONDS", 3600.0)
+    app = create_app(allow_no_auth=True)
+    sockets = APIRouter()
+
+    @sockets.websocket("/sock")
+    async def ws_undeclared(websocket: WebSocket) -> None:
+        await websocket.accept()
+        await websocket.close()
+
+    app.include_router(sockets, prefix="/zz/inc")
+    twice = APIRouter()
+
+    @twice.get("/x")
+    async def undeclared_twice() -> dict[str, str]:
+        return {"ok": "reached"}
+
+    app.include_router(twice, prefix="/zz/a")
+    app.include_router(twice, prefix="/zz/b")
+
+    with TestClient(app) as client:
+        with (
+            pytest.raises(WebSocketDisconnect),
+            client.websocket_connect("/zz/inc/sock"),
+        ):
+            pass
+        assert client.get("/zz/a/x").status_code == 403
+        assert client.get("/zz/b/x").status_code == 403
+        assert client.get("/zz/b/x").status_code == 403
+    assert security_module.undeclared_route_refusal_counts(app.routes) == {
+        "/zz/a/x, /zz/b/x": 3,
+        "/zz/inc/sock": 1,
+    }
 
 
 def test_a_declaration_needs_a_reason() -> None:

@@ -78,6 +78,9 @@ this line.**
 - **Seam only: `/status` names the FHIR lookups that failed to start.** `EngineInfo` gains
   `fhir_lookups_failed` (vault `BACKLOG #3008`). The console does not show it yet, but the field
   is on the seam it pins, so the supported digest moved.
+- **Seam only: the posture reports the deny-by-default refusal count.** `SecurityPosture` gains
+  `undeclared_route_refusals` (vault `BACKLOG #2954`). The console does not show it yet, but the
+  field is on the seam it pins, so the supported digest moved.
 
 ### Fixed
 
