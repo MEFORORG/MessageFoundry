@@ -8679,11 +8679,13 @@ class AuthService:
         already over its idle or absolute limit. Ending the session under a rotated token is not
         attempted here; that is BACKLOG #3028.
 
-        The return is for the caller's own logic and tests, NOT for the client. ``POST
-        /auth/logout`` answers 200 and ``/ui/logout`` redirects whatever it says: sign-out stays
-        idempotent, and must not tell a caller whether the token it presented was live. The audit
-        row already carries the outcome. With no token there is nothing to look up, so this returns
-        ``nothing_to_revoke`` and writes no row.
+        The return is for the caller's own logic and tests, NOT for the client (a Manager ruling on
+        BACKLOG #3029). ``POST /auth/logout`` answers 200 and ``/ui/logout`` redirects whatever it
+        says, so sign-out stays idempotent. ``/ui/logout`` has no auth dependency, so a different
+        answer there would tell an unauthenticated caller whether a cookie value was live; ``POST
+        /auth/logout`` already refuses a dead token at its dependency, and keeps one answer for
+        consistency. The audit row carries the outcome. With no token there is nothing to look up,
+        so this returns ``nothing_to_revoke`` and writes no row.
 
         The row's actor is ``actor`` when given (``POST /auth/logout`` passes the signed-in
         caller). Otherwise it is the OWNER of the row the revoke ended, so a console sign-out, which
