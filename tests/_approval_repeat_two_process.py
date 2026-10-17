@@ -35,9 +35,11 @@ from typing import Any
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
-#: The gap between two rounds' scheduled starts. Longer than one request write, so a round that
-#: runs a little long does not push the next round's two starts apart.
-_ROUND_PERIOD_S = 0.06
+#: The gap between two rounds' scheduled starts. Longer than two request writes in a row, so a
+#: round that runs long does not push the next round's two starts apart: on SQL Server the losing
+#: child waits on the winner's audit applock, so one round costs two serialized writes on a shared
+#: CI container. 25 rounds take 5 s, well inside every wait below.
+_ROUND_PERIOD_S = 0.2
 #: Two starts closer than this count as one race. A request write takes milliseconds.
 _TOGETHER_S = 0.004
 #: The share of rounds that must start together for the run to count as a race at all.
@@ -59,16 +61,18 @@ from uuid import uuid4
 
 async def _open(target):
     if target == "sqlserver":
-        from messagefoundry.config.settings import insecure_tls_allowed, load_settings
+        from messagefoundry.config.settings import load_settings
         from messagefoundry.config.tls_policy import HopPosture
         from messagefoundry.store.sqlserver import SqlServerStore
 
         # The parent's warn posture is a contextvar (tests/conftest.py,
         # _warn_posture_for_the_server_db_legs), which a child does not inherit. Without it the
-        # CI container's self-signed certificate is refused as weakened TLS, so state the same
-        # posture here, on the escape the parent's fixture also requires.
-        posture = HopPosture(enforcing=False) if insecure_tls_allowed() else None
-        return await SqlServerStore.open(load_settings(environ=os.environ).store, posture=posture)
+        # CI container's self-signed certificate is refused as weakened TLS, so state it here, as
+        # the applock child in test_sqlserver_store.py does. It relaxes nothing on its own: the
+        # store still requires the MEFOR_ALLOW_INSECURE_TLS escape as well.
+        return await SqlServerStore.open(
+            load_settings(environ=os.environ).store, posture=HopPosture(enforcing=False)
+        )
     from messagefoundry.store.store import MessageStore
 
     return await MessageStore.open(Path(target))
@@ -152,11 +156,16 @@ def race_repeat_requests(
                     )
                 )
         for proc, err_path in zip(procs, errs, strict=True):
-            ready = _readline_within(proc, 20.0)
+            ready, killed = _readline_within(proc, 20.0)
             if ready.strip() != "READY":
-                # The exit code says whether the child died (and how) or hung and was killed.
+                # Said in words: a kill's exit code can match a crash's (1 on Windows).
+                try:
+                    code: int | None = proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    code = None
                 raise AssertionError(
-                    f"a child never opened its store: {ready!r}, exit code {proc.poll()}; "
+                    f"a child never opened its store: {ready!r}, "
+                    f"{'killed after hanging' if killed else 'exited'} with code {code}; "
                     f"its stderr:\n{_tail(err_path)}"
                 )
         # Both stores are open. The first round starts a little ahead, so both children have
@@ -187,20 +196,21 @@ def race_repeat_requests(
     return answers
 
 
-def _readline_within(proc: subprocess.Popen[str], timeout: float) -> str:
-    """The child's next stdout line, or ``""`` when none comes within ``timeout`` seconds. A
-    child that dies first closes stdout, so the read ends; one that hangs is killed, which ends it
-    too."""
+def _readline_within(proc: subprocess.Popen[str], timeout: float) -> tuple[str, bool]:
+    """The child's next stdout line, or ``""`` when none comes within ``timeout`` seconds, and
+    whether the child was killed for it. A child that dies first closes stdout, so the read ends;
+    one that hangs is killed, which ends it too."""
     stdout = proc.stdout
     assert stdout is not None
     line: list[str] = []
     reader = threading.Thread(target=lambda: line.append(stdout.readline()), daemon=True)
     reader.start()
     reader.join(timeout)
-    if reader.is_alive():
+    killed = reader.is_alive()
+    if killed:
         proc.kill()
         reader.join(5.0)
-    return line[0] if line else ""
+    return (line[0] if line else ""), killed
 
 
 def _tail(path: Path) -> str:
