@@ -6632,12 +6632,13 @@ class SecuritySettings(_Section):
     # contradiction is reported on GET /security/posture.
     memory_encryption_operator_declared: bool = False
     # OPT-IN ENFORCEMENT of the declaration above. Default FALSE, and that default is load-bearing:
-    # an exposed PHI instance with no declaration WARNS, it never refuses, so nothing that boots
-    # today stops booting on upgrade. The property is a HOST property no operator can satisfy on
-    # Windows (the read-out is always null there), so a refusal keyed on it by default would
-    # hard-stop working dev/staging/prod deployments over a platform fact they cannot change — the
-    # outcome ADR 0151 avoided by scoping its companion refusal to its own opt-in, and the reason the
-    # Posture-B widening warns on the recommended loopback-behind-proxy topology. Set TRUE to turn
+    # an exposed PHI instance with no declaration WARNS, it never refuses. The property is a HOST
+    # property the engine cannot observe on Windows (the read-out reports nothing there), and many
+    # Windows hosts cannot provide it (which can: ADR 0152, Amendment 2026-10-17). So a refusal by
+    # default would leave an operator on such a host two choices: do not start, or declare a
+    # property the host does not have. ADR 0151 scoped its companion refusal to its own opt-in, and
+    # the Posture-B widening warns on the recommended loopback-behind-proxy topology; this follows
+    # both. Set TRUE to turn
     # that warning into a refusal for an estate that has standardized on confidential-computing
     # hosts; the refuse/warn dial ([security].enforcement, ADR 0148) still applies on top, so
     # enforcement=warn keeps it a warning even when this is set. Not a loosening (it tightens).

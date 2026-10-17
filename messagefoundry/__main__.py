@@ -4234,19 +4234,20 @@ def _serve(args: argparse.Namespace) -> int:
     # operator to DECLARE it ([security].memory_encryption_operator_declared).
     #
     # WARN BY DEFAULT; REFUSE ONLY ON AN OPT-IN. This is the load-bearing scoping decision and it is
-    # not a softening — it is the only shape that does not hard-stop deployments that boot today:
+    # not a softening — it is the only shape that does not refuse an engine over a host property:
     #   * every instance carries patient data (BACKLOG #1279, after ADR 0148 GIVEN 1 made every
     #     built-in environment name derive PHI), so an exposed dev/test instance that declared
     #     nothing at all is in scope and nothing can declare it out;
     #   * "exposed" includes the loopback-behind-proxy topology OFF-LOOPBACK-DEPLOYMENT.md actually
     #     RECOMMENDS (it declares tls_terminated_upstream), which the Posture-B gate 400 lines above
     #     deliberately spares from its own refusal for exactly this reason;
-    #   * on Windows — the primary deployment platform — the read-out is ALWAYS null, so no host can
-    #     ever clear such a gate by being correctly configured.
-    # A default refusal would therefore stop a working dev/staging/prod service from booting on
-    # upgrade over a platform property nobody can satisfy on Windows. That is the outcome ADR 0151
-    # avoided by scoping its companion refusal to its own opt-in ("only fire on the opt-in, so it
-    # cannot break an existing deployment"). Same rule here: the warning is the default; the refusal
+    #   * on Windows — the primary deployment platform — the read-out reports nothing, so the
+    #     engine can never see the property there, and many Windows hosts cannot provide it (which
+    #     can: ADR 0152, Amendment 2026-10-17).
+    # A default refusal would therefore leave an operator on such a host two choices: do not start,
+    # or declare a property the host does not have. ADR 0151 scoped its companion refusal to its own
+    # opt-in ("only fire on the opt-in, so it cannot break an existing deployment"), and the same
+    # rule applies here: the warning is the default; the refusal
     # requires [security].require_memory_encryption_declaration = true, which nothing has set. The
     # ADR 0148 refuse/warn dial then applies on top of the opt-in, as it does everywhere else.
     #
