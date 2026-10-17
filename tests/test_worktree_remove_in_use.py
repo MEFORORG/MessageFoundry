@@ -58,64 +58,90 @@ def _target(route: str, wt: Path) -> list[str]:
     return [route, wt.name.removeprefix("Repo-") if route == "-Name" else str(wt)]
 
 
-#: The script's OWN listing helper, lifted out of remove.ps1 by the PowerShell parser and called on the
-#: directory, so "the probe cannot list it" means "the script cannot list it". It runs as a -File
-#: script, the way the rig runs remove.ps1: under -Command, pwsh appends the arguments to the command
-#: text and $args is empty. The first version of this probe was a -Command one-liner that read
-#: $args[0], so it threw on every directory and never skipped (engine PR 2371, the second red).
-#: Exit 0: listed. Exit 3: the helper threw. Anything else: the probe itself is broken.
+#: Whether the deny bound, asked of .NET directly, and NOT of the script's helper: a helper that
+#: swallowed access-denied would otherwise answer "listed" and turn its own regression into a skip.
+#: Only an UnauthorizedAccessException counts as bound (exit 3); any other throw is exit 5, so an
+#: unrelated error cannot pass for ACL coverage. The script's own helper is then called on the
+#: script's walk root, for the report only, with the script's $ErrorActionPreference.
+#:
+#: It runs as a -File script, the way the rig runs remove.ps1. Under -Command, pwsh appends the
+#: arguments to the command text and leaves $args empty: the first version of this probe was such a
+#: one-liner, threw on every directory, never skipped, and so the ACL tests failed on a runner where
+#: the deny does not bind (engine PR 2371, the run on head 2d369bff).
 _PROBE = r"""
-param([string]$Script, [string]$Dir)
+param([string]$Script, [string]$Dir, [string]$WalkRoot, [switch]$Recurse)
+$ErrorActionPreference = 'Stop'
+$opts = [System.IO.EnumerationOptions]::new()
+$opts.IgnoreInaccessible = $false
+$opts.AttributesToSkip = [System.IO.FileAttributes]0
+$code = 0
+try {
+    foreach ($e in [System.IO.DirectoryInfo]::new($Dir).EnumerateFileSystemInfos('*', $opts)) {}
+    Write-Output "PROBE: .NET listed '$Dir'"
+} catch {
+    $x = $_.Exception
+    while ($x -and $x -isnot [System.UnauthorizedAccessException]) { $x = $x.InnerException }
+    if ($x) { $code = 3; Write-Output "PROBE: .NET was denied '$Dir': $($x.Message)" }
+    else { $code = 5; Write-Output "PROBE: .NET failed on '$Dir', not denied: $($_.Exception.GetType().FullName): $($_.Exception.Message)" }
+}
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($Script, [ref]$null, [ref]$null)
 $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
     $n.Name -eq 'Get-EntriesOrThrow' }, $true)
-if (-not $fn) { Write-Output "PROBE: no Get-EntriesOrThrow in '$Script'"; exit 4 }
-. ([scriptblock]::Create($fn.Extent.Text))
-$code = 0
-try { Write-Output "PROBE: listed $(@(Get-EntriesOrThrow $Dir 'probe entries').Count) entries under '$Dir'" }
-catch { Write-Output "PROBE: $($_.Exception.Message)"; $code = 3 }
+if (-not $fn) { Write-Output "PROBE: no Get-EntriesOrThrow in '$Script'"; $code = 4 }
+else {
+    . ([scriptblock]::Create($fn.Extent.Text))
+    try { Write-Output "PROBE: the script's helper listed $(@(Get-EntriesOrThrow $WalkRoot 'probe entries' -Recurse:$Recurse).Count) entries under '$WalkRoot'" }
+    catch { Write-Output "PROBE: the script's helper: $($_.Exception.Message)" }
+}
 Write-Output "PROBE: whoami /priv of this pwsh:"
 whoami /priv | Out-String | Write-Output
 exit $code
 """
 
 
-class Denied:
-    """What a test needs to explain a failure it could not have measured on this machine."""
+def _run_probe(
+    root: Path, directory: Path, walk_root: Path, *, recurse: bool = False
+) -> subprocess.CompletedProcess[str]:
+    """The probe, run the way the rig runs remove.ps1: a pwsh -File child with the rig's env."""
+    probe_file = root / "probe-listing.ps1"
+    probe_file.write_text(_PROBE, encoding="utf-8")
+    argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(probe_file), str(SCRIPT)]
+    argv += [str(directory), str(walk_root), *(["-Recurse"] if recurse else [])]
+    # whoami /priv text is localized and arrives in the console's OEM code page.
+    return subprocess.run(
+        argv,
+        capture_output=True,
+        encoding="oem",
+        errors="replace",
+        check=False,
+        timeout=120,
+        env={**_ENV, "USERPROFILE": str(root / "home")},
+    )
 
-    def __init__(self, directory: Path, probe: subprocess.CompletedProcess[str]) -> None:
-        self.directory = directory
-        self.probe = probe
 
-    def explain(self, proc: subprocess.CompletedProcess[str]) -> str:
-        return (
-            f"denied directory: {self.directory}\n"
-            f"probe exit {self.probe.returncode}:\n{_out(self.probe)}\n"
-            f"script exit {proc.returncode}, stdout and stderr:\n{_out(proc)}"
-        )
-
-
-def _listed_dir(wt: Path, *under: str) -> Path:
-    """The directory remove.ps1 lists for ``wt``, resolved the way the script resolves it: git's
-    common dir of the TARGET, then the registry path under it."""
-    common = _git(wt, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
-    return Path(common, *under)
+def _explain(
+    directory: Path, probe: subprocess.CompletedProcess[str], proc: subprocess.CompletedProcess[str]
+) -> str:
+    return (
+        f"denied directory: {directory}\nprobe exit {probe.returncode}:\n{_out(probe)}\n"
+        f"script exit {proc.returncode}, stdout and stderr:\n{_out(proc)}"
+    )
 
 
 @contextmanager
-def _denied_listing(rig: Rig, wt: Path, directory: Path) -> Iterator[Denied]:
-    """Deny this user the right to list ``directory``, and give it back afterwards.
+def _denied_listing(
+    rig: Rig, directory: Path, walk_root: Path, *, recurse: bool = False
+) -> Iterator[subprocess.CompletedProcess[str]]:
+    """Deny this user the right to list ``directory``, and give it back afterwards. ``walk_root`` and
+    ``recurse`` are where and how remove.ps1 walks to reach it, for the probe's report.
 
     The deny must take effect, or the test proves nothing. On the hosted windows-2025 runner the
-    script went on listing the directory after this deny, as runneradmin (engine PR 2371, runs
-    39005284295 and the one on head 2d369bff). Why was not measured; the probe prints the
-    privileges of its pwsh so the next skip says. The probe calls the script's own helper on the
-    path the script resolves, and the test skips when that call still lists. A skip cannot hide a
-    regression on its own: the planted-file test fails the listing on every runner, and a static
-    test pins IgnoreInaccessible.
+    script went on listing the directory after this deny, as runneradmin (engine PR 2371, run
+    39005284295). Why was not measured; the probe prints its pwsh's privileges, so a skip there says.
+    A skip there leaves the access-denied branch undriven on that runner: the planted-file test
+    drives a different exception, and the static pin reads two strings. It is driven only where the
+    deny binds, such as a non-elevated developer box.
     """
-    listed = _listed_dir(wt, *directory.relative_to(_common(rig)).parts)
-    assert listed.resolve() == directory.resolve(), (listed, directory)
     who = subprocess.run(
         ["whoami"], capture_output=True, text=True, check=False, timeout=30
     ).stdout.strip()
@@ -129,21 +155,11 @@ def _denied_listing(rig: Rig, wt: Path, directory: Path) -> Iterator[Denied]:
     if not who or made.returncode != 0:
         pytest.skip(f"could not deny access with icacls: {made.stdout} {made.stderr}")
     try:
-        probe_file = rig.root / "probe-listing.ps1"
-        probe_file.write_text(_PROBE, encoding="utf-8")
-        argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(probe_file), str(SCRIPT)]
-        probe = subprocess.run(
-            [*argv, str(listed)],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=120,
-            env={**_ENV, "USERPROFILE": str(rig.home)},
-        )
+        probe = _run_probe(rig.root, directory, walk_root, recurse=recurse)
         if probe.returncode == 0:
-            pytest.skip(f"{who} can still list {listed} after the deny.\n{_out(probe)}")
-        assert probe.returncode == 3, f"the probe itself failed:\n{_out(probe)}"
-        yield Denied(listed, probe)
+            pytest.skip(f"{who} can still list {directory} after the deny.\n{_out(probe)}")
+        assert probe.returncode == 3, f"the probe did not see a denial:\n{_out(probe)}"
+        yield probe
     finally:
         subprocess.run(
             ["icacls", str(directory), "/remove:d", who],
@@ -445,10 +461,10 @@ def test_a_claims_directory_that_cannot_be_listed_refuses(rig: Rig, route: str) 
     claims = _common(rig) / "mefor-coord" / "claims"
     claims.mkdir(parents=True)
 
-    with _denied_listing(rig, wt, claims) as denied:
+    with _denied_listing(rig, claims, claims) as probe:
         proc = rig.run(*_target(route, wt), "-Force")
-    assert proc.returncode != 0, denied.explain(proc)
-    assert "claims are unknown" in _out(proc), denied.explain(proc)
+    assert proc.returncode != 0, _explain(claims, probe, proc)
+    assert "claims are unknown" in _out(proc), _explain(claims, probe, proc)
     assert wt.exists()
 
     proc = rig.run(*_target(route, wt))
@@ -483,29 +499,21 @@ def test_a_registry_path_whose_listing_throws_refuses(rig: Rig, route: str, regi
     assert not wt.exists()
 
 
-def test_the_listing_probe_tells_a_listable_directory_from_one_that_throws(tmp_path: Path) -> None:
-    """The control the first probe lacked: it exited 3 on every directory, so the ACL tests above
-    never skipped and failed instead wherever the deny did not bind. Both answers are driven here,
-    on every runner, through the script's own helper."""
-    probe_file = tmp_path / "probe-listing.ps1"
-    probe_file.write_text(_PROBE, encoding="utf-8")
+def test_the_listing_probe_tells_listed_from_failed_for_another_reason(tmp_path: Path) -> None:
+    """A control for the probe the ACL tests skip on, run on every runner. The denied answer (exit 3)
+    needs a deny that binds, so only the ACL tests drive it."""
     listable = tmp_path / "listable"
     listable.mkdir()
     (listable / "one.txt").write_text("x\n", encoding="utf-8")
     planted = tmp_path / "planted"
     planted.write_text("not a directory\n", encoding="utf-8")
 
-    def probe(directory: Path) -> subprocess.CompletedProcess[str]:
-        argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(probe_file), str(SCRIPT)]
-        return subprocess.run(
-            [*argv, str(directory)], capture_output=True, text=True, check=False, timeout=120
-        )
-
-    ok = probe(listable)
+    ok = _run_probe(tmp_path, listable, listable)
     assert ok.returncode == 0, _out(ok)
-    assert f"listed 1 entries under '{listable}'" in _out(ok), _out(ok)
-    bad = probe(planted)
-    assert bad.returncode == 3, _out(bad)
+    assert "the script's helper listed 1 entries" in _out(ok), _out(ok)
+    assert "PROBE: whoami /priv of this pwsh:" in _out(ok), _out(ok)
+    bad = _run_probe(tmp_path, planted, planted)
+    assert bad.returncode == 5, _out(bad)
     assert "probe entries are unknown" in _out(bad), _out(bad)
 
 
@@ -530,10 +538,11 @@ def test_an_allocation_directory_that_cannot_be_listed_refuses(rig: Rig, route: 
     hidden = _common(rig) / "mefor-coord" / "alloc" / "backlog"
     hidden.mkdir(parents=True)
 
-    with _denied_listing(rig, wt, hidden) as denied:
+    # The script walks the whole alloc directory recursively and meets this one on the way down.
+    with _denied_listing(rig, hidden, hidden.parent, recurse=True) as probe:
         proc = rig.run(*_target(route, wt), "-Force")
-    assert proc.returncode != 0, denied.explain(proc)
-    assert "allocations are unknown" in _out(proc), denied.explain(proc)
+    assert proc.returncode != 0, _explain(hidden, probe, proc)
+    assert "allocations are unknown" in _out(proc), _explain(hidden, probe, proc)
     assert wt.exists()
 
     proc = rig.run(*_target(route, wt))
