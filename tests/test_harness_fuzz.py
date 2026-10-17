@@ -46,7 +46,8 @@ from harness.fuzz.transport import CLOSED, MALFORMED, REPLY, WireMLLPDriver, _re
 from harness.scenarios._core import control_id_of
 from messagefoundry.api.models import Health, MessageList, MessageSummary
 from messagefoundry.apiclient import ApiError, EngineClient
-from messagefoundry.mllpcodec import frame
+from messagefoundry.mllpcodec import build_ack, frame
+from messagefoundry.parsing import Peek
 from messagefoundry.store.store import MessageStatus
 from tests._harness_engine import REPO, ephemeral_overrides, free_port, serve_harness_config
 
@@ -270,23 +271,103 @@ def test_a_malformed_reply_fails_and_exits_one(
 _ALPHANUMERIC_DELIMITERS = ((11, 5686), (13, 1071))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="engine defect: build_ack (messagefoundry/mllpcodec.py) echoes the inbound's MSH-1/MSH-2 "
-    "verbatim and writes its literal fields unescaped, so an inbound whose delimiters are letters "
-    "gets an AA whose MSH-9 and MSA-1 do not read back as ACK/AA under the ACK's own delimiters",
-)
 @pytest.mark.parametrize(("seed", "iteration"), _ALPHANUMERIC_DELIMITERS)
 def test_an_inbound_with_letter_delimiters_gets_a_readable_ack(
     server: tuple[str, Endpoints], seed: int, iteration: int
 ) -> None:
+    # BACKLOG #2875: build_ack answers such an inbound under |^~\& rather than its own delimiters.
     _api_url, eps = server
     case = make_case(seed, iteration)
+    assert re.match(rb"MSH(\|\^AB\||D)", case.data.lstrip(b"\x0b")), "the case lost its shape"
     exchange = build_transport("mllp", eps, None, timeout=10.0).send(case.data)
-    # The engine did answer, in one frame; it is the answer's content that is unreadable.
     assert exchange.outcome == REPLY and len(exchange.replies) == 1
     verdict = invariants.judge(exchange, expected=len(frames(case.data)))
     assert not verdict.problem, verdict.problem
+
+
+#: Synthetic inbound headers whose delimiters collide with text the ACK writes itself (BACKLOG
+#: #2875). MSH-2 "^AB" is the campaign's first shape; its MSH-1 "D" case also left letters in
+#: MSH-2, and "K", a letter of "ACK", stands in for it. The rest split MSH-7's offset or the version
+#: "2.5.1" the ACK writes when the inbound has none, or give two delimiters one character.
+_COLLIDING_HEADERS = {
+    "msh2-letters": "MSH|^AB|APP|FAC|RCV|RFC|20260101||ORU^R01|C^1|P|2.5.1\r",
+    "msh1-letter": "MSHK^~\\&KAPPKFACKRCVKRFCK20260101KKORU^R01KC|1KPK2.5.1\r",
+    "msh1-in-msh2": "MSH^^APP^FAC^RCV^RFC^20260101^^ORU~R01^C1^P^2.5.1\r",
+    "msh2-duplicate": "MSH|^~^&|APP|FAC|RCV|RFC|20260101||ORU^R01|C1|P|2.5.1\r",
+    # "F" is in the \F\ escape that MSA-3 carries, not only in the fixed fields.
+    "msh1-escape-letter": "MSHF^~\\&FAPPFSACFRCVFRXCF20260101FFORU^R01FC1FPF2.5.1\r",
+    "msh2-minus": "MSH|-~\\&|APP|FAC|RCV|RFC|20260101||ORU^R01|C1|P|2.5.1\r",
+    "msh2-plus": "MSH|+~\\&|APP|FAC|RCV|RFC|20260101||ORU^R01|C1|P|2.5.1\r",
+    "msh2-dot": "MSH|^~\\.|APP|FAC|RCV|RFC|20260101||ORU^R01|C1|P\r",
+}
+
+
+@pytest.mark.parametrize("code", ["AA", "AE", "AR"])
+@pytest.mark.parametrize("timestamp", ["20260101000000-0500", "20260101000000+0100"])
+@pytest.mark.parametrize("inbound", _COLLIDING_HEADERS.values(), ids=list(_COLLIDING_HEADERS))
+def test_build_ack_reads_back_when_the_inbound_delimiters_collide_with_its_own_text(
+    inbound: str, timestamp: str, code: str
+) -> None:
+    ack = build_ack(inbound, code=code, text="bad | data", timestamp=timestamp)
+    assert ack.startswith("MSH|^~\\&|"), ack
+    peek = Peek.parse(ack)
+    assert peek.message_code == "ACK"
+    assert peek.field("MSA-1") == code
+    # Down to the subcomponent: a whole-field read would not see a split.
+    assert peek.field("MSH-7.1.1") == timestamp
+    assert peek.field("MSH-12.1.1") == "2.5.1"
+    assert peek.field("MSA-3") == "bad \\F\\ data"
+
+
+#: Inbounds whose MSH-10 holds a default delimiter as data or in another role, or an escape.
+_DATA_CONTROL_IDS = {
+    "pipe-under-letter-field-sep": _COLLIDING_HEADERS["msh1-letter"],  # C|1, field separator K
+    "backslash-under-letter-escape": "MSH|^AB|APP|FAC|RCV|RFC|20260101||ORU^R01|C\\1|P|2.5.1\r",
+    "caret-as-subcomponent": "MSH|-~\\^|APP|FAC|RCV|RFC|20260101||ORU^R01|C^1|P|2.5.1\r",
+    # \F\ is "K" under the inbound and "|" under the defaults, so even an escape is blanked.
+    "escape-sequence": "MSHK^~\\&KAPPKFACKRCVKRFCK20260101KKORU^R01KC\\F\\1KPK2.5.1\r",
+}
+
+
+@pytest.mark.parametrize("inbound", _DATA_CONTROL_IDS.values(), ids=list(_DATA_CONTROL_IDS))
+def test_build_ack_blanks_an_echoed_value_a_default_delimiter_would_restructure(
+    inbound: str,
+) -> None:
+    # Escaping the control id would send one the store never recorded, so it is blanked.
+    peek = Peek.parse(build_ack(inbound, timestamp="20260101"))
+    assert peek.control_id is None and peek.field("MSA-2") is None
+    # The values that hold no default delimiter are still echoed, sender and receiver swapped.
+    assert [peek.field(f"MSH-{n}") for n in (3, 4, 5, 6)] == ["RCV", "RFC", "APP", "FAC"]
+
+
+@pytest.mark.parametrize(("name", "control_id"), [("msh2-letters", "C^1"), ("msh2-minus", "C1")])
+def test_build_ack_keeps_an_echoed_value_that_reads_the_same_under_the_defaults(
+    name: str, control_id: str
+) -> None:
+    # Under MSH-2 "^AB", "^" is the component separator in both sets, so "C^1" means the same.
+    peek = Peek.parse(build_ack(_COLLIDING_HEADERS[name], timestamp="20260101"))
+    assert (peek.control_id, peek.field("MSA-2")) == (control_id, control_id)
+
+
+def test_build_ack_still_echoes_punctuation_delimiters() -> None:
+    # The control: delimiters the ACK never writes as text are echoed, as before BACKLOG #2875.
+    ack = build_ack(
+        "MSH#@*!%#APP#FAC#RCV#RFC#20260101##ORU@R01#C|1#P#2.5.1\r", timestamp="20260101"
+    )
+    assert ack.startswith("MSH#@*!%#RCV#RFC#APP#FAC#"), ack
+    peek = Peek.parse(ack)
+    assert (peek.message_code, peek.field("MSA-1"), peek.field("MSA-2")) == ("ACK", "AA", "C|1")
+
+
+@pytest.mark.parametrize("code", ["AA", "AE", "AR"])
+def test_build_ack_echoes_a_letter_field_separator_its_own_text_never_holds(code: str) -> None:
+    # MSH-1 "D" splits nothing the ACK writes, so it is echoed and the control id still correlates.
+    inbound = "MSHD^~\\&DAPPDFACDRCVDRFCD20260101DDORU^R01DC|1DPD2.5.1\r"
+    ack = build_ack(inbound, code=code, timestamp="20260101000000-0500")
+    assert ack.startswith("MSHD^~\\&DRCVDRFCDAPPDFACD"), ack
+    peek = Peek.parse(ack)
+    assert (peek.message_code, peek.field("MSA-1"), peek.field("MSA-2")) == ("ACK", code, "C|1")
+    assert peek.field("MSH-7.1.1") == "20260101000000-0500"
 
 
 # --- invariants without an engine ----------------------------------------------------------------
@@ -294,8 +375,8 @@ def test_an_inbound_with_letter_delimiters_gets_a_readable_ack(
 
 def _plain_ack(payload: bytes) -> bytes:
     """An AA for ``payload`` under the standard delimiters, echoing its control id when that id is
-    plain text. Not build_ack: that echoes the payload's own delimiters, which is the engine defect
-    the xfail above pins, and these fakes stand in for an engine without it."""
+    plain text. Not build_ack: these fakes stand in for an engine, and their replies must not move
+    when build_ack's echo rules do."""
     cid = control_id_of(payload) or ""
     if not queryable(cid) or any(ch in cid for ch in "|^~\\&"):
         cid = ""
