@@ -3576,7 +3576,7 @@ class AuthSettings(_Section):
 
     @field_validator("oidc_acr_values", "oidc_prompt")
     @classmethod
-    def _normalise_oidc_acr_values(cls, v: str | None) -> str | None:
+    def _normalise_space_separated_request(cls, v: str | None) -> str | None:
         # BACKLOG #2325, and #3221 for prompt: both requests are space-separated (OIDC Core, the
         # authentication request). A whitespace-only value names nothing, so it becomes None and the
         # authorization request does not carry it, rather than the raw blanks it used to send.
@@ -8277,8 +8277,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
         # BACKLOG #2388: the amr exemption from that floor. Named only while the floor is on, as a
         # part of a limiter is named only while the limiter is built. The text quotes no value.
         exempt = auth.oidc_callback_floor_exempt_amr
-        # The field validator has already stripped the list and dropped blanks (BACKLOG #3221).
-        if exempt and auth.oidc_callback_min_elapsed_seconds > 0:
+        if any(v.strip() for v in exempt) and (auth.oidc_callback_min_elapsed_seconds > 0):
             out.append(
                 (
                     "oidc_callback_floor_exempt_amr",

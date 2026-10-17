@@ -756,10 +756,13 @@ the `http.client` family. This amendment closes both, and states when the flag c
 
 - **`jwks_fetcher` raises typed errors.** `auth/oidc_http.py` defines `IdpReplyError`, an
   `http.client.HTTPException` so every existing outage arm still catches it, and not a `JwksError`,
-  which `claims.py` would retype as `ClaimsError('unknown_kid')`. A reply refused for its framing or
-  its size raises `IdpReplyUnusableError`: an answer, audited `marked_unavailable=false` with
-  `reason=idp_answer_unusable`. A reply that stops before its declared end raises
-  `IdpReplyCutShortError`: a transport failure, as the token leg already reads one.
+  which `claims.py` would retype as `ClaimsError('unknown_kid')`. A reply refused for its framing,
+  or one the bounded reader could not read whole for another reason, raises
+  `IdpReplyUnusableError`: an answer, audited `marked_unavailable=false` with
+  `reason=idp_answer_unusable`. A reply that stops before its declared end, or a chunked body cut
+  short, raises `IdpReplyCutShortError`: a transport failure, as the token leg already reads one. A
+  body over the size bound is unchanged: `JwksCache` refuses it as a `JwksError`, so the sign-in is
+  refused `unknown_kid` and the flag is left alone.
 - **Only named `http.client` faults read as transport.** `is_idp_transport_http_exception` in the
   same module answers for the family: `IdpReplyCutShortError`, `BadStatusLine` (which covers
   `RemoteDisconnected`, a close before any status line) and `IncompleteRead`. Every other one, such
@@ -767,19 +770,22 @@ the `http.client` family. This amendment closes both, and states when the flag c
   `_is_idp_transport_failure` in `auth/service.py` calls it.
 - **A verified token clears the flag.** Both legs clear it once the code exchange yields a token
   that passed the claims ladder, before any later check. A refusal after that point, a too-early
-  one included, no longer leaves the flag set while the IdP is answering. A `token_refused` answer
-  still neither sets nor clears it, as Amendment E says.
+  one included, no longer leaves the flag set. A `token_refused` answer, and a token the ladder
+  refuses (`ClaimsError`), still neither set nor clear it, as Amendment E says for the first.
 
 **Why this cannot weaken a control.** The flag drives only the federated link on `/ui/login` and
 `/auth/providers`; no sign-in path gates on it, and nothing falls back when it is set. Narrowing what
 sets it keeps the link showing in more cases, which takes a lever away from a caller who would hide
 it. Clearing it sooner shows the link once the IdP has proved it answers.
 
-**The cost, stated.** A JWKS endpoint or proxy that answers with a misframed or oversized body, or a
-header line over the limit, no longer hides the link. Visitors keep seeing a federated sign-in that
-fails, and the operator reads `idp_answer_unusable` with the exception type on each audit row.
+**The cost, stated.** A JWKS endpoint or proxy that answers with a misframed body, or a header line
+over the limit, no longer hides the link. Visitors keep seeing a federated sign-in that fails. The
+operator reads `idp_answer_unusable` with the exception type on the row of the sign-in that fetched.
+Sign-ins inside the refetch floor after it meet the cache's throttle, and are refused `unknown_kid`.
 
 **At least these residuals remain.** Amendment E's first residual stands: a firewall that resets a
 connection whose body looks hostile still produces a transport failure. A `BadStatusLine` carrying a
 non-HTTP status line is a reply that arrived, and still reads as transport. So does a refusal the
-engine makes before it sends, such as a proxy URL carrying credentials.
+engine makes before it sends, such as a proxy URL carrying credentials. An IdP that keeps answering
+with a token the claims ladder refuses, after a transport failure set the flag, leaves it set until
+a token passes.

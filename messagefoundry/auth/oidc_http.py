@@ -84,8 +84,9 @@ class IdpReplyError(http.client.HTTPException):
 
 
 class IdpReplyUnusableError(IdpReplyError):
-    """A reply arrived, but its framing or size makes it unusable. The IdP answered, so this does
-    not mark it unavailable."""
+    """A reply arrived, but its framing makes it unusable, or it could not be read whole for a
+    reason other than being cut short. The IdP answered, so this does not mark it unavailable. A
+    body over the size bound is not refused here: ``JwksCache`` refuses it as a ``JwksError``."""
 
 
 class IdpReplyCutShortError(IdpReplyError):

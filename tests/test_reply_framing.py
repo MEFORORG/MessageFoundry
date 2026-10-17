@@ -1042,6 +1042,16 @@ def test_oidc_jwks_fetch_refuses_a_body_short_of_its_content_length() -> None:
         jwks_fetcher(url, urllib.request.build_opener())()
 
 
+def test_oidc_jwks_fetch_reads_a_chunked_body_cut_short_as_cut_short() -> None:
+    """BACKLOG #3221: a chunked JWKS body cut mid-chunk is a transport failure, as on the token
+    leg, so it must not fall to the family arm and read as an unusable answer."""
+    from messagefoundry.auth.oidc_http import jwks_fetcher
+
+    raw = _OK + b"Transfer-Encoding: chunked\r\n\r\n50\r\nhello"
+    with _serve(raw) as url, pytest.raises(IdpReplyCutShortError, match="cut short"):
+        jwks_fetcher(url, urllib.request.build_opener())()
+
+
 def test_both_oidc_reads_retype_the_whole_refusal_family(monkeypatch: pytest.MonkeyPatch) -> None:
     """A refusal added to bounded_read later must still land on FlowError or HTTPException. Caught
     by member instead of by family, it would escape the login as an unhandled DeliveryError."""

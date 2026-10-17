@@ -751,7 +751,8 @@ _STEP_UP_ERRORS: Final[Mapping[str, str]] = MappingProxyType(
         # does, so a junk code's answer cannot show whether the callback floor fired (SECURITY.md,
         # the second-step floors). So does the engine's own client credential refused with a 401,
         # an operator fault. Its audit row carries the status, which is where the operator tells
-        # the two apart (BACKLOG #1948, #3221). IDP_ANSWER_UNUSABLE promises no wait will help.
+        # the two apart (BACKLOG #1948, #3221). IDP_ANSWER_UNUSABLE can be an operator fault too,
+        # so its text no longer says a later try will help.
         IDP_ANSWER_UNUSABLE: (
             "The identity provider could not complete the confirmation. Try again. If it repeats,"
             " ask an administrator."
@@ -1992,8 +1993,9 @@ def _is_idp_transport_failure(exc: BaseException) -> bool:
     In code: a ``TokenEndpointUnreachableError``, an ``http.client`` exception that
     :func:`~messagefoundry.auth.oidc_http.is_idp_transport_http_exception` names (a JWKS reply cut
     short, ``BadStatusLine`` or ``IncompleteRead``; ADR 0142 Amendment G, BACKLOG #3221), or an
-    ``OSError`` that is not an ``HTTPError``. Every other ``http.client`` exception is a reply that
-    arrived, ``MalformedReplyHeadError`` and a JWKS reply refused for its framing among them."""
+    ``OSError`` that is not an ``HTTPError``. Every other ``http.client`` exception is not one: a
+    reply that arrived, ``MalformedReplyHeadError`` and a JWKS reply refused for its framing among
+    them, or a fault on the engine's own side of the connection."""
     if isinstance(exc, oidc.TokenEndpointUnreachableError):
         return True
     if isinstance(exc, http.client.HTTPException):
@@ -4525,7 +4527,8 @@ class AuthService:
             # answer one with a 5xx. It must not mark the IdP unavailable: that flag hides the
             # federated link on /ui/login and in /auth/providers for everyone, so marking here
             # would let any caller switch federated sign-in off. Nor does it clear the flag, as
-            # no sign-in succeeded. It is a FlowError, so this arm must stay above the outage arm.
+            # no token was verified (BACKLOG #3221). It is a FlowError, so this arm must stay
+            # above the outage arm.
             # Audited with the client address, as the outage arm is: a spray of junk codes is the
             # abuse this arm exists for, and the operator needs to see where it comes from. The
             # status is the only other thing recorded, and it is what tells a spray (400) from the
@@ -4894,14 +4897,15 @@ class AuthService:
     def _oidc_callback_floor_exemption(
         exempt_values: frozenset[str], amr: Sequence[str]
     ) -> tuple[str, ...]:
-        """The ``exempt_values`` (:meth:`_oidc_callback_floor_exempt_values`) a signature-verified
-        ``amr`` carries, sorted (BACKLOG #2388). Empty means the callback floor applies. The caller
-        passes the set in, so a step-up callback builds it once (BACKLOG #3221).
+        """The ``exempt_values`` a signature-verified ``amr`` carries, sorted (BACKLOG #2388). Empty
+        means the callback floor applies. The caller passes in what
+        :meth:`_oidc_callback_floor_exempt_values` returned, so a step-up callback builds it once
+        (BACKLOG #3221); the set is filtered again here, so any other set is safe too.
 
         It returns configured values only, never the token's own, so the result is a closed set
         an audit row may carry. A blank or non-string value matches nothing, whoever built the
         settings, by the same rule the MFA gate applies."""
-        return tuple(sorted(exempt_values & set(amr)))
+        return tuple(sorted(oidc.accepted_claim_values(tuple(exempt_values)) & set(amr)))
 
     def _oidc_callback_floor_exempt_values(self) -> frozenset[str]:
         """``[auth].oidc_callback_floor_exempt_amr`` as the values that can match (BACKLOG #2388)."""
