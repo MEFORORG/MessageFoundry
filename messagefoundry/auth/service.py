@@ -3336,6 +3336,21 @@ class AuthService:
                 "no role; remove any authenticator entry it showed. If another provision-admin run "
                 "is in progress, let it finish. Then run the command again"
             )
+        if grant is not AdminGrant.GRANTED:
+            # Fail closed: only GRANTED is success. Any other value -- an outcome added later, or a
+            # store answering out of contract -- is refused, so no recovery codes are shown and no
+            # provisioned row claims an Administrator this run cannot confirm.
+            _log.error(
+                "first-administrator grant for %r returned an unexpected outcome %r; refused",
+                username,
+                grant,
+            )
+            raise FirstAdministratorRefused(
+                "the role grant returned an unexpected outcome, so this run cannot confirm that "
+                f"the account named {username!r} holds the Administrator role and reports no "
+                "success; remove any authenticator entry it showed, and check that account's "
+                "roles in the web console before running the command again"
+            )
         if repaired:
             # AGAIN, after the role (ADR 0197 Amendment A, AC-A5). The earlier holder's password
             # still worked until ``set_password`` above, so a sign-in in that window minted a session

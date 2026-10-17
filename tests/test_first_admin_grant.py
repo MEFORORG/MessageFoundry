@@ -323,6 +323,31 @@ async def test_mutation_control_an_unguarded_grant_lets_both_runs_through(
         await store.close()
 
 
+async def test_an_unknown_grant_outcome_is_refused_and_shows_no_recovery_codes(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The grant's outcome fails closed: only ``AdminGrant.GRANTED`` is success. An outcome the
+    service does not know -- a future enum member, or a store answering out of contract -- is
+    refused with an ERROR log, so no recovery codes are returned and no provisioned row is written.
+    The old comparison refused only ``ADMIN_EXISTS`` and ``ACCOUNT_CHANGED`` and read anything else
+    as granted."""
+    service = AuthService(store, AuthSettings())
+    await service.initialize()
+
+    async def unknown_outcome(*_a: Any, **_k: Any) -> object:
+        return object()
+
+    monkeypatch.setattr(store, "grant_first_admin_unless_admin_exists", unknown_outcome)
+    with (
+        caplog.at_level("ERROR", logger="messagefoundry.auth.service"),
+        pytest.raises(FirstAdministratorRefused, match="unexpected outcome"),
+    ):
+        await _provision(service, "site-admin")
+    assert any(r.levelname == "ERROR" for r in caplog.records)
+    assert await _provisioned_rows(store) == []
+    assert await enabled_admins(store) == set()
+
+
 # --- the #3025 fold-in: no Administrator over another run's credential -----------------------------
 
 
