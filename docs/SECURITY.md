@@ -5536,8 +5536,11 @@ a `logs:view` reader when some notice failed.
   nothing bounds how many wait. A task follows a lock, not an attempt, and a lock takes
   `lockout_threshold` failures on its counter, so the count grows with the accounts being locked at
   once rather than with the attempts against them. Under locks on many accounts the
-  tasks wait behind the one-at-a-time read, so mails arrive later, and any still pending at the
-  shutdown bound are cut off, each with one line. A cap would have to drop a notice or run it on
+  tasks wait behind the one-at-a-time read, so mails arrive later, and any still pending when the
+  shutdown drain reaches its own bound are cancelled, each with one line. Where the API lifespan's
+  shutdown budget cuts that drain first (`_app_drain_steps` in `api/app.py`, BACKLOG #3191), a
+  pending task is not cancelled: it runs on, and can meet the closed security notifier or the
+  closing store. A cap would have to drop a notice or run it on
   the request path, which is what the task exists to avoid.
 
 **Client attribution ([ADR 0150](adr/0150-client-address-on-audit-entries.md)).** Every row also
