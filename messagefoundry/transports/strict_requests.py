@@ -106,7 +106,7 @@ import urllib3.poolmanager
 import urllib3.util
 from urllib3.util.ssl_ import resolve_cert_reqs
 
-from messagefoundry.auth.trust_anchors import ENCRYPTION_HEADER_SCOPE, has_encryption_header
+from messagefoundry.auth.trust_anchors import has_encryption_header
 from messagefoundry.config.tls_policy import (
     HopDisposition,
     HopPosture,
@@ -322,7 +322,7 @@ def _narrowed_pool_classes(
             if isinstance(self.ca_cert_data, str) and has_encryption_header(self.ca_cert_data):
                 # Fixed text: it names no part of the CA text it refuses.
                 raise VaultHopRefused(
-                    f"{connector}: the CA text for this hop {ENCRYPTION_HEADER_SCOPE}. Loading "
+                    f"{connector}: the CA text for this hop {_ENCRYPTED_CA_TEXT}. Loading "
                     "an encrypted block can make the TLS library wait for a password; refusing to "
                     "load it (BACKLOG #3090)"
                 )
@@ -697,6 +697,16 @@ def _unverifiable_proxy_leg(connector: str) -> str:
         "would authenticate nobody. Use an https:// Vault address, which tunnels through the "
         "proxy with both TLS legs verified and narrowed; refusing (BACKLOG #300)"
     )
+
+
+#: What the encrypted-CA-text refusal says the check matches. It is
+#: ``trust_anchors.ENCRYPTION_HEADER_SCOPE`` word for word, held equal by
+#: ``tests/test_vault_encrypted_ca_text.py``. A copy, not an import, because a marked refusal may
+#: interpolate only this module's own string literals (``tests/test_vault_hop_refusal_marker.py``).
+_ENCRYPTED_CA_TEXT = (
+    "names an encryption header (Proc-Type or DEK-Info) somewhere after the first -----BEGIN in "
+    "its PEM text, even outside a block, as in a comment"
+)
 
 
 #: The fixed text of the cleartext refusal. It names no part of the address, so a refusal that

@@ -2056,14 +2056,14 @@ def test_a_chain_walk_reason_quotes_the_path() -> None:
 
     _chain, cause = ap.windows_chain("C:\\evil\nFORGED line\x1b[31m.pem", "C:\\", unreadable)
     assert cause is not None and repr("C:\\evil\nFORGED line\x1b[31m.pem") in cause
-    assert "\x1b" not in cause and "\nFORGED" not in cause
+    _no_raw_control(cause)
 
     def a_file(_p: str) -> tuple[str, str | None]:
         return ap.FILE, None
 
     _chain, cause = ap.windows_chain("C:\\evil\nFORGED\x1b\\ca.pem", "C:\\", a_file)
     assert cause is not None and cause.endswith("is not a directory")
-    assert "\x1b" not in cause and "\nFORGED" not in cause
+    _no_raw_control(cause)
 
 
 async def test_the_restart_required_log_quotes_the_path(
@@ -2168,6 +2168,13 @@ class _NoTlsLoad:
         ),
         pytest.param(
             lambda: _real_ca("crl-test-ca")[0] + b"# DEK-Info: noted\n", id="after the last END"
+        ),
+        pytest.param(
+            lambda: (
+                b"# paste the -----BEGIN block below, no Proc-Type: line\n"
+                + _real_ca("crl-test-ca")[0]
+            ),
+            id="comment above the first block that holds a BEGIN",
         ),
     ],
 )

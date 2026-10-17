@@ -261,10 +261,11 @@ _PEM_TRUSTED = b"-----BEGIN TRUSTED CERTIFICATE-----"
 #: The RFC 1421 headers of an encrypted PEM block, lower-cased (BACKLOG #2270, :func:`anchor_cadata`).
 _PEM_ENCRYPTION_HEADERS = ("proc-type:", "dek-info:")
 #: What :func:`has_encryption_header` matches, in the words every refusal built on it uses (BACKLOG
-#: #3105). It names no block on purpose: the check models none.
+#: #3105). It names no block on purpose: the check models none. ``strict_requests`` keeps its own
+#: copy, since its refusals may only use that module's literals, and a test holds the two equal.
 ENCRYPTION_HEADER_SCOPE = (
-    "names an encryption header (Proc-Type or DEK-Info) after its first PEM BEGIN marker, inside a "
-    "block or in a comment between or after the blocks"
+    "names an encryption header (Proc-Type or DEK-Info) somewhere after the first -----BEGIN in "
+    "its PEM text, even outside a block, as in a comment"
 )
 #: The source-location tail CPython appends to an ``ssl.SSLError`` message, dropped from a refusal.
 _SSL_WHERE = re.compile(r"\s*\(_ssl\.c:\d+\)$")
@@ -342,10 +343,13 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     once with ``PEM lib``. So a start or a reload could hang on this file. A CA certificate never
     carries an RFC 1421 encryption header, so ``Proc-Type:`` and ``DEK-Info:`` both refuse, in any
     case, anywhere after the first BEGIN of the text the load would get, and OpenSSL is never
-    handed that text (:func:`has_encryption_header`). That is wider than the hang: an encrypted
-    private-key block beside a certificate loads through ``cadata=``, and refuses here, because a
-    trust anchor has no use for a key, and so does the header name in a comment between two
-    blocks. The same header in a comment above the first block still passes."""
+    handed that text (:func:`has_encryption_header`). That is wider than the hang: a private-key
+    block encrypted in that legacy header format beside a certificate loads through ``cadata=``,
+    and refuses here, and so does the header name in a comment between two blocks or after the
+    last one. A PKCS#8 ``ENCRYPTED PRIVATE KEY`` block has no such header and is not refused. The
+    same header in a comment above the first block still passes, unless that comment itself holds
+    ``-----BEGIN ``. The check reads the text the load would get, so a comment line that is not
+    ASCII, dropped above, is not checked."""
     kept: list[bytes] = []
 
     inside = False
