@@ -1738,13 +1738,15 @@ async def test_a_reload_after_a_ca_swap_says_a_restart_is_needed_every_time(
     preflight = ta.make_settings_anchor_preflight([spec], store, enforcing=True)
     assert preflight is not None
 
-    await preflight()  # the control: an unchanged anchor says nothing
+    assert await preflight() == ()  # the control: an unchanged anchor says nothing
     assert _events(await _rows(store, spec.label), "restart_required") == []
 
     p.write_bytes(rotated)
     caplog.set_level("WARNING", logger=ta.__name__)
-    await preflight()
-    await preflight()  # the second reload: the audited baseline has already moved
+    # Each pass also returns the setting, for the reload's response (BACKLOG #3015).
+    assert await preflight() == (spec.setting,)
+    # The second reload: the audited baseline has already moved.
+    assert await preflight() == (spec.setting,)
     rows = await _rows(store, spec.label)
     assert len(_events(rows, "changed")) == 1  # the trap: the audit chain fires once
     restart = _events(rows, "restart_required")
@@ -1760,7 +1762,7 @@ async def test_a_reload_after_a_ca_swap_says_a_restart_is_needed_every_time(
     assert len(warned) == 2 and spec.setting in warned[0]
 
     p.write_bytes(good)  # rotated back to the bytes in use: nothing left to apply
-    await preflight()
+    assert await preflight() == ()
     assert len(_events(await _rows(store, spec.label), "restart_required")) == 2
 
 
@@ -1806,7 +1808,10 @@ async def test_the_reload_route_says_a_rotated_ad_ca_needs_a_restart(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Through the real managed-app wiring and a real LDAPS authenticator: the swap lands after
-    the authenticator loaded the CA, so two reloads after it both pass and both write the row."""
+    the authenticator loaded the CA, so two reloads after it both pass and both write the row.
+
+    Each response names the setting too (BACKLOG #3015). The controls: a reload before the swap
+    answers an empty list, and a dry run, which skips the check, answers ``None``."""
     import httpx
 
     from messagefoundry.api.app import create_managed_app
@@ -1830,12 +1835,19 @@ async def test_the_reload_route_says_a_rotated_ad_ca_needs_a_restart(
         egress_settings=EgressSettings(deny_by_default=False),
     )
     async with app.router.lifespan_context(app):
-        p.write_bytes(_block(b"rotated"))
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            r = await client.post("/config/reload", json={})
+            assert r.status_code == 200, r.text
+            assert r.json()["restart_required"] == []  # checked, unchanged
+            p.write_bytes(_block(b"rotated"))
             for _ in range(2):
                 r = await client.post("/config/reload", json={})
                 assert r.status_code == 200, r.text
+                assert r.json()["restart_required"] == [spec.setting]
+            r = await client.post("/config/reload", json={"dry_run": True})
+            assert r.status_code == 200, r.text
+            assert r.json()["restart_required"] is None  # not checked
         rows = await _rows(app.state.engine.store, "ad")
     assert len(_events(rows, "restart_required")) == 2
 

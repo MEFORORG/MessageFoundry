@@ -1721,20 +1721,26 @@ async def run_anchor_preflight(
 
 async def _report_restart_required(
     specs: Sequence[AnchorSpec], store: Store, *, seen: Mapping[str, str]
-) -> None:
+) -> tuple[str, ...]:
     """Log and audit each settings anchor whose bytes on disk differ from the bytes its consumer
-    loaded (:func:`loaded_fingerprint`). An anchor no consumer loaded is skipped: a restart would
-    apply nothing there. The dialling settings CAs of module item 10 are always skipped, since
-    their hops load by path and record no fingerprint.
+    loaded (:func:`loaded_fingerprint`), and return those anchors' setting names, in spec order
+    and once each, for the reload's response (BACKLOG #3015). An anchor no consumer loaded is
+    skipped: a restart would apply nothing there. The dialling settings CAs of module item 10 are
+    always skipped, since their hops load by path and record no fingerprint.
+
+    A name is returned whether or not its audit row was written: the row is advisory, and the
+    restart is needed either way.
 
     The compare is never against the audit chain. The last audited fingerprint moves to the new
     bytes at the first reload that sees them, while the consumers still trust the old bytes. A
     compare with it would go quiet from the second reload on (BACKLOG #2185)."""
+    changed: dict[str, None] = {}  # ordered and once each
     for spec in specs:
         in_use = loaded_fingerprint(spec)
         now = seen[spec.label]
         if in_use is None or in_use == now:
             continue
+        changed[spec.setting] = None
         log.warning(
             "%s: the trust anchor %r changed on disk since the engine loaded it (sha256 %s, was "
             "%s). This reload checked the new file but does not apply it. The engine keeps "
@@ -1750,11 +1756,12 @@ async def _report_restart_required(
             # Advisory: the anchors passed, so a lost row does not refuse the reload. The WARNING
             # above and _store_unavailable's both reached the log (BACKLOG #3091).
             continue
+    return tuple(changed)
 
 
 def make_settings_anchor_preflight(
     specs: Sequence[AnchorSpec], store: Store, *, enforcing: bool
-) -> Callable[[], Awaitable[None]] | None:
+) -> Callable[[], Awaitable[tuple[str, ...]]] | None:
     """The engine's ``settings_preflight`` for ``serve``: :func:`run_anchor_preflight` over the
     settings anchors (:func:`collect_anchor_specs`), run by the engine on EVERY real reload. That is
     the direct ``/config/reload`` route, a held reload a second approver releases, a cluster
@@ -1773,20 +1780,22 @@ def make_settings_anchor_preflight(
     **A reload that passes does not apply a changed anchor** (BACKLOG #2185). No reload rebuilds the
     consumers that loaded these files, so each keeps the bytes it read at start. When this
     preflight passes, it warns and audits ``restart_required`` for each anchor whose bytes on disk
-    differ from its consumer's (:func:`loaded_fingerprint`). That repeats on every reload until a
-    restart. The specs are frozen here, pins included, so a reload re-reads the paths and pins the
-    engine started with. The report skips the dialling settings CAs of module item 10."""
+    differ from its consumer's (:func:`loaded_fingerprint`), and returns those anchors' setting
+    names, which the reload's response reports as ``restart_required`` (BACKLOG #3015). That
+    repeats on every reload until a restart. The specs are frozen here, pins included, so a
+    reload re-reads the paths and pins the engine started with. The report skips the dialling
+    settings CAs of module item 10."""
     if not specs:
         return None
     from messagefoundry.config.wiring import WiringError
 
     frozen = tuple(specs)
 
-    async def preflight() -> None:
+    async def preflight() -> tuple[str, ...]:
         try:
             # An unreadable anchor arrives as a TrustAnchorError naming its setting (_preflight_one).
             seen = await run_anchor_preflight(frozen, store, enforcing=enforcing)
-            await _report_restart_required(frozen, store, seen=seen)
+            return await _report_restart_required(frozen, store, seen=seen)
         except TrustAnchorError as exc:
             raise WiringError(f"a settings trust anchor was refused: {exc}") from exc
         except AnchorStoreUnavailable as exc:

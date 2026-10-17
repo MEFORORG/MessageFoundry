@@ -1222,6 +1222,9 @@ def _build_approval_gate(
                 "outbound": len(registry.outbound),
                 "degraded": outcome.applied and bool(failures),
                 "failures": failures,
+                # The settings anchors a restart must apply, as the inline route reports them
+                # (BACKLOG #3015).
+                "restart_required": _restart_required(outcome),
             }
 
         # A cancelled approve records 'interrupted' in the gate (#1562), and this reload goes on to
@@ -1519,6 +1522,13 @@ async def _reload_or_record_interruption(
                 safe_exc(exc),
             )
         raise
+
+
+def _restart_required(outcome: ReloadOutcome) -> list[str] | None:
+    """:attr:`ReloadOutcome.restart_required` as :attr:`ReloadResult.restart_required` reports it:
+    a list, or ``None`` when the reload did not check (BACKLOG #3015)."""
+    names = outcome.restart_required
+    return None if names is None else list(names)
 
 
 async def _reload_and_record(
@@ -5639,6 +5649,7 @@ def create_app(
             dry_run=req.dry_run,
             degraded=outcome.applied and bool(failures),
             failures=failures,
+            restart_required=_restart_required(outcome),
         )
 
     # --- messages ------------------------------------------------------------
