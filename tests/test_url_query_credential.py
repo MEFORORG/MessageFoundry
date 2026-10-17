@@ -651,8 +651,13 @@ def test_the_rebuild_form_still_refuses_and_only_drops_the_warning(
 async def test_a_start_and_an_operator_start_still_warn_once(
     reload_store: MessageStore, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The builds that run with no build check before them keep the warning: the engine start, for
-    an outbound and a FhirLookup, and the operator start of a lane ``auto_start`` left unbuilt."""
+    """The builds that run with no build check before them keep the warning. At least the engine
+    start, for an outbound and a FhirLookup, and the operator start of a lane ``auto_start`` left
+    unbuilt do, and those are the two exercised here; a connection test is another. Some builds in a
+    reload keep it too, so they warn a second time after the reload's build check. At least the
+    start in ``Engine.reload_detail`` when no runner is up yet does, and so does
+    ``_reconcile_schedulers`` when it resumes a calendar-parked lane with no connector. Neither is
+    exercised here."""
     reg = _reload_graph(fhir=True)
     spec = ConnectionSpec(type=ConnectorType.REST, settings={"url": _KEYED.format(v=1)})
     reg.add_outbound(build_outbound_connection("OB_OFF", spec, auto_start=False))

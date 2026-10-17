@@ -1,8 +1,12 @@
 - **A credential in a connection `url`'s query string is a recorded loosening now (ASVS 14.2.1).**
-  Every outbound and `FhirLookup` build logs a WARNING naming the connection and the parameter
-  names, never a value, when the resolved `url` carries a parameter named like a credential (`key`,
-  `sig`, `signature`, or a name ending in `token`, `secret`, `password` and the rest of the engine's
-  credential vocabulary, in snake_case or camelCase). `messagefoundry check` gains an advisory
+  An outbound or `FhirLookup` build logs a WARNING naming the connection and the parameter names,
+  never a value, when the resolved `url` carries a parameter named like a credential (`key`, `sig`,
+  `signature`, or a name ending in `token`, `secret`, `password` and the rest of the engine's
+  credential vocabulary, in snake_case or camelCase). It fires at least once on each build check and
+  on each build at a start or an operator start. A reload's rebuilds skip it, because that reload's
+  build check has already logged it. Some builds in a reload still log it a second time, at least
+  the start in the engine's reload when no runner is up yet, and a reload's scheduler reconcile
+  when it resumes a calendar-parked lane that has no connector. `messagefoundry check` gains an advisory
   `url-query-credential` line, and `security_loosenings()`, and so `GET /security/posture`, gains a
   `url_query_credential` entry. `GET /metadata` and `graph --json` now withhold such a URL whole,
   and any other URL setting that may carry a credential; they used to mask only a userinfo password

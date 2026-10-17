@@ -1526,8 +1526,15 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `bearer_token`, basic auth, or a `headers` table supplied whole by `env()`.
 - **Compensating controls:** keep the URL itself in `env()` so the credential is not in the config
   file, and treat the partner's and the proxy's access logs as holding a secret.
-- **It is never silent:** a WARNING at each construction naming the connection and the parameter
-  names, never a value; a `url-query-credential` line in `messagefoundry check`; and a
+- **It is never silent:** a WARNING naming the connection and the parameter names, never a value.
+  It fires at least once on each build check, which at least `messagefoundry check`, a dry run and a
+  reload run, and on each build at a start, an operator start or a connection test. A reload's
+  rebuild of an outbound or of the `FhirLookup` executor skips it, because that reload's build check
+  has already logged it, so a reload still logs it. Some builds in a reload log it a second time,
+  at least these two: the start in the engine's reload when no runner is up yet, which builds after
+  the build check, and a reload's scheduler reconcile, when it resumes a calendar-parked lane that
+  has no connector. There is also a
+  `url-query-credential` line in `messagefoundry check`, and a
   `url_query_credential` entry in `security_loosenings()`, and so in `GET /security/posture` on a
   running engine. All three walk outbound connections and `FhirLookup` connections, whose names are
   prefixed `fhir_lookup:`. The construction WARNING reads the resolved URL. The `check` line and the registry
