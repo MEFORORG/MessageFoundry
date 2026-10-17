@@ -1282,10 +1282,12 @@ async def _embedded_lifespan(app: FastAPI) -> AsyncIterator[None]:
     """The lifespan :func:`create_app` gives an app built around a caller's engine.
 
     The caller starts and stops the engine. At start, this runs
-    :meth:`ApprovalGate.reconcile_after_restart`, before the app serves an approval. At shutdown it
-    runs the same drains the managed lifespan runs before engine.stop() (:func:`_app_drain_steps`,
-    BACKLOG #3191), so a caller that stops its engine after the app has shut down loses no outcome
-    write, notice or audit row. The lock notices of an auth service the caller passed in are waited
+    :meth:`ApprovalGate.reconcile_after_restart`, before the app serves an approval, except while
+    the claim owner is not known (below). At shutdown it runs the same drains the managed lifespan
+    runs before engine.stop() (:func:`_app_drain_steps`, BACKLOG #3191), so a caller that stops its
+    engine after the app has shut down does not close the store under an outcome write, notice or
+    audit row those drains wait for. Each drain is bounded, and work past its bound can still meet
+    the closed store. The lock notices of an auth service the caller passed in are waited
     for, not closed: the service is the caller's, which closes it with
     :meth:`AuthService.close_background` before it stops its engine. A caller that passes its own
     ``lifespan`` replaces this one and runs these steps itself, with the store open.
@@ -1789,9 +1791,9 @@ async def _reload_and_record(
 
 #: How long a cancel waits for a reload's audit row to land (:func:`_write_through_cancel`). A store
 #: write may have no bound of its own, and engine.stop() awaits a cancelled convergence reload
-#: without one, so a hung write must not hold the shutdown. Inside CANCEL_GRACE_SECONDS, but not
-#: always inside the grace a lifespan hands the drain, which is a share of the shutdown budget
-#: (_app_drain_steps, BACKLOG #3191) and can be shorter than this.
+#: without one, so a hung write must not hold the shutdown. It is not held inside the shutdown
+#: budget's shares (BACKLOG #3191): the drain's grace (_app_drain_steps) can be shorter, and one
+#: convergence reload's wait can spend all of engine.stop()'s _ENGINE_STOP_RESERVE_SECONDS.
 _ROW_CANCEL_WAIT_SECONDS: Final = 3.0
 
 #: Row writes still running after the cancel bound. The event loop keeps only a weak reference to a
@@ -1809,10 +1811,9 @@ async def _write_through_cancel(
     would lose the row with no ERROR line, since a cancel is no ``Exception``. So the write runs as
     its own task, and a cancel waits up to :data:`_ROW_CANCEL_WAIT_SECONDS` for it to land, through
     the uploads module's ``_wait_to_completion``. Past the bound the cancel goes on and the write is
-    left to finish on its own. The grace a lifespan hands the drain is a share of one shutdown
-    budget (:func:`_app_drain_steps`, BACKLOG #3191) and can be shorter than this bound. A write
-    still running when that grace ends can then meet the store engine.stop() closes, and is logged
-    as below.
+    left to finish on its own. At shutdown the drain can stop waiting first
+    (:data:`_ROW_CANCEL_WAIT_SECONDS` says why), so a write still running then can meet the store
+    engine.stop() closes, and is logged as below.
 
     Not :meth:`ApprovalGate._shielded`'s shape, which re-raises at once and leaves the gate's own
     drain to wait for the write. Nothing would drain this one once the reload's task has ended. A

@@ -602,6 +602,28 @@ async def test_a_quota_refusal_adds_no_clause_when_nothing_hidden_counts(tmp_pat
     assert "are not listed: 2, holding 7 bytes" in str(shard)
 
 
+@_BREAKS
+async def test_an_unsealable_upload_is_billed_only_to_the_uploader_it_names(
+    tmp_path: Path, break_body: Callable[[Path], None]
+) -> None:
+    """The one quota walk (BACKLOG #3184) collects every uploader's never-sealable uploads together,
+    so the per-uploader filter is what keeps uploader A's 409 from billing, and naming the count of,
+    uploader B's hidden uploads (BACKLOG #3183)."""
+    root = tmp_path / "uploads"
+    await _unsealable_upload(root, break_body)  # held by u-op
+    store = UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20, max_files_per_user=1)
+    mine = await store.save(
+        data=_ADT.encode(), filename="o.hl7", uploader="other", uploader_id="u-other"
+    )
+
+    assert store._observed_sync("u-other") == (1, mine.size, 0, 0)
+    with pytest.raises(UploadQuotaError) as refused:
+        await store.save(
+            data=_ADT.encode(), filename="p.hl7", uploader="other", uploader_id="u-other"
+        )
+    assert "not listed" not in str(refused.value)
+
+
 async def test_an_upload_refusal_offers_rotate_key_and_promises_nothing(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
