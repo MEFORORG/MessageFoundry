@@ -609,8 +609,7 @@ async def test_a_logout_raced_by_a_rotation_does_not_audit_a_revoke(
     ended = rotated is None or await service.identity_for_token(rotated, activity=False) is None
     outcomes = [
         json.loads(str(row["detail"] or "{}")).get("outcome")
-        for row in await store.list_audit()
-        if row["action"] == "auth.logout"
+        for row in await store.list_audit(action="auth.logout")
     ]
     assert outcomes == ["revoked" if ended else "nothing_to_revoke"], (
         "the auth.logout row disagrees with whether the session ended"

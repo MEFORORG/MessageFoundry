@@ -97,15 +97,46 @@ async def _live(service: AuthService, token: str) -> bool:
     return await service.identity_for_token(token, activity=False) is not None
 
 
-async def _superseded(store: MessageStore) -> list[dict[str, object]]:
-    """Each ``superseded`` row as its detail plus the row's ``actor``."""
+async def _superseded(store: MessageStore, scope: str = "superseded") -> list[dict[str, object]]:
+    """Each ``auth.session_revoked`` row of ``scope`` as its detail plus the row's ``actor``."""
     out: list[dict[str, object]] = []
-    for row in await store.list_audit():
-        if row["action"] == "auth.session_revoked" and row["detail"]:
+    for row in await store.list_audit(action="auth.session_revoked"):
+        if row["detail"]:
             detail = json.loads(str(row["detail"]))
-            if detail.get("scope") == "superseded":
+            if detail.get("scope") == scope:
                 out.append({**detail, "actor": row["actor"]})
     return out
+
+
+def _rotate_after_first_call(
+    monkeypatch: pytest.MonkeyPatch,
+    store: MessageStore,
+    service: AuthService,
+    token: str,
+    names: tuple[str, ...] = ("get_session", "supersede_session"),
+) -> list[str | None]:
+    """Rotate ``token``'s session right after the FIRST of ``names`` that names its hash.
+
+    Returns a list that holds the rotated token (``None`` if the rotation failed closed) once the
+    injection has fired, and stays empty if it never did."""
+    token_hash = hash_token(token)
+    rotations: list[str | None] = []
+
+    def _inject(name: str) -> None:
+        real = getattr(store, name)
+
+        async def _then_rotate(*args: object, **kwargs: object) -> object:
+            result = await real(*args, **kwargs)
+            if args and args[0] == token_hash and not rotations:
+                rotations.append(None)  # claim the one injection before the rotation re-enters
+                rotations[0] = await service._rotate_session_token(token)
+            return result
+
+        monkeypatch.setattr(store, name, _then_rotate)
+
+    for name in names:
+        _inject(name)
+    return rotations
 
 
 async def test_a_sign_in_ends_only_the_presented_session_and_audits_it(
@@ -212,23 +243,7 @@ async def test_a_rotation_racing_the_supersession_cannot_keep_the_session_live(
     # revoke, or the gap is back.
     service = await _service(store)
     prior = await _token(service)
-    prior_hash = hash_token(prior)
-    rotations: list[str | None] = []
-
-    def _inject(name: str) -> None:
-        real = getattr(store, name)
-
-        async def _then_rotate(*args: object, **kwargs: object) -> object:
-            result = await real(*args, **kwargs)
-            if args and args[0] == prior_hash and not rotations:
-                rotations.append(None)  # claim the one injection before the rotation re-enters
-                rotations[0] = await service._rotate_session_token(prior)
-            return result
-
-        monkeypatch.setattr(store, name, _then_rotate)
-
-    for name in ("get_session", "supersede_session"):
-        _inject(name)
+    rotations = _rotate_after_first_call(monkeypatch, store, service, prior)
     new = await _token(service, supersedes=prior)
 
     assert rotations, "the injection never fired, so this measured nothing"
@@ -292,18 +307,16 @@ async def test_a_session_live_when_the_revoke_began_is_audited_though_it_lapsed_
     real_supersede = store.supersede_session
     real_time = time.time
     clock = {"offset": 30 * 60 - 2.0}  # the prior session has 2 seconds of idle time left
-    steps: list[float] = []
 
     async def _slow(token_hash: str, *, now: float) -> object:
         if token_hash == prior_hash:
             clock["offset"] += 4.0  # the call returns 2 seconds past the idle limit
-            steps.append(now)
         return await real_supersede(token_hash, now=now)
 
     monkeypatch.setattr(time, "time", lambda: real_time() + clock["offset"])
     monkeypatch.setattr(store, "supersede_session", _slow)
     await _token(service, supersedes=prior)
-    assert steps, "the clock never stepped inside the supersession, so this measured nothing"
+    assert clock["offset"] > 30 * 60, "the clock never stepped inside the supersession"
     assert not await _live(service, prior)
     assert await _superseded(store) == [
         {"scope": "superseded", "session": prior_hash[:12], "actor": "op"}
@@ -320,8 +333,7 @@ async def test_a_logout_records_whether_it_ended_a_session(store: MessageStore) 
     assert not await _live(service, token)
     outcomes = [
         json.loads(str(row["detail"] or "{}")).get("outcome")
-        for row in await store.list_audit()
-        if row["action"] == "auth.logout"
+        for row in await store.list_audit(action="auth.logout")
     ]
     assert sorted(map(str, outcomes)) == ["nothing_to_revoke", "revoked"]
 
@@ -341,35 +353,16 @@ async def test_a_rotation_racing_a_self_revoke_is_not_reported_as_a_revoke(
     target_hash = hash_token(target)
     caller = await service.identity_for_token(await _token(service), activity=False)
     assert caller is not None
-    rotations: list[str | None] = []
-
-    def _inject(name: str) -> None:
-        real = getattr(store, name)
-
-        async def _then_rotate(*args: object, **kwargs: object) -> object:
-            result = await real(*args, **kwargs)
-            if args and args[0] == target_hash and not rotations:
-                rotations.append(None)  # claim the one injection before the rotation re-enters
-                rotations[0] = await service._rotate_session_token(target)
-            return result
-
-        monkeypatch.setattr(store, name, _then_rotate)
-
-    for name in ("get_session", "supersede_session"):
-        _inject(name)
+    rotations = _rotate_after_first_call(monkeypatch, store, service, target)
     revoked = await service.revoke_own_session(caller, target_hash, actor="op")
 
     assert rotations, "the injection never fired, so this measured nothing"
     rotated = rotations[0]
     ended = rotated is None or not await _live(service, rotated)
     assert revoked is ended, "revoke_own_session reported a revoke that did not happen"
-    self_rows = [
-        row
-        for row in await store.list_audit()
-        if row["action"] == "auth.session_revoked"
-        and json.loads(str(row["detail"])).get("scope") == "self"
-    ]
-    assert len(self_rows) == (1 if ended else 0), "the audit row disagrees with what happened"
+    assert len(await _superseded(store, "self")) == int(ended), (
+        "the audit row disagrees with what happened"
+    )
 
 
 async def test_a_failed_sign_in_ends_nothing(store: MessageStore) -> None:
