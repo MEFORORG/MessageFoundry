@@ -603,26 +603,80 @@ def test_the_refusal_log_defaults_match_the_dicom_server() -> None:
 # --- Stopping, and the slot accounting -------------------------------------------------------------
 
 
+class _PeerWriter:
+    """The one writer method admission reads, for a peer at ``192.0.2.7``."""
+
+    def get_extra_info(self, name: str, default: object = None) -> object:
+        return ("192.0.2.7", 4000) if name == "peername" else default
+
+
 def test_admission_refuses_while_stopping_and_releases_what_it_admits() -> None:
     gate = ListenerAdmission(
         transport="TCP", max_connections=2, max_connections_per_host=1, source_ip_allowlist=None
     )
-
-    class _W:
-        def get_extra_info(self, name: str, default: object = None) -> object:
-            return ("192.0.2.7", 4000) if name == "peername" else default
-
-    w: Any = _W()
+    w: Any = _PeerWriter()
     assert gate.check(w, "192.0.2.7") is None
-    gate.admit("192.0.2.7")
+    epoch = gate.admit("192.0.2.7")
     refusal = gate.check(w, "192.0.2.7")
     assert refusal is not None and refusal.reason == "max_connections_per_host"
-    gate.release("192.0.2.7")
+    gate.release("192.0.2.7", epoch)
     assert gate.active == 0 and gate.per_host == {}
     assert gate.host_capacity_warned == set()
     gate.stopping = True
     refusal = gate.check(w, "192.0.2.8")
     assert refusal is not None and refusal.kind is None, "a stop refusal emits no event"
+
+
+def test_a_release_from_before_a_restart_leaves_the_restarted_count_alone() -> None:
+    """vault BACKLOG #2939: a connection that outlives its listener's stop() and releases after the
+    restart has re-admitted its host must not take a slot from the new count. Without the epoch, the
+    straggler's release would drop the host to one below the cap and let a third connection in."""
+    host = "192.0.2.7"
+    w: Any = _PeerWriter()
+    gate = ListenerAdmission(
+        transport="TCP", max_connections=10, max_connections_per_host=2, source_ip_allowlist=None
+    )
+    straggler = gate.admit(host)
+    gate.stopping = True  # stop() begins; the straggler's task outlives it
+    gate.reset()
+    gate.stopping = False  # the same instance restarts
+    assert gate.check(w, host) is None
+    current = gate.admit(host)
+    assert gate.check(w, host) is None
+    gate.admit(host)
+    refused = gate.check(w, host)
+    assert refused is not None and refused.reason == "max_connections_per_host"
+    assert host in gate.host_capacity_warned
+    gate.release(host, straggler)
+    assert gate.per_host == {host: 2}, "a pre-restart release took a slot from the restarted run"
+    refused = gate.check(w, host)
+    assert refused is not None and refused.reason == "max_connections_per_host"
+    assert host in gate.host_capacity_warned, "the warned set belongs to the restarted run too"
+    # `active` counts sockets, and the straggler's was open until now, whichever run admitted it.
+    assert gate.active == 2
+    # CONTROL: a release from the current run still gives its slot back.
+    gate.release(host, current)
+    assert gate.per_host == {host: 1}
+    assert gate.check(w, host) is None
+
+
+def test_a_release_still_counts_when_a_late_stop_skipped_the_reset() -> None:
+    """The epoch advances only when reset() really clears the tables. A stop() that finishes after
+    the restart skips its reset, so the tables still hold the earlier connection's slot, and its
+    release must give that slot back, or the host would stay one short of its cap for good."""
+    host = "192.0.2.7"
+    gate = ListenerAdmission(
+        transport="TCP", max_connections=None, max_connections_per_host=2, source_ip_allowlist=None
+    )
+    earlier = gate.admit(host)
+    gate.stopping = True
+    gate.stopping = False  # restarted before the stop() reached its reset
+    gate.reset()  # the late stop(): a no-op now
+    gate.admit(host)
+    assert gate.per_host == {host: 2}
+    gate.release(host, earlier)
+    assert gate.per_host == {host: 1}
+    assert gate.active == 1
 
 
 @pytest.mark.parametrize("kind", ["tcp", "x12", "http"])

@@ -1078,7 +1078,7 @@ class HttpSource(SourceConnector):
                     ),
                 )
                 return  # pre-ingress refusal — nothing accepted, so nothing to count
-            self._admission.admit(peer_host)
+            epoch = self._admission.admit(peer_host)
             established = True  # set with the admit, so the finally below always releases it
             await self._emit_event("established", peer_host=peer_host)
             failed = await self._serve_one(reader, writer, peer_host=peer_host)
@@ -1094,7 +1094,7 @@ class HttpSource(SourceConnector):
             await self._write_safely(writer, build_response(500, '{"error":"internal error"}'))
         finally:
             if established:
-                self._admission.release(peer_host)
+                self._admission.release(peer_host, epoch)
             self._clients.discard(writer)
             if task is not None:
                 self._client_tasks.discard(task)
