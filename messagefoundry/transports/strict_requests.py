@@ -106,7 +106,7 @@ import urllib3.poolmanager
 import urllib3.util
 from urllib3.util.ssl_ import resolve_cert_reqs
 
-from messagefoundry.auth.trust_anchors import _has_encryption_header
+from messagefoundry.auth.trust_anchors import has_encryption_header
 from messagefoundry.config.tls_policy import (
     HopDisposition,
     HopPosture,
@@ -282,7 +282,7 @@ def _narrowed_pool_classes(
             an ``https://`` proxy. A ``Proc-Type: 4,ENCRYPTED`` block in that text sends OpenSSL to
             a password prompt. Measured: that call shape wrote the prompt, and was still waiting
             when its process was killed. So the text first goes through the check ``anchor_cadata``
-            uses, ``trust_anchors._has_encryption_header``, and a flagged text is refused. ``bytes``
+            uses, ``trust_anchors.has_encryption_header``, and a flagged text is refused. ``bytes``
             are DER, which has no PEM header: measured, the same text as ``bytes`` refused at once.
             Nothing the engine ships sets ``ca_cert_data`` today, since requests and hvac never pass
             it, so this guards a later caller.
@@ -319,7 +319,7 @@ def _narrowed_pool_classes(
             set, and requests' ``REQUESTS_CA_BUNDLE`` or ``CURL_CA_BUNDLE``. requests passes a
             directory on as ``ca_cert_dir``. A refusal here would break a hop that works and stop
             nothing that was seen to wait, so the directory is loaded as before."""
-            if isinstance(self.ca_cert_data, str) and _has_encryption_header(self.ca_cert_data):
+            if isinstance(self.ca_cert_data, str) and has_encryption_header(self.ca_cert_data):
                 # Fixed text: it names no part of the CA text it refuses.
                 raise VaultHopRefused(
                     f"{connector}: the CA text for this hop holds a PEM block with an encryption "

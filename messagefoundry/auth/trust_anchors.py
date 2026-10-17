@@ -264,7 +264,7 @@ _PEM_ENCRYPTION_HEADERS = ("proc-type:", "dek-info:")
 _SSL_WHERE = re.compile(r"\s*\(_ssl\.c:\d+\)$")
 
 
-def _has_encryption_header(text: str) -> bool:
+def has_encryption_header(text: str) -> bool:
     """Whether an RFC 1421 encryption header name appears anywhere after the first ``-----BEGIN ``
     in ``text``, the exact text the TLS load is handed (BACKLOG #2270).
 
@@ -335,7 +335,7 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     once with ``PEM lib``. So a start or a reload could hang on this file. A CA certificate never
     carries an RFC 1421 encryption header, so ``Proc-Type:`` and ``DEK-Info:`` both refuse, in any
     case, anywhere after the first BEGIN of the text the load would get, and OpenSSL is never
-    handed that text (:func:`_has_encryption_header`). That is wider than the hang: an encrypted
+    handed that text (:func:`has_encryption_header`). That is wider than the hang: an encrypted
     private-key block beside a certificate loads through ``cadata=``, and refuses here, because a
     trust anchor has no use for a key, and so does the header name in a comment between two
     blocks. The same header in a comment above the first block still passes."""
@@ -374,7 +374,7 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
             f"{spec.setting}: the trust anchor {spec.path!r} has a non-ASCII byte inside a PEM "
             "block, so it is not a readable certificate"
         ) from exc
-    if _has_encryption_header(text):
+    if has_encryption_header(text):
         raise TrustAnchorError(
             f"{spec.setting}: the trust anchor {spec.path!r} holds a PEM block with an encryption "
             "header (Proc-Type or DEK-Info), such as an encrypted certificate or private key. A "
