@@ -2425,10 +2425,12 @@ with no page.
   `account_created` notice.
 - **A directory grant.** An account can get Administrator because the *directory* added it to a
   group already mapped to Administrator. The engine sees that grant in one of the two places below,
-  whichever comes first. Either one raises `administrator_granted`, unless a sign-in that sees it
-  first fails with a server error after the role write; the retry then gains nothing. An account
-  that never signs in again and holds no live session raises nothing. So watch membership of the
-  mapped group in the directory itself.
+  whichever comes first. Either one raises `administrator_granted`, but at least these cases raise
+  none. A sign-in that sees it first and fails with a server error after the role write loses it;
+  the retry then gains nothing. A reconciler pass the mass-revoke breaker aborts writes no roles.
+  An account that never signs in again raises nothing when no pass reaches it: it holds no live
+  session, or `[auth].ad_session_recheck_seconds` is 0. So watch membership of the mapped group in
+  the directory itself.
   **CORRECTED 2026-10-01:** this read "raises no alert. The engine never sees that grant."
   **CORRECTED 2026-10-06:** this read "raises no `administrator_granted` alert", and the sign-in
   case below read "It raises no alert." Vault BACKLOG #2610 added the sign-in alert.
@@ -4118,8 +4120,8 @@ writes no roles, and it strikes and revokes as an absent account does, with the 
 0195 hold. It is never asked, so it is no part of an outage either: a pass whose every lookup fails
 still audits `auth.ad_reconcile_skipped`, and that row's `asked` count leaves it out. Such a pass,
 and one whose every lookup was referred, still strikes the row, because its answer never came from
-the directory (BACKLOG #3170). Neither pass revokes it: that waits for the next pass that is not
-aborted. A referral's `auth.ad_reconcile_referred` row and alert count only
+the directory (BACKLOG #3170). Neither pass revokes it: only a pass that is not aborted can, once
+the row's strikes reach the threshold and the row is in that pass's probe budget. A referral's `auth.ad_reconcile_referred` row and alert count only
 the lookups sent too. Its revocation does count toward the mass-revoke breaker below. Such a
 row cannot take a federated binding: the bind refuses it, so every binding the bind has made since
 BACKLOG #1143 slice C sits on a row probed by its id (ADR 0184 AC-5). A binding already on an id-less
@@ -4134,7 +4136,8 @@ Removing the binding (`DELETE /users/{user_id}/federated-identity`) returns the 
 The pass has these safety properties, because the lookup still returns one indistinguishable "not
 found" for *deleted*, *moved out of the search base* and *the search base was never right*:
 
-- **Fail-OPEN.** An unreachable domain controller revokes **nothing** and does not even accrue a strike.
+- **Fail-OPEN.** An unreachable domain controller revokes **nothing**, and an account the pass asked
+  about accrues no strike. An id-less row, never asked, is still struck (BACKLOG #3170).
   A fail-closed re-check would turn a directory blip into a total console outage during exactly the
   incident when operators need the console.
 - **Two strikes** (`ad_session_recheck_strikes`, default 2) before any revocation.
@@ -4192,7 +4195,7 @@ refers on every pass. Read as an outage, it would stop revocation on a first dep
 page.
 
 The two bases fail differently. A referring user search base refers every probe that searches,
-so the pass judges nothing and revokes nothing, like an outage, but it still pages. A referring
+so the pass judges no account it asked about and revokes nothing, like an outage, but it still pages. A referring
 group search base
 refers only the accounts the user search found enabled. Disables and deletions still revoke, but a
 role or channel-scope change in the directory does not reach those accounts' sessions while it

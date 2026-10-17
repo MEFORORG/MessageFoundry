@@ -33,7 +33,8 @@ Four safety properties are built in, in order of importance:
 A referral is not an outage, and not a reason to stop the pass either (BACKLOG #2538). A
 :attr:`ProbeOutcome.REFERRED` account is left unjudged, like an unreachable one, and every other
 probe in the pass is judged as usual. Unlike an outage, a referral alerts. A pass whose only answers are
-referrals and failures aborts as ``directory_referral``, which judges nothing and alerts.
+referrals and failures aborts as ``directory_referral``, which judges no account it asked about
+and alerts. Such a pass, like an outage, still strikes an UNKEYED row (BACKLOG #3170).
 
 The pass also re-diffs channel scope (ADR 0198, BACKLOG #1957). It revokes when the directory would
 withdraw or narrow a principal's scope, and it never writes the scope: the next login does, through
@@ -258,7 +259,8 @@ class ReconcilePlan:
     def judged_nothing(self) -> bool:
         """True when the pass aborted before judging any account: an outage, or a pass of referrals
         and failures only. Such a pass leaves the hold's state, its message and every clear alone,
-        because it learned nothing about the accounts."""
+        because it learned nothing about the accounts it asked about. It still strikes an UNKEYED
+        row, which was judged without the directory (BACKLOG #3170)."""
         return self.directory_outage or self.directory_referral
 
     @property
