@@ -159,3 +159,73 @@ def test_prefix_match_reports_the_most_alive_candidate(config_root: Path) -> Non
     write_session(config_root, pid=never_live_pid(), session_id="7777abcd-8888")
     write_session(config_root, pid=os.getpid(), session_id="7777efgh-9999")
     assert liveness(config_root, "7777")["State"] == "LIVE"
+
+
+# --------------------------------------------------------------------------------------------------
+# Test-ScheduledTaskSession: the registry cannot tell a scheduled-task run from a person's session,
+# so the function reads the transcript's first line instead.
+# --------------------------------------------------------------------------------------------------
+
+SCHEDULED_FIRST_LINE = {
+    "type": "queue-operation",
+    "operation": "enqueue",
+    "content": '<scheduled-task name="board-refresh" file="x/SKILL.md">\nThis is an automated run.',
+}
+PERSON_FIRST_LINE = {"type": "queue-operation", "operation": "enqueue", "content": "/seat Lander"}
+
+
+def write_transcript(
+    config_root: Path, project: str, session_id: str, first: dict[str, Any]
+) -> None:
+    d = config_root / "projects" / project
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{session_id}.jsonl").write_text(json.dumps(first) + "\n{}\n", encoding="utf-8")
+
+
+def scheduled(config_root: Path, session_id: str) -> bool:
+    script = (
+        f". '{REGISTRY}'; "
+        f"if (Test-ScheduledTaskSession -Root '{config_root}' -SessionId '{session_id}') "
+        "{ 'YES' } else { 'NO' }"
+    )
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout.strip() == "YES"
+
+
+def test_a_scheduled_run_is_recognised_from_its_transcript(config_root: Path) -> None:
+    # A project directory name that encodes no particular cwd: the lookup must not depend on one.
+    write_transcript(config_root, "c--anywhere", "aaaaaaaa-1111", SCHEDULED_FIRST_LINE)
+    assert scheduled(config_root, "aaaaaaaa-1111") is True
+
+
+def test_a_persons_session_is_not_scheduled(config_root: Path) -> None:
+    write_transcript(config_root, "D--repo", "bbbbbbbb-1111", PERSON_FIRST_LINE)
+    assert scheduled(config_root, "bbbbbbbb-1111") is False
+
+
+def test_a_missing_or_broken_transcript_is_not_scheduled(config_root: Path) -> None:
+    """Fails toward 'a person's session', which is what every caller assumed before."""
+    assert scheduled(config_root, "cccccccc-1111") is False
+    d = config_root / "projects" / "D--repo"
+    d.mkdir(parents=True)
+    (d / "dddddddd-1111.jsonl").write_text("not json\n", encoding="utf-8")
+    assert scheduled(config_root, "dddddddd-1111") is False
+
+
+def test_a_hostile_session_id_is_refused(config_root: Path) -> None:
+    write_transcript(config_root, "D--repo", "eeeeeeee-1111", SCHEDULED_FIRST_LINE)
+    assert scheduled(config_root, r"..\D--repo\eeeeeeee-1111") is False
+
+
+def test_a_scheduled_prompt_written_as_a_user_record_is_recognised(config_root: Path) -> None:
+    """A runner that skips the queue entry must not silently turn the flag off."""
+    first = {"type": "user", "message": {"role": "user", "content": '<scheduled-task name="t">'}}
+    write_transcript(config_root, "D--repo", "ffffffff-1111", first)
+    assert scheduled(config_root, "ffffffff-1111") is True

@@ -69,10 +69,14 @@ FEDERATED_IDENTITY_UNBOUND = (
 FIRST_ADMINISTRATOR_TAKEOVER = "first_administrator_takeover"
 ACCOUNT_DISABLED = "account_disabled"  # 6.3.7 — an admin disabled the account
 # 6.3.7 -- the directory session reconciler ended the account's sessions for a reason that is NOT a
-# read disabled bit: the probe could not match the account (``directory_absent``: not found, or its
-# stored id did not match or could not be parsed), or its ``userAccountControl`` could not be read
-# (vault BACKLOG #2140). ACCOUNT_DISABLED would tell the holder an administrator disabled the account,
-# which nothing established. Which reason sends which kind is decided once, in
+# read disabled bit. At least these send it: the probe could not match the account to exactly one
+# entry (``directory_absent``: not found, more than one entry, or its stored id did not match or
+# could not be parsed), its ``userAccountControl`` could not be read (``directory_undetermined``;
+# vault BACKLOG #2140), or the row carries no ``directory_object_id``, so the pass never asked the
+# directory (``directory_object_id_missing``; BACKLOG #2434). Any whole-account reason added later
+# sends it too, so the notice's one wording must be checked against that one as well (vault BACKLOG
+# #3171). ACCOUNT_DISABLED would tell the holder an administrator disabled the account, which
+# nothing established. Which reason sends which kind is decided once, in
 # ``AuthService._apply_reconcile_revocation``.
 DIRECTORY_SESSIONS_ENDED = "directory_sessions_ended"
 MFA_ENABLED = "mfa_enabled"  # 6.3.7 — a second factor (TOTP) was enrolled on the account

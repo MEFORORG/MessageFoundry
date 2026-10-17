@@ -52,9 +52,9 @@ interpreter it starts.
   means a `PYTHONPATH` set with `-e` or in an orchestrator's manifest cannot decide what the
   engine imports, and the working directory, which is the writable store volume, is off the
   import path.
-- **`-u -B`** give unbuffered output and no bytecode files. The image also sets
-  `PYTHONUNBUFFERED` and `PYTHONDONTWRITEBYTECODE`; those now serve only the Python children the
-  engine starts, because the engine itself ignores them.
+- **`-u -B`** give unbuffered output and no bytecode files. The engine's Python children repeat
+  `-I` and `-B`, and take `-u` because the image sets `PYTHONUNBUFFERED`. The image's
+  `PYTHONDONTWRITEBYTECODE` reaches no engine process; it stays for a shell started in the image.
 - **The virtual environment is owned by root, and the engine runs as uid 10001.** So the engine's
   own account cannot add a file to `site-packages`, even where the root file system is left
   writable. Code planted there would run at every interpreter start. Uid 10001 owns only

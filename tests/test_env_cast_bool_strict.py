@@ -98,9 +98,9 @@ def test_a_cast_bool_default_is_read_strictly(default: object, want: bool) -> No
 
 
 def test_a_cast_bool_default_of_none_stays_none() -> None:
-    # Kept as it was before #3138: None is a deliberate "unset". A connector reads a None flag as
-    # False, which on verify_tls is the insecure side. That is a separate question, not settled here.
-    # The DICOMweb unread-CA check below does catch it.
+    # Kept as it was before #3138: None is a deliberate "unset". "flag" is no factory's setting, so
+    # it stays None. On a real bool setting a None default now resolves to that setting's own
+    # default (vault BACKLOG #3234), because at least dicom.py reads a flag with plain bool().
     assert resolve_env_settings({"flag": env("flag", default=None, cast=bool)}, {})["flag"] is None
 
 
@@ -186,8 +186,9 @@ def test_an_unknown_spelling_is_refused_end_to_end_naming_the_key(tmp_path: Path
 
 # --- a DICOMweb verify_tls that RESOLVES falsy meets the unread-CA refusal its literal meets --------
 # The factory tests the literal; an env() reference is truthy there, so it passes. Now that "false"
-# reads False, the resolved value can be the one it refuses. The test reads the value as the
-# connector does, so an uncast "" is refused too. A None default is not: since vault BACKLOG #3230
+# reads False, the resolved value can be the one it refuses. Since vault BACKLOG #3234 an uncast
+# "false" reads False too, and an uncast "" is refused earlier, as an unreadable boolean (see
+# tests/test_env_uncast_bool_setting.py). A None default is not refused: since vault BACKLOG #3230
 # an explicit None means the default, which is on, so the CA is read and the connection builds.
 
 _VERIFY_MODULE = """
@@ -212,7 +213,7 @@ def _verify_dest(tmp_path: Path, name: str, values: dict[str, str]) -> Any:
     [
         ("OB_DW", {"dw_verify": "false"}),
         ("OB_DW", {"dw_verify": "0"}),
-        ("OB_DW_RAW", {"dw_raw": ""}),
+        ("OB_DW_RAW", {"dw_raw": "false"}),
     ],
 )
 def test_a_dicomweb_verify_tls_that_resolves_falsy_is_refused(
@@ -226,10 +227,10 @@ def test_a_dicomweb_verify_tls_that_resolves_none_passes_wiring_with_verificatio
     tmp_path: Path,
 ) -> None:
     # This case was refused at wiring until vault BACKLOG #3230, when None meant off. It now
-    # means the default, on, so the unread-CA refusal does not fire, and the connector's own read
-    # (bool_setting, as dicomweb.py calls it) turns verification on. No connector is built here.
+    # means the default, on, so the unread-CA refusal does not fire. Since vault BACKLOG #3234 the
+    # resolve step itself turns the None into that default. No connector is built here.
     dest = _verify_dest(tmp_path, "OB_DW_NONE", {})
-    assert dest.settings["verify_tls"] is None
+    assert dest.settings["verify_tls"] is True
     assert bool_setting(dest.settings, "verify_tls", default=True) is True
 
 
