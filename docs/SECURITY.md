@@ -4143,10 +4143,11 @@ writes no roles, and it strikes and revokes as an absent account does, with the 
 `directory_object_id_missing`. It is not a `userAccountControl` answer, so it never moves the ADR
 0195 hold. It is never asked, so it is no part of an outage either: a pass whose every lookup fails
 still audits `auth.ad_reconcile_skipped`, and that row's `asked` count leaves it out. Such a pass,
-and one that aborts because its lookups were only referred, faulted or failed, still strikes the
-row, because its answer never came from the directory (BACKLOG #3170). No such pass revokes it: only a pass that is not aborted can, once
-the row's strikes reach the threshold and the row is in that pass's probe budget. A referral's `auth.ad_reconcile_referred` row and alert count only
-the lookups sent too. Its revocation does count toward the mass-revoke breaker below. Such a
+and one that aborts because its lookups were only referred, refused for the configuration, faulted
+or failed, still strikes the row, because its answer never came from the directory (BACKLOG #3170).
+No such pass revokes it: only a pass that is not aborted can, once the row's strikes reach the
+threshold and the row is in that pass's probe budget. The audit rows and alerts of a referral, a
+configuration refusal and a probe fault count only the lookups sent too. Its revocation does count toward the mass-revoke breaker below. Such a
 row cannot take a federated binding: the bind refuses it, so every binding the bind has made since
 BACKLOG #1143 slice C sits on a row probed by its id (ADR 0184 AC-5). A binding already on an id-less
 row, made before that refusal, is **never probed by name** (BACKLOG #2027). The pass skips the row and
@@ -4158,7 +4159,8 @@ disable or demotion no longer ends that row's sessions within one interval, only
 Removing the binding (`DELETE /users/{user_id}/federated-identity`) returns the row to the pass.
 
 The pass has these safety properties, because the lookup still returns one indistinguishable "not
-found" for *deleted*, *moved out of the search base* and *the search base was never right*:
+found" for *deleted*, *moved out of the search base* and *a search base that exists but was never
+the right one*:
 
 - **Fail-OPEN.** An unreachable domain controller revokes **nothing**, and an account the pass asked
   about accrues no strike. An id-less row, never asked, is still struck (BACKLOG #3170).
@@ -4184,8 +4186,10 @@ found" for *deleted*, *moved out of the search base* and *the search base was ne
   and no floor. **The cost:**
   two genuinely disabled accounts whose attribute the bind account cannot read keep their sessions to
   the absolute cap.
-- **A mass-revoke circuit breaker.** A misconfigured `ad_user_search_base`, an OU reorganisation, or a
-  service account that lost read rights answers "not found" for *every* user. A pass whose revocation
+- **A mass-revoke circuit breaker.** An `ad_user_search_base` that names the wrong OU, or an OU
+  reorganisation that moves the users out of it, answers "not found" for *every* user. A base that
+  was deleted or moved, or that the service account may not read, does not: the search ends with a
+  result code, which is the configuration refusal described below (BACKLOG #3010). A pass whose revocation
   set exceeds **both** `ad_session_revoke_max` (5) **and** `ad_session_revoke_max_fraction` (0.34) of
   the probed population **aborts**: nothing is revoked, nothing is written, the engine logs at ERROR
   and audits `auth.ad_reconcile_aborted`, raises the `ad_reconcile_aborted` alert, and the condition
@@ -4231,14 +4235,30 @@ directory outage (BACKLOG #3100). Each such probe is logged at WARNING by name, 
 estate is still reconciled. A pass with any fault logs one ERROR naming no account and audits
 `auth.ad_reconcile_faulted`. It also raises the `ad_reconcile_aborted` alert with reason
 `probe_fault`, under its own source `directory-reconciler-probe-fault`. If every probe faults or
-fails, the pass judges no account it asked about and revokes nothing, like an outage, but it still
-pages, and it still strikes an id-less row (BACKLOG #3170). A
+fails, at least one a fault, the pass judges no account it asked about and revokes nothing, like an
+outage, but it still pages, and it still strikes an id-less row (BACKLOG #3170). A pass where every
+probe fails and none faults is a plain outage, and pages nobody. A
 connection, timeout or name-lookup error that escapes the directory layer is still read as
 unreachable. **The cost:** while a fault repeats, that account's sessions are never revoked by the
 reconciler, so they run to the absolute cap. That cap is the only bound; the alert makes the gap
 visible and limits nothing. A pass with a fault marks no alert clear. When it resolves is stated once, in
 [CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-two-alerts-resolve-themselves). Step-up
 refuses the account with outcome `probe_fault`.
+
+A search the directory refuses with noSuchObject, invalidDNSyntax or insufficientAccessRights is a
+configuration refusal (BACKLOG #3010). A search base that was deleted or moved, or that the service
+account may not read, answers so for every account on every pass. Before #3010 the engine read that
+as "not found", which struck every account and tripped the breaker on a large enough estate. Nor is
+it read as an outage, which would page nobody. The refused account is left unjudged: no strike, no
+revocation. A pass with any such refusal logs one ERROR naming the code and no account, audits
+`auth.ad_reconcile_misconfigured`, and raises the `ad_reconcile_aborted` alert with reason
+`directory_misconfigured`, under its own source `directory-reconciler-misconfigured`. If every
+probe is refused, faulted or fails, at least one refused and none referred, the pass aborts as
+`directory_misconfigured`: it judges no account it asked about and revokes nothing, but it pages.
+Like the fault's, that alert has no inverse; an operator resolves it. **The cost:** while the
+refusal lasts, the refused accounts' sessions are never revoked by the reconciler, so they run to
+the absolute cap. Other result codes that are not an answer, such as busy or unavailable, are an
+outage. Step-up refuses the account with outcome `misconfigured`.
 
 ### The engine session is independent of the IdP session (ASVS 7.6.1)
 
