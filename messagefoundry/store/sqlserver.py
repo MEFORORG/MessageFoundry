@@ -250,6 +250,7 @@ from messagefoundry.store.store import (
     ad_map_write,
     admin_guard_counts,
     approval_update,
+    audit_active_key_id,
     audit_append_refusal,
     audit_append_secret,
     audit_seal_next,
@@ -11951,7 +11952,7 @@ class SqlServerStore:
             raise RuntimeError("store_salt has no row after an insert-if-absent")
         return str(row["salt"])
 
-    # --- vault_transit AES-GCM bound attestation (BACKLOG #2337) -------------
+    # --- keyed audit evidence (vault BACKLOG #3750 item 33) ----------------------------------
 
     async def newest_keyed_audit_row(
         self, action: str, *, actor: str, after_seq: int
@@ -11967,10 +11968,13 @@ class SqlServerStore:
             action=action,
             actor=actor,
             after_seq=after_seq,
+            active_key_id=audit_active_key_id(self._audit_mac_key, self._audit_mac_fn),
             mac_keys=self._audit_mac_keys,
             mac_fn=self._audit_mac_fn,
         )
         return await settle_newest_keyed_audit_row(check)
+
+    # --- vault_transit AES-GCM bound attestation (BACKLOG #2337) -------------
 
     async def get_transit_bound_attestation(self) -> TransitBoundAttestation | None:
         """See the SQLite twin. Each read here is its own pooled statement, not one snapshot, so an

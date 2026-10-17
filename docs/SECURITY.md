@@ -4108,20 +4108,18 @@ raise the `ad_session_revoked` alert, one per revoked principal, once the pass c
 revocations end no session and change no role. Each still writes its row, with `sessions: 0`
 (BACKLOG #3085, owner ruling 2026-10-16). When the directory says the account is disabled or
 absent, that revocation still alerts and sends its notice, as when the user signed out mid-pass
-(owner ruling 2026-10-17). It is quiet only as a repeat: when another pass already revoked
-the account (owner ruling B258-R7), shown by an `auth.ad_session_revoked` row for the same
-username and reason, numbered after this pass began to list the account's sessions, whose MAC
-**verifies under the audit key**. A row that fails its MAC, a keyless audit chain, or a failed
-read gives no evidence, so the revocation alerts. A writer of the database who holds no audit key
-therefore cannot silence the alert with a forged row (vault BACKLOG #3750 item 33). That is the
-Lander's concern there, met by verifying the evidence rather than, as its wording asked, by
-trusting no row this pass did not write. **Residual:** a holder of the audit key can seal a row
-that verifies, and so can still silence a repeat alert. `AuthService._already_revoked_elsewhere`
-states the rule. Any other revocation that ends nothing and changes no role, such as a scope,
-role, undetermined or unkeyed one, is quiet too. If both reconcilers read the old roles, or both
-read before either writes its row, both still report. If the first reconciler's pass ended before
-it alerted, the second's quiet revocation means that account pages nobody. A quiet revocation
-whose own row is refused alerts instead, with no notice.
+(owner ruling 2026-10-17). It is quiet only as a repeat another pass already made (owner ruling
+B258-R7), and only when that pass's row **verifies under the active audit key**
+(`AuthService._already_revoked_elsewhere` states the rule). Anything else alerts: a keyless audit
+chain, a row that fails its MAC or sits under a retired key, or a failed read. So a database writer
+who holds no audit key cannot silence the alert with a forged row (vault BACKLOG #3750 item 33).
+**Residual:** a holder of the active audit key can seal a row that verifies, and so can a writer
+who deletes the newest audit rows within five minutes of a genuine revocation of the same account.
+Any other revocation that ends nothing and changes no role, such as a scope, role, undetermined or
+unkeyed one, is quiet too. Two reconcilers that both read the old roles, or both read before either
+writes its row, both report. If the first reconciler's pass ended before it alerted, the second's
+quiet revocation means that account pages nobody. A quiet revocation whose own row is refused
+alerts instead, with no notice.
 
 A pass that fails part-way keeps the audit rows for what it already revoked, but raises no alert for
 them. A refused audit write does not end the pass (BACKLOG #3018). That holds for the store errors

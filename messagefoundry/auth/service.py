@@ -40,7 +40,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from functools import cache, partial
 from types import MappingProxyType
-from typing import Any, Final, Literal, TypeVar
+from typing import Any, Final, Literal, NamedTuple, TypeVar
 from uuid import uuid4
 
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
@@ -184,6 +184,19 @@ _FACTOR_CEREMONIES: Final = frozenset(
 
 #: What ``AuthService._apply_reconcile_revocation`` did with one planned revocation (BACKLOG #3085).
 _RevocationApplied = Literal["skipped", "quiet", "reported"]
+
+#: How far, in seconds, a verified repeat-revocation row's ``ts`` may fall before this engine's
+#: clock at the account's watermark and still count (``AuthService._already_revoked_elsewhere``).
+#: It allows clock skew between two engines on one store; it is not a pass length.
+_REVOCATION_EVIDENCE_SKEW_S: Final = 300.0
+
+
+class _AuditWatermark(NamedTuple):
+    """Where one account's repeat-revocation evidence window opens (vault BACKLOG #3750 item 33)."""
+
+    seq: int  #: the newest audit sequence number, read just before the session listing
+    at: float  #: this engine's clock when it read ``seq``
+
 
 #: The revocation reasons that report even when they ended no session (owner ruling 2026-10-17,
 #: BACKLOG #3085). The ruling names "disabled or absent in AD", and these are the two reasons with
@@ -6390,7 +6403,7 @@ class AuthService:
         settings = self._settings
         # Each account's audit watermark, read just before its session listing (owner ruling
         # B258-R7, vault BACKLOG #3750 item 33). See `_already_revoked_elsewhere`.
-        watermarks: dict[str, int | None] = {}
+        watermarks: dict[str, _AuditWatermark | None] = {}
 
         # Candidates: AD-provider users that are not already locally disabled AND still hold at least
         # one live session. Nobody signed in => zero binds. Derived from list_users + list_sessions
@@ -6605,7 +6618,7 @@ class AuthService:
                 self._advance_referral_standing("forfeit")
             # An account with no watermark recorded gets None, which reports.
             outcome = await self._apply_reconcile_revocation(
-                revocation, after_seq=watermarks.get(revocation.user_id)
+                revocation, watermark=watermarks.get(revocation.user_id)
             )
             if outcome != "skipped":
                 applied.append(revocation)
@@ -7526,11 +7539,12 @@ class AuthService:
             defects=AUDIT_WRITE_DEFECTS,
         )
 
-    async def _audit_watermark(self) -> int | None:
-        """The newest audit sequence number the store holds now, for
-        :meth:`_already_revoked_elsewhere`; ``0`` for an empty trail. ``None`` when the store
-        cannot give verified evidence or the read fails, logged at ERROR; ``None`` makes that
-        account's revocation report."""
+    async def _audit_watermark(self) -> _AuditWatermark | None:
+        """Where this account's evidence window opens, for :meth:`_already_revoked_elsewhere`: the
+        newest audit sequence number the store holds now (``0`` for an empty trail) and this
+        engine's clock as it read it. ``None`` makes that account's revocation report. It is
+        ``None`` without a log line when the store offers no verified read, and logged at ERROR
+        when the read fails or gives a number that is not an integer."""
         store = self._store
         if not isinstance(store, KeyedAuditEvidenceStore):
             return None
@@ -7544,38 +7558,55 @@ class AuthService:
                 exc_info=True,
             )
             return None
-        return seq if isinstance(seq, int) and not isinstance(seq, bool) else None
+        if isinstance(seq, bool) or not isinstance(seq, int):
+            _log.error(
+                "directory reconcile: the newest audit sequence number is a %s, not an integer; a "
+                "revocation this read covers reports",
+                type(seq).__name__,
+            )
+            return None
+        return _AuditWatermark(seq, time.time())
 
     async def _already_revoked_elsewhere(
-        self, revocation: reconcile.SessionRevocation, *, after_seq: int | None
+        self, revocation: reconcile.SessionRevocation, *, watermark: _AuditWatermark | None
     ) -> bool:
         """Whether another pass already revoked this account for this reason (owner ruling
         B258-R7, vault BACKLOG #3750 item 33). This is the one statement of the rule.
 
         The evidence is the newest ``auth.ad_session_revoked`` row naming the account's planned
-        username, numbered above ``after_seq``, whose MAC verifies under the audit key of its range
-        (:meth:`~messagefoundry.store.store.KeyedAuditEvidenceStore.newest_keyed_audit_row`), and
-        whose ``reason`` matches. ``after_seq`` is :meth:`_audit_watermark`, read just before this
-        pass listed the account's sessions, so an older row does not count. The sequence number is
-        inside the MAC, so a writer of the table who holds no audit key can neither forge such a
-        row nor renumber an old one above the watermark. Read before this revocation's own row is
-        written, so it does not find that row.
+        username, numbered above ``watermark.seq``, whose MAC verifies under the ACTIVE audit key
+        (:meth:`~messagefoundry.store.store.KeyedAuditEvidenceStore.newest_keyed_audit_row`), whose
+        ``reason`` matches, and whose ``ts`` is no more than
+        :data:`_REVOCATION_EVIDENCE_SKEW_S` before ``watermark.at``. The watermark is read just
+        before this pass lists the account's sessions. The sequence number and ``ts`` are inside
+        the MAC, so a writer of the table who holds no audit key can neither forge such a row nor
+        renumber an old one. The ``ts`` bound is there because that writer can still LOWER the
+        watermark, by deleting the newest rows before the read: an older genuine row, such as one
+        from before the account's latest sign-in, then sits above it, but it is too old to count.
+        Read before this revocation's own row is written, so it does not find that row.
 
-        It errs toward reporting: no watermark, a keyless chain, a store without the verified read,
-        a row that fails its MAC, a newest row with another reason, unreadable detail, or any
-        exception (logged at ERROR) all answer False. So does a race in which both reconcilers
-        read before either writes. **Residual:** a holder of the audit key can seal a row that
-        verifies, and so can still silence a repeat alert."""
-        if after_seq is None:
+        It errs toward reporting: no watermark, a keyless chain, a row under a retired key, a row
+        that fails its MAC, a newest row with another reason or an older ``ts``, unreadable detail,
+        or any exception (logged at ERROR) all answer False. So does a race in which both
+        reconcilers read before either writes, and a junk row newer than the genuine one.
+        **Residual:** a holder of the active audit key can seal a row that verifies, and so can
+        still silence a repeat alert, as can a writer who deletes the newest rows within
+        :data:`_REVOCATION_EVIDENCE_SKEW_S` of a genuine revocation of the same account."""
+        if watermark is None:
             return False
         store = self._store
         if not isinstance(store, KeyedAuditEvidenceStore):
             return False
         try:
             row = await store.newest_keyed_audit_row(
-                "auth.ad_session_revoked", actor=revocation.username, after_seq=after_seq
+                "auth.ad_session_revoked", actor=revocation.username, after_seq=watermark.seq
             )
             if row is None:
+                return False
+            ts = row["ts"]
+            if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+                return False
+            if float(ts) < watermark.at - _REVOCATION_EVIDENCE_SKEW_S:
                 return False
             detail = json.loads(row["detail"] or "{}")
         except Exception as exc:  # any class: fail toward reporting, see the docstring
@@ -7590,7 +7621,7 @@ class AuthService:
         return isinstance(detail, dict) and detail.get("reason") == revocation.reason
 
     async def _apply_reconcile_revocation(
-        self, revocation: reconcile.SessionRevocation, *, after_seq: int | None
+        self, revocation: reconcile.SessionRevocation, *, watermark: _AuditWatermark | None
     ) -> _RevocationApplied:
         """Apply one planned revocation: persist a role re-diff (when that is why), drop the user's
         live sessions, audit, and notify the affected user out-of-band (ASVS 6.3.7). A scope
@@ -7610,7 +7641,7 @@ class AuthService:
         So a disabled or absent account's revocation reports even when it ended nothing, as when
         the user signed out mid-pass, unless :meth:`_already_revoked_elsewhere` finds a verified
         row showing another pass already revoked it (owner ruling B258-R7). That method states the
-        rule; ``after_seq`` is its watermark."""
+        rule."""
         user = await self._load_user(revocation.user_id)
         if revocation.reason == reconcile.SCOPE_CHANGED and (
             user is None or user.channel_scope != revocation.scope_from
@@ -7658,7 +7689,7 @@ class AuthService:
             and not roles_changed
             and (
                 revocation.reason not in _ALWAYS_REPORTED_REASONS
-                or await self._already_revoked_elsewhere(revocation, after_seq=after_seq)
+                or await self._already_revoked_elsewhere(revocation, watermark=watermark)
             )
         )
         # Soft (BACKLOG #3018): the writes above are already applied, so a raise would only cost

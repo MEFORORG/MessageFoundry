@@ -47,7 +47,12 @@ from messagefoundry.auth.notifications import (
     USERNAME_CHANGED,
 )
 from messagefoundry.auth.permissions import Role
-from messagefoundry.auth.service import AuthService, DirectoryObjectIdMissing, _RevocationApplied
+from messagefoundry.auth.service import (
+    AuthService,
+    DirectoryObjectIdMissing,
+    _AuditWatermark,
+    _RevocationApplied,
+)
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import CipherError, generate_key, make_cipher
 from messagefoundry.store.store import (
@@ -3545,10 +3550,10 @@ async def test_the_pass_judges_the_scope_stored_after_its_probes() -> None:
         apply = service._apply_reconcile_revocation
 
         async def spy(
-            revocation: reconcile.SessionRevocation, *, after_seq: int | None
+            revocation: reconcile.SessionRevocation, *, watermark: _AuditWatermark | None
         ) -> _RevocationApplied:
             planned.append(revocation)
-            return await apply(revocation, after_seq=after_seq)
+            return await apply(revocation, watermark=watermark)
 
         service._apply_reconcile_revocation = spy  # type: ignore[method-assign]
         plan = await service.reconcile_directory_sessions()
@@ -3569,12 +3574,12 @@ async def test_a_scope_revocation_is_skipped_when_the_scope_moved_before_it_appl
         apply = service._apply_reconcile_revocation
 
         async def login_then_apply(
-            revocation: reconcile.SessionRevocation, *, after_seq: int | None
+            revocation: reconcile.SessionRevocation, *, watermark: _AuditWatermark | None
         ) -> _RevocationApplied:
             await store.set_user_channel_scope(
                 revocation.user_id, json.dumps(["IB_B"]), source=SCOPE_SOURCE_AD
             )
-            return await apply(revocation, after_seq=after_seq)
+            return await apply(revocation, watermark=watermark)
 
         service._apply_reconcile_revocation = login_then_apply  # type: ignore[method-assign]
         plan = await service.reconcile_directory_sessions()
@@ -3663,7 +3668,7 @@ async def test_each_revocation_reason_sends_its_decided_notice(reason: str) -> N
         revocation = reconcile.SessionRevocation(user.id, user.username, reason=reason, **extra)
         assert (
             await service._apply_reconcile_revocation(
-                revocation, after_seq=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark()
             )
             == "reported"
         )
@@ -3689,7 +3694,7 @@ async def test_an_undecided_whole_account_reason_falls_to_the_neutral_notice() -
         )
         assert (
             await service._apply_reconcile_revocation(
-                revocation, after_seq=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark()
             )
             == "reported"
         )
@@ -3899,7 +3904,7 @@ def _revoked_rows(rows: list[Any]) -> list[dict[str, Any]]:
     return [json.loads(a["detail"]) for a in rows if a["action"] == "auth.ad_session_revoked"]
 
 
-_Planted = Literal["before_pass", "during_listing"]
+_Planted = Literal["before_pass", "before_listing", "during_listing"]
 
 
 async def _absent_pass_with_sessions_gone_first(
@@ -3913,8 +3918,9 @@ async def _absent_pass_with_sessions_gone_first(
 
     With ``other_reconciler_row`` the sessions are ended by a second reconciler, which writes its
     own ``auth.ad_session_revoked`` row first. Without it the user signed out mid-pass.
-    ``planted`` writes one more matching row straight into the store: before the pass starts, or
-    while it lists the account's sessions. ``keyed`` opens a store whose audit chain is
+    ``planted`` writes one more matching row through the store's own writer: before the pass
+    starts, after it loads the accounts but before it lists their sessions, or while it lists
+    them. ``keyed`` opens a store whose audit chain is
     HMAC-keyed. Returns the plan, the revoked rows, the notices and the ``ad_session_revoked``
     alerts."""
     if keyed:
@@ -3951,6 +3957,15 @@ async def _absent_pass_with_sessions_gone_first(
             await store.record_audit(
                 "auth.ad_session_revoked", actor="jdoe", detail=absent_row, now=time.time() - 60
             )
+        elif planted == "before_listing":
+            real_load = service._load_users
+
+            async def row_after_loading() -> Any:
+                loaded = await real_load()
+                await store.record_audit("auth.ad_session_revoked", actor="jdoe", detail=absent_row)
+                return loaded
+
+            monkeypatch.setattr(service, "_load_users", row_after_loading)
         elif planted == "during_listing":
             real_list = store.list_sessions
             written: list[bool] = []
@@ -4012,6 +4027,29 @@ async def test_a_verified_row_from_before_the_listing_does_not_silence_a_keyed_p
     assert len(alerts) == 1
 
 
+@pytest.mark.parametrize(
+    ("planted", "quiet"),
+    [("before_pass", False), ("before_listing", False), ("during_listing", True)],
+)
+async def test_a_keyed_pass_counts_only_a_row_written_after_the_listing_began(
+    monkeypatch: pytest.MonkeyPatch, planted: _Planted, quiet: bool
+) -> None:
+    """Owner ruling B258-R7 on a keyed chain. The watermark is read per account, just before the
+    session listing, so a verified matching row written while the pass lists sessions is a repeat
+    and the revocation is quiet. One written before the pass, or after the pass loaded its accounts
+    but before that listing, is not. A watermark read once per pass, or after the listing, fails
+    one of these placements."""
+    plan, _rows, notices, alerts = await _absent_pass_with_sessions_gone_first(
+        monkeypatch, other_reconciler_row=False, planted=planted, keyed=True
+    )
+    if quiet:
+        assert plan.revocations == () and notices == [] and alerts == []
+    else:
+        assert [r.reason for r in plan.revocations] == ["directory_absent"]
+        assert notices == [DIRECTORY_SESSIONS_ENDED]
+        assert len(alerts) == 1
+
+
 async def test_an_absent_account_that_signs_out_mid_pass_still_alerts_and_is_told(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4031,10 +4069,12 @@ async def test_an_absent_account_that_signs_out_mid_pass_still_alerts_and_is_tol
 async def test_a_foreign_revocation_row_does_not_silence_the_alert(
     monkeypatch: pytest.MonkeyPatch, planted: _Planted
 ) -> None:
-    """Vault BACKLOG #3750 item 33. A matching ``auth.ad_session_revoked`` row this pass did not
-    write, before the pass or while it lists the account's sessions, does not silence the
-    revocation's alert or its notice. The ``during_listing`` placement went quiet under PR 2366's
-    earlier evidence read, which counted such a row as another pass's revocation."""
+    """Vault BACKLOG #3750 item 33, on a KEYLESS chain. A matching ``auth.ad_session_revoked`` row
+    this pass did not write, wherever it lands, does not silence the revocation's alert or its
+    notice, because a keyless row's hash is one anyone who can write the table can recompute. The
+    ``during_listing`` placement went quiet under PR 2366's earlier, unverified evidence read. On
+    a keyed chain the same row is sealed by the store's writer and is a verified repeat; see
+    ``test_a_keyed_pass_counts_only_a_row_written_after_the_listing_began``."""
     plan, rows, notices, alerts = await _absent_pass_with_sessions_gone_first(
         monkeypatch, other_reconciler_row=False, planted=planted
     )
@@ -4064,7 +4104,7 @@ async def test_a_disabled_account_that_signs_out_mid_pass_still_alerts_and_is_to
         )
         assert (
             await service._apply_reconcile_revocation(
-                revocation, after_seq=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark()
             )
             == "reported"
         )
@@ -4088,7 +4128,7 @@ async def test_a_repeat_revocation_on_an_unkeyed_chain_still_reports(reason: str
         revocation = reconcile.SessionRevocation(user.id, user.username, reason=reason)
         for _ in range(2):
             assert (
-                await service._apply_reconcile_revocation(revocation, after_seq=watermark)
+                await service._apply_reconcile_revocation(revocation, watermark=watermark)
                 == "reported"
             )
         assert len(notifier.sent) == 2
@@ -4138,7 +4178,7 @@ async def test_a_forged_revocation_row_does_not_silence_a_repeat_on_a_keyed_chai
         await _forge_revocation_row(store, reason)
         revocation = reconcile.SessionRevocation(user.id, user.username, reason=reason)
         assert (
-            await service._apply_reconcile_revocation(revocation, after_seq=watermark) == "reported"
+            await service._apply_reconcile_revocation(revocation, watermark=watermark) == "reported"
         ), "a forged row silenced the alert"
         assert len(notifier.sent) == 1
     finally:
@@ -4158,20 +4198,119 @@ async def test_a_verified_repeat_revocation_on_a_keyed_chain_is_quiet(reason: st
         watermark = await service._audit_watermark()
         revocation = reconcile.SessionRevocation(user.id, user.username, reason=reason)
         assert (
-            await service._apply_reconcile_revocation(revocation, after_seq=watermark) == "reported"
+            await service._apply_reconcile_revocation(revocation, watermark=watermark) == "reported"
         )
-        assert await service._apply_reconcile_revocation(revocation, after_seq=watermark) == "quiet"
+        assert await service._apply_reconcile_revocation(revocation, watermark=watermark) == "quiet"
         assert len(notifier.sent) == 1
         assert len(_revoked_rows(await store.list_audit())) == 2
         # The controls: a verified row at or below the watermark, and a newest row with another
         # reason, do not count.
         later = await service._audit_watermark()
-        assert await service._apply_reconcile_revocation(revocation, after_seq=later) == "reported"
+        assert await service._apply_reconcile_revocation(revocation, watermark=later) == "reported"
         newest = await service._audit_watermark()
         await store.record_audit("auth.ad_session_revoked", actor="jdoe", detail='{"reason": "x"}')
-        assert await service._apply_reconcile_revocation(revocation, after_seq=newest) == "reported"
+        assert await service._apply_reconcile_revocation(revocation, watermark=newest) == "reported"
         assert len(notifier.sent) == 3
         assert (await store.verify_audit_chain())[0]
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(("age", "expected"), [(3600.0, "reported"), (0.0, "quiet")])
+async def test_a_verified_row_older_than_the_skew_allowance_is_not_a_repeat(
+    age: float, expected: str
+) -> None:
+    """A writer without the key cannot forge a row, but can lower the watermark by deleting the
+    newest rows, so an older genuine row sits above it. The ``ts`` bound, inside the MAC, keeps
+    such a row from counting. Modelled here by a watermark numbered below a genuine row stamped an
+    hour ago. The control: the same row stamped now is a repeat."""
+    store, _, service, _ = await _scoped_service(_GRP_A, keyed=True)
+    try:
+        user = await _signed_out(store, "jdoe")
+        seq, _head = await store.audit_anchor()
+        await store.record_audit(
+            "auth.ad_session_revoked",
+            actor="jdoe",
+            detail='{"reason": "directory_disabled", "sessions": 1}',
+            now=time.time() - age,
+        )
+        revocation = reconcile.SessionRevocation(
+            user.id, user.username, reason="directory_disabled"
+        )
+        watermark = _AuditWatermark(seq, time.time())
+        assert (
+            await service._apply_reconcile_revocation(revocation, watermark=watermark) == expected
+        )
+    finally:
+        await store.close()
+
+
+async def test_the_watermark_fails_toward_reporting(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A fault reading the newest sequence number, or a number that is not an integer, gives no
+    watermark and is logged at ERROR, and with none a repeat reports. The control: an empty trail
+    is 0, not a fault."""
+    store, _, service, _ = await _scoped_service(_GRP_A, keyed=True)
+    try:
+
+        async def refused() -> tuple[int, str]:
+            raise sqlite3.OperationalError("synthetic: disk I/O error")
+
+        async def textual() -> tuple[object, str]:
+            return "7", ""
+
+        async def empty() -> tuple[int, str]:
+            return 0, ""
+
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
+            monkeypatch.setattr(store, "audit_anchor", refused)
+            assert await service._audit_watermark() is None
+            monkeypatch.setattr(store, "audit_anchor", textual)
+            assert await service._audit_watermark() is None
+        messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("could not read the newest audit sequence number" in m for m in messages)
+        assert any("is a str, not an integer" in m for m in messages)
+        monkeypatch.setattr(store, "audit_anchor", empty)
+        empty_mark = await service._audit_watermark()
+        assert empty_mark is not None and empty_mark.seq == 0
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("defect", [sqlite3.OperationalError, NotImplementedError, KeyError])
+async def test_a_fault_reading_the_evidence_reports_and_still_writes_the_row(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, defect: type[Exception]
+) -> None:
+    """A fault in the evidence read, a store refusal or a defect, is logged at ERROR and answers
+    no evidence. It is not raised: this revocation's own row is not yet written, so a raise would
+    lose it and end the pass. The revocation reports and writes its row."""
+    store, _, service, _ = await _scoped_service(_GRP_A, keyed=True)
+    try:
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        user = await _signed_out(store, "jdoe")
+        watermark = await service._audit_watermark()
+        revocation = reconcile.SessionRevocation(user.id, user.username, reason="directory_absent")
+        assert await service._apply_reconcile_revocation(revocation, watermark=watermark) == (
+            "reported"
+        )
+
+        async def broken(*_: object, **__: object) -> dict[str, Any] | None:
+            raise defect("synthetic")
+
+        monkeypatch.setattr(store, "newest_keyed_audit_row", broken)
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
+            assert await service._apply_reconcile_revocation(revocation, watermark=watermark) == (
+                "reported"
+            )
+        assert len(notifier.sent) == 2
+        assert len(_revoked_rows(await store.list_audit())) == 2
+        assert any(
+            "could not read a verified earlier revocation" in r.getMessage()
+            and defect.__name__ in r.getMessage()
+            for r in caplog.records
+        )
     finally:
         await store.close()
 
@@ -4189,7 +4328,7 @@ async def test_an_undetermined_revocation_that_ends_nothing_stays_quiet() -> Non
         )
         assert (
             await service._apply_reconcile_revocation(
-                revocation, after_seq=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark()
             )
             == "quiet"
         )
@@ -4215,7 +4354,7 @@ async def test_a_quiet_revocation_whose_row_is_refused_reports_instead(
         )
         assert (
             await service._apply_reconcile_revocation(
-                revocation, after_seq=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark()
             )
             == "quiet"
         )
@@ -4229,7 +4368,7 @@ async def test_a_quiet_revocation_whose_row_is_refused_reports_instead(
         monkeypatch.setattr(store, "record_audit", refusing)
         assert (
             await service._apply_reconcile_revocation(
-                revocation, after_seq=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark()
             )
             == "reported"
         )
@@ -4254,13 +4393,13 @@ async def test_a_role_revocation_another_reconciler_applied_first_is_quiet() -> 
         )
         assert (
             await service._apply_reconcile_revocation(
-                revocation, after_seq=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark()
             )
             == "reported"
         )
         assert (
             await service._apply_reconcile_revocation(
-                revocation, after_seq=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark()
             )
             == "quiet"
         )
@@ -4286,7 +4425,7 @@ async def test_a_role_change_that_ends_no_session_still_reports() -> None:
         )
         assert (
             await service._apply_reconcile_revocation(
-                revocation, after_seq=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark()
             )
             == "reported"
         )
