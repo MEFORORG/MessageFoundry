@@ -2480,17 +2480,18 @@ def _missing_service_config_refused(service_config: str | None, *, fleet: str = 
 
 
 #: How long uvicorn waits, at a stop, for open connections and their requests to finish before it
-#: cancels them and runs the lifespan teardown (BACKLOG #3256). The whole stop shares NSSM's 15 s
-#: AppStopMethodConsole window (scripts/service/install-service.ps1) with that teardown, which
-#: drains the upload retention runner (5 s at most), the other lifespan drains, and then
+#: cancels them and runs the lifespan teardown (BACKLOG #3256). The whole stop shares NSSM's
+#: AppStopMethodConsole window (scripts/service/install-service.ps1) with that teardown and
 #: engine.stop(). Unset, this wait had no bound, so one long request could spend the window and
 #: the service would be killed mid-teardown. A request cut off here is cancelled like one past its
-#: deadline, and uvicorn starts the teardown without waiting for it. So its cancel paths run
-#: alongside the teardown, and at least these can still lose: an upload whose write is still
-#: running waits for the write, which has no bound of its own, and may then pay its quota slot back
-#: to a closed store, leaving the slot to go stale; and an upload cancelled in its own
-#: ``upload.create`` audit write keeps its file with no creation row. Either was a kill mid-teardown
-#: before this bound.
+#: deadline, and uvicorn starts the teardown without waiting for it, so its cancel paths run
+#: alongside the teardown. **Any route that acts in a worker thread and then writes its audit row
+#: can lose that row here,** such as ``DELETE /uploads/{id}``, whose unlink finishes in its thread
+#: while the request is cancelled before its ``upload.delete`` row. At least these upload cases
+#: lose too: a save whose write is still running waits for it, with no bound, and may then pay its
+#: quota slot back to a closed store, leaving the slot to go stale; and a save cancelled in its own
+#: ``upload.create`` audit write keeps its file with no creation row. Before this bound, a request
+#: still open at the window's end was killed with the process instead, at any point.
 _UVICORN_DRAIN_SECONDS = 3.0
 
 

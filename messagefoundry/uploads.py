@@ -250,9 +250,11 @@ class UploadQuotaError(UploadError):
       uploader, from any shard, keeps it alive. **On Postgres and SQL Server the stamp and the
       staleness test both read the database server's clock (BACKLOG #3256),** so an engine host's
       skew no longer moves either. A server clock stepped forward still holds a leaked slot longer by
-      the step, since the stamp never moves backwards. SQLite reads the engine host's clock, which
-      is the server's: a SQLite store has one engine host past one shard
-      (``require_unified_store``).
+      the step, since the stamp never moves backwards, and so does a failover to a replica whose
+      clock lags the old primary's; a replica whose clock runs ahead can reclaim a live slot
+      early. So the database servers' own time sync now carries what each engine host's did. SQLite
+      reads the engine host's clock, and only one host ever writes a SQLite store, because
+      ``require_unified_store`` refuses SQLite for more than one engine shard.
     * **A reclaimed live reservation (BACKLOG #2648).** The store reclaims a row with no activity
       for ``UPLOAD_RESERVATION_STALE_AFTER``, and it cannot tell a dead holder from a slow one.
       Every applied reserve moves the row's clock, and a live save touches it every
@@ -260,8 +262,9 @@ class UploadQuotaError(UploadError):
       keeps its slot. A live slot is still reclaimed in at least these cases: its holder lands no
       touch for the whole window while it is alive (a suspended process or VM, an event loop
       starved for minutes, or a store this shard cannot reach while a sibling can); its save
-      outlives ``_RESERVATION_HEARTBEAT_MAX_SECONDS``; or its touches stall on the store for the
-      whole window. A sibling then counts neither that file nor its slot, and
+      outlives ``_RESERVATION_HEARTBEAT_MAX_SECONDS``; its touches stall on the store for the
+      whole window; or one touch never returns, since no second touch starts while one runs
+      (BACKLOG #3256). A sibling then counts neither that file nor its slot, and
       the holder's later release erases a sibling's slot, so the undercount lasts until the ledger
       next drains to zero. That restores the N-1 bound above while it lasts, never worse than the
       pre-#1112 behaviour. The window is accepted. Host clock skew is not one of these cases on the
@@ -653,7 +656,9 @@ class UploadStore:
         audited like any other. It returns at once: the sweep runs in the runner's own task, and a
         wake during a sweep starts one more sweep after it, never two at once. ``False`` means no
         runner is running, as in an app built with ``create_app`` alone, and the caller sweeps
-        itself (:meth:`prune_on_save`)."""
+        itself (:meth:`prune_on_save`). The cost: the sweep now finishes after the response, so an
+        upload sent straight after it can still be billed for expired files not yet removed. That
+        errs toward refusing, and clears once the sweep lands."""
         wake = self._retention_wake
         return wake is not None and wake()
 
@@ -1216,9 +1221,11 @@ class UploadStore:
 
         **The wait for a touch is bounded, and a touch is never cancelled (BACKLOG #3256).** The
         heartbeat waits ``_RESERVATION_TOUCH_WAIT_SECONDS`` for it, then goes on, so a touch stuck
-        on the store no longer holds the heartbeat or its lifetime cap. The stuck touch is left to
-        land on its own, which still moves the row's clock when it does, and no second touch starts
-        while it runs, so a stalled store never collects one abandoned statement per interval."""
+        on the store no longer holds the heartbeat or its lifetime cap, and a ``stop`` during the
+        wait ends it at once. The stuck touch is left to land on its own, which still moves the
+        row's clock when it does, and no second touch starts while it runs, so a stalled store never
+        collects one abandoned statement per interval. The cost: a touch that never returns ends
+        the refreshing for that save, which :class:`UploadQuotaError` lists."""
         ledger = self._ledger
         if ledger is None:
             return
@@ -1253,12 +1260,18 @@ class UploadStore:
                         touch = asyncio.ensure_future(
                             ledger.reserve_upload_quota(uploader_id, files=0, size_bytes=0)
                         )
-                        done, _ = await asyncio.wait(
-                            {touch}, timeout=_RESERVATION_TOUCH_WAIT_SECONDS
-                        )
-                        if done:
-                            _missed(touch)
-                        else:
+                        # On the touch itself, so a failure that lands after the wait is logged.
+                        touch.add_done_callback(_missed)
+                        stopped = asyncio.ensure_future(stop.wait())
+                        try:
+                            await asyncio.wait(
+                                {touch, stopped},
+                                timeout=_RESERVATION_TOUCH_WAIT_SECONDS,
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                        finally:
+                            stopped.cancel()
+                        if not touch.done() and not stop.is_set():
                             _log.warning(
                                 "a cross-shard upload reservation touch for %s did not finish "
                                 "within %gs; it was left running, and the next waits for it",
@@ -1267,7 +1280,7 @@ class UploadStore:
                             )
             finally:
                 if touch is not None and not touch.done():
-                    self._hold(touch, _missed)  # still referenced, and its outcome still logged
+                    self._hold(touch)  # still referenced; _missed still logs its outcome
 
         task = asyncio.ensure_future(_beat())
         self._heartbeats.add(task)
@@ -1498,10 +1511,12 @@ class UploadStore:
                 if held is None:
                     # _unsealable_sync declines a sidecar it cannot open, so tell an absent one,
                     # whether it was never there or went since the read, from a refused one.
-                    # exists() is also False for a path it cannot stat. Nothing is removed on
-                    # either answer, so that only picks the status.
-                    if not meta_path.exists():
-                        raise UploadNotFoundError(file_id)
+                    # Only FileNotFoundError means absent. Any other OSError propagates, as it does
+                    # from the read above, and is never answered as a missing file.
+                    try:
+                        meta_path.lstat()
+                    except FileNotFoundError as exc:
+                        raise UploadNotFoundError(file_id) from exc
                     raise UploadUnreadableError(refusal)
                 meta = held.as_meta()
             # Remove the body first, then the sidecar (best-effort on the body — the sidecar is the
@@ -1999,9 +2014,10 @@ class UploadStore:
         published half-written, nothing is left behind, and the operator retries. An hour against a
         25 MiB default bound is far outside that window.
 
-        ``abort`` is :meth:`prune_expired`'s, checked before each entry. The pass's audit rows are
-        written only once this returns, so a slow sweep over a large dir must not hold them past a
-        stop (BACKLOG #2264). An aborted sweep returns what it removed so far; the next one resumes."""
+        ``abort`` is :meth:`prune_expired`'s, checked before each entry, so a slow sweep over a large
+        dir does not hold a stop past its bound (BACKLOG #2264). The pass's audit rows are already
+        written when this runs (BACKLOG #3184). An aborted sweep returns what it removed so far; the
+        next one resumes."""
         stop = abort if abort is not None else threading.Event()
         root = self._root
         if stop.is_set() or not root.is_dir():

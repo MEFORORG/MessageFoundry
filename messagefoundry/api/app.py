@@ -7153,7 +7153,7 @@ def create_app(
             client=client_ip(request),
         )
 
-        # ASVS 5.2.4: opportunistic age-based retention sweep at save time (off-loop, best-effort). A prune
+        # ASVS 5.2.4: an age-based retention sweep triggered by the save (off-loop, best-effort). A prune
         # error must never fail the upload the operator just made — it is logged and retried by the
         # periodic task. Each pruned file is audited (file_id + uploader, never content).
         #
