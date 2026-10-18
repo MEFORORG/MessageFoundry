@@ -4,9 +4,9 @@
 
 **WHAT IS AND IS NOT EXERCISED HERE, stated so a green is not over-read.** There is no Active
 Directory in CI and there never has been. ``_find_user`` itself runs -- it takes a connection, so a
-double can drive it, and the ``pragma: no cover - needs real AD`` markers in ``auth/ldap.py`` sit on
-the ``LDAPException`` handlers around it rather than on the lookup. What no test here can reach is
-the bind and the wire: **this is not evidence that a real domain controller returns what the double
+double can drive it. ``auth/ldap.py`` carries no ``pragma: no cover`` marker on the lookup or on
+the ``LDAPException`` handlers around it, which ``tests/test_ldap_error_mapping.py`` drives. What
+no test here can reach is the bind and the wire: **this is not evidence that a real domain controller returns what the double
 returns**, only that the engine asks for the attribute and carries what it gets. The recycle itself
 is driven at the SERVICE layer, where the store is real (SQLite, in memory) and the decision under
 test lives.
@@ -42,12 +42,13 @@ from messagefoundry.auth.ldap import (
     object_guid_filter_value,
 )
 from messagefoundry.auth.notifications import USERNAME_CHANGED, SecurityEvent
-from messagefoundry.auth.service import DIRECTORY_OBJECT_ID_MISSING, AuthService
+from messagefoundry.auth.service import DIRECTORY_OBJECT_ID_MISSING, AuthService, DirectoryRefusal
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
+from tests._fake_directory import RebindDirectory as _RebindDirectory
 
 # One account object, two spellings of the SAME identity: the 16 bytes as they arrive on the wire,
 # and the braced upper-case string ldap3's own formatter produces. Microsoft's GUID layout is
@@ -1142,6 +1143,10 @@ class _RecordingConn:
         self.entries: list[_FakeEntry] = [entry] if entry is not None else []
         self.searches: list[dict[str, Any]] = []
         self.result: dict[str, Any] | None = None  # no referral
+        self.unbinds = 0
+
+    def unbind(self) -> None:
+        self.unbinds += 1
 
     def __enter__(self) -> _RecordingConn:
         return self
@@ -1516,38 +1521,6 @@ async def test_a_locked_mirror_row_does_not_complete_a_kerberos_login(
 # round trips, the engine lockout counter and the ``auth.reauth`` audit row.
 
 
-class _RebindDirectory:
-    """A directory whose re-bind answer the test sets. ``bound`` is who a good password binds as;
-    ``refusal`` is what the bind's own lookup found when it did not bind: ``FOUND`` for an enabled
-    entry that refused the password, any other answer for no enabled entry (BACKLOG #2434).
-    ``binds`` counts password binds, and ``keys`` records the ``object_id`` each call was keyed on,
-    so a second directory read would show as a second key."""
-
-    def __init__(
-        self, bound: AdPrincipal | None, refusal: DirectoryAnswer | None = DirectoryAnswer.FOUND
-    ) -> None:
-        self.bound = bound
-        self.refusal = refusal
-        self.binds = 0
-        self.keys: list[object] = []
-
-    def authenticate(
-        self, username: str, password: str, *, object_id: str | None = None
-    ) -> DirectoryBind:
-        self.binds += 1
-        self.keys.append(object_id)
-        if password == "synthetic-good" and self.bound is not None:
-            return DirectoryBind(DirectoryAnswer.FOUND, self.bound)
-        return DirectoryBind(self.refusal)
-
-    def resolve_principal(
-        self, username: str, *, object_id: str | None = None
-    ) -> AdPrincipal | None:
-        # The re-bind no longer reads this (BACKLOG #2434); a call would show as a second key.
-        self.keys.append(object_id)
-        return self.bound if self.refusal is DirectoryAnswer.FOUND else None
-
-
 async def _reauth_session(
     store: MessageStore, directory: _RebindDirectory, *, keep_id: bool = True
 ) -> tuple[AuthService, Identity, str]:
@@ -1590,7 +1563,7 @@ async def test_a_re_bind_on_a_row_with_no_directory_id_is_refused_unasked() -> N
         elevation = await service.reauth(identity, "synthetic-good", token=token)
         assert not elevation.ok and elevation.token is None
         # Carried so a caller says the directory could not confirm the account, not "wrong password".
-        assert elevation.directory_unconfirmed is True
+        assert elevation.directory_refusal is DirectoryRefusal.UNCONFIRMED
         assert directory.binds == 0, "the password was sent to the directory for an id-less row"
         row = await store.get_user(identity.user_id)
         assert row is not None and row.failed_attempts == 0
@@ -1613,7 +1586,7 @@ async def test_a_re_bind_that_binds_another_directory_object_is_refused(
         service, identity, token = await _reauth_session(store, directory)
         elevation = await service.reauth(identity, "synthetic-good", token=token)
         assert not elevation.ok and elevation.token is None
-        assert elevation.directory_unconfirmed is True
+        assert elevation.directory_refusal is DirectoryRefusal.UNCONFIRMED
         assert directory.binds == 1
         row = await store.get_user(identity.user_id)
         assert row is not None and row.failed_attempts == 0
@@ -1633,7 +1606,7 @@ async def test_a_refused_re_bind_keyed_on_the_rows_id_is_counted() -> None:
         service, identity, token = await _reauth_session(store, directory)
         elevation = await service.reauth(identity, "synthetic-wrong", token=token)
         assert not elevation.ok
-        assert elevation.directory_unconfirmed is False  # judged and wrong, so "wrong" is true
+        assert elevation.directory_refusal is None  # judged and wrong, so "wrong" is true
         row = await store.get_user(identity.user_id)
         assert row is not None and row.failed_attempts == 1
         assert directory.keys == [GUID_A_TEXT]
@@ -1665,7 +1638,7 @@ async def test_a_re_bind_of_the_rows_own_object_still_elevates_and_still_counts(
         directory = _RebindDirectory(own)
         service, identity, token = await _reauth_session(store, directory)
         wrong = await service.reauth(identity, "synthetic-wrong", token=token)
-        assert not wrong.ok and wrong.directory_unconfirmed is False
+        assert not wrong.ok and wrong.directory_refusal is None
         row = await store.get_user(identity.user_id)
         assert row is not None and row.failed_attempts == 1
         good = await service.reauth(identity, "synthetic-good", token=token)
@@ -1695,7 +1668,7 @@ async def test_an_unreachable_directory_re_bind_is_unconfirmed_and_uncounted() -
         directory = _UnreachableRebindDirectory(None)
         service, identity, token = await _reauth_session(store, directory)
         elevation = await service.reauth(identity, "synthetic-good", token=token)
-        assert not elevation.ok and elevation.directory_unconfirmed is True
+        assert not elevation.ok and elevation.directory_refusal is DirectoryRefusal.UNCONFIRMED
         assert directory.binds == 1
         row = await store.get_user(identity.user_id)
         assert row is not None and row.failed_attempts == 0
@@ -1762,7 +1735,7 @@ async def test_an_unjudged_re_bind_names_its_cause_on_the_audit_row(
         directory = _RebindDirectory(None, answer)
         service, identity, token = await _reauth_session(store, directory)
         elevation = await service.reauth(identity, "synthetic-good", token=token)
-        assert not elevation.ok and elevation.directory_unconfirmed is True
+        assert not elevation.ok and elevation.directory_refusal is DirectoryRefusal.UNCONFIRMED
         row = await store.get_user(identity.user_id)
         assert row is not None and row.failed_attempts == 0
         assert any(f'"reason": "{reason}"' in d for d in await _reauth_rows(store))
@@ -1783,7 +1756,7 @@ async def test_an_empty_re_bind_password_is_refused_unasked_and_uncharged() -> N
         for _ in range(6):
             elevation = await service.reauth(identity, "", token=token)
             assert not elevation.ok and elevation.token is None
-            assert elevation.directory_unconfirmed is False
+            assert elevation.directory_refusal is None
             assert not elevation.session_lost
         assert directory.binds == 0, "an empty password reached the directory"
         row = await store.get_user(identity.user_id)

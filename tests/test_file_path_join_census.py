@@ -690,6 +690,12 @@ SITES: dict[str, Site] = {
     "messagefoundry/pipeline/dr_backup.py::_verify_in_staging": Site(
         1, INTERNAL, "A fixed name in a staging directory this module made."
     ),
+    "messagefoundry/pipeline/engine.py::_read_touched": Site(
+        1,
+        INTERNAL,
+        "File names the engine's own config-write caller declares (the connections.toml name "
+        "literal), on the running config directory the operator configured.",
+    ),
     "messagefoundry/pipeline/supervisor.py::_shard_db_path": Site(
         1, OPERATOR, "A shard tag from the operator's config on the operator's --db path."
     ),
@@ -698,6 +704,9 @@ SITES: dict[str, Site] = {
     ),
     "messagefoundry/security/__init__.py::handler_semgrep_rules": Site(
         1, INTERNAL, "Package resource literal."
+    ),
+    "messagefoundry/security/audit_all_platforms.py::main": Site(
+        1, INTERNAL, "The final component of the named lock, inside a temp directory main created."
     ),
     "messagefoundry/service.py::install_script_path": Site(
         1, INTERNAL, "A repo-relative literal beside the installed package."

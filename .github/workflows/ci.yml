@@ -20,7 +20,8 @@ on:
   schedule:
     # Nightly (03:17 UTC — off the top-of-hour rush) run of the HEAVY POST-MERGE legs: the load
     # smokes (load-test, load-test-sqlserver x2 majors), the server-DB suites (sqlserver-store x2
-    # majors, postgres-store), windows-service-smoke (x2 SKUs, 2x-billed) and docker-smoke. These
+    # majors, postgres-store; its advisory Windows twin postgres-store-windows, x2 SKUs, was
+    # never per-push), windows-service-smoke (x2 SKUs, 2x-billed) and docker-smoke. These
     # all used to run on EVERY push to main (~16 auto-merges/day re-validating content whose PR run
     # had just passed); the nightly cadence + the PR path-gates (`changes`) keep the same coverage
     # at a fraction of the runs. `gh workflow run ci.yml --ref main` (workflow_dispatch) still runs
@@ -335,7 +336,7 @@ jobs:
       # from docker/locks/* and installs nothing).
       - name: Set up uv
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -622,14 +623,52 @@ jobs:
       #
       #   leg              max passing step   n     old cap   old margin   new cap   new margin
       #   ubuntu-latest    20:28              35    25:00     1.221x       31:00     1.515x   <- RE-DERIVED 2026-08-12
-      #                    (SUPERSEDED 2026-10-07: 34:00 over a 24:36 row, and again 2026-10-13: 38:00
-      #                    over a 28:07 row, in the two notes directly below)
+      #                    (SUPERSEDED 2026-10-07: 34:00 over a 24:36 row, 2026-10-13: 38:00 over a
+      #                    28:07 row, and 2026-10-18: 46:00 over a 33:33 row, in the three notes
+      #                    directly below)
       #
-      # THE UBUNTU ROW WAS RE-DERIVED A THIRD TIME 2026-10-13, AND IT IS NOW 38:00 / JOB 50:00.
+      # THE UBUNTU ROW WAS RE-DERIVED A FOURTH TIME 2026-10-18, AND IT IS NOW 46:00 / JOB 58:00
+      # (BACKLOG #3456). The gate reddened this leg with every test passing on PR 2409's pull-request
+      # run 39110039682 at 29:15 and on merge-group run 39131597083 (PR 2416) at 30:14, which the queue
+      # ejected, both over the 38:00 cap's 29:14 red line. The pool, its n, its uncensored-on-evidence
+      # reading and every execution in it live ONCE, in this leg's row of
+      # scripts/ci/step_margin_baseline.toml and the pool file beside it; this note carries the sizing.
+      #
+      # THE RE-SIZE LINE ON THE EJECTION SAID 41:00. THE POOL SAYS 46:00. Each RE-SIZE line sizes
+      # from its own run: ceil_minute(1.35 x 1813.6s) is 41. The rule sizes from the pool's worst
+      # passing row, and the pool keeps the runs that did not land. Its worst is 33:33, PR 2344's
+      # pull-request run 38992644994 on 2026-10-17, which the gate reddened at 1.133x. That run's own
+      # RE-SIZE line already gave 46:00, and nothing re-measured the row then.
+      # ceil_minute(1.35 x 33:33) = ceil(45.29) = 46:00. At 41:00 that row would still be LOW
+      # (1.222x). That run printed `40388 passed` in 2002.95s, fewer tests than the `42050 passed` in
+      # 1805.15s of the 30:14 ejection, so it is a slow runner rather than a larger suite. The rule
+      # sizes from the worst row whatever its cause, and this change follows it.
+      #
+      # THE JOB CAP keeps the 12 minutes the overhead row below derives, 46 + 12 = 58, as the two
+      # re-derivations before this one did. The 12 was not re-derived here. From the same job reads
+      # (job and step stamps, which the pool file does not carry), this pool's worst same-row overhead
+      # on this leg is 3:13 and its worst pre-pytest setup over every conclusion is 3:03 (both run
+      # 39081455225), under the 5:22 setup the 2026-08 rows below use. The overhead rule applied to
+      # that 3:13 alone would give 5 and a job cap of 51; whether to shrink the 12 is left open, as it
+      # was on 2026-10-13, and 51 would not hold the 5-minute refused-subjects step after a pytest step
+      # that used its whole cap. On the 5:22 the nesting gap is 58:00 - 5:22 - 46:00 = 6:38; on the
+      # 6:18 setup the 2026-10-13 pool measured, it is 58:00 - 6:18 - 46:00 = 5:42.
+      #
+      # At 46:00 the gate reds a run over 2123.1s (35:23.1), 5.5 percent over the worst pooled run.
+      # By the day a run was created, this leg's median rose from 23:45 on 2026-10-13 to 27:20 on
+      # 2026-10-18. The gate's RE-DERIVE annotation is still the trigger to re-measure.
+      #
+      # THE TWO WINDOWS ROWS ARE LEFT TO #3515. From the same job reads, their worst passing steps in
+      # this window are 37:10 (windows-2022) and 45:30 (windows-2025, push run 39099609761); the
+      # second is over the 55:00 caps' 42:19 red line, and that run's gate step failed with the suite
+      # passing (job 117593065787), so that leg already reds passing suites.
+      #
+      # THE UBUNTU ROW WAS RE-DERIVED A THIRD TIME 2026-10-13, TO 38:00 / JOB 50:00 (SUPERSEDED
+      # 2026-10-18, ABOVE).
       # Merge-group run 38372578370 (PR 2301) reddened this leg at 26:13 of 34:00 (1.297x) with
       # `37755 passed, 1197 skipped`, and the queue ejected it. The pool, its n and its
-      # uncensored-on-evidence reading live ONCE, in this leg's row of
-      # scripts/ci/step_margin_baseline.toml; this note carries the sizing.
+      # uncensored-on-evidence reading live ONCE, in the 2026-10-13 row that
+      # scripts/ci/step_margin_baseline.toml keeps whole in a comment; this note carries the sizing.
       #
       # THE EJECTION WAS NOT THE WORST RUN IN ITS POOL, SO THE CAP IS 38 AND NOT 36. The gate's
       # RE-SIZE annotation on that run computed 36:00 from its own 26:13. The pool's worst passing
@@ -805,6 +844,7 @@ jobs:
       #   ubuntu  22:50 x 1.35 = 30:50 -> 31:00   (1.358x over the anchor, 1.515x over max passing)
       #           SUPERSEDED 2026-10-07: 24:36 x 1.35 -> 34:00, under "RE-DERIVED AGAIN 2026-10-07" above
       #           SUPERSEDED 2026-10-13: 28:07 x 1.35 -> 38:00, under "RE-DERIVED A THIRD TIME 2026-10-13" above
+      #           SUPERSEDED 2026-10-18: 33:33 x 1.35 -> 46:00, under "RE-DERIVED A FOURTH TIME 2026-10-18" above
       #   W22     29:23 x 1.35 = 39:40 -> 40:00   (takes the shared Windows value below)
       #   W25     40:07 x 1.35 = 54:09 -> 55:00   (1.371x over the anchor, 1.537x over max passing)
       #
@@ -890,6 +930,7 @@ jobs:
       #   ubuntu   7:12 (n=451)     5:22 + 2:22 = 7:44   7:44            11:36   12:00  31+12 = 43
       #            (34+12 = 46 since 2026-10-07; the 12 is unchanged)
       #            (38+12 = 50 since 2026-10-13; the 12 is unchanged)
+      #            (46+12 = 58 since 2026-10-18; the 12 is unchanged)
       #   W22      6:16 (n=413)     4:05 + 2:51 = 6:56   6:56            10:24   11:00  55+11 = 66
       #   W25      6:29 (n=372)     2:32 + 3:59 = 6:31   6:31             9:47   10:00  (takes W22's 66)
       #
@@ -899,6 +940,7 @@ jobs:
       #   ubuntu  5:22 + 30:59 + 2:22 = 38:43 vs 43:00  +4:17   |  old: 32:43 vs 37:00  +4:17  (band held)
       #           (since 2026-10-07: 5:22 + 33:59 + 2:22 = 41:43 vs 46:00, +4:17)
       #           (since 2026-10-13, same 2026-08 addends: 5:22 + 37:59 + 2:22 = 45:43 vs 50:00, +4:17)
+      #           (since 2026-10-18, same 2026-08 addends: 5:22 + 45:59 + 2:22 = 53:43 vs 58:00, +4:17)
       #   W22     4:05 + 54:59 + 2:51 = 61:55 vs 66:00  +4:05   |  old: 42:55 vs 46:00  +3:04
       #   W25     2:32 + 54:59 + 3:59 = 61:30 vs 66:00  +4:30   |  old: 42:30 vs 46:00  +3:30
       #
@@ -919,6 +961,7 @@ jobs:
       #   ubuntu  5:22 + 25:00 = 30:22 < 37:00  (gap 6:38)
       #           (since 2026-10-07: 5:22 + 34:00 = 39:22 < 46:00, gap 6:38)
       #           (since 2026-10-13, same 2026-08 setup: 5:22 + 38:00 = 43:22 < 50:00, gap 6:38)
+      #           (since 2026-10-18, same 2026-08 setup: 5:22 + 46:00 = 51:22 < 58:00, gap 6:38)
       #   W22     4:05 + 55:00 = 59:05 < 66:00  (gap 6:55)
       #   W25     2:32 + 55:00 = 57:32 < 66:00  (gap 8:28)
       #
@@ -1147,7 +1190,7 @@ jobs:
       #
       # 5 MINUTES, AND NO MORE. On `!cancelled()` this step also runs after a pytest step that used its
       # whole `step_timeout`, so it must fit in what the ubuntu job cap leaves after setup plus that
-      # step (50 - 38 - about 5.5 minutes of setup). The script's own time budget sits inside it, so a
+      # step (58 - 46 - about 5.5 minutes of setup). The script's own time budget sits inside it, so a
       # slow fetch fails the script by name first.
       #
       # PULL REQUESTS ONLY. Why `merge_group` is skipped, and what the scan does not cover, is in the
@@ -1280,7 +1323,7 @@ jobs:
 
       - name: Set up uv
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -1429,7 +1472,7 @@ jobs:
       #
       # WINDOWS-2025's MARGIN CAP WENT FROM 6 TO 9, AND THE CAUSE WAS RUNNER VARIANCE RATHER THAN SUITE
       # GROWTH. The BACKLOG #1842 re-derivation under "THE MARGIN CAPS ARE RE-DERIVED" below re-sized it
-      # to 8 on a post-xdist pool, and the fourth re-derivation there to 12. This paragraph is the 2026-09-13 reasoning for 9, kept
+      # to 8 on a post-xdist pool, the fourth re-derivation there to 12, and the fifth to 14. This paragraph is the 2026-09-13 reasoning for 9, kept
       # as a record. Every "cap" in this note means `webconsole_margin_cap`, which is what these four
       # runs were measured against; it was spelled `webconsole_step_timeout` when the note was
       # written, because that one variable was then both the ruler and the wall. The numbers are
@@ -1468,13 +1511,13 @@ jobs:
       # and so admits a setup longer than the 5:22 alone would cover. Read the second column as
       # headroom the sum deliberately buys, not as time anyone has measured twice.
       #
-      #   ubuntu-latest   5:22 + 4:30 + kill 10:00 = 19:52   under 21:00, slack 1:08
-      #   windows-2022    4:05 + 4:30 + kill 11:00 = 19:35   under 20:00, slack 0:25
-      #   windows-2025    2:32 + 4:30 + kill 16:00 = 23:02   under 24:00, slack 0:58
+      #   ubuntu-latest   5:22 + 4:30 + kill 12:00 = 21:52   under 23:00, slack 1:08
+      #   windows-2022    4:05 + 4:30 + kill 15:00 = 23:35   under 24:00, slack 0:25
+      #   windows-2025    2:32 + 4:30 + kill 19:00 = 26:02   under 27:00, slack 0:58
       #
       # windows-2022 is the tightest and is the leg to watch, since the third re-derivation raised its
-      # kill to 11. Its setup has to reach 9:00 before the JOB cap fires ahead of the step cap and the
-      # failure stops naming the step. That is 0:25 past the 8:35 this table budgets and 4:55 past the
+      # kill to 11 (15 since the fifth). Its setup has to reach 9:00 before the JOB cap fires ahead of
+      # the step cap and the failure stops naming the step. That is 0:25 past the 8:35 this table budgets and 4:55 past the
       # 4:05 actually recorded for the leg, so the pad is most of what protects it. windows-2025 was
       # the tightest until then, at 0:58. The lever if it ever bites is `webconsole_job_timeout`, which is
       # a deadlock backstop rather than a tightness gate -- not a smaller kill, which would re-narrow
@@ -1485,6 +1528,10 @@ jobs:
       # windows-2025's kill 12 -> 16 and job cap 20 -> 24. Holding ubuntu at 20 would still have
       # passed the sum, at 0:08 of slack, which leaves the pad as the only margin on the one leg where
       # this note says the pad does real work.
+      #
+      # THE FIFTH RE-DERIVATION PULLED IT ON ALL THREE, the same way: each job cap moved by exactly what
+      # its kill moved, ubuntu 10 -> 12 and 21 -> 23, windows-2022 11 -> 15 and 20 -> 24, windows-2025
+      # 16 -> 19 and 24 -> 27. So every leg keeps the slack the table above gives it.
       # tests/test_ci_step_margin.py parses this table and re-adds every row.
       #
       # THE RULER AND THE WALL: THE MARGIN CAP AND THE KILL ARE NOW TWO NUMBERS, DELIBERATELY.
@@ -1509,14 +1556,16 @@ jobs:
       # re-size together would bury the one change that can be reasoned about, so the re-size is
       # deliberately a later, separate change with its own measurement.
       #
-      # THE CAPS ARE NOW 7 / 8 / 12 AND THE ONE PLACE THAT ARGUES THEM IS ABOVE THE SUITE STEP, under
+      # THE CAPS ARE NOW 9 / 11 / 14 AND THE ONE PLACE THAT ARGUES THEM IS ABOVE THE SUITE STEP, under
       # "THE MARGIN CAPS ARE RE-DERIVED". BACKLOG #1879 did the first re-derivation this paragraph
       # defers and came back "unchanged". BACKLOG #1842 did the second, on the first hosted pool taken
       # under xdist, and moved windows-2025 from 9 to 8. The third, by owner request 2026-09-30, moved
       # ubuntu from 5 to 6 and windows-2022 from 6 to 8; it is "THE THIRD RE-DERIVATION", further down
       # than the other two. The fourth, the web console step-margin gate re-measure of 2026-10-07,
       # moved ubuntu from 6 to 7 and windows-2025 from 8 to 12; it is "THE FOURTH RE-DERIVATION",
-      # directly after the third. The notes are far apart and could be
+      # directly after the third. The fifth, the web console step-margin gate re-measure of
+      # 2026-10-17, moved all three: ubuntu 7 to 9, windows-2022 8 to 11 and windows-2025 12 to 14;
+      # it is "THE FIFTH RE-DERIVATION", directly after the fourth. The notes are far apart and could be
       # read as contradicting, which is the only reason this pointer exists. Do not restate the
       # arithmetic here -- one copy, per SDS-3.5.
       #
@@ -1528,10 +1577,11 @@ jobs:
       # of it -- why a decoupling and a re-size do not ship together -- is still the governing reason
       # and #1879 followed it. What that pool says about the caps is set out above the suite step.
       #
-      # THE KILLS ARE 10 / 11 / 16, and each is at least 1.30x its leg's margin cap. windows-2022's went
+      # THE KILLS ARE 12 / 15 / 19, and each is at least 1.30x its leg's margin cap. windows-2022's went
       # from 10 to 11 in the third re-derivation, because its margin cap went to 8 and 10 would be
       # under 1.30x that; the fourth moved ubuntu's from 9 to 10 and windows-2025's from 12 to 16 for
-      # the same reason -- the same ratio
+      # the same reason, and the fifth moved all three, to the smallest whole minute at or over 1.30x
+      # the new cap -- the same ratio
       # the gate's own floor reserves below the cap, so the band a run may be observed in ABOVE the cap
       # is at least as wide, in ratio, as the band the floor reserves below it.
       # tests/test_ci_step_margin.py asserts that headroom per leg, reading BOTH numbers out of the
@@ -1550,8 +1600,8 @@ jobs:
       # is derived from four measured runs and set so the OBSERVED WORST clears the floor, so it is the
       # second. The detector is not disarmed either: at 9:00 it warns again above 6:55, which is outside
       # the entire observed range. That 9 became 8, re-sized by BACKLOG #1842 below; at 8:00 the gate
-      # warned above 6:09. It is 12 now, re-sized by the fourth re-derivation; at 12:00 the gate warns
-      # above 9:13.
+      # warned above 6:09. It was 12 after the fourth re-derivation, warning above 9:13, and is 14 now,
+      # re-sized by the fifth; at 14:00 the gate warns above 10:46.
       #
       # AND THE HAZARD IS NOT ONLY THE WARNING. At 5:25 a green suite came within 35 seconds of being
       # KILLED, because the 6:00 that was then the margin cap was also the `timeout-minutes` -- the
@@ -1574,11 +1624,12 @@ jobs:
       # 7:38 on 2026-09-22, nine days later. Not necessarily its FIRST: the pool above is twelve hours
       # wide, so it can date a breach and cannot date the earliest one.
       #
-      # THE MARGIN CAPS ARE RE-DERIVED, FOUR TIMES. The first re-derivation came back "UNCHANGED" -- 5 /
+      # THE MARGIN CAPS ARE RE-DERIVED, FIVE TIMES. The first re-derivation came back "UNCHANGED" -- 5 /
       # 6 / 9 -- and saying so out loud is the point of the next few paragraphs. The second, BACKLOG
       # #1842, moved windows-2025 to 8; it is the group headed "THE SECOND RE-DERIVATION" below. The
       # third moved ubuntu to 6 and windows-2022 to 8; it is "THE THIRD RE-DERIVATION". The fourth
-      # moved ubuntu to 7 and windows-2025 to 12; it is "THE FOURTH RE-DERIVATION". A cap that
+      # moved ubuntu to 7 and windows-2025 to 12; it is "THE FOURTH RE-DERIVATION". The fifth moved
+      # all three, to 9 / 11 / 14; it is "THE FIFTH RE-DERIVATION". A cap that
       # nobody moved and a cap that was checked and found right look identical in a diff, so here is
       # the first one's arithmetic. Each cap divided by the 1.30x floor gives the longest the step may
       # take on that leg, set beside the WORST SERIAL run in the 66-observation pool above:
@@ -1638,7 +1689,7 @@ jobs:
       # LOWERING windows-2025 TO 8 HAS A COST, AND IT IS TAKEN ON PURPOSE. At 9 the gate reds above
       # 6:55; at 8 it reds above 6:09, 14 percent over the worst pooled run of 5:24. In that pool the
       # rule left windows-2022 10 percent (4:37 over 4:11) and ubuntu 20 percent (3:51 over 3:13), so 8
-      # put windows-2025 between them. The fourth re-derivation's figures supersede these. The rule keeps the ruler close to the work, so the gate speaks when
+      # put windows-2025 between them. The fifth re-derivation's figures supersede these. The rule keeps the ruler close to the work, so the gate speaks when
       # the suite grows. Holding 9 would keep a cap that no run in this pool supports, which is the
       # "bound derived from another bound" #344 closed. If windows-2025 starts ejecting merge groups
       # at 8, re-measure; do not restore 9 by hand.
@@ -1714,8 +1765,8 @@ jobs:
       # of its 6:00 cap with 907 passed and 3 skipped, and the queue ejected the group; a merge-group
       # run for PR 2081 on 2026-10-06 reddened windows-2025 at 379.1s against its 369.2s red line, all
       # tests passing. Same instrument, filter and rule as the third. The pool's definition, n, min and
-      # median live ONCE, in the three web console rows of scripts/ci/step_margin_baseline.toml. The
-      # sizing input:
+      # median live ONCE, in scripts/ci/step_margin_baseline.toml, which kept them in a comment when
+      # the fifth re-derivation replaced those rows. The sizing input:
       #
       #   leg             worst passing   x 1.35   cap
       #   ubuntu-latest   4:41            6:19     7    was 6
@@ -1745,6 +1796,55 @@ jobs:
       # window, and in `test_webui.py` 311 -> 330. The growth lever is still splitting the largest
       # bucket under `--dist loadfile`, not more workers or a larger cap.
       #
+      # THE FIFTH RE-DERIVATION, the web console step-margin gate re-measure of 2026-10-17. On that day
+      # the gate reddened windows-2022 with every test passing on at least engine PRs 2347, 2349, 2360
+      # and 2371, and on merge-group runs 39012965647 (6:10) and 39012997644 (6:22), against its 6:09 red line,
+      # and the queue ejected both groups. Same instrument and rule as the fourth. The filter adds one
+      # clause, executions under 60s dropped, which removed no success row here. The pool's
+      # definition, n, percentiles and worst runs live ONCE, in the three web console rows of
+      # scripts/ci/step_margin_baseline.toml. The sizing input:
+      #
+      #   leg             worst passing   x 1.35   cap
+      #   ubuntu-latest   6:23            8:37     9    was 7
+      #   windows-2022    7:40            10:21    11   was 8
+      #   windows-2025    9:47            13:12    14   was 12
+      #
+      # The kills moved with the caps, to 12 / 15 / 19, so each stays at least 1.30x its cap. The job
+      # caps moved with the kills; the nesting table above carries both sums.
+      #
+      # windows-2022's 11 RESTS ON ONE RUN, AND THAT RUN IS RUNNER TIME. Run 38971346969 took 7:40 on
+      # this leg in attempt 1 and 4:45 in attempt 2, on the same tree; its ubuntu leg took 4:55. The
+      # row's next worst, 6:39, would size the leg at 9. It is kept for the reason the fourth
+      # re-derivation kept windows-2025's 8:29: excluding a run is a change to the sizing rule, which
+      # this re-measure did not make. ubuntu's 9 and windows-2025's 14 rest on single runs too (6:23
+      # against a next worst of 5:41; 9:47 against 9:36 and 9:33).
+      #
+      # THIS IS NOT A ONE-RUN STORY, THOUGH. windows-2022's red was a drift, not a spike: 19 success
+      # rows went red at its 8:00 cap, 18 of them from 2026-10-12 on. Its daily p90 sat at 6:03 on
+      # 2026-10-14 and 2026-10-15 and crossed the 6:09 red line on 2026-10-17, at 6:11 over about 70
+      # rows; 2026-10-16's 6:26 rests on the 7:40 run and is not counted as the crossing. A sizing
+      # that dropped every outlier would still have had to move.
+      #
+      # AT THESE CAPS the gate reds at 6:56 or longer on ubuntu, 8:28 or longer on windows-2022 and
+      # 10:47 or longer on windows-2025 -- 8.6, 10.4 and 10.2 percent over each leg's worst pooled
+      # run. The rule puts the red line between 1.35 / 1.30 = 3.8 percent over the row and that plus
+      # up to 46 seconds of rounding, so the escalation note below gives no fixed fraction.
+      #
+      # THE STEP IS STILL GETTING SLOWER, AND AT ABOUT THE SAME PACE ON EVERY LEG. Daily medians rose
+      # 4:06 -> 4:52 on ubuntu, 4:55 -> 5:49 on windows-2022 and 5:23 -> 6:29 on windows-2025 from
+      # 2026-10-07 (from 03:40Z, where this pool opens) to 2026-10-17 (to 07:29Z), 18 to 20 percent.
+      # The fourth note's 2026-10-07 medians cover that day's first hours, so they differ slightly. Test functions rose 774 -> 875, 13 percent, over
+      # main in the same window, and in `test_webui.py` 330 -> 341. Three runner images slowing by the
+      # same fraction reads as suite cost, not one slow image; the gap over the test count says the
+      # tests added cost more than the average one. If that pace holds, about 1.7 percent a day,
+      # windows-2022's daily p90 (6:11) reaches its 8:28 red line in about 19 days and ubuntu's (5:01)
+      # its 6:56 line about the same time. Both p90s come from the partial day of 2026-10-17. The growth lever is still the one named above,
+      # and nobody has pulled it. One local run on a 20-core box, at this step's flags on main
+      # 679ff8331, says why it is the lever: 1053 passed in 3:02 wall, and `test_webui.py` held 2:53 of
+      # the 8:29 of summed test time, 34 percent, on one worker. So that file is the step's critical
+      # path, and splitting it is what would shorten the wall. One run on a different machine is a
+      # pointer, not a hosted measurement.
+      #
       # THE CONSOLE SUITE HAS ITS OWN TIMING-SENSITIVE TESTS, and contention is the cost this change
       # pays rather than one it avoids. `test_webui.py`'s TOTP helper mints a code only when 3s of the
       # 30s step remain, and `[auth].totp_skew_steps` defaults to 0. Its bucket does not contend with
@@ -1761,8 +1861,9 @@ jobs:
       # red for a stale table would eject pull requests, which is the defect this item was filed for.
       #
       # WHAT IT DOES NOT BUY, SO NOBODY RELIES ON IT FOR MORE. The lead time is set by the sizing rule,
-      # not the annotation: ceil_minute(1.35x) against a 1.30x floor puts the red line under a tenth
-      # over the row; "THE FOURTH RE-DERIVATION" note above gives each leg's. A pull_request run shows
+      # not the annotation: ceil_minute(1.35x) against a 1.30x floor puts the red line 3.8 percent
+      # over the row plus up to 46 seconds of rounding, so the gap varies by leg; "THE FIFTH
+      # RE-DERIVATION" note above gives each leg's. A pull_request run shows
       # the annotation first only when one pull request's growth crosses the row. Growth that crosses
       # it only when several queued pull requests combine is first annotated on a merge-group run,
       # which may land or, past the red line, eject them. Widening that band means changing the
@@ -2079,7 +2180,7 @@ jobs:
           exit 1
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -2465,9 +2566,9 @@ jobs:
           # `webconsole_margin_cap`, so sizing this close to the observed run would buy no detection and
           # cost false reds on green suites. That knob is the gate's ruler and `webconsole_step_timeout`
           # is only the wall -- this sentence named the wall until they were split.
-          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":50,"step_timeout":38,"webconsole_margin_cap":7,"webconsole_step_timeout":10,"webconsole_job_timeout":21,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
-          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":8,"webconsole_step_timeout":11,"webconsole_job_timeout":20,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
-          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":12,"webconsole_step_timeout":16,"webconsole_job_timeout":24,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
+          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":58,"step_timeout":46,"webconsole_margin_cap":9,"webconsole_step_timeout":12,"webconsole_job_timeout":23,"pytest_timeout":60,"fault_timeout":90,"pytest_workers":4}'
+          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":11,"webconsole_step_timeout":15,"webconsole_job_timeout":24,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
+          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":66,"step_timeout":55,"webconsole_margin_cap":14,"webconsole_step_timeout":19,"webconsole_job_timeout":27,"pytest_timeout":120,"fault_timeout":150,"pytest_workers":4}'
           if [ "${GITHUB_REPOSITORY:-}" = "MEFORORG/MessageFoundry" ]; then
             echo "matrix={\"include\":[$U,$W22,$W25]}" >> "$GITHUB_OUTPUT"
           else
@@ -2567,17 +2668,19 @@ jobs:
           # for them), and sqlserver-store, postgres-store, load-test, load-test-sqlserver and
           # windows-service-smoke name it in their JOB `if:`, which is why `serverdb=false` here does
           # not stop them. THE JOBS GATED ON AN OUTPUT OF THIS STEP THAT NAME merge_group NOWHERE are
-          # decided by that output and by nothing else -- docker-smoke, ide, tooling and
-          # packaging-build, via `docker`, `ide`, `tooling` and `packaging` below.
+          # decided by that output and by nothing else -- docker-smoke, ide, tooling,
+          # packaging-build and postgres-store-windows, via `docker`, `ide`, `tooling`, `packaging`
+          # and `serverdb` below. So `serverdb=false` DOES keep postgres-store-windows out of the
+          # queue, which is intended: that leg is advisory, and in the queue it could stop nothing.
           #
           # BOTH HALVES OF THAT PREDICATE ARE LOAD-BEARING, because dropping either changes the
-          # answer. "Names merge_group nowhere" ALONE is true of SEVEN of this file's 14 jobs -- it
+          # answer. "Names merge_group nowhere" ALONE is true of EIGHT of this file's 15 jobs -- it
           # also takes in `changes` and `crypto-operations`, which have no `if:` at all, and
           # `ci-gate`, which is `always()` and reads no output of this step. None of the three is
-          # decided by anything emitted here. Scanned over all 14 job blocks rather than sampled, and
+          # decided by anything emitted here. Scanned over all 15 job blocks rather than sampled, and
           # tests/test_ci_merge_group_gate.py pins the sides of that scan BY MEMBERSHIP, not by count:
-          # the SEVEN jobs whose own job-level or step-level `if:` names merge_group, the SEVEN of
-          # this paragraph, and the FOUR named above.
+          # the SEVEN jobs whose own job-level or step-level `if:` names merge_group, the EIGHT of
+          # this paragraph, and the FIVE named above.
           # THE COUNTS IN THIS PARAGRAPH ARE NOT WHAT IS PINNED -- that module held a count until
           # 2026-09-22 and a count sits at six while a job key is renamed underneath it. It also
           # fails outright if either half of this predicate stops removing anything, which is the
@@ -2699,7 +2802,9 @@ jobs:
           # both server legs run (BACKLOG #2337).
           # test_postgres_store.py and test_sqlserver_store.py import auth/service.py directly since
           # PR 2335; they reached it earlier through tests/_session_seal_contract.py, unchecked.
-          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__main__|messagefoundry/api/(__init__|app|approvals)|messagefoundry/auth/(service)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|sharding|stage_dispatcher|wiring_runner)|messagefoundry/content_type|messagefoundry/uploads|messagefoundry/config/(models|response|settings|wiring)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege|uploads_shard_quota)|tests/_live_scratch\.py|tests/audit_chain_cases\.py|tests/_replay_settle_contract\.py|tests/_pending_approval_store_contract\.py|tests/_ad_group_map_store_contract\.py|tests/test_transit_bound_attestation_server_backends\.py|\.github/workflows/ci\.yml)'; then
+          # Vault BACKLOG #2223: the SQL Server store open runs the pin checks in pki.py and in
+          # auth/trust_anchors.py and auth/anchor_path.py, and test_sqlserver_store.py imports pki.
+          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__main__|messagefoundry/pki|messagefoundry/api/(__init__|app|approvals)|messagefoundry/auth/(service|trust_anchors|anchor_path)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|sharding|stage_dispatcher|wiring_runner)|messagefoundry/content_type|messagefoundry/uploads|messagefoundry/config/(models|response|settings|wiring)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege|uploads_shard_quota)|tests/_live_scratch\.py|tests/audit_chain_cases\.py|tests/_replay_settle_contract\.py|tests/_pending_approval_store_contract\.py|tests/_ad_group_map_store_contract\.py|tests/test_transit_bound_attestation_server_backends\.py|\.github/workflows/ci\.yml)'; then
             echo "serverdb=true" >> "$GITHUB_OUTPUT"
           else
             echo "serverdb=false" >> "$GITHUB_OUTPUT"
@@ -2987,7 +3092,7 @@ jobs:
             -Q "IF DB_ID('MessageFoundry') IS NULL CREATE DATABASE MessageFoundry"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -3323,7 +3428,7 @@ jobs:
           python-version: "3.14"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -3507,6 +3612,149 @@ jobs:
           tests/test_store_privilege_preflight.py
           tests/test_store_privilege_schema_split.py
 
+  # The Postgres store suite on HOSTED WINDOWS, the only supported v1 deployment platform (owner
+  # ruling 2026-10-16). `postgres-store` above runs on ubuntu only, so before this job the store
+  # backend had no automatic leg on the OS v1 ships on. Same test files, pytest flags (bar the
+  # per-test timeout below) and MEFOR_STORE_* env as that job, and its triggers minus merge_group.
+  # The OS and the server differ, and with the server its major, locale and the image's own
+  # machine-wide PGUSER/PGPASSWORD, so a Windows-only red is not attributable to the OS alone.
+  #
+  # THE SERVER IS THE ONE THE RUNNER IMAGE PREINSTALLS, not a container: hosted Windows runners
+  # cannot run Linux service containers. The runner-images readmes (images/windows/
+  # Windows2022-Readme.md and Windows2025-Readme.md in actions/runner-images, read 2026-10-17) list
+  # PostgreSQL 14 on windows-2022 and 17 on windows-2025, service `postgresql-x64-<major>`, stopped
+  # and disabled, PGBIN set, superuser `postgres` with password `root`. Neither is the 16 the ubuntu
+  # leg pins, and the image is not pinned: the first step prints the exact version it got.
+  #
+  # NOT REQUIRED, NOT IN `ci-gate`'s `needs`, AND NOT IN THE MERGE QUEUE; docs/CI.md, "The `CI
+  # gate` roll-up", says why. tests/test_ci_postgres_windows_leg.py pins the test files and their
+  # env to the ubuntu job's. `--timeout=120` is the `test` matrix's Windows per-test value; the
+  # ubuntu job inherits pyproject's 60.
+  #
+  # Fork guard as on windows-service-smoke: 2x-billed Windows minutes are free here (public) and
+  # billed to a fork's owner.
+  postgres-store-windows:
+    name: postgres store (${{ matrix.os }})
+    needs: changes
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.serverdb == 'true') && github.repository == 'MEFORORG/MessageFoundry'
+    runs-on: ${{ matrix.os }}
+    # About 3x the slower of the first measured runs, run 39059057328 (2026-10-17): 7m43s on
+    # windows-2022 and 4m58s on windows-2025. This bounds a hang well below GitHub's 6-hour default;
+    # re-size it from fresh runs if the suite grows.
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    defaults:
+      run:
+        shell: bash  # Git Bash, so the pytest steps read as the ubuntu job's do
+    # The ubuntu job's step env, once. The password is a throwaway set by the first step below.
+    env:
+      MEFOR_TEST_POSTGRES: "1"
+      MEFOR_STORE_BACKEND: postgres
+      MEFOR_STORE_SCHEMA_MANAGEMENT: auto  # #305: CI builds its own schema as the runtime login
+      MEFOR_STORE_SERVER: localhost
+      MEFOR_STORE_PORT: "5432"
+      MEFOR_STORE_DATABASE: messagefoundry
+      MEFOR_STORE_USERNAME: postgres
+      MEFOR_STORE_PASSWORD: mefor
+      # The preinstalled server is reached over loopback without TLS, as the ubuntu container is, so
+      # the same trusted-network dev/test escape applies.
+      MEFOR_STORE_ENCRYPT: "false"
+      MEFOR_ALLOW_INSECURE_TLS: "1"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Start the preinstalled PostgreSQL and create the database
+        shell: pwsh
+        timeout-minutes: 5
+        env:
+          # The image's documented password; the image-wide PGPASSWORD goes stale after the ALTER.
+          PGPASSWORD: root
+        run: |
+          $svc = @(Get-Service -Name 'postgresql-x64-*')
+          if ($svc.Count -ne 1) { throw "expected one postgresql-x64-* service, found $($svc.Count)" }
+          Set-Service -InputObject $svc[0] -StartupType Manual
+          Start-Service -InputObject $svc[0]
+          if (-not $env:PGBIN -or -not (Test-Path "$env:PGBIN\psql.exe")) {
+            throw "the runner image no longer provides PostgreSQL at PGBIN='$env:PGBIN'; re-read its readme"
+          }
+          $port = $env:MEFOR_STORE_PORT
+          & "$env:PGBIN\pg_isready.exe" -h localhost -p $port -t 60
+          if ($LASTEXITCODE -ne 0) { throw "pg_isready exited $LASTEXITCODE" }
+          & "$env:PGBIN\psql.exe" -h localhost -p $port -U $env:MEFOR_STORE_USERNAME -d postgres `
+            -v ON_ERROR_STOP=1 `
+            -c "SELECT version()" `
+            -c "CREATE DATABASE $env:MEFOR_STORE_DATABASE" `
+            -c "ALTER ROLE $env:MEFOR_STORE_USERNAME PASSWORD '$env:MEFOR_STORE_PASSWORD'"
+          if ($LASTEXITCODE -ne 0) { throw "psql exited $LASTEXITCODE" }
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          cache-dependency-glob: |
+            pyproject.toml
+            requirements.lock
+
+      - name: Install project (dev + postgres extras)
+        run: uv pip install --system --constraint constraints.lock -e ".[dev,postgres]"
+
+      - name: Run the Postgres store suite (against the real DB)
+        run: pytest --timeout=120 tests/test_postgres_store.py tests/test_adr0157_postgres_fence.py -v
+
+      - name: Run the failover-LOAD test (two nodes, kill the primary mid-load, against the real DB)
+        run: pytest --timeout=120 tests/test_load_failover_postgres.py -v
+
+      - name: Run the throughput-lever backend invariants on real Postgres
+        run: >-
+          pytest -v --timeout=120
+          tests/test_inline_fast_path.py
+          tests/test_batch_claim_fifo.py
+          tests/test_batch_claim_worker.py
+          tests/test_batch_claim_locking.py
+          tests/test_claim_fifo_heads.py
+          tests/test_seq_only_fifo.py
+          tests/test_fifo_index_migration.py
+          tests/test_per_lane_wake.py
+          tests/test_stage_dispatcher.py
+          tests/test_pooled_rider.py
+          tests/test_uploads_shard_quota_interleave.py
+
+      - name: Run the connection-scale pool-wait smoke on real Postgres (B11 wall #2, tiny pool)
+        env:
+          # Why 4, and not smaller: the ubuntu job's step of the same name.
+          MEFOR_STORE_POOL_SIZE: "4"
+        run: pytest --timeout=120 tests/test_connscale_postgres.py -v
+
+      - name: Run the RTE capture / re-ingress loop on real Postgres (ADR 0013/0016)
+        run: pytest -v --timeout=120 tests/test_x12_rte.py
+
+      - name: Run the failover + engine-shard recovery suites on real Postgres
+        run: >-
+          pytest -v --timeout=120
+          tests/test_cluster_failover_postgres.py
+          tests/test_shard_recovery_postgres.py
+
+      - name: Run the DR seed-gate + backup suites on real Postgres
+        run: >-
+          pytest -v --timeout=120
+          tests/test_dr_server_seed_gate_postgres.py
+          tests/test_backup_runner_server_db_postgres.py
+          tests/test_dr7_server_config_only_backup_postgres.py
+
+      - name: Run the store-principal privilege preflight on real Postgres
+        run: >-
+          pytest -v --timeout=120
+          tests/test_store_privilege_preflight.py
+          tests/test_store_privilege_schema_split.py
+
   # Headless load test (Track B / throughput): serve the synthetic high-fan-out load config (signed
   # in, small fan-out) and drive the smoke profile through the real `python -m harness --load` CLI,
   # asserting zero message loss + all SLOs (exit 0) and uploading the JSON/CSV report. Skipped on PRs
@@ -3532,7 +3780,7 @@ jobs:
           python-version: "3.14"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -3546,11 +3794,13 @@ jobs:
           # THE RIG SIGNS IN (vault BACKLOG #2719). The engine serves with sign-in on, as shipped. The run
           # block provisions one Administrator before the engine starts, and every API read after that
           # carries that account's session (harness/load/rigadmin.py). Two settings follow:
-          #   require_mfa off -- provision-admin enrols an authenticator app at a terminal and offers
-          #     no other way, so the rig account has none. The bind is loopback.
+          #   require_mfa ON, as shipped -- THIS RIG LEG STARTS THE ENGINE WITH MFA REQUIRED (vault
+          #     BACKLOG #2796). The rig account is enrolled with an authenticator key the run block
+          #     draws, and signs in with password and code in one request. The other rig legs keep
+          #     require_mfa off; docs/LOAD-TESTING.md, "Rigs sign in", says why.
           #   an [alerts] channel -- with sign-in on, an enforcing start refuses without a way to send
           #     account-security notices. The gate reads configuration only; nothing listens there.
-          MEFOR_SECURITY_REQUIRE_MFA: "false"
+          MEFOR_SECURITY_REQUIRE_MFA: "true"
           MEFOR_ALERTS_EMAIL_SMTP_HOST: 127.0.0.1
           MEFOR_ALERTS_EMAIL_SMTP_PORT: "2525"
           MEFOR_ALERTS_EMAIL_FROM: rig-operator@example.invalid
@@ -3626,8 +3876,16 @@ jobs:
           # that needs it and is never exported, so the engine's own environment never holds it.
           rig_pw="$(python -c 'import secrets; print(secrets.token_hex(24))')"
           echo "::add-mask::$rig_pw"
-          MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" python -m harness.load.rigadmin provision --db ./load-ci.db
-          python -m messagefoundry serve --config harness/config/load --env dev --db ./load-ci.db \
+          # Its authenticator key, a base32 TOTP secret drawn the same way and handled the same way:
+          # masked, handed only to `provision` and the sign-in, never exported. provision-admin takes
+          # no key as input; rigadmin replaces its terminal enrolment in the provisioning child only.
+          rig_totp="$(python -c 'from messagefoundry.auth import totp; print(totp.generate_secret())')"
+          echo "::add-mask::$rig_totp"
+          MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" MEFOR_RIG_ADMIN_TOTP_KEY="$rig_totp" \
+            python -m harness.load.rigadmin provision --db ./load-ci.db
+          # Vault BACKLOG #2700: this leg runs under `enforce`, which refuses a start with the
+          # interpreter's remote debugging on. Start the interpreter as the service does.
+          python -I -X disable-remote-debug -m messagefoundry serve --config harness/config/load --env dev --db ./load-ci.db \
             --host 127.0.0.1 --port 8765 > engine.log 2>&1 &
           engine_pid=$!
           # The certificate is minted during startup, so a miss on the first turns is ordinary --
@@ -3639,12 +3897,22 @@ jobs:
           set +e
           if [ -n "$ready" ]; then
             # `run` first checks the engine refuses a request with no session, then signs in and
-            # hands the session to the load CLI as --token. Its exit code is the load CLI's.
-            MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" python -m harness.load.rigadmin run \
+            # hands the session to the load CLI as --token. Its exit code is the load CLI's. It signs
+            # in ONCE, and first waits for a TOTP step to open, up to about 31 s; _code_in_a_fresh_step
+            # in harness/load/rigadmin.py says why.
+            MEFOR_RIG_ADMIN_PASSWORD="$rig_pw" MEFOR_RIG_ADMIN_TOTP_KEY="$rig_totp" \
+              python -m harness.load.rigadmin run \
               --engine https://127.0.0.1:8765 --cacert "$cert" -- \
               python -m harness --load smoke --engine https://127.0.0.1:8765 --sink-port 2700 \
               --report-json out/load/smoke-ci.json --report-csv out/load/smoke-ci.csv
             rc=$?
+            # The engine's start-up census warns about a covered account with no authenticator app
+            # (ADR 0197). With MFA required and the rig account enrolled, it must not. This reads
+            # an absence only: a census that never ran, or logged elsewhere, would pass it too.
+            if grep -q "hold a chosen password and no authenticator app" engine.log; then
+              echo "::error::the engine started with MFA required and named an account with no authenticator app"
+              rc=1
+            fi
           else
             # FAIL ON THE REAL CONDITION RATHER THAN 30s LATER ON A DERIVED ONE. The loop above used to
             # end in `|| sleep 0.5`, which made it incapable of failing the step: a never-ready engine
@@ -3759,7 +4027,7 @@ jobs:
             -Q "IF DB_ID('MessageFoundry') IS NULL CREATE DATABASE MessageFoundry; ALTER DATABASE MessageFoundry SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -3772,9 +4040,9 @@ jobs:
         env:
           # THE RIG SIGNS IN (vault BACKLOG #2719). The engine serves with sign-in on, as shipped. The run
           # block provisions one Administrator before the engine starts, and the load CLI polls with
-          # that account's session (harness/load/rigadmin.py). require_mfa is off because
-          # provision-admin enrols an authenticator app at a terminal and offers no other way, so the
-          # rig account has none. This leg is at `warn` (below), where the notification gate that an
+          # that account's session (harness/load/rigadmin.py). require_mfa is off because this leg
+          # supplies no authenticator key, so the rig account has none; docs/LOAD-TESTING.md, "Rigs
+          # sign in", says why. This leg is at `warn` (below), where the notification gate that an
           # enforcing leg must satisfy only warns, so it configures no [alerts] channel.
           MEFOR_SECURITY_REQUIRE_MFA: "false"
           MEFOR_LOAD_FANOUT: "8"
@@ -3903,7 +4171,9 @@ jobs:
   # day); the nightly keeps both Server SKUs covered daily and workflow_dispatch
   # re-validates a specific merge on demand.
   windows-service-smoke:
-    name: windows service smoke (${{ matrix.os }}, py${{ matrix.python-version }})
+    # One expression for the os slot, so the check-list name keeps the shape ci-gate's CHECK_NAMES
+    # table holds, "windows service smoke (*, py*)". An account leg reads "(windows-2025, localsystem, py3.14)".
+    name: windows service smoke (${{ matrix.account && format('{0}, {1}', matrix.os, matrix.account) || matrix.os }}, py${{ matrix.python-version }})
     # This repo only: it spins up 2x-billed hosted Windows runners on BOTH Server SKUs, which is free
     # here (public) and billed to the owner of a fork. Nightly schedule + manual dispatch only. ci-gate
     # `needs` this job, but a `skipped` leg counts as a pass there, so gating it off a fork cannot wedge
@@ -3916,9 +4186,20 @@ jobs:
         # Windows Server 2022 + 2025 on the supported deploy Python (3.14), so the real NSSM
         # install->serve->MLLP path is validated on the version we ship, on each Server SKU. This job
         # is push/dispatch-only, so the Windows minutes cost no PR time.
+        #
+        # vault BACKLOG #2702: account legs install the service under an account other than its own
+        # virtual account, which the installer gives SID type none. Each must start, take a message
+        # and run with exactly the privilege list the installer writes. One Server SKU each.
+        # - localsystem (-AllowLocalSystem) is listed. Its first run is in the merge queue.
+        # - localuser (-ServiceAccount, a local user created on the runner) is WIRED BUT NOT LISTED,
+        #   for the reason docs/SERVICE.md "Restrict the service token" gives (the store's
+        #   _hardening_refusal in messagefoundry/store/store.py). Add this row once that changes:
+        #     - { os: windows-2025, python-version: "3.14", account: localuser }
+        # - A gMSA gets no leg. docs/SERVICE.md "Restrict the service token" says why.
         include:
           - { os: windows-2022, python-version: "3.14" }
           - { os: windows-2025, python-version: "3.14" }
+          - { os: windows-2025, python-version: "3.14", account: localsystem }
     defaults:
       run:
         shell: pwsh
@@ -3933,6 +4214,12 @@ jobs:
     env:
       SMOKE_NSSM_DIR: C:\Program Files\MessageFoundry\nssm
       SMOKE_NSSM_CACHED_EXE: C:\mefor-ci-cache\nssm-2.24-win64\nssm.exe
+      # vault BACKLOG #2702: virtual (the installer's default), localsystem or localuser. Steps
+      # that hold for one account only name it in their `if:`.
+      SMOKE_ACCOUNT: ${{ matrix.account || 'virtual' }}
+      # The local user the localuser leg creates. Its password is drawn at run time and never
+      # leaves the step outputs, masked.
+      SMOKE_LOCAL_USER: mefor-svc
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -3969,7 +4256,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -4033,6 +4320,28 @@ jobs:
           "::add-mask::$drawn"
           "password=$drawn" >> $env:GITHUB_OUTPUT
 
+      # vault BACKLOG #2702, the localuser leg: a local account for the service to run as, made for
+      # this run on a runner that is thrown away after it. The password is drawn here and masked
+      # before anything can echo it, the way the rig password above is. The server's complexity
+      # policy wants three of upper case, lower case, digits and symbols, and hex alone is two, so
+      # the drawn hex is wrapped in characters of the other two kinds. The installer grants the
+      # account "Log on as a service" itself; this step creates it and nothing else.
+      - name: Create the local service account (localuser leg)
+        id: svc
+        if: env.SMOKE_ACCOUNT == 'localuser'
+        run: |
+          $drawn = (& python -c "import secrets; print('Mf-' + secrets.token_hex(24) + '-Q9')").Trim()
+          if (-not $drawn) { throw "could not draw the local service account's password" }
+          "::add-mask::$drawn"
+          # New-LocalUser is a Windows PowerShell module, so it runs there. The password reaches it
+          # through this process's environment, never a command line.
+          $env:SMOKE_LOCAL_USER_PASSWORD = $drawn
+          powershell -NoProfile -NonInteractive -Command '$ErrorActionPreference = "Stop"; $s = ConvertTo-SecureString $env:SMOKE_LOCAL_USER_PASSWORD -AsPlainText -Force; New-LocalUser -Name $env:SMOKE_LOCAL_USER -Password $s -PasswordNeverExpires -AccountNeverExpires -Description "windows-service-smoke run-as account" | Out-Null'
+          $made = $LASTEXITCODE
+          Remove-Item Env:SMOKE_LOCAL_USER_PASSWORD
+          if ($made -ne 0) { throw "could not create the local account $env:SMOKE_LOCAL_USER (exit $made)" }
+          "password=$drawn" >> $env:GITHUB_OUTPUT
+
       # Run the install/uninstall scripts under Windows PowerShell 5.1 (shell: powershell) to
       # match what the console launches on an end-user machine — catches 5.1-only behaviour
       # (e.g. native-command stderr aborting under ErrorActionPreference=Stop). On a cache hit the
@@ -4048,7 +4357,24 @@ jobs:
           NSSM_CACHE_HIT: ${{ github.event_name == 'merge_group' && steps.nssm-cache.outputs.cache-hit || 'false' }}
           NSSM_PIN: ${{ steps.nssm-pin.outputs.pin }}
           MEFOR_RIG_ADMIN_PASSWORD: ${{ steps.rig.outputs.password }}
+          SMOKE_LOCAL_USER_PASSWORD: ${{ steps.svc.outputs.password }}
         run: |
+          # vault BACKLOG #2702: the account this leg runs the service as. $account is what the
+          # installer is handed; $grantee is the name the grants below write for it, SYSTEM's SID
+          # for LocalSystem. The installer itself writes no named grant for LocalSystem.
+          $account = @{}
+          $grantee = "NT SERVICE\MessageFoundry"
+          if ($env:SMOKE_ACCOUNT -eq "localsystem") {
+            $account['AllowLocalSystem'] = $true
+            $grantee = "*S-1-5-18"
+          } elseif ($env:SMOKE_ACCOUNT -eq "localuser") {
+            $grantee = "$env:COMPUTERNAME\$env:SMOKE_LOCAL_USER"
+            $account['ServiceAccount'] = $grantee
+            $account['ServiceAccountPassword'] = ConvertTo-SecureString $env:SMOKE_LOCAL_USER_PASSWORD -AsPlainText -Force
+          } elseif ($env:SMOKE_ACCOUNT -ne "virtual") {
+            throw "unknown SMOKE_ACCOUNT '$env:SMOKE_ACCOUNT'"
+          }
+          Remove-Item Env:SMOKE_LOCAL_USER_PASSWORD -ErrorAction SilentlyContinue
           # The checkout's editable launcher, for `gen-key` below. The service does not run it.
           $exe = (Get-Command messagefoundry).Source
           $cached = @{}
@@ -4070,12 +4396,13 @@ jobs:
           # install path rather than the MEFOR_ALLOW_INSECURE_CONFIG_SOURCE dev escape. It also locks
           # environments\, the value file's folder, which `serve` now refuses to read when Users can
           # write it (vault BACKLOG #2626). -Config is named because it no longer has a default.
-          # #224: NO -ServiceAccount and NO -AllowLocalSystem, so this install exercises the NEW DEFAULT -
+          # #224: on the virtual-account legs, NO -ServiceAccount and NO -AllowLocalSystem, so this install exercises the NEW DEFAULT -
           # the least-privilege virtual account NT SERVICE\MessageFoundry (no password). This leg is the
           # gate for that flip: it proves the virtual account is granted config-read (RX, via the
           # -LockConfigDir path that now runs AFTER ObjectName so the per-service SID resolves) + data-dir
-          # read/write, gets SeServiceLogonRight, and actually starts and serves /health + MLLP. Pass
-          # -AllowLocalSystem here if a run-as-LocalSystem smoke is ever needed instead.
+          # read/write, gets SeServiceLogonRight, and actually starts and serves /health + MLLP. The
+          # account legs (vault BACKLOG #2702) add -AllowLocalSystem or -ServiceAccount through
+          # @account, set at the top of this script.
           # Vault BACKLOG #2626 step 2: `serve` as the service refuses to start with no
           # --service-config. This rig sets everything through the service's environment, so the
           # file is empty. It sits in a folder of its own outside the checkout, so -LockConfigDir
@@ -4087,7 +4414,7 @@ jobs:
           $serviceConfig = "C:\ProgramData\MessageFoundry-settings\messagefoundry.toml"
           New-Item -ItemType Directory -Force -Path (Split-Path -Parent $serviceConfig) | Out-Null
           [System.IO.File]::WriteAllText($serviceConfig, "# windows-service-smoke: set through the service's environment.`n")
-          .\scripts\service\install-service.ps1 -NssmDir $env:SMOKE_NSSM_DIR -Config samples\config -ProjectRoot $PWD -ServiceConfig $serviceConfig -LogLevel INFO -Environment prod -LockConfigDir @cached
+          .\scripts\service\install-service.ps1 -NssmDir $env:SMOKE_NSSM_DIR -Config samples\config -ProjectRoot $PWD -ServiceConfig $serviceConfig -LogLevel INFO -Environment prod -LockConfigDir @cached @account
           # The installer only warns when it cannot lock a folder, and `serve` would then refuse the
           # settings file at start. So run the check `serve` runs on the file and its folder, and
           # fail here, by name, rather than as a service that never comes up.
@@ -4098,10 +4425,10 @@ jobs:
           # grant to Users there no longer counts. So they get the grant docs/SERVICE.md tells an operator
           # to add for any directory a File connection writes. The installer grants the data
           # directory itself; the "Verify the service token" step below shows a directory with
-          # no such grant is refused.
+          # no such grant is refused. The account legs write the same grant for their own account.
           foreach ($d in "in", "dev-inbox", "out") {
             New-Item -ItemType Directory -Force -Path $d | Out-Null
-            & icacls $d /grant "NT SERVICE\MessageFoundry:(OI)(CI)M" | Out-Null
+            & icacls $d /grant "${grantee}:(OI)(CI)M" | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "could not grant the service account on '$d' (icacls exit $LASTEXITCODE)" }
           }
           # The shipped samples graph includes a mutual-TLS WS-* SOAP feed (IB_IMMUNIZATION_VXU) whose
@@ -4152,8 +4479,11 @@ jobs:
           # local user can read, so the key reaches it the way docs/SERVICE.md says first: a DPAPI
           # key file, made from the same key while it is in this shell, and readable by the
           # service's virtual account. The service is registered above, so that account exists.
+          # An account leg grants its own account; LocalSystem needs none, since the file always
+          # names SYSTEM.
           $storeKeyFile = "C:\ProgramData\MessageFoundry\store.key.dpapi"
-          cmd /c "python -m messagefoundry protect-key --out ""$storeKeyFile"" --grant-account ""NT SERVICE\MessageFoundry"" 2>&1"
+          $keyGrant = if ($env:SMOKE_ACCOUNT -eq "localsystem") { "" } else { " --grant-account ""$grantee""" }
+          cmd /c "python -m messagefoundry protect-key --out ""$storeKeyFile""$keyGrant 2>&1"
           $protected = $LASTEXITCODE
           Remove-Item Env:MEFOR_STORE_ENCRYPTION_KEY
           if ($provisioned -ne 0) { throw "could not provision the rig Administrator (exit $provisioned)" }
@@ -4491,7 +4821,9 @@ jobs:
       #    running afterwards, so the stop step below still has a running service to stop.
       #
       # NOT PROVEN HERE: an explicit -ServiceAccount, a gMSA and -AllowLocalSystem. The installer
-      # does not set the restricted SID for those, and no leg installs under them. Nor is a real
+      # does not set the restricted SID for those, so this step runs on the virtual-account legs
+      # only; the next step reads the account legs (localsystem; localuser is wired, not listed), and
+      # no leg runs a gMSA. Nor is a real
       # network share: the probe's credential is made up, so it runs the logon and the
       # impersonation and never the SMB hop, which the far end checks and this token does not.
       #
@@ -4513,6 +4845,7 @@ jobs:
       # probe's report is checked for the account as well, so a set that did change it goes red.
       # The name is quoted: unquoted, YAML reads " #2702)" as a comment and cuts the name there.
       - name: "Verify the service token is restricted (vault BACKLOG #2702)"
+        if: env.SMOKE_ACCOUNT == 'virtual'
         run: |
           # Two commands below exit non-zero on a run that worked, and say so where they are
           # called. Set here so that never depends on the runner's default for this preference.
@@ -4658,6 +4991,81 @@ jobs:
           & python $probe check-inside --report $report --service-sid $serviceSid --privilege $privilege
           Assert-Native "the check on what the service token can do"
 
+      # vault BACKLOG #2702, the account legs. The installer gives LocalSystem and a local user the
+      # same one-entry RequiredPrivileges list as the virtual account, and SID type none, with a
+      # warning. The health and message steps above show the engine still starts and takes a
+      # message under that list. This step shows the list took: it reads the registration, then the
+      # token of the service's root process and of the engine's processes under it, through service_token_probe.py
+      # check-privileges, whose control is this shell. It does not put the probe in the engine's
+      # place: with SID type none there is no write restriction for it to show.
+      #
+      # IF THE LOCALSYSTEM LEG CANNOT START OR SERVE with SeChangeNotifyPrivilege alone, that is a
+      # finding about the privilege list and not a flake. Do not widen the list to make it pass;
+      # read the service logs and report it.
+      - name: "Verify the service token under another account (vault BACKLOG #2702)"
+        if: env.SMOKE_ACCOUNT != 'virtual'
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $privilege = "SeChangeNotifyPrivilege"
+          $probe = Join-Path $PWD "scripts\ci\service_token_probe.py"
+          function Assert-Native([string]$What) {
+            if ($LASTEXITCODE -ne 0) { throw "$What failed (exit $LASTEXITCODE)" }
+          }
+
+          # --- 1. the registration -----------------------------------------------------------------
+          $sidType = (& sc.exe qsidtype MessageFoundry | Out-String); Assert-Native "sc.exe qsidtype MessageFoundry"
+          $privs = (& sc.exe qprivs MessageFoundry | Out-String); Assert-Native "sc.exe qprivs MessageFoundry"
+          "===== sc.exe qsidtype MessageFoundry ====="; $sidType
+          "===== sc.exe qprivs MessageFoundry ====="; $privs
+          $none = '(?m)SID_TYPE\s*:\s*NONE\s*$'
+          # CONTROL: the other two values must NOT match, or the pattern matches everything.
+          foreach ($not in "SERVICE_SID_TYPE:  RESTRICTED", "SERVICE_SID_TYPE:  UNRESTRICTED") {
+            if ($not -match $none) { throw "CONTROL FAILED: '$not' reads as NONE, so the pattern proves nothing" }
+          }
+          if ($sidType -notmatch $none) { throw "the service SID type is not NONE, which is what the installer writes for this account" }
+          $listed = @([regex]::Matches($privs, 'Se[A-Za-z]+Privilege') | ForEach-Object { $_.Value } | Sort-Object -Unique)
+          if (($listed -join ',') -ne $privilege) {
+            throw "the registration lists [$($listed -join ', ')], not exactly $privilege"
+          }
+
+          # --- 2. the running engine's token -------------------------------------------------------
+          # The SID of the account this leg asked for, so a service that runs as some other account
+          # under the same registration fails on the user.
+          if ($env:SMOKE_ACCOUNT -eq "localsystem") { $accountSid = "S-1-5-18" }
+          else {
+            $accountSid = ([Security.Principal.NTAccount]"$env:COMPUTERNAME\$env:SMOKE_LOCAL_USER").Translate(
+              [Security.Principal.SecurityIdentifier]).Value
+          }
+          $svc = Get-CimInstance Win32_Service -Filter "Name='MessageFoundry'"
+          if (-not $svc -or -not $svc.ProcessId) { throw "the service is not running, so there is no token to read" }
+          "the Service Control Manager runs MessageFoundry as $($svc.StartName); this leg expects $accountSid"
+          # Every process under the service's root, the walk the token step above makes: the venv's
+          # python.exe starts the interpreter that runs the engine as a child of its own.
+          $all = @(Get-CimInstance Win32_Process)
+          $tree = @($all | Where-Object { [int]$_.ProcessId -eq [int]$svc.ProcessId })
+          $frontier = $tree
+          while ($frontier.Count -gt 0) {
+            $frontier = @(foreach ($parent in $frontier) {
+              $all | Where-Object {
+                ([int]$_.ParentProcessId -eq [int]$parent.ProcessId) -and
+                ($_.CreationDate -ge $parent.CreationDate) -and
+                (@($tree | ForEach-Object { [int]$_.ProcessId }) -notcontains [int]$_.ProcessId)
+              }
+            })
+            $tree += $frontier
+          }
+          $tree | Format-Table ProcessId, ParentProcessId, Name -AutoSize | Out-String
+          # The same names the token step above reads, the launcher's included.
+          $procs = @($tree[0]) + @($tree | Select-Object -Skip 1 | Where-Object {
+            $_.Name -in @("messagefoundry.exe", "python.exe", "pythonw.exe")
+          })
+          if (-not ($procs | Where-Object { $_.Name -eq "python.exe" })) {
+            throw "no python.exe runs under the service, so the engine's own token was not read"
+          }
+          $pids = @($procs | ForEach-Object { "--pid"; "$($_.ProcessId)" })
+          & python $probe check-privileges --account-sid $accountSid --privilege $privilege --control-pid $PID @pids
+          Assert-Native "the token check on the running service"
+
       # BACKLOG #2747: THE STOP'S EXIT CODE IS NOT THIS STEP'S RESULT. This step used to be the stop
       # command alone, so that command's exit code decided it. In job 111525536301 (windows-2022,
       # 2026-10-04) it printed "Unexpected status SERVICE_RUNNING in response to STOP control" and
@@ -4774,14 +5182,17 @@ jobs:
       # `!cancelled()` rather than the default `success()`: both readings are wanted on every run, so
       # the start-first arm still runs when the provision-first arm or the service smoke went red.
       # Windows PowerShell 5.1, matching the install step above. timeout-minutes bounds a hung arm.
+      #
+      # The three arms run on the virtual-account legs only: each installs the default account
+      # itself, so on an account leg it would repeat what those legs already measure.
       - name: Store access, auth on -- provision first, then the service (ADR 0183 Wave 0)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.SMOKE_ACCOUNT == 'virtual' }}
         timeout-minutes: 15
         shell: powershell
         run: .\scripts\service\measure-store-access.ps1 -Order ProvisionFirst -NssmDir $env:SMOKE_NSSM_DIR -DataDir C:\ProgramData\MessageFoundry-w0-provision-first
 
       - name: Store access, auth on -- the service first, then the operator (ADR 0183 Wave 0)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.SMOKE_ACCOUNT == 'virtual' }}
         timeout-minutes: 15
         shell: powershell
         run: .\scripts\service\measure-store-access.ps1 -Order StartFirst -NssmDir $env:SMOKE_NSSM_DIR -DataDir C:\ProgramData\MessageFoundry-w0-start-first
@@ -4796,13 +5207,13 @@ jobs:
       # nobody named -- the retired default coming back -- and reds the arm. It reds the way the two
       # arms above do: an ::error annotation per failure, then RED lines and a throw.
       - name: Store access, auth on -- start first, then provision, end to end (ADR 0183 Wave 2)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.SMOKE_ACCOUNT == 'virtual' }}
         timeout-minutes: 15
         shell: powershell
         run: .\scripts\service\measure-store-access.ps1 -Order StartFirstEndToEnd -NssmDir $env:SMOKE_NSSM_DIR -DataDir C:\ProgramData\MessageFoundry-w2-start-first-e2e
 
       - name: Upload store-access logs (ADR 0183 Wave 0)
-        if: always()
+        if: ${{ always() && env.SMOKE_ACCOUNT == 'virtual' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: store-access-logs-${{ matrix.os }}-py${{ matrix.python-version }}
@@ -4816,7 +5227,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: service-logs-${{ matrix.os }}-py${{ matrix.python-version }}
+          # The account is in the name: two legs share a Server SKU, and an artifact name must be unique.
+          name: service-logs-${{ matrix.os }}-py${{ matrix.python-version }}-${{ env.SMOKE_ACCOUNT }}
           path: C:\ProgramData\MessageFoundry\logs\
           if-no-files-found: ignore
 
@@ -4896,8 +5308,8 @@ jobs:
           #   * The password is drawn for this run and masked before anything can echo it. Hex cannot
           #     spell a word on the engine's password deny-list. `-e NAME` with no value makes docker
           #     read it from this shell, so it is on no command line.
-          #   * require_mfa is off because provision-admin enrols an authenticator app at a terminal
-          #     and offers no other way, so the rig account has none. The bind is loopback.
+          #   * require_mfa is off because this leg supplies no authenticator key, so the rig account
+          #     has none; docs/LOAD-TESTING.md, "Rigs sign in", says why. The bind is loopback.
           #   * The [alerts] channel is there because, with sign-in on, an enforcing start refuses
           #     without a way to send account-security notices. The gate reads configuration only.
           rig_pw="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
@@ -5062,6 +5474,15 @@ jobs:
             exit 1
           fi
           echo "the engine's uid cannot create a file in $site"
+          # The config directory too (vault BACKLOG #3106 item 3): the engine executes every *.py
+          # there, and the image keeps /config root-owned so its own uid cannot add one. The same
+          # write control above, in a writable place, is what makes this refusal mean something. The
+          # container runs without --read-only, so the refusal comes from ownership, not the mount.
+          if docker exec mefor touch /config/planted-by-smoke.py; then
+            echo "FAIL: the engine's uid created a file in /config"
+            exit 1
+          fi
+          echo "the engine's uid cannot create a file in /config"
 
       - name: Verify graceful shutdown (tini -> SIGTERM -> engine.stop drains)
         run: |
@@ -5325,8 +5746,9 @@ jobs:
       # smoke only where its `github.repository` clause ALSO holds, so on a fork it skips in the queue
       # for the same cost reason it skips on a pull request. They are ENUMERATED here rather than
       # called "the heavy legs" because that phrase is not single-valued in this file: the `schedule`
-      # block at the top and the `changes` nightly arm both use it for SIX jobs, docker-smoke
-      # included, and docker-smoke is the one job this sentence would be false for.
+      # block at the top and the `changes` nightly arm both use it for SEVEN jobs, docker-smoke and
+      # postgres-store-windows included, and those two are the jobs this sentence would be false
+      # for: neither names merge_group, and neither is in this job's `needs`.
       #
       # THE TWO HALVES DESCRIBE DIFFERENT EVENTS, so neither generalises. Path-gating is a
       # pull_request property; running whatever `changes` emits is a merge_group one. WHAT THE QUEUE

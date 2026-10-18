@@ -73,7 +73,7 @@ updates:
     # 0.15.x advisory fix still flows. A uvicorn 0.54.x or websockets 17.2.x fix opens a PR, and
     # that PR stays red until the wire suite is re-measured (the uvicorn note below). Security fixes
     # share ONE `python-security` grouped PR, so that red bump holds back every security fix in it.
-    # Detection is untouched — security.yml's REQUIRED `pip-audit -r requirements.lock` covers all
+    # Detection is untouched — security.yml's REQUIRED requirements.lock audit covers all
     # three on every PR and on the daily cron, so a withheld fix reds a merge-blocking gate within
     # ~24h. A human then lifts the cap. An exact pin moves only after a human re-reads the new
     # release. The PR that moves the pin moves its `_MEASURED_UVICORN` or `_MEASURED_WEBSOCKETS` in
@@ -172,6 +172,11 @@ updates:
       # Why: the comment above the [vault] extra in pyproject.toml.
       - dependency-name: "hvac"
         versions: [">=3.0.0"]
+      # Why: the comment above the [harness] extra in pyproject.toml. The TRADE-OFF note's
+      # detection premise does NOT hold for this entry: an advisory against Qt names Qt, not
+      # `pyside6`, so pip-audit would not red on a Qt fix this range withholds.
+      - dependency-name: "pyside6"
+        versions: [">=6.12.0"]
     groups:
       # Version-update grouping (applies-to defaults to version-updates), SPLIT BY UPDATE TYPE (owner
       # decision 2026-09-30) so one bad major cannot hold the routine minors and patches hostage.

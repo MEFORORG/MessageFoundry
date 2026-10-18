@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from tests import _process_guard as process_guard
 from tests import _tooling_manifest as tooling_manifest
 from tests._extras_probe import report_header_lines, write_incomplete_run_summary
 from tests._qt_cycles import collect_qobjects_in_cycles
@@ -583,6 +584,35 @@ def remote_debugging_off(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("messagefoundry.api.app.service_env_posture", lambda: not_a_service)
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _remote_debug_start_gate_stood_down() -> Iterator[Callable[..., bool]]:
+    """Stand down the start-up refusal for remote debugging (vault BACKLOG #2700) in the
+    in-process ``serve`` and ``supervise`` runs, and yield the real gate.
+
+    That gate reads the PROCESS, and a plain ``pytest`` run has the interpreter's remote
+    debugging on, so under the shipped ``enforce`` every in-process start would stop there,
+    whatever gate the test is about. Autouse for that reason, like the config-source
+    read above: it is a fact about the test runner, not about any scenario. A test whose subject
+    is the gate takes :func:`remote_debug_start_gate`. A subprocess start is not covered."""
+    from messagefoundry import __main__ as cli
+
+    real = cli._remote_debug_refused
+    with pytest.MonkeyPatch.context() as patch:
+        # setattr raises on a missing name, so a renamed gate fails here rather than going unstubbed.
+        patch.setattr(cli, "_remote_debug_refused", lambda *args, **kwargs: False)
+        yield real
+
+
+@pytest.fixture
+def remote_debug_start_gate(
+    monkeypatch: pytest.MonkeyPatch, _remote_debug_start_gate_stood_down: Callable[..., bool]
+) -> None:
+    """Put the real remote-debugging start gate back for one test (vault BACKLOG #2700)."""
+    monkeypatch.setattr(
+        "messagefoundry.__main__._remote_debug_refused", _remote_debug_start_gate_stood_down
+    )
+
+
 @pytest.fixture
 def bounded_warn_only_retention(monkeypatch: pytest.MonkeyPatch) -> None:
     """BACKLOG #1967: an enforcing start refuses a warn-only retention tier with neither a window nor
@@ -797,6 +827,19 @@ def _no_allocation_records_in_the_checkout() -> Iterator[None]:
         )
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    # Runs in the xdist controller and in every worker, so each pytest process's children die with
+    # it on Windows, an os._exit from pytest-timeout included. tests/_process_guard.py says why.
+    if process_guard.install() is None and sys.platform == "win32":
+        config.issue_config_time_warning(
+            pytest.PytestWarning(
+                "the Windows process guard could not set up its job, so a process a test starts "
+                "can outlive this pytest process; the proctree warning in the log says why"
+            ),
+            stacklevel=2,
+        )
+
+
 def pytest_report_header() -> list[str]:
     return report_header_lines()
 
@@ -888,6 +931,17 @@ def _provision_admin_enrols_a_synthetic_authenticator() -> Iterator[None]:
         yield
 
 
+#: The console suite's per-request opt-out (its ``_ui_clients.HEADERLESS_UI_REQUEST``), honoured by
+#: the stand-in below too: one run collects both suites, and this session-scoped wrapper then sits
+#: under the console's own, where it would re-add the header a refusal test left off.
+#: ``test_browser_standin_copies_agree.py`` holds this value and the wrapper to the console's copy.
+HEADERLESS_UI_REQUEST = "mf_headerless_ui_request"
+#: The methods the stand-in leaves alone. Only GET, because ``assert_same_origin`` and
+#: ``require_ui`` treat every other method, HEAD and OPTIONS included, as a write, and a browser
+#: sends ``Sec-Fetch-Site`` on those too.
+_SAFE_METHODS = frozenset({"GET"})
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _in_process_ui_clients_send_what_a_browser_sends() -> Iterator[None]:
     """Give a state-changing /ui request that names no provenance ``Sec-Fetch-Site: same-origin``.
@@ -898,8 +952,9 @@ def _in_process_ui_clients_send_what_a_browser_sends() -> Iterator[None]:
     its own form POST. It only fills a GAP: a request that already carries either header is sent
     untouched, and only the in-process ASGI transport is wrapped.
 
-    The console suite's own ``conftest.py`` carries the same stand-in, with the opt-out its refusal
-    tests need. That suite does not inherit this file, which is why there are two.
+    The console suite's own ``conftest.py`` carries the same stand-in. That suite is separately
+    versioned and does not inherit this file, which is why there are two; the wrapper below must
+    stay identical to that one, and ``test_browser_standin_copies_agree.py`` fails if it does not.
     """
     import httpx
 
@@ -908,12 +963,9 @@ def _in_process_ui_clients_send_what_a_browser_sends() -> Iterator[None]:
     @functools.wraps(original)
     async def as_a_browser(self: httpx.ASGITransport, request: httpx.Request) -> httpx.Response:
         if (
-            request.method not in {"GET", "HEAD", "OPTIONS"}
+            request.method not in _SAFE_METHODS
             and request.url.path.startswith("/ui")
-            # The console suite's opt-out (its _ui_clients.HEADERLESS_UI_REQUEST). Honoured here
-            # too: one run collects both suites, and this session-scoped wrapper then sits under
-            # the console's own, where it would re-add the header a refusal test left off.
-            and not request.extensions.get("mf_headerless_ui_request")
+            and not request.extensions.get(HEADERLESS_UI_REQUEST)
             and "sec-fetch-site" not in request.headers
             and "origin" not in request.headers
         ):

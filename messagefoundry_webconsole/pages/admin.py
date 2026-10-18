@@ -83,7 +83,12 @@ def _scope_cell(user: UserSummary) -> str:
     an account that reaches nothing sends an administrator hunting a permission bug that is not
     there. Showing "(none)" for an account that reaches everything hides real access from the person
     whose job is to review it, which is the worse of the two.
+
+    A scope the engine withheld from this reader (BACKLOG #3189) renders as not shown, never as
+    "(none)".
     """
+    if user.channel_scope_withheld:
+        return "not shown"
     if Role.ADMINISTRATOR.value in user.roles:
         return "all (administrator)"
     stored = user.channel_scope
@@ -141,6 +146,8 @@ def ticked_scope_expected_source(user: UserSummary) -> Literal["ad"] | None:
 
 
 def _scope_source_text(user: UserSummary) -> str:
+    if user.channel_scope_withheld:
+        return "not shown"
     source = user.channel_scope_source
     return _SCOPE_SOURCE_TEXT.get(source, str(source))
 
@@ -252,8 +259,14 @@ def users_page(users: Sequence[UserSummary]) -> Markup:
     """The user list: every account with provider, roles, scope, and status; links to the admin forms.
 
     The Lock column appears only when the engine disclosed lock state, which it does only to a
-    users:manage holder (BACKLOG #1131). An empty column would read as "nobody is locked"."""
+    users:manage holder (BACKLOG #1131). An empty column would read as "nobody is locked".
+
+    The two scope columns appear only when the engine sent at least one account's scope, which its
+    ``channel_scope_withheld`` says (BACKLOG #3189), as the Lock column does. A withheld scope is
+    null, which would otherwise render as "(none)", "reaches nothing", so its cells read "not
+    shown". The engine decides who is shown them; this page does not re-derive the rule."""
     show_lock = any(u.lock_state is not None for u in users)
+    show_scope = any(not u.channel_scope_withheld for u in users)
     rows: list[list[object]] = []
     for u in users:
         row: list[object] = [
@@ -262,23 +275,17 @@ def users_page(users: Sequence[UserSummary]) -> Markup:
             u.display_name or "",
             u.email or "",
             ", ".join(u.roles),
-            _scope_cell(u),
-            _scope_source_text(u),
-            "disabled" if u.disabled else "active",
         ]
+        if show_scope:
+            row += [_scope_cell(u), _scope_source_text(u)]
+        row.append("disabled" if u.disabled else "active")
         if show_lock:
             row.append(_lock_cell(u))
         rows.append(row)
-    headers = [
-        "Username",
-        "Provider",
-        "Display name",
-        "Email",
-        "Roles",
-        "Channel scope",
-        "Scope source",
-        "Status",
-    ]
+    headers = ["Username", "Provider", "Display name", "Email", "Roles"]
+    if show_scope:
+        headers += ["Channel scope", "Scope source"]
+    headers.append("Status")
     if show_lock:
         headers.append("Lock")
     return page(
@@ -975,19 +982,24 @@ def role_form_page(
 
 # --- AD group mappings -----------------------------------------------------------
 
+#: The example full DN each group input shows. A placeholder only: nothing is stored from it.
+_GROUP_DN_EXAMPLE = "CN=MF-Admins,OU=Groups,DC=example,DC=com"
+
 
 def _map_rows(
-    first_name: str,
     pairs: Sequence[tuple[str, Markup]],
     blank: Markup,
     blanks: int = 3,
 ) -> list[object]:
-    """Rows of paired inputs (existing entries + a few blank rows; empty rows are ignored on save)."""
+    """Rows of an ``ad_group`` input and its partner (existing entries + a few blank rows; empty
+    rows are ignored on save).
+
+    Each group input shows an example full DN, because both group maps refuse a short name
+    (BACKLOG #2610, #3222)."""
     rows: list[object] = []
-    for value, partner in pairs:
-        rows.append(el("div", el("input", name=first_name, value=value), partner, class_="maprow"))
-    for _ in range(blanks):
-        rows.append(el("div", el("input", name=first_name, value=""), blank, class_="maprow"))
+    for value, partner in [*pairs, *[("", blank)] * blanks]:
+        group = el("input", name="ad_group", value=value, placeholder=_GROUP_DN_EXAMPLE)
+        rows.append(el("div", group, partner, class_="maprow"))
     return rows
 
 
@@ -1011,7 +1023,6 @@ def ad_groups_page(
     exist to add entries without any client-side scripting (CSP: no inline JS).
     """
     role_rows = _map_rows(
-        "ad_group",
         [(e.ad_group, _role_select(roles, e.role)) for e in map_entries],
         _role_select(roles),
     )
@@ -1024,7 +1035,6 @@ def ad_groups_page(
         class_="ctl",
     )
     scope_rows = _map_rows(
-        "ad_group",
         [
             (e.ad_group, el("input", name="channel", value=e.channel, placeholder="channel or *"))
             for e in scope_entries

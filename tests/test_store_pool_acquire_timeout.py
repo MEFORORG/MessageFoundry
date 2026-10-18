@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #1052 (ASVS 13.2.6) — every store pooled-connection borrow is BOUNDED.
+"""BACKLOG #1052 (ASVS 13.2.6) — every store pooled-connection borrow is BOUNDED. The two session
+writes that follow a committed auth change wait longer on purpose: by a longer, still finite limit
+on SQL Server (BACKLOG #3023), without a limit on Postgres (BACKLOG #2283). Both are pinned by name
+below.
 
 ``[store].connect_timeout`` bounds the login and ``[store].command_timeout`` the statement. Neither
 bounds the WAIT for a free pooled connection, and that wait was unbounded at three sites: the SQL
@@ -379,6 +382,167 @@ async def test_postgres_post_commit_session_writes_wait_out_a_busy_pool(
     assert pool.statements and pool.statements[-1].startswith("UPDATE sessions")
 
 
+class _MssqlSessionCursor:
+    """The cursor the busy SQL Server pool's connection hands out: answers the session row read
+    with one live unsealed row and the re-key's ``OUTPUT`` with one row."""
+
+    def __init__(self, statements: list[str]) -> None:
+        self._statements = statements
+        self._last = ""
+        self.description: list[tuple[str]] = []
+
+    async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
+        self._statements.append(sql)
+        self._last = sql
+        if sql.startswith("SELECT * FROM sessions"):
+            self.description = [
+                (c,)
+                for c in (
+                    "token_hash",
+                    "user_id",
+                    "created_at",
+                    "expires_at",
+                    "last_used_at",
+                    "revoked_at",
+                    "client",
+                    "user_epoch",
+                    "seal",
+                )
+            ]
+
+    async def fetchall(self) -> list[Any]:
+        if self._last.startswith("SELECT * FROM sessions"):
+            return [("a" * 64, "u", 1.0, 9e9, 1.0, None, None, 0, "")]
+        if self._last.startswith("SELECT session_epoch"):
+            return [(0,)]
+        return [("b" * 64,), ("c" * 64,)]
+
+    async def close(self) -> None:
+        return None
+
+
+class _MssqlSessionConn(_Conn):
+    def __init__(self, statements: list[str]) -> None:
+        super().__init__("busy")
+        self._statements = statements
+
+    async def cursor(self) -> _MssqlSessionCursor:
+        return _MssqlSessionCursor(self._statements)
+
+    async def commit(self) -> None:
+        return None
+
+    async def rollback(self) -> None:
+        return None
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [("revoke_user_sessions", 2), ("rotate_session", True)],
+)
+async def test_sqlserver_post_commit_session_writes_wait_out_a_busy_pool(
+    name: str, expected: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3023: the SQL Server half of the Postgres test above. Both writes borrow through
+    ``_acquire_after_commit``, so a busy pool that frees within the longer limit delays them rather
+    than failing them after their caller's change committed. The factor is raised here so the
+    timing has room; the next test proves the real limit. The control proves the stand-in does time
+    an ordinary borrow out, and the release proves the post-commit borrow still goes back to the
+    pool."""
+    from messagefoundry.store import sqlserver
+
+    monkeypatch.setattr(sqlserver, "_AFTER_COMMIT_ACQUIRE_FACTOR", 100)
+    pool = _BusyPool()
+    pool.conn = _MssqlSessionConn(pool.statements)
+    store = _sqlserver_store(pool)
+    store._row_sealer = None  # keyless: the re-key rewrites the row with an empty seal
+    with pytest.raises(StoreAcquireTimeout):
+        async with store._acquire():
+            pytest.fail("the bounded borrow must time out on a busy pool")
+
+    async def bump(cur: Any, user_id: str) -> None:
+        # The sealed epoch write needs a users row this stand-in cannot serve; it runs live in CI.
+        pool.statements.append("raise the epoch")
+
+    store._bump_session_epoch = bump
+    calls = {
+        "revoke_user_sessions": lambda: store.revoke_user_sessions("u", now=1.0),
+        "rotate_session": lambda: store.rotate_session("a" * 64, new_token_hash="b" * 64),
+    }
+    task = asyncio.create_task(calls[name]())
+    await asyncio.sleep(FAST * 4)  # well past the acquire timeout
+    assert not task.done(), f"{name} gave up on a busy pool after its caller's write committed"
+    pool.gate.set()
+    assert await asyncio.wait_for(task, timeout=5) == expected
+    assert pool.statements and pool.statements[-1].startswith("UPDATE sessions")
+    assert pool.released == [pool.conn] and pool.checked_out == []
+    assert store._acquire_wait.summary().count == 1, "the post-commit wait left the histogram"
+
+
+def _post_commit_call(store: Any, name: str) -> Any:
+    if name == "revoke_user_sessions":
+        return store.revoke_user_sessions("u", now=1.0)
+    return store.rotate_session("a" * 64, new_token_hash="b" * 64)
+
+
+@pytest.mark.parametrize("name", ["revoke_user_sessions", "rotate_session"])
+async def test_sqlserver_post_commit_session_writes_are_still_bounded(name: str) -> None:
+    """BACKLOG #3023, PR 2350 repair. RED when: the post-commit borrow waits without a limit (a hung
+    pool then hangs the write until the outer ``wait_for`` fails the test), or it gives up at the
+    ordinary limit.
+
+    A wedged pool must surface as ``StoreAcquireTimeout`` within ``_AFTER_COMMIT_ACQUIRE_FACTOR``
+    times ``acquire_timeout``, so a rotation reaches its fail-closed branch. ``_sqlserver_store``
+    sets ``command_timeout=0``, the setting that lifts the statement limit, so this also proves that
+    setting leaves the acquire wait bounded."""
+    from messagefoundry.store.sqlserver import _AFTER_COMMIT_ACQUIRE_FACTOR
+
+    store = _sqlserver_store(_HangingPool())
+    assert store._settings.command_timeout == 0
+    bound = FAST * _AFTER_COMMIT_ACQUIRE_FACTOR
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    with pytest.raises(StoreAcquireTimeout):
+        await asyncio.wait_for(_post_commit_call(store, name), timeout=bound + 5)
+    elapsed = loop.time() - t0
+    assert elapsed >= bound * 0.9, (
+        f"{name} gave up at {elapsed:.3f}s, before its {bound:.3f}s limit"
+    )
+    assert bound >= FAST * 1.5, "the post-commit limit is no longer than an ordinary borrow's"
+    assert elapsed < bound + 2, f"{name} took {elapsed:.3f}s against a {bound:.3f}s limit"
+
+
+def test_sqlserver_post_commit_limit_is_longer_and_inside_the_request_deadline() -> None:
+    """RED when: the factor makes the post-commit limit no longer than an ordinary borrow's, or so
+    long that at the defaults the API's request deadline cancels the wait first. A cancellation
+    skips the rotation's fail-closed branch, so the limit must leave the request room to answer."""
+    from messagefoundry.api.request_timeout import DEFAULT_REQUEST_TIMEOUT_SECONDS
+    from messagefoundry.store.sqlserver import _AFTER_COMMIT_ACQUIRE_FACTOR
+
+    assert _AFTER_COMMIT_ACQUIRE_FACTOR > 1
+    limit = StoreSettings().acquire_timeout * _AFTER_COMMIT_ACQUIRE_FACTOR
+    assert limit <= DEFAULT_REQUEST_TIMEOUT_SECONDS / 2, f"{limit}s leaves the request no room"
+
+
+async def test_sqlserver_post_commit_borrow_keeps_the_cancellation_quarantine() -> None:
+    """ADR 0159 on the post-commit borrow: a cancellation mid-body still quarantines the connection
+    before it is released, so it is never lent again with its transaction open."""
+    pool = _ReadyPool()
+    store = _sqlserver_store(pool)
+    order: list[str] = []
+
+    async def quarantine(conn: Any) -> None:
+        order.append(f"quarantine {pool.released!r}")
+
+    store._release_dirty = quarantine
+    with pytest.raises(asyncio.CancelledError):
+        async with store._acquire_after_commit() as conn:
+            assert conn is pool.conn
+            raise asyncio.CancelledError
+    assert order == ["quarantine []"], "the cancelled connection was released before quarantine"
+    assert pool.released == [pool.conn]
+
+
 async def test_sqlserver_store_releases_a_healthy_borrow() -> None:
     """Positive control for the acquire/release restructure: the connection still goes back."""
     pool = _ReadyPool()
@@ -451,10 +615,11 @@ def _unbounded_borrow_sites(relpath: str) -> list[str]:
 
 
 def test_sqlserver_acquire_really_is_the_sole_borrow_site() -> None:
-    """The SQL Server claim in docs/CONNECTIONS.md — "every store call is bounded" — rests on
-    ``_acquire`` being the ONLY place that borrows. Anything else touching ``self._pool`` must be
+    """The SQL Server claim in docs/CONNECTIONS.md rests on ``_borrow`` being the ONLY place that
+    borrows, through the bounded ``acquire_pooled``. Anything else touching ``self._pool`` must be
     lifecycle, metrics or the paired release; a new borrow added elsewhere would silently reopen
-    BACKLOG #1052 on that backend. Reports the offending LINES, not a count."""
+    BACKLOG #1052 on that backend. Reports the offending LINES, not a count. Which callers may
+    borrow without the bound is the next test's pin."""
     allowed = re.compile(r"self\._pool\.(close|wait_closed|maxsize|size|freesize|release)\b")
     src = (_REPO / "messagefoundry/store/sqlserver.py").read_text(encoding="utf-8")
     stray = [
@@ -463,7 +628,7 @@ def test_sqlserver_acquire_really_is_the_sole_borrow_site() -> None:
         if "self._pool." in line and not allowed.search(line)
     ]
     assert stray == [], (
-        "a new SQL Server pool borrow appeared outside _acquire, so it is no longer the sole bounded"
+        "a new SQL Server pool borrow appeared outside _borrow, so it is no longer the sole"
         " chokepoint the docs claim it is:\n" + "\n".join(stray)
     )
 
@@ -510,9 +675,14 @@ def test_postgres_borrows_outside_the_bounded_helper_are_pinned() -> None:
     # Store 33 -> 32 on 2026-10-14, a drop: BACKLOG #2592 moved `decide_pending_approval`'s audit-free
     # UPDATE, which borrowed with `self._pool.execute`, into a transaction on the bounded
     # `_timed_acquire`, so the move reads the row and checks its seal before it writes.
-    assert (len(store_sites), len(cluster_sites)) == (32, 0), (
-        "the measured population of pool borrows OUTSIDE the bounded helper moved from 32 (store)"
-        " + 0 (cluster), measured 2026-10-14. Re-read the CONNECTIONS.md scope note before changing"
+    # Store 32 -> 28 on 2026-10-16, a drop: vault BACKLOG #3217 moved the four operator alert
+    # mutations (ack, resolve, suspend, resume), which borrowed with `self._pool.execute`, into
+    # `_alert_write`, a transaction on the bounded `_timed_acquire`, so each commits its audit row
+    # with its change. The CONNECTIONS.md note still says "at least", so this drop also leaves it
+    # true as written.
+    assert (len(store_sites), len(cluster_sites)) == (28, 0), (
+        "the measured population of pool borrows OUTSIDE the bounded helper moved from 28 (store)"
+        " + 0 (cluster), measured 2026-10-16. Re-read the CONNECTIONS.md scope note before changing"
         " this number. Sites scanned:\n" + "\n".join(store_sites + cluster_sites)
     )
 
@@ -536,6 +706,42 @@ def test_postgres_unbounded_post_commit_helper_has_exactly_its_two_callers() -> 
         "a new caller reached the unbounded post-commit borrow; give it the bounded `_execute`"
         " unless it too follows a committed write nothing retries, then update this pin"
     )
+
+
+def _sqlserver_functions_referencing(attr: str) -> list[str]:
+    """Every function in sqlserver.py, at any depth, that reads ``attr`` or passes it as a
+    keyword. A nested function is named with its enclosing one, so a new site cannot hide."""
+    import ast
+
+    tree = ast.parse((_REPO / "messagefoundry/store/sqlserver.py").read_text(encoding="utf-8"))
+    return sorted(
+        {
+            fn.name
+            for fn in ast.walk(tree)
+            if isinstance(fn, ast.AsyncFunctionDef | ast.FunctionDef)
+            for node in ast.walk(fn)
+            if (isinstance(node, ast.Attribute) and node.attr == attr)
+            or (isinstance(node, ast.keyword) and node.arg == attr)
+        }
+    )
+
+
+def test_sqlserver_longer_post_commit_borrow_has_exactly_its_two_writes() -> None:
+    """BACKLOG #3023: the SQL Server counterpart of the Postgres pin above. The longer post-commit
+    borrow is reached from ``revoke_user_sessions`` directly and from ``rotate_session`` through
+    ``_write_session_txn(after_commit=True)``, the only call passing that keyword; nothing else.
+    ``_borrow`` is called only by ``_acquire`` and ``_acquire_after_commit``; strict mypy keeps
+    ``None`` out of its ``float`` limit. A third write moved onto the longer limit would pass every offline test, so
+    its callers are pinned by name."""
+    assert _sqlserver_functions_referencing("_acquire_after_commit") == [
+        "_write_session_txn",
+        "revoke_user_sessions",
+    ], (
+        "a new caller reached the SQL Server longer post-commit borrow; give it `_acquire` unless"
+        " it too follows a committed write nothing retries, then update this pin"
+    )
+    assert _sqlserver_functions_referencing("after_commit") == ["rotate_session"]
+    assert _sqlserver_functions_referencing("_borrow") == ["_acquire", "_acquire_after_commit"]
 
 
 # --- the setting -------------------------------------------------------------

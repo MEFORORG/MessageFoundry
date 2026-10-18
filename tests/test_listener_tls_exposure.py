@@ -14,6 +14,7 @@ Before the fix, neither TCP nor X12 had any exposure guard and a 0.0.0.0 bind st
 from __future__ import annotations
 
 import logging
+import ssl
 from pathlib import Path
 
 import pytest
@@ -79,9 +80,11 @@ def _mock_start(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     # The in-process-TLS start path builds an SSLContext from the cert PEM before uvicorn.run; stub it
-    # so the tests need no on-disk cert (the GATE, not context-building, is under test).
+    # so the tests need no on-disk cert (the GATE, not context-building, is under test). A real, empty
+    # server context rather than a bare object: serve watches its handshakes (vault BACKLOG #3302).
     monkeypatch.setattr(
-        "messagefoundry.api.tls.build_api_ssl_context", lambda api, *, enforcing=True: object()
+        "messagefoundry.api.tls.build_api_ssl_context",
+        lambda api, *, enforcing=True: ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER),
     )
 
 

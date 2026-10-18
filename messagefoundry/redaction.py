@@ -78,7 +78,7 @@ from collections.abc import Callable, MappingView
 from datetime import UTC, datetime
 from functools import lru_cache
 from itertools import islice
-from string import ascii_lowercase, ascii_uppercase, whitespace
+from string import ascii_lowercase, ascii_uppercase, digits, whitespace
 from types import (
     BuiltinFunctionType,
     FunctionType,
@@ -90,6 +90,7 @@ from types import (
 from typing import Any
 
 __all__ = [
+    "RepeatedKeyError",
     "clamp_untrusted",
     "codec_safe_line",
     "codec_safe_str",
@@ -99,6 +100,7 @@ __all__ = [
     "prints_a_codec_error",
     "redact",
     "redact_untrusted",
+    "refuse_repeated_keys",
     "safe_error",
     "safe_exc",
     "safe_name",
@@ -1835,6 +1837,187 @@ def _redact_rounds(text: str, *, widened: bool) -> str:
 #: keeps what that produced, which is at least as redacted as every round before it.
 _STRUCTURED_ROUNDS = 8
 
+# --- a PHI label glued to a field run's token (BACKLOG #3318) ----------------
+#
+# :data:`_HL7_FIELD_RUN` replaces a whole whitespace-free token. When the token ends inside the value
+# of a PHI label -- compact JSON ``...&c=3","name":"Zqxdoe Vandtjane"}``, compact XML, a query string's
+# ``&mrn=``, a comma before ``PatientName:`` -- the label goes with the token and the rest of its value
+# is left for no pass to read. So the run also masks that rest, up to where the value ends.
+#
+# **The rest is MASKED IN PLACE, and that is the whole design.** Call the answer with this rule off
+# the PLAIN answer: every field run replaced, nothing after it touched. A design that kept the label
+# instead left an opener at the answer's edge, and text a caller wrote around the answer was read
+# through it. Here the answer is the plain answer with some letters and digits replaced, character
+# for character:
+#
+# * The rest is a space, then letters, digits and spaces (:data:`_GLUED_VALUE_REST`). It holds no
+#   quote, bracket, delimiter, separator or line break, and its terminator -- a closing quote, the
+#   ``<`` of an end tag, the space after an unquoted value, or the text's end -- stays where it was.
+#   So every structure a pass reads pairs up as it does in the plain answer.
+# * A letter keeps its case and a digit stays a digit: upper case becomes ``X``, lower case ``x`` and
+#   a digit ``0`` (:data:`_SHAPE`). So a pass reading those classes, such as a name run joining a
+#   caller's word, reads the same; and the answer has the plain answer's length and whitespace, so a
+#   limit cuts both at the same place. NOT every class is kept: ``A``-``F`` leave the hex class. Every
+#   hex read here (a tag, a ``0010`` key, a ``%XX`` escape) also needs punctuation the rest refuses.
+# * Words read literally are refused, at least these: one that is, or begins, a word in the sources
+#   of :data:`_ANCHOR_PREFIXES`, and a date (:data:`_DATE_RUN` reads ``19``). A masked ``MRN`` or
+#   ``bearer`` would switch off a gate the plain answer kept on. Other literal reads here (the JSON
+#   and XML vocabulary, the backup carve's ``mfbak``) need punctuation the rest refuses; a new pass
+#   that reads a bare word must add its source there.
+# * A value that ends the answer, trailing whitespace aside, is one a caller can glue text onto, so
+#   its last word must be letters (a caller's digits would join a date arm), and must not end in the
+#   head of a word read with no boundary before it (:data:`_UNBOUNDED_HEADS`): ``...ZqMSH`` plus a
+#   caller's ``*^~\&*`` declares delimiters, and a mask would not.
+#
+# Where any of that fails, the token is scrubbed as in the plain answer. Residuals, at least these: a
+# value holding punctuation, a non-ASCII letter or one of those words; a value longer than
+# :data:`_GLUED_VALUE_MAX`; an unquoted value past its first word; a label outside the vocabulary
+# below, or one behind an earlier quote or tag in the token; every text holding the credential
+# backstop's opener (:data:`_USERINFO_OPENER`), whose bounded tail would read the line differently;
+# and a caller that cuts the answer by characters, not at whitespace, then glues text after the cut.
+
+#: The tail of a token that ends inside a QUOTED PHI value: a vocabulary key and its quote (JSON or
+#: a Python repr, an array or an ``identifier``'s ``value`` member between), or a ``Patient...``
+#: label. Searched in a window ending at the token's last quote, so ``\Z`` is that quote.
+_GLUED_QUOTED_LABEL = re.compile(
+    r"""(?:(["'])(?:family|given|name|birthDate|address|identifier|telecom|0010[0-9A-Fa-f]{4})"""
+    r"""\1:[\[{]{0,2}(?:(["'])value\2:)?|(?<!\w)Patient[A-Za-z]*+['"]?[=:])["']\Z"""
+)
+#: The tail of a token that ends inside an XML element's text: a vocabulary start tag, then text.
+_GLUED_XML_LABEL = re.compile(
+    r"""<(?:family|given|name|birthDate|address|identifier|telecom)>[^<>"'\\]*+"""
+)
+#: The tail of a token that ends on an UNQUOTED label: an MRN, a ``Patient...`` keyword, a group 0010
+#: tag. Its value is the next word.
+_GLUED_BARE_LABEL = re.compile(
+    r"""(?:(?<![A-Za-z0-9])(?i:mrn)['"]?[:#=]{0,2}|(?<!\w)Patient[A-Za-z]*+[=:]"""
+    r"""|\(0010, ?[0-9A-Fa-f]{4}\))\Z"""
+)
+#: How far back of a token's end a label is looked for, and how far on its value may run.
+_GLUED_LABEL_SPAN = 48
+_GLUED_VALUE_MAX = 256
+#: The rest of a value that may be masked: one space, then letters, digits and spaces.
+_GLUED_VALUE_REST = re.compile(r" [A-Za-z0-9 ]*+")
+#: An unquoted value: spaces, one word, then a space or the end of the text.
+_GLUED_BARE_VALUE = re.compile(r" ++[A-Za-z0-9]{1,64}+(?= |\Z)")
+#: What may follow a quoted value's closing quote. Never ``:``, ``=`` or whitespace, which could make
+#: the word before the quote a label.
+_QUOTE_FOLLOWERS = frozenset(",;}])>/<")
+_GLUED_WORD = re.compile(r"[A-Za-z0-9]++")
+#: Something a glued label needs in its token, searched before the per-run work: a quote, a tag, or
+#: an unquoted label's last character.
+_GLUED_HINT = re.compile(r"""["'<]|[:=#)]\Z|(?i:mrn)\Z""")
+_SHAPE = str.maketrans(ascii_uppercase + ascii_lowercase + digits, "X" * 26 + "x" * 26 + "0" * 10)
+#: Every prefix of every word that a pass here, or a filter after it, reads literally, lower-cased.
+#: Taken from the patterns' own sources, so a word added there is refused here; the regex syntax they
+#: also carry in (``za`` from ``[A-Za-z]``) only refuses more.
+_ANCHOR_PREFIXES = frozenset(
+    word[:end]
+    for source in (
+        _DICOM_PHI_LABEL.pattern,
+        _CREDENTIAL_AHEAD.pattern,
+        _MSH_DELIMITERS.pattern,
+        _USERINFO_OPENER,
+        _MRN_LABELLED.pattern,
+        " ".join(_JSON_LITERALS),
+        # The support bundle's scheme words, which it reads after a label. That module imports this
+        # one, so they are spelled here.
+        "basic digest",
+    )
+    for word in re.findall(r"[a-z]{2,}", source.lower())
+    for end in range(1, len(word) + 1)
+)
+#: Every prefix of a word some pass reads with no word boundary before it, so a caller's text glued
+#: after a masked word could complete it: at least the segment ids :data:`_MSH_DELIMITERS` sniffs,
+#: the backstop's opener, and the support bundle's ``mfb64:`` marker (spelled here, as above).
+_UNBOUNDED_HEADS = tuple(
+    sorted(
+        {
+            word[:end]
+            for word in (
+                *_MSH_DELIMITERS.pattern[3:].split(")", 1)[0].lower().split("|"),
+                _USERINFO_OPENER.split(" ", 1)[0],
+                "mfb",
+            )
+            for end in range(1, len(word) + 1)
+        }
+    )
+)
+#: Whitespace to the end of the text, matched where a value ends.
+_TRAILING_SPACE = re.compile(r"\s*+\Z")
+
+
+def _glued_value(text: str, run: re.Match[str], field_run: re.Pattern[str]) -> str | None:
+    """The rest of a PHI value that the field run ``run`` cut through, when it is safe to mask: the
+    text after the token, up to the value's terminator. ``None`` leaves the plain scrub."""
+    token, end = run.group(), run.end()
+    quote = max(token.rfind('"'), token.rfind("'"))
+    if "<" in token[quote + 1 :]:
+        if not _GLUED_XML_LABEL.fullmatch(token, token.rfind("<")):
+            return None
+        stop = text.find("<", end, end + _GLUED_VALUE_MAX)
+        if stop == -1 or not text.startswith("</", stop):
+            return None
+    elif quote != -1 and "\\" not in token[quote:]:
+        if not _GLUED_QUOTED_LABEL.search(token, max(0, quote - _GLUED_LABEL_SPAN), quote + 1):
+            return None
+        stop = text.find(token[quote], end, end + _GLUED_VALUE_MAX)
+        if stop == -1 or text[stop + 1 : stop + 2] not in _QUOTE_FOLLOWERS:
+            return None
+    else:
+        if not _GLUED_BARE_LABEL.search(token, max(0, len(token) - _GLUED_LABEL_SPAN)):
+            return None
+        bare = _GLUED_BARE_VALUE.match(text, end)
+        if bare is None:
+            return None
+        stop = bare.end()
+    rest = text[end:stop]
+    if _GLUED_VALUE_REST.fullmatch(rest) is None:
+        return None
+    words = _GLUED_WORD.findall(rest.lower())
+    if not words or any(word in _ANCHOR_PREFIXES for word in words) or _DATE_RUN.search(rest):
+        return None
+    last = words[-1]
+    ends = _TRAILING_SPACE.match(text, stop) is not None
+    glued = not rest.endswith(" ") and text[stop : stop + 1] not in ("", " ")
+    # Punctuation after the last word, a caller's or the terminator, could complete a word read
+    # with no boundary: ``ZqMSH"]},`` declares delimiters once a JSON log escapes the quote.
+    if (ends or glued) and last.endswith(_UNBOUNDED_HEADS):
+        return None
+    if ends and not last.isalpha():
+        return None  # a caller's glued digits would join a date arm
+    # Two letters glued to a quote can be a string prefix (``b"``, ``rb"``), and a run through the
+    # terminator's token would start inside the mask.
+    if glued and (len(last) <= 2 or field_run.match(text, stop - len(last)) is not None):
+        return None
+    return rest
+
+
+def _scrub_field_runs(text: str, field_run: re.Pattern[str] | None = None) -> str:
+    """``field_run`` (:data:`_HL7_FIELD_RUN` by default, read at call time) replaced by the
+    placeholder, and the rest of a PHI value a run cut through masked in place
+    (:func:`_glued_value`)."""
+    if field_run is None:
+        field_run = _HL7_FIELD_RUN
+    if _USERINFO_OPENER in text:
+        return field_run.sub(_REDACTED, text)
+    out: list[str] = []
+    pos = 0
+    for run in field_run.finditer(text):
+        out.append(text[pos : run.start()])
+        out.append(_REDACTED)
+        pos = run.end()
+        # Every value it masks opens with a space, and its token holds a hint, so most runs skip it.
+        candidate = text.startswith(" ", pos) and _GLUED_HINT.search(text, run.start(), pos)
+        rest = _glued_value(text, run, field_run) if candidate else None
+        if rest is not None:
+            out.append(rest.translate(_SHAPE))
+            pos += len(rest)
+    if not out:
+        return text
+    out.append(text[pos:])
+    return "".join(out)
+
 
 def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
     """Every pass but the structured ones: the credential backstop, the HL7 shapes, a labelled MRN
@@ -1861,7 +2044,7 @@ def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
     if credentials:
         text = _INVALID_URL_USERINFO.sub(lambda m: f"{m.group(1)}{_REDACTED}@", text)
     scrubbed = _HL7_SEGMENT.sub(lambda m: f"{m.group(1)}|{_REDACTED}", text)
-    scrubbed = _HL7_FIELD_RUN.sub(_REDACTED, scrubbed)
+    scrubbed = _scrub_field_runs(scrubbed)
     # BACKLOG #1572. The passes above assume `| ^ ~ &`; MSH DECLARES the real set per message, so a
     # feed using `*` and `$` kept its identifiers. Sniff, and run a separator-aware pass only when the
     # declared set reaches outside the defaults — widening the hardcoded class instead would have been
@@ -1874,7 +2057,7 @@ def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
     if not declared <= _DEFAULT_DELIMITERS:
         segment, field_run = _delimiter_patterns(declared | _DEFAULT_DELIMITERS)
         scrubbed = segment.sub(lambda m: f"{m.group(1)}{m.group(2)}{_REDACTED}", scrubbed)
-        scrubbed = field_run.sub(_REDACTED, scrubbed)
+        scrubbed = _scrub_field_runs(scrubbed, field_run)
     # Before the name run, which would otherwise take the label of `PATIENT MRN 12345` and leave the
     # number behind (BACKLOG #2079).
     if widened:
@@ -3178,7 +3361,7 @@ def json_loads_or_refusal(
     ``UnicodeDecodeError`` on bytes, or json's depth-limit ``RecursionError``, which is a
     ``RuntimeError`` a ``ValueError`` arm does not reach -- BACKLOG #1600). A ``ValueError``
     subclass that ``object_pairs_hook`` raises comes back as its class name too, so a caller can
-    tell its own refusal apart (vault BACKLOG #2804 refuses a repeated key that way).
+    tell its own refusal apart: :func:`refuse_repeated_keys` refuses a repeated key that way.
 
     It returns rather than raises so a caller's refusal is raised outside any handler (BACKLOG
     #2048). The decode error holds the WHOLE input (``JSONDecodeError.doc``,
@@ -3193,3 +3376,21 @@ def json_loads_or_refusal(
     except (ValueError, RecursionError) as exc:
         refusal = type(exc).__name__
     return None, refusal
+
+
+class RepeatedKeyError(ValueError):
+    """A JSON object repeats a key. Carries neither the key nor any value, so its class name, the
+    hint :func:`json_loads_or_refusal` returns for it, is content-free."""
+
+
+def refuse_repeated_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """An ``object_pairs_hook`` for :func:`json_loads_or_refusal` that refuses a repeated key at any
+    depth, raising :class:`RepeatedKeyError`.
+
+    ``json.loads`` keeps the LAST of two equal keys; a server may keep the first. A body the engine
+    gates on one value and forwards verbatim would then be read two ways (vault BACKLOG #2804 for a
+    Bundle, #2812 for a single FHIR resource), so it is refused rather than canonicalised."""
+    obj = dict(pairs)
+    if len(obj) != len(pairs):
+        raise RepeatedKeyError
+    return obj

@@ -853,6 +853,48 @@ async def test_source_zero_max_file_bytes_keeps_the_retrieve_unbounded(
     assert len(h.bodies) == 1  # delivered whole — the operator disabled the cap
 
 
+def _file_cap_off_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "max_file_bytes is off" in r.getMessage()
+    ]
+
+
+@pytest.mark.parametrize("off", [0, None, "0"], ids=["zero", "none", "zero-text"])
+def test_source_warns_once_when_max_file_bytes_is_off(
+    off: object, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #2749: off is documented and allowed, but never silent. The line names where the
+    source polls and the setting, and withholds the value.
+
+    Red mutation: drop the warning from ``RemoteFileSource.__init__``. No record is found."""
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.remotefile"):
+        src = _src(monkeypatch, _FakeClient(), max_file_bytes=off)
+    assert src._max_file_bytes is None
+    [record] = _file_cap_off_warnings(caplog)
+    assert "sftp.example.com:/in" in record.getMessage()
+
+
+async def test_source_default_max_file_bytes_warns_nothing_and_still_refuses_oversize(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The control for the warning above: the shipped default says nothing, and it still refuses a
+    file listed one byte past it, without retrieving it."""
+    name = "/in/big.hl7"
+    client = _FakeClient(files={name: b"x"}, sizes={name: DEFAULT_MAX_FILE_BYTES + 1})
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.remotefile"):
+        src = _src(monkeypatch, client)
+    assert _file_cap_off_warnings(caplog) == []
+    h = _RecordingHandler()
+    src._handler = h
+    await _settle(src)
+    await src._poll_once()
+    assert h.bodies == []
+    assert not any(op == "retrieve" for op, _ in client.ops)
+    assert "/in/.error/big.hl7" in client.files
+
+
 def test_sftp_retrieve_stops_reading_past_the_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     """The SFTP backend reads in chunks and refuses mid-transfer, so a hostile body is never
     buffered whole. ``read_total`` proves the bytes were never pulled."""

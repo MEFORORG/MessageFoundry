@@ -587,7 +587,7 @@ async def test_a_reload_that_swaps_then_rolls_back_marks_no_earlier_row(
         detail = json.loads(row["detail"])
         assert row["actor"] == "alice" and detail["fingerprint"] == digest_a["fingerprint"]
         assert "superseded" not in detail and "baseline_unchecked" not in detail
-        outcome, comparison = await _compare_start_config(engine, digest_a)
+        outcome, comparison = await _compare_start_config(engine, digest_a, before_load=digest_a)
         assert outcome == "compared" and comparison is not None
         assert comparison.baseline_action == "config_reload"
         assert not comparison.changed, "a false config_changed on the next start"
@@ -601,11 +601,11 @@ async def test_a_reload_row_written_after_a_flag_toggle_is_no_baseline(engine: E
     marks itself superseded too. The toggle is stood in for by the rebind it performs."""
     outcome = await engine.reload_detail(propagate=False)
     assert outcome.fingerprint is not None
-    assert await _record_reload_audit(engine, actor="before", outcome=outcome) == []
+    assert await _record_reload_audit(engine, actor="before", loaded=outcome) == []
     loaded = engine.loaded_config_fingerprint
     assert loaded is not None
     engine.loaded_config_fingerprint = dict(loaded)  # what set_connection_flag does
-    assert await _record_reload_audit(engine, actor="after", outcome=outcome) == []
+    assert await _record_reload_audit(engine, actor="after", loaded=outcome) == []
     rows = {r["actor"]: json.loads(r["detail"]) for r in await engine.store.list_audit()}
     assert "superseded" not in rows["before"]
     assert rows["after"]["superseded"] is True and rows["after"]["baseline_unchecked"] is True
@@ -699,6 +699,63 @@ async def test_a_released_reload_refuses_a_swapped_settings_anchor(
         assert failed == [{"requested": None, "dry_run": False, "reason": "trust_anchor"}]
         events = [json.loads(r["detail"])["event"] for r in rows if r["action"] == ta.AUDIT_ACTION]
         assert "pin_mismatch" in events
+    finally:
+        await engine.stop()
+
+
+async def test_a_released_reload_names_a_changed_settings_anchor_it_cannot_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3015: a released reload reports ``restart_required`` as the inline route does, so
+    dual control is not the quieter of the two. The control is a release before the swap, which
+    reports an empty list."""
+    good = _block(b"good")
+    anchor = tmp_path / "ad-ca.pem"
+    anchor.write_bytes(good)
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: PathVerdict(True))
+    auth = AuthSettings(admin_write_min_interval_seconds=0, ad_tls_ca_cert_file=str(anchor))
+    specs = ta.collect_anchor_specs(
+        auth,
+        ApiSettings(),
+        tls=TlsSettings(),
+        alerts=AlertsSettings(),
+        log_settings=LoggingSettings(),
+    )
+    (spec,) = specs
+    # The consumer's load, which the restart report compares against.
+    monkeypatch.setattr(ta, "_LOADED", {(spec.label, spec.path): hashlib.sha256(good).hexdigest()})
+    cfg = tmp_path / "cfg"
+    _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
+    store = await MessageStore.open(tmp_path / "dc.db")
+    engine = Engine(
+        store,
+        poll_interval=0.02,
+        config_dir=cfg,
+        settings_preflight=ta.make_settings_anchor_preflight(specs, store, enforcing=True),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        service = await _service(engine)
+        await _add(service, "op", Role.ADMINISTRATOR)
+        await _add(service, "approver", Role.ADMINISTRATOR)
+        app = create_app(engine, auth=service, approvals=GATED)
+        transport = reproving_transport(PW, app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            op, admin = await _token(c, "op"), await _token(c, "approver")
+
+            async def hold_and_release() -> dict[str, Any]:
+                held = await c.post("/config/reload", json={}, headers=op)
+                assert held.status_code == 202, held.text
+                approval_id = held.json()["approval_id"]
+                r = await c.post(f"/approvals/{approval_id}/approve", headers=admin)
+                assert r.status_code == 200, r.text
+                result: dict[str, Any] = r.json()["result"]
+                return result
+
+            assert (await hold_and_release())["restart_required"] == []
+            anchor.write_bytes(_block(b"rotated"))
+            assert (await hold_and_release())["restart_required"] == [spec.setting]
     finally:
         await engine.stop()
 
@@ -866,12 +923,12 @@ async def test_the_other_lost_reload_rows_cannot_forge_a_log_line(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The same for the two sibling lost-row logs: a reload's own row after the swap, and the
-    attempt row an ungated reload writes first. The fake engine has no graph, so the first one
-    loses the row before its detail is built and logs the actor alone."""
+    attempt row an ungated reload writes first. The fake engine has no coordinator, so the first
+    one loses the row before its detail is built and logs the actor alone."""
     lost_actions: list[str] = []
     sink = SimpleNamespace(audit_write_failed=lambda name, *, action: lost_actions.append(action))
     with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
-        steps = await _record_reload_audit(_AUDIT_DOWN, actor=_FORGING_ACTOR)
+        steps = await _record_reload_audit(_AUDIT_DOWN, actor=_FORGING_ACTOR, loaded=None)
         with pytest.raises(HTTPException) as refused:
             await _audit_reload_attempt(
                 _AUDIT_DOWN,

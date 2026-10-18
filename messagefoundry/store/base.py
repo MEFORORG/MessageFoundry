@@ -67,6 +67,8 @@ from messagefoundry.store.row_seal import RowSealer
 from messagefoundry.store.store import (
     UPLOAD_RESERVATION_STALE_AFTER,
     AdMap,
+    AdminGrant,
+    AdminHolderTest,
     AdminRemoval,
     AlertInstance,
     AlertSummary,
@@ -104,6 +106,7 @@ from messagefoundry.store.store import (
     ResendSourceNotFound,
     RoleGrant,
     SessionRecord,
+    SignCountAnswer,
     Stage,
     StreamingAttachmentsUnsupported,
     UserRecord,
@@ -1105,8 +1108,13 @@ class QueueStore(StoreLifecycle, Protocol):
         *,
         top_only: bool = False,
         now: float | None = None,
-        audit: OperatorAudit[int] | None = None,
-    ) -> int: ...
+        audit: OperatorAudit[int],
+    ) -> int:
+        """``audit`` is REQUIRED (vault BACKLOG #3217), so every caller has to say what the purge
+        records, and the row it returns commits in the cancel's own transaction. It is not a
+        guarantee that a row is written: an :data:`OperatorAudit` may return ``None``, which records
+        nothing. The API's purge paths both return a ``connection_purge`` row for every call."""
+        ...
 
     # --- read helpers (API / console) ----------------------------------------
     # Row sequences are returned as Sequence[Row] (covariant) so a backend may return its own row
@@ -1376,15 +1384,20 @@ class QueueStore(StoreLifecycle, Protocol):
         """
         ...
 
+    # The four operator alert mutations below take a REQUIRED ``audit`` (vault BACKLOG #3217). The
+    # row is appended in the mutation's own transaction, and only when the change applied, so a
+    # failed append changes nothing and an unknown or resolved id writes no row.
     async def ack_alert_instance(
-        self, alert_id: int, *, actor: str, now: float | None = None
+        self, alert_id: int, *, actor: str, audit: AuditAppend, now: float | None = None
     ) -> bool:
         """Acknowledge a live instance (``open``/``acknowledged`` → ``acknowledged``), recording
         ``acked_by``/``acked_at``. Idempotent. Returns ``True`` iff a non-resolved instance with this id
         existed (so the API 404s a resolved/unknown id)."""
         ...
 
-    async def resolve_alert_instance(self, alert_id: int, *, now: float | None = None) -> bool:
+    async def resolve_alert_instance(
+        self, alert_id: int, *, audit: AuditAppend, now: float | None = None
+    ) -> bool:
         """Resolve a live instance (``open``/``acknowledged`` → ``resolved``), recording ``resolved_at``.
         Returns ``True`` iff a non-resolved instance with this id existed."""
         ...
@@ -1397,7 +1410,7 @@ class QueueStore(StoreLifecycle, Protocol):
         ...
 
     async def suspend_alert_instance(
-        self, alert_id: int, *, until: float, now: float | None = None
+        self, alert_id: int, *, until: float, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
         """Windowed suspend (#143, ADR 0044 amendment): set ``suspended_until`` on a live instance so its
         NOTIFICATIONS are muted until that epoch. **Notification-only** — status/count/visibility are
@@ -1407,7 +1420,7 @@ class QueueStore(StoreLifecycle, Protocol):
         ...
 
     async def resume_alert_instance(
-        self, alert_id: int, *, now: float | None = None
+        self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
         """Clear a windowed suspend (#143) so re-alerts resume immediately. Idempotent. Returns the
         updated instance, or ``None`` if unknown / already resolved."""
@@ -1479,56 +1492,71 @@ class QueueStore(StoreLifecycle, Protocol):
     async def reserve_upload_quota(
         self,
         uploader_id: str,
+        reservation_id: str,
         *,
-        files: int,
         size_bytes: int,
-        max_files: int = 0,
-        max_total_bytes: int = 0,
+        max_files: int,
+        max_total_bytes: int,
         stale_after: float = UPLOAD_RESERVATION_STALE_AFTER,
     ) -> bool:
-        """Atomically reserve (or release) an uploader's IN-FLIGHT upload budget; return whether the
-        reserve applied. The cross-process half of the per-uploader upload quota, and not the whole
-        decision: the caller decides after reserving, from :meth:`upload_quota_in_flight` plus a
-        fresh disk scan (BACKLOG #1941).
+        """Atomically reserve ONE in-flight upload slot for ``uploader_id``, named
+        ``reservation_id``; return whether it applied. The cross-process half of the per-uploader
+        upload quota, and not the whole decision: the caller decides after reserving, from
+        :meth:`upload_quota_in_flight` plus a fresh disk scan (BACKLOG #1941).
 
         **Why the store owns this.** ``UploadStore._quota_lock`` is an ``asyncio.Lock``, so it is
         per-event-loop and therefore per-process. Engine sharding is the built, shipped, default
         scaling axis and nothing partitions ``uploads_dir`` per shard, so N shards over one directory
         hold N independent locks and each can overshoot the budget by one file. Every shard sits on
         the ONE unified store (ADR 0063 — and ``require_unified_store`` makes a server DB mandatory
-        past one shard), so this row is authoritative for all of them.
+        past one shard), so these rows are authoritative for all of them.
 
         **What is counted here, and what is not.** The files already ON DISK are counted by the
         caller's sidecar scan, which is uncached and therefore already fleet-visible. The gap this
         closes is only the uploads IN FLIGHT on other shards — reserved but not yet landed, so
         invisible to any scan. The caller passes its remaining HEADROOM (cap minus what its scan
-        observed) as ``max_files`` / ``max_total_bytes``; this method holds only the in-flight sum.
+        observed) as ``max_files`` / ``max_total_bytes``; the store holds only the in-flight rows.
 
-        ``files > 0`` reserves: the post-add in-flight totals must fit inside the headroom or nothing
-        is written and this returns ``False`` (fail-closed — a caller that forgets the headroom
-        arguments gets the 0 defaults and is refused). ``files <= 0`` releases, always applies,
-        clamps at zero, ignores the headroom arguments and returns ``True``.
+        **One row per reservation (vault BACKLOG #3180).** The reserve applies only if the
+        uploader's live reservations plus this one fit inside the headroom; otherwise nothing is
+        written and this returns ``False``. A headroom that cannot fit one slot is refused before
+        the store is touched. The caller mints ``reservation_id``, so it can pay the slot back with
+        :meth:`release_upload_quota` even when it never learned whether the reserve committed.
 
-        ``stale_after`` bounds a leak: a process killed between reserve and release never releases,
-        and its slot would otherwise consume the uploader's budget forever. A row with no activity
-        for longer than ``stale_after`` seconds is reset to zero before the add. Activity is an
-        applied reserve or any release, and both move the row's clock to now, never backwards, so a
-        host whose clock lags cannot age a row a sibling keeps fresh. A release of zero
-        files and zero bytes is therefore a pure touch, which is how a live save keeps its slot
-        past ``stale_after`` (BACKLOG #2648). So the reset normally reclaims only slots no live
-        process holds. When it does reclaim a live one, it can only restore the pre-ledger
+        ``stale_after`` bounds a leak: a process killed between reserve and release never releases.
+        Before the add, every reservation of this uploader whose own clock is older than
+        ``stale_after`` seconds is deleted. Each reservation has its own clock, which only its own
+        reserve and :meth:`touch_upload_quota` move, so a leaked slot is reclaimed once its window
+        passes however active the uploader stays. Which clock "now" is, per backend, is stated in
+        ``messagefoundry.uploads.UploadQuotaError`` (BACKLOG #3256). A live save keeps its slot by
+        touching it (BACKLOG #2648). When the reclaim does take a live slot, it can only restore the pre-ledger
         behaviour (an overshoot bounded by the number of concurrent writers), never something
         worse."""
         ...
 
+    async def release_upload_quota(self, reservation_id: str) -> None:
+        """Pay back the reservation ``reservation_id`` by deleting its row (vault BACKLOG #3180).
+
+        Idempotent, and it touches no other reservation, so it is safe after a reserve whose outcome
+        is unknown: a reserve that never committed leaves no row, and this deletes nothing."""
+        ...
+
+    async def touch_upload_quota(self, reservation_id: str) -> None:
+        """Move the reservation's clock to now, never backwards, so a slow save keeps its slot past
+        ``stale_after`` (BACKLOG #2648). A no-op once the reservation is released or reclaimed.
+        Never backwards, so a touch after the clock is stepped back cannot make a reservation look
+        older than its last stamp. Which clock "now" is, per backend, is stated in
+        ``messagefoundry.uploads.UploadQuotaError`` (BACKLOG #3256)."""
+        ...
+
     async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
         """``(files, bytes)`` currently reserved in flight for ``uploader_id``, as stored; ``(0, 0)``
-        when the uploader has no row. A plain read that writes nothing.
+        when the uploader has no reservation. A plain read that writes nothing.
 
         The caller reserves, THEN reads this, THEN scans the disk (BACKLOG #1941). That order is what
         makes the cross-shard quota hold; ``messagefoundry.uploads.UploadQuotaError`` carries the
-        argument. Read raw on purpose, with no staleness reset: a reset here could only drop
-        reservations, which lets an upload through, never refuses one."""
+        argument. Read raw on purpose, with no staleness filter: dropping a reservation here could
+        only let an upload through, never refuse one."""
         ...
 
     # --- retention / purge + maintenance (PHI.md §8) -------------------------
@@ -2246,7 +2274,9 @@ class AuthStore(Protocol):
         ...
 
     # --- The first-seen sign-in address baseline (BACKLOG #288, vault BACKLOG #2145) ---
-    # One row per (account id, host key). The caller folds the address to its host key; the store
+    # One row per (account id, host key), plus, after an administrator's reset, one marker row that
+    # holds no host (auth/service.py ``_LOGIN_ADDRESS_RESET_MARKER``, vault BACKLOG #2946). The
+    # caller folds the address to its host key; the store
     # compares it byte for byte. Both reads and writes go through the (user_id, address) primary key.
     #
     # The host keys recorded for the account with ``last_seen >= since``, in no order.
@@ -2340,9 +2370,13 @@ class AuthStore(Protocol):
 
     async def delete_all_webauthn_credentials(self, user_id: str) -> int: ...
 
+    # Compare-and-set of a passkey's sign count. It answers ``"moved"``, ``"mismatch"`` (the passkey
+    # exists and holds another count) or ``"gone"`` (no such passkey) under ONE locked write on every
+    # backend, so a delete cannot land between a miss and the answer (BACKLOG #3774). Either miss is
+    # a clone signal (ADR 0068 decision 4); the answer only says which.
     async def update_webauthn_sign_count(
         self, credential_id_hash: str, *, expected: int, new: int, used_at: float
-    ) -> bool: ...
+    ) -> SignCountAnswer: ...
 
     # A FULL authentication: stamps ``last_login_at`` and zeroes all six lockout columns, both
     # counters' counts, expiries and cycle counts, in one UPDATE (ADR 0197 AC-8).
@@ -2522,11 +2556,52 @@ class AuthStore(Protocol):
         this process: the server backends take a transaction-scoped lock before the read, because
         each engine shard serves its own API over one unified store (ADR 0063). So two removals
         that each see two administrators cannot both pass, which a check in one await and a write
-        in the next allowed. Writes that only ADD administrators need no lock: they cannot empty
-        the set. The directory-driven role writes (the AD sign-in sync and the session reconciler)
-        do not come through here and were never guarded: they take roles on the directory's word.
-        ``DISABLE`` and ``SET_ROLES`` leave the account's sessions for the caller to revoke after;
-        ``DELETE``, like :meth:`delete_user`, removes them with the account."""
+        in the next allowed. A write that only ADDS an administrator cannot empty the set, so it
+        needs this lock only when it is itself guarded, as the first-administrator grant
+        (:meth:`grant_first_admin_unless_admin_exists`, BACKLOG #3078) is. An unguarded role write
+        that adds one, such as :meth:`set_user_roles`, takes no lock. The directory-driven role
+        writes (the AD sign-in sync and the session reconciler) do not come through here and were
+        never guarded: they take roles on the directory's word. ``DISABLE`` and ``SET_ROLES`` leave
+        the account's sessions for the caller to revoke after; ``DELETE``, like
+        :meth:`delete_user`, removes them with the account."""
+        ...
+
+    async def grant_first_admin_unless_admin_exists(
+        self,
+        user_id: str,
+        *,
+        admin_role_id: str,
+        expected_password_hash: str,
+        expected_totp_secret_cell: str | None,
+        counts_as_admin: AdminHolderTest,
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> AdminGrant:
+        """Give ``user_id`` exactly ``admin_role_id`` unless another enabled administrator that
+        ``counts_as_admin`` passes exists (BACKLOG #3078). ``provision_first_administrator``'s
+        grant.
+
+        One transaction re-reads the enabled accounts holding ``admin_role_id``, counting each other
+        than ``user_id`` only when its record passes its integrity seal, as
+        :meth:`remove_unless_last_admin` counts them, and ``counts_as_admin`` passes its ``users``
+        row. The auth service passes the predicate its ``provision-admin`` refusal reads, so only
+        an administrator that signs in with a local password counts (vault BACKLOG #2711 step 1,
+        owner ruling B258-R4); a directory one does not. When any is counted it writes nothing and
+        returns :attr:`AdminGrant.ADMIN_EXISTS`. Otherwise it writes the role only while the
+        account is enabled, holds no role, and still holds the credentials the caller wrote:
+        ``expected_password_hash``, and no TOTP secret when ``expected_totp_secret_cell`` is
+        ``None`` or TOTP on with that staged cell when it is not. When those no longer hold it
+        writes nothing and returns :attr:`AdminGrant.ACCOUNT_CHANGED`; a missing account, and a
+        compare on the seal lost to a concurrent write, answer the same.
+
+        **It is serialized against every other call of this and of :meth:`remove_unless_last_admin`
+        on the same database**, under the same lock, not only in this process. So two provisioning
+        runs with different usernames, each of which saw no administrator ``counts_as_admin``
+        passes, cannot both be granted:
+        the one whose grant commits second reads the first and is refused. SQLite has no such lock
+        across processes and relies on its single writer instead; its implementation re-runs the
+        transaction a bounded number of times when the write fails busy, and raises past that bound
+        rather than answering a refusal."""
         ...
 
     async def set_user_channel_scope(
@@ -2647,7 +2722,8 @@ class AuthStore(Protocol):
         cleared, and a pair read by a separate ``get_user`` is a pair a concurrent unbind-and-rebind
         can have replaced before this transaction runs — the audit row would then name a binding this
         call never touched, which is worse than no record at all. Reading it inside the same
-        transaction makes the reported pair the one the UPDATE actually cleared.
+        transaction makes the reported pair the one the UPDATE actually cleared. The same holds
+        for the factor fields; see :class:`FederatedUnbind`.
 
         **An already-unbound account writes NOTHING and revokes nothing**, reporting a NULL pair and
         0 sessions. The check is in here rather than above so it is atomic with the write: an unbind
@@ -3080,7 +3156,7 @@ class StoreNotFoundError(RuntimeError):
         super().__init__(
             message
             or f"no SQLite store at {path}: refusing to create one "
-            "(check [store].path or --db; `messagefoundry serve` creates the store on its first run)"
+            "(check [store].path or --db; `python -P -X disable-remote-debug -m messagefoundry serve` creates the store on its first run)"
         )
 
     @classmethod
@@ -3102,7 +3178,7 @@ class StoreNotFoundError(RuntimeError):
                 "schema_meta table this login can see, and this command does not build one (check "
                 f"[store].database and {where}. Under [store].schema_management = 'external', the "
                 f"default, a DBA builds the store with `{PROVISION_SCHEMA_COMMAND}`; under 'auto', "
-                "`messagefoundry serve` builds it on its first run)"
+                "`python -P -X disable-remote-debug -m messagefoundry serve` builds it on its first run)"
             ),
         )
 
@@ -3391,7 +3467,7 @@ async def open_store(
 
     ``posture`` (#200, ADR 0092) is the deriving instance's :class:`HopPosture`, threaded into the
     server-DB backends so the engine<->store weakened-TLS refusal (``connection_string`` / ``_build_ssl``)
-    clamps the ``MEFOR_ALLOW_INSECURE_TLS`` escape on a production-PHI hop (decision 2). ``None`` reads
+    clamps the ``MEFOR_ALLOW_INSECURE_TLS`` escape on an enforcing hop (decision 2). ``None`` reads
     the ambient posture, and with none the escape is NOT permitted (vault BACKLOG #2354). CORRECTED:
     this read *"``None`` ... leaves it unclamped, byte-identical to pre-#200"*. So a CLI command that
     opens a weakened store needs an instance at ``[security].enforcement = warn`` AND a posture; the
@@ -3570,7 +3646,7 @@ async def provision_store_schema(
     refusing keeps this command from creating a file at a path it was merely pointed at (#1780)."""
     if settings.backend is StoreBackend.SQLITE:
         raise ValueError(
-            "the sqlite store builds its own schema when `messagefoundry serve` first opens it; "
+            "the sqlite store builds its own schema when `python -P -X disable-remote-debug -m messagefoundry serve` first opens it; "
             f"`{PROVISION_SCHEMA_COMMAND}` applies to the sqlserver and postgres backends only"
         )
     return await _server_store_class(settings.backend).provision_schema(settings, posture=posture)

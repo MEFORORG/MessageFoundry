@@ -20,7 +20,7 @@ claims move with it.
 | `security.yml` | Static and supply-chain security: `bandit` (Python SAST), `semgrep`, `pip-audit` and `npm-audit` against the hash-locked tree, `gitleaks` (secret scan), `forbidden-content` (customer/PHI leak guard), a crypto-inventory check, an SBOM build, and a `trivy` scan. A **daily cron** re-runs the dependency audits so a CVE filed against an unchanged pin is caught within ~24h. A separate `released-line-audit` job runs on the same cron and audits the **latest release tag's** pinned core runtime, which the daily audits do not cover — they read the checked-out tree, so between a fix landing on `main` and a release carrying it the two answers differ. Hard-failing but **not** a required check (schedule/dispatch only), the same posture as `dast.yml`. A `cla-action-audit` job, in the same posture, audits the vendored CLA action's upstream lockfile against a baseline of advisories already known (`scripts/security/cla-action-advisories.toml`) and fails on a new one (BACKLOG #1578). Two **composite** jobs, `repo-scan` and `dependency-and-secret-scan`, run the same seven scans in two runner slots instead of seven; they are staged alongside the originals, so during the overlap every scan runs twice. **Only the composite copy gates the merge, since 2026-09-16** -- this cell said *"both are now required ... both copies gate the merge"*, which was true for two days and then was not. `.github/required-contexts.txt` is the live answer; see *Consolidating the seven security contexts* below. |
 | `codeql.yml` | GitHub CodeQL analysis (python / javascript-typescript). Advisory — **not** required checks. |
 | `py315-canary.yml` | Python 3.15 readiness canary: installs the engine on the 3.15 prerelease (Linux and Windows), names any dependency with no cp315 wheel, and runs the TLS and apiclient tests plus an engine-suite smoke. Weekly, on dispatch, and on a pull request that changes the workflow itself. Advisory, allowed to go red, and **not** a required check. |
-| `dependency-floors.yml` | Installs the engine at the lowest releases `pyproject.toml` allows (`uv pip install --resolution lowest-direct`, deliberately without `constraints.lock`), checks each runtime dependency landed on its floor with `scripts/ci/check_dependency_floors.py`, and runs the route-walk and thread-pool guards there (vault BACKLOG #3055). Weekly, on dispatch, and on a pull request that changes a dependency declaration, the API, auth or web console code, or the guards. Advisory and **not** a required check. Its header lists the declared floors that do not install on Python 3.14. `nightly-notice.yml` watches it, so a red scheduled run opens an issue. |
+| `dependency-floors.yml` | Installs the engine at the lowest releases `pyproject.toml` allows (`uv pip install --resolution lowest-direct`, deliberately without `constraints.lock`), checks each runtime dependency landed on its floor with `scripts/ci/check_dependency_floors.py`, and runs the route-walk and thread-pool guards there (vault BACKLOG #3055). Weekly, on dispatch, and on a pull request that changes a dependency declaration, the API, auth or web console code, or the guards. Advisory and **not** a required check. Its header says why it carries no override and what it cannot see: a [dev] floor the resolver skips. `nightly-notice.yml` watches it, so a red scheduled run opens an issue. |
 | `scorecard.yml` | OpenSSF Scorecard analysis. |
 | `cla.yml` | CLA Assistant — records the Contributor License Agreement signature on each PR. |
 | `zizmor.yml` | Lints the workflow files themselves for insecure patterns (template injection, over-broad tokens), and runs `actionlint` on the workflow syntax. Hard-fails, but **not a required check** — it is paths-filtered, so it does not report on a PR that touches no workflow, and requiring it would wedge every such PR. The `actionlint` pre-commit hook is the local half. |
@@ -335,6 +335,29 @@ would be exactly the thing it exists to prevent.
 `cancelled` leg. A **`skipped`** leg counts as a **pass** — that is what lets a path-gated leg stay off
 an unrelated PR without turning the gate red.
 
+**The Windows Postgres leg is deliberately outside the roll-up.** `postgres store (windows-2022)`
+and `postgres store (windows-2025)` (job `postgres-store-windows` in `ci.yml`) run the same Postgres
+store test files as `postgres store`, on hosted Windows, the only supported v1 deployment platform.
+They use the PostgreSQL the runner image preinstalls; the job header in `ci.yml` names the majors,
+which differ from the ubuntu leg's. They run on a pull request that touches the server-DB paths,
+nightly and on dispatch, on this repository only. **They are not required, and `CI gate` does not
+`need` them, so a red there blocks no merge.** That is deliberate: the leg is new, runs on an
+unpinned runner image, and has no run history to judge a red against, so it is read rather than
+gated on. It stays out of the merge queue because there it could stop nothing and would take
+Windows runners from the required `test` legs. Its `if:` does not name `merge_group`; it is kept
+out because `changes` emits `serverdb=false` on a queue entry, so a change that makes that filter
+real in the queue would let it in. A red one still turns the workflow run red, so a red nightly
+opens the usual `nightly-notice.yml` issue and a red PR run gets `failure-signal.yml`'s `ci-red`
+label, as `ide build` and `docker image smoke` already do. `tests/test_ci_postgres_windows_leg.py`
+keeps the leg's test files and their env equal to the ubuntu leg's and checks that it is not
+required or rolled up. Making the leg blocking is a decision that moves that test.
+
+There is no SQL Server leg on hosted Windows. The runner images ship no SQL Server instance. The
+only engine on them, the LocalDB runtime that comes with Visual Studio, has no TCP listener, so the
+store's `SERVER=host,port` connection string cannot reach it. Installing SQL Server during the job
+would need a large download that is not pinned. `.github/workflows/selfhosted-win2025-sql.yml` is
+the Windows SQL Server leg; its self-hosted runner is deferred, so it does not run.
+
 > ### The required-but-absent trap
 > A **required** status check that never reports **blocks every PR forever**. So before you stop a job
 > from running on PRs (path-gate it, or make it schedule-only), make sure it is **not** in the required
@@ -352,7 +375,9 @@ gh run list --repo MEFORORG/MessageFoundry --workflow=ci.yml --event=schedule --
 ```
 
 A **green nightly run** means every gated leg was green on `main` that night, because `CI gate`
-`needs:` them all -- one run conclusion answers it, with no per-job walk.
+`needs:` them all -- one run conclusion answers it, with no per-job walk. The converse does not
+hold: a red run may be only an ungated leg, such as `postgres store (windows-*)`, so read the
+`CI gate` job's conclusion, not the run's, to ask whether a gated leg broke.
 
 Two limits, stated so nobody reads more into a green than it carries:
 

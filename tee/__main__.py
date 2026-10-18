@@ -394,7 +394,11 @@ async def _export(args: argparse.Namespace) -> int:
         await store.close()
     text = json.dumps(data, indent=2)
     if args.out:
-        Path(args.out).write_text(text + "\n", encoding="utf-8")
+        try:
+            _write_owner_only(args.out, text + "\n", in_place_on_windows=True)
+        except OSError as exc:
+            print(f"error: could not write the export to {args.out}: {exc}", file=sys.stderr)
+            return 1
         print(f"wrote {len(data['rows'])} row(s) to {args.out}", file=sys.stderr)
     else:
         print(text)
@@ -470,36 +474,71 @@ async def _load_captures(db: str, since: float | None) -> list[CorepointOutput]:
     ]
 
 
-def _write_owner_only(path: str, text: str) -> None:
+def _write_owner_only(path: str, text: str, *, in_place_on_windows: bool) -> None:
     """Write ``text`` to ``path`` so that, on POSIX, only its owner can read it (vault BACKLOG #2792).
 
-    A ``compare --show-diffs`` report holds field values from both engines. ``write_text`` would
-    create it at the process umask, world-readable under 022, beside a capture DB that
-    :mod:`tee.store` keeps at 0600.
+    Every ``--out`` the tee writes goes through here (vault BACKLOG #3166). A ``compare
+    --show-diffs`` report holds field values from both engines; an ``anonymize-captures`` dataset
+    holds surrogates and every value a rule kept; an ``export`` carries control ids, message types
+    and NAK details from the capture DB. ``write_text`` would create any of them at the process
+    umask, world-readable under 022, beside a capture DB that :mod:`tee.store` keeps at 0600.
 
-    The report is written to a NEW file that ``mkstemp`` creates exclusively at 0600 in the same
-    directory, flushed to disk, then renamed over ``path``. A regular file already at ``path``, or a
-    link, is replaced rather than written into, so neither its owner nor its mode carries over, and
-    a reader holding the old file open keeps the old contents. A failed write leaves no temp file.
+    ``in_place_on_windows`` is True for ``export`` and ``anonymize-captures``, and False for
+    ``compare``. False keeps ``compare``'s writer on main, unchanged on every OS: newlines are the
+    platform's (CRLF on Windows), a named stream is written through, and anything else is replaced
+    by a ``mkstemp`` file with ``os.replace``, an existing file or link on Windows included. There
+    the report takes the folder's access list, whatever list the old file had, even one that
+    denied this account writing; a link is replaced rather than followed; and the write is atomic.
+    A folder's list can itself let another account read the report, and the replace does not stop
+    that. The POSIX paragraph below applies to both values; the paragraphs on Windows describe
+    True.
 
-    One exception: a stream the caller named on purpose, such as ``/dev/stdout`` or a shell's
-    ``>(...)``, is written through, since replacing it would break it and nothing is created there.
-    That covers a character device, and a pipe or socket this account owns; any other non-regular
-    file falls to the replace.
+    With True, newlines are written as LF on every platform. The text layer's default would write
+    CRLF on Windows, and the dataset is JSONL that the harness corpus reads back line by line.
 
-    Windows has no POSIX mode, and the tee imports nothing from ``messagefoundry``, so the engine's
-    ``restricted_file`` is out of reach: there the file takes its directory's access list, the
-    stance :mod:`tee.store` takes for the capture DB.
+    A ``path`` naming nothing, on any platform -- no file and no link, not even a dangling one --
+    is created as a NEW file that ``mkstemp`` creates exclusively at 0600 in the same directory,
+    flushed to disk, then renamed to ``path``. A failed write leaves no temp file. On Windows the
+    0600 mode means nothing and the new file takes its directory's access list, the stance
+    :mod:`tee.store` takes for the capture DB; the tee imports nothing from ``messagefoundry``, so
+    the engine's ``restricted_file`` is out of reach. There the rename refuses a name that appeared
+    since the check, and that name is then written in place as below rather than replaced.
+
+    On POSIX an existing ``path`` gets the same treatment: a regular file, or a link, is replaced
+    rather than written into, so neither its owner nor its mode carries over, and a reader holding
+    the old file open keeps the old contents. One exception: a stream the caller named on purpose,
+    such as ``/dev/stdout`` or a shell's ``>(...)``, is written through, since replacing it would
+    break it and nothing is created there. That covers a character device, and a pipe or socket
+    this account owns; any other non-regular file falls to the replace.
+
+    On Windows an existing ``path`` of any kind -- a regular file, one with a second hard link, a
+    symlink, even a dangling one -- is opened for writing through ``Path(path)``, as
+    ``Path.write_text`` did for ``export`` and ``anonymize-captures`` on main before #3166, so a
+    link's target is the file written (or created, for a dangling link). A renamed-in file would
+    take the folder's access list, so a hardened export, dataset or report in a looser folder would
+    lose its hardening; written in place, the file keeps its access list and owner. A target the
+    open refuses raises, and the command prints its error line and exits 1; it never falls back to
+    a replace. The open refuses at least a file this account may not write, a read-only one, one
+    with the Hidden or System attribute, a directory, and one another process holds open without
+    write sharing.
+
+    For ``export`` and ``anonymize-captures`` these known properties, at least, match ``write_text``
+    on main and are not new: the list is kept whatever it holds, so a target another account
+    pre-created stays that account's; the write is not atomic and not fsynced, so an OSError or an
+    interruption part way, or a crash after it, would leave the file truncated or partly written;
+    and the refusals above.
     """
-    if _is_named_stream(path):
-        with open(path, "w", encoding="utf-8") as stream:
-            stream.write(text)
-        return
     target = Path(path)
+    windows_in_place = in_place_on_windows and os.name == "nt"
+    newline = "\n" if in_place_on_windows else None
+    in_place = os.path.lexists(target) if windows_in_place else _is_named_stream(path)
+    if in_place:
+        _write_through(target, text, newline)
+        return
     fd, temp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
     try:
         try:
-            handle = os.fdopen(fd, "w", encoding="utf-8")
+            handle = os.fdopen(fd, "w", encoding="utf-8", newline=newline)
         except BaseException:
             os.close(fd)  # nothing owns the descriptor yet, and Windows cannot unlink an open file
             raise
@@ -507,10 +546,24 @@ def _write_owner_only(path: str, text: str) -> None:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp, target)
+        if not windows_in_place:
+            os.replace(temp, target)
+            return
+        try:
+            os.rename(temp, target)  # on Windows it refuses an existing name; os.replace would not
+        except FileExistsError:
+            Path(temp).unlink()
+            _write_through(target, text, newline)
     except BaseException:
         Path(temp).unlink(missing_ok=True)
         raise
+
+
+def _write_through(target: Path, text: str, newline: str | None) -> None:
+    """Open ``target`` for writing in place, as ``Path.write_text`` does, and write ``text`` with
+    ``newline``: None is the platform's, CRLF on Windows."""
+    with target.open("w", encoding="utf-8", newline=newline) as stream:
+        stream.write(text)
 
 
 def _is_named_stream(path: str) -> bool:
@@ -547,7 +600,7 @@ def _compare(args: argparse.Namespace) -> int:
     text = json.dumps(report, indent=2)
     if args.out:
         try:
-            _write_owner_only(args.out, text + "\n")
+            _write_owner_only(args.out, text + "\n", in_place_on_windows=False)
         except OSError as exc:
             print(f"error: could not write the report to {args.out}: {exc}", file=sys.stderr)
             return 1
@@ -570,8 +623,10 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
     """Read captured bodies, de-identify them, and write a de-identified JSONL dataset (#36, ADR 0030).
 
     Fail-closed: the salt must come from the environment (never a flag/commit), and if ANY message
-    still carries a forbidden token after anonymization the whole dataset is refused — a partial,
-    possibly-leaky file is never written. Never echoes a body to stdout/stderr (only counts).
+    still carries a forbidden token after anonymization the whole dataset is refused — a dataset
+    holding a message that failed is never written, though an existing target on Windows can be
+    left truncated or partly written (:func:`_write_owner_only` says when). Never echoes a body to stdout/stderr
+    (only counts).
     """
     salt = os.environ.get(args.salt_env, "")
     if not salt:
@@ -709,7 +764,11 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    Path(args.out).write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    try:
+        _write_owner_only(args.out, "\n".join(lines) + "\n", in_place_on_windows=True)
+    except OSError as exc:
+        print(f"error: could not write the dataset to {args.out}: {exc}", file=sys.stderr)
+        return 1
     print(f"wrote {len(lines)} de-identified message(s) to {args.out}", file=sys.stderr)
     return 0
 

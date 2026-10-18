@@ -58,6 +58,9 @@ from tests._admin_account import (
 )
 
 PW = "a-strong-test-passphrase"
+#: The actions the issuer lookup reads as an issue, written out rather than read from
+#: ``_ISSUE_ROW_KEYS``, so a regression there cannot shrink this test with it (BACKLOG #3160).
+_ISSUING_ACTIONS = frozenset({"user.created", "auth.password_reset", "auth.mfa_reset"})
 
 #: Every 3-character string over the lower-cased ``token_urlsafe`` alphabet: see the module docstring.
 _EVERY_TRIGRAM = [
@@ -140,7 +143,7 @@ async def test_create_reset_and_factor_reset_write_nothing_when_no_credential_ca
         issue_rows_before = [
             r["action"]
             for r in await store.list_audit(limit=200)
-            if r["action"] in ("user.created", "auth.password_reset")
+            if r["action"] in _ISSUING_ACTIONS
         ]
 
         service = AuthService(store, _unissuable())
@@ -175,9 +178,7 @@ async def test_create_reset_and_factor_reset_write_nothing_when_no_credential_ca
             (ADMIN_USERNAME, {"op": "mfa_reset", "username": "holder", "user_id": target}),
             (ADMIN_USERNAME, {"op": "password_reset", "username": "holder", "user_id": target}),
         ]
-        issue_rows_after = [
-            r["action"] for r in rows if r["action"] in ("user.created", "auth.password_reset")
-        ]
+        issue_rows_after = [r["action"] for r in rows if r["action"] in _ISSUING_ACTIONS]
         assert issue_rows_after == issue_rows_before
     finally:
         await store.close()

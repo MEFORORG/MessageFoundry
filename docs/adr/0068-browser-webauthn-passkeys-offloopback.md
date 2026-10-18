@@ -123,7 +123,8 @@ and permanent for synced passkeys. The store contract test lives in an **extra-f
 imported inside test functions of the SQLite *and both live* suites (a module-level
 `importorskip("webauthn")` would silently skip parity on exactly the legs it exists to cover), and a
 minimal TOTP-contract backfill lands in the same commit — finally executing the Postgres/SQL Server
-row-lock paths under test.
+row-lock paths under test. *Amended 2026-10-17: this decision is unchanged, and the clone row
+now records the store's answer; see the amendment of that date.*
 
 ### 5. Factor generalization and recovery
 
@@ -257,7 +258,7 @@ amendment of that date.*
 - **AC-1** — WHILE a session is MFA-pending (no step-up freshness — WP-14), WHEN it POSTs
   `/ui/account/webauthn/enroll`, THE SYSTEM SHALL 303 to `/ui/reauth` and permit enrollment only
   after the password-only re-proof (a stolen pre-MFA cookie can never bind a passkey).
-  → `tests/test_webui.py::test_webauthn_enroll_requires_password_reproof`
+  → `packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py::test_webauthn_enroll_requires_password_reproof`
 - **AC-2** — WHEN a passkey assertion verifies at `POST /ui/reauth/webauthn`, THE SYSTEM SHALL stamp
   `mfa_verified_at` ONLY (no `reauth_at`, no client re-anchor); the subsequent password leg SHALL
   stamp `reauth_at` and re-anchor the client IP.
@@ -266,7 +267,7 @@ amendment of that date.*
   THE SYSTEM SHALL render the reauth page with the passkey prompt (never divert to
   `enroll_first`, never demand a TOTP code), and the generalized anti-loop check SHALL run before
   the login rate limiter.
-  → `tests/test_webui.py::test_webauthn_browser_enroll_and_stepup_e2e`
+  → `packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py::test_webauthn_browser_enroll_and_stepup_e2e`
 - **AC-4** — IF an assertion reports a `sign_count` at or below the stored nonzero counter, THEN THE
   SYSTEM SHALL reject it and audit `auth.webauthn_clone_suspected`; WHILE both counters are 0
   (synced passkey), THE SYSTEM SHALL accept repeatedly.
@@ -282,14 +283,14 @@ amendment of that date.*
   is off-loopback), THE SYSTEM SHALL fail WebAuthn ceremonies closed with a legible notice on every
   affected surface (409 on endpoints; explanatory text on `/ui/account` and `/ui/reauth` — never a
   redirect loop, never a request-Host-derived rp_id).
-  → `tests/test_webui.py::test_webauthn_rp_fail_closed_legible`
+  → `packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py::test_webauthn_rp_fail_closed_legible`
 - **AC-8** — WHEN a request presents a bearer `Authorization` header without the `mf_session` cookie
   to a `/ui` WebAuthn JSON route, THE SYSTEM SHALL reject it; the ADR 0065 AC-2 inverse (cookie
   alone on a JSON API route → 401) SHALL keep passing untouched.
-  → `tests/test_webui.py::test_webauthn_json_endpoints_reject_bearer_without_cookie`
+  → `packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py::test_webauthn_json_endpoints_reject_bearer_without_cookie`
 - **AC-9** — WHEN any new `/ui` POST (enroll, verify, delete, `/ui/reauth/webauthn`) receives a
   cross-site request, THE SYSTEM SHALL reject it with 403.
-  → `tests/test_webui.py::test_all_admin_posts_reject_cross_site`
+  → `packaging/messagefoundry-webconsole/tests/test_webui_users.py::test_all_admin_posts_reject_cross_site`
 - **AC-10** — IF deleting a WebAuthn credential would remove the user's last second factor WHILE MFA
   is required for them, THEN THE SYSTEM SHALL refuse with "enroll another factor first".
   → `tests/test_webauthn.py::test_last_factor_delete_refused_while_required`
@@ -298,7 +299,7 @@ amendment of that date.*
   → `tests/test_webauthn.py::test_admin_reset_mfa_clears_webauthn_credentials`
 - **AC-12** — WHILE `exposure_protected` is true, THE SYSTEM SHALL set the session cookie `Secure`
   and emit HSTS regardless of the per-request scheme.
-  → `tests/test_webui.py::test_forced_secure_cookie_and_hsts_when_protected`
+  → `packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py::test_forced_secure_cookie_and_hsts_when_protected`
 - **AC-13** — WHEN `GET /ui/sso` is requested without an `Authorization` header, THE SYSTEM SHALL
   respond 401 + `WWW-Authenticate: Negotiate` without consuming a rate-limit slot; IF the
   token-bearing leg exhausts `allow_login_attempt` (checked FIRST, so it bounds every downstream
@@ -309,13 +310,13 @@ amendment of that date.*
   reason, THE SYSTEM SHALL audit with the `<kerberos>` sentinel and 303 to `/ui/login?e=sso_failed`
   — never a second 401; WHEN `Sec-Fetch-Mode` is present and not `navigate` on the token leg, THE
   SYSTEM SHALL reject and audit likewise, WHILE cross-site top-level navigations SHALL be allowed.
-  → `tests/test_webui.py::test_sso_challenge_and_single_leg_failure` +
-  `tests/test_webui.py::test_sso_rate_limits_token_leg_only` +
-  `tests/test_webui.py::test_sso_cross_site_hygiene`
+  → `packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py::test_sso_challenge_and_single_leg_failure` +
+  `packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py::test_sso_rate_limits_token_leg_only` +
+  `packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py::test_sso_cross_site_hygiene`
 - **AC-14** — WHEN a browser Kerberos SSO session is minted, THE SYSTEM SHALL issue it with
   `seed_reauth=False` (first sensitive action forces the directory-password step-up), WHILE
   AD-password login and the JSON `/auth/negotiate` keep seeding reauth (regression-pinned).
-  → `tests/test_webui.py::test_sso_session_not_reauth_seeded`
+  → `packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py::test_sso_session_not_reauth_seeded`
 - **AC-15** — THE SYSTEM SHALL exercise the `webauthn_credentials` store contract (multi-row CRUD,
   CAS under each backend's row-lock idiom, 1023-byte credential-id round-trip, duplicate-label
   IntegrityError) on SQLite, Postgres, and SQL Server via an extra-free contract module.
@@ -323,7 +324,7 @@ amendment of that date.*
 - **AC-16** — WHILE the `[webauthn]` extra is not installed AND a user has enrolled credentials, THE
   SYSTEM SHALL log a startup advisory naming `admin_reset_mfa` and render a legible
   "passkeys unavailable on this install" notice at reauth — never a silent loop.
-  → `tests/test_webui.py::test_webauthn_extra_less_renders_notice` + `tests/test_webui.py::test_reauth_extra_less_with_credentials_renders_notice`
+  → `packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py::test_webauthn_extra_less_renders_notice` + `packaging/messagefoundry-webconsole/tests/test_webui_search_sso.py::test_reauth_extra_less_with_credentials_renders_notice`
 - **AC-17** — IF an operator targets their OWN account on `POST /users/{user_id}/reset-mfa`, THEN
   THE SYSTEM SHALL refuse (400) and direct them to the self-service MFA settings; cross-user reset
   is unaffected and remains the recovery path of §2. AC-10 and AC-18 refuse the last-factor case on
@@ -343,9 +344,8 @@ amendment of that date.*
   control, and `tests/test_mfa.py::test_the_ADMIN_recovery_path_is_not_narrowed_by_the_guard`
   pinning the carve-out) +
   `tests/test_api_auth.py::test_disabling_the_LAST_second_factor_is_a_400_not_a_500` +
-  `packaging/messagefoundry-webconsole/tests/test_webui.py::test_disabling_the_LAST_factor_renders_the_page_not_raw_json`
-  — that last path is spelled in full on purpose: the web console suite moved under `packaging/`,
-  so the bare `tests/test_webui.py` this section uses elsewhere no longer resolves.
+  `packaging/messagefoundry-webconsole/tests/test_webui_account.py::test_disabling_the_LAST_factor_renders_the_page_not_raw_json`
+  — the web console suite moved under `packaging/`, so its paths are spelled in full.
 
 ## Options considered
 
@@ -648,3 +648,44 @@ BACKLOG #2620 was filed on 2026-10-01 from that day's security architecture revi
 records as owner-approved. The row carries the verdict "build" and asks for the new-address check
 in the PHI-read gates and the paced-write gate, and not in the base gate. No file in this public
 tree records the approval itself, so nothing here quotes the owner.
+
+## Amendment (2026-10-17) -- the clone row records the store's sign-count answer (BACKLOG #3068, #3774, #3777)
+
+**Status:** Decision 4 is UNCHANGED: every compare-and-set miss is a clone signal and writes one
+`auth.webauthn_clone_suspected` row, as the engine did before this amendment. What changed is what
+the row records. `update_webauthn_sign_count` answers `moved`, `mismatch` or `gone` under one locked
+write on every backend: on SQLite the existence read runs in the guarded UPDATE's own write
+transaction, before its commit; on PostgreSQL and SQL Server the answer is the row-locking
+`SELECT ... FOR UPDATE` / `UPDLOCK` read that the UPDATE follows in one transaction. The clone row's
+detail carries that answer as `sign_count_answer`, `mismatch` or `gone`, so an operator can tell a
+passkey deleted during the assertion from a counter that held another value.
+
+**When it is written.** Once per assertion, as soon as the store answers and before any other read
+or refusal, so a session revocation, a disable, a lock, a passkey delete or a store error in the
+reads that follow cannot drop it. A cancel before the row is written writes none. The assertion is
+then refused, and no refusal writes a second clone row. The reasons a gone passkey is refused
+with, audited `auth.webauthn_failed`, include at least `factor_removed`, `factor_unverified` when
+the passkey set read after the write fails its seal, `session_lost` when the session or the
+account went with it, and `locked` when a second-step lock landed; a store error in those reads
+raises instead.
+
+**Why a gone passkey still raises the signal.** A self-service passkey delete takes no account
+queue, and an MFA reset deletes every passkey before it revokes the sessions, so either can land
+during an assertion and fail its compare-and-set with nothing cloned. An earlier build of this
+change exempted such a miss when it judged the passkey gone. Each review round found a path on
+which that exemption alerted less than the engine had before it, so the exemption was withdrawn: a
+false clone row on a deleted passkey is preferred to a missing one. `gone` alone does not show a
+holder's delete: a passkey row removed outside the store's sealed write path, or with its account,
+answers `gone` too. Before discounting a `gone` row, read the same request's refusal: a
+`factor_unverified` refusal, with an `integrity.authority_seal_failed` row for the account's
+passkeys, means the row did not leave through the store.
+
+A py_webauthn counter regression (the library's own rejection) is untouched: it is a clone signal
+whether or not the passkey is later deleted. AC-4 is unchanged. Section 4's text is left as
+written; the only edit there is a dated pointer to this amendment.
+
+**Who decided.** The change was built under BACKLOG #3068 (engine PR 2392). The ledger rows #3774
+and #3777, filed at the Lander's request on 2026-10-17, ask that the answer be decided atomically
+and recorded here. The rule that every answer other than `moved` writes the row, with the answer
+recorded, is the batch 259 Manager's ruling on PR 2392 on 2026-10-17; no owner ruling is recorded
+for it.

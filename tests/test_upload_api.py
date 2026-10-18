@@ -39,7 +39,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStatus
-from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.crypto import AesGcmCipher, generate_key, make_cipher
 from messagefoundry.store.store import AuditAppend
 from messagefoundry.uploads import UploadStore
 from tests._admin_account import create_local_user_chosen
@@ -1057,6 +1057,65 @@ async def test_a_deadline_mid_sweep_still_writes_a_prune_row_per_deleted_file(
     assert len(deleted) == 2, f"expected the sweep to stop after its second pair, got {deleted}"
 
 
+async def test_an_upload_wakes_the_retention_runner_instead_of_sweeping_inline(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """BACKLOG #3184 item 4. Where a retention runner is running, the upload route wakes it and
+    returns, so the sweep is never on the request path or under its deadline. The runner's sweep
+    still prunes the aged file and writes its row. Red before the fix: the route swept inline."""
+    import dataclasses
+    import time
+
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+    from messagefoundry.api.app import _record_upload_prune
+    from messagefoundry.uploads import UploadedFileMeta, UploadRetentionRunner
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    us = app.state.upload_store
+    inline: list[object] = []
+
+    async def _inline(audit: Any) -> Any:
+        inline.append(audit)
+        raise AssertionError("the route swept on the request path")
+
+    us.prune_on_save = _inline
+
+    async def _audit(meta: UploadedFileMeta) -> None:
+        await _record_upload_prune(engine.store, meta)
+
+    runner = UploadRetentionRunner(us, audit=_audit, interval_seconds=3600)
+    transport = reproving_transport(PW, app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        r = await c.post("/uploads", files={"file": ("a.hl7", BATCH, "text/plain")}, headers=h)
+        assert r.status_code == 200, r.text
+        assert inline, "control: with no runner running, the route sweeps inline"
+        inline.clear()
+        aged = r.json()["file_id"]
+        meta = next(m for m in await us.list_files() if m.file_id == aged)
+        (tmp_path / "uploads" / f"{aged}.meta").write_text(
+            us._encrypt_meta(dataclasses.replace(meta, uploaded_at=time.time() - 31 * 86_400)),
+            encoding="utf-8",
+        )
+        runner.start()
+        try:
+            # The runner's first sweep may already have taken the file; either way the upload must
+            # not sweep inline, and the row must land from the runner.
+            r = await c.post("/uploads", files={"file": ("b.hl7", BATCH, "text/plain")}, headers=h)
+            assert r.status_code == 200, r.text
+            rows: list[Any] = []
+            deadline = time.monotonic() + 10.0
+            while not rows and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+                rows = list(await engine.store.list_audit(action="upload.prune"))
+        finally:
+            await runner.stop()
+    assert not inline, "the route swept inline although a runner was running"
+    assert [json.loads(str(a["detail"]))["file_id"] for a in rows] == [aged]
+
+
 async def test_a_prune_failure_of_any_kind_never_fails_the_upload(
     engine: Engine, tmp_path: Path
 ) -> None:
@@ -1333,7 +1392,13 @@ async def test_an_override_holder_deletes_an_upload_rotate_key_cannot_seal(
         blob, sidecar = root / f"{fid}.blob", root / f"{fid}.meta"
         break_body(blob)
         had_body = blob.exists()
-        app.state.upload_store = _keyed_store(root)  # the key is now enabled
+        # The key is now enabled. The refusal hook is what raises the upload-cipher alert in the
+        # engine, so counting its calls counts the alerts (BACKLOG #3240).
+        cipher = make_cipher(generate_key(), write_v2=True)
+        assert isinstance(cipher, AesGcmCipher)
+        alerts: list[tuple[str, str]] = []
+        cipher.set_refusal_hook(lambda table, column: alerts.append((table, column)))
+        app.state.upload_store = UploadStore(root, cipher, max_bytes=10**6)
 
         r = await c.delete(f"/uploads/{fid}", headers=h)
         assert r.status_code == 404, r.text  # the owner is unreadable: no existence oracle
@@ -1342,12 +1407,14 @@ async def test_an_override_holder_deletes_an_upload_rotate_key_cannot_seal(
         )
 
         caplog.clear()
+        alerts.clear()
         with caplog.at_level(logging.WARNING, logger="messagefoundry.store.crypto"):
             r = await c.delete(f"/uploads/{fid}", headers=ha)
         assert r.status_code == 200, r.text
         assert r.json() == {"file_id": fid, "filename": "", "deleted": True}
         refusals = [m for m in caplog.messages if m.startswith("refused an unmarked value")]
         assert len(refusals) == 1, refusals
+        assert alerts == [("uploaded_file", "meta")], alerts
         assert not sidecar.exists() and not blob.exists(), "the delete left a file behind"
 
     rows = [a for a in await engine.store.list_audit() if a["action"] == "upload.delete"]
@@ -1357,3 +1424,110 @@ async def test_an_override_holder_deletes_an_upload_rotate_key_cannot_seal(
     assert detail["file_id"] == fid
     assert set(detail) == {"file_id", "size"}  # no file name (vault BACKLOG #2619)
     assert "acme" not in str(rows[0]["detail"])
+
+
+# --- vault BACKLOG #3178: the upload.create and upload.delete rows outlive the request -------------
+
+
+def _park_audit(engine: Engine, action: str, monkeypatch: pytest.MonkeyPatch) -> asyncio.Event:
+    """Make ``record_audit`` for ``action`` wait until the returned event is set, so the request
+    deadline fires while that row is being written. Every other row writes through."""
+    release = asyncio.Event()
+    real = engine.store.record_audit
+
+    async def _parked(name: str, **kwargs: Any) -> Any:
+        if name == action:
+            await release.wait()
+        return await real(name, **kwargs)
+
+    monkeypatch.setattr(engine.store, "record_audit", _parked)
+    return release
+
+
+async def _settle(app: Any) -> None:
+    """Wait for the app's outliving operations to finish."""
+    for _ in range(200):
+        if not app.state.outliving_operations.inflight:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("an outliving operation never finished")
+
+
+async def test_a_deadline_during_the_create_row_still_writes_it(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Red before #3178: the deadline cancelled the route inside its ``upload.create`` write, so
+    the stored file had no row saying who created it."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    async with httpx.AsyncClient(
+        transport=reproving_transport(PW, app=app), base_url="http://t"
+    ) as c:
+        h = await _login(c, "op")
+        release = _park_audit(engine, "upload.create", monkeypatch)
+        app.state.request_timeout_seconds = 0.5
+        r = await c.post("/uploads", files={"file": ("a.hl7", BATCH, "text/plain")}, headers=h)
+        assert r.status_code == 503, r.text
+        release.set()
+        await _settle(app)
+    [stored] = await app.state.upload_store.list_files()
+    [row] = await engine.store.list_audit(action="upload.create")
+    assert row["actor"] == "op" and json.loads(str(row["detail"]))["file_id"] == stored.file_id
+
+
+async def test_a_create_row_that_fails_removes_the_stored_file(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row that cannot be written leaves no file behind it, rather than a file with no row."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    real = engine.store.record_audit
+
+    async def _failing(name: str, **kwargs: Any) -> Any:
+        if name == "upload.create":
+            raise RuntimeError("the audit log refused the row")
+        return await real(name, **kwargs)
+
+    async with httpx.AsyncClient(
+        transport=reproving_transport(PW, app=app, raise_app_exceptions=False),
+        base_url="http://t",
+    ) as c:
+        h = await _login(c, "op")
+        monkeypatch.setattr(engine.store, "record_audit", _failing)
+        r = await c.post("/uploads", files={"file": ("a.hl7", BATCH, "text/plain")}, headers=h)
+    assert r.status_code == 500
+    assert await app.state.upload_store.list_files() == []
+    assert not list((tmp_path / "uploads").iterdir())
+
+
+async def test_a_deadline_during_the_delete_row_still_writes_it(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Red before #3178: the file was already unlinked when the deadline cancelled the route in
+    its ``upload.delete`` write, so a removed file had no row saying who removed it."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    async with httpx.AsyncClient(
+        transport=reproving_transport(PW, app=app), base_url="http://t"
+    ) as c:
+        h = await _login(c, "op")
+        r = await c.post("/uploads", files={"file": ("a.hl7", BATCH, "text/plain")}, headers=h)
+        fid = r.json()["file_id"]
+        release = _park_audit(engine, "upload.delete", monkeypatch)
+        app.state.request_timeout_seconds = 0.5
+        d = await c.delete(f"/uploads/{fid}", headers=h)
+        assert d.status_code == 503, d.text
+        release.set()
+        await _settle(app)
+    assert await app.state.upload_store.list_files() == []
+    [row] = await engine.store.list_audit(action="upload.delete")
+    assert row["actor"] == "op" and json.loads(str(row["detail"]))["file_id"] == fid

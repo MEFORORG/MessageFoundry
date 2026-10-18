@@ -54,6 +54,7 @@ from .._auth import (
 )
 from .._service import _service
 from ._common import _form_pairs, _rate_limited
+from .core import _refusal_error
 
 # --- L4b: self-service account (change password + TOTP MFA lifecycle) -------
 # Self-scoped actions: any authenticated session acts on ITS OWN credential, so the registry
@@ -255,6 +256,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 passkeys=passkeys,
                 webauthn_notice=wa_notice,
                 session_offer=session_offer,
+                # Read only where the page uses it, the no-TOTP branch. The session half is
+                # BACKLOG #3116; _enrol_before_step_up in routes/core.py says why.
+                factor_owed=not mfa.enabled
+                and (mfa.required or not await service.mfa_satisfied(session_token(request))),
             ),
             status_code=status_code,
         )
@@ -460,7 +465,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         try:
             enroll = await admin.enroll_mfa(service=service, identity=identity)
         except HTTPException as exc:
-            # AD account / already enrolled — surface on the account page.
+            # Unknown account / already enrolled — surface on the account page. A directory account
+            # is accepted here (BACKLOG #1144), so this is not its refusal.
             return await _account_response(
                 service, identity, request, error=str(exc.detail), status_code=400
             )
@@ -508,7 +514,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 identity, code, token=token, client=client
             )
         except ValueError as exc:
-            # No enrollment staged / not a local account — back to the account page.
+            # At least: unknown account, no enrollment staged, or a factor bound meanwhile
+            # (BACKLOG #3014, #3061) — back to the account page.
             return await _account_response(
                 service, identity, request, error=str(exc), status_code=400
             )
@@ -521,7 +528,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # second confirm TOTP is already on, so the operator signs in with it, not enrols.
             return login_redirect_response()
         if elevation.token is None:
-            return HTMLResponse(pages.mfa_confirm_page(error="Invalid code."), status_code=400)
+            # A wrong code answers "Invalid code.". So does the login-to-MFA floor, on purpose,
+            # though it refuses before the code is checked (BACKLOG #2389). Two other refusals also
+            # check no code, and for them that answer would be false: the directory could not
+            # vouch for a directory account (BACKLOG #3061), or a second-step lock, said in
+            # /ui/reauth's words (BACKLOG #3810 finding 4).
+            error = _refusal_error(elevation, "Invalid code.")
+            return HTMLResponse(pages.mfa_confirm_page(error=error), status_code=400)
         # Activated: the recovery codes render ONCE — never re-fetchable. The confirm re-keyed the
         # session (ASVS 7.2.4), so this response must carry the new cookie or the operator is signed
         # out on the very page showing codes they have not written down yet.
@@ -678,7 +691,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             options = await service.begin_webauthn_registration(
                 identity, token=token, rp_id=rp[0], rp_name=_RP_NAME
             )
-        except ValueError as exc:  # AD account
+        except ValueError as exc:  # unknown account, or a first factor that must be TOTP
             return await _account_response(
                 service, identity, request, error=str(exc), status_code=400
             )
@@ -710,26 +723,34 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             label = str(body.get("label", ""))
         except (ValueError, KeyError, TypeError):
             return JSONResponse({"ok": False, "error": "malformed request"}, status_code=400)
+        # BACKLOG #3014: ui_mfa_verify's per-actor budget, charged only on a request that reaches
+        # the ceremony, and after the gate's admin-write charge (that order is BACKLOG #2652's, left
+        # alone). JSON, so the page's fetch can read `error`.
+        client = client_ip(request)
+        if not allow_reauth_attempt(service, identity, client):
+            exc = _rate_limited(request, "passkey-enroll")
+            return JSONResponse({"ok": False, "error": exc.detail}, status_code=exc.status_code)
         try:
             elevation = await service.finish_webauthn_registration(
                 identity,
                 response_json,
                 label=label,
                 token=token,
-                client=client_ip(request),
+                client=client,
                 rp_id=rp[0],
                 origin=rp[1],
             )
         except ValueError as exc:
             # Service-authored, safe messages only (expired ceremony / duplicate label or
-            # credential / bad label / AD) — never reflected input.
+            # credential / bad label / a factor owed first) — never reflected input.
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
         if elevation.session_lost:
             return JSONResponse({"ok": False, "error": "session expired"}, status_code=401)
         if elevation.token is None:
-            return JSONResponse(
-                {"ok": False, "error": "passkey verification failed"}, status_code=400
-            )
+            # BACKLOG #3061: a directory refusal checked no attestation, and
+            # neither did a lock refusal (BACKLOG #3810 finding 4).
+            error = _refusal_error(elevation, "passkey verification failed")
+            return JSONResponse({"ok": False, "error": error}, status_code=400)
         # Enrolling a passkey marks the session MFA-satisfied, so it re-keys (ASVS 7.2.4). The page
         # follows `redirect` immediately, and that GET must carry the new cookie.
         resp = JSONResponse({"ok": True, "redirect": "/ui/account?m=passkey_added"})

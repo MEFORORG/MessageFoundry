@@ -91,6 +91,7 @@ from messagefoundry.api.security import (
     recheck_standing,
     record_repeated_credential,
     require,
+    require_paced,
     require_reauth_only_action,
     require_step_up,
     require_step_up_action,
@@ -139,6 +140,7 @@ from messagefoundry.auth.service import (
     DirectoryAccountNotFound,
     DirectoryAccountRefused,
     DirectoryObjectIdMissing,
+    DirectoryRefusal,
     FactorEnrolmentRequired,
     FederatedBindingChanged,
     FederatedSubjectHeld,
@@ -159,12 +161,36 @@ _VALID_ROLE_IDS = {role.value for role in Role}
 
 _log = logging.getLogger(__name__)
 
-#: What ``/auth/mfa-verify`` and ``/me/reauth`` say when ``Elevation.directory_unconfirmed`` is set
-#: (BACKLOG #2023, #2027): the directory could not vouch for the account, so the proof was never
-#: checked. It names no directory internals; the precise reason is on the audit row.
+#: What ``/auth/mfa-verify``, ``/me/reauth`` and ``/me/mfa/confirm`` say when a directory refused
+#: the account: the proof was never checked, or, on a demoted account's re-bind, it was checked and
+#: the account was refused for its roles (BACKLOG #2023, #2027, #3061, #3081). One text per fix,
+#: chosen by ``Elevation.directory_refusal`` (BACKLOG #3082): an account the directory did not
+#: confirm, an outage included, is told to try later or ask an administrator, never to sign out,
+#: since a new sign-in fails the same way and the working session would be lost. A lost role is told
+#: to sign in again, which takes the roles the groups grant now. Neither names a group, a role or a
+#: directory detail; the precise reason is on the audit row. The console's
+#: ``_DIRECTORY_UNCONFIRMED_ERROR`` and ``_DIRECTORY_DEMOTED_ERROR`` name the same fixes, and a
+#: console test holds them in step.
 _DIRECTORY_UNCONFIRMED_DETAIL = (
-    "the directory could not confirm this account; try again later, or ask an administrator"
+    "the directory could not confirm this account; try again later, and if it is still refused,"
+    " ask an administrator"
 )
+_DIRECTORY_DEMOTED_DETAIL = (
+    "this account's access changed in the directory since this session signed in;"
+    " sign out and sign in again"
+)
+
+
+def _directory_refusal_detail(refusal: DirectoryRefusal) -> str:
+    """The 403 text for a directory refusal, by the fix that clears it (BACKLOG #3082)."""
+    if refusal is DirectoryRefusal.DEMOTED:
+        return _DIRECTORY_DEMOTED_DETAIL
+    return _DIRECTORY_UNCONFIRMED_DETAIL
+
+
+#: What ``/me/mfa/confirm`` says when ``Elevation.locked`` is set (BACKLOG #3810 finding 4): a
+#: directory account's second-step lock was found before the code was checked.
+_ACCOUNT_LOCKED_DETAIL = "account locked; try again later"
 
 
 def _alert_administrator_granted(app: FastAPI, key: str, *, via: str, granted_by: str) -> None:
@@ -362,10 +388,12 @@ def _user_summary(
     *,
     credential_expires_at: float | None = None,
     lock_state_at: float | None = None,
+    show_scope: bool = True,
 ) -> UserSummary:
     """``lock_state_at`` is the instant to evaluate the account's locks at, and passing it is what
     DISCLOSES them: pass it only on a ``users:manage`` surface (BACKLOG #1131). Left ``None``, the
-    summary carries ``lock_state=None``, which reads as "not shown", never as "not locked"."""
+    summary carries ``lock_state=None``, which reads as "not shown", never as "not locked".
+    ``show_scope=False`` withholds the channel scope and its source the same way (BACKLOG #3189)."""
     return UserSummary(
         id=user.id,
         username=user.username,
@@ -375,8 +403,9 @@ def _user_summary(
         notify_email=user.notify_email,
         disabled=user.disabled,
         roles=sorted(role_ids),
-        channel_scope=_parse_channel_scope(user.channel_scope),
-        channel_scope_source=user.channel_scope_source,
+        channel_scope=_parse_channel_scope(user.channel_scope) if show_scope else None,
+        channel_scope_source=user.channel_scope_source if show_scope else None,
+        channel_scope_withheld=not show_scope,
         credential_expires_at=credential_expires_at,
         lock_state=None if lock_state_at is None else _lock_state(user, lock_state_at),
     )
@@ -411,12 +440,20 @@ def _canonical_group_dns(groups: list[str]) -> list[str]:
     what it returns, in the same order. A short name used to match a same-named group in any unit,
     so it is refused rather than stored. The canonical form is the one ``_resolve_groups`` gives a
     member's groups, so a key matches however it escapes a value (:func:`canonical_group_dn`). The
-    store still strips and folds case, which changes nothing in that form. A blank key stays blank,
-    and the store drops it as it always has. A canonical key longer than
-    :data:`_STORED_GROUP_MAX` is refused too."""
+    store still strips and folds case, which changes nothing in that form. A key that is blank
+    once a space, a tab and a line break are trimmed stays blank, and the store drops it as it always has. A
+    canonical key longer than :data:`_STORED_GROUP_MAX` is refused too."""
     # Outer white space is trimmed first: a pasted key often carries a line break, and the last
-    # RDN of a group DN is a domain component, which holds none.
-    keys = [g.strip() for g in groups]
+    # RDN of a group DN is a domain component, which holds none. Only a space, a tab and a line
+    # break are trimmed (BACKLOG #3222). A key that still starts or ends with a character that
+    # does not print, such as a no-break space or a zero-width space, is refused with its own
+    # reason: trimming it guessed, and keeping a trailing one stored a key that matches no group.
+    keys = [g.strip(" \t\r\n") for g in groups]
+    _refuse_group_keys(
+        sorted({k for k in keys if k and not (k[0].isprintable() and k[-1].isprintable())}),
+        "AD group starts or ends with white space other than a space, a tab or a line break, or "
+        "with another character that does not print",
+    )
     canonical = [canonical_group_dn(k) if k else "" for k in keys]
     pairs = list(zip(keys, canonical, strict=True))
     _refuse_group_keys(
@@ -433,13 +470,16 @@ def _canonical_group_dns(groups: list[str]) -> list[str]:
 
 
 def _refuse_group_keys(bad: list[str], reason: str) -> None:
-    """Raise the 400 naming the first :data:`_GROUPS_NAMED` of ``bad``, if there are any."""
+    """Raise the 400 naming the first :data:`_GROUPS_NAMED` of ``bad``, if there are any.
+
+    A key holding a character that does not print is named in its ``ascii()`` form, so a no-break
+    space cannot pass for a plain one in the message (BACKLOG #3222)."""
     if bad:
         more = len(bad) - _GROUPS_NAMED
+        named = [k if k.isprintable() else ascii(k) for k in bad[:_GROUPS_NAMED]]
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            f"{reason}; refused: {', '.join(bad[:_GROUPS_NAMED])}"
-            + (f" and {more} more" if more > 0 else ""),
+            f"{reason}; refused: {', '.join(named)}" + (f" and {more} more" if more > 0 else ""),
         )
 
 
@@ -684,14 +724,19 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         body: NotifyEmailRequest,
         request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require()),
+        identity: Identity = Depends(require_paced()),
     ) -> SimpleMessage:
         """Set the caller's own notification address where it has none (BACKLOG #1139, ASVS 6.3.7).
 
         The way out of the confinement ``require()`` applies to ``must_set_notify_email``. It fills a
         missing address only: an account that has one gets 409, and an administrator changes it,
         which notifies the old address. ``require()`` leaves this route under the factor gate, so a
-        session still owing its second factor cannot reach it."""
+        session still owing its second factor cannot reach it.
+
+        ``require_paced`` rather than the base gate (vault BACKLOG #3052 item 6), so it matches its
+        console twin ``POST /ui/account/notify-address``: a request from a host the session has not
+        verified from is refused with the step-up answer, and the write is paced. ``POST /me/reauth``
+        stays open to a confined session, so the refusal has a way out."""
         try:
             await service.fill_own_notify_email(identity, body.email, client=client_ip(request))
         except NotifyEmailAlreadySet as exc:
@@ -716,7 +761,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         session's re-proof budget, and toward the account lockout unless the sign-in lock is already
         live. The failure that exhausts the budget ends the session with a 401 (BACKLOG #1138).
         Neither account lock refuses it. A directory re-bind the directory could not judge is also a
-        403, saying so, and charges nothing (BACKLOG #2027).
+        403, saying so, and charges nothing (BACKLOG #2027), as is a right password on an account
+        the directory has demoted since sign-in (BACKLOG #3081).
 
         On success the session is RE-KEYED (ASVS 7.2.4) and the response carries the new bearer
         token — the one this request authenticated with is dead by the time the client reads it."""
@@ -757,11 +803,15 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                     " there through the web console at /ui/reauth, not with a password",
                     headers={"X-Step-Up-Via": "idp"},
                 )
-            if elevation.directory_unconfirmed:
+            if elevation.directory_refusal is not None:
                 # BACKLOG #2027: the directory could not judge the password, so "failed" would
-                # call a password wrong that was never checked. Same words as /auth/mfa-verify's
-                # directory refusal; the precise reason is on the audit row only.
-                raise HTTPException(status.HTTP_403_FORBIDDEN, _DIRECTORY_UNCONFIRMED_DETAIL)
+                # call a password wrong that was never checked; or (BACKLOG #3081) it judged it
+                # right on an account it has demoted. Same words as /auth/mfa-verify's directory
+                # refusal; the precise reason is on the audit row only.
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN,
+                    _directory_refusal_detail(elevation.directory_refusal),
+                )
             raise HTTPException(status.HTTP_403_FORBIDDEN, "re-verification failed")
         return ElevatedResponse(detail="re-verified", token=elevation.token)
 
@@ -805,10 +855,13 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                     " step up there through the web console at /ui/reauth",
                     headers={"X-Step-Up-Via": "idp"},
                 )
-            if elevation.directory_unconfirmed:
+            if elevation.directory_refusal is not None:
                 # BACKLOG #2023: the code was never checked, and the token still authenticates, so a
                 # 403 rather than the 401 that would send the client back to sign-in.
-                raise HTTPException(status.HTTP_403_FORBIDDEN, _DIRECTORY_UNCONFIRMED_DETAIL)
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN,
+                    _directory_refusal_detail(elevation.directory_refusal),
+                )
             # A correct code on a session revoked mid-ceremony is already a 401 here, so unlike
             # /me/reauth there is no status to split — only the message differs.
             detail = "session ended; sign in again" if elevation.session_lost else "invalid code"
@@ -861,7 +914,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         identity: Identity = Depends(require_reauth_only_action(STEP_UP_ACTION_MFA_CONFIRM)),
     ) -> MfaConfirmResponse:
         """Confirm a staged enrollment by proving a live TOTP code; activates MFA and returns the
-        single-use recovery codes (shown **once** — save them). A wrong code is a 400. Gated by a fresh
+        single-use recovery codes (shown **once** — save them). A wrong code is a 400, and a
+        directory account the directory could not confirm a 403 (BACKLOG #3061), as is a directory
+        account under a second-step lock (BACKLOG #3810 finding 4). Gated by a fresh
         password step-up BOUND to this confirm action (ADR 0077), independent of the enroll grant."""
         # Post-session ceremony (enrolling a factor while signed in): per-ACTOR budget.
         if not service.allow_reauth_attempt(identity.user_id):
@@ -878,6 +933,17 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         if elevation.token is None:
             if elevation.session_lost:
                 raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session ended; sign in again")
+            if elevation.directory_refusal is not None:
+                # BACKLOG #3061: the code was never checked, so "invalid code" would be false. The
+                # same 403 and words as /auth/mfa-verify's directory refusal (BACKLOG #3082).
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN,
+                    _directory_refusal_detail(elevation.directory_refusal),
+                )
+            if elevation.locked:
+                # BACKLOG #3810 finding 4: a directory account's lock is found before the code is
+                # checked, so "invalid code" would call an unchecked code wrong.
+                raise HTTPException(status.HTTP_403_FORBIDDEN, _ACCOUNT_LOCKED_DETAIL)
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid code")
         # The body now carries BOTH the one-time recovery codes and a live session token; the route's
         # CredentialReply model keeps the reply out of every cache (BACKLOG #2372).
@@ -1115,14 +1181,21 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # [diagnostics].audit_all_authz off, this GET writes no grant row. The web console calls
         # this handler in-process and writes none at all, an open gap (BACKLOG #1197).
         # One instant for the whole list, so every row answers "locked now?" for the same now.
-        lock_state_at = time.time() if identity.has(Permission.USERS_MANAGE) else None
+        manager = identity.has(Permission.USERS_MANAGE)
+        lock_state_at = time.time() if manager else None
         summaries: list[UserSummary] = []
         for user in await service.store.list_users():
             role_ids = await service.store.get_user_role_ids(user.id)
             # No credential_expires_at here, deliberately (BACKLOG #1141). This route needs only
             # users:read, and which accounts hold a live admin-issued temporary password, and until
             # when, is a target list. The users:manage surfaces state it.
-            summaries.append(_user_summary(user, role_ids, lock_state_at=lock_state_at))
+            # BACKLOG #3189: every account's channel scope, and who wrote it, go only to a
+            # users:manage holder, the tier GET /users/{id}/channel-scope reads on. users:read can
+            # be minted into a custom role, which can be channel-scoped, and the list would
+            # otherwise name every other account's channels to it.
+            summaries.append(
+                _user_summary(user, role_ids, lock_state_at=lock_state_at, show_scope=manager)
+            )
         return summaries
 
     @app.get("/users/{user_id}/permissions", response_model=UserPermissions)

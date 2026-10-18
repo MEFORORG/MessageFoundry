@@ -44,6 +44,7 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_MESSAGE_EDIT_RESEND,
     STEP_UP_ACTION_MESSAGE_RESEND,
     AuthService,
+    DirectoryRefusal,
     Elevation,
     MfaStatus,
 )
@@ -56,6 +57,7 @@ from .. import pages
 from .._auth import (
     CLEAR_SITE_DATA_HEADER,
     CLEAR_SITE_DATA_VALUE,
+    ENROL_FIRST_PAGE,
     WEBAUTHN_EXTRA_MISSING_NOTICE,
     WEBAUTHN_RP_CHANGED_NOTICE,
     WEBAUTHN_RP_MISSING_NOTICE,
@@ -107,25 +109,68 @@ _CLEAR_SITE_DATA_LOGIN_CODES = frozenset({"expired", "loggedout", "pwchanged"})
 #: truncated to a count. The reports are attacker-influenceable, so the log line is bounded.
 _CSP_REPORT_SUMMARY_MAX = 5
 
-#: What the MFA gate and the re-auth form say when ``verify_mfa``, ``reauth`` or
-#: ``finish_webauthn_assertion`` refused a directory account the directory did not confirm (BACKLOG
-#: #2023, #2027, #2239). The code, password or passkey was never checked, so "invalid code",
-#: "incorrect password" or "passkey verification failed" would be false.
+#: What the MFA gate, the re-auth form and the account page's two enrolment finishes say when
+#: ``verify_mfa``, ``reauth``, ``finish_webauthn_assertion``, ``confirm_mfa_enrollment`` or
+#: ``finish_webauthn_registration`` refused a directory account the directory did not confirm
+#: (BACKLOG #2023, #2027, #2239, #3061). The code, password or passkey was never checked, so
+#: "invalid code", "incorrect password" or "passkey verification failed" would be false. One text
+#: per fix, as the API's ``_DIRECTORY_UNCONFIRMED_DETAIL`` and ``_DIRECTORY_DEMOTED_DETAIL``
+#: (BACKLOG #3082): an account the directory did not confirm, an outage included, is never told to
+#: sign out, since a new sign-in fails the same way and the working session would be lost. A lost
+#: role is told to sign in again. Neither names a group, a role or a directory detail.
 _DIRECTORY_UNCONFIRMED_ERROR = (
-    "The directory could not confirm your account. Try again later, or ask an administrator."
+    "The directory could not confirm your account. Try again later. If it is still refused,"
+    " ask an administrator."
+)
+_DIRECTORY_DEMOTED_ERROR = (
+    "Your access changed in the directory since you signed in. Sign out, then sign in again."
 )
 
+#: What the re-auth form and the account page's two enrolment finishes say when the leg refused
+#: the account for a second-step lock (``Elevation.locked``) before checking the code or passkey
+#: (BACKLOG #3810 finding 4), so "invalid code" would be false.
+_ACCOUNT_LOCKED_ERROR = "Account locked. Try again later."
 
-def _directory_unconfirmed(elevation: Elevation) -> bool:
-    """``Elevation.directory_unconfirmed``, read so an engine that predates the field degrades.
 
-    The console ships as a separately versioned wheel. When this was written the seam digest
-    recorded ``verify_mfa``'s signature but not ``Elevation``'s fields, so an older engine would
-    pass the handshake and then raise ``AttributeError`` here. The digest records those fields since
-    BACKLOG #2015, so such an engine now ships a different seam; the fallback stays as a second
-    guard. The ``allow_reauth_attempt`` precedent in ``_auth.py`` is the same.
-    """
-    return bool(getattr(elevation, "directory_unconfirmed", False))
+def _directory_refusal_error(elevation: Elevation) -> str | None:
+    """The text for ``Elevation.directory_refusal``, or ``None`` when no directory refused.
+
+    Read directly: this module imports ``DirectoryRefusal`` from the engine, and the seam digest
+    records ``Elevation``'s fields (BACKLOG #2015), so no engine without the field can pair with
+    this console."""
+    refusal = elevation.directory_refusal
+    if refusal is None:
+        return None
+    if refusal is DirectoryRefusal.DEMOTED:
+        return _DIRECTORY_DEMOTED_ERROR
+    return _DIRECTORY_UNCONFIRMED_ERROR
+
+
+def _refusal_error(elevation: Elevation, fallback: str) -> str:
+    """The words for a refused code or passkey: the directory's refusal, then a lock, then the leg's
+    own ``fallback`` for a wrong proof. The first two never checked the proof, so ``fallback``
+    would be false for them (BACKLOG #3061, #3810 finding 4). No leg sets both flags on one
+    answer, so the order between them decides nothing today."""
+    directory = _directory_refusal_error(elevation)
+    if directory is not None:
+        return directory
+    if elevation.locked:
+        return _ACCOUNT_LOCKED_ERROR
+    return fallback
+
+
+def _enrol_before_step_up(mfa: MfaStatus, *, satisfied: bool, step_up: bool) -> bool:
+    """Whether the password ``/ui/reauth`` sends this session to enrol instead of rendering its form.
+
+    True for a full-step-up action when the account holds no factor of EITHER kind (ADR 0068
+    decision 1(a)) and a factor is owed. The session half (``satisfied`` is ``mfa_satisfied``) is a
+    deadlock guard: such a session can never pass the step-up, so the form would loop straight back
+    (BACKLOG #3116). The account-rule half (``mfa.required``) is policy, not a deadlock: it sends a
+    required-but-unenrolled account to enrol even when a stamp leaves its session satisfied. ``AuthService._unverified_session_owes_factor`` says when a session owes a factor
+    the account rule does not. Enrolment itself is ``step_up=False``, so it never bounces here."""
+    if not step_up or mfa.enabled or mfa.webauthn_enrolled:
+        return False
+    return mfa.required or not satisfied
 
 
 #: The message log's received-date bounds, validated by the SAME annotated type the JSON ``/messages``
@@ -275,7 +320,7 @@ register_ui_action(
 # `is_unlock_action` fullmatch the RAW value — so a path-only pattern would match nothing and
 # dead-end the flow at /ui with the selection silently gone.
 # KEEP THE OPTIONAL GROUP rather than pinning `\?to=...`: this form also fullmatches the bare route
-# TEMPLATE, which is what keeps the coverage guard in test_webui.py able to see this entry.
+# TEMPLATE, which is what keeps the coverage guard in test_webui_monitoring.py able to see this entry.
 # The re-auth mints the resend grant (vault BACKLOG #2625), which the POST behind the page spends.
 register_ui_action(
     r"^/ui/messages/[^/?#]+/resend-confirm(\?[^#]*)?$",
@@ -1591,9 +1636,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> Response:
         """/ui/reauth for a session the federated login minted (BACKLOG #296).
 
-        Runs BEFORE the password page's enroll-first bounce, because that bounce keys on the account
-        (``mfa.required``, nothing enrolled) and an OIDC session minted with the IdP's MFA claim has
-        met its factor without any engine enrollment. Only a session that has NOT met it is routed:
+        Runs BEFORE the password page's enroll-first bounce, because an OIDC session must never see
+        the password page, and because that bounce also keys on the account (``mfa.required``) while
+        an OIDC session minted with the IdP's MFA claim has met its factor without any engine
+        enrollment. Only a session that has NOT met it is routed:
         one owing an ENROLLED engine factor proves it at the MFA gate first (the IdP leg re-proves
         the sign-in, not the engine's factor), and one that owes a factor it has not enrolled goes
         to enroll for a full step-up action, as the password page sends it."""
@@ -1601,10 +1647,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             if mfa.enabled or mfa.webauthn_enrolled:
                 return RedirectResponse("/ui/mfa", status_code=303)
             if step_up:
-                # Keyed on "not satisfied", not on the account rule mfa.required: the directory
-                # floor can leave a session unsatisfied that the account rule calls exempt, and
-                # the step-up gate asks the session.
-                return RedirectResponse("/ui/account?m=enroll_first", status_code=303)
+                # Session only, unlike _enrol_before_step_up: an IdP-claim session is satisfied
+                # with no engine factor while mfa.required holds, and must pass (docstring above).
+                return RedirectResponse(ENROL_FIRST_PAGE, status_code=303)
         return reauth_idp_response(deps, auth, next_, continues=continues)
 
     async def _mfa_gate_deadline(auth: AuthService, identity: Identity) -> float | None:
@@ -1689,8 +1734,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             set_session_cookie(resp, elevation.token, request=request)
             return resp
         if elevation.session_lost:
-            # A correct code on a session revoked underneath it: there is nothing to re-render the
-            # gate for, and the cookie is dead. Land on login like any other post-termination exit.
+            # The session or its account went during the ceremony, under a correct code or before
+            # the code was checked (BACKLOG #3068): there is nothing to re-render the gate for, and
+            # the cookie is dead. Land on login like any other post-termination exit.
             return login_redirect_response()
         if elevation.idp_step_up_required:
             # BACKLOG #2142: an oidc session that already met its factor owes no code, as the GET
@@ -1706,9 +1752,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             pages.mfa_gate(
                 totp_enrolled=mfa.enabled,
                 error=(
-                    _DIRECTORY_UNCONFIRMED_ERROR
-                    if _directory_unconfirmed(elevation)
-                    else "That code wasn't accepted. Try again."
+                    _directory_refusal_error(elevation) or "That code wasn't accepted. Try again."
                 ),
                 webauthn_options=wa_options,
                 webauthn_notice=wa_notice,
@@ -1752,18 +1796,14 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # mechanism, not the account: a Kerberos session keeps the password form below.
             # Ahead of the enroll-first bounce; _reauth_idp_page says why.
             return await _reauth_idp_page(auth, token, mfa, next_, action.step_up, continues)
-        if mfa.required and not (mfa.enabled or mfa.webauthn_enrolled) and action.step_up:
-            # A full-step-up action a required-but-UNENROLLED session (no factor of EITHER
-            # kind — ADR 0068 decision 1(a)) can NEVER satisfy — send it to enroll instead
-            # of a password form that would loop straight back. Enrollment itself is
-            # step_up=False (below).
-            return RedirectResponse("/ui/account?m=enroll_first", status_code=303)
+        satisfied = await auth.mfa_satisfied(token)
+        if _enrol_before_step_up(mfa, satisfied=satisfied, step_up=action.step_up):
+            return RedirectResponse(ENROL_FIRST_PAGE, status_code=303)
         # The rendering splits BY FACTOR (decision 1(b)): the TOTP code field renders iff
         # TOTP is enrolled (a required-but-unenrolled account can never produce a code —
         # demanding one would deadlock, L4b); the passkey hook renders iff WebAuthn is
         # enrolled — a WebAuthn-only user sees password + passkey, never an unanswerable
         # code field; a both-enrolled user sees both, either satisfies.
-        satisfied = await auth.mfa_satisfied(token)
         mfa_needed = not satisfied and mfa.enabled
         wa_options, wa_notice = await _reauth_webauthn_state(request, auth, token, mfa, satisfied)
         return HTMLResponse(
@@ -1805,14 +1845,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         mfa = await auth.mfa_status(identity)
         # continues_after_reauth is asked of `token` at each use, not once here: the code leg below
         # rotates it and re-keys the issued continuation onto the new token.
-        if mfa.required and not (mfa.enabled or mfa.webauthn_enrolled) and action.step_up:
-            # See ui_reauth_form: a full-step-up action this session can never satisfy (no
-            # factor of EITHER kind — ADR 0068 decision 1(a)) — send it to enroll rather
-            # than loop. Checked BEFORE the rate limiter so a correct password isn't burned
-            # into a 429 (the review's silent-loop finding; the ordering pin covers the
-            # generalized condition too).
-            return RedirectResponse("/ui/account?m=enroll_first", status_code=303)
         satisfied = await auth.mfa_satisfied(token)
+        if _enrol_before_step_up(mfa, satisfied=satisfied, step_up=action.step_up):
+            # Checked BEFORE the rate limiter so a correct password isn't burned into a 429 (the
+            # review's silent-loop finding). test_ui_mfa_gate.py pins the order for the session half
+            # with the budget denied.
+            return RedirectResponse(ENROL_FIRST_PAGE, status_code=303)
         if not satisfied and not mfa.enabled and mfa.webauthn_enrolled:
             # ADR 0068 decision 1(d): a WebAuthn-ONLY user's password form can never satisfy
             # MFA by itself — the passkey leg (POST /ui/reauth/webauthn) must run first.
@@ -1871,7 +1909,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 await auth.verify_mfa(token, code, client=client) if code else Elevation()
             )
             if code_elevation.session_lost:
-                return login_redirect_response()  # session ended under a correct code
+                # The session ended during the ceremony, whether or not the code was checked yet
+                # (BACKLOG #3068).
+                return login_redirect_response()
             if code_elevation.token is not None:
                 rekey_continuations(token, code_elevation.token)
                 token = code_elevation.token  # rotation 1 of 2
@@ -1888,13 +1928,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                         mfa_needed=True,
                         webauthn_options=wa_options,
                         webauthn_notice=wa_notice,
-                        error=(
-                            "Account locked. Try again later."
-                            if code_elevation.locked
-                            else _DIRECTORY_UNCONFIRMED_ERROR
-                            if _directory_unconfirmed(code_elevation)
-                            else "Invalid code."
-                        ),
+                        error=_refusal_error(code_elevation, "Invalid code."),
                     )
                 )
         # 7.5.1 (ADR 0077): mint the single-use grant bound to this continuation's action.
@@ -1943,11 +1977,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                         mfa_needed=mfa_enrolled and still_unsatisfied,
                         webauthn_options=wa_options,
                         webauthn_notice=wa_notice,
-                        error=(
-                            _DIRECTORY_UNCONFIRMED_ERROR
-                            if _directory_unconfirmed(pw_elevation)
-                            else "Incorrect password."
-                        ),
+                        error=_directory_refusal_error(pw_elevation) or "Incorrect password.",
                     )
                 ),
                 token,
@@ -2031,11 +2061,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if elevation.token is None:
             # BACKLOG #2239: the directory could not vouch for a directory account, so the
             # assertion was never checked and "verification failed" would be false.
-            error = (
-                _DIRECTORY_UNCONFIRMED_ERROR
-                if _directory_unconfirmed(elevation)
-                else "passkey verification failed"
-            )
+            error = _directory_refusal_error(elevation) or "passkey verification failed"
             return JSONResponse({"ok": False, "error": error}, status_code=400)
         # The assertion re-keyed the session (ASVS 7.2.4). The new cookie rides this JSON response,
         # because the page's next request is the POST /ui/reauth password leg — it would otherwise

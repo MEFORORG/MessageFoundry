@@ -51,6 +51,7 @@ import base64
 import datetime as _dt
 import json
 import math
+import re
 import struct
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -1045,8 +1046,11 @@ class GraphShape:
 
     ``bindings`` maps an inbound to its Router, for the inbounds the process holds. An engine shard
     holds only its own, so ``inbound`` carries every inbound NAME in the deployment beside it.
-    ``accepts`` is the Handlers that declare an ``accepts=`` predicate. **Names only:** two graphs
-    with one shape can still differ in what a function of the same name does."""
+    ``accepts`` is the Handlers that declare an ``accepts=`` predicate. Names alone cannot tell
+    apart two graphs whose function of one name does different things, so ``code_digest``
+    carries a digest of the config modules' bytes as the load read them
+    (:func:`messagefoundry.config.wiring.config_code_digest`, vault BACKLOG #2724). It is None for a
+    graph built in code or a module that could not be read, and the comparison then skips it."""
 
     bindings: Mapping[str, str]
     inbound: frozenset[str]
@@ -1054,6 +1058,7 @@ class GraphShape:
     handlers: frozenset[str]
     accepts: frozenset[str]
     outbound: frozenset[str]
+    code_digest: str | None = None
 
 
 #: The name sets of a :class:`GraphShape`, as its fields and its wire keys.
@@ -1064,9 +1069,21 @@ def _dec_names(node: Any, what: str) -> frozenset[str]:
     return frozenset(_req_str(name, what) for name in _req_list(node, what))
 
 
+#: A ``code_digest`` on the wire: a SHA-256 in lower-case hex.
+_DIGEST_RE: Final = re.compile(r"[0-9a-f]{64}")
+
+
+def _dec_digest(node: Any) -> str | None:
+    digest = _opt_str(node, "graph code_digest")
+    if digest is not None and not _DIGEST_RE.fullmatch(digest):
+        raise SandboxCodecError("sandbox graph code_digest must be a SHA-256 in lower-case hex")
+    return digest
+
+
 def encode_ready(shape: GraphShape) -> bytes:
     graph: dict[str, Any] = {key: sorted(getattr(shape, key)) for key in _SHAPE_SETS}
     graph["bindings"] = sorted([name, router] for name, router in shape.bindings.items())
+    graph["code_digest"] = shape.code_digest
     return encode_frame(_envelope({"graph": graph}, "ready"), ())
 
 
@@ -1096,6 +1113,7 @@ def decode_boot_reply(body: bytes) -> tuple[GraphShape | None, str]:
     shape = GraphShape(
         bindings=bindings,
         **{key: _dec_names(graph.get(key), f"graph {key}") for key in _SHAPE_SETS},
+        code_digest=_dec_digest(graph.get("code_digest")),
     )
     reader.finish()
     return shape, ""

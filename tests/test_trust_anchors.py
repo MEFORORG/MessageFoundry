@@ -1479,8 +1479,14 @@ def _pinned_ad_anchor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[
 
 
 async def _anchored_engine(
-    tmp_path: Path, spec: AnchorSpec, *, with_config_dir: bool = True
+    tmp_path: Path,
+    spec: AnchorSpec,
+    *,
+    with_config_dir: bool = True,
+    preflight_store: Any = None,
 ) -> tuple[Any, Path]:
+    """``preflight_store`` is the store the settings preflight audits through; the engine's own
+    store when it is None."""
     from messagefoundry.pipeline import Engine
 
     cfg = tmp_path / "cfg"
@@ -1489,14 +1495,16 @@ async def _anchored_engine(
     engine = Engine(
         store,
         config_dir=cfg if with_config_dir else None,
-        settings_preflight=ta.make_settings_anchor_preflight([spec], store, enforcing=True),
+        settings_preflight=ta.make_settings_anchor_preflight(
+            [spec], store if preflight_store is None else preflight_store, enforcing=True
+        ),
         egress_settings=EgressSettings(deny_by_default=False),
     )
     return engine, cfg
 
 
 async def _convergence(engine: Any, _cfg: Path) -> None:
-    await engine._converge_reload()
+    await engine._converge_reload(1)
 
 
 async def _dr_profile(engine: Any, _cfg: Path) -> None:
@@ -1730,13 +1738,15 @@ async def test_a_reload_after_a_ca_swap_says_a_restart_is_needed_every_time(
     preflight = ta.make_settings_anchor_preflight([spec], store, enforcing=True)
     assert preflight is not None
 
-    await preflight()  # the control: an unchanged anchor says nothing
+    assert await preflight() == ()  # the control: an unchanged anchor says nothing
     assert _events(await _rows(store, spec.label), "restart_required") == []
 
     p.write_bytes(rotated)
     caplog.set_level("WARNING", logger=ta.__name__)
-    await preflight()
-    await preflight()  # the second reload: the audited baseline has already moved
+    # Each pass also returns the setting, for the reload's response (BACKLOG #3015).
+    assert await preflight() == (spec.setting,)
+    # The second reload: the audited baseline has already moved.
+    assert await preflight() == (spec.setting,)
     rows = await _rows(store, spec.label)
     assert len(_events(rows, "changed")) == 1  # the trap: the audit chain fires once
     restart = _events(rows, "restart_required")
@@ -1752,7 +1762,7 @@ async def test_a_reload_after_a_ca_swap_says_a_restart_is_needed_every_time(
     assert len(warned) == 2 and spec.setting in warned[0]
 
     p.write_bytes(good)  # rotated back to the bytes in use: nothing left to apply
-    await preflight()
+    assert await preflight() == ()
     assert len(_events(await _rows(store, spec.label), "restart_required")) == 2
 
 
@@ -1798,7 +1808,10 @@ async def test_the_reload_route_says_a_rotated_ad_ca_needs_a_restart(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Through the real managed-app wiring and a real LDAPS authenticator: the swap lands after
-    the authenticator loaded the CA, so two reloads after it both pass and both write the row."""
+    the authenticator loaded the CA, so two reloads after it both pass and both write the row.
+
+    Each response names the setting too (BACKLOG #3015). The controls: a reload before the swap
+    answers an empty list, and a dry run, which skips the check, answers ``None``."""
     import httpx
 
     from messagefoundry.api.app import create_managed_app
@@ -1822,12 +1835,19 @@ async def test_the_reload_route_says_a_rotated_ad_ca_needs_a_restart(
         egress_settings=EgressSettings(deny_by_default=False),
     )
     async with app.router.lifespan_context(app):
-        p.write_bytes(_block(b"rotated"))
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            r = await client.post("/config/reload", json={})
+            assert r.status_code == 200, r.text
+            assert r.json()["restart_required"] == []  # checked, unchanged
+            p.write_bytes(_block(b"rotated"))
             for _ in range(2):
                 r = await client.post("/config/reload", json={})
                 assert r.status_code == 200, r.text
+                assert r.json()["restart_required"] == [spec.setting]
+            r = await client.post("/config/reload", json={"dry_run": True})
+            assert r.status_code == 200, r.text
+            assert r.json()["restart_required"] is None  # not checked
         rows = await _rows(app.state.engine.store, "ad")
     assert len(_events(rows, "restart_required")) == 2
 
@@ -1952,10 +1972,16 @@ def test_a_blank_pin_without_mtls_fails_its_own_lane_not_the_graph() -> None:
 _CONTROL_PATH = "C:/anchors/evil\nFORGED: line\x1b[31m.pem"
 
 
+def _no_raw_control(text: str | None) -> None:
+    """Neither control byte of the hostile paths below reaches ``text`` raw."""
+    assert text is not None
+    assert "\x1b" not in text and "\nFORGED" not in text, text
+
+
 def _quoted(text: str) -> None:
     """``text`` names the control-character path only in its escaped form."""
     assert repr(_CONTROL_PATH) in text, text
-    assert "\x1b" not in text and "\nFORGED" not in text, text
+    _no_raw_control(text)
 
 
 @pytest.mark.parametrize(
@@ -2030,14 +2056,14 @@ def test_a_chain_walk_reason_quotes_the_path() -> None:
 
     _chain, cause = ap.windows_chain("C:\\evil\nFORGED line\x1b[31m.pem", "C:\\", unreadable)
     assert cause is not None and repr("C:\\evil\nFORGED line\x1b[31m.pem") in cause
-    assert "\x1b" not in cause and "\nFORGED" not in cause
+    _no_raw_control(cause)
 
     def a_file(_p: str) -> tuple[str, str | None]:
         return ap.FILE, None
 
     _chain, cause = ap.windows_chain("C:\\evil\nFORGED\x1b\\ca.pem", "C:\\", a_file)
     assert cause is not None and cause.endswith("is not a directory")
-    assert "\x1b" not in cause and "\nFORGED" not in cause
+    _no_raw_control(cause)
 
 
 async def test_the_restart_required_log_quotes_the_path(
@@ -2082,11 +2108,25 @@ def _byte_order_mark_before_the_block() -> bytes:
 
 
 def _encrypted_key_beside_the_certificate() -> bytes:
-    """Manager decision: a key block refuses too, though cadata= loads the certificate beside it.
-    A trust anchor has no use for a key, and the header is refused in a block of any label."""
+    """Manager decision: a key block with a legacy encryption header refuses too, though cadata=
+    loads the certificate beside it, since the header is refused in a block of any label. A PKCS#8
+    ENCRYPTED PRIVATE KEY block, or a plain key block, has no such header and is not refused."""
     label = b"RSA PRIVATE" + b" KEY"  # split, so the secret scanner does not read a real key
     key = b"-----BEGIN " + label + b"-----\n" + _ENCRYPTED + b"AAAA\n-----END " + label + b"-----\n"
     return _real_ca("crl-test-ca")[0] + key
+
+
+def _encrypted_block_then_a_plain_one() -> bytes:
+    """BACKLOG #3105: red under a header search from the last BEGIN, as the last block is plain."""
+    return _with_headers(_ENCRYPTED) + _real_ca("second-ca")[0]
+
+
+def _mid_line_begin_with_headers_then_a_plain_block() -> bytes:
+    """BACKLOG #3105: red under a search from the last BEGIN, and under one that counts a BEGIN only
+    at a line start. The BEGIN that carries the headers sits after 254 bytes of one line, where
+    OpenSSL reads it (as in :func:`_begin_past_a_long_line`), so the only BEGIN at a line start,
+    and the last one, is the plain block's after it."""
+    return b"#" * 254 + _with_headers(_ENCRYPTED) + _real_ca("second-ca")[0]
 
 
 class _NoTlsLoad:
@@ -2116,15 +2156,38 @@ class _NoTlsLoad:
         ),
         pytest.param(_byte_order_mark_before_the_block, id="byte-order mark"),
         pytest.param(_encrypted_key_beside_the_certificate, id="encrypted key block"),
+        pytest.param(_encrypted_block_then_a_plain_one, id="header block, then a plain block"),
+        pytest.param(
+            _mid_line_begin_with_headers_then_a_plain_block,
+            id="BEGIN after 254 bytes with headers, then a plain block",
+        ),
+        # The check errs wide on purpose (has_encryption_header's docstring), so these refuse
+        # though no block carries a header, and the refusal text says so (BACKLOG #3105).
+        pytest.param(
+            lambda: _real_ca("crl-test-ca")[0] + b"Proc-Type: noted\n" + _real_ca("second-ca")[0],
+            id="comment between blocks",
+        ),
+        pytest.param(
+            lambda: _real_ca("crl-test-ca")[0] + b"# DEK-Info: noted\n", id="after the last END"
+        ),
+        pytest.param(
+            lambda: (
+                b"# paste the -----BEGIN block below, no Proc-Type: line\n"
+                + _real_ca("crl-test-ca")[0]
+            ),
+            id="comment above the first block that holds a BEGIN",
+        ),
     ],
 )
 def test_an_encrypted_pem_block_refuses_before_the_tls_load(
     monkeypatch: pytest.MonkeyPatch, shape: Any
 ) -> None:
+    """Every shape is refused before the load, with the text naming the check's real scope."""
     spec = AnchorSpec("api_client", "[api].tls_client_ca_file", "ca.pem", None)
     monkeypatch.setattr(ta, "ssl", _NoTlsLoad)
-    with pytest.raises(TrustAnchorError, match="holds a PEM block with an encryption header"):
+    with pytest.raises(TrustAnchorError) as err:
         ta.anchor_cadata(shape(), spec)
+    assert ta._ENCRYPTION_HEADER_SCOPE in str(err.value)
 
 
 def test_an_encryption_header_outside_a_block_still_passes() -> None:
@@ -2151,6 +2214,144 @@ async def test_the_preflight_refuses_an_encrypted_anchor_as_the_consumer_does(
     assert str(central.value) == str(consumer.value)
     assert "encryption header" in str(central.value)
     assert "pem_refused" in {r["event"] for r in await _rows(store, "api_client")}
+
+
+# --- BACKLOG #3105: the repr sites engine PR 2063 left without a test -----------------------------
+#
+# The icacls call and the POSIX stat are stood in, but each runs only on its own platform: patching
+# os.name would hand pytest the wrong pathlib flavour (see the note above the DACL pin test). The
+# chain walks take their host reads as arguments and run everywhere.
+
+
+def test_the_encryption_header_refusal_quotes_the_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    spec = AnchorSpec("api_client", "[api].tls_client_ca_file", _CONTROL_PATH, None)
+    monkeypatch.setattr(ta, "ssl", _NoTlsLoad)
+    with pytest.raises(TrustAnchorError, match="encryption header") as err:
+        ta.anchor_cadata(_with_headers(_ENCRYPTED), spec)
+    _quoted(str(err.value))
+
+
+def test_the_vault_hop_states_the_same_scope() -> None:
+    """strict_requests keeps its own copy of the scope sentence (its marked refusals may use only
+    its own literals), so the two are compared exactly here. Read from the source, so this runs on
+    a leg without the [vault] extra."""
+    import ast
+
+    import messagefoundry.transports as transports
+
+    source = (Path(transports.__file__).parent / "strict_requests.py").read_text(encoding="utf-8")
+    (value,) = [
+        stmt.value.value
+        for stmt in ast.parse(source).body
+        if isinstance(stmt, ast.Assign)
+        and any(isinstance(n, ast.Name) and n.id == "_ENCRYPTED_CA_TEXT" for n in stmt.targets)
+        and isinstance(stmt.value, ast.Constant)
+    ]
+    assert value == ta._ENCRYPTION_HEADER_SCOPE
+
+
+def _ran(returncode: int, stdout: str | None, stderr: str = "") -> Any:
+    return subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+
+def _icacls_fails() -> Any:
+    raise OSError(2, "icacls could not be started")
+
+
+@pytest.mark.parametrize(
+    "ran",
+    [
+        pytest.param(_icacls_fails, id="icacls could not run"),
+        pytest.param(lambda: _ran(0, None), id="no readable output"),
+        pytest.param(
+            lambda: _ran(5, "", f"{_CONTROL_PATH}: Access is denied."), id="exit non-zero"
+        ),
+        pytest.param(lambda: _ran(0, "this is not icacls output\n"), id="no readable ACE"),
+    ],
+)
+@_windows_only
+def test_each_icacls_log_branch_quotes_the_path(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, ran: Any
+) -> None:
+    """The non-zero exit is the control: a real icacls already reached it."""
+    monkeypatch.setattr(subprocess, "run", lambda *_a, **_k: ran())
+    with caplog.at_level("WARNING", logger=ta.log.name):
+        assert dacl_is_owner_only(_CONTROL_PATH) is None
+    (record,) = [r for r in caplog.records if r.name == ta.log.name]
+    _quoted(record.getMessage())
+
+
+@_posix_only
+def test_the_posix_stat_log_quotes_the_path(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    class _Unstatable:
+        def __init__(self, _name: str) -> None:
+            pass
+
+        def stat(self) -> Any:
+            raise OSError(13, "denied")
+
+    monkeypatch.setattr(ta, "Path", _Unstatable)
+    with caplog.at_level("WARNING", logger=ta.log.name):
+        assert dacl_is_owner_only(_CONTROL_PATH) is None
+    (record,) = [r for r in caplog.records if r.name == ta.log.name]
+    _quoted(record.getMessage())
+
+
+def test_the_volume_cause_quotes_the_root() -> None:
+    from messagefoundry.auth import anchor_path as ap
+
+    root = "\x1b:\\"
+    _chain, cause = ap.windows_chain(
+        "\x1b:\\anchors\\ca.pem",
+        "C:\\",
+        lambda _p: (ap.DIRECTORY, None),
+        volume_cause=lambda _root: "it is a FAT volume",
+    )
+    assert cause == f"{root!r}: it is a FAT volume"
+    _no_raw_control(cause)
+
+
+def test_a_link_to_a_path_the_check_does_not_read_quotes_the_link() -> None:
+    from messagefoundry.auth import anchor_path as ap
+
+    def probe(p: str) -> tuple[str, str | None]:
+        return (ap.LINK, "") if "FORGED" in p else (ap.DIRECTORY, None)
+
+    _chain, cause = ap.windows_chain("C:\\evil\nFORGED\x1b[31m\\ca.pem", "C:\\", probe)
+    assert cause is not None and cause.startswith("the link ")
+    assert repr("C:\\evil\nFORGED\x1b[31m") in cause
+    _no_raw_control(cause)
+
+
+def test_the_posix_sticky_link_reason_quotes_the_folder() -> None:
+    """A link owned by another uid in a sticky, world-writable folder whose name holds a newline
+    and an escape byte. The reason names that folder, and the path a finding carries is quoted
+    later, by the message that prints it."""
+    from messagefoundry.auth import anchor_path as ap
+
+    folder = "/tmp\nFORGED\x1b[31m"
+    stats = {
+        "/": ap.PosixStat(0, 0o040755),
+        folder: ap.PosixStat(0, 0o041777),
+        folder + "/ca.pem": ap.PosixStat(1234, 0o120777),
+    }
+
+    def unreadable_link(_p: str) -> str:
+        raise OSError(13, "denied")
+
+    verdict = ap.posix_path_verdict(
+        folder + "/ca.pem",
+        cwd="/",
+        euid=1000,
+        lstat_fn=lambda p: stats[p],
+        readlink_fn=unreadable_link,
+        fstype_fn=lambda _p: ("/", "ext4"),
+    )
+    (reason,) = [f.reason for f in verdict.findings if f.kind == ap.LINK and f.insecure]
+    assert repr(folder) in reason, reason
+    _no_raw_control(reason)
 
 
 # --- BACKLOG #2183: an unreadable inbound CA audits as trust_anchor, as a settings anchor does ------
@@ -2464,3 +2665,245 @@ async def test_a_refused_dialling_settings_ca_refuses_the_start(
     with pytest.raises(TrustAnchorError, match=r"\[alerts\]\.email_tls_ca_file"):
         async with app.router.lifespan_context(app):
             pass
+
+
+# --- BACKLOG #3091: a store fault inside a trust-anchor check is not a refused anchor --------------
+#
+# Each of the three checks that go through _preflight_one meets a store whose audit read, or
+# separately its audit write, raises an OSError: the settings preflight, the registry preflight and
+# the per-lane check. Before the fix each turned that OSError into a TrustAnchorError, so a reload
+# audited reason="trust_anchor" and the lane check remembered the store fault as the CA's refusal.
+
+
+class _FaultyAuditStore:
+    """Just the two audit calls the preflight makes, either of which can be told to fail."""
+
+    def __init__(self, fail: str | None) -> None:
+        self.fail = fail
+        self.writes: list[str] = []
+
+    async def list_audit(self, **_kw: object) -> list[dict[str, Any]]:
+        if self.fail == "list_audit":
+            raise OSError(5, "Input/output error")
+        return []
+
+    async def record_audit(self, action: str, *, actor: str | None, detail: str) -> None:
+        if self.fail == "record_audit":
+            raise OSError(5, "Input/output error")
+        self.writes.append(detail)
+
+
+_AUDIT_FAULTS = pytest.mark.parametrize("fail", ["list_audit", "record_audit"])
+
+
+def _no_anchor_refusal_in(exc: BaseException) -> None:
+    """Nothing on the explicit cause chain is an anchor refusal, and the store's OSError is its root."""
+    from messagefoundry.api.app import _caused_by_trust_anchor
+
+    assert not _caused_by_trust_anchor(exc)
+    root = exc
+    while root.__cause__ is not None:
+        root = root.__cause__
+    assert type(root) is OSError, root
+
+
+def _judged_clean(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+
+
+@_AUDIT_FAULTS
+async def test_a_store_fault_in_the_settings_preflight_is_not_an_anchor_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail: str
+) -> None:
+    from messagefoundry.config.wiring import WiringError
+
+    _judged_clean(monkeypatch)
+    spec = AnchorSpec("ad", "[auth].ad_tls_ca_cert_file", str(_pem(tmp_path)), None)
+    preflight = ta.make_settings_anchor_preflight([spec], _FaultyAuditStore(fail), enforcing=True)  # type: ignore[arg-type]
+    assert preflight is not None
+    with pytest.raises(WiringError, match="a trust anchor could not be checked") as err:
+        await preflight()
+    assert isinstance(err.value.__cause__, ta.AnchorStoreUnavailable)
+    _no_anchor_refusal_in(err.value)
+    # The control: the same anchor over a store that works passes.
+    working = _FaultyAuditStore(None)
+    ok = ta.make_settings_anchor_preflight([spec], working, enforcing=True)  # type: ignore[arg-type]
+    assert ok is not None
+    await ok()
+    assert working.writes
+
+
+@_AUDIT_FAULTS
+async def test_a_store_fault_in_the_registry_preflight_is_not_an_anchor_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail: str
+) -> None:
+    from messagefoundry.config.wiring import WiringError, load_config
+
+    _judged_clean(monkeypatch)
+    cfg = tmp_path / "cfg"
+    _one_listener_graph(cfg, _pem(tmp_path, _block(b"ca")))
+    preflight = ta.make_registry_anchor_preflight(_FaultyAuditStore(fail), enforcing=True)  # type: ignore[arg-type]
+    with pytest.raises(WiringError, match="a trust anchor could not be checked") as err:
+        await preflight(load_config(cfg), {})
+    assert isinstance(err.value.__cause__, ta.AnchorStoreUnavailable)
+    _no_anchor_refusal_in(err.value)
+    await ta.make_registry_anchor_preflight(_FaultyAuditStore(None), enforcing=True)(  # type: ignore[arg-type]
+        load_config(cfg), {}
+    )
+
+
+@_AUDIT_FAULTS
+async def test_a_store_fault_in_the_lane_check_is_not_remembered_as_a_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail: str
+) -> None:
+    """Red under: the store's OSError cached in refused[...] as the CA's refusal, so the next check
+    re-raised it as a TrustAnchorError without asking the store again."""
+    _judged_clean(monkeypatch)
+    store = _FaultyAuditStore(fail)
+    check = ta.make_lane_anchor_check(store, enforcing=True)  # type: ignore[arg-type]
+    settings = {"tls_ca_file": str(_pem(tmp_path))}
+    with pytest.raises(ta.AnchorStoreUnavailable) as err:
+        await check("outbound", "OUT", settings)
+    _no_anchor_refusal_in(err.value)
+    store.fail = None  # the store recovers; the file never changed
+    await check("outbound", "OUT", settings)
+    assert store.writes
+
+
+async def test_an_unreadable_settings_anchor_names_its_setting(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """BACKLOG #3105, item 6: the settings preflight's refusal of a file it cannot read names the
+    setting, as the connection checks' refusal names the connection, and stays an anchor refusal."""
+    from messagefoundry.config.wiring import WiringError
+
+    gone = AnchorSpec("ad", "[auth].ad_tls_ca_cert_file", str(tmp_path / "gone.pem"), None)
+    nul = AnchorSpec("oidc", "[auth].oidc_tls_ca_cert_file", "bad\x00path.pem", None)
+    for spec, cause in ((gone, FileNotFoundError), (nul, ValueError)):
+        preflight = ta.make_settings_anchor_preflight([spec], store, enforcing=True)
+        assert preflight is not None
+        with pytest.raises(
+            WiringError, match=re.escape(f"refused: {spec.setting}: could not read")
+        ) as err:
+            await preflight()
+        assert isinstance(err.value.__cause__, TrustAnchorError)
+        assert isinstance(err.value.__cause__.__cause__, cause)
+
+
+async def test_the_reload_route_audits_a_store_fault_in_an_anchor_check_as_store_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The direct /config/reload route answers 503 and writes reason="store_unavailable". The
+    preflight's store is the faulty one; the route's own audit rows land in a working store."""
+    import httpx
+
+    from messagefoundry.api import create_app
+
+    _judged_clean(monkeypatch)
+    spec = AnchorSpec("ad", "[auth].ad_tls_ca_cert_file", str(_pem(tmp_path)), None)
+    engine, cfg = await _anchored_engine(
+        tmp_path, spec, preflight_store=_FaultyAuditStore("list_audit")
+    )
+    store = engine.store
+    try:
+        transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            r = await client.post("/config/reload", json={"config_dir": str(cfg)})
+        assert r.status_code == 503, r.text
+        rows = await store.list_audit(action="config_reload_failed", limit=10)
+        assert [json.loads(row["detail"])["reason"] for row in rows] == ["store_unavailable"]
+    finally:
+        await engine.stop()
+
+
+@_AUDIT_FAULTS
+async def test_a_refused_anchor_is_still_a_refusal_when_its_audit_row_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail: str
+) -> None:
+    """The verdict is reached before any store call, so a substituted anchor (a pin mismatch here)
+    whose audit read or write then fails is audited as trust_anchor, never as a store outage."""
+    from messagefoundry.config.wiring import WiringError
+
+    _judged_clean(monkeypatch)
+    spec = AnchorSpec("ad", "[auth].ad_tls_ca_cert_file", str(_pem(tmp_path)), "00" * 32)
+    preflight = ta.make_settings_anchor_preflight([spec], _FaultyAuditStore(fail), enforcing=True)  # type: ignore[arg-type]
+    assert preflight is not None
+    with pytest.raises(WiringError, match="a settings trust anchor was refused") as err:
+        await preflight()
+    assert isinstance(err.value.__cause__, TrustAnchorError)
+
+
+async def test_a_store_fault_fails_a_lane_without_marking_its_ca_refused(tmp_path: Path) -> None:
+    """An operator start of a lane whose CA check the store stopped reads failed, through the
+    TrustAnchorError the control route answers, but the lane is not marked refused, and the fixed
+    line says the file could not be checked rather than that it was refused."""
+    from messagefoundry.config.wiring import Registry
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+
+    async def stopped(_direction: str, _name: str, _settings: Any) -> None:
+        raise ta.AnchorStoreUnavailable("the store refused the trust-anchor audit read")
+
+    store = await MessageStore.open(tmp_path / "r.db")
+    try:
+        runner = RegistryRunner(
+            Registry(),
+            store,
+            egress=EgressSettings(deny_by_default=False),
+            lane_anchor_check=stopped,
+        )
+        with pytest.raises(TrustAnchorError, match="its tls_ca_file could not be checked") as err:
+            await runner._check_lane_anchor("outbound", "OUT", {}, fails_lane=True)
+        assert isinstance(err.value.__cause__, ta.AnchorStoreUnavailable)
+        assert ("outbound", "OUT") not in runner._anchor_refused
+        # A reload's pre-check (fails_lane=False) lets the store fault through for the reload to
+        # answer as store_unavailable.
+        with pytest.raises(ta.AnchorStoreUnavailable):
+            await runner._check_lane_anchor("outbound", "OUT", {}, fails_lane=False)
+    finally:
+        await store.close()
+
+
+async def test_a_lane_refusal_whose_audit_failed_is_checked_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refusal made while the store refused its rows is not remembered, so once the store is back
+    the next check writes the pin_mismatch row rather than raising from memory with no row."""
+    _judged_clean(monkeypatch)
+    store = _FaultyAuditStore("record_audit")
+    check = ta.make_lane_anchor_check(store, enforcing=True)  # type: ignore[arg-type]
+    settings = {"tls_ca_file": str(_pem(tmp_path)), "tls_ca_pin": "00" * 32}
+    with pytest.raises(TrustAnchorError, match="does not match") as err:
+        await check("outbound", "OUT", settings)
+    assert err.value.unaudited
+    store.fail = None
+    with pytest.raises(TrustAnchorError, match="does not match") as again:
+        await check("outbound", "OUT", settings)
+    assert not again.value.unaudited
+    assert any(json.loads(d)["event"] == "pin_mismatch" for d in store.writes)
+
+
+async def test_a_store_fault_on_an_earlier_anchor_does_not_hide_a_later_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two settings anchors: the first passes its checks, the second is pinned to other bytes. A
+    store that refuses every audit read must not stop the preflight at the first, or the substituted
+    second would read as a store outage."""
+    from messagefoundry.config.wiring import WiringError
+
+    _judged_clean(monkeypatch)
+    good = tmp_path / "good"
+    bad = tmp_path / "bad"
+    good.mkdir()
+    bad.mkdir()
+    specs = [
+        AnchorSpec("oidc", "[auth].oidc_tls_ca_cert_file", str(_pem(good)), None),
+        AnchorSpec("ad", "[auth].ad_tls_ca_cert_file", str(_pem(bad)), "00" * 32),
+    ]
+    faulty: Any = _FaultyAuditStore("list_audit")
+    preflight = ta.make_settings_anchor_preflight(specs, faulty, enforcing=True)
+    assert preflight is not None
+    with pytest.raises(WiringError, match="a settings trust anchor was refused") as err:
+        await preflight()
+    assert isinstance(err.value.__cause__, TrustAnchorError)
+    assert "[auth].ad_tls_ca_cert_file" in str(err.value)

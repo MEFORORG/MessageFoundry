@@ -341,7 +341,8 @@ def run_checks(
         # surface listed at all until 2026-10-01. Advisory, as tls_allow_expired is -- see the check.
         _check_hostname_unchecked(config_dir),
         # ASVS 14.2.1: an endpoint url carrying a credential in its query string. Advisory, and a
-        # refusal was weighed and declined -- see the check and wiring_runner's warning.
+        # refusal was weighed and declined -- see the check and
+        # transports.egress.warn_url_query_credentials.
         _check_url_query_credentials(config_dir),
         _check_generic_db_tls(config_dir),
         # Owner ruling 2026-09-24: every attested hop, the one per-hop declaration that ALLOWs. Advisory.

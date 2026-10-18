@@ -13,8 +13,9 @@ the **Windows / virtualization admins** who place the VMs. This is the on-prem "
 [ADR 0047](adr/0047-cloud-kubernetes-ha-deployment-packaging.md) and sketched in
 [`CLOUD-DEPLOYMENT.md`](CLOUD-DEPLOYMENT.md) §2.3, now realized for Windows Server VMs.
 
-**Windows Server + SQL Server only.** This document does not cover PostgreSQL HA (streaming
-replication, managed-PG failover); see [`CLOUD-DEPLOYMENT.md`](CLOUD-DEPLOYMENT.md) for that path.
+**Windows Server + SQL Server only.** This document does not cover PostgreSQL HA. For engine HA on a
+PostgreSQL store, see [`CLUSTERING.md`](CLUSTERING.md), which leaves the database's own HA to the
+database tier. No MessageFoundry guide covers that tier for PostgreSQL in a v1 deployment.
 
 ---
 
@@ -473,6 +474,9 @@ three consequences for the AG:
 - ODBC Driver 18 validates against the **Windows machine trust store** (`LocalMachine\Root`), and
   there is no CA-file keyword. Import the DB CA on **every engine VM in both DCs**
   ([`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §5, `scripts/service/import-db-ca.ps1`).
+  `[store].ssl_root_cert` is no substitute here: on SQL Server it pins one exact certificate and
+  switches the store to `Encrypt=strict`, so after a failover to a replica that presents a different
+  certificate, every store connection is refused.
 - The engine offers no hostname-override keyword, so the certificate presented after failover must
   be valid for **exactly the listener DNS name** in `[store].server`. Every replica that can host
   the primary, including the DR replica, **must carry the listener DNS name in its certificate

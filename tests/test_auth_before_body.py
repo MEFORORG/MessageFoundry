@@ -38,7 +38,7 @@ from typing import Any
 import httpx
 import pytest
 from _totp_clock import fresh_totp
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.routing import APIRoute, request_response
 from pydantic import BaseModel
 
@@ -51,10 +51,13 @@ from messagefoundry.api.security import (
     before_body_of,
     mark_route_gate,
     no_store_reply,
+    public_route,
     refuse_undeclared_route,
     require,
     require_phi_read,
     require_service_cert,
+    route_has_gate,
+    route_is_declared,
     steps_before_body,
 )
 from messagefoundry.auth import Identity, Permission, Role
@@ -198,12 +201,39 @@ def _fastapi_own_handler(route: APIRoute) -> bool:
     return name == APIRoute.get_route_handler(route).__qualname__
 
 
+def _included_body_routes(app: FastAPI) -> list[str]:
+    """Every route reached through ``include_router`` that takes a body and is gated or refused, but
+    is not refused before that body is read (vault BACKLOG #2956 item 1).
+
+    FastAPI keeps an included router as ONE opaque entry in ``app.routes``, so each entry is unpacked
+    and every route it serves is read; a route that is not the entry itself came through an include.
+    Such a route is served by its own router's route class. It is refused early only when that class
+    is the engine's and the route's OWN gate carries a step; the app-level refusal and a gate the
+    include call adds are not among its own dependencies, so neither answers before the body."""
+    problems: list[str] = []
+    for entry in app.routes:
+        for context in route_gates.iter_route_contexts([entry]):
+            route = context.original_route
+            if route is entry or not isinstance(route, APIRoute) or route.body_field is None:
+                continue
+            steps = steps_before_body(route.dependant)
+            if isinstance(route, AuthenticatedBeforeBodyRoute) and steps:
+                continue
+            if route_has_gate(route) or not route_is_declared(route, websocket=False):
+                problems.append(
+                    f"{context.path}: reached through include_router, which the early check does "
+                    "not cover"
+                )
+    return problems
+
+
 def _uncovered(app: FastAPI) -> list[str]:
     """Every JSON-API-gated route the early check is wrongly absent from, or wrongly on, and why.
 
     It belongs in front of a gated route that declares a body, and nowhere else: with no body
-    FastAPI already runs the gate first, and a second sign-in check there would buy nothing."""
-    problems: list[str] = []
+    FastAPI already runs the gate first, and a second sign-in check there would buy nothing. A route
+    reached through an include is read by :func:`_included_body_routes`."""
+    problems = _included_body_routes(app)
     for route in app.routes:
         if not isinstance(route, APIRoute):
             continue
@@ -230,7 +260,8 @@ class _Body(BaseModel):
 
 
 async def test_every_gated_json_route_is_covered_with_no_list_kept_by_hand(engine: Engine) -> None:
-    app = create_app(engine, auth=await _service(engine), serve_ui=True, oidc_enabled=True)
+    # Every route-registering flag on, so a route only one flag registers, or includes, is read.
+    app = route_gates.full_surface_app(engine=engine, auth=await _service(engine))
     routes = [route for route in app.routes if isinstance(route, APIRoute)]
     gated = [route for route in routes if _api_gate(route) is not None]
     with_body = [route for route in gated if route.body_field is not None]
@@ -280,6 +311,57 @@ async def test_a_gated_route_the_check_does_not_cover_is_named(engine: Engine) -
         "/planted/plain-class: served by APIRoute",
         "/planted/unmarked-gate: its gate carries no step that answers before the body",
     ]
+
+
+async def _undeclared_body(body: _Body) -> None:
+    return None
+
+
+@public_route("a synthetic public route that takes a body, as sign-in does")
+async def _public_body(body: _Body) -> None:
+    return None
+
+
+async def _gated_no_body(identity: Identity = Depends(_SESSION_GATE)) -> None:
+    return None
+
+
+async def test_a_guarded_body_route_reached_through_an_include_is_named(engine: Engine) -> None:
+    """Vault BACKLOG #2956 item 1, THE CONTROL for the structural case above. The early check does
+    not cover a route reached through ``include_router`` (see ``AuthenticatedBeforeBodyRoute``), and
+    FastAPI keeps an included router as one opaque entry in ``app.routes``, so a check reading that
+    list alone passed with such a route on the app. This is what fails when one is added with a body
+    and a gate, or with a body and no declaration."""
+    app = create_app(engine, auth=await _service(engine))
+    sub = APIRouter()
+    sub.add_api_route("/gated", _session_gated, methods=["POST"])
+    sub.add_api_route("/undeclared", _undeclared_body, methods=["POST"])
+    sub.add_api_route("/public", _public_body, methods=["POST"])
+    sub.add_api_route("/no-body", _gated_no_body, methods=["GET"])
+    app.include_router(sub, prefix="/planted")
+    # A router built with the engine's route class refuses early on its routes' own gates, so its
+    # gated route is covered; the app-level refusal is not among its own dependencies, so its
+    # undeclared route is not.
+    engine_class = APIRouter(route_class=AuthenticatedBeforeBodyRoute)
+    engine_class.add_api_route("/gated", _session_gated, methods=["POST"])
+    engine_class.add_api_route("/undeclared", _undeclared_body, methods=["POST"])
+    app.include_router(engine_class, prefix="/engine-class")
+    gap = "reached through include_router, which the early check does not cover"
+    assert _uncovered(app) == [
+        f"/planted/gated: {gap}",
+        f"/planted/undeclared: {gap}",
+        f"/engine-class/undeclared: {gap}",
+    ]
+    # The premise, measured: an anonymous caller's unreadable body is answered by the body parser
+    # on the included route, where the same route on the app itself, or in a router built with the
+    # engine's route class, gets the gate's 401.
+    app.post("/direct/gated")(_session_gated)
+    answers: dict[str, int] = {}
+    async with _client(app) as client:
+        for path in ("/planted/gated", "/direct/gated", "/engine-class/gated"):
+            response = await client.post(path, content=_MALFORMED[0], headers=_JSON)
+            answers[path] = response.status_code
+    assert answers == {"/planted/gated": 422, "/direct/gated": 401, "/engine-class/gated": 401}
 
 
 async def test_every_dependency_ahead_of_a_gate_is_accounted_for(engine: Engine) -> None:
@@ -683,7 +765,7 @@ async def test_a_signed_in_caller_pays_a_second_session_read_only_where_a_body_i
             response = await client.request(method, path, content=body, headers={**_JSON, **bearer})
         return response.status_code, dict(tally)
 
-    malformed = _PROBES["malformed JSON"][0]
+    malformed = _MALFORMED[0]
     assert await send(control, "POST", _CHAT, malformed) == (422, {})
     assert await send(live, "POST", _CHAT, malformed) == (422, _SECOND_LOOKUP)
 

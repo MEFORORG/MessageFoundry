@@ -156,13 +156,13 @@ tests = [
 [[mutation]]
 id = "connection-flag-audit-renamed"
 item = 1643
-file = "messagefoundry/api/app.py"
+file = "messagefoundry/pipeline/engine.py"
 find = '''
-        await engine.store.record_audit(
+        return await self.write_baseline_config(
             "connection_flag_set",
 '''
 replace = '''
-        await engine.store.record_audit(
+        return await self.write_baseline_config(
             "connection_flag_set_mutated",
 '''
 tests = [

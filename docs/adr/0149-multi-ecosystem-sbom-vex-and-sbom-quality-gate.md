@@ -216,6 +216,16 @@ write scope.
 - Cost: one more `ubuntu-latest` job per release. A failure in either SBOM job now skips the whole
   `release` job, including its always-run artifact upload, as a Windows failure already did.
 
+## Amendment 2026-10-16 — the Linux container is not a supported v1 deployment path
+
+> Append-only. It records an owner ruling and does not change the Status line above.
+
+The 2026-09-30 amendment above says the engine runs "in the Linux container". Under the owner's
+2026-10-16 v1 platform [ruling](../SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target),
+neither the container nor a Linux host is a supported way to deploy v1. The Windows SBOM describes
+the core runtime of the supported v1 install. The release still ships the Linux SBOM, `security.yml` still
+builds the container-image SBOM, and nothing in the jobs above changes.
+
 ## To resolve on acceptance
 
 - [x] Confirm MessageFoundry is not FDA-regulated (owner-confirmed 2026-07-21) — no medical-device SBOM

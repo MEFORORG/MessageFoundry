@@ -76,7 +76,7 @@ from messagefoundry.config.tls_policy import (
     smtp_login_approved,
 )
 from messagefoundry.controlchars import has_control_char, has_lone_surrogate
-from messagefoundry.domainshape import domain_shape_problem
+from messagefoundry.domainshape import MAX_MAIL_ADDRESS, domain_shape_problem
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -152,10 +152,8 @@ _LOCAL_ATEXT = frozenset(string.ascii_letters + string.digits + "#$&'*+-^_`{}~")
 #: SEPARATOR). ``policy.default`` refuses a header value holding one, so a subject or sender with
 #: one would fail every send. The shared ``controlchars`` alphabet is deliberately blind to them.
 _UNICODE_LINE_BREAKS = frozenset("\u0085\u2028\u2029")
-#: The RFC 5321 size limits: a local part of 64 octets, and 254 for the whole address. The address
-#: limit holds the domain to 252 characters, so the shared rule's 253 never binds here.
+#: The RFC 5321 limit on a local part. The whole-address limit is ``domainshape.MAX_MAIL_ADDRESS``.
 _MAX_LOCAL = 64
-_MAX_ADDRESS = 254
 
 
 def envelope_address_problem(address: str) -> str | None:
@@ -178,7 +176,7 @@ def envelope_address_problem(address: str) -> str | None:
     local, at, domain = address.rpartition("@")
     if not (at and local and domain):
         return "is not a readable address"
-    if len(local) > _MAX_LOCAL or len(address) > _MAX_ADDRESS:
+    if len(local) > _MAX_LOCAL or len(address) > MAX_MAIL_ADDRESS:
         return "is longer than SMTP allows"
     if any(not part or set(part) - _LOCAL_ATEXT for part in local.split(".")):
         return "has a local part outside plain mailbox characters"

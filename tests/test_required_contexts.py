@@ -110,6 +110,10 @@ _MUST_NOT_BE_REQUIRED = (
     # The nightly mutation list over the invariant tests (BACKLOG #1746). Schedule and dispatch only,
     # so it never reports on a pull request: required, it would wedge every one.
     "invariant mutations (nightly)",
+    # The hosted-Windows Postgres store leg. Path-gated, so required it would wedge every unrelated
+    # PR; advisory on purpose, and docs/CI.md (`The CI gate roll-up`) says why.
+    "postgres store (windows-2022)",
+    "postgres store (windows-2025)",
 )
 
 

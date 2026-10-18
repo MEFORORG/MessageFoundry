@@ -82,7 +82,7 @@ promotable = true
 Start the same `serve` command on each host/process — e.g.:
 
 ```
-python -m messagefoundry serve --service-config messagefoundry.toml --config ./config
+python -P -X disable-remote-debug -m messagefoundry serve --service-config messagefoundry.toml --config ./config
 ```
 
 (For a local DEV Postgres, `scripts/dev/postgres.ps1` sets the `MEFOR_STORE_*` connection env and
@@ -339,10 +339,10 @@ fixed node — so a failover is transparent to senders (modulo a reconnect):
 
 > **Planned alternative — engine-managed VIP (Windows-only).** [ADR 0056](adr/0056-engine-managed-vip-failover.md)
 > proposes an **opt-in** mode where the **engine itself** owns the VIP (no external LB/VRRP/WSFC), moving it
-> in lockstep with the leadership lease. It is **Windows-only** and **not yet built**. Until it ships — and
-> on **Linux/containerized** deployments, which it does **not** cover — use the external floating VIP / LB
-> described here, which stays the **cross-platform** default and the recommended posture for the strictest
-> split-brain guarantee.
+> in lockstep with the leadership lease. It is **Windows-only** and **not yet built**. Until it ships, use
+> the external floating VIP / LB described here, which stays the default and the recommended posture for
+> the strictest split-brain guarantee. (Linux and containers, which it would not cover, are
+> [not supported for v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target).)
 >
 > **What HAS shipped from that ADR is only the control plane** — `POST /cluster/stepdown` (below), which
 > moves *leadership*. It moves no address: with the external VIP / LB the address follows on its own,
@@ -582,6 +582,15 @@ sensitive: the **row** leases (see below) and the `nodes.last_seen` heartbeat be
 2. **Identical config on every node.** Each node loads the graph (Connections / Routers / Handlers) from
    its **own** config dir; convergence coordinates the reload *version*, not the files. Deploy the same
    config dir to all nodes.
+
+   So a cluster node refuses every engine write to a config file, because the write could reach
+   only its own copy. At least the connection flag toggle is such a write (`POST
+   /connections/{name}/flag`, the web console's object-of-interest flag). On a cluster node it is
+   refused with **409**, and nothing is written. The node's `connections.toml`, its live flag and the
+   audit trail are all unchanged. To flag a connection in a cluster, set `flagged = true` on its entry
+   in the `connections.toml` you deploy to every node, and apply it the way item 3 says. The engine
+   refuses rather than propagates because no engine path reaches another node's config dir. Vault
+   BACKLOG #2933 records that decision.
 3. **Coordinated config changes.** Apply a config change as a **coordinated (not rolling) restart**, so
    nodes don't run divergent graphs across the change window.
 

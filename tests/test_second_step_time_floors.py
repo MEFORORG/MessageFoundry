@@ -27,13 +27,14 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 from pydantic import ValidationError
 
-from messagefoundry.auth import oidc, totp
+from messagefoundry.auth import oidc, totp, webauthn
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.service import TOO_EARLY, AuthService, Elevation
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_USERNAME, login_admin
+from tests._fake_directory import DirectoryOf
 from tests._totp_clock import pin_totp_clock
 from tests.test_auth_oidc_service import (
     AUTH_CODE,
@@ -359,6 +360,57 @@ async def test_a_totp_enrolment_just_inside_the_floor_is_refused_and_spends_no_s
         await store.close()
 
 
+async def test_a_totp_confirm_with_nothing_staged_answers_the_same_inside_and_past_the_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # RED when: confirm_mfa_enrollment runs the floor before its "no enrollment in progress" check
+    # (BACKLOG #3194). That order would answer a confirm with nothing staged as a wrong code inside
+    # the floor and as "no enrollment" past it, which tells timing, and would audit an enrolment
+    # attempt that could never have succeeded. The passkey twin is in the directory test below.
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings())
+        identity, token, _password = await login_admin(service)
+        session = await store.get_session(hash_token(token))
+        assert session is not None and session.mfa_verified_at is None
+        assert not await service.mfa_satisfied(token), "the session must owe its factor"
+        now = [session.created_at]
+        _fake_service_wall_clock(monkeypatch, now)
+        answers = []
+        for offset in (0.0, MFA_FLOOR + 0.001):  # inside the floor, then past it
+            now[0] = session.created_at + offset
+            with pytest.raises(ValueError) as refused:
+                await service.confirm_mfa_enrollment(identity, "000000", token=token)
+            answers.append(str(refused.value))
+        assert answers == ["no enrollment in progress"] * 2
+        assert await _audit_rows(store, "auth.mfa_failed") == []
+    finally:
+        await store.close()
+
+
+def test_a_challenge_peek_reads_without_consuming_and_hides_an_expired_one() -> None:
+    # RED when: ChallengeCache.peek consumes or re-stages the entry, or returns one past its
+    # deadline (BACKLOG #3194). finish_webauthn_registration peeks before the floor, so a consuming peek would spend
+    # the ceremony on a floor refusal, and a stale one would let an expired ceremony reach the floor.
+    clock = [100.0]
+    cache = webauthn.ChallengeCache(ttl_seconds=10.0, clock=lambda: clock[0])
+    key = ("token-hash", "register")
+    assert cache.peek(key) is None
+    cache.put(key, "user-1", b"challenge")
+    clock[0] += 5.0  # a peek later in the ceremony must not move its deadline
+    first = cache.peek(key)
+    assert first is not None and first.user_id == "user-1" and first.challenge == b"challenge"
+    assert first.deadline == 110.0, "a peek re-staged the ceremony and extended its deadline"
+    assert cache.peek(key) is first, "a peek consumed the ceremony"
+    assert cache.pop(key) == first  # CONTROL: pop still consumes it
+    assert cache.peek(key) is None and cache.pop(key) is None
+
+    cache.put(key, "user-1", b"challenge")  # deadline 115.0
+    clock[0] += 10.0  # at the deadline, which pop already treats as expired
+    assert cache.peek(key) is None
+    assert cache.pop(key) is None
+
+
 async def test_an_enrolment_on_a_session_that_owes_no_factor_is_not_floored(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -384,7 +436,7 @@ async def test_an_enrolment_on_a_session_that_owes_no_factor_is_not_floored(
         await store.close()
 
 
-async def test_a_passkey_registration_just_inside_the_floor_is_refused_and_keeps_its_ceremony(
+async def test_a_pending_sessions_passkey_registration_is_refused_for_its_factor_not_its_timing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pytest.importorskip("webauthn")
@@ -393,9 +445,10 @@ async def test_a_passkey_registration_just_inside_the_floor_is_refused_and_keeps
     from tests._soft_webauthn import SoftAuthenticator
 
     rp, origin = "t", "http://t"
-    # An account with TOTP, signed in again, so its session OWES the factor. The service floor is
-    # tested on this state directly; the routes refuse to begin a registration here until the TOTP
-    # is proven, so the directory test below is the case a route can reach.
+    # An account with TOTP, signed in again, so its session OWES the factor. The routes refuse to
+    # begin a registration here until the TOTP is proven, and the finish refuses it too (BACKLOG
+    # #3014), BEFORE the floor: inside the floor it answers as it would outside it, so the answer
+    # does not tell the caller which side it is on. The directory test below is the floor's case.
     store, service, token, _code, minted = await _pending_totp_session(monkeypatch)
     try:
         pending = await store.get_session(hash_token(token))
@@ -412,27 +465,18 @@ async def test_a_passkey_registration_just_inside_the_floor_is_refused_and_keeps
             base64url_to_bytes(options["challenge"]), transports=["usb"]
         )
 
-        now = [minted + MFA_FLOOR - 0.001]
-        _fake_service_wall_clock(monkeypatch, now)
-        early = await service.finish_webauthn_registration(
-            identity, response, label="key", token=token, rp_id=rp, origin=origin
-        )
+        _fake_service_wall_clock(monkeypatch, [minted + MFA_FLOOR - 0.001])
+        with pytest.raises(ValueError, match="already has a second factor"):
+            await service.finish_webauthn_registration(
+                identity, response, label="key", token=token, rp_id=rp, origin=origin
+            )
 
-        assert early == Elevation()
         assert not await service.mfa_satisfied(token)
-        failed = await _audit_rows(store, "auth.webauthn_failed")
-        assert _reasons(failed) == [TOO_EARLY] and _phases(failed) == ["enroll"]
+        assert await _audit_rows(store, "auth.webauthn_failed") == []  # no too_early row
+        assert len(await _audit_rows(store, "auth.mfa_denied")) == 1
         assert await store.list_webauthn_credentials(identity.user_id) == []
         user = await store.get_user(identity.user_id)
         assert user is not None and user.second_step_failed_attempts == 0, "it charged the lockout"
-
-        # CONTROL: the refusal left the ceremony in flight, so the SAME response is served now.
-        now[0] = minted + MFA_FLOOR + 0.001
-        served = await service.finish_webauthn_registration(
-            identity, response, label="key", token=token, rp_id=rp, origin=origin
-        )
-        assert served.ok and served.token is not None
-        assert await service.mfa_satisfied(served.token)
     finally:
         await store.close()
 
@@ -453,7 +497,10 @@ async def test_a_directory_sessions_first_passkey_inside_the_floor_is_refused(
     rp, origin = "t", "http://t"
     store = await MessageStore.open(":memory:")
     try:
-        service = AuthService(store, AuthSettings())  # require_mfa on, the shipped default
+        # require_mfa on, the shipped default. BACKLOG #3061: the enrolment legs ask the
+        # directory about a directory account first.
+        directory = DirectoryOf(_principal("adfloor"), _principal("adfloor2"))
+        service = AuthService(store, AuthSettings(), ldap=directory)  # type: ignore[arg-type]
         await service.initialize()
         out = await service._complete_ad_login(_principal("adfloor"), None, mfa_verified=False)
         assert out.ok and out.token is not None

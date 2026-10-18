@@ -34,10 +34,12 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from pydantic import ValidationError
 
 from messagefoundry.api import app as app_module
 from messagefoundry.api import create_managed_app
 from messagefoundry.api.app import (
+    _PROBE_FAULT_ALERT_SOURCE,
     _RECONCILE_CLEAR_RESOLVES,
     _REFERRAL_ALERT_SOURCE,
     _alert_reconcile_plan,
@@ -50,19 +52,30 @@ from messagefoundry.auth.ldap import DirectoryAnswer, LdapAuthenticator, _accoun
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.reconcile import (
     HOLD_REASON,
+    PROBE_FAULT_ABORT,
     REFERRAL_ABORT,
     ProbeOutcome,
     ReconcilePlan,
     SessionRevocation,
+    breaker_tripped,
 )
-from messagefoundry.auth.service import AuthService, _BreakerStanding, _HoldStanding
+from messagefoundry.auth.service import (
+    AuthService,
+    _AuditWatermark,
+    _BreakerStanding,
+    _HoldStanding,
+    _ReferralStanding,
+    _RevocationApplied,
+)
 from messagefoundry.config.settings import (
     _ALERT_EVENT_TYPES,
+    AlertsSettings,
     AuthSettings,
     EgressSettings,
     SecurityEnforcement,
     SecuritySettings,
     StoreSettings,
+    load_settings,
 )
 from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
@@ -267,6 +280,81 @@ def _settings(**over: Any) -> AuthSettings:
     }
     base.update(over)
     return AuthSettings(**base)
+
+
+# --- BACKLOG #3085: settings under which the mass-revoke breaker could never trip ---------------
+
+
+def test_a_fraction_of_one_is_refused_while_the_reconciler_runs() -> None:
+    """A pass never revokes more accounts than it probed, so with the AND in ``breaker_tripped`` a
+    1.0 fraction leaves the whole breaker unable to trip.
+
+    RED when: 1.0 loads with the reconciler on, and a site has no breaker without being told."""
+    with pytest.raises(ValidationError, match="must be below 1.0"):
+        _settings(ad_session_revoke_max_fraction=1.0)
+
+
+@pytest.mark.parametrize("users", [5, 1], ids=["budget-equals-cap", "budget-below-cap"])
+def test_a_budget_at_or_below_the_cap_loads_and_names_the_dead_breaker(users: int) -> None:
+    """Warned of, not refused (owner ruling 2026-10-17): the setting loads with the default cap of
+    5, revocation keeps working, and the warning names the settings and what to set.
+
+    RED when: the pair is refused, or loads with no warning."""
+    note = _settings(ad_session_recheck_max_users=users).breaker_budget_warning()
+    assert note is not None
+    assert "can never trip" in note
+    assert "raise ad_session_recheck_max_users above ad_session_revoke_max" in note
+
+
+def test_a_budget_one_above_the_cap_does_not_warn() -> None:
+    """The boundary control: at cap + 1 a pass can revoke more than the cap, so the breaker can
+    trip and nothing is warned of."""
+    assert _settings(ad_session_recheck_max_users=6).breaker_budget_warning() is None
+
+
+def test_serve_logs_the_dead_breaker_warning_once_logging_is_configured() -> None:
+    """``serve`` loads its settings before ``configure_logging``, so the warning is logged after it,
+    or it would reach bare stderr only. Read from the source, as the unread-variable replay test in
+    tests/test_settings_env_keys.py does, because running ``serve`` that far starts an engine."""
+    import inspect
+
+    from messagefoundry import __main__ as cli
+
+    source = inspect.getsource(cli._serve)
+    checked = source.index("if _logging_refused is not None:")
+    warned = source.index("settings.auth.breaker_budget_warning()")
+    assert source.index("_load_service_settings(") < checked < warned
+    assert "breaker_budget_warning" not in inspect.getsource(load_settings)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"ad_session_revoke_max_fraction": 1.0},
+        {"ad_session_recheck_max_users": 5},
+    ],
+    ids=["fraction-1.0", "budget-equals-cap"],
+)
+def test_the_breaker_settings_check_waits_for_a_reconciler_that_can_run(
+    override: dict[str, Any],
+) -> None:
+    """With AD off, or the interval at 0, the reconciler never runs, so these knobs are inert."""
+    assert _settings(ad_session_recheck_seconds=0, **override).breaker_budget_warning() is None
+    assert AuthSettings(**override).breaker_budget_warning() is None
+
+
+def test_the_shipped_breaker_defaults_pass_with_the_reconciler_on() -> None:
+    """The control: the defaults (200, 5, 0.34) load with no warning and can trip, and a fraction
+    just below 1.0 loads."""
+    defaults = _settings()
+    assert defaults.breaker_budget_warning() is None
+    assert breaker_tripped(
+        revoke_count=defaults.ad_session_recheck_max_users,
+        probed=defaults.ad_session_recheck_max_users,
+        max_absolute=defaults.ad_session_revoke_max,
+        max_fraction=defaults.ad_session_revoke_max_fraction,
+    ), "the shipped defaults leave the breaker unable to trip"
+    _settings(ad_session_revoke_max_fraction=0.99)
 
 
 # --- login: the password path and the password-free (Kerberos) path ----------------------------
@@ -614,20 +702,31 @@ async def test_a_pass_the_breaker_also_aborts_still_writes_the_held_row_and_aler
 # --- BACKLOG #2137: a failed write of the pass's own row does not end the pass -------------------
 
 
-def _refuse_audit(monkeypatch: pytest.MonkeyPatch, store: MessageStore, action: str) -> None:
-    """Make the store refuse every audit write of ``action``, as a full or failing disk would."""
+def _refuse_audit(
+    monkeypatch: pytest.MonkeyPatch,
+    store: MessageStore,
+    action: str,
+    error: Exception | None = None,
+) -> None:
+    """Make the store refuse every audit write of ``action``, as a full or failing disk would, or
+    raise ``error`` there instead."""
     real = store.record_audit
 
     async def refusing(name: str, **kwargs: Any) -> None:
         if name == action:
-            raise sqlite3.OperationalError("synthetic: disk I/O error")
+            raise error or sqlite3.OperationalError("synthetic: disk I/O error")
         await real(name, **kwargs)
 
     monkeypatch.setattr(store, "record_audit", refusing)
 
 
+def _said(caplog: pytest.LogCaptureFixture, phrase: str, level: int = logging.WARNING) -> int:
+    """How many captured lines at ``level`` carry ``phrase``."""
+    return sum(1 for r in caplog.records if r.levelno == level and phrase in r.getMessage())
+
+
 def _logged_at_error(caplog: pytest.LogCaptureFixture, action: str) -> bool:
-    return any(r.levelno == logging.ERROR and action in r.getMessage() for r in caplog.records)
+    return _said(caplog, action, logging.ERROR) > 0
 
 
 async def test_a_failed_held_row_write_still_alerts_each_revocation_and_the_hold(
@@ -854,11 +953,12 @@ class _InverseSink(_Sink):
         self.events.append(("ad_reconcile_hold_released", name, {}))
 
 
-#: Stands in for the auth service: the alerting reads only these two latched messages from it.
+#: Stands in for the auth service: the alerting reads only these latched messages from it.
 _AUTH = SimpleNamespace(
     directory_reconcile_alert=None,
     directory_reconcile_hold=None,
     directory_reconcile_referral=None,
+    directory_reconcile_fault=None,
 )
 
 #: The referral's own source label (BACKLOG #2538), apart from the breaker's.
@@ -943,6 +1043,58 @@ def test_a_referral_pages_and_clears_under_its_own_source(
     sink = _InverseSink()
     _alert_reconcile_plan(plan, _AUTH, sink)  # type: ignore[arg-type]
     assert [(e[0], e[1]) for e in sink.events] == expected
+    # BACKLOG #3100 item 6: every referral page carries the closed-set slug.
+    pages = [e for e in sink.events if (e[0], e[1]) == ("ad_reconcile_aborted", _REFERRAL_SOURCE)]
+    assert len(pages) == sum(1 for e in expected if e[1] == _REFERRAL_SOURCE and "aborted" in e[0])
+    assert all(e[2]["reason"] == REFERRAL_ABORT for e in pages)
+
+
+_FAULT_PAGE = ("ad_reconcile_aborted", _PROBE_FAULT_ALERT_SOURCE)
+
+
+@pytest.mark.parametrize(
+    ("plan", "expected"),
+    [
+        (
+            # A fault beside an applied revocation: the revocation, then the fault's page.
+            ReconcilePlan(
+                probed=3,
+                faulted=("a",),
+                revocations=(SessionRevocation("b", "bwong", reason="directory_absent"),),
+            ),
+            [("ad_session_revoked", "bwong"), _FAULT_PAGE],
+        ),
+        (
+            # A pass of faults only: the fault's page alone, never the breaker's instance.
+            ReconcilePlan(probed=2, faulted=("a", "b"), aborted=PROBE_FAULT_ABORT),
+            [_FAULT_PAGE],
+        ),
+        (
+            # A pass of referrals and faults only: one page on each of their instances.
+            ReconcilePlan(probed=2, referred=("a",), faulted=("b",), aborted=REFERRAL_ABORT),
+            [("ad_reconcile_aborted", _REFERRAL_SOURCE), _FAULT_PAGE],
+        ),
+        (
+            # A breaker trip beside a fault: one page on each instance.
+            ReconcilePlan(probed=12, faulted=("a",), aborted="mass_revoke_breaker"),
+            [("ad_reconcile_aborted", "directory-reconciler"), _FAULT_PAGE],
+        ),
+    ],
+    ids=["beside-a-revocation", "faults-only", "beside-a-referral", "beside-a-trip"],
+)
+def test_a_probe_fault_pages_under_its_own_source(
+    plan: ReconcilePlan, expected: list[tuple[str, str]]
+) -> None:
+    """BACKLOG #3100 items 1 and 3. A probe fault used to read as unavailable, and a pass of them
+    as an outage, which pages nobody. It pages on every pass with a fault, under its own source,
+    so an acknowledged fault never silences a breaker trip or a referral.
+
+    RED when: a pass of faults only pages nothing, or pages the breaker's instance."""
+    sink = _InverseSink()
+    _alert_reconcile_plan(plan, _AUTH, sink)  # type: ignore[arg-type]
+    assert [(e[0], e[1]) for e in sink.events] == expected
+    faulted = [e for e in sink.events if (e[0], e[1]) == _FAULT_PAGE]
+    assert faulted and all(e[2]["reason"] == PROBE_FAULT_ABORT for e in faulted)
 
 
 def test_the_inverses_resolve_their_alerts_and_are_not_rule_targetable() -> None:
@@ -977,16 +1129,22 @@ HELD = ("ad_reconcile_held", "directory-reconciler")
 REFERRAL = ("ad_reconcile_aborted", _REFERRAL_ALERT_SOURCE)
 
 
-async def _left_open_by_an_earlier_run(store: MessageStore) -> None:
+async def _left_open_by_an_earlier_run(
+    store: MessageStore, alerts: frozenset[tuple[str, str]] = frozenset({ABORTED, HELD})
+) -> None:
+    """The breaker's and the hold's instances, or only those in ``alerts``, as an earlier run of
+    the engine left them open."""
     last_run = NotifierAlertSink([], store=store)
-    last_run.ad_reconcile_aborted(
-        "directory-reconciler", reason="mass_revoke_breaker", probed=12, detail="tripped"
-    )
-    last_run.ad_reconcile_held(
-        "directory-reconciler", reason=HOLD_REASON, undetermined=2, detail="held"
-    )
+    if ABORTED in alerts:
+        last_run.ad_reconcile_aborted(
+            "directory-reconciler", reason="mass_revoke_breaker", probed=12, detail="tripped"
+        )
+    if HELD in alerts:
+        last_run.ad_reconcile_held(
+            "directory-reconciler", reason=HOLD_REASON, undetermined=2, detail="held"
+        )
     await _settle(last_run)
-    assert await _open_alerts(store) == {ABORTED, HELD}
+    assert await _open_alerts(store) == alerts
 
 
 async def _alerted_pass(service: AuthService, sink: NotifierAlertSink) -> ReconcilePlan:
@@ -1093,6 +1251,34 @@ async def test_a_trip_does_not_resolve_when_the_reconciler_revokes_the_accounts_
         assert ABORTED in await _open_alerts(store)
 
 
+async def test_a_trip_does_not_resolve_on_the_pass_that_revokes_its_role_changed_accounts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The revocation loop reads the unconfirmed set as it stood BEFORE the pass (BACKLOG #3084).
+    Six of twelve accounts hold roles the directory no longer grants, and the breaker trips. Twelve
+    more users sign in, so the next pass's six role revocations are under the fraction and go
+    through. Those six read PRESENT on that pass, which confirms them, so the set after the pass no
+    longer holds them. They were behind the trip all the same, and their revocation forfeits it.
+
+    RED when the loop reads the set after this pass's PRESENT reads: the revoking pass then clears
+    the trip on the eighteen that remain."""
+    names = [f"ok{i}" for i in range(6)] + [f"demoted{i}" for i in range(6)]
+    later = [f"late{i}" for i in range(12)]
+    async with _signed_in_estate(monkeypatch, names + later) as estate:
+        _directory, service, store, _tokens = estate
+        await _expire(store, later)
+        sink = NotifierAlertSink([], store=store)
+        for name in names[6:]:  # roles the directory no longer grants
+            await store.set_user_roles(await _id(store, name), [Role.VIEWER.value])
+        assert (await _alerted_pass(service, sink)).aborted == "mass_revoke_breaker"
+        await _sign_in(service, later)
+        revoked = await _alerted_pass(service, sink)
+        assert revoked.aborted is None and len(revoked.revocations) == 6
+        assert not revoked.breaker_clear, "the trip resolved on the pass that revoked its accounts"
+        assert not (await _alerted_pass(service, sink)).breaker_clear
+        assert ABORTED in await _open_alerts(store)
+
+
 async def test_a_hold_whose_accounts_leave_on_a_pass_with_nobody_signed_in_still_forfeits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1133,14 +1319,19 @@ async def test_an_account_that_leaves_after_it_was_read_again_does_not_forfeit_t
         assert (await _alerted_pass(service, sink)).breaker_clear
 
 
+@pytest.mark.parametrize("struck_by", ["absent", "disabled"])
 async def test_a_trip_does_not_resolve_when_its_accounts_leave_after_a_read_that_struck_them(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, struck_by: str
 ) -> None:
     """Only a PRESENT read confirms an account a trip left unconfirmed. Ten accounts read absent
     and the breaker trips. A flapping attribute read then holds them, which resets their strikes,
-    and the next pass finds them absent again on strike 1: not aborted, nothing revoked. That read
-    is a strike, not a clean read. Their sessions then end, and the strike ledger forgets them, so
-    the two that remain must not resolve the trip."""
+    and the next pass finds them absent, or present with the disabled bit set, on strike 1: not
+    aborted, nothing revoked. That read is a strike, not a clean read. Their sessions then end, and
+    the strike ledger forgets them, so the two that remain must not resolve the trip.
+
+    The ``disabled`` case is RED when a DISABLED read confirms an account as PRESENT does
+    (BACKLOG #3084): DISABLED is a readable answer, so it releases a hold, but it is no clean read
+    of the account behind a trip."""
     names = ["ok1", "ok2"] + [f"gone{i}" for i in range(10)]
     async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
         sink = NotifierAlertSink([], store=store)
@@ -1153,7 +1344,10 @@ async def test_a_trip_does_not_resolve_when_its_accounts_leave_after_a_read_that
         directory.uac.update(dict.fromkeys(names[2:], ABSENT))  # the attribute will not read
         assert (await _alerted_pass(service, sink)).hold
         for name in names[2:]:
-            directory.delete(name)
+            if struck_by == "absent":
+                directory.delete(name)
+            else:
+                directory.uac[name] = DISABLED
         struck = await _alerted_pass(service, sink)
         assert struck.aborted is None and struck.revocations == () and not struck.breaker_clear
         await _expire(store, names[2:])
@@ -1624,6 +1818,41 @@ async def test_the_clear_predicate_control_reads_both_clear() -> None:
     assert await _marked(plan, {"a": PRESENT, "b": PRESENT}) == (True, True)
 
 
+_CLEAN_TWO = ReconcilePlan(probed=3, readable=2, outcomes={"a": PRESENT, "b": PRESENT})
+
+
+@pytest.mark.parametrize(
+    "plan",
+    [replace(_CLEAN_TWO, referred=("c",)), replace(_CLEAN_TWO, faulted=("c",))],
+    ids=["referral", "probe-fault"],
+)
+async def test_a_pass_with_a_referral_or_fault_beside_clean_answers_marks_no_clear(
+    plan: ReconcilePlan,
+) -> None:
+    """BACKLOG #3100 item 6. The control's inputs, plus one account the pass referred or faulted
+    on. Its answer on record may predate the referral or the fault, so the pass is no evidence of
+    either clear, however clean the rest reads.
+
+    RED when: a pass with a referral or a fault beside other answers marks a clear."""
+    record = {"a": PRESENT, "b": PRESENT, "c": PRESENT}
+    # The control: the same record, on a pass that left ``c`` in the budget remainder instead.
+    assert await _marked(replace(_CLEAN_TWO, probed=2), record) == (True, True)
+    assert await _marked(plan, record) == (False, False)
+    # The referral's own clear, on a process whose pass saw a referral and whose marked accounts
+    # have all read PRESENT since: only the referral or the fault in this pass stops it.
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _fresh_process(store)
+        service._reconcile_referral_standing = "referred"
+        service._reconcile_referred = set()
+        service._reconcile_outcomes = dict(record)
+        users = cast(Mapping[str, UserRecord], dict.fromkeys(record))
+        assert not service._mark_reconcile_clears(plan, users).referral_clear
+        assert service._mark_reconcile_clears(_CLEAN_TWO, users).referral_clear  # the control
+    finally:
+        await store.close()
+
+
 async def test_an_estate_that_reads_only_undetermined_is_no_breaker_clear() -> None:
     """``undetermined not in outcomes``: a pass of held accounts only cannot trip the breaker at
     all, so it says nothing about whether the breaker is still tripped."""
@@ -1700,29 +1929,62 @@ async def test_a_process_whose_own_pass_has_not_tripped_resolves_no_trip() -> No
     assert await _marked(plan, record, breaker="tripped") == (True, True)
 
 
-@pytest.mark.parametrize(
-    ("start", "event", "end"),
-    [
-        ("fresh", "tripped", "tripped"),
-        ("fresh", "forfeit", "forfeit"),
-        ("tripped", "tripped", "tripped"),
-        ("tripped", "forfeit", "forfeit"),
-        ("forfeit", "tripped", "forfeit"),
-        ("forfeit", "forfeit", "forfeit"),
-    ],
-)
+#: Every move of the breaker's standing. The referral's runs the same machine (BACKLOG #3100 item
+#: 12), so its table is this one with its own opened state.
+_BREAKER_MOVES = [
+    ("fresh", "tripped", "tripped"),
+    ("fresh", "forfeit", "forfeit"),
+    ("tripped", "tripped", "tripped"),
+    ("tripped", "forfeit", "forfeit"),
+    ("forfeit", "tripped", "forfeit"),
+    ("forfeit", "forfeit", "forfeit"),
+]
+
+
+@pytest.mark.parametrize(("start", "event", "end"), _BREAKER_MOVES)
 async def test_the_breaker_standing_never_leaves_a_forfeit(
-    start: _BreakerStanding, event: _BreakerStanding, end: _BreakerStanding
+    start: _BreakerStanding,
+    event: _BreakerStanding,
+    end: _BreakerStanding,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A forfeit is never left, not even by a later trip. A new trip lands on the instance the
     forfeit kept open, and the account the forfeit gave up on is still unread, so resolving it
-    would rest on the rest of the estate again."""
+    would rest on the rest of the estate again. It warns once, on the move into a forfeit."""
     store = await MessageStore.open(":memory:")
     try:
         service = _fresh_process(store)
         service._reconcile_breaker_standing = start
-        service._advance_breaker_standing(event)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            service._advance_breaker_standing(event)
         assert service._reconcile_breaker_standing == end
+        warned = [r for r in caplog.records if "last breaker trip left" in r.getMessage()]
+        assert len(warned) == (1 if start != "forfeit" and end == "forfeit" else 0)
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("start", "event", "end"),
+    [tuple("referred" if s == "tripped" else s for s in move) for move in _BREAKER_MOVES],
+)
+async def test_the_referral_standing_runs_the_breakers_machine(
+    start: _ReferralStanding,
+    event: _ReferralStanding,
+    end: _ReferralStanding,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #2538, and #3100 item 12, which folded the two machines into one. The referral's
+    standing moves exactly as the breaker's does, and warns once, on the move into a forfeit."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _fresh_process(store)
+        service._reconcile_referral_standing = start
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            service._advance_referral_standing(event)
+        assert service._reconcile_referral_standing == end
+        warned = [r for r in caplog.records if "LDAP referral left" in r.getMessage()]
+        assert len(warned) == (1 if start != "forfeit" and end == "forfeit" else 0)
     finally:
         await store.close()
 
@@ -1757,12 +2019,53 @@ async def test_the_hold_standing_never_leaves_a_forfeit(
         await store.close()
 
 
+@pytest.mark.parametrize(
+    ("standing", "start", "says"),
+    [
+        ("breaker", "fresh", "left before a pass read it clean"),
+        ("breaker", "tripped", "left before a pass read it clean"),
+        ("referral", "fresh", "left before a pass read it without one"),
+        ("referral", "referred", "left before a pass read it without one"),
+        ("hold", "fresh", "before any pass here had held, and an earlier run's hold may"),
+        ("hold", "held", "before this process released its hold"),
+    ],
+)
+async def test_each_forfeit_logs_one_warning_that_names_what_happened(
+    caplog: pytest.LogCaptureFixture, standing: str, start: str, says: str
+) -> None:
+    """The three forfeit warnings, each said once on the move into ``"forfeit"`` and never again,
+    since nothing moves out of it (BACKLOG #3084, the review's unpinned log lines). An operator
+    reads this line to know an open instance is now theirs to resolve.
+
+    The hold's line names the state it came from. A fresh process never held, so a line saying it
+    left "before this process released a hold" described a hold that never happened (BACKLOG
+    #3084, item 3)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _fresh_process(store)
+        setattr(service, f"_reconcile_{standing}_standing", start)
+        advance = getattr(service, f"_advance_{standing}_standing")
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            advance("forfeit")
+            advance("forfeit")
+        lines = [r.getMessage() for r in caplog.records if "will not resolve" in r.getMessage()]
+        assert len(lines) == 1, lines
+        assert says in lines[0]
+        if standing == "hold" and start == "fresh":
+            assert "released" not in lines[0]
+    finally:
+        await store.close()
+
+
 async def test_a_pass_that_raises_after_revoking_an_undetermined_account_still_forfeits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The forfeit is recorded before the revocation lands. Here the revocation's own audit write
-    fails, so the pass raises after the sessions are gone and returns no plan. The next pass no
-    longer sees the account, and must not release the hold on the accounts it left."""
+    raises a defect, so the pass raises after the sessions are gone and returns no plan. The next
+    pass no longer sees the account, and must not release the hold on the accounts it left.
+
+    A defect, not a store refusal: since BACKLOG #3018 a refused revocation row is logged and the
+    pass goes on, so only a defect still raises from that write."""
     names = ["u1", "ok1", "ok2"]
     async with _signed_in_estate(monkeypatch, names) as (directory, _service, store, _tokens):
         await _left_open_by_an_earlier_run(store)
@@ -1772,8 +2075,9 @@ async def test_a_pass_that_raises_after_revoking_an_undetermined_account_still_f
         sink = NotifierAlertSink([], store=store)
         assert (await _alerted_pass(service, sink)).revocations == ()  # strike 1
         real = store.record_audit
-        _refuse_audit(monkeypatch, store, "auth.ad_session_revoked")
-        with pytest.raises(sqlite3.OperationalError):
+        defect = NotImplementedError("synthetic defect")
+        _refuse_audit(monkeypatch, store, "auth.ad_session_revoked", defect)
+        with pytest.raises(NotImplementedError):
             await service.reconcile_directory_sessions()
         monkeypatch.setattr(store, "record_audit", real)
         after = await _alerted_pass(service, sink)
@@ -1863,13 +2167,30 @@ def test_only_a_process_alone_on_its_store_is_the_sole_reconciler() -> None:
     assert not _is_sole_reconciler(clustered, None, _runner(None))  # a [cluster] node
 
 
+#: An SMTP transport, which wires the notifier; no message is sent by the lifespan tests.
+_SMTP_ALERTS = AlertsSettings(
+    email_smtp_host="smtp.example.invalid",
+    email_from="alerts@example.invalid",
+    email_to=["ops@example.invalid"],
+    security_notifications_required=False,
+)
+
+
+@pytest.mark.parametrize("alerts", [None, _SMTP_ALERTS], ids=["no-alerts", "smtp-alerts"])
 @pytest.mark.parametrize("sole", [False, True], ids=["not-sole", "sole"])
 async def test_the_lifespan_passes_the_sole_reconciler_answer_to_the_reconciler_task(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sole: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sole: bool, alerts: AlertsSettings | None
 ) -> None:
     """The call site in ``create_managed_app``. The test above pins what the answer is; this one
     pins that the lifespan asks for it, with the process's own coordinator, filter and runner, and
-    hands it on. A call site passing ``True`` regardless fails the ``not-sole`` case."""
+    hands it on. A call site passing ``True`` regardless fails the ``not-sole`` case.
+
+    It also pins ``alert_state`` (BACKLOG #3084, item 4). With no ``[alerts]`` transport nothing
+    records an instance, so it is ``None``. With one, the notifier records instances in the
+    engine's store, and the reconciler must read that same store to tell an earlier run's open
+    instance from its own. The ``smtp-alerts`` cases are RED when the call site passes
+    ``alert_state=None`` regardless: a restarted engine whose own pass trips would then resolve
+    the earlier run's row."""
     asked: list[tuple[object, object, object]] = []
     handed: list[bool] = []
     states: list[object] = []
@@ -1898,6 +2219,7 @@ async def test_the_lifespan_passes_the_sole_reconciler_answer_to_the_reconciler_
             enforcement=SecurityEnforcement.WARN, allow_unencrypted_phi=True
         ),
         egress_settings=EgressSettings(deny_by_default=False),
+        alerts_settings=alerts,
     )
     async with app.router.lifespan_context(app):
         for _ in range(200):
@@ -1906,8 +2228,10 @@ async def test_the_lifespan_passes_the_sole_reconciler_answer_to_the_reconciler_
             await asyncio.sleep(0.005)
         engine = app.state.engine
         assert asked == [(engine.coordinator, None, engine.registry_runner)]
+        assert (app.state.notifier is not None) is (alerts is not None)
     assert handed == [sole]
-    assert states == [None]  # no [alerts] notifier, so nothing records an instance to read
+    assert len(states) == 1
+    assert states[0] is (None if alerts is None else engine.store)
 
 
 class _PlanAuth:
@@ -2150,6 +2474,508 @@ async def test_a_referral_does_not_resolve_when_a_referred_account_signs_out(
         assert not (await _alerted_pass(service, sink)).referral_clear
 
 
+# --- a forfeited standing says so once per new trip, hold or referral (BACKLOG #3083) ------------
+#
+# The forfeit itself is kept until a restart (`AuthService._forfeit_clears_on_attrition` says why).
+# What these pin is the log line a later trip, hold or referral in that process gives: once when
+# it opens, not on every pass while it stands, which would flood the log.
+
+
+_TRIPPED_AGAIN = "the breaker tripped after this process gave up"
+_HELD_AGAIN = "hold engaged after this process gave up"
+_REFERRED_AGAIN = "referral opened after this process gave up"
+
+
+async def test_a_forfeited_breaker_logs_once_on_a_new_trip_and_not_on_each_pass(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The ten accounts behind a trip leave, so the process forfeits the breaker's clear. A pass
+    that is not aborted probes the two that remain, which ends that trip. Ten other accounts then
+    read absent and the breaker trips again: one WARNING says this process will not resolve it,
+    and the next tripped pass of the same trip says nothing more.
+
+    RED when: the line is removed, or it is said on every tripped pass."""
+    names = ["ok1", "ok2"] + [f"gone{i}" for i in range(10)]
+    later = [f"back{i}" for i in range(10)]
+    async with _signed_in_estate(monkeypatch, names + later) as estate:
+        directory, service, store, _tokens = estate
+        await _expire(store, later)
+        sink = NotifierAlertSink([], store=store)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            for name in names[2:]:
+                directory.delete(name)
+            await _alerted_pass(service, sink)  # strike 1
+            assert (await _alerted_pass(service, sink)).aborted == "mass_revoke_breaker"
+            await _expire(store, names[2:])
+            assert (await _alerted_pass(service, sink)).aborted is None  # ends the first trip
+            assert service._reconcile_breaker_standing == "forfeit"
+            assert _said(caplog, _TRIPPED_AGAIN) == 0
+
+            await _sign_in(service, later)
+            for name in later:
+                directory.delete(name)
+            assert (await _alerted_pass(service, sink)).aborted is None  # strike 1
+            assert _said(caplog, _TRIPPED_AGAIN) == 0
+            for _ in range(2):  # the new trip, then a later pass of the same trip
+                plan = await _alerted_pass(service, sink)
+                assert plan.aborted == "mass_revoke_breaker" and not plan.breaker_clear
+                assert _said(caplog, _TRIPPED_AGAIN) == 1
+                directory.down = True  # an outage between the two judges nothing, and ends nothing
+                assert (await _alerted_pass(service, sink)).directory_outage
+                directory.down = False
+        assert ABORTED in await _open_alerts(store)
+
+
+async def test_a_forfeited_hold_logs_once_on_each_new_engagement_and_not_on_each_pass(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The two accounts a hold holds leave, so the process forfeits the hold's release. A later
+    hold of other accounts says once that this process will not resolve it, and not again on the
+    next held pass. Released and engaged once more, it says so once more.
+
+    RED when: the line is removed, or it is said on every held pass."""
+    names = ["u1", "u2", "v1", "v2", "ok1", "ok2", "ok3"]
+    async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
+        sink = NotifierAlertSink([], store=store)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+            assert (await _alerted_pass(service, sink)).hold
+            await _expire(store, ["u1", "u2"])
+            assert not (await _alerted_pass(service, sink)).hold  # releases the latch
+            assert service._reconcile_hold_standing == "forfeit"
+            assert _said(caplog, _HELD_AGAIN) == 0
+
+            for said in (1, 2):
+                directory.uac.update({"v1": ABSENT, "v2": ABSENT})
+                for _ in range(2):  # the new engagement, then a later pass of the same hold
+                    plan = await _alerted_pass(service, sink)
+                    assert plan.hold and not plan.hold_clear
+                    assert _said(caplog, _HELD_AGAIN) == said
+                    directory.down = True  # an outage between the two ends nothing
+                    assert (await _alerted_pass(service, sink)).directory_outage
+                    directory.down = False
+                directory.uac.update({"v1": ENABLED, "v2": ENABLED})
+                plan = await _alerted_pass(service, sink)
+                assert not plan.hold and not plan.hold_clear
+        assert HELD in await _open_alerts(store)
+
+
+async def test_a_forfeited_referral_logs_once_on_each_new_referral_and_not_on_each_pass(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The referral's standing, by the same rule (BACKLOG #2538). A referred account signs out, so
+    the process forfeits the referral's clear. A later referral says once that this process will
+    not resolve it, and not again on the next referred pass. A referral ends once every account
+    signed in at it has been probed on a pass with no referral, or left. An outage between two
+    referred passes does not end it.
+
+    RED when: the line is removed, or it is said on every referred pass."""
+    names = ["jdoe", "asmith"]
+    groups = {"ad_group_search_base": "OU=Groups,DC=other,DC=invalid"}
+    async with _signed_in_estate(monkeypatch, names, **groups) as estate:
+        directory, service, store, _tokens = estate
+        sink = NotifierAlertSink([], store=store)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            directory.refer_groups = True
+            assert (await _alerted_pass(service, sink)).referred
+            await _expire(store, ["jdoe"])
+            directory.refer_groups = False
+            assert (await _alerted_pass(service, sink)).referred == ()  # ends the first referral
+            assert service._reconcile_referral_standing == "forfeit"
+            assert _said(caplog, _REFERRED_AGAIN) == 0
+
+            for said in (1, 2):
+                directory.refer_groups = True
+                assert (await _alerted_pass(service, sink)).referred  # the new referral
+                assert _said(caplog, _REFERRED_AGAIN) == said
+                directory.down = True
+                assert (await _alerted_pass(service, sink)).directory_outage
+                directory.down = False
+                assert (await _alerted_pass(service, sink)).referred  # the same referral
+                assert _said(caplog, _REFERRED_AGAIN) == said
+                directory.refer_groups = False
+                plan = await _alerted_pass(service, sink)
+                assert plan.referred == () and not plan.referral_clear
+        assert REFERRAL in await _open_alerts(store)
+
+
+async def test_a_forfeited_hold_logs_once_when_its_held_passes_raise(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A held pass that raises in its revocation loop never reaches the end of the pass, where the
+    hold's message is latched. The hold is open all the same, so it is said once, not once per
+    pass that raises.
+
+    RED when: whether a hold is new is read off the message the raising pass never set."""
+    names = ["u1", "u2", "v1", "v2", "d1", "ok1", "ok2", "ok3"]
+    async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
+        sink = NotifierAlertSink([], store=store)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+            assert (await _alerted_pass(service, sink)).hold
+            await _expire(store, ["u1", "u2"])
+            directory.uac["d1"] = DISABLED
+            assert not (await _alerted_pass(service, sink)).hold  # d1 strike 1
+            assert service._reconcile_hold_standing == "forfeit"
+
+            async def refusing(
+                revocation: SessionRevocation, *, watermark: _AuditWatermark | None
+            ) -> _RevocationApplied:
+                raise sqlite3.OperationalError("synthetic: the store refused the revocation")
+
+            monkeypatch.setattr(service, "_apply_reconcile_revocation", refusing)
+            directory.uac.update({"v1": ABSENT, "v2": ABSENT})
+            for _ in range(3):  # each held pass revokes d1, and raises
+                with pytest.raises(sqlite3.OperationalError):
+                    await service.reconcile_directory_sessions()
+            assert _said(caplog, _HELD_AGAIN) == 1
+
+
+async def test_a_hold_forfeited_before_it_ever_held_does_not_say_it_held_again(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A fresh process forfeits the hold's release when it revokes a lone undetermined account,
+    with no hold engaged. Its first hold is logged once, and the line does not say "again"."""
+    names = ["u1", "v1", "v2", "ok1", "ok2"]
+    async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
+        sink = NotifierAlertSink([], store=store)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            directory.uac["u1"] = ABSENT
+            assert not (await _alerted_pass(service, sink)).hold  # strike 1
+            assert (await _alerted_pass(service, sink)).revocations
+            assert service._reconcile_hold_standing == "forfeit"
+            directory.uac.update({"v1": ABSENT, "v2": ABSENT})
+            assert (await _alerted_pass(service, sink)).hold
+            assert _said(caplog, _HELD_AGAIN) == 1
+            assert _said(caplog, "engaged again") == 0
+
+
+async def test_a_forfeited_breaker_logs_a_trip_of_new_accounts_after_nobody_was_signed_in(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Everyone behind a trip signs out, and a pass finds nobody. The breaker's message stays
+    latched on purpose, but the accounts behind that trip have all gone, so a trip of accounts that
+    sign in later is a new one, and the forfeited process says it will not resolve it.
+
+    RED when: a pass with nobody signed in leaves the trip open."""
+    names = ["ok1", "ok2"] + [f"gone{i}" for i in range(10)]
+    later = [f"back{i}" for i in range(12)]
+    async with _signed_in_estate(
+        monkeypatch, names + later, ad_session_recheck_strikes=1
+    ) as estate:
+        directory, service, store, _tokens = estate
+        await _expire(store, later)
+        sink = NotifierAlertSink([], store=store)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            for name in names[2:]:
+                directory.delete(name)
+            assert (await _alerted_pass(service, sink)).aborted == "mass_revoke_breaker"
+            await _expire(store, names)
+            assert (await _alerted_pass(service, sink)).probed == 0
+            assert service._reconcile_breaker_standing == "forfeit"
+            assert service.directory_reconcile_alert is not None  # kept latched, on purpose
+            await _sign_in(service, later)
+            for name in later:
+                directory.delete(name)
+            assert (await _alerted_pass(service, sink)).aborted == "mass_revoke_breaker"
+            assert _said(caplog, _TRIPPED_AGAIN) == 1
+
+
+async def test_a_forfeited_referral_is_not_said_while_a_rotating_sample_misses_it(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One probe per pass. Two held accounts never reach the group search, so a pass that samples
+    one sees no referral, and that is no sign the referral has gone: it ends only that account's
+    part, and the next referred pass marks every candidate again. This referral opened before the
+    forfeit, so it is never said, however the samples rotate.
+
+    RED when: any pass that judged something without a referral ends the whole referral."""
+    names = ["a", "b", "c", "h1", "h2"]
+    settings = {
+        "ad_group_search_base": "OU=Groups,DC=other,DC=invalid",
+        "ad_session_recheck_max_users": 1,
+    }
+    async with _signed_in_estate(monkeypatch, names, **settings) as estate:
+        directory, service, store, _tokens = estate
+        sink = NotifierAlertSink([], store=store)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            directory.uac.update({"h1": ABSENT, "h2": ABSENT})
+            directory.refer_groups = True
+            referred = 0
+            for i in range(16):
+                if i == 6:
+                    await _expire(store, ["c"])  # a referred account leaves: the forfeit
+                referred += bool((await _alerted_pass(service, sink)).referred)
+            assert service._reconcile_referral_standing == "forfeit"
+            assert referred > 2  # the referral recurred across the rotation
+            assert _said(caplog, _REFERRED_AGAIN) == 0
+
+
+async def test_a_forfeited_breaker_is_not_said_when_a_sample_of_new_accounts_misses_the_trip(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A probe budget of twelve. One account behind a trip leaves, which forfeits. Twelve healthy
+    accounts sign in, and since a never-probed account is sampled first, the next pass reads only
+    them: not aborted, but it read none of the trip's accounts. The pass after samples those
+    again and trips. That is the same trip, so nothing more is said.
+
+    RED when: any pass that was not aborted ends the whole trip."""
+    names = ["ok1", "ok2"] + [f"gone{i}" for i in range(10)]
+    later = [f"new{i}" for i in range(12)]
+    async with _signed_in_estate(
+        monkeypatch, names + later, ad_session_recheck_max_users=12
+    ) as estate:
+        directory, service, store, _tokens = estate
+        await _expire(store, later)
+        sink = NotifierAlertSink([], store=store)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            for name in names[2:]:
+                directory.delete(name)
+            await _alerted_pass(service, sink)  # strike 1
+            assert (await _alerted_pass(service, sink)).aborted == "mass_revoke_breaker"
+            await _expire(store, ["gone0"])
+            await _sign_in(service, later)
+            missed = await _alerted_pass(service, sink)
+            assert missed.aborted is None and missed.readable == 12
+            assert service._reconcile_breaker_standing == "forfeit"
+            assert (await _alerted_pass(service, sink)).aborted == "mass_revoke_breaker"
+            assert _said(caplog, _TRIPPED_AGAIN) == 0
+
+
+async def test_a_forfeited_hold_is_said_once_while_a_rotating_sample_misses_its_account(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One probe per pass. After a forfeit, one account reads undetermined. Sampled alone, with
+    nothing readable beside it, it is held; a pass that samples a readable account does not hold,
+    but the undetermined answer stays on record. So the hold is said once, not every time the
+    rotation comes back to it.
+
+    RED when: any judged pass that does not hold ends the whole hold."""
+    names = ["u1", "u2", "x", "ok1", "ok2"]
+    async with _signed_in_estate(monkeypatch, names, ad_session_recheck_max_users=1) as estate:
+        directory, service, store, _tokens = estate
+        sink = NotifierAlertSink([], store=store)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+            for _ in range(5):  # once both are on record, the wave holds
+                await _alerted_pass(service, sink)
+            assert service._reconcile_hold_standing == "held"
+            await _expire(store, ["u1", "u2"])
+            await _alerted_pass(service, sink)
+            assert cast(str, service._reconcile_hold_standing) == "forfeit"  # mypy narrowed it
+            directory.uac["x"] = ABSENT
+            held = 0
+            for _ in range(9):
+                held += (await _alerted_pass(service, sink)).hold
+            assert held >= 2  # the rotation came back to it
+            assert _said(caplog, _HELD_AGAIN) == 1
+
+
+_GAVE_UP_ON_A_TRIP = "an account signed in at the last breaker trip left"
+
+
+async def test_a_forfeited_breaker_logs_a_later_trip_while_held_accounts_stay_signed_in(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Two held accounts never read PRESENT and never leave. A pass that is not aborted and probes
+    them still ends the trip they were signed in at, so a later trip of other accounts is a new
+    one, and the forfeited process says it will not resolve it.
+
+    RED when: only a PRESENT read or leaving ends a trip, so the held pair keeps it open."""
+    names = ["ok1", "ok2", "u1", "u2"] + [f"gone{i}" for i in range(10)]
+    later = [f"back{i}" for i in range(10)]
+    async with _signed_in_estate(monkeypatch, names + later) as estate:
+        directory, service, store, _tokens = estate
+        await _expire(store, later)
+        sink = NotifierAlertSink([], store=store)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+            for name in names[4:]:
+                directory.delete(name)
+            await _alerted_pass(service, sink)  # strike 1, and the pair is held
+            assert (await _alerted_pass(service, sink)).aborted == "mass_revoke_breaker"
+            await _expire(store, names[4:])
+            plan = await _alerted_pass(service, sink)
+            assert plan.aborted is None and plan.hold  # probes the held pair: ends the trip
+            assert service._reconcile_breaker_standing == "forfeit"
+
+            await _sign_in(service, later)
+            for name in later:
+                directory.delete(name)
+            assert (await _alerted_pass(service, sink)).aborted is None  # strike 1
+            assert _said(caplog, _TRIPPED_AGAIN) == 0
+            for _ in range(2):  # the new trip, then a later pass of the same trip
+                assert (await _alerted_pass(service, sink)).aborted == "mass_revoke_breaker"
+                assert _said(caplog, _TRIPPED_AGAIN) == 1
+
+
+async def test_a_forfeited_referral_logs_a_later_referral_while_held_accounts_stay_signed_in(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The referral's half of the test above. The held pair never reaches the group search, so it
+    never reads PRESENT, but a pass with no referral that probes it ends the referral it was
+    signed in at. A later referral is a new one, and is said once.
+
+    RED when: only a PRESENT read or leaving ends a referral."""
+    names = ["jdoe", "asmith", "u1", "u2"]
+    groups = {"ad_group_search_base": "OU=Groups,DC=other,DC=invalid"}
+    async with _signed_in_estate(monkeypatch, names, **groups) as estate:
+        directory, service, store, _tokens = estate
+        sink = NotifierAlertSink([], store=store)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+            directory.refer_groups = True
+            assert (await _alerted_pass(service, sink)).referred
+            await _expire(store, ["jdoe"])
+            directory.refer_groups = False
+            plan = await _alerted_pass(service, sink)
+            assert plan.referred == () and plan.hold  # ends the first referral
+            assert service._reconcile_referral_standing == "forfeit"
+            assert _said(caplog, _REFERRED_AGAIN) == 0
+
+            directory.refer_groups = True
+            for _ in range(2):  # the new referral, then a later pass of the same referral
+                assert (await _alerted_pass(service, sink)).referred
+                assert _said(caplog, _REFERRED_AGAIN) == 1
+
+
+async def test_a_forfeited_hold_logs_a_new_hold_beside_an_account_outside_it(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A lone undetermined account is held, then reads clean, which ends that hold. Another lone
+    account then reads undetermined beside readable ones: it strikes, and no hold engages. A later
+    wave of two more is a new hold, and is said, though an undetermined answer stood on record
+    the whole time.
+
+    RED when: whether a hold is open reads the whole outcome record, not the hold's own accounts."""
+    names = ["u1", "u2", "ok1", "x", "y", "d", "v1", "v2"]
+    async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
+        await _expire(store, ["x", "y", "d", "v1", "v2"])
+        sink = NotifierAlertSink([], store=store)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+            assert (await _alerted_pass(service, sink)).hold
+            await _expire(store, ["u1", "u2"])
+            assert not (await _alerted_pass(service, sink)).hold  # releases the latch
+            assert service._reconcile_hold_standing == "forfeit"
+
+            await _expire(store, ["ok1"])
+            await _sign_in(service, ["x", "d"])
+            directory.uac["x"] = ABSENT
+            directory.delete("d")
+            plan = await _alerted_pass(service, sink)
+            assert plan.hold and plan.readable == 0  # x alone, with nothing readable beside it
+            assert _said(caplog, _HELD_AGAIN) == 1
+
+            await _sign_in(service, ["ok1", "y"])
+            directory.uac.update({"x": ENABLED, "y": ABSENT})
+            plan = await _alerted_pass(service, sink)
+            assert not plan.hold and plan.readable == 2  # x reads clean; y strikes beside it
+            y_id = await _id(store, "y")
+            assert service._reconcile_outcomes[y_id] is ProbeOutcome.UNDETERMINED
+
+            await _sign_in(service, ["v1", "v2"])
+            directory.uac.update({"v1": ABSENT, "v2": ABSENT})
+            assert (await _alerted_pass(service, sink)).hold
+            assert _said(caplog, _HELD_AGAIN) == 2
+
+
+async def test_a_forfeited_hold_that_flaps_on_one_account_is_said_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A lone undetermined account is held on passes where its one neighbour is absent, and
+    strikes on passes where the neighbour reads clean. Its answer never changes, so this is one
+    hold however often it engages again, and it is said once.
+
+    RED when: any answer for the account, an undetermined one too, ends its part of a hold."""
+    names = ["u1", "u2", "ok1", "x"]
+    async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
+        sink = NotifierAlertSink([], store=store)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+            assert (await _alerted_pass(service, sink)).hold
+            await _expire(store, ["u1", "u2"])
+            assert not (await _alerted_pass(service, sink)).hold  # releases the latch
+            assert service._reconcile_hold_standing == "forfeit"
+
+            directory.uac["x"] = ABSENT
+            ok1 = directory.ids["ok1"]
+            held = 0
+            for _ in range(4):
+                directory.delete("ok1")
+                held += (await _alerted_pass(service, sink)).hold  # x alone: held
+                directory.ids["ok1"] = ok1
+                assert not (await _alerted_pass(service, sink)).hold  # x strikes beside ok1
+            assert held == 4
+            assert _said(caplog, _HELD_AGAIN) == 1
+
+
+async def test_a_new_trip_on_the_pass_that_forfeits_after_the_last_one_ended_is_said(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A trip ends: its accounts read clean, and a held pair is probed. The pair stays unconfirmed,
+    so when one of it signs out the breaker forfeits. On that same pass twelve new accounts trip
+    the breaker. The forfeit line is about the ended trip, so the new trip is said as well.
+
+    RED when: a standing that forfeits on a pass never logs a new trip on that pass."""
+    names = ["ok1", "ok2", "u1", "u2"] + [f"gone{i}" for i in range(10)]
+    later = [f"back{i}" for i in range(12)]
+    async with _signed_in_estate(
+        monkeypatch, names + later, ad_session_recheck_strikes=1
+    ) as estate:
+        directory, service, store, _tokens = estate
+        await _expire(store, later)
+        sink = NotifierAlertSink([], store=store)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+            ids = {name: directory.ids[name] for name in names[4:]}
+            for name in names[4:]:
+                directory.delete(name)
+            assert (await _alerted_pass(service, sink)).aborted == "mass_revoke_breaker"
+            directory.ids.update(ids)  # the search base is fixed
+            plan = await _alerted_pass(service, sink)
+            assert plan.aborted is None and plan.hold  # the trip ends; the pair is held
+            assert service._reconcile_breaker_standing == "tripped"
+
+            await _expire(store, ["u1"])
+            await _sign_in(service, later)
+            for name in later:
+                directory.delete(name)
+            assert (await _alerted_pass(service, sink)).aborted == "mass_revoke_breaker"
+            assert _said(caplog, _GAVE_UP_ON_A_TRIP) == 1
+            assert _said(caplog, _TRIPPED_AGAIN) == 1
+
+
+async def test_a_trip_that_forfeits_on_its_own_pass_is_not_also_said_as_a_new_trip(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Everyone behind a trip leaves, and on the same pass other accounts sign in and trip it
+    again. The forfeit's own warning has just said this process will not resolve the trip, so the
+    pass does not say it twice. The next tripped pass says nothing more.
+
+    RED when: a pass that forfeits also logs its trip as a new one."""
+    names = ["ok1", "ok2"] + [f"gone{i}" for i in range(10)]
+    later = [f"back{i}" for i in range(12)]
+    async with _signed_in_estate(
+        monkeypatch, names + later, ad_session_recheck_strikes=1
+    ) as estate:
+        directory, service, store, _tokens = estate
+        await _expire(store, later)
+        sink = NotifierAlertSink([], store=store)
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            for name in names[2:]:
+                directory.delete(name)
+            assert (await _alerted_pass(service, sink)).aborted == "mass_revoke_breaker"
+            await _expire(store, names)
+            await _sign_in(service, later)
+            for name in later:
+                directory.delete(name)
+            for _ in range(2):
+                assert (await _alerted_pass(service, sink)).aborted == "mass_revoke_breaker"
+                assert _said(caplog, _GAVE_UP_ON_A_TRIP) == 1
+                assert _said(caplog, _TRIPPED_AGAIN) == 0
+
+
 async def test_an_account_that_leaves_after_it_read_present_does_not_forfeit_the_referral(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2330,30 +3156,6 @@ async def test_a_process_never_resolves_an_instance_an_earlier_run_left_open() -
         await store.close()
 
 
-async def test_a_failed_alert_state_read_costs_a_clear_and_never_makes_one() -> None:
-    """Until a read of alert state succeeds, the loop cannot tell inherited instances from its
-    own, so every clear is dropped. What is open at the first read that succeeds then counts as
-    inherited, including a trip this process opened meanwhile: a missed clear, never a false
-    one."""
-    store = await MessageStore.open(":memory:")
-    real = store.list_active_alert_instances
-    failures = [sqlite3.OperationalError("synthetic: database is locked")]
-
-    async def failing_once(**kwargs: Any) -> list[Any]:
-        if failures:
-            raise failures.pop()
-        return await real(**kwargs)
-
-    try:
-        store.list_active_alert_instances = failing_once  # type: ignore[method-assign]
-        auth = _ScriptedAuth([_BOTH_CLEAR], {0: partial(_open_both_again, store)})
-        await _run_reconciler(auth, store, NotifierAlertSink([], store=store), passes=4)
-        assert await _open_alerts(store) == {ABORTED, HELD}
-        assert not failures, "the read never failed"
-    finally:
-        await store.close()
-
-
 def test_every_clear_flag_names_the_instance_it_resolves() -> None:
     """``_without_inherited_clears`` drops a flag its map does not name, so a ``*_clear`` flag left
     out of the map is a clear that never fires on an engine with alert state (BACKLOG #2538)."""
@@ -2409,3 +3211,205 @@ async def test_a_process_never_resolves_a_referral_an_earlier_run_left_open() ->
         assert await _open_alerts(store) == set(), "this process's own referral stayed open"
     finally:
         await store.close()
+
+
+def _script_reads(
+    monkeypatch: pytest.MonkeyPatch, store: MessageStore, script: list[str]
+) -> list[str]:
+    """Patch ``list_active_alert_instances`` to answer read ``n`` as ``script[n]`` says, and every
+    read past the script as the last entry: ``real`` reads the store, ``fail`` raises a driver
+    error and ``hang`` never returns. Returns the log of what each read did."""
+    real = store.list_active_alert_instances
+    done: list[str] = []
+
+    async def read(**kwargs: Any) -> list[Any]:
+        how = script[min(len(done), len(script) - 1)]
+        done.append(how)
+        if how == "fail":
+            raise sqlite3.OperationalError("synthetic: database is locked")
+        if how == "hang":
+            await asyncio.Event().wait()
+        return await real(**kwargs)
+
+    monkeypatch.setattr(store, "list_active_alert_instances", read)
+    return done
+
+
+@pytest.mark.parametrize(
+    ("script", "resolves"),
+    [
+        (["real"], True),
+        (["fail", "real"], False),
+        (["hang", "real"], False),
+        (["real", "fail"], False),
+        (["real", "hang"], False),
+        (["real", "fail", "real"], True),
+    ],
+    ids=[
+        "control",
+        "first-read-fails",
+        "first-read-hangs",
+        "later-read-fails",
+        "later-read-hangs",
+        "one-later-read-fails",
+    ],
+)
+async def test_a_pass_whose_alert_read_fails_or_runs_long_drops_its_clears(
+    monkeypatch: pytest.MonkeyPatch, script: list[str], resolves: bool
+) -> None:
+    """BACKLOG #3084, items 2 and 5. Both reads of alert state are bounded, and a pass whose read
+    failed or ran past the bound drops its clears: a missed clear, never a false one. The first
+    read fixes what counts as inherited; the later one is each pass's own, in
+    ``_without_inherited_clears``. The store is empty when the loop starts, so the trip and hold the
+    first pass opens are this process's own, and the control resolves both. Until a first read
+    succeeds the loop cannot tell inherited instances from its own, so what is open at the first
+    read that succeeds counts as inherited, including the trip and hold this process opened
+    meanwhile. One failed later read costs only its own pass's clears: the next pass that reads
+    resolves them (``one-later-read-fails``).
+
+    RED when a failed later read keeps the pass's clears (``later-read-fails``), or when either read
+    has no bound: a hung read then stalls the loop, and the pass count is never reached."""
+    # Short enough that four hung passes finish quickly, long enough that a real :memory: read on a
+    # loaded runner does not time out and turn the control red.
+    monkeypatch.setattr(app_module, "_RECONCILE_ALERT_READ_TIMEOUT", 0.25)
+    store = await MessageStore.open(":memory:")
+    try:
+        done = _script_reads(monkeypatch, store, script)
+        auth = _ScriptedAuth([_BOTH_CLEAR], {0: partial(_open_both_again, store)})
+        await _run_reconciler(auth, store, NotifierAlertSink([], store=store), passes=4)
+        assert done[: len(script)] == script, f"the scripted reads did not all run: {done}"
+        monkeypatch.undo()
+        assert await _open_alerts(store) == (set() if resolves else {ABORTED, HELD})
+    finally:
+        await store.close()
+
+
+async def test_a_reconciler_that_may_share_its_store_never_reads_alert_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reconciler that may share its store raises no clear, so the read that tells inherited
+    instances from its own has no use there. It must not run: each would cost a pass up to the read
+    bound before its revocations, and log an inherited-alert line about clears it never makes
+    (BACKLOG #3084)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        done = _script_reads(monkeypatch, store, ["fail"])
+        auth = _ScriptedAuth([_BOTH_CLEAR], {})
+        task = asyncio.create_task(
+            _directory_reconciler(
+                auth,  # type: ignore[arg-type]
+                0.001,
+                NotifierAlertSink([], store=store),
+                sole_reconciler=False,
+                alert_state=store,
+            )
+        )
+        try:
+            for _ in range(2000):
+                if auth.passes >= 3:
+                    break
+                await asyncio.sleep(0.005)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        assert auth.passes >= 3
+        assert done == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("left_open", [HELD, ABORTED], ids=["hold-inherited", "trip-inherited"])
+async def test_an_inherited_row_keeps_only_its_own_clear_from_resolving(
+    left_open: tuple[str, str],
+) -> None:
+    """BACKLOG #3084, item 5: the hold's clear against an inherited hold row alone. An earlier run
+    left one reconcile alert open, and this process opens the other. A pass the service marks clear
+    for both resolves this process's own row and leaves the inherited one for an operator.
+
+    RED when any inherited row drops every clear, so this process's own row stays open, or when an
+    inherited row is resolved."""
+    store = await MessageStore.open(":memory:")
+    try:
+        await _left_open_by_an_earlier_run(store, frozenset({left_open}))
+        auth = _ScriptedAuth([_BOTH_CLEAR], {0: partial(_open_both_again, store)})
+        await _run_reconciler(auth, store, NotifierAlertSink([], store=store), passes=4)
+        assert await _open_alerts(store) == {left_open}, "own row stayed open, or inherited closed"
+    finally:
+        await store.close()
+
+
+#: The logger the lifespan loop writes through (``_log`` in messagefoundry/api/app.py).
+_RECONCILER_LOGGER = "messagefoundry.api.app"
+
+#: Logged through :data:`_RECONCILER_LOGGER` after the passes, so a capture that sees nothing from
+#: that logger reads as empty rather than as a reconciler that said nothing.
+_CAPTURE_CONTROL = "capture control: the reconciler's logger reaches this capture"
+
+
+async def _reconciler_warnings(caplog: pytest.LogCaptureFixture, *, inherited: bool) -> list[str]:
+    """The WARNING-and-above messages :data:`_RECONCILER_LOGGER` logs over four passes of the
+    lifespan loop on a fresh store, with the earlier run's two alerts left open when ``inherited``,
+    then :data:`_CAPTURE_CONTROL`. Read before the store closes, so nothing it logs lands here."""
+    store = await MessageStore.open(":memory:")
+    try:
+        if inherited:
+            await _left_open_by_an_earlier_run(store)
+        auth = _ScriptedAuth([_BOTH_CLEAR], {})
+        with caplog.at_level(logging.WARNING, logger=_RECONCILER_LOGGER):
+            caplog.clear()
+            await _run_reconciler(auth, store, NotifierAlertSink([], store=store), passes=4)
+            logging.getLogger(_RECONCILER_LOGGER).warning(_CAPTURE_CONTROL)
+            return [
+                r.getMessage()
+                for r in caplog.records
+                if r.name == _RECONCILER_LOGGER and r.levelno >= logging.WARNING
+            ]
+    finally:
+        await store.close()
+
+
+async def test_a_restart_over_open_reconcile_alerts_says_once_that_it_will_not_resolve_them(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #3084, item 1. A restarted engine drops every clear of an instance an earlier run
+    left open. It says so once, at the read that fixes the inherited set, naming each alert by its
+    event type and source, and not again on each pass that drops the clear. The control: an engine
+    that starts over no open alert says nothing at WARNING or above, read from a capture shown to
+    hold the line the test logs through the reconciler's logger, so an empty capture cannot pass."""
+    restarted = await _reconciler_warnings(caplog, inherited=True)
+    lines = [m for m in restarted if "already open" in m]
+    assert len(lines) == 1, lines
+    assert "ad_reconcile_aborted (directory-reconciler)" in lines[0]
+    assert "ad_reconcile_held (directory-reconciler)" in lines[0]
+    assert "will not resolve those alerts itself" in lines[0]
+
+    fresh = await _reconciler_warnings(caplog, inherited=False)
+    assert len(fresh) >= 1, "the capture saw nothing, so its silence proves nothing"
+    said = [m for m in fresh if m != _CAPTURE_CONTROL]
+    assert said == []
+
+
+async def test_a_pass_that_revokes_every_account_is_no_evidence_for_a_clear(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clear rests on an answer for every signed-in account the pass did not just revoke, and it
+    needs at least one such account (``bool(ids)`` in ``_mark_reconcile_clears``; BACKLOG #3084,
+    item 5). Both accounts read undetermined and are held. Both then read with the disabled bit
+    set, and with one strike to revoke, that pass revokes both. Their answers are readable, so no
+    revocation forfeits the hold, but nobody is left signed in for the pass to have read. The hold
+    stays open for an operator, or for a later pass that reads a signed-in account.
+
+    RED when an empty set of remaining accounts counts as covered: every test over it then passes
+    vacuously, and the hold resolves on a pass that left nobody signed in."""
+    names = ["u1", "u2"]
+    async with _signed_in_estate(monkeypatch, names, ad_session_recheck_strikes=1) as estate:
+        directory, service, store, _tokens = estate
+        sink = NotifierAlertSink([], store=store)
+        directory.uac.update(dict.fromkeys(names, ABSENT))
+        assert (await _alerted_pass(service, sink)).hold
+        assert await _open_alerts(store) == {HELD}
+        directory.uac.update(dict.fromkeys(names, DISABLED))
+        every = await _alerted_pass(service, sink)
+        assert every.aborted is None and len(every.revocations) == 2 and every.readable == 2
+        assert not every.hold_clear, "the hold resolved on a pass that left nobody signed in"
+        assert HELD in await _open_alerts(store)

@@ -39,6 +39,16 @@ point already resolves to it. The tray needs no elevation to run (service contro
 elevation per-action — see below). It is Windows-only at runtime; on any other OS `main()` prints a
 friendly note and exits.
 
+**A tray started from Explorer or a Start-menu shortcut may exit at once, with no message**, if
+your environment sets `PYTHONFAULTHANDLER` or `PYTHONDEVMODE`, at least. All three starts above run
+`pythonw.exe` without `-E`, and a start with no stderr then stops before any tray code runs. To
+get past it, start the tray once from a terminal with those variables cleared, for example
+`$env:PYTHONFAULTHANDLER = $null; $env:PYTHONDEVMODE = $null; messagefoundry-tray`, and turn on
+**Start at Login**, whose command carries `-E`. A start from Explorer or the Start menu keeps
+failing while the variables stay in your user environment, and so does every start where Start at
+Login is refused for its length; remove the variables there to fix those starts.
+`docs/DANGEROUS-FUNCTIONALITY.md` section 3 gives the measurement and what it did not cover.
+
 To **start it automatically at login**, use the tray's **Start at Login** menu item (opt-in, off by
 default). It writes an `HKCU\…\Run` entry pinning the absolute `pythonw.exe` you launched with, so it
 keeps resolving after a reboot. The entry carries the interpreter options the engine's own Python
@@ -324,6 +334,6 @@ installed `MessageFoundry` service and are verified by hand:
 - [ ] Launching a second instance shows "already running" and exits; the first keeps its icon.
 - [ ] **Start at Login** toggles the `HKCU\…\Run` value; survives a reboot.
 - [ ] Open Monitor Console is disabled (with a hint) when `serve_ui = false`; enabled when true.
-- [ ] A dev `python -m messagefoundry serve` on the port with the service stopped → `RUNNING_UNMANAGED`.
+- [ ] A dev `python -P -X disable-remote-debug -m messagefoundry serve` on the port with the service stopped → `RUNNING_UNMANAGED`.
 - [ ] **Exit** removes the icon and leaves the engine service running.
 - [ ] Log-off / shutdown removes the icon cleanly (no ghost after re-login).

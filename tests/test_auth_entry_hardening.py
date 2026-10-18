@@ -311,6 +311,118 @@ def test_limiter_retry_after_hides_other_keys_when_the_global_budget_is_full(
     assert limiter.retry_after("c") == 60.0  # not the 29 s until a's hit ages out
 
 
+def test_limiter_drops_aged_buckets_of_keys_that_never_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #2714: a bucket used to go only inside a later call for the same key, so a table
+    # keyed on a peer address grew with every address ever seen. Now any call drops aged buckets,
+    # whoever calls.
+    clock = [1000.0]
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    limiter = SlidingWindowRateLimiter(per_key=1, glob=0, window_seconds=60.0)
+    for n in range(1000):
+        assert limiter.allow(f"peer-{n}")
+    assert len(limiter._hits) == 1000
+    # Inside the window nothing has aged out, and a refused key keeps the bucket retry_after reads.
+    clock[0] = 1030.0
+    assert not limiter.allow("peer-0")
+    assert limiter.retry_after("peer-0") == 30.0
+    assert len(limiter._hits) == 1000
+    # Four windows later the thousand that never returned drain, two per call, so no one call
+    # pays for the whole table.
+    clock[0] = 1240.0
+    assert limiter.allow("new")
+    assert len(limiter._hits) == 999  # two dropped, one added
+    for _ in range(499):
+        assert not limiter.would_allow("new")  # per_key=1: refused, and records nothing
+    assert set(limiter._hits) == {"new"}
+    # A bucket whose newest hit is still live survives; would_allow records nothing.
+    clock[0] = 1290.0
+    assert limiter.allow("late")
+    clock[0] = 1300.5
+    assert not limiter.would_allow("late")
+    assert set(limiter._hits) == {"late"}
+    assert list(limiter._hits["late"]) == [1290.0]
+
+
+def test_limiter_orders_buckets_by_newest_hit_so_eviction_stops_at_the_first_live_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The table is ordered by each key's newest hit, so a call drops aged buckets from the front
+    # and never scans the rest. A key that returns moves to the back, past an older key.
+    clock = [1000.0]
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    limiter = SlidingWindowRateLimiter(per_key=2, glob=0, window_seconds=60.0)
+    assert limiter.allow("a")
+    clock[0] = 1010.0
+    assert limiter.allow("b")
+    clock[0] = 1020.0
+    assert limiter.allow("a")  # "a" now has the newer hit
+    assert list(limiter._hits) == ["b", "a"]
+    clock[0] = 1071.0
+    assert limiter.allow("c")  # drops "b" (1010), keeps "a" (1020) though its first hit is older
+    assert list(limiter._hits) == ["a", "c"]
+    assert list(limiter._hits["a"]) == [1000.0, 1020.0]  # its own hits prune on its own call
+    clock[0] = 1081.0
+    assert limiter.would_allow("z")  # evicts "a" (1020), and records nothing for "z"
+    assert list(limiter._hits) == ["c"]
+
+
+def test_limiter_table_stays_bounded_under_a_stream_of_new_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A peer-keyed table under a steady stream of addresses never seen again: one new key a second,
+    # for ten windows. The table never grows past the 60 keys live at one time, the new one included.
+    clock = [1000.0]
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    limiter = SlidingWindowRateLimiter(per_key=5, glob=0, window_seconds=60.0)
+    for n in range(600):
+        clock[0] = 1000.0 + n
+        assert limiter.allow(f"peer-{n}")
+        assert len(limiter._hits) == min(n + 1, 60)
+    # A limiter with no per-key gate (the intake global window) keeps no buckets at all.
+    global_only = SlidingWindowRateLimiter(per_key=0, glob=1000, window_seconds=60.0)
+    for n in range(100):
+        assert global_only.allow(f"peer-{n}")
+    assert not global_only._hits
+    # A gap with no count still keeps buckets, or the gap would never fire.
+    gap_only = SlidingWindowRateLimiter(
+        per_key=0, glob=0, window_seconds=60.0, min_interval_seconds=1.0
+    )
+    assert gap_only.allow("a")
+    assert not gap_only.allow("a")
+    clock[0] += 1.0
+    assert gap_only.allow("a")
+
+
+def test_limiter_with_no_global_gate_keeps_no_global_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #2714 follow-up. With the global gate off, nothing reads the global window, so an
+    # admitted call must not add to it; it used to hold every call of the last window.
+    # RED when: a call admitted with ``glob=0`` lands in ``_global_hits``.
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: 1000.0)
+    )
+    per_key_only = SlidingWindowRateLimiter(per_key=5, glob=0, window_seconds=60.0)
+    for n in range(500):
+        assert per_key_only.allow(f"peer-{n}")
+    assert not per_key_only._global_hits
+    # The control: with the gate on, the window still counts and still refuses.
+    global_on = SlidingWindowRateLimiter(per_key=0, glob=3, window_seconds=60.0)
+    for n in range(3):
+        assert global_on.allow(f"peer-{n}")
+    assert len(global_on._global_hits) == 3
+    assert not global_on.allow("peer-x")
+    assert global_on.retry_after("peer-x") == 60.0
+
+
 async def test_admin_write_retry_after_is_whole_seconds_rounded_up_and_at_least_one(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:

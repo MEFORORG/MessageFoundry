@@ -22,7 +22,7 @@
 #
 # A SCHEDULED RED REPORTS THROUGH nightly-notice.yml, which watches this workflow by its `name:`
 # below and opens one issue per watched workflow. A manual run's red shows only in the Actions tab.
-# It acts only on a run that concluded `failure`, and a
+# For this workflow it acts only on a run that concluded `failure`, and a
 # job-level timeout concludes `cancelled`, which it ignores. So the run step carries its OWN
 # `timeout-minutes`, under the job's: a step killed by its own timeout concludes `failure` (see
 # scripts/ci/step_margin.py), and a hung nightly still opens an issue.
@@ -65,7 +65,7 @@ jobs:
         with:
           python-version: "3.14"
       - name: Set up uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
       - name: Install the engine and the test toolchain
         run: |
           set -euo pipefail
