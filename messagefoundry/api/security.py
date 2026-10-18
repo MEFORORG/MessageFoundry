@@ -1158,7 +1158,7 @@ async def refuse_from_new_address(request: Request) -> None:
     them the step-up gates' refusal: 403 + ``X-Step-Up-Required: 1``, cleared by a
     ``POST /me/reauth`` from the new address, which re-anchors the session. An ``oidc`` session is
     sent to the IdP step-up instead (:func:`_step_up_refusal`). A first sighting writes
-    ``auth.admin_action_new_ip`` and a notice, deduped and capped per session as
+    ``auth.new_address_reverify_required`` and a notice, deduped and capped per session as
     :meth:`AuthService.flag_new_client_ip` says.
 
     It is NOT in :func:`require`, deliberately: the base gate carries the monitoring polls, and an

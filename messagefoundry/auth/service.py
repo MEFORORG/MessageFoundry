@@ -69,7 +69,6 @@ from messagefoundry.auth.notifications import (
     ACCOUNT_CREATED,
     ACCOUNT_DISABLED,
     ACCOUNT_LOCKED,
-    ADMIN_NEW_IP,
     DIRECTORY_SESSIONS_ENDED,
     EMAIL_CHANGED,
     FEDERATED_IDENTITY_BOUND,
@@ -81,6 +80,7 @@ from messagefoundry.auth.notifications import (
     MFA_CREDENTIAL_REMOVED,
     MFA_DISABLED,
     MFA_ENABLED,
+    NEW_ADDRESS_REVERIFY,
     NOTIFY_EMAIL_SET,
     PASSWORD_CHANGED,
     PASSWORD_RESET,
@@ -10970,12 +10970,14 @@ class AuthService:
         """Admin-interface contextual-risk signal (ASVS 8.4.2, WP-L3-13): return ``True`` when this
         sensitive request arrives from a client address that differs from the one the caller's session
         last verified from. On the **first** observation of a given (session, address) since the
-        session's last re-verification it emits an ``auth.admin_action_new_ip`` audit event + a
-        best-effort out-of-band notice; **repeat** hits from an address already flagged in that
+        session's last re-verification it emits an ``auth.new_address_reverify_required`` audit
+        event + a best-effort out-of-band notice; **repeat** hits from an address already flagged in that
         epoch still return ``True`` (so the step-up stays forced) but only log to the rotating ops
         log — so a token replayed in a tight loop, from one address or alternating between several,
         cannot inflate the audit table / notification channel (mirrors the ``_rate_limited``
-        precedent). One epoch audits at most ``_NEW_IP_PER_SESSION_MAX`` addresses, plus one row
+        precedent). Why those WARNING lines are not throttled is in docs/SECURITY.md,
+        "Administrative-interface defense-in-depth". One epoch audits at most
+        ``_NEW_IP_PER_SESSION_MAX`` addresses, plus one row
         carrying ``cap_reached`` for the first address past that, because this runs on every
         sensitive request (BACKLOG #2159). The step-up
         dependencies treat ``True`` as "force a fresh step-up"; a successful re-verify (``POST
@@ -11015,17 +11017,17 @@ class AuthService:
         flag = self._first_new_ip_flag(token_hash, seen_key)
         if flag == "repeat":
             _log.warning(
-                "admin action from a new client IP already flagged since the session's last "
-                "re-verification (audit suppressed): path=%s",
+                "a request from a new client address must re-verify; the address was already "
+                "flagged since the session's last re-verification (audit suppressed): path=%s",
                 path,
             )
             return True
         if flag == "over_cap":
-            # Past the cap no row is written, so this line is the only record of where the token
-            # is being used from. The address is attacker-supplied text on a proxied hop.
+            # Past the cap no new-address row is written, so this line carries the address. The
+            # address is attacker-supplied text on a proxied hop.
             _log.warning(
-                "admin action from a new client IP past the per-session cap of %d (audit "
-                "suppressed): path=%s seen_ip=%s",
+                "a request from a new client address must re-verify; the address is past the "
+                "per-session cap of %d (audit suppressed): path=%s seen_ip=%s",
                 _NEW_IP_PER_SESSION_MAX,
                 path,
                 scrub_log_argument(client_ip),
@@ -11047,7 +11049,10 @@ class AuthService:
             # The client column too (vault BACKLOG #3197), so a search or export by address finds
             # this row. `seen_ip` stays in the detail beside `known_ip`, which it is compared with.
             await self._audit(
-                "auth.admin_action_new_ip", actor=username, detail=_json(detail), client=client_ip
+                "auth.new_address_reverify_required",
+                actor=username,
+                detail=_json(detail),
+                client=client_ip,
             )
             written = True
         finally:
@@ -11062,7 +11067,7 @@ class AuthService:
         if flag == "audit_cap_reached":
             notice["cap_reached"] = _NEW_IP_PER_SESSION_MAX
         await self._notify_security(
-            ADMIN_NEW_IP,
+            NEW_ADDRESS_REVERIFY,
             username=username,
             email=user.notify_email if user is not None else None,
             client=client_ip,
