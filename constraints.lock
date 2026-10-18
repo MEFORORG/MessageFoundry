@@ -247,7 +247,7 @@ six==1.17.0
     # via python-dateutil
 sspilib==0.6.0 ; sys_platform == 'win32'
     # via pyspnego
-starlette==1.7.0
+starlette==1.8.0
     # via
     #   fastapi
     #   messagefoundry
