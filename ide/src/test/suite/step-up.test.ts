@@ -230,7 +230,7 @@ suite("stepUp — withStepUp re-proves once and retries once (vault BACKLOG #262
           new HttpError(
             403,
             "the directory could not confirm this account; try again later, and if it is still refused," +
-              " sign out and sign in again, or ask an administrator",
+              " ask an administrator",
           ),
         ),
       storeToken: () => Promise.resolve(),

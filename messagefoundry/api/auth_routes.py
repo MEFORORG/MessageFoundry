@@ -139,6 +139,7 @@ from messagefoundry.auth.service import (
     DirectoryAccountNotFound,
     DirectoryAccountRefused,
     DirectoryObjectIdMissing,
+    DirectoryRefusal,
     FactorEnrolmentRequired,
     FederatedBindingChanged,
     FederatedSubjectHeld,
@@ -159,16 +160,29 @@ _VALID_ROLE_IDS = {role.value for role in Role}
 
 _log = logging.getLogger(__name__)
 
-#: What ``/auth/mfa-verify`` and ``/me/reauth`` say when ``Elevation.directory_unconfirmed`` is set
-#: (BACKLOG #2023, #2027): the directory could not vouch for the account, so the proof was never
-#: checked. It names no directory internals; the precise reason is on the audit row. One text covers
-#: every cause, so it names both fixes (BACKLOG #3082). docs/SECURITY.md says which fix clears which
-#: cause. The console's ``_DIRECTORY_UNCONFIRMED_ERROR`` names the same fixes, and a console test
-#: holds the two in step.
+#: What ``/auth/mfa-verify`` and ``/me/reauth`` say when a directory refused the account, so the
+#: proof was never checked (BACKLOG #2023, #2027). One text per fix, chosen by
+#: ``Elevation.directory_refusal`` (BACKLOG #3082): an account the directory did not confirm, an
+#: outage included, is told to try later or ask an administrator, never to sign out, since a new
+#: sign-in fails the same way and the working session would be lost. A lost role is told to sign in
+#: again, which takes the roles the groups grant now. Neither names a group, a role or a directory
+#: detail; the precise reason is on the audit row. The console's ``_DIRECTORY_UNCONFIRMED_ERROR``
+#: and ``_DIRECTORY_DEMOTED_ERROR`` name the same fixes, and a console test holds them in step.
 _DIRECTORY_UNCONFIRMED_DETAIL = (
     "the directory could not confirm this account; try again later, and if it is still refused,"
-    " sign out and sign in again, or ask an administrator"
+    " ask an administrator"
 )
+_DIRECTORY_DEMOTED_DETAIL = (
+    "this account's access changed in the directory since this session signed in;"
+    " sign out and sign in again"
+)
+
+
+def _directory_refusal_detail(refusal: DirectoryRefusal) -> str:
+    """The 403 text for a directory refusal, by the fix that clears it (BACKLOG #3082)."""
+    if refusal is DirectoryRefusal.DEMOTED:
+        return _DIRECTORY_DEMOTED_DETAIL
+    return _DIRECTORY_UNCONFIRMED_DETAIL
 
 
 def _alert_administrator_granted(app: FastAPI, key: str, *, via: str, granted_by: str) -> None:
@@ -772,11 +786,14 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                     " there through the web console at /ui/reauth, not with a password",
                     headers={"X-Step-Up-Via": "idp"},
                 )
-            if elevation.directory_unconfirmed:
+            if elevation.directory_refusal is not None:
                 # BACKLOG #2027: the directory could not judge the password, so "failed" would
                 # call a password wrong that was never checked. Same words as /auth/mfa-verify's
                 # directory refusal; the precise reason is on the audit row only.
-                raise HTTPException(status.HTTP_403_FORBIDDEN, _DIRECTORY_UNCONFIRMED_DETAIL)
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN,
+                    _directory_refusal_detail(elevation.directory_refusal),
+                )
             raise HTTPException(status.HTTP_403_FORBIDDEN, "re-verification failed")
         return ElevatedResponse(detail="re-verified", token=elevation.token)
 
@@ -820,10 +837,13 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                     " step up there through the web console at /ui/reauth",
                     headers={"X-Step-Up-Via": "idp"},
                 )
-            if elevation.directory_unconfirmed:
+            if elevation.directory_refusal is not None:
                 # BACKLOG #2023: the code was never checked, and the token still authenticates, so a
                 # 403 rather than the 401 that would send the client back to sign-in.
-                raise HTTPException(status.HTTP_403_FORBIDDEN, _DIRECTORY_UNCONFIRMED_DETAIL)
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN,
+                    _directory_refusal_detail(elevation.directory_refusal),
+                )
             # A correct code on a session revoked mid-ceremony is already a 401 here, so unlike
             # /me/reauth there is no status to split — only the message differs.
             detail = "session ended; sign in again" if elevation.session_lost else "invalid code"

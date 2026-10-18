@@ -444,12 +444,20 @@ from typing import Any
 #: ignores that return value, so no call breaks in either skew direction. The value below was
 #: re-derived with ``--write`` on the merged tree, so it covers both.
 #:
+#: BACKLOG #3082: ``Elevation.directory_unconfirmed`` became a property derived from the new
+#: ``directory_refusal`` field, a ``DirectoryRefusal``, so the console can tell a lost role, which a
+#: new sign-in clears, from an outage, which it does not, and show each its own fix. The console
+#: imports ``DirectoryRefusal`` and builds no ``Elevation`` with the old keyword. The digest moved
+#: from ``344979df3bd2c662`` because the imported surface and a field changed. An older console on
+#: this engine is refused at mount; a newer console on an older engine fails earlier, at import,
+#: since ``DirectoryRefusal`` does not exist there.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "344979df3bd2c662"
+ENGINE_UI_SEAM: str = "36f98b50d3d628f2"
 
 
 @dataclass(frozen=True, slots=True)

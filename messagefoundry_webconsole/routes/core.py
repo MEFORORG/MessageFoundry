@@ -44,6 +44,7 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_MESSAGE_EDIT_RESEND,
     STEP_UP_ACTION_MESSAGE_RESEND,
     AuthService,
+    DirectoryRefusal,
     Elevation,
     MfaStatus,
 )
@@ -111,24 +112,36 @@ _CSP_REPORT_SUMMARY_MAX = 5
 #: What the MFA gate and the re-auth form say when ``verify_mfa``, ``reauth`` or
 #: ``finish_webauthn_assertion`` refused a directory account the directory did not confirm (BACKLOG
 #: #2023, #2027, #2239). The code, password or passkey was never checked, so "invalid code",
-#: "incorrect password" or "passkey verification failed" would be false. It names both fixes, a
-#: later try and a new sign-in, as the API's ``_DIRECTORY_UNCONFIRMED_DETAIL`` does (BACKLOG #3082).
+#: "incorrect password" or "passkey verification failed" would be false. One text per fix, as the
+#: API's ``_DIRECTORY_UNCONFIRMED_DETAIL`` and ``_DIRECTORY_DEMOTED_DETAIL`` (BACKLOG #3082): an
+#: account the directory did not confirm, an outage included, is never told to sign out, since a
+#: new sign-in fails the same way and the working session would be lost. A lost role is told to
+#: sign in again. Neither names a group, a role or a directory detail.
 _DIRECTORY_UNCONFIRMED_ERROR = (
     "The directory could not confirm your account. Try again later. If it is still refused,"
-    " sign out and sign in again, or ask an administrator."
+    " ask an administrator."
+)
+_DIRECTORY_DEMOTED_ERROR = (
+    "Your access changed in the directory since you signed in. Sign out, then sign in again."
 )
 
 
-def _directory_unconfirmed(elevation: Elevation) -> bool:
-    """``Elevation.directory_unconfirmed``, read so an engine that predates the field degrades.
+def _directory_refusal_error(elevation: Elevation) -> str | None:
+    """The text for ``Elevation.directory_refusal``, or ``None`` when no directory refused.
 
-    The console ships as a separately versioned wheel. When this was written the seam digest
-    recorded ``verify_mfa``'s signature but not ``Elevation``'s fields, so an older engine would
-    pass the handshake and then raise ``AttributeError`` here. The digest records those fields since
-    BACKLOG #2015, so such an engine now ships a different seam; the fallback stays as a second
-    guard. The ``allow_reauth_attempt`` precedent in ``_auth.py`` is the same.
+    Read with ``getattr`` so an engine that predates the field degrades. The console ships as a
+    separately versioned wheel. When the first such field was added the seam digest recorded
+    ``verify_mfa``'s signature but not ``Elevation``'s fields, so an older engine would pass the
+    handshake and then raise ``AttributeError`` here. The digest records those fields since BACKLOG
+    #2015, so such an engine now ships a different seam; the fallback stays as a second guard. The
+    ``allow_reauth_attempt`` precedent in ``_auth.py`` is the same.
     """
-    return bool(getattr(elevation, "directory_unconfirmed", False))
+    refusal = getattr(elevation, "directory_refusal", None)
+    if refusal is None:
+        return None
+    if refusal is DirectoryRefusal.DEMOTED:
+        return _DIRECTORY_DEMOTED_ERROR
+    return _DIRECTORY_UNCONFIRMED_ERROR
 
 
 def _enrol_before_step_up(mfa: MfaStatus, *, satisfied: bool, step_up: bool) -> bool:
@@ -1723,9 +1736,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             pages.mfa_gate(
                 totp_enrolled=mfa.enabled,
                 error=(
-                    _DIRECTORY_UNCONFIRMED_ERROR
-                    if _directory_unconfirmed(elevation)
-                    else "That code wasn't accepted. Try again."
+                    _directory_refusal_error(elevation) or "That code wasn't accepted. Try again."
                 ),
                 webauthn_options=wa_options,
                 webauthn_notice=wa_notice,
@@ -1902,9 +1913,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                         error=(
                             "Account locked. Try again later."
                             if code_elevation.locked
-                            else _DIRECTORY_UNCONFIRMED_ERROR
-                            if _directory_unconfirmed(code_elevation)
-                            else "Invalid code."
+                            else _directory_refusal_error(code_elevation) or "Invalid code."
                         ),
                     )
                 )
@@ -1954,11 +1963,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                         mfa_needed=mfa_enrolled and still_unsatisfied,
                         webauthn_options=wa_options,
                         webauthn_notice=wa_notice,
-                        error=(
-                            _DIRECTORY_UNCONFIRMED_ERROR
-                            if _directory_unconfirmed(pw_elevation)
-                            else "Incorrect password."
-                        ),
+                        error=_directory_refusal_error(pw_elevation) or "Incorrect password.",
                     )
                 ),
                 token,
@@ -2042,11 +2047,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if elevation.token is None:
             # BACKLOG #2239: the directory could not vouch for a directory account, so the
             # assertion was never checked and "verification failed" would be false.
-            error = (
-                _DIRECTORY_UNCONFIRMED_ERROR
-                if _directory_unconfirmed(elevation)
-                else "passkey verification failed"
-            )
+            error = _directory_refusal_error(elevation) or "passkey verification failed"
             return JSONResponse({"ok": False, "error": error}, status_code=400)
         # The assertion re-keyed the session (ASVS 7.2.4). The new cookie rides this JSON response,
         # because the page's next request is the POST /ui/reauth password leg — it would otherwise

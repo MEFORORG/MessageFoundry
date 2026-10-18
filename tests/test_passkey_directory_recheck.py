@@ -37,6 +37,7 @@ from messagefoundry.auth.service import (  # noqa: E402
     DIRECTORY_ROLES_DEMOTED,
     DIRECTORY_UNCONFIRMED,
     AuthService,
+    DirectoryRefusal,
     Elevation,
 )
 from messagefoundry.auth.tokens import hash_token  # noqa: E402
@@ -170,7 +171,11 @@ async def _assert_refused_and_uncharged(p: _Pending, outcome: str, sign_count: i
         p.token, p.response, rp_id=_RP, origin=_ORIGIN
     )
     assert refused.ok is False
-    assert refused.directory_unconfirmed is True
+    assert refused.directory_refusal is (
+        DirectoryRefusal.DEMOTED
+        if outcome == DIRECTORY_ROLES_DEMOTED
+        else DirectoryRefusal.UNCONFIRMED
+    )
     assert refused.session_lost is False
     session = await p.store.get_session(hash_token(p.token))
     assert session is not None and session.revoked_at is None  # the token still authenticates

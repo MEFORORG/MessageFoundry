@@ -750,6 +750,29 @@ EMPTY_PASSWORD = "empty_password"  # nosec B105 -- an audit reason slug, not a c
 #: step-up leg refuses with it too, as its own closed-set reason (BACKLOG #2154).
 DIRECTORY_ROLES_DEMOTED = "directory_roles_demoted"
 
+
+class DirectoryRefusal(Enum):
+    """Why a step-up leg refused a directory account it never checked the proof of, carried on
+    ``Elevation.directory_refusal`` so a caller can name the fix that clears it (BACKLOG #3082).
+
+    ``UNCONFIRMED``: the directory did not confirm the account is present and enabled, or could not
+    be asked. A later try, or an administrator, clears it; a new sign-in would fail the same way.
+    ``DEMOTED``: the account is present and enabled, but a role it holds is no longer among those
+    its directory groups grant (BACKLOG #2240). A new sign-in clears it, because it takes the roles
+    the groups grant now. The precise cause stays on the audit row; a caller says only which fix."""
+
+    UNCONFIRMED = DIRECTORY_UNCONFIRMED
+    DEMOTED = DIRECTORY_ROLES_DEMOTED
+
+
+def _directory_refusal(outcome: str) -> DirectoryRefusal:
+    """The fix a ``_directory_step_up_refusal`` outcome needs: a lost role is a demotion, and every
+    other outcome, an outage included, is an account the directory did not confirm."""
+    if outcome == DIRECTORY_ROLES_DEMOTED:
+        return DirectoryRefusal.DEMOTED
+    return DirectoryRefusal.UNCONFIRMED
+
+
 #: The closed-set reasons the federated step-up leg refuses with (BACKLOG #296), on the
 #: ``auth.reauth`` audit row and on :class:`OidcStepUp`. A claims-ladder slug can also appear there.
 STEP_UP_NOT_FRESH = "step_up_not_fresh"
@@ -947,15 +970,23 @@ class Elevation:
     #: answers as ``verify_mfa`` (BACKLOG #2239). In every case the proof was never checked and
     #: nothing was charged. It qualifies the wrong-proof state: the token still authenticates, and
     #: the caller must say the directory could not confirm the account rather than call the code,
-    #: the password or the passkey wrong. The cause goes to the audit row (``reason`` on
-    #: ``auth.reauth``, ``outcome`` on ``auth.mfa_failed`` or ``auth.webauthn_failed``) and never
-    #: to the caller.
-    directory_unconfirmed: bool = False
+    #: the password or the passkey wrong. The precise cause goes to the audit row (``reason`` on
+    #: ``auth.reauth``, ``outcome`` on ``auth.mfa_failed`` or ``auth.webauthn_failed``). The caller
+    #: gets only which fix clears it: :attr:`DirectoryRefusal.DEMOTED` for a lost role, which a new
+    #: sign-in clears, and :attr:`DirectoryRefusal.UNCONFIRMED` for every other cause, which a new
+    #: sign-in does not (BACKLOG #3082). ``None`` when no directory refused.
+    directory_refusal: DirectoryRefusal | None = None
 
     @property
     def ok(self) -> bool:
         """Elevated: a new session token was minted. See the class docstring for the three states."""
         return self.token is not None
+
+    @property
+    def directory_unconfirmed(self) -> bool:
+        """A directory refused the account and the proof was never checked, for either cause.
+        Derived from :attr:`directory_refusal`, so the two cannot disagree."""
+        return self.directory_refusal is not None
 
 
 @dataclass(frozen=True)
@@ -9677,7 +9708,7 @@ class AuthService:
         ok = proof.ok
         elevation = Elevation(
             session_lost=proof.session_revoked or proof.session_gone,
-            directory_unconfirmed=proof.directory_unconfirmed,
+            directory_refusal=DirectoryRefusal.UNCONFIRMED if proof.directory_unconfirmed else None,
         )
         grant_refused = False
         if ok:
@@ -10908,7 +10939,7 @@ class AuthService:
                     detail=_json({"reason": DIRECTORY_UNCONFIRMED, "outcome": refusal}),
                     client=client,
                 )
-                return Elevation(directory_unconfirmed=True)
+                return Elevation(directory_refusal=_directory_refusal(refusal))
         async with self._account_credential_lock(user.username):
             # Read the session, the account and its lock again. For a directory account the lookup
             # above was a network round trip, and for any account the queue may have been a wait, so
@@ -11782,7 +11813,7 @@ class AuthService:
                     detail=_json({"reason": DIRECTORY_UNCONFIRMED, "outcome": refusal}),
                     client=client,
                 )
-                return Elevation(directory_unconfirmed=True)
+                return Elevation(directory_refusal=_directory_refusal(refusal))
             # The lookup was a network round trip, so read the session, the account and its lock
             # again, as verify_mfa does. A revocation, a disable or a second-step lock that landed
             # meanwhile must stop this assertion before it marks the factor or clears the counters.

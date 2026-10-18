@@ -35,7 +35,7 @@ from messagefoundry.auth.ldap import (
     LdapError,
     LdapReferralError,
 )
-from messagefoundry.auth.service import DIRECTORY_UNCONFIRMED, AuthService
+from messagefoundry.auth.service import DIRECTORY_UNCONFIRMED, AuthService, DirectoryRefusal
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
@@ -170,7 +170,7 @@ async def test_a_directory_the_account_is_not_confirmed_in_refuses_the_renewal(
     refused = await e.service.verify_mfa(e.token, code)
 
     assert refused.ok is False
-    assert refused.directory_unconfirmed is True
+    assert refused.directory_refusal is DirectoryRefusal.UNCONFIRMED
     assert refused.session_lost is False
     assert e.directory.probes == [("jdoe", _PRINCIPAL.directory_object_id)]  # by the immutable id
     session = await store.get_session(hash_token(e.token))
@@ -384,7 +384,7 @@ async def test_a_directory_account_demoted_since_sign_in_is_refused_the_renewal(
 
     refused = await e.service.verify_mfa(e.token, code)
 
-    assert refused.ok is False and refused.directory_unconfirmed is True
+    assert refused.ok is False and refused.directory_refusal is DirectoryRefusal.DEMOTED
     assert refused.session_lost is False
     session = await store.get_session(hash_token(e.token))
     assert session is not None and session.revoked_at is None
@@ -615,20 +615,26 @@ async def test_a_local_account_is_never_probed(store: MessageStore) -> None:
 
 
 @pytest.mark.parametrize(
-    ("cause", "outcome"),
+    ("cause", "outcome", "refusal"),
     [
-        ("disabled", "disabled"),
-        ("outage", "unavailable"),
-        ("demotion", "directory_roles_demoted"),
+        ("disabled", "disabled", DirectoryRefusal.UNCONFIRMED),
+        ("outage", "unavailable", DirectoryRefusal.UNCONFIRMED),
+        ("demotion", "directory_roles_demoted", DirectoryRefusal.DEMOTED),
     ],
 )
-async def test_the_route_says_the_directory_could_not_confirm_the_account(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cause: str, outcome: str
+async def test_the_route_says_which_fix_clears_the_directory_refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cause: str,
+    outcome: str,
+    refusal: DirectoryRefusal,
 ) -> None:
-    """The API answers 403, not the wrong-code 401, and names the directory as the reason. RED when
-    the text names only a later try, which does not clear a demotion the way docs/SECURITY.md
-    (BACKLOG #2240, #3082) says a new sign-in does. One text covers every cause, so an outage gets
-    both fixes too. It names no group and no role."""
+    """The API answers 403, not the wrong-code 401, with the text for the fix that clears the cause
+    (BACKLOG #3082; docs/SECURITY.md states which). A demotion is told to sign in again, which takes
+    the roles the groups grant now. A disabled account or an outage is told to try later or ask an
+    administrator, and never to sign out: a new sign-in fails the same way, and the working session
+    would be gone. RED when the outage text tells the operator to sign out, or the demotion text
+    only to wait. Neither names a group or a role."""
     engine = await Engine.create(
         tmp_path / "mfa_directory.db",
         poll_interval=0.02,
@@ -653,9 +659,23 @@ async def test_the_route_says_the_directory_could_not_confirm_the_account(
             )
         assert r.status_code == 403
         detail = r.json()["detail"]
-        assert "directory could not confirm this account" in detail
-        assert "try again later" in detail and "sign in again" in detail
-        for internal in ("MF-Operators", "MF-Viewers", "operator", "viewer", "demoted", "group"):
+        if refusal is DirectoryRefusal.DEMOTED:
+            assert "access changed in the directory" in detail
+            assert "sign out and sign in again" in detail
+            assert "try again later" not in detail
+        else:
+            assert "directory could not confirm this account" in detail
+            assert "try again later" in detail and "ask an administrator" in detail
+            assert "sign out" not in detail and "sign in" not in detail
+        for internal in (
+            "MF-Operators",
+            "MF-Viewers",
+            "operator",
+            "viewer",
+            "demoted",
+            "group",
+            "role",
+        ):
             assert internal not in detail
         # The cause the test set is the one the engine met: the precise reason is on the audit row.
         audited = [row["outcome"] for row in await _audited_mfa_failures(engine.store)]

@@ -21,15 +21,18 @@ import pytest
 from _ui_clients import SAME_ORIGIN, create_local_user_chosen, held_totp_code
 
 from messagefoundry.api import create_app
-from messagefoundry.api.auth_routes import _DIRECTORY_UNCONFIRMED_DETAIL
+from messagefoundry.api.auth_routes import _DIRECTORY_DEMOTED_DETAIL, _DIRECTORY_UNCONFIRMED_DETAIL
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.passwords import hash_password
-from messagefoundry.auth.service import AuthService, Elevation
+from messagefoundry.auth.service import AuthService, DirectoryRefusal, Elevation
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
-from messagefoundry_webconsole.routes.core import _DIRECTORY_UNCONFIRMED_ERROR
+from messagefoundry_webconsole.routes.core import (
+    _DIRECTORY_DEMOTED_ERROR,
+    _DIRECTORY_UNCONFIRMED_ERROR,
+)
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 
@@ -1303,76 +1306,108 @@ async def test_a_satisfied_session_on_a_required_account_with_no_factor_is_still
 # --- a directory the account is not confirmed in (BACKLOG #2023) --------------------------------
 
 _DIRECTORY_UNCONFIRMED_TEXT = "The directory could not confirm your account."
+_DIRECTORY_DEMOTED_TEXT = "Your access changed in the directory since you signed in."
+
+#: Each refusal the engine can hand the console, with the text it must show (BACKLOG #3082).
+_REFUSALS = pytest.mark.parametrize(
+    ("refusal", "text"),
+    [
+        (DirectoryRefusal.UNCONFIRMED, _DIRECTORY_UNCONFIRMED_TEXT),
+        (DirectoryRefusal.DEMOTED, _DIRECTORY_DEMOTED_TEXT),
+    ],
+    ids=["unconfirmed", "demoted"],
+)
 
 
-def _directory_refuses(service: AuthService, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make ``verify_mfa`` answer as it does for a directory account the directory did not confirm.
+def _directory_refuses(
+    service: AuthService,
+    monkeypatch: pytest.MonkeyPatch,
+    refusal: DirectoryRefusal = DirectoryRefusal.UNCONFIRMED,
+) -> None:
+    """Make ``verify_mfa`` answer as it does for a directory account the directory refused.
 
     The service-level refusal is pinned in tests/test_mfa_directory_recheck.py. The subject here is
     only what the console SAYS, so the answer is stubbed rather than driven through a fake directory.
     """
 
     async def _refused(token: str | None, code: str, *, client: str | None = None) -> Elevation:
-        return Elevation(directory_unconfirmed=True)
+        return Elevation(directory_refusal=refusal)
 
     monkeypatch.setattr(service, "verify_mfa", _refused)
 
 
+@_REFUSALS
 async def test_the_gate_says_the_directory_could_not_confirm_the_account(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, refusal: DirectoryRefusal, text: str
 ) -> None:
-    """RED when: /ui/mfa drops the directory_unconfirmed branch and calls the code wrong."""
+    """RED when: /ui/mfa drops the directory refusal branch and calls the code wrong, or shows one
+    cause's text for the other (BACKLOG #3082)."""
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     await _enroll_totp(service)
     async with _client(engine, service) as c:
         await _login(c)
-        _directory_refuses(service, monkeypatch)
+        _directory_refuses(service, monkeypatch, refusal)
         r = await c.post("/ui/mfa", data={"code": "123456"})
         assert r.status_code == 400
-        assert _DIRECTORY_UNCONFIRMED_ERROR in r.text
+        assert text in r.text
         assert "That code wasn" not in r.text
+        # Only the demotion's text sends the operator to sign out; an outage's never does.
+        assert ("Sign out, then sign in again." in r.text) is (refusal is DirectoryRefusal.DEMOTED)
 
 
-def test_the_directory_refusal_names_both_fixes() -> None:
-    """BACKLOG #3082, the console's half. Which fix clears which cause, an outage or a role lost in
-    the directory (``directory_roles_demoted``), is stated once in docs/SECURITY.md (BACKLOG
-    #2240). The engine hands the console the same
-    ``Elevation(directory_unconfirmed=True)`` for both causes and keeps the cause on the audit row,
-    so this one text is what a demoted operator and an operator meeting an outage both see; the gate
-    test above shows it on the page. The engine's half drives the real refusal for each cause:
-    ``test_the_route_says_the_directory_could_not_confirm_the_account`` in
-    tests/test_mfa_directory_recheck.py.
+def test_each_directory_refusal_names_its_own_fix() -> None:
+    """BACKLOG #3082, the console's half. Which fix clears which cause is stated once in
+    docs/SECURITY.md. An account the directory did not confirm, an outage among them, is told to
+    try later or ask an administrator, and NEVER to sign out: a new sign-in fails the same way, and
+    the working session would be gone. A role lost in the directory (``directory_roles_demoted``)
+    is told to sign in again, which takes the roles the groups grant now. The engine's half drives
+    the real refusal for each cause: ``test_the_route_says_which_fix_clears_the_directory_refusal``
+    in tests/test_mfa_directory_recheck.py.
 
-    It also keeps the console's text in step with the API's 403 detail, which a client of the API
-    shows instead: both name the same fixes, and neither names a group or role.
+    It also keeps the console's texts in step with the API's 403 details, which a client of the API
+    shows instead: each pair names the same fix, and none names a group or role.
 
-    RED when either text tells a demoted operator only to try again later."""
+    RED when the outage text tells the operator to sign out, or the demotion text only to wait."""
     for text in (_DIRECTORY_UNCONFIRMED_ERROR, _DIRECTORY_UNCONFIRMED_DETAIL):
         said = text.lower()
-        for fix in ("try again later", "sign out and sign in again", "ask an administrator"):
+        for fix in ("try again later", "ask an administrator"):
             assert fix in said, (fix, text)
+        for wrong in ("sign out", "sign in"):
+            assert wrong not in said, (wrong, text)
+    for text in (_DIRECTORY_DEMOTED_ERROR, _DIRECTORY_DEMOTED_DETAIL):
+        said = text.lower()
+        assert "sign in again" in said and "sign out" in said, text
+        assert "try again later" not in said, text
+    for text in (
+        _DIRECTORY_UNCONFIRMED_ERROR,
+        _DIRECTORY_UNCONFIRMED_DETAIL,
+        _DIRECTORY_DEMOTED_ERROR,
+        _DIRECTORY_DEMOTED_DETAIL,
+    ):
         for internal in ("demoted", "group", "role"):
-            assert internal not in said, (internal, text)
+            assert internal not in text.lower(), (internal, text)
 
 
+@_REFUSALS
 async def test_the_reauth_code_leg_says_the_directory_could_not_confirm_the_account(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, refusal: DirectoryRefusal, text: str
 ) -> None:
-    """RED when: /ui/reauth's code leg drops the directory_unconfirmed branch."""
+    """RED when: /ui/reauth's code leg drops the directory refusal branch, or shows one cause's
+    text for the other."""
     service = await _service(engine, require_mfa=True)
     await _add(service, "op", Role.OPERATOR)
     await _enroll_totp(service)
     async with _client(engine, service) as c:
         assert (await _login(c)).status_code == 303
-        _directory_refuses(service, monkeypatch)
+        _directory_refuses(service, monkeypatch, refusal)
         r = await c.post(
             "/ui/reauth",
             data={"next": "/ui/account/mfa/disable", "code": "123456", "password": PW},
             headers={"origin": "http://t"},
         )
         assert r.status_code == 200
-        assert _DIRECTORY_UNCONFIRMED_TEXT in r.text
+        assert text in r.text
         assert "Invalid code." not in r.text
 
 
@@ -1384,15 +1419,16 @@ async def test_the_reauth_password_leg_says_the_directory_could_not_confirm_the_
     id, an entry that is not the row's own, no entry, an outage) never checked the password, so the
     form must not call it wrong. The service-level refusal is pinned in
     tests/test_ad_directory_identity.py; here the answer is stubbed and the subject is the words.
+    The password re-bind compares no roles, so it only ever refuses as unconfirmed.
 
-    RED when: /ui/reauth's password leg drops the directory_unconfirmed branch (the refused arm then
+    RED when: /ui/reauth's password leg drops the directory refusal branch (the refused arm then
     reads "Incorrect password."), or applies it to an ordinary wrong password (the control arm)."""
     # No factor required and none enrolled, so the form goes straight to the password leg.
     service = await _service(engine, require_mfa=False)
     await _add(service, "op", Role.OPERATOR)
 
     async def _refused(identity: object, password: str, **_kwargs: object) -> Elevation:
-        return Elevation(directory_unconfirmed=unconfirmed)
+        return Elevation(directory_refusal=DirectoryRefusal.UNCONFIRMED if unconfirmed else None)
 
     async with _client(engine, service) as c:
         assert (await _login(c)).status_code == 303
@@ -1407,21 +1443,33 @@ async def test_the_reauth_password_leg_says_the_directory_could_not_confirm_the_
         assert ("Incorrect password." in r.text) is not unconfirmed
 
 
-@pytest.mark.parametrize("unconfirmed", [True, False], ids=["directory-refused", "bad-assertion"])
+@pytest.mark.parametrize(
+    ("refusal", "text"),
+    [
+        (DirectoryRefusal.UNCONFIRMED, _DIRECTORY_UNCONFIRMED_TEXT),
+        (DirectoryRefusal.DEMOTED, _DIRECTORY_DEMOTED_TEXT),
+        (None, "passkey verification failed"),
+    ],
+    ids=["unconfirmed", "demoted", "bad-assertion"],
+)
 async def test_the_passkey_leg_says_the_directory_could_not_confirm_the_account(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch, unconfirmed: bool
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    refusal: DirectoryRefusal | None,
+    text: str,
 ) -> None:
     """BACKLOG #2239: the passkey leg asks the directory before it checks a directory account's
     assertion, so a refusal never judged the passkey and must not say it failed. The service-level
     refusal is pinned in tests/test_passkey_directory_recheck.py; here the answer is stubbed.
 
-    RED when: /ui/reauth/webauthn drops the directory_unconfirmed branch (the refused arm then reads
-    "passkey verification failed"), or applies it to an ordinary failed assertion (the control)."""
+    RED when: /ui/reauth/webauthn drops the directory refusal branch (the refused arms then read
+    "passkey verification failed"), applies it to an ordinary failed assertion (the control), or
+    shows one cause's text for the other (BACKLOG #3082)."""
     service = await _service(engine, require_mfa=False)
     await _add(service, "op", Role.OPERATOR)
 
     async def _refused(token: str | None, response_json: str, **_kwargs: object) -> Elevation:
-        return Elevation(directory_unconfirmed=unconfirmed)
+        return Elevation(directory_refusal=refusal)
 
     async with _client(engine, service) as c:
         assert (await _login(c)).status_code == 303
@@ -1429,8 +1477,8 @@ async def test_the_passkey_leg_says_the_directory_could_not_confirm_the_account(
         r = await c.post("/ui/reauth/webauthn", json={"response": {}}, headers=SAME_ORIGIN)
         assert r.status_code == 400
         error = r.json()["error"]
-        assert (_DIRECTORY_UNCONFIRMED_TEXT in error) is unconfirmed
-        assert (error == "passkey verification failed") is not unconfirmed
+        assert error.startswith(text)
+        assert (error == "passkey verification failed") is (refusal is None)
 
 
 # --- the temporary credential's deadline on the factor and password pages (BACKLOG #2009) ------
