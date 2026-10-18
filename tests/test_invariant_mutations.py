@@ -308,7 +308,7 @@ _WORKFLOW = "invariant-mutations.yml"
 
 #: Minutes the job cap must exceed the run step's own timeout by, to cover checkout and install.
 #: The step's timeout concludes `failure`; the job's concludes `cancelled`, which nightly-notice
-#: ignores, so the job cap must never be the one that fires.
+#: ignores for this workflow, so the job cap must never be the one that fires.
 _SETUP_MARGIN_MINUTES = 10
 
 
