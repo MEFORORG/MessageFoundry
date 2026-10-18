@@ -753,6 +753,172 @@ def test_the_smoke_leg_judges_the_probe_start_by_its_report() -> None:
     )
 
 
+def test_the_token_step_reconfigures_only_a_stopped_service() -> None:
+    """The step stops the engine, then rewrites the service's program to the probe. It must not
+    rewrite a service that is still running: the stop's exit code is cleared, so the 30 second
+    poll of the Service Control Manager and its throw are the only thing between the two. Engine
+    PR 1931's third review found no test held that check."""
+    script = _smoke_step_script("Verify the service token is restricted")
+    stop = script.index('nssm.exe" stop MessageFoundry')
+    poll = script.index("foreach ($i in 1..60) {", stop)
+    stopped = script.index(
+        'if ((Get-Service -Name MessageFoundry).Status -eq "Stopped") { break }', poll
+    )
+    refuse = script.index(
+        'if ((Get-Service -Name MessageFoundry).Status -ne "Stopped") { throw "the engine did not '
+        'stop within 30 seconds" }',
+        stopped,
+    )
+    # CONTROL: both of the things the throw must come before are in the script at all.
+    save = script.index("$key = Get-Item -LiteralPath $parameters")
+    first_set = script.index('nssm.exe" set MessageFoundry')
+    assert stop < poll < stopped < refuse < save < first_set, (
+        "the stop is not polled to Stopped, and refused otherwise, before the service is reconfigured"
+    )
+
+
+def test_the_account_legs_run_localsystem_and_wire_a_local_user() -> None:
+    """Vault BACKLOG #2702: the installer gives LocalSystem and any -ServiceAccount SID type none
+    and the privilege list. A LocalSystem leg runs, and a local-user leg is wired but not listed.
+    This checks the wiring; the
+    legs' own result is the reading, and a pull_request event skips the job."""
+    from tests._workflow_contexts import jobs_of
+
+    job = jobs_of("ci.yml")["windows-service-smoke"]
+    accounts = [leg.get("account") for leg in job["strategy"]["matrix"]["include"]]
+    # localuser is wired and left out of the matrix until the store shares its files with a named
+    # account; the comment above the matrix says why. Listing it then is the one-line change.
+    assert accounts.count(None) == 2 and "localsystem" in accounts, accounts
+    assert job["env"]["SMOKE_ACCOUNT"] == "${{ matrix.account || 'virtual' }}"
+    steps = {str(s.get("name")): s for s in job["steps"]}
+
+    def step(starts: str) -> dict[str, Any]:
+        found = [s for name, s in steps.items() if name.startswith(starts)]
+        assert len(found) == 1, (starts, list(steps))
+        return found[0]
+
+    # The restricted-token step judges the virtual account, and only it.
+    assert step("Verify the service token is restricted")["if"] == "env.SMOKE_ACCOUNT == 'virtual'"
+    other = step("Verify the service token under another account")
+    assert other["if"] == "env.SMOKE_ACCOUNT != 'virtual'"
+    script = _smoke_step_script("Verify the service token under another account")
+    for needle in (
+        f'$privilege = "{_PRIVILEGE}"',
+        "$none = '(?m)SID_TYPE\\s*:\\s*NONE\\s*$'",
+        '$accountSid = "S-1-5-18"',
+        "& python $probe check-privileges --account-sid $accountSid --privilege $privilege "
+        "--control-pid $PID @pids",
+        'Assert-Native "the token check on the running service"',
+    ):
+        assert needle in script, f"the account step no longer runs {needle!r}"
+    install = _smoke_step_script("Install the service")
+    assert "-LockConfigDir @cached @account" in install, (
+        "the install no longer takes the leg's account"
+    )
+    for needle in ("$account['AllowLocalSystem'] = $true", "$account['ServiceAccount'] = $grantee"):
+        assert needle in install, f"the install no longer sets {needle!r}"
+    # The password is masked before it is written anywhere, and never echoed.
+    create = _smoke_step_script("Create the local service account")
+    assert create.index('"::add-mask::$drawn"') < create.index('"password=$drawn"'), create
+    assert step("Create the local service account")["if"] == "env.SMOKE_ACCOUNT == 'localuser'"
+
+
+def _privilege_token(**changes: Any) -> dict[str, Any]:
+    token = {
+        "user": "S-1-5-18",
+        "privileges": [_PRIVILEGE],
+        "restricting_sids": [],
+        "write_restricted": False,
+    }
+    return {**token, **changes}
+
+
+@pytest.mark.parametrize(
+    ("changes", "expect"),
+    [
+        ({"user": "S-1-5-21-1-2-3-1001"}, "not as S-1-5-18"),
+        ({"privileges": [_PRIVILEGE, "SeImpersonatePrivilege"]}, "not exactly"),
+        ({"privileges": []}, "no privilege"),
+        ({"write_restricted": True}, "SID type none"),
+        # A FULLY restricted token: restricting SIDs and no write-restricted flag.
+        ({"restricting_sids": ["S-1-1-0"]}, "restricting list holds S-1-1-0"),
+        ({"error": "OpenProcess(4) failed"}, "could not be read"),
+    ],
+)
+def test_the_account_rule_fails_each_way_a_token_can_be_wrong(
+    changes: dict[str, Any], expect: str
+) -> None:
+    """The rule the account legs judge by, as a plain function. The passing token is the control,
+    and each case changes one reading in it."""
+    probe = _probe()
+    rule = {"account_sid": "S-1-5-18", "privileges": [_PRIVILEGE]}
+    assert probe.privilege_problems(_privilege_token(), **rule) == [], "CONTROL: the base passes"
+    problems = probe.privilege_problems(_privilege_token(**changes), **rule)
+    assert len(problems) == 1 and expect in problems[0], problems
+
+
+@_windows_only
+def test_the_account_reader_does_not_pass_an_ordinary_process() -> None:
+    """The control the account step relies on: its own shell holds more than the one privilege."""
+    probe = _probe()
+    token = probe.read_token(None)
+    problems = probe.privilege_problems(token, account_sid=token["user"], privileges=[_PRIVILEGE])
+    assert any("not exactly" in p for p in problems), problems
+
+
+@_windows_only
+def test_the_check_privileges_mode_fails_a_process_with_more_privileges(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The command line the account step runs, end to end on this process: its own token holds
+    more than the one privilege, so the --pid reading fails and the mode exits 1. The control fails
+    the rule too, which is the control working, so no CONTROL line prints. A wiring slip in the
+    subparser would fail here and not first on a hosted runner."""
+    probe = _probe()
+    me = probe.read_token(None)
+    pid = str(me["pid"])
+    argv = ["check-privileges", "--account-sid", me["user"], "--privilege", _PRIVILEGE]
+    assert probe.main([*argv, "--control-pid", pid, "--pid", pid]) == 1
+    out = capsys.readouterr().out
+    assert f"FAIL: process {pid}: it holds" in out, out
+    assert "FAIL: CONTROL" not in out and "OK:" not in out, out
+
+
+@pytest.mark.parametrize(
+    ("logon_error", "stage"),
+    [(True, "the logon or the impersonation"), (False, "outside the logon")],
+    ids=["logon", "elsewhere"],
+)
+def test_a_failed_credential_call_names_where_it_failed(
+    monkeypatch: pytest.MonkeyPatch, logon_error: bool, stage: str
+) -> None:
+    """Only the logon and the impersonation raise CredentialLogonError, so an OSError from anywhere
+    else must not be reported as one of them. Engine PR 1931's first review, LOW 5."""
+    from messagefoundry.transports import wincred
+
+    class Failing:
+        def __init__(self, **_: Any) -> None:
+            pass
+
+        async def run(self, fn: Any) -> Any:
+            if logon_error:
+                raise wincred.CredentialLogonError("LogonUser win32 error 5")
+            raise OSError(5, "somewhere else")
+
+        async def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(wincred, "CredentialContext", Failing)
+    # The function puts the repository root on sys.path itself; keep that inside this test.
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    probe = _probe()
+    result = probe.try_alternate_credential(Path("granted"), Path("denied"))
+    assert result["ok"] is False and stage in result["stage"], result
+    report = {**_passing_report(), "wincred": result}
+    problems = probe.inside_problems(report, service_sid="S-1-5-80-1", privileges=[_PRIVILEGE])
+    assert any(f"failed in {result['stage']}" in p for p in problems), problems
+
+
 def test_a_reinstall_is_told_the_host_may_need_a_restart(tmp_path: Path) -> None:
     """Only a NEW service's first start has been measured to pick the settings up. On a service
     that was already installed the installer says a restart may be needed, on every re-install,

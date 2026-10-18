@@ -27,9 +27,10 @@ def test_scaffolded_ci_is_valid_yaml_and_hardens_the_transitive_resolve(tmp_path
     assert "audit-pin" in doc["jobs"]
 
     ci = ci_path.read_text(encoding="utf-8")
-    # verify a hash-pinned lock when present; warn (fail-soft) on the unhashed default path
-    assert "--require-hashes" in ci
-    assert "requirements.lock" in ci
+    # A lock, when present, goes to the engine's auditor, whose --require-hashes dry-run is unit-tested
+    # in tests/test_security_audit_all_platforms.py; the unhashed default path warns (fail-soft).
+    # tests/test_scaffold.py executes the step and pins which branch runs what.
+    assert "python -P -m messagefoundry.security.audit_all_platforms requirements.lock" in ci
     assert "::warning::" in ci
 
 

@@ -507,8 +507,10 @@ def _ninth_sweep_problems(config_text: str, connections_text: str) -> list[str]:
             "first-seen address is born with no window (BACKLOG #288)"
         )
     for clause in (
-        "not among its recent completed sign-ins (the hosts it finished a sign-in or passed a "
-        "step-up from, at most 90 days back)",
+        # vault BACKLOG #2964: the baseline and the record's writers, as the code reads them.
+        "An account has a baseline once it has finished a sign-in, or once its record holds a "
+        "row of any age.",
+        "A sign-in that stopped at its factor adds nothing to the record;",
         "A step-up from that address passes the challenge; signing in again does not.",
         "first-seen address challenge (BACKLOG #288)",
         "The check fails open",
@@ -2375,16 +2377,19 @@ def test_lockout_is_fed_by_two_legs_but_enforced_on_the_assertion_leg_too() -> N
     tree = ast.parse(_SERVICE.read_text(encoding="utf-8"))
     assertion = named_func(tree, "finish_webauthn_assertion")
     # ADR 0197: the assertion leg is refused by the SECOND-STEP lock, read through the row's
-    # ``second_step_locked`` (the sign-in lock guards the step the session already passed).
-    reads_lock = any(
-        isinstance(n, ast.Attribute)
-        and n.attr in {"second_step_locked", "second_step_locked_until"}
-        for n in ast.walk(assertion)
-    )
-    assert reads_lock, (
+    # ``second_step_locked`` (the sign-in lock guards the step the session already passed). Since
+    # BACKLOG #3068 the read lives in ``_mfa_lock_refused``, which both second-factor legs call, so
+    # the pin follows the call into the helper rather than reading the leg alone.
+    assert calls_to(assertion, {"_mfa_lock_refused"}), (
         "finish_webauthn_assertion no longer refuses a locked account; docs/SECURITY.md says the "
         "lock is ENFORCED across every local factor."
     )
+    helper = named_func(tree, "_mfa_lock_refused")
+    assert any(
+        isinstance(n, ast.Attribute)
+        and n.attr in {"second_step_locked", "second_step_locked_until"}
+        for n in ast.walk(helper)
+    ), "_mfa_lock_refused no longer reads the second-step lock, so neither factor leg refuses it."
     assert not calls_to(assertion, {"_register_failure"}), (
         "WebAuthn assertion failures now feed the lockout; the doc's deliberate-divergence note is "
         "stale — update it in the same change."

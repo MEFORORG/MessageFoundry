@@ -139,7 +139,7 @@ async def test_the_guard_asks_for_an_administrator_not_an_empty_table() -> None:
 async def test_an_interrupted_provision_is_completed_by_re_running(crashed_after: str) -> None:
     """A crash between the command's writes must not strand the install -- at EITHER crash point.
 
-    The writes are create (no hash) -> set_password -> set_user_roles, so there are exactly two
+    The writes are create (no hash) -> set_password -> the role grant, so there are exactly two
     half-written states: an account that cannot be signed into, and one that can but holds no role.
     Both are parametrized here because the second is the one an earlier draft got wrong: it also
     refused a stamped ``password_claimed_at``, which ``set_password`` writes, so the second state
@@ -1502,6 +1502,62 @@ async def test_a_takeover_notifies_the_address_the_account_held_before(
         await store.close()
 
 
+async def test_a_crash_after_the_address_write_still_told_the_earlier_holder() -> None:
+    """BACKLOG #2915: the notice goes out before ``--email`` replaces the earlier holder's address.
+
+    The run stops at the role write, after the address write. Before the fix the notice came after
+    the role, so this crash sent nothing, and the re-run read the operator's address as the earlier
+    holder's: the earlier holder was never told. Now the earlier holder is told in the first run.
+
+    The re-run reads the operator's own address as the stored one and sends its notice there. A
+    crash between the notice and the address write would instead send the earlier holder a second
+    notice on the re-run. Both are the accepted at-least-once cost; no state records a sent notice.
+    """
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _Recorder()
+        service = AuthService(store, AuthSettings(), security_notifier=notifier)
+        await _roleless_account(store, email="holder@example.invalid")
+        real_grant = store.grant_first_admin_unless_admin_exists
+
+        async def stop_at_the_role(*a: object, **k: object) -> None:
+            raise RuntimeError("synthetic stop at the role write")
+
+        store.grant_first_admin_unless_admin_exists = stop_at_the_role  # type: ignore[method-assign,assignment]
+        with pytest.raises(RuntimeError, match="synthetic stop"):
+            await service.provision_first_administrator(
+                username="site-admin",
+                password=_PASSWORD,
+                notify_email="operator@example.invalid",
+                actor="test",
+                **provision_totp(),
+            )
+        store.grant_first_admin_unless_admin_exists = real_grant  # type: ignore[method-assign]
+        half = await store.get_user_by_username("site-admin")
+        assert half is not None and half.notify_email == "operator@example.invalid"
+        assert await store.get_user_role_ids(half.id) == []
+        assert [(e.event_type, e.email) for e in notifier.events] == [
+            (FIRST_ADMINISTRATOR_TAKEOVER, "holder@example.invalid")
+        ]
+        assert notifier.events[0].detail == {"new_notify_email": "operator@example.invalid"}
+
+        outcome = await service.provision_first_administrator(
+            username="site-admin",
+            password=_PASSWORD,
+            notify_email="operator@example.invalid",
+            actor="test",
+            **provision_totp(),
+        )
+        assert outcome.repaired is True
+        assert Role.ADMINISTRATOR.value in await store.get_user_role_ids(half.id)
+        # The earlier holder's notice is the first one sent, and the only one sent to them.
+        told = [e.email for e in notifier.events]
+        assert told[0] == "holder@example.invalid"
+        assert told.count("holder@example.invalid") == 1
+    finally:
+        await store.close()
+
+
 # --- BACKLOG #2288: a row that holds an address is completed only when --email is given ----------
 
 
@@ -1528,8 +1584,10 @@ async def test_a_repair_of_a_row_that_holds_an_address_is_refused_without_an_ema
             must_change_password=False,
             password_generated=False,
         )
-        await store.set_totp_secret("roleless", secret="JBSWY3DPEHPK3PXP")
-        assert await store.enable_totp("roleless", recovery_code_hashes=["h1", "h2"])
+        staged_cell = await store.set_totp_secret("roleless", secret="JBSWY3DPEHPK3PXP")
+        assert await store.enable_totp(
+            "roleless", expected_secret_cell=staged_cell, recovery_code_hashes=["h1", "h2"]
+        )
         await store.add_webauthn_credential(
             WebAuthnCredential(
                 credential_id_hash="holder-passkey-hash",
@@ -2369,8 +2427,10 @@ async def test_the_repair_branch_clears_the_earlier_holders_factors_and_sessions
             must_change_password=False,
             password_generated=False,
         )
-        await store.set_totp_secret("earlier", secret="JBSWY3DPEHPK3PXP")
-        assert await store.enable_totp("earlier", recovery_code_hashes=["h1", "h2"])
+        staged_cell = await store.set_totp_secret("earlier", secret="JBSWY3DPEHPK3PXP")
+        assert await store.enable_totp(
+            "earlier", expected_secret_cell=staged_cell, recovery_code_hashes=["h1", "h2"]
+        )
         await store.add_webauthn_credential(
             WebAuthnCredential(
                 credential_id_hash="earlier-passkey-hash",
@@ -2447,7 +2507,7 @@ async def test_an_enable_that_matches_no_row_refuses_before_the_role(
 ) -> None:
     """BACKLOG #2224: ``enable_totp`` is conditional, so a factor clear landing between the staged
     secret and the enable (another run's repair branch) makes it match no row. The run must refuse
-    before ``set_user_roles`` rather than grant the role over an account with TOTP off, and the
+    before the role grant rather than grant the role over an account with TOTP off, and the
     roleless row it leaves must be one a re-run completes."""
     store = await MessageStore.open(":memory:")
     try:
@@ -2455,10 +2515,19 @@ async def test_an_enable_that_matches_no_row_refuses_before_the_role(
         real_enable = store.enable_totp
 
         async def cleared_then_enable(
-            user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
+            user_id: str,
+            *,
+            recovery_code_hashes: list[str],
+            expected_secret_cell: str | None,
+            now: float | None = None,
         ) -> bool:
             await store.disable_totp(user_id)
-            return await real_enable(user_id, recovery_code_hashes=recovery_code_hashes, now=now)
+            return await real_enable(
+                user_id,
+                recovery_code_hashes=recovery_code_hashes,
+                expected_secret_cell=expected_secret_cell,
+                now=now,
+            )
 
         monkeypatch.setattr(store, "enable_totp", cleared_then_enable)
         kw = provision_totp()
@@ -2478,6 +2547,88 @@ async def test_an_enable_that_matches_no_row_refuses_before_the_role(
         done = await store.get_user(row.id)
         assert done is not None and done.totp_enabled
         assert Role.ADMINISTRATOR.value in await store.get_user_role_ids(row.id)
+    finally:
+        await store.close()
+
+
+async def test_a_re_stage_between_the_stage_and_the_enable_refuses_before_the_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3025: the enable is bound to the cell THIS run staged. Another run that stages its
+    own secret in between makes the enable match no row, so the run refuses before the role and
+    never turns on a secret it did not prove."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings())
+        real_enable = store.enable_totp
+        other_seed = PROVISION_TOTP_SECRET[::-1]
+
+        async def restaged_then_enable(user_id: str, **kw: object) -> bool:
+            assert await store.set_totp_secret(user_id, secret=other_seed) is not None
+            return await real_enable(user_id, **kw)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(store, "enable_totp", restaged_then_enable)
+        with pytest.raises(FirstAdministratorRefused, match="changed while this command ran"):
+            await service.provision_first_administrator(
+                username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
+            )
+        row = await store.get_user_by_username("site-admin")
+        assert row is not None and not row.totp_enabled
+        assert await store.get_totp_secret(row.id) == other_seed
+        assert not await store.get_user_role_ids(row.id)
+    finally:
+        await store.close()
+
+
+async def test_a_stage_that_lands_after_another_runs_enable_refuses_before_the_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3025: the stage is conditional on TOTP being off. Another run that enabled TOTP on
+    the row first makes this run's stage write nothing, so it refuses before hashing any codes or
+    granting the role, and the other run's enabled secret stands."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings())
+        real_stage = store.set_totp_secret
+        other_seed = PROVISION_TOTP_SECRET[::-1]
+
+        async def other_run_enabled_first(user_id: str, **kw: object) -> str | None:
+            cell = await real_stage(user_id, secret=other_seed)
+            assert await store.enable_totp(
+                user_id, recovery_code_hashes=[], expected_secret_cell=cell
+            )
+            return await real_stage(user_id, **kw)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(store, "set_totp_secret", other_run_enabled_first)
+        with pytest.raises(FirstAdministratorRefused, match="did not stage its authenticator"):
+            await service.provision_first_administrator(
+                username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
+            )
+        row = await store.get_user_by_username("site-admin")
+        assert row is not None and row.totp_enabled
+        assert await store.get_totp_secret(row.id) == other_seed
+        assert not await store.get_user_role_ids(row.id)
+    finally:
+        await store.close()
+
+
+async def test_the_provisioning_codes_step_stays_spent_after_the_stage() -> None:
+    """BACKLOG #3025 review: provision consumes its code's step BEFORE it stages the secret, so the
+    stage must not reset the step high-water mark, or the code typed at the terminal would pass the
+    first sign-in's second factor again (ASVS 6.5.1, BACKLOG #1021)."""
+    from messagefoundry.auth import totp
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings())
+        kw = provision_totp()
+        await service.provision_first_administrator(
+            username="site-admin", password=_PASSWORD, actor="test", **kw
+        )
+        row = await store.get_user_by_username("site-admin")
+        assert row is not None and row.totp_enabled
+        step = int(kw["totp_code_read_at"] // totp.DEFAULT_PERIOD)
+        assert not await store.consume_totp_step(row.id, step)
     finally:
         await store.close()
 

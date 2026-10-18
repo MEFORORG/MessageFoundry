@@ -25,7 +25,6 @@ from messagefoundry.auth.notifications import (
     ACCOUNT_CREATED,
     ACCOUNT_DISABLED,
     ACCOUNT_LOCKED,
-    ADMIN_NEW_IP,
     DIRECTORY_SESSIONS_ENDED,
     EMAIL_CHANGED,
     FEDERATED_IDENTITY_BOUND,
@@ -37,6 +36,7 @@ from messagefoundry.auth.notifications import (
     MFA_CREDENTIAL_REMOVED,
     MFA_DISABLED,
     MFA_ENABLED,
+    NEW_ADDRESS_REVERIFY,
     NOTIFY_EMAIL_SET,
     PASSWORD_CHANGED,
     PASSWORD_RESET,
@@ -86,13 +86,13 @@ _SUBJECTS = {
     FEDERATED_IDENTITY_UNBOUND: "An external sign-in identity was removed from your MessageFoundry account",
     FIRST_ADMINISTRATOR_TAKEOVER: "Your MessageFoundry account was made an Administrator from the host",
     ACCOUNT_DISABLED: "Your MessageFoundry account was disabled",
-    DIRECTORY_SESSIONS_ENDED: "Your MessageFoundry sessions were ended by a directory check",
+    DIRECTORY_SESSIONS_ENDED: "Your MessageFoundry sessions were ended",
     MFA_ENABLED: "Two-factor authentication was enabled on your MessageFoundry account",
     MFA_DISABLED: "Two-factor authentication was disabled on your MessageFoundry account",
     MFA_CREDENTIAL_REMOVED: "A second factor was removed from your MessageFoundry account",
     NOTIFY_EMAIL_SET: "Security notices for your MessageFoundry account now come to this address",
     RECOVERY_CODE_USED: "A MessageFoundry recovery code was used on your account",
-    ADMIN_NEW_IP: "A sensitive action on your MessageFoundry account from a new location",
+    NEW_ADDRESS_REVERIFY: "A sensitive action on your MessageFoundry account from a new location",
     LOGIN_NEW_IP: "New MessageFoundry sign-in from a new location",
     ACCOUNT_CREATED: "A MessageFoundry account was created with this address",
 }
@@ -122,10 +122,15 @@ _DESCRIPTIONS = {
         "no longer works."
     ),
     ACCOUNT_DISABLED: "Your account was disabled by an administrator.",
-    # vault BACKLOG #2140. Says only what the engine did. The probe either could not match the
-    # account or could not read whether it is disabled, so this must not say disabled or deleted.
+    # vault BACKLOG #2140, #3171. One wording for every reason that sends this kind, with no branch on
+    # ``detail["reason"]``. Which reasons those are is decided in
+    # ``AuthService._apply_reconcile_revocation``, and any reason added later falls here too; the
+    # constant's comment in ``auth/notifications.py`` names at least the current ones. For at least
+    # one of them no directory lookup ran, so neither this nor the subject may say one did, or that
+    # the account is disabled or deleted. "Could not confirm" stays true whatever the cause.
     DIRECTORY_SESSIONS_ENDED: (
-        "A check against your organization's directory ended your MessageFoundry sessions."
+        "MessageFoundry ended your sessions. It could not confirm from your organization's "
+        "directory that your account may still sign in."
     ),
     MFA_ENABLED: "A two-factor authenticator (TOTP) was enrolled on your account.",
     MFA_DISABLED: "Two-factor authentication was removed from your account.",
@@ -146,10 +151,10 @@ _DESCRIPTIONS = {
         "One of your single-use recovery codes was accepted as a second factor. That code is now "
         "spent and cannot be used again."
     ),
-    ADMIN_NEW_IP: (
-        "A sensitive administrative action on your account was attempted from a client address that "
-        "differs from your session's last verified address. It was required to re-verify before "
-        "proceeding."
+    NEW_ADDRESS_REVERIFY: (
+        "A sensitive request on your account (an administrative action, a message read or a "
+        "state-changing request) came from a client address that differs from your "
+        "session's last verified address. It was required to re-verify before proceeding."
     ),
     ACCOUNT_CREATED: (
         "An administrator created this account and set this address to receive its security notices."
@@ -415,7 +420,7 @@ def _build_body(event: SecurityEvent) -> str:
         roles = event.detail.get("roles")
         if isinstance(roles, list) and roles:
             lines.append("Roles: " + ", ".join(str(r) for r in roles))
-    if event.event_type == ADMIN_NEW_IP and event.detail.get("cap_reached"):
+    if event.event_type == NEW_ADDRESS_REVERIFY and event.detail.get("cap_reached"):
         # vault BACKLOG #2159: past this notice the session reports no further new addresses until
         # it re-verifies, so silence after it must not read as "no more new locations".
         lines.append(
@@ -570,10 +575,14 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
             # **Never for a lock notice** (BACKLOG #1131, LOG_SILENT_EVENT_TYPES): the line would show
             # a logs:view reader when a lock landed. The users:manage-only ``auth.lock_notice`` row
             # records ``mailed: false`` for that account instead.
+            #
+            # "Usually" in the line, not "always" (BACKLOG #3018): the directory reconciler's audit
+            # write is soft, so a store that refuses it still lets the notice reach here with no row.
             if event.event_type not in LOG_SILENT_EVENT_TYPES:
                 log.warning(
                     "security notice %s for %s dropped: the account has no notification address on "
-                    "file, so it was not told out of band (the event is still in the audit log)",
+                    "file, so it was not told out of band (the event is usually still in the audit "
+                    "log)",
                     event.event_type,
                     event.username,
                 )
@@ -604,7 +613,8 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         try:
             await asyncio.to_thread(self._send, event)
         except Exception:
-            # Best-effort: a failed send must never propagate. The event is also in the audit log.
+            # Best-effort: a failed send must never propagate. The event is usually also in the audit
+            # log; a refused directory-reconciler audit write leaves no row (BACKLOG #3018).
             # A lock notice fails silently here (BACKLOG #1131, LOG_SILENT_EVENT_TYPES): a line per
             # failed lock mail would show a logs:view reader when a lock landed. A relay that is down
             # still shows, on every other kind of notice.

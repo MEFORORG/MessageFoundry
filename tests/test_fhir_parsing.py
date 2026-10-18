@@ -162,6 +162,60 @@ def test_peek_error_never_leaks_the_body() -> None:
     assert exc.__cause__ is None and exc.__context__ is None
 
 
+# --- a repeated JSON key is refused (vault BACKLOG #2812) ---------------------
+#
+# json keeps the LAST of two equal keys and a server may keep the first, while the engine gates and
+# routes on the peeked value and sends the body verbatim. Every key and value below is synthetic; the
+# canary is the value the refusal must not echo.
+
+_REPEATED_ID = '{"resourceType": "Patient", "id": "first-id", "id": "' + PHI_CANARY + '"}'
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        _REPEATED_ID,
+        # The measured case: the URL took Patient while a server keeping the first key reads
+        # Observation.
+        '{"resourceType": "Observation", "resourceType": "Patient", "id": "' + PHI_CANARY + '"}',
+        '{"resourceType": "Patient", "id": "p-1", "meta": {"versionId": "1", "versionId": "'
+        + PHI_CANARY
+        + '"}}',
+        _REPEATED_ID.encode("utf-8"),
+        "\N{ZERO WIDTH NO-BREAK SPACE}" + _REPEATED_ID,
+    ],
+    ids=["top-level-id", "observation-then-patient", "nested", "bytes", "behind-a-bom"],
+)
+def test_peek_refuses_a_repeated_key_at_any_depth(body: str | bytes) -> None:
+    with pytest.raises(FhirPeekError, match="repeats a key") as excinfo:
+        FhirPeek.parse(body)
+    exc = excinfo.value
+    # Neither the key nor a value is named, and nothing is chained.
+    for word in ("id", "resourceType", "versionId", "Patient", "first-id", PHI_CANARY):
+        assert word not in str(exc)
+    assert exc.__cause__ is None and exc.__context__ is None
+
+
+def test_peek_accepts_equal_keys_in_different_objects() -> None:
+    # Control: the refusal is per object. Sibling and nested objects may each carry the same key,
+    # as every Bundle entry carries its own resource id.
+    body = json.dumps(
+        {
+            "resourceType": "Bundle",
+            "id": "b-1",
+            "type": "transaction",
+            "meta": {"id": "m-1"},
+            "entry": [
+                {"resource": {"resourceType": "Patient", "id": "p-1"}},
+                {"resource": {"resourceType": "Observation", "id": "o-1"}},
+            ],
+        }
+    )
+    peek = FhirPeek.parse(body)
+    assert peek.id == "b-1"
+    assert peek.entry_resource_types() == ["Patient", "Observation"]
+
+
 # --- console carve-out: import purity (mirrors tests/test_x12_parsing.py) ----
 
 

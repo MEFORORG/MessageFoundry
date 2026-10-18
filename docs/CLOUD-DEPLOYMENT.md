@@ -12,6 +12,11 @@ For the **PHI / HIPAA cloud architecture** (BAA, KMS, PrivateLink, region pinnin
 [`CLOUD-PHI-HIPAA.md`](CLOUD-PHI-HIPAA.md). For the per-channel TLS posture and bind guards, read
 [`DEPLOYMENT.md`](DEPLOYMENT.md). For the container image itself, read [`../docker/README.md`](../docker/README.md).
 
+> **Not supported for v1.** The Kubernetes and container shapes here run the Linux image
+> ([why](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target)). For engine HA on
+> Windows, see [CLUSTERING.md](CLUSTERING.md), and for a SQL Server Always On store,
+> [AOAG-DEPLOYMENT.md](AOAG-DEPLOYMENT.md).
+
 > **On-prem-first.** MessageFoundry's identity is on-premises ([ADR 0017](adr/0017-consumer-deployment-model.md)
 > Decision 8: every instance runs inside the adopter's trusted network). Cloud is a **credible,
 > demand-gated fast-follow**, not a hosted SaaS — there is no MessageFoundry-operated multi-tenant
@@ -109,7 +114,9 @@ mechanism against a SQL Server store with **Always On Availability Groups** for 
   has no ODBC.
 - Trust the DB CA via the host **machine trust store** (the CA-chain path, recommended for rotation), or
   pin the server cert by file with `[store].ssl_root_cert` (ODBC Driver **18.1+** `ServerCertificate`, a
-  leaf pin — rotate in lockstep). See [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §5.
+  leaf pin — rotate in lockstep). The engine sends the pin with `Encrypt=strict`, which needs SQL Server
+  2022 or later. It matches one exact certificate, so on an AG every replica must present that same
+  certificate, or a failover refuses every store connection. See [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §5.
 - Everything else (the leader lease, graph gating, the LB recipe below) is identical — both backends run
   the same active-passive coordinator.
 

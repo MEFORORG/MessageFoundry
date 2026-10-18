@@ -61,6 +61,7 @@ from messagefoundry.pipeline.alerts import (
     crl_reload_refused_detail,
     intake_pause_detail,
     remote_debug_refused_detail,
+    sandbox_worker_refused_detail,
 )
 
 # Not lazy, unlike the two transports imports below: the shared webhook opener is built at import.
@@ -1175,7 +1176,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
         # ADR 0079 mechanism 2: the mass-revoke breaker tripped and the pass applied nothing, or one
-        # or more probes were referred and left unjudged (BACKLOG #2538; `reason` tells which). The
+        # or more probes were referred (BACKLOG #2538) or faulted (BACKLOG #3100) and left unjudged;
+        # `reason` tells which. The
         # fixed source label keys the throttle, so a standing misconfiguration that trips every pass
         # pages once per cooldown rather than once per pass. `detail` is the latched operator explanation,
         # and it is what the instance's reason column shows (detail wins over reason there).
@@ -1311,6 +1313,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         baseline_actor: str | None,
         baseline_at: str,
         baseline_node: str | None,
+        comparison: str = "compared",
     ) -> None:
         # vault BACKLOG #2597: the start's config differs from the store's baseline. The
         # subject (`config:<12 hex>`) stands in for "connection", so each distinct config is its own
@@ -1335,6 +1338,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 "baseline_actor": baseline_actor,
                 "baseline_at": baseline_at,
                 "baseline_node": baseline_node,
+                # vault BACKLOG #2944: a partial digest or a directory that moved during the load.
+                "comparison": comparison,
             }
         )
 
@@ -1388,6 +1393,18 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 "count": count,
                 "total": total,
                 "detail": remote_debug_refused_detail(count=count, total=total),
+            }
+        )
+
+    def sandbox_worker_refused(self, name: str, *, content_only: bool) -> None:
+        # vault BACKLOG #2724: a sandbox worker was refused for a graph mismatch. The inbound's own
+        # name is the "connection", so the instance is per inbound and channel scope applies. Fixed
+        # words only: the refusal text stays on the message's last error, never in the alert.
+        self._emit(
+            {
+                "type": "sandbox_worker_refused",
+                "connection": name,
+                "detail": sandbox_worker_refused_detail(content_only=content_only),
             }
         )
 

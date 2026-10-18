@@ -16,14 +16,22 @@
  *  `ModuleNotFoundError: No module named 'pydantic'` a hand-run `python -m messagefoundry serve` produces. */
 export const PREFLIGHT_IMPORT = "messagefoundry.config.models";
 
+/** The interpreter options the pill's engine lifecycle takes: the preflight, provision-admin (and
+ *  its held wrapper) and serve. `-P` keeps the working directory off the import path, so all of
+ *  them import the same engine; `-X disable-remote-debug` is what serve's enforce refusal names
+ *  (vault BACKLOG #2700). The CLI bridge in cli.ts (validate, graph and the rest) does not take
+ *  them yet. */
+export const INTERPRETER_OPTIONS: readonly string[] = ["-P", "-X", "disable-remote-debug"];
+
 /** The argv for the preflight import check (`python <these>`). */
 export function preflightArgs(): string[] {
-  return ["-c", `import ${PREFLIGHT_IMPORT}`];
+  return [...INTERPRETER_OPTIONS, "-c", `import ${PREFLIGHT_IMPORT}`];
 }
 
 /**
  * The command the pill's Start action runs. Deliberately identical to the command ADR 0110 shipped for the
- * clipboard — `python -m messagefoundry serve --config <configDir>` — with NO `--db`/`--env`/`--port`
+ * clipboard — `python -P -X disable-remote-debug -m messagefoundry serve --config <configDir>`, the options
+ * added for vault BACKLOG #2700 and named by serve's own refusal — with NO `--db`/`--env`/`--port`
  * overrides: the service TOML is the authority on which store, which environment and which port this engine
  * is (ADR 0110 rejected a `messagefoundry.engineEnv` setting for exactly this reason). The only change from
  * "copy" to "run" is that `python` is the resolved workspace interpreter, not whatever the user's terminal
@@ -38,8 +46,18 @@ export function buildServeInvocation(opts: {
 }): { command: string; args: string[] } {
   return {
     command: opts.python,
-    args: ["-m", "messagefoundry", "serve", "--config", opts.configDir],
+    // Vault BACKLOG #2700: under the default enforce, serve refuses to start with the
+    // interpreter's remote debugging on. The argv is the launch that refusal names.
+    args: [...INTERPRETER_OPTIONS, "-m", "messagefoundry", "serve", "--config", opts.configDir],
   };
+}
+
+/** The pill's Start command as one line, for the clipboard and for hints: the argv of
+ *  {@link buildServeInvocation}, with `python` for the interpreter, and an element holding
+ *  whitespace double-quoted so a pasted path with a space stays one argument. */
+export function serveCommandLine(configDir: string): string {
+  const args = buildServeInvocation({ python: "python", configDir }).args;
+  return ["python", ...args.map((a) => (/\s/.test(a) ? `"${a}"` : a))].join(" ");
 }
 
 /** The outcome of the interpreter preflight, each with a DIFFERENT remedy. */
@@ -123,7 +141,10 @@ export function buildBootstrapPlan(opts: {
 // plan ASKS the engine, with a probe: `provision-admin` run with no terminal. It answers "an enabled
 // Administrator already exists" BEFORE it checks for a terminal, and otherwise refuses for want of one.
 // It creates no store and no account either way. The first answer is go-ahead; the second means provision
-// first.
+// first. Since vault BACKLOG #2711 step 1 the first answer means an enabled LOCAL Administrator with a
+// usable password, so a store whose Administrators all sign in through the directory gets the second
+// answer. The modal in `statusBar.ts` still words that case as "no enabled administrator"; rewording it
+// is not done here.
 //
 // The probe and the provisioning terminal run in the workspace, as `serve` does, with no `--db` or
 // `--service-config`. In the default layout that is the store `serve` opens. It is NOT when the service
@@ -160,7 +181,7 @@ export function buildProvisionInvocation(opts: { python: string } & AdminDetails
   command: string;
   args: string[];
 } {
-  const args = ["-m", "messagefoundry", "provision-admin", `--username=${opts.username}`, `--email=${opts.email.trim()}`];
+  const args = [...INTERPRETER_OPTIONS, "-m", "messagefoundry", "provision-admin", `--username=${opts.username}`, `--email=${opts.email.trim()}`];
   return { command: opts.python, args };
 }
 
@@ -194,7 +215,9 @@ export function buildHeldInvocation(inv: { command: string; args: string[] }): {
   command: string;
   args: string[];
 } {
-  return { command: inv.command, args: ["-c", HOLD_OPEN_SCRIPT, ...inv.args] };
+  // The wrapper takes the options too: it runs in the workspace, where -P keeps a stray module
+  // there from replacing the subprocess module the wrapper imports.
+  return { command: inv.command, args: [...INTERPRETER_OPTIONS, "-c", HOLD_OPEN_SCRIPT, ...inv.args] };
 }
 
 /** What the shell captured from running the probe with no terminal. */

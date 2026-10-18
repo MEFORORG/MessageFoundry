@@ -21,7 +21,7 @@ from messagefoundry.api.security import ExportStopped, deadline_utc
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
-from messagefoundry.auth.service import AuthService, CurrentPasswordCheck
+from messagefoundry.auth.service import AuthService, CurrentPasswordCheck, Elevation
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import AiSettings, AuthSettings, EgressSettings, StoreSettings
@@ -30,6 +30,7 @@ from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
 from tests._role_pairing import bypass_view_raw_pairing_rule
+from tests._session_race import rotate_after_first_call
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 
@@ -469,6 +470,69 @@ async def test_require_mfa_admin_is_not_bootstrap_locked_out(engine: Engine) -> 
         assert status["enabled"] is True and status["required"] is True
 
 
+async def test_the_confirm_route_says_the_directory_could_not_confirm_the_account(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3061: ``confirm_mfa_enrollment`` asks the directory before it checks a directory
+    account's code, so a refusal never judged the code. RED when ``/me/mfa/confirm`` answers it as
+    the wrong-code ``400 invalid code``. The service answer is stubbed; the refusal itself is pinned
+    in tests/test_enrolment_directory_recheck.py."""
+    service = await _service(
+        engine, AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False)
+    )
+    await _add(service, "adm", Role.ADMINISTRATOR)
+
+    async def _refused(*_args: object, **_kwargs: object) -> Elevation:
+        return Elevation(directory_unconfirmed=True)
+
+    async with _client(engine, service) as c:
+        tok = (await _login(c, "adm")).json()["token"]
+        _r, tok = await _reauth(c, tok, purpose="mfa_enroll")
+        assert (await c.post("/me/mfa/enroll", headers=_auth(tok))).status_code == 200
+        _r, tok = await _reauth(c, tok, purpose="mfa_confirm")
+        monkeypatch.setattr(service, "confirm_mfa_enrollment", _refused)
+        r = await c.post("/me/mfa/confirm", headers=_auth(tok), json={"code": "123456"})
+    assert r.status_code == 403, r.text
+    assert "directory could not confirm this account" in r.json()["detail"]
+
+
+async def test_the_confirm_route_says_a_locked_account_is_locked(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3810 finding 4: a directory account's enrolment refuses a live second-step lock
+    before the code is checked, and says so with ``locked``. RED when ``/me/mfa/confirm`` answers
+    it as the wrong-code ``400 invalid code``. The service answer is stubbed; the refusal itself is
+    pinned in tests/test_enrolment_directory_recheck.py."""
+    service = await _service(
+        engine, AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False)
+    )
+    await _add(service, "adm", Role.ADMINISTRATOR)
+
+    async def _locked(*_args: object, **_kwargs: object) -> Elevation:
+        return Elevation(locked=True)
+
+    async with _client(engine, service) as c:
+        tok = (await _login(c, "adm")).json()["token"]
+        _r, tok = await _reauth(c, tok, purpose="mfa_enroll")
+        assert (await c.post("/me/mfa/enroll", headers=_auth(tok))).status_code == 200
+        _r, tok = await _reauth(c, tok, purpose="mfa_confirm")
+        monkeypatch.setattr(service, "confirm_mfa_enrollment", _locked)
+        r = await c.post("/me/mfa/confirm", headers=_auth(tok), json={"code": "123456"})
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"] == "account locked; try again later"
+
+
+def _hold_auth_wall_clock(monkeypatch: pytest.MonkeyPatch, now: list[float]) -> None:
+    """Hold the wall clock the service and the store read at ``now[0]``; ``monotonic()`` stays real.
+
+    Both, because the store stamps the session's mint and the service reads the floor against it.
+    One held clock makes the elapsed time the test's own choice, however slow the runner is
+    (BACKLOG #3194), and it never falls behind a stamp, which would end the session."""
+    held = SimpleNamespace(time=lambda: now[0], monotonic=time.monotonic)
+    monkeypatch.setattr("messagefoundry.auth.service.time", held)
+    monkeypatch.setattr("messagefoundry.store.store.time", held)
+
+
 async def test_a_confirm_inside_the_login_to_mfa_floor_is_an_ordinary_invalid_code(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -477,15 +541,18 @@ async def test_a_confirm_inside_the_login_to_mfa_floor_is_an_ordinary_invalid_co
     # its single-use password step-up before the service runs, so the retry needs a fresh one, which
     # is what docs/SECURITY.md says. The service-level cases are in test_second_step_time_floors.py.
     #
-    # A 30 s floor on the real clock, rather than a faked one held just inside 1 s: a session whose
-    # clock steps BACK behind its own stamps is ended, so the clock here only ever moves forward.
-    floor = 30.0
-    service = await _service(
-        engine, AuthSettings(mfa_verify_min_elapsed_seconds=floor, login_rate_limit_enabled=False)
-    )
+    # The shipped floor, on a held clock (BACKLOG #3194): no time passes between the sign-in and the
+    # early confirm however slow the runner is, and the clock then moves only forward.
+    floor = AuthSettings().mfa_verify_min_elapsed_seconds
+    assert floor > 0
+    now = [time.time()]
+    _hold_auth_wall_clock(monkeypatch, now)
+    service = await _service(engine, AuthSettings(login_rate_limit_enabled=False))
     await _add(service, "adm", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
         tok = (await _login(c, "adm")).json()["token"]
+        minted = await engine.store.get_session(hash_token(tok))
+        assert minted is not None and minted.created_at == now[0], "the mint is off the held clock"
         _r, tok = await _reauth(c, tok, purpose="mfa_enroll")
         secret = (await c.post("/me/mfa/enroll", headers=_auth(tok))).json()["secret"]
         _r, tok = await _reauth(c, tok, purpose="mfa_confirm")
@@ -501,10 +568,7 @@ async def test_a_confirm_inside_the_login_to_mfa_floor_is_an_ordinary_invalid_co
         assert retry.status_code == 403 and retry.headers.get("X-Step-Up-Required") == "1"
 
         # Past the floor: a genuinely wrong code gets the very answer the early good code got.
-        monkeypatch.setattr(
-            "messagefoundry.auth.service.time",
-            SimpleNamespace(time=lambda: time.time() + floor, monotonic=time.monotonic),
-        )
+        now[0] += floor + 0.001
         _r, tok = await _reauth(c, tok, purpose="mfa_confirm")
         wrong = str((int(good) + 1) % 1_000_000).zfill(6)
         refused = await c.post("/me/mfa/confirm", headers=_auth(tok), json={"code": wrong})
@@ -561,6 +625,39 @@ async def test_login_then_permission_enforced(engine: Engine) -> None:
         # logout revokes the token immediately
         assert (await c.post("/auth/logout", headers=_auth(token))).status_code == 200
         assert (await c.get("/stats", headers=_auth(token))).status_code == 401
+
+
+async def test_a_logout_raced_by_a_rotation_does_not_audit_a_revoke(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3029. ``POST /auth/logout`` reads the session in its auth dependency, then the
+    service revokes it by hash. A step-up on the same session that re-keys it between the two
+    leaves that hash naming no session. The ``auth.logout`` row used to read the same either way.
+
+    The rotation runs right after the dependency's read of the presented hash, so it always lands
+    and the session lives on under its new token. The row's ``outcome`` must then say nothing was
+    revoked. Ending it under the rotated token is not this route's to do; that is BACKLOG #3028.
+    The branch where the revoke lands is test_session_supersession.py's logout test.
+    """
+    service = await _service(engine)
+    await _add(service, "u", Role.VIEWER)
+    store = engine.store
+    async with _client(engine, service) as c:
+        token = (await _login(c, "u")).json()["token"]
+        rotations = rotate_after_first_call(
+            monkeypatch, store, service, token, names=("get_session",)
+        )
+        assert (await c.post("/auth/logout", headers=_auth(token))).status_code == 200
+
+    assert rotations, "the injection never fired, so this measured nothing"
+    rotated = rotations[0]
+    assert rotated is not None, "the rotation failed closed, so the race was not driven"
+    assert await service.identity_for_token(rotated, activity=False) is not None
+    outcomes = [
+        json.loads(str(row["detail"] or "{}")).get("outcome")
+        for row in await store.list_audit(action="auth.logout")
+    ]
+    assert outcomes == ["nothing_to_revoke"], "the auth.logout row claimed a revoke that missed"
 
 
 async def test_cluster_endpoints_gated_by_monitoring_read(engine: Engine) -> None:
@@ -864,6 +961,39 @@ async def test_create_user_route_refuses_a_site_context_word(engine: Engine) -> 
         created = await c.post("/users", headers=h, json=body)
         assert created.status_code == 201
         assert "globex" not in created.json()["temp_password"].lower()
+
+
+async def test_create_user_with_a_repeated_role_grants_it_once(engine: Engine) -> None:
+    # BACKLOG #2733: a repeated role once failed the user_roles primary key after the account row
+    # had committed. The store now writes one grant, and the request model names the role once,
+    # so the reply and both audit rows do too.
+    settings = AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
+    service = await _service(engine, settings)
+    await _add(service, "root", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        h = _auth((await _login(c, "root")).json()["token"])
+        body = {"username": "twice", "roles": ["viewer", "viewer"], "email": "t@x.org"}
+        created = await c.post("/users", headers=h, json=body)
+        assert created.status_code == 201, created.text
+        assert created.json()["roles"] == ["viewer"]
+        uid = created.json()["id"]
+        # The role change takes the same list type, so it names a repeated role once too.
+        changed = await c.put(
+            f"/users/{uid}/roles", headers=h, json={"roles": ["operator", "operator"]}
+        )
+        assert changed.status_code == 200, changed.text
+    assert await service.store.get_user_role_ids(uid) == ["operator"]
+    audit = [dict(a) for a in await engine.store.list_audit(limit=50)]
+    created_details = [
+        json.loads(a["detail"])
+        for a in audit
+        if a["action"] == "user.created" and a["actor"] == "root"
+    ]
+    assert created_details == [{"username": "twice", "roles": ["viewer"]}]
+    changed_details = [
+        json.loads(a["detail"]) for a in audit if a["action"] == "user.roles_changed"
+    ]
+    assert changed_details == [{"user_id": uid, "roles": ["operator"]}]
 
 
 async def test_a_reset_the_generator_cannot_satisfy_names_the_setting(

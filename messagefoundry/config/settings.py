@@ -101,10 +101,14 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.connection_names import is_connection_name
 from messagefoundry.controlchars import has_control_char, has_lone_surrogate
-from messagefoundry.domainshape import domain_shape_problem, is_canonical_ipv4
+from messagefoundry.domainshape import MAX_MAIL_DOMAIN, domain_shape_problem, is_canonical_ipv4
 from messagefoundry.logging_setup import LOG_LEVELS
 from messagefoundry.redaction import json_loads_or_refusal
-from messagefoundry.remotedebug import RemoteDebugPosture, remote_debug_loosening
+from messagefoundry.remotedebug import (
+    REMOTE_DEBUG_ACCEPTANCE_LOOSENING,
+    RemoteDebugPosture,
+    remote_debug_loosening,
+)
 from messagefoundry.service_status import is_safe_service_name
 from messagefoundry.serviceenv import ServiceEnvPosture, service_env_loosenings
 from messagefoundry.startupcode import StartupPosture, startup_loosenings
@@ -439,42 +443,51 @@ class _Section(_InputHidingModel):
         return data
 
 
-#: Env var that explicitly permits MITM-able TLS overrides for a trusted-network dev/test bind.
+#: Env var that explicitly permits MITM-able TLS overrides for a trusted-network dev/test bind,
+#: honoured only on an instance at ``[security].enforcement = warn``.
 INSECURE_TLS_ESCAPE_ENV = "MEFOR_ALLOW_INSECURE_TLS"
 
 
 def insecure_tls_allowed() -> bool:
-    """Whether the explicit dev escape to permit insecure TLS overrides is set (ASVS 12.3.2).
+    """Whether the dev escape for insecure TLS overrides is SET to a true value (ASVS 12.3.2).
 
-    Certificate-validation overrides (``trust_server_certificate=true`` for SQL Server, for one) are
-    MITM-able, so they now **refuse** at startup unless ``MEFOR_ALLOW_INSECURE_TLS`` is truthy. This means a production deployment can't silently disable
-    server-cert validation; an operator must opt in loudly for a trusted-network dev/test bind."""
+    Set is not honoured. Certificate-validation overrides (``trust_server_certificate=true`` for
+    SQL Server, for one) are MITM-able, so the escape lets one through only when
+    ``MEFOR_ALLOW_INSECURE_TLS`` is set on an instance at ``[security].enforcement = warn``. The
+    cells ask :func:`weakened_tls_escape_permitted` or :func:`hop_insecure_escape_downgrades`, which
+    add that condition. Under ``enforce``, the default, or where the code knows no posture, the
+    escape changes nothing. Some connections have a per-hop way across that needs neither the escape
+    nor the dial, such as ``tls_hop_attested``. Some credential hops refuse even at ``warn``;
+    docs/SECURITY-LOOSENING.md, *No escape sends a credential to an unverified peer*, names them
+    and the ones that still cross."""
     return os.environ.get(INSECURE_TLS_ESCAPE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def hop_insecure_escape_downgrades(*, enforcing: bool) -> bool:
-    """Whether ``MEFOR_ALLOW_INSECURE_TLS`` may downgrade an insecure-hop REFUSE→WARN here (#200).
+    """Whether ``MEFOR_ALLOW_INSECURE_TLS`` may downgrade an insecure-hop REFUSE→WARN here (#200):
+    only on an instance at ``[security].enforcement = warn``.
 
     The **clamp** on the blunt global escape for the posture-keyed hop refusal (ADR 0092, decision 2):
     the escape may only relax a hop REFUSE to WARN when the security dial is **not enforcing**. Under
     ENFORCE it is **inert** — it can NEVER satisfy an enforcing hop (a deliberate behaviour change from
     the pre-#200 global escape, which silenced the refusal in every environment).
 
-    **Scope after ADR 0153 (decision 5): the TRANSPORT cells no longer consult this at all.** The
-    cleartext-hop authority lost its ``audited_opt_out`` parameter, so the variable cannot influence a
-    connection's cleartext-hop decision; the per-connection ``cleartext_accepted`` declaration replaced
-    it there. This clamp survives for the two **non-connection** cells that still key on the escape and
-    have nowhere to carry a per-hop declaration — the ``[logging]`` forwarder
-    (:func:`forward_hop_disposition`) and the API PHI-read serve hop
-    (:func:`~messagefoundry.config.tls_policy.phi_read_hop_disposition`) — plus the verify-off cells via
-    :func:`weakened_tls_escape_permitted`. On a connection, ``tls_hop_attested`` (ALLOW) or
-    ``cleartext_accepted`` (WARN + audit) is now the only way across an enforcing hop."""
+    **Scope after ADR 0153 (decision 5).** The cleartext-hop authority
+    (:func:`~messagefoundry.config.tls_policy.insecure_hop_disposition`) lost its
+    ``audited_opt_out`` parameter, so the variable no longer reaches a hop that authority decides as
+    cleartext; the per-connection ``cleartext_accepted`` declaration replaced it there. This clamp
+    is still called by at least the ``[logging]`` forwarder (:func:`forward_hop_disposition`), the
+    API PHI-read serve hop, and the HTTP family's ``verify_tls=false`` cell
+    (``transports.rest._shipped_strict_disposition``). :func:`weakened_tls_escape_permitted` applies
+    the same clamp to at least the other verify-off cells and the Direct and Email cleartext SMTP
+    hops."""
     return insecure_tls_allowed() and not enforcing
 
 
 def weakened_tls_escape_permitted(posture: HopPosture | None) -> bool:
     """Whether ``MEFOR_ALLOW_INSECURE_TLS`` may permit a weakened / verify-off TLS hop under ``posture``,
-    CLAMPED so an enforcing PHI hop is NEVER relaxed (#200, ADR 0092 decision 2).
+    CLAMPED so an enforcing hop is NEVER relaxed (#200, ADR 0092 decision 2): only when ``posture``
+    is known and the instance is at ``[security].enforcement = warn``.
 
     The **weakened-TLS / cleartext-escape** cells route their global-escape check through
     here so the blunt escape can no longer silence an **enforcing** refusal (matching the
@@ -488,7 +501,8 @@ def weakened_tls_escape_permitted(posture: HopPosture | None) -> bool:
     :func:`~messagefoundry.config.tls_policy.current_hop_posture` (in-gate transport cells, via
     :func:`weakened_tls_escape_permitted_here`) or an explicitly-threaded posture (the store hop and the
     out-of-gate #329 cells, whose construction never stamps the contextvar). Semantics: the escape must
-    be set, AND a posture must be known, AND it must not be enforcing.
+    be set, AND a posture must be known, AND it must not be enforcing. For a known posture this is
+    :func:`hop_insecure_escape_downgrades`, which it calls rather than repeats (vault BACKLOG #3753).
 
     **``None`` FAILS CLOSED (vault BACKLOG #2354).** No posture means the escape is NOT permitted.
     CORRECTED: this read *"``None`` (a backup utility / embedding / test outside the construction gate)
@@ -501,7 +515,7 @@ def weakened_tls_escape_permitted(posture: HopPosture | None) -> bool:
     The clamp used to require an enforcing **PHI** hop. Every instance carries patient data now
     (BACKLOG #1279), so the second conjunct could not vary and is gone: under ``enforce`` the blunt
     escape is inert, full stop."""
-    return insecure_tls_allowed() and posture is not None and not posture.enforcing
+    return posture is not None and hop_insecure_escape_downgrades(enforcing=posture.enforcing)
 
 
 def weakened_tls_escape_permitted_here() -> bool:
@@ -552,11 +566,12 @@ def insecure_config_source_escape_permitted(environ: Mapping[str, str] | None = 
     so it never does under ``[security].enforcement = enforce`` (vault BACKLOG #2599).
 
     The escape is honoured only when the SAME environment also carries
-    ``MEFOR_SECURITY_ENFORCEMENT=warn``. Under ``enforce`` it is inert, as ``MEFOR_ALLOW_INSECURE_TLS``
-    is (:func:`weakened_tls_escape_permitted`): a safe source loads, an unsafe one is refused, and the
-    refusal names the variable. It used to be honoured at any dial, so one variable in the service
-    environment would have turned off the check that keeps writable Python from running as the service
-    account, and nothing would have reported it.
+    ``MEFOR_SECURITY_ENFORCEMENT=warn``. Under ``enforce`` it is inert: a safe source loads, an unsafe
+    one is refused, and the refusal names the variable. It used to be honoured at any dial, so one
+    variable in the service environment would have turned off the check that keeps writable Python
+    from running as the service account, and nothing would have reported it. The insecure-TLS escape
+    ``MEFOR_ALLOW_INSECURE_TLS`` has its own clamp, honoured only on an instance at
+    ``[security].enforcement = warn`` (:func:`weakened_tls_escape_permitted`).
 
     **Why the dial is read from the environment and not from loaded settings.** The check runs inside
     ``load_config``, in every process that executes config: ``serve``, a reload, the sandbox worker's
@@ -933,14 +948,17 @@ class StoreSettings(_Section):
     schema_management: SchemaManagement | None = None
     encrypt: bool = True
     trust_server_certificate: bool = False
-    # Optional certificate file to verify the DB server certificate against a PRIVATE / self-signed CA (the
-    # common hospital-estate posture) WITHOUT installing it box-globally into the OS trust store. Honored by
-    # BOTH server-DB backends (#45), on the SECURE posture only (encrypt=true, trust_server_certificate=false)
-    # — it NEVER disables verification:
+    # Optional certificate file to verify the DB server WITHOUT installing anything box-globally into the OS
+    # trust store (the common hospital-estate posture is a PRIVATE / self-signed CA). Honored by BOTH
+    # server-DB backends (#45), on the SECURE posture only (encrypt=true, trust_server_certificate=false),
+    # and never applied on a weakened one. The two backends read it differently:
     #   * POSTGRES — asyncpg takes an SSLContext, so this loads ssl.create_default_context(cafile=...), a
     #     CA-bundle pin (chain + hostname still verified).
-    #   * SQL SERVER — the ODBC Driver 18.1+ `ServerCertificate` keyword pins the server's certificate by
-    #     file (a leaf/exact-cert match, brace-quoted STORE-5-safe); requires ODBC Driver 18.1 or newer.
+    #   * SQL SERVER — the ODBC Driver 18.1+ `ServerCertificate` keyword pins the server's OWN certificate
+    #     by file (an exact-cert match, brace-quoted STORE-5-safe), so a CA file matches nothing. It goes
+    #     out with `Encrypt=strict`: on the Driver 18.7 build tested, the pin was enforced with strict and
+    #     not with `Encrypt=yes` (vault BACKLOG #2223). Strict is TDS 8.0, so it needs SQL Server 2022 or
+    #     later, the supported floor; an older server refuses the connection. Not a revocation control.
     # REJECTED for SQLite (no TLS at all). A path, not a secret — it may live in the config file /
     # connections.toml. Empty = use the system trust store (the secure default). Existence is checked at load
     # (a missing file fails loud here, not confusingly at connect).
@@ -972,7 +990,10 @@ class StoreSettings(_Section):
     # a transient stage failure (retry / dead-letter) — see docs/CONNECTIONS.md "Behaviour at the
     # store-pool acquire limit". 30 s matches the connector tier's per-connection `acquire_timeout` and
     # sits far above a healthy wait; watch p95/p99 in the pool_status acquire-wait histogram before
-    # lowering it. Must be > 0: the point of the knob is that the wait is always bounded.
+    # lowering it. Must be > 0: the point of the knob is that the wait is always bounded. The two
+    # session writes that follow a committed auth change wait without it on Postgres (BACKLOG
+    # #2283) and for a fixed multiple of it on SQL Server, longer but still bounded (BACKLOG #3023);
+    # docs/CONNECTIONS.md has both, and says what else this knob does not reach.
     acquire_timeout: float = 30.0
     # POSTGRES ONLY, refused on the other backends (see _db_schema_backend). 'db_schema' avoids
     # shadowing BaseModel.schema; env: MEFOR_STORE_DB_SCHEMA.
@@ -1139,13 +1160,24 @@ class StoreSettings(_Section):
     def _ssl_root_cert_backend(self) -> StoreSettings:
         """``ssl_root_cert`` pins the DB server certificate for verification (#45). Both server-DB
         backends honor it — Postgres as an asyncpg SSLContext CA-bundle, SQL Server via the ODBC Driver
-        18.1+ ``ServerCertificate`` keyword — but SQLite uses no TLS, so setting it there is a silent
-        no-op: fail loud instead of leaving the operator thinking a private CA is pinned."""
+        18.1+ ``ServerCertificate`` keyword under ``Encrypt=strict`` — but SQLite uses no TLS, so
+        setting it there is a silent no-op: fail loud instead of leaving the operator thinking a
+        private CA is pinned."""
         if self.ssl_root_cert and self.backend is StoreBackend.SQLITE:
             raise ValueError(
                 "[store].ssl_root_cert requires a server-DB backend (postgres or sqlserver); "
                 "SQLite uses no TLS, so pinning a certificate has no effect."
             )
+        sends_pin = self.encrypt and not self.trust_server_certificate  # as the store decides
+        if self.ssl_root_cert and self.backend is StoreBackend.SQLSERVER and sends_pin:
+            # Vault BACKLOG #2223: on SQL Server the file is an exact-match pin, so a bundle or a CA
+            # certificate would refuse every connect. Say so at load, naming the setting. The file
+            # holds only a public certificate, and no part of it goes into the message.
+            from messagefoundry.pki import read_pinned_server_certificate
+
+            problem = read_pinned_server_certificate(self.ssl_root_cert)
+            if isinstance(problem, str):
+                raise ValueError(f"[store].ssl_root_cert {self.ssl_root_cert!r} {problem}")
         return self
 
     @field_validator("ssl_crl_file")
@@ -1272,14 +1304,139 @@ def request_host_is_browser_origin(
     return loopback and not trusted_proxies and not tls_terminated_upstream
 
 
+#: What uvicorn's ``_TrustedHosts`` builds from one ``forwarded_allow_ips`` entry: a network for an
+#: entry holding "/", an address for any other.
+_TrustedProxy = (
+    ipaddress.IPv4Address | ipaddress.IPv6Address | ipaddress.IPv4Network | ipaddress.IPv6Network
+)
+
+_TRUST_ALL_PROXIES_REFUSAL = (
+    "[api].trusted_proxies = '*' trusts the X-Forwarded-For header from EVERY peer, so "
+    "any client can declare its own source address (poisoning the audit trail, the "
+    "per-IP login limiter and the new-client-IP step-up signal). List the reverse "
+    "proxy's exact address(es) instead."
+)
+
+
+_ZONED_HOST = (
+    "an IPv6 entry with a zone. The engine reports every peer without its zone and uvicorn "
+    "compares a host entry's zone, so uvicorn would parse this entry and match no peer, "
+    "collapsing every client source IP to the proxy."
+)
+_ZONED_NETWORK = (
+    "an IPv6 entry with a zone. uvicorn ignores a network's zone, so it would trust this prefix "
+    "on every interface, not only on the one the zone names."
+)
+
+#: The IPv4-mapped block. An entry inside it names IPv4 hosts in their IPv6 spelling (BACKLOG #3042).
+_IPV4_MAPPED = ipaddress.IPv6Network("::ffff:0:0/96")
+_IPV4_MAPPED_BASE = int(_IPV4_MAPPED.network_address)
+
+
+def _matching_form(parsed: _TrustedProxy) -> _TrustedProxy | None:
+    """The form uvicorn would actually match peers with, for a ``parsed`` entry it would read
+    other than as written. None when ``parsed`` matches as it stands (BACKLOG #3042).
+
+    That form is an IPv6 entry with a zone: CPython reports a peer's host without its zone (the
+    zone goes in ``scope_id``, since Python 3.7; the link-local test measures it), and an
+    ``IPv6Address`` compares its zone, so the host ``fe80::1%eth0`` never equals the peer
+    ``fe80::1``. A network matches by prefix and ignores its zone, so a zoned network trusts the
+    prefix on every interface; it is refused too, so that no entry claims a narrowing it lacks.
+    The check reads the integer, never the address object, whose comparisons include the zone.
+
+    An IPv4-mapped entry is NOT such a form. uvicorn compares a mapped peer with a mapped entry
+    only, and a dual-stack inner proxy may write a mapped hop into ``X-Forwarded-For``, so
+    :func:`uvicorn_trusted_hosts` hands uvicorn both spellings of every IPv4 entry instead."""
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.scope_id is not None:
+        return ipaddress.IPv6Address(int(parsed))
+    if isinstance(parsed, ipaddress.IPv6Network) and parsed.network_address.scope_id is not None:
+        return ipaddress.IPv6Network((int(parsed.network_address), parsed.prefixlen))
+    return None
+
+
+def _ipv4_meaning(
+    network: ipaddress.IPv4Network | ipaddress.IPv6Network,
+) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
+    """``network`` as the IPv4 range it names when it sits inside the mapped block, else itself, so
+    ``::ffff:0:0/96`` counts as the whole IPv4 family it trusts (BACKLOG #3042)."""
+    # Every caller passes a zoneless network: a zoned entry is refused, or stripped of its zone.
+    if isinstance(network, ipaddress.IPv6Network) and network.subnet_of(_IPV4_MAPPED):
+        return ipaddress.IPv4Network(
+            (int(network.network_address) & 0xFFFF_FFFF, network.prefixlen - _IPV4_MAPPED.prefixlen)
+        )
+    return network
+
+
+def _trusts_every_ipv4_host(network: ipaddress.IPv4Network | ipaddress.IPv6Network) -> bool:
+    """Whether ``network`` trusts every IPv4 host in some spelling: ``0.0.0.0/0``, or an IPv6 range
+    holding the whole mapped block, such as ``::ffff:0:0/96``, ``::/80`` or ``::/0``, which trusts
+    the mapped hop of every IPv4 host (BACKLOG #3042)."""
+    if isinstance(network, ipaddress.IPv4Network):
+        return network.prefixlen == 0
+    return _IPV4_MAPPED.subnet_of(network)
+
+
+def _span_wording(network: ipaddress.IPv4Network | ipaddress.IPv6Network) -> str:
+    """How a refusal names a range it will not recommend: every host inside a trusted range may set
+    its own source address, and a whole family is what the refused ``'*'`` trusts."""
+    if network.prefixlen == 0 or _trusts_every_ipv4_host(network):
+        family = "IPv6" if network.prefixlen == 0 and network.version == 6 else "IPv4"
+        return (
+            f"It spans '{network}', which would trust every {family} peer, as the refused '*' does."
+        )
+    return (
+        f"It spans the network '{network}'. Trust that range only if every host in it is a "
+        "proxy, since each one may set its own source address. With "
+        "[security].allowed_client_networks set, the load refuses any range."
+    )
+
+
+def _as_matched(parsed: _TrustedProxy) -> _TrustedProxy:
+    """``parsed`` in the form uvicorn would match a peer with."""
+    matching = _matching_form(parsed)
+    return parsed if matching is None else matching
+
+
+def _parse_trusted_proxy(entry: str) -> _TrustedProxy:
+    """Read one ``[api].trusted_proxies`` entry the way uvicorn's ``_TrustedHosts`` does (``uvicorn``
+    is pinned exactly in ``pyproject.toml``), and refuse the forms known to load there and match
+    other than as written. It is the one reader of the list: at least the load check, the
+    allow-list pin check, the loosening check and :func:`uvicorn_trusted_hosts` call it, so they
+    cannot disagree (BACKLOG #3042).
+
+    uvicorn parses an entry holding "/" with a STRICT ``ip_network`` and any other with
+    ``ip_address``. Whatever fails either becomes a literal that matches no peer, which would
+    collapse every client source IP to the proxy and degrade the audit source IP, the per-IP login
+    limiter and the new-client-IP step-up signal. ``'*'`` trusts every peer. Each raises
+    ``ValueError`` with its own message, and so does a form :func:`_matching_form` names."""
+    if entry == "*":
+        raise ValueError(_TRUST_ALL_PROXIES_REFUSAL)
+    parsed: _TrustedProxy
+    try:
+        parsed = ipaddress.ip_network(entry) if "/" in entry else ipaddress.ip_address(entry)
+    except ValueError as exc:
+        raise ValueError(_trusted_proxy_refusal(entry, exc)) from exc
+    form = _matching_form(parsed)
+    if form is not None:
+        why = _ZONED_NETWORK if isinstance(form, ipaddress.IPv6Network) else _ZONED_HOST
+        if isinstance(form, ipaddress.IPv6Network) and form.num_addresses > 1:
+            fix = _span_wording(form)  # a range is named, never recommended
+        elif isinstance(form, ipaddress.IPv6Network):
+            fix = f"List '{form.network_address}' instead."
+        else:
+            fix = f"List '{form}' instead."
+        raise ValueError(f"[api].trusted_proxies entry {entry!r} is {why} {fix}")
+    return parsed
+
+
 def _trusted_proxy_refusal(entry: str, exc: ValueError) -> str:
-    """The message for an ``[api].trusted_proxies`` entry that a strict ``ip_network`` refuses.
+    """The message for an ``[api].trusted_proxies`` entry that uvicorn's own parse refuses.
 
     A host-bits CIDR such as ``10.0.0.1/24`` gets its own message naming the single proxy address
-    first, then the network it spans (BACKLOG #2488). The address is the host part AS WRITTEN, so
-    an IPv6 zone survives: uvicorn compares a scoped peer with a host entry's zone, and ``fe80::1``
-    never matches ``fe80::1%eth0``. A network entry is matched by prefix alone, zone or not. The network is named, never recommended, because every host inside a
-    trusted range may set its own source address."""
+    first, then the network it spans (BACKLOG #2488). Neither name is ever a form
+    :func:`_parse_trusted_proxy` refuses: a zoned spelling is replaced by the one that matches, so
+    ``fe80::1%eth0/64`` names ``fe80::1`` and ``fe80::/64`` (BACKLOG #3042). The network is named,
+    never recommended, because every host inside a trusted range may set its own source address."""
     try:
         network = ipaddress.ip_network(entry, strict=False)
     except ValueError:
@@ -1288,21 +1445,60 @@ def _trusted_proxy_refusal(entry: str, exc: ValueError) -> str:
             f"{exc} (uvicorn would silently treat it as a literal that never matches, "
             "collapsing every client source IP to the proxy)"
         )
-    if network.prefixlen == 0:
-        spans = (
-            f"It spans '{network}', which would trust every peer of its address family, as the "
-            "refused '*' does."
-        )
-    else:
-        spans = (
-            f"It spans the network '{network}'. Trust that range only if every host in it is a "
-            "proxy, since each one may set its own source address."
-        )
+    host = _as_matched(ipaddress.ip_address(entry.partition("/")[0]))
+    spanned = ipaddress.ip_network(_as_matched(network))  # a network's matching form is a network
     return (
         f"[api].trusted_proxies entry {entry!r} has host bits set. uvicorn parses a CIDR strictly, "
         "so it would treat this entry as a literal that never matches, collapsing every client "
-        f"source IP to the proxy. List the proxy's own address {entry.partition('/')[0]!r}. {spans}"
+        f"source IP to the proxy. List the proxy's own address '{host}'. {_span_wording(spanned)}"
     )
+
+
+def _other_spelling(parsed: _TrustedProxy) -> _TrustedProxy | None:
+    """``parsed`` in its other IPv4 spelling: the mapped twin of an IPv4 entry, the plain twin of a
+    mapped one. None for any other entry."""
+    if isinstance(parsed, ipaddress.IPv4Address):
+        return ipaddress.IPv6Address(_IPV4_MAPPED_BASE | int(parsed))
+    if isinstance(parsed, ipaddress.IPv4Network):
+        start = _IPV4_MAPPED_BASE | int(parsed.network_address)
+        return ipaddress.IPv6Network((start, _IPV4_MAPPED.prefixlen + parsed.prefixlen))
+    if isinstance(parsed, ipaddress.IPv6Address):
+        return parsed.ipv4_mapped
+    meaning = _ipv4_meaning(parsed)
+    return meaning if isinstance(meaning, ipaddress.IPv4Network) else None
+
+
+def uvicorn_trusted_hosts(entries: Sequence[str]) -> list[str]:
+    """The ``forwarded_allow_ips`` that ``serve`` hands uvicorn for ``[api].trusted_proxies``
+    ``entries``: each entry as written, then the other IPv4 spelling of each IPv4 or mapped entry
+    that the list does not already hold (BACKLOG #3042).
+
+    uvicorn's ``_TrustedHosts`` compares an ``ip_address`` with each entry and never normalises a
+    mapped one, so ``::ffff:10.0.0.1`` misses the entry ``10.0.0.1`` and the reverse. That check
+    runs on the socket peer and on every ``X-Forwarded-For`` hop, and a dual-stack inner proxy
+    writes its hop mapped. Both spellings name the same hosts, so the second trusts no host the
+    first did not name; it does trust that host in its other spelling, so a mapped entry's plain
+    twin also trusts it as a plain IPv4 socket peer, and ``::ffff:0:0/96`` gains ``0.0.0.0/0``.
+    Every entry must already have loaded: one :func:`_parse_trusted_proxy` refuses raises
+    ``ValueError``."""
+    parsed = [_parse_trusted_proxy(entry) for entry in entries]
+    seen = set(parsed)
+    out = list(entries)
+    for item in parsed:
+        twin = _other_spelling(item)
+        if twin is not None and twin not in seen:
+            seen.add(twin)
+            out.append(str(twin))
+    return out
+
+
+def _split_address_list(v: object) -> object:
+    """Split the env form of a list of addresses or origins on COMMAS, never ``os.pathsep``.
+    ``os.pathsep`` is ':' on POSIX, which also separates IPv6 groups and an origin's port, so it
+    would shred both on the Linux leg (BACKLOG #3042). A list from the file passes through."""
+    if isinstance(v, str):
+        return [item.strip() for item in v.split(",") if item.strip()]
+    return v
 
 
 class ApiSettings(_Section):
@@ -1542,50 +1738,30 @@ class ApiSettings(_Section):
         # is reliable regardless of how the admin cased it or how the browser sends the Origin.
         return f"{parts.scheme.lower()}://{parts.netloc.lower()}"
 
-    @field_validator(
-        "config_reload_roots",
-        "ws_allowed_origins",
-        "trusted_proxies",
-        "tls_client_cert_files",
-        mode="before",
-    )
+    @field_validator("config_reload_roots", "tls_client_cert_files", mode="before")
     @classmethod
     def _split_roots(cls, v: object) -> object:
-        # The env layer delivers list settings (MEFOR_API_CONFIG_RELOAD_ROOTS,
-        # MEFOR_API_WS_ALLOWED_ORIGINS, MEFOR_API_TRUSTED_PROXIES,
+        # The env layer delivers path-list settings (MEFOR_API_CONFIG_RELOAD_ROOTS,
         # MEFOR_API_TLS_CLIENT_CERT_FILES) as one string; split it on the
         # platform path separator so these list-typed settings can be set via env (review low-12).
         if isinstance(v, str):
             return [p for p in v.split(os.pathsep) if p]
         return v
 
+    @field_validator("ws_allowed_origins", "trusted_proxies", mode="before")
+    @classmethod
+    def _split_comma_list(cls, v: object) -> object:
+        return _split_address_list(v)
+
     @field_validator("trusted_proxies", mode="after")
     @classmethod
     def _check_trusted_proxies(cls, v: list[str]) -> list[str]:
-        # Both spellings below are FAIL-OPENS that uvicorn accepts silently, so validate them here
-        # rather than discover them from a poisoned audit trail:
-        #   "*"  -> uvicorn's _TrustedHosts trusts EVERY peer and hands back the client-authored
-        #           LEFTMOST X-Forwarded-For entry for every request, so any client can declare its own
-        #           source address (uvicorn.middleware.proxy_headers).
-        #   typo -> an unparseable entry degrades to a "trusted literal" that can never match, which
-        #           still satisfies the tls_terminated_upstream pairing check below while trusting
-        #           nothing — quietly collapsing every client to the proxy address and degrading the
-        #           audit source IP, the per-IP login limiter, and the new-client-IP step-up signal.
-        # A host-bits CIDR such as 10.0.0.1/24 fails the same way: uvicorn parses an entry holding
-        # "/" with a STRICT ip_network, so it too becomes a literal that matches no peer. Parse
-        # strictly here for that reason (BACKLOG #2488).
+        # Every form _parse_trusted_proxy refuses is a FAIL-OPEN uvicorn accepts silently: '*' trusts
+        # every peer, and the rest load and match no peer, which still satisfies the
+        # tls_terminated_upstream pairing check below while trusting nothing. Refuse them here
+        # rather than discover them from a poisoned audit trail (BACKLOG #2488, #3042).
         for entry in v:
-            if entry == "*":
-                raise ValueError(
-                    "[api].trusted_proxies = '*' trusts the X-Forwarded-For header from EVERY peer, so "
-                    "any client can declare its own source address (poisoning the audit trail, the "
-                    "per-IP login limiter and the new-client-IP step-up signal). List the reverse "
-                    "proxy's exact address(es) instead."
-                )
-            try:
-                ipaddress.ip_network(entry)
-            except ValueError as exc:
-                raise ValueError(_trusted_proxy_refusal(entry, exc)) from exc
+            _parse_trusted_proxy(entry)
         return v
 
     @field_validator("tls_client_cert_identities", mode="before")
@@ -1834,7 +2010,7 @@ class InboundSettings(_Section):
     # Default ACK timing for every inbound (staged pipeline, ADR 0001): INGEST = ACK-on-receipt
     # (the message is ACKed once durably committed to the ingress stage). A connection's own
     # ack_after= overrides this. Step A supports only INGEST; 'delivered' (defer the ACK until
-    # delivery) is not yet implemented and is rejected at engine start.
+    # delivery) is not yet implemented and is refused at load (_ack_after_is_built).
     ack_after: AckAfter = AckAfter.INGEST
 
     # Very-large-document streaming in-flight budget (#149, ADR 0105 Phase 1a) — the OPT-IN aggregate DoS
@@ -1882,6 +2058,19 @@ class InboundSettings(_Section):
     def _non_negative_depth(cls, value: int) -> int:
         if value < 0:
             raise ValueError("max_staged_depth must be >= 0 (0 = off)")
+        return value
+
+    @field_validator("ack_after")
+    @classmethod
+    def _ack_after_is_built(cls, value: AckAfter) -> AckAfter:
+        # Vault BACKLOG #3063 item 9: refused here, at load, as a connection's own
+        # ack_after='delivered' is refused at wiring. Listener start refused only the inherited
+        # value, so `messagefoundry check` said OK and serve came up with every listener isolated.
+        if value == AckAfter.DELIVERED:
+            raise ValueError(
+                "ack_after = 'delivered' (defer the ACK until delivery) is not yet implemented; "
+                "use 'ingest', the default (ACK-on-receipt)"
+            )
         return value
 
 
@@ -3198,6 +3387,9 @@ class AuthSettings(_Section):
     # population — the signature of a misconfiguration, not of offboarding. Below the floor the breaker
     # cannot distinguish the two cases and revokes.
     #
+    # Where that AND can never hold, `_refuse_a_dead_breaker_fraction` refuses a 1.0 fraction and
+    # `breaker_budget_warning` warns of a budget at or below the cap (BACKLOG #3085).
+    #
     # A service account that loses read on `userAccountControl` ALONE is NOT this breaker's case any
     # more (ADR 0195, BACKLOG #2039). Those accounts read UNDETERMINED, not "not found", and the
     # reconciler holds them without revoking under the rule ADR 0195 states (`hold_engaged` in
@@ -3305,7 +3497,7 @@ class AuthSettings(_Section):
     # with no non-blank required value is refused at load (BACKLOG #2032), and so is setting it
     # while oidc_require_mfa_claim is off (BACKLOG #2325). A whitespace-only value loads as None.
     oidc_acr_values: str | None = None
-    oidc_prompt: str | None = None  # requested `prompt` authorize param
+    oidc_prompt: str | None = None  # requested `prompt` authorize param; blank loads as None
     oidc_jwks_ttl_seconds: int = 3600
     oidc_jwks_min_refetch_seconds: int = 300  # the amplification bound
     oidc_flow_ttl_seconds: int = 300  # single-use flow window; validator-capped 30..1800
@@ -3574,12 +3766,12 @@ class AuthSettings(_Section):
         # lists compared with a token claim; a non-string item is left for the type check to refuse.
         return _normalise_claim_value_list(v)
 
-    @field_validator("oidc_acr_values")
+    @field_validator("oidc_acr_values", "oidc_prompt")
     @classmethod
-    def _normalise_oidc_acr_values(cls, v: str | None) -> str | None:
-        # BACKLOG #2325: the request is space-separated (OIDC Core, the authentication request). A whitespace-only
-        # value names no class, so it becomes None and the authorization request carries no
-        # acr_values at all, rather than the raw blanks it used to send.
+    def _normalise_space_separated_request(cls, v: str | None) -> str | None:
+        # BACKLOG #2325, and #3221 for prompt: both requests are space-separated (OIDC Core, the
+        # authentication request). A whitespace-only value names nothing, so it becomes None and the
+        # authorization request does not carry it, rather than the raw blanks it used to send.
         if v is None:
             return None
         return " ".join(v.split()) or None
@@ -3718,12 +3910,14 @@ class AuthSettings(_Section):
     @field_validator("ad_session_revoke_max_fraction")
     @classmethod
     def _check_ad_revoke_fraction(cls, value: float) -> float:
-        # A 0.0 fraction can never be exceeded by a non-negative count in the AND-form trip test, which
-        # would silently disable the proportional half of the breaker; refuse it rather than pretend.
+        # At 0.0 any revocation exceeds the proportional half, so every pass above the absolute cap
+        # trips on any estate, a genuine offboarding wave included; refused. At 1.0 it is never
+        # exceeded, so the whole breaker is dead; `_refuse_a_dead_breaker_fraction` refuses that
+        # while the reconciler can run (#3085).
         if not 0.0 < value <= 1.0:
             raise ValueError(
-                "ad_session_revoke_max_fraction must be > 0.0 and <= 1.0 (1.0 = the proportional "
-                "half of the breaker never trips; the absolute ad_session_revoke_max still applies)"
+                "ad_session_revoke_max_fraction must be > 0.0 and <= 1.0, and below 1.0 while the "
+                "directory reconciler runs"
             )
         return value
 
@@ -3800,6 +3994,52 @@ class AuthSettings(_Section):
                 "principals through the same LDAP service-account bind)"
             )
         return self
+
+    @property
+    def reconciler_configured(self) -> bool:
+        """Whether the directory session reconciler is set to run: AD on and a non-zero interval.
+        ``AuthService.directory_reconcile_enabled`` also needs an LDAP client, which settings
+        cannot see."""
+        return self.ad_enabled and self.ad_session_recheck_seconds > 0
+
+    @model_validator(mode="after")
+    def _refuse_a_dead_breaker_fraction(self) -> AuthSettings:
+        """BACKLOG #3085. Refuse a fraction under which the mass-revoke breaker never trips.
+
+        ``breaker_tripped`` in ``auth/reconcile.py`` trips only when a pass's revocations exceed
+        BOTH thresholds. A pass never revokes more accounts than it probed, so a 1.0 fraction is never
+        exceeded and the whole breaker is dead. Checked only while the reconciler can run. A budget
+        at or below the cap also leaves it dead, and is warned of rather than refused (owner ruling
+        2026-10-17); :meth:`breaker_budget_warning` says why. At least one more dead case is
+        neither: an estate with no more signed-in directory users than the cap.
+        """
+        if self.reconciler_configured and self.ad_session_revoke_max_fraction >= 1.0:
+            raise ValueError(
+                "ad_session_revoke_max_fraction must be below 1.0 while the directory reconciler "
+                "runs: a pass never revokes more accounts than it probed, so at 1.0 the mass-revoke "
+                "breaker can never trip"
+            )
+        return self
+
+    def breaker_budget_warning(self) -> str | None:
+        """The start-up warning for a budget at or below the revoke cap, or ``None`` (BACKLOG #3085).
+
+        A pass probes at most ``ad_session_recheck_max_users`` accounts, so it can never revoke more
+        than ``ad_session_revoke_max`` of them, and with the AND in ``breaker_tripped`` the breaker
+        never trips. Warned of, not refused (owner ruling 2026-10-17): refusing it would force a
+        small-budget site to a cap so low that every revoking pass trips, and revocation stops."""
+        if not self.reconciler_configured:
+            return None
+        if self.ad_session_recheck_max_users > self.ad_session_revoke_max:
+            return None
+        return (
+            f"[auth].ad_session_recheck_max_users ({self.ad_session_recheck_max_users}) is at or "
+            f"below [auth].ad_session_revoke_max ({self.ad_session_revoke_max}): a pass probes at "
+            "most that many accounts, so it can never revoke more than the cap, and the "
+            "mass-revoke circuit breaker can never trip. Revocation still works. To arm the "
+            "breaker, raise ad_session_recheck_max_users above ad_session_revoke_max. Lowering "
+            "the cap instead makes a pass that revokes its whole small sample trip."
+        )
 
     @property
     def oidc_private_key_jwt(self) -> bool:
@@ -4072,6 +4312,10 @@ class AuthSettings(_Section):
         ``ad_domain`` the LDAP layer already builds UPNs from (``auth/ldap.py``). Empty means no
         suffix source is configured at all, which the validator above refuses when stripping is on.
         """
+        # Its own rule, not the shared domain rule (BACKLOG #3075 item 3, declined): an entry is
+        # compared with the raw suffix an identity provider writes into a claim, not with a DNS
+        # name the engine resolves, and a UPN suffix may be non-ASCII or hold an underscore,
+        # both of which the shared rule refuses.
         if self.oidc_allowed_username_domains:
             return tuple(d.strip().lower() for d in self.oidc_allowed_username_domains if d.strip())
         return (self.ad_domain.strip().lower(),) if self.ad_domain else ()
@@ -4557,23 +4801,51 @@ def forward_hop_disposition(log: LoggingSettings, posture: HopPosture) -> HopDis
     )
 
 
-def _bare_domain_entries(value: list[str], *, allow_ipv4: bool, refusal: str) -> list[str]:
+def _not_a_host_address(text: str) -> bool:
+    """Whether the canonical IPv4 ``text`` is not one host's address: at least the unspecified
+    ``0.0.0.0``, a multicast group, and the reserved class E range, which holds the limited
+    broadcast ``255.255.255.255`` (BACKLOG #3075). No identity provider or link is served from one,
+    and some browsers route ``0.0.0.0`` to the local machine. This does not refuse loopback: a
+    ``127.0.0.1`` entry still loads, as ``localhost`` does."""
+    address = ipaddress.IPv4Address(text)
+    return address.is_unspecified or address.is_multicast or address.is_reserved
+
+
+def _bare_domain_entries(
+    value: list[str], *, allow_ipv4: bool, refusal: str, max_length: int | None = None
+) -> list[str]:
     """One domain list's entries, normalised, or a ``ValueError`` for the first that can never match.
 
     Shared by ``[egress].allowed_recipient_domains`` and the two ``[security]`` navigation lists
     (vault BACKLOG #2843). Surrounding whitespace is stripped and a blank entry is skipped. Each
     entry must pass :func:`~messagefoundry.domainshape.domain_shape_problem`, or with
-    ``allow_ipv4`` be a canonical IPv4 address. No dot is stripped, so a leading or trailing dot is
-    refused rather than silently dropped. An entry is lowercased only after the check, because
-    ``str.lower()`` turns some non-ASCII letters, such as the Kelvin sign, into ASCII ones, which
-    would accept a value that differs from the one written. ``refusal`` ends the error message."""
+    ``allow_ipv4`` be a canonical IPv4 address :func:`_not_a_host_address` does not refuse
+    (BACKLOG #3075). ``max_length``, when set, is a
+    tighter cap than the shape rule's 253 characters. No dot is stripped, so a leading or trailing
+    dot is refused rather than silently dropped. An entry is lowercased only after the check,
+    because ``str.lower()`` turns some non-ASCII letters, such as the Kelvin sign, into ASCII ones,
+    which would accept a value that differs from the one written. ``refusal`` ends the error
+    message.
+
+    A single label is accepted, a bare public suffix such as ``com`` included (BACKLOG #3075 item
+    4, declined): an intranet name is often one label, and telling a public suffix from a private
+    name needs the Public Suffix List, which this stdlib-only rule does not carry."""
     cleaned: list[str] = []
     for raw in value:
         item = raw.strip()
         if not item:
             continue
-        problem = domain_shape_problem(item)
-        if problem is not None and not (allow_ipv4 and is_canonical_ipv4(item)):
+        if allow_ipv4 and is_canonical_ipv4(item):
+            problem = (
+                "an IPv4 address that is not one host's; list a single host's address"
+                if _not_a_host_address(item)
+                else None
+            )
+        elif max_length is not None and len(item) > max_length:
+            problem = f"a domain longer than {max_length} characters"
+        else:
+            problem = domain_shape_problem(item)
+        if problem is not None:
             raise ValueError(f"{item!r} is {problem}. {refusal}")
         cleaned.append(item.lower())
     return cleaned
@@ -4638,7 +4910,11 @@ class EgressSettings(_Section):
     proxy_url: str | None = None
     # The site-wide NO_PROXY-style bypass list inherited by a connection that sets no per-connection
     # `proxy_no_proxy` (#128). Each entry is a host / `.suffix` / `*.suffix` / `*`. Env (comma-separated):
-    # MEFOR_EGRESS_PROXY_NO_PROXY.
+    # MEFOR_EGRESS_PROXY_NO_PROXY. It keeps its own rule, transports/rest.py `_proxy_bypasses`, which
+    # config/static_credentials.py reads rather than restates (BACKLOG #3075 item 2, declined). It
+    # takes an IP literal, a port and an underscore host the shared domain rule refuses. An entry
+    # that matches nothing sends that host through the proxy; that rule ignores a port and reads
+    # '*:443' as '*', so a malformed entry can also bypass the proxy for every host.
     proxy_no_proxy: list[str] = []
     # The forward-PROXY host allowlist (BACKLOG #1659). Each entry is "host" (any port) or "host:port".
     # NOT a destination list: it gates the operator-chosen transport INTERMEDIARY an http-family
@@ -4713,14 +4989,15 @@ class EgressSettings(_Section):
         ``[security].organization_domains``, subdomains are NOT matched: each needs its own entry.
 
         Each entry must pass the shape rule the send path applies to a recipient's domain, so an
-        entry shaped like no sendable domain is refused here, not at the gate. One gap remains: a
-        domain of exactly 253 characters passes here, but the send path's 254-character address cap
-        refuses every address in it. Normalisation, in
+        entry shaped like no sendable domain is refused here, not at the gate. The domain is also
+        capped at 252 characters, the most the send path's 254-character address cap leaves, so a
+        253-character domain no address can carry is refused too (BACKLOG #3075). Normalisation, in
         :func:`_bare_domain_entries`: whitespace stripped, blanks skipped, no dot stripped, and
         lowercased after the check. No IP address is accepted (vault BACKLOG #2843)."""
         return _bare_domain_entries(
             value,
             allow_ipv4=False,
+            max_length=MAX_MAIL_DOMAIN,
             refusal="[egress].allowed_recipient_domains needs a bare domain such as "
             "'hospital.example', not an address, URL, port, wildcard or suffix; list each "
             "subdomain as its own entry",
@@ -4857,6 +5134,11 @@ _ALERT_EVENT_TYPES = frozenset(
         # several engine processes share the store, which no connection can be named. It has no
         # inverse: a refusal is an event, not a state that clears.
         "remote_debug_refused",
+        # vault BACKLOG #2724 (owner ruling 2026-10-16): a [sandbox].mode = "subprocess" worker was
+        # refused because the graph it loaded differs from the engine's, most often a config file
+        # edited on disk with no reload. Keyed by the inbound's name, once per refusal. Not in
+        # _ALERT_CONTROL_EVENT_TYPES: a restart reloads nothing, so it cannot clear the cause.
+        "sandbox_worker_refused",
         # NOTE: the INVERSE events (leadership_lost / dr_released / intake_resumed /
         # ad_reconcile_breaker_cleared / ad_reconcile_hold_released) are auto-resolve-only
         # (alert_sinks _AUTO_RESOLVE), NOT rule-targetable alert types -- a step-down, a fail-back,
@@ -6542,12 +6824,13 @@ class SecuritySettings(_Section):
     # contradiction is reported on GET /security/posture.
     memory_encryption_operator_declared: bool = False
     # OPT-IN ENFORCEMENT of the declaration above. Default FALSE, and that default is load-bearing:
-    # an exposed PHI instance with no declaration WARNS, it never refuses, so nothing that boots
-    # today stops booting on upgrade. The property is a HOST property no operator can satisfy on
-    # Windows (the read-out is always null there), so a refusal keyed on it by default would
-    # hard-stop working dev/staging/prod deployments over a platform fact they cannot change — the
-    # outcome ADR 0151 avoided by scoping its companion refusal to its own opt-in, and the reason the
-    # Posture-B widening warns on the recommended loopback-behind-proxy topology. Set TRUE to turn
+    # an exposed PHI instance with no declaration WARNS, it never refuses. The property is a HOST
+    # property the engine cannot observe on Windows (the read-out reports nothing there), and many
+    # Windows hosts cannot provide it (which can: ADR 0152, Amendment 2026-10-17). So a refusal by
+    # default would leave an operator on such a host two choices: do not start, or declare a
+    # property the host does not have. ADR 0151 scoped its companion refusal to its own opt-in, and
+    # the Posture-B widening warns on the recommended loopback-behind-proxy topology; this follows
+    # both. Set TRUE to turn
     # that warning into a refusal for an estate that has standardized on confidential-computing
     # hosts; the refuse/warn dial ([security].enforcement, ADR 0148) still applies on top, so
     # enforcement=warn keeps it a warning even when this is set. Not a loosening (it tightens).
@@ -6578,6 +6861,14 @@ class SecuritySettings(_Section):
     # AUDIT: line at every start that uses it, over_grant_accepted=true on the store_privilege_preflight
     # audit row, and a security_loosenings() entry. DIRECT-READ by the serve lifespan, not desugared.
     allow_over_granted_store_principal: bool = False
+
+    # ── Interpreter remote debugging (PEP 768, vault BACKLOG #2700) ──
+    # The named acceptance that lifts the refusal `serve` and `supervise` make under enforcement =
+    # enforce when the interpreter's remote debugging is enabled in their process (owner ruling
+    # 2026-10-16; messagefoundry/remotedebug.py remote_debug_refusal). For the developer loop.
+    # Default FALSE. Setting it TRUE is a LOOSENING and security_loosenings() names it. DIRECT-READ
+    # by the start gates.
+    allow_remote_debugging: bool = False
 
     # ── Backend credentials (ASVS 13.2.1, BACKLOG #1182) ─────────────
     # OPT-IN REFUSAL of every backend hop that presents an unchanging credential or none. Default
@@ -6738,11 +7029,7 @@ class SecuritySettings(_Section):
     @field_validator("allowed_client_networks", mode="before")
     @classmethod
     def _split_client_networks(cls, v: object) -> object:
-        # COMMA, never os.pathsep. os.pathsep is ':' on POSIX — which is also the IPv6 group separator —
-        # so reusing the [api] list splitter (_split_roots) would shred every v6 entry on the Linux leg.
-        if isinstance(v, str):
-            return [item.strip() for item in v.split(",") if item.strip()]
-        return v
+        return _split_address_list(v)
 
     @field_validator("allowed_client_networks", mode="after")
     @classmethod
@@ -6855,7 +7142,8 @@ class ServiceSettings(_InputHidingModel):
         """Under ``[security].enforcement = enforce``, ``[auth].ad_allow_insecure_ldap`` is inert, so a
         plain ``ldap://`` AD bind is refused (vault BACKLOG #2354).
 
-        The ``MEFOR_ALLOW_INSECURE_TLS`` escape is clamped this way (ADR 0092 decision 2, and
+        The ``MEFOR_ALLOW_INSECURE_TLS`` escape is clamped this way, honoured only at
+        ``[security].enforcement = warn`` (ADR 0092 decision 2, and
         ``weakened_tls_escape_permitted``). This one was honoured at any dial, so on a first deployment
         at the shipped ``enforce`` it would have sent the service-account and user passwords over a
         cleartext SIMPLE bind. The dial and the bind live in different sections, so the check lives
@@ -6889,7 +7177,8 @@ class ServiceSettings(_InputHidingModel):
         if not self.security.allowed_client_networks:
             return self
         for entry in self.api.trusted_proxies:
-            net = ipaddress.ip_network(entry, strict=False)  # already validated by ApiSettings
+            # Already validated by ApiSettings, so it parses; a host is its one-address network.
+            net = ipaddress.ip_network(_parse_trusted_proxy(entry))
             if net.num_addresses != 1:
                 raise ValueError(
                     f"[api].trusted_proxies entry {entry!r} covers {net.num_addresses} addresses. "
@@ -7339,8 +7628,9 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
 
     At least these names are spared:
 
-    * one that names no modelled section either way (``MEFOR_ALLOW_INSECURE_TLS``, a harness
-      variable, another tool's). So a typo in the SECTION part of a name is not refused.
+    * one that names no modelled section either way (``MEFOR_ALLOW_INSECURE_TLS``, the escape
+      honoured only at ``[security].enforcement = warn``; a harness variable; another tool's).
+      So a typo in the SECTION part of a name is not refused.
       :func:`_unread_env_notes` writes a note, which :func:`load_settings` logs as a WARNING,
       for at least some of those, and the rest are dropped with no message;
     * one with no key part, which gets the same note when it is a section's name;
@@ -7876,20 +8166,31 @@ def _classify_proxy_entries(entries: Sequence[str]) -> tuple[list[str], list[str
     ``X-Forwarded-For``, so a ``/31``, a ``/127`` or a small pool trusts a host that is not the
     proxy as surely as a ``/8`` does. Any cutoff above one would leave some range silent.
 
-    Each entry is read the way uvicorn reads it: a strict parse, where a host-bits-set entry is not
-    a network and is skipped. The load refuses such an entry (BACKLOG #2488), so on a loaded config
-    nothing is skipped."""
+    Each entry is read by :func:`_parse_trusted_proxy`, the load's own reader, and one it refuses is
+    skipped. The load refuses such an entry (BACKLOG #2488, #3042), so on a loaded config nothing is
+    skipped."""
     v4: list[tuple[str, ipaddress.IPv4Network]] = []
     v6: list[tuple[str, ipaddress.IPv6Network]] = []
     for entry in dict.fromkeys(entries):  # a repeated entry is named once, in order
         try:
-            net = ipaddress.ip_network(entry)
+            parsed = _parse_trusted_proxy(entry)
         except ValueError:
             continue
+        # A host counts toward its family's collapse as its single-address network, and a mapped
+        # entry toward IPv4's, so ``::ffff:0:0/96`` is named as the whole family it trusts.
+        # A mapped entry also stays in IPv6's collapse, since uvicorn holds it as an IPv6 network.
+        net = ipaddress.ip_network(parsed)
+        meaning = _ipv4_meaning(net)
         if isinstance(net, ipaddress.IPv4Network):
             v4.append((entry, net))
         else:
             v6.append((entry, net))
+            if isinstance(meaning, ipaddress.IPv4Network):
+                v4.append((entry, meaning))
+            elif _trusts_every_ipv4_host(net):
+                # A wider IPv6 range holding the whole mapped block, such as ``::/80``, trusts the
+                # mapped hop of every IPv4 host, so it counts as the whole IPv4 family as well.
+                v4.append((entry, ipaddress.IPv4Network("0.0.0.0/0")))
     whole_family: list[str] = []
     ranges: list[str] = []
     # collapse_addresses takes one family at a time, so each is collapsed on its own.
@@ -7901,7 +8202,9 @@ def _classify_proxy_entries(entries: Sequence[str]) -> tuple[list[str], list[str
     for family, covers_all in families:
         multi = [entry for entry, net in family if net.num_addresses > 1]
         (whole_family if covers_all else ranges).extend(multi)
-    return whole_family, ranges
+    # An entry counted in both families is named once, under the wider wording it earns.
+    whole_family = list(dict.fromkeys(whole_family))
+    return whole_family, [entry for entry in dict.fromkeys(ranges) if entry not in whole_family]
 
 
 def _auth_default(field: str) -> Any:
@@ -9150,11 +9453,12 @@ def security_loosenings(
     out.extend(_approvals_loosenings(approvals))
     # BACKLOG #1131: trusted_proxies ranges covering every peer of a family (0.0.0.0/0, ::/0, or
     # ranges whose union is that) make uvicorn trust X-Forwarded-For from all of them, which is what
-    # the refused "*" does. The load still accepts them; naming them is the fix. Parsed STRICTLY, as
-    # uvicorn's _TrustedHosts parses them (__main__ hands it the list verbatim). A host-bits entry
-    # such as "10.1.2.3/0" would be a literal that matches nothing there, and the validator now
-    # refuses it at load (BACKLOG #2488), so it never reaches this check. Not gated on sign-in: a
-    # forged source address poisons the audit trail either way.
+    # the refused "*" does. The load still accepts them; naming them is the fix. Read by the load's
+    # own parser, _parse_trusted_proxy, which parses as uvicorn's _TrustedHosts does (__main__ hands
+    # it the list plus each IPv4 entry's other spelling, uvicorn_trusted_hosts) and refuses at least
+    # a host-bits entry such as "10.1.2.3/0" (BACKLOG #2488) and a zoned one (#3042), so none
+    # reaches this check. A mapped entry counts as the IPv4 range it names (#3042). Not gated on
+    # sign-in: a forged source address poisons the audit trail either way.
     # A range short of a whole family is named too, with its own wording: any host inside it may
     # forge X-Forwarded-For, which poisons the same three signals for that range's hosts. Every
     # entry covering more than one address counts, /31 and /127 included; the helper says why.
@@ -9287,6 +9591,8 @@ def security_loosenings(
                 "preflight would otherwise raise is acknowledged away",
             )
         )
+    if sec.allow_remote_debugging:
+        out.append(REMOTE_DEBUG_ACCEPTANCE_LOOSENING)  # vault BACKLOG #2700
     # BACKLOG #1182: while the opt-in static-credential refusal is ON, each per-hop opt-out is a
     # deliberate departure from it, so the opt-outs are the loosening. With the refusal OFF (the shipped
     # default, owner decision 2026-09-23) nothing is refused and an opt-out is inert, so it is not

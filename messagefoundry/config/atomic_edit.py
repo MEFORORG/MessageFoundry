@@ -94,6 +94,11 @@ _LOCK_POLL_S = 0.05
 #: FUSE and SMB mounts), as opposed to a lock someone else holds. The same set ``dr_backup`` reads.
 _LOCK_UNSUPPORTED = frozenset({errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOTSUP})
 
+#: ``errno`` values meaning the file system will not let this account write the directory: a
+#: root-owned one, or a read-only mount. Only these become an editor's ``refused_error``; a full
+#: disk or a missing directory keeps its own ``OSError``, so it is not reported as a permission.
+_REFUSED = frozenset({errno.EACCES, errno.EPERM, errno.EROFS})
+
 #: Text-mode translation would rewrite every ``\n`` as ``\r\n`` on Windows; the bytes go out verbatim.
 _O_BINARY = getattr(os, "O_BINARY", 0)
 
@@ -136,6 +141,7 @@ def edit_lock(
     *,
     busy_error: Callable[[str], Exception] = TimeoutError,
     timeout: float = DEFAULT_LOCK_TIMEOUT_S,
+    refused_error: Callable[[str], Exception] | None = None,
 ) -> Iterator[None]:
     """Hold the cross-process edit lock for ``path`` for the body of the ``with``.
 
@@ -143,7 +149,9 @@ def edit_lock(
     another process or thread still holds it after ``timeout`` seconds, raises ``busy_error(message)``,
     which each editor sets to its own refusal type so its callers catch one exception as before. A file
     system that cannot lock is logged and the edit proceeds unlocked, since the lock guards against a
-    lost update, not against a reader of the file."""
+    lost update, not against a reader of the file. When the file system refuses to create the lock
+    file (``EACCES``, ``EPERM`` or ``EROFS``: a root-owned or read-only directory), the ``OSError``
+    propagates, or with ``refused_error`` set it is raised as ``refused_error(message)``."""
     lock_path = lock_path_for(path)
     key = os.path.normcase(str(lock_path.resolve()))
     held: set[str] = _held.__dict__.setdefault("paths", set())
@@ -158,7 +166,8 @@ def edit_lock(
     flags = os.O_RDONLY | os.O_CREAT | _O_BINARY
     flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        fd = os.open(lock_path, flags, 0o600)
+        with _refused_as(path, refused_error, f"create or open its edit lock {lock_path.name}"):
+            fd = os.open(lock_path, flags, 0o600)
     except OSError as exc:
         if exc.errno != errno.ELOOP:
             raise
@@ -188,6 +197,7 @@ def replace_validated(
     validate: Callable[[Path], None],
     *,
     companions: Iterable[Path] = (),
+    refused_error: Callable[[str], Exception] | None = None,
 ) -> None:
     """Replace ``path`` with ``data`` only if ``validate`` accepts a candidate holding ``data``.
 
@@ -196,19 +206,26 @@ def replace_validated(
     receives the candidate path and raises to refuse; the refusal propagates unchanged and the live
     file is left byte-for-byte and mode-for-mode as it was. On success the candidate is renamed over
     ``path`` and re-restricted to its owner. The private directory is removed either way, and a
-    stale one a killed editor of ``path`` left behind is removed first."""
+    stale one a killed editor of ``path`` left behind is removed first.
+
+    With ``refused_error`` set, a refusal creating or writing the candidate (``EACCES``, ``EPERM`` or
+    ``EROFS``: a root-owned or read-only directory) is raised as ``refused_error(message)``. Only
+    those steps: they run before the replace, so the live file is untouched. An error from the
+    replace onward, and any other ``OSError``, is never converted."""
     _remove_stale_candidates(path)
-    private = Path(
-        tempfile.mkdtemp(dir=path.parent, prefix=f".{path.name}.", suffix=CANDIDATE_DIR_SUFFIX)
-    )
+    with _refused_as(path, refused_error, "create its edit candidate"):
+        private = Path(
+            tempfile.mkdtemp(dir=path.parent, prefix=f".{path.name}.", suffix=CANDIDATE_DIR_SUFFIX)
+        )
     try:
         candidate = private / path.name
-        fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, 0o600)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-            # On disk before the rename, so a crash just after it cannot leave an empty live file.
-            handle.flush()
-            os.fsync(handle.fileno())
+        with _refused_as(path, refused_error, "write its edit candidate"):
+            fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                # On disk before the rename, so a crash just after it cannot leave an empty file.
+                handle.flush()
+                os.fsync(handle.fileno())
         for companion in companions:
             if companion.is_file():
                 shutil.copyfile(companion, private / companion.name)
@@ -218,6 +235,39 @@ def replace_validated(
         _remove_private_dir(private)
     _fsync_dir(path.parent)
     _secure_file(path)
+
+
+@contextlib.contextmanager
+def _refused_as(
+    path: Path, refused_error: Callable[[str], Exception] | None, step: str
+) -> Iterator[None]:
+    """Raise a refusal (``_REFUSED``) from the body, which does ``step``, as
+    ``refused_error(message)``; any other ``OSError``, or any at all when ``refused_error`` is
+    ``None``, propagates unchanged. Only for steps before the replace, when the live file is known
+    to be untouched."""
+    try:
+        yield
+    except OSError as exc:
+        if refused_error is None or exc.errno not in _REFUSED:
+            raise
+        raise refused_error(_refusal(path, exc, step)) from exc
+
+
+def _refusal(path: Path, exc: OSError, step: str) -> str:
+    """The message for an edit of ``path`` the file system refused before anything was written.
+
+    It names the file, the step that was refused and the cause, not the directory: it reaches an
+    operator through the API, where an absolute host path adds nothing the file name does not. The
+    full error, with the path, is logged."""
+    _log.warning("the file system refused an edit of %s: %s", path, exc)
+    code = errno.errorcode.get(exc.errno, "") if exc.errno is not None else ""
+    reason = (exc.strerror or type(exc).__name__) + (f" ({code})" if code else "")
+    return (
+        f"{path.name} was not changed: the file system would not let this account {step}: "
+        f"{reason}. Its directory is read-only or another account owns it, as a root-owned or "
+        "read-only config directory is, or another account owns the file named; change the file "
+        "where this account can write it, or as the account that owns it"
+    )
 
 
 def _acquire(

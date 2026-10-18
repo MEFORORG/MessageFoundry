@@ -9,22 +9,42 @@ reads the API with that session.
 
 ``provision-admin`` reads its password from a terminal and has no other input, on purpose. A rig has
 no terminal. So :func:`provision` runs the shipped command in a child process with that one read
-replaced by a value the rig holds. Settings, the at-rest gate, the store open, the password policy
-and the account write are the shipped code path. ``scripts/service/measure-store-access.ps1`` does
+replaced by a value the rig holds. The child also wraps the command's
+``_build_provision_auth_service``, so the service's ``provision_refusal`` and
+``provision_first_administrator`` refuse a store that holds an enabled Administrator, though none
+signs in with a local password (vault BACKLOG #2711, :func:`_keep_the_narrow_rule`). That only
+narrows the command. The rest is the shipped code path: at least the settings, the at-rest gate,
+the store open, the password policy and the account write. ``scripts/service/measure-store-access.ps1`` does
 the same on Windows; this is that recipe for every platform.
 
-**This is test tooling.** It adds no flag, no environment switch and no password path to any shipped
-command. The rig password is drawn per run, and this module never writes it to a file or prints
-it. It is held in memory, in this process's environment for a child harness process, and in the
-environment of the one child that provisions.
+**This is test tooling.** It adds no flag, no environment switch, no password path and no
+authenticator input to any shipped command. The rig password is drawn per run, and this module
+never writes it to a file or prints it. It is held in memory, in this process's environment for a
+child harness process, and in the environment of the one child that provisions.
 
-Two things a rig's ``serve`` needs beside the account:
+**A leg chooses whether its engine requires MFA** (vault BACKLOG #2796). ``provision-admin`` enrols
+an authenticator app at the terminal and offers no other way, so a rig has two choices:
 
-* ``MEFOR_SECURITY_REQUIRE_MFA=false`` (:data:`SERVE_ENV`). The shipped command enrols an
-  authenticator app at the terminal, and offers no other way, so the rig account has none.
-* Under ``[security].enforcement = enforce``, a way to send account-security notices
-  (:data:`NOTIFY_ENV`). A start with sign-in on refuses without one. The account carries an address
-  for the same reason.
+* Run ``serve`` with ``MEFOR_SECURITY_REQUIRE_MFA=false`` (:data:`SERVE_ENV`), and the rig account
+  has no second factor. This is what a rig gets when it supplies no authenticator key.
+* Supply an authenticator key in :data:`ADMIN_FACTOR_ENV`, a base32 TOTP secret the calling shell
+  draws per run, and keep the shipped ``require_mfa = true``. The provisioning child then replaces
+  the terminal enrolment too, with that key and a code computed from it, and runs the rest of the
+  shipped enrolment, at least the code check, the step consumption and the secret write.
+  :func:`sign_in` sends a code with the password, in the combined ``POST /auth/login`` (ADR 0197).
+  The key is held where the calling shell put it: in this process's environment, which a child
+  harness process inherits, and in memory. An engine node and the ``run`` child are kept from it;
+  the provisioning child is handed it and pops it before any engine code runs. It is never printed
+  and never written to a file.
+  The recovery codes the command issues are not shown anywhere, since the rig holds the key itself.
+
+  A sign-in with a key waits for a TOTP step to open, and suits a leg that signs in once;
+  :func:`_code_in_a_fresh_step` says why. The key covers sign-in only: a step-up re-proof
+  (``/me/reauth``) takes the password alone.
+
+Under ``[security].enforcement = enforce``, a rig's ``serve`` also needs a way to send
+account-security notices (:data:`NOTIFY_ENV`). A start with sign-in on refuses without one. The
+account carries an address for the same reason.
 
 **It imports nothing beside the standard library at module level**, and nothing from ``harness``.
 So one file serves three callers: the harness runners import it, a workflow runs
@@ -36,8 +56,9 @@ the store, so one sign-in covers every node that shares a store, however many no
 matters because the engine caps the sessions one user may hold (five by default) and ends the
 oldest past that: a session per node would end the first ones on a large fleet. A node on a
 different store refuses the session, and :func:`renew_session` signs in again there. A drive split
-over several harness PROCESSES holds one session in each, so the rig that splits its drive that way
-sizes the cap on the engine it starts (``connscale/batchbox.py``).
+over several harness PROCESSES holds one session in each and makes one sign-in from each, so the
+rig that splits its drive that way sizes the cap and the sign-in rate limits on the engine it starts
+(``connscale/batchbox.py``, ``rig_sign_in_env``).
 """
 
 from __future__ import annotations
@@ -60,10 +81,11 @@ import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO, Protocol
+from typing import IO, Any, Protocol
 from urllib.parse import urlsplit
 
 __all__ = [
+    "ADMIN_FACTOR_ENV",
     "ADMIN_NAME_ENV",
     "ADMIN_PASS_ENV",
     "EXIT_EXISTS",
@@ -94,18 +116,27 @@ __all__ = [
 #: one server store across runs exports both, since a store that already holds an Administrator
 #: cannot be provisioned again.
 #:
-#: These two hold the NAMES of environment variables, and messages below print them. CodeQL's
-#: clear-text-logging query labels a value by the name it is assigned to, so neither Python name
-#: spells a word its heuristics match (at least "password", "secret", "token" and "account").
+#: These three, ADMIN_FACTOR_ENV below included, hold the NAMES of environment variables, and
+#: messages below print them. CodeQL's clear-text-logging query labels a value by the name it is
+#: assigned to, so no such Python name spells a word its heuristics match (at least "password",
+#: "secret", "token" and "account").
 ADMIN_NAME_ENV = "MEFOR_RIG_ADMIN_USERNAME"
 ADMIN_PASS_ENV = "MEFOR_RIG_ADMIN_PASSWORD"
+#: The rig account's authenticator key, a base32 TOTP secret, for a leg whose engine requires MFA.
+#: Unlike the password it is never drawn here: a leg opts in by supplying it, to ``provision`` and
+#: to the later sign-in, as it supplies the password. Unset means the account has no second factor.
+ADMIN_FACTOR_ENV = "MEFOR_RIG_ADMIN_TOTP_KEY"
 
 _DEFAULT_USERNAME = "rig-operator"
 #: ``.invalid`` never resolves (RFC 2606), so no notice for this account can leave the box.
 _NOTIFY_ADDRESS = "rig-operator@example.invalid"
 
-#: What a rig's ``serve`` carries so the rig account can use the API. ``provision`` sets it for the
-#: provisioning child itself.
+#: What a rig's ``serve`` carries so a rig account with no authenticator key (:data:`ADMIN_FACTOR_ENV`)
+#: can use the API. ``provision`` sets it for the provisioning child of such an account itself. A leg
+#: that supplies a key and wants MFA required leaves it off its ``serve``; the harness runners that
+#: start their own nodes (``failover.EngineNode``) apply it by default whatever the key, so their
+#: engines run with MFA off unless the node's environment says otherwise. An account they enrol
+#: with a key still owes the code at every sign-in, and waits for it there.
 SERVE_ENV: Mapping[str, str] = {"MEFOR_SECURITY_REQUIRE_MFA": "false"}
 
 #: What an ENFORCING rig's ``serve`` carries beside :data:`SERVE_ENV`: a configured channel for
@@ -194,10 +225,12 @@ REMOTE_RIG_SESSION = RigSession("REMOTE_RIG_SESSION", supplied=True)
 
 @dataclass(frozen=True)
 class RigAdmin:
-    """The rig's one account. ``password`` stays out of ``repr`` so a log line cannot carry it."""
+    """The rig's one account. ``password`` and ``totp_secret`` stay out of ``repr`` so a log line
+    cannot carry them. ``totp_secret`` is ``None`` for an account with no second factor."""
 
     username: str
     password: str = field(repr=False)
+    totp_secret: str | None = field(default=None, repr=False)
 
 
 def _new_password() -> str:
@@ -220,7 +253,9 @@ _credential = _HeldAdmin()
 
 
 def rig_admin() -> RigAdmin:
-    """This process's rig credential: the one in the environment, or one drawn on first call."""
+    """This process's rig credential: the one in the environment, or one drawn on first call.
+
+    The authenticator key is never drawn: it is the environment's, or there is none."""
     with _credential.lock:
         if _credential.admin is None:
             username = os.environ.get(ADMIN_NAME_ENV) or _DEFAULT_USERNAME
@@ -229,8 +264,131 @@ def rig_admin() -> RigAdmin:
                 password = _new_password()
                 # A child harness process must sign in as the same account (see ADMIN_NAME_ENV).
                 os.environ[ADMIN_PASS_ENV] = password
-            _credential.admin = RigAdmin(username, password)
+            factor = os.environ.get(ADMIN_FACTOR_ENV) or None
+            _credential.admin = RigAdmin(username, password, factor)
         return _credential.admin
+
+
+# --- the second factor -------------------------------------------------------
+
+
+#: The shortest key the rig takes: 26 base32 characters, which decode to 16 bytes, RFC 4226's
+#: 128-bit floor. The shipped enrolment draws 32 (160 bits). The provisioning swap would otherwise
+#: write a shorter one as an Administrator's factor, since the provisioning path does not check a
+#: key's length.
+_MIN_KEY_CHARS = 26
+
+#: How far from each edge of its TOTP step the rig sends a code. The engine judges a code against
+#: its own clock at the shipped ``totp_skew_steps = 0``, so an engine on another host whose clock is
+#: up to this much behind or ahead of the rig's, or a request this much in transit, still lands in
+#: the code's step.
+_STEP_MARGIN_S = 1.0
+
+
+def _totp_code(key: str, at: float) -> str:
+    """The engine's TOTP code for ``key`` at the instant ``at``.
+
+    Computed by the engine's own :mod:`messagefoundry.auth.totp`, imported here and not at module
+    level, so this file still imports nothing beyond the standard library and there is one TOTP
+    implementation to keep right. Every place that signs in with a key, or provisions one, has the
+    engine installed. Raises :class:`RigAdminError`, naming the variable and never the value, on a
+    key that is not base32 or is shorter than :data:`_MIN_KEY_CHARS` (:func:`_check_key`)."""
+    from messagefoundry.auth import totp
+
+    _check_key(key)
+    return totp.totp(key, now=at)
+
+
+def _check_key(key: str) -> None:
+    """Refuse, as :class:`RigAdminError` naming the variable and never the value, a key that is
+    shorter than :data:`_MIN_KEY_CHARS` or that the engine cannot read as base32."""
+    from messagefoundry.auth import totp
+
+    refusal = RigAdminError(
+        f"{ADMIN_FACTOR_ENV} does not hold a base32 TOTP key of at least 128 bits "
+        f"({_MIN_KEY_CHARS} characters)"
+    )
+    if len(key.strip().replace(" ", "").rstrip("=")) < _MIN_KEY_CHARS:
+        raise refusal
+    try:
+        totp.totp(key, now=0.0)  # the engine's own base32 read
+    except ValueError:  # binascii.Error, the engine's base32 refusal, is a ValueError
+        raise refusal from None
+
+
+#: The clock and the wait :func:`_code_in_a_fresh_step` uses; tests replace them.
+_now = time.time
+_pause = time.sleep
+
+
+class _SpentSteps:
+    """The TOTP steps this process has used on the rig account's key.
+
+    ``last`` is the latest step known to have reached the engine: one a sign-in got an HTTP answer
+    with, or the step a provisioning child ran in. ``claimed`` is the latest step handed to a
+    sign-in, answered or not, so it is never below a sign-in's ``last``; ``last`` bounds a claim on
+    its own only when provisioning recorded it and the wall clock then stepped back. ``-1`` is no
+    step yet. The lock guards both and is held only to read and write them, never across a wait."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.last = -1
+        self.claimed = -1
+
+
+_spent = _SpentSteps()
+
+
+def _note_spent_step(step: int | None = None) -> None:
+    """Record that ``step`` of the rig account's key reached the engine. With no ``step``, the step
+    of now: a provisioning child spent one no later than this call."""
+    from messagefoundry.auth.totp import DEFAULT_PERIOD
+
+    with _spent.lock:
+        if step is None:
+            step = int(_now() // DEFAULT_PERIOD)
+        _spent.last = max(_spent.last, step)
+
+
+def _claim_next_step() -> int:
+    """Hand a sign-in the next step after every step this process has spent or claimed, and after
+    the step of now. Calls are answered in order, each with a later step than the one before."""
+    from messagefoundry.auth.totp import DEFAULT_PERIOD
+
+    with _spent.lock:
+        step = max(int(_now() // DEFAULT_PERIOD), _spent.last, _spent.claimed) + 1
+        _spent.claimed = step
+        return step
+
+
+def _code_in_a_fresh_step(key: str) -> tuple[str, int]:
+    """A code for ``key``, and its step, sent no sooner than :data:`_STEP_MARGIN_S` after that step
+    opens and no later than the margin before it closes.
+
+    The engine takes each step's code once, and counts a reused one as a wrong second factor, which
+    feeds the account's lock. So every sign-in takes the NEXT step boundary after now and after
+    every step this process spent or handed out (:func:`_claim_next_step`), and waits for it plus
+    the margin: up to about 31 seconds. A step that began before the call may already be spent
+    elsewhere, by a provisioning child or a sign-in in an earlier process, so it is never used. When
+    the wait overruns into the closing margin, the sign-in claims the next boundary again.
+
+    That rule assumes uses of one key happen one after another. PROCESSES THAT SIGN IN AT THE SAME
+    TIME WITH ONE KEY CAN TAKE THE SAME STEP, and all but one are refused, so the key suits a leg
+    that signs in once. Within a process the claims keep sign-ins on distinct steps, in call order."""
+    from messagefoundry.auth.totp import DEFAULT_PERIOD
+
+    step = _claim_next_step()
+    while True:
+        at = _now()
+        if at > (step + 1) * DEFAULT_PERIOD - _STEP_MARGIN_S:
+            step = _claim_next_step()
+            continue
+        opens = step * DEFAULT_PERIOD + _STEP_MARGIN_S
+        if at >= opens:
+            # From the claimed step itself, so the code and the step recorded for it cannot differ.
+            return _totp_code(key, step * DEFAULT_PERIOD), step
+        # A floor on each wait, so a clock read just short of the target cannot spin.
+        _pause(max(0.05, opens - at))
 
 
 def require_supplied_credential() -> None:
@@ -260,8 +418,9 @@ def provision(
 
     ``env`` and ``cwd`` are the ones the rig's ``serve`` runs under, so the child loads the same
     settings and opens the same store. Returns ``True`` when it created the account and ``False``
-    when the store already had an enabled Administrator. Raises :class:`RigAdminError` on any other
-    refusal, carrying the command's own words.
+    when the store already had an enabled local Administrator with a usable password. Raises
+    :class:`RigAdminError` on any other refusal, carrying the command's own words, including the
+    rig's own refusal of a store whose enabled Administrators all need an outside service.
 
     The child is this file, run with ``-P`` so its directory is not put on ``sys.path``:
     ``harness/load`` holds modules named like standard-library ones.
@@ -275,6 +434,11 @@ def provision(
         ADMIN_PASS_ENV: admin.password,
         "PYTHONIOENCODING": "utf-8",
     }
+    # The key comes from ``admin`` alone, so an account with none is never enrolled with one that
+    # ``env`` happens to carry.
+    child_env.pop(ADMIN_FACTOR_ENV, None)
+    if admin.totp_secret:
+        child_env[ADMIN_FACTOR_ENV] = admin.totp_secret
     argv = [sys.executable, "-P", str(Path(__file__).resolve()), "provision"]
     if db is not None:
         argv += ["--db", db]
@@ -297,6 +461,9 @@ def provision(
             f"provisioning the rig Administrator did not finish in {_PROVISION_TIMEOUT_S:.0f} s"
         ) from None
     if done.returncode == 0:
+        if admin.totp_secret:
+            # The child spent a step no later than now; a sign-in from this process waits past it.
+            _note_spent_step()
         return True
     if done.returncode == EXIT_EXISTS:
         return False
@@ -307,10 +474,11 @@ def provision(
 
 
 def _provision_here(db: str | None, service_config: str | None) -> int:
-    """Run the shipped ``provision-admin`` in THIS process, with its terminal read replaced."""
+    """Run the shipped ``provision-admin`` in THIS process, with its terminal reads replaced."""
     username = os.environ.get(ADMIN_NAME_ENV) or _DEFAULT_USERNAME
     # Popped, so the engine code below never finds the credential in its environment.
     held = os.environ.pop(ADMIN_PASS_ENV, None)
+    factor = os.environ.pop(ADMIN_FACTOR_ENV, None) or None
     if not held:
         print(
             f"error: {ADMIN_PASS_ENV} is not set. Draw a password for this run in the calling shell "
@@ -318,17 +486,46 @@ def _provision_here(db: str | None, service_config: str | None) -> int:
             file=sys.stderr,
         )
         return 2
-    os.environ.update(SERVE_ENV)
+    if factor is None:
+        os.environ.update(SERVE_ENV)
+    else:
+        try:
+            _check_key(factor)  # refused before any engine work
+        except RigAdminError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
 
     import messagefoundry.__main__ as cli
 
     def _held_password(prompt: str) -> str:
         return held
 
-    # The ONE seam. Everything else provision-admin does is the shipped code path.
+    # The password seam. Everything else provision-admin does is the shipped code path, narrowed
+    # by the guard below and never widened.
     cli._read_new_password = _held_password
+    _keep_the_narrow_rule(cli)
     argv = ["provision-admin", "--username", username, "--email", _NOTIFY_ADDRESS]
-    argv += ["--no-totp", "--json"]
+    if factor is None:
+        argv.append("--no-totp")
+    else:
+        key = factor
+
+        def _held_factor(**_shown: object) -> tuple[str, str, float]:
+            # What the terminal enrolment returns: the key, a code it shows, and when the code was
+            # read. The shipped command then checks the code, spends its step and writes the key.
+            at = time.time()
+            return key, _totp_code(key, at), at
+
+        def _no_recovery_codes(codes: Sequence[str], **_shown: object) -> bool:
+            # The rig holds the key itself, so the codes are shown nowhere. False is what the
+            # shipped display returns when they could not be shown, and the JSON says so.
+            return False
+
+        # The authenticator seams, for a leg that requires MFA: the enrolment's terminal read, and
+        # the console display of the recovery codes it issues.
+        cli._enrol_totp_at_terminal = _held_factor
+        cli._show_recovery_codes_once = _no_recovery_codes
+    argv.append("--json")
     if db is not None:
         argv += ["--db", db]
     if service_config is not None:
@@ -340,12 +537,74 @@ def _provision_here(db: str | None, service_config: str | None) -> int:
         print("provisioned the rig Administrator")
         return 0
     refusal = _json_error(captured.getvalue())
+    if refusal == _RIG_REFUSAL:
+        # A failure, not EXIT_EXISTS: no Administrator here signs in with a local password, so the
+        # rig could not sign in either. ``provision`` carries this text into its error.
+        print(_RIG_REFUSAL, file=sys.stderr)
+        return 1
     if _ADMIN_EXISTS in refusal:
         print("the store already has an enabled Administrator; nothing provisioned")
         return EXIT_EXISTS
     # The command's refusals name settings and clauses, never the password it was given.
     print(refusal or captured.getvalue().strip(), file=sys.stderr)
     return code or 1
+
+
+#: The rig's own refusal, given only where the shipped command would have provisioned.
+#: It does not carry :data:`_ADMIN_EXISTS`: the rig reads it as a failure.
+_RIG_REFUSAL = (
+    "the store has an enabled Administrator, though none signs in with a local password (a "
+    "directory or federated one counts here), so the load rig provisions nothing: it adds its "
+    "Administrator only to a store with no enabled Administrator at all"
+)
+
+
+def _keep_the_narrow_rule(cli: Any) -> None:
+    """Hold the rig to the rule ``provision-admin`` had before vault BACKLOG #2711 step 1.
+
+    Step 1 (owner ruling B258-R4) lets the command run whenever no enabled LOCAL Administrator has
+    a usable password, so a directory-run site can get back in while its directory is down. On
+    such a store the command adds an Administrator beside live directory Administrators and tells
+    them nothing (ADR 0183 Amendment E, *What it opens*). A rig with no authenticator key runs it
+    with ``--no-totp``, so that Administrator would have no second factor either. The rig keeps
+    the old rule instead, with or without a key: it provisions only when the store has no enabled
+    Administrator of any kind. The engine adds no flag for this.
+
+    It wraps the command's one :class:`~messagefoundry.auth.service.AuthService`, built by
+    ``_build_provision_auth_service``, against the store the command has open at that moment. The
+    pre-prompt refusal asks the shipped check and then the wider one. The write asks the wider one
+    before the shipped write runs, so a refused store is never written.
+    """
+    build = cli._build_provision_auth_service
+
+    def _narrow_build(*args: Any, **kwargs: Any) -> Any:
+        service = build(*args, **kwargs)
+        refusal_of = service.provision_refusal
+        write = service.provision_first_administrator
+
+        async def _only_outside_service_admins() -> bool:
+            # The case step 1 opened: an enabled Administrator, but none the shipped rule counts.
+            # Where a local one counts, the shipped command refuses in its own words.
+            return bool(await service.administrators_needing_an_outside_service())
+
+        async def _refusal(*a: Any, **kw: Any) -> Any:
+            shipped = await refusal_of(*a, **kw)
+            if shipped is None and await _only_outside_service_admins():
+                return _RIG_REFUSAL
+            return shipped
+
+        async def _write(*a: Any, **kw: Any) -> Any:
+            if await _only_outside_service_admins():
+                from messagefoundry.auth.service import FirstAdministratorRefused
+
+                raise FirstAdministratorRefused(_RIG_REFUSAL)
+            return await write(*a, **kw)
+
+        service.provision_refusal = _refusal
+        service.provision_first_administrator = _write
+        return service
+
+    cli._build_provision_auth_service = _narrow_build
 
 
 def _json_error(text: str) -> str:
@@ -489,22 +748,46 @@ def _call(
 def sign_in(base_url: str, admin: RigAdmin | None = None, *, cacert: str | None = None) -> str:
     """Sign in as the rig Administrator and return the session's bearer token.
 
+    An account with an authenticator key signs in with both factors in one request, the combined
+    sign-in of ADR 0197, and first waits for a TOTP step to open (:func:`_code_in_a_fresh_step`).
+
     Raises :class:`RigUnreachable` when the engine does not answer and :class:`RigSignInRefused`
-    when it answers anything but a usable session.
+    when it answers anything but a usable session, or when the key is unusable, which is checked
+    before any wait.
     """
     admin = admin or rig_admin()
     base = _checked_base(base_url)
-    status, raw = _call(
-        "POST",
-        f"{base}/auth/login",
-        cacert=cacert,
-        body={"username": admin.username, "password": admin.password},
-    )
+    body = {"username": admin.username, "password": admin.password}
+    step: int | None = None
+    if admin.totp_secret:
+        try:
+            _check_key(admin.totp_secret)
+        except RigAdminError as exc:
+            raise RigSignInRefused(str(exc)) from None
+        body["totp_code"], step = _code_in_a_fresh_step(admin.totp_secret)
+    status, raw = _call("POST", f"{base}/auth/login", cacert=cacert, body=body)
+    if step is not None:
+        # An HTTP answer came back, so the code reached the engine and its step is spent, whatever
+        # the answer. One with no usable answer raised above and records nothing; its step stays
+        # claimed, so this process never hands it out again.
+        _note_spent_step(step)
+    if status == 429:
+        # The sign-in rate limit, not the credential (BACKLOG #2795): the stale-Administrator advice
+        # below would send an operator after the wrong cause. Every attempt counts, successes too,
+        # so a fleet of rig processes signing in from one address can meet the per-address limit.
+        # A refused attempt does not count, which is why waiting out the window clears it.
+        raise RigSignInRefused(
+            "the engine rate-limited the rig Administrator's sign-in (HTTP 429): too many sign-in "
+            "attempts inside its window, which clears once the window passes. A rig of many "
+            "processes signing in from one address needs the engine's "
+            "MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP, and past the all-clients limit "
+            "MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL, sized to its sign-ins."
+        )
     if status != 200:
         raise RigSignInRefused(
             f"the engine refused the rig Administrator's sign-in (HTTP {status}). If this store "
             f"held an Administrator before this run, set {ADMIN_NAME_ENV} and {ADMIN_PASS_ENV} to that "
-            "account, or use a fresh store."
+            f"account, and {ADMIN_FACTOR_ENV} to its key if it has one, or use a fresh store."
         )
     try:
         payload = json.loads(raw)
@@ -515,7 +798,9 @@ def sign_in(base_url: str, admin: RigAdmin | None = None, *, cacert: str | None 
     if payload.get("mfa_required") or payload.get("must_change_password"):
         raise RigSignInRefused(
             "the engine signed the rig Administrator in but asks for a second factor or a "
-            "password change first; the rig's serve needs MEFOR_SECURITY_REQUIRE_MFA=false"
+            "password change first. A rig account with no authenticator key needs its serve at "
+            f"MEFOR_SECURITY_REQUIRE_MFA=false; to keep MFA required, supply {ADMIN_FACTOR_ENV} to "
+            "both provisioning and the sign-in, on a fresh store"
         )
     held = payload.get("token")
     if not isinstance(held, str) or not held:
@@ -598,10 +883,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # Resolved here, so a relative interpreter path works on Windows as it does on POSIX.
     command[0] = shutil.which(command[0]) or command[0]
     # The harness command line takes the session as --token, and the child is the only reader. The
-    # child is given the session and not the password it came from. It goes as ONE argument,
+    # child is given the session and not the password or key it came from. It goes as ONE argument,
     # --token=VALUE: a session is token_urlsafe, whose alphabet holds "-", so about one in 64 starts
     # with "-", and argparse reads a separate argument like that as an option rather than a value.
-    child_env = {name: value for name, value in os.environ.items() if name != ADMIN_PASS_ENV}
+    child_env = {
+        name: value
+        for name, value in os.environ.items()
+        if name not in (ADMIN_PASS_ENV, ADMIN_FACTOR_ENV)
+    }
     try:
         return subprocess.call([*command, f"--token={held}"], env=child_env)
     except OSError as exc:
@@ -670,7 +959,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="rigadmin",
         description="Provision and sign in the Administrator a CI leg or load rig uses. "
-        f"The password comes from {ADMIN_PASS_ENV}; it is never an argument.",
+        f"The password comes from {ADMIN_PASS_ENV}, and an authenticator key, for an engine that "
+        f"requires MFA, from {ADMIN_FACTOR_ENV}; neither is ever an argument.",
     )
     sub = parser.add_subparsers(dest="mode", required=True)
 

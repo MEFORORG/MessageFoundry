@@ -39,7 +39,7 @@ from messagefoundry.config.loaded_crls import (
     crl_path_key,
 )
 from messagefoundry.config.loaded_crls import snapshot as held_crl_snapshot
-from messagefoundry.config.settings import CertMonitorSettings
+from messagefoundry.config.settings import CertMonitorSettings, StoreBackend
 from messagefoundry.config.tls_policy import (
     crl_not_in_effect,
     crl_scratch_context,
@@ -68,6 +68,7 @@ __all__ = [
     "CertCheck",
     "CertExpiryRunner",
     "certs_from_registry",
+    "certs_from_settings",
     "crls_from_settings",
     "held_crl_label",
     "peer_cert_expiry",
@@ -218,6 +219,23 @@ def crls_from_settings(settings: ServiceSettings) -> list[MonitoredCert]:
         for label, path in knobs
         if isinstance(path, str) and path
     ]
+
+
+def certs_from_settings(settings: ServiceSettings) -> list[MonitoredCert]:
+    """The certificate files the service settings name that no connection carries, each a
+    ``kind="cert"`` :class:`MonitoredCert`. Today that is the SQL Server ``[store].ssl_root_cert``
+    pin, labelled ``"store.ssl_root_cert"`` in the dotted style of :func:`crls_from_settings`.
+
+    Vault BACKLOG #2223: the store sends that pin with ``Encrypt=strict``, where a pin match stands in
+    for the driver's own expiry check. The store refuses an expired pin at connect, so watching it here
+    is what warns before that refusal. A PostgreSQL ``ssl_root_cert`` is a CA bundle the driver
+    validates itself, so it is not listed."""
+    store, pin = settings.store, settings.store.ssl_root_cert
+    # Only where the store sends it: an escaped weakened posture sends no pin.
+    sends_pin = store.encrypt and not store.trust_server_certificate
+    if store.backend is StoreBackend.SQLSERVER and sends_pin and isinstance(pin, str) and pin:
+        return [MonitoredCert("store.ssl_root_cert", pin)]
+    return []
 
 
 def peer_cert_expiry(peercert: Mapping[str, Any], *, now: float) -> tuple[str, int] | None:

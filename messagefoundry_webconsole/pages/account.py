@@ -618,6 +618,7 @@ def account_page(
     passkeys: Sequence[Mapping[str, object]] | None = None,
     webauthn_notice: str | None = None,
     session_offer: int | None = None,
+    factor_owed: bool = False,
 ) -> Markup:
     """The signed-in user's account overview: identity, password rotation, and MFA posture/actions.
 
@@ -625,7 +626,10 @@ def account_page(
     last_used_at / backed_up / usable / credential_id_hash) — this module never touches the store.
     ``webauthn_notice`` renders the fail-closed copy in place of the Add-a-passkey form (extra
     absent / public_origin unset). ``session_offer`` is the count of the caller's other sessions,
-    given only on the one view a factor change earned (BACKLOG #1147); ``None`` or 0 renders none."""
+    given only on the one view a factor change earned (BACKLOG #1147); ``None`` or 0 renders none.
+    ``factor_owed`` decides the "REQUIRES MFA" line, read only when TOTP is off: the account rule
+    (``mfa.required``) OR this session (``not mfa_satisfied``) owes a factor. The route computes it
+    because the session half is not in ``mfa`` (BACKLOG #3116)."""
     banner = el("p", error, class_="banner") if error else Markup("")
     note = el("p", notice, class_="muted") if notice else Markup("")
     offer = _session_offer(session_offer or 0)
@@ -661,7 +665,7 @@ def account_page(
     else:
         status_line = el(
             "p",
-            "Not enrolled." + (" This account REQUIRES MFA — enroll now." if mfa.required else ""),
+            "Not enrolled." + (" This account REQUIRES MFA — enroll now." if factor_owed else ""),
             class_="muted",
         )
         action = el(
@@ -1048,6 +1052,20 @@ def webauthn_enroll_page(options_json: str) -> Markup:
             ),
             el("p", "", class_="muted", data_mf_webauthn_status=True),
             class_="ctl",
+        ),
+        # BACKLOG #3810 finding 4: every refusal at finish comes after the authenticator made its
+        # credential, so a failed enrolment can leave one behind, and not every failure means the
+        # server did not store it (docs/SECURITY.md, "A refused registration can leave a passkey
+        # on the authenticator"). So the account's list decides, never the failure; deleting a
+        # registered passkey on a passkey-only account would need an administrator's MFA reset.
+        el(
+            "p",
+            "If your browser or security key saved a passkey but adding it here then failed, "
+            "check the Passkeys list on your account page first. A passkey listed there is "
+            "registered: keep it on your browser or security key. Only a passkey your browser or "
+            "security key shows that is not in that list is a leftover you may delete from your "
+            "browser's or security key's passkey list. If you cannot tell which is which, keep it.",
+            class_="muted",
         ),
         el(
             "noscript",

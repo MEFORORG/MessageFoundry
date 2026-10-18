@@ -69,10 +69,14 @@ FEDERATED_IDENTITY_UNBOUND = (
 FIRST_ADMINISTRATOR_TAKEOVER = "first_administrator_takeover"
 ACCOUNT_DISABLED = "account_disabled"  # 6.3.7 — an admin disabled the account
 # 6.3.7 -- the directory session reconciler ended the account's sessions for a reason that is NOT a
-# read disabled bit: the probe could not match the account (``directory_absent``: not found, or its
-# stored id did not match or could not be parsed), or its ``userAccountControl`` could not be read
-# (vault BACKLOG #2140). ACCOUNT_DISABLED would tell the holder an administrator disabled the account,
-# which nothing established. Which reason sends which kind is decided once, in
+# read disabled bit. At least these send it: the probe could not match the account to exactly one
+# entry (``directory_absent``: not found, more than one entry, or its stored id did not match or
+# could not be parsed), its ``userAccountControl`` could not be read (``directory_undetermined``;
+# vault BACKLOG #2140), or the row carries no ``directory_object_id``, so the pass never asked the
+# directory (``directory_object_id_missing``; BACKLOG #2434). Any whole-account reason added later
+# sends it too, so the notice's one wording must be checked against that one as well (vault BACKLOG
+# #3171). ACCOUNT_DISABLED would tell the holder an administrator disabled the account, which
+# nothing established. Which reason sends which kind is decided once, in
 # ``AuthService._apply_reconcile_revocation``.
 DIRECTORY_SESSIONS_ENDED = "directory_sessions_ended"
 MFA_ENABLED = "mfa_enabled"  # 6.3.7 — a second factor (TOTP) was enrolled on the account
@@ -93,9 +97,11 @@ MFA_CREDENTIAL_REMOVED = "mfa_credential_removed"
 NOTIFY_EMAIL_SET = "notify_email_set"
 # 6.3.7 — a single-use recovery code was spent, which permanently deletes that stored credential.
 RECOVERY_CODE_USED = "recovery_code_used"  # nosec B105 — event-type label, not a credential
-ADMIN_NEW_IP = (
-    "admin_action_new_ip"  # 8.4.2 — a sensitive admin action from a new/unexpected client IP
-)
+# 8.4.2 -- a step-up action, a PHI read or a paced write from a client address the session has not
+# verified from, which must re-verify before it proceeds. Audited as
+# ``auth.new_address_reverify_required``; renamed from an "admin action" name in vault BACKLOG #3052,
+# because the signal fires on more than admin actions since vault BACKLOG #2620.
+NEW_ADDRESS_REVERIFY = "new_address_reverify_required"
 # 8.2.4 (BACKLOG #288) -- a sign-in passed its FIRST step (the password, or the directory
 # sign-in) from a client address this account has not finished authenticating from recently. It
 # fires before any owed second factor is proven, so it is not proof of a completed sign-in. Audited
@@ -160,7 +166,7 @@ NOTICE_KIND_LOG_LABELS: Mapping[str, str] = MappingProxyType(
         MFA_CREDENTIAL_REMOVED: "mfa_credential_removed",
         NOTIFY_EMAIL_SET: "notify_email_set",
         RECOVERY_CODE_USED: "recovery_code_used",
-        ADMIN_NEW_IP: "admin_action_new_ip",
+        NEW_ADDRESS_REVERIFY: "new_address_reverify_required",
         LOGIN_NEW_IP: "login_new_ip",
         ACCOUNT_CREATED: "account_created",
     }

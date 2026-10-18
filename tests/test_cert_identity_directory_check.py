@@ -29,7 +29,8 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore, UserRecord
 from tests._admin_account import login_admin
-from tests.test_mfa_directory_recheck import _OPERATORS, _PRINCIPAL, _VIEWERS, _Directory, _settings
+from tests._fake_directory import FakeDirectory
+from tests.test_mfa_directory_recheck import _OPERATORS, _PRINCIPAL, _VIEWERS, _settings
 
 _SERVICE_LOGGER = "messagefoundry.auth.service"
 _OUTAGE_LINE = "mTLS certificate identities for directory accounts"
@@ -44,14 +45,14 @@ async def store() -> AsyncIterator[MessageStore]:
 
 async def _directory_account(
     store: MessageStore, *groups: str, role_map: list[tuple[str, str]] | None = None
-) -> tuple[AuthService, _Directory, str]:
+) -> tuple[AuthService, FakeDirectory, str]:
     """A directory account whose roles a sign-in wrote from ``groups`` under the synthetic map.
 
     The sign-in is only how the row is born. The certificate path holds no session."""
     await AuthService(store, _settings()).initialize()  # the map's role ids need the seeded roles
     await store.set_ad_group_role_map(role_map or [(_OPERATORS, "operator"), (_VIEWERS, "viewer")])
     principal = replace(_PRINCIPAL, groups=frozenset(groups))
-    directory = _Directory(principal)
+    directory = FakeDirectory(principal)
     service = AuthService(store, _settings(), ldap=directory)  # type: ignore[arg-type]
     await service.initialize()
     login = await service._complete_ad_login(principal, None, mfa_verified=False)
@@ -185,7 +186,7 @@ async def test_an_account_removed_from_every_mapped_group_is_refused(
 
 async def test_a_local_account_is_never_probed(store: MessageStore) -> None:
     """The control: a local row behaves exactly as before, and the directory sees no call."""
-    directory = _Directory(_PRINCIPAL)
+    directory = FakeDirectory(_PRINCIPAL)
     service = AuthService(store, _settings(), ldap=directory)  # type: ignore[arg-type]
     identity, _token, _ = await login_admin(service)
 
@@ -277,7 +278,7 @@ async def test_a_probe_that_raises_after_its_caller_left_reports_nothing_to_the_
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A raise from an orphaned probe would reach the loop's exception handler through the shield,
-    one ERROR per cancelled request. The probe returns an outage instead, and fails closed."""
+    one ERROR per cancelled request. The probe returns a refusal reason instead, and fails closed."""
     service, _directory, user_id = await _directory_account(store, _VIEWERS)
     entered, gate = asyncio.Event(), asyncio.Event()
 
@@ -306,9 +307,512 @@ async def test_a_probe_that_raises_after_its_caller_left_reports_nothing_to_the_
         loop.set_exception_handler(previous)
 
     assert reported == []
-    gate.clear()
-    gate.set()  # the same fault with the caller still waiting is a refusal, not a raise
+    # The same fault with the caller still waiting is a refusal, not a raise. The gate stays set.
     assert await service.identity_for_cert_user_id(user_id) is None
+
+
+async def test_an_engine_fault_in_the_probe_has_its_own_reason_not_unavailable(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3115. A raise past the directory layer's own catches is an engine fault. Reported
+    as ``unavailable`` it would send an operator after a directory outage that is not there.
+
+    RED when: the certificate probe maps the fault to ``unavailable`` again."""
+    service, directory, user_id = await _directory_account(store, _VIEWERS)
+    user = await store.get_user(user_id)
+    assert user is not None
+    caplog.set_level(logging.INFO, logger=_SERVICE_LOGGER)
+    # The control: an unreachable directory is still "unavailable".
+    directory.unreachable = True
+    assert await service._cert_directory_presence(user) == "unavailable"
+    directory.unreachable = False
+
+    async def _raises(user: UserRecord) -> reconcile.Probe | str:
+        raise RuntimeError("synthetic engine fault")
+
+    monkeypatch.setattr(service, "_directory_presence", _raises)
+    assert await service._cert_directory_presence(user) == service_module.CERT_PROBE_FAULT
+    for _ in range(3):
+        assert await service.identity_for_cert_user_id(user_id) is None
+
+    # One WARNING while the fault persists, and never as a directory outage.
+    assert _outage_records(caplog, logging.WARNING) == []
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == _SERVICE_LOGGER
+        and r.levelno == logging.WARNING
+        and "mTLS certificate identity" in r.getMessage()
+    ]
+    assert len(warnings) == 1 and "was refused: probe_fault" in warnings[0]
+    assert "jdoe" not in warnings[0]
+
+
+def _fault_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == _SERVICE_LOGGER
+        and r.levelno == logging.WARNING
+        and "was refused: probe_fault" in r.getMessage()
+    ]
+
+
+async def _faulting_service(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> tuple[AuthService, FakeDirectory, UserRecord, dict[str, bool]]:
+    """A directory account whose certificate probe raises while ``state["faulting"]`` is set.
+    Any other row probes as the account would, so another account answers beside it."""
+    service, directory, user_id = await _directory_account(store, _VIEWERS)
+    user = await store.get_user(user_id)
+    assert user is not None
+    real = service._directory_presence
+    state = {"faulting": True}
+
+    async def _sometimes_raises(probed: UserRecord) -> reconcile.Probe | str:
+        if state["faulting"] and probed.id == user_id:
+            raise LookupError("synthetic engine fault")
+        return await real(user)
+
+    monkeypatch.setattr(service, "_directory_presence", _sometimes_raises)
+    return service, directory, user, state
+
+
+async def _ask(service: AuthService, row: UserRecord) -> object:
+    answer = await service._cert_directory_presence(row)
+    service._note_cert_directory_answer(answer)
+    return answer
+
+
+@pytest.mark.parametrize(
+    "between",
+    [
+        DirectoryAnswer.FOUND,
+        DirectoryAnswer.DISABLED,
+        DirectoryAnswer.NOT_FOUND,
+        DirectoryAnswer.UNDETERMINED,
+    ],
+    ids=lambda answer: answer.name.lower(),
+)
+async def test_a_probe_fault_is_tracked_per_account_and_ends_on_any_directory_answer(
+    store: MessageStore,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    between: DirectoryAnswer,
+) -> None:
+    """BACKLOG #3115, the Lander's asks on PR 2317. A fault logs one WARNING naming the exception
+    type and repeats at DEBUG. Another account's healthy answer does not end it, or one account
+    whose entry always raises beside a healthy one would read as a flapping fault; any directory
+    answer about the same account does. Inside the interval a new fault logs at DEBUG, and it
+    warns once the interval since the account's last WARNING has passed.
+
+    RED when: the WARNING omits the type, or another account's answer ends the fault, or an
+    answer other than present does not, or a fault past the interval does not warn."""
+    service, directory, user, state = await _faulting_service(store, monkeypatch)
+    other = replace(user, id="synthetic-other-user-id")
+    caplog.set_level(logging.DEBUG, logger=_SERVICE_LOGGER)
+
+    assert await _ask(service, user) == service_module.CERT_PROBE_FAULT
+    warnings = _fault_warnings(caplog)
+    assert len(warnings) == 1 and "LookupError" in warnings[0]
+    assert "jdoe" not in warnings[0] and "synthetic engine fault" not in warnings[0]
+
+    # A repeat while the fault persists is DEBUG, and so is it after ANOTHER account's answer.
+    assert await _ask(service, user) == service_module.CERT_PROBE_FAULT
+    assert isinstance(await _ask(service, other), reconcile.Probe)
+    assert await _ask(service, user) == service_module.CERT_PROBE_FAULT
+    assert len(_fault_warnings(caplog)) == 1
+    assert len(_repeat_debugs(caplog)) == 2
+
+    # This account gets a directory answer once, then faults again: a new fault, not a repeat.
+    state["faulting"] = False
+    directory.answer = between
+    assert await _ask(service, user) != service_module.CERT_PROBE_FAULT
+    state["faulting"] = True
+    assert await _ask(service, user) == service_module.CERT_PROBE_FAULT
+    assert len(_fault_warnings(caplog)) == 1
+    assert len(_repeat_debugs(caplog)) == 2
+
+    # The interval passes: the next fault warns.
+    _age_last_warning(service, user)
+    assert await _ask(service, user) == service_module.CERT_PROBE_FAULT
+    assert len(_fault_warnings(caplog)) == 2
+
+
+def _age_last_warning(service: AuthService, user: UserRecord) -> None:
+    """Move the account's last fault WARNING one interval into the past."""
+    service._cert_probe_fault_warned_at[user.id] -= service_module._CERT_OUTAGE_LOG_INTERVAL_SECONDS
+
+
+async def test_a_fault_returning_after_the_account_went_unprobed_warns(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Lander's 2026-10-16 addition. An account that is simply not probed for a while keeps
+    its fault entry, so with no directory answer between, its next fault is a repeat. Once an
+    interval has passed since its last WARNING, that repeat warns.
+
+    RED when: a repeat never warns, so the returning fault is silent above DEBUG however long the
+    gap. Measured RED on a3f41758d7."""
+    service, _directory, user, _state = await _faulting_service(store, monkeypatch)
+    caplog.set_level(logging.DEBUG, logger=_SERVICE_LOGGER)
+    assert await _ask(service, user) == service_module.CERT_PROBE_FAULT
+
+    _age_last_warning(service, user)  # no probe of the account for an interval
+    assert await _ask(service, user) == service_module.CERT_PROBE_FAULT
+
+    warnings = _fault_warnings(caplog)
+    assert len(warnings) == 2 and "LookupError" in warnings[1]
+
+
+async def test_a_fault_repeating_inside_the_interval_stays_debug(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Negative control for the test above: the same two faults with no interval between log one
+    WARNING and one DEBUG repeat. If this ever logs a second WARNING, the test above no longer
+    shows that the elapsed interval is what makes the repeat warn."""
+    service, _directory, user, _state = await _faulting_service(store, monkeypatch)
+    caplog.set_level(logging.DEBUG, logger=_SERVICE_LOGGER)
+    assert await _ask(service, user) == service_module.CERT_PROBE_FAULT
+    assert await _ask(service, user) == service_module.CERT_PROBE_FAULT
+
+    assert len(_fault_warnings(caplog)) == 1
+    assert len(_repeat_debugs(caplog)) == 1
+
+
+async def test_a_flapping_probe_fault_warns_at_most_once_an_interval_and_is_never_silent(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An account whose probe alternates between raising and answering must not log a WARNING per
+    request. A fault inside the interval logs its WARNING on its first repeat after it.
+
+    RED when: the per-account WARNING has no interval, or a fault inside it is never logged."""
+    service, _directory, user, state = await _faulting_service(store, monkeypatch)
+    caplog.set_level(logging.INFO, logger=_SERVICE_LOGGER)
+    for _ in range(3):
+        state["faulting"] = True
+        assert await _ask(service, user) == service_module.CERT_PROBE_FAULT
+        state["faulting"] = False
+        assert isinstance(await _ask(service, user), reconcile.Probe)
+    assert len(_fault_warnings(caplog)) == 1
+
+    # The interval passes while the account faults again.
+    state["faulting"] = True
+    assert await _ask(service, user) == service_module.CERT_PROBE_FAULT
+    _age_last_warning(service, user)
+    assert await _ask(service, user) == service_module.CERT_PROBE_FAULT
+    assert len(_fault_warnings(caplog)) == 2
+
+
+async def _set_disabled(service: AuthService, user: UserRecord, *, disabled: bool) -> None:
+    """The administrator's edit, changing only the disabled flag."""
+    await service.update_user(
+        user.id,
+        display_name=user.display_name,
+        email=user.email,
+        disabled=disabled,
+        actor="synthetic-admin",
+    )
+
+
+def _repeat_debugs(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if r.name == _SERVICE_LOGGER
+        and r.levelno == logging.DEBUG
+        and "raised LookupError again" in r.getMessage()
+    ]
+
+
+async def test_a_re_enabled_account_whose_probe_still_faults_warns_again(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Lander's review of PR 2317 at a3f41758d7. A fault, a local disable, a re-enable, and
+    the probe still raises: that fault is a fresh healthy-to-fault transition, so it warns and
+    names the type, even inside the WARNING interval (left at its real value here).
+
+    RED when: the fault state outlives the account's exit from the probe set, so the re-entry
+    fault takes the repeat branch and logs only at DEBUG."""
+    service, _directory, user, _state = await _faulting_service(store, monkeypatch)
+    caplog.set_level(logging.DEBUG, logger=_SERVICE_LOGGER)
+
+    assert await service.identity_for_cert_user_id(user.id) is None
+    assert len(_fault_warnings(caplog)) == 1
+    # Leaving the probe set drops BOTH of the account's entries.
+    await _set_disabled(service, user, disabled=True)
+    assert user.id not in service._cert_probe_faulting
+    assert user.id not in service._cert_probe_fault_warned_at
+    await _set_disabled(service, user, disabled=False)
+
+    assert await service.identity_for_cert_user_id(user.id) is None
+    warnings = _fault_warnings(caplog)
+    assert len(warnings) == 2 and "LookupError" in warnings[1]
+    assert not _repeat_debugs(caplog)
+
+
+async def test_without_the_reset_the_re_entry_fault_is_only_debug(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Negative control for the test above: with the reset made a no-op, the same sequence logs
+    the re-entry fault only at DEBUG. If this ever logs a second WARNING, the test above no longer
+    shows that the reset is what makes it warn."""
+    service, _directory, user, _state = await _faulting_service(store, monkeypatch)
+    monkeypatch.setattr(service, "_forget_cert_probe_fault", lambda _user_id: None)
+    caplog.set_level(logging.DEBUG, logger=_SERVICE_LOGGER)
+
+    assert await service.identity_for_cert_user_id(user.id) is None
+    await _set_disabled(service, user, disabled=True)
+    await _set_disabled(service, user, disabled=False)
+    assert await service.identity_for_cert_user_id(user.id) is None
+
+    assert len(_fault_warnings(caplog)) == 1
+    assert len(_repeat_debugs(caplog)) == 1
+
+
+async def test_a_disable_the_certificate_path_sees_drops_the_fault_state(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A disable written by another writer (another engine process on the shared store) reaches
+    this process first through the certificate path, which then drops both entries, the
+    warned-at time included, rather than leaving them until eviction.
+
+    RED when: only update_user drops the state, or the warned-at entry is never deleted."""
+    service, _directory, user, _state = await _faulting_service(store, monkeypatch)
+    assert await service.identity_for_cert_user_id(user.id) is None
+    assert user.id in service._cert_probe_faulting
+    assert user.id in service._cert_probe_fault_warned_at
+
+    await store._db.execute("UPDATE users SET disabled = 1 WHERE id = ?", (user.id,))
+    await store._db.commit()
+    assert await service.identity_for_cert_user_id(user.id) is None
+
+    assert user.id not in service._cert_probe_faulting
+    assert user.id not in service._cert_probe_fault_warned_at
+
+
+async def test_a_profile_save_on_an_enabled_faulting_account_keeps_its_fault_state(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every administrator save posts the disabled flag. A save that leaves an enabled account
+    enabled is not a re-entry, so the next fault stays a repeat at DEBUG.
+
+    RED when: any save with ``disabled=False`` resets the state, so an edit re-arms the WARNING."""
+    service, _directory, user, _state = await _faulting_service(store, monkeypatch)
+    caplog.set_level(logging.DEBUG, logger=_SERVICE_LOGGER)
+    assert await service.identity_for_cert_user_id(user.id) is None
+
+    await service.update_user(
+        user.id,
+        display_name="Synthetic Renamed",
+        email=user.email,
+        disabled=False,
+        actor="synthetic-admin",
+    )
+    assert await service.identity_for_cert_user_id(user.id) is None
+
+    assert len(_fault_warnings(caplog)) == 1
+    assert len(_repeat_debugs(caplog)) == 1
+
+
+async def test_an_answer_to_a_probe_issued_before_the_fault_does_not_end_it(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Probes overlap. A slow answer to a probe that started before the fault says nothing about
+    whether the fault cleared, so the next fault is a repeat.
+
+    RED when: the fault ends in completion order rather than issue order."""
+    service, directory, user_id = await _directory_account(store, _VIEWERS)
+    user = await store.get_user(user_id)
+    assert user is not None
+    caplog.set_level(logging.DEBUG, logger=_SERVICE_LOGGER)
+    real = service._directory_presence
+    release = asyncio.Event()
+    calls = 0
+
+    async def _first_slow_then_raises(probed: UserRecord) -> reconcile.Probe | str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await release.wait()
+            return await real(probed)
+        raise LookupError("synthetic engine fault")
+
+    monkeypatch.setattr(service, "_directory_presence", _first_slow_then_raises)
+    slow = asyncio.create_task(service._cert_directory_presence(user))
+    async with asyncio.timeout(10):
+        while calls == 0:
+            await asyncio.sleep(0)
+    assert await service._cert_directory_presence(user) == service_module.CERT_PROBE_FAULT
+    release.set()
+    assert isinstance(await slow, reconcile.Probe)
+    assert await service._cert_directory_presence(user) == service_module.CERT_PROBE_FAULT
+    assert len(_fault_warnings(caplog)) == 1
+    assert len(_repeat_debugs(caplog)) == 1
+
+
+async def test_a_fault_from_a_probe_running_when_the_account_left_is_recorded_nowhere(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Probes that started before a disable say nothing about the account as it is. Their faults
+    log at DEBUG and recreate no state, so requests for the disabled account between them cannot
+    turn each one into a fresh WARNING.
+
+    RED when: a fault from a probe already running at the disable recreates the state, or warns."""
+    service, _directory, user_id = await _directory_account(store, _VIEWERS)
+    user = await store.get_user(user_id)
+    assert user is not None
+    caplog.set_level(logging.DEBUG, logger=_SERVICE_LOGGER)
+    gates: list[asyncio.Event] = []
+
+    async def _slow_raises(probed: UserRecord) -> reconcile.Probe | str:
+        gate = asyncio.Event()
+        gates.append(gate)
+        await gate.wait()
+        raise LookupError("synthetic engine fault")
+
+    monkeypatch.setattr(service, "_directory_presence", _slow_raises)
+    first = asyncio.create_task(service._cert_directory_presence(user))
+    async with asyncio.timeout(10):
+        while not gates:
+            await asyncio.sleep(0)
+    gates[0].set()
+    assert await first == service_module.CERT_PROBE_FAULT
+    assert len(_fault_warnings(caplog)) == 1
+
+    running = [asyncio.create_task(service._cert_directory_presence(user)) for _ in range(3)]
+    async with asyncio.timeout(10):
+        while len(gates) < 4:
+            await asyncio.sleep(0)
+    await _set_disabled(service, user, disabled=True)
+    for task, gate in zip(running, gates[1:], strict=True):
+        gate.set()
+        assert await task == service_module.CERT_PROBE_FAULT
+        assert await service.identity_for_cert_user_id(user.id) is None  # out of the set
+
+    assert len(_fault_warnings(caplog)) == 1
+    assert user.id not in service._cert_probe_faulting
+    assert user.id not in service._cert_probe_fault_warned_at
+    assert not service._cert_probe_inflight and not service._cert_probe_left_at
+    left = [r for r in caplog.records if "after the account left" in r.getMessage()]
+    assert len(left) == 3 and all(r.levelno == logging.DEBUG for r in left)
+
+
+async def test_a_fault_from_a_request_waiting_for_a_slot_at_the_disable_is_recorded_nowhere(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A request that read the account before the disable, and is still waiting for a probe slot,
+    predates the exit too, however late its probe starts.
+
+    RED when: a probe is numbered when its task starts rather than before the slot wait."""
+    service, _directory, user_id = await _directory_account(store, _VIEWERS)
+    user = await store.get_user(user_id)
+    assert user is not None
+    service._cert_probe_slots = asyncio.BoundedSemaphore(1)
+    caplog.set_level(logging.DEBUG, logger=_SERVICE_LOGGER)
+    gate = asyncio.Event()
+    calls = 0
+
+    async def _gated_raises(probed: UserRecord) -> reconcile.Probe | str:
+        nonlocal calls
+        calls += 1
+        await gate.wait()
+        raise LookupError("synthetic engine fault")
+
+    monkeypatch.setattr(service, "_directory_presence", _gated_raises)
+    holding = asyncio.create_task(service._cert_directory_presence(user))
+    async with asyncio.timeout(10):
+        while calls == 0:
+            await asyncio.sleep(0)
+    waiting = asyncio.create_task(service._cert_directory_presence(user))
+    await asyncio.sleep(0)
+    assert calls == 1  # the second request is waiting for the slot
+
+    await _set_disabled(service, user, disabled=True)
+    gate.set()
+    assert await holding == service_module.CERT_PROBE_FAULT
+    assert await waiting == service_module.CERT_PROBE_FAULT
+
+    assert calls == 2
+    assert not _fault_warnings(caplog)
+    assert user.id not in service._cert_probe_faulting
+    assert user.id not in service._cert_probe_fault_warned_at
+    assert not service._cert_probe_inflight and not service._cert_probe_left_at
+
+
+async def test_a_re_enable_after_a_disable_this_process_never_saw_resets_the_state(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A disable written by another writer, with no certificate request while it held, leaves the
+    state in place. The administrator's re-enable here is then the only reset, and the next fault
+    warns at once, inside the interval.
+
+    RED when: update_user drops the state on a disable but not on a re-enable."""
+    service, _directory, user, _state = await _faulting_service(store, monkeypatch)
+    caplog.set_level(logging.DEBUG, logger=_SERVICE_LOGGER)
+    assert await service.identity_for_cert_user_id(user.id) is None
+    await store._db.execute("UPDATE users SET disabled = 1 WHERE id = ?", (user.id,))
+    await store._db.commit()
+    assert user.id in service._cert_probe_fault_warned_at
+
+    await _set_disabled(service, user, disabled=False)
+    assert await service.identity_for_cert_user_id(user.id) is None
+
+    assert len(_fault_warnings(caplog)) == 2
+    assert not _repeat_debugs(caplog)
+
+
+@pytest.mark.parametrize("exit_by", ["admin-delete", "row-gone", "local-provider"])
+async def test_an_account_that_stops_being_a_probed_directory_account_drops_its_state(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, exit_by: str
+) -> None:
+    """The other exits from the probe set: the administrator deletes the account, its row is gone
+    by another route, or it is no longer a directory account. The delete drops both entries at
+    once; otherwise the certificate path's next read of the row does.
+
+    RED when: only a disable drops the state."""
+    service, _directory, user, _state = await _faulting_service(store, monkeypatch)
+    assert await service.identity_for_cert_user_id(user.id) is None
+    assert user.id in service._cert_probe_fault_warned_at
+
+    if exit_by == "admin-delete":
+        await service.delete_user(user.id, actor="synthetic-admin")
+    elif exit_by == "row-gone":
+        await store.delete_user(user.id)
+        assert await service.identity_for_cert_user_id(user.id) is None
+    else:
+        await store._db.execute("UPDATE users SET auth_provider = 'local' WHERE id = ?", (user.id,))
+        await store._db.commit()
+        await service.identity_for_cert_user_id(user.id)
+
+    assert user.id not in service._cert_probe_faulting
+    assert user.id not in service._cert_probe_fault_warned_at
+
+
+async def test_a_directory_key_moved_during_a_healthy_probe_drops_the_state(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The re-read after a healthy probe finds the row moved away from the account it asked
+    about, so the old account's fault state no longer describes this row.
+
+    RED when: the post-probe refusal keeps the state."""
+    service, _directory, user, state = await _faulting_service(store, monkeypatch)
+    assert await service.identity_for_cert_user_id(user.id) is None
+    real_probe = service._probe_principal
+
+    async def _probe(probed: UserRecord) -> reconcile.Probe:
+        probe = await real_probe(probed)
+        await store._db.execute(
+            "UPDATE users SET directory_object_id = 'synthetic-other-object-id' WHERE id = ?",
+            (user.id,),
+        )
+        await store._db.commit()
+        return probe
+
+    monkeypatch.setattr(service, "_probe_principal", _probe)
+    state["faulting"] = False
+    assert await service.identity_for_cert_user_id(user.id) is None
+
+    assert user.id not in service._cert_probe_fault_warned_at
 
 
 @pytest.mark.parametrize(
@@ -558,7 +1062,10 @@ async def test_a_fault_reading_the_entry_does_not_warn_per_request_by_name(
     store: MessageStore, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The probe's own per-fault WARNING names the account. It suits a per-pass reconciler, not a
-    per-request path, so here it goes to DEBUG and the outage line reports the fault once."""
+    per-request path, so here it goes to DEBUG. The fault is not an outage (BACKLOG #3100): the
+    certificate path's per-account fault line reports it once, naming no account.
+
+    RED when: a fault the probe caught is logged as a directory outage again."""
     service, directory, user_id = await _directory_account(store, _VIEWERS)
     caplog.set_level(logging.DEBUG, logger=_SERVICE_LOGGER)
     directory.raises = KeyError("userAccountControl")
@@ -570,8 +1077,11 @@ async def test_a_fault_reading_the_entry_does_not_warn_per_request_by_name(
     warnings = [
         r for r in caplog.records if r.name == _SERVICE_LOGGER and r.levelno >= logging.WARNING
     ]
-    assert len(warnings) == 1 and _OUTAGE_LINE in warnings[0].getMessage()
+    assert len(warnings) == 1 and "was refused: probe_fault" in warnings[0].getMessage()
+    assert "raised KeyError" in warnings[0].getMessage()  # the type survives the reason string
+    assert _OUTAGE_LINE not in warnings[0].getMessage()
     assert "jdoe" not in warnings[0].getMessage()
+    assert service._cert_directory_outage is None and user_id in service._cert_probe_faulting
 
 
 async def test_the_reconciler_and_step_up_still_warn_on_a_fault(
@@ -585,10 +1095,15 @@ async def test_the_reconciler_and_step_up_still_warn_on_a_fault(
     assert user is not None
 
     await service.identity_for_cert_user_id(_user_id)
-    assert await service._directory_step_up_refusal(user) == "unavailable"
+    assert await service._directory_step_up_refusal(user) == "probe_fault"
     await service.reconcile_directory_sessions()  # the sign-in left a live session to probe
 
-    raised = [r for r in caplog.records if "raised KeyError" in r.getMessage()]
+    # The probe's own line only; the certificate path's per-account fault line names the type too.
+    raised = [
+        r
+        for r in caplog.records
+        if r.getMessage().startswith("directory probe of jdoe raised KeyError")
+    ]
     assert [r.levelno for r in raised] == [logging.DEBUG, logging.WARNING, logging.WARNING]
 
 

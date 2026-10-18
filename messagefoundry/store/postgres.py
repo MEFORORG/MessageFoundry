@@ -198,6 +198,8 @@ from messagefoundry.store.store import (
     AdMap,
     AdMapChange,
     AdMapSql,
+    AdminGrant,
+    AdminHolderTest,
     AdminRemoval,
     AlertInstance,
     AlertSummary,
@@ -242,6 +244,7 @@ from messagefoundry.store.store import (
     RoleRow,
     SecretRotationMetaRow,
     SessionRecord,
+    SignCountAnswer,
     Stage,
     UserAuthzRecord,
     UserChange,
@@ -257,6 +260,7 @@ from messagefoundry.store.store import (
     ad_map_write,
     admin_guard_counts,
     approval_update,
+    audit_active_key_id,
     audit_append_refusal,
     audit_append_secret,
     audit_seal_next,
@@ -268,8 +272,10 @@ from messagefoundry.store.store import (
     existing_roles_only,
     federated_bind,
     federated_unbind,
+    first_admin_grant,
     first_sealed_approval,
     full_authentication_clear,
+    if_applied,
     load_audit_chain,
     lockout_clear,
     lockout_increment,
@@ -282,6 +288,7 @@ from messagefoundry.store.store import (
     owned_lane_scope,
     passkey_digest,
     password_change,
+    read_newest_keyed_audit_row,
     read_transit_bound_attestation_rows,
     reauth_stamp,
     recovery_code_spend,
@@ -306,12 +313,14 @@ from messagefoundry.store.store import (
     session_insert_params,
     session_reseal_params,
     session_seal_ok,
+    settle_newest_keyed_audit_row,
     settle_transit_bound_attestation,
     should_record_event,
     tee_audits,
     totp_disable,
     totp_enable,
     totp_replace,
+    totp_stage,
     totp_step_spend,
     transit_attested_audit,
     transit_withdrawn_audit,
@@ -332,6 +341,10 @@ log = logging.getLogger(__name__)
 _FIFO_HEADS_LANE_CHUNK = 500
 # ADR 0066 §3.1: release_claimed id-chunk bound (ids per UPDATE statement).
 _RELEASE_CHUNK = 500
+# BACKLOG #3256: the database server's clock as epoch seconds, the unit `upload_reservation.since` holds.
+# statement_timestamp() is one value for the whole statement, so every reference agrees. The cluster
+# lease reads clock_timestamp() inline (pipeline/cluster.py), which moves within a statement.
+_PG_EPOCH_NOW = "EXTRACT(EPOCH FROM statement_timestamp())::double precision"
 # BACKLOG #1169: rows per batch for the `attachment_chunk` at-rest migration. Every OTHER cipher pass
 # batches 500 because its rows are kilobyte-shaped; one attachment_chunk row is a whole
 # DETACH_CHUNK_BYTES (1 MiB) slice, ~1.33 MiB once base64+GCM sealed. 16 keeps a batch near 21 MiB,
@@ -366,8 +379,18 @@ _LOCK_CLASS_OUTBOUND_LANE = 4
 # Vault BACKLOG #2779: one lock for every last-administrator guarded write, so two of them, from any
 # shard, cannot both read the same two administrators and both remove one.
 _LOCK_CLASS_ADMIN_GUARD = 5
+# Vault BACKLOG #3180: one lock per uploader, so two engine shards' upload reserves for the same
+# uploader cannot both read the same in-flight sums and both insert a slot.
+_LOCK_CLASS_UPLOAD_QUOTA = 6
 _AUDIT_LOCK = "mefor_audit_chain"
 _ADMIN_GUARD_LOCK = "mefor_last_admin"
+#: The ``$n`` twin of the SQLite store's ``_SQL_ADMIN_GUARD_HOLDERS`` (BACKLOG #2592), read by
+#: ``remove_unless_last_admin`` and the first-administrator grant (BACKLOG #3078).
+_PG_SQL_ADMIN_GUARD_HOLDERS: Final = (
+    "SELECT u.id, CASE WHEN u.id = $1 THEN 1 ELSE 0 END AS is_target"
+    " FROM users u JOIN user_roles r ON r.user_id = u.id"
+    " WHERE r.role_id = $2 AND NOT u.disabled"
+)
 
 
 def _audit_write_probe(table: str, privilege: str) -> str:
@@ -760,16 +783,20 @@ _SCHEMA: list[str] = [
         audit_seq   BIGINT NOT NULL,
         audit_hash  TEXT NOT NULL
     )""",
-    # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112) — see the SQLite `_SCHEMA`
-    # for the in-flight-only rationale. This is the backend a real sharded deployment runs:
-    # `require_unified_store` makes a server DB mandatory past one shard. No PHI (an account id and
-    # two counters).
-    """CREATE TABLE IF NOT EXISTS upload_quota (
-        uploader_id    TEXT PRIMARY KEY,
-        inflight_files BIGINT NOT NULL DEFAULT 0,
-        inflight_bytes BIGINT NOT NULL DEFAULT 0,
+    # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112), one row per upload in
+    # flight (vault BACKLOG #3180) — see the SQLite `_SCHEMA` for the rationale. This is the backend
+    # a real sharded deployment runs: `require_unified_store` makes a server DB mandatory past one
+    # shard. No PHI (two ids, a size and a timestamp).
+    # The table this one replaced held one row per uploader (vault BACKLOG #3180). Nothing reads
+    # it. In _SCHEMA, so the drop moves _schema_hash() and a provisioning run carries it too.
+    "DROP TABLE IF EXISTS upload_quota",
+    """CREATE TABLE IF NOT EXISTS upload_reservation (
+        reservation_id TEXT PRIMARY KEY,
+        uploader_id    TEXT NOT NULL,
+        size_bytes     BIGINT NOT NULL,
         since          DOUBLE PRECISION NOT NULL
     )""",
+    "CREATE INDEX IF NOT EXISTS ix_upload_reservation_uploader ON upload_reservation (uploader_id)",
     """CREATE TABLE IF NOT EXISTS pending_approvals (
         id           TEXT PRIMARY KEY,
         operation    TEXT NOT NULL,
@@ -1171,6 +1198,8 @@ _PG_SESSION_RESEAL: Final = (
 _PG_REVOKE_USER_SESSIONS_SQL: Final = (
     "UPDATE sessions SET revoked_at=$1, seal='' WHERE user_id=$2 AND revoked_at IS NULL"
 )
+#: Whether the account holds at least one passkey.
+_PG_WEBAUTHN_ANY_FOR_USER: Final = "SELECT 1 FROM webauthn_credentials WHERE user_id=$1 LIMIT 1"
 
 # The `$n` twins of store.py's sealed user-record statements (BACKLOG #2592), used only by
 # `create_user`, `_write_user` and the passkey writer; store.py states the contract.
@@ -2493,7 +2522,7 @@ class PostgresStore:
         ``_fetchall``/``_fetchone``/``_execute`` convenience trio, which were routed through here for
         exactly that reason — they called ``self._pool.fetch(...)``, which acquires inside asyncpg with
         no timeout, so leaving them outside would have left the class open while looking closed. It is
-        **not** every call in this module that can reach a pool. Unlike ``SqlServerStore._acquire``,
+        **not** every call in this module that can reach a pool. Unlike ``SqlServerStore._borrow``,
         which is that backend's sole borrow site,
         this is not yet a single chokepoint — do not describe it as one, and check
         ``tests/test_store_pool_acquire_timeout.py`` (which pins the set of borrows that bypass it)
@@ -5954,28 +5983,44 @@ class PostgresStore:
             escalation_tier=int(r["escalation_tier"]),
         )
 
+    async def _alert_write(self, sql: str, *params: Any, audit: AuditAppend, now: float) -> bool:
+        """One operator alert UPDATE with its audit row, in one transaction (vault BACKLOG #3217).
+        The row is appended only when the UPDATE matched, so a 404 writes nothing."""
+        async with (
+            AuditedWrite(now) as written,
+            self._timed_acquire(record=False) as conn,
+            conn.transaction(),
+        ):
+            applied = _rowcount(await conn.execute(sql, *params)) > 0
+            await self._append_operator_audit(conn, written, if_applied(audit), applied)
+        return applied
+
     async def ack_alert_instance(
-        self, alert_id: int, *, actor: str, now: float | None = None
+        self, alert_id: int, *, actor: str, audit: AuditAppend, now: float | None = None
     ) -> bool:
         now = time.time() if now is None else now
-        result = await self._pool.execute(
+        return await self._alert_write(
             "UPDATE alert_instance SET status='acknowledged', acked_by=$1, acked_at=$2"
             " WHERE id=$3 AND status<>'resolved'",
             actor,
             now,
             alert_id,
+            audit=audit,
+            now=now,
         )
-        return _rowcount(result) > 0
 
-    async def resolve_alert_instance(self, alert_id: int, *, now: float | None = None) -> bool:
+    async def resolve_alert_instance(
+        self, alert_id: int, *, audit: AuditAppend, now: float | None = None
+    ) -> bool:
         now = time.time() if now is None else now
-        result = await self._pool.execute(
+        return await self._alert_write(
             "UPDATE alert_instance SET status='resolved', resolved_at=$1"
             " WHERE id=$2 AND status<>'resolved'",
             now,
             alert_id,
+            audit=audit,
+            now=now,
         )
-        return _rowcount(result) > 0
 
     async def resolve_alert_instances_for(
         self, *, event_type: str, connection: str, now: float | None = None
@@ -5991,28 +6036,30 @@ class PostgresStore:
         return _rowcount(result)
 
     async def suspend_alert_instance(
-        self, alert_id: int, *, until: float, now: float | None = None
+        self, alert_id: int, *, until: float, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
         # #143 windowed suspend (NOTIFICATION-only): set suspended_until on a live instance. Refuses a
         # resolved one; returns the updated row (for the API echo + seeding the sink cache) or None.
-        result = await self._pool.execute(
+        if not await self._alert_write(
             "UPDATE alert_instance SET suspended_until=$1 WHERE id=$2 AND status<>'resolved'",
             until,
             alert_id,
-        )
-        if _rowcount(result) == 0:
+            audit=audit,
+            now=time.time() if now is None else now,
+        ):
             return None
         return await self.get_alert_instance(alert_id, allowed_channels=None)
 
     async def resume_alert_instance(
-        self, alert_id: int, *, now: float | None = None
+        self, alert_id: int, *, audit: AuditAppend, now: float | None = None
     ) -> AlertInstance | None:
         # #143: clear a windowed suspend. Idempotent; returns the row or None (unknown/already resolved).
-        result = await self._pool.execute(
+        if not await self._alert_write(
             "UPDATE alert_instance SET suspended_until=NULL WHERE id=$1 AND status<>'resolved'",
             alert_id,
-        )
-        if _rowcount(result) == 0:
+            audit=audit,
+            now=time.time() if now is None else now,
+        ):
             return None
         return await self.get_alert_instance(alert_id, allowed_channels=None)
 
@@ -7366,7 +7413,7 @@ class PostgresStore:
         *,
         top_only: bool = False,
         now: float | None = None,
-        audit: OperatorAudit[int] | None = None,
+        audit: OperatorAudit[int],
     ) -> int:
         """Soft-cancel **pending** deliveries for a destination: mark them ``cancelled``, log a
         ``cancelled`` event each, and finalize any message whose deliveries are now all terminal.
@@ -8366,6 +8413,35 @@ class PostgresStore:
             raise RuntimeError("store_salt has no row after an insert-if-absent")
         return str(row["salt"])
 
+    # --- keyed audit evidence (vault BACKLOG #3750 item 33) ----------------------------------
+
+    async def newest_keyed_audit_row(
+        self, action: str, *, actor: str, after_seq: int
+    ) -> dict[str, Any] | None:
+        """See the SQLite twin. Its reads share one borrow and one read-only REPEATABLE READ
+        snapshot; the MAC runs after both are released."""
+        async with (
+            self._timed_acquire(record=False) as conn,
+            conn.transaction(isolation="repeatable_read", readonly=True),
+        ):
+
+            async def fetch(sql: str, params: tuple[object, ...]) -> Mapping[str, Any] | None:
+                parts = sql.split("?")
+                numbered = parts[0] + "".join(f"${i}{part}" for i, part in enumerate(parts[1:], 1))
+                row: Mapping[str, Any] | None = await conn.fetchrow(numbered, *params)
+                return row
+
+            check = await read_newest_keyed_audit_row(
+                fetch,
+                action=action,
+                actor=actor,
+                after_seq=after_seq,
+                active_key_id=audit_active_key_id(self._audit_mac_key, self._audit_mac_fn),
+                mac_keys=self._audit_mac_keys,
+                mac_fn=self._audit_mac_fn,
+            )
+        return await settle_newest_keyed_audit_row(check)
+
     # --- vault_transit AES-GCM bound attestation (BACKLOG #2337) -------------
 
     async def get_transit_bound_attestation(self) -> TransitBoundAttestation | None:
@@ -8465,71 +8541,79 @@ class PostgresStore:
     async def reserve_upload_quota(
         self,
         uploader_id: str,
+        reservation_id: str,
         *,
-        files: int,
         size_bytes: int,
-        max_files: int = 0,
-        max_total_bytes: int = 0,
+        max_files: int,
+        max_total_bytes: int,
         stale_after: float = UPLOAD_RESERVATION_STALE_AFTER,
     ) -> bool:
-        """Atomically reserve (or release) an uploader's in-flight upload budget — see
+        """Atomically reserve one in-flight upload slot named ``reservation_id`` — see
         :meth:`messagefoundry.store.base.Store.reserve_upload_quota` for the contract, and the SQLite
         twin for the statement shape.
 
-        One statement carries the budget predicate into the ``DO UPDATE``, so no other connection can
-        land between the read and the write. ``RETURNING`` (absent on a refusal) discriminates applied
-        from refused."""
-        now = time.time()
-        if files <= 0:
-            # RELEASE — unconditional, clamped at zero (a double release cannot mint budget).
-            await self._execute(
-                "UPDATE upload_quota SET"
-                " inflight_files = GREATEST(0, inflight_files + $2),"
-                " inflight_bytes = GREATEST(0, inflight_bytes + $3),"
-                " since = GREATEST(since, $4)"  # never backwards (BACKLOG #2648)
-                " WHERE uploader_id = $1",
-                uploader_id,
-                int(files),
-                int(size_bytes),
-                now,
-            )
-            return True
-        if files > max_files or size_bytes > max_total_bytes:
-            # Fail closed before touching the row: the insert branch applies unconditionally.
+        A per-uploader advisory lock serializes the reserves of one uploader across every engine
+        shard, so the sums each one reads already hold the previous holder's committed row: under
+        READ COMMITTED a statement sees what committed before it began. The transaction pins READ
+        COMMITTED, because a REPEATABLE READ server default would take the snapshot when the lock
+        statement starts, before it waits, and two reserves would read the same sums. ``RETURNING`` (absent on a
+        refusal) discriminates applied from refused.
+
+        "Now" is the database server's clock, ``_PG_EPOCH_NOW`` (BACKLOG #3256;
+        ``uploads.UploadQuotaError`` says why)."""
+        if max_files < 1 or size_bytes > max_total_bytes:
+            # Fail closed before touching the store: a headroom that cannot hold one slot.
             return False
-        stale = now - max(0.0, stale_after)
-        row = await self._fetchone(
-            "INSERT INTO upload_quota (uploader_id, inflight_files, inflight_bytes, since)"
-            " VALUES ($1,$2,$3,$4)"
-            " ON CONFLICT (uploader_id) DO UPDATE SET"
-            " inflight_files ="
-            " CASE WHEN upload_quota.since <= $5 THEN 0 ELSE upload_quota.inflight_files END + $2,"
-            " inflight_bytes ="
-            " CASE WHEN upload_quota.since <= $5 THEN 0 ELSE upload_quota.inflight_bytes END + $3,"
-            # Every applied reserve refreshes it, never backwards (BACKLOG #2648).
-            " since = GREATEST(upload_quota.since, $4)"
-            " WHERE (CASE WHEN upload_quota.since <= $5 THEN 0"
-            " ELSE upload_quota.inflight_files END) + $2 <= $6"
-            " AND (CASE WHEN upload_quota.since <= $5 THEN 0"
-            " ELSE upload_quota.inflight_bytes END) + $3 <= $7"
-            " RETURNING 1 AS applied",
-            uploader_id,
-            int(files),
-            int(size_bytes),
-            now,
-            stale,
-            int(max_files),
-            int(max_total_bytes),
+        async with (
+            self._timed_acquire(record=False) as conn,
+            conn.transaction(isolation="read_committed"),
+        ):
+            await self._advisory_lock(conn, _LOCK_CLASS_UPLOAD_QUOTA, f"upload_quota:{uploader_id}")
+            await conn.execute(
+                "DELETE FROM upload_reservation WHERE uploader_id = $1"
+                f" AND since <= {_PG_EPOCH_NOW} - $2::double precision",
+                uploader_id,
+                float(max(0.0, stale_after)),
+            )
+            applied = await conn.fetchval(
+                "INSERT INTO upload_reservation (reservation_id, uploader_id, size_bytes, since)"
+                f" SELECT $1::text, $2::text, $3::bigint, {_PG_EPOCH_NOW}"
+                " WHERE (SELECT COUNT(*) FROM upload_reservation WHERE uploader_id = $2::text)"
+                " + 1 <= $4::bigint"
+                " AND (SELECT COALESCE(SUM(size_bytes), 0) FROM upload_reservation"
+                " WHERE uploader_id = $2::text) + $3::bigint <= $5::bigint"
+                " RETURNING 1",
+                reservation_id,
+                uploader_id,
+                int(size_bytes),
+                int(max_files),
+                int(max_total_bytes),
+            )
+        return applied is not None
+
+    async def release_upload_quota(self, reservation_id: str) -> None:
+        """See :meth:`messagefoundry.store.base.Store.release_upload_quota`."""
+        await self._execute(
+            "DELETE FROM upload_reservation WHERE reservation_id = $1", reservation_id
         )
-        return row is not None
+
+    async def touch_upload_quota(self, reservation_id: str) -> None:
+        """See :meth:`messagefoundry.store.base.Store.touch_upload_quota`. "Now" is the database
+        server's clock, as the reserve stamps it (BACKLOG #3256)."""
+        await self._execute(
+            f"UPDATE upload_reservation SET since = GREATEST(since, {_PG_EPOCH_NOW})"
+            " WHERE reservation_id = $1",
+            reservation_id,
+        )
 
     async def upload_quota_in_flight(self, uploader_id: str) -> tuple[int, int]:
         """See :meth:`messagefoundry.store.base.Store.upload_quota_in_flight`."""
         row = await self._fetchone(
-            "SELECT inflight_files, inflight_bytes FROM upload_quota WHERE uploader_id = $1",
+            "SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes), 0) AS b"
+            " FROM upload_reservation WHERE uploader_id = $1",
             uploader_id,
         )
-        return (int(row["inflight_files"]), int(row["inflight_bytes"])) if row else (0, 0)
+        return (int(row["n"]), int(row["b"])) if row else (0, 0)
 
     async def cipher_invocations(self, key_id: str) -> int:
         """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet)."""
@@ -8887,14 +8971,13 @@ class PostgresStore:
     # --- MFA: native TOTP second factor (local accounts, WP-14) --------------
 
     async def set_totp_secret(
-        self, user_id: str, *, secret: str | None, now: float | None = None
-    ) -> None:
-        """Stage (or clear) a user's base32 TOTP secret, store-cipher encrypted. Does not enable MFA."""
+        self, user_id: str, *, secret: str, now: float | None = None
+    ) -> str | None:
+        """See :meth:`MessageStore.set_totp_secret`: conditional on TOTP being off (#3025)."""
         now = time.time() if now is None else now
         sealed = self._enc(secret, aad=cell_aad("users", "totp_secret", user_id))
-        await self._write_user_txn(
-            user_id, lambda r: r.changed(totp_secret=sealed, updated_at=float(now))
-        )
+        written = await self._write_user_txn(user_id, totp_stage(sealed, now))
+        return None if written is None else sealed
 
     async def get_totp_secret(self, user_id: str) -> str | None:
         d = await self._fetchone("SELECT totp_secret FROM users WHERE id=$1", user_id)
@@ -8905,13 +8988,17 @@ class PostgresStore:
         return self._dec(cell, aad=cell_aad("users", "totp_secret", user_id))
 
     async def enable_totp(
-        self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
+        self,
+        user_id: str,
+        *,
+        recovery_code_hashes: list[str],
+        expected_secret_cell: str | None,
+        now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
-        # Conditional, and the result says whether it wrote: see ``totp_enable`` (#2224).
-        return (
-            await self._write_user_txn(user_id, totp_enable(recovery_code_hashes, now)) is not None
-        )
+        # Conditional, and the result says whether it wrote: see ``totp_enable`` (#2224, #3025).
+        change = totp_enable(recovery_code_hashes, now, expected_secret_cell=expected_secret_cell)
+        return await self._write_user_txn(user_id, change) is not None
 
     async def replace_totp_enrolment(
         self,
@@ -9023,10 +9110,12 @@ class PostgresStore:
 
     async def add_webauthn_credential(self, cred: WebAuthnCredential) -> None:
         """Persist one enrolled passkey. Public keys are plaintext by design (COSE verification
-        material, not a secret — excluded from the store cipher). A duplicate ``(user_id, label)``
-        raises asyncpg's UniqueViolationError — the caller renders it as the same "label already in
-        use" error as its pre-check (the concurrent-enroll race, ADR 0068 §4). The account is
-        re-sealed over its new passkey digest in the same transaction (BACKLOG #2592)."""
+        material, not a secret — excluded from the store cipher). asyncpg raises
+        UniqueViolationError for a duplicate ``(user_id, label)`` or a credential id already held,
+        and ForeignKeyViolationError for an account that does not exist; the caller tells them
+        apart by re-reading, as ``AuthService.finish_webauthn_registration`` says (ADR 0068 §4,
+        BACKLOG #2733). The account is re-sealed over its new passkey digest in the same
+        transaction (BACKLOG #2592)."""
         async with self._timed_acquire(record=False) as conn, conn.transaction():
             await self._write_passkeys(
                 conn, cred.user_id, _PG_WEBAUTHN_INSERT, *webauthn_insert_params(cred)
@@ -9049,9 +9138,7 @@ class PostgresStore:
 
     async def has_webauthn_credentials(self, user_id: str) -> bool:
         """True when the user has at least one enrolled passkey (the second-factor predicate)."""
-        d = await self._fetchone(
-            "SELECT 1 FROM webauthn_credentials WHERE user_id=$1 LIMIT 1", user_id
-        )
+        d = await self._fetchone(_PG_WEBAUTHN_ANY_FOR_USER, user_id)
         return d is not None
 
     async def any_webauthn_credentials(self) -> bool:
@@ -9088,20 +9175,22 @@ class PostgresStore:
 
     async def update_webauthn_sign_count(
         self, credential_id_hash: str, *, expected: int, new: int, used_at: float
-    ) -> bool:
+    ) -> SignCountAnswer:
         """Strict compare-and-set of the authenticator sign counter (the ``consume_totp_step``
-        precedent): ``True`` iff the stored count still equalled ``expected``. A miss means a
-        concurrent assertion consumed the same counter — the caller treats it as a clone signal
-        (ADR 0068 §4). The ``SELECT ... FOR UPDATE`` + guarded ``UPDATE`` run in one transaction
-        (no cross-node double-spend)."""
+        precedent), answering :data:`~messagefoundry.store.store.SignCountAnswer`. The answer is
+        read from the ``SELECT ... FOR UPDATE`` that locks the row, in the same transaction as the
+        guarded ``UPDATE`` (no cross-node double-spend), so no delete can land between a miss and
+        the answer (BACKLOG #3774). Either miss is a clone signal (ADR 0068 decision 4)."""
         async with self._timed_acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
                 "SELECT sign_count FROM webauthn_credentials WHERE credential_id_hash=$1"
                 " FOR UPDATE",
                 credential_id_hash,
             )
-            if row is None or row["sign_count"] != expected:
-                return False  # consumed by a concurrent assertion — clone signal
+            if row is None:
+                return "gone"
+            if row["sign_count"] != expected:
+                return "mismatch"  # a concurrent assertion moved the counter, or a cloned key
             await conn.execute(
                 "UPDATE webauthn_credentials SET sign_count=$1, last_used_at=$2"
                 " WHERE credential_id_hash=$3",
@@ -9109,7 +9198,7 @@ class PostgresStore:
                 used_at,
                 credential_id_hash,
             )
-            return True
+            return "moved"
 
     async def list_known_login_addresses(self, user_id: str, *, since: float) -> list[str]:
         """See :meth:`messagefoundry.store.base.AuthStore.list_known_login_addresses`."""
@@ -9163,11 +9252,8 @@ class PostgresStore:
             if change.takes_role(admin_role_id, role_ids):
                 # Only a change that can empty the set queues on the lock.
                 await self._advisory_lock(conn, _LOCK_CLASS_ADMIN_GUARD, _ADMIN_GUARD_LOCK)
-                # The ``$n`` twin of the SQLite store's _SQL_ADMIN_GUARD_HOLDERS (BACKLOG #2592).
                 rows = await conn.fetch(
-                    "SELECT u.id, CASE WHEN u.id = $1 THEN 1 ELSE 0 END AS is_target"
-                    " FROM users u JOIN user_roles r ON r.user_id = u.id"
-                    " WHERE r.role_id = $2 AND NOT u.disabled",
+                    _PG_SQL_ADMIN_GUARD_HOLDERS,
                     user_id,
                     admin_role_id,
                 )
@@ -9193,6 +9279,47 @@ class PostgresStore:
             else:
                 assert_never(change)
         return True
+
+    async def grant_first_admin_unless_admin_exists(
+        self,
+        user_id: str,
+        *,
+        admin_role_id: str,
+        expected_password_hash: str,
+        expected_totp_secret_cell: str | None,
+        counts_as_admin: AdminHolderTest,
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> AdminGrant:
+        """The first-administrator guard and its grant in one transaction (BACKLOG #3078); see
+        ``AuthStore``. It queues on the last-administrator guard's advisory lock, so two grants, or
+        a grant and a removal, never both read before either writes."""
+        now = time.time() if now is None else now
+        change = first_admin_grant(
+            admin_role_id,
+            expected_password_hash=expected_password_hash,
+            expected_totp_secret_cell=expected_totp_secret_cell,
+            assigned_by=assigned_by,
+            now=now,
+        )
+        async with self._timed_acquire() as conn, conn.transaction():
+            await self._advisory_lock(conn, _LOCK_CLASS_ADMIN_GUARD, _ADMIN_GUARD_LOCK)
+            rows = await conn.fetch(
+                _PG_SQL_ADMIN_GUARD_HOLDERS,
+                user_id,
+                admin_role_id,
+            )
+            _, others = await admin_guard_counts(
+                [(str(r["id"]), bool(r["is_target"])) for r in rows],
+                self._row_sealer,
+                lambda holder: self._read_user_record(conn, holder, lock=False),
+                counts_as_admin,
+            )
+            if others:
+                return AdminGrant.ADMIN_EXISTS  # nothing written; the commit releases the lock
+            if await self._write_user(conn, user_id, change) is None:
+                return AdminGrant.ACCOUNT_CHANGED
+        return AdminGrant.GRANTED
 
     @staticmethod
     async def _delete_user_rows(conn: Any, user_id: str) -> None:
@@ -9432,7 +9559,8 @@ class PostgresStore:
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
-                "SELECT username, oidc_issuer, oidc_subject FROM users WHERE id=$1 FOR UPDATE",
+                "SELECT username, oidc_issuer, oidc_subject, totp_enabled, cred_digest FROM users"
+                " WHERE id=$1 FOR UPDATE",
                 user_id,
             )
             if row is None:
@@ -9447,11 +9575,24 @@ class PostgresStore:
                     sessions_revoked=0,
                     changed=True,
                 )
+            # Vault BACKLOG #2711 step 3. A statement of its own AFTER the row lock: under READ
+            # COMMITTED it takes a fresh snapshot, so it sees a passkey whose write (which re-seals
+            # this row) committed while the lock above waited. A passkey counts when either the
+            # table or the sealed digest names one, as the service's own predicate reads it.
+            totp_enrolled = bool(row["totp_enabled"])
+            webauthn_enrolled = await conn.fetchval(
+                _PG_WEBAUTHN_ANY_FOR_USER, user_id
+            ) is not None or bool(row["cred_digest"])
             if issuer is None and subject is None:
                 # Already unbound: write NOTHING, so a no-op cannot sign the account out. AND, not
                 # OR: a half row has something to clear (see FederatedUnbind).
                 return FederatedUnbind(
-                    username=row["username"], issuer=None, subject=None, sessions_revoked=0
+                    username=row["username"],
+                    issuer=None,
+                    subject=None,
+                    sessions_revoked=0,
+                    totp_enrolled=totp_enrolled,
+                    webauthn_enrolled=webauthn_enrolled,
                 )
             await self._write_user(conn, user_id, lambda r: federated_unbind(r, now))
             result = await conn.execute(_PG_REVOKE_USER_SESSIONS_SQL, now, user_id)
@@ -9460,6 +9601,8 @@ class PostgresStore:
                 issuer=issuer,
                 subject=subject,
                 sessions_revoked=_rowcount(result),
+                totp_enrolled=totp_enrolled,
+                webauthn_enrolled=webauthn_enrolled,
             )
 
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:

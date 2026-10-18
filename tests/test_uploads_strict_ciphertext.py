@@ -54,6 +54,7 @@ from messagefoundry.uploads import (
     UploadQuotaError,
     UploadStore,
     UploadUnreadableError,
+    _UnsealableUpload,
 )
 
 _ADT = "MSH|^~\\&|A|B|C|D|202601011200||ADT^A01|MSGID1|P|2.5\rPID|1||MRN123^^^HOSP||DOE^JOHN\r"
@@ -208,6 +209,9 @@ def test_rotate_key_seals_a_refused_upload_and_it_reads_again(
     assert main(["rotate-key", "--db", str(db)]) == 0
     out = capsys.readouterr().out
     assert "sealed 1 plaintext uploaded file(s)" in out
+    # BACKLOG #3240 counts an upload sealed across two runs in both, so the note must not let an
+    # operator read every extra count as a planted file.
+    assert "counts in both" in out
     assert _PHI_NAME not in out
 
     for suffix in (".meta", ".blob"):
@@ -483,6 +487,40 @@ async def test_a_delete_told_the_sidecar_was_refused_still_classifies_it(tmp_pat
 
 
 @_BREAKS
+async def test_a_delete_told_the_sidecar_was_refused_removes_an_unsealable_upload(
+    tmp_path: Path, break_body: Callable[[Path], None]
+) -> None:
+    """BACKLOG #3240, the positive arm the store test lacked: with ``sidecar_refused`` the
+    never-sealable kind is removed, both files, and reported with blank owner fields."""
+    root = tmp_path / "uploads"
+    fid = await _unsealable_upload(root, break_body)
+    store = UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20)
+    meta = await store.delete(fid, sidecar_refused=True)
+    assert (meta.file_id, meta.uploader_id, meta.filename) == (fid, "", "")
+    assert _files(root) == []
+
+
+@pytest.mark.parametrize("sidecar_refused", [False, True], ids=["read-here", "read-by-caller"])
+async def test_a_sidecar_gone_before_it_is_classed_answers_not_found(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sidecar_refused: bool
+) -> None:
+    """BACKLOG #3240. A sidecar that vanished between the refused read and the class check, as when
+    a prune removes it, answered 423 (refused) where an absent sidecar answers 404."""
+    root = tmp_path / "uploads"
+    fid = await _plaintext_upload(root)
+    store = UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20)
+    real = store._unsealable_sync
+
+    def _gone_first(file_id: str, sidecar: Path) -> object:
+        sidecar.unlink()
+        return real(file_id, sidecar)
+
+    monkeypatch.setattr(store, "_unsealable_sync", _gone_first)
+    with pytest.raises(UploadNotFoundError):
+        await store.delete(fid, sidecar_refused=sidecar_refused)
+
+
+@_BREAKS
 async def test_an_unsealable_upload_counts_toward_the_quota_and_is_never_listed(
     tmp_path: Path, break_body: Callable[[Path], None], caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -574,9 +612,30 @@ async def test_a_body_the_engine_could_not_have_written_is_never_read(tmp_path: 
     fid = await _plaintext_upload(root)
     (root / f"{fid}.blob").write_bytes(b"\xff" * (3 * 1024 + 4096))
     store = UploadStore(root, _keyed(generate_key()), max_bytes=1024)
-    assert store._scan_unsealable_sync() == []
+    held: list[_UnsealableUpload] = []
+    assert store._scan_metas_sync(held) == [] and held == []
     assert (await store.prune_expired(now=10**12)).pruned == []
     assert (root / f"{fid}.blob").exists()
+
+
+async def test_a_sidecar_undecodable_only_past_the_class_read_is_still_classed(
+    tmp_path: Path,
+) -> None:
+    """The listing read of the whole sidecar fails, but the class check reads only its head, which
+    decodes. The quota and the prune still class it, as the separate unsealable scan did before the
+    two walks were folded into one (BACKLOG #3184), so it ages out rather than sit forever."""
+    root = tmp_path / "uploads"
+    fid = await _unsealable_upload(root, _remove)
+    sidecar = root / f"{fid}.meta"
+    # Well past the owner read and the decoder's chunk after it, then one byte that is not UTF-8.
+    sidecar.write_bytes(sidecar.read_bytes() + b" " * (4 * 64 * 1024) + b"\xff")
+    store = UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20, retention_days=30)
+    held: list[_UnsealableUpload] = []
+    assert store._scan_metas_sync(held) == []
+    # The owner is not read from a sidecar that was not read whole.
+    assert [(h.file_id, h.uploader_id, h.size) for h in held] == [(fid, "", 0)]
+    assert (await store.prune_expired(now=10**12)).pruned == []  # no body, so no row
+    assert _files(root) == []
 
 
 def test_rotate_key_notes_an_unsealable_upload_and_does_not_warn(

@@ -51,18 +51,19 @@ flowchart TB
     GHREL["Create the GitHub release as a draft<br/>artifacts with their Sigstore bundles"]:::build
   end
 
-  subgraph PUBJOB["release.yml: the publish-pypi job, environment pypi"]
-    CHECK["Fetch the gated files<br/>check each against the release job's digests"]:::build
+  subgraph PUBJOB["release.yml: the publish-pypi job, environment pypi, one approval"]
+    CHECK["Fetch the gated files<br/>check each against the release and harness jobs' digests"]:::build
     PUBTK["Publish the toolkit wheel"]:::build
     PUBENG["Publish the engine sdist and wheel"]:::build
+    PUBHARN["Publish the harness wheel"]:::build
   end
 
   HARN["release-harness job<br/>build wheel, member gate, smoke test"]:::build
-  PUBHARN["publish-pypi-harness job, environment pypi<br/>check the digests, publish the harness wheel"]:::build
   GHPUB["publish-github-release job<br/>publish the draft once every asset is on it"]:::build
   TAGW(["Console tag webconsole-vX.Y.Z pushed"]):::ext
   WEB["release-webconsole job<br/>build wheel, member gate, smoke test, engine floor gate"]:::build
   PUBWEB["publish-pypi-webconsole job, environment pypi<br/>check the digests, publish the console wheel"]:::build
+  WEBPUB["publish-github-release-webconsole job<br/>publish the console draft once the upload job has succeeded"]:::build
 
   GH(["GitHub release assets"]):::ext
   PYPI(["PyPI<br/>Trusted Publishing by OIDC, PEP 740 attestations"]):::ext
@@ -90,6 +91,7 @@ flowchart TB
   SIGN --> SLSA
   SLSA --> GHREL
   GHREL -->|"hand over files and digests"| CHECK
+  HARN -->|"hand over files and digests"| CHECK
   CHECK --> PUBTK
   PUBTK --> PUBENG
   GHREL -->|"draft"| GH
@@ -97,18 +99,20 @@ flowchart TB
   PUBENG --> PYPI
   GHREL -->|"then"| HARN
   HARN -->|"attach wheel to the draft"| GH
-  HARN -->|"hand over files and digests"| PUBHARN
   PUBENG -->|"then"| PUBHARN
   PUBHARN -.->|"publish"| PYPI
   HARN --> GHPUB
   PUBENG --> GHPUB
+  PUBHARN --> GHPUB
   GHPUB -->|"publish the release"| GH
   MAIN -->|"a maintainer tags a console release"| TAGW
   TAGW --> PROV
   PROV --> WEB
-  WEB -->|"create release"| GH
+  WEB -->|"create the release as a draft"| GH
   WEB -->|"hand over files and digests"| PUBWEB
   PUBWEB -.->|"publish"| PYPI
+  PUBWEB --> WEBPUB
+  WEBPUB -->|"publish the release"| GH
 ```
 
 **Legend.** Rounded boxes are events and outside services. The cylinder is the `main` branch. Each
@@ -126,12 +130,13 @@ Facts the labels leave out:
   [`.github/required-contexts.txt`](../.github/required-contexts.txt).
 - **Publishing has its own jobs.** The release job signs and attests with its GitHub OIDC
   identity. Every PyPI publish runs in a separate job that only publishes, names the `pypi`
-  environment and holds nothing but that identity. It downloads the files the build job gated and
-  checks each one against the digests that job recorded. Every PyPI publish is Trusted Publishing,
+  environment and holds nothing but that identity. It downloads the files the build jobs gated and
+  checks each one against the digests those jobs recorded. Every PyPI publish is Trusted Publishing,
   with no API token. A publish job runs only on a tag push, so a manual dry-run never asks for the
   environment.
 - **The `pypi` environment.** It exists, and it admits only tags matching `v*` or `webconsole-v*`.
-  Each publish waits for a named reviewer to approve it, and an admin cannot skip that approval.
+  Each publish job waits for a named reviewer to approve it, on every run attempt, and an admin
+  cannot skip that approval.
   One step remains for the owner, once these publish jobs are on `main`: name `pypi` as the
   environment in each PyPI Trusted Publisher. Until then a publisher with a blank environment would
   accept a token from any job in `release.yml`, so the approval would not bind.
@@ -139,9 +144,19 @@ Facts the labels leave out:
   that built its files has passed. A blocking step that fails there stops the publish. The SBOM
   quality score reports and does not block. The toolkit uploads before the engine
   ([ADR 0201](adr/0201-a-messagefoundry-toolkit-distribution-carries-the-authoring-and-development-tooling-out-of-the-engine-wheel.md)).
+- **One approval per engine tag.** The toolkit, engine and harness uploads are steps of one
+  `publish-pypi` job, so one approval of the `pypi` environment covers all three. The harness
+  upload runs only when the `PUBLISH_HARNESS` repository variable is set.
 - **The draft.** The engine's GitHub release stays a draft until the harness wheel is on it
-  too, and until the engine is on PyPI. A separate job publishes it last, so no job adds an asset
-  to a published release.
+  too, and until every upload `publish-pypi` runs has succeeded. With `PUBLISH_HARNESS` unset,
+  that is the toolkit and the engine only. A separate job publishes it last, so no
+  job adds an asset to a published release. The console's release is a draft too, until its wheel
+  is on PyPI. With `PUBLISH_WEBCONSOLE` unset, the console upload is skipped and the console's
+  release is still published, as the engine's is with `PUBLISH_HARNESS` unset. With either variable
+  set, its draft publisher reads it again when it runs and refuses to publish the release while
+  that run skipped the upload. A re-run that reused an earlier reading of the variable can still
+  skip the upload, and on an engine tag the toolkit and engine are on PyPI by then. The release
+  stays a draft until the build job is re-run, or the variable is unset and the publisher re-run.
 - **The provenance gate.** The tagged commit must be on `main`, and each required check's latest
   run on it must have passed. A red run after the merge blocks the tag even if the merge-queue run
   passed. To clear it, re-run the failed job on that commit, then re-run the release. A check
@@ -190,10 +205,11 @@ Windows than on Linux:
 That list is what the lock's `sys_platform` markers select today. Read the lock, not this table, for
 the current set.
 
-The SBOM generator lists what is actually installed, so one SBOM cannot be right for both. The engine
-runs as a Windows service ([SERVICE.md](SERVICE.md)) and in a Linux container, so the release ships
-both. The Windows SBOM is built on a Windows runner, because only a Windows interpreter picks packages
-the way a Windows install does.
+The SBOM generator lists what is actually installed, so one SBOM cannot be right for both. The release
+ships both. The Windows SBOM covers the core runtime of the supported v1 install, a Windows service
+([SERVICE.md](SERVICE.md)). The Linux SBOM covers a `pip install` on Linux, which is [not supported for
+v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target). The Windows SBOM is built on
+a Windows runner, because only a Windows interpreter picks packages the way a Windows install does.
 
 Neither SBOM is built by the job that signs. Each comes from its own job with read-only access, one on
 Linux and one on Windows, so no package install runs beside the signing identity. The release job
@@ -263,14 +279,14 @@ Write `<version>` in the TAG's spelling, in this command and in the Sigstore one
 pre-release tag is `v0.5.0-rc1`, while its wheel's filename says `0.5.0rc1`. The wheel's spelling
 names a ref no release was built from, so the check fails on a genuine file.
 
-Or verify a Sigstore bundle directly (both SBOMs and the VEX are signed too; for the Windows SBOM,
-name `messagefoundry-sbom-windows.cdx.json` instead):
+Or verify a Sigstore bundle directly (both SBOMs and the VEX are signed too). The examples below
+name the Windows SBOM; for the Linux SBOM, name `messagefoundry-sbom.cdx.json` instead:
 
 ```bash
 python -m sigstore verify identity \
   --cert-identity 'https://github.com/MEFORORG/MessageFoundry/.github/workflows/release.yml@refs/tags/v<version>' \
   --cert-oidc-issuer https://token.actions.githubusercontent.com \
-  messagefoundry-sbom.cdx.json
+  messagefoundry-sbom-windows.cdx.json
 ```
 
 A single `cosign` (v2.4.0+) also verifies the bundle format used across npm provenance, GitHub Artifact
@@ -291,10 +307,10 @@ to the lock file the inventory is built from, not to a field inside the SBOM. Fe
 ```bash
 # Scan the SBOM for known CVEs. --vex applies whatever assessments our VEX carries; --show-suppressed
 # lists what was suppressed, so a run with nothing to apply is visibly a no-op:
-trivy sbom messagefoundry-sbom.cdx.json --vex messagefoundry-vex.openvex.json --show-suppressed
+trivy sbom messagefoundry-sbom-windows.cdx.json --vex messagefoundry-vex.openvex.json --show-suppressed
 
 # Or score the SBOM's completeness (0-10, NTIA minimum elements):
-sbomqs score -b messagefoundry-sbom.cdx.json
+sbomqs score -b messagefoundry-sbom-windows.cdx.json
 ```
 
 **Do not demand a zero-CVE "clean scan."** Per CISA's *Minimum Requirements for VEX* and NTIA's

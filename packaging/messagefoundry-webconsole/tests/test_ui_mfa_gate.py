@@ -969,7 +969,8 @@ _SOME_SESSION_ID = "0" * 64
 #: where that refusal sends it. The password route refuses before rotating (#1954); the rest are the
 #: ``require_ui_reauth_only_action`` lanes (#1951). NOT every pending-exempt POST:
 #: ``POST /ui/account/webauthn/verify`` rides ``require_ui_reauth_only``, which has no such hook and
-#: still charges before its step-up check refuses. #1973 left it out of scope.
+#: still charges before the service's finish-time check refuses (BACKLOG #3014). #1973 left it out
+#: of scope.
 _PENDING_REFUSED_POSTS = (
     pytest.param(_PASSWORD, "/ui/mfa", id="password"),
     pytest.param(
@@ -1137,18 +1138,17 @@ async def test_a_cross_site_pending_post_is_refused_before_it_is_audited(
     assert await _denials_for(engine, _PASSWORD) == 0
 
 
-@pytest.mark.parametrize("enrolled", (False, True), ids=("no-factor", "with-a-factor"))
-async def test_a_directory_account_still_gets_the_directory_refusal(
-    engine: Engine, enrolled: bool, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """RED when: the refusal pre-empts the directory 400.
+async def _directory_session(
+    service: AuthService, *, enrolled: bool, monkeypatch: pytest.MonkeyPatch
+) -> str:
+    """A Kerberos-shaped directory session, minted with no factor asserted.
 
-    A pending directory session is left to the handler whether or not it holds an engine factor, as
-    on the JSON plane: the 400 changes nothing and says where the password lives.
-    """
+    ``enrolled`` activates TOTP on the account first, on a throwaway session, so the returned one
+    is enrolled-but-unverified. Either way the directory floor leaves it unsatisfied."""
+    from _ui_clients import PresentDirectory
+
     from messagefoundry.auth.ldap import AdPrincipal
 
-    service = await _service(engine)
     principal = AdPrincipal(
         username="aduser",
         display_name=None,
@@ -1157,6 +1157,8 @@ async def test_a_directory_account_still_gets_the_directory_refusal(
         groups=frozenset(),
         directory_object_id="1291e547-a91b-5700-88cb-a198a209fb05",
     )
+    # BACKLOG #3061: the TOTP enrolment below asks the directory about a directory account.
+    service._ldap = PresentDirectory(principal)  # type: ignore[assignment]
     if enrolled:
         _pin_totp_clock(monkeypatch, 1_000_000.0)  # no step boundary between code and check
         setup = await service._complete_ad_login(principal, None, mfa_verified=False)
@@ -1167,12 +1169,137 @@ async def test_a_directory_account_still_gets_the_directory_refusal(
         )
         assert confirmed.ok
     out = await service._complete_ad_login(principal, None, mfa_verified=False)
-    assert out.ok and out.token is not None
+    assert out.ok and out.token is not None and out.identity is not None
     assert await service.mfa_satisfied(out.token) is False
+    return out.token
+
+
+@pytest.mark.parametrize("enrolled", (False, True), ids=("no-factor", "with-a-factor"))
+async def test_a_directory_account_still_gets_the_directory_refusal(
+    engine: Engine, enrolled: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the refusal pre-empts the directory 400.
+
+    A pending directory session is left to the handler whether or not it holds an engine factor, as
+    on the JSON plane: the 400 changes nothing and says where the password lives.
+    """
+    service = await _service(engine)
+    token = await _directory_session(service, enrolled=enrolled, monkeypatch=monkeypatch)
     async with _client(engine, service) as c:
-        c.cookies.set("mf_session", out.token)
+        c.cookies.set("mf_session", token)
         r = await _change_password(c)
         assert r.status_code == 400 and "managed in AD" in r.text
+
+
+# --- the enrol-first bounce keys on the session as well as the account rule (BACKLOG #3116) -----
+
+
+_STEP_UP_NEXT = "/ui/account/mfa/disable"  # a full-step-up action (require_ui_step_up_action)
+
+
+@pytest.mark.parametrize("enrolled", (False, True), ids=("no-factor", "with-a-factor"))
+async def test_a_directory_non_admin_is_sent_to_enrol_not_to_an_unpassable_reauth_form(
+    engine: Engine, enrolled: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: either /ui/reauth handler, or the account page, keys the enrol-first decision on
+    ``mfa_status().required`` alone, without ``mfa_satisfied``; or POST asks the per-actor budget
+    before the bounce.
+
+    Under ``require_mfa_scope = "administrators"`` the account rule calls a directory non-admin with
+    no factor exempt (``required`` False), while the directory floor leaves its session unsatisfied,
+    so no password can pass the step-up. The no-factor arm must be bounced to enrol on GET and POST
+    and told on the account page that enrolment is required. The with-a-factor arm is the control: it
+    owes a factor it holds, so it still gets the reauth form with a code field."""
+    service = await _service(engine, require_mfa=True, require_mfa_scope="administrators")
+    token = await _directory_session(service, enrolled=enrolled, monkeypatch=monkeypatch)
+    identity = await service.identity_for_token(token)
+    assert identity is not None
+    assert (await service.mfa_status(identity)).required is enrolled  # the split #2490 keeps
+    async with _client(engine, service) as c:
+        c.cookies.set("mf_session", token)
+        got = await c.get("/ui/reauth", params={"next": _STEP_UP_NEXT})
+        posted = await c.post(
+            "/ui/reauth",
+            data={"next": _STEP_UP_NEXT, "password": "irrelevant"},
+            headers={"origin": "http://t"},
+        )
+        account = await c.get("/ui/account")
+        # The bounce comes before the per-actor budget, so a spent budget never turns it into a 429.
+        monkeypatch.setattr(service, "allow_reauth_attempt", lambda _actor: False)
+        spent = await c.post(
+            "/ui/reauth",
+            data={"next": _STEP_UP_NEXT, "password": "irrelevant"},
+            headers={"origin": "http://t"},
+        )
+    if enrolled:
+        assert spent.status_code == 429
+        assert got.status_code == 200 and 'name="password"' in got.text
+        assert 'name="code"' in got.text
+        assert posted.status_code == 200 and 'name="code"' in posted.text  # asked for the code
+    else:
+        assert got.status_code == 303 and got.headers["location"] == _ENROL_FIRST
+        assert posted.status_code == 303 and posted.headers["location"] == _ENROL_FIRST
+        assert spent.status_code == 303 and spent.headers["location"] == _ENROL_FIRST
+        assert account.status_code == 200 and "REQUIRES MFA" in account.text
+        # The bounce must lead somewhere: enrolment is step_up=False, so its re-auth renders.
+        async with _client(engine, service) as c:
+            c.cookies.set("mf_session", token)
+            enrol = await c.get("/ui/reauth", params={"next": "/ui/account/mfa/enroll"})
+        assert enrol.status_code == 200 and 'name="password"' in enrol.text
+
+
+async def test_an_exempt_local_non_admin_still_gets_the_reauth_form(engine: Engine) -> None:
+    """RED when: the session keying over-reaches and bounces a session that owes no factor.
+
+    A LOCAL non-admin under the ``administrators`` scope with no factor is satisfied (it proved its
+    password to the engine), so a step-up action still asks it for the password alone."""
+    service = await _service(engine, require_mfa=True, require_mfa_scope="administrators")
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        assert (await _login(c)).status_code == 303
+        got = await c.get("/ui/reauth", params={"next": _STEP_UP_NEXT})
+        account = await c.get("/ui/account")
+    assert got.status_code == 200 and 'name="password"' in got.text
+    assert 'name="code"' not in got.text
+    assert account.status_code == 200 and "REQUIRES MFA" not in account.text
+
+
+async def test_a_satisfied_session_on_a_required_account_with_no_factor_is_still_bounced(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the bounce drops the account rule and keys on the session ALONE.
+
+    The inverse of the #3116 split: a session stamped MFA-verified while TOTP was on, whose TOTP was
+    then turned off with the requirement off, is satisfied after the requirement comes on, yet the
+    account rule says it owes a factor it does not hold. It is still sent to enrol, and still told."""
+    _pin_totp_clock(monkeypatch, 1_000_000.0)  # no step boundary between code and check
+    off = await _service(engine, require_mfa=False)
+    user_id = await _add(off, "op", Role.OPERATOR)
+    identity = await off.identity_for_user_id(user_id)
+    assert identity is not None
+    outcome = await off.login("op", PW)
+    assert outcome.ok and outcome.token is not None
+    enrollment = await off.begin_mfa_enrollment(identity)
+    confirmed = await off.confirm_mfa_enrollment(
+        identity, totp.totp(enrollment.secret), token=outcome.token
+    )
+    assert confirmed.ok and confirmed.token is not None
+    await off.disable_mfa(identity)
+    on = await _service(engine, require_mfa=True)
+    assert await on.mfa_satisfied(confirmed.token) is True
+    assert (await on.mfa_status(identity)).required is True
+    async with _client(engine, on) as c:
+        c.cookies.set("mf_session", confirmed.token)
+        got = await c.get("/ui/reauth", params={"next": _STEP_UP_NEXT})
+        posted = await c.post(
+            "/ui/reauth",
+            data={"next": _STEP_UP_NEXT, "password": PW},
+            headers={"origin": "http://t"},
+        )
+        account = await c.get("/ui/account")
+    assert got.status_code == 303 and got.headers["location"] == _ENROL_FIRST
+    assert posted.status_code == 303 and posted.headers["location"] == _ENROL_FIRST
+    assert account.status_code == 200 and "REQUIRES MFA" in account.text
 
 
 # --- a directory the account is not confirmed in (BACKLOG #2023) --------------------------------
@@ -1284,6 +1411,29 @@ async def test_the_passkey_leg_says_the_directory_could_not_confirm_the_account(
         error = r.json()["error"]
         assert (_DIRECTORY_UNCONFIRMED_TEXT in error) is unconfirmed
         assert (error == "passkey verification failed") is not unconfirmed
+
+
+async def test_the_passkey_leg_answers_a_lost_session_with_401(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3068, item 3: the service answers ``session_lost`` when the session or the account
+    went during the ceremony, for example under the directory lookup. The token then no longer
+    authenticates, so the route must send the page back to sign-in rather than report a wrong
+    passkey. The service answer is stubbed.
+
+    RED when: /ui/reauth/webauthn drops its ``session_lost`` branch (the answer is then a 400)."""
+    service = await _service(engine, require_mfa=False)
+    await _add(service, "op", Role.OPERATOR)
+
+    async def _lost(token: str | None, response_json: str, **_kwargs: object) -> Elevation:
+        return Elevation(session_lost=True)
+
+    async with _client(engine, service) as c:
+        assert (await _login(c)).status_code == 303
+        monkeypatch.setattr(service, "finish_webauthn_assertion", _lost)
+        r = await c.post("/ui/reauth/webauthn", json={"response": {}}, headers=SAME_ORIGIN)
+        assert r.status_code == 401, r.text
+        assert r.json() == {"ok": False, "error": "session expired"}
 
 
 # --- the temporary credential's deadline on the factor and password pages (BACKLOG #2009) ------

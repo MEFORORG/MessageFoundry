@@ -32,13 +32,18 @@ from messagefoundry.api import create_app
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import ALL_CHANNELS, Identity
 from messagefoundry.auth.ldap import AdPrincipal
-from messagefoundry.auth.service import STEP_UP_ACTION_SESSION_TERMINATE, AuthService
+from messagefoundry.auth.service import (
+    STEP_UP_ACTION_SESSION_TERMINATE,
+    AuthService,
+    _requirement_covers,
+)
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStore
 from messagefoundry.store.store import WebAuthnCredential
 from tests._admin_account import create_admin, create_local_user_chosen
+from tests._fake_directory import DirectoryOf
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 
@@ -54,10 +59,15 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
     await eng.stop()
 
 
-async def _service(engine: Engine, settings: AuthSettings | None = None) -> AuthService:
+async def _service(
+    engine: Engine, settings: AuthSettings | None = None, *, ldap: DirectoryOf | None = None
+) -> AuthService:
+    """``ldap`` for a test that enrols a directory account: since BACKLOG #3061 the enrolment
+    legs ask the directory first, and with none wired they refuse."""
     service = AuthService(
         engine.store,
         settings or AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False),
+        ldap=ldap,  # type: ignore[arg-type]
     )
     await service.initialize()
     return service
@@ -125,10 +135,11 @@ async def _login(c: httpx.AsyncClient, username: str) -> str:
     return str(r.json()["token"])
 
 
-async def _add_passkey(service: AuthService, username: str) -> None:
-    """Give ``username`` one stored passkey and no TOTP secret, so a passkey is its only factor."""
+async def _add_passkey(service: AuthService, username: str, *, beside_totp: bool = False) -> None:
+    """Give ``username`` one stored passkey. Without ``beside_totp`` the account must hold no TOTP,
+    so the passkey is its only factor."""
     user = await service.store.get_user_by_username(username)
-    assert user is not None and not user.totp_enabled
+    assert user is not None and user.totp_enabled is beside_totp
     await service.store.add_webauthn_credential(
         WebAuthnCredential(
             credential_id_hash=f"{username}-passkey-hash",
@@ -914,7 +925,7 @@ async def test_a_directory_account_is_still_told_its_password_lives_in_the_direc
     (BACKLOG #1144) is left to the handler too: its 400 changes nothing, so a 403 asking for the
     factor would only spend a code to learn the same answer.
     """
-    service = await _service(engine)
+    service = await _service(engine, ldap=DirectoryOf(_principal("aduser9")))
     if enrolled:
         setup = await service._complete_ad_login(_principal("aduser9"), None, mfa_verified=False)
         assert setup.identity is not None and setup.token is not None
@@ -1064,6 +1075,9 @@ async def test_the_status_and_last_factor_guards_skip_the_directory_floor_the_ga
             require_mfa_scope="administrators",
             mfa_recovery_code_count=1,  # this test never spends one; fewer argon2 hashes
         ),
+        ldap=DirectoryOf(
+            _principal("adview"), _principal("adadmin", groups=frozenset({"CN=MF-Admins,DC=x"}))
+        ),
     )
     await service.set_ad_group_map([("CN=MF-Admins,DC=x", "administrator")], actor="test")
 
@@ -1122,8 +1136,15 @@ async def test_the_status_and_last_factor_guards_skip_the_directory_floor_the_ga
     await _add_passkey(service, "adadmin")
     with pytest.raises(ValueError, match="enroll another factor first"):
         await service.delete_webauthn_credential(admin, "adadmin-passkey-hash")
-    # Enrol TOTP, then drop the passkey, so TOTP is the last factor; disabling it must refuse.
+    # Enrol TOTP, then drop the passkey, so TOTP is the last factor; disabling it must refuse. The
+    # passkey is set aside through the store first because confirm_mfa_enrollment refuses a pending
+    # session on an account that holds a passkey (BACKLOG #3061), as the confirm route's gate does,
+    # and put back once TOTP is on, so the service's delete is still exercised beside TOTP.
+    admin_row = await service.store.get_user_by_username("adadmin")
+    assert admin_row is not None
+    assert await service.store.delete_webauthn_credential(admin_row.id, "adadmin-passkey-hash")
     await enrol_totp(admin, admin_login.token)
+    await _add_passkey(service, "adadmin", beside_totp=True)
     assert await service.delete_webauthn_credential(admin, "adadmin-passkey-hash") is True
     with pytest.raises(ValueError, match="enroll another factor first"):
         await service.disable_mfa(admin)
@@ -1178,6 +1199,37 @@ def test_the_per_user_rule_reads_no_provider_at_all(engine: Engine) -> None:
         ), f"provider {provider!r} must not change the answer"
 
 
+async def test_an_unrecognized_provider_row_is_covered_by_the_gates_and_the_census(
+    engine: Engine,
+) -> None:
+    """RED when: ``_requirement_covers`` allow-lists ``LOCAL`` again (BACKLOG #3117).
+
+    A local account with a chosen password and no factor is covered. Planting an unknown provider
+    on its row must leave it covered: AC-A3a's helper says so, and the enrol-first gate still sends
+    it to enrolment. ``ad`` is the one value that leaves it out. The census names only the local
+    row: password sign-in refuses every other provider before it counts a failure, so no other row
+    can be locked, and naming one would ask for a reset that issues it nothing."""
+    service = await _service(engine)
+    user_id = await _add(service, "rogue", Role.VIEWER)
+    identity = await service.identity_for_user_id(user_id)
+    assert identity is not None
+    db = cast(MessageStore, engine.store)._db
+    for provider, covered, censused in (
+        ("local", True, True),
+        ("saml-from-the-future", True, False),
+        ("ad", False, False),
+    ):
+        await db.execute("UPDATE users SET auth_provider = ? WHERE id = ?", (provider, user_id))
+        await db.commit()
+        row = await engine.store.get_user(user_id)
+        assert row is not None and not row.totp_enabled and row.password_hash is not None
+        roles = frozenset({Role.VIEWER})
+        assert _requirement_covers(service._settings, row, roles) is covered, provider
+        assert await service.must_enrol_before_rotating(identity) is covered, provider
+        census = await service.lockable_account_census()
+        assert ("rogue" in census.no_way_past) is censused, provider
+
+
 # --- 6.8.4: the directory legs assert nothing, so the engine assumes nothing --
 
 
@@ -1208,7 +1260,7 @@ async def test_a_directory_session_minted_at_the_minimum_is_confined_until_it_en
     enrollment ceremony and satisfy the gate (otherwise the mint is a lockout, not a control). Either
     half alone passes trivially; asserting both is what pins them together.
     """
-    service = await _service(engine)
+    service = await _service(engine, ldap=DirectoryOf(_principal("aduser4")))
     out = await service._complete_ad_login(_principal("aduser4"), None, mfa_verified=False)
     assert out.ok and out.token is not None and out.identity is not None
     async with _client(engine, service) as c:

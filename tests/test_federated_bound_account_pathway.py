@@ -536,10 +536,13 @@ def test_the_security_doc_states_the_limits_beside_the_session_claim() -> None:
     assert "**A bind and a user delete can collide on the SQL Server and Postgres stores.**" in text
 
 
-def test_the_security_doc_says_provision_admin_does_not_replace_a_local_administrator() -> None:
+def test_the_security_doc_says_a_bound_administrator_does_not_block_provision_admin() -> None:
     """RED when: the recovery sentence leaves the document. A site that binds every Administrator
-    has to read, before the outage, that the host command will refuse."""
+    has to read, before the outage, that the host command is its way back in. Since vault BACKLOG
+    #2711 step 1 (ADR 0183 Amendment E) a bound Administrator no longer blocks ``provision-admin``;
+    this pinned the old sentence, that it "will not rescue the site", until then."""
     text = (Path(__file__).resolve().parents[1] / "docs" / "SECURITY.md").read_text(
         encoding="utf-8"
     )
-    assert "`provision-admin` will not rescue the site" in text
+    assert "`provision-admin` will not rescue the site" not in text
+    assert "a bound one does not block it" in text

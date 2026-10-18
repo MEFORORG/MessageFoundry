@@ -70,7 +70,6 @@ import inspect
 import linecache
 import re
 import types
-from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, Literal
@@ -531,10 +530,11 @@ def _effective_routes(owner: Starlette | APIRouter | Mount) -> Iterator[tuple[Ba
     gate comes from the route's own dependencies."""
     _refuse_low_priority_routes(owner)
     routes: Sequence[BaseRoute] = owner.routes
-    # A count, not a set: a route object registered here AND through an include is served as it is
-    # only once, so its second context must still find the rebuilt copy or fail by name.
-    direct = Counter(id(route) for route in routes)
-    for context in iter_route_contexts(routes):
+    # One entry at a time, so a context with no rebuilt copy is known to be the entry itself only
+    # when its original IS that entry. A count of direct registrations could not say which context
+    # was the direct one: a shared route object included before it is registered here would spend
+    # the count on the include and blame the direct entry (vault BACKLOG #3177).
+    for entry, context in ((r, c) for r in routes for c in iter_route_contexts([r])):
         original: BaseRoute = context.original_route
         if isinstance(original, APIRoute):
             yield original, context
@@ -545,7 +545,7 @@ def _effective_routes(owner: Starlette | APIRouter | Mount) -> Iterator[tuple[Ba
         # both ways still reports its prefixed path through the include.
         served = getattr(context, "starlette_route", None)
         if not isinstance(served, BaseRoute):
-            if direct[id(original)] == 0:
+            if original is not entry:
                 # Reached through an include, so the copy must exist. FastAPI does not promise the
                 # field, and the unprefixed original is the wrong path to report.
                 served = fastapi_symbol(context, "starlette_route")
@@ -553,7 +553,6 @@ def _effective_routes(owner: Starlette | APIRouter | Mount) -> Iterator[tuple[Ba
                     f"FastAPI {fastapi.__version__} serves an included {type(original).__name__} "
                     f"with no rebuilt route ({served!r}), so the walk cannot read its path"
                 )
-            direct[id(original)] -= 1
             served = original
         if isinstance(served, Mount) and not served.routes:
             # A walk descends only into a mount with routes, which refuses there; a mount holding

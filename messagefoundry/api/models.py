@@ -519,6 +519,18 @@ class PendingApprovalResponse(BaseModel):
     detail: str
 
 
+#: Why the gate refuses a pending request's approve whoever approves it (vault BACKLOG #3192).
+#: ``PendingApprovalInfo`` says what each value means.
+ReleaseBlocked = Literal[
+    "no_requester_id",
+    "operation_unavailable",
+    "not_gated",
+    "params_unreadable",
+    "params_no_requester",
+    "requester_not_authorized",
+]
+
+
 class PendingApprovalInfo(BaseModel):
     """One open request in the approver's queue: ``pending`` (awaiting a second approver, unexpired)
     or ``interrupted`` (released, cut off mid-run, awaiting a resolve; BACKLOG #1562). For an
@@ -536,7 +548,24 @@ class PendingApprovalInfo(BaseModel):
     is off, or the operation has left ``[approvals].operations``. The engine then refuses a
     ``pending`` request's approve with 409 (``approval.no_longer_gated``) whatever this says; it lets
     a page offer only the reject. It reads the settings at listing time, and it does not affect the
-    resolve of an ``interrupted`` row."""
+    resolve of an ``interrupted`` row.
+
+    ``release_blocked`` names why the engine refuses a ``pending`` request's approve whoever the
+    approver is, or is ``None`` (vault BACKLOG #3192). Each value is a 409 the gate raises, in the
+    order it raises them: ``no_requester_id`` (the row predates requester-id attribution),
+    ``operation_unavailable`` (no such operation is registered), ``not_gated`` (as ``gated`` above),
+    ``params_unreadable``, ``params_no_requester`` (the operation's executor needs the requester's
+    name, as at least a held purge's and reload's do, and these parameters carry none; vault
+    BACKLOG #3217), and
+    ``requester_not_authorized``, which the gate raises after the dwell floor: the requester no longer holds the authority the operation needs, read when the queue is
+    listed (BACKLOG #3189). A held reload or purge whose requester has since been channel-scoped is
+    one. The listing writes no ``approval.stale_requester`` row; only an approve refused on it
+    does. The read can still report a requester account whose integrity seal fails, as any read
+    of that account does. ``None`` does not promise a release. At least the self-approval
+    refusal, the expiry, the dwell floor, a change to the requester's standing after the listing, a
+    standing the listing could not read, the row's seal and the operation's own refusals, such as a
+    held reload with no config digest, are met only at release. It lets a page offer only the reject. It is ``None`` on
+    an ``interrupted`` row."""
 
     id: str
     operation: str
@@ -550,6 +579,7 @@ class PendingApprovalInfo(BaseModel):
     decided_at: float | None = None
     caller_is_requester: bool = False
     gated: bool = True
+    release_blocked: ReleaseBlocked | None = None
 
 
 class ApprovalList(BaseModel):
@@ -613,7 +643,22 @@ class ReloadResult(BaseModel):
     Reporting outright failure there would describe an engine that does not exist; reporting plain
     success would hide the step. The step labels are stable and PHI-free
     (``config_fingerprint``, ``reference_sync``, ``cluster_propagate``, and ``audit`` when the
-    ``config_reload`` audit row failed after the swap, BACKLOG #1940)."""
+    ``config_reload`` audit row failed after the swap, BACKLOG #1940).
+
+    ``restart_required`` names each settings trust anchor whose consumer loaded its bytes at start
+    (for example ``[auth].ad_tls_ca_cert_file``) and whose file has changed on disk since. The
+    reload checked the new file and passed it, but no reload rebuilds the consumer that loaded the
+    old one, so the engine keeps trusting the old CA until it restarts (BACKLOG #2185, #3015).
+    ``None`` means **not checked**: a dry run skips the settings preflight, so it cannot say.
+
+    An empty list is narrower than "no restart needed". It means no anchor this field covers
+    changed, including when none is configured. It covers only the engine process that answered:
+    another engine shard, or a cluster node that converges on the reload, reports its own anchors
+    only in its own log, as the audit row names no node. It never lists at least the dialling
+    settings CAs (``[tls].internal_ca_file``, ``[alerts].email_tls_ca_file``,
+    ``[logging].forward_tls_ca_file``): their hops load the file by path and record no fingerprint
+    to compare with. A changed one can still need a restart or a rebuild of the connections that
+    use it; ``docs/SECURITY.md`` says which."""
 
     inbound: int
     outbound: int
@@ -623,6 +668,7 @@ class ReloadResult(BaseModel):
     dry_run: bool = False
     degraded: bool = False
     failures: list[str] = []
+    restart_required: list[str] | None = None
 
 
 class ConfigProvenance(BaseModel):
@@ -637,6 +683,19 @@ class ConfigProvenance(BaseModel):
     git_head: str | None = None  # commit sha at load, when the config dir is a git work tree
     files: int | None = None  # number of files folded into the fingerprint
     drift: bool = False  # the on-disk config now differs from what was loaded
+    #: The refusal ``POST /config/reload`` gives THIS caller whatever it proves, or ``None`` when no
+    #: such refusal applies (BACKLOG #3189). Today that is :data:`RELOAD_REFUSED_CHANNEL_SCOPED`
+    #: for a channel-scoped caller. It is computed by the engine's own rule, so a page can stop
+    #: offering a reload the engine will refuse, after the caller has spent a step-up, without
+    #: re-deriving that rule. ``None`` does not promise a reload: at least ``config:deploy``, the
+    #: step-up and the reload's own refusals are still met when it runs. REQUIRED, so no reading
+    #: can leave it unstated.
+    reload_refused: str | None
+
+
+#: The 403 detail ``POST /config/reload`` gives a channel-scoped caller (BACKLOG #3189), and
+#: ``ConfigProvenance.reload_refused`` for one.
+RELOAD_REFUSED_CHANNEL_SCOPED = "channel-scoped users cannot reload the configuration"
 
 
 class ConnectionRow(PhiGatedModel):
@@ -1500,7 +1559,7 @@ class InterpreterView(BaseModel):
     code_path_variables: list[str] = Field(default_factory=list)
     startup_code: list[StartupCodeItemView] = Field(default_factory=list)
     #: The directories start-up code is read from: the site directories and every directory on
-    #: the import path, the engine's own and the one it hands its Python children.
+    #: the engine's import path, which its Python children share (they repeat its isolation).
     startup_dirs: list[str] = Field(default_factory=list)
     #: The ones the engine's own account can add a file to. Empty is the safe reading only while
     #: ``startup_dirs`` is not empty and ``unchecked_startup_dirs`` is.
@@ -1539,6 +1598,13 @@ STATIC_CREDENTIAL_HOPS_COMPLETE = (
 )
 #: The same field's prefix when a half could not be read; the route appends which half and why.
 STATIC_CREDENTIAL_HOPS_PARTIAL = "partial, not read: "
+#: ``SecurityPosture.loosenings_scope`` for a channel-scoped reader (BACKLOG #3189), and the lead of
+#: ``static_credential_hops_scope`` for one. Such a reader is shown a per-connection entry only for an
+#: inbound in its own scope that the running graph holds.
+POSTURE_NARROWED_TO_SCOPE = (
+    "narrowed to your channel scope: a per-connection entry is listed only for an inbound in "
+    "your scope, so one on any other connection is NOT included"
+)
 
 
 class StaticCredentialHopView(BaseModel):
@@ -1596,9 +1662,10 @@ class SecurityPosture(BaseModel):
     # PHI-only gates are (defensibly) relaxed. Read-only; the IDE is the sole authoring surface.
     security: dict[str, object] = Field(default_factory=dict)
     loosenings: list[SecurityLoosening] = Field(default_factory=list)
-    # ``None`` = the loosening list above is COMPLETE. A string names what it could NOT see — set only
+    # ``None`` = the loosening list above is COMPLETE. A string names what it could NOT see — set
     # when this engine has no loaded connection graph (an embedding, or an app queried before start),
-    # where the ADR 0153 per-connection ``cleartext_accepted`` declarations are unreadable. Reporting a
+    # where the ADR 0153 per-connection ``cleartext_accepted`` declarations are unreadable, and for a
+    # channel-scoped reader, whose list is narrowed (POSTURE_NARROWED_TO_SCOPE, BACKLOG #3189). Reporting a
     # settings-only subset with no marker would understate the posture, which is the one thing this
     # route must not do; ``messagefoundry security show`` carries the same marker for the same reason.
     loosenings_scope: str | None = None
@@ -1613,7 +1680,8 @@ class SecurityPosture(BaseModel):
     # This is the INVENTORY, reported whether or not the opt-in refusal
     # ([security].require_nonstatic_credentials, echoed in `security` above) is on. The scope is always
     # a sentence and never absent: it says both halves were read, or names the half this engine could
-    # not see (no loaded graph, or no resolved service configuration). Its default says the inventory
+    # not see (no loaded graph, or no resolved service configuration). For a channel-scoped reader it
+    # starts with POSTURE_NARROWED_TO_SCOPE (BACKLOG #3189). Its default says the inventory
     # was not read at all, so a posture built without it can never pass for a clean, complete list.
     static_credential_hops: list[StaticCredentialHopView] = Field(default_factory=list)
     static_credential_hops_scope: str = STATIC_CREDENTIAL_HOPS_NOT_READ

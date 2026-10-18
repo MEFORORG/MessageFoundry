@@ -139,3 +139,103 @@ async def _assert_federated_binding_service_contract(store: Any) -> None:
             expected_subject=REBOUND_SUB,
             actor="admin",
         )
+
+
+#: The account the factor-state contract below binds, rebinds and unbinds, and its control.
+FACTOR_USER = "bind-factors"
+FACTORLESS_USER = "bind-factorless"
+#: Holds TOTP and a passkey BEFORE its first bind, so the already-unbound arm of the clear is read.
+PRE_ENROLLED_USER = "bind-pre-enrolled"
+
+
+async def _factor_fields(store: Any, action: str, user_id: str) -> tuple[bool, bool]:
+    rows = [json.loads(a["detail"]) for a in await _audit(store, action)]
+    [detail] = [d for d in rows if d["user_id"] == user_id]
+    return detail["totp_enrolled"], detail["webauthn_enrolled"]
+
+
+async def _assert_bind_audit_names_factors_contract(store: Any) -> None:
+    """The bind, rebind and unbind audit rows say whether the account holds an engine factor.
+
+    Vault BACKLOG #2711 step 3: the row an operator reads after a binding change says whether the
+    account holds engine factors. Read in the clear's own transaction on every backend.
+    ``FACTORLESS_USER`` is the control: a row that always said ``True`` would fail there.
+    """
+    from tests._webauthn_store_contract import _cred
+
+    service = AuthService(store, AuthSettings(require_mfa=False, oidc_issuer=ISSUER))
+    for uid in (FACTOR_USER, FACTORLESS_USER, PRE_ENROLLED_USER):
+        await store.create_user(
+            user_id=uid,
+            username=uid,
+            auth_provider="ad",
+            directory_object_id=f"guid-{uid}",
+            now=1_000.0,
+            password_generated=False,
+        )
+
+    # 1. A first bind of an account with no factor says so, on both fields.
+    for uid in (FACTOR_USER, FACTORLESS_USER):
+        await service.bind_federated_subject(
+            uid, f"S-1-{uid}", expected_issuer=None, expected_subject=None, actor="admin"
+        )
+        assert await _factor_fields(store, "auth.federated_subject_bound", uid) == (False, False)
+
+    # 1b. A first bind of an account that already holds both factors reads them in the clear's
+    #     already-unbound arm. Without this, dropping the fields from that arm would still pass 1.
+    staged_cell = await store.set_totp_secret(PRE_ENROLLED_USER, secret="JBSWY3DPEHPK3PXP")
+    assert staged_cell is not None
+    assert await store.enable_totp(
+        PRE_ENROLLED_USER, recovery_code_hashes=["h1"], expected_secret_cell=staged_cell
+    )
+    await store.add_webauthn_credential(_cred(PRE_ENROLLED_USER, "pre", id_hash="pre-passkey-hash"))
+    await service.bind_federated_subject(
+        PRE_ENROLLED_USER,
+        f"S-1-{PRE_ENROLLED_USER}",
+        expected_issuer=None,
+        expected_subject=None,
+        actor="admin",
+    )
+    assert await _factor_fields(store, "auth.federated_subject_bound", PRE_ENROLLED_USER) == (
+        True,
+        True,
+    )
+
+    # 2. The account enrols both factors; the rebind row reads them.
+    staged_cell = await store.set_totp_secret(FACTOR_USER, secret="JBSWY3DPEHPK3PXP")
+    assert staged_cell is not None
+    assert await store.enable_totp(
+        FACTOR_USER, recovery_code_hashes=["h1"], expected_secret_cell=staged_cell
+    )
+    await store.add_webauthn_credential(_cred(FACTOR_USER, "mine", id_hash="factor-passkey-hash"))
+    await service.bind_federated_subject(
+        FACTOR_USER,
+        "S-1-factors-rebound",
+        expected_issuer=ISSUER,
+        expected_subject=f"S-1-{FACTOR_USER}",
+        actor="admin",
+    )
+    assert await _factor_fields(store, "auth.federated_subject_rebound", FACTOR_USER) == (
+        True,
+        True,
+    )
+
+    # 3. TOTP removed, passkey kept: the two fields are read apart, so the unbind row tells them apart.
+    await store.disable_totp(FACTOR_USER)
+    await service.unbind_federated_subject(
+        FACTOR_USER, expected_issuer=ISSUER, expected_subject="S-1-factors-rebound", actor="admin"
+    )
+    await service.unbind_federated_subject(
+        FACTORLESS_USER,
+        expected_issuer=ISSUER,
+        expected_subject=f"S-1-{FACTORLESS_USER}",
+        actor="admin",
+    )
+    assert await _factor_fields(store, "auth.federated_subject_unbound", FACTOR_USER) == (
+        False,
+        True,
+    )
+    assert await _factor_fields(store, "auth.federated_subject_unbound", FACTORLESS_USER) == (
+        False,
+        False,
+    )

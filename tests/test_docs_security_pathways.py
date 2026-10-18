@@ -542,14 +542,29 @@ def test_the_rows_do_not_draw_the_directory_pathways_weaker_than_the_code() -> N
     refusal and exempts nothing, and the Lockout asymmetry paragraph says so. The behaviour the rows
     rest on (a directory account's wrong code feeds the lockout, and its lock is checked before the
     lookup) is pinned in ``tests/test_mfa_directory_recheck.py``, not by this AST read.
+
+    Since BACKLOG #3061 the two enrolment legs call the same helper, so a directory account is
+    asked before an enrolment marks its factor. That too only adds a refusal: a confirmed directory
+    account still enrols TOTP or a passkey, which ``tests/test_enrolment_directory_recheck.py``
+    pins, and ``test_the_enrolment_legs_ask_the_directory_and_the_doc_says_so`` pins the call. The
+    begin legs still read no provider, and the finish legs read none themselves.
     """
-    verify_attrs = [
-        n.attr
-        for n in ast.walk(ast.parse(textwrap.dedent(inspect.getsource(AuthService.verify_mfa))))
-        if isinstance(n, ast.Attribute)
-    ]
+
+    # Since BACKLOG #3068 the one provider branch lives in the shared helper both second-factor legs
+    # call, so verify_mfa reads no provider itself and the helper reads it exactly once.
+    def _attrs(func: object) -> list[str]:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(func)))  # type: ignore[arg-type]
+        return [n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)]
+
+    verify_attrs = _attrs(AuthService.verify_mfa)
+    helper_attrs = _attrs(AuthService._directory_vouches_for_factor)
+    reread_attrs = _attrs(AuthService._factor_holder_current)
     assert (
-        verify_attrs.count("auth_provider") == 1 and "_directory_step_up_refusal" in verify_attrs
+        verify_attrs.count("auth_provider") == 0
+        and reread_attrs.count("auth_provider") == 0
+        and "_directory_vouches_for_factor" in verify_attrs
+        and helper_attrs.count("auth_provider") == 1
+        and "_directory_step_up_refusal" in helper_attrs
     ), (
         "verify_mfa grew a provider branch beyond the BACKLOG #2023 directory check; re-derive the "
         "pathway rows, which say a directory account's TOTP leg feeds and meets the lockout."
@@ -1000,6 +1015,7 @@ def test_the_fourth_sweep_leaves_no_older_pathway_contradiction() -> None:
     ceremony = sorted(r for r, fn in routes.items() if _called(fn, "allow_reauth_attempt"))
     assert ceremony == [
         "POST /ui/account/mfa/verify",
+        "POST /ui/account/webauthn/verify",  # BACKLOG #3014: the passkey registration finish
         "POST /ui/mfa",
         "POST /ui/reauth",
         # BACKLOG #296: the federated step-up's start leg, registered only with federation on.
@@ -1153,7 +1169,9 @@ def test_the_fifth_sweep_carries_the_idp_step_up_leg_into_every_pathway_claim() 
        (BACKLOG #2023), so a code does not renew a disabled directory account's window, and a
        step-up is not the only live directory check.
     """
-    assert _called(_service_func("verify_mfa"), "_directory_step_up_refusal"), (
+    assert _called(_service_func("verify_mfa"), "_directory_vouches_for_factor") and _called(
+        _service_func("_directory_vouches_for_factor"), "_directory_step_up_refusal"
+    ), (
         "verify_mfa no longer asks the directory before a code renews the window; the identity-"
         "provider row and the reconciliation section say it does (BACKLOG #2023)."
     )
@@ -1449,7 +1467,7 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
     code does, then refuses every phrasing that said otherwise:
 
     1. The two second-factor legs read the second-step lock only. ``verify_mfa`` refuses through
-       ``_mfa_lock_refused``; ``finish_webauthn_assertion`` reads ``second_step_locked`` itself.
+       ``_mfa_lock_refused``, and since BACKLOG #3068 so does ``finish_webauthn_assertion``.
     2. The local sign-in refuses on the second-step lock, or on the sign-in lock unless combined.
        A directory sign-in refuses on either lock.
     3. A good code or passkey writes ``record_login_success``, which clears both locks, so the
@@ -1461,7 +1479,9 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
     """
     # 1. The second-factor legs.
     assertion = _service_func("finish_webauthn_assertion")
-    assert "second_step_locked" in _names_read(assertion), (
+    # Since BACKLOG #3068 the passkey leg refuses through the same _mfa_lock_refused as the code leg,
+    # whose own read of the second-step lock is pinned just below.
+    assert _called(assertion, "_mfa_lock_refused"), (
         "finish_webauthn_assertion no longer reads the second-step lock; the lockout paragraph's "
         "table says that lock refuses the assertion leg."
     )
@@ -1475,7 +1495,13 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
         "TOTP/recovery leg."
     )
     verify = _service_func("verify_mfa")
-    for fn, label in ((lock_refused, "_mfa_lock_refused"), (verify, "verify_mfa")):
+    # The two BACKLOG #3068 helpers hold lock logic for both second-factor legs, so they are read too.
+    for fn, label in (
+        (lock_refused, "_mfa_lock_refused"),
+        (verify, "verify_mfa"),
+        (_service_func("_factor_holder_current"), "_factor_holder_current"),
+        (_service_func("_directory_vouches_for_factor"), "_directory_vouches_for_factor"),
+    ):
         assert not _names_read(fn) & _SIGN_IN_LOCK_READS, (
             f"{label} now reads {sorted(_names_read(fn) & _SIGN_IN_LOCK_READS)}; the doc says the "
             "sign-in lock does not refuse the TOTP/recovery leg."
@@ -1734,6 +1760,9 @@ _FALLBACK_CITES = frozenset(
         "_login_local",
         "verify_mfa",
         "finish_webauthn_assertion",
+        # BACKLOG #3061: the enrolment sentences of the TOTP and passkey rows.
+        "confirm_mfa_enrollment",
+        "finish_webauthn_registration",
         "_authenticate_kerberos",
         "_complete_ad_login",
         "_unverified_session_owes_factor",
@@ -2278,8 +2307,10 @@ def test_the_ninth_sweep_probes_the_amendment_a_order_in_the_code() -> None:
             )
             # Item 6: once TOTP is on, a covered account cannot remove it, passkey or not ...
             # (enable_totp needs a staged secret, BACKLOG #2224.)
-            await store.set_totp_secret(identity.user_id, secret="JBSWY3DPEHPK3PXP")
-            assert await store.enable_totp(identity.user_id, recovery_code_hashes=[])
+            staged_cell = await store.set_totp_secret(identity.user_id, secret="JBSWY3DPEHPK3PXP")
+            assert await store.enable_totp(
+                identity.user_id, expected_secret_cell=staged_cell, recovery_code_hashes=[]
+            )
             await store.add_webauthn_credential(
                 WebAuthnCredential(
                     credential_id_hash="ninth-sweep-hash",
@@ -4374,6 +4405,61 @@ def test_the_thirteenth_sweep_phi_says_built_is_not_on() -> None:
     assert not misdirected, f"docs/PHI.md sends forward_* to section 11 again: {misdirected}"
 
 
+def test_the_enrolment_legs_ask_the_directory_and_the_doc_says_so() -> None:
+    """BACKLOG #3061. The passkey row said registering a passkey marks the factor "and the engine
+    does not ask the directory there", which was true until both enrolment legs gained the check
+    the two second-factor legs share. This pins the calls, refuses the old sentence, and asks the
+    rows and the step-up paragraph for the new citation. The behaviour (refused before the step,
+    the recovery codes, the challenge and the stored passkey, nothing charged) is pinned in
+    ``tests/test_enrolment_directory_recheck.py``, not by this AST read."""
+    for name in ("confirm_mfa_enrollment", "finish_webauthn_registration"):
+        assert _called(_service_func(name), "_directory_vouches_for_factor"), (
+            f"{name} no longer asks the directory; the pathway rows and the step-up section say it "
+            "does (BACKLOG #3061)."
+        )
+    text = " ".join(_doc_text().split())
+    assert "and the engine does not ask the directory there" not in text, (
+        "docs/SECURITY.md says passkey registration does not ask the directory again; it does."
+    )
+    recency = next(
+        (
+            t
+            for t in _tables(_doc_text())
+            if t[0][:2] == ["Leg", "What reaches the engine about strength or recency"]
+        ),
+        None,
+    )
+    assert recency is not None, "docs/SECURITY.md lost the recency-and-strength table"
+    rows = {r[0]: " ".join(r) for r in recency[1:]}
+    for leg, method in (
+        ("**Engine TOTP or recovery code**", "`AuthService.confirm_mfa_enrollment`"),
+        ("**WebAuthn passkey**", "`AuthService.finish_webauthn_registration`"),
+    ):
+        assert leg in rows, f"the recency table lost its {leg} row"
+        assert "BACKLOG #3061" in rows[leg] and method in rows[leg], (
+            f"the {leg} row must cite BACKLOG #3061 and name {method}"
+        )
+    paragraph = next(
+        (
+            " ".join(p.split())
+            for p in re.split(r"\n\s*\n", _doc_text())
+            if p.startswith("**The two enrolment legs ask the same question")
+        ),
+        None,
+    )
+    assert paragraph is not None, "the step-up section lost the enrolment legs' directory paragraph"
+    for token in (
+        "`auth.mfa_failed`",
+        "`auth.webauthn_failed`",
+        "`reason=directory_unconfirmed`",
+        "`phase=enroll`",
+        "mints no recovery codes",
+        "stores no passkey",
+        "ceremony in flight",
+    ):
+        assert token in paragraph, f"the enrolment legs' directory paragraph must name {token}"
+
+
 def test_the_passkey_leg_asks_the_directory_and_the_doc_says_so() -> None:
     """BACKLOG #2239. The step-up section said "the passkey leg does not ask the directory", which
     was true until ``finish_webauthn_assertion`` gained the same directory check ``verify_mfa`` has
@@ -4381,16 +4467,24 @@ def test_the_passkey_leg_asks_the_directory_and_the_doc_says_so() -> None:
     behaviour (refused before the challenge is taken, nothing charged) is pinned in
     ``tests/test_passkey_directory_recheck.py``, not by this AST read."""
     assertion = _service_func("finish_webauthn_assertion")
-    assert _called(assertion, "_directory_step_up_refusal"), (
+    helper = _service_func("_directory_vouches_for_factor")
+    assert _called(assertion, "_directory_vouches_for_factor") and _called(
+        helper, "_directory_step_up_refusal"
+    ), (
         "finish_webauthn_assertion no longer asks the directory; the step-up section and the "
         "passkey row say it does (BACKLOG #2239)."
     )
+    # Since BACKLOG #3068 the branch is the shared helper's: the leg reads no provider itself.
     provider_reads = sum(
-        1 for n in ast.walk(assertion) if isinstance(n, ast.Attribute) and n.attr == "auth_provider"
+        1
+        for fn in (assertion, helper, _service_func("_factor_holder_current"))
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Attribute) and n.attr == "auth_provider"
     )
     assert provider_reads == 1, (
-        f"finish_webauthn_assertion reads auth_provider {provider_reads} times; the lockout "
-        "paragraph says each second-factor leg has ONE provider branch, the directory check."
+        f"finish_webauthn_assertion and its two helpers read auth_provider {provider_reads} "
+        "times; the lockout paragraph says each second-factor leg has ONE provider branch, the "
+        "directory check."
     )
     text = " ".join(_doc_text().split())
     assert "the passkey leg does not ask the directory" not in text, (
@@ -4414,3 +4508,20 @@ def test_the_passkey_leg_asks_the_directory_and_the_doc_says_so() -> None:
         "challenge in flight",
     ):
         assert token in paragraph, f"the passkey leg's directory paragraph must name {token}"
+
+
+def test_the_stray_passkey_guidance_sends_the_user_to_the_list_before_deleting() -> None:
+    """BACKLOG #3810 finding 4: a failed passkey finish does not prove the passkey was not stored
+    (the paragraph read here says how). RED when SECURITY.md says again that such a passkey is not
+    stored, which would lead a user to delete a registered factor, or stops sending the user to the
+    account's list first."""
+    block = _flat(_doc_text())
+    start = block.index("**A refused registration can leave a passkey on the authenticator")
+    para = block[start : block.index("Mechanics:", start)]
+    assert "That passkey is not stored" not in para
+    assert "**A failed finish does not prove the passkey was not stored.**" in para
+    assert "check the account's Passkeys list first" in para
+    assert (
+        "A passkey listed there is registered, and the user keeps it on the authenticator." in para
+    )
+    assert "a user who cannot tell which is which keeps it" in para
