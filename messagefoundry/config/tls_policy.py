@@ -2284,8 +2284,9 @@ def insecure_hop_disposition(
     **ADR 0153 removed two parameters.** ``is_phi`` is gone: no data label may permit a cleartext hop,
     because ``data_class`` is authored in the same file as the hosts it governs and a typo in it is
     indistinguishable from a declaration, with every transport hop in the product as its blast radius.
-    ``audited_opt_out`` is gone with it, so the blunt global ``MEFOR_ALLOW_INSECURE_TLS`` escape can no
-    longer influence a cleartext-hop decision (decision 5 — the variable survives for the six
+    ``audited_opt_out`` is gone with it, so the blunt global ``MEFOR_ALLOW_INSECURE_TLS`` escape,
+    honoured only at ``[security].enforcement = warn``, can no longer influence a cleartext-hop
+    decision (decision 5 — the variable survives for the six
     non-connection cells that have no per-connection field to carry a declaration).
 
     Only an arm that returned ALLOW was deleted, so removing it can only ever turn a crossing into a
@@ -2504,7 +2505,8 @@ def phi_read_hop_disposition(
     refusing outright would create a deviation the loosening registry cannot express. What that
     reasoning bought was a ``not is_phi`` ALLOW arm, and with every instance carrying patient data
     there is no longer an instance for it to fire on. So the arm is gone and the escape below is what
-    remains — ``MEFOR_ALLOW_INSECURE_TLS``, already clamped inert by the caller under ``enforce``.
+    remains — ``MEFOR_ALLOW_INSECURE_TLS``, already clamped inert by the caller under ``enforce`` and
+    honoured only at ``[security].enforcement = warn``.
 
     **The ``posture is None`` arm stays and is now the only unconditional ALLOW.** It covers an
     embedding or test that declared no posture at all, where the serve gate never ran to vet the hop.

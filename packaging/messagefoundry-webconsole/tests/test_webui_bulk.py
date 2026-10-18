@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import base64
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlencode
 
 import httpx
+import pytest
 from _webui_support import (
     _GIB,
     ADT,
@@ -717,6 +719,102 @@ async def test_bulk_control_forbidden_target_does_not_abort_batch(
         assert "403" in r.text and "out1" in r.text  # the forbidden target is enumerated
     assert rr.inbound_running("in1") is False  # the in-scope target still applied (batch continued)
     assert rr.outbound_running("out1") is True  # the forbidden target was NOT stopped
+
+
+async def test_bulk_control_answers_an_in_scope_unknown_name_with_the_audited_403(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """BACKLOG #3031 finding 1: the bulk page always passes a ``role``, and the JSON routes never do,
+    so this is the only test of the refusal on the role-keyed path.
+
+    A scoped operator whose scope lists names no connection uses must get the same audited 403 for
+    them as for an out-of-scope connection, on both roles. A 404 there would tell it which listed
+    names exist (BACKLOG #2640). The mutant this kills applied the early refusal only when ``role``
+    was ``None`` or the name was an outbound: both selections below then answered 404."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await service.set_channel_scope(
+        await _uid(service, "op"), ["in1", "ghost_in", "ghost_out"], actor="admin"
+    )
+    await _start_two_out(engine, tmp_path)
+
+    async def denied() -> list[str | None]:
+        rows = await engine.store.list_audit(limit=100, action="auth.channel_denied")
+        return sorted(r["channel_id"] for r in rows)
+
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await _post_pairs(
+            c,
+            "/ui/connections/bulk-control",
+            [
+                ("action", "stop"),
+                ("sel", _rowkey("source", "ghost_in")),
+                ("sel", _rowkey("destination", "in1", "ghost_out")),
+            ],
+        )
+        assert r.status_code == 200, r.text
+        assert r.text.count("403: not authorized for this connection") == 2, r.text
+        assert "404" not in r.text and "no such connection" not in r.text
+    assert await denied() == ["ghost_in", "ghost_out"]
+
+
+async def test_bulk_routes_audit_a_scoped_malformed_name_without_writing_it(
+    engine: Engine,
+) -> None:
+    """BACKLOG #3031 finding 5: a scoped actor's malformed name is still a recorded denial, but the
+    row carries no channel. The name is caller-chosen text bounded only by the request body, and it
+    used to be written whole to ``audit_log.channel_id``."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await service.set_channel_scope(await _uid(service, "op"), ["in1"], actor="admin")
+    long_bad = "bad name " + "x" * 5000
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await _post_pairs(
+            c,
+            "/ui/connections/bulk-control",
+            [("action", "stop"), ("sel", _rowkey("source", long_bad))],
+        )
+        assert r.status_code == 200, r.text
+        assert "not applied: not a valid connection name" in r.text
+        assert long_bad not in r.text
+    rows = await engine.store.list_audit(limit=100, action="auth.channel_denied")
+    assert [(row["actor"], row["channel_id"]) for row in rows] == [("op", None)]
+    assert all("xxxxx" not in str(dict(row)) for row in rows)
+
+
+async def test_a_failed_malformed_name_audit_does_not_abort_the_batch(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3031: the malformed-name denial is written outside the per-target capture, so a
+    failed write must still leave the batch to run and render its result table."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await service.set_channel_scope(await _uid(service, "op"), ["in1"], actor="admin")
+    await _start_two_out(engine, tmp_path)
+    real = engine.store.record_audit
+
+    async def failing(action: str, *args: Any, **kwargs: Any) -> Any:
+        if action == "auth.channel_denied":
+            raise RuntimeError("synthetic audit failure")
+        return await real(action, *args, **kwargs)
+
+    monkeypatch.setattr(engine.store, "record_audit", failing)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await _post_pairs(
+            c,
+            "/ui/connections/bulk-control",
+            [
+                ("action", "stop"),
+                ("sel", _rowkey("source", "bad name")),
+                ("sel", _rowkey("source", "in1")),
+            ],
+        )
+    assert r.status_code == 200, r.text
+    assert "not applied: not a valid connection name" in r.text
+    assert "applied (running=False)" in r.text
 
 
 async def test_bulk_control_bad_action_404(engine: Engine) -> None:

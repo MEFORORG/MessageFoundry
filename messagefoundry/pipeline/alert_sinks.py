@@ -1315,6 +1315,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         baseline_actor: str | None,
         baseline_at: str,
         baseline_node: str | None,
+        comparison: str = "compared",
     ) -> None:
         # vault BACKLOG #2597: the start's config differs from the store's baseline. The
         # subject (`config:<12 hex>`) stands in for "connection", so each distinct config is its own
@@ -1339,6 +1340,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 "baseline_actor": baseline_actor,
                 "baseline_at": baseline_at,
                 "baseline_node": baseline_node,
+                # vault BACKLOG #2944: a partial digest or a directory that moved during the load.
+                "comparison": comparison,
             }
         )
 

@@ -6,13 +6,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import functools
 import json
 import os
 import stat
+import subprocess
 import sys
+import tempfile
 import time
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -218,7 +224,7 @@ def _seed_compare(
     return db
 
 
-def _compare_to(db: str, out: Path) -> int:
+def _compare_to(db: str, out: Path | str) -> int:
     return main(
         [
             "compare",
@@ -238,6 +244,16 @@ def _compare_to(db: str, out: Path) -> int:
 _POSIX_MODES = pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
 
 
+@contextlib.contextmanager
+def _umask_022() -> Iterator[None]:
+    """The umask under which write_text would create a world-readable file."""
+    previous = os.umask(0o022)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+
+
 @_POSIX_MODES
 def test_compare_show_diffs_out_is_created_owner_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -245,11 +261,8 @@ def test_compare_show_diffs_out_is_created_owner_only(
     # vault BACKLOG #2792: under a 022 umask, write_text created this report 0644.
     db = _seed_compare(tmp_path, monkeypatch)
     out = tmp_path / "report.json"
-    previous = os.umask(0o022)
-    try:
+    with _umask_022():
         assert _compare_to(db, out) == 0
-    finally:
-        os.umask(previous)
     assert stat.S_IMODE(out.stat().st_mode) == 0o600
     # Control: the field values the mode protects really are in the file.
     assert json.loads(out.read_text(encoding="utf-8"))["diffs"]
@@ -273,20 +286,21 @@ def test_compare_out_replaces_an_existing_readable_file(
     assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
 
 
-@_POSIX_MODES
 def test_compare_out_replaces_a_link_rather_than_following_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A link at the output name would otherwise send the report to whatever file it points at.
+    # On Windows too: compare's os.replace on main swapped the link itself (vault BACKLOG #3166).
     db = _seed_compare(tmp_path, monkeypatch)
     target = tmp_path / "elsewhere.json"
     target.write_text("untouched\n", encoding="utf-8")
     out = tmp_path / "report.json"
-    out.symlink_to(target)
+    _symlink_or_skip(out, target)
     assert _compare_to(db, out) == 0
     assert target.read_text(encoding="utf-8") == "untouched\n"
     assert not out.is_symlink()
-    assert stat.S_IMODE(out.stat().st_mode) == 0o600
+    if sys.platform != "win32":
+        assert stat.S_IMODE(out.stat().st_mode) == 0o600
 
 
 @_POSIX_MODES
@@ -323,3 +337,439 @@ def test_compare_out_that_cannot_be_written_is_an_error_line(
     assert _compare_to(db, out) == 1
     assert "error: could not write the report" in capsys.readouterr().err
     assert not out.parent.exists()
+
+
+# --- anonymize-captures --out and export --out (vault BACKLOG #3166) ------------------------------
+
+_ANON_SALT = "tee-cli-salt-0123456789abcdef"
+
+
+def _anonymize_to(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, out: Path | str) -> int:
+    """Seed one synthetic capture and run ``anonymize-captures --out`` on it in process. Logging
+    setup is stubbed, since it would reconfigure logging for the whole pytest session."""
+    db = str(tmp_path / "tee.db")
+    raw = (
+        "MSH|^~\\&|SAPP|SFAC|RAPP|RFAC|20260101||ADT^A01|C1|P|2.5.1\r"
+        "PID|1||999^^^H^MR||DOE^JOHN||19800101|M"
+    )
+
+    async def seed() -> None:
+        store = await RelayStore.open(db)
+        try:
+            await store.record_capture(
+                direction="corepoint_copy", control_id="C1", raw=raw.encode()
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+    monkeypatch.setenv("MEFOR_ANON_SALT", _ANON_SALT)
+    monkeypatch.setattr("tee.__main__._configure_logging", lambda level: None)
+    return main(["anonymize-captures", "--db", db, "--out", str(out)])
+
+
+def _export_to(tmp_path: Path, out: Path | str) -> int:
+    db = str(tmp_path / "tee.db")
+    asyncio.run(_seed(db))
+    return main(["export", "--db", db, "--out", str(out)])
+
+
+@_POSIX_MODES
+def test_anonymize_captures_out_is_created_owner_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Under a 022 umask, write_text would leave an anonymized dataset world-readable on first
+    # deployment, beside a capture DB the tee keeps at 0600.
+    out = tmp_path / "ds.jsonl"
+    with _umask_022():
+        assert _anonymize_to(tmp_path, monkeypatch, out) == 0
+    assert stat.S_IMODE(out.stat().st_mode) == 0o600
+    assert json.loads(out.read_text(encoding="utf-8").splitlines()[0])["control_id"] == "C1"
+
+
+@_POSIX_MODES
+def test_export_out_is_created_owner_only(tmp_path: Path) -> None:
+    out = tmp_path / "review.json"
+    with _umask_022():
+        assert _export_to(tmp_path, out) == 0
+    assert stat.S_IMODE(out.stat().st_mode) == 0o600
+
+
+_OUT_COMMANDS = ["anonymize-captures", "export", "compare"]
+# The commands whose existing --out is written in place on Windows, as write_text did on main.
+# compare replaced its file on main and still does (vault BACKLOG #3166).
+_IN_PLACE_COMMANDS = ["anonymize-captures", "export"]
+_WHAT = {"anonymize-captures": "dataset", "export": "export", "compare": "report"}
+
+
+def _write_out(
+    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, out: Path | str
+) -> int:
+    """Run one of the tee commands that take ``--out``, writing to ``out``."""
+    if command == "export":
+        return _export_to(tmp_path, out)
+    if command == "compare":
+        return _compare_to(_seed_compare(tmp_path, monkeypatch), out)
+    return _anonymize_to(tmp_path, monkeypatch, out)
+
+
+@pytest.mark.parametrize("command", _OUT_COMMANDS)
+def test_out_goes_through_the_owner_only_writer(
+    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The mode tests above are POSIX-only. This one runs on every platform, so a Windows run still
+    # fails if a command goes back to write_text.
+    import tee.__main__ as tee_main
+
+    calls: list[tuple[str, bool]] = []
+    real = tee_main._write_owner_only
+
+    def spy(path: str, text: str, *, in_place_on_windows: bool) -> None:
+        calls.append((path, in_place_on_windows))
+        real(path, text, in_place_on_windows=in_place_on_windows)
+
+    monkeypatch.setattr(tee_main, "_write_owner_only", spy)
+    out = tmp_path / "out.json"
+    assert _write_out(command, tmp_path, monkeypatch, out) == 0
+    assert calls == [(str(out), command in _IN_PLACE_COMMANDS)]
+
+
+@pytest.mark.parametrize("command", _OUT_COMMANDS)
+def test_out_newline(command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The dataset is JSONL, read back line by line by the harness corpus, so the in-place commands
+    # write LF everywhere. compare keeps main's text-layer default, CRLF on Windows (vault BACKLOG
+    # #3166). The CRLF count discriminates on win32 for all three commands.
+    newline = b"\n" if command in _IN_PLACE_COMMANDS else os.linesep.encode()
+    out = tmp_path / "out.json"
+    assert _write_out(command, tmp_path, monkeypatch, out) == 0
+    data = out.read_bytes()
+    assert data.endswith(b"}" + newline)  # control: the file really has a line ending
+    crlf = data.count(b"\r\n")
+    assert crlf == (data.count(b"\n") if newline == b"\r\n" else 0)
+
+
+@pytest.mark.parametrize("command", _IN_PLACE_COMMANDS)
+def test_out_that_cannot_be_written_is_an_error_line(
+    command: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    out = tmp_path / "no-such-dir" / "out.json"
+    assert _write_out(command, tmp_path, monkeypatch, out) == 1
+    assert f"error: could not write the {_WHAT[command]}" in capsys.readouterr().err
+    assert not out.parent.exists()
+
+
+# --- a hardened --out target keeps its access list on Windows (vault BACKLOG #3166) ---------------
+
+_WINDOWS_ACLS = pytest.mark.skipif(sys.platform != "win32", reason="Windows access lists")
+
+
+def _win_run(exe: str, *args: str) -> str:
+    """Run a System32 tool by its pinned path, never a search-path lookup (BACKLOG #1680)."""
+    from messagefoundry.service_status import _system_exe
+
+    done = subprocess.run(
+        [_system_exe(exe), *args], capture_output=True, text=True, check=False, encoding="mbcs"
+    )
+    assert done.returncode == 0, f"{exe} {args}: {done.stderr or done.stdout}"
+    return done.stdout
+
+
+@functools.cache
+def _own_sid() -> str:
+    line = _win_run("whoami.exe", "/user", "/fo", "csv", "/nh").strip()
+    return line.rsplit(",", 1)[1].strip().strip('"')
+
+
+def _sddl_of(path: Path, scratch: Path) -> str:
+    """The DACL of ``path`` as SDDL, read by ``icacls /save``, which does not depend on the
+    display language the way icacls's printed listing does."""
+    scratch.mkdir(exist_ok=True)
+    saved = scratch / f"acl-{path.name}.txt"
+    _win_run("icacls.exe", str(path), "/save", str(saved))
+    text = saved.read_bytes().decode("utf-16-le").lstrip("\ufeff")
+    return [line for line in text.splitlines() if line.strip()][1]
+
+
+#: SDDL short names icacls prints for an account that may run the tests (a self-hosted runner's
+#: service runs as one of the first three).
+_SDDL_SHORT_NAMES = {"S-1-5-18": "SY", "S-1-5-19": "LS", "S-1-5-20": "NS"}
+
+#: Short names icacls may print for an entry the fixture removes, as the SIDs /remove:g takes. One
+#: not listed here fails the removal, and so the fixture, rather than surviving.
+_SDDL_ALIASES = {
+    "OW": "S-1-3-4",
+    "CO": "S-1-3-0",
+    "AU": "S-1-5-11",
+    "BU": "S-1-5-32-545",
+    "WD": "S-1-1-0",
+}
+
+
+def _my_sids() -> set[str]:
+    """This account as SDDL may spell it: its SID, ``LA`` when it IS the built-in Administrator
+    (RID 500), which the hosted runners run as (see test_store_trio_acl.py), or a service
+    account's short name."""
+    me = _own_sid()
+    if me.endswith("-500"):
+        return {me, "LA"}
+    return {me, _SDDL_SHORT_NAMES[me]} if me in _SDDL_SHORT_NAMES else {me}
+
+
+def _aces(sddl: str) -> tuple[tuple[str, str, str, str], ...]:
+    """The DACL entries of ``sddl`` as (type, flags, rights, trustee), through the store's parser."""
+    from messagefoundry.store.store import _parse_sddl_dacl
+
+    dacl = _parse_sddl_dacl(sddl)
+    assert dacl is not None, f"fixture: unparseable SDDL {sddl}"
+    return dacl.aces
+
+
+def _harden(path: Path, grant: Literal["F", "R"], scratch: Path) -> str:
+    """Leave ``path`` exactly one entry, granting this account ``grant``, check that it took and
+    binds this process, and return the list as SDDL."""
+    _win_run("icacls.exe", str(path), "/inheritance:r", "/grant:r", f"*{_own_sid()}:{grant}")
+    # /inheritance:r drops only INHERITED entries; explicit ones can survive onto the file (CI run
+    # 36039014999). Measured in CI run 39087669047 (windows-2025): a fixture that removed only
+    # OWNER RIGHTS and CREATOR OWNER left D:PAI(A;;FR;;;LA)(A;;FA;;;SY)(A;;FA;;;BA), and the
+    # runner's elevated token, with Administrators switched on, wrote that R-hardened file. So
+    # every other trustee goes, whoever it is, rather than a list of the ones seen so far.
+    me = _my_sids()
+    others = sorted({sid for *_, sid in _aces(_sddl_of(path, scratch)) if sid not in me})
+    if others:
+        sids = (_SDDL_ALIASES.get(sid, sid) for sid in others)
+        _win_run("icacls.exe", str(path), "/remove:g", *(f"*{sid}" for sid in sids))
+    # A fixture that did not produce its shape is reported as a fixture, not as a product failure.
+    sddl = _sddl_of(path, scratch)
+    rights = {"F": "FA", "R": "FR"}[grant]
+    entries = _aces(sddl)
+    assert len(entries) == 1 and entries[0][:3] == ("A", "", rights), f"fixture: {sddl}"
+    assert entries[0][3] in me, f"fixture: {path.name} has {sddl}"
+    assert _opens_for_writing(path) == (grant == "F"), f"fixture: {path.name} under {sddl}"
+    return sddl
+
+
+def _opens_for_writing(path: Path) -> bool:
+    """Whether this process can open ``path`` for writing. ``r+b`` neither creates nor truncates.
+
+    A sharing violation also raises PermissionError on Windows, so a file another process holds
+    without write sharing reads as unwritable here too; nothing in the error tells them apart."""
+    try:
+        with path.open("r+b"):
+            return True
+    except PermissionError:
+        return False
+
+
+@_WINDOWS_ACLS
+@pytest.mark.parametrize("command", _IN_PLACE_COMMANDS)
+@pytest.mark.parametrize("trailing_separator", [False, True], ids=["plain", "trailing-separator"])
+def test_out_keeps_the_access_list_of_a_hardened_target_on_windows(
+    command: str, trailing_separator: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A file renamed over the target would take the folder's inherited access list, so an export
+    # or dataset an operator had hardened would lose that hardening in a looser folder.
+    scratch = tmp_path / "acl"
+    out = tmp_path / "out.json"
+    # Longer than any output, so a write that skipped the truncate would leave stale bytes behind.
+    out.write_text("stale\n" * 4000, encoding="utf-8")
+    hardened = _harden(out, "F", scratch)
+    sibling = tmp_path / "fresh.json"
+    sibling.write_text("x\n", encoding="utf-8")
+    # Control: the hardening really differs from what a new file in this folder gets.
+    assert hardened != _sddl_of(sibling, scratch)
+    # A str, since Path itself would drop a trailing separator before the CLI saw it; main's
+    # write_text went through Path and wrote the file.
+    named = str(out) + os.sep if trailing_separator else str(out)
+    assert _write_out(command, tmp_path, monkeypatch, named) == 0
+    assert _sddl_of(out, scratch) == hardened
+    data = out.read_bytes()
+    assert b"stale" not in data
+    assert data.endswith(b"}\n")
+    assert b"\r\n" not in data
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+@_POSIX_MODES
+def test_out_replaces_a_second_hard_link_on_posix(tmp_path: Path) -> None:
+    # On POSIX an existing name is replaced, so a second link to the old file is left as it was.
+    other = tmp_path / "elsewhere.json"
+    other.write_text("untouched\n", encoding="utf-8")
+    out = tmp_path / "out.json"
+    os.link(other, out)
+    assert _export_to(tmp_path, out) == 0
+    assert other.read_text(encoding="utf-8") == "untouched\n"
+    assert b"untouched" not in out.read_bytes()
+
+
+@_WINDOWS_ACLS
+@pytest.mark.parametrize("command", _IN_PLACE_COMMANDS)
+def test_out_through_a_second_hard_link_keeps_the_hardened_access_list_on_windows(
+    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # write_text on main wrote a hard-linked name in place, so both names see the new content and
+    # the one file keeps its list. A replace would give the --out name the folder's list instead.
+    scratch = tmp_path / "acl"
+    other = tmp_path / "elsewhere.json"
+    other.write_text("stale\n", encoding="utf-8")
+    out = tmp_path / "out.json"
+    os.link(other, out)
+    hardened = _harden(out, "F", scratch)
+    assert os.stat(out).st_nlink == 2  # control: the target really has a second link
+    assert _write_out(command, tmp_path, monkeypatch, out) == 0
+    assert _sddl_of(out, scratch) == hardened
+    data = out.read_bytes()
+    assert other.read_bytes() == data
+    assert b"stale" not in data
+    assert data.endswith(b"}\n")
+    assert b"\r\n" not in data
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except OSError as exc:  # no SeCreateSymbolicLinkPrivilege and no Developer Mode
+        pytest.skip(f"this account cannot create symlinks: {exc}")
+
+
+@_WINDOWS_ACLS
+@pytest.mark.parametrize("command", _IN_PLACE_COMMANDS)
+def test_out_through_a_symlink_keeps_the_hardened_target_on_windows(
+    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # write_text on main wrote THROUGH the link: the link stays a link and its hardened target
+    # gets the content with its list kept. A replace would put a regular file at the link's name.
+    scratch = tmp_path / "acl"
+    target = tmp_path / "hardened.json"
+    target.write_text("stale\n", encoding="utf-8")
+    hardened = _harden(target, "F", scratch)
+    out = tmp_path / "out.json"
+    _symlink_or_skip(out, target)
+    assert _write_out(command, tmp_path, monkeypatch, out) == 0
+    assert out.is_symlink()
+    assert _sddl_of(target, scratch) == hardened
+    data = target.read_bytes()
+    assert b"stale" not in data
+    assert data.endswith(b"}\n")
+    assert b"\r\n" not in data
+
+
+@_WINDOWS_ACLS
+@pytest.mark.parametrize("command", _IN_PLACE_COMMANDS)
+@pytest.mark.parametrize("name", ["plain", "second-hard-link", "trailing-separator"])
+def test_out_refuses_a_target_hardened_against_this_account_writing_on_windows(
+    command: str,
+    name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A replace could still swap a read-only file out through the folder's grant, trading its list
+    # for the folder's. It is an error instead, and the file is left as it was, whether the name is
+    # one of two hard links to it or carries a trailing separator that Path would drop.
+    scratch = tmp_path / "acl"
+    out = tmp_path / "out.json"
+    if name == "second-hard-link":
+        other = tmp_path / "elsewhere.json"
+        other.write_text("untouched\n", encoding="utf-8")
+        os.link(other, out)
+    else:
+        out.write_text("untouched\n", encoding="utf-8")
+    hardened = _harden(out, "R", scratch)  # and checks this process really may not write it
+    # A str, since Path itself would drop the separator before the CLI saw it.
+    named = str(out) + os.sep if name == "trailing-separator" else str(out)
+    assert _write_out(command, tmp_path, monkeypatch, named) == 1
+    assert f"error: could not write the {_WHAT[command]}" in capsys.readouterr().err
+    assert _sddl_of(out, scratch) == hardened
+    assert out.read_text(encoding="utf-8") == "untouched\n"
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+@pytest.mark.parametrize("in_place_on_windows", [True, False])
+def test_out_creates_a_missing_target_through_mkstemp(
+    in_place_on_windows: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # On every platform, Windows included, a name that is not there is made by mkstemp and renamed
+    # into place, never opened in place.
+    import tee.__main__ as tee_main
+
+    calls: list[str] = []
+    real = tempfile.mkstemp
+
+    def spy(*args: object, **kwargs: object) -> tuple[int, str]:
+        fd, name = real(*args, **kwargs)  # type: ignore[call-overload]
+        calls.append(name)
+        return fd, name
+
+    out = tmp_path / "out.json"
+    monkeypatch.setattr(tempfile, "mkstemp", spy)
+    tee_main._write_owner_only(str(out), "new\n", in_place_on_windows=in_place_on_windows)
+    monkeypatch.undo()
+    assert len(calls) == 1
+    newline = b"\n" if in_place_on_windows else os.linesep.encode()
+    assert out.read_bytes() == b"new" + newline
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+@_WINDOWS_ACLS
+def test_out_that_appears_after_the_check_is_written_in_place_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A hardened file created between the existence check and the rename keeps its list: the
+    # rename refuses it and the writer falls back to the in-place write.
+    import tee.__main__ as tee_main
+
+    scratch = tmp_path / "acl"
+    out = tmp_path / "out.json"
+    out.write_text("stale\n", encoding="utf-8")
+    hardened = _harden(out, "F", scratch)
+    sibling = tmp_path / "fresh.json"
+    sibling.write_text("x\n", encoding="utf-8")
+    # Control: a file renamed into this folder would get a different list, so a replace fails this.
+    assert hardened != _sddl_of(sibling, scratch)
+    monkeypatch.setattr(os.path, "lexists", lambda path: False)
+    tee_main._write_owner_only(str(out), "new\n", in_place_on_windows=True)
+    monkeypatch.undo()
+    assert _sddl_of(out, scratch) == hardened
+    assert out.read_bytes() == b"new\n"
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+@_WINDOWS_ACLS
+def test_out_through_a_dangling_symlink_creates_its_target_on_windows(tmp_path: Path) -> None:
+    # write_text on main followed a dangling link and created the file it names; so does the tee.
+    target = tmp_path / "sub" / "made-through-link.json"
+    target.parent.mkdir()
+    out = tmp_path / "out.json"
+    _symlink_or_skip(out, target)
+    assert not target.exists()  # control: the link really dangles
+    assert _export_to(tmp_path, out) == 0
+    assert out.is_symlink()
+    assert target.read_bytes().endswith(b"}\n")
+
+
+@_WINDOWS_ACLS
+@pytest.mark.parametrize("grant", ["F", "R"])
+def test_compare_out_replaces_a_hardened_target_on_windows(
+    grant: Literal["F", "R"], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # compare replaced an existing --out on main, so the report takes the folder's access list
+    # rather than the old file's, even one that denied this account writing. It still does
+    # (vault BACKLOG #3166).
+    scratch = tmp_path / "acl"
+    out = tmp_path / "out.json"
+    out.write_text("stale\n", encoding="utf-8")
+    hardened = _harden(out, grant, scratch)
+    sibling = tmp_path / "fresh.json"
+    sibling.write_text("x\n", encoding="utf-8")
+    folders = _sddl_of(sibling, scratch)
+    # Control: the hardening really differs from what a new file in this folder gets.
+    assert hardened != folders
+    assert _write_out("compare", tmp_path, monkeypatch, out) == 0
+    assert _sddl_of(out, scratch) == folders
+    data = out.read_bytes()
+    assert b"stale" not in data
+    assert json.loads(data)["summary"]["matched"] == 1
+    assert not list(tmp_path.glob("*.tmp"))

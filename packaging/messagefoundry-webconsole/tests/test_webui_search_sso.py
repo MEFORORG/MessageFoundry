@@ -308,9 +308,14 @@ async def test_reauth_both_factors_enrolled_renders_code_and_passkey(engine: Eng
         from messagefoundry.auth import totp as totp_mod
 
         secret = totp_mod.generate_secret()
-        await service.store.set_totp_secret(boss_id, secret=secret)
+        staged_cell = await service.store.set_totp_secret(boss_id, secret=secret)
         # Conditional since BACKLOG #2224, so the premise is asserted (vault BACKLOG #3113 item 6).
-        assert await service.store.enable_totp(boss_id, recovery_code_hashes=[]) is True
+        assert (
+            await service.store.enable_totp(
+                boss_id, expected_secret_cell=staged_cell, recovery_code_hashes=[]
+            )
+            is True
+        )
 
         await _cookie_login(c, "boss")  # fresh MFA-pending session
         boss_creds = await service.store.list_webauthn_credentials(boss_id)

@@ -84,6 +84,11 @@ federated sign-in on a site that turned the claim gate off.
    the enable, decides which authenticator the account ends up holding. The session that proved the
    first code is stamped all the same. This gap is in the shared step, so it reaches every account
    type. The Lander's review of this record says it goes to the maintainer ledger as its own row.
+
+   *Note (2026-10-16).* The shared-step fix was built under BACKLOG #3025 (first pushed as branch `b259-3025`):
+   `enable_totp` turns TOTP on only while the row still holds the secret cell the confirm
+   verified, and `set_totp_secret` writes only where TOTP is off. This item describes the code as
+   it stood when this record was drafted.
 7. **The passkey finish route draws the console write floor, but not the ceremony budget.** The
    engine API's `POST /me/mfa/confirm` and the web console's TOTP confirm route (`ui_mfa_verify`)
    both draw the per-actor ceremony budget (`allow_reauth_attempt`) before the service runs. The
@@ -313,6 +318,9 @@ problems. This command is not #2711's answer.
   help there: using one needs a session, and a Kerberos session needs the directory.
 - This command changes no rule of ADR 0183. `provision-admin` still refuses while any enabled
   Administrator exists, and #2711's step 1 still owes its own decision on that.
+  *(Amended 2026-10-16: step 1 is decided, by owner ruling B258-R4. `provision-admin` now refuses
+  only while an enabled local Administrator has a usable password; see ADR 0183 Amendment E. This
+  command is still not #2711's answer.)*
 - The documented advice stands: keep a local Administrator (`docs/SECURITY.md`, "Keep a local
   Administrator"). A site that does so issues codes from that account and never needs this command.
 

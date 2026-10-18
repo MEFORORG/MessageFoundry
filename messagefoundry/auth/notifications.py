@@ -102,9 +102,11 @@ MFA_CREDENTIAL_REMOVED = "mfa_credential_removed"
 NOTIFY_EMAIL_SET = "notify_email_set"
 # 6.3.7 — a single-use recovery code was spent, which permanently deletes that stored credential.
 RECOVERY_CODE_USED = "recovery_code_used"  # nosec B105 — event-type label, not a credential
-ADMIN_NEW_IP = (
-    "admin_action_new_ip"  # 8.4.2 — a sensitive admin action from a new/unexpected client IP
-)
+# 8.4.2 -- a step-up action, a PHI read or a paced write from a client address the session has not
+# verified from, which must re-verify before it proceeds. Audited as
+# ``auth.new_address_reverify_required``; renamed from an "admin action" name in vault BACKLOG #3052,
+# because the signal fires on more than admin actions since vault BACKLOG #2620.
+NEW_ADDRESS_REVERIFY = "new_address_reverify_required"
 # 8.2.4 (BACKLOG #288) -- a sign-in passed its FIRST step (the password, or the directory
 # sign-in) from a client address this account has not finished authenticating from recently. It
 # fires before any owed second factor is proven, so it is not proof of a completed sign-in. Audited
@@ -169,7 +171,7 @@ NOTICE_KIND_LOG_LABELS: Mapping[str, str] = MappingProxyType(
         MFA_CREDENTIAL_REMOVED: "mfa_credential_removed",
         NOTIFY_EMAIL_SET: "notify_email_set",
         RECOVERY_CODE_USED: "recovery_code_used",
-        ADMIN_NEW_IP: "admin_action_new_ip",
+        NEW_ADDRESS_REVERIFY: "new_address_reverify_required",
         LOGIN_NEW_IP: "login_new_ip",
         ACCOUNT_CREATED: "account_created",
     }

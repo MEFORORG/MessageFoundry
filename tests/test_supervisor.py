@@ -917,7 +917,8 @@ async def test_a_config_that_needs_the_working_directory_is_refused_before_any_s
 async def test_the_preflight_reports_the_exception_whatever_its_message_holds(
     tmp_path: Path,
 ) -> None:
-    """A message of several lines still arrives with the exception's name and its first line."""
+    """The exception's name arrives; a config module's own message does not (vault BACKLOG #3249),
+    however many lines it holds."""
     config = tmp_path / "config"
     config.mkdir()
     (config / "graph.py").write_text(
@@ -925,7 +926,8 @@ async def test_the_preflight_reports_the_exception_whatever_its_message_holds(
     )
     refusal = await preflight_shard_config(str(config))
     assert refusal is not None
-    assert "the first line names the problem the second line" in refusal
+    assert "ValueError" in refusal
+    assert "the first line" not in refusal and "the second line" not in refusal
     assert "`_`-prefixed" not in refusal  # not an import failure, so no advice about helpers
 
 

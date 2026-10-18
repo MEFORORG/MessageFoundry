@@ -35,8 +35,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from messagefoundry.controlchars import strip_control_chars
-from messagefoundry.privilege_check import printable, vault_admin_paths
+from messagefoundry.controlchars import scrub_log_argument, strip_control_chars
+from messagefoundry.privilege_check import vault_admin_paths
 
 logger = logging.getLogger(__name__)
 
@@ -86,8 +86,10 @@ class VaultTokenReading:
 
 def _problem(text: str) -> str:
     """Log one probe problem and return it. The text is already secret-free (:func:`_why`), and
-    is logged without control or format characters, as it is printed."""
-    logger.warning("check-privileges: %s", printable(text))
+    is logged with every character in ``CONTROL_CATEGORIES`` escaped visibly, by the log's own
+    rule, as the terminal escapes them (``privilege_check.render_text``), so neither deletes a
+    character the server sent (BACKLOG #2891)."""
+    logger.warning("check-privileges: %s", scrub_log_argument(text))
     return text
 
 
@@ -99,8 +101,9 @@ def _why(exc: BaseException) -> str:
     from messagefoundry.store.keyprovider import KeyProviderError
 
     # The engine's own fail-closed types carry fixed, secret-free text by contract; the cleartext
-    # refusal (BACKLOG #2317) arrives wrapped in one of them. An LdapError from a failed bind carries
-    # ldap3's result line, which names no password. A directory may supply control characters.
+    # refusal (BACKLOG #2317) arrives wrapped in one of them. An LdapError from a failed bind
+    # names the result code or ldap3's error type (BACKLOG #3017), never a password. Control
+    # characters are stripped from every one of these texts all the same.
     if isinstance(exc, (KeyProviderError, SecretProviderError, LdapError, InsecureHopRefused)):
         return strip_control_chars(str(exc))
     name = type(exc).__name__
@@ -117,8 +120,9 @@ def _why(exc: BaseException) -> str:
 
 def _strings(value: object) -> tuple[str, ...]:
     """The string members of a Vault list, kept EXACTLY as Vault sent them. A policy name is also
-    a path the probe asks about, so altering it here would ask about a different policy. Every
-    printed or logged text goes through ``printable()`` at the output boundary instead."""
+    a path the probe asks about, so altering it here would ask about a different policy. A
+    printed line is escaped at ``privilege_check.render_text``, and a logged one by
+    ``scrub_log_argument``, each at its output boundary instead."""
     if not isinstance(value, (list, tuple)):
         return ()
     return tuple(v for v in value if isinstance(v, str))

@@ -15,11 +15,12 @@ pure `messagefoundry.parsing` lib — never `pipeline`/`store`/`transports`/`con
 
 ## Install
 
-Console 0.4.0 pairs with engine 0.5.0. Install the pair into one environment:
+Console 0.4.0 pairs with engines 0.5.0 and 0.5.1, which share one UI seam. Install the pair into
+one environment:
 
 ```
-pip install "messagefoundry==0.5.0" "messagefoundry-webconsole==0.4.0"
-# or from a checkout, for development:
+pip install "messagefoundry==0.5.1" "messagefoundry-webconsole==0.4.0"
+# or, for development, beside an engine installed from the same checkout:
 pip install -e packaging/messagefoundry-webconsole
 ```
 
@@ -37,9 +38,10 @@ absent, it serves the JSON API only and prints a warning at startup. Setting
 
 The console pins itself against the engine's `ENGINE_UI_SEAM` (`SUPPORTED_ENGINE_SEAMS` +
 `assert_engine_seam`) and supports **exactly one** seam — the engine build it was released against
-(BACKLOG #279). Console 0.4.0 supports seam `32ad621e6081555e`, which is engine 0.5.0. With the
-console on, the engine refuses to start beside any other console. The refusal is `UiSeamMismatch`
-when startup reaches the seam check, and an import error when a mismatched pair fails before it.
+(BACKLOG #279). Console 0.4.0 supports seam `32ad621e6081555e`, which engines 0.5.0 and 0.5.1
+provide. With the console on, the engine refuses to start beside any other console. The refusal is
+`UiSeamMismatch` when startup reaches the seam check, and an import error when a mismatched pair
+fails before it.
 
 Console 0.4.0 declares `messagefoundry>=0.5.0`, a floor with no ceiling. So pip will not leave it
 beside an engine older than 0.5.0. It upgrades the engine instead, and an unpinned upgrade takes
