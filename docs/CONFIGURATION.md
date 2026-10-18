@@ -863,6 +863,11 @@ source `directory-reconciler-probe-fault` (BACKLOG #3100). The reconciler raises
 which a probe fails to read an entry. Nothing resolves it automatically. Resolve it by hand once the
 WARNING lines that name each faulting account stop.
 
+A paging refusal opens one `ad_reconcile_aborted` instance per account, under the source
+`directory-reconciler-paging:<username>` (vault BACKLOG #3696). Nothing resolves it automatically.
+Resolve it by hand once that account no longer hits the bound, for example once its sign-in
+succeeds again.
+
 A pass judges only accounts that hold a session, and nothing reads an account again once it has
 left. An account leaves at least when it signs out, reaches the session cap, is revoked by the
 reconciler, is disabled locally, or is deleted, and when the hourly session reaper deletes an idle

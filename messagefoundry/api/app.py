@@ -10205,7 +10205,8 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     (:data:`_PROBE_FAULT_ALERT_SOURCE`). It has no inverse: an operator resolves it.
 
     A paging refusal (vault BACKLOG #3696) pages once per account as it enters that state, on an
-    outage-shaped pass too, and has no row of its own; :func:`_alert_paging_refusals` says how.
+    outage-shaped pass too, matching its ``auth.ad_reconcile_paging_refused`` row;
+    :func:`_alert_paging_refusals` says how.
 
     Reads the RETURNED plan, so it sees only a pass that finished. A failed write of the pass's own
     held, aborted, skipped, referred, faulted or unkeyed-binding row no longer ends the pass

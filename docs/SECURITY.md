@@ -4632,6 +4632,13 @@ visible and limits nothing. A pass with a fault marks no alert clear. When it re
 [CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-alerts-resolve-themselves). Step-up
 refuses the account with outcome `probe_fault`.
 
+A group search the engine refuses for its own bound, past `[auth].ad_group_search_deadline` or
+past its cap on groups, reads that account as unreachable, so the reconciler never revokes it while
+that lasts (vault BACKLOG #3696). Unlike an outage it pages, once per account as the account enters
+that state, and audits `auth.ad_reconcile_paging_refused` naming the account. The bound and the
+page are stated in [CONNECTIONS.md](CONNECTIONS.md#table-b--per-service-resource-strategy-asvs-1313),
+the Active Directory rows.
+
 ### The engine session is independent of the IdP session (ASVS 7.6.1)
 
 The engine mints its own session at sign-in. That session does not follow the identity provider
