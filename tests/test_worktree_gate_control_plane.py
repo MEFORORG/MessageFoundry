@@ -82,6 +82,16 @@ def test_writing_the_installed_gate_script_is_denied(primary: Path, repos_file: 
     assert_denied(run_gate(edit(installed, cwd=primary), repos_file))
 
 
+def test_writing_the_installed_shell_guard_dispatcher_is_denied(
+    primary: Path, repos_file: Path
+) -> None:
+    """install-gate.ps1 routes every Bash and PowerShell call through this copy, and it is what runs
+    the gate on them. One edit dropping the gate's path from it turns rules 3 to 3d off for every
+    session on the box, as quietly as an edit to the gate script would."""
+    installed = repos_file.parent / "shell-guard-dispatch.ps1"
+    assert "kill switch" in assert_denied(run_gate(edit(installed, cwd=primary), repos_file))
+
+
 def test_rule_1a_fires_from_a_worktree_too(tmp_path: Path, repos_file: Path) -> None:
     """It keys on the TARGET, like every other write rule -- where the session sits is irrelevant."""
     assert_denied(run_gate(edit(repos_file, cwd=tmp_path / "Repo-alerts"), repos_file))
@@ -101,8 +111,9 @@ def test_a_neighbouring_file_in_the_same_directory_is_not_gate_surface(
 def test_the_repos_source_script_is_not_gate_surface(tmp_path: Path, repos_file: Path) -> None:
     """Editing the gate AT SOURCE is the sanctioned way to change a rule -- that is what the deny message
     tells you to do, so it must not itself be blocked."""
-    src = tmp_path / "Repo-work" / "scripts" / "hooks" / "worktree_gate.ps1"
-    assert run_gate(edit(src, cwd=tmp_path / "Repo-work"), repos_file) is None
+    for name in ("worktree_gate.ps1", "shell-guard-dispatch.ps1"):
+        src = tmp_path / "Repo-work" / "scripts" / "hooks" / name
+        assert run_gate(edit(src, cwd=tmp_path / "Repo-work"), repos_file) is None
 
 
 def test_rule_1a_is_off_when_the_gate_is_off(primary: Path, tmp_path: Path) -> None:

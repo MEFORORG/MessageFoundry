@@ -11,7 +11,9 @@ CORRECTED, AND THE SENTENCE WAS IN THIS FILE (BACKLOG #1339). This paragraph use
 the file carries "the deny-list and the `block-blanket-git-stage` guard". It carried the deny-list.
 It carried nothing about that guard, because no matcher in it named the script -- so the module
 whose job is to catch a control that reads as enforced and is not was itself asserting one. A
-matcher names the script now. The third check below is what makes either statement checkable
+matcher named the script later; now `scripts/hooks/shell-guards.txt` names it, and the shell
+handler `install-gate.ps1` installs at account level runs what that file lists, so this settings
+file wires no shell guard at all. The third check below is what makes either statement checkable
 instead of merely rewritten; three earlier
 prose corrections on this claim each landed a new false statement, which is why the fix had to be
 an instrument.
@@ -256,13 +258,32 @@ def _installer_wired(root: Path | None = None) -> set[str]:
     return wired
 
 
+def _manifest_wired(root: Path | None = None) -> set[str]:
+    """Hook script basenames `scripts/hooks/shell-guards.txt` lists.
+
+    A FOURTH WAY TO BE WIRED, and a real one. The shell guards left this settings file: the
+    account-level handler `install-gate.ps1` installs runs `shell-guard-dispatch.ps1`, which runs
+    the guards this manifest names (its header says how). Counting the manifest as wiring is
+    sound only while that handler is what reads it, which is what `install-gate.ps1` naming the
+    dispatcher, measured by `_installer_wired`, stands for.
+    """
+    manifest = (root or _ROOT) / "scripts" / "hooks" / "shell-guards.txt"
+    if not manifest.is_file():
+        return set()
+    return {
+        line.strip().rsplit("/", 1)[-1]
+        for line in manifest.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+
+
 def _unclassified_hook_scripts(settings: dict[str, Any], root: Path | None = None) -> list[str]:
-    """Hook scripts that are in NONE of the three states. This is the thing that must be empty."""
+    """Hook scripts that are in NONE of the states. This is the thing that must be empty."""
     referenced: set[str] = set()
     for _event, handler in _hook_handlers(settings):
         for ref in _repo_script_refs(handler):
             referenced.add(ref.rsplit("/", 1)[-1])
-    accounted = referenced | _installer_wired(root) | set(_KNOWN_UNWIRED)
+    accounted = referenced | _installer_wired(root) | _manifest_wired(root) | set(_KNOWN_UNWIRED)
     return [n for n in _hook_scripts() if n not in accounted]
 
 
@@ -406,7 +427,7 @@ def test_the_unwired_list_does_not_name_a_script_that_is_actually_wired() -> Non
         for _event, handler in _hook_handlers(settings)
         for ref in _repo_script_refs(handler)
     }
-    wired = referenced | _installer_wired()
+    wired = referenced | _installer_wired() | _manifest_wired()
     stale = sorted(set(_KNOWN_UNWIRED) & wired)
     assert not stale, (
         f"{len(stale)} script(s) are named as deliberately unwired but ARE wired: {stale}.\n"

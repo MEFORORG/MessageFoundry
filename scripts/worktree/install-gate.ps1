@@ -31,6 +31,13 @@
         copy outside every tree (once, shared, referenced by absolute path from each account) and re-copy
         it on each install.
 
+    BASH AND POWERSHELL CALLS GO THROUGH ONE DISPATCHER. scripts\hooks\shell-guard-dispatch.ps1 is copied
+    beside the gate, and the Bash|PowerShell matcher runs IT, naming the gate, with -ProjectGuards. It
+    runs the gate and then the guards the session's repo lists in scripts/hooks/shell-guards.txt, all in
+    one pwsh process, so a shell tool call pays pwsh startup once rather than once per guard. A repo with
+    no list gets the gate alone. The Write and Task matchers still run the gate on its own. The
+    dispatcher's header says how the list is read and what it refuses.
+
     The gate only governs the checkouts listed in worktree-gate.repos.txt. That file IS the kill switch:
     -Uninstall removes it (and the hook entries from every config dir).
 
@@ -116,6 +123,9 @@ $HomeDir   = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::Ge
 $HooksDir  = Join-Path $HomeDir ".claude/hooks"
 $GateDst   = Join-Path $HooksDir "worktree_gate.ps1"
 $ReposFile = Join-Path $HooksDir "worktree-gate.repos.txt"
+# Gate rule 1a protects this file too: it is what runs the gate on every shell call.
+$DispatchDst = Join-Path $HooksDir "shell-guard-dispatch.ps1"
+$DispatchRel = "scripts/hooks/shell-guard-dispatch.ps1"
 
 # Marker so we can find (and remove) exactly the entries we added, without disturbing other hooks.
 $Marker = "worktree_gate.ps1"
@@ -210,6 +220,41 @@ function Remove-GateHooks($Data) {
     if ($kept.Count -gt 0) { $Data.hooks.PreToolUse = $kept }
     else { $null = $Data.hooks.Remove("PreToolUse") }
     return $Data
+}
+
+# The PreToolUse entries for $Matchers. PARAMETER-FED, like the allowlist functions below, so
+# tests/test_install_gate_wiring.py can lift it out by AST and read what an install would write.
+#
+# The shell matcher runs the DISPATCHER, naming the gate, with -ProjectGuards; its timeout is the
+# gate's 15 seconds plus the 45 the project's shell handler had, because the dispatcher now runs that
+# handler's guards too. Every other matcher runs the gate alone, exactly as before. Both commands
+# carry the gate's filename, which is what Remove-GateHooks and Get-WiredMatchers key on, so a
+# re-install replaces the shell entry and an uninstall removes it.
+function New-GateHookEntries {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string[]]$Matchers,
+        [Parameter(Mandatory)][string]$GatePath,
+        [Parameter(Mandatory)][string]$DispatchPath
+    )
+    foreach ($m in $Matchers) {
+        $hook = if ($m -eq "Bash|PowerShell") {
+            [ordered]@{
+                type          = "command"
+                command       = "pwsh -NoProfile -NonInteractive -File `"$DispatchPath`" -ProjectGuards `"$GatePath`""
+                timeout       = 60
+                statusMessage = "Checking worktree gate and this repo's shell guards"
+            }
+        } else {
+            [ordered]@{
+                type          = "command"
+                command       = "pwsh -NoProfile -File `"$GatePath`""
+                timeout       = 15
+                statusMessage = "Checking worktree gate"
+            }
+        }
+        [ordered]@{ matcher = $m; hooks = @($hook) }
+    }
 }
 
 # Tool names reachable through a PreToolUse entry whose command names the gate. ONE reader, used by both
@@ -417,11 +462,13 @@ function Get-StaleSourceRefusal {
     param(
         [string]$SourcePath,
         [string]$SourceSha,
-        [Parameter(Mandatory)]$Upstream
+        [Parameter(Mandatory)]$Upstream,
+        # What the file is, for the message. The installer checks the shell-guard dispatcher too.
+        [string]$Noun = "gate"
     )
 
     if (-not $SourceSha) {
-        return "Refusing to install: this checkout has no gate at $SourcePath, so there is nothing to install. Nothing on this box has been changed."
+        return "Refusing to install: this checkout has no $Noun at $SourcePath, so there is nothing to install. Nothing on this box has been changed."
     }
     if ($Upstream.Available -and $Upstream.Sha -eq $SourceSha) { return $null }
 
@@ -429,17 +476,17 @@ function Get-StaleSourceRefusal {
     $ref = $Upstream.Ref
     $head = if ($Upstream.Available) {
         @(
-            "Refusing to install: this checkout's gate is not the one on $ref."
+            "Refusing to install: this checkout's $Noun is not the one on $ref."
             "  this checkout : $SourcePath  sha $(& $short $SourceSha)"
             "  upstream      : $ref  sha $(& $short $Upstream.Sha)  (as last fetched; this script never fetches)"
             "  position      : $(Format-UpstreamPosition $Upstream -ContentDiffers)"
-            "Installing would put THIS checkout's gate in place for every session on this box. Bring this"
+            "Installing would put THIS checkout's $Noun in place for every session on this box. Bring this"
             "checkout up to $ref and re-run, or run the installer from a checkout that is at $ref."
         )
     } else {
         @(
             "Refusing to install: $ref could not be read ($($Upstream.Reason)),"
-            "so nothing shows that this checkout's gate is current."
+            "so nothing shows that this checkout's $Noun is current."
             "  this checkout : $SourcePath  sha $(& $short $SourceSha)"
             "Fetch $ref in this checkout, or name a readable ref with -UpstreamRef, and re-run."
         )
@@ -1062,6 +1109,17 @@ if ($staleRefusal) {
     Write-Host "NOTE: the source was checked against -UpstreamRef $UpstreamRef, not the default origin/main." -ForegroundColor Yellow
 }
 
+# THE DISPATCHER IS MACHINE-GLOBAL TOO: it runs the gate on every shell call, so a stale copy is the
+# same hazard as a stale gate, and it gets the same check and the same override.
+$DispatchSrc = Join-Path $RepoRoot "scripts\hooks\shell-guard-dispatch.ps1"
+$checkedDispatchSha = Get-GateHash $DispatchSrc
+$dispatchUpstream = Get-UpstreamGate -RepoRoot $RepoRoot -Ref $UpstreamRef -RelPath $DispatchRel
+$dispatchRefusal = Get-StaleSourceRefusal -SourcePath $DispatchSrc -SourceSha $checkedDispatchSha -Upstream $dispatchUpstream -Noun "shell-guard dispatcher"
+if ($dispatchRefusal) {
+    if (-not $AllowStaleSource -or -not $checkedDispatchSha) { throw $dispatchRefusal }
+    Write-Host "WARNING: installing a shell-guard dispatcher that is not the one on $UpstreamRef, because -AllowStaleSource was given." -ForegroundColor Yellow
+}
+
 New-Item -ItemType Directory -Force -Path $HooksDir | Out-Null
 
 # READ AND MERGE BEFORE ANYTHING ON THIS BOX CHANGES. An allowlist this run cannot read must stop the
@@ -1146,8 +1204,6 @@ if ((Get-GateHash $GateDst) -ne $checkedSha) {
     Write-Host "         is NOT the one that was checked against $UpstreamRef. Run -Status, then re-install." -ForegroundColor Yellow
 }
 
-$command = "pwsh -NoProfile -File `"$GateDst`""
-
 # One matcher per rule in scripts/hooks/worktree_gate.ps1. A rule the hook implements but that is not
 # matched here NEVER FIRES -- the hook is simply not invoked for that tool, and nothing says so. Rule 3
 # shipped in exactly that state. tests/test_install_gate_wiring.py now asserts that every tool the script
@@ -1164,17 +1220,7 @@ if ($EnterWorktreeGate) {
     $matchers += "EnterWorktree"          # rule 4 -- OPT-IN, see the parameter's note for why
 }
 
-$entries = foreach ($m in $matchers) {
-    [ordered]@{
-        matcher = $m
-        hooks   = @([ordered]@{
-            type          = "command"
-            command       = $command
-            timeout       = 15
-            statusMessage = "Checking worktree gate"
-        })
-    }
-}
+$entries = @(New-GateHookEntries -Matchers $matchers -GatePath $GateDst -DispatchPath $DispatchDst)
 
 # Wire (idempotently) into every target config dir. Each file is read-modified-written independently with
 # its own backup/validate/rollback, so a failure on one account cannot corrupt another.

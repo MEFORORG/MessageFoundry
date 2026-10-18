@@ -548,9 +548,10 @@ seconds.
 
 ### The hook's run time is bounded by a length cap
 
-The guard runs first in the one shell handler in `.claude/settings.json`, through
-`scripts/hooks/shell-guard-dispatch.ps1`, whose timeout is 15 seconds for each of the three guards
-it runs. A hook that runs longer lets the command run. So a slow path is a way past the guard. Wiring the guard under that timeout made its slow
+The guard runs first of the guards `scripts/hooks/shell-guards.txt` lists, after the worktree
+gate, in the one account-level shell handler that `scripts/worktree/install-gate.ps1` installs.
+That handler is `scripts/hooks/shell-guard-dispatch.ps1`, whose timeout is 60 seconds, 15 for each
+of the four scripts it runs. A hook that runs longer lets the command run. So a slow path is a way past the guard. Wiring the guard under that timeout made its slow
 paths matter, and three rounds of repair on the wiring change each closed one and found or opened
 another. **This page does not claim that no slow path is left.** The bound on run time is a cap
 on length instead.

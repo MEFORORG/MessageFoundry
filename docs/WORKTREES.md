@@ -1219,8 +1219,9 @@ contract.
 
 **No hook guards this, and that is a decision.** The obvious guard is a `PreToolUse` matcher on
 `Bash` that refuses the bad shape. This repo has guards built that way: at least the three
-guards the one `^(Bash|PowerShell)$` handler in `.claude/settings.json` runs through
-[`shell-guard-dispatch.ps1`](../scripts/hooks/shell-guard-dispatch.ps1):
+guards [`shell-guards.txt`](../scripts/hooks/shell-guards.txt) lists, which the account-level
+shell handler [`install-gate.ps1`](../scripts/worktree/install-gate.ps1) installs runs through
+[`shell-guard-dispatch.ps1`](../scripts/hooks/shell-guard-dispatch.ps1), after the worktree gate:
 [`block-api-burn.ps1`](../scripts/hooks/block-api-burn.ps1),
 [`block-unbounded-fs-scan.ps1`](../scripts/hooks/block-unbounded-fs-scan.ps1) and
 [`block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1). The last sat
@@ -1484,7 +1485,10 @@ The install and `-Status` both check the gate against `origin/main`; see
 
 [`install-gate.ps1`](../scripts/worktree/install-gate.ps1) copies
 [`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1) into `~/.claude/hooks/` and
-registers it as a `PreToolUse` hook in the **user-scope** `~/.claude/settings.json`. It denies:
+registers it as a `PreToolUse` hook in the **user-scope** `~/.claude/settings.json`. For `Bash` and
+`PowerShell` calls it registers a copy of
+[`shell-guard-dispatch.ps1`](../scripts/hooks/shell-guard-dispatch.ps1) instead, which runs the gate
+and then the guards the session's repo lists in `scripts/hooks/shell-guards.txt`, in one process. It denies:
 
 1. a **`Write`/`Edit`/`MultiEdit`/`NotebookEdit` whose target path is inside the primary's working tree**;
 2. a **`Task`/`Agent`/`Workflow` dispatch made from the primary** — a subagent inherits the parent's cwd,

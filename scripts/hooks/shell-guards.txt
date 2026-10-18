@@ -1,0 +1,12 @@
+# Shell-call guards this repo declares. Claude Code does not read this file.
+#
+# scripts/hooks/shell-guard-dispatch.ps1, run with -ProjectGuards, runs each guard below, in this
+# order, after the guards named on its command line, all in ONE pwsh process. Its header says how a
+# line is read and which lines it refuses: one path per line, exactly scripts/hooks/<name>.ps1,
+# nothing outside this repo's scripts/hooks/.
+#
+# block-blanket-git-stage.ps1 stays FIRST: it refuses an over-long payload unread, so a huge payload
+# never reaches the guards after it, which parse whatever they are given.
+scripts/hooks/block-blanket-git-stage.ps1
+scripts/hooks/block-api-burn.ps1
+scripts/hooks/block-unbounded-fs-scan.ps1

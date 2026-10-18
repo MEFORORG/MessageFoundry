@@ -67,7 +67,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.10.04.1"
+$GateVersion = "2026.10.17.1"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -4284,9 +4284,15 @@ if (-not [System.IO.Path]::IsPathRooted($target)) {
 # wrong twice over: $ReposFile is a parameter that can point anywhere (under test it sits in a temp dir,
 # where it swallowed every unrelated path), and ~/.claude/hooks/ also holds things this rule has no
 # business governing. The surface worth protecting is precisely the kill switch and the script it arms.
+#
+# THE THIRD FILE IS AN INSTALLED SHELL-GUARD DISPATCHER. A copy of scripts/hooks/shell-guard-dispatch.ps1
+# installed here, as the handler that runs this gate on Bash and PowerShell calls, is the gate's
+# surface too: one Edit dropping the gate's path from it would switch rules 3 to 3d off as quietly as
+# an edit to this script.
 $gateFiles = @(
     (Get-ComparablePath $ReposFile)
     (Get-ComparablePath (Join-Path (Split-Path -Parent $ReposFile) "worktree_gate.ps1"))
+    (Get-ComparablePath (Join-Path (Split-Path -Parent $ReposFile) "shell-guard-dispatch.ps1"))
 ) | Where-Object { $_ }
 if ((Get-ComparablePath $target) -in $gateFiles) {
     Write-Deny -Rule "1a" -Detail $target -Reason @"

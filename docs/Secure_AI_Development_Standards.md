@@ -538,8 +538,13 @@ This standard governs *how* to use AI at each tier; it **does not mandate** usin
 | Plan mode, `/code-review`, `/security-review` | Plan approval (in MEFOR the Manager's plan and the owner's go — §6.2), diff review | **Advisory** (the owner rules on what is routed to them — §6.6) | — (Claude Code feature) |
 
 > **NOTE ON THE PreToolUse ROW -- WIRED, AND A BEST-EFFORT CHECK (BACKLOG #1339).**
-> [`.claude/settings.json`](../.claude/settings.json) runs `block-blanket-git-stage.ps1` on every
-> Bash and PowerShell tool call. Until BACKLOG #1339 wired it, this row read *PRESENT, NOT WIRED*:
+> The account-level shell handler that
+> [`install-gate.ps1`](../scripts/worktree/install-gate.ps1) installs runs
+> `block-blanket-git-stage.ps1` on every Bash and PowerShell tool call, because
+> [`shell-guards.txt`](../scripts/hooks/shell-guards.txt) lists it. That holds only on an account
+> where that installer has run. [`.claude/settings.json`](../.claude/settings.json) wired it until
+> the handler took it over, so a clone used to carry the guard on its own and no longer does.
+> Until BACKLOG #1339 wired it, this row read *PRESENT, NOT WIRED*:
 > no PreToolUse matcher in any settings file referenced it, measured on 2026-08-23. The vault's
 > rulings file of 2026-10-08 says the vault's tracked settings wire an older copy.
 >
@@ -590,7 +595,7 @@ The repo's tiered-honesty taxonomy, applied to the **dev-process tooling itself*
 
 **Built (in code today):**
 
-- **A best-effort guard, not coverage:** [`block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1) is wired for Bash and PowerShell tool calls by [`.claude/settings.json`](../.claude/settings.json) (BACKLOG #1339). It fails open and lets through at least the forms listed in [`BLANKET-STAGE-GUARD-FAIL-OPENS.md`](BLANKET-STAGE-GUARD-FAIL-OPENS.md), so do not count it as a gate.
+- **A best-effort guard, not coverage:** [`block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1) is wired for Bash and PowerShell tool calls by [`shell-guards.txt`](../scripts/hooks/shell-guards.txt), which the shell handler [`install-gate.ps1`](../scripts/worktree/install-gate.ps1) installs reads, so only on an account where that installer has run (BACKLOG #1339). It fails open and lets through at least the forms listed in [`BLANKET-STAGE-GUARD-FAIL-OPENS.md`](BLANKET-STAGE-GUARD-FAIL-OPENS.md), so do not count it as a gate.
 - [`.claude/settings.json`](../.claude/settings.json) secrets/keys/`*.db` **path-based** deny-list + destructive-command denies.
 - Blocking security CI: bandit, semgrep ([`.semgrep/messagefoundry.yml`](../.semgrep/messagefoundry.yml)), pip-audit, gitleaks, crypto-inventory, forbidden-content ([`scripts/security/scan_forbidden.py`](../scripts/security/scan_forbidden.py)). The CycloneDX **SBOM** job is **advisory** (`continue-on-error`), not blocking.
 - **Dependency-CVE fast response (SSDF RV.2 evidence):** dependency-vulnerability metrics ([`vuln-metrics.yml`](../.github/workflows/vuln-metrics.yml)), scoped Dependabot auto-merge + supply-chain cooldown ([`dependabot-auto-merge.yml`](../.github/workflows/dependabot-auto-merge.yml)), auto lock-resync ([`dependabot-lock-resync.yml`](../.github/workflows/dependabot-lock-resync.yml)), and the adopter vulnerable-pin CI tripwire. The **`CI gate` roll-up** required check gates the conditional/matrix legs in [`ci.yml`](../.github/workflows/ci.yml). *(This is the **audit/known-CVE** posture. The distinct hallucinated/typosquatted **new-dependency-introduction** check is now built alongside it — [`new_dependency_check.py`](../scripts/security/new_dependency_check.py), a step in the same required `pip-audit` job — with a documented residual; see below.)*

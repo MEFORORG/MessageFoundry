@@ -188,6 +188,7 @@ tests/test_steer_inject.py
 tests/test_testpaths_webconsole_coverage.py
 tests/test_unbounded_fs_scan_guard.py
 tests/test_shell_guard_dispatch.py
+tests/test_shell_guard_project_manifest.py
 tests/test_api_burn_guard.py
 tests/test_webconsole_engine_floor.py
 tests/test_wheel_license_files.py

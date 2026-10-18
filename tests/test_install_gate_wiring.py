@@ -21,6 +21,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -640,3 +641,62 @@ def test_one_wired_matcher_is_membership_not_a_substring_search(tmp_path: Path) 
     # The contrast that localises it: same dir, same single matcher, but not a substring of it.
     assert "MultiEdit" in unwired, f"MultiEdit is not wired here either:\n{out}"
     assert "NotebookEdit" not in unwired, f"NotebookEdit IS wired here:\n{out}"
+
+
+# ----------------------------------------------------------------- what each matcher's entry runs
+
+_GATE_AT = "C:/h/.claude/hooks/worktree_gate.ps1"
+_DISPATCH_AT = "C:/h/.claude/hooks/shell-guard-dispatch.ps1"
+
+
+def _entries_for(tmp_path: Path, matchers: list[str]) -> list[dict[str, Any]]:
+    """What New-GateHookEntries writes, extracted by AST and run, never read as text: the installer
+    refuses to run inside Claude Code, so this is the only way a session sees its output."""
+    from tests.test_install_gate_allowlist_merge import _harness, _ok, _ps_array, _psq
+
+    body = (
+        f"  $e = @(New-GateHookEntries -Matchers {_ps_array(matchers)} "
+        f"-GatePath {_psq(_GATE_AT)} -DispatchPath {_psq(_DISPATCH_AT)})\n"
+        "  ConvertTo-Json -InputObject $e -Depth 6 -Compress"
+    )
+    out = _ok(_harness([(INSTALLER, ["New-GateHookEntries"])], body), tmp_path)
+    entries: list[dict[str, Any]] = json.loads(out)
+    return entries
+
+
+def test_the_shell_matcher_runs_the_dispatcher_and_the_others_run_the_gate(tmp_path: Path) -> None:
+    """The shell entry is the ONE handler for every Bash and PowerShell call: the dispatcher, naming
+    the gate, told to add the session's repo guards. Every other matcher runs the gate on its own,
+    as it did before the dispatcher existed."""
+    matchers = ["Write|Edit|MultiEdit|NotebookEdit", "Bash|PowerShell", "Task|Agent|Workflow"]
+    entries = _entries_for(tmp_path, matchers)
+    assert [e["matcher"] for e in entries] == matchers
+    by = {e["matcher"]: e["hooks"][0] for e in entries}
+    shell = by["Bash|PowerShell"]
+    assert shell["command"] == (
+        f'pwsh -NoProfile -NonInteractive -File "{_DISPATCH_AT}" -ProjectGuards "{_GATE_AT}"'
+    )
+    # The gate's 15 s plus the 45 s the project's own shell handler had: it runs those guards now.
+    assert shell["timeout"] == 60
+    for m in ("Write|Edit|MultiEdit|NotebookEdit", "Task|Agent|Workflow"):
+        assert by[m]["command"] == f'pwsh -NoProfile -File "{_GATE_AT}"'
+        assert by[m]["timeout"] == 15
+
+
+def test_every_entry_still_carries_the_marker_reinstall_and_uninstall_key_on(
+    tmp_path: Path,
+) -> None:
+    """Remove-GateHooks and Get-WiredMatchers find the gate's entries by the gate's FILENAME in the
+    command. A shell entry without it would survive a re-install beside its replacement, survive an
+    uninstall, and read as unwired in -Status."""
+    for e in _entries_for(tmp_path, ["Bash|PowerShell", "Write|Edit|MultiEdit|NotebookEdit"]):
+        assert "worktree_gate.ps1" in e["hooks"][0]["command"], e
+
+
+def test_the_install_path_feeds_its_matchers_to_the_entry_builder() -> None:
+    """The two tests above read the builder; this pins that the install path uses it, with the
+    installed copies' paths rather than the checkout's."""
+    assert (
+        "$entries = @(New-GateHookEntries -Matchers $matchers -GatePath $GateDst "
+        "-DispatchPath $DispatchDst)"
+    ) in INSTALLER.read_text(encoding="utf-8")
