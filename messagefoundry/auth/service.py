@@ -11290,13 +11290,21 @@ class AuthService:
         ``auth.session_rotation_failed``: no rotation was attempted."""
         if await self._load_session(hash_token(token)) is not None:
             return False
-        await self._audit(
-            event,
-            actor=actor,
-            detail=_json({"reason": "session_lost", "phase": "enroll"}),
-            client=client,
-        )
+        await self._audit_session_lost(event, actor=actor, client=client, phase="enroll")
         return True
+
+    async def _audit_session_lost(
+        self, event: str, *, actor: str, client: str | None, phase: str | None
+    ) -> None:
+        """The ``session_lost`` row a factor leg writes when its session or account went: ``event``
+        with ``reason=session_lost``, and ``phase`` when given. The one spelling
+        :meth:`_factor_holder_current` and :meth:`_enrolment_session_gone` share, so the row a
+        directory account's re-read writes and the one a local account's enrolment guard writes
+        cannot drift apart."""
+        lost = {"reason": "session_lost"}
+        if phase is not None:
+            lost["phase"] = phase
+        await self._audit(event, actor=actor, detail=_json(lost), client=client)
 
     async def _directory_vouches_for_factor(
         self,
@@ -11387,10 +11395,7 @@ class AuthService:
             else (await self._load_user(session.user_id))
         )
         if user is None or user.disabled:
-            lost = {"reason": "session_lost"}
-            if phase is not None:
-                lost["phase"] = phase
-            await self._audit(event, actor=actor, detail=_json(lost), client=client)
+            await self._audit_session_lost(event, actor=actor, client=client, phase=phase)
             return Elevation(session_lost=True)
         if await self._mfa_lock_refused(user, client=client, event=event):
             return Elevation(locked=report_lock)

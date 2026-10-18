@@ -167,6 +167,10 @@ _DIRECTORY_UNCONFIRMED_DETAIL = (
     "the directory could not confirm this account; try again later, or ask an administrator"
 )
 
+#: What ``/me/mfa/confirm`` says when ``Elevation.locked`` is set (BACKLOG #3810 finding 4): a
+#: directory account's second-step lock was found before the code was checked.
+_ACCOUNT_LOCKED_DETAIL = "account locked; try again later"
+
 
 def _alert_administrator_granted(app: FastAPI, key: str, *, via: str, granted_by: str) -> None:
     """The user-administration routes' grant alert; :func:`alert_administrator_granted` says why
@@ -899,7 +903,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             if elevation.locked:
                 # BACKLOG #3810 finding 4: a directory account's lock is found before the code is
                 # checked, so "invalid code" would call an unchecked code wrong.
-                raise HTTPException(status.HTTP_403_FORBIDDEN, "account locked; try again later")
+                raise HTTPException(status.HTTP_403_FORBIDDEN, _ACCOUNT_LOCKED_DETAIL)
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid code")
         # The body now carries BOTH the one-time recovery codes and a live session token; the route's
         # CredentialReply model keeps the reply out of every cache (BACKLOG #2372).

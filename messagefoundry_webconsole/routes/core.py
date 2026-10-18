@@ -135,6 +135,18 @@ def _directory_unconfirmed(elevation: Elevation) -> bool:
     return bool(getattr(elevation, "directory_unconfirmed", False))
 
 
+def _refusal_error(elevation: Elevation, fallback: str) -> str:
+    """The words for a refused code or passkey: the directory's refusal, then a lock, then the leg's
+    own ``fallback`` for a wrong proof. The first two never checked the proof, so ``fallback``
+    would be false for them (BACKLOG #3061, #3810 finding 4). The two never come together: a
+    directory refusal returns before the lock is read."""
+    if _directory_unconfirmed(elevation):
+        return _DIRECTORY_UNCONFIRMED_ERROR
+    if elevation.locked:
+        return _ACCOUNT_LOCKED_ERROR
+    return fallback
+
+
 def _enrol_before_step_up(mfa: MfaStatus, *, satisfied: bool, step_up: bool) -> bool:
     """Whether the password ``/ui/reauth`` sends this session to enrol instead of rendering its form.
 
@@ -1906,13 +1918,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                         mfa_needed=True,
                         webauthn_options=wa_options,
                         webauthn_notice=wa_notice,
-                        error=(
-                            _ACCOUNT_LOCKED_ERROR
-                            if code_elevation.locked
-                            else _DIRECTORY_UNCONFIRMED_ERROR
-                            if _directory_unconfirmed(code_elevation)
-                            else "Invalid code."
-                        ),
+                        error=_refusal_error(code_elevation, "Invalid code."),
                     )
                 )
         # 7.5.1 (ADR 0077): mint the single-use grant bound to this continuation's action.
