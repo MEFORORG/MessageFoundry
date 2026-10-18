@@ -1828,7 +1828,13 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         }
     ),
     "messagefoundry/verify/runner.py": frozenset(
-        {"hash:via messagefoundry.verify.smoke", "tls_context:via messagefoundry.verify.smoke"}
+        {
+            "hash:via messagefoundry.verify.smoke",
+            "tls_context:via messagefoundry.verify.smoke",
+            # BACKLOG #3277: the host.ciphers hop census loads the config graph (load_config's
+            # digest, vault BACKLOG #2724), as the self smoke does.
+            "hash:via messagefoundry.config.wiring",
+        }
     ),
     # ADR 0197 Amendment A (AC-A9): the lockable-account census computes one TOTP code per enabled
     # secret (HMAC, via auth.service -> auth.totp) only to prove the secret is usable; the code is

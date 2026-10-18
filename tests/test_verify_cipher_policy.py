@@ -14,6 +14,7 @@ import subprocess
 import sys
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -271,6 +272,22 @@ def test_a_policy_entry_that_is_not_a_suite_name_is_a_failed_read(
         cipher_policy._schannel_policy_order()
 
 
+def test_policy_order_as_an_expandable_string_is_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """QA finding 10 of PR 2406: a REG_EXPAND_SZ order read as an ERROR, which failed the run."""
+    found = (f"{_A},{_WIN_CBC}", 2)
+    monkeypatch.setattr(cipher_policy, "_hklm_value", lambda subkey, name: found)
+    assert cipher_policy._schannel_policy_order() == [_A, _WIN_CBC]
+
+
+def test_an_expandable_order_that_would_expand_is_a_failed_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    found = (f"{_A},%SUITES%", 2)
+    monkeypatch.setattr(cipher_policy, "_hklm_value", lambda subkey, name: found)
+    with pytest.raises(ProbeFailed, match="is not a suite name"):
+        cipher_policy._schannel_policy_order()
+
+
 def test_policy_order_of_another_type_is_a_failed_read(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cipher_policy, "_hklm_value", lambda subkey, name: (5, 4))
     with pytest.raises(ProbeFailed, match="registry type 4"):
@@ -414,6 +431,59 @@ def test_a_file_with_no_chain_has_no_policy_section(
     # The chain broken at its second link: ssl_conf names nothing.
     broken = "openssl_conf = init\n[init]\nproviders = p\n" + text
     assert _read_cnf(monkeypatch, tmp_path / "b.cnf", broken)[1:] == (None, [])
+
+
+_HEALTHY_SECTION = "[system_default_sect]\nCipherString = ECDHE+AESGCM\nMinProtocol = TLSv1.2\n"
+
+
+def _module_cnf(module_line: str) -> str:
+    """A healthy file whose chain names the SSL module by ``module_line``."""
+    return (
+        f"openssl_conf = init\n[init]\n{module_line} = ssl_sect\n"
+        "[ssl_sect]\nsystem_default = system_default_sect\n" + _HEALTHY_SECTION
+    )
+
+
+@pytest.mark.parametrize("module_line", ["ssl_conf.0", "ssl_conf.x", "ssl_conf"])
+def test_a_suffixed_ssl_module_line_is_followed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, module_line: str
+) -> None:
+    """QA finding 3 of PR 2406: OpenSSL reads ``ssl_conf.0`` as the SSL module, so the chain goes
+    on through it. Before, the row found no section and read FAIL on a healthy file."""
+    text = _module_cnf(module_line)
+    r = _linux_from_file(monkeypatch, tmp_path / "openssl.cnf", text)
+    assert r.status is Status.PASS, r.detail
+
+
+def test_the_last_ssl_module_line_wins(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    text = (
+        "openssl_conf = init\n[init]\nssl_conf = other\nssl_conf.1 = ssl_sect\n"
+        "[other]\nsystem_default = weak\n[weak]\nMinProtocol = TLSv1\n"
+        "[ssl_sect]\nsystem_default = system_default_sect\n" + _HEALTHY_SECTION
+    )
+    _, section, _ = _read_cnf(monkeypatch, tmp_path / "openssl.cnf", text)
+    assert section == "system_default_sect"
+
+
+@pytest.mark.parametrize("module_line", ["ssl", "ssl.0", "s"])
+def test_a_shorter_ssl_module_stem_is_manual(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, module_line: str
+) -> None:
+    """A stem OpenSSL matches as a prefix may name the SSL module or an earlier one."""
+    text = _module_cnf(module_line)
+    r = _linux_from_file(monkeypatch, tmp_path / "openssl.cnf", text)
+    assert r.status is Status.MANUAL, r.detail
+    assert "may read as ssl_conf" in r.detail
+
+
+@pytest.mark.parametrize(
+    "module_line", ["ssl_confx", "ssl_conf_x", "ssl_conf.x.y", "providers", ".0"]
+)
+def test_other_module_lines_do_not_name_the_ssl_module(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, module_line: str
+) -> None:
+    text = _module_cnf(module_line)
+    assert _read_cnf(monkeypatch, tmp_path / "openssl.cnf", text)[1:] == (None, [])
 
 
 @pytest.mark.parametrize(
@@ -561,7 +631,7 @@ def test_an_unforeseen_exception_is_an_error_row(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setattr(checks, "_can_import", lambda module: True)
     monkeypatch.setattr(cipher_policy, "read_host_cipher_policy", boom)
-    r = checks.check_host_cipher_policy()
+    r = checks.check_host_cipher_policy(lambda: _A_HOP)
     assert (r.id, r.status) == ("host.ciphers", Status.ERROR)
     assert "ValueError: unexpected" in r.detail
 
@@ -628,15 +698,199 @@ def test_no_odbc_driver_means_skip(monkeypatch: pytest.MonkeyPatch) -> None:
 
     _hide_pyodbc(monkeypatch)
     monkeypatch.setattr(cipher_policy, "read_host_cipher_policy", must_not_run)
-    r = checks.check_host_cipher_policy()
+    r = checks.check_host_cipher_policy(lambda: _A_HOP)
     assert (r.id, r.status) == ("host.ciphers", Status.SKIP)
 
 
-def test_odbc_driver_present_reads_the_policy(monkeypatch: pytest.MonkeyPatch) -> None:
-    stub = CheckResult("host.ciphers", "t", Status.FAIL, "stub reading")
-    monkeypatch.setattr(checks, "_can_import", lambda module: True)
+def _with_pyodbc(monkeypatch: pytest.MonkeyPatch, reading: Status) -> CheckResult:
+    """pyodbc reads as installed and the policy read returns ``reading``."""
+    real = checks._can_import
+    monkeypatch.setattr(checks, "_can_import", lambda module: module == "pyodbc" or real(module))
+    stub = CheckResult("host.ciphers", "t", reading, "stub reading", evidence="stub evidence")
     monkeypatch.setattr(cipher_policy, "read_host_cipher_policy", lambda: stub)
-    assert checks.check_host_cipher_policy() is stub
+    return stub
+
+
+_A_HOP = checks.OdbcHops(found=("the [store] backend is sqlserver",))
+
+
+@pytest.mark.parametrize("reading", list(Status))
+def test_a_configured_hop_reports_the_reading_as_it_is(
+    monkeypatch: pytest.MonkeyPatch, reading: Status
+) -> None:
+    """A host that takes an ODBC hop keeps every reading, FAIL included."""
+    stub = _with_pyodbc(monkeypatch, reading)
+    assert checks.check_host_cipher_policy(lambda: _A_HOP) is stub
+
+
+def test_pyodbc_with_no_configured_hop_skips(monkeypatch: pytest.MonkeyPatch) -> None:
+    """pyodbc installed and no hop configured is not a FAIL (the PR 2406 send-back, finding 4).
+    The policy is not read at all, because no hop of this deployment takes it."""
+
+    def must_not_run() -> CheckResult:
+        raise AssertionError("the policy was read for a configuration with no ODBC hop")
+
+    _with_pyodbc(monkeypatch, Status.FAIL)
+    monkeypatch.setattr(cipher_policy, "read_host_cipher_policy", must_not_run)
+    r = checks.check_host_cipher_policy(lambda: checks.OdbcHops())
+    assert (r.id, r.status) == ("host.ciphers", Status.SKIP)
+    assert "no ODBC hop" in r.detail
+
+
+@pytest.mark.parametrize(
+    ("reading", "expect"),
+    [
+        (Status.FAIL, Status.MANUAL),
+        (Status.ERROR, Status.MANUAL),
+        (Status.PASS, Status.PASS),
+        (Status.MANUAL, Status.MANUAL),
+    ],
+)
+def test_an_unknown_configuration_never_fails_the_run(
+    monkeypatch: pytest.MonkeyPatch, reading: Status, expect: Status
+) -> None:
+    """Where the configuration could not be read, a failing reading is MANUAL and keeps its text."""
+    _with_pyodbc(monkeypatch, reading)
+    r = checks.check_host_cipher_policy(lambda: checks.OdbcHops(unknown="no config dir"))
+    assert r.status is expect
+    if reading is not expect:
+        assert "no config dir" in r.detail and f"reads {reading.value}: stub reading" in r.detail
+        assert r.evidence == "stub evidence"
+
+
+def test_the_hop_census_is_not_taken_without_pyodbc(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The census can load the config graph, so it waits until pyodbc shows a hop could run."""
+
+    def must_not_run() -> checks.OdbcHops:
+        raise AssertionError("the hop census ran with no pyodbc")
+
+    _hide_pyodbc(monkeypatch)
+    assert checks.check_host_cipher_policy(must_not_run).status is Status.SKIP
+
+
+def test_a_census_that_raises_is_an_error_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom() -> checks.OdbcHops:
+        raise RuntimeError("census broke")
+
+    _with_pyodbc(monkeypatch, Status.PASS)
+    r = checks.check_host_cipher_policy(boom)
+    assert r.status is Status.ERROR and "RuntimeError: census broke" in r.detail
+
+
+def _host_ciphers_row(results: list[CheckResult]) -> CheckResult:
+    return next(r for r in results if r.id == "host.ciphers")
+
+
+def test_verify_on_a_host_with_pyodbc_and_no_hop_does_not_fail(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The finding as the Lander measured it, end to end: ``verify`` with pyodbc importable, the
+    default SQLite store and a config graph with no DATABASE connection read FAIL and exit 1. The
+    graph here is empty, which loads as a graph with no hop. The policy reading is a FAIL, as on a
+    stock Windows 11 host, so only the hop gate can turn the row away from it."""
+    from messagefoundry.verify.runner import run_verify
+
+    _with_pyodbc(monkeypatch, Status.FAIL)
+    monkeypatch.delenv("MEFOR_STORE_BACKEND", raising=False)
+    row = _host_ciphers_row(run_verify(config_dir=str(tmp_path), sections=["host"]))
+    assert row.status is Status.SKIP, row.detail
+
+
+def test_verify_with_no_config_dir_reports_manual(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from messagefoundry.verify.runner import run_verify
+
+    _with_pyodbc(monkeypatch, Status.FAIL)
+    monkeypatch.delenv("MEFOR_STORE_BACKEND", raising=False)
+    row = _host_ciphers_row(run_verify(config_dir=str(tmp_path / "absent"), sections=["host"]))
+    assert row.status is Status.MANUAL, row.detail
+    assert "no config dir" in row.detail
+
+
+def _registry_with(monkeypatch: pytest.MonkeyPatch, **parts: Any) -> None:
+    from messagefoundry.config import wiring
+
+    monkeypatch.setattr(
+        wiring, "load_config", lambda d, allow_empty=False: wiring.Registry(**parts)
+    )
+
+
+def _hops(config_dir: Path, *, settings: Any = None) -> checks.OdbcHops:
+    from messagefoundry.verify.runner import _odbc_hops
+
+    return _odbc_hops(settings, str(config_dir))
+
+
+def test_the_census_finds_each_kind_of_hop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import (
+        ConnectionSpec,
+        DatabaseLookupSpec,
+        OutboundConnection,
+        ReferenceSourceSpec,
+        ReferenceSpec,
+    )
+
+    def outbound(kind: ConnectorType) -> OutboundConnection:
+        return OutboundConnection(name="x", spec=ConnectionSpec(type=kind, settings={}))
+
+    _registry_with(
+        monkeypatch,
+        outbound={"OB_DB": outbound(ConnectorType.DATABASE), "OB_F": outbound(ConnectorType.FILE)},
+        references={
+            "REF_DB": ReferenceSpec("REF_DB", ReferenceSourceSpec("database", {})),
+            "REF_F": ReferenceSpec("REF_F", ReferenceSourceSpec("file", {})),
+        },
+        lookups={"LK": DatabaseLookupSpec("LK", {})},
+    )
+    assert _hops(tmp_path).found == (
+        "DATABASE connection OB_DB",
+        "DatabaseRef reference set REF_DB",
+        "DatabaseLookup LK",
+    )
+
+
+def test_the_census_without_a_hop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """No hop in the graph: "none" when the settings loaded, unknown when they did not, because
+    the store could then be SQL Server."""
+    from messagefoundry.config.settings import ServiceSettings
+
+    _registry_with(monkeypatch)
+    assert _hops(tmp_path, settings=ServiceSettings()) == checks.OdbcHops()
+    unknown = _hops(tmp_path).unknown
+    assert unknown is not None and "settings did not load" in unknown
+
+
+def test_a_sql_server_store_is_a_hop_without_the_graph(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from types import SimpleNamespace
+
+    from messagefoundry.config import wiring
+    from messagefoundry.config.settings import StoreBackend
+
+    def must_not_load(d: object, allow_empty: bool = False) -> object:
+        raise AssertionError("the graph was loaded although the store already shows a hop")
+
+    monkeypatch.setattr(wiring, "load_config", must_not_load)
+    settings = SimpleNamespace(store=SimpleNamespace(backend=StoreBackend.SQLSERVER))
+    assert _hops(tmp_path / "absent", settings=settings).found == (
+        "the [store] backend is sqlserver",
+    )
+
+
+def test_a_graph_that_does_not_load_is_unknown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from messagefoundry.config import wiring
+
+    def broken(d: object, allow_empty: bool = False) -> object:
+        raise wiring.WiringError("bad graph")
+
+    monkeypatch.setattr(wiring, "load_config", broken)
+    unknown = _hops(tmp_path).unknown
+    assert unknown is not None and "WiringError" in unknown
 
 
 def test_host_section_carries_the_row(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

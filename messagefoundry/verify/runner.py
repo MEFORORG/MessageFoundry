@@ -9,6 +9,7 @@ from pathlib import Path
 
 from messagefoundry.config.settings import ServiceSettings, StoreBackend
 from messagefoundry.verify.checks import (
+    OdbcHops,
     check_credential_generation,
     check_lockable_accounts,
     run_host_checks,
@@ -85,6 +86,48 @@ def _writable_dir(settings: ServiceSettings | None) -> Path:
     if settings is not None and settings.store.backend is StoreBackend.SQLITE:
         return Path(settings.store.path).resolve().parent
     return Path.cwd()
+
+
+def _odbc_hops(settings: ServiceSettings | None, config_dir: str) -> OdbcHops:
+    """Which ODBC hops this deployment takes, for the ``host.ciphers`` row (BACKLOG #3277).
+
+    The SQL Server store is read from the service settings. A DATABASE connection, a ``DatabaseRef``
+    reference set and a ``DatabaseLookup`` are read from the config graph, which this loads the way
+    the self smoke does, so it runs only when the store has not already shown a hop. A hop found
+    either way is enough. A graph that cannot be loaded, or settings that did not load, leave the
+    answer unknown rather than "no hop", because a hop could sit in what was not read."""
+    if settings is not None and settings.store.backend is StoreBackend.SQLSERVER:
+        return OdbcHops(found=("the [store] backend is sqlserver",))
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import WiringError, load_config
+
+    if not Path(config_dir).is_dir():
+        return OdbcHops(unknown=f"no config dir at {config_dir!r}; pass --config")
+    try:
+        # allow_empty: an empty graph takes no hop, which is an answer, not an unknown.
+        reg = load_config(config_dir, allow_empty=True)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return OdbcHops(unknown=f"the config dir did not load: {type(exc).__name__}")
+    database_connections = sorted(
+        name
+        for table in (reg.inbound, reg.outbound)
+        for name, conn in table.items()
+        if conn.spec.type is ConnectorType.DATABASE
+    )
+    found = (
+        *(f"DATABASE connection {name}" for name in database_connections),
+        *(
+            f"DatabaseRef reference set {name}"
+            for name, ref in sorted(reg.references.items())
+            if ref.source.kind == "database"
+        ),
+        *(f"DatabaseLookup {name}" for name in sorted(reg.lookups)),
+    )
+    if found:
+        return OdbcHops(found=found)
+    if settings is None:
+        return OdbcHops(unknown="service settings did not load, so the store backend is not known")
+    return OdbcHops()
 
 
 def _manual_rows() -> list[CheckResult]:
@@ -205,7 +248,11 @@ def run_verify(
     if "host" in selected:
         api_port = settings.api.port if settings is not None else _DEFAULT_API_PORT
         ports = {"MLLP": mllp_port, "DICOM": _DEFAULT_DICOM_PORT, "API": api_port}
-        results += run_host_checks(ports=ports, writable_dir=_writable_dir(settings))
+        results += run_host_checks(
+            ports=ports,
+            writable_dir=_writable_dir(settings),
+            odbc_hops=lambda: _odbc_hops(settings, config_dir),
+        )
 
     if "store" in selected:
         if settings is None:

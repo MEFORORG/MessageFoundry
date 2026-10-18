@@ -24,6 +24,8 @@ import importlib.util
 import socket
 import sys
 import tempfile
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -31,7 +33,7 @@ from messagefoundry import __version__
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import codec_safe_str
 from messagefoundry.verify import cipher_policy
-from messagefoundry.verify.model import CheckResult, Status
+from messagefoundry.verify.model import FAILING, CheckResult, Status
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import AuthSettings, StoreSettings
@@ -123,32 +125,70 @@ def check_sqlserver_odbc_driver() -> CheckResult:
     )
 
 
-def check_host_cipher_policy() -> CheckResult:
+@dataclass(frozen=True)
+class OdbcHops:
+    """The ODBC Driver hops a deployment's configuration takes, as ``verify`` read them.
+
+    ``found`` names each hop that was read. ``unknown`` says why the configuration could not be
+    read in full, and is ``None`` when it was. Nothing found and nothing unknown means the
+    configuration takes no ODBC hop from this host."""
+
+    found: tuple[str, ...] = ()
+    unknown: str | None = None
+
+
+_NO_CONFIGURATION = OdbcHops(unknown="the check was handed no configuration")
+
+
+def check_host_cipher_policy(odbc_hops: Callable[[], OdbcHops]) -> CheckResult:
     """DEPLOY-SERVER-DB.md section 5.4: the host TLS policy every ODBC Driver 18 hop takes.
 
-    Reported wherever pyodbc is installed, found on the import path without being imported: the SQL
-    Server store, the DATABASE connector, ``db_lookup`` and ``DatabaseRef`` all reach the driver
-    through it. Without it no such hop exists here, so the row SKIPs. With it, the row reads the
-    policy whether or not this host's configuration uses an ODBC hop, because this check is handed
-    no engine configuration; a host that installed pyodbc and uses no hop still reads FAIL on a stock
-    policy, and DEPLOY-SERVER-DB.md section 5.4 says so."""
+    Without pyodbc, found on the import path without being imported, no ODBC hop runs from this
+    Python, so the row SKIPs. With it, ``odbc_hops`` says whether the configuration takes one: the
+    SQL Server store, a DATABASE connection, a ``DatabaseRef`` reference set or a ``DatabaseLookup``.
+    A configuration that takes none SKIPs, so a host that only has pyodbc installed is never failed
+    for a policy no hop of its uses. A configuration that takes one reports the reading as it is,
+    FAIL included. Where the configuration could not be read, a FAIL or ERROR reading is reported as
+    MANUAL with the reading in its detail: the policy may be wrong, but whether it matters here is
+    not known, and the verifier must not fail a host on a guess. ``odbc_hops`` is called only when
+    pyodbc is there, because it can load the configuration."""
+    rid, title = cipher_policy.RID, cipher_policy.TITLE
     if not _can_import("pyodbc"):
         return CheckResult(
-            cipher_policy.RID,
-            cipher_policy.TITLE,
+            rid,
+            title,
             Status.SKIP,
             "pyodbc is not installed in this Python, so no ODBC hop runs from it; run verify "
             "from the engine's own environment to read the policy",
         )
     try:
-        return cipher_policy.read_host_cipher_policy()
+        hops = odbc_hops()
+        if not hops.found and hops.unknown is None:
+            return CheckResult(
+                rid,
+                title,
+                Status.SKIP,
+                "this configuration takes no ODBC hop (no SQL Server store, DATABASE connection, "
+                "DatabaseRef or DatabaseLookup), so the host policy does not reach one",
+            )
+        reading = cipher_policy.read_host_cipher_policy()
     except Exception as exc:  # a reading the probe mapping did not foresee: the check broke
         return CheckResult(
-            cipher_policy.RID,
-            cipher_policy.TITLE,
+            rid,
+            title,
             Status.ERROR,
             f"the policy read raised {type(exc).__name__}: {codec_safe_str(exc)}",
         )
+    if hops.found or reading.status not in FAILING:
+        return reading
+    return CheckResult(
+        rid,
+        title,
+        Status.MANUAL,
+        f"whether this host takes an ODBC hop is not known ({hops.unknown}); if it takes one, the "
+        f"policy reads {reading.status.value}: {reading.detail}",
+        evidence=reading.evidence,
+    )
 
 
 def _asyncpg_has_connect_hook() -> bool | None:
@@ -439,13 +479,20 @@ def check_credential_generation(auth: AuthSettings) -> CheckResult:
     )
 
 
-def run_host_checks(*, ports: dict[str, int], writable_dir: Path) -> list[CheckResult]:
-    """Run every host/environment check and return their results (order is stable)."""
+def run_host_checks(
+    *,
+    ports: dict[str, int],
+    writable_dir: Path,
+    odbc_hops: Callable[[], OdbcHops] = lambda: _NO_CONFIGURATION,
+) -> list[CheckResult]:
+    """Run every host/environment check and return their results (order is stable).
+
+    ``odbc_hops`` reads which ODBC hops the configuration takes, for :func:`check_host_cipher_policy`."""
     return [
         check_python_runtime(),
         check_optional_drivers(),
         check_sqlserver_odbc_driver(),
-        check_host_cipher_policy(),
+        check_host_cipher_policy(odbc_hops),
         check_postgres_driver(),
         check_listener_ports(ports),
         check_writable_dir(writable_dir),

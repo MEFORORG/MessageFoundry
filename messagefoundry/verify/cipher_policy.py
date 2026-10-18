@@ -46,7 +46,7 @@ _PROBE_TIMEOUT_S = 30.0
 
 #: Registry value types, as ``winreg`` numbers them; named here so no import of ``winreg`` is
 #: needed off Windows.
-_REG_SZ, _REG_DWORD, _REG_MULTI_SZ = 1, 4, 7
+_REG_SZ, _REG_EXPAND_SZ, _REG_DWORD, _REG_MULTI_SZ = 1, 2, 4, 7
 _SCHANNEL_PROTOCOLS = r"SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols"
 #: Where Group Policy's "SSL Cipher Suite Order" setting writes its list.
 _POLICY_ORDER_KEY = r"SOFTWARE\Policies\Microsoft\Cryptography\Configuration\SSL\00010002"
@@ -100,6 +100,10 @@ _ASSIGNMENT = re.compile(r"^\s*([^\s=#]+)\s*=(.*)$")
 _DIRECTIVE = re.compile(r"^\s*(\.include|\.pragma)(?![\w.])")
 #: The names OpenSSL follows from the default section to the system-default policy section.
 _SYSTEM_DEFAULT_CHAIN = ("openssl_conf", "ssl_conf", "system_default")
+#: The one link that names a configuration MODULE rather than a fixed name. OpenSSL reads a module
+#: line's name up to its last ``.``, so ``ssl_conf.1`` names this module too, and then matches that
+#: stem as a prefix of each module it knows, so a stem such as ``ssl`` can name it as well.
+_SSL_MODULE = "ssl_conf"
 _TLS12_OR_HIGHER = frozenset({"TLSv1.2", "TLSv1.3"})
 
 _SEE_DOC = "see DEPLOY-SERVER-DB.md section 5.4"
@@ -230,13 +234,15 @@ def _schannel_client_enabled(version: str) -> int | None:
 def _schannel_policy_order() -> list[str] | None:
     """The suite list Group Policy's "SSL Cipher Suite Order" sets, or ``None`` when it sets none.
 
-    Split on commas in either string form, and every entry must be a suite name, so an entry that
-    joins a CBC and a GCM suite some other way is an ERROR, never one AEAD suite."""
+    Split on commas in any of the three string forms, and every entry must be a suite name, so an
+    entry that joins a CBC and a GCM suite some other way is an ERROR, never one AEAD suite. An
+    expandable string is read as it is, unexpanded: a suite name holds no ``%``, so a value that
+    would expand fails the name check rather than being judged on text SChannel may not see."""
     found = _hklm_value(_POLICY_ORDER_KEY, "Functions")
     if found is None:
         return None
     value, kind = found
-    if kind == _REG_SZ and isinstance(value, str):
+    if kind in (_REG_SZ, _REG_EXPAND_SZ) and isinstance(value, str):
         items = [value]
     elif kind == _REG_MULTI_SZ and isinstance(value, list):
         items = [str(item) for item in value]
@@ -344,14 +350,35 @@ def _system_default_section(sections: dict[str, list[tuple[str, str]]]) -> str |
 
     ``openssl_conf`` in the default section names a section, that section's ``ssl_conf`` names
     another, and its ``system_default`` names the one applied: ``[system_default_sect]`` on the
-    stock Ubuntu file section 5.4 measured. A name set twice takes its last value, as in OpenSSL."""
+    stock Ubuntu file section 5.4 measured. A name set twice takes its last value, as in OpenSSL.
+    The module link is matched as :func:`_names_the_ssl_module` says."""
     name = "default"
     for key in _SYSTEM_DEFAULT_CHAIN:
-        found = dict(sections.get(name, [])).get(key)  # dict() keeps a repeated name's last value
+        lines = sections.get(name, [])
+        if key == _SSL_MODULE:
+            values = [value for line_name, value in lines if _names_the_ssl_module(line_name)]
+            found = values[-1] if values else None
+        else:
+            found = dict(lines).get(key)  # dict() keeps a repeated name's last value
         if found is None:
             return None
         name = _expanded_nowhere(found)
     return name
+
+
+def _names_the_ssl_module(name: str) -> bool:
+    """Whether a line of the ``openssl_conf`` section names the SSL module.
+
+    ``ssl_conf`` and ``ssl_conf.<anything>`` do: OpenSSL drops the last ``.`` and what follows. A
+    stem that is a shorter prefix of ``ssl_conf``, such as ``ssl``, may name it or an earlier
+    module, depending on which modules that OpenSSL build registers first, so it raises
+    :class:`ProbeUnavailable` rather than being guessed either way."""
+    stem = name.rsplit(".", 1)[0]
+    if stem == _SSL_MODULE:
+        return True
+    if stem and _SSL_MODULE.startswith(stem):
+        raise _not_followed(f"the module name {name!r}, which OpenSSL may read as {_SSL_MODULE}")
+    return False
 
 
 def _openssl_policy_lines() -> tuple[Path, str | None, list[tuple[str, str]]]:
