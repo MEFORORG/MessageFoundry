@@ -1706,7 +1706,9 @@ class AdminGrant(StrEnum):
 
     #: The account now holds Administrator.
     GRANTED = "granted"
-    #: Another enabled, seal-valid administrator exists, so nothing was written.
+    #: Another enabled, seal-valid administrator the caller's test counts exists, so nothing was
+    #: written. ``provision_first_administrator`` counts only one that signs in with a local
+    #: password (vault BACKLOG #2711 step 1).
     ADMIN_EXISTS = "admin_exists"
     #: The account no longer holds the credentials the caller wrote, holds a role already, or is
     #: disabled or gone, so nothing was written.
@@ -1735,8 +1737,11 @@ def _is_sqlite_busy(exc: sqlite3.OperationalError) -> bool:
 #: ``WHERE id=?`` does, under the database's own collation. SQL Server runs it as is; Postgres
 #: carries a ``$n``/boolean twin. One more copy of "enabled administrator" beside the service's
 #: enumerations (``AuthService.has_notifiable_admin`` lists them); a condition added to one belongs
-#: in all. Since BACKLOG #2592 the other holders are counted only when their record passes its
-#: integrity seal (:func:`admin_guard_counts`), as the service's enumerations count them.
+#: in all. The first-administrator grant's own narrowing (``counts_as_admin``, vault BACKLOG #2711)
+#: is not such a condition: it is applied after this read, to the grant only, and the removal
+#: guard must keep counting directory administrators. Since BACKLOG #2592 the other holders are
+#: counted only when their record passes its integrity seal (:func:`admin_guard_counts`), as the
+#: service's enumerations count them.
 _SQL_ADMIN_GUARD_HOLDERS = (
     "SELECT u.id, CASE WHEN u.id = ? THEN 1 ELSE 0 END"
     " FROM users u JOIN user_roles r ON r.user_id = u.id"
@@ -1744,22 +1749,34 @@ _SQL_ADMIN_GUARD_HOLDERS = (
 )
 
 
+#: Which other enabled administrators the first-administrator grant counts (vault BACKLOG #2711
+#: step 1, owner ruling B258-R4). The auth service supplies it from the same predicate its
+#: ``provision-admin`` refusal reads, so the guard and the refusal cannot disagree; the store has no
+#: rule of its own for what a usable administrator is.
+type AdminHolderTest = Callable[[UserRow], bool]
+
+
 async def admin_guard_counts(
     holders: Iterable[tuple[str, bool]],
     sealer: RowSealer | None,
     read_record: Callable[[str], Awaitable[UserAuthzRecord | None]],
+    counts: AdminHolderTest | None = None,
 ) -> tuple[int, int]:
     """``(target, others)`` for the last-administrator guard from :data:`_SQL_ADMIN_GUARD_HOLDERS`'
     rows (BACKLOG #2592). Another holder counts only when its record passes its seal, read with
     ``read_record`` inside the guard's transaction: a refused administrator can sign nobody in, so
-    counting it would let the last usable administrator be removed."""
+    counting it would let the last usable administrator be removed. With ``counts``, it must also
+    pass that test (the first-administrator grant's); the removal guard passes none, so it counts
+    every sealed holder."""
     target = others = 0
     for holder_id, is_target in holders:
         if is_target:
             target += 1
             continue
         record = await read_record(holder_id)
-        if record is not None and user_seal_ok(sealer, record):
+        if record is None or not user_seal_ok(sealer, record):
+            continue
+        if counts is None or counts(record.row):
             others += 1
     return target, others
 
@@ -15391,6 +15408,7 @@ class MessageStore:
         admin_role_id: str,
         expected_password_hash: str,
         expected_totp_secret_cell: str | None,
+        counts_as_admin: AdminHolderTest,
         assigned_by: str | None = None,
         now: float | None = None,
     ) -> AdminGrant:
@@ -15412,7 +15430,7 @@ class MessageStore:
                     cur = await self._db.execute(_SQL_ADMIN_GUARD_HOLDERS, (user_id, admin_role_id))
                     holders = [(str(r[0]), bool(r[1])) for r in await cur.fetchall()]
                     _, others = await admin_guard_counts(
-                        holders, self._row_sealer, self._read_user_record
+                        holders, self._row_sealer, self._read_user_record, counts_as_admin
                     )
                     if others:
                         await self._db.rollback()

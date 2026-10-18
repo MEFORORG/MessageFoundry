@@ -68,6 +68,7 @@ from messagefoundry.store.store import (
     UPLOAD_RESERVATION_STALE_AFTER,
     AdMap,
     AdminGrant,
+    AdminHolderTest,
     AdminRemoval,
     AlertInstance,
     AlertSummary,
@@ -2273,7 +2274,9 @@ class AuthStore(Protocol):
         ...
 
     # --- The first-seen sign-in address baseline (BACKLOG #288, vault BACKLOG #2145) ---
-    # One row per (account id, host key). The caller folds the address to its host key; the store
+    # One row per (account id, host key), plus, after an administrator's reset, one marker row that
+    # holds no host (auth/service.py ``_LOGIN_ADDRESS_RESET_MARKER``, vault BACKLOG #2946). The
+    # caller folds the address to its host key; the store
     # compares it byte for byte. Both reads and writes go through the (user_id, address) primary key.
     #
     # The host keys recorded for the account with ``last_seen >= since``, in no order.
@@ -2570,15 +2573,20 @@ class AuthStore(Protocol):
         admin_role_id: str,
         expected_password_hash: str,
         expected_totp_secret_cell: str | None,
+        counts_as_admin: AdminHolderTest,
         assigned_by: str | None = None,
         now: float | None = None,
     ) -> AdminGrant:
-        """Give ``user_id`` exactly ``admin_role_id`` unless another enabled administrator exists
-        (BACKLOG #3078). ``provision_first_administrator``'s grant.
+        """Give ``user_id`` exactly ``admin_role_id`` unless another enabled administrator that
+        ``counts_as_admin`` passes exists (BACKLOG #3078). ``provision_first_administrator``'s
+        grant.
 
         One transaction re-reads the enabled accounts holding ``admin_role_id``, counting each other
         than ``user_id`` only when its record passes its integrity seal, as
-        :meth:`remove_unless_last_admin` counts them. When any is counted it writes nothing and
+        :meth:`remove_unless_last_admin` counts them, and ``counts_as_admin`` passes its ``users``
+        row. The auth service passes the predicate its ``provision-admin`` refusal reads, so only
+        an administrator that signs in with a local password counts (vault BACKLOG #2711 step 1,
+        owner ruling B258-R4); a directory one does not. When any is counted it writes nothing and
         returns :attr:`AdminGrant.ADMIN_EXISTS`. Otherwise it writes the role only while the
         account is enabled, holds no role, and still holds the credentials the caller wrote:
         ``expected_password_hash``, and no TOTP secret when ``expected_totp_secret_cell`` is
@@ -2588,7 +2596,8 @@ class AuthStore(Protocol):
 
         **It is serialized against every other call of this and of :meth:`remove_unless_last_admin`
         on the same database**, under the same lock, not only in this process. So two provisioning
-        runs with different usernames, each of which saw no administrator, cannot both be granted:
+        runs with different usernames, each of which saw no administrator ``counts_as_admin``
+        passes, cannot both be granted:
         the one whose grant commits second reads the first and is refused. SQLite has no such lock
         across processes and relies on its single writer instead; its implementation re-runs the
         transaction a bounded number of times when the write fails busy, and raises past that bound

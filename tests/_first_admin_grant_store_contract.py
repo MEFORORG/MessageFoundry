@@ -16,8 +16,12 @@ and synthetic hash strings only: nothing here verifies a password.
 from __future__ import annotations
 
 import asyncio
+import time
+from functools import partial
 from typing import Any
 
+from messagefoundry.auth.service import AuthService
+from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import AdminGrant
 from tests._last_admin_store_contract import ADMIN, VIEWER, enabled_admins
 
@@ -61,11 +65,19 @@ async def provisioned_row(store: Any, user_id: str, *, totp: bool) -> str | None
     return str(cell)
 
 
+def counts_as_admin(store: Any) -> Any:
+    """The test the service passes the grant: its own ``provision-admin`` predicate (vault BACKLOG
+    #2711 step 1), so this contract runs the rule the service runs, not a copy of it."""
+    service = AuthService(store, AuthSettings())
+    return partial(service._signs_in_without_an_outside_service, now=time.time())
+
+
 async def grant(store: Any, user_id: str, cell: str | None, **overrides: Any) -> AdminGrant:
     kwargs: dict[str, Any] = {
         "admin_role_id": ADMIN,
         "expected_password_hash": hash_of(user_id),
         "expected_totp_secret_cell": cell,
+        "counts_as_admin": counts_as_admin(store),
         "assigned_by": "test",
     }
     kwargs.update(overrides)
@@ -117,6 +129,52 @@ async def assert_first_admin_grant_contract(store: Any) -> None:
     await store.set_user_disabled("c", disabled=True)
     assert await grant(store, "c", None) is AdminGrant.ACCOUNT_CHANGED
     assert await store.get_user_role_ids("c") == []
+
+
+async def assert_grant_counts_only_a_local_administrator_that_signs_in(store: Any) -> None:
+    """Vault BACKLOG #2711 step 1, owner ruling B258-R4: ``provision-admin`` runs whenever no
+    enabled local Administrator has a usable password, so its in-transaction guard must not refuse
+    where its refusal did not. A directory Administrator, or a local one with no password, does not
+    refuse the grant; a local one with a password does.
+
+    RED when: the guard counts every enabled holder of the role, as it did before step 1."""
+    await seed_roles(store)
+    await store.create_user(
+        user_id="dir",
+        username="name-dir",
+        auth_provider="ad",
+        now=1.0,
+        password_hash=None,
+        password_generated=False,
+    )
+    await store.set_user_roles("dir", [ADMIN], assigned_by="test")
+    # A directory account holding a hash still needs the directory: the provider is what decides.
+    await store.create_user(
+        user_id="dir-hashed",
+        username="name-dir-hashed",
+        auth_provider="ad",
+        now=1.0,
+        password_hash="synthetic-hash-dir-hashed",
+        password_generated=False,
+    )
+    await store.set_user_roles("dir-hashed", [ADMIN], assigned_by="test")
+    await store.create_user(
+        user_id="hashless",
+        username="name-hashless",
+        auth_provider="local",
+        now=1.0,
+        password_hash=None,
+        password_generated=False,
+    )
+    await store.set_user_roles("hashless", [ADMIN], assigned_by="test")
+    await provisioned_row(store, "a", totp=False)
+    await provisioned_row(store, "b", totp=False)
+
+    assert await grant(store, "a", None) is AdminGrant.GRANTED
+    assert await enabled_admins(store) == {"dir", "dir-hashed", "hashless", "a"}
+    # Paired control: a local Administrator with a usable password now exists, so it refuses.
+    assert await grant(store, "b", None) is AdminGrant.ADMIN_EXISTS
+    assert await store.get_user_role_ids("b") == []
 
 
 async def assert_concurrent_grants_leave_one(store: Any) -> None:

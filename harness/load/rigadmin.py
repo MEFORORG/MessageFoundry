@@ -9,8 +9,12 @@ reads the API with that session.
 
 ``provision-admin`` reads its password from a terminal and has no other input, on purpose. A rig has
 no terminal. So :func:`provision` runs the shipped command in a child process with that one read
-replaced by a value the rig holds. The rest is the shipped code path: at least the settings, the
-at-rest gate, the store open, the password policy and the account write. ``scripts/service/measure-store-access.ps1`` does
+replaced by a value the rig holds. The child also wraps the command's
+``_build_provision_auth_service``, so the service's ``provision_refusal`` and
+``provision_first_administrator`` refuse a store that holds an enabled Administrator, though none
+signs in with a local password (vault BACKLOG #2711, :func:`_keep_the_narrow_rule`). That only
+narrows the command. The rest is the shipped code path: at least the settings, the at-rest gate,
+the store open, the password policy and the account write. ``scripts/service/measure-store-access.ps1`` does
 the same on Windows; this is that recipe for every platform.
 
 **This is test tooling.** It adds no flag, no environment switch, no password path and no
@@ -77,7 +81,7 @@ import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO, Protocol
+from typing import IO, Any, Protocol
 from urllib.parse import urlsplit
 
 __all__ = [
@@ -414,8 +418,9 @@ def provision(
 
     ``env`` and ``cwd`` are the ones the rig's ``serve`` runs under, so the child loads the same
     settings and opens the same store. Returns ``True`` when it created the account and ``False``
-    when the store already had an enabled Administrator. Raises :class:`RigAdminError` on any other
-    refusal, carrying the command's own words.
+    when the store already had an enabled local Administrator with a usable password. Raises
+    :class:`RigAdminError` on any other refusal, carrying the command's own words, including the
+    rig's own refusal of a store whose enabled Administrators all need an outside service.
 
     The child is this file, run with ``-P`` so its directory is not put on ``sys.path``:
     ``harness/load`` holds modules named like standard-library ones.
@@ -495,8 +500,10 @@ def _provision_here(db: str | None, service_config: str | None) -> int:
     def _held_password(prompt: str) -> str:
         return held
 
-    # The password seam. Everything else provision-admin does is the shipped code path.
+    # The password seam. Everything else provision-admin does is the shipped code path, narrowed
+    # by the guard below and never widened.
     cli._read_new_password = _held_password
+    _keep_the_narrow_rule(cli)
     argv = ["provision-admin", "--username", username, "--email", _NOTIFY_ADDRESS]
     if factor is None:
         argv.append("--no-totp")
@@ -530,12 +537,74 @@ def _provision_here(db: str | None, service_config: str | None) -> int:
         print("provisioned the rig Administrator")
         return 0
     refusal = _json_error(captured.getvalue())
+    if refusal == _RIG_REFUSAL:
+        # A failure, not EXIT_EXISTS: no Administrator here signs in with a local password, so the
+        # rig could not sign in either. ``provision`` carries this text into its error.
+        print(_RIG_REFUSAL, file=sys.stderr)
+        return 1
     if _ADMIN_EXISTS in refusal:
         print("the store already has an enabled Administrator; nothing provisioned")
         return EXIT_EXISTS
     # The command's refusals name settings and clauses, never the password it was given.
     print(refusal or captured.getvalue().strip(), file=sys.stderr)
     return code or 1
+
+
+#: The rig's own refusal, given only where the shipped command would have provisioned.
+#: It does not carry :data:`_ADMIN_EXISTS`: the rig reads it as a failure.
+_RIG_REFUSAL = (
+    "the store has an enabled Administrator, though none signs in with a local password (a "
+    "directory or federated one counts here), so the load rig provisions nothing: it adds its "
+    "Administrator only to a store with no enabled Administrator at all"
+)
+
+
+def _keep_the_narrow_rule(cli: Any) -> None:
+    """Hold the rig to the rule ``provision-admin`` had before vault BACKLOG #2711 step 1.
+
+    Step 1 (owner ruling B258-R4) lets the command run whenever no enabled LOCAL Administrator has
+    a usable password, so a directory-run site can get back in while its directory is down. On
+    such a store the command adds an Administrator beside live directory Administrators and tells
+    them nothing (ADR 0183 Amendment E, *What it opens*). A rig with no authenticator key runs it
+    with ``--no-totp``, so that Administrator would have no second factor either. The rig keeps
+    the old rule instead, with or without a key: it provisions only when the store has no enabled
+    Administrator of any kind. The engine adds no flag for this.
+
+    It wraps the command's one :class:`~messagefoundry.auth.service.AuthService`, built by
+    ``_build_provision_auth_service``, against the store the command has open at that moment. The
+    pre-prompt refusal asks the shipped check and then the wider one. The write asks the wider one
+    before the shipped write runs, so a refused store is never written.
+    """
+    build = cli._build_provision_auth_service
+
+    def _narrow_build(*args: Any, **kwargs: Any) -> Any:
+        service = build(*args, **kwargs)
+        refusal_of = service.provision_refusal
+        write = service.provision_first_administrator
+
+        async def _only_outside_service_admins() -> bool:
+            # The case step 1 opened: an enabled Administrator, but none the shipped rule counts.
+            # Where a local one counts, the shipped command refuses in its own words.
+            return bool(await service.administrators_needing_an_outside_service())
+
+        async def _refusal(*a: Any, **kw: Any) -> Any:
+            shipped = await refusal_of(*a, **kw)
+            if shipped is None and await _only_outside_service_admins():
+                return _RIG_REFUSAL
+            return shipped
+
+        async def _write(*a: Any, **kw: Any) -> Any:
+            if await _only_outside_service_admins():
+                from messagefoundry.auth.service import FirstAdministratorRefused
+
+                raise FirstAdministratorRefused(_RIG_REFUSAL)
+            return await write(*a, **kw)
+
+        service.provision_refusal = _refusal
+        service.provision_first_administrator = _write
+        return service
+
+    cli._build_provision_auth_service = _narrow_build
 
 
 def _json_error(text: str) -> str:

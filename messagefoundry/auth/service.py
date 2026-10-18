@@ -164,6 +164,7 @@ from messagefoundry.store.store import (
     SessionRecord,
     UserAuthzRecord,
     UserRecord,
+    UserRow,
     VerifiedUser,
     WebAuthnCredential,
     ad_map_seal_ok,
@@ -469,6 +470,15 @@ _LOGIN_ADDRESS_KEY_MAX = 256
 # One ``login_new_ip`` notice per account and address per this many seconds, in each engine process
 # (see ``_login_new_ip_notice_due``). The audit row is not debounced.
 _LOGIN_NEW_IP_NOTICE_SECONDS = 900.0
+# The one row an administrator's password or MFA reset leaves in the account's known-address record
+# (vault BACKLOG #2946). It is the baseline for an account that has never stamped ``last_login_at``,
+# so the next sign-in after the reset is judged NEW rather than failed open as no-baseline. It is
+# never a match: it is stamped at the epoch, outside every lookback, ``_mark_login_address_known``
+# never writes a client whose text equals it, and the next real write's prune usually removes it.
+_LOGIN_ADDRESS_RESET_MARKER = "cleared by reset"
+# Larger than any ``last_seen`` the record can hold, so a prune with it deletes every row. Finite,
+# because SQL Server's FLOAT cannot hold an infinity.
+_LOGIN_ADDRESS_FOREVER = 1e18
 
 
 class _LoginAddress(Enum):
@@ -482,7 +492,8 @@ class _LoginAddress(Enum):
     NEW = "new"
     # The account has never completed a sign-in and has no known address, so every address would be
     # "first seen". Challenging and notifying here would fire on every account's first login, which is
-    # noise, not signal.
+    # noise, not signal. An administrator's password or MFA reset leaves a marker row, so an account
+    # reset before its first sign-in is judged, and that sign-in is NEW (vault BACKLOG #2946).
     UNEVALUATED_NO_BASELINE = "no_baseline"
     # The caller passed no client address (an in-process caller, or an ASGI scope with no client).
     UNEVALUATED_UNKNOWN_ADDRESS = "unknown_address"
@@ -2578,6 +2589,15 @@ _UNSEALED_NAME_REFUSAL: Final = (
     "the account named {username!r} fails its integrity seal, so it is refused and cannot be"
     " repaired -- provision under a different username"
 )
+#: ``provision-admin``'s refusal while a local Administrator can sign in with its password (vault
+#: BACKLOG #2711 step 1). Keep the words "already has an enabled Administrator": at least the VS
+#: Code extension (``ide/src/engineControlModel.ts``), the load rig (``harness/load/rigadmin.py``)
+#: and ``scripts/service/measure-store-access.ps1`` key on them.
+_ADMINISTRATOR_EXISTS_REFUSAL: Final = (
+    "this store already has an enabled Administrator that signs in with a local password, so there"
+    " is nothing to provision -- create further accounts from the web console, and use"
+    " `admin-unlock` if that administrator is locked out"
+)
 
 
 def _lookup_keys(user: UserRecord) -> tuple[str | None, ...]:
@@ -3215,13 +3235,55 @@ class AuthService:
         return False
 
     async def has_enabled_administrator(self) -> bool:
-        """True iff some enabled account holds Administrator.
+        """True iff some enabled account holds Administrator, whichever kind.
 
-        The provisioning refusal below asks this, and so does ``provision-admin`` before it prompts.
-        (Further open-coded copies of that enumeration exist -- see :meth:`has_notifiable_admin` --
-        and unifying them is its own item, not this one.)
+        The directory-demotion alert asks this. The provisioning refusal does not since vault BACKLOG
+        #2711 step 1; it asks :meth:`has_self_sufficient_administrator`. (Further open-coded copies
+        of that enumeration exist -- see :meth:`has_notifiable_admin` -- and unifying them is its
+        own item, not this one.)
         """
         return await self._other_enabled_admin_exists()
+
+    def _signs_in_without_an_outside_service(self, user: UserRecord | UserRow, now: float) -> bool:
+        """True iff ``user`` is a local account holding a password the login gate would still
+        accept: not a must-change credential past its deadline (:meth:`_credential_lapsed`). A
+        directory account needs the directory (a federated binding is only ever on one), and a
+        local row with no hash, or an expired temporary one, cannot sign in at all. Enabled and the
+        role are the caller's to check. It takes a raw ``UserRow`` too, for the first-administrator
+        grant's in-transaction guard (``counts_as_admin``), which checks the seal itself."""
+        if user.auth_provider != AuthProvider.LOCAL.value or user.password_hash is None:
+            return False
+        return not self._credential_lapsed(user, now)
+
+    async def _administrator_standing(self) -> tuple[bool, tuple[str, ...]]:
+        """Whether some enabled Administrator signs in without an outside service, and every
+        enabled Administrator's username, sorted.
+
+        THE ONE COMPUTATION behind both the ``provision-admin`` refusal and the start notice of
+        vault BACKLOG #2711 (owner ruling B258-R4, ADR 0183 Amendment E), so the command cannot
+        refuse a site the notice says it would rescue, or the reverse."""
+        now = time.time()
+        usable = False
+        names: list[str] = []
+        for user in await self._load_users():
+            if user.disabled or Role.ADMINISTRATOR.value not in user.role_ids:
+                continue
+            usable = usable or self._signs_in_without_an_outside_service(user, now)
+            names.append(user.username)
+        return usable, tuple(sorted(names))
+
+    async def has_self_sufficient_administrator(self) -> bool:
+        """True iff some enabled Administrator is a local account with a usable password, so it can
+        sign in with no directory or identity provider up.
+
+        ``provision-admin`` refuses whenever this holds (vault BACKLOG #2711 step 1, ADR 0183
+        Amendment E), and otherwise only for its own reasons, such as the named row or the password
+        policy. Before that, it refused while any enabled Administrator existed, so a site
+        whose every Administrator needed an outside service had no host command to get back in
+        while that service was down. :meth:`administrators_needing_an_outside_service` names
+        accounts exactly when this is false and an enabled Administrator exists."""
+        usable, _names = await self._administrator_standing()
+        return usable
 
     async def provision_first_administrator(
         self,
@@ -3276,6 +3338,16 @@ class AuthService:
         wider than an emptiness guard by design: it makes this a standing recovery path whenever
         every administrator is lost, which overlaps BACKLOG #1236's subject on the same host boundary.
 
+        **SINCE VAULT BACKLOG #2711 STEP 1 IT ASKS FOR A SELF-SUFFICIENT ONE** (owner ruling B258-R4,
+        ADR 0183 Amendment E): an enabled LOCAL Administrator with a usable password, by
+        :meth:`has_self_sufficient_administrator`, the same computation the start notice reads. A
+        directory or federated Administrator no longer blocks it, so a site whose every
+        Administrator needs an outside service can make a local one at the host while that service
+        is down. The check is a read before the writes, so two runs with different usernames can
+        both pass it; the guarded grant below closes that race (vault BACKLOG #3078). It counts what
+        this check counts, so it never counts an Administrator this check passed over, such as a
+        directory one; it refuses only for one it counts that appeared after the check.
+
         **THE CREDENTIAL IS CLAIMED AT BIRTH, so there is no half-claimed state to restart into.**
         The password is typed by the operator at a TTY and reaches no file, no argv and no log, so
         "the holder set their own credential" is already true and ``users.password_claimed_at`` is
@@ -3292,8 +3364,13 @@ class AuthService:
         refused the SECOND state, leaving a row this command could never complete -- a stranded
         install, which is exactly the risk the design exists to avoid. Roleless
         is also what makes the takeover safe rather than merely convenient: the account holds no
-        permission to inherit, and this branch is reachable only when the store has no enabled
-        administrator at all, which is already the state an operator needs recovering from. Safe is
+        permission to inherit, and before #2711 step 1 this branch was reachable only when the store
+        had no enabled administrator at all, which is already the state an operator needs
+        recovering from. **Since step 1 that premise is narrower.** The branch is reachable whenever
+        no enabled local Administrator has a usable password. On a directory-run site it can then
+        take over a roleless local account while the directory Administrators still sign in. The
+        host gate is unchanged, and the audit row's ``administrators_at_check`` names who held the
+        role. A tighter rule for that case is not built here. Safe is
         not silent, though: a roleless account can still be somebody's, so a repair tells the
         address it held before (BACKLOG #2019). And a row that holds an address is completed only
         when ``notify_email`` is given (BACKLOG #2288), so the sole Administrator's notices never
@@ -3318,12 +3395,9 @@ class AuthService:
                 raise FirstAdministratorRefused(
                     f"the notification address was refused: {exc}"
                 ) from exc
-        if await self.has_enabled_administrator():
-            raise FirstAdministratorRefused(
-                "this store already has an enabled Administrator, so there is nothing to provision "
-                "-- create further accounts from the web console, and use `admin-unlock` if the "
-                "administrator is locked out"
-            )
+        usable, standing_admins = await self._administrator_standing()
+        if usable:
+            raise FirstAdministratorRefused(_ADMINISTRATOR_EXISTS_REFUSAL)
         violations = self._policy.violations(password, username=username)
         if violations:
             raise FirstAdministratorRefused("; ".join(violations))
@@ -3533,11 +3607,15 @@ class AuthService:
             admin_role_id=Role.ADMINISTRATOR.value,
             expected_password_hash=password_hash,
             expected_totp_secret_cell=staged_cell,
+            # vault BACKLOG #2711 step 1: the guard counts what the refusal above counts, so a
+            # directory Administrator does not refuse the grant any more than it refused the run.
+            counts_as_admin=partial(self._signs_in_without_an_outside_service, now=time.time()),
             assigned_by=actor,
         )
         if grant is AdminGrant.ADMIN_EXISTS:
             raise FirstAdministratorRefused(
-                "another enabled Administrator was created while this command ran, so this run "
+                "another enabled Administrator was created while this command ran, or one "
+                "gained a usable password, so this run "
                 f"granted no role, and the account named {username!r} holds none; remove any "
                 "authenticator entry it showed. If this run created that account and nobody needs "
                 "it, delete it from the web console"
@@ -3590,6 +3668,11 @@ class AuthService:
                     # The earlier address itself is not recorded here; the notice went to it.
                     "notify_email_moved": moved,
                     "totp_enrolled": totp_secret is not None,
+                    # Vault BACKLOG #2711 step 1: every enabled Administrator when this run checked.
+                    # None of them could sign in with a local password; most are directory
+                    # accounts. Empty on a first install; non-empty means this one was added beside
+                    # them.
+                    "administrators_at_check": list(standing_admins),
                 }
             ),
         )
@@ -3638,7 +3721,9 @@ class AuthService:
                 "admin-reset-totp`, naming that account and giving the same --db and "
                 "--service-config as this run"
             )
-        if await self.has_enabled_administrator():
+        # The refusal's own test (vault BACKLOG #2711 step 1): a directory Administrator is not
+        # one this command would have been refused for, so it is not named as the cause here.
+        if await self.has_self_sufficient_administrator():
             return (
                 f"{prefix}. That account holds no Administrator role, and another enabled "
                 "Administrator now exists; remove any authenticator entry this run showed. If "
@@ -3698,7 +3783,8 @@ class AuthService:
 
     async def provision_refusal(self, username: str, *, notify_email: str | None) -> str | None:
         """What ``provision_first_administrator`` would refuse ``username`` for, asked BEFORE any
-        prompt (ADR 0197 Amendment A): an enabled Administrator exists, or the named row is one this
+        prompt (ADR 0197 Amendment A): an enabled local Administrator with a usable password exists
+        (:meth:`has_self_sufficient_administrator`, vault BACKLOG #2711), or the named row is one this
         command will not complete. ``provision-admin`` asks it first, so an operator is never shown
         an authenticator key for an account the store then refuses. The service still refuses on its
         own; this is the courtesy, that is the control. ``notify_email`` is the ``--email`` value,
@@ -3710,12 +3796,8 @@ class AuthService:
                 notify_email = _require_single_mailbox(notify_email)
             except InvalidNotifyEmail as exc:
                 return f"the notification address was refused: {exc}"
-        if await self.has_enabled_administrator():
-            return (
-                "this store already has an enabled Administrator, so there is nothing to provision "
-                "-- create further accounts from the web console, and use `admin-unlock` if the "
-                "administrator is locked out"
-            )
+        if await self.has_self_sufficient_administrator():
+            return _ADMINISTRATOR_EXISTS_REFUSAL
         lookup = await self._lookup_by_username(name)
         existing = lookup.user
         if existing is None:
@@ -3743,7 +3825,7 @@ class AuthService:
             return None
         return password_changed_at + hours * 3600.0
 
-    def _credential_lapsed(self, user: UserRecord, now: float) -> bool:
+    def _credential_lapsed(self, user: UserRecord | UserRow, now: float) -> bool:
         """Whether ``user`` holds an admin-issued must-change credential past its deadline at ``now``.
 
         The sign-in gate's own test, over :meth:`initial_credential_deadline`, for a session opened
@@ -8421,9 +8503,10 @@ class AuthService:
         the role at once. This adds the ``no_enabled_administrator`` alert and a
         :data:`NO_ENABLED_ADMINISTRATOR_ACTION` row, so the operators learn of it. The cost the
         ruling accepts: an all-directory Administrator set can end up with no Administrator, noted
-        with vault BACKLOG #2711, the open recovery row for such a set. Until the directory grants
-        the role again at a sign-in, the way back is ``provision-admin`` at the host, which runs
-        once no enabled Administrator exists (docs/SECURITY.md, *Keep a local Administrator*).
+        with vault BACKLOG #2711, the recovery row for such a set. Until the directory grants the
+        role again at a sign-in, the way back is ``provision-admin`` at the host. Since #2711 step 1
+        it runs whenever no enabled local Administrator has a usable password, which a set left with
+        no Administrator always meets (docs/SECURITY.md, *Keep a local Administrator*).
 
         It fires only when this write took Administrator from an enabled account and none is left.
         The count is read after the write, so when two directory demotions race, the later read
@@ -10742,7 +10825,8 @@ class AuthService:
         ``last_login_at`` and no row of any age. Both are needed. A first sign-in finished through
         factor enrolment writes a row but never stamps ``last_login_at``, so an account that did that
         and then sat idle past the lookback still has a baseline, and its next sign-in is judged
-        rather than failed open. That case costs the one extra read, outside the lookback.
+        rather than failed open. That case costs the one extra read, outside the lookback. The row
+        :meth:`_clear_login_addresses` leaves after a reset is such a baseline, and never a match.
 
         A failed read fails open as ``UNEVALUATED_READ_FAILED``. The exception classes differ per
         store backend (sqlite3, asyncpg, pyodbc), none of which ``auth/`` may import, so the catch
@@ -10821,13 +10905,21 @@ class AuthService:
         followed by a prune of the account's rows older than the lookback, the record's only
         retention, in its own call, so a failed prune never reads as a lost write.
 
-        The catches are broad for the reason :meth:`_classify_login_address` states, except that a
-        programming error (``AttributeError``, ``TypeError``) is re-raised rather than logged."""
+        The catches are broad for the reason :meth:`_classify_login_address` states, and they cover a
+        programming error too: this helper never raises. Its callers run it after the ceremony has
+        committed, and some still hold a reply to send, such as the rotated token and the recovery
+        codes an enrolment returns. A raise here would lose that reply (vault BACKLOG #2964). The
+        logged traceback is how a programming error surfaces instead."""
         if not client:
             return
         try:
             key = _host_key(client)
-            if len(key.encode("utf-16-le")) // 2 > _LOGIN_ADDRESS_KEY_MAX:
+            # A client text equal to the reset marker (a forged forwarded header can carry any
+            # text) is not written, or the upsert would move the marker into the lookback.
+            if (
+                key == _LOGIN_ADDRESS_RESET_MARKER
+                or len(key.encode("utf-16-le")) // 2 > _LOGIN_ADDRESS_KEY_MAX
+            ):
                 return
             if step_up:
                 user = await self._load_user(user_id)
@@ -10840,8 +10932,6 @@ class AuthService:
                 return
             now = time.time()
             await self._store.remember_login_address(user_id, key, now=now)
-        except (AttributeError, TypeError):
-            raise
         except Exception:
             _log.exception(
                 "could not record a known sign-in address; the ceremony it records stands"
@@ -10851,12 +10941,46 @@ class AuthService:
             await self._store.forget_login_addresses(
                 user_id, before=now - _LOGIN_ADDRESS_LOOKBACK_SECONDS
             )
-        except (AttributeError, TypeError):
-            raise
         except Exception:
-            _log.warning(
-                "could not prune old known sign-in addresses; the address itself was recorded",
-                exc_info=True,
+            # ERROR with the traceback, as the write logs: a fault here that repeats at every
+            # sign-in disables the record's only retention, and must not read as a passing warning.
+            _log.exception(
+                "could not prune old known sign-in addresses; the address itself was recorded"
+            )
+
+    async def _clear_login_addresses(self, user_id: str, *, username: str) -> None:
+        """Empty the account's known-address record after an administrator's password or MFA reset
+        (vault BACKLOG #2946, owner ruling 2026-10-16), so an address learned before the reset, by
+        the holder or by whoever the reset shuts out, reads NEW at the next sign-in. Revoking every
+        session does not call this, because revoking is routine.
+
+        It leaves one row, ``_LOGIN_ADDRESS_RESET_MARKER``, stamped at the epoch so the lookback
+        read never returns it. An account that never stamped ``last_login_at`` would otherwise read
+        as having no baseline, and its next sign-in would fail open as ``UNEVALUATED_NO_BASELINE``
+        rather than be judged NEW. In the usual case the prune after the next real write removes
+        it, and that write has just added a real row; ``delete_user`` and a later reset also remove
+        it. Every reset leaves it, an account that never signed in included, as the ruling asks.
+
+        Best-effort and never raising, for the reason :meth:`_mark_login_address_known` gives: the
+        reset's credential write has committed, and its reply carries the one-time credential. A
+        failure is logged at ERROR with the username, and the reset stands with the record as the
+        failure left it: unchanged, or emptied with no marker. The two calls are separate
+        transactions, so any record write still in flight for the account, from a sign-in, a
+        step-up, a factor proof or an enrolment, can land after the delete."""
+        # The notice debounce goes too, so the first NEW sign-in after the reset is also mailed.
+        for key in [k for k in self._login_new_ip_noticed if k[0] == user_id]:
+            del self._login_new_ip_noticed[key]
+        try:
+            await self._store.forget_login_addresses(user_id, before=_LOGIN_ADDRESS_FOREVER)
+            # Stamped at the epoch, so the lookback read never returns it and only the any-age
+            # baseline read sees it.
+            await self._store.remember_login_address(user_id, _LOGIN_ADDRESS_RESET_MARKER, now=0.0)
+        except Exception:
+            _log.exception(
+                "could not clear the known sign-in addresses of %s after a reset; the reset stands, "
+                "and the next sign-in may read an address seen before it as known, or find no "
+                "baseline",
+                username,
             )
 
     def _login_new_ip_notice_due(self, user_id: str, client: str | None) -> bool:
@@ -11148,30 +11272,17 @@ class AuthService:
 
     async def administrators_needing_an_outside_service(self) -> tuple[str, ...]:
         """The enabled Administrators, by username, when NONE of them can sign in without an outside
-        identity service; empty otherwise (vault BACKLOG #2711, step 2).
+        identity service (:meth:`_signs_in_without_an_outside_service`); empty otherwise (vault
+        BACKLOG #2711, step 2). Empty too when there is no enabled Administrator at all: the
+        first-run notices of ADR 0183 cover that case.
 
-        An Administrator counts as self-sufficient when it is a local account holding a password the
-        login gate would still accept: not a must-change credential past its
-        :meth:`initial_credential_deadline`. A directory account needs the directory (a federated
-        binding is only ever on one), and a local row with no password hash, or an expired
-        temporary one, cannot sign in at all. ``provision-admin`` refuses while any enabled
-        Administrator exists, whichever kind, so such a site has no host command to get back in
-        while the outside service is down. Empty too when there is no enabled Administrator at all:
-        the first-run notices of ADR 0183 cover that case."""
-        now = time.time()
-        admins: list[str] = []
-        for user in await self._load_users():
-            if user.disabled:
-                continue
-            if Role.ADMINISTRATOR.value not in user.role_ids:
-                continue
-            if user.auth_provider == AuthProvider.LOCAL.value and user.password_hash is not None:
-                deadline = self.initial_credential_deadline(user.password_changed_at)
-                expired = user.must_change_password and deadline is not None and now > deadline
-                if not expired:
-                    return ()
-            admins.append(user.username)
-        return tuple(sorted(admins))
+        It reads :meth:`_administrator_standing`, as the ``provision-admin`` refusal does, so
+        whenever this names anyone, these accounts do not block ``provision-admin`` (step 1, ADR
+        0183 Amendment E). Under the same settings, that is: the command reads its own
+        ``--service-config``, and it can still refuse for reasons this never checks, such as the
+        password policy or a missing authenticator under ``require_mfa``."""
+        usable, names = await self._administrator_standing()
+        return () if usable else names
 
     async def report_administrators_needing_an_outside_service(self) -> tuple[str, ...]:
         """Run :meth:`administrators_needing_an_outside_service` at startup: WARN and write one audit
@@ -11184,9 +11295,10 @@ class AuthService:
             "no enabled Administrator can sign in without an outside identity service (the "
             "directory or a federated identity provider); each is a directory account or a local "
             "one with no usable password: %s. If that service is down, no Administrator can sign "
-            "in to manage this engine, and `messagefoundry provision-admin` will not create a local "
-            "Administrator while these accounts exist. Create a local Administrator now, before "
-            "an outage (docs/SECURITY.md, 'Keep a local Administrator').",
+            "in to manage this engine. Create a local Administrator now, before an outage, from "
+            "the web console. During an outage, `messagefoundry provision-admin`, run at the host "
+            "with the engine stopped, is not blocked by these accounts "
+            "(docs/SECURITY.md, 'Keep a local Administrator').",
             ", ".join(names),
         )
         await self._audit(
@@ -11537,8 +11649,8 @@ class AuthService:
         )
         # vault BACKLOG #2145: a first sign-in under require_mfa finishes HERE, so without this it
         # left no baseline and the account's next sign-in failed open again. Not for a NEW
-        # address: see _mark_login_address_known. Last, after the audit row and the notice, so a
-        # programming error it re-raises cannot drop either.
+        # address: see _mark_login_address_known. Last, after the audit row, so no address is known
+        # for an enrolment with no row; tests/test_login_new_ip.py pins the order (BACKLOG #2964).
         await self._mark_login_address_known(identity.user_id, client, enrolment=user)
         return elevation
 
@@ -12361,7 +12473,10 @@ class AuthService:
         before the holder signs in to enrol again. **The credential is written FIRST**, before TOTP
         and the passkeys are cleared, so a crash between the writes leaves a generated credential
         with factors, never a chosen password without them. A directory account has no engine
-        password and gets ``None``."""
+        password and gets ``None``.
+
+        It also clears the account's known sign-in addresses, local or directory (vault BACKLOG
+        #2946; see :meth:`_clear_login_addresses`)."""
         user = await self._load_user(user_id)
         if user is None:
             raise ValueError("no such user")
@@ -12400,6 +12515,9 @@ class AuthService:
                 ),
             )
         await self._store.revoke_user_sessions(user_id)
+        # Straight after the revoke, before the audit row, so a raise from the audit or a notice
+        # cannot skip it. It never raises itself.
+        await self._clear_login_addresses(user_id, username=user.username)
         await self._audit(
             "auth.mfa_reset",
             actor=actor,
@@ -13564,6 +13682,9 @@ class AuthService:
         mechanism, and this return value is the only thing that reaches the issuing administrator.
         ``expires_at`` is read back from the STORED ``password_changed_at`` the write above just
         stamped rather than from a fresh clock, so the surfaced instant is the one the login gate will actually refuse on.
+
+        It also clears the account's known sign-in addresses (vault BACKLOG #2946; see
+        :meth:`_clear_login_addresses`).
         """
         user = await self._load_user(user_id)
         if user is None:
@@ -13580,6 +13701,7 @@ class AuthService:
             password_generated=True,
         )
         await self._store.revoke_user_sessions(user_id)  # invalidate any live sessions on reset
+        await self._clear_login_addresses(user_id, username=user.username)  # as in admin_reset_mfa
         await self._audit(
             "auth.password_reset",
             actor=actor,
@@ -14348,10 +14470,13 @@ class AuthService:
 
         Enumerates as :meth:`is_last_enabled_admin` and :meth:`_other_enabled_admin_exists` do --
         same store calls, same disabled-skip, same role test. **That agreement is a convention, not
-        a mechanism, and this docstring must not claim otherwise:** these are now THREE independent
-        copies of "who is an enabled administrator", and nothing binds them. If one gains a
-        condition -- a lockout check, an auth_provider filter -- the others keep the old answer
-        silently. Extracting a shared enumeration is worth its own item; it is deliberately not done
+        a mechanism, and this docstring must not claim otherwise:** these are at least THREE
+        independent copies of "who is an enabled administrator", and nothing binds them. If one
+        gains a condition -- a lockout check, an auth_provider filter -- the others keep the old
+        answer silently. The ``provision-admin`` refusal (:meth:`_administrator_standing`) and the
+        first-administrator grant's guard filter on ``auth_provider`` on purpose (vault BACKLOG
+        #2711 step 1, owner ruling B258-R4), through one predicate,
+        :meth:`_signs_in_without_an_outside_service`; that is not this drift. Extracting a shared enumeration is worth its own item; it is deliberately not done
         here, because it would rewrite two guards this change has no business touching.
         """
         for user in await self._load_users():
@@ -14553,8 +14678,9 @@ class AuthService:
         one channel that reaches both of those accounts, so the label has to be written where it reads.
 
         The row is written whether or not a notifier is wired, for that reason. It is written BEFORE
-        the notice, and the action is resolved before either, so the notifier's "the event is still in
-        the audit log" is true when it says it and an unknown kind fails before any side effect.
+        the notice, and the action is resolved before either, so for this event the notifier's "the
+        event is usually still in the audit log" always holds, and an unknown kind fails before any
+        side effect.
 
         **``audit_detail`` MIRRORS THE ATTEMPT'S OWN ROW, never ``notice_detail``.** The failure count
         goes in the notice only. The audit row carries no more than the ``auth.login_failed``,

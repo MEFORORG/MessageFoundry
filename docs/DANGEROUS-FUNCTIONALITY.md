@@ -1038,8 +1038,13 @@ store's cluster records too. Run the harness only where those variables name a t
 **A run-time function swap.** This class is the harness's own. `provision-admin` reads the new
 password from a terminal and takes it no other way. A test rig has no terminal. So
 `load/rigadmin.py` imports the engine's command module and replaces its `_read_new_password`
-function with one that returns a password the rig holds. It then calls the shipped command's
-`main`. The rest of `provision-admin` runs as shipped.
+function with one that returns a password the rig holds. It also wraps the command's
+`_build_provision_auth_service`, so the service it builds refuses any store that holds an enabled
+Administrator (vault BACKLOG #2711). On that service it replaces `provision_refusal` and
+`provision_first_administrator` with wrappers. The pre-prompt refusal asks the shipped check and
+then the rig's. The write asks the rig's check before the shipped write runs, so a refused store is
+never written. That only narrows the command. It then calls the shipped
+command's `main`. The rest of `provision-admin` runs as shipped.
 
 When the rig also holds an authenticator key, for a leg whose engine requires MFA (vault BACKLOG
 #2796), two more functions of the same module are replaced. `_enrol_totp_at_terminal` returns that
@@ -1057,8 +1062,10 @@ What holds it:
 - The password comes from the `MEFOR_RIG_ADMIN_PASSWORD` environment variable, and the key from
   `MEFOR_RIG_ADMIN_TOTP_KEY`. The process takes both out of its own environment before any engine
   code runs.
-- The shipped command refuses a store that already has an enabled Administrator, and the swap
-  does not change that.
+- The shipped command refuses a store that already has an enabled local Administrator with a
+  usable password, and the swap does not change that. Since vault BACKLOG #2711, a directory or
+  federated Administrator does not block the shipped command. The rig adds a check of its own: it
+  refuses a store that holds an enabled Administrator of any kind, with or without a key.
 
 What it means: on a store with no enabled Administrator, whoever can run the harness with access
 to that store can create one with no terminal. With no key, the swap passes `--no-totp` and sets

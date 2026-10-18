@@ -248,12 +248,14 @@ suite("engine control — planActions offers lifecycle only under the right cont
 // Administrator first, with `provision-admin` in its OWN terminal (the password is typed there, never
 // passed), and treats "an enabled Administrator already exists" as go-ahead.
 
-/** What `provision-admin --json` prints for its two answers, copied from `messagefoundry/__main__.py`. */
+/** What `provision-admin --json` prints for its two answers, copied from the engine: the admin-exists text is
+ *  `_ADMINISTRATOR_EXISTS_REFUSAL` in `messagefoundry/auth/service.py`, the no-terminal one is in
+ *  `messagefoundry/__main__.py`. */
 const ENGINE_ADMIN_EXISTS = JSON.stringify({
   error:
-    "this store already has an enabled Administrator, so there is nothing to provision " +
-    "-- create further accounts from the web console, and use `admin-unlock` if the " +
-    "administrator is locked out",
+    "this store already has an enabled Administrator that signs in with a local password, so there " +
+    "is nothing to provision -- create further accounts from the web console, and use " +
+    "`admin-unlock` if that administrator is locked out",
 });
 const ENGINE_NO_TERMINAL = JSON.stringify({
   error:

@@ -199,6 +199,7 @@ from messagefoundry.store.store import (
     AdMapChange,
     AdMapSql,
     AdminGrant,
+    AdminHolderTest,
     AdminRemoval,
     AlertInstance,
     AlertSummary,
@@ -9286,6 +9287,7 @@ class PostgresStore:
         admin_role_id: str,
         expected_password_hash: str,
         expected_totp_secret_cell: str | None,
+        counts_as_admin: AdminHolderTest,
         assigned_by: str | None = None,
         now: float | None = None,
     ) -> AdminGrant:
@@ -9311,6 +9313,7 @@ class PostgresStore:
                 [(str(r["id"]), bool(r["is_target"])) for r in rows],
                 self._row_sealer,
                 lambda holder: self._read_user_record(conn, holder, lock=False),
+                counts_as_admin,
             )
             if others:
                 return AdminGrant.ADMIN_EXISTS  # nothing written; the commit releases the lock
