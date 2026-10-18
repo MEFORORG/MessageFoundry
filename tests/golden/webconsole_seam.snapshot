@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-8b2fa06dd4c4938b
+685dca559a2f6600
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -129,7 +129,8 @@ record_repeated_credential: (conn: 'Request | WebSocket', credential: 'str') -> 
 
 ## auth.service names imported by the console
 AuthService: class; its members are the AuthService section
-Elevation: constructor (token: 'str | None' = None, session_lost: 'bool' = False, recovery_codes: 'tuple[str, ...]' = (), locked: 'bool' = False, idp_step_up_required: 'bool' = False, directory_unconfirmed: 'bool' = False) -> None; fields: directory_unconfirmed, idp_step_up_required, locked, recovery_codes, session_lost, token; properties: ok
+DirectoryRefusal: enum: DEMOTED, UNCONFIRMED
+Elevation: constructor (token: 'str | None' = None, session_lost: 'bool' = False, recovery_codes: 'tuple[str, ...]' = (), locked: 'bool' = False, idp_step_up_required: 'bool' = False, directory_refusal: 'DirectoryRefusal | None' = None) -> None; fields: directory_refusal, idp_step_up_required, locked, recovery_codes, session_lost, token; properties: ok
 FEDERATED_BINDING_CHANGED: attribute: str
 LoginOutcome: constructor (ok: 'bool', token: 'str | None' = None, identity: 'Identity | None' = None, must_change_password: 'bool' = False, error: 'str | None' = None, mfa_required: 'bool' = False, reason: 'str | None' = None, roles_gained: 'RolesGained | None' = None, flow_consumed: 'bool' = True) -> None; fields: error, flow_consumed, identity, mfa_required, must_change_password, ok, reason, roles_gained, token; properties: none
 MfaStatus: constructor (enabled: 'bool', enrolled_at: 'float | None', recovery_codes_remaining: 'int', required: 'bool', webauthn_enrolled: 'bool' = False) -> None; fields: enabled, enrolled_at, recovery_codes_remaining, required, webauthn_enrolled; properties: none

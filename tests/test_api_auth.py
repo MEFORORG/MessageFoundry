@@ -21,7 +21,12 @@ from messagefoundry.api.security import ExportStopped, deadline_utc
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
-from messagefoundry.auth.service import AuthService, CurrentPasswordCheck, Elevation
+from messagefoundry.auth.service import (
+    AuthService,
+    CurrentPasswordCheck,
+    DirectoryRefusal,
+    Elevation,
+)
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import AiSettings, AuthSettings, EgressSettings, StoreSettings
@@ -483,7 +488,7 @@ async def test_the_confirm_route_says_the_directory_could_not_confirm_the_accoun
     await _add(service, "adm", Role.ADMINISTRATOR)
 
     async def _refused(*_args: object, **_kwargs: object) -> Elevation:
-        return Elevation(directory_unconfirmed=True)
+        return Elevation(directory_refusal=DirectoryRefusal.UNCONFIRMED)
 
     async with _client(engine, service) as c:
         tok = (await _login(c, "adm")).json()["token"]

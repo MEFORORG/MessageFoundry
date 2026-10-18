@@ -500,6 +500,22 @@ from typing import Any
 #: Re-derived with ``--write`` on the merged tree; the digest did not move, so the value below
 #: covers every entry above.
 #:
+#: BACKLOG #3082: ``Elevation.directory_unconfirmed`` was replaced by the new
+#: ``directory_refusal`` field, a ``DirectoryRefusal``, so the console can tell a lost role, which a
+#: new sign-in clears, from an outage, which it does not, and show each its own fix. The console
+#: imports ``DirectoryRefusal`` and builds no ``Elevation`` with the old keyword. The digest moved
+#: from ``344979df3bd2c662`` because the imported surface and a field changed, and again when the
+#: derived ``directory_unconfirmed`` property, which nothing read, was removed. An older console on
+#: this engine is refused at mount; a newer console on an older engine fails earlier, at import,
+#: since ``DirectoryRefusal`` does not exist there.
+#:
+#: BACKLOG #3082 merged with main after the vault BACKLOG #3192 entries above. Re-derived
+#: with ``--write`` on the merged tree, so the value below covers every entry above.
+#:
+#: BACKLOG #3082 (at 257a8fbb6caed9e3) merged with main again after BACKLOG #3052 (PR 2400)
+#: moved main's seam to da529979e55cb966. Re-derived with ``--write`` on the merged tree, from
+#: both values to ecbe601fd4934dcb, so the value below covers every entry above.
+#:
 #: Vault BACKLOG #3316 merged with main after BACKLOG #2709 landed there (digest
 #: da529979e55cb966 on main). #2709 hashes the console helpers a gate calls, and #3316 changes
 #: them in ``_auth.py``: it edits ``assert_same_origin`` and ``assert_not_cross_site`` and adds
@@ -507,12 +523,16 @@ from typing import Any
 #: the move comes from the merge.
 #: Re-derived with ``--write`` on the merged tree.
 #:
+#: BACKLOG #3082 (at ecbe601fd4934dcb) merged with main again after vault BACKLOG #3316
+#: (PR 2396) moved main's seam to 8b2fa06dd4c4938b. Re-derived with ``--write`` on the merged
+#: tree, from both values to 685dca559a2f6600, so the value below covers every entry above.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "8b2fa06dd4c4938b"
+ENGINE_UI_SEAM: str = "685dca559a2f6600"
 
 
 @dataclass(frozen=True, slots=True)

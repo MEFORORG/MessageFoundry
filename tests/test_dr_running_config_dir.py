@@ -945,7 +945,7 @@ async def test_convergence_still_reloads_the_startup_dir(box: _Box) -> None:
     await engine.reload_detail(box.staging)
     assert _inbound_names(engine) == {"IB_STAGING_ADT"}  # control: the operator's graph runs
 
-    await engine._converge_reload()
+    await engine._converge_reload(1)
 
     assert _inbound_names(engine) == {"IB_LIVE_ADT"}
 

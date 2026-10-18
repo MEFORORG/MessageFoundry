@@ -119,21 +119,8 @@ async def test_a_failed_start_row_does_not_block_the_start(
     assert prov["loaded"] is True
 
 
-async def test_a_reload_row_names_its_shard_node_and_the_running_digest(tmp_path: Path) -> None:
-    app, cfg = _app(tmp_path)
-    async with app.router.lifespan_context(app), _client(app) as c:
-        engine: Engine = app.state.engine
-        r = await c.post("/config/reload", json={"config_dir": str(cfg)})
-        assert r.status_code == 200, r.text
-        reload_rows = await _rows(engine, "config_reload")
-        start_rows = await _rows(engine, "config_loaded")
-    assert len(reload_rows) == 1 and len(start_rows) == 1
-    # One digest per load: the row names the baseline the provenance route compares against.
-    assert reload_rows[0]["fingerprint"] == config_fingerprint(cfg)
-    assert reload_rows[0]["dir"] == str(cfg.resolve())
-    assert reload_rows[0]["node"] == start_rows[0]["node"]
-    assert "shard" in reload_rows[0]
-    assert "loosenings" not in reload_rows[0]
+# A reload row's shape is checked in test_start_config_change_alert.py, beside the start row it is
+# compared against (vault BACKLOG #3076 item 6 folded the copy that stood here into that test).
 
 
 async def test_an_unreadable_vcs_head_degrades_the_same_way_at_every_load(

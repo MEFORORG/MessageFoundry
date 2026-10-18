@@ -33,6 +33,7 @@ from messagefoundry.auth.service import (
     DIRECTORY_ROLES_DEMOTED,
     DIRECTORY_UNCONFIRMED,
     AuthService,
+    DirectoryRefusal,
     Elevation,
 )
 from messagefoundry.auth.tokens import hash_token
@@ -165,7 +166,11 @@ async def _assert_totp_refused_and_unspent(t: _TotpStaged, outcome: str) -> None
     s = t.signed
     refused = await s.service.confirm_mfa_enrollment(s.identity, t.code, token=s.token)
     assert refused.ok is False
-    assert refused.directory_unconfirmed is True
+    assert refused.directory_refusal is (
+        DirectoryRefusal.DEMOTED
+        if outcome == DIRECTORY_ROLES_DEMOTED
+        else DirectoryRefusal.UNCONFIRMED
+    )
     assert refused.session_lost is False
     assert refused.recovery_codes == ()
     assert t.minted == []  # no recovery codes were minted
@@ -266,7 +271,7 @@ async def test_a_session_revoked_during_the_lookup_is_a_lost_totp_enrolment(
         t.signed.identity, t.code, token=t.signed.token
     )
 
-    assert lost.ok is False and lost.session_lost is True and lost.directory_unconfirmed is False
+    assert lost.ok is False and lost.session_lost is True and lost.directory_refusal is None
     assert t.minted == []
     assert {"reason": "session_lost", "phase": "enroll"} in await _audited(store, "auth.mfa_failed")
     # The step is unspent: a new session confirms with the same code.
@@ -290,7 +295,7 @@ async def test_the_totp_enrolment_lookup_comes_after_the_floor(
 
     floored = await s.service.confirm_mfa_enrollment(s.identity, t.code, token=s.token)
 
-    assert floored.ok is False and floored.directory_unconfirmed is False
+    assert floored.ok is False and floored.directory_refusal is None
     assert s.directory.probes == []
 
 
@@ -342,7 +347,7 @@ async def test_a_second_step_locked_directory_account_cannot_enrol(
         t.signed.identity, t.code, token=t.signed.token
     )
 
-    assert refused.ok is False and refused.directory_unconfirmed is False
+    assert refused.ok is False and refused.directory_refusal is None
     assert refused.locked is True and refused.session_lost is False
     assert t.minted == []
     user = await store.get_user(t.signed.identity.user_id)
@@ -360,7 +365,7 @@ async def test_a_second_step_locked_directory_account_cannot_register_a_passkey(
 
     refused = await _register(p)
 
-    assert refused.ok is False and refused.directory_unconfirmed is False
+    assert refused.ok is False and refused.directory_refusal is None
     assert refused.locked is True and refused.session_lost is False
     assert await store.list_webauthn_credentials(p.signed.identity.user_id) == []
     key = (hash_token(p.signed.token), "register")
@@ -499,7 +504,11 @@ async def _assert_passkey_refused_and_unspent(p: _PasskeyStaged, outcome: str) -
     s = p.signed
     refused = await _register(p)
     assert refused.ok is False
-    assert refused.directory_unconfirmed is True
+    assert refused.directory_refusal is (
+        DirectoryRefusal.DEMOTED
+        if outcome == DIRECTORY_ROLES_DEMOTED
+        else DirectoryRefusal.UNCONFIRMED
+    )
     assert refused.session_lost is False
     assert await s.store.list_webauthn_credentials(s.identity.user_id) == []  # nothing stored
     session = await s.store.get_session(hash_token(s.token))
@@ -565,7 +574,7 @@ async def test_the_passkey_registration_lookup_comes_after_the_floor(store: Mess
 
     floored = await _register(p)
 
-    assert floored.ok is False and floored.directory_unconfirmed is False
+    assert floored.ok is False and floored.directory_refusal is None
     assert s.directory.probes == []
     assert await store.list_webauthn_credentials(s.identity.user_id) == []
     # The floor refusal leaves the ceremony in flight.
