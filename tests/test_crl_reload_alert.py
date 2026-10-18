@@ -1519,9 +1519,25 @@ class _RaiseDown(_Sink):
         super()._record(kind, name, payload)
 
 
+class _CountedCollect:
+    """The ``gc`` module as :mod:`crl_reload` sees it, with ``collect`` counted and not run."""
+
+    def __init__(self) -> None:
+        self.calls: list[int] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(gc, name)
+
+    def collect(self, generation: int = 2) -> int:
+        if generation not in (0, 1, 2):
+            raise ValueError("invalid generation")
+        self.calls.append(generation)
+        return 0
+
+
 @pytest.mark.parametrize("raise_lands", [True, False], ids=["follow-the-record", "first-sight"])
 async def test_the_loop_decides_from_the_refusal_record_its_own_pass_left(
-    pki: _Pki, raise_lands: bool
+    pki: _Pki, monkeypatch: pytest.MonkeyPatch, raise_lands: bool
 ) -> None:
     """Vault BACKLOG #3543, review of 585270cd3. Every write to the refusal record is made under
     the pass lock, and a pass an earlier runner's stop abandoned may still be making one. So the
@@ -1544,23 +1560,24 @@ async def test_the_loop_decides_from_the_refusal_record_its_own_pass_left(
 
     runner = _runner(sink, interval_seconds=0.01, reload=reload)
     pki.crl.write_bytes(_expired(pki))
-    # While a cleared record makes the pass's collect gate fire, every pass here runs a real
-    # gc.collect(), and its cost grows with the heap the suite has built up: in a worker that has
-    # run many files, four passes may not fit the wait. Frozen objects are not walked, so each
-    # collect costs what this test allocates.
-    gc.freeze()
+    # While a cleared record makes the pass's collect gate fire, every pass here would run a full
+    # gc.collect(), whose cost grows with the heap the suite has built up: in a worker that has
+    # run many files, four passes may not fit the wait. The hop is held strongly, so the collect
+    # decides nothing this test asserts; the pass calls a counter instead. Not gc.freeze(): that
+    # is process-wide, and pre-freeze garbage would outlive this test into a later one.
+    collects = _CountedCollect()
+    monkeypatch.setattr(crl_reload, "gc", collects)
     runner.start()
     try:
         await until(lambda: len(refused) >= 4, "four passes that refused the file")
         # Before the stop, which resolves whatever is still open.
         kinds = sink.kinds()
     finally:
-        try:
-            await runner.stop()
-        finally:
-            gc.unfreeze()
+        await runner.stop()
 
     assert all(refused), "the premise: each pass refused the file and recorded the refusal"
+    # The first pass reads new bytes, so it collects whatever the gate does on a cleared record.
+    assert collects.calls, "the control: the pass's collect reached the stand-in"
     assert sink.threads, "the control: the runner tried to raise the refusal"
     assert kinds == (["refused"] if raise_lands else [])
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
