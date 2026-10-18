@@ -2819,17 +2819,23 @@ async def _renamed_service(
         store = await MessageStore.open(
             keyed_path, cipher=make_cipher(generate_key(), write_v2=True)
         )
-    ldap = _FakeLdap({"jdoe": _principal("jdoe")})
-    service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
-    notifier = _CapturingNotifier()
-    service._security_notifier = notifier
-    await service.initialize()
-    await _signed_in_ad_user(service, store, "jdoe")
-    jdoe = await store.get_user_by_username("jdoe")
-    assert jdoe is not None
-    # Set explicitly, so the address assertion below cannot pass on whatever the birth chose.
-    await store.set_user_notify_email(jdoe.id, email="holder@example.org")
-    ldap.present = {"jdoe-married": _principal("jdoe-married", object_id=_object_id_for("jdoe"))}
+    try:
+        ldap = _FakeLdap({"jdoe": _principal("jdoe")})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        await service.initialize()
+        await _signed_in_ad_user(service, store, "jdoe")
+        jdoe = await store.get_user_by_username("jdoe")
+        assert jdoe is not None
+        # Set explicitly, so the address assertion below cannot pass on whatever the birth chose.
+        await store.set_user_notify_email(jdoe.id, email="holder@example.org")
+        ldap.present = {
+            "jdoe-married": _principal("jdoe-married", object_id=_object_id_for("jdoe"))
+        }
+    except BaseException:
+        await store.close()
+        raise
     return store, ldap, service, notifier, jdoe.id
 
 
@@ -3501,11 +3507,11 @@ async def test_a_store_fault_on_the_holder_re_read_skips_only_that_rename(
     The first by-name read of either new name is the pass's ``held`` read for the first rename it
     applies, so the faulting rename is always the earlier of the two."""
     store = await MessageStore.open(":memory:")
-    ldap = _FakeLdap({"jdoe": _principal("jdoe"), "asmith": _principal("asmith")})
-    service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
-    notifier = _CapturingNotifier()
-    service._security_notifier = notifier
     try:
+        ldap = _FakeLdap({"jdoe": _principal("jdoe"), "asmith": _principal("asmith")})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
         await service.initialize()
         ids: dict[str, str] = {}
         for name in ("jdoe", "asmith"):
@@ -3552,6 +3558,32 @@ async def test_a_store_fault_on_the_holder_re_read_skips_only_that_rename(
         [logged] = [r.getMessage() for r in caplog.records if "BACKLOG #3070" in r.getMessage()]
         assert ids[skipped] in logged and "OperationalError" in logged
         assert [e.username for e in notifier.sent if e.event_type == USERNAME_CHANGED] == [applied]
+    finally:
+        await store.close()
+
+
+async def test_a_store_fault_on_the_holder_re_read_still_raises_off_the_reconciler_path() -> None:
+    """BACKLOG #3070, the control for the skip above. Only the reconciler (``audit_soft``) skips a
+    rename on a faulting holder re-read; any other caller, such as a sign-in, gets the error."""
+    store, _ldap, service, _notifier, user_id = await _renamed_service()
+    try:
+
+        async def _faults(username: str) -> _UserLookup:
+            raise sqlite3.OperationalError("database is locked")
+
+        row = await store.get_user(user_id)
+        assert row is not None
+        service._lookup_by_username = _faults  # type: ignore[method-assign]
+        with pytest.raises(sqlite3.OperationalError):
+            await service._refresh_cached_username(
+                user_id=user_id,
+                old_username="jdoe",
+                new_username="jdoe-married",
+                held=replace(row, id="gone-holder", username="jdoe-married"),
+                from_plan=False,
+            )
+        after = await store.get_user(user_id)
+        assert after is not None and after.username == "jdoe"
     finally:
         await store.close()
 

@@ -2982,8 +2982,10 @@ class AuthService:
         self._reconcile_unkeyed_refused: dict[str, None] = {}
         if self.directory_reconcile_enabled:
             # Built now, at startup, so a reconciler's first refused audit write does not import
-            # the server drivers on the event loop (see `_audit_write_errors`).
+            # the server drivers on the event loop (see `_audit_write_errors`). The same for the
+            # rename refresh's holder re-read, which catches `_session_write_errors` (#3070).
             _audit_write_errors()
+            _session_write_errors()
         # Advisory, NON-STICKY federated-IdP health (ADR 0142 AC-8) — see the oidc_available docstring.
         self._oidc_unavailable_reason: str | None = None
         self._oidc_client_auth: oidc.ClientAuthentication | None = None
@@ -7896,16 +7898,21 @@ class AuthService:
             # write-path refusal's "a later pass retries it", which is false while that holder
             # stays seal-failed. Its id is not verified, so the audit names ``held``, the last
             # verified holder. NOT CLOSED HERE: the reconciler's own ``held`` read, and at least
-            # the two write-path holder reads below, still read a seal-failed holder as None.
+            # the two write-path holder reads below, still read a seal-failed holder as None; and
+            # ``refused`` also reads true for a holder deleted or re-keyed between the re-read's
+            # own row and role reads, a narrow window that still files this refusal.
             #
-            # A store fault on this re-read skips this one rename for this pass rather than
-            # raising: the caller is the reconciler's rename loop, and a raise would end the pass
-            # before the renames after this one. Nothing was written; a later pass that probes
-            # the account retries it. The cached store-error tuple, so a fault never imports a
-            # driver on the event loop.
+            # On the reconciler's path (``audit_soft``) a store fault on this re-read skips this
+            # one rename for this pass rather than raising: a raise would end the pass before the
+            # renames after this one. Nothing was written; a later pass that probes the account
+            # retries it. The other store reads in the rename loop still raise. A sign-in re-raises,
+            # so it fails loud as it does elsewhere in this method. The error tuple is cached and
+            # built at construction when the reconciler runs, so no driver is imported here.
             try:
                 current = await self._lookup_by_username(new_username)
             except _session_write_errors() as exc:
+                if not audit_soft:
+                    raise
                 _log.warning(
                     "AD account %s: reading the holder of its new directory name raised %s, so its "
                     "rename was not applied on this pass; a later pass that probes it retries it "
