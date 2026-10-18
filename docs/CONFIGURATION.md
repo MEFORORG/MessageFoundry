@@ -1663,6 +1663,10 @@ started together, can each raise it; the alert list folds them into one instance
   a restart picked up does, by design: nothing else tells that deploy apart from an unrecorded edit.
 - A connection flag toggle does not alert either. Its row vouches for the directory it wrote only
   when nothing else changed since the load, so a toggle never hides an edit nobody loaded.
+- A toggle whose row fails, or is not recorded within 10 seconds, is refused, and the engine
+  puts the file back as it was, so no toggle stays on disk without its row (vault BACKLOG #2945).
+  A file another edit changed in the meantime is left as that edit wrote it and logged, and the
+  next start reports it. So does a row the store commits just as the 10 seconds run out.
 - A fresh store, a baseline row with no fingerprint, or one taken under another fingerprint scheme
   raises nothing. The engine logs that at INFO.
 - The check is alert-only. A baseline read that fails or takes over five seconds is logged at

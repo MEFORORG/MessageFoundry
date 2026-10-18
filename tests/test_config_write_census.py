@@ -85,7 +85,7 @@ LIBRARY: frozenset[str] = frozenset(
     }
 )
 
-type Verdict = Literal["helper", "cli", "settings"]
+type Verdict = Literal["helper", "undo", "cli", "settings"]
 
 #: ``helper``: an engine write of a covered file; it moves the baseline through the helper.
 #: ``cli``: a CLI subcommand, which runs in its own process and records no row. Its edit does not
@@ -93,12 +93,19 @@ type Verdict = Literal["helper", "cli", "settings"]
 #: engine would. A reload that loads it records a ``config_reload`` row with the new digest, which
 #: moves the baseline then. A start that loads it first raises ``config_changed``, and that alert is
 #: the record of an edit no engine made. ``settings``: writes the service settings file, which the
-#: config digest does not cover, so there is no baseline for it to move.
+#: config digest does not cover, so there is no baseline for it to move. ``undo``: the helper's own
+#: put-back of the bytes a write changed when its row fails, so it moves no baseline: the files go
+#: back to the bytes the newest row already names. Only the helper may call it.
 CENSUS: dict[tuple[str, str], tuple[Verdict, str]] = {
     ("messagefoundry/pipeline/engine.py", "Engine.set_connection_flag"): (
         "helper",
         "POST /connections/{name}/flag rewrites connections.toml in the running engine. Refused "
         "on a cluster node (vault BACKLOG #2933).",
+    ),
+    ("messagefoundry/pipeline/engine.py", "_undo_covered_changes"): (
+        "undo",
+        "write_baseline_config puts back what a write changed when its row fails or times out, "
+        "so no write stays on disk without its row (vault BACKLOG #2945)",
     ),
     ("messagefoundry/__main__.py", "_connection"): (
         "cli",
@@ -274,10 +281,45 @@ def test_every_engine_config_write_goes_through_the_helper() -> None:
 
 def test_only_the_cli_writes_config_outside_the_helper() -> None:
     """A ``cli`` or ``settings`` verdict says the write runs in its own process. Only the CLI
-    module's subcommands can earn one; engine code that writes a config file uses the helper."""
+    module's subcommands can earn one; engine code that writes a config file uses the helper, or is
+    the helper's own undo."""
     for (path, site), (verdict, _why) in CENSUS.items():
-        if verdict != "helper":
+        if verdict in ("cli", "settings"):
             assert path == "messagefoundry/__main__.py", (path, site)
+        elif verdict == "undo":
+            assert path == "messagefoundry/pipeline/engine.py", (path, site)
+
+
+def _undo_callers(tree: ast.Module) -> set[str]:
+    """The defs in ``tree`` that name an ``undo`` site, charged to the outermost def as
+    :func:`_writer_sites` charges a writer call."""
+    undo = {site for (_path, site), (verdict, _why) in CENSUS.items() if verdict == "undo"}
+    callers: set[str] = set()
+
+    def walk(node: ast.AST, owner: list[str], in_function: bool) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if in_function:
+                    walk(child, owner, True)
+                else:
+                    walk(child, [*owner, child.name], not isinstance(child, ast.ClassDef))
+                continue
+            if isinstance(child, ast.Name) and child.id in undo:
+                callers.add(".".join(owner) or "<module>")
+            walk(child, owner, in_function)
+
+    walk(tree, [], False)
+    return callers
+
+
+def test_only_the_helper_calls_the_undo() -> None:
+    """The undo rewrites covered files and records no row. The helper calls it only once its own
+    row has failed; any other caller would be a config write with no baseline row."""
+    tree = _package_trees()["messagefoundry/pipeline/engine.py"]
+    assert _undo_callers(tree) == {"Engine.write_baseline_config"}
+    # Positive control: a second caller is seen.
+    rogue = ast.parse("def toggle(d):\n    _undo_covered_changes(d, {})\n")
+    assert _undo_callers(rogue) == {"toggle"}
 
 
 def test_the_guard_refuses_an_unlisted_writer_and_a_helper_bypass() -> None:

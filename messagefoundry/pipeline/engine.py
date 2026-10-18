@@ -151,6 +151,15 @@ _CONFIG_WRITE_DRAIN_SECONDS = 5.0
 #: ``api/app.py``), and spent only while such a write is still running.
 _CONFIG_WRITE_LATE_DRAIN_SECONDS = 1.0
 
+#: How long a config write waits for its baseline audit row before it gives up and puts the files
+#: back (vault BACKLOG #2945). The row is written under the engine's config-write lock, so the
+#: rows of two writes land in write order; without a bound, a store that never answers would hold
+#: that lock, and every later config write, until it did. A row normally takes milliseconds, so
+#: this is a stuck store, not a busy one. Well under the API's 120 s request deadline
+#: (``api/request_timeout.py``), so the caller who asked for the write hears the refusal. Read at
+#: call time.
+CONFIG_WRITE_AUDIT_TIMEOUT_SECONDS = 10.0
+
 #: How long a DR release waits for the staged queue to drain before it hands back anyway, leaving
 #: the rest queued (vault BACKLOG #2752). Kept well under the API's 120 s request deadline
 #: (``api/request_timeout.py``) with room for the release hook's default 30 s bound and the
@@ -238,6 +247,76 @@ def _log_abandoned_config_write(task: asyncio.Task[dict[str, object] | None]) ->
         log.warning("config write failed after its caller had gone: %s", safe_exc(exc))
 
 
+#: What a config write changed among the files the config digest covers: each changed path, mapped
+#: to ``(before, after)`` bytes, ``None`` for a file that did not exist on that side.
+type _CoveredChanges = dict[Path, tuple[bytes | None, bytes | None]]
+
+
+def _read_covered(cfg_dir: Path) -> dict[Path, bytes]:
+    """The bytes of every file the config digest covers in ``cfg_dir``. Blocking. A file that cannot
+    be read is left out, so it is never one a failed write's undo rewrites."""
+    from messagefoundry.config.fingerprint import covered_files
+
+    found: dict[Path, bytes] = {}
+    for path in covered_files(cfg_dir):
+        try:
+            found[path] = path.read_bytes()
+        except OSError:
+            continue
+    return found
+
+
+def _covered_changes(prior: dict[Path, bytes], now: dict[Path, bytes]) -> _CoveredChanges:
+    """The covered files a write changed, created or removed, from reads before and after it."""
+    return {
+        path: (prior.get(path), now.get(path))
+        for path in prior.keys() | now.keys()
+        if prior.get(path) != now.get(path)
+    }
+
+
+def _undo_covered_changes(cfg_dir: Path, changes: _CoveredChanges) -> bool:
+    """Put back what a config write changed, after its audit row failed (vault BACKLOG #2945).
+
+    Blocking, under the same cross-process lock the write took. A file is put back only while it
+    still holds the bytes the write left, so an edit that landed since, such as a ``connection``
+    CLI edit, is never overwritten: that file is left as it is, and logged, and so is one the undo
+    could not write. Either leaves a change on disk with no row, which the next start reports as a
+    config change. Returns whether every change was put back. Never raises: the caller is already
+    refusing the write."""
+    from messagefoundry.config import atomic_edit, connections_edit
+
+    try:
+        with connections_edit.locked(cfg_dir):
+            undone = True
+            for path, (before, after) in sorted(changes.items()):
+                try:
+                    try:
+                        current: bytes | None = path.read_bytes()
+                    except FileNotFoundError:
+                        current = None
+                    if current != after:
+                        log.error(
+                            "a failed config write left %s as another edit changed it since",
+                            path.name,
+                        )
+                        undone = False
+                    elif before is None:
+                        path.unlink()
+                    else:
+                        atomic_edit.replace_validated(path, before, lambda _candidate: None)
+                except OSError as exc:
+                    log.error(
+                        "a failed config write could not put back %s: %s", path.name, safe_exc(exc)
+                    )
+                    undone = False
+            return undone
+    except WiringError as exc:
+        # The cross-process lock could not be taken, so nothing was put back.
+        log.error("a failed config write could not be undone: %s", safe_exc(exc))
+        return False
+
+
 class ClusteredConfigWrite(WiringError):
     """A config file write refused because this engine is a cluster node (vault BACKLOG #2933).
 
@@ -246,6 +325,29 @@ class ClusteredConfigWrite(WiringError):
     engine path can reach the others' files, so :meth:`Engine.write_baseline_config` refuses every
     write before it touches a file. A :class:`WiringError`, so a route that maps a refused config
     write to 409 maps this one too."""
+
+
+class ConfigWriteAuditTimeout(WiringError):
+    """A config write refused because its audit row did not land within
+    :data:`CONFIG_WRITE_AUDIT_TIMEOUT_SECONDS` (vault BACKLOG #2945).
+
+    :meth:`Engine.write_baseline_config` has already tried to put back the bytes the write changed.
+    ``undone`` says whether it put back all of them; a file another edit changed in the meantime is
+    left as that edit wrote it, and logged. A :class:`WiringError`, so a route that maps a refused
+    config write to 409 maps this one too."""
+
+    def __init__(self, timeout: float, *, undone: bool) -> None:
+        super().__init__(
+            f"the config write was refused: its audit row was not recorded within {timeout:g} s"
+            + (
+                ", so the change was undone. Try again; if it keeps failing, the audit store is "
+                "not answering"
+                if undone
+                else ", and the change could not be fully undone, so the next start reports a "
+                "config change. The engine log names the file"
+            )
+        )
+        self.undone = undone
 
 
 @dataclass(frozen=True, slots=True)
@@ -2454,11 +2556,18 @@ class Engine:
         ``connection`` or ``codeset`` CLI edit, which takes the same config-directory lock, cannot
         land between the write and either digest. The ``impact`` CLI's rename takes no lock, so one
         landing during ``write`` can still be taken into the after digest. It raises
-        :class:`WiringError` to refuse, and then nothing is recorded. ``reflect``, when given, then
-        runs on the event loop, still under the engine lock, to show the write on the live graph; a
-        failure there is logged and the row is still written. Last, the row is written under
+        :class:`WiringError` to refuse, and then nothing is recorded. Next the row is written under
         ``action`` with ``detail``, this node's id and the fingerprint returned, still under the
-        engine lock, so two writes' rows land in the order of their writes. ``detail`` must be JSON
+        engine lock, so two writes' rows land in the order of their writes. The row is bounded by
+        :data:`CONFIG_WRITE_AUDIT_TIMEOUT_SECONDS`, so a store that never answers cannot hold the
+        lock and every later write (vault BACKLOG #2945). A row that fails or times out first puts
+        back the bytes the write changed in the files the digest covers, so no write is left on disk
+        without its row; a timeout is then refused as :class:`ConfigWriteAuditTimeout`, and any
+        other failure is re-raised. A file another edit changed since is left alone and logged, and
+        the next start reports it. A row the store commits just as the bound runs out can still
+        land beside the undone write; the next start then reports that as a config change too.
+        Last, ``reflect``, when given, runs on the event loop, still under the engine lock, to show
+        the write on the live graph; a failure there is logged. ``detail`` must be JSON
         and may not set a key the helper writes (:data:`_BASELINE_ROW_KEYS`); either fault raises
         before anything is written. A caller cancelled while it waits for the engine lock gets no
         write. Once the lock is held, a cancelled caller stops waiting but does not stop the write or
@@ -2502,20 +2611,24 @@ class Engine:
 
         def _locked_write(
             cfg_dir: Path, loaded_fp: object
-        ) -> tuple[dict[str, object] | None, bool]:
+        ) -> tuple[dict[str, object] | None, bool, _CoveredChanges]:
             """The write and both digests, all under the cross-process lock (vault BACKLOG #2782).
 
             The lock spans the whole of ``write``, so a read-modify-write in it cannot lose a
             `connection` CLI edit landing in the middle. It spans the digests too, so neither can
             take in a CLI edit this engine never loaded. Re-entrant, so a writer's own acquisition
-            nests. Returns ``(after, vouched)``; ``vouched`` is False when this write was not the one
-            change."""
+            nests. Returns ``(after, vouched, changes)``; ``vouched`` is False when this write was
+            not the one change, and ``changes`` is what :func:`_undo_covered_changes` puts back if
+            the row then fails (vault BACKLOG #2945)."""
             with connections_edit.locked(cfg_dir):
+                # Read before the write, so a row that fails can put back what this write changed.
+                prior = _read_covered(cfg_dir)
                 # vault BACKLOG #2597: whether the directory still holds the bytes the running
                 # graph loaded, read before this write changes it. With no loaded digest there is
                 # nothing to vouch against, so the two reads are skipped.
                 before = _digest(cfg_dir) if isinstance(loaded_fp, str) else None
                 write(cfg_dir)
+                changes = _covered_changes(prior, _read_covered(cfg_dir))
                 # The digest covers the whole directory, so it may vouch for this write only when
                 # the write is the one change since the load. Otherwise another edit is on disk
                 # that the running graph never loaded, and the row keeps the loaded digest, so the
@@ -2525,7 +2638,7 @@ class Engine:
                     or not isinstance(loaded_fp, str)
                     or not fingerprint_matches(before.get("fingerprint"), loaded_fp)
                 ):
-                    return None, False
+                    return None, False, changes
                 # The write has landed, so an unexpected failure here is logged and costs the
                 # digest, never the answer: a raise would report a landed write as failed, with
                 # no audit row.
@@ -2534,10 +2647,10 @@ class Engine:
                 except Exception:  # noqa: BLE001 - see the comment above; logged, never silent
                     log.exception("config written; its config fingerprint was not taken")
                     after = None
-                return after, True
+                return after, True, changes
 
         async def _apply() -> dict[str, object] | None:
-            """The write, reflect and row, with the engine lock already held. The lock is released
+            """The write, row and reflect, with the engine lock already held. The lock is released
             by :meth:`_config_write_done`, which runs however the task ends, even cancelled before
             its first step."""
             if self._config_writes_closed:
@@ -2553,44 +2666,58 @@ class Engine:
                 prepare()
             loaded = self.loaded_config_fingerprint
             loaded_fp = loaded.get("fingerprint") if loaded is not None else None
-            after, vouched = await asyncio.to_thread(_locked_write, config_dir, loaded_fp)
+            after, vouched, changes = await asyncio.to_thread(_locked_write, config_dir, loaded_fp)
+            # With no digest of what is on disk now, the loaded one would read as a change at the
+            # next start, so a vouched row records none and that start compares nothing.
+            fingerprint = after if vouched else loaded
+            # vault BACKLOG #2945: the row is written under the engine lock, so two writes' rows
+            # land in write order, and it is bounded, so a store that never answers cannot hold
+            # that lock and every later write. A row that fails or times out puts the files back
+            # first, so the refusal leaves no write on disk without its row.
+            bound = CONFIG_WRITE_AUDIT_TIMEOUT_SECONDS
+            deadline = asyncio.timeout(bound)
+            try:
+                async with deadline:
+                    await self.store.record_audit(
+                        action,
+                        actor=actor,
+                        detail=json.dumps(
+                            {
+                                **detail,
+                                "node": self._coordinator.node_id,
+                                **(fingerprint or {}),
+                                # A process whose start never checked its config cannot vouch
+                                # for it.
+                                **(
+                                    {CONFIG_BASELINE_UNCHECKED_KEY: True}
+                                    if self.config_baseline_unchecked
+                                    else {}
+                                ),
+                            }
+                        ),
+                        client=client,
+                    )
+            except Exception:
+                undone = await asyncio.to_thread(_undo_covered_changes, config_dir, changes)
+                if deadline.expired():
+                    log.warning(
+                        "config write %s refused: its audit row was not recorded within %g s",
+                        action,
+                        bound,
+                    )
+                    raise ConfigWriteAuditTimeout(bound, undone=undone) from None
+                raise
+            if vouched and after is not None:
+                # The row has landed and the write is reflected next, so the running graph matches
+                # these bytes and the provenance baseline moves with it. After the row, not before:
+                # a row that fails puts the files back, and the baseline still matches them.
+                self.loaded_config_fingerprint = after
             if reflect is not None:
-                # The write has landed, so a failed reflect costs the live view, never the row.
+                # The write and its row have landed, so a failed reflect costs the live view only.
                 try:
                     reflect()
                 except Exception:  # noqa: BLE001 - logged; the durable file is the truth
                     log.exception("config written; reflecting it on the live graph failed")
-            fingerprint: dict[str, object] | None
-            if not vouched:
-                fingerprint = loaded
-            elif after is None:
-                # No digest of what is on disk now. The loaded one would read as a change at
-                # the next start, so the row records none and that start compares nothing.
-                fingerprint = None
-            else:
-                # The running graph now matches these bytes (the write was reflected live), so
-                # the provenance baseline moves with it. Before the row: a row that fails to
-                # write must not leave this process's baseline behind its own disk and graph.
-                self.loaded_config_fingerprint = after
-                fingerprint = after
-            await self.store.record_audit(
-                action,
-                actor=actor,
-                detail=json.dumps(
-                    {
-                        **detail,
-                        "node": self._coordinator.node_id,
-                        **(fingerprint or {}),
-                        # A process whose start never checked its config cannot vouch for it.
-                        **(
-                            {CONFIG_BASELINE_UNCHECKED_KEY: True}
-                            if self.config_baseline_unchecked
-                            else {}
-                        ),
-                    }
-                ),
-                client=client,
-            )
             return fingerprint
 
         # The engine lock serializes the whole read-modify-write, live reflect and row, so two

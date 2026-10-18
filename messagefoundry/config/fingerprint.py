@@ -36,6 +36,7 @@ __all__ = [
     "ConfigDirMissing",
     "config_fingerprint",
     "config_fingerprint_detail",
+    "covered_files",
     "fingerprint_matches",
     "is_missing_directory",
 ]
@@ -101,21 +102,10 @@ def _iter_entries(base: Path, *, strict: bool = False) -> list[tuple[str, bytes]
     skipped rather than crashing the audit it feeds, unless ``strict`` (see
     :func:`config_fingerprint`).
     """
-    # Lazy: wiring is the loader, and this module stays importable without pulling it in at import time.
-    from messagefoundry.config.wiring import config_py_files
-
     if strict:
         _require_listable(base)
-    seen: set[Path] = set()
     entries: list[tuple[str, bytes]] = []
-    globbed = (path for pattern in _FINGERPRINT_GLOBS for path in base.glob(pattern))
-    for path in [*config_py_files(base), *globbed]:
-        if not _is_file(path, strict=strict):
-            continue
-        resolved = path.resolve()
-        if resolved in seen:
-            continue
-        seen.add(resolved)
+    for path in _covered(base, strict=strict):
         try:
             data = path.read_bytes()
         except OSError:
@@ -126,6 +116,34 @@ def _iter_entries(base: Path, *, strict: bool = False) -> list[tuple[str, bytes]
         entries.append((rel, hashlib.sha256(data).digest()))
     entries.sort()
     return entries
+
+
+def covered_files(directory: str | Path) -> list[Path]:
+    """Every regular file the digest covers in ``directory``, each once, in listing order.
+
+    The same rule the digest applies, so a caller that must put the covered bytes back, as
+    ``Engine.write_baseline_config`` does when a write's audit row fails (vault BACKLOG #2945),
+    restores exactly what the digest reads."""
+    return _covered(Path(directory), strict=False)
+
+
+def _covered(base: Path, *, strict: bool) -> list[Path]:
+    """The covered regular files under ``base``, deduplicated by resolved path."""
+    # Lazy: wiring is the loader, and this module stays importable without pulling it in at import time.
+    from messagefoundry.config.wiring import config_py_files
+
+    seen: set[Path] = set()
+    found: list[Path] = []
+    globbed = (path for pattern in _FINGERPRINT_GLOBS for path in base.glob(pattern))
+    for path in [*config_py_files(base), *globbed]:
+        if not _is_file(path, strict=strict):
+            continue
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        found.append(path)
+    return found
 
 
 def _require_listable(base: Path) -> None:

@@ -398,13 +398,15 @@ async def test_a_caller_cancelled_before_its_write_starts_gets_no_write(
 async def test_a_failed_row_does_not_leave_the_loaded_digest_behind(
     engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The loaded digest moves with the write, before the row. If the row then fails, this
-    process's baseline still matches its own disk and live graph, so its next toggle vouches again
-    and records the true digest. The round-one order kept the old digest, and every later row
-    recorded it until a reload."""
+    """If the row fails, the write is put back (vault BACKLOG #2945), so this process's baseline
+    still matches its own disk and live graph, and its next toggle vouches again and records the
+    true digest. The round-one order kept the old digest, and every later row recorded it until a
+    reload."""
     from messagefoundry.config.fingerprint import config_fingerprint_detail
 
     engine.loaded_config_fingerprint = config_fingerprint_detail(tmp_path)
+    toml_path = tmp_path / "connections.toml"
+    before = toml_path.read_bytes()
 
     async def _refused(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("the audit store refused the row")
@@ -414,6 +416,10 @@ async def test_a_failed_row_does_not_leave_the_loaded_digest_behind(
         await engine.set_connection_flag(
             "OB_TOML", direction="outbound", flagged=True, actor="tester", client=None
         )
+    # No write left on disk without its row, and the live graph never showed it.
+    assert toml_path.read_bytes() == before
+    assert engine.registry_runner is not None
+    assert engine.registry_runner.registry.outbound["OB_TOML"].flagged is False
     assert engine.loaded_config_fingerprint == config_fingerprint_detail(tmp_path)
     monkeypatch.undo()
     returned = await engine.set_connection_flag(
@@ -608,3 +614,107 @@ async def test_the_toggle_takes_its_digests_under_the_config_edit_lock(
     )
     assert held_at_digest == [True, True], "control: both digests were taken, each under the lock"
     assert not _probe(), "control: the probe reads the lock as free once the toggle returns"
+
+
+def _hang_the_row(engine: Engine, monkeypatch: pytest.MonkeyPatch, *, bound: float = 0.3) -> None:
+    """A store that never answers the config row, and a short audit bound (vault BACKLOG #2945)."""
+    from messagefoundry.pipeline import engine as engine_module
+
+    async def _hung(*_args: object, **_kwargs: object) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(engine_module, "CONFIG_WRITE_AUDIT_TIMEOUT_SECONDS", bound)
+    monkeypatch.setattr(engine.store, "record_audit", _hung)
+
+
+async def test_a_hung_row_times_out_undoes_the_write_and_frees_the_lock(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """vault BACKLOG #2945: the row is written under the engine lock, so a store that never answers
+    used to hold the lock, and every later config write, until it did. The row is now bounded: the
+    write times out, its file goes back to the bytes it held, the caller is told why, and the lock
+    is free for the next write."""
+    from messagefoundry.config.fingerprint import config_fingerprint_detail
+    from messagefoundry.pipeline.engine import ConfigWriteAuditTimeout
+
+    engine.loaded_config_fingerprint = loaded = config_fingerprint_detail(tmp_path)
+    toml_path = tmp_path / "connections.toml"
+    before = toml_path.read_bytes()
+    _hang_the_row(engine, monkeypatch)
+    with pytest.raises(ConfigWriteAuditTimeout, match="was not recorded within 0.3 s") as refused:
+        await asyncio.wait_for(
+            engine.set_connection_flag(
+                "OB_TOML", direction="outbound", flagged=True, actor="tester", client=None
+            ),
+            20,
+        )
+    assert refused.value.undone is True
+    assert "undone" in str(refused.value)
+    assert isinstance(refused.value, WiringError), "a route maps it to 409 with the other refusals"
+    assert toml_path.read_bytes() == before
+    assert engine.registry_runner is not None
+    assert engine.registry_runner.registry.outbound["OB_TOML"].flagged is False
+    assert engine.loaded_config_fingerprint == loaded
+    assert not engine._toml_write_lock.locked()
+    assert not engine._config_writes
+    # The store answers again, and the next write lands with its row.
+    monkeypatch.undo()
+    returned = await engine.set_connection_flag(
+        "OB_TOML", direction="outbound", flagged=True, actor="tester", client=None
+    )
+    assert returned is not None
+    assert returned["fingerprint"] == config_fingerprint_detail(tmp_path)["fingerprint"]
+    assert "flagged = true" in toml_path.read_text(encoding="utf-8")
+    assert len(await engine.store.list_audit(action="connection_flag_set")) == 1
+
+
+async def test_a_hung_row_undoes_a_file_the_write_created(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A covered file the write created is removed by the undo, so the directory digests as it did
+    before the write; an uncovered file the write left is not the undo's to touch."""
+    from messagefoundry.config.fingerprint import config_fingerprint
+    from messagefoundry.pipeline.engine import ConfigWriteAuditTimeout
+
+    digest_before = config_fingerprint(tmp_path)
+
+    def _write(cfg: Path) -> None:
+        (cfg / "environments").mkdir()
+        (cfg / "environments" / "dev.toml").write_text("x = 1\n", encoding="utf-8")
+        (cfg / "notes.txt").write_text("not covered\n", encoding="utf-8")
+
+    _hang_the_row(engine, monkeypatch)
+    with pytest.raises(ConfigWriteAuditTimeout):
+        await engine.write_baseline_config(
+            "connection_flag_set", _write, detail={}, actor="tester", client=None
+        )
+    assert not (tmp_path / "environments" / "dev.toml").exists()
+    assert (tmp_path / "notes.txt").exists(), "control: the write ran"
+    assert config_fingerprint(tmp_path) == digest_before
+
+
+async def test_a_hung_row_leaves_an_edit_that_landed_since(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The undo puts a file back only while it holds the bytes the write left, so an edit that
+    landed while the row hung (a `connection` CLI edit, say) is never overwritten. The refusal says
+    the change could not be fully undone."""
+    from messagefoundry.pipeline import engine as engine_module
+    from messagefoundry.pipeline.engine import ConfigWriteAuditTimeout
+
+    toml_path = tmp_path / "connections.toml"
+    other = b"# another editor's bytes\n"
+
+    async def _hung(*_args: object, **_kwargs: object) -> None:
+        toml_path.write_bytes(other)
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(engine_module, "CONFIG_WRITE_AUDIT_TIMEOUT_SECONDS", 0.3)
+    monkeypatch.setattr(engine.store, "record_audit", _hung)
+    with pytest.raises(ConfigWriteAuditTimeout, match="could not be fully undone") as refused:
+        await engine.set_connection_flag(
+            "OB_TOML", direction="outbound", flagged=True, actor="tester", client=None
+        )
+    assert refused.value.undone is False
+    assert toml_path.read_bytes() == other
+    assert not engine._toml_write_lock.locked()
