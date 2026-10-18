@@ -75,19 +75,23 @@ _NO_CMDLET_EXIT = 64
 #:
 #: The module is imported by its path under ``$PSHOME``, the folder of the pinned
 #: ``powershell.exe``; this does not guard against a change to that system folder, which takes an
-#: administrator. Every construct here works in Constrained Language Mode, which WDAC or AppLocker
-#: script enforcement imposes on ``-Command`` input; a static .NET call does not. Only a missing
-#: module folder or a module without the cmdlet exits with the "not on this host" status; a module
-#: that is there and fails to import stops the command, which exits 1, an ERROR. Output is UTF-8,
-#: so a localized error line reaches the ERROR detail readable; under Constrained Language Mode
-#: that one setting is refused and the rest runs.
+#: administrator. The text runs in Constrained Language Mode, which WDAC or AppLocker script
+#: enforcement imposes on ``-Command`` input and which refuses a method call on, or a property set
+#: of, a type outside its allowed core types. So the one such statement, the UTF-8 output setting
+#: that keeps a localized error line readable, runs in Full Language Mode only, where an ERROR's
+#: first stderr line would otherwise be that refusal. A module folder that is missing, or present
+#: with no module in it (the import gives one error id for both, measured), or a module without
+#: the cmdlet, exits with the "not on this host" status. A module that is there and fails to
+#: import, or an import that returns no module, stops the command, which exits 1, an ERROR.
 _SUITES_COMMAND = (
-    "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
+    "if ($ExecutionContext.SessionState.LanguageMode -eq 'FullLanguage') "
+    "{ [Console]::OutputEncoding = [Text.Encoding]::UTF8 }; "
     "$WarningPreference = 'SilentlyContinue'; $VerbosePreference = 'SilentlyContinue'; "
     '$p = "$PSHOME\\Modules\\TLS"; '
     "try { $m = @(Microsoft.PowerShell.Core\\Import-Module -Name $p -PassThru -ErrorAction Stop)[0] } "
     "catch { if ($_.FullyQualifiedErrorId -like 'Modules_ModuleNotFound*') "
     f"{{ exit {_NO_CMDLET_EXIT} }}; throw }}; "
+    "if ($null -eq $m) { throw 'Import-Module returned no module' }; "
     "if (-not ($m.ExportedCommands.Keys -contains 'Get-TlsCipherSuite')) "
     f"{{ exit {_NO_CMDLET_EXIT} }}; "
     "(& $m.ExportedCommands['Get-TlsCipherSuite']).Name"

@@ -807,9 +807,10 @@ It runs the commands of this step. It differs from them in at least the ways nam
   filter of check 1 applied in Python, and the two `Enabled` values of check 2 read from the
   registry. It imports the system TLS module by its path under the Windows PowerShell folder and
   runs that module's own `Get-TlsCipherSuite`, so a script on the `PATH` or a module in the
-  account's Documents folder with the same name cannot answer instead. It names no other
-  command by a bare name, so a `.cmd` on the `PATH` cannot answer for one either; why, and what
-  was measured, is in the comment on `_SUITES_COMMAND` in `messagefoundry/verify/cipher_policy.py`.
+  account's Documents folder with the same name cannot answer instead. No command it runs is
+  looked up by a bare name, so a program or script of that name on the `PATH`, such as a
+  `Join-Path.cmd`, cannot answer either; why, and what was measured, is in the comment on
+  `_SUITES_COMMAND` in `messagefoundry/verify/cipher_policy.py`.
   It silences PowerShell's
   warning and verbose streams. Any other output line that is not shaped like a suite name makes the
   row ERROR, so such a line is neither counted as a suite nor dropped. **It also reads one thing the

@@ -352,8 +352,8 @@ service.
 the system-directory `powershell.exe` with `-Command` and a script, so PowerShell parses and runs
 that text, as a shell runs a shell string. The script is a constant in the module: no host data,
 setting or message reaches it, and it calls `Get-TlsCipherSuite` through the system TLS module
-imported by its path, never by name. It names no other command by a bare name, so a `.cmd` on
-the `PATH` cannot answer for one. Its argument list is still the form in the table above. The
+imported by its path, never by name. No command it runs is looked up by a bare name, so a
+program or script of that name on the `PATH` cannot answer for one. Its argument list is still the form in the table above. The
 site check in the test suite counts a `-Command` start as a shell start, as it counts these two.
 
 **The tray opens files and URLs through Windows.** `os.startfile`, and `webbrowser.open` on Windows,

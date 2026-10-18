@@ -208,6 +208,8 @@ def test_the_command_runs_the_system_tls_modules_own_cmdlet() -> None:
     assert command.endswith("(& $m.ExportedCommands['Get-TlsCipherSuite']).Name")
     # Every mention of the cmdlet's name is a quoted key on the imported module, never a call.
     assert command.count("Get-TlsCipherSuite") == command.count("'Get-TlsCipherSuite'")
+    # ...and each is a key on the imported module's exported commands, so `& 'name'` is refused.
+    assert command.count("'Get-TlsCipherSuite'") == command.count("ExportedCommands")
     # Only an absent module folder or cmdlet exits "not on this host"; a failed import stops.
     assert command.count(f"exit {cipher_policy._NO_CMDLET_EXIT}") == 2
     for bare in ("Join-Path", "Test-Path", "Get-Command", "Select-Object", "ForEach-Object"):
@@ -235,11 +237,20 @@ def _run_powershell(
 
 @pytest.mark.skipif(sys.platform != "win32", reason="runs the real Windows PowerShell")
 def test_the_command_runs_in_constrained_language_mode() -> None:
-    """WDAC or AppLocker script enforcement runs ``-Command`` text in Constrained Language Mode,
-    which refuses a static .NET call; the probe text must still read the suites there."""
+    """WDAC or AppLocker script enforcement runs ``-Command`` text in Constrained Language Mode;
+    the probe text must still read the suites there, and write nothing to stderr, so a real
+    error's first line is not hidden behind a language-mode refusal."""
     clm = "$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'; "
+    # Control: the mode really changed, and a statement CLM refuses is refused.
+    control = _run_powershell(
+        clm + "$ExecutionContext.SessionState.LanguageMode; "
+        "[Console]::OutputEncoding = [Text.Encoding]::UTF8"
+    )
+    assert control.stdout.split()[:1] == ["ConstrainedLanguage"]
+    assert "core types" in control.stderr
     done = _run_powershell(clm + cipher_policy._SUITES_COMMAND)
     assert done.returncode == 0, done.stderr[:300]
+    assert done.stderr.strip() == ""
     lines = [ln.strip() for ln in done.stdout.splitlines() if ln.strip()]
     assert lines and all(cipher_policy._SCHANNEL_SUITE_NAME.fullmatch(ln) for ln in lines)
 
@@ -253,9 +264,10 @@ def test_a_missing_module_folder_exits_not_on_this_host() -> None:
 
 @pytest.mark.skipif(sys.platform != "win32", reason="parses with Windows PowerShell's parser")
 def test_no_command_in_the_probe_text_is_a_bare_name(tmp_path: Path) -> None:
-    """PowerShell's own parser lists every command the text names. The only name allowed is the
-    Core-qualified ``Import-Module``; the command object run with ``&`` has no name. Planting a
-    bare ``Join-Path`` back in must be caught."""
+    """PowerShell's own parser lists every command the text runs. The only name allowed is the
+    Core-qualified ``Import-Module``, and the only nameless one is the imported module's command
+    object; a dynamic ``& $name`` would be a lookup by name too. Planting a bare ``Join-Path`` back
+    in must be caught."""
 
     def command_names(text: str) -> list[str]:
         script = tmp_path / "probe.ps1.txt"
@@ -266,20 +278,27 @@ def test_no_command_in_the_probe_text_is_a_bare_name(tmp_path: Path) -> None:
             "if ($e.Count) { exit 3 }; "
             "foreach ($c in $ast.FindAll({ param($n) "
             "$n -is [Management.Automation.Language.CommandAst] }, $true)) "
-            "{ $n = $c.GetCommandName(); if ($n) { [Console]::Out.WriteLine($n) } }"
+            "{ $n = $c.GetCommandName(); if (-not $n) { $n = '& ' + $c.CommandElements[0].Extent.Text }; "
+            "[Console]::Out.WriteLine($n) }"
         )
         done = _run_powershell(lister, {"MF_PROBE_TEXT": str(script)})
         assert done.returncode == 0, done.stderr[:300]
-        return done.stdout.split()
+        return [line.strip() for line in done.stdout.splitlines() if line.strip()]
 
     assert command_names(cipher_policy._SUITES_COMMAND) == [
-        "Microsoft.PowerShell.Core\\Import-Module"
+        "Microsoft.PowerShell.Core\\Import-Module",
+        "& $m.ExportedCommands['Get-TlsCipherSuite']",
     ]
     planted = cipher_policy._SUITES_COMMAND.replace(
         '"$PSHOME\\Modules\\TLS"', "(Join-Path $PSHOME 'Modules\\TLS')"
     )
     assert planted != cipher_policy._SUITES_COMMAND
-    assert [n for n in command_names(planted) if "\\" not in n] == ["Join-Path"]
+    assert [n for n in command_names(planted) if "\\" not in n and "&" not in n] == ["Join-Path"]
+    dynamic = cipher_policy._SUITES_COMMAND.replace(
+        "(& $m.ExportedCommands['Get-TlsCipherSuite']).Name",
+        "$j = 'Get-TlsCipherSuite'; (& $j).Name",
+    )
+    assert "& $j" in command_names(dynamic)
 
 
 @pytest.mark.parametrize("odd", ["WARNING: module loaded late", "AVERTISSEMENT : x", "TLS AES"])
@@ -315,8 +334,9 @@ def test_the_powershell_command_runs_on_this_host() -> None:
 
 
 _PLANTED_SUITE = "TLS_PLANTED_AES_256_GCM_SHA384"
-#: At least the two helpers the Lander found shadowed, and the cmdlet the probe still calls.
-_PLANTED_COMMANDS = ("Join-Path", "Test-Path", "Import-Module")
+#: At least the two helpers the Lander found shadowed, and the cmdlet the probe exists to run.
+#: ``Import-Module`` is planted too, though a Core cmdlet always wins over a ``PATH`` external.
+_PLANTED_COMMANDS = ("Join-Path", "Test-Path", "Get-TlsCipherSuite", "Import-Module")
 #: The probe text as it stood at the hold: bare ``Join-Path`` and ``Test-Path``. The positive
 #: control, so the plant is shown to run where a bare name is looked up.
 _SHADOWABLE_COMMAND = (
@@ -342,11 +362,16 @@ def _plant_on_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     planted.mkdir()
     ran = tmp_path / "ran"
     ran.mkdir()
-    answers = {"Join-Path": str(fake_module), "Test-Path": "True", "Import-Module": ""}
+    answers = {
+        "Join-Path": str(fake_module),
+        "Test-Path": "True",
+        "Get-TlsCipherSuite": _PLANTED_SUITE,
+        "Import-Module": "",
+    }
     for name in _PLANTED_COMMANDS:
         (planted / f"{name}.cmd").write_text(
             f'@echo off\r\ntype nul > "{ran / name}"\r\necho {answers[name]}\r\n',
-            encoding="ascii",
+            encoding="oem",  # cmd.exe reads a batch file in the OEM code page
         )
     monkeypatch.setenv("PATH", f"{planted}{os.pathsep}{os.environ.get('PATH', '')}")
     return ran
