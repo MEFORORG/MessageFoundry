@@ -811,9 +811,11 @@ role write's own transaction, under the last-administrator guard's lock, so of t
 different usernames the one whose grant commits second is refused. The service hands that guard
 the same predicate the refusal reads (`_signs_in_without_an_outside_service`), so it counts only
 an enabled local Administrator with a usable password, and a directory or federated one refuses
-the grant no more than it refused the run. A directory Administrator who is signed in could still
-create a local one from the web console during the run, by a role write that takes no lock. The
-store would then hold two. Each was made by someone with authority to make one.
+the grant no more than it refused the run. The store can still end with two at least these ways,
+each through a write that takes no lock: a directory Administrator who is signed in creates a
+local one from the web console during the run, or resets the password of a local Administrator
+the check passed over (a hashless or lapsed one). Each was made by someone with authority to make
+one.
 
 **New acceptance criterion.**
 
@@ -824,3 +826,6 @@ store would then hold two. Each was made by someone with authority to make one.
   and `::test_the_refusal_and_the_start_notice_agree`, parametrized over directory-only,
   federated-only, a hashless, expired or disabled local Administrator beside a directory one, and
   two controls that refuse: a local Administrator with a usable password, and a locked-out one.
+  The in-transaction guard's half is
+  `tests/_first_admin_grant_store_contract.py::assert_grant_counts_only_a_local_administrator_that_signs_in`,
+  run on SQLite, Postgres and SQL Server.

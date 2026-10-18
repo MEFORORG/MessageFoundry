@@ -1739,8 +1739,9 @@ def _is_sqlite_busy(exc: sqlite3.OperationalError) -> bool:
 #: enumerations (``AuthService.has_notifiable_admin`` lists them); a condition added to one belongs
 #: in all. The first-administrator grant's own narrowing (``counts_as_admin``, vault BACKLOG #2711)
 #: is not such a condition: it is applied after this read, to the grant only, and the removal
-#: guard must keep counting directory administrators. Since BACKLOG #2592 the other holders are counted only when their record passes its
-#: integrity seal (:func:`admin_guard_counts`), as the service's enumerations count them.
+#: guard must keep counting directory administrators. Since BACKLOG #2592 the other holders are
+#: counted only when their record passes its integrity seal (:func:`admin_guard_counts`), as the
+#: service's enumerations count them.
 _SQL_ADMIN_GUARD_HOLDERS = (
     "SELECT u.id, CASE WHEN u.id = ? THEN 1 ELSE 0 END"
     " FROM users u JOIN user_roles r ON r.user_id = u.id"

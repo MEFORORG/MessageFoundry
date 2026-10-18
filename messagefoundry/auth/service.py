@@ -3292,8 +3292,9 @@ class AuthService:
         directory or federated Administrator no longer blocks it, so a site whose every
         Administrator needs an outside service can make a local one at the host while that service
         is down. The check is a read before the writes, so two runs with different usernames can
-        both pass it; the guarded grant below closes that race (vault BACKLOG #3078), and it counts
-        what this check counts, so it does not refuse where this check passed.
+        both pass it; the guarded grant below closes that race (vault BACKLOG #3078). It counts what
+        this check counts, so it never counts an Administrator this check passed over, such as a
+        directory one; it refuses only for one it counts that appeared after the check.
 
         **THE CREDENTIAL IS CLAIMED AT BIRTH, so there is no half-claimed state to restart into.**
         The password is typed by the operator at a TTY and reaches no file, no argv and no log, so
@@ -3561,7 +3562,8 @@ class AuthService:
         )
         if grant is AdminGrant.ADMIN_EXISTS:
             raise FirstAdministratorRefused(
-                "another enabled Administrator was created while this command ran, so this run "
+                "another enabled Administrator was created while this command ran, or one "
+                "gained a usable password, so this run "
                 f"granted no role, and the account named {username!r} holds none; remove any "
                 "authenticator entry it showed. If this run created that account and nobody needs "
                 "it, delete it from the web console"
@@ -13970,10 +13972,13 @@ class AuthService:
 
         Enumerates as :meth:`is_last_enabled_admin` and :meth:`_other_enabled_admin_exists` do --
         same store calls, same disabled-skip, same role test. **That agreement is a convention, not
-        a mechanism, and this docstring must not claim otherwise:** these are now THREE independent
-        copies of "who is an enabled administrator", and nothing binds them. If one gains a
-        condition -- a lockout check, an auth_provider filter -- the others keep the old answer
-        silently. Extracting a shared enumeration is worth its own item; it is deliberately not done
+        a mechanism, and this docstring must not claim otherwise:** these are at least THREE
+        independent copies of "who is an enabled administrator", and nothing binds them. If one
+        gains a condition -- a lockout check, an auth_provider filter -- the others keep the old
+        answer silently. The ``provision-admin`` refusal (:meth:`_administrator_standing`) and the
+        first-administrator grant's guard filter on ``auth_provider`` on purpose (vault BACKLOG
+        #2711 step 1, owner ruling B258-R4), through one predicate,
+        :meth:`_signs_in_without_an_outside_service`; that is not this drift. Extracting a shared enumeration is worth its own item; it is deliberately not done
         here, because it would rewrite two guards this change has no business touching.
         """
         for user in await self._load_users():

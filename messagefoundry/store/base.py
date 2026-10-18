@@ -2591,7 +2591,8 @@ class AuthStore(Protocol):
 
         **It is serialized against every other call of this and of :meth:`remove_unless_last_admin`
         on the same database**, under the same lock, not only in this process. So two provisioning
-        runs with different usernames, each of which saw no administrator, cannot both be granted:
+        runs with different usernames, each of which saw no administrator ``counts_as_admin``
+        passes, cannot both be granted:
         the one whose grant commits second reads the first and is refused. SQLite has no such lock
         across processes and relies on its single writer instead; its implementation re-runs the
         transaction a bounded number of times when the write fails busy, and raises past that bound
