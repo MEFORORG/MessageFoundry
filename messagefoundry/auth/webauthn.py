@@ -525,7 +525,8 @@ def verify_assertion(
     py_webauthn enforces counter increment only when both counts are >0 (synced-passkey 0/0 is
     accepted); the *service* layer applies the strict compare-and-set on top (a CAS miss is the
     clone signal — ADR 0068 §4 — except on a passkey the same locked write confirms gone, which
-    is refused without one: ADR 0068, amendment of 2026-10-17, BACKLOG #3774).
+    is refused without one unless the account's passkey set then fails its seal: ADR 0068,
+    amendment of 2026-10-17, BACKLOG #3774).
 
     The stored key is checked first, with the same rule registration applies
     (:func:`_require_usable_public_key`). The library's own sign-in checks do not include that

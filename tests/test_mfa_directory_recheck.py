@@ -628,6 +628,52 @@ async def test_a_factor_changed_during_the_check_charges_no_lockout(
     assert all(r["detail"] for r in rows)
 
 
+@pytest.mark.parametrize("change", ["reset", "admin-replace"])
+async def test_a_factor_changed_with_the_sessions_revoked_answers_a_lost_session(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """BACKLOG #3780 item 1, the review of PR 2392 at 5d8901d8. An MFA reset, or an administrator's
+    replace, turns the factor off (and enrols a new one) and revokes the sessions, so a CORRECT
+    recovery code checked meanwhile fails its spend on a session that no longer authenticates. RED
+    when: the failed-spend branch answers ``factor_removed`` or ``factor_replaced`` with
+    ``session_lost`` unset, because it skipped the holder re-read the proved branch runs. The code
+    matched, so it is still charged nothing."""
+    service = AuthService(store, _settings())
+    identity, first, _ = await login_admin(service)
+    enroll = await service.begin_mfa_enrollment(identity)
+    confirmed = await service.confirm_mfa_enrollment(
+        identity, fresh_totp(enroll.secret), token=first
+    )
+    assert confirmed.ok and confirmed.token is not None and confirmed.recovery_codes
+    token = confirmed.token
+    user_id = identity.user_id
+    real_verify = service._verify_second_factor
+
+    async def _verify_while_an_admin_changes_the_factor(*args: Any, **kwargs: Any) -> bool:
+        # The check holds the row it loaded, so a change landing now is one it cannot see.
+        await store.disable_totp(user_id)
+        if change == "admin-replace":
+            cell = await store.set_totp_secret(user_id, secret=_REPLACING_SECRET)
+            assert cell is not None
+            assert await store.enable_totp(
+                user_id, recovery_code_hashes=[], expected_secret_cell=cell, now=_T1
+            )
+        await store.revoke_session(hash_token(token))
+        return await real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_verify_second_factor", _verify_while_an_admin_changes_the_factor)
+
+    refused = await service.verify_mfa(token, confirmed.recovery_codes[0])
+
+    assert refused.ok is False and refused.session_lost is True and refused.locked is False
+    failures = await _audited_mfa_failures(store)
+    assert {"reason": "session_lost"} in failures
+    assert {"reason": "factor_removed"} not in failures
+    assert {"reason": "factor_replaced"} not in failures
+    user = await store.get_user(user_id)
+    assert user is not None and user.second_step_failed_attempts == 0
+
+
 async def test_a_rename_during_the_code_check_is_audited_under_the_new_name(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

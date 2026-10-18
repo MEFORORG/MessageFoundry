@@ -2065,7 +2065,8 @@ class SessionRecord:
 #: What :meth:`MessageStore.update_webauthn_sign_count` found, decided under the one locked write on
 #: every backend (BACKLOG #3774): ``"moved"`` (the stored count equalled ``expected`` and now holds
 #: ``new``), ``"mismatch"`` (the passkey exists and holds another count: a clone signal, ADR 0068
-#: decision 4) or ``"gone"`` (no such passkey, the only miss that is not a clone signal).
+#: decision 4) or ``"gone"`` (no such passkey, the only miss that is not a clone signal, save when
+#: the account's passkey set then fails its seal: ADR 0068, amendment of 2026-10-17).
 SignCountAnswer = Literal["moved", "mismatch", "gone"]
 
 
@@ -15103,7 +15104,7 @@ class MessageStore:
         The UPDATE takes SQLite's write lock even when it matches no row, so no writer, in this
         process or another on the same file, can delete the passkey between the miss and the answer
         (BACKLOG #3774). The caller reads ``"mismatch"`` as a clone signal (ADR 0068 decision 4)
-        and ``"gone"`` as none."""
+        and ``"gone"`` as none, save when the passkey set then fails its seal."""
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE webauthn_credentials SET sign_count=?, last_used_at=?"
