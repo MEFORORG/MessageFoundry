@@ -123,6 +123,15 @@ _DOCSTRING_FILES = frozenset(
         "messagefoundry/transports/rest.py",
     }
 )
+#: A floor under ``_DOCSTRING_FILES``, so an emptied list cannot pass the tests that read it.
+#: Measured 2026-10-17 (vault BACKLOG #3753): ``_package_sources`` keeps 20 of the package files,
+#: 14 of those hold a docstring that names the escape, and all 14 are pinned. 10 leaves room to
+#: unpin a file whose mention moved.
+_MIN_DOCSTRING_FILES = 10
+_PINNED_LIST_SHRANK = (
+    f"_DOCSTRING_FILES holds fewer than {_MIN_DOCSTRING_FILES} files. It is the walk's pinned "
+    "control; lower _MIN_DOCSTRING_FILES only for a file whose last naming docstring went away."
+)
 #: Functions whose own docstring must spell the variable, so a rewrite that drops it, and with it
 #: the posture, fails here rather than leaving nothing in that docstring for the walk to judge.
 #: The pinned file can still pass the walk on its other docstrings.
@@ -463,6 +472,8 @@ def test_every_runtime_text_naming_the_escape_names_the_posture() -> None:
         if seen:
             found.add(rel)
         failures.extend(f"{rel}:{line}" for line in unposted)
+    # _MUST_FIND pins 10 files at 2026-10-17; 8 is the floor under that pinned control.
+    assert len(_MUST_FIND) >= 8, "_MUST_FIND has shrunk below its floor of 8 pinned files"
     missing = _MUST_FIND - found
     assert not missing, f"the scan found no escape text in {sorted(missing)}"
     assert not failures, (
@@ -481,6 +492,7 @@ def test_the_docstring_walk_flags_a_pinned_file_whose_posture_is_struck_out() ->
     posture fails the walk. The sources come from the walk's own read, so a pinned file the walk
     drops fails here too."""
     walked = dict(_package_sources())
+    assert len(_DOCSTRING_FILES) >= _MIN_DOCSTRING_FILES, _PINNED_LIST_SHRANK
     for rel in sorted(_DOCSTRING_FILES):
         assert rel in walked, f"the walk does not read {rel}"
         source = walked[rel]
@@ -494,6 +506,7 @@ def test_the_docstring_walk_flags_a_pinned_file_whose_posture_is_struck_out() ->
 
 
 def test_the_pinned_functions_still_name_the_escape_in_their_docstrings() -> None:
+    assert _MUST_NAME_IN_DOCSTRING, "_MUST_NAME_IN_DOCSTRING is empty, so nothing is pinned"
     for rel, name in _MUST_NAME_IN_DOCSTRING:
         text = ast.get_docstring(named_func(parse_source(_text(rel)), name), clean=False) or ""
         assert INSECURE_TLS_ESCAPE_ENV in text, f"{rel}:{name}"
@@ -507,11 +520,8 @@ def test_every_authoring_text_naming_the_escape_names_the_posture() -> None:
         if seen:
             found.add(rel)
         failures.extend(f"{rel}:{line} (docstring)" for line in unposted)
-    # Measured 2026-10-17 (vault BACKLOG #3753): the walk reads 20 package files, and 14 of them
-    # hold a docstring that names the escape, all 14 pinned. A floor of 10 leaves room to move a
-    # mention, and still fails a walk or a pinned list that went blind and judges nothing.
-    assert len(found) >= 10, f"the docstring walk found only {sorted(found)}"
-    assert len(_DOCSTRING_FILES) >= 10, sorted(_DOCSTRING_FILES)
+    assert len(_DOCSTRING_FILES) >= _MIN_DOCSTRING_FILES, _PINNED_LIST_SHRANK
+    assert _COMMENT_FILES, "_COMMENT_FILES is empty, so no comment would be judged"
     silent = [f"{rel} (docstrings)" for rel in sorted(_DOCSTRING_FILES - found)]
     for rel in _COMMENT_FILES:
         unposted, seen = comments_without_posture(_text(rel))
