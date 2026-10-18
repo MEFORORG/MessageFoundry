@@ -1844,39 +1844,44 @@ _STRUCTURED_ROUNDS = 8
 # ``&mrn=``, a comma before ``PatientName:`` -- the label goes with the token and the rest of its value
 # is left for no pass to read. So the run also masks that rest, up to where the value ends.
 #
-# **The rest is MASKED IN PLACE, and that is the whole design.** Two earlier attempts kept the label
-# instead. A kept opener left the answer's edge in a parse state main's answer did not have, and text
-# a caller wrote before or after the answer was read through it. Here the answer is main's answer
-# with some letters and digits replaced, character for character:
+# **The rest is MASKED IN PLACE, and that is the whole design.** Call the answer with this rule off
+# the PLAIN answer: every field run replaced, nothing after it touched. A design that kept the label
+# instead left an opener at the answer's edge, and text a caller wrote around the answer was read
+# through it. Here the answer is the plain answer with some letters and digits replaced, character
+# for character:
 #
 # * The rest is a space, then letters, digits and spaces (:data:`_GLUED_VALUE_REST`). It holds no
 #   quote, bracket, delimiter, separator or line break, and its terminator -- a closing quote, the
 #   ``<`` of an end tag, the space after an unquoted value, or the text's end -- stays where it was.
-#   So every structure any pass reads pairs up as it does in main's answer.
-# * Each character keeps its class: an upper-case letter becomes ``X``, a lower-case one ``x`` and a
-#   digit ``0`` (:data:`_SHAPE`). A pass that reads a class, such as a name run joining a caller's
-#   word, reads the same class; and the answer has main's length and main's whitespace, so a limit
-#   cuts both at the same place.
-# * Nothing in it may be read LITERALLY: no word that is, or begins, a word a pass here or a filter
-#   after it spells (:data:`_ANCHOR_PREFIXES`), and no date (:data:`_DATE_RUN`, which reads ``19``).
-#   A masked ``MRN`` or ``bearer`` would switch off a gate main's answer kept on.
+#   So every structure a pass reads pairs up as it does in the plain answer.
+# * A letter keeps its case and a digit stays a digit: upper case becomes ``X``, lower case ``x`` and
+#   a digit ``0`` (:data:`_SHAPE`). So a pass reading those classes, such as a name run joining a
+#   caller's word, reads the same; and the answer has the plain answer's length and whitespace, so a
+#   limit cuts both at the same place. NOT every class is kept: ``A``-``F`` leave the hex class. Every
+#   hex read here (a tag, a ``0010`` key, a ``%XX`` escape) also needs punctuation the rest refuses.
+# * Words read literally are refused, at least these: one that is, or begins, a word in the sources
+#   of :data:`_ANCHOR_PREFIXES`, and a date (:data:`_DATE_RUN` reads ``19``). A masked ``MRN`` or
+#   ``bearer`` would switch off a gate the plain answer kept on. Other literal reads here (the JSON
+#   and XML vocabulary, the backup carve's ``mfbak``) need punctuation the rest refuses; a new pass
+#   that reads a bare word must add its source there.
 # * A value that ends the answer, trailing whitespace aside, is one a caller can glue text onto, so
-#   its last word must be letters (a caller's digits would join a date arm main's digits fed), and
-#   must not end in the head of a word read with no boundary before it (:data:`_UNBOUNDED_HEADS`):
-#   main's ``...ZqMSH`` plus a caller's ``*^~\&*`` declares delimiters, and a mask would not.
+#   its last word must be letters (a caller's digits would join a date arm), and must not end in the
+#   head of a word read with no boundary before it (:data:`_UNBOUNDED_HEADS`): ``...ZqMSH`` plus a
+#   caller's ``*^~\&*`` declares delimiters, and a mask would not.
 #
-# Where any of that fails, the token is scrubbed exactly as main scrubs it. Residuals, at least these:
-# a value holding punctuation, a non-ASCII letter or one of those words; a value longer than
+# Where any of that fails, the token is scrubbed as in the plain answer. Residuals, at least these: a
+# value holding punctuation, a non-ASCII letter or one of those words; a value longer than
 # :data:`_GLUED_VALUE_MAX`; an unquoted value past its first word; a label outside the vocabulary
-# below; and every text holding the credential backstop's opener (:data:`_USERINFO_OPENER`), whose
-# bounded tail would read the line differently.
+# below, or one behind an earlier quote or tag in the token; every text holding the credential
+# backstop's opener (:data:`_USERINFO_OPENER`), whose bounded tail would read the line differently;
+# and a caller that cuts the answer by characters, not at whitespace, then glues text after the cut.
 
 #: The tail of a token that ends inside a QUOTED PHI value: a vocabulary key and its quote (JSON or
 #: a Python repr, an array or an ``identifier``'s ``value`` member between), or a ``Patient...``
 #: label. Searched in a window ending at the token's last quote, so ``\Z`` is that quote.
 _GLUED_QUOTED_LABEL = re.compile(
     r"""(?:(["'])(?:family|given|name|birthDate|address|identifier|telecom|0010[0-9A-Fa-f]{4})"""
-    r"""\1:[\[{]?(?:(["'])value\2:)?|(?<!\w)Patient[A-Za-z]*+['"]?[=:])["']\Z"""
+    r"""\1:[\[{]{0,2}(?:(["'])value\2:)?|(?<!\w)Patient[A-Za-z]*+['"]?[=:])["']\Z"""
 )
 #: The tail of a token that ends inside an XML element's text: a vocabulary start tag, then text.
 _GLUED_XML_LABEL = re.compile(
@@ -1925,16 +1930,26 @@ _ANCHOR_PREFIXES = frozenset(
 #: Every prefix of a word some pass reads with no word boundary before it, so a caller's text glued
 #: after a masked word could complete it: at least the segment ids :data:`_MSH_DELIMITERS` sniffs,
 #: the backstop's opener, and the support bundle's ``mfb64:`` marker (spelled here, as above).
-_UNBOUNDED_HEADS = frozenset(
-    word[:end]
-    for word in ("msh", "bhs", "fhs", "nonnumeric", "mfb")
-    for end in range(1, len(word) + 1)
+_UNBOUNDED_HEADS = tuple(
+    sorted(
+        {
+            word[:end]
+            for word in (
+                *_MSH_DELIMITERS.pattern[3:].split(")", 1)[0].lower().split("|"),
+                _USERINFO_OPENER.split(" ", 1)[0],
+                "mfb",
+            )
+            for end in range(1, len(word) + 1)
+        }
+    )
 )
+#: Whitespace to the end of the text, matched where a value ends.
+_TRAILING_SPACE = re.compile(r"\s*+\Z")
 
 
 def _glued_value(text: str, run: re.Match[str], field_run: re.Pattern[str]) -> str | None:
     """The rest of a PHI value that the field run ``run`` cut through, when it is safe to mask: the
-    text after the token, up to the value's terminator. ``None`` leaves the token as main scrubs it."""
+    text after the token, up to the value's terminator. ``None`` leaves the plain scrub."""
     token, end = run.group(), run.end()
     quote = max(token.rfind('"'), token.rfind("'"))
     if "<" in token[quote + 1 :]:
@@ -1963,8 +1978,8 @@ def _glued_value(text: str, run: re.Match[str], field_run: re.Pattern[str]) -> s
     if not words or any(word in _ANCHOR_PREFIXES for word in words) or _DATE_RUN.search(rest):
         return None
     last = words[-1]
-    if not text[stop:].strip() and (
-        not last.isalpha() or any(last[i:] in _UNBOUNDED_HEADS for i in range(len(last)))
+    if _TRAILING_SPACE.match(text, stop) and (
+        not last.isalpha() or last.lower().endswith(_UNBOUNDED_HEADS)
     ):
         return None  # it ends the answer, and a caller's glued text could read it
     # A last word glued to a quote or a tag: two letters there can be a string prefix (``b"``,
@@ -1975,9 +1990,12 @@ def _glued_value(text: str, run: re.Match[str], field_run: re.Pattern[str]) -> s
     return rest
 
 
-def _scrub_field_runs(text: str, field_run: re.Pattern[str] = _HL7_FIELD_RUN) -> str:
-    """``field_run`` replaced by the placeholder, and the rest of a PHI value a run cut through
-    masked in place (:func:`_glued_value`)."""
+def _scrub_field_runs(text: str, field_run: re.Pattern[str] | None = None) -> str:
+    """``field_run`` (:data:`_HL7_FIELD_RUN` by default, read at call time) replaced by the
+    placeholder, and the rest of a PHI value a run cut through masked in place
+    (:func:`_glued_value`)."""
+    if field_run is None:
+        field_run = _HL7_FIELD_RUN
     if _USERINFO_OPENER in text:
         return field_run.sub(_REDACTED, text)
     out: list[str] = []

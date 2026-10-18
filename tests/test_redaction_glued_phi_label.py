@@ -275,7 +275,7 @@ def test_the_boundary_free_heads_are_what_guard_glued_text(monkeypatch: pytest.M
     """THE POSITIVE CONTROL: without the heads, a masked ``ZqMSH`` no longer declares the caller's
     delimiters, and the field it scrubbed prints."""
     text, after, value = _GLUED_AFTER["segment-id head"]
-    monkeypatch.setattr(redaction, "_UNBOUNDED_HEADS", frozenset())
+    monkeypatch.setattr(redaction, "_UNBOUNDED_HEADS", ())
     assert value in _through_the_chain(safe_exc(ValueError(text)) + after)
 
 
@@ -292,6 +292,15 @@ def test_a_top_level_value_key_is_not_masked() -> None:
     with _rule_off():
         main = redact(text)
     assert redact(text) == main
+
+
+def test_an_identifier_array_of_objects_masks_its_value() -> None:
+    """FHIR writes ``identifier`` as an array of objects, so the ``value`` member sits two brackets
+    in (code review round 2)."""
+    text = 'x|y|z,"identifier":[{"value":"Zq 4455667"}]'
+    assert "4455667" not in redact(text)
+    with _rule_off():
+        assert "4455667" in redact(text)
 
 
 def test_a_short_unquoted_value_is_masked() -> None:
