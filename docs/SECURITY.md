@@ -4428,8 +4428,8 @@ found" for *deleted*, *moved out of the search base* and *the search base was ne
   must be exceeded — the floor alone would sign out a five-person site, the proportion alone would fire
   on a genuine 3-of-3 offboarding — so it trips only on a change that is simultaneously large and broad.
 
-When the hold's and the breaker's alerts resolve themselves, and where they never do, is stated
-once, in [CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-two-alerts-resolve-themselves).
+When the hold's, the breaker's and the referral's alerts resolve themselves, and where they never do, is stated
+once, in [CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-alerts-resolve-themselves).
 
 Revocation is therefore bounded by *interval × strikes* (10 minutes at the recommended 300 s), not
 immediate, and one LDAP bind per signed-in directory user per pass is the cost —
@@ -4443,7 +4443,8 @@ revoked. A pass with any referral audits `auth.ad_reconcile_referred` and raises
 `ad_reconcile_aborted` alert with reason `directory_referral`, under its own source
 `directory-reconciler-referral`. So it is its own instance, apart from the breaker's, and
 acknowledging or suspending one does not silence the other. An `[alerts]` rule keyed on the event
-type alone matches both, and so does a source glob such as `directory-reconciler*`. To mute only
+type alone matches the breaker, the referral and the probe fault, and so does a source glob such
+as `directory-reconciler*`, which also matches the hold's `ad_reconcile_held`. To mute only
 the referral, a rule names its source exactly. The alert's text names `ad_user_search_base` and
 `ad_group_search_base`. A bind response that carries a referral, the service account's included,
 is a referral too (BACKLOG #3010). ldap3 cannot decode its hosts, so the ERROR line names none. The
@@ -4452,7 +4453,7 @@ so for this case it names the wrong setting. A service-account bind answered wit
 code and no referral field is refused as a referral as well (BACKLOG #3017), with the same wrong
 setting named. When it resolves itself
 is stated once, in
-[CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-two-alerts-resolve-themselves).
+[CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-alerts-resolve-themselves).
 Referred accounts stay in the mass-revoke breaker's count, as unreachable ones do. Left out, a referring group base would
 trip the breaker on any handful of genuine disables. A base in another domain of the forest
 refers on every pass. Read as an outage, it would stop revocation on a first deployment without a
@@ -4481,7 +4482,7 @@ down or reset. Another network-class error can still read as a probe fault and p
 **The cost:** while a fault repeats, that account's sessions are never revoked by the
 reconciler, so they run to the absolute cap. That cap is the only bound; the alert makes the gap
 visible and limits nothing. A pass with a fault marks no alert clear. When it resolves is stated once, in
-[CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-two-alerts-resolve-themselves). Step-up
+[CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-alerts-resolve-themselves). Step-up
 refuses the account with outcome `probe_fault`.
 
 ### The engine session is independent of the IdP session (ASVS 7.6.1)
