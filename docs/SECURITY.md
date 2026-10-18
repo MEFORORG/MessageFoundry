@@ -2373,7 +2373,7 @@ five minutes for each kind of read, and pages nothing, because a read loses no a
 is decided or run.
 The queue's own read of each requester's `users` row, which predicts a refusal (BACKLOG
 #3189), is the exception: a fault there leaves that requester's requests with no prediction, the
-queue still answers, and the fault is logged at ERROR on every listing that meets it. Approving
+queue still answers, and the fault is logged at ERROR once per requester on every listing. Approving
 the request reads the row again and answers 503 as above.
 
 What this does not cover, at least: a request or a repeat whose write fails, and that does not
