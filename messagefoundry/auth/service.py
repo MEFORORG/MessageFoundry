@@ -94,7 +94,11 @@ from messagefoundry.auth.notifications import (
     notice_kind_log_label,
 )
 from messagefoundry.auth.oidc import PendingFlow
-from messagefoundry.auth.oidc_http import build_idp_opener, jwks_fetcher
+from messagefoundry.auth.oidc_http import (
+    build_idp_opener,
+    is_idp_transport_http_exception,
+    jwks_fetcher,
+)
 from messagefoundry.auth.passwords import hash_password, needs_rehash, verify_password
 from messagefoundry.auth.permissions import (
     CUSTOM_ROLE_ID_PREFIX,
@@ -130,7 +134,7 @@ from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.credential import constant_time_equal
 from messagefoundry.keyed_lock import KeyedLock as _KeyedLock
 from messagefoundry.keyed_lock import hold_keyed_lock as _hold_keyed_lock
-from messagefoundry.store.base import AdminStore, store_driver_errors
+from messagefoundry.store.base import AdminStore, store_driver_errors, store_open_errors
 from messagefoundry.store.crypto import MARKER_PREFIX, CipherError
 from messagefoundry.store.row_seal import (
     ADSET_KIND,
@@ -168,7 +172,6 @@ from messagefoundry.store.store import (
     session_sealed_by_retired_key,
     user_seal_ok,
 )
-from messagefoundry.transports.bounded_read import EgressReplyError
 from messagefoundry.transports.email import envelope_address_problem
 from messagefoundry.transports.rest import opener_tls_context
 
@@ -197,6 +200,28 @@ def _audit_write_errors() -> tuple[type[Exception], ...]:
     runs the reconciler builds it at construction, so that import never runs on the event loop in
     the middle of a store incident."""
     return (RuntimeError, OSError, CipherError, *store_driver_errors())
+
+
+@cache
+def _session_write_errors() -> tuple[type[Exception], ...]:
+    """What a refused session read or write raises, at least on the store backends named there
+    (BACKLOG #3023): :func:`~messagefoundry.store.base.store_open_errors`, which takes the drivers'
+    own errors, the acquire timeout, ``OSError`` for a connection lost at the socket, and pyodbc's
+    ``Error`` root, which pyodbc raises for an unmapped SQLSTATE such as a deadlock victim. Narrower
+    than :func:`_audit_write_errors`, which also takes every ``RuntimeError`` and ``CipherError``: a
+    session row's seal is a local HMAC, so no Transit call can refuse it, and an engine
+    ``RuntimeError`` other than the acquire timeout still reads as a defect."""
+    return store_open_errors()
+
+
+class _RotationStoreError(Exception):
+    """A session rotation the store refused (BACKLOG #3023). ``old_revoked`` says whether every
+    best-effort revoke that followed it landed, under the old hash and the new one; the audit row
+    records it as ``revokes_landed``."""
+
+    def __init__(self, old_revoked: bool) -> None:
+        super().__init__("session rotation refused by the store")
+        self.old_revoked = old_revoked
 
 
 def _warn_if_corpus_unreadable(path: str | None) -> None:
@@ -740,13 +765,15 @@ FLOW_PURPOSE_MISMATCH = "flow_purpose_mismatch"
 
 #: The audit reason for a second step refused under its ASVS 2.4.2 minimum-elapsed floor (BACKLOG
 #: #2301): an MFA code or passkey too soon after sign-in, or an IdP callback too soon after its flow
-#: started. Audit only. The caller sees its leg's ordinary failure, which says nothing about timing.
+#: started. Audit only. The caller sees its leg's ordinary failure, whose TEXT says nothing about
+#: timing. Its response time can: the federated step-up leg is not padded, so a floor refusal made
+#: before the code exchange returns sooner than a refusal after the IdP round trip (BACKLOG #3221).
 TOO_EARLY = "too_early"
 
 #: The reason for a federated failure that is neither a transport failure nor a token-endpoint
 #: answer (BACKLOG #1948): at least a status from the JWKS fetch, and the engine's own token request
-#: refused over the length bound before it was sent. Neither marks the IdP unavailable. Distinct
-#: from ``idp_error``, which is the IdP's own ``error=`` on the callback.
+#: refused over the length bound before it was sent, an operator configuration fault. Neither marks
+#: the IdP unavailable. Distinct from ``idp_error``, which is the IdP's own ``error=`` on the callback.
 IDP_ANSWER_UNUSABLE = "idp_answer_unusable"
 
 #: Operator-readable text for the step-up leg's refusals. None of it echoes anything the IdP sent.
@@ -780,12 +807,16 @@ _STEP_UP_ERRORS: Final[Mapping[str, str]] = MappingProxyType(
         "idp_unavailable": "The identity provider is unavailable. Try again later.",
         # `token_refused` is deliberately NOT listed: it reads as the generic line, as `too_early`
         # does, so a junk code's answer cannot show whether the callback floor fired (SECURITY.md,
-        # the second-step floors). Its audit row carries the status (BACKLOG #1948).
+        # the second-step floors). So does the engine's own client credential refused with a 401,
+        # an operator fault. Its audit row carries the status, which is where the operator tells
+        # the two apart (BACKLOG #1948, #3221). IDP_ANSWER_UNUSABLE can be an operator fault too,
+        # so its text sends a repeat to an administrator rather than saying "try again later".
         IDP_ANSWER_UNUSABLE: (
-            "The identity provider could not complete the confirmation. Try again later."
+            "The identity provider could not complete the confirmation. Try again. If it repeats,"
+            " ask an administrator."
         ),
         "not_configured": "Federated sign-in is not configured.",
-        "idp_error": "The identity provider did not complete the sign-in. Try again.",
+        "idp_error": "The identity provider did not complete the confirmation. Try again.",
         "malformed_callback": "The identity provider's answer was incomplete. Try again.",
         "not_in_directory": (
             "Your directory account could not be found or is disabled. Ask an administrator."
@@ -2017,14 +2048,16 @@ def _is_idp_transport_failure(exc: BaseException) -> bool:
     unavailable (BACKLOG #1948). ADR 0142 Amendment E is the source of record for the rule, its
     reason, and the residuals it leaves.
 
-    In code: a ``TokenEndpointUnreachableError``, an ``http.client`` exception such as
-    ``BadStatusLine``, or an ``OSError`` that is not an ``HTTPError``."""
+    In code: a ``TokenEndpointUnreachableError``, an ``http.client`` exception that
+    :func:`~messagefoundry.auth.oidc_http.is_idp_transport_http_exception` names (a JWKS reply cut
+    short, ``BadStatusLine`` or ``IncompleteRead``; ADR 0142 Amendment G, BACKLOG #3221), or an
+    ``OSError`` that is not an ``HTTPError``. Every other ``http.client`` exception is not one: a
+    reply that arrived, ``MalformedReplyHeadError`` and a JWKS reply refused for its framing among
+    them, or a fault on the engine's own side of the connection."""
     if isinstance(exc, oidc.TokenEndpointUnreachableError):
         return True
     if isinstance(exc, http.client.HTTPException):
-        # MalformedReplyHeadError is an HTTPException too, raised for a reply whose header block
-        # did not parse, as from the JWKS fetch. A reply arrived, so it is an answer.
-        return not isinstance(exc, EgressReplyError)
+        return is_idp_transport_http_exception(exc)
     # HTTPError is an OSError subclass that carries a received status, as from the JWKS fetch.
     return isinstance(exc, OSError) and not isinstance(exc, urllib.error.HTTPError)
 
@@ -2940,10 +2973,11 @@ class AuthService:
 
         **Deliberately NOT the same shape as** :attr:`kerberos_available`, which is boot-once and
         sticky-until-restart (ADR 0068 §9). This flag is **advisory and non-sticky**: it is set by a
-        failed login and cleared by the next successful one, and *no login path gates on it* — the
-        start leg always attempts. That is what satisfies AC-8's "SHALL recover without an engine
-        restart"; a copy of the Kerberos latch would leave one IdP blip disabling federated login
-        until a restart, which is exactly what AC-8 forbids. It exists to drive the login-page link
+        failed login and cleared by the next code exchange that yields a verified token, on either
+        leg, whether or not a later check then refuses the attempt (BACKLOG #3221). *No login path
+        gates on it* — the start leg always attempts. That is what satisfies AC-8's "SHALL recover
+        without an engine restart"; a copy of the Kerberos latch would leave one IdP blip disabling
+        federated login until a restart, which is exactly what AC-8 forbids. It exists to drive the login-page link
         and ``/auth/providers``, nothing more. Do not "fix" the asymmetry with the Kerberos twin.
 
         "A failed login" means a TRANSPORT failure and nothing else (BACKLOG #1948): see
@@ -4553,7 +4587,8 @@ class AuthService:
             # answer one with a 5xx. It must not mark the IdP unavailable: that flag hides the
             # federated link on /ui/login and in /auth/providers for everyone, so marking here
             # would let any caller switch federated sign-in off. Nor does it clear the flag, as
-            # no sign-in succeeded. It is a FlowError, so this arm must stay above the outage arm.
+            # no token was verified (BACKLOG #3221). It is a FlowError, so this arm must stay
+            # above the outage arm.
             # Audited with the client address, as the outage arm is: a spray of junk codes is the
             # abuse this arm exists for, and the operator needs to see where it comes from. The
             # status is the only other thing recorded, and it is what tells a spray (400) from the
@@ -4607,6 +4642,7 @@ class AuthService:
             return LoginOutcome(
                 ok=False, error="identity provider unavailable", reason="idp_unavailable"
             )
+        self.clear_oidc_unavailable()  # a verified token: the IdP answered (BACKLOG #3221)
         # BACKLOG #2301 (ASVS 2.4.2): the minimum-elapsed floor, only when the person signed in at
         # the IdP during THIS flow, which the verified auth_time says. An IdP holding a live single
         # sign-on session answers with no human step, so there is nothing to floor, and flooring it
@@ -4619,7 +4655,9 @@ class AuthService:
         # in oidc_callback_floor_exempt_amr) is exempt. Recorded on the success row, below, and on
         # each refusal after this point, a lock refusal excepted (BACKLOG #3220).
         floor_exempt_amr = (
-            self._oidc_callback_floor_exemption(principal_claims.amr)
+            self._oidc_callback_floor_exemption(
+                self._oidc_callback_floor_exempt_values(), principal_claims.amr
+            )
             if signed_in_during_flow and arrived_too_early
             else ()
         )
@@ -4802,7 +4840,6 @@ class AuthService:
             )
         max_expires_at = min(recency_deadline, max_expires_at)
 
-        self.clear_oidc_unavailable()
         # ASVS 6.3.4, the one directory leg the engine can actually verify. Keyed on the SETTING, not
         # on mech == "oidc": when the claim gate is on (default), _check_mfa_gate has already refused
         # any token lacking a configured amr/acr, so a principal reaching this line provably carried
@@ -4916,14 +4953,19 @@ class AuthService:
         flows = self._oidc_flows
         return floor > 0 and flows is not None and flows.age(flow) < floor
 
-    def _oidc_callback_floor_exemption(self, amr: Sequence[str]) -> tuple[str, ...]:
-        """The ``[auth].oidc_callback_floor_exempt_amr`` values a signature-verified ``amr`` carries,
-        sorted (BACKLOG #2388). Empty means the callback floor applies.
+    @staticmethod
+    def _oidc_callback_floor_exemption(
+        exempt_values: frozenset[str], amr: Sequence[str]
+    ) -> tuple[str, ...]:
+        """The ``exempt_values`` a signature-verified ``amr`` carries, sorted (BACKLOG #2388). Empty
+        means the callback floor applies. The caller passes in what
+        :meth:`_oidc_callback_floor_exempt_values` returned, which a step-up callback reads once
+        (BACKLOG #3221). The set is filtered again here, so a set built any other way is safe too.
 
         It returns configured values only, never the token's own, so the result is a closed set
         an audit row may carry. A blank or non-string value matches nothing, whoever built the
         settings, by the same rule the MFA gate applies."""
-        return tuple(sorted(self._oidc_callback_floor_exempt_values() & set(amr)))
+        return tuple(sorted(oidc.accepted_claim_values(tuple(exempt_values)) & set(amr)))
 
     def _oidc_callback_floor_exempt_values(self) -> frozenset[str]:
         """``[auth].oidc_callback_floor_exempt_amr`` as the values that can match (BACKLOG #2388)."""
@@ -5047,7 +5089,10 @@ class AuthService:
         # amr, which only the exchange yields, so an opted-in site pays for the exchange and the
         # refusal waits for it below. With the list empty (the default) nothing changes here.
         arrived_too_early = self._oidc_callback_too_early(flow)
-        if arrived_too_early and not self._oidc_callback_floor_exempt_values():
+        exempt_values = (
+            self._oidc_callback_floor_exempt_values() if arrived_too_early else frozenset()
+        )
+        if arrived_too_early and not exempt_values:
             return await self._step_up_refused(
                 TOO_EARLY, actor=actor, client=client, return_to=return_to
             )
@@ -5089,8 +5134,11 @@ class AuthService:
                 return_to=return_to,
                 extra=_idp_error_fields(exc),
             )
+        self.clear_oidc_unavailable()  # a verified token: the IdP answered (BACKLOG #3221)
         floor_exempt_amr = (
-            self._oidc_callback_floor_exemption(principal_claims.amr) if arrived_too_early else ()
+            self._oidc_callback_floor_exemption(exempt_values, principal_claims.amr)
+            if arrived_too_early
+            else ()
         )
         # BACKLOG #3220: every refusal past the floor carries the marker when the exemption applied,
         # so a failed exempted step-up is as visible to the loosening's review as a served one.
@@ -5288,7 +5336,6 @@ class AuthService:
         if purpose is not None and not grant_refused and elevation.token is not None:
             # (3) The purpose-bound grant, against the NEW hash.
             self._grant_action_step_up(hash_token(elevation.token), purpose)
-        self.clear_oidc_unavailable()
         # BACKLOG #2160: the start leg staged its caller's address, and the session is re-anchored
         # to the callback's above. Record whether the address moved mid-ceremony, compared as the
         # new-address signal compares. Recorded only: refusing a move, or anchoring to the start
@@ -8000,14 +8047,37 @@ class AuthService:
         carries those columns forward, and every session stamp UPDATE is rowcount-blind (which
         session writes report what they changed is :meth:`AuthStore.rotate_session`'s docstring to
         say) — a stamp issued *after* the rotation silently writes nothing. Any purpose-bound grant must be minted AFTER, against the NEW hash.
+
+        A rotation the store refused is ``None`` here too (BACKLOG #3023); see
+        :meth:`_rotate_session_hash`.
         """
-        return await self._rotate_session_hash(hash_token(token))
+        try:
+            return await self._rotate_session_hash(hash_token(token))
+        except _RotationStoreError:
+            return None
 
     async def _rotate_session_hash(self, old_hash: str) -> str | None:
         """:meth:`_rotate_session_token` keyed on the session's HASH, for the one ceremony that holds
         no token: the federated step-up callback, which the SameSite=Strict cookie never reaches
-        (BACKLOG #296). Same contract, same lock, same re-key."""
-        session = await self._load_session(old_hash)
+        (BACKLOG #296). Same contract, same lock, same re-key.
+
+        **A rotation the store refuses fails closed (BACKLOG #3023).** A raise from the store, such
+        as a lost connection or a pool shortage at the acquire limit, would otherwise leave the old
+        token live and carrying whatever stamp the ceremony just wrote against it, which is what the
+        rotation exists to prevent. So the session is revoked, best effort, under both its old and
+        its new hash, since a re-key whose commit landed before the error reached us has already
+        moved the row. Then :class:`_RotationStoreError` is raised for :meth:`_elevated_hash` to
+        audit and answer as ``session_lost``. If a revoke is refused too, the session stays live
+        until it lapses; the error records which. On Postgres the re-key waits out a pool shortage
+        rather than raising. On SQL Server it waits up to a longer, still finite limit, and a
+        ``StoreAcquireTimeout`` at that limit reaches this branch like any other refusal.
+
+        A cancellation is not an ``Exception``, so it skips this branch and propagates with the old
+        hash unrotated and unrevoked. The longer post-commit wait widens the window for one."""
+        try:
+            session = await self._load_session(old_hash)
+        except _session_write_errors() as exc:
+            raise _RotationStoreError(await self._revoke_unrotated(old_hash, None, exc)) from exc
         if session is None:
             return None
         # Under the account's re-proof lock (BACKLOG #1138), so no rotation lands while a password
@@ -8022,10 +8092,44 @@ class AuthService:
             except RowSealError:  # BACKLOG #2592: the row failed its seal; nothing was written
                 await self._session_seal_failed(old_hash)
                 return None
+            except _session_write_errors() as exc:
+                raise _RotationStoreError(
+                    await self._revoke_unrotated(old_hash, hash_token(new_token), exc)
+                ) from exc
             if not rotated:
                 return None
             self._rekey_token_state(old_hash, hash_token(new_token))
             return new_token
+
+    async def _revoke_unrotated(
+        self, old_hash: str, new_hash: str | None, cause: Exception
+    ) -> bool:
+        """Revoke a session whose rotation the store refused, under ``old_hash`` and, when a re-key
+        was attempted, ``new_hash``; ``True`` when every revoke landed (BACKLOG #3023). Best effort: a
+        second refusal is logged, never raised, so the caller still fails closed. The log names the
+        error classes only, never a hash.
+
+        Each revoke is the ordinary, bounded ``revoke_session``. It has other callers that do not
+        follow a committed write, so it is not moved onto a store's longer post-commit borrow
+        here, and at the acquire limit it can be refused while the pool is still short."""
+        refused: list[str] = []
+        for token_hash in (old_hash, new_hash):
+            if token_hash is None:
+                continue
+            try:
+                await self._store.revoke_session(token_hash)
+            except _session_write_errors() as exc:
+                refused.append(type(exc).__name__)
+        outcome = (
+            f"a revoke was refused too ({', '.join(refused)})" if refused else "it was revoked"
+        )
+        _log.warning(
+            "auth: a session rotation was refused by the store (%s); %s",
+            type(cause).__name__,
+            outcome,
+            exc_info=cause,  # a SQL defect is caught here too, so its traceback must survive
+        )
+        return not refused
 
     async def _elevated(
         self,
@@ -8094,16 +8198,38 @@ class AuthService:
         just before can run past it, for example while confirming an enrolment hashes its recovery
         codes. Refused here, before the rotation, so a confirming enrolment refused here does not
         turn MFA on. The ask is made before the rotation waits for the account's re-proof lock, so
-        a deadline that passes during that wait is not caught."""
-        if await self._rotation_lapsed(token_hash, ceremony=ceremony, client=client):
-            return Elevation(session_lost=True)
-        rotated = await self._rotate_session_hash(token_hash)
+        a deadline that passes during that wait is not caught.
+
+        A store refusal anywhere from the lapse check to the re-key fails closed (BACKLOG #3023):
+        see :meth:`_rotate_session_hash`."""
+        rotated: str | None = None
+        failure: dict[str, object] = {"reason": "session_gone"}
+        try:
+            if await self._rotation_lapsed(token_hash, ceremony=ceremony, client=client):
+                return Elevation(session_lost=True)
+            rotated = await self._rotate_session_hash(token_hash)
+        except _RotationStoreError as refused:
+            # BACKLOG #3023: the store refused the re-key. The session was revoked, best effort,
+            # and this fails closed exactly as a session gone underneath the ceremony does.
+            failure = {"reason": "store_error", "revokes_landed": refused.old_revoked}
+        except _session_write_errors() as exc:
+            # The lapse check's own reads, refused: the ceremony's stamp is already on this hash.
+            revoked = await self._revoke_unrotated(token_hash, None, exc)
+            failure = {"reason": "store_error", "revokes_landed": revoked}
         if rotated is None:
-            await self._audit(
-                "auth.session_rotation_failed",
-                actor=actor,
-                detail=_json({"ceremony": ceremony, "reason": "session_gone"}),
-                client=client,
+            # Soft, so a refused audit write still answers session_lost rather than a 500: the
+            # answer is the fail-closed control, and the row only records it.
+            await write_audit_soft(
+                lambda: self._audit(
+                    "auth.session_rotation_failed",
+                    actor=actor,
+                    detail=_json({"ceremony": ceremony, **failure}),
+                    client=client,
+                ),
+                log=_log,
+                message="the auth.session_rotation_failed audit row could not be written",
+                errors=_session_write_errors(),
+                defects=AUDIT_WRITE_DEFECTS,
             )
             return Elevation(session_lost=True)
         await self._audit(
@@ -11503,9 +11629,11 @@ class AuthService:
         try:
             await self._store.add_webauthn_credential(cred)
         except Exception as exc:
-            # The concurrent duplicate-label race (ADR 0068 §4): each backend raises its own
-            # integrity class (sqlite3.IntegrityError / asyncpg UniqueViolationError / pyodbc
-            # IntegrityError) — rendered as the same legible error as a pre-checked duplicate.
+            # A concurrent enrolment raced this one past the pre-checks above (ADR 0068 §4): each
+            # backend raises its own integrity class (sqlite3.IntegrityError, asyncpg
+            # UniqueViolationError or ForeignKeyViolationError, pyodbc IntegrityError) for at least
+            # the user foreign key, the credential-id primary key and the (user_id, label) index.
+            # The first two are told apart below; anything else is answered as the label clash.
             if not _is_integrity_refusal(exc):
                 raise
             # BACKLOG #1807: the same classes carry the user_id foreign-key refusal, raised when the
@@ -11513,6 +11641,11 @@ class AuthService:
             # driver's message: that text can echo the operator-chosen label.
             if await self._load_user(user.id) is None:
                 raise ValueError("no such user") from exc
+            # BACKLOG #2733: the credential-id primary key fires too, when the same authenticator
+            # enrols concurrently (on this account or another). Told apart the same way: a row now
+            # holding this credential id is that refusal, whatever label it carries.
+            if await self._store.get_webauthn_credential(credential_id_hash) is not None:
+                raise ValueError("this passkey is already enrolled") from exc
             raise ValueError("label already in use") from exc
         # Parity with confirm_mfa_enrollment: the enrolling session is now MFA-verified (it just
         # proved possession of the freshly-bound authenticator). Stamped against the OLD hash, then

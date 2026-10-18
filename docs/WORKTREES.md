@@ -182,7 +182,7 @@ nothing prompts.
 
 | Route | Reaches | Refuses, before it removes anything |
 |---|---|---|
-| `-Name <dir>` | The `<repo>-<dir>` sibling of the checkout that copy of the script lives in | Uncommitted tracked changes. A detached HEAD no ref holds. An unlanded ledger number. A held claim, git or working-tree activity in six hours, and a nested worktree, whatever `-Force` says. |
+| `-Name <dir>` | The `<repo>-<dir>` sibling of the checkout that copy of the script lives in | Uncommitted tracked changes, and the git repositories inside the tree listed in the next section. A detached HEAD no ref holds. An unlanded ledger number. A held claim, git or working-tree activity in six hours, uncommitted work written in six hours at any depth, and a nested worktree, whatever `-Force` says. |
 | `-Path <path>` | Any registered linked worktree that is not under `.claude/worktrees` | Everything `-Name` refuses, and the list in the next section. |
 | `-List` | Nothing. It is read-only. | It prints each worktree, its class, and which route reaches it. |
 
@@ -233,14 +233,31 @@ is a copy for readers and can lag it.
 - A tree whose own git directory was written to in the last six hours, by a commit, a checkout, a
   merge or a fetch.
 - A tree whose working tree was written to in six hours.
+- A tree holding uncommitted work written in six hours, at any depth. Each path `git status` lists
+  is dated, and so is every folder above it. A nested repository's own git state is dated too. A
+  path that cannot be dated refuses, and so does a tree with more pending paths than the cap. The
+  script header gives the cap and at least what this does not date, such as ignored files. (Vault
+  BACKLOG #1017 point (iv), #2554 finding 3.) `-Name` refuses this too.
 
 Without `-Force` it also refuses uncommitted tracked changes, untracked files, ignored files, and
-files flagged skip-worktree or assume-unchanged. **One exception:** an *ignored directory* named
-`.venv`, `node_modules`, `__pycache__`, `.pytest_cache`, `.mypy_cache` or `.ruff_cache` goes with
-the worktree. An *untracked* directory of one of those names still refuses. So does an ignored
+files flagged skip-worktree or assume-unchanged. For tracked changes and untracked files, `-Force`
+discards only those older than six hours. **One exception:** an *ignored directory* named
+`node_modules`, `__pycache__`, `.pytest_cache`, `.mypy_cache` or `.ruff_cache` at any depth, or
+`.venv` at the tree root, goes with the worktree. A `.venv` below the root refuses (vault BACKLOG
+#1017 point (i)). An *untracked* directory of one of those names still refuses. So does an ignored
 *file* of one, and so does a directory of one that is a junction or a symlink. Other ignored
 entries refuse too, such as a generated `out/` directory, a local certificate pair, or a
 `.claude/seat.local.txt`.
+
+Git never reads inside an ignored directory, so a git repository there would go unseen. Both
+routes refuse at least these without `-Force`:
+
+- an untracked nested repository;
+- a package with its own `.git` in an ignored `.venv/src` or `venv/src`, where pip puts editable
+  clones;
+- a package with its own `.git` in an ignored `node_modules`, one `@scope` level included.
+
+A clone deeper than that, or in any other ignored directory, is not looked for.
 
 `-AllowOrphanedAllocations` is the only override for a tree that owns an unlanded ledger number.
 
@@ -262,24 +279,26 @@ worktree**, and for a harness-made worktree that is also under `.claude/worktree
 refuses it like the rest. The copy of `remove.ps1` in that linked worktree still removes it by
 `-Name`.
 
-**The session registry does not see where a session works, so two other signals are read.** The
+**The session registry does not see where a session works, so other signals are read.** The
 registry records a launch directory. A subagent Builder is recorded under its parent's directory,
 and so is any session that works in a tree by absolute path. On this machine that is the ordinary
 case: the sessions sit under `.claude/worktrees` and the work sits in sibling trees. A review of
 the first version of this route found that the registry check alone would have removed trees of a
 running batch.
 
-So `-Path` also refuses on a held **claim** and on **recent activity**, the last three entries in
-the list above. `-Name` refuses on the same three. A claim names the worktree that took it,
+So `-Path` also refuses on a held **claim** and on **recent activity**, the last four entries in
+the list above. `-Name` refuses on the same four. A claim names the worktree that took it,
 whoever launched the session. Git activity is read from the tree's own git directory. Working-tree
 activity is read from the tree's top folder, each entry directly under it, and `.pytest_cache` and
-`.ruff_cache`. None is proof that a tree is free:
+`.ruff_cache`. Uncommitted work is dated path by path, at any depth. None is proof that a tree is
+free:
 
 - Work that was never claimed, in a tree nobody has committed to or written in for six hours,
-  passes all three.
+  passes all four.
 - The six hours are a judgement. A test run still in progress has not yet written its cache, so it
   can outlast them.
-- A tree that passes all three is still removed only if it is clean.
+- A tree that passes all four still goes through the route's own content rules above. On `-Name`,
+  older untracked files and ignored files go with it.
 
 **The occupancy check is on `-Path` only.** `-Name` has none, and it also keeps its blanket
 `git worktree prune`, which `-Path` does not run because a blanket prune drops other worktrees'
@@ -298,12 +317,14 @@ exact command with the root already filled in. (BACKLOG #1078.)
 ```powershell
 scripts\worktree\remove.ps1 -Name alerts            # refuses if there are uncommitted tracked changes
 scripts\worktree\remove.ps1 -Name alerts -DeleteBranch
-scripts\worktree\remove.ps1 -Name alerts -Force     # discard uncommitted tracked changes too
+scripts\worktree\remove.ps1 -Name alerts -Force     # discard uncommitted tracked changes older than six hours too
 pwsh -NoProfile -File <that-checkout>\scripts\worktree\remove.ps1 -Name alerts   # from any cwd
 ```
 
-The untracked `.venv` / `node_modules` are expected and removed automatically; only uncommitted
-**tracked** changes block removal (unless `-Force`).
+The untracked `.venv` / `node_modules` are expected and removed automatically. Without `-Force`,
+uncommitted **tracked** changes and a git repository inside the tree block removal. Uncommitted work
+written in the last six hours blocks it whatever `-Force` says, as do the other in-use refusals in
+the table above.
 
 `-Name` always names the **directory**. `-DeleteBranch` deletes whichever branch that worktree
 actually has checked out — read from git, not assumed from the directory name, since `-Branch` lets
@@ -1219,7 +1240,8 @@ contract.
 
 **No hook guards this, and that is a decision.** The obvious guard is a `PreToolUse` matcher on
 `Bash` that refuses the bad shape. This repo has guards built that way: at least the three
-handlers on the `^(Bash|PowerShell)$` matcher in `.claude/settings.json`,
+guards the one `^(Bash|PowerShell)$` handler in `.claude/settings.json` runs through
+[`shell-guard-dispatch.ps1`](../scripts/hooks/shell-guard-dispatch.ps1):
 [`block-api-burn.ps1`](../scripts/hooks/block-api-burn.ps1),
 [`block-unbounded-fs-scan.ps1`](../scripts/hooks/block-unbounded-fs-scan.ps1) and
 [`block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1). The last sat

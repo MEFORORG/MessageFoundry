@@ -24,6 +24,8 @@ Each test names the mutation that must turn it RED.
 
 from __future__ import annotations
 
+import asyncio
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -37,6 +39,7 @@ from messagefoundry.auth.service import (
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.store.base import StoreAcquireTimeout
 from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms — satisfies the ASVS policy (WP-3)
@@ -215,3 +218,181 @@ def test_rekey_leaves_other_sessions_alone() -> None:
 
     assert cache.pop(("theirs", "register")) is not None, "a sibling session was disturbed"
     assert cache.pop(("moved", "register")) is not None
+
+
+# --- a rotation the store refuses (BACKLOG #3023) ---------------------------
+
+
+async def _refuse_rotation(service: AuthService, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def refused(token_hash: str, *, new_token_hash: str) -> bool:
+        raise StoreAcquireTimeout("sqlserver: store pool acquire timed out after 30s")
+
+    monkeypatch.setattr(service.store, "rotate_session", refused)
+
+
+async def _rotation_failures(service: AuthService) -> list[dict[str, object]]:
+    return [
+        json.loads(str(e["detail"]))
+        for e in await service.security_events_for("rot")
+        if e["action"] == "auth.session_rotation_failed"
+    ]
+
+
+async def test_a_rotation_the_store_refuses_fails_closed_and_revokes_the_old_token(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: a raising ``rotate_session`` escapes the elevation, or the branch stops revoking.
+
+    The ceremony's stamp is already on the old hash when the rotation runs, so a raise that left the
+    old token live would leave it elevated and unrotated, the outcome the rotation exists to
+    prevent. A raise is answered like a session gone: ``session_lost``, no token, an audit row, and
+    the old token no longer resolves.
+    """
+    service, token = await _service_and_token(engine)
+    await _refuse_rotation(service, monkeypatch)
+
+    elevation = await service._elevated(token, ceremony="mfa_verify", actor="rot")
+
+    assert elevation.session_lost is True and elevation.token is None
+    assert await service.identity_for_token(token) is None, "the unrotated token still resolves"
+    assert await _rotation_failures(service) == [
+        {"ceremony": "mfa_verify", "reason": "store_error", "revokes_landed": True}
+    ]
+
+
+async def test_a_refused_rotation_still_fails_closed_when_the_revoke_is_refused_too(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: a second refusal, on the revoke, escapes the elevation or is recorded as a revoke.
+
+    The test above shows the revoke normally lands. Here it cannot, so the old session stays live,
+    and the audit row says so rather than claiming a revoke that never happened."""
+    service, token = await _service_and_token(engine)
+    await _refuse_rotation(service, monkeypatch)
+
+    async def revoke_refused(token_hash: str, *, now: float | None = None) -> None:
+        raise StoreAcquireTimeout("sqlserver: store pool acquire timed out after 30s")
+
+    monkeypatch.setattr(service.store, "revoke_session", revoke_refused)
+
+    elevation = await service._elevated(token, ceremony="mfa_verify", actor="rot")
+
+    assert elevation.session_lost is True and elevation.token is None
+    assert await service.identity_for_token(token) is not None, "the flag would be untrue"
+    assert await _rotation_failures(service) == [
+        {"ceremony": "mfa_verify", "reason": "store_error", "revokes_landed": False}
+    ]
+
+
+async def test_a_rotation_whose_commit_landed_before_the_raise_leaves_no_live_session(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the branch revokes only the old hash. A re-key whose commit landed before a lost
+    connection reached us has already moved the row to the new hash, which nobody holds."""
+    service, token = await _service_and_token(engine)
+    identity = await service.identity_for_token(token)
+    assert identity is not None
+    real_rotate = service.store.rotate_session
+
+    async def landed_then_lost(token_hash: str, *, new_token_hash: str) -> bool:
+        await real_rotate(token_hash, new_token_hash=new_token_hash)
+        raise ConnectionResetError("lost after the commit")
+
+    monkeypatch.setattr(service.store, "rotate_session", landed_then_lost)
+
+    elevation = await service._elevated(token, ceremony="mfa_verify", actor="rot")
+
+    assert elevation.session_lost is True and elevation.token is None
+    assert await service.store.list_sessions(identity.user_id) == []
+    assert (await _rotation_failures(service))[0]["revokes_landed"] is True
+
+
+async def test_a_refused_read_before_the_rotation_fails_closed_too(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the lapse check's reads sit outside the branch. They run after the ceremony's
+    stamp and before the re-key, so a raise there would leave the old token elevated."""
+    service, token = await _service_and_token(engine)
+
+    async def lapse_check_refused(token_hash: str, *, ceremony: str, client: str | None) -> bool:
+        raise StoreAcquireTimeout("postgres: store pool acquire timed out after 30s")
+
+    monkeypatch.setattr(service, "_rotation_lapsed", lapse_check_refused)
+
+    elevation = await service._elevated(token, ceremony="mfa_verify", actor="rot")
+
+    assert elevation.session_lost is True and elevation.token is None
+    assert await service.identity_for_token(token) is None
+    assert await _rotation_failures(service) == [
+        {"ceremony": "mfa_verify", "reason": "store_error", "revokes_landed": True}
+    ]
+
+
+async def test_a_hung_sqlserver_post_commit_borrow_fails_the_rotation_closed_within_its_bound(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3023, PR 2350 repair. RED when: the SQL Server post-commit borrow waits without a
+    limit (the elevation then hangs until the outer ``wait_for`` fails the test), or its
+    ``StoreAcquireTimeout`` no longer reaches the fail-closed branch.
+
+    The real ``SqlServerStore.rotate_session``, on a pool whose acquire never returns, stands in for
+    the SQLite store's: the rotation must give up at the longer limit and be answered as a lost
+    session, with the old token revoked and the refusal audited."""
+    from messagefoundry.config.settings import StoreSettings
+    from messagefoundry.store.pool_metrics import AcquireWaitHistogram
+    from messagefoundry.store.sqlserver import _AFTER_COMMIT_ACQUIRE_FACTOR, SqlServerStore
+
+    class HangingPool:
+        async def acquire(self) -> None:
+            await asyncio.Event().wait()
+
+        async def release(self, conn: object) -> None:
+            return None
+
+    acquire_timeout = 0.05
+    hung = SqlServerStore.__new__(SqlServerStore)
+    hung._pool = HangingPool()
+    hung._settings = StoreSettings(acquire_timeout=acquire_timeout)
+    hung._acquire_wait = AcquireWaitHistogram()
+
+    service, token = await _service_and_token(engine)
+    monkeypatch.setattr(service.store, "rotate_session", hung.rotate_session)
+    bound = acquire_timeout * _AFTER_COMMIT_ACQUIRE_FACTOR
+
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    elevation = await asyncio.wait_for(
+        service._elevated(token, ceremony="mfa_verify", actor="rot"), timeout=bound + 5
+    )
+    assert loop.time() - t0 >= bound * 0.9, "the rotation gave up before its longer limit"
+
+    assert elevation.session_lost is True and elevation.token is None
+    assert await service.identity_for_token(token) is None, "the unrotated token still resolves"
+    assert await _rotation_failures(service) == [
+        {"ceremony": "mfa_verify", "reason": "store_error", "revokes_landed": True}
+    ]
+
+
+async def test_the_primitive_answers_a_refused_rotation_with_none(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``_rotate_session_token`` stops keeping its ``None`` contract for a store raise."""
+    service, token = await _service_and_token(engine)
+    await _refuse_rotation(service, monkeypatch)
+    assert await service._rotate_session_token(token) is None
+    assert await service.identity_for_token(token) is None
+
+
+async def test_a_defect_in_the_rotation_is_not_mistaken_for_a_refusal(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the branch widens to a broad ``except Exception``. A defect must surface, not be
+    filed as a store refusal."""
+    service, token = await _service_and_token(engine)
+
+    async def broken(token_hash: str, *, new_token_hash: str) -> bool:
+        raise TypeError("a defect, not a refusal")
+
+    monkeypatch.setattr(service.store, "rotate_session", broken)
+    with pytest.raises(TypeError):
+        await service._elevated(token, ceremony="mfa_verify", actor="rot")
