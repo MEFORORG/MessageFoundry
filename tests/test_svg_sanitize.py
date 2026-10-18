@@ -386,7 +386,7 @@ def test_a_large_body_whose_head_is_only_noise_is_cleared_by_its_first_content_b
     monkeypatch.setattr(svg_sanitize, "_HEAD_BYTES", 1024)
     monkeypatch.setattr(svg_sanitize, "_MAX_SVG_BYTES", 4096)
     body = _gz(b" " * 2048 + b"%PDF-1.4 synthetic" + b"A" * 8192)
-    assert sanitize_if_svg("application/gzip", body) is body
+    assert sanitize_if_svg("image/svg+xml", body) is body
     tagged = _gz(b" " * 2048 + b"%PDF-1.4 synthetic <svg onload=x>" + b"A" * 8192)
     with pytest.raises(SvgRejected, match="svg start tag"):
         sanitize_if_svg("image/svg+xml", tagged)
@@ -790,9 +790,10 @@ def test_iso_2022_jp_text_with_a_lt_and_no_tag_is_served_plain_and_gzipped() -> 
     data = "note: value < 5, svg drawing attached later".encode("iso2022_jp")
     data = "日本 ".encode("iso2022_jp") + data + " 語".encode("iso2022_jp")
     assert b"\x1b$B" in data and b"\x1b(B" in data and b"<" in data
-    assert sanitize_if_svg("text/plain", data) is data
+    # Under an HTML label, so the escape pass really runs.
+    assert sanitize_if_svg("text/html", data) is data
     gz = _gz(data)
-    assert sanitize_if_svg("text/plain", gz) is gz
+    assert sanitize_if_svg("text/html", gz) is gz
 
 
 @pytest.mark.parametrize(
@@ -820,6 +821,9 @@ def test_iso_2022_jp_text_with_a_lt_and_no_tag_is_served_plain_and_gzipped() -> 
         "text/html",
         "Text/HTML; charset=utf-8",
         "application/xhtml+xml",
+        "text/x-html",
+        "application/hta",
+        "image/svg",
     ],
 )
 def test_an_svg_tag_past_leading_text_is_refused_under_a_rendering_label(
@@ -856,19 +860,27 @@ _JSON_QUOTING_SVG = b'{"note": "synthetic", "icon": "<svg onload=alert(1)><rect/
         ("image/png", bytes.fromhex("89504e470d0a1a0a") + b"<svg/>"),
         ("application/dicom", b"\x00" * 128 + b"DICM synthetic <svg onload=x>"),
         (None, b"synthetic <svg onload=x>"),
+        ("text/plain; name=icon.svg", _HL7_QUOTING_SVG),
     ],
 )
 def test_a_quoted_svg_tag_under_a_data_label_is_served_plain_and_gzipped(
-    label: str | None, data: bytes
+    label: str | None, data: bytes, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The Lander's ruling on PR 2346: a quoted ``<svg>`` in a data field, under a label no browser
     renders as SVG or HTML, is data, and is served as stored, plain and gzipped. The tag sits well
-    inside the head, so only the label decides."""
+    inside the head, so only the label decides: the same bytes are refused under ``text/html``, and
+    the label-blind pre-check sends them on. A gzip under a data label is cleared on its first
+    pass, with no re-read."""
     assert not _starts_as_markup(data)
     assert data.index(b"<svg") < svg_sanitize._HEAD_BYTES
+    assert may_be_svg(data)
+    with pytest.raises(SvgRejected, match="svg start tag"):
+        sanitize_if_svg("text/html", data)
     assert sanitize_if_svg(label, data) is data
     gz = _gz(data)
+    calls = _spy_on_inflate(monkeypatch)
     assert sanitize_if_svg(label, gz) is gz
+    assert calls == [(False, svg_sanitize._HEAD_BYTES)]
 
 
 def test_a_gzip_tag_scan_reads_the_head_from_the_first_content_byte(
@@ -970,7 +982,7 @@ def test_a_gzip_whose_content_starts_too_near_the_bound_is_refused(
     # Under a data label the tag scan does not run, so the body is served as on origin/main.
     assert sanitize_if_svg("application/gzip", near) is near
     room = _gz(b" " * 2048 + b"%PDF-1.4 " + b"A" * 8192)
-    assert sanitize_if_svg("application/gzip", room) is room
+    assert sanitize_if_svg("image/svg+xml", room) is room
 
 
 @pytest.mark.parametrize(
@@ -1026,10 +1038,10 @@ def test_the_pre_check_leaves_noise_past_a_head_to_the_thread() -> None:
     that is noise to its end within a head is cleared on the spot (BACKLOG #3257)."""
     long_noise = b"\x00" * (svg_sanitize._HEAD_BYTES + 1) + b"%PDF-1.4 synthetic"
     assert may_be_svg(long_noise)
-    assert sanitize_if_svg("application/pdf", long_noise) is long_noise
+    assert sanitize_if_svg("text/html", long_noise) is long_noise
     short_noise = b"\x00" * 128
     assert not may_be_svg(short_noise)
-    assert sanitize_if_svg("application/pdf", short_noise) is short_noise
+    assert sanitize_if_svg("text/html", short_noise) is short_noise
 
 
 #: ASVS 1.5.3's shared hostile corpus (``tests/test_xml_parser_consistency.py``), with each document's

@@ -580,7 +580,8 @@ wrong. See the correction below.
 *Amended 2026-10-16 (BACKLOG #3257):* the first rule read *"No SVG reader renders anything else"*,
 and bytes that were not markup were served with no scan at all. So leading text before
 `<svg onload=...>` passed, under an SVG label too, and a browser reading such a body as HTML would
-run it. *Amended again 2026-10-17 (BACKLOG #3257, the Lander's ruling on PR 2346):* the refusal
+run it. *Amended again 2026-10-17 (BACKLOG #3257, the Lander's send-back of PR 2346, as the batch
+Manager dispatched it):* the refusal
 applies only under a label a browser renders as SVG or HTML: one that names `svg` in any case, such
 as `image/svg+xml` or `image/svg+xml-compressed`, and `text/html` or `application/xhtml+xml`. Under
 any other label, such as `text/plain`, `application/json`, an HL7 type, a PDF, an image, DICOM or
@@ -705,15 +706,17 @@ real detach and the download, and fails against the sanitizer this correction re
 3. The first 64 KiB is inflated first. If its first byte past leading whitespace, NUL and
    byte-order-mark bytes is not `<`, the body is not markup. Under any label but an SVG or HTML one
    it is served as stored without reading the rest. Under an SVG or HTML label it is refused when
-   the 64 KiB from that byte on hold an `svg` start tag, and otherwise served as stored. Where the
-   leading noise took part of the first 64 KiB, the head is read on to exactly 64 KiB past the
-   noise, so a full 64 KiB past it is scanned, and damage that read reaches is refused as in step 2.
-   The scan also reads the tag spelled through an ISO-2022-JP escape sequence. Damage past the bytes read is not
-   seen, and nor is a tag past the head. That rests on the inert-type allow-list, as it does for
+   the 64 KiB from that byte on hold an `svg` start tag, and otherwise served as stored. Under such
+   a label, where the leading noise took part of the first 64 KiB, the head is read on to exactly
+   64 KiB past the noise, so a full 64 KiB past it is scanned, and damage that read reaches is
+   refused as in step 2. The scan also reads the tag spelled through an ISO-2022-JP escape sequence.
+   Damage past the bytes read is not seen, and nor is a tag past the head. That rests on the
+   inert-type allow-list, as it does for
    plain bytes, whose scan reads the same 64 KiB past the noise and needs no second read, since all
    their bytes are at hand. It does not rest on how a browser reads the document. *Amended
    2026-10-16 (BACKLOG #3257):* this step read that the trade could not hide an SVG, *"since no
-   browser renders a document as SVG when its first byte past that noise is not `<`"*, and a head that was not markup was served with no scan. Inflating the rest of every large
+   browser renders a document as SVG when its first byte past that noise is not `<`"*, and a head
+   that was not markup was served with no scan. Inflating the rest of every large
    PDF or image would undo BACKLOG #1129, so the scan stops at the head. A reader that autodetects
    EBCDIC could still find an SVG; plain bytes rest on the same assumption. Bytes that are only that
    noise for the whole head do not clear the body: it is inflated up to the bound, and the same rule
@@ -772,7 +775,17 @@ declares or names the SVG namespace without using it is served.
     PDF, whatever it holds;
   - *added 2026-10-16, narrowed 2026-10-17 (BACKLOG #3257):* a body under an SVG or HTML label
     that is not markup and whose head quotes an `svg` start tag as text, or whose head ends on
-    `<svg`, which is refused as if the tag went on. Under any other label such a body is served.
+    `<svg`, which is refused as if the tag went on, or whose head spells an `svg` start tag by
+    chance, such as a compressed PDF stream under such a label. Under any other label such a body
+    is served.
+- *Added 2026-10-17 (BACKLOG #3257):* the label is the stored one, and at least two paths keep the
+  refusal from reaching an HTML or SVG body. Detach stores a body under an `+xml` label, such as
+  `image/svg+xml` or `application/xhtml+xml`, whose first byte is not `<` as
+  `application/octet-stream` (`attachment_mime_agrees`), so under those labels the refusal reaches
+  only a body stored another way; it does reach `text/html`, the other HTML types and SVG labels
+  without `+xml`, such as `image/svg`. And an HL7 ED value stores only OBX-5.2, so an HTML
+  document sent as type `TEXT` with subtype `HTML` is stored as `TEXT` and treated as data.
+  Both rest on the inert-type allow-list, like every body the scan does not refuse.
 - *Added 2026-10-16 (BACKLOG #3257):* the download's pre-check, which runs on the event loop, now
   reads the first 64 KiB past leading noise of every plain body that is not markup, a copy of at
   most 64 KiB, scanned only when it holds a `<`. A body whose head holds an `svg` start tag, or

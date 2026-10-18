@@ -81,10 +81,13 @@ _MAX_GZIP_MEMBERS: Final = 16
 #: inflated (BACKLOG #3257). Also how much of a gzip body is inflated first, to clear one that is
 #: plainly not markup cheaply.
 _HEAD_BYTES: Final = 64 * 1024
-#: The HTML media types. A browser that renders one parses an inline ``<svg>`` as a live element, so
-#: such a label, like an SVG label, makes an ``svg`` start tag past leading text markup rather than
-#: data (BACKLOG #3257).
-_HTML_TYPES: Final = frozenset({"text/html", "application/xhtml+xml"})
+#: Media types a browser renders as HTML. Such a renderer parses an inline ``<svg>`` as a live
+#: element, so such a label, like an SVG label, makes an ``svg`` start tag past leading text markup
+#: rather than data (BACKLOG #3257). At least these; a type left off is treated as data. Each is one
+#: ``api/app.py`` names as browser-active beside its inert-type allow-list.
+_HTML_TYPES: Final = frozenset(
+    {"text/html", "application/xhtml+xml", "text/x-html", "application/hta"}
+)
 #: Any byte that is not NUL. Only NUL padding may follow the last gzip member.
 _NOT_NUL_RE: Final = re.compile(rb"[^\x00]")
 #: Traces of SVG in markup the parser could not read through: an ``svg`` start tag under any prefix
@@ -438,10 +441,11 @@ def _label_names_svg(label: str | None) -> bool:
 
 def _label_renders_markup(label: str | None) -> bool:
     """Whether the stored label names a type a browser renders as SVG or HTML, so an ``svg`` start
-    tag past leading text would be live markup rather than data (BACKLOG #3257): SVG under any
-    label :func:`_label_names_svg` accepts, and the HTML types in :data:`_HTML_TYPES`."""
+    tag past leading text would be live markup rather than data (BACKLOG #3257): a media type that
+    names ``svg``, and the HTML types in :data:`_HTML_TYPES`. Only the media type counts, so a data
+    label whose parameter names a ``.svg`` file is still data."""
     media_type = (label or "").partition(";")[0].strip().casefold()
-    return _label_names_svg(label) or media_type in _HTML_TYPES
+    return _label_names_svg(media_type) or media_type in _HTML_TYPES
 
 
 def _refuse_if_tagged(head: bytes) -> None:
@@ -600,10 +604,11 @@ def _vet_markup(label: str | None, body: bytes) -> bytes:
     served. Only the head is read, the same span past leading noise a gzip body's tag scan reads,
     so a large body is never copied whole. A tag past the head rests on the route's content-type
     allow-list, as it does for gzip."""
-    head = _plain_head(body, _FIRST_CONTENT_BYTE_RE.search(body))
-    if head is not None:
+    first = _FIRST_CONTENT_BYTE_RE.search(body)
+    if first is None or first.group() != b"<":
+        # The label is checked first, so a body under a data label costs no head copy.
         if _label_renders_markup(label):
-            _refuse_if_tagged(head)
+            _refuse_if_tagged(_plain_head(body, first) or b"")
         return body
     if _label_names_svg(label) or _root_is_svg(body):
         return sanitize_svg(body)
