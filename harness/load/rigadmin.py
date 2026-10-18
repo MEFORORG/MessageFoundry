@@ -563,10 +563,11 @@ def _keep_the_narrow_rule(cli: Any) -> None:
     """Hold the rig to the rule ``provision-admin`` had before vault BACKLOG #2711 step 1.
 
     Step 1 (owner ruling B258-R4) lets the command run whenever no enabled LOCAL Administrator has
-    a usable password, so a directory-run site can get back in while its directory is down. A rig
-    with no authenticator key runs it with ``--no-totp``, so on such a store it would add a no-MFA
-    Administrator beside live directory Administrators. The rig keeps the old rule instead, with or
-    without a key (vault BACKLOG #2796): it provisions only when the store has no enabled
+    a usable password, so a directory-run site can get back in while its directory is down. On
+    such a store the command adds an Administrator beside live directory Administrators and tells
+    them nothing (ADR 0183 Amendment E, *What it opens*). A rig with no authenticator key runs it
+    with ``--no-totp``, so that Administrator would have no second factor either. The rig keeps
+    the old rule instead, with or without a key: it provisions only when the store has no enabled
     Administrator of any kind. The engine adds no flag for this.
 
     It wraps the command's one :class:`~messagefoundry.auth.service.AuthService`, built by

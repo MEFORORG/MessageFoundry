@@ -911,20 +911,27 @@ def _engine_view(db: Path, key: str, username: str) -> tuple[str | None, bool]:
 
 
 @pytest.mark.timeout(240)
+@pytest.mark.parametrize("keyed", [False, True], ids=["no-totp", "with-a-key"])
 def test_the_rig_provisions_only_into_a_store_with_no_enabled_administrator(
-    tmp_path: Path,
+    tmp_path: Path, keyed: bool
 ) -> None:
     """Vault BACKLOG #2711: the rig keeps the rule ``provision-admin`` had before step 1.
 
-    Step 1 lets the command add a local Administrator beside directory ones. The rig provisions with
-    ``--no-totp`` when it holds no key, so there it would add a no-MFA Administrator beside live
-    directory Administrators. The rule holds with a key too.
-    It refuses instead, and only a store with no enabled Administrator at all is provisioned."""
+    Step 1 lets the command add a local Administrator beside directory ones, and tells them
+    nothing. The rig provisions with ``--no-totp`` when it holds no key, so there it would add a
+    no-MFA Administrator beside live directory Administrators. It refuses instead, with or without
+    a key, and only a store with no enabled Administrator at all is provisioned.
+
+    RED when: the guard is installed on one arm only, such as the keyless one."""
+    from messagefoundry.auth import totp
+
     admin = RigAdmin("rig-operator", rigadmin._new_password())
     key = _store_key()
+    factor = {rigadmin.ADMIN_FACTOR_ENV: totp.generate_secret()} if keyed else {}
     env = _env_for_a_sqlite_store(
         MEFOR_STORE_ENCRYPTION_KEY=key,
         **{rigadmin.ADMIN_NAME_ENV: admin.username, rigadmin.ADMIN_PASS_ENV: admin.password},
+        **factor,
     )
     argv = [sys.executable, "-P", str(Path(rigadmin.__file__).resolve()), "provision"]
 
