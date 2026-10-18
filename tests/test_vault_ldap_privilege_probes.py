@@ -870,7 +870,8 @@ def test_a_missing_entry_keeps_the_identity_and_is_unobservable(
 ) -> None:
     reading = _read(monkeypatch, _FakeLdapConn(None))
     assert reading.authzid == "u:EXAMPLE\\svc"
-    assert reading.problem is not None and "returned no entry (noSuchObject)" in reading.problem
+    # BACKLOG #3010: a read that did not end with success is refused naming ldap3's code name.
+    assert reading.problem is not None and "result code 32 (noSuchObject)" in reading.problem
     assert _judge(reading).state is HopState.UNOBSERVABLE
 
 
