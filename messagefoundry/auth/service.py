@@ -6954,9 +6954,13 @@ class AuthService:
           pass did not just revoke. A probe that could not reach the directory leaves none.
         * A pass in which any probe was referred marks none of the three (BACKLOG #2538). A
           referred account has no answer from this pass, and an older one on record may predate
-          the referral. So a standing referral keeps the breaker's and the hold's instances open
-          after their own causes are gone: a missed clear, never a false one (BACKLOG #3100 item
-          7). A pass with a probe fault marks none either, for the same reason. Unlike a referral, a fault is not carried to later passes, so a later pass whose sample misses the faulting account can still mark one (left open under BACKLOG #3100).
+          the referral. So while a referred account is probed, a standing referral keeps the
+          breaker's and the hold's instances open after their own causes are gone: a missed
+          clear, never a false one (BACKLOG #3100 item 7). A pass with a probe fault marks none
+          either, for the same reason. For these two clears neither is carried to later passes:
+          a later pass whose sample misses the referred or faulting account reads its older
+          answer on record and can still mark one (left open under BACKLOG #3100). Only the
+          referral's own clear below carries its accounts across passes.
         * The referral's own instance is clear when, on top of the first test, every account signed
           in at the last referral has since read PRESENT on a pass with no referral
           (``_reconcile_referred``), and ``_reconcile_referral_standing`` is ``"referred"``: a

@@ -822,7 +822,8 @@ pass of its own tripped, the hold only after a pass of its own held, and the ref
 a pass of its own saw one. It never resolves an alert that was already open when it started, even
 after it trips, holds or sees a referral itself. A restart forgets which accounts were behind each
 of these, and it cannot see the accounts that sign out while the engine is down. So an operator
-resolves an alert the last run left open. After that, the engine resolves the next one of these three on its own.
+resolves an alert the last run left open. After that, the engine resolves the next one of these
+three on its own, until it restarts again.
 
 - The hold resolves when no answer is undetermined and this pass read `userAccountControl` at
   least once. An account the pass just revoked still counts as an answer here.
