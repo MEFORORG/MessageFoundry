@@ -108,13 +108,19 @@ _CLEAR_SITE_DATA_LOGIN_CODES = frozenset({"expired", "loggedout", "pwchanged"})
 #: truncated to a count. The reports are attacker-influenceable, so the log line is bounded.
 _CSP_REPORT_SUMMARY_MAX = 5
 
-#: What the MFA gate and the re-auth form say when ``verify_mfa``, ``reauth`` or
-#: ``finish_webauthn_assertion`` refused a directory account the directory did not confirm (BACKLOG
-#: #2023, #2027, #2239). The code, password or passkey was never checked, so "invalid code",
-#: "incorrect password" or "passkey verification failed" would be false.
+#: What the MFA gate, the re-auth form and the account page's two enrolment finishes say when
+#: ``verify_mfa``, ``reauth``, ``finish_webauthn_assertion``, ``confirm_mfa_enrollment`` or
+#: ``finish_webauthn_registration`` refused a directory account the directory did not confirm
+#: (BACKLOG #2023, #2027, #2239, #3061). The code, password or passkey was never checked, so
+#: "invalid code", "incorrect password" or "passkey verification failed" would be false.
 _DIRECTORY_UNCONFIRMED_ERROR = (
     "The directory could not confirm your account. Try again later, or ask an administrator."
 )
+
+#: What the re-auth form and the account page's two enrolment finishes say when the leg refused
+#: the account for a second-step lock (``Elevation.locked``) before checking the code or passkey
+#: (BACKLOG #3810 finding 4), so "invalid code" would be false.
+_ACCOUNT_LOCKED_ERROR = "Account locked. Try again later."
 
 
 def _directory_unconfirmed(elevation: Elevation) -> bool:
@@ -127,6 +133,18 @@ def _directory_unconfirmed(elevation: Elevation) -> bool:
     guard. The ``allow_reauth_attempt`` precedent in ``_auth.py`` is the same.
     """
     return bool(getattr(elevation, "directory_unconfirmed", False))
+
+
+def _refusal_error(elevation: Elevation, fallback: str) -> str:
+    """The words for a refused code or passkey: the directory's refusal, then a lock, then the leg's
+    own ``fallback`` for a wrong proof. The first two never checked the proof, so ``fallback``
+    would be false for them (BACKLOG #3061, #3810 finding 4). No leg sets both flags on one
+    answer, so the order between them decides nothing today."""
+    if _directory_unconfirmed(elevation):
+        return _DIRECTORY_UNCONFIRMED_ERROR
+    if elevation.locked:
+        return _ACCOUNT_LOCKED_ERROR
+    return fallback
 
 
 def _enrol_before_step_up(mfa: MfaStatus, *, satisfied: bool, step_up: bool) -> bool:
@@ -1900,13 +1918,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                         mfa_needed=True,
                         webauthn_options=wa_options,
                         webauthn_notice=wa_notice,
-                        error=(
-                            "Account locked. Try again later."
-                            if code_elevation.locked
-                            else _DIRECTORY_UNCONFIRMED_ERROR
-                            if _directory_unconfirmed(code_elevation)
-                            else "Invalid code."
-                        ),
+                        error=_refusal_error(code_elevation, "Invalid code."),
                     )
                 )
         # 7.5.1 (ADR 0077): mint the single-use grant bound to this continuation's action.
