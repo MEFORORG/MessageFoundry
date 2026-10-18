@@ -4193,8 +4193,30 @@ at once. The mass-revoke breaker is the brake on that, and a partial one. It abo
 revocations exceed **both** its floor and its fraction of the judged probes. Where few signed-in
 principals hold a directory scope, the pass stays under the fraction and revokes them all. Their next
 logins would read the same empty groups and withdraw the scope anyway. Revocations audit `auth.ad_session_revoked` and
-raise the `ad_session_revoked` alert, one per revoked principal, once the pass completes. A pass that
-fails part-way keeps the audit rows for what it already revoked, but raises no alert for them.
+raise the `ad_session_revoked` alert, one per revoked principal, once the pass completes. Some
+revocations end no session and change no role. Each still writes its row, with `sessions: 0`
+(BACKLOG #3085, owner ruling 2026-10-16). When the directory says the account is disabled or
+absent, that revocation still alerts and sends its notice, as when the user signed out mid-pass.
+It is quiet only as a repeat another pass already made (owner ruling B258-R7, 2026-10-17), and,
+under vault BACKLOG #3750 item 33, only when that pass's row **verifies under the active audit
+key** (`AuthService._already_revoked_elsewhere` states the rule). Anything else alerts: a keyless
+audit chain, a row that fails its MAC or sits under a retired key, or a failed read. So a database writer
+who holds no audit key cannot silence the alert with a forged row. That method names the
+residuals, at least a holder of the active audit key and a writer who lowers the watermark close
+to a genuine revocation of the same account. On a keyless audit chain no repeat is quiet.
+Any other revocation that ends nothing and changes no role, such as a scope, role, undetermined or
+unkeyed one, is quiet too. Two reconcilers that both read the old roles, or both read before either
+writes its row, both report. If the first reconciler's pass ended before it alerted, the second's
+quiet revocation means that account pages nobody. A quiet revocation whose own row is refused
+alerts instead, with no notice.
+
+A pass that fails part-way keeps the audit rows for what it already revoked, but raises no alert for
+them. A refused audit write does not end the pass (BACKLOG #3018). That holds for the store errors
+the reconciler treats as a refusal. Any other error still ends the pass. The reconciler logs
+a refused row at ERROR, naming the action and the account. That line is the only record of the row,
+and nothing writes it later. Any notice the account was due still goes. Its alert still goes too,
+unless something later in the same pass raises and ends it. Then that account has neither its row
+nor its alert. A later refused audit write does not end the pass.
 
 **The probe is keyed on the directory's immutable `objectGUID`**, the same identifier a directory login
 is identified by, and a renamed account's stored username is refreshed from the directory on the same
