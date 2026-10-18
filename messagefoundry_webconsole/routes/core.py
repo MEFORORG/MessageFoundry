@@ -117,6 +117,11 @@ _DIRECTORY_UNCONFIRMED_ERROR = (
     "The directory could not confirm your account. Try again later, or ask an administrator."
 )
 
+#: What the re-auth form and the account page's two enrolment finishes say when the leg refused
+#: the account for a second-step lock (``Elevation.locked``) before checking the code or passkey
+#: (BACKLOG #3810 finding 4), so "invalid code" would be false.
+_ACCOUNT_LOCKED_ERROR = "Account locked. Try again later."
+
 
 def _directory_unconfirmed(elevation: Elevation) -> bool:
     """``Elevation.directory_unconfirmed``, read so an engine that predates the field degrades.
@@ -1902,7 +1907,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                         webauthn_options=wa_options,
                         webauthn_notice=wa_notice,
                         error=(
-                            "Account locked. Try again later."
+                            _ACCOUNT_LOCKED_ERROR
                             if code_elevation.locked
                             else _DIRECTORY_UNCONFIRMED_ERROR
                             if _directory_unconfirmed(code_elevation)

@@ -54,7 +54,7 @@ from .._auth import (
 )
 from .._service import _service
 from ._common import _form_pairs, _rate_limited
-from .core import _DIRECTORY_UNCONFIRMED_ERROR, _directory_unconfirmed
+from .core import _ACCOUNT_LOCKED_ERROR, _DIRECTORY_UNCONFIRMED_ERROR, _directory_unconfirmed
 
 # --- L4b: self-service account (change password + TOTP MFA lifecycle) -------
 # Self-scoped actions: any authenticated session acts on ITS OWN credential, so the registry
@@ -527,10 +527,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return login_redirect_response()
         if elevation.token is None:
             # BACKLOG #3061: the directory could not vouch for a directory account, so the code was
-            # never checked and "Invalid code." would be false.
+            # never checked and "Invalid code." would be false. Nor was it under a second-step lock
+            # (BACKLOG #3810 finding 4), which says so in /ui/reauth's words.
             error = (
                 _DIRECTORY_UNCONFIRMED_ERROR
                 if _directory_unconfirmed(elevation)
+                else _ACCOUNT_LOCKED_ERROR
+                if elevation.locked
                 else "Invalid code."
             )
             return HTMLResponse(pages.mfa_confirm_page(error=error), status_code=400)
@@ -746,10 +749,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if elevation.session_lost:
             return JSONResponse({"ok": False, "error": "session expired"}, status_code=401)
         if elevation.token is None:
-            # BACKLOG #3061: as on ui_mfa_confirm, a directory refusal checked no attestation.
+            # BACKLOG #3061: as on ui_mfa_confirm, a directory refusal checked no attestation, and
+            # neither did a lock refusal (BACKLOG #3810 finding 4).
             error = (
                 _DIRECTORY_UNCONFIRMED_ERROR
                 if _directory_unconfirmed(elevation)
+                else _ACCOUNT_LOCKED_ERROR
+                if elevation.locked
                 else "passkey verification failed"
             )
             return JSONResponse({"ok": False, "error": error}, status_code=400)

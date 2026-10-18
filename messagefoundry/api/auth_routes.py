@@ -874,7 +874,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     ) -> MfaConfirmResponse:
         """Confirm a staged enrollment by proving a live TOTP code; activates MFA and returns the
         single-use recovery codes (shown **once** — save them). A wrong code is a 400, and a
-        directory account the directory could not confirm a 403 (BACKLOG #3061). Gated by a fresh
+        directory account the directory could not confirm a 403 (BACKLOG #3061), as is a directory
+        account under a second-step lock (BACKLOG #3810 finding 4). Gated by a fresh
         password step-up BOUND to this confirm action (ADR 0077), independent of the enroll grant."""
         # Post-session ceremony (enrolling a factor while signed in): per-ACTOR budget.
         if not service.allow_reauth_attempt(identity.user_id):
@@ -895,6 +896,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 # BACKLOG #3061: the code was never checked, so "invalid code" would be false. The
                 # same 403 and words as /auth/mfa-verify's directory refusal.
                 raise HTTPException(status.HTTP_403_FORBIDDEN, _DIRECTORY_UNCONFIRMED_DETAIL)
+            if elevation.locked:
+                # BACKLOG #3810 finding 4: a directory account's lock is found before the code is
+                # checked, so "invalid code" would call an unchecked code wrong.
+                raise HTTPException(status.HTTP_403_FORBIDDEN, "account locked; try again later")
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid code")
         # The body now carries BOTH the one-time recovery codes and a live session token; the route's
         # CredentialReply model keeps the reply out of every cache (BACKLOG #2372).

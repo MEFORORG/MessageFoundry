@@ -2689,6 +2689,13 @@ the lookup's outcome and `phase=enroll`. After a confirmed lookup each leg reads
 account and its lock again, and a session or account gone meanwhile is a lost session, which
 also ends a staged passkey ceremony. That re-read refuses a second-step lock too, so a locked
 directory account cannot enrol a factor, while a local account is not lock-checked at enrolment.
+The lock refusal reads as a lock, not as a wrong code, since the code or passkey was never
+checked (BACKLOG #3810 finding 4): `POST /me/mfa/confirm` answers **403** `account locked; try
+again later`, and the account page's two enrolment finishes show `Account locked. Try again
+later.`, the words `/ui/reauth` shows. On either account kind, a session found gone just before
+each leg's second factor-binding ask is a lost session audited as the leg's failure event with
+`reason=session_lost` and `phase=enroll` (BACKLOG #3807), so a local account's lost enrolment
+leaves the row a directory account's re-read writes.
 The TOTP leg judges the code as of the request's arrival, so a slow lookup does not push a good code
 out of its step. A refusal is not free: the route in front of each leg has already drawn its
 per-actor attempt budget, and `POST /me/mfa/confirm` and `/ui/account/mfa/verify` have spent their
@@ -2982,6 +2989,13 @@ always-available recovery, because passkeys mint **no recovery codes by design**
 knowledge secrets that would undercut the phishing-resistant tier). A covered local account that has TOTP
 keeps it beside its passkeys, since it cannot remove it, so TOTP is its fallback. On any other
 account, enroll a second passkey or keep TOTP.
+
+**A refused registration can leave a passkey on the authenticator (BACKLOG #3810 finding 4).** The
+browser's `navigator.credentials.create` makes the credential before the finish request reaches the
+engine, so every refusal at finish comes after it: the factor-binding refusal, the login-to-MFA
+floor, a lost session, a failed verification, a duplicate, and a directory account's directory and
+lock refusals. That passkey is not stored, so it cannot sign in. The passkey page says the user may
+delete it from the browser's or security key's passkey list.
 
 Mechanics: ceremony challenges are **first-party 64-byte CSPRNG values**, single-use, 120 s TTL, staged
 in a bounded process-local cache (multi-node LBs need session affinity — the failure message says so).

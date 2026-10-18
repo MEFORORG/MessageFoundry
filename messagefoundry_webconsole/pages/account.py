@@ -1053,6 +1053,15 @@ def webauthn_enroll_page(options_json: str) -> Markup:
             el("p", "", class_="muted", data_mf_webauthn_status=True),
             class_="ctl",
         ),
+        # BACKLOG #3810 finding 4: every refusal at finish comes after the authenticator made its
+        # credential, so a failed enrolment can leave one behind that the server never stored.
+        el(
+            "p",
+            "If your browser or security key saved a passkey but adding it here then failed, that "
+            "passkey was not added to your account and cannot sign you in. You can delete it from "
+            "your browser's or security key's passkey list.",
+            class_="muted",
+        ),
         el(
             "noscript",
             el(

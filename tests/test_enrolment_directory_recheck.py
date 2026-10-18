@@ -330,7 +330,10 @@ async def test_a_second_step_locked_directory_account_cannot_enrol(
 ) -> None:
     """The re-read after a confirmed lookup refuses a live second-step lock, so neither leg lets a
     locked directory account enrol, and neither spends anything. Pinned so the asymmetry with a
-    local account, which is not lock-checked at enrolment, is a decision and not an accident."""
+    local account, which is not lock-checked at enrolment, is a decision and not an accident.
+
+    The refusal carries ``locked`` (BACKLOG #3810 finding 4), so a route says the account is locked
+    rather than call a code it never checked wrong. RED when the leg passes ``report_lock=False``."""
     t = await _totp_staged(await _directory_sign_in(store), monkeypatch)
     await _lock_second_step(store, t.signed.identity.user_id)
 
@@ -339,6 +342,7 @@ async def test_a_second_step_locked_directory_account_cannot_enrol(
     )
 
     assert refused.ok is False and refused.directory_unconfirmed is False
+    assert refused.locked is True and refused.session_lost is False
     assert t.minted == []
     user = await store.get_user(t.signed.identity.user_id)
     assert user is not None and not user.totp_enabled
@@ -348,13 +352,15 @@ async def test_a_second_step_locked_directory_account_cannot_enrol(
 async def test_a_second_step_locked_directory_account_cannot_register_a_passkey(
     store: MessageStore,
 ) -> None:
-    """As above, on the passkey leg: nothing stored, the ceremony left in flight."""
+    """As above, on the passkey leg: nothing stored, the ceremony left in flight, and ``locked``
+    set. RED when the leg passes ``report_lock=False``."""
     p = await _passkey_staged(await _directory_sign_in(store))
     await _lock_second_step(store, p.signed.identity.user_id)
 
     refused = await _register(p)
 
     assert refused.ok is False and refused.directory_unconfirmed is False
+    assert refused.locked is True and refused.session_lost is False
     assert await store.list_webauthn_credentials(p.signed.identity.user_id) == []
     key = (hash_token(p.signed.token), "register")
     assert p.signed.service._webauthn_challenges.peek(key) is not None
@@ -386,6 +392,9 @@ async def test_a_session_revoked_between_the_two_totp_asks_is_lost_not_owing_a_f
 
     assert lost.session_lost is True and lost.ok is False and lost.recovery_codes == ()
     assert await store.list_audit(action="auth.mfa_denied") == []
+    # BACKLOG #3807: the guard leaves an audit row, the shape a directory account's re-read writes
+    # for the same lost session. Engine main wrote one in this interleaving; RED when it is silent.
+    assert {"reason": "session_lost", "phase": "enroll"} in await _audited(store, "auth.mfa_failed")
     user = await store.get_user(identity.user_id)
     assert user is not None and not user.totp_enabled
     step = totp.verify_totp_step(secret, code, now=_T0)

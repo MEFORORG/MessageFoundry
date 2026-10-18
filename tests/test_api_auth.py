@@ -496,6 +496,32 @@ async def test_the_confirm_route_says_the_directory_could_not_confirm_the_accoun
     assert "directory could not confirm this account" in r.json()["detail"]
 
 
+async def test_the_confirm_route_says_a_locked_account_is_locked(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3810 finding 4: a directory account's enrolment refuses a live second-step lock
+    before the code is checked, and says so with ``locked``. RED when ``/me/mfa/confirm`` answers
+    it as the wrong-code ``400 invalid code``. The service answer is stubbed; the refusal itself is
+    pinned in tests/test_enrolment_directory_recheck.py."""
+    service = await _service(
+        engine, AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False)
+    )
+    await _add(service, "adm", Role.ADMINISTRATOR)
+
+    async def _locked(*_args: object, **_kwargs: object) -> Elevation:
+        return Elevation(locked=True)
+
+    async with _client(engine, service) as c:
+        tok = (await _login(c, "adm")).json()["token"]
+        _r, tok = await _reauth(c, tok, purpose="mfa_enroll")
+        assert (await c.post("/me/mfa/enroll", headers=_auth(tok))).status_code == 200
+        _r, tok = await _reauth(c, tok, purpose="mfa_confirm")
+        monkeypatch.setattr(service, "confirm_mfa_enrollment", _locked)
+        r = await c.post("/me/mfa/confirm", headers=_auth(tok), json={"code": "123456"})
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"] == "account locked; try again later"
+
+
 def _hold_auth_wall_clock(monkeypatch: pytest.MonkeyPatch, now: list[float]) -> None:
     """Hold the wall clock the service and the store read at ``now[0]``; ``monotonic()`` stays real.
 
