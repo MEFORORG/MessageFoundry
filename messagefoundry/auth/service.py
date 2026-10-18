@@ -415,15 +415,19 @@ _NEW_IP_OVER_CAP_LOG_MAX = 64
 # WARNING writes.
 _NEW_IP_LOG_KEY_MAX = 64
 _NEW_IP_UNPARSED_LOG_KEY = "unparsed"
+# The longest address text, scope id included, that _over_cap_log_key parses at all.
+_NEW_IP_SCOPED_KEY_MAX = 4 * _NEW_IP_LOG_KEY_MAX
 
 
 def _over_cap_log_key(address_key: str) -> str:
     """The bounded key the log throttle remembers for a past-the-cap address (vault BACKLOG
     #3052): ``address_key``, a :func:`_host_key` result, with any IPv6 scope id dropped, so
     link-local peers on a direct bind (``fe80::a%eth0``, ``fe80::b%eth0``) stay distinct
-    (vault BACKLOG #3773 item 2). Text that does not parse is one sentinel."""
-    if len(address_key.partition("%")[0]) > _NEW_IP_LOG_KEY_MAX:
-        return _NEW_IP_UNPARSED_LOG_KEY  # longer than any address, so skip the parse
+    (vault BACKLOG #3773 item 2). One address on two interfaces (``fe80::a%eth0``,
+    ``fe80::a%eth1``) shares a key. Text that does not parse, or is longer than
+    ``_NEW_IP_SCOPED_KEY_MAX``, is one sentinel."""
+    if len(address_key) > _NEW_IP_SCOPED_KEY_MAX:
+        return _NEW_IP_UNPARSED_LOG_KEY  # no parse for text far longer than an address
     try:
         parsed = ipaddress.ip_address(address_key)
     except ValueError:
@@ -445,6 +449,9 @@ class _NewIpLogState:
     suppressed: int = 0
     over_cap_logged: set[str] = field(default_factory=set)
     flush_handle: asyncio.TimerHandle | None = None
+    # The loop the timer is on: a handle left on a loop that has stopped never runs, so a request
+    # on another loop arms a fresh one rather than trusting it.
+    flush_loop: asyncio.AbstractEventLoop | None = None
 
     def take_held_back(self) -> int:
         """The count held back, which the line carrying it reports; starts it over and cancels
@@ -10121,7 +10128,7 @@ class AuthService:
     def _new_ip_log_due(self, token_hash: str, over_cap_key: str | None = None) -> int | None:
         """Whether this session's new-address WARNING may be written now (vault BACKLOG #3052
         item 16): ``None`` holds it back, and a number means write it, carrying that count of lines
-        held back since the session's last interval line.
+        held back since the last line that carried the count.
 
         ``over_cap_key`` is the host key of an address past the per-session cap: its first sighting
         is always due, for up to ``_NEW_IP_OVER_CAP_LOG_MAX`` addresses, because that line is its
@@ -10151,11 +10158,15 @@ class AuthService:
             state.suppressed += 1
             _log.debug(
                 "a new-address WARNING was held back by the per-session throttle: "
-                "suppressed=%d since the last interval line",
+                "suppressed=%d since the last line that carried the count",
                 state.suppressed,
             )
-            if state.flush_handle is None:
-                state.flush_handle = asyncio.get_running_loop().call_later(
+            loop = asyncio.get_running_loop()
+            if state.flush_handle is None or state.flush_loop is not loop:
+                if state.flush_handle is not None:
+                    state.flush_handle.cancel()
+                state.flush_loop = loop
+                state.flush_handle = loop.call_later(
                     state.last_line + _NEW_IP_REPEAT_LOG_SECONDS - now,
                     self._new_ip_interval_ended,
                     state,
@@ -10190,8 +10201,8 @@ class AuthService:
         if not held_back:
             return
         _log.warning(
-            "new-address re-verify refusals the per-session throttle held back, written now "
-            "because %s: held_back=%d",
+            "a request from a new client address must re-verify; the refusals the per-session "
+            "throttle held back are written now because %s: held_back=%d",
             reason,
             held_back,
         )

@@ -19,8 +19,9 @@ import inspect
 import json
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -72,6 +73,26 @@ class _FakeNotifier:
 
     async def notify(self, event: SecurityEvent) -> None:
         self.events.append(event)
+
+
+@pytest.fixture(autouse=True)
+def _cancel_new_ip_flush_timers(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Cancel every new-address flush timer a test here leaves armed (vault BACKLOG #3773 item 1).
+    The loop is shared across tests, so a timer left behind would write its WARNING about a
+    minute later, inside whichever test is running then."""
+    services: list[AuthService] = []
+    original = AuthService.__init__
+
+    def tracking(self: AuthService, *args: Any, **kwargs: Any) -> None:
+        original(self, *args, **kwargs)
+        services.append(self)
+
+    monkeypatch.setattr(AuthService, "__init__", tracking)
+    yield
+    for service in services:
+        for state in service._new_ip_logged.values():
+            if state.flush_handle is not None:
+                state.flush_handle.cancel()
 
 
 async def _enabled_admin(service: AuthService, *, client: str) -> tuple[str, Identity]:
@@ -424,10 +445,17 @@ async def test_a_trailing_burst_is_counted_when_the_interval_ends(
         with caplog.at_level("WARNING", logger="messagefoundry.auth.service"):
             for _ in range(5):
                 assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
+            state = service._new_ip_logged[hash_token(token)]
+            started, held = state.last_line, state.suppressed
+            assert started is not None
             # The flush is due at most 0.2 s after the last interval line, so it runs first.
             await asyncio.sleep(0.6)
-        assert _refusals_on_record(caplog.records) == 5
-        assert service._new_ip_logged[hash_token(token)].suppressed == 0
+            assert _refusals_on_record(caplog.records) == 5
+            assert state.suppressed == 0 and state.flush_handle is None
+            if held:
+                # The line the timer wrote starts a new interval, so the session still writes at
+                # most one WARNING per interval.
+                assert state.last_line is not None and state.last_line > started
     finally:
         await store.close()
 
@@ -457,6 +485,8 @@ async def test_summing_held_back_counts_each_refusal_once(
             assert await service.flag_new_client_ip(token, "10.3.3.0", path="/users") is True
             refused += 1
         assert _refusals_on_record(caplog.records) == refused
+        # The line that carried the count disarmed the timer, so it cannot write the count again.
+        assert state.flush_handle is None
     finally:
         await store.close()
 

@@ -3094,18 +3094,20 @@ alone:
    writes no row, so the line is its only record: its first sighting always logs, with the
    address, for up to 64 such addresses per session (`_NEW_IP_OVER_CAP_LOG_MAX`), and its repeats
    share the per-minute limit. Only an address's host key is remembered for that, with any IPv6
-   scope id dropped, because the text after the `%` is the sender's. The host key is the one the
-   dedupe uses (`_host_key`): an IPv4-mapped address takes its IPv4 form, any loopback address
-   becomes `::1`, and any other address takes its canonical text. So link-local peers on a direct
-   bind, such as `fe80::a%eth0` and `fe80::b%eth0`, stay distinct (vault BACKLOG #3773). Text
-   that does not parse is remembered as one sentinel and shares one first sighting, so the record
-   holds no text past the address itself; a proxy that appends a port to the address therefore
-   gets one first sighting in all. The line carries at most 64 characters of the address. A line
-   held back writes a DEBUG line with the count held back since the session's last interval
-   line, and a WARNING carries that count as `held_back`: the next line the session writes, or a
-   line of the count's own when the minute ends with no later line, when the session
-   re-verifies, when the process drops the session's record, or at shutdown. Whichever line
-   carries the count starts it over, so summing `held_back` counts each held-back request once.
+   scope id dropped, because the text after the `%` is the sender's. The host key is computed as
+   the dedupe's is (`_host_key`): an IPv4-mapped address takes its IPv4 form, any loopback address
+   becomes `::1`, and any other address takes its canonical text; then the scope id goes. So
+   link-local peers on a direct bind, such as `fe80::a%eth0` and `fe80::b%eth0`, stay distinct
+   (vault BACKLOG #3773), while one address on two interfaces, which the dedupe keeps apart,
+   shares one first sighting here. Text that does not parse is remembered as one sentinel and
+   shares one first sighting, so the record holds no text past the address itself; a proxy that
+   appends a port to the address therefore gets one first sighting in all. The line carries at
+   most 64 characters of the address. A line held back writes a DEBUG line with the count held
+   back since the last line that carried it, and a WARNING carries that count as `held_back`: the
+   next line the session writes, or a line of the count's own when the minute ends with no later
+   line, when the session re-verifies, when the process drops the session's record, or at
+   shutdown. Whichever line carries the count starts it over, so summing `held_back` counts each
+   held-back request once.
    The throttle touches log lines only: every such request is refused, and the audit rows are
    the ones the cap above allows.
    **That bound is per process, and the owner accepted it as one (vault BACKLOG #2951, owner
