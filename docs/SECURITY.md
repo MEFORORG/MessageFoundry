@@ -2243,8 +2243,9 @@ included, and released, any error the reload raises that none of the other reaso
 raised by a runner start or swap. A `FileNotFoundError` there is never `not_found`, which only a
 missing config directory writes. The row does not claim the old graph is still serving: at least a
 fault raised after the swap committed leaves the new one live, and `GET /config/provenance` says
-which is. At least these write no such row: a convergence reload, a DR activation's reload, and a
-row whose own write fails, which is logged. A cancellation is not a fault: an applied reload's
+which is. At least these write no such row: a DR activation's reload, and a row whose own write
+fails, which is logged. A cluster convergence reload records such a fault with reason
+`reload_error` instead (vault BACKLOG #3109). A cancellation is not a fault: an applied reload's
 writes `config_reload_interrupted`, and a cancelled dry run or digest capture writes nothing. An
 inline reload answers **500** with a generic detail for `reload_fault`; a released one answers 422,
 the approve route's answer for a release the engine did not run. A trust-anchor check that the

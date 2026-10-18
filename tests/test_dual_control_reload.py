@@ -2088,6 +2088,13 @@ def _slow_writer(writer: str, store: _SlowAudit) -> tuple[Any, str]:
             fake, ConfigDirMissing("gone"), actor="alice", requested="/cfg", dry_run=False
         )
         return refused, "config_reload_failed"
+    if writer == "convergence":
+        # A fault outside _RELOAD_REFUSALS, which the convergence path writes its own row for.
+        from messagefoundry.api.app import _audit_failed_convergence
+
+        return _audit_failed_convergence(fake, RuntimeError("PROBE"), 1, set()), (
+            "config_reload_failed"
+        )
     return _record_reload_audit(fake, actor="alice", loaded=None), "config_reload"
 
 
@@ -2104,7 +2111,7 @@ async def _drain_mid_write(op: Any, store: _SlowAudit) -> None:
     await asyncio.sleep(0.1)  # time for a write the cancel cut off to have landed, had it not been
 
 
-@pytest.mark.parametrize("writer", ["refusal", "reload"])
+@pytest.mark.parametrize("writer", ["refusal", "reload", "convergence"])
 @pytest.mark.parametrize("shielded", [True, False])
 async def test_a_shutdown_drain_does_not_cut_a_reload_row_short(
     writer: str, shielded: bool, monkeypatch: pytest.MonkeyPatch

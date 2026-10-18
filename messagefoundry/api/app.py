@@ -2226,8 +2226,8 @@ async def _record_reload_audit(
 #: release. The catch sites (the inline route, a dry run included, the hold-parameter capture and
 #: the released executor; the console reaches the first two through the seam) catch ``Exception``
 #: around the reload alone, never ``BaseException``, so a cancellation, ``KeyboardInterrupt`` and
-#: ``SystemExit`` propagate. At least a convergence reload and a DR activation's reload are not
-#: among them, and a row whose own write fails is logged, not written.
+#: ``SystemExit`` propagate. At least a DR activation's reload is not among them; a convergence
+#: reload records a fault outside this tuple with reason ``reload_error`` (vault BACKLOG #3109), and a row whose own write fails is logged, not written.
 _RELOAD_REFUSALS: tuple[type[Exception], ...] = (
     ConfigReloadDenied,
     ConfigDigestMismatch,
@@ -2237,8 +2237,8 @@ _RELOAD_REFUSALS: tuple[type[Exception], ...] = (
     WiringError,
 )
 
-#: The answer bound :func:`_audit_refused_reload` passes to ``safe_exc`` for its 404 and 422 refusal
-#: WARNINGs and its reload_fault ERROR, which carry the real reload error that the answer
+#: The answer bound :func:`_audit_refused_reload` passes to ``safe_exc`` for at least its 404, 422
+#: and 503 refusal WARNINGs and its reload_fault ERROR, which carry the real reload error that the answer
 #: withholds. ``safe_exc``'s default 200-character cut dropped the directory from a long config
 #: path and the fix from a long WiringError. 8192 is twice the 4096 that ``FilesystemPath`` allows a ``config_dir``, so any
 #: directory the API accepts fits with its message, and a multi-line WiringError fits too. It still
@@ -2398,7 +2398,8 @@ async def _audit_refused_reload(
         # could not open. Each escaped as a raw 500 with no outcome row. Last, so a refusal type
         # added without its own branch above is answered as a fault rather than as a bad graph.
         # The row names the error's type, never its text, which can carry a path.
-        _log.error(
+        # A convergence retry logs at DEBUG, as warn does: its runner already logs each at ERROR.
+        (_log.error if reported is None else _log.debug)(
             "config reload failed (fault): %s",
             scrub_log_argument(safe_exc(exc, limit=_REFUSAL_LOG_LIMIT)),
             exc_info=exc,
@@ -2483,7 +2484,11 @@ async def _audit_failed_convergence(
         return
     row = json.dumps(detail)
     if await write_audit_soft(
-        lambda: engine.store.record_audit(action, actor=_CONVERGENCE_ACTOR, detail=row),
+        # A shutdown's cancel waits a bounded time for the row, as the refusal path's does (#3157).
+        lambda: _write_through_cancel(
+            engine.store.record_audit(action, actor=_CONVERGENCE_ACTOR, detail=row),
+            lambda: _lost_row(action, _CONVERGENCE_ACTOR, row),
+        ),
         log=_log,
         message="a failed convergence reload's %s audit row failed. Lost row: actor=%s detail=%s",
         args=lambda: (action, _CONVERGENCE_ACTOR, scrub_log_argument(row)),
