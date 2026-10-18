@@ -35,8 +35,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from messagefoundry.controlchars import strip_control_chars
-from messagefoundry.privilege_check import printable, vault_admin_paths
+from messagefoundry.controlchars import scrub_log_argument, strip_control_chars
+from messagefoundry.privilege_check import vault_admin_paths
 
 logger = logging.getLogger(__name__)
 
@@ -86,8 +86,10 @@ class VaultTokenReading:
 
 def _problem(text: str) -> str:
     """Log one probe problem and return it. The text is already secret-free (:func:`_why`), and
-    is logged without control or format characters, as it is printed."""
-    logger.warning("check-privileges: %s", printable(text))
+    is logged with every character in ``CONTROL_CATEGORIES`` escaped visibly, by the log's own
+    rule, as the terminal escapes them (``privilege_check.render_text``), so neither deletes a
+    character the server sent (BACKLOG #2891)."""
+    logger.warning("check-privileges: %s", scrub_log_argument(text))
     return text
 
 
@@ -117,8 +119,9 @@ def _why(exc: BaseException) -> str:
 
 def _strings(value: object) -> tuple[str, ...]:
     """The string members of a Vault list, kept EXACTLY as Vault sent them. A policy name is also
-    a path the probe asks about, so altering it here would ask about a different policy. Every
-    printed or logged text goes through ``printable()`` at the output boundary instead."""
+    a path the probe asks about, so altering it here would ask about a different policy. A
+    printed line is escaped at ``privilege_check.render_text``, and a logged one by
+    ``scrub_log_argument``, each at its output boundary instead."""
     if not isinstance(value, (list, tuple)):
         return ()
     return tuple(v for v in value if isinstance(v, str))

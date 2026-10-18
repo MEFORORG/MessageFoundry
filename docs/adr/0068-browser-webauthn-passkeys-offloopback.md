@@ -123,7 +123,8 @@ and permanent for synced passkeys. The store contract test lives in an **extra-f
 imported inside test functions of the SQLite *and both live* suites (a module-level
 `importorskip("webauthn")` would silently skip parity on exactly the legs it exists to cover), and a
 minimal TOTP-contract backfill lands in the same commit — finally executing the Postgres/SQL Server
-row-lock paths under test.
+row-lock paths under test. *Amended 2026-10-17: this decision is unchanged, and the clone row
+now records the store's answer; see the amendment of that date.*
 
 ### 5. Factor generalization and recovery
 
@@ -647,3 +648,44 @@ BACKLOG #2620 was filed on 2026-10-01 from that day's security architecture revi
 records as owner-approved. The row carries the verdict "build" and asks for the new-address check
 in the PHI-read gates and the paced-write gate, and not in the base gate. No file in this public
 tree records the approval itself, so nothing here quotes the owner.
+
+## Amendment (2026-10-17) -- the clone row records the store's sign-count answer (BACKLOG #3068, #3774, #3777)
+
+**Status:** Decision 4 is UNCHANGED: every compare-and-set miss is a clone signal and writes one
+`auth.webauthn_clone_suspected` row, as the engine did before this amendment. What changed is what
+the row records. `update_webauthn_sign_count` answers `moved`, `mismatch` or `gone` under one locked
+write on every backend: on SQLite the existence read runs in the guarded UPDATE's own write
+transaction, before its commit; on PostgreSQL and SQL Server the answer is the row-locking
+`SELECT ... FOR UPDATE` / `UPDLOCK` read that the UPDATE follows in one transaction. The clone row's
+detail carries that answer as `sign_count_answer`, `mismatch` or `gone`, so an operator can tell a
+passkey deleted during the assertion from a counter that held another value.
+
+**When it is written.** Once per assertion, as soon as the store answers and before any other read
+or refusal, so a session revocation, a disable, a lock, a passkey delete or a store error in the
+reads that follow cannot drop it. A cancel before the row is written writes none. The assertion is
+then refused, and no refusal writes a second clone row. The reasons a gone passkey is refused
+with, audited `auth.webauthn_failed`, include at least `factor_removed`, `factor_unverified` when
+the passkey set read after the write fails its seal, `session_lost` when the session or the
+account went with it, and `locked` when a second-step lock landed; a store error in those reads
+raises instead.
+
+**Why a gone passkey still raises the signal.** A self-service passkey delete takes no account
+queue, and an MFA reset deletes every passkey before it revokes the sessions, so either can land
+during an assertion and fail its compare-and-set with nothing cloned. An earlier build of this
+change exempted such a miss when it judged the passkey gone. Each review round found a path on
+which that exemption alerted less than the engine had before it, so the exemption was withdrawn: a
+false clone row on a deleted passkey is preferred to a missing one. `gone` alone does not show a
+holder's delete: a passkey row removed outside the store's sealed write path, or with its account,
+answers `gone` too. Before discounting a `gone` row, read the same request's refusal: a
+`factor_unverified` refusal, with an `integrity.authority_seal_failed` row for the account's
+passkeys, means the row did not leave through the store.
+
+A py_webauthn counter regression (the library's own rejection) is untouched: it is a clone signal
+whether or not the passkey is later deleted. AC-4 is unchanged. Section 4's text is left as
+written; the only edit there is a dated pointer to this amendment.
+
+**Who decided.** The change was built under BACKLOG #3068 (engine PR 2392). The ledger rows #3774
+and #3777, filed at the Lander's request on 2026-10-17, ask that the answer be decided atomically
+and recorded here. The rule that every answer other than `moved` writes the row, with the answer
+recorded, is the batch 259 Manager's ruling on PR 2392 on 2026-10-17; no owner ruling is recorded
+for it.

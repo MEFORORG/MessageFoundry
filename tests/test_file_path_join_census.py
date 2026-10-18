@@ -699,6 +699,9 @@ SITES: dict[str, Site] = {
     "messagefoundry/security/__init__.py::handler_semgrep_rules": Site(
         1, INTERNAL, "Package resource literal."
     ),
+    "messagefoundry/security/audit_all_platforms.py::main": Site(
+        1, INTERNAL, "The final component of the named lock, inside a temp directory main created."
+    ),
     "messagefoundry/service.py::install_script_path": Site(
         1, INTERNAL, "A repo-relative literal beside the installed package."
     ),

@@ -206,8 +206,9 @@ jobs:
           # EVERY PIN, WHATEVER ITS MARKER. pip-audit skips a pin whose environment marker does not
           # match the host, so on this Linux runner this gate never audited the Windows-only pins (at
           # least sspilib and colorama) of the only supported v1 platform (owner ruling 2026-10-16).
-          # Each line below goes through scripts/security/audit_all_platforms.py, which carries the
-          # 2026-10-17 measurement and the reasoning. `--ignore-vuln <ID>` goes at the END of a line.
+          # Each line below goes through scripts/security/audit_all_platforms.py, a wrapper over
+          # messagefoundry/security/audit_all_platforms.py, which carries the 2026-10-17 measurement
+          # and the reasoning. `--ignore-vuln <ID>` goes at the END of a line.
           # Audit the committed, pinned set — reproducible (vs auditing a fresh latest-resolve).
           python scripts/security/audit_all_platforms.py requirements.lock
           # Audit the TOOLCHAIN locks too. NOT bookkeeping: hash-pinning makes the toolchain STICKY, so
@@ -468,7 +469,7 @@ jobs:
           echo "NOT EVERY RED HERE IS AN ADVISORY. If the log shows the dry-run install check failing"
           echo "(a hash mismatch, no installable artifact) or pip-audit stopping on '<name>: <reason>' under"
           echo "--strict (a pin it could not look up, such as one PyPI no longer serves), there is no"
-          echo "advisory to triage: read the error, and see scripts/security/audit_all_platforms.py"
+          echo "advisory to triage: read the error, and see messagefoundry/security/audit_all_platforms.py"
           echo "for what each step checks."
 
   cla-action-audit:
@@ -1681,8 +1682,9 @@ jobs:
           # EVERY PIN, WHATEVER ITS MARKER. pip-audit skips a pin whose environment marker does not
           # match the host, so on this Linux runner this gate never audited the Windows-only pins (at
           # least sspilib and colorama) of the only supported v1 platform (owner ruling 2026-10-16).
-          # Each line below goes through scripts/security/audit_all_platforms.py, which carries the
-          # 2026-10-17 measurement and the reasoning. `--ignore-vuln <ID>` goes at the END of a line.
+          # Each line below goes through scripts/security/audit_all_platforms.py, a wrapper over
+          # messagefoundry/security/audit_all_platforms.py, which carries the 2026-10-17 measurement
+          # and the reasoning. `--ignore-vuln <ID>` goes at the END of a line.
           # Audit the committed, pinned set — reproducible (vs auditing a fresh latest-resolve).
           python scripts/security/audit_all_platforms.py requirements.lock
           # Audit the TOOLCHAIN locks too. NOT bookkeeping: hash-pinning makes the toolchain STICKY, so

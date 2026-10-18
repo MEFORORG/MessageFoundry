@@ -169,6 +169,7 @@ def _card_text(auth_provider: AuthProvider) -> str:
         auth_provider=auth_provider.value,
         disabled=False,
         roles=[Role.VIEWER.value],
+        channel_scope_withheld=False,
         lock_state=UserLockState(
             sign_in_locked=True,
             locked_until=time.time() + 600,

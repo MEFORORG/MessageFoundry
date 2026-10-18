@@ -10,6 +10,7 @@ the offset through and states a total the caller can actually page through.
 
 from __future__ import annotations
 
+import importlib
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -22,10 +23,12 @@ from messagefoundry.auth import Role
 from messagefoundry.auth.audit_visibility import LOCKED_REFUSAL_DETAIL
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.store import KeyedAuditEvidenceStore, MessageStore
 from tests._audit_event_paging_contract import (
     check_audit_paging,
     check_connection_event_paging,
+    check_keyed_audit_evidence,
     check_security_events_paging,
 )
 from tests.test_api_auth import _add, _auth, _client, _login, _service
@@ -42,6 +45,21 @@ async def store(tmp_path: Path) -> AsyncIterator[MessageStore]:
 
 async def test_audit_pages_by_offset_after_the_exclusion(store: MessageStore) -> None:
     await check_audit_paging(store, "sqlite")
+
+
+async def test_keyed_audit_evidence_is_none_on_a_keyless_store(store: MessageStore) -> None:
+    await check_keyed_audit_evidence(store, "sqlite")
+
+
+async def test_keyed_audit_evidence_reads_the_newest_verified_row(tmp_path: Path) -> None:
+    cipher = make_cipher(generate_key())
+    keyed = await MessageStore.open(
+        tmp_path / "keyed.db", cipher=cipher, audit_mac_key=cipher.audit_mac_key()
+    )
+    try:
+        await check_keyed_audit_evidence(keyed, "sqlite-keyed")
+    finally:
+        await keyed.close()
 
 
 async def test_security_events_page_by_offset(store: MessageStore) -> None:
@@ -229,3 +247,18 @@ async def test_get_events_pages_by_offset_under_a_snapshot_pin(engine: Engine) -
         assert body["total"] == 5 and body["before_id"] == pin
         assert [e["id"] for e in body["events"]] == [e["id"] for e in whole["events"]][2:4]
         assert (await c.get("/events", params={"offset": -1})).status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("module", "name"),
+    [
+        ("messagefoundry.store.store", "MessageStore"),
+        ("messagefoundry.store.sqlserver", "SqlServerStore"),
+        ("messagefoundry.store.postgres", "PostgresStore"),
+    ],
+)
+def test_every_backend_offers_keyed_audit_evidence(module: str, name: str) -> None:
+    """Without it the reconciler's ``isinstance`` gate reads a backend as giving no evidence, so a
+    repeat revocation would always alert there (vault BACKLOG #3750 item 33)."""
+    cls = getattr(importlib.import_module(module), name)
+    assert isinstance(object.__new__(cls), KeyedAuditEvidenceStore)

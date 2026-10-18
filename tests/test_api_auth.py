@@ -496,6 +496,32 @@ async def test_the_confirm_route_says_the_directory_could_not_confirm_the_accoun
     assert "directory could not confirm this account" in r.json()["detail"]
 
 
+async def test_the_confirm_route_says_a_locked_account_is_locked(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3810 finding 4: a directory account's enrolment refuses a live second-step lock
+    before the code is checked, and says so with ``locked``. RED when ``/me/mfa/confirm`` answers
+    it as the wrong-code ``400 invalid code``. The service answer is stubbed; the refusal itself is
+    pinned in tests/test_enrolment_directory_recheck.py."""
+    service = await _service(
+        engine, AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False)
+    )
+    await _add(service, "adm", Role.ADMINISTRATOR)
+
+    async def _locked(*_args: object, **_kwargs: object) -> Elevation:
+        return Elevation(locked=True)
+
+    async with _client(engine, service) as c:
+        tok = (await _login(c, "adm")).json()["token"]
+        _r, tok = await _reauth(c, tok, purpose="mfa_enroll")
+        assert (await c.post("/me/mfa/enroll", headers=_auth(tok))).status_code == 200
+        _r, tok = await _reauth(c, tok, purpose="mfa_confirm")
+        monkeypatch.setattr(service, "confirm_mfa_enrollment", _locked)
+        r = await c.post("/me/mfa/confirm", headers=_auth(tok), json={"code": "123456"})
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"] == "account locked; try again later"
+
+
 def _hold_auth_wall_clock(monkeypatch: pytest.MonkeyPatch, now: list[float]) -> None:
     """Hold the wall clock the service and the store read at ``now[0]``; ``monotonic()`` stays real.
 
@@ -935,6 +961,39 @@ async def test_create_user_route_refuses_a_site_context_word(engine: Engine) -> 
         created = await c.post("/users", headers=h, json=body)
         assert created.status_code == 201
         assert "globex" not in created.json()["temp_password"].lower()
+
+
+async def test_create_user_with_a_repeated_role_grants_it_once(engine: Engine) -> None:
+    # BACKLOG #2733: a repeated role once failed the user_roles primary key after the account row
+    # had committed. The store now writes one grant, and the request model names the role once,
+    # so the reply and both audit rows do too.
+    settings = AuthSettings(admin_write_min_interval_seconds=0, require_mfa=False)
+    service = await _service(engine, settings)
+    await _add(service, "root", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        h = _auth((await _login(c, "root")).json()["token"])
+        body = {"username": "twice", "roles": ["viewer", "viewer"], "email": "t@x.org"}
+        created = await c.post("/users", headers=h, json=body)
+        assert created.status_code == 201, created.text
+        assert created.json()["roles"] == ["viewer"]
+        uid = created.json()["id"]
+        # The role change takes the same list type, so it names a repeated role once too.
+        changed = await c.put(
+            f"/users/{uid}/roles", headers=h, json={"roles": ["operator", "operator"]}
+        )
+        assert changed.status_code == 200, changed.text
+    assert await service.store.get_user_role_ids(uid) == ["operator"]
+    audit = [dict(a) for a in await engine.store.list_audit(limit=50)]
+    created_details = [
+        json.loads(a["detail"])
+        for a in audit
+        if a["action"] == "user.created" and a["actor"] == "root"
+    ]
+    assert created_details == [{"username": "twice", "roles": ["viewer"]}]
+    changed_details = [
+        json.loads(a["detail"]) for a in audit if a["action"] == "user.roles_changed"
+    ]
+    assert changed_details == [{"user_id": uid, "roles": ["operator"]}]
 
 
 async def test_a_reset_the_generator_cannot_satisfy_names_the_setting(

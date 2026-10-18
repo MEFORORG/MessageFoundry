@@ -4,7 +4,8 @@
 
 Deliberately **extra-free** (ADR 0068 §4 / decision 4): this module imports NOTHING from the
 optional ``webauthn`` extra — it exercises only ``AuthStore`` methods and the
-``WebAuthnCredential`` record — so the live Postgres/SQL Server suites can import it *inside their
+``WebAuthnCredential`` record, and judges a refusal with the service's own extra-free
+``_is_integrity_refusal`` — so the live Postgres/SQL Server suites can import it *inside their
 test functions* and run the parity contract on CI legs that install ``.[dev,postgres]`` /
 ``.[dev,sqlserver]`` **without** the webauthn extra. (A module-level
 ``pytest.importorskip("webauthn")`` anywhere on this path would silently skip parity on exactly
@@ -19,8 +20,10 @@ invoked from the SQLite suite (``tests/test_webauthn_store.py``) and both live s
 from __future__ import annotations
 
 import secrets
+from collections.abc import Awaitable
 from typing import Any
 
+from messagefoundry.auth.service import _is_integrity_refusal
 from messagefoundry.store.store import WebAuthnCredential
 
 #: A base64url credential id at WebAuthn's maximum raw size (1023 bytes -> ~1364 chars) — the
@@ -54,6 +57,19 @@ def _cred(
         created_at=created_at,
         last_used_at=None,
     )
+
+
+async def _assert_integrity_refused(write: Awaitable[object], what: str) -> None:
+    """``write`` fails with a refusal the service recognises as an integrity refusal: the one
+    predicate it uses, so this contract pins exactly what finish_webauthn_registration relies on."""
+    try:
+        await write
+    except Exception as exc:  # noqa: BLE001 - each backend raises its own integrity class
+        assert _is_integrity_refusal(exc), (
+            f"{what} raised {type(exc).__name__}, not an integrity refusal"
+        )
+    else:
+        raise AssertionError(f"{what} was accepted")
 
 
 async def _assert_webauthn_store_contract(store: Any) -> None:
@@ -109,27 +125,29 @@ async def _assert_webauthn_store_contract(store: Any) -> None:
     # error (sqlite3.IntegrityError / asyncpg UniqueViolationError / pyodbc.IntegrityError) — the
     # service catches it and renders "label already in use". Same label on ANOTHER user is fine.
     await store.add_webauthn_credential(_cred("wa-u2", "yubikey", id_hash="h3", created_at=40.0))
-    try:
-        await store.add_webauthn_credential(
-            _cred("wa-u1", "yubikey", id_hash="h-dup", created_at=50.0)
-        )
-    except Exception as exc:  # noqa: BLE001 - each backend raises its own integrity class
-        name = type(exc).__name__ + "".join(t.__name__ for t in type(exc).__mro__)
-        assert "Integrity" in name or "UniqueViolation" in name, (
-            f"duplicate label raised {type(exc).__name__}, not an integrity violation"
-        )
-    else:
-        raise AssertionError("duplicate (user_id, label) was silently accepted")
+    await _assert_integrity_refused(
+        store.add_webauthn_credential(_cred("wa-u1", "yubikey", id_hash="h-dup", created_at=50.0)),
+        "duplicate (user_id, label)",
+    )
 
-    # Sign-count CAS (the consume_totp_step precedent): True iff stored == expected; a miss is the
-    # clone signal. 0->0 (synced passkey) succeeds repeatedly and stays 0; last_used_at is stamped.
-    assert await store.update_webauthn_sign_count("h1", expected=5, new=6, used_at=60.0) is True
-    assert await store.update_webauthn_sign_count("h1", expected=5, new=7, used_at=61.0) is False
+    # Sign-count CAS (the consume_totp_step precedent), answered by the one locked write (BACKLOG
+    # #3774): "moved" iff stored == expected; "mismatch" when the passkey exists with another count
+    # (the clone signal), which writes nothing; "gone" when there is no such passkey. 0->0 (synced
+    # passkey) succeeds repeatedly and stays 0; last_used_at is stamped.
+    assert await store.update_webauthn_sign_count("h1", expected=5, new=6, used_at=60.0) == "moved"
+    assert (
+        await store.update_webauthn_sign_count("h1", expected=5, new=7, used_at=61.0) == "mismatch"
+    )
     got = await store.get_webauthn_credential("h1")
     assert got.sign_count == 6 and got.last_used_at == 60.0
+    assert (
+        await store.update_webauthn_sign_count("h-none", expected=0, new=1, used_at=62.0) == "gone"
+    )
+    assert await store.get_webauthn_credential("h-none") is None
     for used_at in (70.0, 71.0):
         assert (
-            await store.update_webauthn_sign_count("h2", expected=0, new=0, used_at=used_at) is True
+            await store.update_webauthn_sign_count("h2", expected=0, new=0, used_at=used_at)
+            == "moved"
         )
     assert (await store.get_webauthn_credential("h2")).sign_count == 0
 
@@ -138,6 +156,8 @@ async def _assert_webauthn_store_contract(store: Any) -> None:
     assert await store.get_webauthn_credential("h1") is not None
     assert await store.delete_webauthn_credential("wa-u1", "h1") is True
     assert await store.delete_webauthn_credential("wa-u1", "h1") is False  # already gone
+    # A deleted passkey answers "gone" whatever count is offered, the stored one included.
+    assert await store.update_webauthn_sign_count("h1", expected=6, new=8, used_at=63.0) == "gone"
     assert await store.has_webauthn_credentials("wa-u1") is True  # h2 remains
 
     # delete_all (admin_reset_mfa) returns the removed count.
@@ -150,6 +170,14 @@ async def _assert_webauthn_store_contract(store: Any) -> None:
     assert await store.get_webauthn_credential("h-big") is None
     assert await store.get_webauthn_credential("h3") is None
     assert await store.has_webauthn_credentials("wa-u2") is False
+
+    # BACKLOG #2733: a passkey for an account that does not exist is refused by the user foreign
+    # key on every backend. SQL Server lacked the key, so this write once committed an orphan there.
+    await _assert_integrity_refused(
+        store.add_webauthn_credential(_cred("wa-u2", "orphan", id_hash="h-orphan")),
+        "a passkey for an account that does not exist",
+    )
+    assert await store.get_webauthn_credential("h-orphan") is None
 
 
 async def _assert_totp_contract(store: Any) -> None:

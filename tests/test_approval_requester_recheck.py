@@ -31,6 +31,7 @@ from messagefoundry.api.app import (
 )
 from messagefoundry.api.approvals import ApprovalError, ApprovalGate
 from messagefoundry.auth import Permission, Role
+from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.reconcile import ReconcilePlan, SessionRevocation
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import (
@@ -45,6 +46,7 @@ from messagefoundry.pipeline.alerts import LoggingAlertSink
 
 # The provisioning helpers are shared with the gate's own suite rather than copied, so a change to
 # what a provisioned operator is (scope grant, rotation clear) lands once.
+from tests._approval_queue import release_blocked as _release_blocked
 from tests.test_alert_sinks import _drain, _RecordingTransport
 from tests.test_approvals import ON, _add, _service, _token
 
@@ -120,7 +122,10 @@ async def _hold_replay(
 async def _assert_refused(
     engine: Engine, c: httpx.AsyncClient, approval_id: str, sink: _Sink, reason: str
 ) -> None:
-    r = await c.post(f"/approvals/{approval_id}/approve", headers=await _token(c, "checker"))
+    checker = await _token(c, "checker")
+    # BACKLOG #3189: the queue predicts this refusal, so a page offers only the reject.
+    assert await _release_blocked(c, approval_id, checker) == "requester_not_authorized"
+    r = await c.post(f"/approvals/{approval_id}/approve", headers=checker)
     assert r.status_code == 409, r.text
     assert STALE in r.json()["detail"]
     # Refused BEFORE the transition: the row is still pending and nothing executed.
@@ -215,7 +220,10 @@ async def test_a_requester_still_in_good_standing_is_released(engine: Engine) ->
     c, _ = _client_with_sink(engine, service, sink)
     async with c:
         approval_id = await _hold_replay(c, await _token(c, "maker"), {"channel_id": "IB_ACME_ADT"})
-        r = await c.post(f"/approvals/{approval_id}/approve", headers=await _token(c, "checker"))
+        checker = await _token(c, "checker")
+        # The control for the prediction in _assert_refused: nothing withdrawn, nothing predicted.
+        assert await _release_blocked(c, approval_id, checker) is None
+        r = await c.post(f"/approvals/{approval_id}/approve", headers=checker)
         assert r.status_code == 200, r.text
         assert r.json()["result"] == {"requeued": 0}
     assert sink.events == []
@@ -244,6 +252,56 @@ async def test_a_gate_with_no_resolver_refuses_rather_than_trusting(engine: Engi
     assert caught.value.status == 409
     assert ran == []
     assert sink.events[0][2]["reason"] == "requester_unverifiable"
+
+
+async def test_the_queue_reads_each_requester_once_and_survives_one_whose_read_fails(
+    engine: Engine,
+) -> None:
+    """BACKLOG #3189: the queue reads each requester's standing, so it must not fail the whole
+    listing when one read raises, and must not repeat a requester's read for every request they
+    hold. A failed read predicts nothing for that row, and approve() reads it again."""
+    service = await _service(engine)
+    maker = await _add(service, "maker", Role.OPERATOR)
+    viewer = await _add(service, "viewer", Role.VIEWER)
+    broken = await _add(service, "broken", Role.OPERATOR)
+    calls: list[str] = []
+
+    async def _resolve(user_id: str) -> Identity | None:
+        calls.append(user_id)
+        if user_id == broken:
+            raise RuntimeError("a store read that failed")
+        return await service.identity_for_user_id(user_id)
+
+    gate = ApprovalGate(engine.store, ON, resolve_identity=_resolve, alert_sink=_Sink())
+
+    async def _record(p: Mapping[str, Any]) -> dict[str, Any]:
+        return {}
+
+    gate.register("dead_letter_replay", "replay", _record, permission=Permission.MESSAGES_REPLAY)
+    held: dict[str, str] = {}
+    for name, uid, channel in (
+        ("maker", maker, "IB_A"),
+        ("maker", maker, "IB_B"),
+        ("viewer", viewer, "IB_A"),
+        ("broken", broken, "IB_A"),
+        ("broken", broken, "IB_B"),
+    ):
+        approval_id = await gate.guard(
+            "dead_letter_replay", {"channel_id": channel}, requester=name, requester_user_id=uid
+        )
+        assert approval_id is not None
+        held[f"{name}:{channel}"] = approval_id
+    calls.clear()
+    listed = {e["id"]: e["release_blocked"] for e in await gate.list_pending()}
+    assert listed == {
+        held["maker:IB_A"]: None,
+        held["maker:IB_B"]: None,
+        held["viewer:IB_A"]: "requester_not_authorized",  # VIEWER holds no messages:replay
+        held["broken:IB_A"]: None,  # unread, so nothing is predicted
+        held["broken:IB_B"]: None,
+    }
+    # Once each, not once per request, a failed read included.
+    assert sorted(calls) == sorted([maker, viewer, broken])
 
 
 async def test_the_live_purge_registration_requires_an_unscoped_requester(engine: Engine) -> None:

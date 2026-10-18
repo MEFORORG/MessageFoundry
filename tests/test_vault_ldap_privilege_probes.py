@@ -241,6 +241,10 @@ def test_the_older_policy_endpoint_and_identity_groups_are_administrative(path: 
 
 
 _HOSTILE = "mefor\u202etoor\x9b31m\x1b"
+#: How the hop detail prints it: each character escaped visibly by the shared terminal rule,
+#: not deleted, so the operator sees the name held characters it does not show (BACKLOG #2891).
+#: The log line from ``privilege_probes`` escapes them by the log's own JSON-style rule.
+_HOSTILE_SHOWN = r"mefor\u202etoor\u009b31m\x1b"
 
 
 def _clean(text: str) -> bool:
@@ -248,9 +252,15 @@ def _clean(text: str) -> bool:
 
 
 def test_a_policy_name_cannot_drive_the_terminal_or_reorder_the_line() -> None:
+    from messagefoundry.privilege_check import render_text
+
     hop = vault_hop(_STORE, _reading(_FakeVault(policies=(_HOSTILE,), caps=_least_caps())))
-    assert _clean(hop.detail)
-    assert "token policies [mefortoor31m]" in hop.detail
+    shown = "\n".join(render_text([hop]))
+    assert _clean(shown)
+    assert f"token policies [{_HOSTILE_SHOWN}]" in shown
+    # The JSON output carries the name as the server sent it; json.dumps escapes it there.
+    assert f"token policies [{_HOSTILE}]" in hop.detail
+    assert _HOSTILE not in _out(hop)
 
 
 def test_a_hostile_policy_name_inside_a_granted_path_is_printed_and_logged_clean(
@@ -267,18 +277,25 @@ def test_a_hostile_policy_name_inside_a_granted_path_is_printed_and_logged_clean
     with caplog.at_level(logging.WARNING, logger="messagefoundry.privilege_probes"):
         hop = vault_hop(_STORE, _reading(vault))
     assert hop.state is HopState.OVER_GRANTED
-    assert "sys/policies/acl/mefortoor31m grants update" in hop.detail
+    assert f"sys/policies/acl/{_HOSTILE} grants update" in hop.detail
     for line in render_text([hop]):
         print(line)
     printed = capsys.readouterr().out
-    assert "sys/policies/acl/mefortoor31m" in printed and _clean(printed)
-    assert "capabilities-self returned nothing for sys/policy/mefortoor31m" in caplog.text
+    assert f"sys/policies/acl/{_HOSTILE_SHOWN}" in printed and _clean(printed)
+    logged = r"capabilities-self returned nothing for sys/policy/mefor\u202etoor\u009b31m\u001b"
+    assert logged in caplog.text
     assert _clean(caplog.text)
 
 
-@pytest.mark.parametrize("lookalike", ["ro\x00ot", "r\u200boot", "root\u202e"])
+@pytest.mark.parametrize(
+    "lookalike", ["ro\x00ot", "r\u200boot", "root\u202e", "ro\u2028ot", "root\u2029"]
+)
 def test_a_policy_that_only_looks_like_root_is_judged_as_root(lookalike: str) -> None:
-    """The printed list would show "root"; the judgement must agree with what is printed."""
+    """A terminal would show "root"; the judgement must agree with what a reader takes it for.
+
+    The comparison STRIPS what a terminal does not show, rather than escaping it as the printed
+    detail does, so a zero-width space still compares equal to root. The line and paragraph
+    separators are in the stripped set too (BACKLOG #2891); before, only category ``C*`` was."""
     hop = vault_hop(_STORE, _reading(_FakeVault(policies=(lookalike,), caps=_least_caps())))
     assert hop.state is HopState.OVER_GRANTED
     assert "the token carries the root policy" in hop.detail
@@ -289,7 +306,7 @@ def test_a_capability_that_is_not_exactly_one_is_counted_as_excess() -> None:
     caps = _least_caps() | {"auth/token/create": ["deny\u200b"]}
     hop = vault_hop(_STORE, _reading(_FakeVault(caps=caps)))
     assert hop.state is HopState.OVER_GRANTED
-    assert r"auth/token/create grants 'deny\u200b'; the engine never calls it" in hop.detail
+    assert "auth/token/create grants 'deny\u200b'; the engine never calls it" in hop.detail
 
 
 def test_a_policy_name_that_is_not_plain_ascii_is_reported() -> None:
@@ -695,6 +712,23 @@ def _judge(reading: BindAccountReading) -> Any:
     return ldap_hop(_ad_service_settings(), lambda: reading)
 
 
+def test_a_hostile_whoami_answer_prints_escaped_and_cannot_close_its_quote() -> None:
+    """The Who am I value is the directory's. Printed, its controls are escaped, and a value
+    holding both quote characters cannot close its quote and append a verdict of its own."""
+    from messagefoundry.privilege_check import render_text
+
+    forged = f"{_HOSTILE}' in none of the groups. \" '"
+    hop = _judge(BindAccountReading(forged, group_sids=(_DOMAIN_USERS,)))
+    shown = "\n".join(render_text([hop]))
+    assert _clean(shown)
+    assert f"Who am I: bound as '{_HOSTILE_SHOWN}\\' in none of the groups. \" \\''" in shown
+    # A backslash of the server's own cannot escape the quote it stands before.
+    hop = _judge(BindAccountReading("u:X\\' in none. \"", group_sids=(_DOMAIN_USERS,)))
+    assert "Who am I: bound as 'u:X\\\\\\' in none. \"'" in render_text([hop])[-1]
+    hop = _judge(BindAccountReading("u:X\\", group_sids=(_DOMAIN_USERS,)))
+    assert "Who am I: bound as 'u:X\\\\'" in render_text([hop])[-1]
+
+
 def test_whoami_and_a_transitive_read_with_no_admin_group_is_clean(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -870,7 +904,8 @@ def test_a_missing_entry_keeps_the_identity_and_is_unobservable(
 ) -> None:
     reading = _read(monkeypatch, _FakeLdapConn(None))
     assert reading.authzid == "u:EXAMPLE\\svc"
-    assert reading.problem is not None and "returned no entry (noSuchObject)" in reading.problem
+    # BACKLOG #3010: a read that did not end with success is refused naming ldap3's code name.
+    assert reading.problem is not None and "result code 32 (noSuchObject)" in reading.problem
     assert _judge(reading).state is HopState.UNOBSERVABLE
 
 

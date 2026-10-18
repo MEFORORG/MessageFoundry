@@ -168,6 +168,9 @@ async def test_a_session_revoked_mid_ceremony_is_answered_as_lost_not_as_owing_a
     assert lost.session_lost is True and lost.ok is False
     assert await store.list_webauthn_credentials(identity.user_id) == []
     assert await store.list_audit(action="auth.mfa_denied") == []
+    # BACKLOG #3807: this first guard is audited as the second one is. RED when it is silent.
+    rows = await store.list_audit(action="auth.webauthn_failed")
+    assert {"reason": "session_lost", "phase": "enroll"} in [json.loads(r["detail"]) for r in rows]
 
 
 async def test_a_session_that_proves_the_existing_factor_first_still_finishes(
@@ -254,6 +257,10 @@ async def test_a_session_revoked_between_the_two_asks_is_lost_not_owing_a_factor
     assert lost.session_lost is True and lost.ok is False
     assert await store.list_webauthn_credentials(identity.user_id) == []
     assert await store.list_audit(action="auth.mfa_denied") == []
+    # BACKLOG #3807, the passkey mirror: the code before #3061 reached the rotation here and
+    # audited its failure, so the guard that now answers first leaves a row too. RED when silent.
+    rows = await store.list_audit(action="auth.webauthn_failed")
+    assert {"reason": "session_lost", "phase": "enroll"} in [json.loads(r["detail"]) for r in rows]
     # A dead session can never finish the ceremony, so the lost answer ends it.
     assert service._webauthn_challenges.peek((hash_token(token), "register")) is None
 

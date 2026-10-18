@@ -167,6 +167,10 @@ _DIRECTORY_UNCONFIRMED_DETAIL = (
     "the directory could not confirm this account; try again later, or ask an administrator"
 )
 
+#: What ``/me/mfa/confirm`` says when ``Elevation.locked`` is set (BACKLOG #3810 finding 4): a
+#: directory account's second-step lock was found before the code was checked.
+_ACCOUNT_LOCKED_DETAIL = "account locked; try again later"
+
 
 def _alert_administrator_granted(app: FastAPI, key: str, *, via: str, granted_by: str) -> None:
     """The user-administration routes' grant alert; :func:`alert_administrator_granted` says why
@@ -363,10 +367,12 @@ def _user_summary(
     *,
     credential_expires_at: float | None = None,
     lock_state_at: float | None = None,
+    show_scope: bool = True,
 ) -> UserSummary:
     """``lock_state_at`` is the instant to evaluate the account's locks at, and passing it is what
     DISCLOSES them: pass it only on a ``users:manage`` surface (BACKLOG #1131). Left ``None``, the
-    summary carries ``lock_state=None``, which reads as "not shown", never as "not locked"."""
+    summary carries ``lock_state=None``, which reads as "not shown", never as "not locked".
+    ``show_scope=False`` withholds the channel scope and its source the same way (BACKLOG #3189)."""
     return UserSummary(
         id=user.id,
         username=user.username,
@@ -376,8 +382,9 @@ def _user_summary(
         notify_email=user.notify_email,
         disabled=user.disabled,
         roles=sorted(role_ids),
-        channel_scope=_parse_channel_scope(user.channel_scope),
-        channel_scope_source=user.channel_scope_source,
+        channel_scope=_parse_channel_scope(user.channel_scope) if show_scope else None,
+        channel_scope_source=user.channel_scope_source if show_scope else None,
+        channel_scope_withheld=not show_scope,
         credential_expires_at=credential_expires_at,
         lock_state=None if lock_state_at is None else _lock_state(user, lock_state_at),
     )
@@ -876,7 +883,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     ) -> MfaConfirmResponse:
         """Confirm a staged enrollment by proving a live TOTP code; activates MFA and returns the
         single-use recovery codes (shown **once** — save them). A wrong code is a 400, and a
-        directory account the directory could not confirm a 403 (BACKLOG #3061). Gated by a fresh
+        directory account the directory could not confirm a 403 (BACKLOG #3061), as is a directory
+        account under a second-step lock (BACKLOG #3810 finding 4). Gated by a fresh
         password step-up BOUND to this confirm action (ADR 0077), independent of the enroll grant."""
         # Post-session ceremony (enrolling a factor while signed in): per-ACTOR budget.
         if not service.allow_reauth_attempt(identity.user_id):
@@ -897,6 +905,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 # BACKLOG #3061: the code was never checked, so "invalid code" would be false. The
                 # same 403 and words as /auth/mfa-verify's directory refusal.
                 raise HTTPException(status.HTTP_403_FORBIDDEN, _DIRECTORY_UNCONFIRMED_DETAIL)
+            if elevation.locked:
+                # BACKLOG #3810 finding 4: a directory account's lock is found before the code is
+                # checked, so "invalid code" would call an unchecked code wrong.
+                raise HTTPException(status.HTTP_403_FORBIDDEN, _ACCOUNT_LOCKED_DETAIL)
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid code")
         # The body now carries BOTH the one-time recovery codes and a live session token; the route's
         # CredentialReply model keeps the reply out of every cache (BACKLOG #2372).
@@ -1134,14 +1146,21 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # [diagnostics].audit_all_authz off, this GET writes no grant row. The web console calls
         # this handler in-process and writes none at all, an open gap (BACKLOG #1197).
         # One instant for the whole list, so every row answers "locked now?" for the same now.
-        lock_state_at = time.time() if identity.has(Permission.USERS_MANAGE) else None
+        manager = identity.has(Permission.USERS_MANAGE)
+        lock_state_at = time.time() if manager else None
         summaries: list[UserSummary] = []
         for user in await service.store.list_users():
             role_ids = await service.store.get_user_role_ids(user.id)
             # No credential_expires_at here, deliberately (BACKLOG #1141). This route needs only
             # users:read, and which accounts hold a live admin-issued temporary password, and until
             # when, is a target list. The users:manage surfaces state it.
-            summaries.append(_user_summary(user, role_ids, lock_state_at=lock_state_at))
+            # BACKLOG #3189: every account's channel scope, and who wrote it, go only to a
+            # users:manage holder, the tier GET /users/{id}/channel-scope reads on. users:read can
+            # be minted into a custom role, which can be channel-scoped, and the list would
+            # otherwise name every other account's channels to it.
+            summaries.append(
+                _user_summary(user, role_ids, lock_state_at=lock_state_at, show_scope=manager)
+            )
         return summaries
 
     @app.get("/users/{user_id}/permissions", response_model=UserPermissions)

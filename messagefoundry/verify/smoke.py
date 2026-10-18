@@ -419,7 +419,7 @@ def check_store_connectivity(store: StoreSettings) -> CheckResult:
             rid,
             title,
             Status.FAIL,
-            f"no SQLite store at {absent} — run `messagefoundry serve` once to create it, "
+            f"no SQLite store at {absent} — start the engine once (`python -P -X disable-remote-debug -m messagefoundry serve`) to create it, "
             "or check [store].path (verify does not create it for you)",
             evidence=str(absent),
         )

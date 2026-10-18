@@ -191,8 +191,8 @@ def test_readout_never_raises_and_names_its_source() -> None:
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the Windows arm")
 def test_windows_reports_unknown_not_false() -> None:
-    """ADR 0152 makes the Windows in-guest attestation path a spike that has NOT landed. Reporting
-    ``False`` there would be a measurement we never made; ``None`` is the honest answer."""
+    """ADR 0152's Windows spike (2026-07-22) decided that no Windows read-out is built.
+    Reporting ``False`` there would be a measurement we never made; ``None`` is the honest answer."""
     report = platform_memory_encryption_readout()
     assert report.capability is None
     assert report.active is None

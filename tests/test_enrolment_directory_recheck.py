@@ -18,6 +18,7 @@ here is synthetic.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, replace
 
@@ -330,7 +331,10 @@ async def test_a_second_step_locked_directory_account_cannot_enrol(
 ) -> None:
     """The re-read after a confirmed lookup refuses a live second-step lock, so neither leg lets a
     locked directory account enrol, and neither spends anything. Pinned so the asymmetry with a
-    local account, which is not lock-checked at enrolment, is a decision and not an accident."""
+    local account, which is not lock-checked at enrolment, is a decision and not an accident.
+
+    The refusal carries ``locked`` (BACKLOG #3810 finding 4), so a route says the account is locked
+    rather than call a code it never checked wrong. RED when the leg passes ``report_lock=False``."""
     t = await _totp_staged(await _directory_sign_in(store), monkeypatch)
     await _lock_second_step(store, t.signed.identity.user_id)
 
@@ -339,6 +343,7 @@ async def test_a_second_step_locked_directory_account_cannot_enrol(
     )
 
     assert refused.ok is False and refused.directory_unconfirmed is False
+    assert refused.locked is True and refused.session_lost is False
     assert t.minted == []
     user = await store.get_user(t.signed.identity.user_id)
     assert user is not None and not user.totp_enabled
@@ -348,13 +353,15 @@ async def test_a_second_step_locked_directory_account_cannot_enrol(
 async def test_a_second_step_locked_directory_account_cannot_register_a_passkey(
     store: MessageStore,
 ) -> None:
-    """As above, on the passkey leg: nothing stored, the ceremony left in flight."""
+    """As above, on the passkey leg: nothing stored, the ceremony left in flight, and ``locked``
+    set. RED when the leg passes ``report_lock=False``."""
     p = await _passkey_staged(await _directory_sign_in(store))
     await _lock_second_step(store, p.signed.identity.user_id)
 
     refused = await _register(p)
 
     assert refused.ok is False and refused.directory_unconfirmed is False
+    assert refused.locked is True and refused.session_lost is False
     assert await store.list_webauthn_credentials(p.signed.identity.user_id) == []
     key = (hash_token(p.signed.token), "register")
     assert p.signed.service._webauthn_challenges.peek(key) is not None
@@ -386,6 +393,9 @@ async def test_a_session_revoked_between_the_two_totp_asks_is_lost_not_owing_a_f
 
     assert lost.session_lost is True and lost.ok is False and lost.recovery_codes == ()
     assert await store.list_audit(action="auth.mfa_denied") == []
+    # BACKLOG #3807: the guard leaves an audit row, the shape a directory account's re-read writes
+    # for the same lost session. The code before #3061 wrote one here; RED when it is silent.
+    assert {"reason": "session_lost", "phase": "enroll"} in await _audited(store, "auth.mfa_failed")
     user = await store.get_user(identity.user_id)
     assert user is not None and not user.totp_enabled
     step = totp.verify_totp_step(secret, code, now=_T0)
@@ -432,10 +442,16 @@ async def test_a_totp_enabled_by_another_confirm_is_still_a_lost_session_not_a_f
 async def test_a_local_account_is_never_probed_on_totp_enrolment(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A local account's enrolment is unchanged, and costs no directory round trip."""
+    """A local account's enrolment is unchanged, and costs no directory round trip. Under a live
+    second-step lock too: the enrolment legs read the lock only after the directory lookup, so a
+    local account is not lock-checked here and writes no lock row (BACKLOG #3810 finding 4). RED
+    when a local enrolment starts refusing, or auditing, the lock without the docs saying so."""
     directory = _Directory(_PRINCIPAL)
     service = AuthService(store, _settings(), ldap=directory)  # type: ignore[arg-type]
     identity, token, _password = await login_admin(service)
+    await _lock_second_step(store, identity.user_id)
+    locked = await store.get_user(identity.user_id)
+    assert locked is not None and locked.second_step_locked(time.time())  # the lock is live
     pin_totp_clock(monkeypatch, _T0)
     enroll = await service.begin_mfa_enrollment(identity)
 
@@ -443,8 +459,9 @@ async def test_a_local_account_is_never_probed_on_totp_enrolment(
         identity, totp.totp(enroll.secret, now=_T0), token=token
     )
 
-    assert served.ok is True
+    assert served.ok is True and served.locked is False
     assert directory.probes == []
+    assert {"reason": "locked"} not in await _audited(store, "auth.mfa_failed")
 
 
 # --- the passkey leg: finish_webauthn_registration ---------------------------------------------
@@ -584,13 +601,18 @@ async def test_a_disable_during_the_lookup_is_a_lost_passkey_registration(
 async def test_a_local_account_is_never_probed_on_passkey_registration(
     store: MessageStore,
 ) -> None:
-    """A local account's passkey registration is unchanged, and costs no directory round trip."""
+    """A local account's passkey registration is unchanged, and costs no directory round trip.
+    Under a live second-step lock too, writing no lock row, as on the TOTP leg above."""
     directory = _Directory(_PRINCIPAL)
     service = AuthService(store, _settings(), ldap=directory)  # type: ignore[arg-type]
     identity, token, _password = await login_admin(service)
+    await _lock_second_step(store, identity.user_id)
+    locked = await store.get_user(identity.user_id)
+    assert locked is not None and locked.second_step_locked(time.time())  # the lock is live
     p = await _passkey_staged(_Signed(service, store, directory, identity, token))
 
     served = await _register(p)
 
-    assert served.ok is True
+    assert served.ok is True and served.locked is False
     assert directory.probes == []
+    assert {"reason": "locked"} not in await _audited(store, "auth.webauthn_failed")

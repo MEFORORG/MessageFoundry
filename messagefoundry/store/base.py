@@ -104,6 +104,7 @@ from messagefoundry.store.store import (
     ResendSourceNotFound,
     RoleGrant,
     SessionRecord,
+    SignCountAnswer,
     Stage,
     StreamingAttachmentsUnsupported,
     UserRecord,
@@ -2365,9 +2366,13 @@ class AuthStore(Protocol):
 
     async def delete_all_webauthn_credentials(self, user_id: str) -> int: ...
 
+    # Compare-and-set of a passkey's sign count. It answers ``"moved"``, ``"mismatch"`` (the passkey
+    # exists and holds another count) or ``"gone"`` (no such passkey) under ONE locked write on every
+    # backend, so a delete cannot land between a miss and the answer (BACKLOG #3774). Either miss is
+    # a clone signal (ADR 0068 decision 4); the answer only says which.
     async def update_webauthn_sign_count(
         self, credential_id_hash: str, *, expected: int, new: int, used_at: float
-    ) -> bool: ...
+    ) -> SignCountAnswer: ...
 
     # A FULL authentication: stamps ``last_login_at`` and zeroes all six lockout columns, both
     # counters' counts, expiries and cycle counts, in one UPDATE (ADR 0197 AC-8).
@@ -3106,7 +3111,7 @@ class StoreNotFoundError(RuntimeError):
         super().__init__(
             message
             or f"no SQLite store at {path}: refusing to create one "
-            "(check [store].path or --db; `messagefoundry serve` creates the store on its first run)"
+            "(check [store].path or --db; `python -P -X disable-remote-debug -m messagefoundry serve` creates the store on its first run)"
         )
 
     @classmethod
@@ -3128,7 +3133,7 @@ class StoreNotFoundError(RuntimeError):
                 "schema_meta table this login can see, and this command does not build one (check "
                 f"[store].database and {where}. Under [store].schema_management = 'external', the "
                 f"default, a DBA builds the store with `{PROVISION_SCHEMA_COMMAND}`; under 'auto', "
-                "`messagefoundry serve` builds it on its first run)"
+                "`python -P -X disable-remote-debug -m messagefoundry serve` builds it on its first run)"
             ),
         )
 
@@ -3596,7 +3601,7 @@ async def provision_store_schema(
     refusing keeps this command from creating a file at a path it was merely pointed at (#1780)."""
     if settings.backend is StoreBackend.SQLITE:
         raise ValueError(
-            "the sqlite store builds its own schema when `messagefoundry serve` first opens it; "
+            "the sqlite store builds its own schema when `python -P -X disable-remote-debug -m messagefoundry serve` first opens it; "
             f"`{PROVISION_SCHEMA_COMMAND}` applies to the sqlserver and postgres backends only"
         )
     return await _server_store_class(settings.backend).provision_schema(settings, posture=posture)

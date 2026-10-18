@@ -156,7 +156,13 @@ jobs:
 
           # `cancelled` and `skipped` are not failures: a cancelled nightly is usually a superseded or
           # manually-stopped run, and reporting it as a break would train the reader to ignore this.
-          if [ "$CONCLUSION" != "failure" ]; then
+          # ONE EXCEPTION, `dependency floors`: its scheduled run has a concurrency group of its own, so
+          # nothing supersedes it, and a job that hits its `timeout-minutes` concludes `cancelled`
+          # (the API also documents `timed_out`). There either is most likely a hung install, which is
+          # a red nobody else sees, so both are reported. A run stopped by hand is reported too.
+          if [ "$CONCLUSION" != "failure" ] \
+             && ! { [ "$WF_NAME" = "dependency floors" ] \
+                    && { [ "$CONCLUSION" = "cancelled" ] || [ "$CONCLUSION" = "timed_out" ]; }; }; then
             echo "nightly concluded '$CONCLUSION' — not a failure, nothing to do"
             exit 0
           fi
@@ -258,10 +264,16 @@ jobs:
           code, because the pull-request leg is advisory and path-filtered, or an upstream release or
           yank. Read the failing step first.
 
-          - The install failed: a declared floor no longer installs on Python 3.14, for example a
-            yanked release. Raise that floor in \`pyproject.toml\`.
-          - The floor check failed: a runtime dependency landed off its floor, or a \`--raised\`
-            entry in \`.github/workflows/dependency-floors.yml\` is no longer needed.
+          - The install failed: a declared floor no longer installs on Python 3.14, for example no
+            wheel and an sdist that does not build. Raise that floor in \`pyproject.toml\`.
+          - The floor check failed: a runtime dependency landed off its floor. A yanked >= floor
+            usually lands here, because the resolver skips it. Raise that floor in \`pyproject.toml\`.
+          - The floor check said a dependency \`declares no floor this check can read\`: give it a
+            \`>=X\` lower bound that no specifier for the same name excludes.
+          - The run concluded cancelled or timed out, so no step shows red and this issue still says
+            failed: the job hit its \`timeout-minutes\`, most likely
+            an install that hung or a build from source, unless someone stopped it by hand. Read the
+            install step.
           - A guard failed: the engine does not work at its declared floors. Fix the code or raise
             the floor; the failure names the missing FastAPI symbol when that is the cause."
               ;;
