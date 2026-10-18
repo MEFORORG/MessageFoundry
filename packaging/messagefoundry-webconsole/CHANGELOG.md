@@ -83,12 +83,13 @@ this line.**
   stored from it. The page's two save forms now trim only a space, a tab and a line break from a
   group, as the engine route does, so a group ending in a no-break space is refused with the
   route's 400 rather than trimmed. (vault `BACKLOG #3222`)
-- **A directory refusal at the second factor or a step-up names a new sign-in as well as a later
-  try.** When the directory cannot confirm the account, the MFA gate (`/ui/mfa`) and the re-auth
-  page (`/ui/reauth`, its passkey leg included) now say to try again later and, if it is still
-  refused, to sign out and sign in again, or to ask an administrator. They used to name only a later
-  try and an administrator. The text names the same fixes as the engine's 403 detail. No seam
-  change. (`BACKLOG #3082`)
+- **A directory refusal at the second factor or a step-up names the fix for its cause.** When a
+  directory refuses the account, the MFA gate (`/ui/mfa`) and the re-auth page (`/ui/reauth`, its
+  passkey leg included) now show one text per fix. A role lost in the directory since sign-in is
+  told to sign out, then sign in again. Every other cause, an outage included, is told to try again
+  later and, if it is still refused, to ask an administrator. Each names the same fix as the
+  engine's 403 for that cause. Seam change: the console imports `DirectoryRefusal` and reads
+  `Elevation.directory_refusal`, so the supported digest moved. (`BACKLOG #3082`)
 - **The "Flag not changed" page has a hint for a cluster node.** A cluster node refuses the
   connection flag toggle with a 409. The page now carries a second hint, shown beside the
   code-first one on every refusal: each node loads its own config directory, so set `flagged` on the
