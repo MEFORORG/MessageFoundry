@@ -139,7 +139,7 @@ async def test_the_guard_asks_for_an_administrator_not_an_empty_table() -> None:
 async def test_an_interrupted_provision_is_completed_by_re_running(crashed_after: str) -> None:
     """A crash between the command's writes must not strand the install -- at EITHER crash point.
 
-    The writes are create (no hash) -> set_password -> set_user_roles, so there are exactly two
+    The writes are create (no hash) -> set_password -> the role grant, so there are exactly two
     half-written states: an account that cannot be signed into, and one that can but holds no role.
     Both are parametrized here because the second is the one an earlier draft got wrong: it also
     refused a stamped ``password_claimed_at``, which ``set_password`` writes, so the second state
@@ -1518,12 +1518,12 @@ async def test_a_crash_after_the_address_write_still_told_the_earlier_holder() -
         notifier = _Recorder()
         service = AuthService(store, AuthSettings(), security_notifier=notifier)
         await _roleless_account(store, email="holder@example.invalid")
-        real_set_user_roles = store.set_user_roles
+        real_grant = store.grant_first_admin_unless_admin_exists
 
         async def stop_at_the_role(*a: object, **k: object) -> None:
             raise RuntimeError("synthetic stop at the role write")
 
-        store.set_user_roles = stop_at_the_role  # type: ignore[method-assign]
+        store.grant_first_admin_unless_admin_exists = stop_at_the_role  # type: ignore[method-assign,assignment]
         with pytest.raises(RuntimeError, match="synthetic stop"):
             await service.provision_first_administrator(
                 username="site-admin",
@@ -1532,7 +1532,7 @@ async def test_a_crash_after_the_address_write_still_told_the_earlier_holder() -
                 actor="test",
                 **provision_totp(),
             )
-        store.set_user_roles = real_set_user_roles  # type: ignore[method-assign]
+        store.grant_first_admin_unless_admin_exists = real_grant  # type: ignore[method-assign]
         half = await store.get_user_by_username("site-admin")
         assert half is not None and half.notify_email == "operator@example.invalid"
         assert await store.get_user_role_ids(half.id) == []
@@ -2507,7 +2507,7 @@ async def test_an_enable_that_matches_no_row_refuses_before_the_role(
 ) -> None:
     """BACKLOG #2224: ``enable_totp`` is conditional, so a factor clear landing between the staged
     secret and the enable (another run's repair branch) makes it match no row. The run must refuse
-    before ``set_user_roles`` rather than grant the role over an account with TOTP off, and the
+    before the role grant rather than grant the role over an account with TOTP off, and the
     roleless row it leaves must be one a re-run completes."""
     store = await MessageStore.open(":memory:")
     try:
