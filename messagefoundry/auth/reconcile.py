@@ -134,7 +134,9 @@ class Probe:
     #: For :attr:`ProbeOutcome.REFERRED`: the refusal's text, which names the referred search and
     #: the referred hosts and nothing else (BACKLOG #2530). The pass logs the first one. For
     #: :attr:`ProbeOutcome.FAULT`: the exception's type name, never its message (BACKLOG #3100).
-    #: None for every other outcome.
+    #: For :attr:`ProbeOutcome.UNAVAILABLE`: :data:`PAGING_DEADLINE` or :data:`PAGING_CAP` when the
+    #: group search was refused for its bounds rather than unanswered (vault BACKLOG #3696), else
+    #: None. None for every other outcome.
     detail: str | None = None
 
 
@@ -181,6 +183,14 @@ REFERRAL_ABORT = "directory_referral"
 #: fault (BACKLOG #3100). Also the reason slug of the fault's own audit row and alert, on any pass
 #: with a fault. The same string as :attr:`ProbeOutcome.FAULT`'s value.
 PROBE_FAULT_ABORT = ProbeOutcome.FAULT.value
+
+#: The causes of an :attr:`ProbeOutcome.UNAVAILABLE` probe whose group search the engine refused
+#: for its own bounds (vault BACKLOG #3696): past ``[auth].ad_group_search_deadline``, or past the
+#: entry cap or its page backstop. Each pages, once per account as it enters
+#: (``AuthService._note_paging_refusals``): unlike an outage it does not pass on its own, and the
+#: account is never revoked while it lasts. Also the alert's ``reason``.
+PAGING_DEADLINE = "group_search_deadline"
+PAGING_CAP = "group_search_cap"
 
 #: The outcomes that judge nothing about the account: no strike, no recorded outcome (rule item 4).
 _UNJUDGED = frozenset({ProbeOutcome.UNAVAILABLE, ProbeOutcome.REFERRED, ProbeOutcome.FAULT})
@@ -265,6 +275,12 @@ class ReconcilePlan:
     breaker_clear: bool = False
     hold_clear: bool = False
     referral_clear: bool = False
+    #: Set by the auth service after the pass, never by :func:`plan_pass` (vault BACKLOG #3696):
+    #: ``(username, cause)`` of each account that has just ENTERED the state of reading UNAVAILABLE
+    #: because its group search was refused for its bounds, ``cause`` being :data:`PAGING_DEADLINE`
+    #: or :data:`PAGING_CAP`. An account already in that state is not here, so each pages once per
+    #: state change. Set on every pass, an outage-shaped one included.
+    paging_refused: tuple[tuple[str, str], ...] = ()
 
     @property
     def directory_outage(self) -> bool:

@@ -398,6 +398,11 @@ def _import_code_defaults() -> list[tuple[str, float | int, str]]:
         ),
         ("ad_connect_timeout", _default(AuthSettings, "ad_connect_timeout"), "config.settings"),
         ("ad_receive_timeout", _default(AuthSettings, "ad_receive_timeout"), "config.settings"),
+        (
+            "ad_group_search_deadline",
+            _default(AuthSettings, "ad_group_search_deadline"),
+            "config.settings",
+        ),
         ("forward_host", logging_setup._FORWARD_TCP_TIMEOUT, "logging_setup"),
         ("ntp_peer", logging_setup._SNTP_TIMEOUT, "logging_setup"),
         # The token POST does NOT use the shared IdP constant: AuthService._oidc_exchange passes no

@@ -12,8 +12,8 @@ All calls here are **synchronous**; :class:`~messagefoundry.auth.service.AuthSer
 so the only bound on an unresponsive domain controller is the pair of finite ``ldap3`` timeouts every
 ``Server``/``Connection`` here is constructed with — ``[auth].ad_connect_timeout`` (the TCP connect) and
 ``[auth].ad_receive_timeout`` (each LDAP response read), both defaulting to 10 s (ASVS 13.1.3). ldap3's
-own defaults are ``None`` on both, i.e. wait forever. The paged nested group search also spends one
-``ad_receive_timeout`` across all its pages (:func:`_search_paged`, BACKLOG #3696).
+own defaults are ``None`` on both, i.e. wait forever. All the pages of the paged nested group search
+also share one ``[auth].ad_group_search_deadline`` (:func:`_search_paged`, BACKLOG #3696).
 ``ldap3``/``spnego`` are imported lazily so a local-only deployment never touches them.
 
 **No referral is followed, and one is refused** (BACKLOG #2530); :func:`_refuse_referral` says why.
@@ -1116,6 +1116,14 @@ _MAX_PAGED_ENTRIES = 10_000
 #: :data:`_MAX_PAGED_ENTRIES` on any page of 10 entries or more.
 _MAX_PAGES = _MAX_PAGED_ENTRIES // 10 + 1
 
+#: The ``code_name`` of a paged search refused for its bounds rather than for its answer: past its
+#: overall deadline, past :data:`_MAX_PAGED_ENTRIES`, or past the :data:`_MAX_PAGES` backstop
+#: (BACKLOG #3696). Public, because the directory reconciler pages on them where it reads every
+#: other unanswered search as an outage (``AuthService._probe_principal``).
+PAGING_DEADLINE_SPENT = "deadline spent"
+PAGING_TOO_MANY_ENTRIES = "too many entries"
+PAGING_TOO_MANY_PAGES = "too many pages"
+
 #: The clock a paged search's overall deadline reads. Monotonic, so a wall-clock step cannot
 #: stretch or cut the budget; a module name so a test can drive it.
 _monotonic = time.monotonic
@@ -1182,7 +1190,7 @@ def _search_paged(conn: Any, operation: str, *, budget: float, **kwargs: Any) ->
         out_of_time = True
         return _paging_refused(
             operation,
-            "deadline spent",
+            PAGING_DEADLINE_SPENT,
             f"did not finish paging within {budget:g} s",
             "BACKLOG #3696",
         )
@@ -1216,7 +1224,7 @@ def _search_paged(conn: Any, operation: str, *, budget: float, **kwargs: Any) ->
                 newest = None
                 raise _paging_refused(
                     operation,
-                    "too many entries",
+                    PAGING_TOO_MANY_ENTRIES,
                     f"returned more than {_MAX_PAGED_ENTRIES:,} entries",
                     "BACKLOG #3696",
                 )
@@ -1224,7 +1232,7 @@ def _search_paged(conn: Any, operation: str, *, budget: float, **kwargs: Any) ->
                 return entries
             newest = cookie
         raise _paging_refused(
-            operation, "too many pages", f"was still paging after {_MAX_PAGES} pages"
+            operation, PAGING_TOO_MANY_PAGES, f"was still paging after {_MAX_PAGES} pages"
         )
     except (LdapUnansweredError, LdapReferralError):
         remaining = deadline - _monotonic()
@@ -1921,12 +1929,12 @@ class LdapAuthenticator:
             # A search the directory did not finish raises here (BACKLOG #3010), never a shorter
             # group list.
             # Paged, so an account in more groups than the directory's unpaged cap still resolves.
-            # All the pages together get one [auth].ad_receive_timeout, rounded up as every read
-            # here is, so paging no longer multiplies the wait (BACKLOG #3696 item 3).
+            # All the pages together get one [auth].ad_group_search_deadline, so paging no longer
+            # multiplies the per-read ad_receive_timeout (BACKLOG #3696 item 3).
             groups = _search_paged(
                 conn,
                 "group search",
-                budget=_ldap3_receive_timeout(self._s.ad_receive_timeout),
+                budget=self._s.ad_group_search_deadline,
                 search_base=self._s.ad_group_search_base,
                 search_filter=f"(member:{_MATCHING_RULE_IN_CHAIN}:={_escape_filter(user_dn)})",
                 search_scope=ldap3.SUBTREE,

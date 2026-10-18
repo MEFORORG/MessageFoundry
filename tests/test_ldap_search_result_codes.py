@@ -67,6 +67,7 @@ from messagefoundry.auth.ldap import (
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.reconcile import ProbeOutcome
 from messagefoundry.auth.service import AuthService
+from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests.test_ad_user_account_control import _alive, _audited, _pass, _signed_in_estate
 from tests.test_ldap_referrals import (
@@ -628,6 +629,22 @@ def test_a_directory_that_never_stops_paging_is_refused(monkeypatch: pytest.Monk
 # --- BACKLOG #3696 items 3 and 4: one deadline across the pages, a cap on entries ----------------
 
 
+def test_the_group_search_deadline_is_its_own_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Lander's send-back on PR 2431. The pages share ``[auth].ad_group_search_deadline``,
+    whole and unrounded, not the per-read ``ad_receive_timeout``, which ships at 10 s."""
+    budgets: list[float] = []
+
+    def record(_conn: Any, _operation: str, *, budget: float, **_kwargs: Any) -> list[Any]:
+        budgets.append(budget)
+        return []
+
+    monkeypatch.setattr(ldap_module, "_search_paged", record)
+    settings = _ad_settings(ad_receive_timeout=10.0, ad_group_search_deadline=37.5)
+    LdapAuthenticator(settings)._resolve_groups(object(), _USER_DN, [])
+    assert budgets == [37.5]
+    assert AuthSettings().ad_group_search_deadline > AuthSettings().ad_receive_timeout
+
+
 class _FakeClock:
     """A monotonic clock that moves only when a test moves it."""
 
@@ -1149,8 +1166,10 @@ def test_real_ldap3_refuses_a_page_read_that_waits_out_the_deadline(
 ) -> None:
     """BACKLOG #3696 item 3 through a real socket. The second page takes 0.6 s, inside the 2 s
     receive timeout, so before the deadline it was read. The first page spends all but 0.2 s of
-    the deadline on the engine's clock, so the second page's read may wait only that, and times
-    out. The timeout is refused as the deadline, not passed on as one slow read."""
+    the 3 s ``ad_group_search_deadline`` on the engine's clock, so the second page's read may wait
+    only that, and times out. The timeout is refused as the deadline, not passed on as one slow
+    read. The deadline is its own setting: had the receive timeout been the deadline, the first
+    page would have spent it, and the second never been asked."""
     clock = _FakeClock()
     monkeypatch.setattr(ldap_module, "_monotonic", clock)
 
@@ -1158,13 +1177,16 @@ def test_real_ldap3_refuses_a_page_read_that_waits_out_the_deadline(
         if b"synthetic-cookie-1" in raw:
             time.sleep(0.6)
         else:
-            clock.now += 1.8  # before the reply is sent, so before the engine reads it
+            clock.now += 2.8  # before the reply is sent, so before the engine reads it
         return _two_pages(raw)
 
     with (
-        _scripted_dc(answer, ad_receive_timeout=2.0) as (dc, authenticator),
+        _scripted_dc(answer, ad_receive_timeout=2.0, ad_group_search_deadline=3.0) as (
+            dc,
+            authenticator,
+        ),
         _service_conn(authenticator) as conn,
-        pytest.raises(LdapUnansweredError, match="did not finish paging within 2 s") as refused,
+        pytest.raises(LdapUnansweredError, match="did not finish paging within 3 s") as refused,
     ):
         authenticator._resolve_groups(conn, _USER_DN, [])
     assert isinstance(refused.value.__cause__, ldap3.core.exceptions.LDAPSocketReceiveError)

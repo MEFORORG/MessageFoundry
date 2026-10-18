@@ -3083,7 +3083,8 @@ def split_kerberos_spn(spn: str) -> tuple[str, str]:
 #: and ``tests/test_site_context_words.py`` holds the two equal.
 EXTRA_CONTEXT_WORD_MIN_LENGTH = 3
 
-#: Upper bound for ``[auth].ad_connect_timeout`` and ``ad_receive_timeout``. An hour is far past any
+#: Upper bound for ``[auth].ad_connect_timeout``, ``ad_receive_timeout`` and
+#: ``ad_group_search_deadline``. An hour is far past any
 #: real directory round trip and far below the point where a socket timeout overflows.
 _AD_TIMEOUT_MAX_SECONDS = 3600.0
 
@@ -3341,9 +3342,14 @@ class AuthSettings(_Section):
     # for a login. Both must be > 0: a 0/negative value would restore the unbounded wait. A value
     # above 10 s is a LOOSENING that security_loosenings() names while AD is on (vault BACKLOG #2567).
     ad_connect_timeout: float = 10.0  # seconds — bound the LDAP/LDAPS TCP connect
-    # seconds — bound each LDAP response read (bind + search); also the paged group search's
-    # overall deadline (auth/ldap.py _search_paged, vault BACKLOG #3696)
-    ad_receive_timeout: float = 10.0
+    ad_receive_timeout: float = 10.0  # seconds — bound each LDAP response read (bind + search)
+    # seconds — the one deadline all the pages of the nested group search share (auth/ldap.py
+    # _search_paged, vault BACKLOG #3696). Each page's reads are still bounded by
+    # ad_receive_timeout, so a directory that stops answering fails at that, not at this. Well
+    # above it on purpose: a search past it refuses the account, which the reconciler then cannot
+    # revoke. 120 s is twelve per-read stalls, and still below the 200 s the old 20-page cap
+    # allowed. Validated and named as a loosening with the two timeouts above.
+    ad_group_search_deadline: float = 120.0
 
     # --- directory session reconciliation (ADR 0079 mechanism 2) -------------------------------
     # Disabling an account in AD does NOT terminate its live engine session: once an opaque token is
@@ -3848,16 +3854,16 @@ class AuthSettings(_Section):
             )
         return value
 
-    @field_validator("ad_connect_timeout", "ad_receive_timeout")
+    @field_validator("ad_connect_timeout", "ad_receive_timeout", "ad_group_search_deadline")
     @classmethod
-    def _check_ad_timeout(cls, value: float) -> float:
+    def _check_ad_timeout(cls, value: float, info: ValidationInfo) -> float:
         # Must stay FINITE and positive (ASVS 13.1.3): ldap3 treats a None, or a 0 connect_timeout, as
         # "wait forever", which is exactly the unbounded wait these settings exist to remove, and
         # inf/NaN are the same hole by another spelling. (A 0 receive_timeout instead makes the socket
         # non-blocking, so every read fails at once.) Rejected at config load, not at bind time.
         if not value > 0 or value == float("inf"):
             raise ValueError(
-                "ad_connect_timeout / ad_receive_timeout must be a finite number of seconds > 0 "
+                f"{info.field_name} must be a finite number of seconds > 0 "
                 "(inf, NaN or a None connect timeout would mean an unbounded LDAP wait; 0 or a "
                 "negative value would fail every LDAP read or connect)"
             )
@@ -3867,7 +3873,7 @@ class AuthSettings(_Section):
         # every time. The cap refuses the value at load instead, far below that point.
         if value > _AD_TIMEOUT_MAX_SECONDS:
             raise ValueError(
-                f"ad_connect_timeout / ad_receive_timeout must be at most {_AD_TIMEOUT_MAX_SECONDS:g} "
+                f"{info.field_name} must be at most {_AD_TIMEOUT_MAX_SECONDS:g} "
                 f"seconds (got {value:g}); the cap keeps the value far below where a socket "
                 "timeout overflows"
             )
@@ -8260,7 +8266,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
     * ``ad_connect_timeout`` and ``ad_receive_timeout`` (vault BACKLOG #2567) bound how long one
       directory call may hold a worker thread, so a value above its default is looser, named while
       AD is on. They are timeouts and not rate limits; they sit here because they are read the same
-      way, against the shipped default.
+      way, against the shipped default. So is ``ad_group_search_deadline`` (vault BACKLOG #3696),
+      the deadline the pages of the nested group search share.
     * ``step_up_max_age_seconds``, ``totp_skew_steps`` and ``initial_password_expiry_hours`` (vault
       BACKLOG #2600 step 4) are read the same way too. A step-up window or a temporary-password
       life above its default is looser, and so is any TOTP skew above the strict 0. A
@@ -8630,13 +8637,26 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
     # default is looser. The load refuses 0, a negative, inf and NaN, so there is no off value.
     # Named only with AD on, as ad_session_recheck_seconds is: with no directory nothing reads them.
     if auth.ad_enabled:
-        for field, what in (
-            ("ad_connect_timeout", "the LDAP connect timeout"),
+        stalled = (
+            "a directory call (at least a sign-in, a step-up and a session recheck) to a domain "
+            "controller that has stopped answering holds a worker thread longer before it fails"
+        )
+        for field, what, so in (
+            ("ad_connect_timeout", "the LDAP connect timeout", stalled),
             # auth/ldap.py hands ldap3 this value rounded UP to a whole second.
             (
                 "ad_receive_timeout",
-                "the LDAP response-read timeout and the paged group search's overall deadline "
-                "(each applied rounded up to a whole second)",
+                "the LDAP response-read timeout (applied rounded up to a whole second)",
+                stalled,
+            ),
+            # Vault BACKLOG #3696. Each page is still bounded by ad_receive_timeout, so this one
+            # holds the thread only while a slow directory keeps answering.
+            (
+                "ad_group_search_deadline",
+                "the nested group search's overall deadline",
+                "the paged group search of a sign-in or a session recheck, against a domain "
+                "controller that keeps answering slowly, holds a worker thread longer before it "
+                "is refused",
             ),
         ):
             value, default = getattr(auth, field), _auth_default(field)
@@ -8645,11 +8665,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     (
                         field,
                         # repr round-trips, so a value one step past the default never prints as it.
-                        f"{what} is {value!r} s, above the default of {default:g} s, so a "
-                        "directory call (at least a sign-in, a step-up and a session recheck) to "
-                        "a domain controller that has stopped answering holds a worker thread "
-                        "longer before it fails -- stalled calls then tie up the thread pool that "
-                        "sign-in shares for longer",
+                        f"{what} is {value!r} s, above the default of {default:g} s, so {so} -- "
+                        "stalled calls then tie up the thread pool that sign-in shares for longer",
                     )
                 )
 

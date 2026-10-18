@@ -282,6 +282,8 @@ from messagefoundry.auth import Identity, Permission, Role
 from messagefoundry.auth.audit_visibility import reads_audit_copies_in_the_log
 from messagefoundry.auth.reconcile import (
     HOLD_REASON,
+    PAGING_CAP,
+    PAGING_DEADLINE,
     PROBE_FAULT_ABORT,
     REFERRAL_ABORT,
     ReconcilePlan,
@@ -10158,6 +10160,17 @@ _REFERRAL_ALERT_SOURCE = "directory-reconciler-referral"
 #: The source label of the probe fault's own ``ad_reconcile_aborted`` instance (BACKLOG #3100), apart
 #: from the breaker's and the referral's for the same reason.
 _PROBE_FAULT_ALERT_SOURCE = "directory-reconciler-probe-fault"
+#: The source label prefix of a paging refusal's ``ad_reconcile_aborted`` instance (vault BACKLOG
+#: #3696). The account name follows it, so each account is its own instance and throttle, as
+#: ``ad_session_revoked`` is keyed on the account: a second account entering inside the first's
+#: cooldown still pages.
+_PAGING_ALERT_SOURCE = "directory-reconciler-paging"
+#: What each paging refusal cause tells the operator. The account name leads the detail, because
+#: the store keeps only the first 200 characters of an instance's reason.
+_PAGING_REFUSAL_TEXT: Final[Mapping[str, str]] = {
+    PAGING_DEADLINE: "ran past [auth].ad_group_search_deadline",
+    PAGING_CAP: "returned more groups than the engine's cap",
+}
 
 
 def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSink) -> None:
@@ -10191,6 +10204,9 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     alert with reason ``probe_fault``, under its own source label
     (:data:`_PROBE_FAULT_ALERT_SOURCE`). It has no inverse: an operator resolves it.
 
+    A paging refusal (vault BACKLOG #3696) pages once per account as it enters that state, on an
+    outage-shaped pass too, and has no row of its own; :func:`_alert_paging_refusals` says how.
+
     Reads the RETURNED plan, so it sees only a pass that finished. A failed write of the pass's own
     held, aborted, skipped, referred, faulted or unkeyed-binding row no longer ends the pass
     (BACKLOG #2137): the service logs it at ERROR and returns the plan, so these alerts still fire.
@@ -10212,6 +10228,9 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     earlier run left open (:func:`_without_inherited_clears` drops that clear);
     ``_mark_reconcile_clears`` states that rule once."""
     if plan.directory_outage:
+        # A paging refusal is not the outage, so a pass whose only answers were outages and
+        # paging refusals still pages for those (vault BACKLOG #3696).
+        _alert_paging_refusals(plan, sink)
         return
     if plan.aborted is not None and not plan.directory_referral and not plan.probe_fault:
         # A breaker trip. A pass of referrals only is not one: its one alert is the referral's below.
@@ -10250,6 +10269,7 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
             undetermined=plan.undetermined,
             detail=auth.directory_reconcile_hold or HOLD_REASON,
         )
+    _alert_paging_refusals(plan, sink)
     # The inverses LAST: they page nobody, so a sink raising on one cannot cost a page above.
     if plan.breaker_clear:
         sink.ad_reconcile_breaker_cleared("directory-reconciler")
@@ -10257,6 +10277,27 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         sink.ad_reconcile_hold_released("directory-reconciler")
     if plan.referral_clear:
         sink.ad_reconcile_breaker_cleared(_REFERRAL_ALERT_SOURCE)
+
+
+def _alert_paging_refusals(plan: ReconcilePlan, sink: AlertSink) -> None:
+    """Page each account that has just entered the paging-refused state (vault BACKLOG #3696).
+
+    Its group search was refused for the engine's own bound, so the reconciler reads it as
+    unavailable and never revokes it while that lasts. The auth service latches the state per
+    account (``AuthService._note_paging_refusals``), so this pages once on entry, not every pass.
+    It has no inverse, like the probe fault's: an operator resolves it. The account name is the
+    one ``ad_session_revoked`` already carries; nothing else about the account is."""
+    for username, cause in plan.paging_refused:
+        sink.ad_reconcile_aborted(
+            f"{_PAGING_ALERT_SOURCE}:{username}",
+            reason=cause,
+            probed=plan.probed,
+            detail=(
+                f"{username}: the directory group search {_PAGING_REFUSAL_TEXT[cause]}, so the "
+                "account reads as unavailable and the reconciler cannot revoke its sessions while "
+                "this lasts; they run to [auth].session_absolute_hours."
+            ),
+        )
 
 
 def _without_clears(plan: ReconcilePlan) -> ReconcilePlan:

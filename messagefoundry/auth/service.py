@@ -55,12 +55,16 @@ from messagefoundry.auth.audit_visibility import (
 )
 from messagefoundry.auth.identity import ALL_CHANNELS, AuthProvider, Identity, SessionMechanism
 from messagefoundry.auth.ldap import (
+    PAGING_DEADLINE_SPENT,
+    PAGING_TOO_MANY_ENTRIES,
+    PAGING_TOO_MANY_PAGES,
     AdPrincipal,
     DirectoryAnswer,
     KerberosTokenRefused,
     LdapAuthenticator,
     LdapError,
     LdapReferralError,
+    LdapUnansweredError,
     LdapUndecodableError,
     kerberos_principal,
     normalise_object_guid,
@@ -1792,6 +1796,17 @@ _REFUSED_OUTCOMES: dict[DirectoryAnswer, reconcile.ProbeOutcome] = {
     DirectoryAnswer.AMBIGUOUS: reconcile.ProbeOutcome.ABSENT,
 }
 
+#: The paged group search refusals that are the engine's own bounds, and the cause each pages as
+#: (vault BACKLOG #3696). The reconciler reads them as UNAVAILABLE like any unanswered search, and
+#: then pages (`AuthService._note_paging_refusals`), because unlike an outage they recur.
+_PAGING_BOUND_CAUSES: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        PAGING_DEADLINE_SPENT: reconcile.PAGING_DEADLINE,
+        PAGING_TOO_MANY_ENTRIES: reconcile.PAGING_CAP,
+        PAGING_TOO_MANY_PAGES: reconcile.PAGING_CAP,
+    }
+)
+
 #: The ``auth.reauth`` reason for each step-up re-bind whose lookup judged no password (BACKLOG
 #: #2434). None is counted toward the lockout. ``None`` means no lookup ran. ``_reauth_ad`` refuses
 #: an empty password before it asks, so ``None`` from a directory reads as one that could not be
@@ -2952,6 +2967,10 @@ class AuthService:
         #: 0195 rule item 3). The undetermined-wave hold counts UNDETERMINED entries here across the
         #: probe rotation, so two unreadable accounts sampled on different passes are still two.
         self._reconcile_outcomes: dict[str, reconcile.ProbeOutcome] = {}
+        #: user_id -> the bound that refused that account's group search on its latest probe that
+        #: reached the directory (vault BACKLOG #3696). The latch that makes the page fire once
+        #: per account per state change: `_note_paging_refusals` is its only writer.
+        self._reconcile_paging_refused: dict[str, str] = {}
         #: The undetermined-wave hold's operator message (ADR 0195). Its own latch, because a held
         #: pass is not an aborted one and so clears `_reconcile_alert`. Set on a pass that holds,
         #: cleared on the next pass that judges and does not. A pass with no candidates, or a
@@ -6948,7 +6967,16 @@ class AuthService:
             # need the console. Debug-level — a flapping DC must not flood the log at one line per
             # user per pass; the pass-level summary below reports the count at WARNING.
             _log.debug("directory probe failed for %s: %s", user.username, exc)
-            return reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.UNAVAILABLE)
+            # Vault BACKLOG #3696. A group search past its deadline or its entry cap is still
+            # unjudged, so still UNAVAILABLE, but it says which bound refused it, so it pages.
+            cause = (
+                _PAGING_BOUND_CAUSES.get(exc.code_name)
+                if isinstance(exc, LdapUnansweredError)
+                else None
+            )
+            return reconcile.Probe(
+                user.id, user.username, reconcile.ProbeOutcome.UNAVAILABLE, detail=cause
+            )
         except Exception as exc:
             if _unreached_directory(exc):
                 # BACKLOG #3100. ldap.py wraps the socket faults it knows of as LdapError (BACKLOG
@@ -7014,6 +7042,40 @@ class AuthService:
             # `None` here leaves the residual no-objectGUID site on genuinely unchanged behaviour.
             directory_username=principal.username if user.directory_object_id is not None else None,
         )
+
+    def _note_paging_refusals(
+        self, probes: Iterable[reconcile.Probe], users: Mapping[str, UserRecord]
+    ) -> tuple[tuple[str, str], ...]:
+        """``(username, cause)`` of each probed account that ENTERED the paging-refused state on
+        this pass, and move the latch (vault BACKLOG #3696).
+
+        Its group search was refused for the engine's own bound, past
+        ``[auth].ad_group_search_deadline`` or past the entry cap, so it reads UNAVAILABLE and is
+        never revoked while that lasts. Unlike an outage it recurs on every pass, so it pages,
+        once: an account already latched with the same cause is not returned again. Any outcome
+        but UNAVAILABLE re-arms the account. A plain outage (UNAVAILABLE with no cause) leaves the
+        latch alone, since it says nothing about the bound. An account that left the candidate set
+        leaves the latch too, and the latch is process-local, so a restart pages a standing one
+        once more. Each entry is logged at WARNING by account name; the lifespan task pages it as
+        ``ad_reconcile_aborted``.
+        """
+        latch = self._reconcile_paging_refused
+        for user_id in [u for u in latch if u not in users]:
+            del latch[user_id]
+        entered: list[tuple[str, str]] = []
+        for probe in probes:
+            if probe.outcome is not reconcile.ProbeOutcome.UNAVAILABLE:
+                latch.pop(probe.user_id, None)
+            elif probe.detail is not None and latch.get(probe.user_id) != probe.detail:
+                latch[probe.user_id] = probe.detail
+                entered.append((probe.username, probe.detail))
+                _log.warning(
+                    "directory reconcile: the group search for %s was refused for its bound (%s), "
+                    "so its sessions cannot be revoked while this lasts",
+                    probe.username,
+                    probe.detail,
+                )
+        return tuple(entered)
 
     async def reconcile_directory_sessions(self) -> reconcile.ReconcilePlan:
         """Run one reconciliation pass and apply it; return what it did (for the loop + tests).
@@ -7190,6 +7252,8 @@ class AuthService:
         self._reconcile_strikes.update(plan.strikes)
         self._reconcile_outcomes.update(plan.outcomes)
         self._reconcile_hold_latched = plan.latched
+        # Vault BACKLOG #3696. Before any return below, so an outage-shaped pass pages too.
+        plan = replace(plan, paging_refused=self._note_paging_refusals(probes, users))
         if plan.hold:
             self._advance_hold_standing("held")
         # BACKLOG #2136. A trip makes every candidate unconfirmed until a pass that is not aborted
