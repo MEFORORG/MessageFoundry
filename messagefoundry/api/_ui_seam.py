@@ -490,6 +490,16 @@ from typing import Any
 #: its review repair (at 6d7dcabe1103f08d), then with main: re-derived with ``--write`` on the
 #: merged tree, so the value below covers every entry above.
 #:
+#: Vault BACKLOG #3192 merged with main after BACKLOG #2709 landed there (PR 2341, digest
+#: 344979df3bd2c662 on main). Main moved the seam by that merge alone: the route-gate table and
+#: its review repairs, which this branch had already taken. Re-derived with ``--write`` on the
+#: merged tree; the digest did not move. Main carries that branch at 6d7dcabe1103f08d (PR 2352).
+#:
+#: Vault BACKLOG #3189 and #3031 (at 0b2a8d6524e4acc6) merged with main after PR 2352 landed
+#: there at 6d7dcabe1103f08d. The #3192 review-repair entry above is that branch's own, kept once.
+#: Re-derived with ``--write`` on the merged tree; the digest did not move, so the value below
+#: covers every entry above.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders

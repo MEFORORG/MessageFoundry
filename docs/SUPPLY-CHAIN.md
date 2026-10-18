@@ -190,9 +190,10 @@ Windows than on Linux:
 That list is what the lock's `sys_platform` markers select today. Read the lock, not this table, for
 the current set.
 
-The SBOM generator lists what is actually installed, so one SBOM cannot be right for both. The engine
-runs as a Windows service ([SERVICE.md](SERVICE.md)) and in a Linux container, so the release ships
-both. The Windows SBOM is built on a Windows runner, because only a Windows interpreter picks packages
+The SBOM generator lists what is actually installed, so one SBOM cannot be right for both. The release
+ships both. The Windows SBOM covers the core runtime of the supported v1 install, a Windows service
+([SERVICE.md](SERVICE.md)). The Linux SBOM covers a `pip install` on Linux, which is
+[not supported for v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target). The Windows SBOM is built on a Windows runner, because only a Windows interpreter picks packages
 the way a Windows install does.
 
 Neither SBOM is built by the job that signs. Each comes from its own job with read-only access, one on
@@ -263,14 +264,14 @@ Write `<version>` in the TAG's spelling, in this command and in the Sigstore one
 pre-release tag is `v0.5.0-rc1`, while its wheel's filename says `0.5.0rc1`. The wheel's spelling
 names a ref no release was built from, so the check fails on a genuine file.
 
-Or verify a Sigstore bundle directly (both SBOMs and the VEX are signed too; for the Windows SBOM,
-name `messagefoundry-sbom-windows.cdx.json` instead):
+Or verify a Sigstore bundle directly (both SBOMs and the VEX are signed too). The examples below
+name the Windows SBOM; for the Linux SBOM, name `messagefoundry-sbom.cdx.json` instead:
 
 ```bash
 python -m sigstore verify identity \
   --cert-identity 'https://github.com/MEFORORG/MessageFoundry/.github/workflows/release.yml@refs/tags/v<version>' \
   --cert-oidc-issuer https://token.actions.githubusercontent.com \
-  messagefoundry-sbom.cdx.json
+  messagefoundry-sbom-windows.cdx.json
 ```
 
 A single `cosign` (v2.4.0+) also verifies the bundle format used across npm provenance, GitHub Artifact
@@ -291,10 +292,10 @@ to the lock file the inventory is built from, not to a field inside the SBOM. Fe
 ```bash
 # Scan the SBOM for known CVEs. --vex applies whatever assessments our VEX carries; --show-suppressed
 # lists what was suppressed, so a run with nothing to apply is visibly a no-op:
-trivy sbom messagefoundry-sbom.cdx.json --vex messagefoundry-vex.openvex.json --show-suppressed
+trivy sbom messagefoundry-sbom-windows.cdx.json --vex messagefoundry-vex.openvex.json --show-suppressed
 
 # Or score the SBOM's completeness (0-10, NTIA minimum elements):
-sbomqs score -b messagefoundry-sbom.cdx.json
+sbomqs score -b messagefoundry-sbom-windows.cdx.json
 ```
 
 **Do not demand a zero-CVE "clean scan."** Per CISA's *Minimum Requirements for VEX* and NTIA's

@@ -111,13 +111,14 @@ leaves the engine.
 | | `allow_unencrypted_phi` | `false` |
 | | `allow_unencrypted_phi_under_strict_enforcement` | `false` |
 | In-use data protection | `memory_encryption_operator_declared` | `false` (ADR 0152 — *not* a loosening: it ASSERTS a host property rather than giving one up. Its absence on an exposed PHI instance warns at every start) |
-| | `require_memory_encryption_declaration` | `false` (*not* a loosening either — it TIGHTENS, turning that warning into a refusal. Opt-in because the property is a host property that cannot be satisfied on Windows) |
+| | `require_memory_encryption_declaration` | `false` (*not* a loosening either — it TIGHTENS, turning that warning into a refusal. Opt-in because the property is a host property most Windows hosts cannot provide: a Windows guest gets it only as an Azure or Azure Local confidential VM ([SYSTEM-REQUIREMENTS.md](SYSTEM-REQUIREMENTS.md#hardware-memory-encryption--required-for-an-asvs-level-3-phi-deployment))) |
 | Sign-in & identity | `require_mfa` | `true` |
 | | `allow_single_factor_admin_when_exposed` | `false` |
 | | `sign_out_after_idle_minutes` | `30` |
 | | `max_session_hours` | `12` |
 | Alert transport | `allow_unverified_alert_smtp_tls` | `false` |
 | Store principal | `allow_over_granted_store_principal` | `false` (ADR 0199: accept an over-granted store login under `enforce`, audited) |
+| Interpreter | `allow_remote_debugging` | `false` (vault BACKLOG #2700: accept the interpreter's remote debugging on under `enforce`, which otherwise refuses the start; reported) |
 | Backend credentials | `require_nonstatic_credentials` | `false` (*not* a loosening — it TIGHTENS, refusing backend hops on a static credential or none. Opt-in by owner decision, because several hops have no compliant kind in the product) |
 | | `static_credential_accepted` | `{}` (each opt-out is a loosening while `require_nonstatic_credentials` is on, and is reported as `static_credential_accepted`; with the refusal off an opt-out does nothing and is not reported) |
 | Data handling | `block_unlisted_outbound` | `true` |
@@ -1111,9 +1112,10 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
 > every range of that family as trusting every peer, so a `10.0.0.0/8` beside `0.0.0.0/0` gets that
 > wording too. A range in the other family gets the range wording.
 >
-> The check parses each entry the way uvicorn does, strictly. An entry with host bits set, such as
-> `10.1.2.3/0`, would become a literal in uvicorn that matches no peer, so the load refuses it
-> ([BACKLOG #2488](BACKLOG.md)).
+> The check reads each entry with the same parser as the load, and skips an entry the load
+> refuses. Those forms, a host-bits CIDR such as `10.1.2.3/0` among them, are listed in the
+> `trusted_proxies` row of [CONFIGURATION.md](CONFIGURATION.md). An IPv4-mapped entry counts as
+> the IPv4 range it names, so `::ffff:0:0/96` gets the whole-family wording.
 - **What you lose:** uvicorn trusts `X-Forwarded-For` from every host an entry covers, so each of those
   hosts can declare its own source address. For a whole family, that is any client. That poisons the
   audit source address, the per-address sign-in limit and the new-client-IP step-up signal. With
@@ -1814,10 +1816,19 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   `messagefoundry security show` is a separate process, so it reports neither entry, and its scope
   line says so. Other commands, such as `rotate-key`, `backup` and `restore`, install the hook
   for their own process and report nothing.
-- **A start through the console script reports `remote_debug_enabled`.** `messagefoundry serve`
-  runs through a console-script launcher, which cannot pass an interpreter option, so the
-  interface stays on. A developer's own start reports it, and so does each CI leg that starts the
-  engine that way.
+- **Under `enforce`, `serve` and `supervise` refuse to start with the interface on** (owner
+  ruling 2026-10-16). Each reads its own process, after the settings load and before any side
+  effect, and the refusal names the launch that fixes it and the acceptance below. The supervisor's
+  engine shards start with the interface off, so none of them refuses on it. Under
+  `enforcement = warn` the reading is only reported. The other commands neither refuse nor report.
+- **A start through the console script would refuse under `enforce`.** `messagefoundry serve` runs
+  through a console-script launcher, which cannot pass an interpreter option, so the interface
+  stays on. That launch can set `PYTHON_DISABLE_REMOTE_DEBUG=1` instead; the interpreter ignores
+  the variable under `-I` or `-E`. A developer loop that cannot do either sets
+  `[security].allow_remote_debugging = true`, the next section. It does not let an attach
+  debugger in: the hook still refuses its script. Do not use
+  `enforcement = warn` for this: it relaxes every gate, not only this one. At least the two CI load legs
+  that start the engine under `enforce` start it as `python -I -X disable-remote-debug -m messagefoundry serve`.
 - **The two shipped service launches report neither entry** (vault BACKLOG #2701). The Windows
   installer and the container image start the interpreter itself, with
   `-I -X disable-remote-debug`, so the interface is off before any engine code runs.
@@ -1826,16 +1837,41 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   interpreter accepts the underscore spelling and ignores it. `-I` keeps the working directory off
   the import path, which `python -m` would otherwise put first. It also makes the interpreter
   ignore `PYTHON_DISABLE_REMOTE_DEBUG=1`, so with `-I` the option is the only form that works.
-- **It is not refused**, at any `enforcement` level. A refusal would stop every start through the
-  console script.
+- **CORRECTED 2026-10-16:** this point read *"It is not refused, at any `enforcement` level."*
+  That was the design until the owner ruling above.
 - **Attach debugging goes with it.** `python -m pdb -p <pid>` uses this interface, so it cannot
   attach to `serve` or `supervise`. The same holds for every other `messagefoundry` command,
   `validate`, `check` and `dryrun` included: the hook goes in before the command is known. It
   also holds for a process of your own that imports `messagefoundry.__main__`. There is no
   switch that turns the hook off. To debug a command, start it under the debugger, as
-  `python -m pdb -m messagefoundry <command>`, which does not use the interface. That reaches
+  `python -P -X disable-remote-debug -m pdb -m messagefoundry <command>`, which does not use
+  the interface; without the option, `serve` and `supervise` refuse under `enforce`. That reaches
   the command's own process. Router and Handler bodies that run in a sandbox worker
   (`[sandbox].mode = "subprocess"`) are in a child process, which it does not reach.
+
+### `allow_remote_debugging = true` -- start under `enforce` with the interpreter's remote debugging on
+
+> **A switch.** `[security].allow_remote_debugging`, default `false`. Vault BACKLOG #2700.
+- **What you lose:** the start-up refusal the section above describes. The engine would start with
+  the interface on, and keep only the residual that section lists: a script injected before the
+  hook goes in runs, and a process that can write the engine's memory can run code in it by other
+  means.
+- **When acceptable:** a developer's own start through the console script, where neither the
+  option nor the variable fits. Never for a deployment: the shipped service launches turn the
+  interface off, so they need nothing here.
+- **It is never silent:** an entry here and in `GET /security/posture` for `serve`, and a WARNING
+  line at each `supervise` start. Where it lifts a refusal that would fire, `serve` and
+  `supervise` also write a WARNING-level log line that begins `AUDIT:`, as the gate runs.
+  `serve` writes it again once logging reaches its handlers; `supervise` writes it again only
+  where a log forwarder is installed, for the off-box copy. The acceptance has no audit row
+  or alert of its own. `serve` names it as it names every loosening: in the loosenings list
+  of the start's `config_loaded` audit row, and so in the `posture_loosened` alert that
+  list raises. At least some of those rows record no list, such as a start whose snapshot
+  step failed. `supervise` leaves only the log lines. The `remote_debug_enabled` entry
+  still reports the interface itself.
+- **What it does not do:** it does not turn the hook off, and under `enforcement = warn` it has
+  nothing to lift.
+- **How to turn it off:** remove it, and start the interpreter with `-X disable-remote-debug`.
 
 ### `interpreter_not_isolated`, `startup_code_unexpected` and `startup_directory_writable`: what runs in the interpreter before the engine does
 
@@ -1900,7 +1936,7 @@ Named as `alerts.rules`, with each rule's position, its `id`, and the reminder e
   **A start under a tool that injects a `sitecustomize` through `PYTHONPATH` does refuse**, unless
   an installed package records that file. Some debuggers and tracing agents work this way.
 - **What the shipped service launches report:** the Windows installer and the container image
-  start the interpreter with `-I`, so neither reports `interpreter_not_isolated`. The image copies
+  ([not supported for v1](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target)) start the interpreter with `-I`, so neither reports `interpreter_not_isolated`. The image copies
   its virtual environment owned by root, and the engine runs as another user, so it does not
   report `startup_directory_writable`. **On Windows that entry depends on the install.** The
   installer does not change the permissions of the virtual environment, so the reading follows

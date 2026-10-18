@@ -1023,8 +1023,8 @@ def test_a_run_of_slashes_does_not_hang_the_hook() -> None:
 
 
 def test_a_slow_added_reading_cannot_delay_the_original_deny() -> None:
-    """The settings file gives the hook 15 seconds, and a hook that runs longer lets the command
-    run. Many unclosed brackets made the arithmetic skip slow: with every view built first, this
+    """The guard's budget is 15 seconds of its handler's timeout, and a hook that runs longer lets
+    the command run. Many unclosed brackets made the arithmetic skip slow: with every view built first, this
     payload took 19.7 s and so turned a deny into an allow. The original views are now judged
     first, so the real stage at the front is denied before any added reading runs."""
     command = "git add -A; echo '" + "(" * 30000 + "' ; echo '<<'"
@@ -1033,8 +1033,9 @@ def test_a_slow_added_reading_cannot_delay_the_original_deny() -> None:
     assert time.monotonic() - started < 15
 
 
-# RUN TIME, AND THE LENGTH CAP THAT BOUNDS IT. The settings file gives the hook 15 seconds, and a
-# hook that runs longer lets the command run. Every repair of a slow path so far has opened
+# RUN TIME, AND THE LENGTH CAP THAT BOUNDS IT. The guard's budget is 15 seconds of its handler's
+# timeout (scripts/hooks/shell-guard-dispatch.ps1 says how that is summed), and a hook that runs
+# longer lets the command run. Every repair of a slow path so far has opened
 # another, so the guard refuses, unread, any command longer than its cap.
 # docs/BLANKET-STAGE-GUARD-FAIL-OPENS.md section 4a has the measurements, the table the cap was
 # chosen from, and the false denies the cap costs. Each timing test below was run against the guard

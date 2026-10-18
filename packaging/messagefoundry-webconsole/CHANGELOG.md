@@ -72,6 +72,9 @@ this line.**
 
 ### Changed
 
+- **Linux is not a supported v1 deployment target.** The package drops the
+  `Operating System :: POSIX :: Linux` classifier, matching the engine
+  ([why](../../docs/SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target)).
 - **Seam only: the engine's posture model grew.** `SecurityPosture` gains
   `transit_bound_attestation`, a `TransitBoundAttestationView` (`BACKLOG #2337`). The console
   renders nothing new, but the field is on the seam it pins, so the supported digest moved.

@@ -9,7 +9,7 @@ one graph spans a cheap pass-through run and a transform-bound ceiling run. Serv
 
     # SQLite (smoke/dev); swap --db for the Postgres scale-out comparison
     MEFOR_LOAD_FANOUT=20 MEFOR_LOAD_TRANSFORM=edit MEFOR_LOAD_SINK_PORT=2700 \
-      python -m messagefoundry serve --config harness/config/load --db ./load.db
+      python -P -X disable-remote-debug -m messagefoundry serve --config harness/config/load --db ./load.db
 
 Every value here is synthetic and generic — no real partner, site, host, or volume. Each hub routes
 **every** message it receives to its lane's handlers (the load sender pre-partitions message types to
