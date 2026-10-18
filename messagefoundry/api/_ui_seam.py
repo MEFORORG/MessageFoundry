@@ -514,11 +514,12 @@ from typing import Any
 #:
 #: Vault BACKLOG #2954 (and #2956, which builds on it) merged with main after the #3189 / #3031
 #: entries above landed there (main at 440d71aaf, seam digest da529979e55cb966). #2956 moves no
-#: seam field itself.
-#: Re-derived with ``--write`` on the merged tree, so the value below covers every entry above.
+#: seam field itself. Re-derived with ``--write`` on that merged tree to 40dde1530423fece, which
+#: covered the entries above it at the time, not the #3316 entry above it now.
 #:
 #: Vault BACKLOG #2954 / #2956 merged with main again after BACKLOG #3316 landed there (main at
-#: fc0d05e1b, seam digest 8b2fa06dd4c4938b). The #3316 entry above is main's, kept once.
+#: fc0d05e1b, seam digest 8b2fa06dd4c4938b; the branch at 40dde1530423fece). The #3316 entry
+#: above is main's, kept once. Neither parent's value covered both, so the move comes from the merge.
 #: Re-derived with ``--write`` on the merged tree, so the value below covers every entry above.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
