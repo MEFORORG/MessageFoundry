@@ -1178,7 +1178,9 @@ def test_every_engine_leg_clears_its_own_recorded_maximum_at_its_step_cap() -> N
     two Windows caps are sized from an anchor in ci.yml's engine note rather than from their rows,
     so they carry the floor only.
 
-    Re-falsified at the 2026-10-13 re-measure, against the 28:07 row: `step_timeout` set to 36
+    Re-falsified at the 2026-10-18 re-measure, against the 33:33 row: `step_timeout` set to 43
+    (43:00 / 33:33 = 1.282x) went RED on the floor, and set to 47 went RED on the rule. Restored
+    both times. At the 2026-10-13 re-measure, against the 28:07 row: `step_timeout` set to 36
     (36:00 / 28:07 = 1.280x) went RED on the floor, and set to 39 went RED on the rule. Restored
     both times. The original record, at the 2026-10-07 row:
     Falsified by setting ubuntu's `step_timeout` to 31 against its 24:36 row (31:00 / 24:36 =
@@ -1210,6 +1212,37 @@ def test_every_engine_leg_clears_its_own_recorded_maximum_at_its_step_cap() -> N
                 f"and ceil_minute(1.35x) of that, floored at 5:00, is "
                 f"{sized_cap_minutes(recorded)}m. Move the cap and the row together."
             )
+
+
+def test_a_row_that_names_a_pool_file_is_that_pool_s_worst_passing_run() -> None:
+    """A row whose `source` names a committed pool file must be derivable from it.
+
+    The 2026-10-18 ubuntu re-measure committed its whole pool, one line per job execution, so its
+    `max_passing` and run count can be re-checked rather than re-read. Unchecked, the file is a
+    second hand-typed copy that can drift from the row. Rows that name no pool file are skipped.
+    """
+    checked = 0
+    for row in load_baselines(_BASELINE_FILE):
+        named = set(re.findall(r"step_margin_pool_[\w-]+\.tsv", row.source))
+        for name in named:
+            lines = (_BASELINE_FILE.parent / name).read_text(encoding="utf-8").splitlines()
+            data = [line.split("\t") for line in lines if line and not line.startswith("#")]
+            header, body = data[0], data[1:]
+            run, keep, secs = header.index("run_id"), header.index("keep"), header.index("step_s")
+            worst: dict[str, int] = {}
+            for fields in body:
+                if fields[keep] == "row":
+                    worst[fields[run]] = max(worst.get(fields[run], 0), int(fields[secs]))
+            assert max(worst.values()) == row.max_passing_seconds, (
+                f"{row.leg}: {name}'s worst passing row is {format_clock(max(worst.values()))}, "
+                f"but the row records {format_clock(row.max_passing_seconds)}"
+            )
+            assert f"n={len(worst)} " in row.source, (
+                f"{row.leg}: {name} has {len(worst)} runs with a row; the row's source disagrees"
+            )
+            checked += 1
+    if not checked:
+        pytest.skip("no row names a committed pool file")
 
 
 def test_the_webconsole_nesting_arithmetic_in_ci_yml_is_read_and_checks_out() -> None:

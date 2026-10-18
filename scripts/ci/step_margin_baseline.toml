@@ -37,11 +37,51 @@
 # Splitting the engine pair the way the web console pair is now split is a separate change nobody has
 # made.
 
-# THE UBUNTU ENGINE ROW WAS RE-MEASURED 2026-10-13 UTC, after merge-group run 38372578370 (PR 2301)
-# reddened it at 26:13 of 34:00 with every test passing. ci.yml's "THE UBUNTU ROW WAS RE-DERIVED A
-# THIRD TIME 2026-10-13" note sizes `step_timeout` from it. The row it replaces was measured
-# 2026-10-07 UTC, after merge-group run 37568821379 reddened this leg at 24:36 of 31:00; ci.yml's
-# "THE UBUNTU ROW WAS RE-DERIVED AGAIN 2026-10-07" note cites it, so it is kept here whole:
+# THE UBUNTU ENGINE ROW WAS RE-MEASURED 2026-10-18 UTC (BACKLOG #3456), after the gate reddened this
+# leg with every test passing on PR 2409's pull-request run 39110039682 at 29:15 and on merge-group
+# run 39131597083 (PR 2416) at 30:14, which the queue ejected. ci.yml's "THE UBUNTU ROW WAS
+# RE-DERIVED A FOURTH TIME 2026-10-18" note sizes `step_timeout` from it. Every execution in its
+# pool, row or not, is a line of step_margin_pool_ubuntu_2026-10-18.tsv beside this file. The row it
+# replaces was measured 2026-10-13 UTC, after merge-group run 38372578370 (PR 2301) reddened this
+# leg at 26:13 of 34:00; ci.yml's "THE UBUNTU ROW WAS RE-DERIVED A THIRD TIME 2026-10-13" note
+# cites it, so it is kept here whole:
+#
+#   max_passing 28:07, uncensored.
+#   measured 2026-10-13 UTC (ubuntu engine step-margin re-measure, 2026-10-13, cut after merge-group
+#   run 38372578370 was ejected with every test passing). Pool: every ci.yml run with event
+#   merge_group, pull_request, push or workflow_dispatch created
+#   2026-10-07T04:25:00Z..2026-10-13T09:35:28Z UTC, both ends inclusive, as the runs endpoint's
+#   created=A..B filter reads them. It opens at the second after the 2026-10-07 pool closed, so no
+#   run is in both. Each event was listed on its own in 12-hour slices, the largest slice 88 runs
+#   against the listing's 1000 cap: 896 runs (merge_group 277, pull_request 456, push 161,
+#   workflow_dispatch 2). Jobs fetched with ?filter=all; a row is this leg's `Tests (pytest)` STEP,
+#   kept when THAT STEP concluded success, duration = its completed_at minus started_at, executions
+#   under 60s dropped (1, a cancellation), re-run copies with identical stamps dropped (33). The
+#   pool closes at the second before merge-group run 38377412991 was created, PR 2301's next group,
+#   which was still running when the jobs were read; every run in the pool had finished. Jobs were
+#   read 2026-10-13 between about 09:37Z and 09:42Z UTC; a later re-run of a run in the window adds
+#   an attempt this pool does not hold. PR 2122 moved this cap from 31:00 to 34:00 and landed at
+#   2026-10-07T07:19:56Z. A run's cap is the one in its own tree: of the runs created before that
+#   instant, at least 4 merge-group runs already carried 34:00 (37583565202, PR 2122's own group,
+#   and the three groups stacked on it) and the rest ran under 31:00. n=694 (merge_group 245,
+#   pull_request 288, push 159, workflow_dispatch 2), one row per run, min 15:07, median 22:10, p90
+#   24:49, p95 25:10, percentiles interpolated linearly. The other 202 runs gave no row: the step
+#   failed in 81, was cancelled in 85, was skipped in 31, and 5 had no such step or no such job.
+#   Worst 28:07, run 37591955946 job 112695453766 (merge_group, 2026-10-07, PR 2130's group, ejected
+#   by this gate at the 34:00 cap; PR 2130 merged later that day); next 27:30, run 38280521752 (push
+#   to main, 2026-10-12); then 26:22, run 38302538710 (pull_request, 2026-10-12, PR 2300, since
+#   merged); then 26:13, run 38372578370 job 115213077231 (merge_group, 2026-10-13, PR 2301, the
+#   ejection this re-measure was cut for). The gate went red on those 4 success rows, all at the
+#   34:00 cap (merge_group 2, pull_request 1, push 1), and on no other: they are the only 4 whose
+#   step succeeded and whose job failed, and none of the 56 rows from runs created before PR 2122
+#   landed is over the 31:00 cap's red line. 94 success rows have an API step duration over the
+#   24:36 row this one replaces. Uncensored on evidence even though this leg's cap is also its kill:
+#   the longest of 84 step failures (run 38314948582) stopped at 26:19 and the longest of 84
+#   cancellations at 25:41, both under the 31:00 kill, the lower of the two in force in the window.
+#
+# The row before that one was measured 2026-10-07 UTC, after merge-group run 37568821379 reddened
+# this leg at 24:36 of 31:00; ci.yml's "THE UBUNTU ROW WAS RE-DERIVED AGAIN 2026-10-07" note cites
+# it, so it is kept here whole too:
 #
 #   max_passing 24:36, uncensored.
 #   measured 2026-10-07 UTC (web console step-margin gate re-measure, 2026-10-07). Pool: every
@@ -60,7 +100,7 @@
 #   though this leg's cap is also its kill: the longest of 118 step failures (run 37571163103)
 #   stopped at 22:22 and the longest of 72 cancellations at 19:06, both far under the 31:00 kill.
 #
-# The row before that one, measured 2026-08-08, read:
+# The row before those, measured 2026-08-08, read:
 #
 #   max_passing 16:08, uncensored. Pool: every ci.yml run created 2026-08-01T00:00Z..2026-08-09T00:00Z
 #   UTC (688 runs, 1,618 leg-executions), jobs fetched with ?filter=all, rows this leg's
@@ -73,10 +113,10 @@
 [[baseline]]
 step = "Tests (pytest)"
 leg = "ubuntu-latest"
-max_passing = "28:07"
+max_passing = "33:33"
 censored = false
 censored_by = ""
-source = "measured 2026-10-13 UTC (ubuntu engine step-margin re-measure, 2026-10-13, cut after merge-group run 38372578370 was ejected with every test passing). Pool: every ci.yml run with event merge_group, pull_request, push or workflow_dispatch created 2026-10-07T04:25:00Z..2026-10-13T09:35:28Z UTC, both ends inclusive, as the runs endpoint's created=A..B filter reads them. It opens at the second after the 2026-10-07 pool closed, so no run is in both. Each event was listed on its own in 12-hour slices, the largest slice 88 runs against the listing's 1000 cap: 896 runs (merge_group 277, pull_request 456, push 161, workflow_dispatch 2). Jobs fetched with ?filter=all; a row is this leg's `Tests (pytest)` STEP, kept when THAT STEP concluded success, duration = its completed_at minus started_at, executions under 60s dropped (1, a cancellation), re-run copies with identical stamps dropped (33). The pool closes at the second before merge-group run 38377412991 was created, PR 2301's next group, which was still running when the jobs were read; every run in the pool had finished. Jobs were read 2026-10-13 between about 09:37Z and 09:42Z UTC; a later re-run of a run in the window adds an attempt this pool does not hold. PR 2122 moved this cap from 31:00 to 34:00 and landed at 2026-10-07T07:19:56Z. A run's cap is the one in its own tree: of the runs created before that instant, at least 4 merge-group runs already carried 34:00 (37583565202, PR 2122's own group, and the three groups stacked on it) and the rest ran under 31:00. n=694 (merge_group 245, pull_request 288, push 159, workflow_dispatch 2), one row per run, min 15:07, median 22:10, p90 24:49, p95 25:10, percentiles interpolated linearly. The other 202 runs gave no row: the step failed in 81, was cancelled in 85, was skipped in 31, and 5 had no such step or no such job. Worst 28:07, run 37591955946 job 112695453766 (merge_group, 2026-10-07, PR 2130's group, ejected by this gate at the 34:00 cap; PR 2130 merged later that day); next 27:30, run 38280521752 (push to main, 2026-10-12); then 26:22, run 38302538710 (pull_request, 2026-10-12, PR 2300, since merged); then 26:13, run 38372578370 job 115213077231 (merge_group, 2026-10-13, PR 2301, the ejection this re-measure was cut for). The gate went red on those 4 success rows, all at the 34:00 cap (merge_group 2, pull_request 1, push 1), and on no other: they are the only 4 whose step succeeded and whose job failed, and none of the 56 rows from runs created before PR 2122 landed is over the 31:00 cap's red line. 94 success rows have an API step duration over the 24:36 row this one replaces. Uncensored on evidence even though this leg's cap is also its kill: the longest of 84 step failures (run 38314948582) stopped at 26:19 and the longest of 84 cancellations at 25:41, both under the 31:00 kill, the lower of the two in force in the window."
+source = "measured 2026-10-18 UTC (ubuntu engine step-margin re-measure, 2026-10-18, BACKLOG #3456, cut after the gate reddened PR 2409's pull-request run 39110039682 and PR 2416's merge-group run 39131597083 with every test passing). Pool: every ci.yml run with event merge_group, pull_request, push or workflow_dispatch created 2026-10-13T09:35:29Z..2026-10-18T13:41:05Z UTC, both ends inclusive, as the runs endpoint's created=A..B filter reads them. It opens at the second after the 2026-10-13 pool closed, so no run is in both. It KEEPS the runs that did not land, merge groups the queue ejected and pull-request runs alike, as the gate's RE-SIZE line asks. Each event was listed on its own in 12-hour slices, the largest slice 134 runs against the listing's 1000 cap, and every slice's total_count equals the runs listed: 621 runs (merge_group 148, pull_request 388, push 83, workflow_dispatch 2). Jobs fetched with ?filter=all; a row is this leg's `Tests (pytest)` STEP, kept when THAT STEP concluded success, duration = its completed_at minus started_at, executions under 60s dropped (17), re-run copies with identical stamps dropped (17). The pool closes at the second before push run 39132625200 was created, the earliest run still in progress when the runs were listed; every run in the pool had finished. Jobs were read 2026-10-18 between about 14:10Z and 14:13Z UTC; a later re-run of a run in the window adds an attempt this pool does not hold. Every execution, row or not, is a line of step_margin_pool_ubuntu_2026-10-18.tsv. PR 2314 moved this cap from 34:00 to 38:00 and landed at 2026-10-14T03:04:06Z; a run's cap is the one in its own tree. n=467 (merge_group 142, pull_request 241, push 82, workflow_dispatch 2), one row per run, the worse of its success rows where a run has two (470 rows across attempts), min 17:53, median 26:31, p90 27:53, p95 28:23, percentiles interpolated linearly. The other 154 runs gave no row: the step was cancelled in 102, failed in 31, was skipped in 15 and cancelled under 60s in 2, and 4 had no such job (3) or no such step (1). Worst 33:33, run 38992644994 job 117278235424 (pull_request, 2026-10-17, PR 2344, `40388 passed` in 2002.95s by pytest's clock; PR 2344 merged later that day); next 30:14, run 39131597083 job 117687801389 (merge_group, 2026-10-18, PR 2416's group, ejected by this gate; PR 2416 open when read); then 29:53, run 39124776717 (push to main, 2026-10-18); then 29:21, run 39100173412 (merge_group, 2026-10-18, PR 2421's group; PR 2421 merged later that day); then 29:15, run 39110039682 job 117624069812 (pull_request, 2026-10-18, PR 2409, since merged). The gate's step failed on 13 success rows (merge_group 5, pull_request 6, push 2): those 5 at the 38:00 cap, and 8 from 26:13 to 27:53 in runs created 2026-10-13 and 2026-10-14 under the 34:00 cap. 37 runs' rows are over the 28:07 row this one replaces. Uncensored on evidence even though this leg's cap is also its kill: the longest of 32 step failures (run 39099124742) stopped at 28:19 and the longest of 102 cancelled executions (run 39088163078) at 28:01, both under the 34:00 kill, the lower of the two in force in the window."
 
 [[baseline]]
 step = "Tests (pytest)"
