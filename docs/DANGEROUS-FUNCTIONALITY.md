@@ -16,7 +16,9 @@ Six things:
 
 1. **The engine wheel** -- the `messagefoundry` distribution itself.
 2. **The deployment path the project documents** -- the container image in `docker/`, and the
-   Windows service scripts in `scripts/service/` (section 8).
+   Windows service scripts in `scripts/service/` (section 8). Only the Windows service is supported
+   for v1 ([why](SYSTEM-REQUIREMENTS.md#linux-is-not-a-supported-v1-deployment-target)); the image
+   stays in scope here.
 3. **The VS Code extension** in `ide/` (section 9, and its parsers in section 7).
 4. **The web console**, `messagefoundry_webconsole`, which the engine serves at `/ui` (section 10).
 5. **The toolkit**, `messagefoundry_toolkit`, shipped as the `messagefoundry-toolkit` distribution.

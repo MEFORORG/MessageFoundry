@@ -21,6 +21,24 @@ def test_sqlserver_schema_hash_tracks_ddl(monkeypatch: pytest.MonkeyPatch) -> No
     assert sqlserver._schema_hash() != h1  # ANY batch edit forces a full run: no version to forget
 
 
+def test_sqlserver_passkeys_carry_the_user_foreign_key() -> None:
+    # BACKLOG #2733: the live contract that proves the key refuses an orphan runs only on the
+    # sqlserver leg, so pin the statement here too, after both tables it names.
+    sqlserver = pytest.importorskip(
+        "messagefoundry.store.sqlserver", reason="requires the sqlserver extra (aioodbc)"
+    )
+    schema = sqlserver._SCHEMA
+
+    def first(fragment: str) -> int:
+        return next(i for i, stmt in enumerate(schema) if fragment in stmt)
+
+    fk = first("fk_webauthn_credentials_user")
+    assert "IF OBJECT_ID('fk_webauthn_credentials_user','F') IS NULL" in schema[fk]
+    assert "FOREIGN KEY (user_id) REFERENCES users(id)" in schema[fk]
+    assert "CASCADE" not in schema[fk]
+    assert fk > first("CREATE TABLE users (") and fk > first("CREATE TABLE webauthn_credentials (")
+
+
 def test_postgres_schema_hash_tracks_ddl(monkeypatch: pytest.MonkeyPatch) -> None:
     postgres = pytest.importorskip(
         "messagefoundry.store.postgres", reason="requires the postgres extra (asyncpg)"
