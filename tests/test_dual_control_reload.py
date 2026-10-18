@@ -15,6 +15,7 @@ when not gated).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -54,6 +55,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.config.wiring import WiringError
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStore
+from messagefoundry.transports.base import SourceStartupError
 from tests._admin_account import create_local_user_chosen
 from tests._bound_proof import reproving_transport
 from tests.test_config_fingerprint import INVALID_DIR_NAMES, _unreadable
@@ -1905,11 +1907,13 @@ def test_load_config_names_a_missing_directory_as_missing(tmp_path: Path) -> Non
         load_config(tmp_path / "moved-away")
 
 
-def test_a_missing_directory_and_a_runner_fault_are_both_reload_refusals() -> None:
+def test_a_missing_directory_is_a_refusal_and_a_runner_file_not_found_is_not() -> None:
+    """The tuple tells them apart now: ConfigDirMissing is the not_found refusal, and a plain
+    FileNotFoundError falls to the catch sites' reload_fault branch with every other fault."""
     from messagefoundry.api.app import _RELOAD_REFUSALS
 
     assert isinstance(ConfigDirMissing("gone"), _RELOAD_REFUSALS)
-    assert isinstance(FileNotFoundError("a file the runner opened"), _RELOAD_REFUSALS)
+    assert not isinstance(FileNotFoundError("a file the runner opened"), _RELOAD_REFUSALS)
 
 
 _FAULT_DETAIL = "the reload failed inside the engine; see the engine log"
@@ -1919,17 +1923,39 @@ async def _raise_file_not_found(*_a: Any, **_k: Any) -> None:
     raise FileNotFoundError("a file the runner opened")
 
 
-async def test_a_runner_start_file_not_found_is_a_fault_row_not_a_missing_dir(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
+def _runner_raising(error: BaseException) -> Any:
+    async def _raise(*_a: Any, **_k: Any) -> None:
+        raise error
+
+    return _raise
+
+
+#: Faults a runner start or swap can raise that no refusal maps: each must still be audited
+#: (BACKLOG #3157). SourceStartupError is a File inbound whose validate_directory target is gone.
+_RUNNER_FAULTS = pytest.mark.parametrize(
+    "fault",
+    [
+        FileNotFoundError("a file the runner opened"),
+        PermissionError("a certificate the runner could not open"),
+        SourceStartupError("an inbound's directory is not there"),
+    ],
+    ids=["file_not_found", "permission", "source_startup"],
+)
+
+
+@_RUNNER_FAULTS
+async def test_a_runner_start_fault_is_a_fault_row_on_release(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, fault: Exception
 ) -> None:
-    """A FileNotFoundError raised starting or swapping the runner was mapped to not_found, then
-    escaped as a raw 500 with no outcome row. The released reload now writes config_reload_failed
-    with reason reload_fault, never not_found, and answers the release's refusal."""
+    """A fault raised starting or swapping the runner escaped the release as a raw 500 with no
+    outcome row (a FileNotFoundError was once mapped to not_found). The released reload now writes
+    config_reload_failed with reason reload_fault, never not_found, and answers the release's
+    refusal."""
     from messagefoundry.pipeline.wiring_runner import RegistryRunner
 
     def _break_the_runner() -> None:
-        monkeypatch.setattr(RegistryRunner, "start", _raise_file_not_found)
-        monkeypatch.setattr(RegistryRunner, "reload", _raise_file_not_found)
+        monkeypatch.setattr(RegistryRunner, "start", _runner_raising(fault))
+        monkeypatch.setattr(RegistryRunner, "reload", _runner_raising(fault))
 
     service = await _service(engine)
     approval_id, r = await _hold_then_release(engine, service, {}, between=_break_the_runner)
@@ -1942,8 +1968,9 @@ async def test_a_runner_start_file_not_found_is_a_fault_row_not_a_missing_dir(
     assert row is not None and str(row["status"]) == "failed"
 
 
-async def test_an_inline_runner_file_not_found_answers_the_generic_error_and_a_fault_row(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
+@_RUNNER_FAULTS
+async def test_an_inline_runner_fault_answers_the_generic_error_and_a_fault_row(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, fault: Exception
 ) -> None:
     """The inline route with the fault raised where it really is, in the runner's start or swap,
     rather than by a stubbed reload: 500 with the generic detail, and one reload_fault row after
@@ -1952,14 +1979,35 @@ async def test_an_inline_runner_file_not_found_answers_the_generic_error_and_a_f
 
     service = await _service(engine)
     await _add(service, "op", Role.ADMINISTRATOR)
-    monkeypatch.setattr(RegistryRunner, "start", _raise_file_not_found)
-    monkeypatch.setattr(RegistryRunner, "reload", _raise_file_not_found)
+    monkeypatch.setattr(RegistryRunner, "start", _runner_raising(fault))
+    monkeypatch.setattr(RegistryRunner, "reload", _runner_raising(fault))
     async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
         r = await c.post("/config/reload", json={}, headers=await _token(c, "op"))
     assert r.status_code == 500, r.text
     assert r.json() == {"detail": _FAULT_DETAIL}
     rows = await _failed_reload_rows(engine)
     assert [(d["reason"], d["dry_run"]) for d in rows] == [("reload_fault", False)]
+
+
+async def test_a_cancelled_reload_is_not_audited_as_a_fault(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The catch-all is ``Exception``, never ``BaseException``: a cancellation of the reload still
+    propagates, writes its own config_reload_interrupted row, and is never a reload_fault."""
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    monkeypatch.setattr(RegistryRunner, "start", _runner_raising(asyncio.CancelledError()))
+    monkeypatch.setattr(RegistryRunner, "reload", _runner_raising(asyncio.CancelledError()))
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        headers = await _token(c, "op")
+        with contextlib.suppress(asyncio.CancelledError):
+            r = await asyncio.wait_for(c.post("/config/reload", json={}, headers=headers), 10.0)
+            assert r.status_code != 200, r.text
+    assert await _failed_reload_rows(engine) == []
+    interrupted = await engine.store.list_audit(action="config_reload_interrupted")
+    assert len(interrupted) == 1
 
 
 @pytest.mark.parametrize("dry_run", [False, True])

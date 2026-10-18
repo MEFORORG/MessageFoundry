@@ -2616,7 +2616,8 @@ class Engine:
         if missing:
             # Outside the handler, so the error it replaces does not ride __context__. Its own
             # type, so the routes map only this to not_found. A plain FileNotFoundError, such as
-            # one a runner start raises, is mapped to reason reload_fault instead (BACKLOG #3157).
+            # one a runner start raises, is audited as reason reload_fault, as every other reload
+            # fault is (BACKLOG #3157).
             raise ConfigDirMissing(f"config directory not found: {config_dir}")
         return path
 
@@ -2750,11 +2751,13 @@ class Engine:
         live graph is the one that was already running. A reload applies the environment values it
         re-read only with the swap, a refused or rolled-back swap puts the old ones back, and a dry
         run never applies them, so a raise of one of these leaves the running values as they were.
-        Any other error is not a refusal, and the callers do not map it, with one exception: a bare
-        ``FileNotFoundError``, at least one from a first load's runner start or from the swap,
-        which is raised after a swap's rollback rather than before it. The API callers audit that
-        one with reason ``reload_fault`` and answer a generic error (BACKLOG #3157). A cancellation is not one of the refusals either: one that lands after the
-        swap committed keeps the new values, and so does one during a first load's runner start.
+        Any other ``Exception`` is not a refusal. It is a fault inside the reload, at least a bare
+        ``FileNotFoundError``, a ``PermissionError`` or a ``SourceStartupError`` from a first load's
+        runner start or from the swap, and one from the swap is raised after its rollback rather
+        than before it. The API callers audit every such fault with reason ``reload_fault`` and
+        answer a generic error (BACKLOG #3157). A cancellation is not one of the refusals either,
+        and is never audited as a fault: one that lands after the swap committed keeps the new
+        values, and so does one during a first load's runner start.
         """
         failures: list[ReloadStepFailure] = []
         restart_required: tuple[str, ...] = ()
