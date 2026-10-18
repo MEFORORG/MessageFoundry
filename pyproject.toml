@@ -153,8 +153,19 @@ Contributing = "https://github.com/MEFORORG/MessageFoundry/blob/main/CONTRIBUTIN
 # now the sole consumer of PySide6. keyring was dropped with the console (OS-token cache was
 # launcher-only). The harness monitor's HTTP client (httpx/truststore via messagefoundry.apiclient) is
 # now a BASE dependency, so it's no longer declared here.
+#
+# The <6.12 cap (Dependabot PR 2416) keeps the harness closure to the names docs/RISKY-COMPONENTS.md
+# assesses. PySide6 6.12 adds the pyside6-pdf and pyside6-webengine wheels, and neither has a reading
+# in security/risky-component-readings.json or an answer in security/bundled-code-survey.json. The
+# cap is in published metadata, not only the lock, so an install from an index gets the assessed
+# names too. Lifting it needs, in one PR: both readings and survey answers, the RISKY-COMPONENTS.md
+# harness tables and counts, the dependabot.yml `pyside6` ignore entry removed, and a fix for the
+# forbidden-content scanner reading their four-part versions (6.12.0 and a build number) in
+# security/runtime-closure-harness.txt as routable IPv4 addresses. While it holds, a Qt fix shipped
+# only in 6.12 is withheld, and no gate here would show it: an advisory against Qt names Qt, not a
+# PyPI package pip-audit reads.
 harness = [
-    "PySide6>=6.6",         # the harness GUI (LGPL — OSS-distributable)
+    "PySide6>=6.6,<6.12",   # the harness GUI (LGPL — OSS-distributable); cap: see above
 ]
 # NOTE: there is no [tray] extra. The Windows notification-area tray service-manager (ADR 0113) ships
 # INSIDE the wheel as `messagefoundry.tray` (gui-scripts `messagefoundry-tray`, `pythonw -m
@@ -518,13 +529,6 @@ ci-quality = [
     "pytest-cov>=7.0",
     "pytest-timeout>=2.3.1",
 ]
-
-[tool.uv]
-# LOCK-ONLY hold, never published metadata. PySide6 6.12 adds the pyside6-pdf and pyside6-webengine
-# wheels to the harness closure, and docs/RISKY-COMPONENTS.md, security/risky-component-readings.json
-# and security/bundled-code-survey.json hold no reading or survey answer for either, so
-# tests/test_risky_component_designation.py refuses the lock. Lift this in the PR that adds them.
-constraint-dependencies = ["pyside6<6.12"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
