@@ -102,6 +102,8 @@ from messagefoundry.api.metrics import (
     render_metrics,
 )
 from messagefoundry.api.models import (
+    POSTURE_NARROWED_TO_SCOPE,
+    RELOAD_REFUSED_CHANNEL_SCOPED,
     STATIC_CREDENTIAL_HOPS_COMPLETE,
     STATIC_CREDENTIAL_HOPS_PARTIAL,
     STORE_PRIVILEGE_NOT_PROBED,
@@ -360,7 +362,7 @@ from messagefoundry.config.settings import (
     request_host_is_browser_origin,
     security_loosenings,
 )
-from messagefoundry.config.static_credentials import static_credential_hops
+from messagefoundry.config.static_credentials import SETTINGS_PREFIX, static_credential_hops
 from messagefoundry.config.tls_policy import (
     fips_attestation,
     kex_groups_report,
@@ -382,6 +384,7 @@ from messagefoundry.config.wiring import (
     revocation_attested_hops,
     unverified_generic_db_hops,
 )
+from messagefoundry.connection_names import inbound_name_of
 from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.integrity import run_startup_attestation
 from messagefoundry.last_resort import install_loop_exception_handler
@@ -1010,10 +1013,19 @@ def _connection_purge_audit(
     return _row
 
 
-def _purge_in_scope(identity: Identity) -> bool:
-    """Whether ``identity`` may purge an outbound. A purge spans every inbound feeding it, so only an
-    unscoped caller may. Read by the route and by the approval gate, like :func:`_replay_in_scope`."""
+def _cross_channel_in_scope(identity: Identity) -> bool:
+    """Whether ``identity`` may take an action no channel scope can confine, so only an unscoped
+    caller may. A purge spans every inbound feeding its outbound. A reload swaps the whole graph and
+    runs the config's Python, and even its dry run describes every channel (BACKLOG #3189). Read by
+    each route, its core and the approval gate, like :func:`_replay_in_scope`."""
     return identity.allowed_channels is None
+
+
+def _reload_refusal(identity: Identity) -> str | None:
+    """The refusal ``POST /config/reload`` gives ``identity`` whatever it proves, or ``None``. The
+    reload's core refuses on it and ``GET /config/provenance`` reports it as ``reload_refused``, so
+    the console's form cannot disagree with the refusal (BACKLOG #3189)."""
+    return None if _cross_channel_in_scope(identity) else RELOAD_REFUSED_CHANNEL_SCOPED
 
 
 def _purge_hold_params(name: str, scope: str, requester: str) -> dict[str, Any]:
@@ -1410,8 +1422,9 @@ def _build_approval_gate(
         # auditor filtering on the action name sees the released replays too.
         channel_id = p.get("channel_id")
         destination_name = p.get("destination_name")
-        # `.get`, never p["requester"] the way _config_reload reads it below: a request persisted
-        # before the guard started capturing that key carries none. The actor is the REQUESTER,
+        # `.get` with no refusal, unlike _purge and _config_reload below, which refuse a hold naming
+        # no requester (named_requester): a request persisted before the guard started capturing
+        # that key carries none. The actor is the REQUESTER,
         # matching the inline row; no `client` accompanies it, per _record_reload_audit's docstring
         # (ADR 0150).
         requester = p.get("requester")
@@ -1579,7 +1592,7 @@ def _build_approval_gate(
         "Purge queued deliveries to an outbound connection",
         _purge,
         permission=Permission.MESSAGES_PURGE,
-        in_scope=lambda identity, _p: _purge_in_scope(identity),
+        in_scope=lambda identity, _p: _cross_channel_in_scope(identity),
         requires_requester=True,
     )
     gate.register(
@@ -1587,21 +1600,59 @@ def _build_approval_gate(
         "Reload the live config graph (config:deploy)",
         _config_reload,
         permission=Permission.CONFIG_DEPLOY,
+        in_scope=lambda identity, _p: _cross_channel_in_scope(identity),
         requires_requester=True,
     )
     return gate
 
 
-def _posture_security(state: Any) -> SecuritySettings:
+def _posture_security(state: Any, visible: Callable[[str], bool] | None = None) -> SecuritySettings:
     """The ``[security]`` a posture reading judges. BACKLOG #1989: when serve stashed its resolved
     settings, ``[security]`` is read from THAT object, the one the static-credential hops come from, so
     every part of a reading uses one ``[security]``. On the serve path the two stashes are the same
-    object; off it they can differ."""
+    object; off it they can differ.
+
+    ``visible`` (:func:`_posture_visible`) narrows it for a channel-scoped reader (BACKLOG #3189).
+    The static-credential opt-outs are the one ``[security]`` value keyed by connection name, and
+    an opt-out ``visible`` hides is dropped."""
     cred_settings = getattr(state, "static_credential_settings", None)
     if cred_settings is not None:
         security: SecuritySettings = cred_settings.security
+    else:
+        security = getattr(state, "security", None) or SecuritySettings()
+    if visible is None:
         return security
-    return getattr(state, "security", None) or SecuritySettings()
+    accepted = {
+        name: reason
+        for name, reason in security.static_credential_accepted.items()
+        if visible(name)
+    }
+    return security.model_copy(update={"static_credential_accepted": accepted})
+
+
+def _posture_visible(
+    identity: Identity, runner: RegistryRunner | None
+) -> Callable[[str], bool] | None:
+    """Which per-connection report names a posture reader is shown, or ``None`` for an unscoped
+    reader, who is shown every one (BACKLOG #3189). A channel-scoped reader is shown only an inbound
+    in its own scope that the running graph holds, the connections dashboard's rule: an outbound
+    spans channels, and a ``FhirLookup`` is no channel. A ``settings:`` static-credential name is a
+    service-settings hop, which names no connection, so it is shown. Names are read as
+    :func:`~messagefoundry.connection_names.inbound_record_name` spells them."""
+    if identity.allowed_channels is None:
+        return None
+
+    def shown(record: str) -> bool:
+        if record.startswith(SETTINGS_PREFIX):
+            return True
+        name = inbound_name_of(record)
+        if name is None or runner is None or not identity.can_access_channel(name):
+            return False
+        # Read at each call, not once: a reload swaps runner.registry, and the readers this
+        # filters read the graph at their own call, after the route's awaits.
+        return name in runner.registry.inbound
+
+    return shown
 
 
 def _posture_loosenings(
@@ -1612,6 +1663,8 @@ def _posture_loosenings(
     remote_debug: RemoteDebugPosture,
     startup: StartupPosture,
     service_env: ServiceEnvPosture,
+    security: SecuritySettings,
+    visible: Callable[[str], bool] | None = None,
 ) -> tuple[list[tuple[str, str]], str | None]:
     """The active ``security_loosenings()`` entries and the scope note, read off ``state``, plus
     the ``allow_no_auth`` open mode, which is an app opt-in rather than a setting.
@@ -1619,10 +1672,13 @@ def _posture_loosenings(
     ``GET /security/posture`` and the start's ``config_loaded`` audit row (vault BACKLOG #2597) both
     call this, so the row records the list the route would report. ``runner`` and the three process
     readings (vault BACKLOG #2700 / #2701 / #2595) are passed in rather than read here, so a caller that
-    also reports them elsewhere reads each once."""
+    also reports them elsewhere reads each once, ``security`` (:func:`_posture_security`) among them.
+
+    ``visible`` is :func:`_posture_visible` for a channel-scoped reader (BACKLOG #3189). Each
+    per-connection entry then names only the connections it allows, the scope note says the list is
+    narrowed, and an entry left with no connection is dropped."""
     store = getattr(state, "store_settings", None) or StoreSettings()
     cred_settings = getattr(state, "static_credential_settings", None)
-    security = _posture_security(state)
     # #1008: the store-principal privilege OBSERVATION the serve lifespan stashed, or None when no
     # preflight ran in this process; the registry then reports nothing for it.
     store_privilege = getattr(state, "store_privilege", None)
@@ -1657,33 +1713,38 @@ def _posture_loosenings(
     # posture. An engine with no
     # registry runner (an embedding, or an app queried before start) cannot see them at all, so it
     # DECLARES that in `loosenings_scope` rather than returning a settings-only subset that reads as
-    # the whole posture — the same discipline `messagefoundry security show` follows.
-    if runner is not None:
-        cleartext_hops = [name for name, _ in accepted_cleartext_hops(runner.registry)]
-        expired_hops = [name for name, _ in expiry_relaxed_hops(runner.registry)]
-        hostname_hops = [name for name, _ in hostname_unchecked_hops(runner.registry)]
-        query_hops = [name for name, _ in query_credential_hops(runner.registry)]
-        db_hops = [name for name, _ in unverified_generic_db_hops(runner.registry)]
-        attested_hops = [name for name, _ in attested_secure_hops(runner.registry)]
-        revocation_hops = [name for name, _ in revocation_attested_hops(runner.registry)]
-        # Vault BACKLOG #2571. This reader returns plain names already.
-        path_form_hops = path_form_fhir_updates(runner.registry)
-    else:
-        cleartext_hops, expired_hops, hostname_hops, db_hops = [], [], [], []
-        query_hops = []
-        attested_hops, revocation_hops = [], []
-        path_form_hops = []
-    loosenings_scope = (
-        None
-        if runner is not None
-        else (
+    # the whole posture — the same discipline `messagefoundry security show` follows. A narrowed
+    # list for a channel-scoped reader is declared there the same way (BACKLOG #3189).
+    registry = runner.registry if runner is not None else None
+
+    def keep(names: list[str]) -> list[str]:
+        return [name for name in names if visible is None or visible(name)]
+
+    def hops(reader: Callable[[Registry], list[tuple[str, str]]]) -> list[str]:
+        return [] if registry is None else keep([name for name, _ in reader(registry)])
+
+    cleartext_hops = hops(accepted_cleartext_hops)
+    expired_hops = hops(expiry_relaxed_hops)
+    hostname_hops = hops(hostname_unchecked_hops)
+    query_hops = hops(query_credential_hops)
+    db_hops = hops(unverified_generic_db_hops)
+    attested_hops = hops(attested_secure_hops)
+    revocation_hops = hops(revocation_attested_hops)
+    # Vault BACKLOG #2571. This reader returns plain names already.
+    path_form_hops = [] if registry is None else keep(path_form_fhir_updates(registry))
+    notes: list[str] = []
+    if runner is None:
+        notes.append(
             "settings only — no connection graph is loaded on this engine, so the per-connection "
             "cleartext_accepted / tls_allow_expired / tls_check_hostname / url_query_credential / "
             "generic-ODBC-DATABASE-TLS / tls_hop_attested / "
             "tls_revocation_attested / FHIR update_url_form declarations are NOT included "
             "(see `messagefoundry check`)"
         )
-    )
+    if visible is not None:
+        # With no graph too: the [security] opt-outs keyed by connection are still narrowed.
+        notes.append(POSTURE_NARROWED_TO_SCOPE)
+    loosenings_scope = "; ".join(notes) or None
     pairs = list(
         security_loosenings(
             security,
@@ -2570,6 +2631,7 @@ async def _record_start_audit(
             remote_debug=remote_debug_posture(),
             startup=await asyncio.to_thread(startup_posture),
             service_env=await asyncio.to_thread(service_env_posture),
+            security=_posture_security(app.state),
         )
         switches = [name for name, _risk in pairs]
     except Exception:  # noqa: BLE001 - a start must not fail on its own audit row (step 5)
@@ -3941,7 +4003,15 @@ def create_app(
         ``cleartext_accepted`` declarations) is read off THIS process's registry, which in a sharded
         deployment is the shard-filtered graph — so each shard reports its own declared set, not the
         estate's. ``messagefoundry check`` reads the whole config dir and is the estate-wide surface.
-        ``loosenings_scope`` is non-``None`` when this engine has no loaded graph at all."""
+        ``loosenings_scope`` is non-``None`` when this engine has no loaded graph at all, and for a
+        channel-scoped reader.
+
+        **Channel scope (BACKLOG #3189).** A channel-scoped reader is shown a per-connection entry
+        only for an inbound in its own scope that the graph holds, in at least ``loosenings``,
+        ``static_credential_hops``, ``security``'s static-credential opt-outs and the audit row.
+        ``loosenings_scope`` and ``static_credential_hops_scope`` then say the reading is narrowed.
+        The rest is shown whole, and some of it is operator free text, such as an alert rule's id or
+        an attestation reason, which may name a connection."""
         # The live cipher posture (on/off + key fingerprint only). cipher_info() is the public Store
         # accessor — the route never touches engine.store._cipher.
         info = engine.store.cipher_info()
@@ -3959,8 +4029,11 @@ def create_app(
         # the one the static-credential hops below come from, so every part of this response reads one
         # [security]. On the serve path the two stashes are the same object; off it they can differ.
         cred_settings = getattr(request.app.state, "static_credential_settings", None)
-        security = _posture_security(request.app.state)
         runner = engine.registry_runner
+        # BACKLOG #3189: a channel-scoped reader is shown connection names only for an inbound in
+        # its own scope, in every part of this response that names one, and in the audit row.
+        visible = _posture_visible(identity, runner)
+        security = _posture_security(request.app.state, visible)
         # #1008: the store-principal privilege OBSERVATION the serve lifespan stashed. `None` means no
         # preflight ran in this process (an embedding, or an app built without the managed lifespan) —
         # the registry then reports nothing for it and `store_privilege` below renders the explicit
@@ -3984,6 +4057,8 @@ def create_app(
             remote_debug=remote_debug,
             startup=startup,
             service_env=service_env,
+            security=security,
+            visible=visible,
         )
         loosenings = [SecurityLoosening(switch=name, risk=risk) for name, risk in pairs]
         interpreter_view = InterpreterView.from_readings(startup, remote_debug)
@@ -4002,6 +4077,7 @@ def create_app(
             for hop in static_credential_hops(
                 registry=runner.registry if runner is not None else None, settings=cred_settings
             )
+            if visible is None or visible(hop.name)
         ]
         unseen = [
             half
@@ -4022,6 +4098,10 @@ def create_app(
             static_hops_scope = STATIC_CREDENTIAL_HOPS_PARTIAL + "; ".join(unseen)
         else:
             static_hops_scope = STATIC_CREDENTIAL_HOPS_COMPLETE
+        if visible is not None:
+            # Read, then withheld from this reader (BACKLOG #3189), so it is not an unread half. It
+            # leads, so a reading never starts with "complete" for a reader shown less than all.
+            static_hops_scope = POSTURE_NARROWED_TO_SCOPE + "; " + static_hops_scope
         store_privilege_view = (
             StorePrivilegeView(status=STORE_PRIVILEGE_NOT_PROBED)
             if store_privilege is None
@@ -4056,6 +4136,9 @@ def create_app(
                     # observe a different graph after a concurrent reload, and the audit row must record
                     # exactly what the response reports.
                     "loosenings": [entry.switch for entry in loosenings],
+                    # BACKLOG #3189: a channel-scoped reader's list is narrowed, and the row says
+                    # so, so it never reads as the whole posture.
+                    "loosenings_scope": loosenings_scope,
                 }
             ),
             client=client_ip(request),
@@ -4509,35 +4592,61 @@ def create_app(
         # The one refusal a channel-scoped caller gets for a connection it may not reach. It names
         # no reason on purpose: a body naming "shared outbound" would tell an outbound apart from an
         # out-of-scope inbound or a name that exists nowhere (BACKLOG #2551).
+        # A name that fails the connection-name rule is recorded with no channel by the audit
+        # helper itself (BACKLOG #3031).
         await _audit_channel_denied(engine, identity, name, client)
         raise HTTPException(403, "not authorized for this connection")
 
-    async def _guarded_direction(
-        engine: Engine, identity: Identity, name: str, client: str | None
-    ) -> tuple[RegistryRunner, Literal["in", "out"]]:
-        """The runner, and which side of its registry holds ``name``, checked against the caller's channel scope
-        BEFORE its existence is (BACKLOG #2551, #2640).
+    async def _resolve_connection(
+        engine: Engine,
+        identity: Identity,
+        name: str,
+        client: str | None,
+        *,
+        role: str | None = None,
+    ) -> tuple[RegistryRunner | None, Literal["in", "out"] | None]:
+        """The runner, and which side of its registry holds ``name``, decided under the caller's
+        channel scope so that no answer tells a scoped caller which names exist (BACKLOG #2551,
+        #2640). The one scope rule behind :func:`_guarded_direction` and
+        :func:`_dual_role_control`, so the two cannot drift apart (BACKLOG #3031).
 
         A channel-scoped caller reaches only an inbound in its own scope. Every other name gets one
-        answer, :func:`_deny_connection`: an inbound outside its scope, any outbound (an outbound spans
-        channels), and a name that exists nowhere, even one listed in its own scope. Had any of these
-        answered 404, on a first deployment such a caller could tell which names exist by probing.
-        Only an unscoped caller gets 404 for an unknown name. An inbound wins when a name is both, as
-        on the control routes. With no runner the scope is still checked first, so a scoped caller
-        gets the 503 only for a name its scope lists, which tells it nothing it does not know."""
+        answer, :func:`_deny_connection`: an inbound outside its scope, any outbound (an outbound
+        spans channels), and a name that exists nowhere, even one listed in its own scope. Had any
+        of these answered 404, on a first deployment such a caller could tell which names exist by
+        probing. ``role`` ``"source"`` looks only at the inbounds and ``"destination"`` only at the
+        outbounds; ``None`` looks at both, and an inbound wins when a name is both. The refusal does
+        not depend on ``role``: the web console's bulk control always passes one.
+
+        The side is ``None`` for a miss the scope let through: an unscoped caller's, or, with no
+        runner, where no name exists, any name the scope allows."""
         rr = engine.registry_runner
         if rr is None:
             await _control_guard(engine, identity, name, client)
-            raise HTTPException(503, "engine not started")
-        if name in rr.registry.inbound:
+            return None, None
+        if role in (None, "source") and name in rr.registry.inbound:
             await _control_guard(engine, identity, name, client)  # inbound is per-channel
             return rr, "in"
         if identity.allowed_channels is not None:
             # An outbound, or a miss: the answer an out-of-scope inbound gets (BACKLOG #2640).
             await _deny_connection(engine, identity, name, client)
-        if name in rr.registry.outbound:
+        if role in (None, "destination") and name in rr.registry.outbound:
             return rr, "out"
-        raise HTTPException(404, f"no such connection: {name}")
+        return rr, None
+
+    async def _guarded_direction(
+        engine: Engine, identity: Identity, name: str, client: str | None
+    ) -> tuple[RegistryRunner, Literal["in", "out"]]:
+        """The runner, and which side of its registry holds ``name``, through
+        :func:`_resolve_connection`. Only an unscoped caller gets 404 for an unknown name. With no
+        runner the scope is still checked first, so a scoped caller gets the 503 only for a name its
+        scope lists."""
+        rr, side = await _resolve_connection(engine, identity, name, client)
+        if rr is None:
+            raise HTTPException(503, "engine not started")
+        if side is None:
+            raise HTTPException(404, f"no such connection: {name}")
+        return rr, side
 
     async def _dual_role_control(
         engine: Engine,
@@ -4560,12 +4669,10 @@ def create_app(
 
         ``role`` disambiguates a name declared as BOTH an inbound and an outbound: ``"source"`` targets
         only the inbound, ``"destination"`` only the outbound. ``None`` (the bare-name JSON/legacy
-        callers) keeps the inbound-first resolution — a name that is both hits the inbound, unchanged."""
-        rr = engine.registry_runner
-        want_in = role in (None, "source")
-        want_out = role in (None, "destination")
-        if rr is not None and want_in and name in rr.registry.inbound:
-            await _control_guard(engine, identity, name, client)
+        callers) keeps the inbound-first resolution — a name that is both hits the inbound, unchanged.
+        The name and its scope are resolved by :func:`_resolve_connection`."""
+        rr, side = await _resolve_connection(engine, identity, name, client, role=role)
+        if rr is not None and side == "in":
             anchor_refused = False
             try:
                 # An operator door, so it overrides a passive DR standby (vault BACKLOG #3140).
@@ -4595,12 +4702,7 @@ def create_app(
                 engine, identity, name, action, role="source", running=running, client=client
             )
             return {"name": name, "running": running}
-        if rr is not None and identity.allowed_channels is not None:
-            # Past the inbound arm, a channel-scoped user can reach nothing: a shared outbound spans
-            # channels (mirrors purge), and a miss gets the same refusal so that no answer tells an
-            # outbound, an unknown name and an out-of-scope inbound apart (BACKLOG #2551, #2640).
-            await _deny_connection(engine, identity, name, client)
-        if rr is not None and want_out and name in rr.registry.outbound:
+        if rr is not None and side == "out":
             try:
                 if action == "start":
                     await rr.start_outbound(name)
@@ -4626,9 +4728,8 @@ def create_app(
                 engine, identity, name, action, role="destination", running=running, client=client
             )
             return {"name": name, "running": running}
-        # With a runner, only an unscoped user reaches here. With none, no name exists, so a 404
-        # after the scope check tells a scoped user nothing its own scope does not.
-        await _control_guard(engine, identity, name, client)
+        # The resolver has already checked the scope. With a runner, only an unscoped user reaches
+        # here. With none, no name exists, so a 404 tells a scoped user nothing its scope does not.
         raise HTTPException(404, f"no such connection: {name}")
 
     @app.post("/connections/{name}/start")
@@ -4922,7 +5023,7 @@ def create_app(
         before it is held or run."""
         # Both of the core's refusals before its guard, so a doomed purge is never told "held".
         if (
-            _purge_in_scope(identity)
+            _cross_channel_in_scope(identity)
             and _purge_target_refusal(engine.registry_runner, name) is None
         ):
             held = await _rejoin_without_proof(
@@ -4959,7 +5060,7 @@ def create_app(
         action-bound gate, which has already spent the proof."""
         # Purge targets an outbound and spans every inbound feeding it, so it can't be confined to a
         # per-(inbound-)channel scope — a channel-scoped user may not purge a shared outbound.
-        if not _purge_in_scope(identity):
+        if not _cross_channel_in_scope(identity):
             await _audit_channel_denied(engine, identity, name, client_ip(request))
             raise HTTPException(
                 403, "channel-scoped users cannot purge a shared outbound connection"
@@ -5906,14 +6007,18 @@ def create_app(
         included, spends the proof bound to ``config_reload`` first.
 
         Error responses are intentionally generic (the detail is logged server-side, not returned)
-        so a config:deploy holder can't probe the filesystem via reload error text."""
+        so a config:deploy holder can't probe the filesystem via reload error text.
+
+        A channel-scoped caller is refused 403, a dry run included (BACKLOG #3189): see
+        :func:`_cross_channel_in_scope`. The core refuses it after the spend, as purge does."""
         # The core refuses a target the reload would refuse before its guard (vault BACKLOG #2596).
         # Such a request skips the rejoin, as the purge route's _purge_target_refusal does, so a
         # doomed repeat is never told "held"; the core answers it after the spend, as the inline
-        # path does, so the refusal is no cheaper to reach than an inline one.
+        # path does, so the refusal is no cheaper to reach than an inline one. A channel-scoped
+        # caller, whom the core refuses first, skips it the same way.
         hold_params: dict[str, Any] | None = None
         hold_refusal: Exception | None = None
-        if not req.dry_run:
+        if not req.dry_run and _cross_channel_in_scope(user):
             try:
                 hold_params = await _reload_hold_params(engine, gate, req.config_dir, user.username)
             except _RELOAD_REFUSALS as exc:
@@ -5952,6 +6057,12 @@ def create_app(
         the route's rejoin captured, so a first request takes the directory's digest once, and
         ``hold_refusal`` is the refusal taking them met instead. The console passes neither, and
         the params are captured here."""
+        # BACKLOG #3189: here rather than in the route, so the console's path is refused too. The
+        # refusal names no channel, so its audit row carries none.
+        refusal = _reload_refusal(user)
+        if refusal is not None:
+            await _audit_channel_denied(engine, user, None, client_ip(request))
+            raise HTTPException(403, refusal)
         # Hold a real (non-dry-run) reload for a second approver when dual-control gates it. A dry_run
         # is a read-only pre-flight (no swap), so it is never held. The guard runs AFTER the caller's
         # own step-up + config:deploy check (in reload_config, or the console's own gate) — the second
@@ -8462,11 +8573,16 @@ def create_app(
         DRIFTED. No PHI/secrets — a one-way hash + a commit sha; gated by ``monitoring:read`` like
         ``/status`` (no step-up). ``drift`` recomputes the on-disk fingerprint off the event loop and
         compares it to the loaded baseline; it degrades to clean when the baseline is missing or the
-        config dir is unreadable, so a read never raises."""
+        config dir is unreadable, so a read never raises.
+
+        ``reload_refused`` is :func:`_reload_refusal`, the rule the reload itself refuses on, so the
+        console's Reload form follows the engine (BACKLOG #3189)."""
+        reload_refused = _reload_refusal(_user)
         loaded = engine.loaded_config_fingerprint
         fp = loaded.get("fingerprint") if loaded else None
         if not isinstance(fp, str) or not fp:
-            return ConfigProvenance(loaded=False)  # no graph loaded yet, or fingerprint unavailable
+            # No graph loaded yet, or fingerprint unavailable.
+            return ConfigProvenance(loaded=False, reload_refused=reload_refused)
         drift = False
         target = engine.running_config_dir
         if target is not None:
@@ -8484,6 +8600,7 @@ def create_app(
             git_head=git_head if isinstance(git_head, str) else None,
             files=files if isinstance(files, int) else None,
             drift=drift,
+            reload_refused=reload_refused,
         )
 
     # --- engine + DB status --------------------------------------------------
