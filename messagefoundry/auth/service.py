@@ -1865,6 +1865,38 @@ def _directory_answer_mismatch(principal: AdPrincipal, object_id: str) -> str | 
     return None
 
 
+async def _ask_directory[**P, T](call: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs) -> T:
+    """``call`` off the event loop, with any fault it raises read as an :class:`LdapError`.
+
+    BACKLOG #3017 and vault BACKLOG #3100 item 11. A sign-in or step-up leg that catches only
+    ``LdapError`` let any other fault from :class:`LdapAuthenticator` escape as an unhandled error,
+    a 500 with no audit row. ``ldap.py`` maps the directory's own failures, and on purpose leaves a
+    fault such as a ``TypeError`` from a search as itself (BACKLOG #2566), since mapped there the
+    session reconciler would read an engine defect as an outage. These legs grant rather than
+    revoke, so each fails closed on the ``LdapError`` this raises, through its existing handler and
+    audit row. The reconciler's own probe does not use this: ``_probe_principal`` reads such a fault
+    as a probe fault, which alerts.
+
+    **The defect stays visible.** The type is logged at WARNING on every call, and the traceback at
+    DEBUG; the text never reaches the log line, the ``LdapError`` or an audit row, because it can
+    quote a directory value. ``CancelledError`` is not an ``Exception``, so it propagates.
+    """
+    try:
+        return await asyncio.to_thread(call, *args, **kwargs)
+    except LdapError:
+        raise
+    except Exception as exc:
+        kind = type(exc).__name__
+        _log.warning(
+            "directory call %s raised %s; read as the directory not answering, so the request "
+            "is refused",
+            getattr(call, "__name__", "?"),
+            kind,
+        )
+        _log.debug("directory call raised", exc_info=exc)
+        raise LdapError(f"directory call failed: unexpected {kind}") from exc
+
+
 #: How much of a typed username :func:`_credential_lock_key` reads (BACKLOG #1943). Four times the
 #: 256-character column the store keeps, so no real name is cut.
 _CREDENTIAL_KEY_INPUT_MAX = 1024
@@ -4328,7 +4360,7 @@ class AuthService:
                     "<kerberos>", "kerberos", "no_principal", client=client
                 )
                 return LoginOutcome(ok=False, error="SSO authentication failed")
-            principal = await asyncio.to_thread(
+            principal = await _ask_directory(
                 self._ldap.resolve_principal,
                 username,
                 tie_break_object_id=await self._stored_directory_object_id(username),
@@ -4879,7 +4911,7 @@ class AuthService:
         # resolves (BACKLOG #1532). The branch above guarantees the row carries one, so this
         # re-resolve is never keyed on the name alone (BACKLOG #2027).
         try:
-            principal = await asyncio.to_thread(
+            principal = await _ask_directory(
                 self._ldap.resolve_principal, bound.username, object_id=bound.directory_object_id
             )
         except LdapError as exc:
@@ -5363,7 +5395,7 @@ class AuthService:
                 extra=floor_marker,
             )
         try:
-            principal = await asyncio.to_thread(
+            principal = await _ask_directory(
                 self._ldap.resolve_principal, user.username, object_id=user.directory_object_id
             )
         except LdapError as exc:
@@ -6410,7 +6442,7 @@ class AuthService:
         with no readable ``objectGUID`` (:class:`DirectoryObjectIdMissing`, since such a row could
         never take a binding), a name or id a row already holds (:class:`UsernameTaken`), and the
         address rule above. :class:`~messagefoundry.auth.ldap.LdapError` propagates when the
-        directory is unreachable.
+        directory is unreachable, and for any other fault the lookup raises (``_ask_directory``).
 
         The row carries no roles. A directory account's roles come from the AD-group map at each
         sign-in, and no administrator route sets them. Audited as ``user.created`` with
@@ -6422,7 +6454,7 @@ class AuthService:
         name = username.strip()
         if not name:
             raise DirectoryAccountRefused("a directory account name is required")
-        principal = await asyncio.to_thread(self._ldap.resolve_principal, name)
+        principal = await _ask_directory(self._ldap.resolve_principal, name)
         if principal is None:
             raise DirectoryAccountNotFound("the directory returned no enabled account by that name")
         if not principal.directory_object_id:
@@ -10404,7 +10436,7 @@ class AuthService:
         if self._ldap is None:
             return _DirectoryRebind(None, "not_configured")
         try:
-            bind = await asyncio.to_thread(
+            bind = await _ask_directory(
                 self._ldap.authenticate, username, password, object_id=object_id
             )
         except LdapError:
