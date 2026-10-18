@@ -737,6 +737,7 @@ class AlertSink(Protocol):
         baseline_actor: str | None,
         baseline_at: str,
         baseline_node: str | None,
+        comparison: str = "compared",
     ) -> None:
         """This process started with a config whose ADR 0041 D1 fingerprint differs from the store's
         baseline (vault BACKLOG #2597). The baseline is the newest usable ``config_loaded``,
@@ -753,7 +754,13 @@ class AlertSink(Protocol):
         ``baseline_node`` describe the row the older digest came from. Never a path, a git commit
         or message content (no PHI). It is not a connection-scoped event, so no rule's
         ``control_action`` fires on it (BACKLOG #1898). Raised once per start at most, never on a
-        fresh store, a baseline without a digest, or one taken under another fingerprint scheme."""
+        fresh store, a baseline without a digest, or one taken under another fingerprint scheme.
+
+        ``comparison`` is the start's outcome: ``compared``, or a marker that the start's digest
+        left out a file it could not read (``partial_start_digest``), the baseline's did
+        (``partial_baseline``), or the directory changed while the start loaded it
+        (``changed_during_load``). A marker adds to the page; it never suppresses one (vault
+        BACKLOG #2944, #3765)."""
         ...
 
     def leadership_acquired(self, node: str, *, role: str, epoch: int | None = None) -> None:
@@ -1251,10 +1258,11 @@ class LoggingAlertSink:
         baseline_actor: str | None,
         baseline_at: str,
         baseline_node: str | None,
+        comparison: str = "compared",
     ) -> None:
         log.warning(
             "ALERT config_changed: %r %s (this node %s, engine shard %s; baseline actor %s; "
-            "fingerprint %s, previous %s)",
+            "fingerprint %s, previous %s; comparison %s)",
             name,
             config_changed_detail(
                 fingerprint=fingerprint,
@@ -1268,6 +1276,7 @@ class LoggingAlertSink:
             baseline_actor,
             fingerprint,
             previous_fingerprint,
+            comparison,
         )
 
     def leadership_acquired(self, node: str, *, role: str, epoch: int | None = None) -> None:

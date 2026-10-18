@@ -1652,7 +1652,8 @@ newest usable `config_loaded`, `config_reload` or `connection_flag_set` audit ro
 from any node or engine shard, because they all share one config directory. A start that sees a
 change raises `config_changed` once. Its `config_loaded` row records the outcome as `comparison`
 (at least `compared`, `no_start_digest`, `no_baseline`, `degraded_baseline`,
-`scheme_mismatch`, `read_failed`, `partial_start_digest` and `changed_during_load`), plus
+`scheme_mismatch`, `read_failed`, `partial_start_digest`, `partial_baseline` and
+`changed_during_load`), plus
 `previous_fingerprint` and `changed`. Starts that race, such as engine shards
 started together, can each raise it; the alert list folds them into one instance.
 
@@ -1662,24 +1663,28 @@ started together, can each raise it; the alert list folds them into one instance
   when nothing else changed since the load, so a toggle never hides an edit nobody loaded.
 - A fresh store, a baseline row with no fingerprint, or one taken under another fingerprint scheme
   raises nothing. The engine logs that at INFO.
+- Any fingerprint change raises the alert. The markers below add detail to the page, as its
+  `comparison` field, and never stop one (vault BACKLOG #3765).
 - A fingerprint that could not read a file it covers leaves it out and lists it under
-  `unreadable_files` (vault BACKLOG #2944). Two fingerprints are compared only when they left out
-  the same files. A start whose list differs from the baseline's is `partial_start_digest`, logged
-  at WARNING with the files, and marked `baseline_unchecked`; a start that read everything reads a
-  partial baseline as `degraded_baseline`. A file that stays unreadable holds every start unchecked
-  until the look-back window below fills and a start begins a new baseline that left out the same
-  file, so fix the file the WARNING names.
+  `unreadable_files` (vault BACKLOG #2944). It is still compared. A start whose own fingerprint
+  left a file out is `partial_start_digest`, logged at WARNING with the files; a start that read
+  everything and meets a partial baseline is `partial_baseline`. Two fingerprints that left out
+  different files always differ, so a file that an antivirus lock holds at one start and not at the
+  next raises the alert on the same bytes, at the locked start and again at the next whole one. A
+  file that stays unreadable compares like for like from the second start on, so an edit to any
+  file both fingerprints cover still alerts.
 - The start fingerprints the directory just before it loads it and again just after. When the two
-  differ, or the first cannot be taken, the comparison is `changed_during_load` and the row is
-  marked `baseline_unchecked`. When both cover the same files and still differ, `GET
+  differ, or the first cannot be taken, the comparison is `changed_during_load`, and the start is
+  still compared, on the fingerprint taken after the load. When that one matches the baseline but
+  the one taken before the load does not, the alert names the one taken before, since the process
+  may have loaded those bytes. When both cover the same files and still differ, `GET
   /config/provenance` also has no loaded fingerprint to vouch for until the next reload. The two
   reads miss at least an edit that lands and is reverted between them, and a module the loader runs
   from a still-valid `__pycache__` bytecode file rather than from its source.
 - The check is alert-only. A baseline read that fails or takes over five seconds is logged at
   WARNING, and the start goes on.
-- A start that never checked its config, because its read failed, it took no fingerprint, its
-  fingerprint is partial and left out other files than the baseline's, or its directory changed
-  while it loaded, marks its own row `baseline_unchecked`, and every flag toggle row that process writes too. A
+- A start that never checked its config, because its read failed or it took no fingerprint,
+  marks its own row `baseline_unchecked`, and every flag toggle row that process writes too. A
   later start passes over those rows, and over any row whose detail is not a JSON object (at
   WARNING), and compares against the newest usable row before them. So the change the unchecked
   start could not see is reported by the next start that can read. A config reload's row is
@@ -1700,8 +1705,9 @@ started together, can each raise it; the alert list folds them into one instance
   (vault BACKLOG #3076). Its actor is `system:cluster-convergence` and its `initiator` is
   `cluster_convergence`. So the store's newest baseline names the graph the node converged on,
   whether the reload lands before or after the start's row. A convergence row that could not take
-  a fingerprint, or took a partial one, is marked `baseline_unchecked`, so a later start passes
-  over it.
+  a fingerprint is marked `baseline_unchecked`, so a later start passes over it. One that took a
+  partial fingerprint is a baseline like any other. The row names the fingerprint that reload
+  took, and is marked `superseded` when a later reload or flag toggle moved the engine on first.
 - The pass-over looks through the newest 50 config rows at most. If none is usable, the start
   begins a new baseline and says at WARNING that a change made before those rows is not reported.
 
