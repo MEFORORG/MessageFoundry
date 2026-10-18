@@ -152,6 +152,7 @@ from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
     AdMap,
+    AdminGrant,
     AdminRemoval,
     AuditAppend,
     ChannelScopeSource,
@@ -532,6 +533,30 @@ _BreakerStanding = Literal["fresh", "tripped", "forfeit"]
 #: `AuthService._reconcile_referral_standing`, the same rule for the referral's own instance
 #: (BACKLOG #2538). Only ``"referred"`` may resolve it.
 _ReferralStanding = Literal["fresh", "referred", "forfeit"]
+#: The three standings above, as `AuthService._reconcile_episodes` keys them (BACKLOG #3083).
+_EpisodeKind = Literal["breaker", "referral", "hold"]
+#: What a forfeited standing logs when a new condition of its kind opens (BACKLOG #3083). Why a
+#: restarted process does not resolve an instance it finds open: `AuthService._mark_reconcile_clears`.
+_FORFEITED_EPISODE_WARNINGS: Final[dict[_EpisodeKind, str]] = {
+    "breaker": (
+        "directory reconcile: the breaker tripped after this process gave up resolving "
+        "ad_reconcile_aborted, so it will not resolve this trip's alert itself; once the "
+        "directory reads clean, resolve any open instance by hand, because a restarted process "
+        "does not resolve one it finds open"
+    ),
+    "referral": (
+        "directory reconcile: an LDAP referral opened after this process gave up resolving the "
+        "referral's ad_reconcile_aborted instance, so it will not resolve this one itself; once "
+        "the search bases are fixed, resolve any open instance by hand, because a restarted "
+        "process does not resolve one it finds open"
+    ),
+    "hold": (
+        "directory reconcile: the undetermined userAccountControl hold engaged after this process "
+        "gave up resolving ad_reconcile_held, so it will not resolve this hold itself; once the "
+        "attribute reads clean, resolve any open instance by hand, because a restarted process "
+        "does not resolve one it finds open"
+    ),
+}
 
 
 def _advance_watched[S: (_BreakerStanding, _ReferralStanding)](
@@ -1855,6 +1880,38 @@ def _directory_answer_mismatch(principal: AdPrincipal, object_id: str) -> str | 
     return None
 
 
+async def _ask_directory[**P, T](call: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs) -> T:
+    """``call`` off the event loop, with any fault it raises read as an :class:`LdapError`.
+
+    BACKLOG #3017 and vault BACKLOG #3100 item 11. A sign-in or step-up leg that catches only
+    ``LdapError`` let any other fault from :class:`LdapAuthenticator` escape as an unhandled error,
+    a 500 with no audit row. ``ldap.py`` maps the directory's own failures, and on purpose leaves a
+    fault such as a ``TypeError`` from a search as itself (BACKLOG #2566), since mapped there the
+    session reconciler would read an engine defect as an outage. These legs grant rather than
+    revoke, so each fails closed on the ``LdapError`` this raises, through its existing handler and
+    audit row. The reconciler's own probe does not use this: ``_probe_principal`` reads such a fault
+    as a probe fault, which alerts.
+
+    **The defect stays visible.** The type is logged at WARNING on every call, and the traceback at
+    DEBUG; the text never reaches the log line, the ``LdapError`` or an audit row, because it can
+    quote a directory value. ``CancelledError`` is not an ``Exception``, so it propagates.
+    """
+    try:
+        return await asyncio.to_thread(call, *args, **kwargs)
+    except LdapError:
+        raise
+    except Exception as exc:
+        kind = type(exc).__name__
+        _log.warning(
+            "directory call %s raised %s; read as the directory not answering, so the request "
+            "is refused",
+            getattr(call, "__name__", "?"),
+            kind,
+        )
+        _log.debug("directory call raised", exc_info=exc)
+        raise LdapError(f"directory call failed: unexpected {kind}") from exc
+
+
 #: How much of a typed username :func:`_credential_lock_key` reads (BACKLOG #1943). Four times the
 #: 256-character column the store keeps, so no real name is cut.
 _CREDENTIAL_KEY_INPUT_MAX = 1024
@@ -2752,6 +2809,18 @@ class AuthService:
         #: ``"fresh"``: no pass here saw a referral. ``"referred"``: one did. ``"forfeit"``: see
         #: `_forfeit_clears_on_attrition`. Only `_advance_referral_standing` moves it.
         self._reconcile_referral_standing: _ReferralStanding = "fresh"
+        #: The accounts behind the trip, referral and hold now open, kept only so that a forfeited
+        #: standing logs once per new one (BACKLOG #3083). Logging state: no decision reads it.
+        #: Not `_reconcile_unconfirmed` or `_reconcile_referred`: those leave id-less rows out and
+        #: end an account's part only on a PRESENT read, which would leave a trip of id-less rows
+        #: never open and an account that never reads PRESENT keeping one open for good.
+        #: `_track_reconcile_episodes` is the only writer besides the attrition prune, and states
+        #: when one opens and ends.
+        self._reconcile_episodes: dict[_EpisodeKind, set[str]] = {
+            "breaker": set(),
+            "referral": set(),
+            "hold": set(),
+        }
         #: Latched probe fault (BACKLOG #3100): set on a pass in which a probe faulted, and released
         #: by the next pass that judged something with no fault (`_record_reconcile_fault`).
         self._reconcile_fault_alert: str | None = None
@@ -3310,13 +3379,16 @@ class AuthService:
                 "that authenticator code was already used on this account; no password was set. "
                 "Wait for the next code and run the command again"
             )
+        # BACKLOG #3078: kept, because the grant below is bound to the credentials this run wrote.
+        password_hash = await self._argon2(hash_password, password)
         await self._store.set_password(
             user_id,
-            password_hash=await self._argon2(hash_password, password),
+            password_hash=password_hash,
             must_change_password=False,
             password_generated=False,
         )
         plain_codes: tuple[str, ...] = ()
+        staged_cell: str | None = None
         if totp_secret is not None and matched_step is not None:
             # Enrolled BEFORE the role, which stays last, so every interruption still leaves a
             # roleless row a re-run completes -- and the repair branch above clears a half-enrolled
@@ -3364,6 +3436,11 @@ class AuthService:
         # was never told. An earlier slot would tell them of a takeover that a later refusal leaves
         # unfinished. A refusal above, on the repair branch, has still cleared their factors and
         # sessions and tells nobody; that predates #2915 and is shipped open.
+        # BACKLOG #3078 adds at least two refusals after this slot: the guarded grant below, which a
+        # race can refuse, and its fail-closed refusal of an unexpected outcome. On the repair
+        # branch either refusal leaves the notice sent and the address replaced,
+        # as the crash #2915 names does, and a re-run then reads the operator's address as the
+        # earlier holder's. It is shipped open: the grant has to stay last (see there).
         # Two at-least-once costs remain, and no state records a sent notice. A crash between this
         # notice and the address write sends the earlier holder a second notice on the re-run. A
         # crash after the address write makes the re-run send one to the operator's own address,
@@ -3397,7 +3474,64 @@ class AuthService:
             # seeded the same value; on a REPAIRED row an earlier run created the account, so this
             # write is the only one that carries it.
             await self._store.set_user_notify_email(user_id, email=notify_email)
-        await self._store.set_user_roles(user_id, [Role.ADMINISTRATOR.value], assigned_by=actor)
+        # BACKLOG #3078: the refusal at the top is a read, and the account writes came in later
+        # awaits, so two runs with different usernames could each pass it and each grant. The grant
+        # re-checks under the last-administrator guard's lock, in the transaction that writes it,
+        # so the run whose grant commits second is refused. It is also bound to the password and the
+        # TOTP cell this run wrote, and refuses a row that already holds a role: two runs on ONE row
+        # can interleave so that one run's password sits beside the other's TOTP before either
+        # grant, and then neither run is granted. A run on ONE row whose writes land after the
+        # other's grant committed can still overwrite that Administrator's credentials, because
+        # the writes above are not conditional on the row being roleless; that window is open and
+        # is the same-username race's, not this one's. A loser was refused after
+        # its credential writes rather than before them, because the role stays last (ADR 0183):
+        # granted first, a crash would leave an Administrator with no credential and a store this
+        # command then refuses. Its account therefore holds no role, and nothing it wrote is undone:
+        # a compare-free undo of the password could erase the winner's on a row both runs wrote.
+        # Typed ``object``, not ``AdminGrant``: narrowed by the three checks below, the enum would
+        # make mypy read the fail-closed block as unreachable and stop checking it.
+        grant: object = await self._store.grant_first_admin_unless_admin_exists(
+            user_id,
+            admin_role_id=Role.ADMINISTRATOR.value,
+            expected_password_hash=password_hash,
+            expected_totp_secret_cell=staged_cell,
+            assigned_by=actor,
+        )
+        if grant is AdminGrant.ADMIN_EXISTS:
+            raise FirstAdministratorRefused(
+                "another enabled Administrator was created while this command ran, so this run "
+                f"granted no role, and the account named {username!r} holds none; remove any "
+                "authenticator entry it showed. If this run created that account and nobody needs "
+                "it, delete it from the web console"
+            )
+        if grant is AdminGrant.ACCOUNT_CHANGED:
+            raise FirstAdministratorRefused(
+                "the account was changed or removed while this command ran, so this run granted "
+                "no role; remove any authenticator entry it showed. If another provision-admin run "
+                "is in progress, let it finish. Then run the command again"
+            )
+        if grant is not AdminGrant.GRANTED:
+            # Fail closed: only GRANTED is success. Any other value -- an outcome added later, or a
+            # store answering out of contract -- is refused, so no recovery codes are shown and no
+            # provisioned row is written. No audit row records this refusal, so the ERROR line is
+            # its only trace and is written FIRST, before any later await can raise past it. The
+            # outcome is logged as a member's name or a type name, never a repr, because an
+            # out-of-contract value could carry what the grant was handed. The name is scrubbed
+            # over its repr, so it reads as ``%r`` wrote it (see ``scrub_log_argument``).
+            _log.error(
+                "first-admin grant for %s returned unexpected outcome %s; refused",
+                scrub_log_argument(repr(username)),
+                grant.name if isinstance(grant, AdminGrant) else type(grant).__name__,
+            )
+            if repaired:
+                # The repair branch's second revoke, as on success below, and ahead of the read
+                # below so a read that raises cannot skip it. Harmless if no role was written.
+                await self._store.revoke_user_sessions(user_id)
+            raise FirstAdministratorRefused(
+                await self._unexpected_grant_refusal(
+                    username, user_id, enrolled=totp_secret is not None
+                )
+            )
         if repaired:
             # AGAIN, after the role (ADR 0197 Amendment A, AC-A5). The earlier holder's password
             # still worked until ``set_password`` above, so a sign-in in that window minted a session
@@ -3427,6 +3561,60 @@ class AuthService:
             repaired=repaired,
             holder_notice=holder_notice,
             recovery_codes=plain_codes,
+        )
+
+    async def _unexpected_grant_refusal(
+        self, username: str, user_id: str, *, enrolled: bool
+    ) -> str:
+        """The operator-facing text for a first-admin grant that answered out of contract (#3078).
+
+        Such a store MAY still have written a role, so the row is read again, through the same
+        seal-checked loader a re-run uses, and the advice matches what it holds. The read runs
+        after the grant's transaction, so it can also see another run's work; the text says
+        "may" for that reason. "Keep the entry and re-run" is wrong in at least two states: a re-run
+        refuses a row that holds the Administrator role, and on a roleless row it clears the
+        authenticator this run enrolled.
+        """
+        prefix = (
+            "the role grant returned an unexpected outcome, so this run showed no recovery codes "
+            f"for the account named {username!r}"
+        )
+        again = (
+            "If the command is refused the same way again, the store has a fault this command "
+            "cannot repair"
+        )
+        lookup = await self._lookup_by_username(username)
+        row = lookup.user
+        if row is None or row.id != user_id:
+            return f"{prefix}, and could not read what that account holds now. {again}"
+        if Role.ADMINISTRATOR.value in row.role_ids:
+            if not enrolled:
+                return (
+                    f"{prefix}. That account holds the Administrator role, so an Administrator may "
+                    "now exist under this name; this run enrolled no authenticator"
+                )
+            return (
+                f"{prefix}. That account holds the Administrator role, so an Administrator may now "
+                "exist under this name. If no other provision-admin run used this name, replace "
+                "its authenticator seed and get recovery codes with `messagefoundry "
+                "admin-reset-totp`, naming that account and giving the same --db and "
+                "--service-config as this run"
+            )
+        if await self.has_enabled_administrator():
+            return (
+                f"{prefix}. That account holds no Administrator role, and another enabled "
+                "Administrator now exists; remove any authenticator entry this run showed. If "
+                "nobody needs that account, delete it from the web console"
+            )
+        if row.role_ids:
+            return (
+                f"{prefix}. That account holds a role other than Administrator, so the command "
+                "refuses it; remove any authenticator entry this run showed, and run the command "
+                "again with another username"
+            )
+        return (
+            f"{prefix}. That account holds no role; remove any authenticator entry this run "
+            f"showed, then run the command again. {again}"
         )
 
     async def _existing_row_refusal(
@@ -4306,7 +4494,7 @@ class AuthService:
                     "<kerberos>", "kerberos", "no_principal", client=client
                 )
                 return LoginOutcome(ok=False, error="SSO authentication failed")
-            principal = await asyncio.to_thread(
+            principal = await _ask_directory(
                 self._ldap.resolve_principal,
                 username,
                 tie_break_object_id=await self._stored_directory_object_id(username),
@@ -4857,7 +5045,7 @@ class AuthService:
         # resolves (BACKLOG #1532). The branch above guarantees the row carries one, so this
         # re-resolve is never keyed on the name alone (BACKLOG #2027).
         try:
-            principal = await asyncio.to_thread(
+            principal = await _ask_directory(
                 self._ldap.resolve_principal, bound.username, object_id=bound.directory_object_id
             )
         except LdapError as exc:
@@ -5341,7 +5529,7 @@ class AuthService:
                 extra=floor_marker,
             )
         try:
-            principal = await asyncio.to_thread(
+            principal = await _ask_directory(
                 self._ldap.resolve_principal, user.username, object_id=user.directory_object_id
             )
         except LdapError as exc:
@@ -6388,7 +6576,7 @@ class AuthService:
         with no readable ``objectGUID`` (:class:`DirectoryObjectIdMissing`, since such a row could
         never take a binding), a name or id a row already holds (:class:`UsernameTaken`), and the
         address rule above. :class:`~messagefoundry.auth.ldap.LdapError` propagates when the
-        directory is unreachable.
+        directory is unreachable, and for any other fault the lookup raises (``_ask_directory``).
 
         The row carries no roles. A directory account's roles come from the AD-group map at each
         sign-in, and no administrator route sets them. Audited as ``user.created`` with
@@ -6400,7 +6588,7 @@ class AuthService:
         name = username.strip()
         if not name:
             raise DirectoryAccountRefused("a directory account name is required")
-        principal = await asyncio.to_thread(self._ldap.resolve_principal, name)
+        principal = await _ask_directory(self._ldap.resolve_principal, name)
         if principal is None:
             raise DirectoryAccountNotFound("the directory returned no enabled account by that name")
         if not principal.directory_object_id:
@@ -6711,9 +6899,18 @@ class AuthService:
                 continue
             candidates.append((user.id, user.username))
             users[user.id] = user
+        # BACKLOG #3083. Read before the forfeit below: a standing that forfeits on this pass, over
+        # a condition still open, has just logged so, and does not also log it as a new one.
+        forfeited = self._forfeited_reconcile_standings()
+        open_before = frozenset(
+            kind for kind, accounts in self._reconcile_episodes.items() if accounts
+        )
         # Before the prunes, which drop the outcomes it reads. And before the no-candidate return
         # below, so a pass with nobody signed in still records who left.
         self._forfeit_clears_on_attrition(users)
+        for episode in self._reconcile_episodes.values():
+            episode.intersection_update(users)  # an account that left ends its part (#3083)
+        announced = (self._forfeited_reconcile_standings() - forfeited) & open_before
         reconcile.prune_ledger(self._reconcile_strikes, users, rank=float)
         reconcile.prune_ledger(self._reconcile_last_probed, users, rank=float)
         reconcile.prune_ledger(self._reconcile_outcomes, users, rank=reconcile.outcome_rank)
@@ -6828,7 +7025,7 @@ class AuthService:
             if outcome is reconcile.ProbeOutcome.PRESENT
         }
         if plan.aborted is None:
-            self._reconcile_unconfirmed -= read_present
+            self._reconcile_unconfirmed.difference_update(read_present)
         elif not plan.judged_nothing:
             self._reconcile_unconfirmed = set(keyed)
             self._advance_breaker_standing("tripped")
@@ -6839,7 +7036,10 @@ class AuthService:
             self._reconcile_referred = set(keyed)
             self._advance_referral_standing("referred")
         else:
-            self._reconcile_referred -= read_present
+            self._reconcile_referred.difference_update(read_present)
+        # BACKLOG #3083. After every decision above, so its log line cannot skip one, and before
+        # anything below can raise or return, so every pass that judged or saw a condition counts.
+        self._track_reconcile_episodes(plan, users, announced=announced)
         referral = next((p for p in probes if p.outcome is reconcile.ProbeOutcome.REFERRED), None)
         if plan.aborted is not None:
             if not plan.directory_referral and not plan.probe_fault:
@@ -7100,6 +7300,18 @@ class AuthService:
         long trip or referral forfeits its clear. This is one process's memory: what leaves across
         a restart is not seen here. The rule in `_mark_reconcile_clears` covers that case, because
         a fresh process resolves nothing an earlier run left open.
+
+        **Why the forfeit lasts until a restart (BACKLOG #3083, kept by a Manager ruling).** A false
+        clear would come exactly when the accounts behind the alert have left, and after that no
+        pass probes them, so nothing raises the alert again and the fault would stand with its alert
+        resolved. A missed clear hides less: an alert resolved by hand opens again on the next
+        pass that returns its plan and sees the condition (``api/app.py::_alert_reconcile_plan``
+        says which). That pass may be some way off, under a probe sample that misses the
+        condition's accounts or a pass that raises; until then a hand-resolved alert stays
+        resolved.
+
+        **A forfeited standing logs once when a new trip, hold or referral opens, not once per
+        pass (BACKLOG #3083).** `_track_reconcile_episodes` says when one opens and ends.
         """
         if not self._reconcile_unconfirmed <= users.keys():
             self._advance_breaker_standing("forfeit")
@@ -7114,6 +7326,77 @@ class AuthService:
             if user_id not in users
         ):
             self._advance_hold_standing("forfeit")
+
+    def _forfeited_reconcile_standings(self) -> frozenset[_EpisodeKind]:
+        """The standings that have given up their clear (BACKLOG #3083)."""
+        standings: dict[_EpisodeKind, str] = {
+            "breaker": self._reconcile_breaker_standing,
+            "referral": self._reconcile_referral_standing,
+            "hold": self._reconcile_hold_standing,
+        }
+        return frozenset(kind for kind, standing in standings.items() if standing == "forfeit")
+
+    def _track_reconcile_episodes(
+        self,
+        plan: reconcile.ReconcilePlan,
+        users: Mapping[str, UserRecord],
+        *,
+        announced: frozenset[_EpisodeKind],
+    ) -> None:
+        """Open or end this pass's trip, referral and hold episodes, and log a new one that a
+        forfeited standing will not resolve (BACKLOG #3083). **Logging only:** nothing that
+        revokes, holds or clears reads ``_reconcile_episodes``.
+
+        One WARNING per new condition, not one per pass, so a standing condition does not flood the
+        log. An episode is the set of accounts behind its condition.
+
+        * It opens on a pass that sees the condition, when none is open. Each such pass sets it
+          again: for a trip or a referral, every candidate, id-less rows too, so a trip of id-less
+          rows alone is still one trip; for a hold, every account whose answer on record is
+          undetermined, which is what the hold counts.
+        * An account ends its part when it leaves (the prune before the pass), or when a pass that
+          judged accounts reads an answer for it without seeing the condition: a pass that was not
+          aborted for a trip, one with no referral for a referral. Any answer on the outcome record
+          counts, a held one too, so an account that never reads PRESENT does not keep a trip or a
+          referral open for good. For a hold the answer must not be undetermined: a lone account
+          that is held, then strikes, then is held again is one hold, not one per flap. A probe
+          that reached no answer (unavailable, referred, faulted), a probe sample that misses the
+          accounts, and a pass that judged nothing end nothing, so one condition seen across a
+          rotation or an outage stays one episode.
+
+        The line is said by a standing that has forfeited, except one in ``announced``: it
+        forfeited on this pass over an episode still open, and its forfeit line has just said so.
+        """
+        seen: dict[_EpisodeKind, bool] = {
+            "breaker": plan.aborted is not None and not plan.judged_nothing,
+            "referral": bool(plan.referred),
+            "hold": plan.hold,
+        }
+        undetermined = reconcile.ProbeOutcome.UNDETERMINED
+        forfeited = self._forfeited_reconcile_standings()
+        opened: list[_EpisodeKind] = []
+        for kind, seen_now in seen.items():
+            episode = self._reconcile_episodes[kind]
+            if seen_now:
+                if not episode and kind in forfeited and kind not in announced:
+                    opened.append(kind)
+                episode.clear()
+                if kind == "hold":
+                    episode.update(
+                        uid
+                        for uid, outcome in self._reconcile_outcomes.items()
+                        if outcome is undetermined
+                    )
+                else:
+                    episode.update(users)
+            elif kind == "hold":
+                episode.difference_update(
+                    uid for uid, outcome in plan.outcomes.items() if outcome is not undetermined
+                )
+            elif not plan.judged_nothing:
+                episode.difference_update(plan.outcomes)
+        for kind in opened:  # after the state, so a raising log handler cannot skip it
+            _log.warning(_FORFEITED_EPISODE_WARNINGS[kind])
 
     def _advance_breaker_standing(self, event: _BreakerStanding) -> None:
         """Move ``_reconcile_breaker_standing`` on ``event`` (BACKLOG #2136), the only place it moves.
@@ -10286,7 +10569,7 @@ class AuthService:
         if self._ldap is None:
             return _DirectoryRebind(None, "not_configured")
         try:
-            bind = await asyncio.to_thread(
+            bind = await _ask_directory(
                 self._ldap.authenticate, username, password, object_id=object_id
             )
         except LdapError:
