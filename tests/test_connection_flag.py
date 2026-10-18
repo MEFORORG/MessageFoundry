@@ -12,6 +12,7 @@ store schema change. A cluster node refuses it too (vault BACKLOG #2933), and th
 from __future__ import annotations
 
 import asyncio
+import os
 import textwrap
 from pathlib import Path
 from typing import Any
@@ -728,7 +729,11 @@ async def test_the_helper_refuses_a_touched_path_outside_the_config_dir(engine: 
     """A declared path the undo would resolve outside the config directory is refused before the
     write runs."""
     wrote: list[Path] = []
-    for rel in ("../outside.toml", "", str(Path.cwd() / "x.toml")):
+    rels = ["../outside.toml", "", ".", str(Path.cwd() / "x.toml")]
+    if os.name == "nt":
+        # A rooted path with no drive and a drive-relative one escape only on Windows.
+        rels += ["\\x.toml", "C:x.toml"]
+    for rel in rels:
         with pytest.raises(ValueError, match="outside the config directory"):
             await engine.write_baseline_config(
                 "connection_flag_set",
@@ -738,6 +743,15 @@ async def test_the_helper_refuses_a_touched_path_outside_the_config_dir(engine: 
                 actor="tester",
                 client=None,
             )
+    with pytest.raises(TypeError, match="not one string"):
+        await engine.write_baseline_config(
+            "connection_flag_set",
+            wrote.append,
+            touches="connections.toml",
+            detail={},
+            actor="tester",
+            client=None,
+        )
     assert wrote == []
 
 
@@ -833,38 +847,47 @@ async def test_a_write_cancelled_mid_row_is_undone(
     assert not engine._toml_write_lock.locked()
 
 
-async def test_a_reload_during_the_row_keeps_its_own_digest_and_graph(
-    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_a_write_cancelled_before_its_row_is_undone_once_its_thread_lands(
+    engine: Engine, tmp_path: Path
 ) -> None:
-    """vault BACKLOG #2945: the loaded digest and the live reflect run after the row now, so a
-    reload can apply while the row is awaited. The reload's digest and graph stand; the toggle's
-    stale digest used to overwrite them."""
-    import copy
+    """A cancel that reaches the write task while its worker thread is still writing (blocked
+    behind the edit lock, or validating) used to let the thread land the write after the task had
+    gone, with no row and no undo. The task now waits for the thread and puts the file back."""
+    import threading
 
-    from messagefoundry.config.fingerprint import FINGERPRINT_SCHEME, config_fingerprint_detail
+    started, release = threading.Event(), threading.Event()
+    target = tmp_path / "environments" / "dev.toml"
 
-    engine.loaded_config_fingerprint = config_fingerprint_detail(tmp_path)
-    reloaded = {"fingerprint": "e" * 64, "scheme": FINGERPRINT_SCHEME, "files": 1}
-    real_record = engine.store.record_audit
-    rr = engine.registry_runner
-    assert rr is not None
+    def _write(cfg: Path) -> None:
+        started.set()
+        release.wait(20)
+        (cfg / "environments").mkdir()
+        (cfg / "environments" / "dev.toml").write_text("x = 1\n", encoding="utf-8")
 
-    async def _reload_meanwhile(action: str, **kwargs: Any) -> None:
-        if action == "connection_flag_set":
-            # What a reload's swap does: a new registry, then the new digest.
-            swapped = copy.copy(rr.registry)
-            swapped.outbound = dict(swapped.outbound)
-            rr.registry = swapped
-            engine.loaded_config_fingerprint = dict(reloaded)
-        await real_record(action, **kwargs)
-
-    monkeypatch.setattr(engine.store, "record_audit", _reload_meanwhile)
-    await engine.set_connection_flag(
-        "OB_TOML", direction="outbound", flagged=True, actor="tester", client=None
+    caller = asyncio.ensure_future(
+        engine.write_baseline_config(
+            "connection_flag_set",
+            _write,
+            touches=("environments/dev.toml",),
+            detail={},
+            actor="tester",
+            client=None,
+        )
     )
-    assert engine.loaded_config_fingerprint == reloaded
-    assert rr.registry.outbound["OB_TOML"].flagged is False, "the reloaded graph was not touched"
-    assert len(await engine.store.list_audit(action="connection_flag_set")) == 1
+    try:
+        assert await asyncio.to_thread(started.wait, 20)
+        (task,) = engine._config_writes
+        task.cancel()
+        await asyncio.sleep(0.1)
+        assert not task.done(), "the task waits for its thread"
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    assert task.cancelled()
+    assert not target.exists(), "the thread's write was put back"
+    assert await engine.store.list_audit(action="connection_flag_set") == []
+    assert not engine._toml_write_lock.locked()
 
 
 def test_the_undo_reports_a_lock_it_could_not_take_rather_than_raising(

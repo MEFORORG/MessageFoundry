@@ -1665,7 +1665,7 @@ started together, can each raise it; the alert list folds them into one instance
   when nothing else changed since the load, so a toggle never hides an edit nobody loaded.
 - A toggle whose row fails, is not recorded within 10 seconds, or is cancelled by a shutdown is
   refused, and the engine tries to put `connections.toml` back as it was (vault BACKLOG #2945).
-  The API answers 503. The next start reports a config change whenever the disk and the newest
+  The API answers a failed or late row 503. The next start reports a config change whenever the disk and the newest
   row still disagree, which happens in at least these cases: another edit changed the file in the
   meantime, and it is left as that edit wrote it and logged; the engine could not read, lock or
   write the file to put it back; the process stopped before the row; or the store committed the

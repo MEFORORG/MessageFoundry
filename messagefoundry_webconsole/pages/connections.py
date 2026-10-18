@@ -554,9 +554,9 @@ def flag_not_recorded(name: str, detail: str) -> Markup:
         el("p", text(detail), class_="muted"),
         el(
             "p",
-            "The audit log did not answer, so the change was undone. Try again. If the message "
-            "above says the change could not be fully undone, the next engine start reports a "
-            "config change, and the engine log names the file.",
+            "The audit log did not record the change, so the engine undid it, unless the "
+            "message above says it could not be fully undone. Then the next engine start "
+            "reports a config change, and the engine log names the file. Try again.",
             class_="muted",
         ),
         el("p", el("a", "Back to Connections", href="/ui")),

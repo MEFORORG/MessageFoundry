@@ -91,6 +91,6 @@ async def test_ui_flag_names_the_fix_for_a_toggle_the_audit_log_did_not_record(
             headers=SAME_ORIGIN,
         )
     assert r.status_code == 200, r.text[:300]
-    assert "The audit log did not answer, so the change was undone. Try again." in r.text
+    assert "The audit log did not record the change, so the engine undid it" in r.text
     assert "was not recorded within 10 s" in r.text
     assert "code-first connection" not in r.text and "cluster node" not in r.text

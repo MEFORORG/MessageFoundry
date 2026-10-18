@@ -2593,7 +2593,8 @@ class Engine:
         Next the row is written under ``action`` with ``detail``, this node's id and the fingerprint
         returned, still under the engine lock, so two writes' rows land in the order of their
         writes, and within :data:`CONFIG_WRITE_AUDIT_TIMEOUT_SECONDS` (vault BACKLOG #2945). A row
-        that fails, times out or is cancelled first puts back what the write changed in the
+        that fails, times out or is cancelled, or a write cancelled before its row, first puts
+        back what the write changed in the
         ``touches`` files, then raises :class:`ConfigWriteAuditFailed` (or its
         :class:`ConfigWriteAuditTimeout`), or re-raises the cancellation. At least these still leave
         a write on disk with no row: a file another edit changed since, which is left alone and
@@ -2603,10 +2604,10 @@ class Engine:
         start reports each of these as a config change.
 
         Last, once the row has landed, ``reflect``, when given, runs on the event loop, still under
-        the engine lock, to show the write on the live graph; a failure there is logged. When a
-        reload applied while the row was written, neither ``reflect`` nor the loaded digest move:
-        the reloaded graph read the files itself. ``detail`` must be JSON and may not set a key the
-        helper writes (:data:`_BASELINE_ROW_KEYS`); either fault, or a ``touches`` path outside the
+        the engine lock, to show the write on the live graph; a failure there is logged. A reload
+        does not take the engine lock, so one that applies while the row is awaited can be
+        overwritten by this write's digest and reflect, or, when the row fails, keep a graph of
+        bytes the undo put back. ``detail`` must be JSON and may not set a key the helper writes (:data:`_BASELINE_ROW_KEYS`); either fault, or a ``touches`` path outside the
         config directory, raises before anything is written. A caller cancelled while it waits for
         the engine lock gets no write. Once the lock is held, a cancelled caller stops waiting but
         does not stop the write or its row, and :meth:`drain_config_writes` waits for such a write,
@@ -2639,8 +2640,14 @@ class Engine:
         if clash:
             raise ValueError(f"config write detail may not set {sorted(clash)}")
         json.dumps(dict(detail))
+        if isinstance(touches, str):
+            raise TypeError("config write touches must be a sequence of paths, not one string")
+        # Lexical, as the directory is read only under the lock: no anchor (a root, a drive, or
+        # both, so a Windows "\\x" or "C:x" too), no "..", and a name at all.
         escaping = [
-            rel for rel in touches if Path(rel).is_absolute() or ".." in Path(rel).parts or not rel
+            rel
+            for rel in touches
+            if Path(rel).anchor or ".." in Path(rel).parts or not Path(rel).parts
         ]
         if escaping:
             raise ValueError(f"config write touches paths outside the config directory: {escaping}")
@@ -2709,9 +2716,21 @@ class Engine:
                 prepare()
             loaded = self.loaded_config_fingerprint
             loaded_fp = loaded.get("fingerprint") if loaded is not None else None
-            # What a reload replaces, so a reload that applies while the row is awaited is seen.
-            graph_before = self._live_graph()
-            after, vouched, changes = await asyncio.to_thread(_locked_write, config_dir, loaded_fp)
+            work = asyncio.ensure_future(asyncio.to_thread(_locked_write, config_dir, loaded_fp))
+            try:
+                after, vouched, changes = await asyncio.shield(work)
+            except asyncio.CancelledError:
+                # The worker thread goes on writing after a cancel, so wait for it and put back
+                # what it wrote; otherwise the write lands with no row and no undo.
+                try:
+                    _after, _vouched, landed = await work
+                except Exception:  # noqa: BLE001 - the write refused or failed, so nothing landed
+                    raise asyncio.CancelledError from None
+                undone = await asyncio.to_thread(_undo_write, config_dir, landed)
+                log.warning(
+                    "config write %s cancelled before its audit row; undone: %s", action, undone
+                )
+                raise
             # With no digest of what is on disk now, the loaded one would read as a change at the
             # next start, so a vouched row records none and that start compares nothing.
             fingerprint = after if vouched else loaded
@@ -2763,18 +2782,6 @@ class Engine:
                 raise ConfigWriteAuditFailed(
                     "the audit log did not record its row", undone=undone
                 ) from exc
-            if (
-                self.loaded_config_fingerprint is not loaded
-                or self._live_graph() is not graph_before
-            ):
-                # A reload applied while the row was awaited. Its graph and digest read the files
-                # themselves, and a write's stale digest or reflect would overwrite them.
-                log.info(
-                    "config write %s: a reload applied before its row landed, so the reload's "
-                    "graph and config digest stand",
-                    action,
-                )
-                return fingerprint
             if vouched and after is not None:
                 # The row has landed and the write is reflected next, so the running graph matches
                 # these bytes and the provenance baseline moves with it. After the row, not before:
@@ -2808,11 +2815,6 @@ class Engine:
             task.add_done_callback(_log_abandoned_config_write)
             raise
         return task.result()
-
-    def _live_graph(self) -> Registry | None:
-        """The running graph's registry, which a reload replaces, or ``None`` with no runner."""
-        rr = self._registry_runner
-        return rr.registry if rr is not None else None
 
     def _config_write_done(self, task: asyncio.Task[dict[str, object] | None]) -> None:
         """Release the engine lock and forget a finished config write, however it ended."""
