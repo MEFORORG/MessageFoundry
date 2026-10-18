@@ -489,7 +489,7 @@ class _PassView:
     :meth:`CrlReloadRunner._judged_pass` in a hold of its own. The loop reads a view only once it
     is filled, and decides from it alone, never from the pass state above or the live record,
     which a pass abandoned by an earlier runner's :meth:`~CrlReloadRunner.stop` may still be
-    changing."""
+    changing. The runner keeps the last view it took (:attr:`CrlReloadRunner._last_view`)."""
 
     def __init__(self) -> None:
         self.judged: dict[str, str] = {}
@@ -515,7 +515,9 @@ class _PassView:
     def refusals(self) -> dict[str, ReloadRefusal]:
         """The refusal record as this view copied it, by path key."""
         if self._unread is not None:
-            raise self._unread
+            # Without the traceback of the last raise: a view kept as the runner's last one is
+            # raised from again every interval, and each raise would add its frames to the last.
+            raise self._unread.with_traceback(None)
         if self._refusals is None:
             raise RuntimeError("the pass took no copy of the refusal record")
         return self._refusals
@@ -937,7 +939,8 @@ def _forget_all() -> _PassView | None:
     """:func:`_prune` everything, when no hop holds any CRL, and return the refusal record as that
     left it (a :class:`_PassView` that judged nothing). Never waits on the pass lock: it runs on
     the event loop, and a pass abandoned by :meth:`CrlReloadRunner.stop` may still hold it. Then it
-    returns ``None``, having pruned and read nothing, and a later interval tries again."""
+    returns ``None``, having pruned and read nothing, and a later interval tries again. Until then
+    the runner follows the last view it took itself (:attr:`CrlReloadRunner._last_view`)."""
     if not _PASS_LOCK.acquire(blocking=False):
         return None
     try:
@@ -1067,7 +1070,9 @@ class CrlReloadRunner:
     under the pass lock by this runner's own pass or, when no hop holds a CRL, by its idle branch
     (:class:`_PassView`). That is when the file was applied, when it was put back to the bytes
     the hops hold, and when no hop holds it any more. :meth:`stop` resolves what is still open, because a restart rebuilds
-    every context from the file and nothing later would clear it.
+    every context from the file and nothing later would clear it. While a pass an earlier
+    runner's stop abandoned holds that lock, the idle branch follows the last view this runner
+    took instead (:attr:`_last_view`).
 
     **A process that died without stopping is cleared up after, where it can be (vault BACKLOG
     #3543).** Its alerts were open in the alert list and in no runner's memory. A process with
@@ -1113,6 +1118,12 @@ class CrlReloadRunner:
         self._seen_held: set[str] = set()
         # Per report step, the failure last logged (:meth:`_guarded`).
         self._report_failing: dict[str, str] = {}
+        # The view this runner's own pass, or its idle branch, last took under the pass lock.
+        # While another thread holds that lock the idle branch follows it, so a standing refusal
+        # is still reminded about, a clear the sink refused is retried and a streak no longer
+        # owed ends. Never a view of the live record, and no first-sight clear runs from it: a
+        # clear needs the judgment of a pass the loop has just run.
+        self._last_view: _PassView | None = None
 
     def start(self) -> None:
         """Spawn the loop (idempotent)."""
@@ -1171,10 +1182,12 @@ class CrlReloadRunner:
             if self._skip_when_idle and not has_held_copies():
                 # No pass runs, so nothing else would resolve an alert for a file no hop holds
                 # now. From the record as _forget_all left it, read under the pass lock. When a
-                # pass an earlier runner's stop abandoned holds that lock, nothing is decided:
-                # the record is that pass's to change, and a later interval tries again.
-                if (idle := _forget_all()) is not None:
-                    self._guarded("follow the record", functools.partial(self._follow_record, idle))
+                # pass an earlier runner's stop abandoned holds that lock, the record is that
+                # pass's to change, so it is not read: the last view is followed instead, and a
+                # later interval reads the record again. With no such view, nothing is decided.
+                if (view := _forget_all() or self._last_view) is not None:
+                    self._last_view = view
+                    self._guarded("follow the record", functools.partial(self._follow_record, view))
                 continue
             outcomes: object = None
             view = _PassView()
@@ -1182,6 +1195,10 @@ class CrlReloadRunner:
                 outcomes = await asyncio.to_thread(self._judged_pass, view)
             except Exception:
                 log.exception("crl_reload pass failed; will retry next interval")
+            # Also from a pass that raised: the record it copied is what it left. Untaken only
+            # when the thread never ran, and then the view before it stays the last one.
+            if view.taken:
+                self._last_view = view
             if self._stop.is_set():
                 # stop() resolves what is open. A refusal raised now would page, and the stop
                 # would resolve it a moment later, for a condition the restart itself ends.

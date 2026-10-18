@@ -29,6 +29,8 @@ import os
 import ssl
 import threading
 import time
+import traceback
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -1006,12 +1008,69 @@ async def test_the_idle_runner_resolves_an_alert_for_a_file_no_hop_holds(pki: _P
     assert sink.kinds() == ["refused", "applied"]
 
 
-async def test_the_idle_runner_decides_nothing_while_another_pass_holds_the_lock(
+class _AbandonedPass:
+    """Holds the pass lock from a thread of its own, as a pass an earlier runner's stop abandoned
+    does, until released. A loop that waited on the lock would then stall for the timeout and fail
+    the test, not deadlock on a lock its own thread holds."""
+
+    def __init__(self) -> None:
+        self.held = threading.Event()
+        self._release = threading.Event()
+        self._thread = threading.Thread(target=self._hold, name="abandoned-pass")
+
+    def _hold(self) -> None:
+        with crl_reload._PASS_LOCK:
+            self.held.set()
+            self._release.wait(10)
+
+    def start(self) -> None:
+        self._thread.start()
+        assert self.held.wait(5), "the premise: the abandoned pass holds the lock"
+
+    def release(self) -> None:
+        self._release.set()
+        if self._thread.ident is not None:
+            self._thread.join(10)
+
+
+def _idle_after_one_pass(
+    passes: list[int], abandoned: _AbandonedPass, clock: _Clock
+) -> Callable[[], bool]:
+    """A stand-in for ``has_held_copies``: a hop holds a CRL until the runner's first pass, and
+    none after it. At the first idle interval the abandoned pass takes the lock and the reminder
+    clock moves past the reminder of a refusal raised at that pass, before the branch runs."""
+
+    def held_copies() -> bool:
+        if not passes:
+            return True
+        if not abandoned.held.is_set():
+            abandoned.start()
+            clock.now += 300
+        return False
+
+    return held_copies
+
+
+def _count_idle_reads(patched: pytest.MonkeyPatch) -> list[int]:
+    """Count the idle branch's tries at the record: one entry per call of ``_forget_all``."""
+    ticks: list[int] = []
+    forget_all = crl_reload._forget_all
+
+    def counted() -> crl_reload._PassView | None:
+        ticks.append(1)
+        return forget_all()
+
+    patched.setattr(crl_reload, "_forget_all", counted)
+    return ticks
+
+
+async def test_the_idle_runner_with_no_view_of_its_own_decides_nothing_while_the_lock_is_held(
     pki: _Pki,
 ) -> None:
     """The record is written only under the pass lock. While a pass an earlier runner's stop
-    abandoned holds it, the record is that pass's to change, so the idle branch decides nothing
-    from it, and resolves once it can read the record under the lock itself."""
+    abandoned holds it, the record is that pass's to change, so the idle branch does not read it.
+    This runner has run no pass, so it has no view of its own to follow, and decides nothing until
+    it can read the record under the lock itself."""
     sink = _Sink()
     passes: list[int] = []
     runner = CrlReloadRunner(
@@ -1022,41 +1081,128 @@ async def test_the_idle_runner_decides_nothing_while_another_pass_holds_the_lock
     runner._report([ReloadOutcome(str(pki.crl), 0, refusal, 1)], _recorded())
     loaded_crls.clear_reload_refusal(pki.crl)  # the abandoned pass's write
     assert sink.kinds() == ["refused"] and not loaded_crls.has_held_copies()
-    ticks: list[int] = []
-    forget_all = crl_reload._forget_all
-
-    def counted() -> crl_reload._PassView | None:
-        ticks.append(1)
-        return forget_all()
-
-    held, release = threading.Event(), threading.Event()
-
-    def abandoned_pass() -> None:
-        # Its own thread, as an abandoned pass is, so a loop that waited on the lock would stall
-        # for the timeout and fail the test, not deadlock on a lock its own thread holds.
-        with crl_reload._PASS_LOCK:
-            held.set()
-            release.wait(10)
-
-    holder = threading.Thread(target=abandoned_pass, name="abandoned-pass")
-    holder.start()
+    abandoned = _AbandonedPass()
+    abandoned.start()
     try:
-        assert held.wait(5), "the premise: the abandoned pass holds the lock"
         with pytest.MonkeyPatch.context() as patched:
-            patched.setattr(crl_reload, "_forget_all", counted)
+            ticks = _count_idle_reads(patched)
             runner.start()
             try:
                 await until(lambda: len(ticks) >= 3, "three idle intervals")
                 assert sink.kinds() == ["refused"], "nothing decided while the lock is held"
-                release.set()
+                abandoned.release()
                 # The control: the same branch resolves once it can take the lock.
                 await until(lambda: "applied" in sink.kinds(), "the idle branch's clear")
             finally:
                 await runner.stop()
     finally:
-        release.set()
-        holder.join(10)
+        abandoned.release()
     assert passes == [] and sink.kinds() == ["refused", "applied"]
+
+
+async def test_the_idle_runner_reminds_from_its_last_view_while_another_pass_holds_the_lock(
+    pki: _Pki, clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3543: while a pass an earlier runner's stop abandoned holds the lock, the
+    idle branch does not read the record, but a standing refusal must still page. It reminds from
+    the view this runner's own pass last took, and resolves once it can read the record itself."""
+    sink = _Sink()
+    refusal = ReloadRefusal((1, 2), "why", RESTART)
+    passes: list[int] = []
+    abandoned = _AbandonedPass()
+
+    def reload() -> list[ReloadOutcome]:
+        passes.append(1)
+        loaded_crls.record_reload_refusal(pki.crl, refusal)
+        return [ReloadOutcome(str(pki.crl), 0, refusal, 1)]
+
+    monkeypatch.setattr(
+        crl_reload, "has_held_copies", _idle_after_one_pass(passes, abandoned, clock)
+    )
+    runner = _runner(sink, interval_seconds=0.01, reload=reload, reminder_seconds=300)
+    runner.start()
+    try:
+        await until(lambda: len(sink.refused()) >= 2, "the reminder from the last view")
+        assert crl_reload._PASS_LOCK.locked(), "the premise: sent while the lock was held"
+        assert sink.kinds() == ["refused", "refused"] and passes == [1]
+        first, reminder = sink.refused()
+        assert reminder == first, "the version that pass raised"
+        abandoned.release()
+        # The control: once the lock is free the branch reads the record, which no hop holds.
+        await until(lambda: "applied" in sink.kinds(), "the idle branch's clear")
+    finally:
+        abandoned.release()
+        await runner.stop()
+    assert passes == [1] and sink.kinds() == ["refused", "refused", "applied"]
+
+
+async def test_the_idle_runner_runs_no_first_sight_clear_from_its_last_view(
+    pki: _Pki, clock: _Clock, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A first-sight clear needs the judgment of a pass the loop has just run. The last view
+    serves the reminders alone: a file it judged, with no clear sent for it yet, gets none from
+    the idle branch. The reminder from the same view is the control that the branch followed it."""
+    sink = _Sink()
+    refusal = ReloadRefusal((1, 2), "why", RESTART)
+    judged = str(tmp_path / "judged.pem")
+    passes: list[int] = []
+    abandoned = _AbandonedPass()
+
+    def reload() -> None:
+        passes.append(1)
+        view = crl_reload._PASS_VIEW.get()
+        assert view is not None
+        view.judged[crl_path_key(judged)] = judged
+        # A pass that raised runs no first-sight clear, so the judged file is still unseen.
+        raise RuntimeError("the pass failed after judging a file")
+
+    monkeypatch.setattr(
+        crl_reload, "has_held_copies", _idle_after_one_pass(passes, abandoned, clock)
+    )
+    runner = _runner(sink, interval_seconds=0.01, reload=reload, reminder_seconds=300)
+    loaded_crls.record_reload_refusal(pki.crl, refusal)
+    runner._report([ReloadOutcome(str(pki.crl), 0, refusal, 1)], _recorded())
+    ticks = _count_idle_reads(monkeypatch)
+    runner.start()
+    try:
+        await until(lambda: len(sink.refused()) >= 2, "the reminder from the last view")
+        # Three more idle intervals on the same view, for a clear to show up in if one were sent.
+        reminded_at = len(ticks)
+        await until(lambda: len(ticks) >= reminded_at + 3, "three more idle intervals")
+        assert crl_reload._PASS_LOCK.locked(), "the premise: decided while the lock was held"
+        assert sink.kinds() == ["refused", "refused"], "no clear for the file the view judged"
+        abandoned.release()
+        await until(lambda: "applied" in sink.kinds(), "the idle branch's clear")
+    finally:
+        abandoned.release()
+        await runner.stop()
+    subject = reload_alert_subject(pki.crl)
+    assert [(kind, name) for kind, name, _ in sink.events] == [
+        ("refused", subject),
+        ("refused", subject),
+        ("applied", subject),
+    ], "the judged file was never cleared from that view"
+    assert passes == [1]
+
+
+def test_a_kept_read_failure_raised_again_does_not_grow_its_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The idle branch can raise from its last view every interval. Raising one exception object
+    again adds each raise's frames to the last unless its traceback is dropped first."""
+
+    def broken_record() -> dict[str, ReloadRefusal]:
+        raise RuntimeError("the record could not be read")
+
+    view = crl_reload._PassView()
+    monkeypatch.setattr(crl_reload, "reload_refusals", broken_record)
+    view.take_refusals()
+    depths = []
+    for _ in range(3):
+        with pytest.raises(RuntimeError) as caught:
+            view.refusals()
+        depths.append(len(traceback.extract_tb(caught.value.__traceback__)))
+    assert depths[0] >= 1 and depths == [depths[0]] * 3
 
 
 @pytest.mark.parametrize("final", [True, False], ids=["a-final-verdict", "a-retried-verdict"])
