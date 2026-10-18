@@ -172,6 +172,7 @@ def _mssql_store(seen: list[tuple[str, tuple[Any, ...]]]) -> Any:
         yield _MssqlConn(seen)
 
     store._acquire = _acquire
+    store._acquire_after_commit = _acquire  # BACKLOG #3023: the rotate and revoke borrow
     return store
 
 
@@ -206,6 +207,7 @@ def _nocount_store(seen: list[tuple[str, tuple[Any, ...]]], output_rows: list[An
         yield _NoCountConn(seen)
 
     store._acquire = _acquire
+    store._acquire_after_commit = _acquire
     return store
 
 

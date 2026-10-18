@@ -5247,8 +5247,8 @@ not (see *The console's refusal differs from the JSON floor's* under
 **Per-IP limiter caveat (SEC-024).** The per-client-IP sign-in window is in-process and keyed on the
 caller's source address, so an attacker who can rotate source addresses creates a fresh empty per-IP
 bucket each time and is bounded only by the **global** ceiling. The source IP is already proxy-aware —
-uvicorn runs with `forwarded_allow_ips = settings.api.trusted_proxies` (defaults to `[]` = trust
-nothing), and an off-loopback proxied bind is gated to require a declared trusted proxy — but an
+uvicorn runs with `forwarded_allow_ips` built from `settings.api.trusted_proxies` (defaults to `[]`
+= trust nothing; the [`trusted_proxies` row](CONFIGURATION.md) says what is added), and an off-loopback proxied bind is gated to require a declared trusted proxy — but an
 in-process per-IP limiter inherently cannot stop pure IP rotation by a **directly-reachable** attacker.
 The anti-guessing controls that survive rotation are the **global sign-in ceiling** plus the
 **per-account argon2 lockout (5 / 15 min)**, applied to **both** the password and the MFA
@@ -5842,7 +5842,9 @@ system lets that process write the target's memory. On a first deployment, code 
 service account could be such a process. It would then run Python inside the engine, with
 everything the engine holds.
 
-Three controls answer it, and they differ in strength:
+Under `enforce`, `serve` and `supervise` refuse to start with the interface on, unless
+`[security].allow_remote_debugging` accepts it (vault BACKLOG #2700). Three further controls
+answer it, and they differ in strength:
 
 - **The engine's Python children start with the interface off.** `messagefoundry/childenv.py` is
   the one place that says which children and how.
@@ -5851,8 +5853,11 @@ Three controls answer it, and they differ in strength:
   longer the console-script launcher, which cannot pass an option
   ([the next section](#isolated-mode-and-start-up-code-of-the-engines-interpreter)).
 - **The engine process refuses the script where the interface is still on.** A start through the
-  console script, such as a developer's `messagefoundry serve`, leaves it on. So the command line
-  installs an audit hook as it starts, for every command (`messagefoundry/remotedebug.py`). The
+  console script, such as a developer's `messagefoundry serve`, leaves it on unless
+  `PYTHON_DISABLE_REMOTE_DEBUG=1` is set. So the command line installs an audit hook as it
+  starts, for every command (`messagefoundry/remotedebug.py`): the interface can be on in any
+  command, and `serve` or `supervise` runs with it on under `enforcement = warn` or with the
+  acceptance above set. The
   interpreter raises an event before it runs an injected script, the hook raises on it, and the
   interpreter drops the script. A refusal is logged. Under `serve` the engine also writes a
   `remote_debug_refused` audit row and raises an alert of that name (vault BACKLOG #2742).
