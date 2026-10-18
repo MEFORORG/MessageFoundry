@@ -399,11 +399,11 @@ async def test_the_grant_is_judged_on_the_roles_read_at_apply_time_not_the_plans
     rig.ldap.present["jdoe"] = _principal("jdoe", ADMINS)
     real = rig.service._apply_reconcile_revocation
 
-    async def a_sign_in_lands_first(revocation: Any) -> bool:
+    async def a_sign_in_lands_first(revocation: Any, *, watermark: Any) -> str:
         await rig.store.set_user_roles(
             revocation.user_id, [Role.ADMINISTRATOR.value], assigned_by="ad-sync"
         )
-        return await real(revocation)
+        return await real(revocation, watermark=watermark)
 
     monkeypatch.setattr(rig.service, "_apply_reconcile_revocation", a_sign_in_lands_first)
 
