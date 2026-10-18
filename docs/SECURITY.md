@@ -196,8 +196,9 @@ the route takes a body.
   case can also write an `auth.temp_password_expired` audit row. `AuthService.identity_for_token`
   is the full list. A caller this lookup refuses gets 401 before the body is read.
 - A route with no gate that is declared public is not touched. `POST /auth/login` has to parse a
-  body from a caller with no session. A route with no gate and no declaration is refused before
-  its body is read, as described below. A gated route that declares no body is not touched either, because FastAPI already
+  body from a caller with no session. A route with no gate and no declaration, built by the
+  app's route class and registered on the app, is refused before its body is read, as described
+  below. A gated route that declares no body is not touched either, because FastAPI already
   runs its gate first. That includes the web console's `/ui` routes, which read their forms
   inside the handler.
 
@@ -222,12 +223,20 @@ body, the early sign-in check above still answers before it. A route passes in o
 Any other route answers **403** `this route declares no authorization`, and a WebSocket is refused
 before it is accepted. Such a route is a defect in the code that registered it. The engine counts
 every refusal in memory and writes an ERROR line at most once a minute for each route. Each line
-names the route's path template, never the request, and says how many refusals came since the
-previous line. Refusals after a burst's last line stay in that count. They reach the log only with
-a later refusal of the same route, a minute or more after the last line. No API reads the count,
-and a restart loses it. On a body-taking route built by the app's route class, the
-refusal comes before the body is read. The check asks only that a route declared a gate. It does not check that
-the gate is correct.
+names the route by its path template, never the request, and says how many refusals came since the
+previous line. The name is meant to be the key `GET /security/posture` reports the route under,
+include prefix included (vault BACKLOG #2956); `_logged_key` in `messagefoundry/api/security.py`
+says where the two can still differ. Refusals after a burst's last line stay in that count. They reach the log only with
+a later refusal of the same route, a minute or more after the last line. `GET /security/posture`
+reports the count as `undeclared_route_refusals`, under `monitoring:read`, keyed by path template
+(vault BACKLOG #2954). It is the count of the process that answered; under engine shards each
+process has its own. `undeclared_route_refusal_counts` in `messagefoundry/api/security.py` says
+what each key means, including `<unknown>`, and what the walk misses. The count is not persisted,
+and a restart loses it. On a body-taking route built by the app's route class and registered on
+the app, the refusal comes before the body is read. An undeclared route on an included router,
+even one built with that class, can answer first with the body parser's **422** or **400**: the
+class docstring says when. The check asks only that a route declared a gate. It does not check
+that the gate is correct.
 
 - A route whose gate is nested inside another dependency, or added only by `include_router`, is
   refused. That is the safe side.
@@ -1436,7 +1445,7 @@ tuple: they act only on the caller's own account.
 | `POST` | `/messages/export` | `messages:export` **+** `messages:view_raw` | `require_step_up_action` (action `message_export`) | the needle-bearing sibling of the export GET (BACKLOG #1184); same two permissions, same fail-closed-on-either behaviour, same pre-stream audit — only the criteria's carrier differs; data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `GET` | `/messages/{message_id}` | `messages:view_raw` | `require_phi_read` | per-property redaction of the wrapper **and** each nested `OutboxInfo`/`EventInfo`; returns **no body** (BACKLOG #2345); `summary` and `metadata` come back display-masked unless the request passes `reveal_summary=true`, and the `message_view` audit row lists the properties returned complete in `revealed` (BACKLOG #2346); the error text (`error`, each `outbox[].last_error`, each `events[].detail`) comes back as a fixed `****` mask unless the request passes `reveal_errors=true`, a separate act, recorded in `revealed` as `error`, `outbox.last_error` and `events.detail` (BACKLOG #2436) |
 | `GET` | `/messages/{message_id}/raw` | `messages:view_raw` | `require_phi_read` | the raw body, as its own act: writes a `message_body_view` audit row carrying a `surface`. An HTTP caller declares `harness`, `apiclient` or `api` (the default); the engine records `console` itself for the web console's in-process call, and the query parameter does not accept it (BACKLOG #2345) |
-| `GET` | `/messages/{message_id}/attachments/{attachment_id}` | `messages:view_raw` | `require_phi_read` | raw attachment bytes, audited `attachment_download`; the handler's two 422 refusals (an undecodable stored value, an SVG it cannot sanitize) serve nothing and are audited `attachment_download_refused` with a `reason`; a request-validation 422 never reaches the handler and is not (BACKLOG #2387) |
+| `GET` | `/messages/{message_id}/attachments/{attachment_id}` | `messages:view_raw` | `require_phi_read` | raw attachment bytes, audited `attachment_download`; the handler's two 422 refusals (an undecodable stored value; SVG it cannot sanitize, which covers a document that is not an SVG but carries an SVG element, or an `svg` start tag in the head of SVG- or HTML-labelled bytes that are not markup, BACKLOG #3257) serve nothing and are audited `attachment_download_refused` with a `reason`; a request-validation 422 never reaches the handler and is not (BACKLOG #2387) |
 | `GET` | `/messages/{message_id}/responses` | `messages:read` | `require_phi_read` | the reply **body** additionally needs `messages:view_raw` **and** `messages:view_summary`, enforced inline at the route; without either, `body` is null |
 | `GET` | `/messages/{message_id}/outbound` | `messages:view_raw` + `messages:view_summary` | `require_phi_read` | the transformed outbound payload; one of the two-permission routes on the JSON plane, and it fails closed on either: a caller missing one gets 403 and an `auth.permission_denied` row. Owner ruling R18 makes this request the reveal act only for a `messages:view_summary` holder. Minting now refuses a custom role holding `messages:view_raw` alone, so this gate is the second line (ASVS 14.2.6, vault BACKLOG #1187) |
 | `POST` | `/messages/{message_id}/replay` | `messages:replay` | `require_step_up` | per-channel scope |
@@ -2227,13 +2236,25 @@ the requested directory. If the audit log refuses that row, the route answers **
 loads or swaps, and an `audit_write_failed` alert keyed `config_reload:inline` is raised. A dry run
 writes no such row, because it swaps nothing. Like the gate's row, it says *attempted*, and an
 attempt row with no row after it is not proof the reload was refused or cancelled. At least a
-refusal or cancellation whose own row then fails, and an unexpected fault in the reload, leave it
-alone. The 503 has the same lost-COMMIT exception as the gate's, stated above, where the attempt
+refusal, a fault or a cancellation whose own row then fails leaves it alone. An unexpected fault
+in the reload now writes a `reload_fault` row after it (BACKLOG #3157). The 503 has the same lost-COMMIT exception as the gate's, stated above, where the attempt
 row may have committed after all.
 
 **A reload's `config_reload_failed` row names why in `reason`.** At least these values are
 written: `trust_anchor`, `invalid_config`, `not_found`, `unreadable`, `digest_mismatch`,
-`no_approved_digest`, `digest_unavailable` and `store_unavailable`. A trust-anchor check that the
+`no_approved_digest`, `digest_unavailable`, `store_unavailable` and `reload_fault`. **An operator
+reload's faults write a row too (BACKLOG #3157).** On the reload routes, inline, a dry run
+included, and released, any error the reload raises that none of the other reasons names is
+`reload_fault`, with the error's type name: at least a `FileNotFoundError` or a `PermissionError`
+raised by a runner start or swap. A `FileNotFoundError` there is never `not_found`, which only a
+missing config directory writes. The row does not claim the old graph is still serving: at least a
+fault raised after the swap committed leaves the new one live, and `GET /config/provenance` says
+which is. At least these write no such row: a DR activation's reload, and a row whose own write
+fails, which is logged. A cluster convergence reload records such a fault with reason
+`reload_error` instead (vault BACKLOG #3109). A cancellation is not a fault: an applied reload's
+writes `config_reload_interrupted`, and a cancelled dry run or digest capture writes nothing. An
+inline reload answers **500** with a generic detail for `reload_fault`; a released one answers 422,
+the approve route's answer for a release the engine did not run. A trust-anchor check that the
 store stops, by refusing the `auth.trust_anchor` audit read or write it needs, is
 `store_unavailable` (BACKLOG #3091). The checks of the file run before any store call, so this
 reason is written only for an anchor that passed them. An anchor they refuse is still
@@ -2242,15 +2263,14 @@ Such a refusal may then have no `auth.trust_anchor` row behind it, so the engine
 of it. An inline reload answers **503** for `store_unavailable`; a released one answers 422, as
 every refused release does. The engine log carries the store's error.
 
-**An inline or released reload's `config_reload` row names that reload's own config (vault
-BACKLOG #2257).** It is built from the reload's own result: its directory, connection counts and
-the digest it took before the swap. The row is written after the swap, so a second reload or a
-connection flag toggle can move the engine on first. The row then still names its own config, but
-is marked `superseded` and `baseline_unchecked`, so the next start passes over it and does not
-compare against it. Only a committed reload or a flag toggle that moves the engine's loaded
+**An inline, released or cluster convergence reload's `config_reload` row names that reload's own
+config (vault BACKLOG #2257, #3109).** It is built from the reload's own result: its directory,
+connection counts and the digest it took before the swap. The row is written after the swap, so a
+second reload or a connection flag toggle can move the engine on first. The row then still names
+its own config, but is marked `superseded` and `baseline_unchecked`, so the next start passes over
+it and does not compare against it. Only a committed reload or a flag toggle that moves the engine's loaded
 fingerprint counts. A later reload that fails and rolls back does not mark the row. The check
-runs just before the write, so a change after it is not caught. A cluster convergence reload's
-row is still read from the engine's live state when it is written.
+runs just before the write, so a change after it is not caught.
 
 **A released reload loads only the config its approval named (vault BACKLOG #2596, step 3).** When
 dual control holds a reload, the hold's `params` carry `fingerprint`: the ADR 0041 D1 content
@@ -2358,10 +2378,21 @@ ERROR line and no alert for at least two writes: a rejection, and a refusal's ro
 shields at least the request or repeat write, the claim, each outcome and a resolution from a
 cancel. Those writes finish on their own, and log and page as above.
 
-What this does not cover, at least: a store that refuses READS of the request row or the
-requester's account still answers a raw 500. A request or a repeat whose write fails, and that
-does not read back as held, is not mapped either. It answers a raw 500, or the request timeout's
-503 when the call is cancelled.
+A store that refuses a READ on the approval routes answers 503 for at least the queue, the request
+row and the requester's `users` row (BACKLOG #3157). The gate logs it at ERROR, at most once per
+five minutes for each kind of read, and pages nothing, because a read loses no audit row. Nothing
+is decided or run.
+The queue's own read of each requester's `users` row, which predicts a refusal (BACKLOG
+#3189), is the exception: a fault there leaves that requester's requests with no prediction, the
+queue still answers, and the fault is logged at ERROR once per requester on every listing. Approving
+the request reads the row again and answers 503 as above.
+
+What this does not cover, at least: a request or a repeat whose write fails, and that does not
+read back as held, is not mapped. It answers a raw 500, or the request timeout's 503 when the call
+is cancelled. At least these reads are not mapped either, and can answer a raw 500: the
+requester's roles and scope, which the release reads through the auth service, and the
+open-request read a reload or purge makes before its step-up to answer a repeat. A read that fails
+on a programming defect, rather than a store fault, is raised as it is.
 
 **A failed request write is read back, and the write outlives its caller (vault BACKLOG #3193).**
 The request and its `approval.requested` row are one write, as above. When that write reports an
@@ -2480,6 +2511,12 @@ row claimed before the column existed has no owner, and the first process to sta
 own. Two plain `serve` processes over one store would share the `engine` owner; that layout is
 unsupported anyway. For the same reason, build one app per engine: a second app over the same
 engine runs the reconcile again and would take the first one's live releases for leftovers.
+
+An app embedded around an engine (`create_app(engine=...)`) can start before its engine holds its
+graph, when the engine shard's name is not known yet. Its start then puts the reconcile off, and
+the first queue read that finds the owner known runs it, over rows claimed before the app started
+(BACKLOG #3252). A release made before the engine holds its graph claims under `engine` and keeps
+that owner for the app's life, so start the engine before the app serves approvals.
 
 **A request must also be old enough before it can be approved (ASVS 2.4.2).** The expiry is a
 ceiling. `[approvals].min_dwell_seconds` is the floor, default **2 s**. An approve that arrives sooner
@@ -2873,7 +2910,23 @@ not the permissions they grant. So a move from one role to another refuses, even
 grants more. A lookup whose groups map to no role refuses every directory account that holds a
 role. The refusal writes no roles; the next reconciliation pass, when it runs, or the next sign-in
 re-syncs them. Otherwise it behaves as the refusals above, audited with the outcome
-`directory_roles_demoted`. Channel scope is not compared on these legs.
+`directory_roles_demoted`. Channel scope is not compared on these legs. When the AD group-to-role
+map fails its seal, no role can be judged, so these legs and the IdP step-up leg below refuse an
+account that holds a role with `directory_role_map_unsealed` instead. That is not a demotion: nothing
+changed in the directory, a new sign-in reads the same map, and the fix is an administrator saving
+the map again. So it is never told to sign out.
+
+**The caller is told which fix clears the refusal, and not its cause (BACKLOG #3082).** The precise
+cause stays on the audit row. A demotion is told to sign out and sign in again. A new sign-in clears
+it at once, because it writes the roles the current groups grant. A later try on the same session
+clears it only if the groups are restored in the directory, and once the reconciliation pass
+re-syncs the roles it also revokes the account's sessions. Every other directory refusal, an outage
+included, is told to try again later or ask an administrator, and never to sign out: a new sign-in
+would fail the same way, and the working session would be gone. The engine carries the two cases as
+`Elevation.directory_refusal`; the texts are `_DIRECTORY_DEMOTED_DETAIL` and
+`_DIRECTORY_UNCONFIRMED_DETAIL` in `api/auth_routes.py`, and the console shows the same fixes. The
+password re-bind makes the role test too (below), so it gives a demoted account the first. Neither
+text names a group, a role or a directory detail.
 
 **The IdP step-up leg makes the same role test (BACKLOG #2154).** `complete_oidc_step_up` already
 looks the account up by its directory object id. It now maps the groups that lookup returns to
@@ -2892,9 +2945,11 @@ theirs. A row whose directory object id or provider moved during the bind is ref
 keyed on. The password was right, so the refusal is charged to
 neither the lockout nor the session's re-proof budget, and clears neither. No window is renewed, no
 action-bound grant is minted, and no roles are written. The `auth.reauth` row carries
-`reason=directory_roles_demoted`, and the caller gets the answer for a directory that could not
-confirm the account: 403 on `POST /me/reauth`. A retry is refused the same way until a new sign-in
-re-syncs the roles; those words do not say so yet. Channel scope is not compared on this leg either. The enrolment legs make the
+`reason=directory_roles_demoted`, and the caller gets the demotion answer: 403 on `POST /me/reauth`,
+telling it to sign out and sign in again (BACKLOG #3082); what else clears that refusal is in the
+paragraph on telling the caller the fix, above. A role map that fails its seal is refused as
+`directory_role_map_unsealed` and gets the answer for a directory that could not confirm the
+account, as on the other legs. Channel scope is not compared on this leg either. The enrolment legs make the
 test too, through the code leg's directory check (BACKLOG #3061). The code, passkey, IdP and
 re-bind legs call one shared comparison rather than each writing it out.
 
@@ -3774,7 +3829,8 @@ listener start, a refusal isolates that one listener and the rest of the graph c
 At build check, the same refusal fails the whole config. That covers `messagefoundry check`, a
 reload or dry-run reload, promote, a connection edit, a connection-flag toggle, a DR activation
 and a cluster follower's convergence reload. A follower whose own settings refuse the graph would
-keep its old graph, log the refusal and retry each interval.
+keep its old graph, log the refusal and retry each interval. It would also write a
+`config_reload_failed` audit row under `system:cluster-convergence` (vault BACKLOG #3109).
 The build check runs the gates only on a listener the engine would bind: deployed and `auto_start`.
 On a running engine it also skips one the DR run-profile parks, and it gates one an operator
 started. It gates an `auto_start` listener outside its schedule window, because the scheduler binds
@@ -5742,7 +5798,7 @@ under `monitoring:diagnose`, and a lock alert there would show lock state to a r
 withholds it from. **Switching the layer off is not yet reported as a posture loosening**:
 `[alerts].security_signals = false`, or a threshold of `0`, is absent from
 `GET /security/posture`. Nor does `posture_loosened` fire on a start whose `config_loaded` row
-records its loosenings as unknown, such as one a cluster convergence reload superseded.
+records its loosenings as unknown, such as one whose config snapshot could not be taken.
 
 **The console exports too, for an auditor with no bearer session (BACKLOG #2446).** `GET
 /audit/export` reads only an `Authorization` bearer, and an account that signs in only through OIDC

@@ -193,6 +193,21 @@ _ALLOWED: tuple[_Allowed, ...] = (
         _SAFE + "asyncio.wait_for timeout; its chain is a CancelledError with no content",
     ),
     _Allowed(
+        "messagefoundry/pipeline/engine.py::Engine.write_baseline_config._apply::"
+        "(Exception, asyncio.CancelledError)::ConfigWriteAuditTimeout",
+        _SAFE + "raised only once the asyncio.timeout deadline expired, so the caught error is "
+        "that TimeoutError over a content-free CancelledError, or at least a store error that a "
+        "cleanup raised in its place while writing the row, whose detail is the config "
+        "fingerprint and the flag detail, never a message body; it is logged with safe_exc",
+    ),
+    _Allowed(
+        "messagefoundry/pipeline/engine.py::Engine.write_baseline_config._apply::Exception"
+        "::CancelledError",
+        _SAFE + "the config write's own refusal or fault under the connections.toml lock, at "
+        "least a WiringError, a connections_edit or TOML error or an OSError; the flag route "
+        "already answers such a refusal with str(exc), and it is logged with safe_exc",
+    ),
+    _Allowed(
         "messagefoundry/pipeline/dryrun.py::select_inbound::KeyError::UnknownInboundError",
         _SAFE + "KeyError carries the inbound name, which the new message also quotes",
     ),

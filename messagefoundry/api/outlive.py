@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import weakref
 from collections.abc import Coroutine
 from typing import Any
 
@@ -38,7 +39,12 @@ from messagefoundry.api.approvals import _outlive_caller
 from messagefoundry.pipeline.dr import _HOOK_REAP_SECONDS
 from messagefoundry.redaction import safe_exc
 
-__all__ = ["CANCEL_GRACE_SECONDS", "DRAIN_TIMEOUT_SECONDS", "OutlivingOperations"]
+__all__ = [
+    "CANCEL_GRACE_SECONDS",
+    "DRAIN_TIMEOUT_SECONDS",
+    "OutlivingOperations",
+    "cancel_grace_left",
+]
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +64,25 @@ DRAIN_TIMEOUT_SECONDS = 0.5
 #: when they are idle, so at least a takeover hook that takes most of its reap can still be rolling
 #: back when the store closes, and the drain logs it.
 CANCEL_GRACE_SECONDS = _HOOK_REAP_SECONDS + 1.0
+
+#: The loop time each operation a drain cancelled has its grace until. Keyed by the operation's own
+#: task, so a task it spawned, an operation started after the drain, and a cancel from anywhere
+#: else find nothing. Weak, and popped when the operation ends, so no entry outlives it.
+_grace_ends: weakref.WeakKeyDictionary[asyncio.Future[Any], float] = weakref.WeakKeyDictionary()
+
+
+def cancel_grace_left() -> float | None:
+    """Seconds left of the grace :meth:`OutlivingOperations.drain` gave the CURRENT task, or
+    ``None`` when no drain cancelled it.
+
+    It is the drain's own ``grace``, the share of the shutdown budget a lifespan handed it (BACKLOG
+    #3191), counted from when the drain cancelled. A cancellation arm that waits on work of its own
+    can bound that wait by it, so the drain does not give up on an arm still waiting; at least
+    ``api.app._write_through_cancel`` does (BACKLOG #3157). At or below zero, the drain has
+    already stopped waiting."""
+    task = asyncio.current_task()
+    ends = None if task is None else _grace_ends.get(task)
+    return None if ends is None else ends - asyncio.get_running_loop().time()
 
 
 def _log_orphan_outcome(task: asyncio.Future[Any], label: str) -> None:
@@ -118,6 +143,7 @@ class OutlivingOperations:
 
     def _forget(self, task: asyncio.Future[Any]) -> None:
         self._inflight.pop(task, None)
+        _grace_ends.pop(task, None)
 
     async def drain(
         self,
@@ -144,7 +170,10 @@ class OutlivingOperations:
             timeout,
             ", ".join(cancelled),
         )
+        # Set before the cancels, so an arm reading cancel_grace_left() as its cancel lands sees it.
+        ends = asyncio.get_running_loop().time() + grace
         for task in left:
+            _grace_ends[task] = ends
             task.cancel()
         _done, stuck = await asyncio.wait(left, timeout=grace)
         if stuck:

@@ -3,11 +3,12 @@
 """Audit writes on the two connection routes that had no success-arm test (BACKLOG #1643).
 
 ``connection_flag_set`` (``POST /connections/{name}/flag``) and ``connection_credential_test``
-(``POST /connections/{name}/test-credential``) each call ``record_audit`` only AFTER their route
-body succeeds, and every pre-existing test of either route stops short of that point -- the flag
-tests drive ``Engine.set_connection_flag`` directly (no API, so no audit), and the credential-test
+(``POST /connections/{name}/test-credential``) each call ``record_audit`` only AFTER their write
+succeeds, and every pre-existing test of either route stopped short of that point -- the flag
+tests drove ``Engine.set_connection_flag`` directly (no API, so then no audit), and the credential-test
 arms in ``tests/test_channel_rbac.py`` all short-circuit at 403 / 400 / 404. So both writes could be
-deleted with the suite staying green.
+deleted with the suite staying green. The flag row is now written by the engine itself (vault
+BACKLOG #2945), and this test still pins the actor the route hands it.
 
 These two tests reach the success arm and assert the row is there under the acting user.
 
@@ -21,6 +22,7 @@ from __future__ import annotations
 import textwrap
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -141,10 +143,10 @@ async def test_flag_route_audits_connection_flag_set_under_the_acting_user(
 ) -> None:
     """BACKLOG #1643: a successful flag write leaves a ``connection_flag_set`` row naming the caller.
 
-    RED when the ``connection_flag_set`` ``record_audit`` call in ``api/app.py`` is deleted, or when
-    it stops passing ``actor=identity.username``. Unobservable before this test: every existing flag
-    test calls ``Engine.set_connection_flag`` directly, and the audit write lives in the ROUTE, above
-    the engine method -- so the whole of ``tests/test_connection_flag.py`` stays green without it.
+    RED when the ``record_audit`` call in ``Engine.write_baseline_config`` is deleted, or when the
+    route stops passing ``actor=identity.username`` to ``Engine.set_connection_flag``. The row moved
+    into that engine helper with vault BACKLOG #2945; before that it lived in the ROUTE, where no
+    engine-level flag test could see it go.
 
     The 409 arm below is the negative control: it proves the row is written by the SUCCESS path and
     not unconditionally on entry, which a write hoisted above the ``set_connection_flag`` call would
@@ -175,6 +177,37 @@ async def test_flag_route_audits_connection_flag_set_under_the_acting_user(
     assert [row["actor"] for row in rows] == ["deployer"]
     assert len(rows) == 1, "the refused 409 write must not be audited as a flag set"
     assert "OB_TOML" in str(rows[0]["detail"])
+
+
+async def test_flag_route_answers_503_when_the_audit_row_fails(
+    toml_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """vault BACKLOG #2945: a toggle whose ``connection_flag_set`` row fails is refused and undone,
+    and the route answers 503, the audit log being at fault, not the request. It used to pass the
+    store's own error up as a 500, which said nothing of whether the toggle was still on disk."""
+    service = await _deployer(toml_engine)
+    real_record = toml_engine.store.record_audit
+
+    async def _flag_row_refused(action: str, **kwargs: Any) -> None:
+        if action == "connection_flag_set":
+            raise RuntimeError("synthetic: the audit store refused the row")
+        await real_record(action, **kwargs)
+
+    assert toml_engine.config_dir is not None
+    toml_path = Path(toml_engine.config_dir) / "connections.toml"
+    before = toml_path.read_bytes()
+    transport = httpx.ASGITransport(app=create_app(toml_engine, auth=service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c)
+        monkeypatch.setattr(toml_engine.store, "record_audit", _flag_row_refused)
+        r = await c.post(
+            "/connections/OB_TOML/flag",
+            json={"direction": "outbound", "flagged": True},
+            headers=h,
+        )
+    assert r.status_code == 503, r.text
+    assert "was undone" in r.json()["detail"]
+    assert toml_path.read_bytes() == before
 
 
 async def test_credential_test_route_audits_under_the_acting_user(

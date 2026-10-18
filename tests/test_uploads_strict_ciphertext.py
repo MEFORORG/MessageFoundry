@@ -54,6 +54,7 @@ from messagefoundry.uploads import (
     UploadQuotaError,
     UploadStore,
     UploadUnreadableError,
+    _Observed,
     _UnsealableUpload,
 )
 
@@ -532,7 +533,7 @@ async def test_an_unsealable_upload_counts_toward_the_quota_and_is_never_listed(
     store = UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20, max_files_per_user=1)
 
     on_disk = (root / f"{fid}.blob").stat().st_size if break_body is _garble else 0
-    assert store._observed_sync("u-op") == (1, on_disk)
+    assert store._observed_sync("u-op") == (1, on_disk, 1, on_disk)
     with pytest.raises(UploadQuotaError):
         await store.save(data=_ADT.encode(), filename="b.hl7", uploader="op", uploader_id="u-op")
     assert await store.list_files() == []
@@ -542,6 +543,123 @@ async def test_an_unsealable_upload_counts_toward_the_quota_and_is_never_listed(
     assert _counts(caplog) == []
     [line] = [r.getMessage() for r in caplog.records if "rotate-key cannot seal" in r.getMessage()]
     assert "1 uploaded file(s)" in line and _PHI_NAME not in line
+
+
+@_BREAKS
+async def test_a_file_cap_refusal_names_what_it_bills_that_the_listing_hides(
+    tmp_path: Path, break_body: Callable[[Path], None]
+) -> None:
+    """BACKLOG #3183: an uploader at the cap was refused over files the listing never shows. The
+    refusal now says how many it billed that way and how many bytes they hold. It names no file:
+    the name in a plaintext sidecar is unverified and may carry PHI."""
+    root = tmp_path / "uploads"
+    fid = await _unsealable_upload(root, break_body)
+    on_disk = (root / f"{fid}.blob").stat().st_size if break_body is _garble else 0
+    store = UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20, max_files_per_user=1)
+
+    with pytest.raises(UploadQuotaError) as refused:
+        await store.save(data=_ADT.encode(), filename="b.hl7", uploader="op", uploader_id="u-op")
+    text = str(refused.value)
+    assert f"are not listed: 1, holding {on_disk} bytes" in text
+    assert _PHI_NAME not in text and "DOE" not in text and fid not in text
+
+
+async def test_a_byte_cap_refusal_names_the_hidden_bytes_that_tipped_it(tmp_path: Path) -> None:
+    """The byte cap is set so this upload fits only if the hidden body's bytes are not billed. The
+    refusal shows they are, and names them."""
+    root = tmp_path / "uploads"
+    fid = await _unsealable_upload(root, _garble)
+    on_disk = (root / f"{fid}.blob").stat().st_size
+    cap = len(_ADT.encode()) + on_disk - 1
+    store = UploadStore(
+        root, _keyed(generate_key()), max_bytes=1 << 20, max_total_bytes_per_user=cap
+    )
+    with pytest.raises(UploadQuotaError) as refused:
+        await store.save(data=_ADT.encode(), filename="b.hl7", uploader="op", uploader_id="u-op")
+    text = str(refused.value)
+    assert "would hold" in text and f"are not listed: 1, holding {on_disk} bytes" in text
+    assert _PHI_NAME not in text and fid not in text
+
+
+async def test_a_quota_refusal_adds_no_clause_when_nothing_hidden_counts(tmp_path: Path) -> None:
+    """The clause is there only when hidden uploads count toward the cap that fired, and on the
+    engine-shard refusal only when any is billed. A hidden upload with no body holds no byte, so it never tips the byte
+    cap."""
+    root = tmp_path / "uploads"
+    store = UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20, max_files_per_user=1)
+    await store.save(data=_ADT.encode(), filename="a.hl7", uploader="op", uploader_id="u-op")
+    with pytest.raises(UploadQuotaError) as refused:
+        await store.save(data=_ADT.encode(), filename="b.hl7", uploader="op", uploader_id="u-op")
+    assert "not listed" not in str(refused.value)
+
+    lost = tmp_path / "lost"
+    await _unsealable_upload(lost, _remove)
+    store = UploadStore(lost, _keyed(generate_key()), max_bytes=1 << 20, max_total_bytes_per_user=4)
+    with pytest.raises(UploadQuotaError) as refused:
+        await store.save(data=_ADT.encode(), filename="b.hl7", uploader="op", uploader_id="u-op")
+    assert "would hold" in str(refused.value) and "not listed" not in str(refused.value)
+
+    shard = store._shard_refusal(uploader="op", observed=_Observed(3, 30, 0, 0))
+    assert "not listed" not in str(shard)
+    shard = store._shard_refusal(uploader="op", observed=_Observed(3, 30, 2, 7))
+    assert "are not listed: 2, holding 7 bytes" in str(shard)
+
+
+@_BREAKS
+async def test_an_unsealable_upload_is_billed_only_to_the_uploader_it_names(
+    tmp_path: Path, break_body: Callable[[Path], None]
+) -> None:
+    """The one quota walk (BACKLOG #3184) collects every uploader's never-sealable uploads together,
+    so the per-uploader filter is what keeps uploader A's 409 from billing, and naming the count of,
+    uploader B's hidden uploads (BACKLOG #3183)."""
+    root = tmp_path / "uploads"
+    await _unsealable_upload(root, break_body)  # held by u-op
+    store = UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20, max_files_per_user=1)
+    mine = await store.save(
+        data=_ADT.encode(), filename="o.hl7", uploader="other", uploader_id="u-other"
+    )
+
+    assert store._observed_sync("u-other") == (1, mine.size, 0, 0)
+    with pytest.raises(UploadQuotaError) as refused:
+        await store.save(
+            data=_ADT.encode(), filename="p.hl7", uploader="other", uploader_id="u-other"
+        )
+    assert "not listed" not in str(refused.value)
+
+
+async def test_an_upload_refusal_offers_rotate_key_and_promises_nothing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3183: ``rotate-key`` does not seal every refused upload (#2322), so neither the
+    ``upload-cipher`` alert nor the cipher's refusal, which the listing scan logs, may say it will.
+    Each offers it and names the one remedy left when it fails, as the by-id 423 text does."""
+    root = tmp_path / "uploads"
+    fid = await _plaintext_upload(root)
+    cipher = _keyed(generate_key())
+    sink = _Sink()
+
+    def _alert(table: str, column: str) -> None:
+        alert_store_cipher_refusal(sink, table, column)  # type: ignore[arg-type]
+
+    cipher.set_refusal_hook(_alert)
+    store = UploadStore(root, cipher, max_bytes=1 << 20)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        assert await store.list_files() == []
+    [scanned] = [r.getMessage() for r in caplog.records if "cipher declined it" in r.getMessage()]
+    with pytest.raises(CipherError) as refused:
+        await store.read_bytes(fid)
+    assert sink.events and all(name == UPLOAD_CIPHER_SUBJECT for name, _, _ in sink.events)
+
+    for text in (scanned, str(refused.value), *(reason for _, reason, _ in sink.events)):
+        assert "rotate-key" in text and "may seal it" in text, text
+        assert "with the engine stopped" in text, text
+        assert "unsealed for good, an operator may delete it" in text, text
+        assert "docs/PHI.md section 3 names at least some kinds neither can remove" in text, text
+        assert "can only be deleted" not in text, text
+        assert "retention prune" in text, text
+        assert "until" not in text and "to seal it" not in text, text
+        assert _PHI_NAME not in text, text
 
 
 async def test_a_planted_lone_sidecar_is_never_sealed_and_ages_out(tmp_path: Path) -> None:
@@ -563,7 +681,7 @@ async def test_a_planted_lone_sidecar_is_never_sealed_and_ages_out(tmp_path: Pat
     assert await store.reseal_to_active() == ResealResult(unsealable=1)
     assert not (root / f"{plant}.meta").read_text(encoding="utf-8").startswith(MARKER_PREFIX)
     assert [m.file_id for m in await store.list_files()] == [victim.file_id]
-    assert store._observed_sync("u-op") == (2, victim.size)
+    assert store._observed_sync("u-op") == (2, victim.size, 1, 0)
 
     _age(root, plant, -2)  # two days in the future
     assert (await store.prune_expired()).pruned == []  # no body, so no row

@@ -195,9 +195,13 @@ def test_auth_service_symbols_are_what_the_console_actually_imports(surface: Any
     route for (resend, edit-resend, upload resend, purge, reload).
 
     Vault BACKLOG #3198 added ``LoginOutcome``, whose ``flow_consumed`` the ``/ui/oidc`` callback
-    reads, and with it ``RolesGained``, the type of one of its fields."""
+    reads, and with it ``RolesGained``, the type of one of its fields.
+
+    BACKLOG #3082 added ``DirectoryRefusal``, the type of ``Elevation.directory_refusal``, which the
+    console imports to pick the text for each fix."""
     assert surface.auth_service_symbols == (
         "AuthService",
+        "DirectoryRefusal",
         "Elevation",
         "FEDERATED_BINDING_CHANGED",
         "LoginOutcome",
@@ -382,9 +386,10 @@ def _auth_service_names(source: str) -> set[str]:
 
 
 def test_auth_service_from_import_records_the_original_name() -> None:
-    """The alias is a local label; the engine ships the original name."""
+    """The alias is a local label; the engine ships the original name. ``DirectoryRefusal`` comes in
+    as the type of an ``Elevation`` field (BACKLOG #3082)."""
     src = "from messagefoundry.auth.service import NotifyEmailAlreadySet as Taken, Elevation\n"
-    assert _auth_service_names(src) == {"NotifyEmailAlreadySet", "Elevation"}
+    assert _auth_service_names(src) == {"NotifyEmailAlreadySet", "Elevation", "DirectoryRefusal"}
 
 
 def test_a_planted_rename_moves_the_discovered_auth_service_names(
@@ -509,10 +514,12 @@ def test_the_nested_walk_reads_fields_only_and_sees_callable_parameters(
 def test_a_class_reached_only_through_a_field_is_recorded() -> None:
     """``OidcStepUp.elevation`` is an ``Elevation``, and the console reads its fields through it.
     Importing ``OidcStepUp`` alone must bring ``Elevation`` into the seam, so its fields do not
-    depend on some other route importing it."""
+    depend on some other route importing it. Transitively: ``Elevation.directory_refusal`` brings
+    ``DirectoryRefusal`` in too (BACKLOG #3082)."""
     assert _auth_service_names("from messagefoundry.auth.service import OidcStepUp\n") == {
         "OidcStepUp",
         "Elevation",
+        "DirectoryRefusal",
     }
 
 

@@ -15,12 +15,13 @@ when not gated).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
 import os
 import sqlite3
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -41,6 +42,7 @@ from messagefoundry.auth import Role
 from messagefoundry.auth import trust_anchors as ta
 from messagefoundry.auth.anchor_path import PathVerdict
 from messagefoundry.auth.service import AuthService
+from messagefoundry.config.fingerprint import ConfigDirMissing
 from messagefoundry.config.settings import (
     AlertsSettings,
     ApiSettings,
@@ -53,6 +55,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.config.wiring import WiringError
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStore
+from messagefoundry.transports.base import SourceStartupError
 from tests._admin_account import create_local_user_chosen
 from tests._bound_proof import reproving_transport
 from tests.test_config_fingerprint import INVALID_DIR_NAMES, _unreadable
@@ -601,11 +604,11 @@ async def test_a_reload_row_written_after_a_flag_toggle_is_no_baseline(engine: E
     marks itself superseded too. The toggle is stood in for by the rebind it performs."""
     outcome = await engine.reload_detail(propagate=False)
     assert outcome.fingerprint is not None
-    assert await _record_reload_audit(engine, actor="before", outcome=outcome) == []
+    assert await _record_reload_audit(engine, actor="before", loaded=outcome) == []
     loaded = engine.loaded_config_fingerprint
     assert loaded is not None
     engine.loaded_config_fingerprint = dict(loaded)  # what set_connection_flag does
-    assert await _record_reload_audit(engine, actor="after", outcome=outcome) == []
+    assert await _record_reload_audit(engine, actor="after", loaded=outcome) == []
     rows = {r["actor"]: json.loads(r["detail"]) for r in await engine.store.list_audit()}
     assert "superseded" not in rows["before"]
     assert rows["after"]["superseded"] is True and rows["after"]["baseline_unchecked"] is True
@@ -905,7 +908,7 @@ async def test_a_lost_refusal_row_cannot_forge_a_log_line(
     with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
         status, _answer = await _audit_refused_reload(
             _AUDIT_DOWN,
-            FileNotFoundError(f"config directory not found: {_FORGING_DIR}"),
+            ConfigDirMissing(f"config directory not found: {_FORGING_DIR}"),
             actor=_FORGING_ACTOR,
             requested=_FORGING_DIR,
             dry_run=False,
@@ -923,12 +926,12 @@ async def test_the_other_lost_reload_rows_cannot_forge_a_log_line(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The same for the two sibling lost-row logs: a reload's own row after the swap, and the
-    attempt row an ungated reload writes first. The fake engine has no graph, so the first one
-    loses the row before its detail is built and logs the actor alone."""
+    attempt row an ungated reload writes first. The fake engine has no coordinator, so the first
+    one loses the row before its detail is built and logs the actor alone."""
     lost_actions: list[str] = []
     sink = SimpleNamespace(audit_write_failed=lambda name, *, action: lost_actions.append(action))
     with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
-        steps = await _record_reload_audit(_AUDIT_DOWN, actor=_FORGING_ACTOR)
+        steps = await _record_reload_audit(_AUDIT_DOWN, actor=_FORGING_ACTOR, loaded=None)
         with pytest.raises(HTTPException) as refused:
             await _audit_reload_attempt(
                 _AUDIT_DOWN,
@@ -983,7 +986,7 @@ async def test_a_missing_dir_refusal_logs_the_whole_long_path(
     with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
         status, answer = await _audit_refused_reload(
             _AUDIT_UP,
-            FileNotFoundError(f"config directory not found: {long_dir}"),
+            ConfigDirMissing(f"config directory not found: {long_dir}"),
             actor="alice",
             requested=long_dir,
             dry_run=False,
@@ -991,7 +994,7 @@ async def test_a_missing_dir_refusal_logs_the_whole_long_path(
     assert (status, answer) == (404, "config directory not found")
     [warning] = _refusal_warnings(caplog)
     assert warning == (
-        f"config reload failed (missing dir): FileNotFoundError: config directory not found: {long_dir}"
+        f"config reload failed (missing dir): ConfigDirMissing: config directory not found: {long_dir}"
     )
 
 
@@ -1051,7 +1054,7 @@ async def test_a_refused_release_is_refused_and_recorded_inside_the_outliving_op
     """Vault BACKLOG #2753 made a released reload outlive the approve request; vault BACKLOG #2459
     gave its refusal the inline route's row and answer. Batch 197 merged the two. This pins the
     structure that lets a refusal's row survive a timed-out approve, without timing one out: the
-    outliving operation itself ends in the 422, not in the raw FileNotFoundError, and the refusal
+    outliving operation itself ends in the 422, not in the raw ConfigDirMissing, and the refusal
     row is already written when it ends."""
     from messagefoundry.api.approvals import ApprovalError
     from messagefoundry.api.outlive import OutlivingOperations
@@ -1075,7 +1078,7 @@ async def test_a_refused_release_is_refused_and_recorded_inside_the_outliving_op
     secret_dir = "missing-config-dir-text"
 
     async def _refuse(*_args: Any, **_kwargs: Any) -> Any:
-        raise FileNotFoundError(f"config directory not found: {secret_dir}")
+        raise ConfigDirMissing(f"config directory not found: {secret_dir}")
 
     monkeypatch.setattr(OutlivingOperations, "run", _spy)
     service = await _service(engine)
@@ -1100,7 +1103,7 @@ async def test_a_refused_release_is_refused_and_recorded_inside_the_outliving_op
     assert len(marks) == 1
     assert marks[0].levelno == logging.WARNING
     # The marker names the type only, never the exception text.
-    assert marks[0].getMessage() == "released config reload refused: FileNotFoundError"
+    assert marks[0].getMessage() == "released config reload refused: ConfigDirMissing"
 
 
 # --- BACKLOG #2183: a released reload audits an unreadable inbound CA as trust_anchor -------------
@@ -1879,15 +1882,431 @@ async def test_the_gated_engine_path_refuses_a_name_no_directory_can_have_as_mis
     engine: Engine, tmp_path: Path, name: str
 ) -> None:
     """:meth:`Engine.reload_target_digest` and an approval-bound reload both raise
-    ``FileNotFoundError``, not ``ConfigDirUnreadable``. Both refuse at the target check, before any
+    ``ConfigDirMissing``, not ``ConfigDirUnreadable``. Both refuse at the target check, before any
     digest is taken. The strict digest's own rule for such a name is pinned in
     tests/test_config_fingerprint.py."""
     from messagefoundry.config.fingerprint import config_fingerprint
     from messagefoundry.pipeline import ApprovedConfig
 
     config_dir = tmp_path / "cfg" / name
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(ConfigDirMissing):
         await engine.reload_target_digest(config_dir)
     approval = ApprovedConfig(config_fingerprint(tmp_path / "cfg"))
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(ConfigDirMissing):
         await engine.reload_detail(config_dir, approval=approval)
+
+
+# --- BACKLOG #3157 item 3: only a missing directory is not_found ---------------------------------
+
+
+def test_load_config_names_a_missing_directory_as_missing(tmp_path: Path) -> None:
+    """A directory moved away after the reload's own check is still answered as missing."""
+    from messagefoundry.config.wiring import load_config
+
+    with pytest.raises(ConfigDirMissing):
+        load_config(tmp_path / "moved-away")
+
+
+def test_a_missing_directory_is_a_refusal_and_a_runner_file_not_found_is_not() -> None:
+    """The tuple tells them apart now: ConfigDirMissing is the not_found refusal, and a plain
+    FileNotFoundError falls to the catch sites' reload_fault branch with every other fault."""
+    from messagefoundry.api.app import _RELOAD_REFUSALS
+
+    assert isinstance(ConfigDirMissing("gone"), _RELOAD_REFUSALS)
+    assert not isinstance(FileNotFoundError("a file the runner opened"), _RELOAD_REFUSALS)
+
+
+_FAULT_DETAIL = "the reload failed inside the engine; see the engine log"
+
+
+async def _raise_file_not_found(*_a: Any, **_k: Any) -> None:
+    raise FileNotFoundError("a file the runner opened")
+
+
+def _runner_raising(make: Callable[[], BaseException]) -> Any:
+    """A runner method that raises a FRESH error on each call, so no traceback is carried from
+    one test, or one call, into the next."""
+
+    async def _raise(*_a: Any, **_k: Any) -> None:
+        raise make()
+
+    return _raise
+
+
+#: Errors a runner start or swap can raise that no refusal maps: each must still be audited
+#: (BACKLOG #3157). SourceStartupError stands for any other Exception type here; a real first-load
+#: start isolates that one per inbound rather than raising it.
+_RUNNER_FAULTS = pytest.mark.parametrize(
+    "fault",
+    [
+        lambda: FileNotFoundError("a file the runner opened"),
+        lambda: PermissionError("a certificate the runner could not open"),
+        lambda: SourceStartupError("an inbound's directory is not there"),
+    ],
+    ids=["FileNotFoundError", "PermissionError", "SourceStartupError"],
+)
+
+
+@_RUNNER_FAULTS
+async def test_a_runner_start_fault_is_a_fault_row_on_release(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: Callable[[], Exception],
+) -> None:
+    """A fault raised starting or swapping the runner escaped the release as a raw 500 with no
+    outcome row (a FileNotFoundError was once mapped to not_found). The released reload now writes
+    config_reload_failed with reason reload_fault, never not_found, and answers the release's
+    refusal."""
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+
+    def _break_the_runner() -> None:
+        monkeypatch.setattr(RegistryRunner, "start", _runner_raising(fault))
+        monkeypatch.setattr(RegistryRunner, "reload", _runner_raising(fault))
+
+    service = await _service(engine)
+    approval_id, r = await _hold_then_release(engine, service, {}, between=_break_the_runner)
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"] == _FAULT_DETAIL
+    rows = await _failed_reload_rows(engine)
+    assert [(d["reason"], d["error"]) for d in rows] == [("reload_fault", type(fault()).__name__)]
+    assert rows[0]["dry_run"] is False
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None and str(row["status"]) == "failed"
+
+
+@_RUNNER_FAULTS
+async def test_an_inline_runner_fault_answers_the_generic_error_and_a_fault_row(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: Callable[[], Exception],
+) -> None:
+    """The inline route with the fault raised where it really is, in the runner's start or swap,
+    rather than by a stubbed reload: 500 with the generic detail, and one reload_fault row after
+    the attempt row (BACKLOG #3157)."""
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    monkeypatch.setattr(RegistryRunner, "start", _runner_raising(fault))
+    monkeypatch.setattr(RegistryRunner, "reload", _runner_raising(fault))
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        r = await c.post("/config/reload", json={}, headers=await _token(c, "op"))
+    assert r.status_code == 500, r.text
+    assert r.json() == {"detail": _FAULT_DETAIL}
+    rows = await _failed_reload_rows(engine)
+    assert [(d["reason"], d["dry_run"], d["error"]) for d in rows] == [
+        ("reload_fault", False, type(fault()).__name__)
+    ]
+
+
+async def test_a_swap_fault_on_a_running_graph_is_a_fault_row(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The swap path, not a first load: a graph is running, and the second reload's swap raises.
+    Its answer and row are the same as a start fault's (BACKLOG #3157)."""
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        headers = await _token(c, "op")
+        first = await c.post("/config/reload", json={}, headers=headers)
+        assert first.status_code == 200, first.text
+        assert engine.registry_runner is not None  # so the next reload swaps, not starts
+        monkeypatch.setattr(
+            RegistryRunner, "reload", _runner_raising(lambda: PermissionError("a cert"))
+        )
+        r = await c.post("/config/reload", json={}, headers=headers)
+    assert r.status_code == 500, r.text
+    assert r.json() == {"detail": _FAULT_DETAIL}
+    rows = await _failed_reload_rows(engine)
+    assert [(d["reason"], d["error"]) for d in rows] == [("reload_fault", "PermissionError")]
+
+
+async def test_a_cancelled_reload_is_not_audited_as_a_fault(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The catch-all is ``Exception``, never ``BaseException``: a cancellation of the reload still
+    propagates, writes its own config_reload_interrupted row, and is never a reload_fault."""
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    monkeypatch.setattr(RegistryRunner, "start", _runner_raising(asyncio.CancelledError))
+    monkeypatch.setattr(RegistryRunner, "reload", _runner_raising(asyncio.CancelledError))
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        headers = await _token(c, "op")
+        with contextlib.suppress(asyncio.CancelledError):
+            r = await asyncio.wait_for(c.post("/config/reload", json={}, headers=headers), 10.0)
+            assert r.status_code != 200, r.text
+    assert await _failed_reload_rows(engine) == []
+    interrupted = await engine.store.list_audit(action="config_reload_interrupted")
+    assert len(interrupted) == 1
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+async def test_an_inline_reload_file_not_found_answers_the_generic_error_and_a_fault_row(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, dry_run: bool
+) -> None:
+    """The inline route, a dry run included, answers the reload's generic error shape rather than
+    a raw 500, and writes the fault row (BACKLOG #3157)."""
+    service = await _service(engine)
+    await _add(service, "op", Role.ADMINISTRATOR)
+    monkeypatch.setattr(engine, "reload_detail", _raise_file_not_found)
+    async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
+        r = await c.post("/config/reload", json={"dry_run": dry_run}, headers=await _token(c, "op"))
+    assert r.status_code == 500, r.text
+    assert r.json() == {"detail": _FAULT_DETAIL}
+    rows = await _failed_reload_rows(engine)
+    assert [(d["reason"], d["dry_run"]) for d in rows] == [("reload_fault", dry_run)]
+
+
+# --- BACKLOG #3157 item 4: a shutdown drain does not cut a reload's own row short -----------------
+
+
+class _SlowAudit:
+    """An audit log that takes a moment to write, so a cancel can land inside the write."""
+
+    def __init__(self, *, fails: bool = False) -> None:
+        self.entered = asyncio.Event()
+        self.rows: list[str] = []
+        self._fails = fails
+
+    async def record_audit(self, action: str, **_kw: Any) -> None:
+        self.entered.set()
+        await asyncio.sleep(0.05)
+        if self._fails:
+            raise sqlite3.OperationalError("PROBE: the audit log refused the row")
+        self.rows.append(action)
+
+
+def _slow_writer(writer: str, store: _SlowAudit) -> tuple[Any, str]:
+    """The writer under test over a fake engine, and the action it writes."""
+    fake = cast(Engine, SimpleNamespace(store=store, coordinator=SimpleNamespace(node_id=None)))
+    if writer == "refusal":
+        refused = _audit_refused_reload(
+            fake, ConfigDirMissing("gone"), actor="alice", requested="/cfg", dry_run=False
+        )
+        return refused, "config_reload_failed"
+    if writer == "convergence":
+        # A fault outside _RELOAD_REFUSALS, which the convergence path writes its own row for.
+        from messagefoundry.api.app import _audit_failed_convergence
+
+        return _audit_failed_convergence(fake, RuntimeError("PROBE"), 1, set()), (
+            "config_reload_failed"
+        )
+    return _record_reload_audit(fake, actor="alice", loaded=None), "config_reload"
+
+
+async def _drain_mid_write(op: Any, store: _SlowAudit) -> None:
+    """Run ``op`` as an outliving operation, and let a shutdown drain cancel it mid write."""
+    from messagefoundry.api.outlive import OutlivingOperations
+
+    outliving = OutlivingOperations()
+    caller = asyncio.create_task(outliving.run(op, "config reload"))
+    await asyncio.wait_for(store.entered.wait(), 5.0)
+    assert await outliving.drain(timeout=0.0, grace=5.0) == ["config reload"]
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    await asyncio.sleep(0.1)  # time for a write the cancel cut off to have landed, had it not been
+
+
+@pytest.mark.parametrize("writer", ["refusal", "reload", "convergence"])
+@pytest.mark.parametrize("shielded", [True, False])
+async def test_a_shutdown_drain_does_not_cut_a_reload_row_short(
+    writer: str, shielded: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The unshielded run is the control: the same cancel then loses the row."""
+    from messagefoundry.api import app as app_module
+
+    if not shielded:
+
+        async def _plain(write: Any, _lost: Any) -> None:
+            await write
+
+        monkeypatch.setattr(app_module, "_write_through_cancel", _plain)
+    store = _SlowAudit()
+    op, action = _slow_writer(writer, store)
+    await _drain_mid_write(op, store)
+    assert store.rows == ([action] if shielded else [])
+
+
+async def test_a_write_the_store_cancels_itself_is_a_failed_row_not_a_cancel() -> None:
+    """Nobody cancelled the reload, so its row helper reports a lost row, as it promises, rather
+    than letting a CancelledError escape into a caller nobody cancelled."""
+    from messagefoundry.api.app import _RELOAD_AUDIT_STEP
+
+    async def _cancelled_by_the_store(*_a: Any, **_k: Any) -> None:
+        raise asyncio.CancelledError
+
+    fake = cast(
+        Engine,
+        SimpleNamespace(
+            store=SimpleNamespace(record_audit=_cancelled_by_the_store),
+            coordinator=SimpleNamespace(node_id=None),
+        ),
+    )
+    steps = await _record_reload_audit(fake, actor="alice", loaded=None)
+    assert steps == [_RELOAD_AUDIT_STEP]
+
+
+@pytest.mark.parametrize("writer", ["refusal", "reload"])
+async def test_a_reload_row_that_fails_after_a_drain_cancel_is_logged(
+    writer: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The cancel reaches the caller's fail-soft handler instead of the write's fault, so the loss
+    is logged where the write ends, with the row."""
+    store = _SlowAudit(fails=True)
+    op, action = _slow_writer(writer, store)
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.app"):
+        await _drain_mid_write(op, store)
+    [lost] = [r for r in caplog.records if "after its operation was cancelled" in r.getMessage()]
+    assert f"Lost row: action={action} actor=alice" in lost.getMessage()
+    assert lost.exc_info is not None and isinstance(lost.exc_info[1], sqlite3.OperationalError)
+
+
+class _HeldAudit(_SlowAudit):
+    """An audit log whose write holds until ``release`` is set. It then fails, as one would on the
+    store engine.stop() closes, or, with ``lands``, records the row."""
+
+    def __init__(self, *, lands: bool = False) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+        self._lands = lands
+
+    async def record_audit(self, action: str, **_kw: Any) -> None:
+        self.entered.set()
+        await self.release.wait()
+        if not self._lands:
+            raise sqlite3.ProgrammingError("PROBE: the store is closed")
+        self.rows.append(action)
+
+
+async def _settle_unlanded() -> None:
+    """Let the row writes a test left running end, so none outlives the test."""
+    from messagefoundry.api.app import _UNLANDED_ROW_WRITES
+
+    if _UNLANDED_ROW_WRITES:
+        await asyncio.wait(set(_UNLANDED_ROW_WRITES), timeout=1.0)
+
+
+@pytest.mark.parametrize("writer", ["refusal", "reload"])
+async def test_a_row_wait_ends_inside_the_grace_the_drain_has_left(
+    writer: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3157 against #3191: the drain's grace is a share of the shutdown budget, and can be
+    shorter than the row wait. The wait is cut to what the grace has left, so the reload's task
+    ends while the drain still waits for it, and the row it could not land is logged at ERROR
+    rather than holding the shutdown."""
+    from messagefoundry.api.outlive import OutlivingOperations
+
+    store = _HeldAudit()
+    op, action = _slow_writer(writer, store)
+    outliving = OutlivingOperations()
+    caller = asyncio.create_task(outliving.run(op, "config reload"))
+    try:
+        await asyncio.wait_for(store.entered.wait(), 5.0)
+        with caplog.at_level(logging.ERROR):
+            assert await outliving.drain(timeout=0.0, grace=0.3) == ["config reload"]
+            # The pin: the drain saw the reload end inside its grace, with nothing left rolling back.
+            assert outliving.inflight == []
+            assert not [r for r in caplog.records if "finished rolling back" in r.getMessage()]
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+            store.release.set()  # the write left running now meets the closed store
+            await _settle_unlanded()
+    finally:
+        store.release.set()
+        await _settle_unlanded()
+    [lost] = [r for r in caplog.records if "after its operation was cancelled" in r.getMessage()]
+    assert f"Lost row: action={action} actor=alice" in lost.getMessage()
+
+
+async def test_a_drained_row_wait_is_not_cut_to_the_undrained_cap() -> None:
+    """Under a drain the grace bounds the wait, so a row slower than the undrained cap, but inside
+    the grace, still lands."""
+    from messagefoundry.api.app import _ROW_CANCEL_WAIT_SECONDS
+    from messagefoundry.api.outlive import OutlivingOperations
+
+    store = _HeldAudit(lands=True)
+    op, action = _slow_writer("reload", store)
+    outliving = OutlivingOperations()
+    caller = asyncio.create_task(outliving.run(op, "config reload"))
+    loop = asyncio.get_running_loop()
+    try:
+        await asyncio.wait_for(store.entered.wait(), 5.0)
+        loop.call_later(_ROW_CANCEL_WAIT_SECONDS + 0.3, store.release.set)
+        await outliving.drain(timeout=0.0, grace=_ROW_CANCEL_WAIT_SECONDS + 0.8)
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        # Landed before the reload ended, so before a real shutdown would go on to close the store.
+        assert store.rows == [action]
+    finally:
+        store.release.set()
+        await _settle_unlanded()
+
+
+async def test_the_grace_reaches_only_the_operations_the_drain_cancelled() -> None:
+    """The grace is keyed by the drained operation's own task. A task it spawned, and a later
+    operation on the same holder cancelled by anything but a drain, read None, not a stale grace."""
+    from messagefoundry.api.outlive import OutlivingOperations, cancel_grace_left
+
+    seen: dict[str, float | None] = {}
+    children: list[asyncio.Task[None]] = []
+
+    async def _waits(name: str, *, spawn: bool = False) -> None:
+        if spawn:
+            children.append(asyncio.create_task(_waits("child")))
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            seen[name] = cancel_grace_left()
+            raise
+
+    outliving = OutlivingOperations()
+    first = asyncio.create_task(outliving.run(_waits("first", spawn=True), "first"))
+    await asyncio.sleep(0.01)
+    assert await outliving.drain(timeout=0.0, grace=1.0) == ["first"]
+    second = asyncio.create_task(outliving.run(_waits("second"), "second"))
+    await asyncio.sleep(0.01)
+    for task in (*children, *outliving._inflight):
+        task.cancel()
+    await asyncio.gather(first, second, *children, return_exceptions=True)
+    await asyncio.sleep(0)
+    left = seen["first"]
+    assert left is not None and 0 < left <= 1.0
+    assert seen["child"] is None and seen["second"] is None
+
+
+async def test_a_row_wait_with_no_grace_left_does_not_wait() -> None:
+    """The bound is read when the cancel lands. With none of the drain's grace left, the cancel
+    goes on at once and the write is left running."""
+    from messagefoundry.uploads import _wait_to_completion
+
+    reads: list[float] = []
+
+    def _left() -> float:
+        reads.append(0.0)
+        return 0.0
+
+    write = asyncio.ensure_future(asyncio.sleep(10))
+    waiter = asyncio.ensure_future(_wait_to_completion(write, cancel_bound=_left))
+    try:
+        await asyncio.sleep(0)
+        assert reads == []  # not read before the cancel
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(waiter, 1.0)
+        assert reads == [0.0] and not write.done()
+    finally:
+        write.cancel()
+        await asyncio.gather(write, return_exceptions=True)
+
+
+def test_the_undrained_row_wait_fits_inside_the_engine_stop_reserve() -> None:
+    """Nothing hands engine.stop() a remaining time, so the cap alone bounds a cancelled convergence
+    reload's row wait there, and it must leave most of the reserve to the rest of the stop
+    (BACKLOG #3191)."""
+    from messagefoundry.api import app as app_module
+
+    assert app_module._ROW_CANCEL_WAIT_SECONDS <= app_module._ENGINE_STOP_RESERVE_SECONDS / 3

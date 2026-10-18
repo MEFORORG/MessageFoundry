@@ -11,6 +11,7 @@ and confirms the ``checks.py`` commit/CI mirror fails-closed on an unresolved po
 
 from __future__ import annotations
 
+import json
 import os
 import tomllib
 from pathlib import Path
@@ -507,6 +508,8 @@ _EXPOSURE_ARMS = [
     # serve folds [security].require_encryption_for_remote=false into its cleartext escape, and
     # under enforcement=warn the escape crosses with a warning. check must agree.
     ("escape-under-warn-passes", 'security.enforcement = "warn"\n' + _ESCAPE, True, True),
+    # The escape is on but has nothing to admit, so the OK line must not say it admitted one.
+    ("escape-with-nothing-to-admit", 'security.enforcement = "warn"\n' + _ESCAPE, False, True),
     # Under enforce the escape is clamped, at start and at check alike.
     ("escape-under-enforce-refused", _ESCAPE, True, False),
 ]
@@ -555,7 +558,13 @@ def test_build_check_runs_the_inbound_exposure_gates(
     if not ok:
         assert "IB_EXPOSED" in result.detail and "without TLS" in result.detail
         # The gate's text names serve's flag; the leg must say check cannot read it.
-        assert "reads only [security].require_encryption_for_remote = false" in result.detail
+        assert "in place of the flag [security].require_encryption_for_remote" in result.detail
+    # BACKLOG #3063 item 8: an OK the escape bought says so and names the listener, where it was a
+    # plain OK line; an OK it did not buy says nothing about it.
+    admitted = "admitted at least one cleartext listener" in result.detail
+    assert admitted is (arm == "escape-under-warn-passes"), f"{arm}: {result.detail}"
+    if admitted:
+        assert "IB_EXPOSED" in result.detail and "without TLS" in result.detail
 
 
 # --- vault BACKLOG #2355: an instance declared in MEFOR_* variables alone is checked, not skipped --
@@ -806,6 +815,173 @@ def test_a_directory_named_messagefoundry_toml_is_not_read_past(
     result = _leg(cfg, "posture")
     assert result.skipped and _ENV_ONLY_NOTE not in result.detail, result.detail
     assert "--service-config" in result.detail
+
+
+def test_a_directory_named_messagefoundry_toml_fails_without_project_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #3063 item 3, the arm without --project-root. serve with no --service-config tests
+    # ./messagefoundry.toml with exists() and opens it, so a directory there stops serve. The upward
+    # search passed over it and read the environment alone, printing OK. The config dir sits inside
+    # the working directory, so the search reaches the working directory before leaving tmp_path.
+    _scrub_mefor_env(monkeypatch)
+    here = tmp_path / "here"
+    cfg = here / "config"
+    cfg.mkdir(parents=True)
+    (cfg / "c.py").write_text(_MLLP_CONFIG, encoding="utf-8")
+    (here / "messagefoundry.toml").mkdir()
+    monkeypatch.chdir(here)
+    monkeypatch.setenv("MEFOR_AI_ENVIRONMENT", "dev")
+    report = run_checks(cfg, run_lint=False, suppress_service_toml_search=False)
+    for name in _SETTINGS_LEGS:
+        result = next(r for r in report.results if r.name == name)
+        assert _ENV_ONLY_NOTE not in result.detail, f"{name}: {result.detail}"
+    posture = next(r for r in report.results if r.name == "posture")
+    assert posture.required and not posture.ok and not posture.skipped, posture.detail
+    assert "settings did not load" in posture.detail and "is a directory" in posture.detail
+    assert not report.ok
+    # Control: with the directory gone, the same run reads the environment alone and passes.
+    (here / "messagefoundry.toml").rmdir()
+    posture = next(
+        r
+        for r in run_checks(cfg, run_lint=False, suppress_service_toml_search=False).results
+        if r.name == "posture"
+    )
+    assert posture.ok and not posture.skipped and _ENV_ONLY_NOTE in posture.detail
+
+
+#: A settings file the upstream-hop-ack leg refuses, so a FAIL shows the file was read and a SKIP
+#: shows it was not.
+_REFUSED_TERMINATOR = '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
+
+
+def _cli_check(
+    capsys: pytest.CaptureFixture[str], *argv: str
+) -> tuple[int, dict[str, dict[str, object]]]:
+    """``messagefoundry check --no-lint --json`` with ``argv``: the exit code and each leg by name."""
+    rc = main(["check", "--no-lint", "--json", *argv])
+    report = json.loads(capsys.readouterr().out)
+    return rc, {leg["name"]: leg for leg in report["checks"]}
+
+
+def _root_with_toml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+    """A project root holding config/ and a refused messagefoundry.toml, and no MEFOR_* variable."""
+    _scrub_mefor_env(monkeypatch)
+    root = tmp_path / "root"
+    cfg = root / "config"
+    cfg.mkdir(parents=True)
+    (cfg / "c.py").write_text(_MLLP_CONFIG, encoding="utf-8")
+    toml = root / "messagefoundry.toml"
+    toml.write_text(_REFUSED_TERMINATOR, encoding="utf-8")
+    return root, toml
+
+
+_SERVE_READS_OTHER = "serve --project-root with no --service-config reads"
+
+
+@pytest.mark.parametrize("where", ["root", "config"])
+def test_a_file_serve_may_not_read_is_graded_and_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], where: str
+) -> None:
+    # BACKLOG #3063 item 2. serve --project-root with no --service-config reads
+    # ./messagefoundry.toml in its own working directory; check reads the project root's file, or
+    # the config dir's. Run from elsewhere, check still grades that file, since skipping it would
+    # turn its refusal into a pass, and each settings line now names the difference.
+    root, toml = _root_with_toml(tmp_path, monkeypatch)
+    if where == "config":
+        toml = toml.rename(root / "config" / "messagefoundry.toml")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    rc, legs = _cli_check(capsys, "--project-root", str(root), "--config", "config")
+    hop = legs["upstream-hop-ack"]
+    assert rc == 1 and not hop["ok"] and not hop["skipped"], hop["detail"]
+    for name in _SETTINGS_LEGS:
+        if not legs[name]["skipped"]:
+            detail = str(legs[name]["detail"])
+            assert f"read {toml}" in detail and _SERVE_READS_OTHER in detail, f"{name}: {detail}"
+    # Control: run from the file's own folder, the two are one file and no line carries the note.
+    monkeypatch.chdir(toml.parent)
+    rc, legs = _cli_check(capsys, "--project-root", str(root), "--config", "config")
+    assert rc == 1 and not legs["upstream-hop-ack"]["ok"]
+    assert not any(_SERVE_READS_OTHER in str(leg["detail"]) for leg in legs.values())
+
+
+def test_an_explicit_service_config_is_read_wherever_it_points(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # BACKLOG #3063 items 2 and 11. Under --project-root, an explicit --service-config is read
+    # wherever it points, run from anywhere: the root's file, and the working directory's file,
+    # which the help said was left unread without saying that naming it reads it.
+    root, toml = _root_with_toml(tmp_path, monkeypatch)
+    here = tmp_path / "here"
+    here.mkdir()
+    local = here / "messagefoundry.toml"
+    local.write_text(_REFUSED_TERMINATOR, encoding="utf-8")
+    monkeypatch.chdir(here)
+    for named in (toml, local):
+        rc, legs = _cli_check(
+            capsys,
+            "--project-root",
+            str(root),
+            "--config",
+            "config",
+            "--service-config",
+            str(named),
+        )
+        hop = legs["upstream-hop-ack"]
+        assert rc == 1 and not hop["ok"] and not hop["skipped"], f"{named}: {hop['detail']}"
+        # A named file is the one serve reads with the same flags, so there is no difference.
+        assert _SERVE_READS_OTHER not in str(hop["detail"])
+
+
+def test_check_help_says_what_it_reads_under_project_root(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # BACKLOG #3063 item 11: the help must say an explicit --service-config is read, the working
+    # directory's file included, beside saying the working directory's file is otherwise unread.
+    with pytest.raises(SystemExit):
+        main(["check", "--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    assert "each settings check's line names the file it read" in text
+    assert "An explicit --service-config is read wherever it points" in text
+
+
+def test_connection_exposure_refusal_names_service_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # BACKLOG #3063 item 7. The exposure gate's refusal names serve's --allow-insecure-bind, which
+    # `connection` does not take, and did not say which settings were read or name --service-config.
+    _scrub_mefor_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)  # no ./messagefoundry.toml here
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "logic.py").write_text(
+        "from messagefoundry import router\n@router('r')\ndef r(m): return []\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("MEFOR_INBOUND_BIND_HOST", "0.0.0.0")
+    edit = {
+        "direction": "inbound",
+        "name": "IB_EXPOSED",
+        "transport": "mllp",
+        "router": "r",
+        "settings": {"port": 2615},
+        "messages_days": 0,
+    }
+    argv = ["connection", "upsert", "--config", str(cfg), "--data", json.dumps(edit), "--json"]
+    rc = main(argv)
+    out = capsys.readouterr().out
+    assert rc == 1 and "IB_EXPOSED" in out and "without TLS" in out, out
+    assert "`messagefoundry connection` has no --allow-insecure-bind" in out
+    assert "No --service-config was given" in out and "--service-config <path" in out
+    assert not (cfg / "connections.toml").exists()
+    # Named settings: the flag note stays, and the account of a missing --service-config goes.
+    svc = tmp_path / "svc.toml"
+    svc.write_text("", encoding="utf-8")
+    rc = main([*argv, "--service-config", str(svc)])
+    out = capsys.readouterr().out
+    assert rc == 1 and "`messagefoundry connection` has no --allow-insecure-bind" in out
+    assert "No --service-config was given" not in out
 
 
 # BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only

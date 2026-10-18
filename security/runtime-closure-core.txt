@@ -46,7 +46,7 @@ pydantic==2.14.1
 pydantic-core==2.50.1
 pyspnego==0.12.4
 sspilib==0.6.0
-starlette==1.7.0
+starlette==1.8.0
 tomlkit==0.15.1
 truststore==0.10.5
 typing-extensions==4.16.0

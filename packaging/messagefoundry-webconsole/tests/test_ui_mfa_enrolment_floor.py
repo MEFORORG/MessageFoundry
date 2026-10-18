@@ -41,7 +41,7 @@ from _ui_clients import (
 )
 
 from messagefoundry.auth.ldap import AdPrincipal
-from messagefoundry.auth.service import TOO_EARLY, AuthService, Elevation
+from messagefoundry.auth.service import TOO_EARLY, AuthService, DirectoryRefusal, Elevation
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
@@ -199,7 +199,10 @@ _ENROL_REFUSALS = pytest.mark.parametrize(
 
 
 def _refusal(refusal: str) -> Elevation:
-    return Elevation(directory_unconfirmed=refusal == "directory", locked=refusal == "locked")
+    return Elevation(
+        directory_refusal=DirectoryRefusal.UNCONFIRMED if refusal == "directory" else None,
+        locked=refusal == "locked",
+    )
 
 
 @_ENROL_REFUSALS
@@ -211,7 +214,7 @@ async def test_the_console_totp_confirm_says_why_an_unchecked_code_was_refused(
     in tests/test_enrolment_directory_recheck.py. A second-step lock found by the re-read after the
     lookup never judged the code either (BACKLOG #3810 finding 4).
 
-    RED when: ``/ui/account/mfa/verify`` drops the directory_unconfirmed or the locked branch (the
+    RED when: ``/ui/account/mfa/verify`` drops the directory_refusal or the locked branch (the
     refused arm then reads "Invalid code."), or applies either to an ordinary wrong code (the
     control arm)."""
     service, _now = await _floored_service(engine, monkeypatch)
@@ -241,7 +244,7 @@ async def test_the_console_passkey_finish_says_why_an_unchecked_passkey_was_refu
 ) -> None:
     """As above, for ``finish_webauthn_registration``. The service answer is stubbed.
 
-    RED when: ``/ui/account/webauthn/verify`` drops the directory_unconfirmed or the locked branch
+    RED when: ``/ui/account/webauthn/verify`` drops the directory_refusal or the locked branch
     (the refused arm then reads "passkey verification failed"), or applies either to an ordinary
     failed attestation."""
     principal = AdPrincipal(

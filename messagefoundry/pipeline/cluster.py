@@ -776,7 +776,16 @@ class ClusterCoordinator(Protocol):
         """The current cluster-wide config-reload version (Track B Step 6). :class:`DbCoordinator` reads
         ``cluster_config`` (initializing the single row to 0 if absent) and caches it; the engine reads
         it once at startup to seed ``_applied_config_version`` so a fresh node doesn't self-reload.
-        :class:`NullCoordinator` returns 0 (single-node has no shared token)."""
+        :class:`NullCoordinator` returns 0 (single-node has no shared token).
+
+        **It must answer BEFORE :meth:`start`.** The engine seeds from it before its first config
+        load (:meth:`Engine.seed_config_version`, vault BACKLOG #3076), and that load runs before
+        the engine starts this coordinator, so a sibling's reload in between is still ahead of the
+        seed (vault BACKLOG #3109). Both shipped DB coordinators meet this: ``cluster_config`` is in
+        the store's own schema batch, which runs when the store opens (or which ``provision-schema``
+        ran, under ``[store].schema_management = external``), so the read needs no table
+        :meth:`start` creates. A backend that cannot meet it raises here; the engine logs that and
+        seeds at its own start instead, as it did before the early seed."""
         ...
 
     def config_version_cached(self) -> int:

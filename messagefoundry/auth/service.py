@@ -844,7 +844,7 @@ IDP_STEP_UP_REQUIRED = "idp_step_up_required"
 #: :meth:`AuthService.finish_webauthn_assertion` (BACKLOG #2239) refuse a directory account with
 #: when the directory does not confirm it is present and enabled. Written into the
 #: ``auth.mfa_failed`` or ``auth.webauthn_failed`` audit row beside the probe's outcome, and carried
-#: on ``Elevation.directory_unconfirmed``. The code or assertion is never checked and nothing is
+#: on ``Elevation.directory_refusal``. The code or assertion is never checked and nothing is
 #: charged.
 DIRECTORY_UNCONFIRMED = "directory_unconfirmed"
 
@@ -858,6 +858,37 @@ EMPTY_PASSWORD = "empty_password"  # nosec B105 -- an audit reason slug, not a c
 #: step-up leg refuses with it too, as its own closed-set reason (BACKLOG #2154), and so does the
 #: password re-bind, as the ``auth.reauth`` row's ``reason`` (BACKLOG #3081).
 DIRECTORY_ROLES_DEMOTED = "directory_roles_demoted"
+
+#: The outcome :meth:`AuthService._directory_step_up_refusal` gives a present, enabled directory
+#: account when the AD group-to-role map fails its seal (BACKLOG #2592), so no role can be judged.
+#: Not :data:`DIRECTORY_ROLES_DEMOTED`: nothing changed in the directory, a new sign-in takes its
+#: roles from the same failing map, and the fix is an administrator re-saving the map (BACKLOG
+#: #3082). Audited beside :data:`DIRECTORY_UNCONFIRMED`.
+DIRECTORY_ROLE_MAP_UNSEALED = "directory_role_map_unsealed"
+
+
+class DirectoryRefusal(Enum):
+    """Why a step-up leg refused a directory account it never checked the proof of, carried on
+    ``Elevation.directory_refusal`` so a caller can name the fix that clears it (BACKLOG #3082).
+
+    ``UNCONFIRMED``: the directory did not confirm the account is present and enabled, or could not
+    be asked. A later try, or an administrator, clears it; a new sign-in would fail the same way.
+    ``DEMOTED``: the account is present and enabled, but a role it holds is no longer among those
+    its directory groups grant (BACKLOG #2240). A new sign-in clears it, because it takes the roles
+    the groups grant now. The precise cause stays on the audit row; a caller says only which fix."""
+
+    UNCONFIRMED = DIRECTORY_UNCONFIRMED
+    DEMOTED = DIRECTORY_ROLES_DEMOTED
+
+
+def _directory_refusal(outcome: str) -> DirectoryRefusal:
+    """The fix a ``_directory_step_up_refusal`` outcome needs: a lost role is a demotion, and every
+    other outcome, an outage or a role map that failed its seal included, is an account the
+    directory did not confirm."""
+    if outcome == DIRECTORY_ROLES_DEMOTED:
+        return DirectoryRefusal.DEMOTED
+    return DirectoryRefusal.UNCONFIRMED
+
 
 #: The closed-set reasons the federated step-up leg refuses with (BACKLOG #296), on the
 #: ``auth.reauth`` audit row and on :class:`OidcStepUp`. A claims-ladder slug can also appear there.
@@ -936,6 +967,12 @@ _STEP_UP_ERRORS: Final[Mapping[str, str]] = MappingProxyType(
         DIRECTORY_ROLES_DEMOTED: (
             "Your directory groups no longer grant the roles this session holds. Sign out, then"
             " sign in again to take the roles your groups grant now."
+        ),
+        # Not a demotion: a new sign-in reads the same failing map, so it is never told to sign
+        # out (BACKLOG #3082).
+        DIRECTORY_ROLE_MAP_UNSEALED: (
+            "Your directory roles could not be confirmed. Try again later. If it is still refused,"
+            " ask an administrator."
         ),
     }
 )
@@ -1068,11 +1105,13 @@ class Elevation:
     #: checked, except on a demoted account's re-bind (BACKLOG #3081): the bind proved the password
     #: right, and the account was refused for its roles, so a retry is refused again until a new
     #: sign-in re-syncs them. It qualifies the wrong-proof state: the token still authenticates, and
-    #: the caller must say the directory could not confirm the account rather than call the code,
-    #: the password or the passkey wrong. The cause goes to the audit row (``reason`` on
-    #: ``auth.reauth``, ``outcome`` on ``auth.mfa_failed`` or ``auth.webauthn_failed``) and never
-    #: to the caller.
-    directory_unconfirmed: bool = False
+    #: the caller must name the directory's refusal, by the fix below, rather than call the code,
+    #: the password or the passkey wrong. The precise cause goes to the audit row (``reason`` on
+    #: ``auth.reauth``, ``outcome`` on ``auth.mfa_failed`` or ``auth.webauthn_failed``). The caller
+    #: gets only which fix clears it: :attr:`DirectoryRefusal.DEMOTED` for a lost role, which a new
+    #: sign-in clears, and :attr:`DirectoryRefusal.UNCONFIRMED` for every other cause, which a new
+    #: sign-in does not (BACKLOG #3082). ``None`` when no directory refused.
+    directory_refusal: DirectoryRefusal | None = None
 
     @property
     def ok(self) -> bool:
@@ -1886,7 +1925,7 @@ class _Reproof:
     reason: str | None = None
     #: A directory re-proof the directory could not vouch for, so nothing was charged: it could not
     #: judge the password, or the account lost a role there (#3081); ``reason`` says why. Carried
-    #: to ``Elevation.directory_unconfirmed`` so a caller does not report the password as wrong.
+    #: to ``Elevation.directory_refusal`` so a caller does not report the password as wrong.
     directory_unconfirmed: bool = False
 
 
@@ -2690,6 +2729,11 @@ class AuthService:
         admin_grant_alert: Callable[[str, str], None] | None = None,
     ) -> None:
         self._store = store
+        # A copy: the caller's object is also stashed as app.state.auth_settings, and the section
+        # is not frozen, so a write through that stash would otherwise change a live limit with no
+        # audit row (vault BACKLOG #3215). The name is rebound so every object built below, the
+        # directory authenticator and the limiters included, gets the copy too.
+        settings = settings.model_copy(deep=True)
         self._settings = settings
         # BACKLOG #2592: raises the integrity alert when an authority row fails its seal. Injected by
         # the API lifespan (the service never imports the alert sinks). None logs only.
@@ -3145,6 +3189,15 @@ class AuthService:
         ``require_reauth_only_action`` fallback so an org can opt out via
         ``[auth].require_action_step_up = false``."""
         return self._settings.require_action_step_up
+
+    @property
+    def settings(self) -> AuthSettings:
+        """A copy of the ``[auth]`` limits this service enforces. ``GET /security/posture`` reports
+        its loosenings from here, so an embedder that attaches a service with loosened limits sees
+        them named (vault BACKLOG #3215). A deep copy, for the reason the constructor copies its
+        argument: the section is not frozen and holds lists, so a reader that set a field, or
+        appended to a list, on the enforced object would change a live limit with no audit row."""
+        return self._settings.model_copy(deep=True)
 
     @property
     def kerberos_enabled(self) -> bool:
@@ -5650,8 +5703,9 @@ class AuthService:
         fresh = await self._load_user(user.id)
         if fresh is None:
             return await refuse("session_gone", lost=True)
-        if await self._directory_roles_lost(fresh.role_ids, principal.groups):
-            return await refuse(DIRECTORY_ROLES_DEMOTED)
+        lost = await self._directory_roles_lost(fresh.role_ids, principal.groups)
+        if lost is not None:
+            return await refuse(lost)
         purpose = flow.step_up_purpose
         # The password leg's three ORDER-CRITICAL steps (see :meth:`reauth`), against the hash.
         # (1) Every stamp against the OLD hash, re-anchoring the session to this client address.
@@ -7383,8 +7437,9 @@ class AuthService:
           referral marks every candidate, so an account that pass itself revokes forfeits too.
 
         At least these take an account out: it signs out or reaches the session cap, the reconciler
-        revokes it, an operator disables it locally, or its row is deleted. The cost is a missed
-        clear when an account leaves for an ordinary reason while the evidence is pending. A trip
+        revokes it, an operator disables it locally, its row is deleted, or the session reaper deletes
+        its idle sessions (an idle row stays a candidate until then, BACKLOG #2283). The cost is a
+        missed clear when an account leaves for an ordinary reason while the evidence is pending. A trip
         or a referral marks every candidate unconfirmed, healthy ones too, so a sign-out during a
         long trip or referral forfeits its clear. This is one process's memory: what leaves across
         a restart is not seen here. The rule in `_mark_reconcile_clears` covers that case, because
@@ -7540,11 +7595,16 @@ class AuthService:
             self._reconcile_hold_standing = "held"
         elif event == "forfeit" and current not in ("settled", "forfeit"):
             self._reconcile_hold_standing = "forfeit"
+            # A fresh process has held nothing: its account left with an undetermined answer that
+            # an earlier run's hold may still cover, so the line must not say this process held
+            # (BACKLOG #3084).
             _log.warning(
                 "directory reconcile: an account whose userAccountControl read undetermined left "
-                "before this process released a hold, so it will not resolve ad_reconcile_held "
-                "itself "
-                "until it restarts; an operator resolves it once the attribute reads clean"
+                "%s, so this process will not resolve ad_reconcile_held itself until it restarts; "
+                "an operator resolves any open instance once the attribute reads clean",
+                "before this process released its hold"
+                if current == "held"
+                else "before any pass here had held, and an earlier run's hold may still cover it",
             )
         elif event == "settled" and current in _HOLD_RELEASABLE:
             self._reconcile_hold_standing = "settled"
@@ -9348,6 +9408,12 @@ class AuthService:
         is reported: a failing map grants nothing from any of its pairs, because the seal covers
         the set, so a pair added outside the store cannot be told from the rest. The map is read
         in one statement, so an honest write cannot tear the read."""
+        sealed = await self._sealed_ad_map(name)
+        return sealed if sealed is not None else AdMap(name)
+
+    async def _sealed_ad_map(self, name: str) -> AdMap | None:
+        """:meth:`_ad_map`, but ``None`` rather than an empty map when the seal fails, for a caller
+        that must tell a failing map from an honestly empty one. The failure is still reported."""
         current = await self._store.get_ad_map(name)
         if ad_map_seal_ok(self._store.row_sealer(), current):
             return current
@@ -9356,28 +9422,14 @@ class AuthService:
             f"the {name} failed its integrity check and grants nothing",
             {"kind": ADSET_KIND, "map": name},
         )
-        return AdMap(name)
+        return None
 
     async def _ad_roles_for_groups(self, groups: Iterable[str]) -> set[str]:
         """The role ids the AD group-to-role map gives ``groups``; none when the map fails its
-        seal. A directory role decision reads the map through here, or through :meth:`_ad_map`
-        once for a whole pass."""
+        seal. A directory role decision reads the map through here, through :meth:`_ad_map` once
+        for a whole pass, or through :meth:`_directory_roles_lost`, which tells a failing map from a
+        lost role."""
         return (await self._ad_map(AD_ROLE_MAP)).values_for(groups)
-
-    async def _directory_roles_lost(self, role_ids: Iterable[str], groups: Iterable[str]) -> bool:
-        """Whether a stored role in ``role_ids`` is not among the roles ``groups`` map to: the
-        demotion test every directory step-up leg refuses on with :data:`DIRECTORY_ROLES_DEMOTED`
-        (BACKLOG #2240, #2154, #3081), shared by every leg that refuses on it (BACKLOG #3081 item
-        6). This docstring is where the rule's reasons live.
-
-        Only a LOST role counts: an added role leaves the account holding fewer roles than the
-        directory grants, not more. Roles are compared by id, not by permission, so a move from one
-        role to another counts even when the new role grants more. Channel scope is not compared.
-        At least three role decisions ask a different question and do not call this: sign-in and
-        the reconciler ask whether the roles CHANGED at all, because they re-sync or revoke, and
-        :meth:`identity_for_cert_user_id` keeps the stored roles still mapped, because it narrows
-        rather than refuses."""
-        return not set(role_ids) <= await self._ad_roles_for_groups(groups)
 
     async def _ad_channels_for_groups(self, groups: Iterable[str]) -> frozenset[str]:
         """The channels the AD group-to-channel map gives ``groups``; none when the map fails its
@@ -10365,15 +10417,16 @@ class AuthService:
             # another object's groups, as identity_for_cert_user_id refuses it. The password was
             # right, so nothing is charged or registered, and the session's budget and the account
             # counter are left as they were. It refuses and writes nothing: the reconciler or the
-            # next sign-in re-syncs the roles.
-            refusal: str | None = None
+            # next sign-in re-syncs the roles. A role map that fails its seal is refused as
+            # DIRECTORY_ROLE_MAP_UNSEALED rather than as a demotion (BACKLOG #3082).
+            refusal: str | None
             if (
                 current.directory_object_id != user.directory_object_id
                 or current.auth_provider != user.auth_provider
             ):
                 refusal = DIRECTORY_IDENTITY_CONFLICT
-            elif await self._directory_roles_lost(current.role_ids, groups):
-                refusal = DIRECTORY_ROLES_DEMOTED
+            else:
+                refusal = await self._directory_roles_lost(current.role_ids, groups)
             if refusal is not None:
                 return _Reproof(ok=False, user=current, reason=refusal, directory_unconfirmed=True)
         if not clear:
@@ -10475,7 +10528,12 @@ class AuthService:
         ok = proof.ok
         elevation = Elevation(
             session_lost=proof.session_revoked or proof.session_gone,
-            directory_unconfirmed=proof.directory_unconfirmed,
+            # A demoted account's re-bind proved the password right and is told to sign in again,
+            # which re-syncs its roles; every other directory refusal is UNCONFIRMED (BACKLOG
+            # #3081, #3082).
+            directory_refusal=_directory_refusal(proof.reason or "")
+            if proof.directory_unconfirmed
+            else None,
         )
         grant_refused = False
         if ok:
@@ -11569,7 +11627,7 @@ class AuthService:
         **A directory account must be confirmed by the directory first** (BACKLOG #3061), through
         the same :meth:`_directory_vouches_for_factor` :meth:`verify_mfa` calls, so an account
         disabled, gone or demoted in the directory cannot clear the MFA gate by enrolling. It asks
-        after the floor and before the code is checked. A refusal returns ``directory_unconfirmed``
+        after the floor and before the code is checked. A refusal returns ``directory_refusal``
         (or, when the session or account went during the lookup, ``session_lost``), spends no TOTP
         step, mints no recovery codes, and leaves MFA off with the staged secret in place. Since the
         re-read after the lookup refuses a second-step lock, a locked directory account cannot enrol
@@ -12266,7 +12324,7 @@ class AuthService:
         :meth:`finish_webauthn_assertion` (BACKLOG #2239) each used to spell out (BACKLOG #3068).
         For an AD row it asks :meth:`_directory_step_up_refusal`. A refusal is audited as ``event``
         with ``reason=directory_unconfirmed`` and the lookup's outcome, and returns
-        ``directory_unconfirmed``: nothing was checked or charged, and the token still
+        ``directory_refusal``: nothing was checked or charged, and the token still
         authenticates. A confirmed lookup was a network round trip, so the session, the account
         and its second-step lock are then read again through :meth:`_factor_holder_current`.
 
@@ -12293,7 +12351,7 @@ class AuthService:
             if phase is not None:
                 detail["phase"] = phase
             await self._audit(event, actor=user.username, detail=_json(detail), client=client)
-            return Elevation(directory_unconfirmed=True)
+            return Elevation(directory_refusal=_directory_refusal(refusal))
         return await self._factor_holder_current(
             token,
             actor=user.username,
@@ -12385,7 +12443,35 @@ class AuthService:
         fresh = await self._load_user(user.id)
         if fresh is None:
             return ACCOUNT_REFUSED
-        if await self._directory_roles_lost(fresh.role_ids, answer.groups):
+        return await self._directory_roles_lost(fresh.role_ids, answer.groups)
+
+    async def _directory_roles_lost(
+        self, role_ids: Iterable[str], groups: Iterable[str]
+    ) -> str | None:
+        """Why a stored role in ``role_ids`` is not among the roles ``groups`` map to, or ``None``
+        when every one is: the demotion test every directory step-up leg refuses on (BACKLOG #2240,
+        #2154, #3081), shared by every leg that refuses on it (BACKLOG #3081 item 6). This
+        docstring is where the rule's reasons live. An account with no roles has none to lose.
+
+        :data:`DIRECTORY_ROLES_DEMOTED` for a lost role, and :data:`DIRECTORY_ROLE_MAP_UNSEALED`
+        when the role map fails its seal, since every stored role would then read as lost and
+        telling the account to sign in again would cost it the session for nothing (BACKLOG
+        #3082).
+
+        Only a LOST role counts: an added role leaves the account holding fewer roles than the
+        directory grants, not more. Roles are compared by id, not by permission, so a move from one
+        role to another counts even when the new role grants more. Channel scope is not compared.
+        At least three role decisions ask a different question and do not call this: sign-in and
+        the reconciler ask whether the roles CHANGED at all, because they re-sync or revoke, and
+        :meth:`identity_for_cert_user_id` keeps the stored roles still mapped, because it narrows
+        rather than refuses."""
+        held = set(role_ids)
+        if not held:
+            return None
+        role_map = await self._sealed_ad_map(AD_ROLE_MAP)
+        if role_map is None:
+            return DIRECTORY_ROLE_MAP_UNSEALED
+        if not held <= role_map.values_for(groups):
             return DIRECTORY_ROLES_DEMOTED
         return None
 
@@ -12802,7 +12888,7 @@ class AuthService:
 
         **A directory account must be confirmed by the directory first** (BACKLOG #3061), as on
         :meth:`confirm_mfa_enrollment`. It asks after the floor and before the challenge is popped,
-        so a refusal verifies no attestation and stores no passkey. A ``directory_unconfirmed``
+        so a refusal verifies no attestation and stores no passkey. A ``directory_refusal``
         refusal leaves the ceremony in flight; a ``session_lost`` one, when the session or account
         went during the lookup, ends it. Since the re-read after the lookup refuses a second-step
         lock, a locked directory account cannot enrol a passkey, and that refusal carries
@@ -13014,7 +13100,7 @@ class AuthService:
 
         **A directory account must be confirmed by the directory first** (BACKLOG #2239), through
         the same :meth:`_directory_vouches_for_factor` :meth:`verify_mfa` calls. A refusal returns
-        ``directory_unconfirmed`` and spends neither the challenge nor the sign count. The lookup
+        ``directory_refusal`` and spends neither the challenge nor the sign count. The lookup
         runs only once a ceremony is staged for the session, so a post with nothing staged gets the
         plain ``expired`` refusal and costs no lookup (BACKLOG #3068). The session, the account and
         the lock are read once more right before the factor is written."""

@@ -637,7 +637,7 @@ async def test_a_quota_check_walks_the_uploads_directory_once(tmp_path: Path) ->
         return real_iter()
 
     store._iter_sidecars = _counting_iter  # type: ignore[method-assign]
-    assert store._observed_sync("u-op") == (2, len(b"sealed\n"))
+    assert store._observed_sync("u-op") == (2, len(b"sealed\n"), 1, 0)
     assert walks == 1
 
 

@@ -180,7 +180,7 @@ backend-limited.
 | `encryption_keys_retired` | secret | — | **env only** (`MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`); comma-separated base64 **decrypt-only** keys kept available during a rotation until `messagefoundry rotate-key` finishes re-encrypting under the active key (ASVS 11.2.2). Keep them through the engine's first start after the rotation as well. That start re-keys the secret-rotation fingerprints, and needs the old key to spot a secret changed in the same window (BACKLOG #2242; [PHI.md §3](PHI.md#3-encryption-at-rest)). Not under the Windows service: `serve` refuses a store key in the service's environment lists, so that start runs without it ([SERVICE.md](SERVICE.md#protect-the-store-encryption-key-at-rest-wp-11d)). |
 | `encryption_key_file` | path | — | Windows **DPAPI-protected** key file (WP-11d, ASVS 13.3.1) — a path produced by `messagefoundry protect-key`. When `encryption_key` is unset and this is set, the active key is `CryptUnprotectData`'d from this file at store open, so the plaintext key never sits in the service environment. Windows-only, and the **env key takes precedence** when both are present. A **path, not a secret** — it may live in the file. Unset = use `encryption_key`. **Under the Windows service, use this file:** `serve` refuses the store key in the service's environment lists ([SERVICE.md](SERVICE.md#protect-the-store-encryption-key-at-rest-wp-11d)). `protect-key` creates the file restricted and refuses to replace an existing one. When the provider reads this file, `serve` first checks that no broad account can read it, and refuses to start under `[security].enforcement = "enforce"` if one can ([PHI.md](PHI.md), "Key files"). |
 | `aad_bind` | bool | `true` | **not a secret** (`MEFOR_STORE_AAD_BIND`); cell binding (ASVS 11.3.3, [ADR 0019](adr/0019-pluggable-keyprovider-hsm-kms-vault.md)). New at-rest AES-256-GCM writes use the cell-bound writer, `mfenc:v4` (`mfenc:v2` before [ADR 0196](adr/0196-a-fresh-or-rewound-store-must-not-restart-a-store-key-s-aes-gcm-invocation-count.md), which seals each store under its own HKDF data sub-key) — each value is bound to its `(table, column, row)` cell via GCM Associated Data, so a ciphertext cut-and-pasted into another cell **fails the auth tag** (dead-lettered `CipherError`) instead of silently decrypting. **On by default** (ADR 0148 GIVEN 1: the shipped configuration runs the hardened path). Setting it `false` selects the frozen `mfenc:v1` writer (byte-identical at rest) and is a **loosening** — `security_loosenings()` names it, so the opt-out is never silent. No effect without an `encryption_key` (the identity cipher has nothing to bind). Legacy `v1` rows still decrypt (dual-read); `messagefoundry rotate-key` upgrades them `v1` to `v4`, so the default is safe and reversible on an existing store. |
-| `allow_unmarked_ciphertext` | bool | `false` | **not a secret** (`MEFOR_STORE_ALLOW_UNMARKED_CIPHERTEXT`); refuse unmarked values (ASVS 11.3.3, BACKLOG #1169). On a keyed store, a non-blank value with no `mfenc:` marker in an encrypted column is **refused** (`CipherError`, plus an `integrity_drift` alert with subject `store-cipher` naming only the table and column) instead of being read back as plaintext: it is a stripped marker or a planted row. A purged `''` is never refused. The keyed open seals legacy plaintext only on a `(table, column)` that is still unsealed, one transaction per column. A column is sealed once it holds ciphertext, or once the store has recorded it in its `keyed_surface` table (BACKLOG #3383). A writable keyed open that finishes its sweep records every column. So a plant into a recorded column is refused even when the column holds no ciphertext. Setting it `true` restores the old behaviour (plaintext passthrough, and the open seals every unmarked value, recorded column or not) and is a **loosening** — `security_loosenings()` names it. No effect without an `encryption_key`. **It covers the uploaded-file store too** (owner ruling 2026-09-23): on a keyed store a plaintext upload under `uploads_dir` is refused on read until `messagefoundry rotate-key` seals it, alerting under its own subject `upload-cipher`, and `serve` logs the count of such uploads at startup. Setting this `true` restores the upload passthrough as well. Under `cipher_provider = "vault_transit"` uploads keep the passthrough either way; [PHI.md](PHI.md) §3 says why. |
+| `allow_unmarked_ciphertext` | bool | `false` | **not a secret** (`MEFOR_STORE_ALLOW_UNMARKED_CIPHERTEXT`); refuse unmarked values (ASVS 11.3.3, BACKLOG #1169). On a keyed store, a non-blank value with no `mfenc:` marker in an encrypted column is **refused** (`CipherError`, plus an `integrity_drift` alert with subject `store-cipher` naming only the table and column) instead of being read back as plaintext: it is a stripped marker or a planted row. A purged `''` is never refused. The keyed open seals legacy plaintext only on a `(table, column)` that is still unsealed, one transaction per column. A column is sealed once it holds ciphertext, or once the store has recorded it in its `keyed_surface` table (BACKLOG #3383). A writable keyed open that finishes its sweep records every column. So a plant into a recorded column is refused even when the column holds no ciphertext. Setting it `true` restores the old behaviour (plaintext passthrough, and the open seals every unmarked value, recorded column or not) and is a **loosening** — `security_loosenings()` names it. No effect without an `encryption_key`. **It covers the uploaded-file store too** (owner ruling 2026-09-23): on a keyed store a plaintext upload under `uploads_dir` is refused on every read, and `messagefoundry rotate-key` seals it where it can (not every one: [PHI.md](PHI.md) §3 says which it leaves, and what removes them), alerting under its own subject `upload-cipher`, and `serve` logs the count of such uploads at startup. Setting this `true` restores the upload passthrough as well. Under `cipher_provider = "vault_transit"` uploads keep the passthrough either way; [PHI.md](PHI.md) §3 says why. |
 | `key_provider` | enum | `auto` | selects **how** the active/retired DEK bytes are *sourced* — never how they are used (the cipher, keyring, and `mfenc:v1` format are unchanged; ADR 0019, ASVS 13.3.3). `auto` (default) is the env-then-DPAPI ladder, **byte-identical** to the pre-seam behavior; `env` pins `MEFOR_STORE_ENCRYPTION_KEY` and `dpapi` pins `encryption_key_file`, and each ignores the other source. A key set only in the source the pinned provider ignores is **refused, not used as keyless** (BACKLOG #2077): `serve`, `supervise` and `provision-admin` refuse before opening, whatever the audited opt-out says, and `open_store` refuses for every other command. Set `auto` or the source the provider reads. Under `cipher_provider = "vault_transit"` the gate still counts any local key, because the store never resolves `key_provider` there; DR backups and `rotate-key` do, and refuse the ignored key. `vault` **is built** ([store/keyprovider_vault.py](../messagefoundry/store/keyprovider_vault.py)): it envelope-decrypts a wrapped DEK through HashiCorp Vault **Transit** and needs the optional `[vault]` extra. Its wiring comes from the environment. `MEFOR_STORE_VAULT_TRANSIT_KEY` (the KEK name; not the next row's `MEFOR_STORE_TRANSIT_KEY`) and `MEFOR_STORE_VAULT_WRAPPED_DEK` are required. `MEFOR_STORE_VAULT_ADDR`, `MEFOR_STORE_VAULT_TOKEN` and `MEFOR_STORE_VAULT_CA_FILE` are optional, and an unset address or token is **not refused**: hvac falls back to its own `VAULT_ADDR`/`VAULT_TOKEN` handling and built-in defaults, so set both. The unwrap runs wherever the key is resolved, at least at every store open and every DR backup pass. It reads the KEK's metadata to check its type before decrypting, so the token needs both. A missing required variable or extra, a KEK of an unsuitable type, a Vault that is off the box with no `vault_revocation_attested` (two rows below), or a failed unwrap **fails closed**: the store does not open, or that backup pass fails. Only the **active** key comes from Vault; retired keys still come from `encryption_keys_retired`, in plaintext. The unwrapped DEK feeds the in-process cipher, so unlike `cipher_provider = "vault_transit"` it does enter engine heap. **The keyless-PHI gate counts it as a key** (BACKLOG #1998). `_store_key_configured` in [`__main__.py`](../messagefoundry/__main__.py) treats every external provider as a configured key without resolving it, because the gate runs before the store opens and must not need the network. So a PHI instance set to `vault` with no local key passes the gate, and a provider that cannot resolve fails closed when the store opens. Under `cipher_provider = "vault_transit"` the store never resolves `key_provider`; DR backups and `rotate-key` still do, and fail closed there. `aws_kms`·`azure_kv`·`gcp_kms`·`pkcs11` are **not built yet**; selecting one **fails closed** the same way, never a silent downgrade. Names a *provider*, not key material, so it is **not** a secret. |
 | `cipher_provider` | enum | `aesgcm` | selects the at-rest **cipher itself** — distinct from `key_provider`, which only *sources* DEK bytes for the in-process cipher ([ADR 0138](adr/0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md), ASVS 13.3.3). `aesgcm` (the default) is that in-process AES-256-GCM cipher, byte-identical to today. `vault_transit` performs the bulk encrypt/decrypt **inside** Vault/OpenBao Transit, so the plaintext DEK never enters engine heap; at-rest values then carry the `mfenc:v3:` marker, the local `encryption_key`/`key_provider` go unused (Transit holds the key), and the audit chain is keyed by Transit's `generate_hmac` — computed inside the vault, so no HMAC key enters heap either. Threaded through **all three** backends. Vault address / token / data-key name come from `MEFOR_STORE_VAULT_ADDR`, `MEFOR_STORE_VAULT_TOKEN` and `MEFOR_STORE_TRANSIT_KEY` (optionally `MEFOR_STORE_TRANSIT_AUDIT_KEY`). Names a *provider*, not key material, so it is **not** a secret. Any other value **fails closed** at `open_store` — never a silent downgrade to plaintext. **Needs the optional `[vault]` extra** (`pip install 'messagefoundry[vault]'` — hvac); lazy-imported, so a base install pulls no Vault SDK and an absent extra fails closed at `open_store` rather than degrading. **At least four preconditions before you plan a deployment on this — read the three here, and the `vault_revocation_attested` row below for the fourth: a Vault that is off the box is refused without it.** (1) *The keyless-PHI serve gate does not treat this setting as a key.* [`__main__.py`](../messagefoundry/__main__.py)'s gate tests `encryption_key` / `encryption_key_file` and an external `key_provider` (previous row). It consults `cipher_provider` only to count a local key that a pinned `key_provider` ignores (BACKLOG #2077). All three built-in environment names derive PHI, so a PHI instance configured for `vault_transit` **with no local key and no external `key_provider` still refuses to start (exit 2)** and points you at `messagefoundry gen-key`. Forcing past it with `[security].allow_unencrypted_phi` (+ `…_under_strict_enforcement`) makes `security_loosenings()` and `GET /security/posture` publish the instance as *PHI stored UNENCRYPTED at rest* while it is in fact encrypted inside Transit — a false read-out, not a real posture. Until the gate learns `cipher_provider`, **also configure a local `encryption_key`**, with a `key_provider` that reads it (`auto` or `env`): the Transit cipher never reads it, but it satisfies the gate, and it remains the key `.mfbak` DR archives actually use (`resolve_active_key` never consults `cipher_provider`, so Transit does **not** cover backups). (2) *Greenfield stores only.* The Transit cipher **fails closed** (`CipherError`) on any pre-existing `mfenc:v1`/`v2` value, and `rotate-key` both refuses to run without an active *local* key and would itself have to decrypt those values through the Transit cipher — so there is **no in-place migration** off an already-encrypted store today. Flipping this on a populated store makes its historical PHI unreadable. (3) *The AES-GCM bound is yours, and `serve` needs your recorded attestation of it* (BACKLOG #2337). The engine counts no encryptions on this cipher, so rotate the Transit data key (`MEFOR_STORE_TRANSIT_KEY`) before any one key version seals 2^32 values; plan to rotate by 2^31, sized from the peak encrypt rate (Vault's `auto_rotate_period`, or a manual schedule). Then run `messagefoundry store attest-transit-bound --reason "<your rotation policy>"` once, on the host, or `serve` **refuses to start** under `[security].enforcement = enforce`. What the record holds, what keeps or voids it, and what it does not check are in [SECURITY.md](SECURITY.md), *On vault_transit, a recorded attestation stands in for the AES-GCM count*. |
 | `vault_revocation_attested` | bool | `false` | attests that revocation of the **store Vault's** server certificate is covered outside the engine (vault BACKLOG #2983, owner ruling 2026-10-13). It covers both store hops to that Vault: `key_provider = "vault"` and `cipher_provider = "vault_transit"`. The engine verifies that certificate, and its handshake checks no CRL and no OCSP. So each client build **refuses** a Vault that is off the box unless this is `true`. On the box means a loopback host reached with no proxy, decided on the address the client will really dial. The refusal applies under `[security].enforcement = enforce`, and wherever a client is built without a known posture, which counts as enforcing. A caller that hands its posture down crosses with a WARNING on an `enforcement = warn` instance, and a command that holds none refuses; [`SECURITY-LOOSENING.md`](SECURITY-LOOSENING.md) names the callers. **Under `enforce` this flag is the only way across:** no CRL lever is built for these hops, and the process-wide `MEFOR_TLS_REVOCATION_ATTESTED` does not cross an enforcing hop. Setting it adds no check on the wire. It never lifts the cleartext or proxy-credential refusals. A loosening, named as `store.vault_revocation_attested`: read [`SECURITY-LOOSENING.md`](SECURITY-LOOSENING.md) for what the attestation can truthfully rest on. Not a secret. Env: `MEFOR_STORE_VAULT_REVOCATION_ATTESTED` |
@@ -826,7 +826,8 @@ resolves an alert the last run left open. After that, the engine resolves the ne
 three on its own, until it restarts again.
 
 - The hold resolves when no answer is undetermined and this pass read `userAccountControl` at
-  least once. An account the pass just revoked still counts as an answer here.
+  least once. An account the pass just revoked still counts as an answer here, but a pass that
+  revokes every signed-in account resolves nothing.
 - An engine can also give up resolving the hold. That happens when an account whose last answer
   was undetermined leaves, unless the engine has released a hold and has not held since. The
   reconciler may revoke it, or its sessions may end some other way. The engine then resolves no
@@ -863,9 +864,12 @@ WARNING lines that name each faulting account stop.
 
 A pass judges only accounts that hold a session, and nothing reads an account again once it has
 left. An account leaves at least when it signs out, reaches the session cap, is revoked by the
-reconciler, is disabled locally, or is deleted. The give-up rules above stop an alert resolving
-on the accounts that remain. The cost is a missed resolve when an account leaves for an ordinary
-reason, such as a sign-out, while the evidence is still pending.
+reconciler, is disabled locally, or is deleted, and when the hourly session reaper deletes an idle
+session. An idle session stays a candidate after `[security].sign_out_after_idle_minutes` until
+the reaper deletes it, which is at least 10 minutes and up to about 70 minutes past that limit. At
+the default settings, idle expiry is the likeliest of these. The give-up rules above stop an alert
+resolving on the accounts that remain. The cost is a missed resolve when an account leaves for an
+ordinary reason, such as a sign-out or an idle session, while the evidence is still pending.
 
 Once an engine has given up resolving the breaker's `ad_reconcile_aborted` instance, the referral's
 instance or `ad_reconcile_held`, it logs a warning when a later trip, referral or hold opens, saying
@@ -1672,6 +1676,13 @@ started together, can each raise it; the alert list folds them into one instance
   a restart picked up does, by design: nothing else tells that deploy apart from an unrecorded edit.
 - A connection flag toggle does not alert either. Its row vouches for the directory it wrote only
   when nothing else changed since the load, so a toggle never hides an edit nobody loaded.
+- A toggle whose row fails, is not recorded within 10 seconds, or is cancelled by a shutdown is
+  refused, and the engine tries to put `connections.toml` back as it was (vault BACKLOG #2945).
+  The API answers a failed or late row 503. The next start reports a config change whenever the disk and the newest
+  row still disagree, which happens in at least these cases: another edit changed the file in the
+  meantime, and it is left as that edit wrote it and logged; the engine could not read, lock or
+  write the file to put it back; the process stopped before the row; or the store committed the
+  row after all, after the 10 seconds or before it reported its failure.
 - A fresh store, a baseline row with no fingerprint, or one taken under another fingerprint scheme
   raises nothing. The engine logs that at INFO.
 - Any fingerprint change raises the alert. The markers below add detail to the page, as its
@@ -1703,14 +1714,17 @@ started together, can each raise it; the alert list folds them into one instance
   #2257).
 - A reload can swap the graph after a start loads it and before its `config_loaded` row is written;
   on a cluster node, the convergence loop does this. The row still names the graph the start
-  loaded, with its comparison. It is marked `superseded` and `baseline_unchecked`, and its
-  `loosenings` is `null`, since the loosenings reader sees only the reloaded graph. A later start
-  passes over it to the reload's own row.
-- A start that could not take that snapshot still starts, with comparison `no_start_digest`. Its
-  row is degraded with the `start_snapshot` step. Its `dir`, counts and `loosenings` are `null`,
-  and it has no `fingerprint` key at all. A start that could not tell whether a reload swapped its
-  graph names its own graph, degraded with the `start_swap_check` step and `loosenings` `null`. A
-  later start passes over both rows.
+  loaded, with its comparison and its `loosenings`, which are read off that graph (vault BACKLOG
+  #3076). It is marked `superseded` and `baseline_unchecked`. A later start passes over it to the
+  reload's own row.
+- A start that could not take that snapshot still starts, and still compares the digest its load
+  took, so a changed config still raises `config_changed` (vault BACKLOG #3076). Its row is
+  degraded with the `start_snapshot` step and marked `baseline_unchecked`. Its `dir`, counts and
+  `loosenings` are `null`, and it has no `shard` key and no `fingerprint` key at all. A start that
+  could not tell whether a reload swapped its graph names its own graph, degraded with the
+  `start_swap_check` step. A later start passes over both rows. So after a snapshot fault, the
+  next start raises `config_changed` again for the same change, unless a flag toggle or reload row
+  lands in between and becomes the baseline.
 - A convergence reload writes its own `config_reload` row, in the shape an operator reload writes
   (vault BACKLOG #3076). Its actor is `system:cluster-convergence` and its `initiator` is
   `cluster_convergence`. So the store's newest baseline names the graph the node converged on,
@@ -1718,6 +1732,21 @@ started together, can each raise it; the alert list folds them into one instance
   a fingerprint is marked `baseline_unchecked`, so a later start passes over it. One that took a
   partial fingerprint is a baseline like any other. The row names the fingerprint that reload
   took, and is marked `superseded` when a later reload or flag toggle moved the engine on first.
+- On a cluster, a reload row carries `config_version`, the shared version the reload applied
+  (vault BACKLOG #3109). An operator reload's row carries the version it bumped the cluster to. A
+  convergence row carries the version the node converged on. An operator reload whose bump failed
+  carries none. A follower's row records the bytes that node loaded, not the operator's digest.
+- A convergence reload that fails writes a `config_reload_failed` row under the same actor, or
+  `config_reload_denied` when its directory is outside the reload roots (vault BACKLOG #3109). The loop retries that version every interval and logs each failure. An
+  engine process writes each distinct row once per version: rows that differ in action, `reason`
+  or `error` are each written once, and a fault that writes the same row as an earlier one writes
+  nothing. A row the audit log refuses is tried again on the next failure. The record is per
+  process, so a node that restarts, or another node, writes its own. The row carries `initiator` and `config_version`, and its `requested` is `null`. Its
+  reason is the one an operator's refused reload records, or `reload_error` with the fault's type
+  name.
+- A convergence row the audit log refuses is logged at ERROR and raises no alert. An operator
+  reload's lost row raises none either, but the operator's answer names an `audit` step. A
+  convergence reload has no answer to name it in.
 - The pass-over looks through the newest 50 config rows at most. If none is usable, the start
   begins a new baseline and says at WARNING that a change made before those rows is not reported.
 
@@ -1908,7 +1937,8 @@ a restart for a file that is not in effect yet, it also says not to restart befo
 **A start checks each CRL's signature too (vault BACKLOG #2905).** When a hop builds its TLS context,
 the engine checks each CRL in the file against the CA certificates that hop already lists. It refuses
 the file in one case only, where it has proof. Three things all hold then. A listed CA has the
-CRL's issuer name, compared exactly. The CRL names that CA's key by its key identifier. The engine
+CRL's issuer name, compared as OpenSSL compares it for the case of ASCII letters and exactly
+otherwise (the first bullet below says what that leaves out). The CRL names that CA's key by its key identifier. The engine
 ran the signature check with that key, and the check failed. Where several listed CAs share that
 name, the check must run and fail for each of them that the engine finds to fit the CRL's
 authority key identifier. A handshake that OpenSSL judges by such a CRL fails with
@@ -1928,13 +1958,17 @@ such a file was measured to pass its handshakes. Remove the bad copy.
 Anything short of that proof loads, and the engine logs one WARNING for the file. At least these
 three cases warn:
 
-- The engine matches the CRL to no CA the hop lists. It compares the issuer name exactly, and then
-  the CRL's authority key identifier, where it carries one. This is the usual case when the peer
+- The engine matches the CRL to no CA the hop lists. It compares the issuer name exactly but for
+  the case of ASCII letters, which it folds as OpenSSL does (vault BACKLOG #3543), and then the
+  CRL's authority key identifier, where it carries one. This is the usual case when the peer
   sends the intermediate CA that issued the CRL. A CA in a CA directory reads the same way until a
   handshake first uses it. So does a listed CA whose name differs from the CRL's issuer name only
-  in letter case. Where the letters that differ are ASCII, OpenSSL was measured to treat the two
-  names as one, so it still judges peers by that CRL. A badly signed CRL of that kind started with
-  the WARNING, and then failed its handshake with `CRL signature failure`.
+  in white space, at least: around a value, which was measured, and in a run of spaces inside one,
+  by OpenSSL's source. OpenSSL treats those two names as one, so it still judges peers by that
+  CRL, and a badly signed CRL of that kind starts with the WARNING and then fails its handshake
+  with `CRL signature failure`. A name that differs in a letter outside ASCII, case included, is
+  another name to OpenSSL too. The name a CRL's authority key identifier may carry for the CA's
+  issuer is compared the same way as the issuer name.
 - A listed CA has the CRL's issuer name and does not verify it, but the CRL names no key. A CA that
   renewed its key can read this way while handshakes still pass. That was measured for one chain
   shape, where the peer sends the renewed CA certified by the old key.
@@ -2001,7 +2035,7 @@ transport it is a WARNING in the log, beside the reload's ERROR.
 | `connection` | `crl_reload:` and the CRL file's absolute path, case-folded on Windows. `@node:<node_id>` or `@shard:<id>` follows when several engine processes share the store, because each process holds its own TLS contexts. A long path is shortened to a checksum and its tail; `path` holds it whole. |
 | `path` | the file's absolute path, case kept. A relative path in a setting appears here in its absolute form |
 | `remedy_class` | a short token for what to do next; see the next table |
-| `stale_contexts` | how many running TLS contexts still held the old copy when the alert was raised |
+| `stale_contexts` | how many running TLS contexts still held the old copy at the last reload pass that reported the refusal. A reminder carries that latest count, so it can differ from the count the alert was first raised with |
 | `detail` | fixed words: the class, the count and the engine's own remedy sentence. It is also the alert's reason in the alert list |
 | `start_refuses` | `true`, and present only then. The remedy names a restart, and a start would refuse the file too until one of its CRLs takes effect. Do not restart before then |
 
@@ -2025,13 +2059,28 @@ belong to the CRL expiry alert too. This event carries none of them.
 The engine sends at least these eight. A remedy it has no token for would be sent as `other`, with
 no remedy sentence.
 
-**One alert per file version.** The engine raises the alert when it first refuses a version of the
-file. It raises it again only when the file's bytes change or the reason does, which is the rule the
-ERROR line follows. It sends no reminders while a refusal stands. The notifier's cooldown still
-applies while the alert is open: a second refused version inside `[alerts].realert_seconds` of the
-first updates the open alert and does not page again. So a page can name an older class than the
-alert list shows. When the engine resolves the alert itself, that ends the cooldown, so it does not
-hold back a refusal that follows a fix. A resolve made by hand in the alert list does not end it.
+**A reminder while the refusal stands (vault BACKLOG #3543).** The engine raises the alert at once
+when it first refuses a version of the file, and at once again when the file's bytes change or the
+reason does, which is the rule the ERROR line follows. While a refusal stands it then raises the
+alert again as a reminder, as `intake_paused` reminds, with the same fields. A reminder goes at the
+first reload pass five minutes or more after the last try, so they come five to six minutes apart. This replaced
+the rule of one alert per file version, under which a page that was throttled, muted or resolved
+by hand was never sent again. Each reminder is another occurrence of the alert, as an
+`intake_paused` reminder is, so a rule's count-based `escalate` tiers climb while the refusal
+stands. Neither acknowledging the alert nor resolving it by hand stops the reminders; suspending
+it mutes their pages. While the engine cannot read the file, a
+reminder is still sent for a refusal the engine treats as final, such as `fix_file`. One it judges
+again every pass gets a reminder only from a reload pass that judged it again, and none while the
+engine cannot read the file. That covers at least `wait`, `lapses_first`, `retry`, `no_issuer` and
+one that carries `start_refuses`: such a refusal can name a time that has passed, or lift on its
+own. A read that hangs
+rather than fails, such as on a share that stops answering, holds the whole reload loop, so no
+reminder is sent while it hangs. The notifier's cooldown still applies while the alert is open: a second
+refused version, or a reminder, inside `[alerts].realert_seconds` of the last page updates the open
+alert and does not page again. So a page can name an older class than the alert list shows, until
+the next reminder pages. A cooldown longer than five minutes throttles some reminders. When the
+engine resolves the alert itself, that ends the cooldown, so it does not hold back a refusal that
+follows a fix. A resolve made by hand in the alert list does not end it.
 
 **Restart only when the class says to.** That is `restart`, `no_issuer` or `retry`, and only when
 the event carries no `start_refuses`. With any other class a start can refuse the file too, and
@@ -2046,7 +2095,11 @@ rule's `event_type`. The engine raises it once the refusal no longer stands on t
 
 A file the engine cannot read resolves nothing, and neither does a reload pass that fails. The
 engine also resolves its open alerts when it stops, because a restart builds every hop from the
-file. An engine that dies without stopping leaves its alert open; resolve it in the alert list. A
+file. An engine that dies without stopping leaves its alert open (vault BACKLOG #3543). Its next
+start under the same identity resolves it at the first reload pass that judges the file, if a
+hop still holds the file and the engine refuses nothing in it. Resolve any other in the alert list: one for a file no hop
+holds now, and one raised under an identity that changes on every start, as an unpinned cluster
+node's does. A
 rule cannot attach a `control_action` to `crl_reload_refused`, because it is not a connection-scoped
 event.
 

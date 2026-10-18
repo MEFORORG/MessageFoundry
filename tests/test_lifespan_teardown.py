@@ -24,6 +24,7 @@ from messagefoundry.api import app as app_module
 from messagefoundry.api import create_app, create_managed_app
 from messagefoundry.api.app import _run_teardown, _TeardownStep
 from messagefoundry.config.settings import ApprovalsSettings, EgressSettings
+from messagefoundry.pipeline import engine as engine_module
 from messagefoundry.pipeline.engine import Engine
 
 _WAIT_S = 10.0
@@ -394,13 +395,69 @@ async def test_the_retention_runner_s_stop_waits_less_than_its_step_s_bound(
     assert timeout < uploads_module._DEFAULT_STOP_TIMEOUT_SECONDS
 
 
+async def test_the_managed_teardown_drains_config_writes_under_its_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #2945 under BACKLOG #3191: the config-write drain is a budgeted step before
+    engine.stop(), handed a share of its bound, and engine.stop() then does not run its own fixed
+    wait as well, which would spend time past the budget."""
+    labels: list[str] = []
+    bounds: list[float] = []
+    real_run, real_invoke = app_module._run_teardown, app_module._invoke
+
+    async def _run(steps: list[_TeardownStep], budget: float) -> None:
+        labels.extend(step.label for step in steps)
+        await real_run(steps, budget)
+
+    async def _invoke(run: Callable[[float], Awaitable[object]], bound: float) -> object:
+        bounds.append(bound)
+        return await real_invoke(run, bound)
+
+    monkeypatch.setattr(app_module, "_run_teardown", _run)
+    monkeypatch.setattr(app_module, "_invoke", _invoke)
+    app = _managed(tmp_path / "config-drain.db")
+    calls: list[tuple[str, float | None]] = []
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        real_drain, real_stop = engine.drain_config_writes, engine.stop
+
+        async def _drain(timeout: float) -> None:
+            calls.append(("drain", timeout))
+            await real_drain(timeout)
+
+        async def _stop() -> None:
+            calls.append(("stop", None))
+            await real_stop()
+
+        async def _in_flight_write() -> dict[str, object] | None:
+            # Stands in for a write whose caller went: it lands after the teardown began.
+            await asyncio.sleep(0.3)
+            calls.append(("write landed", None))
+            return None
+
+        write = asyncio.ensure_future(_in_flight_write())
+        engine._config_writes.add(write)
+        write.add_done_callback(engine._config_writes.discard)
+        monkeypatch.setattr(engine, "drain_config_writes", _drain)
+        monkeypatch.setattr(engine, "stop", _stop)
+    step = labels.index("the config-write drain")
+    assert step < labels.index("engine.stop()")
+    # The drain waited for the write before engine.stop() ran, and engine.stop() read the closed
+    # gate and drained again with only the late wait, not its own fixed one.
+    assert [name for name, _ in calls] == ["drain", "write landed", "stop", "drain"], calls
+    assert calls[0][1] == pytest.approx(bounds[step] * app_module._INNER_SHARE)
+    assert calls[3][1] == engine_module._CONFIG_WRITE_LATE_DRAIN_SECONDS
+    assert engine_module._CONFIG_WRITE_LATE_DRAIN_SECONDS < app_module._ENGINE_STOP_RESERVE_SECONDS
+    assert engine._config_writes_closed
+
+
 async def test_the_teardown_is_bounded_when_every_drain_hangs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Every drain before engine.stop() hangs, and the whole teardown still ends within the budget,
     the cut graces and what the real engine.stop() takes. The budget just covers the floors of the
     steps that apply here, as the shipped one covers the managed set's."""
-    budget = 3.5
+    budget = 3.75
     monkeypatch.setattr(app_module, "_SHUTDOWN_BUDGET_SECONDS", budget)
     monkeypatch.setattr(app_module, "_ENGINE_STOP_RESERVE_SECONDS", 0.2)
     app = _managed(tmp_path / "bounded.db")
@@ -422,16 +479,27 @@ async def test_the_teardown_is_bounded_when_every_drain_hangs(
                 await real_stop()
                 stop_took.append(time.monotonic() - began)
 
+            engine: Engine = app.state.engine
+
+            async def _config_drain_hangs(_timeout: float) -> None:
+                # The lifespan's drain hangs. engine.stop()'s late drain, called once the gate is
+                # closed, returns at once, as the real one does with no write running.
+                if engine._config_writes_closed:
+                    return
+                engine._config_writes_closed = True
+                await asyncio.Event().wait()
+
             app.state.outliving_operations.drain = _hangs
             app.state.approval_gate.drain = _hangs
             app.state.summary_auditor.flush = _hangs
+            monkeypatch.setattr(engine, "drain_config_writes", _config_drain_hangs)
             app.state.engine.stop = _timed_stop
             started = time.monotonic()
         elapsed = time.monotonic() - started
     finally:
         await spies.stop_if_needed()
     assert spies.calls == ["stop", "executor"]
-    graces = 3 * app_module._CUT_GRACE_SECONDS
+    graces = 4 * app_module._CUT_GRACE_SECONDS
     assert elapsed < budget + graces + stop_took[0] + 0.5, f"teardown took {elapsed:.2f}s"
 
 
