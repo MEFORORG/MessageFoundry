@@ -10,6 +10,7 @@ tests check that it does. ``tests/test_object_scope_flag_and_alert_rules.py`` co
 
 from __future__ import annotations
 
+import pytest
 from _ui_clients import SAME_ORIGIN, auth_service, cookie_login, provision, ui_client
 
 from messagefoundry.auth import Role
@@ -66,3 +67,30 @@ async def test_ui_alerts_page_lists_only_rules_inside_the_scope(engine: Engine) 
         r = await c.get("/ui/alerts")
         assert r.status_code == 200
         assert "IB_MINE" in r.text and "IB_THEIRS" not in r.text
+
+
+async def test_ui_flag_names_the_fix_for_a_toggle_the_audit_log_did_not_record(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """vault BACKLOG #2945: a toggle whose audit row failed is refused 503 and undone. The console
+    names that fix, not ``flag_rejected``'s code-first and cluster-node hints, which do not apply.
+    A 503 used to escape the route as an error page."""
+    from messagefoundry.pipeline.engine import ConfigWriteAuditTimeout
+
+    async def _not_recorded(*_args: object, **_kwargs: object) -> None:
+        raise ConfigWriteAuditTimeout(10.0, undone=True)
+
+    monkeypatch.setattr(engine, "set_connection_flag", _not_recorded)
+    service = await auth_service(engine)
+    await provision(service, "dep", [Role.DEPLOYMENT.value])
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "dep")
+        r = await c.post(
+            "/ui/connections/IB_A/flag",
+            data={"direction": "inbound", "flagged": "true"},
+            headers=SAME_ORIGIN,
+        )
+    assert r.status_code == 200, r.text[:300]
+    assert "The audit log did not answer, so the change was undone. Try again." in r.text
+    assert "was not recorded within 10 s" in r.text
+    assert "code-first connection" not in r.text and "cluster node" not in r.text

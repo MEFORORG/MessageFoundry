@@ -22,6 +22,7 @@ from __future__ import annotations
 import textwrap
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -176,6 +177,37 @@ async def test_flag_route_audits_connection_flag_set_under_the_acting_user(
     assert [row["actor"] for row in rows] == ["deployer"]
     assert len(rows) == 1, "the refused 409 write must not be audited as a flag set"
     assert "OB_TOML" in str(rows[0]["detail"])
+
+
+async def test_flag_route_answers_503_when_the_audit_row_fails(
+    toml_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """vault BACKLOG #2945: a toggle whose ``connection_flag_set`` row fails is refused and undone,
+    and the route answers 503, the audit log being at fault, not the request. It used to pass the
+    store's own error up as a 500, which said nothing of whether the toggle was still on disk."""
+    service = await _deployer(toml_engine)
+    real_record = toml_engine.store.record_audit
+
+    async def _flag_row_refused(action: str, **kwargs: Any) -> None:
+        if action == "connection_flag_set":
+            raise RuntimeError("synthetic: the audit store refused the row")
+        await real_record(action, **kwargs)
+
+    assert toml_engine.config_dir is not None
+    toml_path = Path(toml_engine.config_dir) / "connections.toml"
+    before = toml_path.read_bytes()
+    transport = httpx.ASGITransport(app=create_app(toml_engine, auth=service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c)
+        monkeypatch.setattr(toml_engine.store, "record_audit", _flag_row_refused)
+        r = await c.post(
+            "/connections/OB_TOML/flag",
+            json={"direction": "outbound", "flagged": True},
+            headers=h,
+        )
+    assert r.status_code == 503, r.text
+    assert "was undone" in r.json()["detail"]
+    assert toml_path.read_bytes() == before
 
 
 async def test_credential_test_route_audits_under_the_acting_user(

@@ -16,6 +16,7 @@ import os
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, Protocol, get_args, runtime_checkable
 
@@ -247,50 +248,70 @@ def _log_abandoned_config_write(task: asyncio.Task[dict[str, object] | None]) ->
         log.warning("config write failed after its caller had gone: %s", safe_exc(exc))
 
 
-#: What a config write changed among the files the config digest covers: each changed path, mapped
-#: to ``(before, after)`` bytes, ``None`` for a file that did not exist on that side.
-type _CoveredChanges = dict[Path, tuple[bytes | None, bytes | None]]
+#: What a config write did to one file it declared it touches: ``(before, after)``, each the file's
+#: bytes, ``None`` when it did not exist, or :attr:`_Unread.UNREAD` when it existed but could not be
+#: read, so the undo cannot know what to put back.
+type _FileImage = bytes | None | _Unread
+type _WriteChanges = dict[Path, tuple[_FileImage, _FileImage]]
 
 
-def _read_covered(cfg_dir: Path) -> dict[Path, bytes]:
-    """The bytes of every file the config digest covers in ``cfg_dir``. Blocking. A file that cannot
-    be read is left out, so it is never one a failed write's undo rewrites."""
-    from messagefoundry.config.fingerprint import covered_files
+class _Unread(Enum):
+    """A file that existed but could not be read, told apart from one that did not exist."""
 
-    found: dict[Path, bytes] = {}
-    for path in covered_files(cfg_dir):
+    UNREAD = "unread"
+
+
+def _read_touched(cfg_dir: Path, touches: Sequence[str]) -> dict[Path, _FileImage]:
+    """The bytes of each file a config write declared it touches. Blocking.
+
+    Only the declared files, never the whole directory, so an edit another writer made elsewhere
+    in it while this write ran, such as a hand save of a handler module, is never taken for this
+    write's own change and never undone (vault BACKLOG #2945)."""
+    found: dict[Path, _FileImage] = {}
+    for rel in touches:
+        path = cfg_dir / rel
         try:
             found[path] = path.read_bytes()
+        except FileNotFoundError:
+            found[path] = None
         except OSError:
-            continue
+            found[path] = _Unread.UNREAD
     return found
 
 
-def _covered_changes(prior: dict[Path, bytes], now: dict[Path, bytes]) -> _CoveredChanges:
-    """The covered files a write changed, created or removed, from reads before and after it."""
+def _write_changes(prior: dict[Path, _FileImage], now: dict[Path, _FileImage]) -> _WriteChanges:
+    """The declared files the write changed, created or removed, and any read that failed."""
     return {
-        path: (prior.get(path), now.get(path))
-        for path in prior.keys() | now.keys()
-        if prior.get(path) != now.get(path)
+        path: (prior[path], now[path])
+        for path in prior
+        if prior[path] != now[path] or _Unread.UNREAD in (prior[path], now[path])
     }
 
 
-def _undo_covered_changes(cfg_dir: Path, changes: _CoveredChanges) -> bool:
+def _undo_write(cfg_dir: Path, changes: _WriteChanges) -> bool:
     """Put back what a config write changed, after its audit row failed (vault BACKLOG #2945).
 
     Blocking, under the same cross-process lock the write took. A file is put back only while it
     still holds the bytes the write left, so an edit that landed since, such as a ``connection``
-    CLI edit, is never overwritten: that file is left as it is, and logged, and so is one the undo
-    could not write. Either leaves a change on disk with no row, which the next start reports as a
-    config change. Returns whether every change was put back. Never raises: the caller is already
-    refusing the write."""
+    CLI edit, is never overwritten. That file is left as it is and logged, and so is one the undo
+    could not read or write. Either leaves a change on disk with no row, which the next start
+    reports as a config change. Returns whether every change was put back. Never raises an
+    ``OSError`` or :class:`WiringError`: the caller is already refusing the write."""
     from messagefoundry.config import atomic_edit, connections_edit
 
     try:
         with connections_edit.locked(cfg_dir):
             undone = True
-            for path, (before, after) in sorted(changes.items()):
+            for path in sorted(changes):
+                before, after = changes[path]
                 try:
+                    if _Unread.UNREAD in (before, after):
+                        log.error(
+                            "a failed config write could not read %s, so it was not put back",
+                            path.name,
+                        )
+                        undone = False
+                        continue
                     try:
                         current: bytes | None = path.read_bytes()
                     except FileNotFoundError:
@@ -303,7 +324,7 @@ def _undo_covered_changes(cfg_dir: Path, changes: _CoveredChanges) -> bool:
                         undone = False
                     elif before is None:
                         path.unlink()
-                    else:
+                    elif isinstance(before, bytes):
                         atomic_edit.replace_validated(path, before, lambda _candidate: None)
                 except OSError as exc:
                     log.error(
@@ -311,7 +332,7 @@ def _undo_covered_changes(cfg_dir: Path, changes: _CoveredChanges) -> bool:
                     )
                     undone = False
             return undone
-    except WiringError as exc:
+    except (WiringError, OSError) as exc:
         # The cross-process lock could not be taken, so nothing was put back.
         log.error("a failed config write could not be undone: %s", safe_exc(exc))
         return False
@@ -327,18 +348,18 @@ class ClusteredConfigWrite(WiringError):
     write to 409 maps this one too."""
 
 
-class ConfigWriteAuditTimeout(WiringError):
-    """A config write refused because its audit row did not land within
-    :data:`CONFIG_WRITE_AUDIT_TIMEOUT_SECONDS` (vault BACKLOG #2945).
+class ConfigWriteAuditFailed(WiringError):
+    """A config write refused because its audit row failed (vault BACKLOG #2945).
 
     :meth:`Engine.write_baseline_config` has already tried to put back the bytes the write changed.
     ``undone`` says whether it put back all of them; a file another edit changed in the meantime is
-    left as that edit wrote it, and logged. A :class:`WiringError`, so a route that maps a refused
-    config write to 409 maps this one too."""
+    left as that edit wrote it, and logged. The API answers 503, since the audit log and not the
+    request is at fault. Still a :class:`WiringError`, so a caller that maps every refused config
+    write to one answer refuses this one too rather than failing."""
 
-    def __init__(self, timeout: float, *, undone: bool) -> None:
+    def __init__(self, cause: str, *, undone: bool) -> None:
         super().__init__(
-            f"the config write was refused: its audit row was not recorded within {timeout:g} s"
+            f"the config write was refused: {cause}"
             + (
                 ", so the change was undone. Try again; if it keeps failing, the audit store is "
                 "not answering"
@@ -348,6 +369,14 @@ class ConfigWriteAuditTimeout(WiringError):
             )
         )
         self.undone = undone
+
+
+class ConfigWriteAuditTimeout(ConfigWriteAuditFailed):
+    """:class:`ConfigWriteAuditFailed` for a row that did not land within
+    :data:`CONFIG_WRITE_AUDIT_TIMEOUT_SECONDS`."""
+
+    def __init__(self, timeout: float, *, undone: bool) -> None:
+        super().__init__(f"its audit row was not recorded within {timeout:g} s", undone=undone)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2531,6 +2560,7 @@ class Engine:
         action: ConfigWriteAction,
         write: Callable[[Path], None],
         *,
+        touches: Sequence[str],
         detail: Mapping[str, object],
         actor: str | None,
         client: str | None,
@@ -2556,23 +2586,31 @@ class Engine:
         ``connection`` or ``codeset`` CLI edit, which takes the same config-directory lock, cannot
         land between the write and either digest. The ``impact`` CLI's rename takes no lock, so one
         landing during ``write`` can still be taken into the after digest. It raises
-        :class:`WiringError` to refuse, and then nothing is recorded. Next the row is written under
-        ``action`` with ``detail``, this node's id and the fingerprint returned, still under the
-        engine lock, so two writes' rows land in the order of their writes. The row is bounded by
-        :data:`CONFIG_WRITE_AUDIT_TIMEOUT_SECONDS`, so a store that never answers cannot hold the
-        lock and every later write (vault BACKLOG #2945). A row that fails or times out first puts
-        back the bytes the write changed in the files the digest covers, so no write is left on disk
-        without its row; a timeout is then refused as :class:`ConfigWriteAuditTimeout`, and any
-        other failure is re-raised. A file another edit changed since is left alone and logged, and
-        the next start reports it. A row the store commits just as the bound runs out can still
-        land beside the undone write; the next start then reports that as a config change too.
-        Last, ``reflect``, when given, runs on the event loop, still under the engine lock, to show
-        the write on the live graph; a failure there is logged. ``detail`` must be JSON
-        and may not set a key the helper writes (:data:`_BASELINE_ROW_KEYS`); either fault raises
-        before anything is written. A caller cancelled while it waits for the engine lock gets no
-        write. Once the lock is held, a cancelled caller stops waiting but does not stop the write or
-        its row, and :meth:`drain_config_writes` waits for such a write, for a bounded time, before
-        the store closes.
+        :class:`WiringError` to refuse, and then nothing is recorded. ``touches`` names, relative to
+        the config directory, each file ``write`` may create, change or remove; they are read before
+        and after it, and only they are put back if the row fails.
+
+        Next the row is written under ``action`` with ``detail``, this node's id and the fingerprint
+        returned, still under the engine lock, so two writes' rows land in the order of their
+        writes, and within :data:`CONFIG_WRITE_AUDIT_TIMEOUT_SECONDS` (vault BACKLOG #2945). A row
+        that fails, times out or is cancelled first puts back what the write changed in the
+        ``touches`` files, then raises :class:`ConfigWriteAuditFailed` (or its
+        :class:`ConfigWriteAuditTimeout`), or re-raises the cancellation. At least these still leave
+        a write on disk with no row: a file another edit changed since, which is left alone and
+        logged; a file the undo could not read, write or lock; a file ``write`` changed that
+        ``touches`` does not name; and a crash before the row. A row the store committed after all,
+        past the bound or before it reported its failure, names a write that was undone. The next
+        start reports each of these as a config change.
+
+        Last, once the row has landed, ``reflect``, when given, runs on the event loop, still under
+        the engine lock, to show the write on the live graph; a failure there is logged. When a
+        reload applied while the row was written, neither ``reflect`` nor the loaded digest move:
+        the reloaded graph read the files itself. ``detail`` must be JSON and may not set a key the
+        helper writes (:data:`_BASELINE_ROW_KEYS`); either fault, or a ``touches`` path outside the
+        config directory, raises before anything is written. A caller cancelled while it waits for
+        the engine lock gets no write. Once the lock is held, a cancelled caller stops waiting but
+        does not stop the write or its row, and :meth:`drain_config_writes` waits for such a write,
+        for a bounded time, before the store closes.
 
         Returns the ADR 0041 D1 fingerprint the row records (vault BACKLOG #2597). When the directory
         held the loaded bytes before this write, it is the digest of the directory just written, and
@@ -2601,6 +2639,11 @@ class Engine:
         if clash:
             raise ValueError(f"config write detail may not set {sorted(clash)}")
         json.dumps(dict(detail))
+        escaping = [
+            rel for rel in touches if Path(rel).is_absolute() or ".." in Path(rel).parts or not rel
+        ]
+        if escaping:
+            raise ValueError(f"config write touches paths outside the config directory: {escaping}")
 
         def _digest(cfg_dir: Path) -> dict[str, object] | None:
             # Already on a worker thread and holding the lock, so the blocking twin of
@@ -2611,24 +2654,24 @@ class Engine:
 
         def _locked_write(
             cfg_dir: Path, loaded_fp: object
-        ) -> tuple[dict[str, object] | None, bool, _CoveredChanges]:
+        ) -> tuple[dict[str, object] | None, bool, _WriteChanges]:
             """The write and both digests, all under the cross-process lock (vault BACKLOG #2782).
 
             The lock spans the whole of ``write``, so a read-modify-write in it cannot lose a
             `connection` CLI edit landing in the middle. It spans the digests too, so neither can
             take in a CLI edit this engine never loaded. Re-entrant, so a writer's own acquisition
             nests. Returns ``(after, vouched, changes)``; ``vouched`` is False when this write was
-            not the one change, and ``changes`` is what :func:`_undo_covered_changes` puts back if
+            not the one change, and ``changes`` is what :func:`_undo_write` puts back if
             the row then fails (vault BACKLOG #2945)."""
             with connections_edit.locked(cfg_dir):
                 # Read before the write, so a row that fails can put back what this write changed.
-                prior = _read_covered(cfg_dir)
+                prior = _read_touched(cfg_dir, touches)
                 # vault BACKLOG #2597: whether the directory still holds the bytes the running
                 # graph loaded, read before this write changes it. With no loaded digest there is
                 # nothing to vouch against, so the two reads are skipped.
                 before = _digest(cfg_dir) if isinstance(loaded_fp, str) else None
                 write(cfg_dir)
-                changes = _covered_changes(prior, _read_covered(cfg_dir))
+                changes = _write_changes(prior, _read_touched(cfg_dir, touches))
                 # The digest covers the whole directory, so it may vouch for this write only when
                 # the write is the one change since the load. Otherwise another edit is on disk
                 # that the running graph never loaded, and the row keeps the loaded digest, so the
@@ -2666,14 +2709,13 @@ class Engine:
                 prepare()
             loaded = self.loaded_config_fingerprint
             loaded_fp = loaded.get("fingerprint") if loaded is not None else None
+            # What a reload replaces, so a reload that applies while the row is awaited is seen.
+            graph_before = self._live_graph()
             after, vouched, changes = await asyncio.to_thread(_locked_write, config_dir, loaded_fp)
             # With no digest of what is on disk now, the loaded one would read as a change at the
             # next start, so a vouched row records none and that start compares nothing.
             fingerprint = after if vouched else loaded
-            # vault BACKLOG #2945: the row is written under the engine lock, so two writes' rows
-            # land in write order, and it is bounded, so a store that never answers cannot hold
-            # that lock and every later write. A row that fails or times out puts the files back
-            # first, so the refusal leaves no write on disk without its row.
+            # Bounded, for the reason CONFIG_WRITE_AUDIT_TIMEOUT_SECONDS gives (vault BACKLOG #2945).
             bound = CONFIG_WRITE_AUDIT_TIMEOUT_SECONDS
             deadline = asyncio.timeout(bound)
             try:
@@ -2697,8 +2739,17 @@ class Engine:
                         ),
                         client=client,
                     )
-            except Exception:
-                undone = await asyncio.to_thread(_undo_covered_changes, config_dir, changes)
+            except (Exception, asyncio.CancelledError) as exc:
+                # Cancelled too: a shutdown cancels a write its drain left waiting on a stuck row,
+                # and that write would otherwise stay on disk with no row.
+                undone = await asyncio.to_thread(_undo_write, config_dir, changes)
+                if isinstance(exc, asyncio.CancelledError):
+                    log.warning(
+                        "config write %s cancelled before its audit row landed; undone: %s",
+                        action,
+                        undone,
+                    )
+                    raise
                 if deadline.expired():
                     log.warning(
                         "config write %s refused: its audit row was not recorded within %g s",
@@ -2706,7 +2757,24 @@ class Engine:
                         bound,
                     )
                     raise ConfigWriteAuditTimeout(bound, undone=undone) from None
-                raise
+                log.error(
+                    "config write %s refused: its audit row failed: %s", action, safe_exc(exc)
+                )
+                raise ConfigWriteAuditFailed(
+                    "the audit log did not record its row", undone=undone
+                ) from exc
+            if (
+                self.loaded_config_fingerprint is not loaded
+                or self._live_graph() is not graph_before
+            ):
+                # A reload applied while the row was awaited. Its graph and digest read the files
+                # themselves, and a write's stale digest or reflect would overwrite them.
+                log.info(
+                    "config write %s: a reload applied before its row landed, so the reload's "
+                    "graph and config digest stand",
+                    action,
+                )
+                return fingerprint
             if vouched and after is not None:
                 # The row has landed and the write is reflected next, so the running graph matches
                 # these bytes and the provenance baseline moves with it. After the row, not before:
@@ -2740,6 +2808,11 @@ class Engine:
             task.add_done_callback(_log_abandoned_config_write)
             raise
         return task.result()
+
+    def _live_graph(self) -> Registry | None:
+        """The running graph's registry, which a reload replaces, or ``None`` with no runner."""
+        rr = self._registry_runner
+        return rr.registry if rr is not None else None
 
     def _config_write_done(self, task: asyncio.Task[dict[str, object] | None]) -> None:
         """Release the engine lock and forget a finished config write, however it ended."""
@@ -2871,6 +2944,7 @@ class Engine:
         return await self.write_baseline_config(
             "connection_flag_set",
             _write,
+            touches=(CONNECTIONS_FILE_NAME,),
             detail={"connection": name, "direction": direction, "flagged": flagged},
             actor=actor,
             client=client,

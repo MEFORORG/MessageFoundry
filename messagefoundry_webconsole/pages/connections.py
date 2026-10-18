@@ -27,6 +27,7 @@ __all__ = [
     "connections_fragment",
     "dashboard",
     "decode_row_key",
+    "flag_not_recorded",
     "flag_rejected",
     "purge_confirm",
     "purge_pending",
@@ -536,6 +537,29 @@ def flag_rejected(name: str, detail: str) -> Markup:
             class_="muted",
         ),
         el("p", el("a", "← Connections", href="/ui")),
+        class_="card",
+    )
+    return page("Flag not changed", body, active="dashboard")
+
+
+def flag_not_recorded(name: str, detail: str) -> Markup:
+    """Shown when a flag toggle is refused because the audit log did not record it (vault BACKLOG
+    #2945). The engine undoes such a toggle, and ``detail`` says when it could not. Its own page,
+    because :func:`flag_rejected`'s hints name fixes for other refusals. Both ``name`` and
+    ``detail`` are escaped."""
+    body = el(
+        "div",
+        el("h1", "Flag not changed"),
+        el("p", text(f"Connection: {name}"), class_="muted"),
+        el("p", text(detail), class_="muted"),
+        el(
+            "p",
+            "The audit log did not answer, so the change was undone. Try again. If the message "
+            "above says the change could not be fully undone, the next engine start reports a "
+            "config change, and the engine log names the file.",
+            class_="muted",
+        ),
+        el("p", el("a", "Back to Connections", href="/ui")),
         class_="card",
     )
     return page("Flag not changed", body, active="dashboard")

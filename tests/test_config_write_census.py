@@ -95,17 +95,18 @@ type Verdict = Literal["helper", "undo", "cli", "settings"]
 #: the record of an edit no engine made. ``settings``: writes the service settings file, which the
 #: config digest does not cover, so there is no baseline for it to move. ``undo``: the helper's own
 #: put-back of the bytes a write changed when its row fails, so it moves no baseline: the files go
-#: back to the bytes the newest row already names. Only the helper may call it.
+#: back to the bytes the newest row names, unless the store committed the failed row after all,
+#: which ``Engine.write_baseline_config`` says the next start reports. Only the helper may call it.
 CENSUS: dict[tuple[str, str], tuple[Verdict, str]] = {
     ("messagefoundry/pipeline/engine.py", "Engine.set_connection_flag"): (
         "helper",
         "POST /connections/{name}/flag rewrites connections.toml in the running engine. Refused "
         "on a cluster node (vault BACKLOG #2933).",
     ),
-    ("messagefoundry/pipeline/engine.py", "_undo_covered_changes"): (
+    ("messagefoundry/pipeline/engine.py", "_undo_write"): (
         "undo",
-        "write_baseline_config puts back what a write changed when its row fails or times out, "
-        "so no write stays on disk without its row (vault BACKLOG #2945)",
+        "write_baseline_config puts back what a write changed when its row fails, times out or "
+        "is cancelled, so a refused write does not stay on disk (vault BACKLOG #2945)",
     ),
     ("messagefoundry/__main__.py", "_connection"): (
         "cli",
@@ -318,7 +319,7 @@ def test_only_the_helper_calls_the_undo() -> None:
     tree = _package_trees()["messagefoundry/pipeline/engine.py"]
     assert _undo_callers(tree) == {"Engine.write_baseline_config"}
     # Positive control: a second caller is seen.
-    rogue = ast.parse("def toggle(d):\n    _undo_covered_changes(d, {})\n")
+    rogue = ast.parse("def toggle(d):\n    _undo_write(d, {})\n")
     assert _undo_callers(rogue) == {"toggle"}
 
 

@@ -422,7 +422,7 @@ from messagefoundry.pipeline.cluster import (
 )
 from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
-from messagefoundry.pipeline.engine import CONFIG_WRITE_ACTIONS
+from messagefoundry.pipeline.engine import CONFIG_WRITE_ACTIONS, ConfigWriteAuditFailed
 from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmission
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 from messagefoundry.pipeline.security_signals import (
@@ -4675,7 +4675,7 @@ def create_app(
         comment-preserving, validate-before-persist writer (``connections_edit``) and reflects it on the
         live registry **without a reload** (a cosmetic-field replace — no connector rebuild, no delivery
         change). A **code-first** connection has no TOML home and is refused **409** (the scope fork).
-        Gated by ``config:deploy`` (deny-by-default, paced) and audited — the console→TOML mutation path.
+        A toggle whose audit row fails is refused **503** (vault BACKLOG #2945). Gated by ``config:deploy`` (deny-by-default, paced) and audited — the console→TOML mutation path.
 
         A channel-scoped caller may flag only an inbound in its own scope (BACKLOG #1152). Every
         other target gets :func:`_deny_connection`, the per-name routes' one refusal, before the
@@ -4700,6 +4700,12 @@ def create_app(
                 actor=identity.username,
                 client=client_ip(request),
             )
+        except ConfigWriteAuditFailed as exc:
+            # The audit log did not record the row, so the engine refused the toggle and undid it,
+            # or says it could not (vault BACKLOG #2945). The audit log, not the request, is at
+            # fault, so 503 as for any refused audit write. The route's only 503, which the console
+            # relies on to name this fix.
+            raise HTTPException(503, str(exc)) from exc
         except WiringError as exc:
             # Not TOML-managed (scope fork), a validate-before-persist failure, or a cluster node,
             # which writes no config file (vault BACKLOG #2933): the edit never landed.
