@@ -376,7 +376,8 @@ class AlertSink(Protocol):
         ``remedy_class`` is
         a short token for what the operator does next (``restart``, ``fix_file``, ``wait`` and so
         on; ``pipeline/crl_reload.py`` holds the set). ``stale_contexts`` counts the contexts
-        still on the old copy when the alert was raised. ``remedy`` is the engine's own fixed
+        still on the old copy at the last pass that reported the refusal, so a reminder carries
+        the latest count, not the one first raised. ``remedy`` is the engine's own fixed
         sentence for that class. ``start_refuses`` is True when the remedy names a restart and a
         start would refuse the file too, until one of its CRLs takes effect.
 

@@ -467,9 +467,10 @@ def _issuer_name_key(name: x509.Name) -> _NameKey:
     (vault BACKLOG #3543).
 
     It is ``cryptography``'s own comparison with one change: **the case of ASCII letters is
-    folded**, because OpenSSL folds it. OpenSSL compares names by a canonical form that lowers
-    ``A`` to ``Z`` and copies every other byte, so a listed CA named ``CN=Partner CA`` is the
-    issuer of a CRL from ``CN=PARTNER CA``. Matched exactly, that CA read as unlisted, so a badly
+    folded**, because OpenSSL folds it. OpenSSL compares names by a canonical form. For letters,
+    that form lowers ``A`` to ``Z`` and leaves every other letter as it is; it treats white space
+    and string types in ways of its own, as the last paragraph says. So a listed CA named
+    ``CN=Partner CA`` is the issuer of a CRL from ``CN=PARTNER CA``. Matched exactly, that CA read as unlisted, so a badly
     signed CRL naming its key started with a warning and failed at the handshake.
 
     **Nothing else is loosened, and RFC 5280 is not followed where it reaches further.** Its
