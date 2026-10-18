@@ -16,6 +16,7 @@ from, re-reading was 0-for-7 at catching a wrong number.
 
 from __future__ import annotations
 
+import csv
 import json
 import re
 from pathlib import Path
@@ -1219,30 +1220,60 @@ def test_a_row_that_names_a_pool_file_is_that_pool_s_worst_passing_run() -> None
 
     The 2026-10-18 ubuntu re-measure committed its whole pool, one line per job execution, so its
     `max_passing` and run count can be re-checked rather than re-read. Unchecked, the file is a
-    second hand-typed copy that can drift from the row. Rows that name no pool file are skipped.
+    second hand-typed copy that can drift from the row.
+
+    The `keep` column is not trusted: each line's label is re-derived from its step conclusion and
+    duration, so a passing execution relabelled out of the pool reds here even when the maximum it
+    hides is not the recorded one. A row binds only the file its source names in the fixed phrase
+    "is a line of <file>", never a file it mentions as a predecessor's pool. Rows that bind no pool
+    file are skipped.
+
+    Falsified 2026-10-18: the row's `max_passing` set to 33:32 went RED on the maximum, its n set to
+    466 went RED on the count, and a 33:33 `row` line relabelled `no-row` went RED on the label.
+    Restored each time.
     """
     checked = 0
     for row in load_baselines(_BASELINE_FILE):
-        named = set(re.findall(r"step_margin_pool_[\w-]+\.tsv", row.source))
-        for name in named:
-            lines = (_BASELINE_FILE.parent / name).read_text(encoding="utf-8").splitlines()
-            data = [line.split("\t") for line in lines if line and not line.startswith("#")]
-            header, body = data[0], data[1:]
-            run, keep, secs = header.index("run_id"), header.index("keep"), header.index("step_s")
+        for name in re.findall(r"is a line of (step_margin_pool_[\w-]+\.tsv)", row.source):
+            path = _BASELINE_FILE.parent / name
+            lines = path.read_text(encoding="utf-8").splitlines()
+            body = csv.DictReader(
+                (line for line in lines if not line.startswith("#")), delimiter="\t"
+            )
             worst: dict[str, int] = {}
-            for fields in body:
-                if fields[keep] == "row":
-                    worst[fields[run]] = max(worst.get(fields[run], 0), int(fields[secs]))
+            seen: dict[str, set[tuple[str, str]]] = {}
+            for i, line in enumerate(body):
+                secs = int(line["step_s"]) if line["step_s"] else None
+                stamp = (line["step_conclusion"], line["step_s"])
+                if secs is not None and stamp in seen.get(line["run_id"], set()):
+                    derived = {"dropped-rerun-copy", "row" if stamp[0] == "success" else "no-row"}
+                elif line["step_conclusion"] == "success" and secs is not None and secs >= 60:
+                    derived = {"row"}
+                elif secs is not None and secs < 60 and line["step_conclusion"] != "skipped":
+                    derived = {"dropped-under-60s"}
+                else:
+                    derived = {"no-row"}
+                assert line["keep"] in derived, (
+                    f"{name} line {i + 1} (run {line['run_id']}) is labelled {line['keep']!r}, "
+                    f"but its step conclusion and duration give {sorted(derived)}"
+                )
+                if secs is not None:
+                    seen.setdefault(line["run_id"], set()).add(stamp)
+                if line["keep"] == "row" and secs is not None:
+                    worst[line["run_id"]] = max(worst.get(line["run_id"], 0), secs)
+            assert worst, f"{name} holds no row, so it cannot be the pool behind {row.leg}"
             assert max(worst.values()) == row.max_passing_seconds, (
                 f"{row.leg}: {name}'s worst passing row is {format_clock(max(worst.values()))}, "
                 f"but the row records {format_clock(row.max_passing_seconds)}"
             )
-            assert f"n={len(worst)} " in row.source, (
-                f"{row.leg}: {name} has {len(worst)} runs with a row; the row's source disagrees"
+            stated = re.findall(r"\bn=(\d+) \(merge_group", row.source)
+            assert stated == [str(len(worst))], (
+                f"{row.leg}: {name} has {len(worst)} runs with a row; the row's source states "
+                f"{stated}"
             )
             checked += 1
     if not checked:
-        pytest.skip("no row names a committed pool file")
+        pytest.skip("no row binds a committed pool file")
 
 
 def test_the_webconsole_nesting_arithmetic_in_ci_yml_is_read_and_checks_out() -> None:
