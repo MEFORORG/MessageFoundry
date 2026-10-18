@@ -1235,7 +1235,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         help="on-box deployment acceptance: host checks + store connectivity + end-to-end smoke",
     )
     verify.add_argument(
-        "--config", default="samples/config", help="config modules dir (for the self smoke)"
+        "--config",
+        default="samples/config",
+        help="config modules dir (for the self smoke, and the host.ciphers hop census)",
     )
     verify.add_argument(
         "--service-config",
