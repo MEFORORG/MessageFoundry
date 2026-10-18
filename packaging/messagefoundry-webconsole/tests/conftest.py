@@ -230,7 +230,10 @@ def _tolerate_logging_on_closed_capture_streams() -> Iterator[None]:
         logging.raiseExceptions = prior_raise
 
 
-_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+#: The methods the stand-in leaves alone. Only GET, because ``assert_same_origin`` and
+#: ``require_ui`` treat every other method, HEAD and OPTIONS included, as a write, and a browser
+#: sends ``Sec-Fetch-Site`` on those too.
+_SAFE_METHODS = frozenset({"GET"})
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -247,6 +250,9 @@ def _in_process_ui_clients_send_what_a_browser_sends() -> Iterator[None]:
     cross-site, same-site and ``Origin``-fallback test still exercises the branch it names. A request
     marked :data:`HEADERLESS_UI_REQUEST` is sent untouched too. Only the in-process ASGI transport is
     wrapped, so a real outbound ``httpx`` call is never altered.
+
+    The engine suite's ``tests/conftest.py`` carries a copy, because this suite does not inherit
+    that file. ``tests/test_browser_standin_copies_agree.py`` there fails if the two drift apart.
     """
     original = httpx.ASGITransport.handle_async_request
 

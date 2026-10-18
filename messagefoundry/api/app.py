@@ -3509,7 +3509,8 @@ class _SummaryAuditCoalescer:
 # fastapi's spans, request metrics and validation logs, and fastapi would still parse inbound trace
 # headers through the global propagators. The engine's own optional OTLP metrics export
 # (api/metrics.py, BACKLOG #21) builds its own provider and does not depend on any of this.
-# tests/test_api_fastapi_telemetry_off.py pins it.
+# fastapi 0.143 turns auto_configure on only when FASTAPI_OTEL_AUTO_CONFIGURE=true; the explicit
+# False here beats that variable. tests/test_api_fastapi_telemetry_off.py pins it.
 _FASTAPI_TELEMETRY_OFF: TelemetryConfig = {
     "tracing": False,
     "metrics": False,
