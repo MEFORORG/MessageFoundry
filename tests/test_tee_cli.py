@@ -18,6 +18,7 @@ import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -492,40 +493,60 @@ def _sddl_of(path: Path, scratch: Path) -> str:
     return [line for line in text.splitlines() if line.strip()][1]
 
 
+#: SDDL short names icacls prints for an account that may run the tests (a self-hosted runner's
+#: service runs as one of the first three).
+_SDDL_SHORT_NAMES = {"S-1-5-18": "SY", "S-1-5-19": "LS", "S-1-5-20": "NS"}
+
+#: Short names icacls may print for an entry the fixture removes, as the SIDs /remove:g takes. One
+#: not listed here fails the removal, and so the fixture, rather than surviving.
+_SDDL_ALIASES = {
+    "OW": "S-1-3-4",
+    "CO": "S-1-3-0",
+    "AU": "S-1-5-11",
+    "BU": "S-1-5-32-545",
+    "WD": "S-1-1-0",
+}
+
+
 def _my_sids() -> set[str]:
-    """This account as SDDL may spell it: its SID, or ``LA`` when it IS the built-in Administrator
-    (RID 500), which the hosted runners run as (see test_store_trio_acl.py)."""
+    """This account as SDDL may spell it: its SID, ``LA`` when it IS the built-in Administrator
+    (RID 500), which the hosted runners run as (see test_store_trio_acl.py), or a service
+    account's short name."""
     me = _own_sid()
-    return {me, "LA"} if me.endswith("-500") else {me}
+    if me.endswith("-500"):
+        return {me, "LA"}
+    return {me, _SDDL_SHORT_NAMES[me]} if me in _SDDL_SHORT_NAMES else {me}
 
 
-def _harden(path: Path, grant: str) -> str:
-    """Leave ``path`` exactly one entry, granting this account ``grant`` (F or R), check that it
-    took, and return the list as SDDL."""
-    # /inheritance:r drops only INHERITED entries. SYSTEM, Administrators, OWNER RIGHTS and CREATOR
-    # OWNER can survive onto the file as EXPLICIT ones (test_store_trio_acl.py, CI run
-    # 36039014999), and a hosted runner's elevated token has Administrators switched on. Measured
-    # in CI run 39087669047 (windows-2025): removing only the last two left
-    # D:PAI(A;;FR;;;LA)(A;;FA;;;SY)(A;;FA;;;BA), and the process opened that R-hardened file for
-    # writing through the Administrators entry.
-    _win_run(
-        "icacls.exe",
-        str(path),
-        "/inheritance:r",
-        "/remove:g",
-        "*S-1-3-4",
-        "*S-1-3-0",
-        "*S-1-5-18",
-        "*S-1-5-32-544",
-        "/grant:r",
-        f"*{_own_sid()}:{grant}",
-    )
-    # A fixture that did not produce its shape is reported as a fixture, not as a product failure,
-    # on any host whose token the list does not bind as written. A plain split, not store's SDDL
-    # parser: the tee's tests import nothing from the engine they do not already.
-    sddl = _sddl_of(path, path.parent / "acl")
-    trustees = [ace.rstrip(")").rsplit(";", 1)[-1] for ace in sddl.split("(")[1:]]
-    assert len(trustees) == 1 and trustees[0] in _my_sids(), f"fixture: {path.name} has {sddl}"
+def _aces(sddl: str) -> tuple[tuple[str, str, str, str], ...]:
+    """The DACL entries of ``sddl`` as (type, flags, rights, trustee), through the store's parser."""
+    from messagefoundry.store.store import _parse_sddl_dacl
+
+    dacl = _parse_sddl_dacl(sddl)
+    assert dacl is not None, f"fixture: unparseable SDDL {sddl}"
+    return dacl.aces
+
+
+def _harden(path: Path, grant: Literal["F", "R"], scratch: Path) -> str:
+    """Leave ``path`` exactly one entry, granting this account ``grant``, check that it took and
+    binds this process, and return the list as SDDL."""
+    _win_run("icacls.exe", str(path), "/inheritance:r", "/grant:r", f"*{_own_sid()}:{grant}")
+    # /inheritance:r drops only INHERITED entries; explicit ones can survive onto the file (CI run
+    # 36039014999). Measured in CI run 39087669047 (windows-2025): a fixture that removed only
+    # OWNER RIGHTS and CREATOR OWNER left D:PAI(A;;FR;;;LA)(A;;FA;;;SY)(A;;FA;;;BA), and the
+    # runner's elevated token, with Administrators switched on, wrote that R-hardened file. So
+    # every other trustee goes, whoever it is, rather than a list of the ones seen so far.
+    me = _my_sids()
+    others = sorted({sid for *_, sid in _aces(_sddl_of(path, scratch)) if sid not in me})
+    if others:
+        sids = (_SDDL_ALIASES.get(sid, sid) for sid in others)
+        _win_run("icacls.exe", str(path), "/remove:g", *(f"*{sid}" for sid in sids))
+    # A fixture that did not produce its shape is reported as a fixture, not as a product failure.
+    sddl = _sddl_of(path, scratch)
+    rights = {"F": "FA", "R": "FR"}[grant]
+    entries = _aces(sddl)
+    assert len(entries) == 1 and entries[0][:3] == ("A", "", rights), f"fixture: {sddl}"
+    assert entries[0][3] in me, f"fixture: {path.name} has {sddl}"
     assert _opens_for_writing(path) == (grant == "F"), f"fixture: {path.name} under {sddl}"
     return sddl
 
@@ -554,7 +575,7 @@ def test_out_keeps_the_access_list_of_a_hardened_target_on_windows(
     out = tmp_path / "out.json"
     # Longer than any output, so a write that skipped the truncate would leave stale bytes behind.
     out.write_text("stale\n" * 4000, encoding="utf-8")
-    hardened = _harden(out, "F")
+    hardened = _harden(out, "F", scratch)
     sibling = tmp_path / "fresh.json"
     sibling.write_text("x\n", encoding="utf-8")
     # Control: the hardening really differs from what a new file in this folder gets.
@@ -595,7 +616,7 @@ def test_out_through_a_second_hard_link_keeps_the_hardened_access_list_on_window
     other.write_text("stale\n", encoding="utf-8")
     out = tmp_path / "out.json"
     os.link(other, out)
-    hardened = _harden(out, "F")
+    hardened = _harden(out, "F", scratch)
     assert os.stat(out).st_nlink == 2  # control: the target really has a second link
     assert _write_out(command, tmp_path, monkeypatch, out) == 0
     assert _sddl_of(out, scratch) == hardened
@@ -623,7 +644,7 @@ def test_out_through_a_symlink_keeps_the_hardened_target_on_windows(
     scratch = tmp_path / "acl"
     target = tmp_path / "hardened.json"
     target.write_text("stale\n", encoding="utf-8")
-    hardened = _harden(target, "F")
+    hardened = _harden(target, "F", scratch)
     out = tmp_path / "out.json"
     _symlink_or_skip(out, target)
     assert _write_out(command, tmp_path, monkeypatch, out) == 0
@@ -656,7 +677,7 @@ def test_out_refuses_a_target_hardened_against_this_account_writing_on_windows(
         os.link(other, out)
     else:
         out.write_text("untouched\n", encoding="utf-8")
-    hardened = _harden(out, "R")  # and checks this process really may not write it
+    hardened = _harden(out, "R", scratch)  # and checks this process really may not write it
     # A str, since Path itself would drop the separator before the CLI saw it.
     named = str(out) + os.sep if name == "trailing-separator" else str(out)
     assert _write_out(command, tmp_path, monkeypatch, named) == 1
@@ -703,7 +724,7 @@ def test_out_that_appears_after_the_check_is_written_in_place_on_windows(
     scratch = tmp_path / "acl"
     out = tmp_path / "out.json"
     out.write_text("stale\n", encoding="utf-8")
-    hardened = _harden(out, "F")
+    hardened = _harden(out, "F", scratch)
     sibling = tmp_path / "fresh.json"
     sibling.write_text("x\n", encoding="utf-8")
     # Control: a file renamed into this folder would get a different list, so a replace fails this.
@@ -732,7 +753,7 @@ def test_out_through_a_dangling_symlink_creates_its_target_on_windows(tmp_path: 
 @_WINDOWS_ACLS
 @pytest.mark.parametrize("grant", ["F", "R"])
 def test_compare_out_replaces_a_hardened_target_on_windows(
-    grant: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    grant: Literal["F", "R"], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # compare replaced an existing --out on main, so the report takes the folder's access list
     # rather than the old file's, even one that denied this account writing. It still does
@@ -740,7 +761,7 @@ def test_compare_out_replaces_a_hardened_target_on_windows(
     scratch = tmp_path / "acl"
     out = tmp_path / "out.json"
     out.write_text("stale\n", encoding="utf-8")
-    hardened = _harden(out, grant)
+    hardened = _harden(out, grant, scratch)
     sibling = tmp_path / "fresh.json"
     sibling.write_text("x\n", encoding="utf-8")
     folders = _sddl_of(sibling, scratch)
