@@ -443,7 +443,8 @@ class _Section(_InputHidingModel):
         return data
 
 
-#: Env var that explicitly permits MITM-able TLS overrides for a trusted-network dev/test bind.
+#: Env var that explicitly permits MITM-able TLS overrides for a trusted-network dev/test bind,
+#: honoured only on an instance at ``[security].enforcement = warn``.
 INSECURE_TLS_ESCAPE_ENV = "MEFOR_ALLOW_INSECURE_TLS"
 
 
@@ -485,7 +486,8 @@ def hop_insecure_escape_downgrades(*, enforcing: bool) -> bool:
 
 def weakened_tls_escape_permitted(posture: HopPosture | None) -> bool:
     """Whether ``MEFOR_ALLOW_INSECURE_TLS`` may permit a weakened / verify-off TLS hop under ``posture``,
-    CLAMPED so an enforcing PHI hop is NEVER relaxed (#200, ADR 0092 decision 2).
+    CLAMPED so an enforcing hop is NEVER relaxed (#200, ADR 0092 decision 2): only when ``posture``
+    is known and the instance is at ``[security].enforcement = warn``.
 
     The **weakened-TLS / cleartext-escape** cells route their global-escape check through
     here so the blunt escape can no longer silence an **enforcing** refusal (matching the
@@ -499,7 +501,8 @@ def weakened_tls_escape_permitted(posture: HopPosture | None) -> bool:
     :func:`~messagefoundry.config.tls_policy.current_hop_posture` (in-gate transport cells, via
     :func:`weakened_tls_escape_permitted_here`) or an explicitly-threaded posture (the store hop and the
     out-of-gate #329 cells, whose construction never stamps the contextvar). Semantics: the escape must
-    be set, AND a posture must be known, AND it must not be enforcing.
+    be set, AND a posture must be known, AND it must not be enforcing. For a known posture this is
+    :func:`hop_insecure_escape_downgrades`, which it calls rather than repeats (vault BACKLOG #3753).
 
     **``None`` FAILS CLOSED (vault BACKLOG #2354).** No posture means the escape is NOT permitted.
     CORRECTED: this read *"``None`` (a backup utility / embedding / test outside the construction gate)
@@ -512,7 +515,7 @@ def weakened_tls_escape_permitted(posture: HopPosture | None) -> bool:
     The clamp used to require an enforcing **PHI** hop. Every instance carries patient data now
     (BACKLOG #1279), so the second conjunct could not vary and is gone: under ``enforce`` the blunt
     escape is inert, full stop."""
-    return insecure_tls_allowed() and posture is not None and not posture.enforcing
+    return posture is not None and hop_insecure_escape_downgrades(enforcing=posture.enforcing)
 
 
 def weakened_tls_escape_permitted_here() -> bool:
@@ -563,11 +566,12 @@ def insecure_config_source_escape_permitted(environ: Mapping[str, str] | None = 
     so it never does under ``[security].enforcement = enforce`` (vault BACKLOG #2599).
 
     The escape is honoured only when the SAME environment also carries
-    ``MEFOR_SECURITY_ENFORCEMENT=warn``. Under ``enforce`` it is inert, as ``MEFOR_ALLOW_INSECURE_TLS``
-    is (:func:`weakened_tls_escape_permitted`): a safe source loads, an unsafe one is refused, and the
-    refusal names the variable. It used to be honoured at any dial, so one variable in the service
-    environment would have turned off the check that keeps writable Python from running as the service
-    account, and nothing would have reported it.
+    ``MEFOR_SECURITY_ENFORCEMENT=warn``. Under ``enforce`` it is inert: a safe source loads, an unsafe
+    one is refused, and the refusal names the variable. It used to be honoured at any dial, so one
+    variable in the service environment would have turned off the check that keeps writable Python
+    from running as the service account, and nothing would have reported it. The insecure-TLS escape
+    ``MEFOR_ALLOW_INSECURE_TLS`` has its own clamp, honoured only on an instance at
+    ``[security].enforcement = warn`` (:func:`weakened_tls_escape_permitted`).
 
     **Why the dial is read from the environment and not from loaded settings.** The check runs inside
     ``load_config``, in every process that executes config: ``serve``, a reload, the sandbox worker's
@@ -7138,7 +7142,8 @@ class ServiceSettings(_InputHidingModel):
         """Under ``[security].enforcement = enforce``, ``[auth].ad_allow_insecure_ldap`` is inert, so a
         plain ``ldap://`` AD bind is refused (vault BACKLOG #2354).
 
-        The ``MEFOR_ALLOW_INSECURE_TLS`` escape is clamped this way (ADR 0092 decision 2, and
+        The ``MEFOR_ALLOW_INSECURE_TLS`` escape is clamped this way, honoured only at
+        ``[security].enforcement = warn`` (ADR 0092 decision 2, and
         ``weakened_tls_escape_permitted``). This one was honoured at any dial, so on a first deployment
         at the shipped ``enforce`` it would have sent the service-account and user passwords over a
         cleartext SIMPLE bind. The dial and the bind live in different sections, so the check lives
@@ -7623,8 +7628,9 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
 
     At least these names are spared:
 
-    * one that names no modelled section either way (``MEFOR_ALLOW_INSECURE_TLS``, a harness
-      variable, another tool's). So a typo in the SECTION part of a name is not refused.
+    * one that names no modelled section either way (``MEFOR_ALLOW_INSECURE_TLS``, the escape
+      honoured only at ``[security].enforcement = warn``; a harness variable; another tool's).
+      So a typo in the SECTION part of a name is not refused.
       :func:`_unread_env_notes` writes a note, which :func:`load_settings` logs as a WARNING,
       for at least some of those, and the rest are dropped with no message;
     * one with no key part, which gets the same note when it is a section's name;
