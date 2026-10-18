@@ -198,6 +198,7 @@ from messagefoundry.store.store import (
     AdMap,
     AdMapChange,
     AdMapSql,
+    AdminGrant,
     AdminRemoval,
     AlertInstance,
     AlertSummary,
@@ -270,6 +271,7 @@ from messagefoundry.store.store import (
     existing_roles_only,
     federated_bind,
     federated_unbind,
+    first_admin_grant,
     first_sealed_approval,
     full_authentication_clear,
     if_applied,
@@ -381,6 +383,13 @@ _LOCK_CLASS_ADMIN_GUARD = 5
 _LOCK_CLASS_UPLOAD_QUOTA = 6
 _AUDIT_LOCK = "mefor_audit_chain"
 _ADMIN_GUARD_LOCK = "mefor_last_admin"
+#: The ``$n`` twin of the SQLite store's ``_SQL_ADMIN_GUARD_HOLDERS`` (BACKLOG #2592), read by
+#: ``remove_unless_last_admin`` and the first-administrator grant (BACKLOG #3078).
+_PG_SQL_ADMIN_GUARD_HOLDERS: Final = (
+    "SELECT u.id, CASE WHEN u.id = $1 THEN 1 ELSE 0 END AS is_target"
+    " FROM users u JOIN user_roles r ON r.user_id = u.id"
+    " WHERE r.role_id = $2 AND NOT u.disabled"
+)
 
 
 def _audit_write_probe(table: str, privilege: str) -> str:
@@ -9242,11 +9251,8 @@ class PostgresStore:
             if change.takes_role(admin_role_id, role_ids):
                 # Only a change that can empty the set queues on the lock.
                 await self._advisory_lock(conn, _LOCK_CLASS_ADMIN_GUARD, _ADMIN_GUARD_LOCK)
-                # The ``$n`` twin of the SQLite store's _SQL_ADMIN_GUARD_HOLDERS (BACKLOG #2592).
                 rows = await conn.fetch(
-                    "SELECT u.id, CASE WHEN u.id = $1 THEN 1 ELSE 0 END AS is_target"
-                    " FROM users u JOIN user_roles r ON r.user_id = u.id"
-                    " WHERE r.role_id = $2 AND NOT u.disabled",
+                    _PG_SQL_ADMIN_GUARD_HOLDERS,
                     user_id,
                     admin_role_id,
                 )
@@ -9272,6 +9278,45 @@ class PostgresStore:
             else:
                 assert_never(change)
         return True
+
+    async def grant_first_admin_unless_admin_exists(
+        self,
+        user_id: str,
+        *,
+        admin_role_id: str,
+        expected_password_hash: str,
+        expected_totp_secret_cell: str | None,
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> AdminGrant:
+        """The first-administrator guard and its grant in one transaction (BACKLOG #3078); see
+        ``AuthStore``. It queues on the last-administrator guard's advisory lock, so two grants, or
+        a grant and a removal, never both read before either writes."""
+        now = time.time() if now is None else now
+        change = first_admin_grant(
+            admin_role_id,
+            expected_password_hash=expected_password_hash,
+            expected_totp_secret_cell=expected_totp_secret_cell,
+            assigned_by=assigned_by,
+            now=now,
+        )
+        async with self._timed_acquire() as conn, conn.transaction():
+            await self._advisory_lock(conn, _LOCK_CLASS_ADMIN_GUARD, _ADMIN_GUARD_LOCK)
+            rows = await conn.fetch(
+                _PG_SQL_ADMIN_GUARD_HOLDERS,
+                user_id,
+                admin_role_id,
+            )
+            _, others = await admin_guard_counts(
+                [(str(r["id"]), bool(r["is_target"])) for r in rows],
+                self._row_sealer,
+                lambda holder: self._read_user_record(conn, holder, lock=False),
+            )
+            if others:
+                return AdminGrant.ADMIN_EXISTS  # nothing written; the commit releases the lock
+            if await self._write_user(conn, user_id, change) is None:
+                return AdminGrant.ACCOUNT_CHANGED
+        return AdminGrant.GRANTED
 
     @staticmethod
     async def _delete_user_rows(conn: Any, user_id: str) -> None:

@@ -4,9 +4,9 @@
 
 **WHAT IS AND IS NOT EXERCISED HERE, stated so a green is not over-read.** There is no Active
 Directory in CI and there never has been. ``_find_user`` itself runs -- it takes a connection, so a
-double can drive it, and the ``pragma: no cover - needs real AD`` markers in ``auth/ldap.py`` sit on
-the ``LDAPException`` handlers around it rather than on the lookup. What no test here can reach is
-the bind and the wire: **this is not evidence that a real domain controller returns what the double
+double can drive it. ``auth/ldap.py`` carries no ``pragma: no cover`` marker on the lookup or on
+the ``LDAPException`` handlers around it, which ``tests/test_ldap_error_mapping.py`` drives. What
+no test here can reach is the bind and the wire: **this is not evidence that a real domain controller returns what the double
 returns**, only that the engine asks for the attribute and carries what it gets. The recycle itself
 is driven at the SERVICE layer, where the store is real (SQLite, in memory) and the decision under
 test lives.
@@ -1143,6 +1143,10 @@ class _RecordingConn:
         self.entries: list[_FakeEntry] = [entry] if entry is not None else []
         self.searches: list[dict[str, Any]] = []
         self.result: dict[str, Any] | None = None  # no referral
+        self.unbinds = 0
+
+    def unbind(self) -> None:
+        self.unbinds += 1
 
     def __enter__(self) -> _RecordingConn:
         return self

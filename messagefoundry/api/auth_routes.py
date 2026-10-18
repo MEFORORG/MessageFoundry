@@ -91,6 +91,7 @@ from messagefoundry.api.security import (
     recheck_standing,
     record_repeated_credential,
     require,
+    require_paced,
     require_reauth_only_action,
     require_step_up,
     require_step_up_action,
@@ -703,14 +704,19 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         body: NotifyEmailRequest,
         request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require()),
+        identity: Identity = Depends(require_paced()),
     ) -> SimpleMessage:
         """Set the caller's own notification address where it has none (BACKLOG #1139, ASVS 6.3.7).
 
         The way out of the confinement ``require()`` applies to ``must_set_notify_email``. It fills a
         missing address only: an account that has one gets 409, and an administrator changes it,
         which notifies the old address. ``require()`` leaves this route under the factor gate, so a
-        session still owing its second factor cannot reach it."""
+        session still owing its second factor cannot reach it.
+
+        ``require_paced`` rather than the base gate (vault BACKLOG #3052 item 6), so it matches its
+        console twin ``POST /ui/account/notify-address``: a request from a host the session has not
+        verified from is refused with the step-up answer, and the write is paced. ``POST /me/reauth``
+        stays open to a confined session, so the refusal has a way out."""
         try:
             await service.fill_own_notify_email(identity, body.email, client=client_ip(request))
         except NotifyEmailAlreadySet as exc:
