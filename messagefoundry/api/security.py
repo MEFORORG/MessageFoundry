@@ -1001,8 +1001,9 @@ def _stamp_no_store(
 class AuthenticatedBeforeBodyRoute(APIRoute):
     """Refuse a caller the gate would refuse for having no identity BEFORE the body is read.
 
-    ``create_app`` sets this as the router's route class, so every route registered on the app
-    itself is one, and a new gated route is covered with nothing to remember. Three kinds of
+    ``create_app`` sets this as the router's route class, so a route registered on the app itself
+    is one unless it names another class (listed below), and a new gated route is covered with
+    nothing to remember. Three kinds of
     route get FastAPI's own handler back unchanged: one that declares no body, where FastAPI
     already runs the gate before it reads anything; one with no gate; and one whose gate is not
     this module's (the web console's ``require_ui*``, whose routes declare no body).
@@ -1018,9 +1019,13 @@ class AuthenticatedBeforeBodyRoute(APIRoute):
       override set on the app is not seen for it. The engine includes no router (vault BACKLOG
       #2739). ``tests/test_auth_before_body.py`` fails when an included route that takes a body is
       gated or undeclared and its body would be parsed before its refusal (#2956). An included
-      router whose route class is this one does refuse early on the route's own gate, but not
-      on an undeclared route: the app-level refusal is not among that route's own dependencies,
-      so its body is read first and one that does not parse gets 422 before the refusal.
+      router whose route class is this one does refuse early on the route's own gate. An
+      undeclared route on it is not refused early unless the router carries
+      ``refuse_undeclared_route`` itself, because the app-level refusal is not among the route's
+      own dependencies. FastAPI then decodes the body first, so a JSON body it cannot decode gets
+      at least 422 or 400 before the refusal; a body it decodes, or does not try to, gets the 403.
+    * A route registered on the app with another route class, such as one added with
+      ``route_class_override`` or appended to ``app.router.routes``. It is not this class.
     * A gate nested inside another dependency. Only a route's top-level dependencies are read,
       which is also all ``scripts/security/route_gates.py`` reads.
     * A dependency that sits ahead of the gate and carries no mark. The gate's refusal answers

@@ -196,8 +196,9 @@ the route takes a body.
   case can also write an `auth.temp_password_expired` audit row. `AuthService.identity_for_token`
   is the full list. A caller this lookup refuses gets 401 before the body is read.
 - A route with no gate that is declared public is not touched. `POST /auth/login` has to parse a
-  body from a caller with no session. A route registered on the app with no gate and no
-  declaration is refused before its body is read, as described below. A gated route that declares no body is not touched either, because FastAPI already
+  body from a caller with no session. A route with no gate and no declaration, built by the
+  app's route class and registered on the app, is refused before its body is read, as described
+  below. A gated route that declares no body is not touched either, because FastAPI already
   runs its gate first. That includes the web console's `/ui` routes, which read their forms
   inside the handler.
 
@@ -231,12 +232,11 @@ reports the count as `undeclared_route_refusals`, under `monitoring:read`, keyed
 (vault BACKLOG #2954). It is the count of the process that answered; under engine shards each
 process has its own. `undeclared_route_refusal_counts` in `messagefoundry/api/security.py` says
 what each key means, including `<unknown>`, and what the walk misses. The count is not persisted,
-and a restart loses it. On a body-taking route registered on the app itself, the refusal comes
-before the body is read. A route reached through `include_router` is not covered, even on a
-router built with the app's route class: FastAPI reads its body first, so a body that does not
-parse gets **422** before the refusal, and only a body that parses gets the 403. The
-`AuthenticatedBeforeBodyRoute` docstring lists at least the shapes the early check misses. The check asks only that a route declared a gate. It does not check that
-the gate is correct.
+and a restart loses it. On a body-taking route built by the app's route class and registered on
+the app, the refusal comes before the body is read. An undeclared route on an included router,
+even one built with that class, can answer first with the body parser's **422** or **400**: the
+class docstring says when. The check asks only that a route declared a gate. It does not check
+that the gate is correct.
 
 - A route whose gate is nested inside another dependency, or added only by `include_router`, is
   refused. That is the safe side.
